@@ -1,12 +1,18 @@
 package basicvalidation
 
 import (
+	"os"
 	"testing"
 
-	_ "fast-sandbox/test/e2e/support/suiteenv"
-	_ "sigs.k8s.io/e2e-framework/pkg/env"
+	"fast-sandbox/test/e2e/support/suiteenv"
 )
 
-func TestSuiteBootstrapPlaceholder(t *testing.T) {
-	t.Fatal("suite bootstrap not implemented")
+var testSuite = suiteenv.New()
+
+func TestMain(m *testing.M) {
+	os.Exit(testSuite.Env().Run(m))
+}
+
+func TestBasicValidationSuiteBootstrap(t *testing.T) {
+	t.Skip("basicvalidation suite cases are not implemented yet")
 }
