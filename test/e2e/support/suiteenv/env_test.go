@@ -77,6 +77,24 @@ func TestRunCleanupsReturnsFirstError(t *testing.T) {
 	}
 }
 
+func TestAgentImageUsesDefaultWhenUnset(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_AGENT_IMAGE", "")
+	t.Setenv("AGENT_IMAGE", "")
+
+	if got := AgentImage(); got != "fast-sandbox/agent:dev" {
+		t.Fatalf("expected default agent image, got %q", got)
+	}
+}
+
+func TestAgentImagePrefersFastSandboxSpecificEnv(t *testing.T) {
+	t.Setenv("AGENT_IMAGE", "fallback:dev")
+	t.Setenv("FAST_SANDBOX_AGENT_IMAGE", "preferred:dev")
+
+	if got := AgentImage(); got != "preferred:dev" {
+		t.Fatalf("expected FAST_SANDBOX_AGENT_IMAGE to win, got %q", got)
+	}
+}
+
 func containsUppercase(value string) bool {
 	for _, r := range value {
 		if r >= 'A' && r <= 'Z' {

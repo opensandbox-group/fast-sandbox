@@ -55,14 +55,20 @@ func (f *FixtureClient) WaitForSandboxPhase(ctx context.Context, name types.Name
 	for _, phase := range phases {
 		allowed[string(phase)] = struct{}{}
 	}
+	return f.WaitForSandbox(ctx, name, func(sandbox *apiv1alpha1.Sandbox) bool {
+		_, ok := allowed[sandbox.Status.Phase]
+		return ok
+	})
+}
 
+func (f *FixtureClient) WaitForSandbox(ctx context.Context, name types.NamespacedName, predicate func(*apiv1alpha1.Sandbox) bool) (*apiv1alpha1.Sandbox, error) {
 	ticker := time.NewTicker(f.pollInterval)
 	defer ticker.Stop()
 
 	for {
 		sandbox := &apiv1alpha1.Sandbox{}
 		if err := f.client.Get(ctx, name, sandbox); err == nil {
-			if _, ok := allowed[sandbox.Status.Phase]; ok {
+			if predicate(sandbox) {
 				return sandbox, nil
 			}
 		}
@@ -85,6 +91,12 @@ func (f *FixtureClient) EnsureSandboxRemainsUnassigned(ctx context.Context, name
 	for {
 		sandbox := &apiv1alpha1.Sandbox{}
 		if err := f.client.Get(checkCtx, name, sandbox); err != nil {
+			if checkCtx.Err() == context.DeadlineExceeded {
+				return nil
+			}
+			if checkCtx.Err() != nil {
+				return checkCtx.Err()
+			}
 			return err
 		}
 		if sandbox.Status.AssignedPod != "" || sandbox.Status.SandboxID != "" {
