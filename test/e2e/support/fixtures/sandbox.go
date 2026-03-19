@@ -7,6 +7,7 @@ import (
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -109,6 +110,27 @@ func (f *FixtureClient) EnsureSandboxRemainsUnassigned(ctx context.Context, name
 				return nil
 			}
 			return checkCtx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (f *FixtureClient) WaitForSandboxDeleted(ctx context.Context, name types.NamespacedName) error {
+	ticker := time.NewTicker(f.pollInterval)
+	defer ticker.Stop()
+
+	for {
+		sandbox := &apiv1alpha1.Sandbox{}
+		err := f.client.Get(ctx, name, sandbox)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				return nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-ticker.C:
 		}
 	}
