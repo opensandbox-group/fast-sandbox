@@ -141,6 +141,63 @@ func TestResourceSlotCapacity(t *testing.T) {
 	testSuite.Env().Test(t, feature)
 }
 
+func TestAutoScaling(t *testing.T) {
+	suiteenv.SkipUnlessEnabled(t)
+
+	feature := features.New("auto-scaling").
+		WithLabel("suite", "scheduling").
+		WithLabel("tier", "smoke").
+		Assess("pool scales from 1 to 2 pods on demand", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+			k8sClient := testSuite.MustKubeClient(t)
+			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
+
+			namespace := testSuite.AllocateNamespace("autoscale")
+			if err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
+				t.Fatalf("create namespace: %v", err)
+			}
+			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
+
+			pool := createSchedulingPool(namespace, "scale-pool", 1, 2, 1)
+			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
+				t.Fatalf("create sandbox pool: %v", err)
+			}
+
+			poolWaitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+			defer cancel()
+			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for initial agent pod: %v", err)
+			}
+
+			sandbox1 := createSandboxWithPorts(namespace, "sb-scale-1", pool.Name, nil)
+			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox1); err != nil {
+				t.Fatalf("create sandbox 1: %v", err)
+			}
+
+			sandbox2 := createSandboxWithPorts(namespace, "sb-scale-2", pool.Name, nil)
+			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox2); err != nil {
+				t.Fatalf("create sandbox 2: %v", err)
+			}
+
+			scaleCtx, cancelScale := context.WithTimeout(ctx, 120*time.Second)
+			defer cancelScale()
+			if _, err := fixture.WaitForReadyAgentPods(scaleCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 2); err != nil {
+				t.Fatalf("wait for pool to scale to 2 pods: %v", err)
+			}
+
+			assigned1 := waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-scale-1")
+			assigned2 := waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-scale-2")
+
+			if assigned1.Status.AssignedPod == assigned2.Status.AssignedPod {
+				t.Fatalf("both sandboxes on same pod %s, expected different pods", assigned1.Status.AssignedPod)
+			}
+
+			return ctx
+		}).
+		Feature()
+
+	testSuite.Env().Test(t, feature)
+}
+
 func createSchedulingPool(namespace, name string, min, max, maxPerPod int32) *apiv1alpha1.SandboxPool {
 	return &apiv1alpha1.SandboxPool{
 		TypeMeta: metav1.TypeMeta{
