@@ -83,6 +83,64 @@ func TestPortMutualExclusion(t *testing.T) {
 	testSuite.Env().Test(t, feature)
 }
 
+func TestResourceSlotCapacity(t *testing.T) {
+	suiteenv.SkipUnlessEnabled(t)
+
+	feature := features.New("resource-slot-capacity").
+		WithLabel("suite", "scheduling").
+		WithLabel("tier", "smoke").
+		Assess("maxSandboxesPerPod limit enforced correctly", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+			k8sClient := testSuite.MustKubeClient(t)
+			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
+
+			namespace := testSuite.AllocateNamespace("slot")
+			if err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
+				t.Fatalf("create namespace: %v", err)
+			}
+			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
+
+			pool := createSchedulingPool(namespace, "slot-pool", 1, 1, 2)
+			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
+				t.Fatalf("create sandbox pool: %v", err)
+			}
+
+			poolWaitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+			defer cancel()
+			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for ready agent pods: %v", err)
+			}
+
+			sandbox1 := createSandboxWithPorts(namespace, "sb-slot-1", pool.Name, nil)
+			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox1); err != nil {
+				t.Fatalf("create sandbox 1: %v", err)
+			}
+			waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-slot-1")
+
+			sandbox2 := createSandboxWithPorts(namespace, "sb-slot-2", pool.Name, nil)
+			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox2); err != nil {
+				t.Fatalf("create sandbox 2: %v", err)
+			}
+			waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-slot-2")
+
+			sandbox3 := createSandboxWithPorts(namespace, "sb-slot-3", pool.Name, nil)
+			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox3); err != nil {
+				t.Fatalf("create sandbox 3: %v", err)
+			}
+
+			// Verify sandbox 3 remains unassigned due to capacity limit
+			ensureCtx, cancelEnsure := context.WithTimeout(ctx, 30*time.Second)
+			defer cancelEnsure()
+			if err := fixture.EnsureSandboxRemainsUnassigned(ensureCtx, types.NamespacedName{Name: "sb-slot-3", Namespace: namespace}, 10*time.Second); err != nil {
+				t.Fatalf("sandbox 3 should remain unassigned due to capacity limit: %v", err)
+			}
+
+			return ctx
+		}).
+		Feature()
+
+	testSuite.Env().Test(t, feature)
+}
+
 func createSchedulingPool(namespace, name string, min, max, maxPerPod int32) *apiv1alpha1.SandboxPool {
 	return &apiv1alpha1.SandboxPool{
 		TypeMeta: metav1.TypeMeta{
