@@ -26,15 +26,17 @@ Shell 不再承载业务断言。
 
 所有真正的 E2E case 都应放在这里，并使用 Go 编写。这里会逐步切换到 `sigs.k8s.io/e2e-framework` 风格的 suite。
 
-目标 suite 包括：
+当前已迁移的测试套件：
 
-- `basicvalidation`
-- `scheduling`
-- `lifecycle`
-- `janitor`
-- `advanced`
-- `cli`
-- `recovery`
+| Suite | Tests | Description |
+|-------|-------|-------------|
+| `basicvalidation` | 5 | CRD 验证、namespace 隔离、端口验证、环境变量/工作目录 |
+| `lifecycle` | 2 | 基础生命周期、优雅关闭 |
+| `scheduling` | 3 | 端口互斥、资源槽容量、自动扩缩容 |
+| `cleanupjanitor` | 2 | Namespace 感知、Janitor 恢复 |
+| `advancedfeatures` | 1 | Infra 注入验证 |
+| `cliintegration` | 3 | fsb-ctl update/reset/logs 命令测试 |
+| `faultrecovery` | 4 | 自动过期、内存泄漏防护、受控恢复、Pod 存在性检查 |
 
 ### `test/e2e/support/`
 
@@ -52,13 +54,46 @@ Shell 不再承载业务断言。
 
 ## 运行入口
 
-重构完成后的主入口会是：
+### 前置条件
+
+1. **Kubernetes 集群**：需要有可访问的 K8s 集群，并配置好 kubeconfig
+2. **Controller 已部署**：fast-sandbox-controller 需要运行在集群中
+3. **环境变量**：
+   - `FAST_SANDBOX_E2E=1` - 必须，否则测试会跳过
+   - `FAST_SANDBOX_AGENT_IMAGE` 或 `AGENT_IMAGE` - Agent 镜像地址（默认 `fast-sandbox/agent:dev`）
+   - `KUBECONFIG` - kubeconfig 文件路径（可选，默认使用 `~/.kube/config`）
+
+### 运行所有测试
 
 ```bash
-go test ./test/e2e/suites/...
+# 设置环境变量
+export FAST_SANDBOX_E2E=1
+export FAST_SANDBOX_AGENT_IMAGE=fast-sandbox/agent:dev
+
+# 运行所有测试套件
+go test ./test/e2e/suites/... -v
+
+# 运行特定套件
+go test ./test/e2e/suites/basicvalidation/... -v
+go test ./test/e2e/suites/lifecycle/... -v
+go test ./test/e2e/suites/scheduling/... -v
+go test ./test/e2e/suites/cleanupjanitor/... -v
+go test ./test/e2e/suites/advancedfeatures/... -v
+go test ./test/e2e/suites/cliintegration/... -v
+go test ./test/e2e/suites/faultrecovery/... -v
+
+# 运行单个测试
+go test ./test/e2e/suites/basicvalidation/... -v -run TestCRDValidation
 ```
 
-以及：
+### 运行特定标签的测试
+
+```bash
+# 只运行 smoke 级别的测试
+go test ./test/e2e/suites/... -v --label-filter=tier=smoke
+```
+
+### Makefile 目标（如果已配置）
 
 ```bash
 make e2e-smoke
