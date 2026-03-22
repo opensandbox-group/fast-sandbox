@@ -123,10 +123,10 @@ test-e2e: setup-e2e
 	@echo ""
 	@echo "=== Running all E2E tests ==="
 	@FAST_SANDBOX_E2E=1 FAST_SANDBOX_AGENT_IMAGE=$(AGENT_IMAGE) \
-		$(GO) test ./test/e2e/suites/... -v
+		$(GO) test ./test/e2e/suites/... -v -count=1
 
 # E2E test - run specific suite (assumes environment is already setup)
 test-e2e-basicvalidation test-e2e-lifecycle test-e2e-scheduling test-e2e-cleanupjanitor test-e2e-advancedfeatures test-e2e-cliintegration test-e2e-faultrecovery:
 	@echo "=== Running E2E test: $@ ==="
 	@FAST_SANDBOX_E2E=1 FAST_SANDBOX_AGENT_IMAGE=$(AGENT_IMAGE) \
-		$(GO) test ./test/e2e/suites/$(subst test-e2e-,,$@)/... -v
+		$(GO) test ./test/e2e/suites/$(subst test-e2e-,,$@)/... -v -count=1
