@@ -38,18 +38,38 @@ type Runtime interface {
 type RuntimeType string
 
 const (
-	RuntimeTypeContainerd RuntimeType = "container"
-
-	RuntimeTypeGVisor RuntimeType = "gvisor"
+	RuntimeTypeContainer RuntimeType = "container"
+	RuntimeTypeGVisor    RuntimeType = "gvisor"
+	RuntimeTypeKataQemu  RuntimeType = "kata-qemu"
+	RuntimeTypeKataFc    RuntimeType = "kata-fc"
+	RuntimeTypeKataClh   RuntimeType = "kata-clh"
 )
 
+// defaultRuntimeHandlers maps RuntimeType to containerd runtime handler.
+var defaultRuntimeHandlers = map[RuntimeType]string{
+	RuntimeTypeContainer: "io.containerd.runc.v2",
+	RuntimeTypeGVisor:    "io.containerd.runsc.v1",
+	RuntimeTypeKataQemu:  "io.containerd.kata-qemu.v2",
+	RuntimeTypeKataFc:    "io.containerd.kata-fc.v2",
+	RuntimeTypeKataClh:   "io.containerd.kata-clh.v2",
+}
+
+// GetRuntimeHandler returns the containerd runtime handler for the given type.
+func GetRuntimeHandler(rt RuntimeType) string {
+	if handler, ok := defaultRuntimeHandlers[rt]; ok {
+		return handler
+	}
+	return defaultRuntimeHandlers[RuntimeTypeContainer]
+}
+
 func NewRuntime(ctx context.Context, runtimeType RuntimeType, socketPath string) (Runtime, error) {
+	handler := GetRuntimeHandler(runtimeType)
+
 	var rt Runtime
 	switch runtimeType {
-	case RuntimeTypeContainerd:
-		rt = newContainerdRuntime("io.containerd.runc.v2")
-	case RuntimeTypeGVisor:
-		rt = newContainerdRuntime("io.containerd.runsc.v1")
+	case RuntimeTypeContainer, RuntimeTypeGVisor,
+		RuntimeTypeKataQemu, RuntimeTypeKataFc, RuntimeTypeKataClh:
+		rt = newContainerdRuntime(handler)
 	default:
 		return nil, ErrUnsupportedRuntime
 	}
