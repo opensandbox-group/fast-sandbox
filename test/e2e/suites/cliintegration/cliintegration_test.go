@@ -80,7 +80,7 @@ func startControllerPortForward(ctx context.Context, t *testing.T, namespace str
 	// Use deployment instead of pod for more reliability
 	args = []string{
 		"port-forward",
-		fmt.Sprintf("deployment/fast-sandbox-controller-manager"),
+		fmt.Sprintf("deployment/fast-sandbox-controller"),
 		fmt.Sprintf("%d:9090", localPort),
 		"-n", namespace,
 	}

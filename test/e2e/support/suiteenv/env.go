@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	DefaultControllerNamespace = "fast-sandbox-system"
+	DefaultControllerNamespace = "default"
 	defaultNamespacePrefix     = "fsb-e2e"
 	maxNamespaceLength         = 63
 	defaultAgentImage          = "fast-sandbox/agent:dev"
