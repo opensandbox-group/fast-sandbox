@@ -7,12 +7,19 @@ import (
 )
 
 // RuntimeType defines the isolation level for sandboxes in this pool.
-
 type RuntimeType string
 
 const (
+	// RuntimeContainer is the default runc runtime (process-level isolation).
 	RuntimeContainer RuntimeType = "container"
-	RuntimeGVisor    RuntimeType = "gvisor"
+	// RuntimeGVisor uses gVisor with runsc (user-space kernel).
+	RuntimeGVisor RuntimeType = "gvisor"
+	// RuntimeKataQemu uses Kata Containers with QEMU hypervisor.
+	RuntimeKataQemu RuntimeType = "kata-qemu"
+	// RuntimeKataFc uses Kata Containers with Firecracker microVM.
+	RuntimeKataFc RuntimeType = "kata-fc"
+	// RuntimeKataClh uses Kata Containers with Cloud Hypervisor.
+	RuntimeKataClh RuntimeType = "kata-clh"
 )
 
 // SandboxPoolSpec defines the desired state of SandboxPool.
@@ -22,7 +29,19 @@ type SandboxPoolSpec struct {
 
 	MaxSandboxesPerPod int32 `json:"maxSandboxesPerPod,omitempty"`
 
+	// RuntimeType specifies the secure runtime type for this pool.
+	// Default: "container" (standard runc)
+	// +kubebuilder:default=container
 	RuntimeType RuntimeType `json:"runtimeType,omitempty"`
+
+	// RuntimeClassName specifies the Kubernetes RuntimeClass to use for validation.
+	// If not set, defaults to the string representation of RuntimeType.
+	// Ignored when RuntimeType is "container".
+	RuntimeClassName string `json:"runtimeClassName,omitempty"`
+
+	// ContainerdRuntimeHandler overrides the containerd runtime handler.
+	// If not set, defaults based on RuntimeType.
+	ContainerdRuntimeHandler string `json:"containerdRuntimeHandler,omitempty"`
 
 	AgentTemplate corev1.PodTemplateSpec `json:"agentTemplate"`
 }
@@ -45,6 +64,17 @@ type SandboxPoolStatus struct {
 	BusyAgents         int32              `json:"busyAgents,omitempty"`
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`
 }
+
+// Pool condition types
+const (
+	PoolConditionRuntimeReady = "RuntimeReady"
+)
+
+// Pool condition reasons
+const (
+	ReasonRuntimeAvailable   = "RuntimeAvailable"
+	ReasonRuntimeUnavailable = "RuntimeUnavailable"
+)
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
