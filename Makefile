@@ -15,7 +15,7 @@ FAST_SANDBOX_E2E ?= 1
 GO ?= go
 GOFLAGS ?= -gcflags="all=-N -l"
 
-.PHONY: all build build-controller build-agent build-janitor build-agent-linux build-controller-linux build-janitor-linux test test-e2e tidy e2e docker-agent docker-controller docker-janitor kind-load-agent kind-load-controller kind-load-janitor help
+.PHONY: all build build-controller build-agent build-janitor build-agent-linux build-controller-linux build-janitor-linux test test-e2e setup-e2e tidy e2e docker-agent docker-controller docker-janitor kind-load-agent kind-load-controller kind-load-janitor help
 
 all: build
 
@@ -26,20 +26,27 @@ help:
 	@echo "  make build-controller-linux - build controller binary for linux/amd64"
 	@echo "  make build-janitor-linux    - build janitor binary for linux/amd64"
 	@echo "  make test                   - run unit tests"
-	@echo "  make test-e2e               - run e2e tests (fresh kind cluster)"
-	@echo "  make test-e2e-<suite>       - run specific e2e suite"
 	@echo "  make docker-agent           - build agent image"
 	@echo "  make docker-controller      - build controller image"
 	@echo "  make docker-janitor         - build janitor image"
+	@echo ""
+	@echo "E2E targets:"
+	@echo "  make setup-e2e              - setup fresh kind cluster + deploy components"
+	@echo "  make test-e2e               - full e2e: setup + run all tests"
+	@echo "  make test-e2e-<suite>       - run specific suite (env must be ready)"
 	@echo ""
 	@echo "E2E test suites:"
 	@echo "  basicvalidation, lifecycle, scheduling, cleanupjanitor"
 	@echo "  advancedfeatures, cliintegration, faultrecovery"
 	@echo ""
 	@echo "E2E examples:"
-	@echo "  make test-e2e                          # run all tests"
-	@echo "  make test-e2e-basicvalidation          # run basicvalidation suite"
-	@echo "  E2E_SUITE=scheduling make test-e2e     # run scheduling suite"
+	@echo "  # Full verification (fresh env + all tests)"
+	@echo "  make test-e2e"
+	@echo ""
+	@echo "  # Quick iteration (setup once, run multiple times)"
+	@echo "  make setup-e2e"
+	@echo "  make test-e2e-basicvalidation"
+	@echo "  make test-e2e-lifecycle"
 
 build: build-controller build-agent build-janitor build-fsb-ctl
 
@@ -96,11 +103,10 @@ kind-load-controller: docker-controller
 kind-load-janitor: docker-janitor
 	kind load docker-image $(JANITOR_IMAGE) --name fast-sandbox
 
-# E2E test - full test suite with fresh kind cluster
-test-e2e:
-	@echo "=== Running E2E tests with fresh kind cluster ==="
+# E2E test - setup environment (fresh kind cluster with all components)
+setup-e2e:
+	@echo "=== Setting up E2E environment ==="
 	@echo "Cluster name: $(KIND_CLUSTER_NAME)"
-	@echo "E2E suite: $(or $(E2E_SUITE),all)"
 	@echo ""
 	@if kind get clusters 2>/dev/null | grep -q "^$(KIND_CLUSTER_NAME)$$"; then \
 		echo "Deleting existing kind cluster '$(KIND_CLUSTER_NAME)'..."; \
@@ -109,15 +115,18 @@ test-e2e:
 	@echo "Creating fresh kind cluster and deploying components..."
 	@FORCE_RECREATE_CLUSTER=true ./test/e2e/setup-kind.sh
 	@echo ""
-	@echo "Running E2E tests..."
-	@if [ -n "$(E2E_SUITE)" ]; then \
-		FAST_SANDBOX_E2E=1 FAST_SANDBOX_AGENT_IMAGE=$(AGENT_IMAGE) \
-		$(GO) test ./test/e2e/suites/$(E2E_SUITE)/... -v; \
-	else \
-		FAST_SANDBOX_E2E=1 FAST_SANDBOX_AGENT_IMAGE=$(AGENT_IMAGE) \
-		$(GO) test ./test/e2e/suites/... -v; \
-	fi
+	@echo "=== E2E environment ready ==="
+	@echo "Run tests with: make test-e2e-<suite>"
 
-# E2E test for specific suite (shorthand)
+# E2E test - full test with fresh environment (setup + test)
+test-e2e: setup-e2e
+	@echo ""
+	@echo "=== Running all E2E tests ==="
+	@FAST_SANDBOX_E2E=1 FAST_SANDBOX_AGENT_IMAGE=$(AGENT_IMAGE) \
+		$(GO) test ./test/e2e/suites/... -v
+
+# E2E test - run specific suite (assumes environment is already setup)
 test-e2e-basicvalidation test-e2e-lifecycle test-e2e-scheduling test-e2e-cleanupjanitor test-e2e-advancedfeatures test-e2e-cliintegration test-e2e-faultrecovery:
-	@$(MAKE) test-e2e E2E_SUITE=$(subst test-e2e-,,$@)
+	@echo "=== Running E2E test: $@ ==="
+	@FAST_SANDBOX_E2E=1 FAST_SANDBOX_AGENT_IMAGE=$(AGENT_IMAGE) \
+		$(GO) test ./test/e2e/suites/$(subst test-e2e-,,$@)/... -v
