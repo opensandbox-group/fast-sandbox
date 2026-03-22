@@ -1,124 +1,123 @@
 # Fast Sandbox E2E Tests
 
-端到端测试套件，验证 Fast Sandbox 的核心功能和用户场景。
+`test/e2e` 正在重构为标准的 Kubernetes 风格 E2E 结构。
 
-## 测试套件结构
+目标边界很明确：
 
-### 01-basic-validation (基础验证)
+- `hack/` 只负责环境准备
+- `suites/` 是唯一的可执行 E2E 入口
+- `support/` 放 fast-sandbox 领域的 E2E 支撑代码
+- `legacy/` 只保留旧 shell case 作为参考
 
-测试 CRD API 的基础校验和基本功能。
+## 目录职责
 
-- `crd-validation.sh` - API 字段校验（必填字段、空值、枚举）
-- `port-validation.sh` - 端口范围校验（0、65536 越界）
-- `namespace-isolation.sh` - 命名空间隔离（同 NS 调度成功，跨 NS 拒绝）
-- `env-workingdir.sh` - 环境变量和工作目录
+### `test/e2e/hack/`
 
-### 02-scheduling-resources (调度与资源)
+Shell 脚本只做这些事：
 
-测试 Sandbox 调度逻辑和资源分配。
+- kind 集群创建和销毁
+- 镜像构建和加载
+- controller / agent / janitor 安装
+- webhook 或 chaos 辅助环境准备
 
-- `resource-slot.sh` - 容量限制（maxSandboxesPerPod=2，第3个被拒绝）
-- `port-mutual-exclusion.sh` - 端口互斥调度（相同端口分配到不同 Pod）
-- `autoscaling.sh` - Pool 自动扩缩容（poolMin=1→2）
+Shell 不再承载业务断言。
 
-### 03-lifecycle (生命周期)
+### `test/e2e/suites/`
 
-测试 Sandbox 完整生命周期，包括用户最关心的创建-删除-重建场景。
+所有真正的 E2E case 都应放在这里，并使用 Go 编写。这里会逐步切换到 `sigs.k8s.io/e2e-framework` 风格的 suite。
 
-- `basic-lifecycle.sh` - **核心测试**：创建→删除→同名重建完整流程（含循环测试）
-- `graceful-shutdown.sh` - 优雅关闭流程（SIGTERM → Terminating → 删除）
+当前已迁移的测试套件：
 
-### 04-cleanup-janitor (Janitor 与清理)
+| Suite | Tests | Description |
+|-------|-------|-------------|
+| `basicvalidation` | 5 | CRD 验证、namespace 隔离、端口验证、环境变量/工作目录 |
+| `lifecycle` | 2 | 基础生命周期、优雅关闭 |
+| `scheduling` | 3 | 端口互斥、资源槽容量、自动扩缩容 |
+| `cleanupjanitor` | 2 | Namespace 感知、Janitor 恢复 |
+| `advancedfeatures` | 1 | Infra 注入验证 |
+| `cliintegration` | 3 | fsb-ctl update/reset/logs 命令测试 |
+| `faultrecovery` | 4 | 自动过期、内存泄漏防护、受控恢复、Pod 存在性检查 |
 
-测试过期清理和 Janitor 功能。
+### `test/e2e/support/`
 
-- `namespace-aware.sh` - Janitor 正确处理非 default namespace
-- `janitor-recovery.sh` - Janitor 孤儿容器清理
+这里放仓库专用的 E2E 支撑能力，例如：
 
-### 05-advanced-features (高级特性)
+- `SandboxPool` / `Sandbox` fixture
+- CLI 调用封装
+- port-forward 管理
+- diagnostics 转储
+- suite 级环境 bootstrap
 
-测试高级功能和特性。
+### 旧 shell 目录
 
-- `fast-path.sh` - Fast/Strong 一致性模式、端口隔离、孤儿清理
-- `goroutine-leak.sh` - Controller Goroutine 泄漏防护
-- `snapshot-cleanup.sh` - 快照清理和同名重建（CLI 场景）
+当前 `01-basic-validation` 到 `07-fault-recovery` 仍然存在，但它们会被逐步降级为 legacy source。新的行为实现不应该继续写进这些目录。
 
-### 06-cli-integration (CLI 集成)
+## 运行入口
 
-测试 CLI 工具与系统集成。
+### 前置条件
 
-- `cli-cache.sh` - CLI 缓存机制
-- `cli-logs.sh` - CLI 日志功能
-- `update-reset.sh` - 更新和重置功能
+1. **Kubernetes 集群**：需要有可访问的 K8s 集群，并配置好 kubeconfig
+2. **Controller 已部署**：fast-sandbox-controller 需要运行在集群中
+3. **环境变量**：
+   - `FAST_SANDBOX_E2E=1` - 必须，否则测试会跳过
+   - `FAST_SANDBOX_AGENT_IMAGE` 或 `AGENT_IMAGE` - Agent 镜像地址（默认 `fast-sandbox/agent:dev`）
+   - `KUBECONFIG` - kubeconfig 文件路径（可选，默认使用 `~/.kube/config`）
 
-### 07-fault-recovery (故障与恢复)
-
-测试故障场景和恢复机制。
-
-- `controlled-recovery.sh` - AutoRecreate 和 ResetRevision
-- `auto-expiry.sh` - 自动过期（expireTime 触发）
-- `memory-leak.sh` - Registry 内存泄漏防护
-
-## 运行测试
-
-### 运行所有测试套件
-
-```bash
-cd test/e2e
-./common.sh
-```
-
-### 运行特定套件
+### 运行所有测试
 
 ```bash
-cd test/e2e/01-basic-validation
-./test.sh
+# 设置环境变量
+export FAST_SANDBOX_E2E=1
+export FAST_SANDBOX_AGENT_IMAGE=fast-sandbox/agent:dev
+
+# 运行所有测试套件
+go test ./test/e2e/suites/... -v
+
+# 运行特定套件
+go test ./test/e2e/suites/basicvalidation/... -v
+go test ./test/e2e/suites/lifecycle/... -v
+go test ./test/e2e/suites/scheduling/... -v
+go test ./test/e2e/suites/cleanupjanitor/... -v
+go test ./test/e2e/suites/advancedfeatures/... -v
+go test ./test/e2e/suites/cliintegration/... -v
+go test ./test/e2e/suites/faultrecovery/... -v
+
+# 运行单个测试
+go test ./test/e2e/suites/basicvalidation/... -v -run TestCRDValidation
 ```
 
-### 运行特定测试（过滤）
+### 运行特定标签的测试
 
 ```bash
-cd test/e2e
-./common.sh "lifecycle"
+# 只运行 smoke 级别的测试
+go test ./test/e2e/suites/... -v --label-filter=tier=smoke
 ```
 
-### 强制重建集群
+### Makefile 目标（如果已配置）
 
 ```bash
-FORCE_RECREATE_CLUSTER=true bash test/e2e/common.sh
+make e2e-smoke
+make e2e-cli
 ```
+
+当前仓库仍保留旧 shell 结构，但新的权威方向已经是 `hack + suites + support`。
 
 ## 调试技巧
 
-### 查看 Controller 日志
+查看 Controller 日志：
 
 ```bash
 kubectl logs -l app=fast-sandbox-controller -n fast-sandbox-system --tail=50
 ```
 
-### 查看 Agent 日志
+查看 Agent 日志：
 
 ```bash
 kubectl logs -l app=sandbox-agent -n <namespace> --all-containers --tail=50
 ```
 
-### 查看 Sandbox 状态
+查看 Sandbox 状态：
 
 ```bash
 kubectl get sandbox <name> -n <namespace> -o yaml
 ```
-
-## 测试覆盖的核心场景
-
-1. ✅ **创建 → 删除 → 重建同名 Sandbox**（用户报告的 bug 场景）
-2. ✅ 容量限制和资源分配
-3. ✅ 端口冲突和互斥调度
-4. ✅ 命名空间隔离
-5. ✅ 自动扩缩容
-6. ✅ 优雅关闭和 Finalizer 清理
-7. ✅ Agent 丢失恢复（AutoRecreate/Manual）
-8. ✅ 自动过期
-9. ✅ Janitor 孤儿清理
-10. ✅ CLI 缓存和交互模式
-11. ✅ Fast/Strong 一致性模式
-12. ✅ 内存和 Goroutine 泄漏防护
