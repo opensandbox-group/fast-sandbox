@@ -6,9 +6,12 @@ import (
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
+	agentruntime "fast-sandbox/internal/agent/runtime"
 	"fast-sandbox/internal/controller/agentpool"
 
 	corev1 "k8s.io/api/core/v1"
+	nodev1 "k8s.io/api/node/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
@@ -26,11 +29,33 @@ type SandboxPoolReconciler struct {
 
 // Reconcile manages the lifecycle of Agent Pods based on the demand from Sandboxes.
 func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-logger := klog.FromContext(ctx)
+	logger := klog.FromContext(ctx)
 
 	var pool apiv1alpha1.SandboxPool
 	if err := r.Get(ctx, req.NamespacedName, &pool); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Validate RuntimeClass if specified
+	if err := r.validateRuntimeClass(ctx, &pool); err != nil {
+		logger.Error(err, "RuntimeClass validation failed")
+		_ = r.updatePoolCondition(ctx, &pool, metav1.Condition{
+			Type:    apiv1alpha1.PoolConditionRuntimeReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  apiv1alpha1.ReasonRuntimeUnavailable,
+			Message: err.Error(),
+		})
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// Update condition to ready if using secure runtime
+	if getRuntimeClassName(&pool) != "" {
+		_ = r.updatePoolCondition(ctx, &pool, metav1.Condition{
+			Type:    apiv1alpha1.PoolConditionRuntimeReady,
+			Status:  metav1.ConditionTrue,
+			Reason:  apiv1alpha1.ReasonRuntimeAvailable,
+			Message: fmt.Sprintf("RuntimeClass %s is available", getRuntimeClassName(&pool)),
+		})
 	}
 
 	var childPods corev1.PodList
@@ -52,7 +77,6 @@ logger := klog.FromContext(ctx)
 			}
 		}
 	}
-	//logger.Info("Load statistics", "pool", pool.Name, "active", activeCount, "pending", pendingCount)
 
 	maxPerPod := getAgentCapacity(&pool)
 	if maxPerPod <= 0 {
@@ -70,7 +94,6 @@ logger := klog.FromContext(ctx)
 	}
 
 	currentCount := int32(len(childPods.Items))
-	//logger.Info("Scaling analysis", "pool", pool.Name, "current", currentCount, "desired", desiredPods)
 
 	if currentCount < desiredPods {
 		diff := desiredPods - currentCount
@@ -161,6 +184,10 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool) *cor
 				Name:  "RUNTIME_TYPE",
 				Value: string(getRuntimeType(pool)),
 			},
+			corev1.EnvVar{
+				Name:  "RUNTIME_HANDLER",
+				Value: getContainerdRuntimeHandler(pool),
+			},
 			corev1.EnvVar{Name: "RUNTIME_SOCKET", Value: "/run/containerd/containerd.sock"},
 			corev1.EnvVar{Name: "INFRA_DIR_IN_POD", Value: "/opt/fast-sandbox/infra"},
 		)
@@ -239,6 +266,62 @@ func getRuntimeType(pool *apiv1alpha1.SandboxPool) apiv1alpha1.RuntimeType {
 		return pool.Spec.RuntimeType
 	}
 	return apiv1alpha1.RuntimeContainer
+}
+
+// getRuntimeClassName returns the RuntimeClassName for the pool.
+// Returns empty string for default container runtime.
+func getRuntimeClassName(pool *apiv1alpha1.SandboxPool) string {
+	if pool.Spec.RuntimeType == "" || pool.Spec.RuntimeType == apiv1alpha1.RuntimeContainer {
+		return ""
+	}
+	if pool.Spec.RuntimeClassName != "" {
+		return pool.Spec.RuntimeClassName
+	}
+	return string(pool.Spec.RuntimeType)
+}
+
+// getContainerdRuntimeHandler returns the containerd runtime handler for the pool.
+func getContainerdRuntimeHandler(pool *apiv1alpha1.SandboxPool) string {
+	if pool.Spec.ContainerdRuntimeHandler != "" {
+		return pool.Spec.ContainerdRuntimeHandler
+	}
+	return agentruntime.GetRuntimeHandler(agentruntime.RuntimeType(pool.Spec.RuntimeType))
+}
+
+// validateRuntimeClass checks if the specified RuntimeClass exists.
+func (r *SandboxPoolReconciler) validateRuntimeClass(ctx context.Context, pool *apiv1alpha1.SandboxPool) error {
+	runtimeClassName := getRuntimeClassName(pool)
+	if runtimeClassName == "" {
+		return nil // No validation needed for default runtime
+	}
+
+	runtimeClass := &nodev1.RuntimeClass{}
+	if err := r.Get(ctx, client.ObjectKey{Name: runtimeClassName}, runtimeClass); err != nil {
+		if errors.IsNotFound(err) {
+			return fmt.Errorf("RuntimeClass %q not found", runtimeClassName)
+		}
+		return fmt.Errorf("failed to get RuntimeClass %q: %w", runtimeClassName, err)
+	}
+	return nil
+}
+
+// updatePoolCondition updates a condition on the pool status.
+func (r *SandboxPoolReconciler) updatePoolCondition(ctx context.Context, pool *apiv1alpha1.SandboxPool, condition metav1.Condition) error {
+	condition.LastTransitionTime = metav1.Now()
+
+	found := false
+	for i, c := range pool.Status.Conditions {
+		if c.Type == condition.Type {
+			pool.Status.Conditions[i] = condition
+			found = true
+			break
+		}
+	}
+	if !found {
+		pool.Status.Conditions = append(pool.Status.Conditions, condition)
+	}
+
+	return r.Status().Update(ctx, pool)
 }
 
 func boolPtr(b bool) *bool {
