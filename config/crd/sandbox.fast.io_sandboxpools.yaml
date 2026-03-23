@@ -30,16 +30,29 @@ spec:
                   bufferMax: {type: integer}
               maxSandboxesPerPod: {type: integer}
               runtimeType: {type: string}
+              runtimeClassName: {type: string}
+              containerdRuntimeHandler: {type: string}
               agentTemplate:
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
           status:
             type: object
             properties:
+              observedGeneration: {type: integer}
               currentPods: {type: integer}
               readyPods: {type: integer}
               totalAgents: {type: integer}
               idleAgents: {type: integer}
               busyAgents: {type: integer}
+              conditions:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    type: {type: string}
+                    status: {type: string}
+                    reason: {type: string}
+                    message: {type: string}
+                    lastTransitionTime: {type: string}
     subresources:
       status: {}

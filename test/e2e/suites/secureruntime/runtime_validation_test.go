@@ -52,6 +52,18 @@ func TestInvalidRuntimeClass(t *testing.T) {
 					RuntimeClassName:   "non-existent-runtime",
 					AgentTemplate: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
+							Tolerations: []corev1.Toleration{
+								{
+									Key:      "sigma.ali/resource-pool",
+									Operator: corev1.TolerationOpExists,
+									Effect:   corev1.TaintEffectNoSchedule,
+								},
+								{
+									Key:      "sigma.ali/is-ecs",
+									Operator: corev1.TolerationOpExists,
+									Effect:   corev1.TaintEffectNoSchedule,
+								},
+							},
 							Containers: []corev1.Container{{
 								Name:  "agent",
 								Image: suiteenv.AgentImage(),
