@@ -217,6 +217,34 @@ func (r *SandboxReconciler) handleTerminatingDeletion(ctx context.Context, sandb
 		"assignedPod", sandbox.Status.AssignedPod,
 		"deletionTimestamp", sandbox.DeletionTimestamp)
 
+	// Check for reset request - reset takes priority over graceful shutdown
+	// This allows TestControlledRecovery to proceed when ResetRevision is set during termination
+	if sandbox.Spec.ResetRevision != nil && !sandbox.Spec.ResetRevision.IsZero() {
+		if sandbox.Status.AcceptedResetRevision == nil ||
+			sandbox.Spec.ResetRevision.After(sandbox.Status.AcceptedResetRevision.Time) {
+			logger.Info("[DEBUG-TERM] Reset request detected during termination - processing reset first")
+			// Process reset: clear status and set AcceptedResetRevision
+			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				latest := &apiv1alpha1.Sandbox{}
+				if err := r.Get(ctx, client.ObjectKeyFromObject(sandbox), latest); err != nil {
+					return err
+				}
+				latest.Status.AssignedPod = ""
+				latest.Status.SandboxID = ""
+				latest.Status.Phase = string(apiv1alpha1.PhasePending)
+				latest.Status.AcceptedResetRevision = sandbox.Spec.ResetRevision
+				return r.Status().Update(ctx, latest)
+			})
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			// Release the old agent resource
+			r.Registry.Release(agentpool.AgentID(sandbox.Status.AssignedPod), sandbox)
+			logger.Info("[DEBUG-TERM] Reset processed successfully, sandbox transitioning to Pending")
+			return ctrl.Result{Requeue: true}, nil
+		}
+	}
+
 	// Check if Agent still exists
 	agent, agentExists := r.Registry.GetAgentByID(agentpool.AgentID(sandbox.Status.AssignedPod))
 	logger.Info("[DEBUG-TERM] Agent existence check",
@@ -699,6 +727,12 @@ func (r *SandboxReconciler) syncStatusFromAgent(ctx context.Context, sandbox *ap
 
 	// Map Agent phase to Controller phase
 	controllerPhase := mapAgentPhaseToController(status.Phase)
+
+	// Skip status sync if sandbox has been reset (AcceptedResetRevision is set)
+	// This prevents Agent-reported Terminated state from overwriting the reset state
+	if sandbox.Status.AcceptedResetRevision != nil {
+		return nil
+	}
 
 	// Check if update is needed
 	if sandbox.Status.Phase == string(controllerPhase) && sandbox.Status.SandboxID == status.SandboxID {
