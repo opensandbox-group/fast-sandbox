@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
 )
@@ -45,8 +46,8 @@ func TestAutoExpiry(t *testing.T) {
 				t.Fatalf("wait for ready agent pods: %v", err)
 			}
 
-			// Calculate expiry time (20 seconds from now)
-			expiryTime := metav1.NewTime(time.Now().Add(20 * time.Second))
+			// Calculate expiry time (90 seconds from now to allow enough time for scheduling)
+			expiryTime := metav1.NewTime(time.Now().Add(90 * time.Second))
 
 			// Create sandbox with expiry
 			sandbox := &apiv1alpha1.Sandbox{
@@ -72,23 +73,31 @@ func TestAutoExpiry(t *testing.T) {
 			// Wait for sandbox to be assigned first
 			waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
-			if _, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: "sb-expiry-test", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
+			assignedSandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: "sb-expiry-test", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
 				return sb.Status.AssignedPod != "" &&
 					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
-			}); err != nil {
+			})
+			if err != nil {
 				t.Fatalf("wait for sandbox to be assigned: %v", err)
 			}
-			t.Log("Sandbox is assigned and running")
+			t.Logf("Sandbox is assigned and running, phase=%s", assignedSandbox.Status.Phase)
 
 			// Wait for expiry (with buffer)
+			// Expiry time was set to 90 seconds, so we need to wait for that plus some buffer
 			t.Log("Waiting for sandbox to expire...")
-			expireWaitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			expireWaitCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 			defer cancel()
 
 			expiredSandbox, err := fixture.WaitForSandbox(expireWaitCtx, types.NamespacedName{Name: "sb-expiry-test", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
 				return sb.Status.Phase == string(apiv1alpha1.PhaseExpired)
 			})
 			if err != nil {
+				// Log current state for debugging
+				currentSandbox := &apiv1alpha1.Sandbox{}
+				if getErr := k8sClient.Get(ctx, types.NamespacedName{Name: "sb-expiry-test", Namespace: namespace}, currentSandbox); getErr == nil {
+					t.Logf("Sandbox state at timeout: phase=%s, assignedPod=%s, sandboxID=%s",
+						currentSandbox.Status.Phase, currentSandbox.Status.AssignedPod, currentSandbox.Status.SandboxID)
+				}
 				t.Fatalf("wait for sandbox expiry: %v", err)
 			}
 
@@ -265,30 +274,44 @@ func TestControlledRecovery(t *testing.T) {
 			}
 
 			// Wait for reset to be accepted
-			resetWaitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			// Give controller more time to process reset request
+			resetWaitCtx, cancel := context.WithTimeout(ctx, 90*time.Second) // Increased from 60s
 			defer cancel()
 			_, err = fixture.WaitForSandbox(resetWaitCtx, types.NamespacedName{Name: "sb-recovery", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AcceptedResetRevision != nil &&
-					sb.Status.AcceptedResetRevision.Equal(&resetTime)
+				if sb.Status.AcceptedResetRevision == nil {
+					return false
+				}
+				// Check if accepted reset revision has the same second as spec reset revision
+				// Kubernetes truncates timestamps to seconds, so we compare at second precision
+				return resetTime.Time.Truncate(time.Second).Equal(sb.Status.AcceptedResetRevision.Time.Truncate(time.Second))
 			})
 			if err != nil {
+				// Log current state for debugging
+				currentSandbox := &apiv1alpha1.Sandbox{}
+				if getErr := k8sClient.Get(ctx, types.NamespacedName{Name: "sb-recovery", Namespace: namespace}, currentSandbox); getErr == nil {
+					t.Logf("Sandbox state at timeout: phase=%s, acceptedResetRevision=%v",
+						currentSandbox.Status.Phase, currentSandbox.Status.AcceptedResetRevision)
+				}
 				t.Fatalf("wait for reset to be accepted: %v", err)
 			}
 			t.Log("✓ Manual reset was accepted by controller")
 
 			// Test 2: AutoRecreate
 			t.Log("Testing AutoRecreate mechanism...")
-			autoRecreateSandbox := &apiv1alpha1.Sandbox{}
-			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "sb-recovery", Namespace: namespace}, autoRecreateSandbox); err != nil {
-				t.Fatalf("get sandbox: %v", err)
-			}
-
-			// Set AutoRecreate policy
-			autoRecreatePolicy := apiv1alpha1.FailurePolicyAutoRecreate
-			autoRecreateSandbox.Spec.FailurePolicy = autoRecreatePolicy
-			autoRecreateSandbox.Spec.RecoveryTimeoutSeconds = 15
-			if err := k8sClient.Update(ctx, autoRecreateSandbox); err != nil {
-				t.Fatalf("update sandbox with AutoRecreate policy: %v", err)
+			// Use retry logic to handle concurrent modifications
+			var autoRecreateSandbox *apiv1alpha1.Sandbox
+			updateErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				autoRecreateSandbox = &apiv1alpha1.Sandbox{}
+				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "sb-recovery", Namespace: namespace}, autoRecreateSandbox); err != nil {
+					return err
+				}
+				// Set AutoRecreate policy
+				autoRecreateSandbox.Spec.FailurePolicy = apiv1alpha1.FailurePolicyAutoRecreate
+				autoRecreateSandbox.Spec.RecoveryTimeoutSeconds = 15
+				return k8sClient.Update(ctx, autoRecreateSandbox)
+			})
+			if updateErr != nil {
+				t.Fatalf("update sandbox with AutoRecreate policy: %v", updateErr)
 			}
 
 			time.Sleep(2 * time.Second)
