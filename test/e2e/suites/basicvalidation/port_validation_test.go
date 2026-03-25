@@ -47,9 +47,9 @@ func TestPortValidation(t *testing.T) {
 				Spec: apiv1alpha1.SandboxPoolSpec{
 					Capacity: apiv1alpha1.PoolCapacity{
 						PoolMin: 1,
-						PoolMax: 1,
+						PoolMax: 3, // Increased for multiple valid port tests
 					},
-					MaxSandboxesPerPod: 5,
+					MaxSandboxesPerPod: 10,
 					RuntimeType:        apiv1alpha1.RuntimeContainer,
 					AgentTemplate: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{

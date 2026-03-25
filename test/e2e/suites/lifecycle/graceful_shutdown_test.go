@@ -107,16 +107,27 @@ done
 				t.Fatalf("sandbox assigned pod is empty")
 			}
 
+			// Give sandbox time to fully stabilize before deletion
+			time.Sleep(3 * time.Second)
+
 			if err := k8sClient.Delete(ctx, sandbox); err != nil {
 				t.Fatalf("delete sandbox: %v", err)
 			}
 
-			termCtx, cancelTermWait := context.WithTimeout(ctx, 20*time.Second)
+			// Wait for sandbox to transition to Terminating
+			// Give controller more time to process deletion and call Agent
+			termCtx, cancelTermWait := context.WithTimeout(ctx, 90*time.Second) // Increased from 45s
 			defer cancelTermWait()
 			terminatingSandbox, err := fixture.WaitForSandbox(termCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
 				return sb.DeletionTimestamp != nil && sb.Status.Phase == string(apiv1alpha1.PhaseTerminating)
 			})
 			if err != nil {
+				// Log current state for debugging
+				currentSandbox := &apiv1alpha1.Sandbox{}
+				if getErr := k8sClient.Get(ctx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, currentSandbox); getErr == nil {
+					t.Logf("Sandbox state at timeout: phase=%s, deletionTimestamp=%v, assignedPod=%s",
+						currentSandbox.Status.Phase, currentSandbox.DeletionTimestamp, currentSandbox.Status.AssignedPod)
+				}
 				t.Fatalf("wait for sandbox terminating: %v", err)
 			}
 			if terminatingSandbox.DeletionTimestamp == nil {

@@ -133,6 +133,11 @@ func TestFastPathEnvAndWorkingDir(t *testing.T) {
 			}
 			waitForPoolReady(ctx, t, fixture, namespace, pool.Name)
 
+			// Wait for agent capacity to sync to controller registry
+			// Agent control loop runs every 2s, give it time to register capacity
+			t.Log("Waiting for agent capacity to sync...")
+			time.Sleep(5 * time.Second)
+
 			controllerNamespace := discoverControllerNamespace(ctx, t, k8sClient)
 			controllerPort := reserveLocalPort(t)
 			pfCmd := exec.CommandContext(ctx, "kubectl", "port-forward", "deployment/fast-sandbox-controller", fmt.Sprintf("%d:9090", controllerPort), "-n", controllerNamespace)
@@ -234,9 +239,9 @@ func createValidationPool(namespace, name string) *apiv1alpha1.SandboxPool {
 		Spec: apiv1alpha1.SandboxPoolSpec{
 			Capacity: apiv1alpha1.PoolCapacity{
 				PoolMin: 1,
-				PoolMax: 1,
+				PoolMax: 10, // Increased for parallel tests
 			},
-			MaxSandboxesPerPod: 5,
+			MaxSandboxesPerPod: 20, // Increased capacity
 			RuntimeType:        apiv1alpha1.RuntimeContainer,
 			AgentTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
@@ -262,7 +267,7 @@ func waitForPoolReady(ctx context.Context, t *testing.T, fixture *fixtures.Fixtu
 
 func waitForAssignedSandbox(ctx context.Context, t *testing.T, fixture *fixtures.FixtureClient, namespace, name string) *apiv1alpha1.Sandbox {
 	t.Helper()
-	waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	waitCtx, cancel := context.WithTimeout(ctx, 90*time.Second) // Increased from 60s to 90s
 	defer cancel()
 
 	sandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {

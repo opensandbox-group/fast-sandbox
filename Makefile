@@ -10,6 +10,7 @@ KIND_CLUSTER_NAME ?= fast-sandbox
 # E2E test settings
 E2E_SUITE ?=
 FAST_SANDBOX_E2E ?= 1
+E2E_KEEP_CLUSTER ?= 0
 
 # Go settings
 GO ?= go
@@ -35,6 +36,9 @@ help:
 	@echo "  make test-e2e               - full e2e: setup + run all tests"
 	@echo "  make test-e2e-<suite>       - run specific suite (env must be ready)"
 	@echo ""
+	@echo "E2E settings:"
+	@echo "  E2E_KEEP_CLUSTER=1          - keep cluster after test failure for debugging (default: 0)"
+	@echo ""
 	@echo "E2E test suites:"
 	@echo "  basicvalidation, lifecycle, scheduling, cleanupjanitor"
 	@echo "  advancedfeatures, cliintegration, faultrecovery"
@@ -42,6 +46,9 @@ help:
 	@echo "E2E examples:"
 	@echo "  # Full verification (fresh env + all tests)"
 	@echo "  make test-e2e"
+	@echo ""
+	@echo "  # Keep cluster on failure for debugging"
+	@echo "  E2E_KEEP_CLUSTER=1 make test-e2e"
 	@echo ""
 	@echo "  # Quick iteration (setup once, run multiple times)"
 	@echo "  make setup-e2e"
@@ -123,7 +130,23 @@ test-e2e: setup-e2e
 	@echo ""
 	@echo "=== Running all E2E tests ==="
 	@FAST_SANDBOX_E2E=1 FAST_SANDBOX_AGENT_IMAGE=$(AGENT_IMAGE) \
-		$(GO) test ./test/e2e/suites/... -v -count=1
+		$(GO) test ./test/e2e/suites/... -v -count=1 -failfast || \
+		(if [ "$(E2E_KEEP_CLUSTER)" = "1" ]; then \
+			echo ""; \
+			echo "❌ E2E tests failed, keeping cluster for debugging..."; \
+			echo "Run 'kind delete cluster --name $(KIND_CLUSTER_NAME)' when done debugging"; \
+		else \
+			echo ""; \
+			echo "❌ E2E tests failed, cleaning up cluster..."; \
+			kind delete cluster --name $(KIND_CLUSTER_NAME); \
+		fi; \
+		exit 1)
+	@echo ""
+	@echo "✅ All E2E tests passed"
+	@if [ "$(E2E_KEEP_CLUSTER)" = "0" ]; then \
+		echo "Cleaning up kind cluster..."; \
+		kind delete cluster --name $(KIND_CLUSTER_NAME); \
+	fi
 
 # E2E test - run specific suite (assumes environment is already setup)
 test-e2e-basicvalidation test-e2e-lifecycle test-e2e-scheduling test-e2e-cleanupjanitor test-e2e-advancedfeatures test-e2e-cliintegration test-e2e-faultrecovery:
