@@ -45,31 +45,66 @@ const (
 	RuntimeTypeKataClh   RuntimeType = "kata-clh"
 )
 
-// defaultRuntimeHandlers maps RuntimeType to containerd runtime handler.
-var defaultRuntimeHandlers = map[RuntimeType]string{
-	RuntimeTypeContainer: "io.containerd.runc.v2",
-	RuntimeTypeGVisor:    "io.containerd.runsc.v1",
-	RuntimeTypeKataQemu:  "io.containerd.kata-qemu.v2",
-	RuntimeTypeKataFc:    "io.containerd.kata-fc.v2",
-	RuntimeTypeKataClh:   "io.containerd.kata-clh.v2",
+// RuntimeConfig defines the configuration for each runtime type.
+type RuntimeConfig struct {
+	Handler     string // containerd runtime handler name
+	ConfigPath  string // configuration file path (optional)
+	NeedsTTY    bool   // whether TTY is required for this runtime
+	OptionsType string // TypeUrl for runtime options (optional, e.g., gVisor)
+}
+
+// runtimeConfigs maps RuntimeType to its complete configuration.
+// This is the single source of truth for runtime-specific settings.
+var runtimeConfigs = map[RuntimeType]RuntimeConfig{
+	RuntimeTypeContainer: {
+		Handler: "io.containerd.runc.v2",
+	},
+	RuntimeTypeGVisor: {
+		Handler:     "io.containerd.runsc.v1",
+		ConfigPath:  "/etc/containerd/runsc.toml",
+		NeedsTTY:    true, // see: https://github.com/google/gvisor/issues/12198
+		OptionsType: "io.containerd.runsc.v1.options",
+	},
+	RuntimeTypeKataQemu: {
+		Handler:    "/opt/kata/bin/containerd-shim-kata-v2",
+		ConfigPath: "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml",
+	},
+	RuntimeTypeKataFc: {
+		Handler:    "/opt/kata/bin/containerd-shim-kata-v2",
+		ConfigPath: "/opt/kata/share/defaults/kata-containers/configuration-fc.toml",
+	},
+	RuntimeTypeKataClh: {
+		Handler:    "/opt/kata/bin/containerd-shim-kata-v2",
+		ConfigPath: "/opt/kata/share/defaults/kata-containers/configuration-clh.toml",
+	},
 }
 
 // GetRuntimeHandler returns the containerd runtime handler for the given type.
 func GetRuntimeHandler(rt RuntimeType) string {
-	if handler, ok := defaultRuntimeHandlers[rt]; ok {
-		return handler
+	if cfg, ok := runtimeConfigs[rt]; ok {
+		return cfg.Handler
 	}
-	return defaultRuntimeHandlers[RuntimeTypeContainer]
+	return runtimeConfigs[RuntimeTypeContainer].Handler
+}
+
+// GetRuntimeConfig returns the full RuntimeConfig for the given type.
+func GetRuntimeConfig(rt RuntimeType) RuntimeConfig {
+	if cfg, ok := runtimeConfigs[rt]; ok {
+		return cfg
+	}
+	return runtimeConfigs[RuntimeTypeContainer]
 }
 
 func NewRuntime(ctx context.Context, runtimeType RuntimeType, socketPath string) (Runtime, error) {
-	handler := GetRuntimeHandler(runtimeType)
+	if _, ok := runtimeConfigs[runtimeType]; !ok {
+		return nil, ErrUnsupportedRuntime
+	}
 
 	var rt Runtime
 	switch runtimeType {
 	case RuntimeTypeContainer, RuntimeTypeGVisor,
 		RuntimeTypeKataQemu, RuntimeTypeKataFc, RuntimeTypeKataClh:
-		rt = newContainerdRuntime(handler)
+		rt = newContainerdRuntime(runtimeType)
 	default:
 		return nil, ErrUnsupportedRuntime
 	}

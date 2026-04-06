@@ -1,0 +1,11 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  extraMounts:
+  # KVM device for Kata Containers
+  - hostPath: /dev/kvm
+    containerPath: /dev/kvm
+  # Required for KVM access inside container
+  - hostPath: /sys/devices/virtual/misc/kvm
+    containerPath: /sys/devices/virtual/misc/kvm

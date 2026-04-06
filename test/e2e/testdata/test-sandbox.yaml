@@ -1,0 +1,8 @@
+apiVersion: sandbox.fast.io/v1alpha1
+kind: Sandbox
+metadata:
+  name: test-kata-sandbox
+spec:
+  image: docker.io/library/alpine:latest
+  command: ["/bin/sh", "-c", "uname -a && echo 'Running in Kata VM!' && sleep 3600"]
+  poolRef: kata-clh-pool

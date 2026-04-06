@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kata-deploy
+  namespace: kata-system
+spec:
+  selector:
+    matchLabels:
+      app: kata-deploy
+  template:
+    metadata:
+      labels:
+        app: kata-deploy
+    spec:
+      serviceAccountName: kata-deploy
+      hostPID: true
+      containers:
+      - name: kata-deploy
+        image: quay.io/kata-containers/kata-deploy:3.27.0
+        imagePullPolicy: IfNotPresent
+        command: ["/opt/kata-artifacts/scripts/kata-deploy.sh", "install"]
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: DEBUG
+          value: "true"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: rootfs
+          mountPath: /host
+      volumes:
+      - name: rootfs
+        hostPath:
+          path: /
+          type: Directory

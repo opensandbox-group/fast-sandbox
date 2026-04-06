@@ -264,3 +264,4 @@ generated/
 
 # Archive directory for old documentation (local only)
 docs/archive/
+.sisyphus

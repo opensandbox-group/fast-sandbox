@@ -6,6 +6,7 @@ import (
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
+	"fast-sandbox/test/e2e/support/envcheck"
 	"fast-sandbox/test/e2e/support/fixtures"
 	"fast-sandbox/test/e2e/support/suiteenv"
 
@@ -16,6 +17,16 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/features"
 )
 
+// getEnvChecker returns the global environment checker.
+func getEnvChecker(t *testing.T) *envcheck.Checker {
+	t.Helper()
+	checker, err := envcheck.GetChecker()
+	if err != nil {
+		t.Fatalf("create env checker: %v", err)
+	}
+	return checker
+}
+
 func TestKataQemuSandbox(t *testing.T) {
 	suiteenv.SkipUnlessEnabled(t)
 
@@ -23,8 +34,13 @@ func TestKataQemuSandbox(t *testing.T) {
 		WithLabel("suite", "secureruntime").
 		WithLabel("runtime", "kata").
 		Assess("Kata QEMU pool creates sandbox successfully", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
-			secureClient := MustSecureRuntimeClient(t)
-			secureClient.SkipIfRuntimeClassNotExists(t, ctx, "kata-qemu")
+			// Check if kata-qemu should run in this environment
+			checker := getEnvChecker(t)
+			shouldRun, reason := checker.ShouldRunKataQemu(ctx)
+			if !shouldRun {
+				t.Skipf("kata-qemu test skipped: %s", reason)
+			}
+			t.Logf("Running kata-qemu test: %s", reason)
 
 			k8sClient := testSuite.MustKubeClient(t)
 			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
@@ -79,8 +95,13 @@ func TestKataFcSandbox(t *testing.T) {
 		WithLabel("suite", "secureruntime").
 		WithLabel("runtime", "kata-fc").
 		Assess("Kata Firecracker pool creates sandbox successfully", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
-			secureClient := MustSecureRuntimeClient(t)
-			secureClient.SkipIfRuntimeClassNotExists(t, ctx, "kata-fc")
+			// Check if kata-fc should run in this environment
+			checker := getEnvChecker(t)
+			shouldRun, reason := checker.ShouldRunKataFc(ctx)
+			if !shouldRun {
+				t.Skipf("kata-fc test skipped: %s", reason)
+			}
+			t.Logf("Running kata-fc test: %s", reason)
 
 			k8sClient := testSuite.MustKubeClient(t)
 			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
@@ -131,8 +152,13 @@ func TestKataClhSandbox(t *testing.T) {
 		WithLabel("suite", "secureruntime").
 		WithLabel("runtime", "kata-clh").
 		Assess("Kata Cloud Hypervisor pool creates sandbox successfully", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
-			secureClient := MustSecureRuntimeClient(t)
-			secureClient.SkipIfRuntimeClassNotExists(t, ctx, "kata-clh")
+			// Check if kata-clh should run in this environment
+			checker := getEnvChecker(t)
+			shouldRun, reason := checker.ShouldRunKataClh(ctx)
+			if !shouldRun {
+				t.Skipf("kata-clh test skipped: %s", reason)
+			}
+			t.Logf("Running kata-clh test: %s", reason)
 
 			k8sClient := testSuite.MustKubeClient(t)
 			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))

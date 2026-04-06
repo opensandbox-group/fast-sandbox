@@ -516,19 +516,15 @@ func TestSandboxManager_DeleteSandbox_Idempotent(t *testing.T) {
 }
 
 func TestSandboxManager_DeleteSandbox_NonExistent(t *testing.T) {
-	// DS-03: Deleting non-existent sandbox - this is an edge case that triggers a nil pointer panic
-	// Note: The current implementation has a bug where it tries to set Phase on a nil sandbox
-	// In production, DeleteSandbox should only be called on sandboxes that were previously created
-	// This test documents the current buggy behavior
+	// DS-03: Deleting non-existent sandbox - should be idempotent and return success
+	// This follows the principle that DELETE operations should be idempotent
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
-	// The following will panic due to nil pointer dereference in sandbox_manager.go:85
-	// The implementation does: sandbox.Phase = "terminating" even when ok is false
-	// This test verifies this buggy behavior exists
-	assert.Panics(t, func() {
-		manager.DeleteSandbox("non-existent-sandbox")
-	}, "DeleteSandbox should panic when called on non-existent sandbox due to nil pointer bug")
+	// Deleting a non-existent sandbox should succeed (idempotent behavior)
+	resp, err := manager.DeleteSandbox("non-existent-sandbox")
+	assert.NoError(t, err)
+	assert.True(t, resp.Success)
 }
 
 func TestSandboxManager_DeleteSandbox_MultipleDeletes(t *testing.T) {

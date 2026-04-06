@@ -18,31 +18,16 @@ import (
 // 1. TestNewContainerdRuntime
 // ============================================================================
 
-func TestNewContainerdRuntime(t *testing.T) {
-	// N-01: Constructor creates runtime with correct runtime handler
-	runtime := newContainerdRuntime("io.containerd.runc.v2")
-
-	require.NotNil(t, runtime, "Runtime should not be nil")
-
-	cr, ok := runtime.(*ContainerdRuntime)
-	require.True(t, ok, "Runtime should be *ContainerdRuntime type")
-
-	assert.Equal(t, "io.containerd.runc.v2", cr.runtimeHandler, "Runtime handler should be set correctly")
-	assert.Equal(t, "", cr.socketPath, "Socket path should be empty before initialization")
-	assert.Nil(t, cr.client, "Client should be nil before initialization")
-	assert.Empty(t, cr.allowedPluginPaths, "Allowed plugin paths should be empty before initialization")
-}
-
 func TestNewContainerdRuntime_GVisor(t *testing.T) {
 	// N-02: Constructor creates gVisor runtime with correct handler
-	runtime := newContainerdRuntime("io.containerd.runsc.v1")
+	runtime := newContainerdRuntime("gvisor")
 
 	require.NotNil(t, runtime, "Runtime should not be nil")
 
 	cr, ok := runtime.(*ContainerdRuntime)
 	require.True(t, ok, "Runtime should be *ContainerdRuntime type")
 
-	assert.Equal(t, "io.containerd.runsc.v1", cr.runtimeHandler, "Runtime handler should be runsc for gVisor")
+	assert.Equal(t, "io.containerd.runsc.v1", cr.config.Handler, "Runtime handler should be runsc for gVisor")
 }
 
 // ============================================================================

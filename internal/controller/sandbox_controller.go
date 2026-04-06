@@ -136,7 +136,7 @@ func (r *SandboxReconciler) getSandboxID(sandbox *apiv1alpha1.Sandbox) string {
 // handleDeletion processes the Sandbox deletion workflow.
 // State transitions: Bound/Running → Terminating → (Agent confirms) → Removed
 func (r *SandboxReconciler) handleDeletion(ctx context.Context, sandbox *apiv1alpha1.Sandbox) (ctrl.Result, error) {
-	klog.Info("[SIMPLE-LOG] handleDeletion called for sandbox", "sandbox", sandbox.Name)
+	klog.Info("[SIMPLE-LOG] handleDeletion called for", "sandbox:", sandbox.Name)
 	logger := klog.FromContext(ctx)
 
 	if !controllerutil.ContainsFinalizer(sandbox, FinalizerName) {
