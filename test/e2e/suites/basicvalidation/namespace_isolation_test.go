@@ -51,11 +51,11 @@ func TestNamespaceIsolation(t *testing.T) {
 					},
 					MaxSandboxesPerPod: 5,
 					RuntimeType:        apiv1alpha1.RuntimeContainer,
-					AgentTemplate: corev1.PodTemplateSpec{
+					FastletTemplate: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
 							Containers: []corev1.Container{{
-								Name:  "agent",
-								Image: suiteenv.AgentImage(),
+								Name:  "fastlet",
+								Image: suiteenv.FastletImage(),
 							}},
 						},
 					},
@@ -64,8 +64,8 @@ func TestNamespaceIsolation(t *testing.T) {
 			if _, err := fixture.CreateSandboxPool(ctx, namespaceA, pool); err != nil {
 				t.Fatalf("create sandbox pool: %v", err)
 			}
-			if _, err := fixture.WaitForReadyAgentPods(ctx, types.NamespacedName{Name: pool.Name, Namespace: namespaceA}, 1); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(ctx, types.NamespacedName{Name: pool.Name, Namespace: namespaceA}, 1); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
 			sameNamespaceSandbox := &apiv1alpha1.Sandbox{
@@ -87,7 +87,7 @@ func TestNamespaceIsolation(t *testing.T) {
 				t.Fatalf("create same-namespace sandbox: %v", err)
 			}
 			if _, err := fixture.WaitForSandbox(ctx, types.NamespacedName{Name: sameNamespaceSandbox.Name, Namespace: namespaceA}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedPod != "" &&
+				return sb.Status.AssignedFastlet != "" &&
 					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
 			}); err != nil {
 				t.Fatalf("wait for same-namespace sandbox assignment: %v", err)

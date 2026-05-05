@@ -63,7 +63,7 @@ spec:
                 type: string
                 enum: ["Manual", "AutoRecreate"]
                 default: "Manual"
-                description: "Recovery strategy when agent is lost"
+                description: "Recovery strategy when fastlet is lost"
               recoveryTimeoutSeconds:
                 type: integer
                 minimum: 1
@@ -74,7 +74,7 @@ spec:
             type: object
             properties:
               phase: {type: string}
-              assignedPod: {type: string}
+              assignedFastlet: {type: string}
               nodeName: {type: string}
               sandboxID: {type: string}
               endpoints: {type: array, items: {type: string}}

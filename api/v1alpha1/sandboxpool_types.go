@@ -43,10 +43,10 @@ type SandboxPoolSpec struct {
 	// If not set, defaults based on RuntimeType.
 	ContainerdRuntimeHandler string `json:"containerdRuntimeHandler,omitempty"`
 
-	AgentTemplate corev1.PodTemplateSpec `json:"agentTemplate"`
+	FastletTemplate corev1.PodTemplateSpec `json:"fastletTemplate"`
 }
 
-// PoolCapacity describes the sizing policy of the agent pool.
+// PoolCapacity describes the sizing policy of the fastlet pool.
 type PoolCapacity struct {
 	PoolMin   int32 `json:"poolMin"`
 	PoolMax   int32 `json:"poolMax"`
@@ -59,9 +59,9 @@ type SandboxPoolStatus struct {
 	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
 	CurrentPods        int32              `json:"currentPods,omitempty"`
 	ReadyPods          int32              `json:"readyPods,omitempty"`
-	TotalAgents        int32              `json:"totalAgents,omitempty"`
-	IdleAgents         int32              `json:"idleAgents,omitempty"`
-	BusyAgents         int32              `json:"busyAgents,omitempty"`
+	TotalFastlets      int32              `json:"totalFastlets,omitempty"`
+	IdleFastlets       int32              `json:"idleFastlets,omitempty"`
+	BusyFastlets       int32              `json:"busyFastlets,omitempty"`
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`
 }
 

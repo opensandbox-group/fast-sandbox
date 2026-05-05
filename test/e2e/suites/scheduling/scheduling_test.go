@@ -39,8 +39,8 @@ func TestPortMutualExclusion(t *testing.T) {
 
 			poolWaitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 			defer cancel()
-			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 2); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 2); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
 			sandboxA := createSandboxWithPorts(namespace, "sb-port-a", pool.Name, []int32{8080})
@@ -49,7 +49,7 @@ func TestPortMutualExclusion(t *testing.T) {
 			}
 
 			assignedA := waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-port-a")
-			podA := assignedA.Status.AssignedPod
+			podA := assignedA.Status.AssignedFastlet
 			if podA == "" {
 				t.Fatalf("sandbox A not assigned")
 			}
@@ -60,7 +60,7 @@ func TestPortMutualExclusion(t *testing.T) {
 			}
 
 			assignedB := waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-port-b")
-			podB := assignedB.Status.AssignedPod
+			podB := assignedB.Status.AssignedFastlet
 			if podB == "" {
 				t.Fatalf("sandbox B not assigned")
 			}
@@ -106,8 +106,8 @@ func TestResourceSlotCapacity(t *testing.T) {
 
 			poolWaitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 			defer cancel()
-			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
 			sandbox1 := createSandboxWithPorts(namespace, "sb-slot-1", pool.Name, nil)
@@ -164,8 +164,8 @@ func TestAutoScaling(t *testing.T) {
 
 			poolWaitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 			defer cancel()
-			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
-				t.Fatalf("wait for initial agent pod: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for initial fastlet pod: %v", err)
 			}
 
 			sandbox1 := createSandboxWithPorts(namespace, "sb-scale-1", pool.Name, nil)
@@ -180,15 +180,15 @@ func TestAutoScaling(t *testing.T) {
 
 			scaleCtx, cancelScale := context.WithTimeout(ctx, 120*time.Second)
 			defer cancelScale()
-			if _, err := fixture.WaitForReadyAgentPods(scaleCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 2); err != nil {
+			if _, err := fixture.WaitForReadyFastletPods(scaleCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 2); err != nil {
 				t.Fatalf("wait for pool to scale to 2 pods: %v", err)
 			}
 
 			assigned1 := waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-scale-1")
 			assigned2 := waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-scale-2")
 
-			if assigned1.Status.AssignedPod == assigned2.Status.AssignedPod {
-				t.Fatalf("both sandboxes on same pod %s, expected different pods", assigned1.Status.AssignedPod)
+			if assigned1.Status.AssignedFastlet == assigned2.Status.AssignedFastlet {
+				t.Fatalf("both sandboxes on same pod %s, expected different pods", assigned1.Status.AssignedFastlet)
 			}
 
 			return ctx
@@ -215,11 +215,11 @@ func createSchedulingPool(namespace, name string, min, max, maxPerPod int32) *ap
 			},
 			MaxSandboxesPerPod: maxPerPod,
 			RuntimeType:        apiv1alpha1.RuntimeContainer,
-			AgentTemplate: corev1.PodTemplateSpec{
+			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
-						Name:  "agent",
-						Image: suiteenv.AgentImage(),
+						Name:  "fastlet",
+						Image: suiteenv.FastletImage(),
 					}},
 				},
 			},
@@ -252,7 +252,7 @@ func waitForAssignedSandbox(ctx context.Context, t *testing.T, fixture *fixtures
 	defer cancel()
 
 	sandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-		return sb.Status.AssignedPod != "" &&
+		return sb.Status.AssignedFastlet != "" &&
 			(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
 	})
 	if err != nil {

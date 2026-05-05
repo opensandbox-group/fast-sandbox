@@ -8,7 +8,7 @@
 
 ## 2. 核心架构
 
-系统采用 **Controller-Agent** 分离架构，建立在 Kubernetes 之上。
+系统采用 **Controller-Fastlet** 分离架构，建立在 Kubernetes 之上。
 
 ![ARCHITECTURE](ARCHITECTURE.png)
 
@@ -17,8 +17,8 @@
 | 链路 | 协议 | 用途 |
 |------|------|------|
 | **CLI → Controller** | gRPC | Fast-Path API，<50ms 延迟 |
-| **Controller → Agent** | HTTP | 沙箱创建/删除请求 |
-| **CLI → Agent** | HTTP (隧道) | 日志流、未来的 exec |
+| **Controller → Fastlet** | HTTP | 沙箱创建/删除请求 |
+| **CLI → Fastlet** | HTTP (隧道) | 日志流、未来的 exec |
 | **控制面** | K8s CRD | 持久化存储和最终一致性 |
 
 ## 3. 核心组件
@@ -37,24 +37,24 @@
 - `GetSandbox` - 获取沙箱详情
 
 **一致性模式**:
-- **FAST** (默认): Agent 先创建 → 异步写 CRD。延迟 <50ms
-- **STRONG**: 先写 CRD (Pending) → Watch 触发 → Agent 创建。延迟 ~200ms
+- **FAST** (默认): Fastlet 先创建 → 异步写 CRD。延迟 <50ms
+- **STRONG**: 先写 CRD (Pending) → Watch 触发 → Fastlet 创建。延迟 ~200ms
 
 ### 3.2 Registry (内存态)
 
-**位置**: `internal/controller/agentpool/registry.go`
+**位置**: `internal/controller/fastletpool/registry.go`
 
 **职责**:
-- 维护所有 Agent 的实时负载和镜像缓存列表
+- 维护所有 Fastlet 的实时负载和镜像缓存列表
 - 原子分配，使用互斥锁保证并发安全
-- 镜像亲和性评分（优先选择有缓存的 Agent）
+- 镜像亲和性评分（优先选择有缓存的 Fastlet）
 
 **分配算法**:
 1. 按池、命名空间、容量、端口冲突过滤候选
 2. 评分: `score = allocated + (无镜像 ? 1000 : 0)`
 3. 选择最低分（有镜像则胜出）
 
-**性能**: 100 Agent 时 ~1.3ms，1000 Agent 时 ~14ms
+**性能**: 100 Fastlets 时 ~1.3ms，1000 Fastlets 时 ~14ms
 
 ### 3.3 SandboxController
 
@@ -78,13 +78,13 @@ Pending → Creating → Running → Deleting → Gone
 **位置**: `internal/controller/sandboxpool_controller.go`
 
 **职责**:
-- 管理 Agent Pod 生命周期（Min/Max 容量）
+- 管理 Fastlet Pod 生命周期（Min/Max 容量）
 - 注入 Containerd 访问所需的特权配置
 - 通过心跳维持 Registry 状态
 
-### 3.5 Agent (数据面)
+### 3.5 Fastlet (数据面)
 
-**位置**: `internal/agent/`
+**位置**: `internal/fastlet/`
 
 **组件**:
 - **Sandbox Manager**: 生命周期管理（创建/删除/状态）
@@ -93,10 +93,10 @@ Pending → Creating → Running → Deleting → Gone
 
 **HTTP 端点**:
 ```
-POST /api/v1/agent/create
-POST /api/v1/agent/delete
-GET  /api/v1/agent/status
-GET  /api/v1/agent/logs?follow=true
+POST /api/v1/fastlet/create
+POST /api/v1/fastlet/delete
+GET  /api/v1/fastlet/status
+GET  /api/v1/fastlet/logs?follow=true
 ```
 
 **核心特性**:
@@ -110,23 +110,23 @@ GET  /api/v1/agent/logs?follow=true
 
 **职责**:
 - 扫描孤儿容器（无对应 CRD）
-- Agent Pod 消失时清理
+- Fastlet Pod 消失时清理
 - 删除 FIFO 文件和 containerd 快照
 
 **孤儿判定标准**:
-1. Agent Pod 消失（UID 不在 pod lister 中）
+1. Fastlet Pod 消失（UID 不在 pod lister 中）
 2. Sandbox CRD 不存在
 3. 容器与 CRD 的 UID 不匹配
 
 **保护窗口**: 10 秒（可配置），为 Fast-Path 异步 CRD 写入留出时间
 
-### 3.7 CLI (fsb-ctl)
+### 3.7 CLI (fastctl)
 
-**位置**: `cmd/fsb-ctl/`
+**位置**: `cmd/fastctl/`
 
 **功能**:
 - 交互式 YAML 编辑创建沙箱
-- 自动 port-forward 隧道连接 Agent Pod
+- 自动 port-forward 隧道连接 Fastlet Pod
 - 流式日志查看
 - 配置分层: Flags > File > Interactive
 
@@ -135,14 +135,14 @@ GET  /api/v1/agent/logs?follow=true
 ### 4.1 创建沙箱 (Fast Mode)
 
 ```
-用户                    控制器                   Agent
+用户                    控制器                   Fastlet
   │                         │                         │
   ├─ run my-sb ────────────>│                         │
   │                         │                         │
   │                         ├─ Allocate() ──────────>│
   │                         │  (Registry 选择)        │
   │                         │<────────────────────────┤
-  │                         │  (Agent 已选择)         │
+  │                         │  (Fastlet 已选择)         │
   │                         │                         │
   │                         ├─ HTTP POST /create ───>│
   │                         │                         │
@@ -158,15 +158,15 @@ GET  /api/v1/agent/logs?follow=true
 ```
 
 **延迟分解**:
-- Registry Allocate: ~1.3ms (100 agents)
-- Agent HTTP RPC: ~10-30ms
+- Registry Allocate: ~1.3ms (100 fastlets)
+- Fastlet HTTP RPC: ~10-30ms
 - Containerd create: <10ms (镜像已缓存)
 - **总计**: <50ms
 
 ### 4.2 创建沙箱 (Strong Mode)
 
 ```
-用户                    控制器              K8s                 Agent
+用户                    控制器              K8s                 Fastlet
   │                         │                    │                    │
   ├─ run my-sb ────────────>│                    │                    │
   │                         │                    │                    │
@@ -194,15 +194,15 @@ GET  /api/v1/agent/logs?follow=true
 ### 4.3 日志流 (Logs)
 
 ```
-CLI                      控制器                Agent
+CLI                      控制器                Fastlet
   │                         │                      │
   ├─ logs my-sb ───────────>│                      │
   │                         │                      │
-  │<─ Agent Pod IP ──────────┤                      │
+  │<─ Fastlet Pod IP ──────────┤                      │
   │                         │                      │
   ├─ kubectl port-forward ──────────────────────────>│
   │                         │                      │
-  ├─ GET /api/v1/agent/logs?follow=true ────────────>│
+  ├─ GET /api/v1/fastlet/logs?follow=true ────────────>│
   │<─ 分块日志流 ─────────────────────────────────────┤
 ```
 
@@ -212,17 +212,17 @@ CLI                      控制器                Agent
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--agent-port` | `5758` | Agent HTTP 服务器端口 |
+| `--fastlet-port` | `5758` | Fastlet HTTP 服务器端口 |
 | `--metrics-bind-address` | `:9091` | Prometheus 指标端点 |
 | `--health-probe-bind-address` | `:5758` | 健康检查端点 |
 | `--fastpath-consistency-mode` | `fast` | 一致性模式: fast/strong |
 | `--fastpath-orphan-timeout` | `10s` | Fast 模式孤儿清理超时 |
 
-### 5.2 Agent 环境变量
+### 5.2 Fastlet 环境变量
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `AGENT_CAPACITY` | `5` | 每个 Agent 最大沙箱数 |
+| `FASTLET_CAPACITY` | `5` | 每个 Fastlet 最大沙箱数 |
 | `CONTAINERD_SOCKET` | `/run/containerd/containerd.sock` | Containerd socket 路径 |
 
 ### 5.3 Sandbox CRD Spec
@@ -280,9 +280,9 @@ Fast Sandbox 使用 [klog](https://github.com/kubernetes/klog)，这是 Kubernet
 # Controller
 ./bin/controller -v=2
 
-# Agent
-./bin/agent -v=4
+# Fastlet
+./bin/fastlet -v=4
 
 # CLI
-fsb-ctl -v=4 list
+fastctl -v=4 list
 ```

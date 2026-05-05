@@ -40,7 +40,7 @@ message SandboxInfo {
   string sandbox_id = 1;    // container ID (md5 hash or UID)
   string sandbox_name = 8;   // CRD name (user-provided)
   string phase = 2;
-  string agent_pod = 3;
+  string fastlet_pod = 3;
   repeated string endpoints = 4;
   int64 created_at = 5;
   string image = 6;
@@ -50,11 +50,11 @@ message SandboxInfo {
 
 // ConsistencyMode 定义创建 sandbox 的一致性模式
 enum ConsistencyMode {
-  // FAST 模式：先创建 Agent，后写 CRD（默认）
+  // FAST 模式：先创建 Fastlet，后写 CRD（默认）
   // 最低延迟，但 CRD 写入失败可能导致正在使用的 sandbox 被清理
   FAST = 0;
 
-  // STRONG 模式：先写 CRD，后创建 Agent
+  // STRONG 模式：先写 CRD，后创建 Fastlet
   // 延迟略高，但保证强一致性
   STRONG = 1;
 }
@@ -75,7 +75,7 @@ message CreateRequest {
 message CreateResponse {
   string sandbox_id = 1;      // container ID (md5 hash or UID)
   string sandbox_name = 4;    // CRD name (user-provided)
-  string agent_pod = 2;
+  string fastlet_pod = 2;
   repeated string endpoints = 3; // IP:Port 列表
 }
 

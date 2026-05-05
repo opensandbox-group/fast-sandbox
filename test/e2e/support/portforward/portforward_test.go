@@ -9,8 +9,8 @@ import (
 )
 
 func TestBuildKubectlArgs(t *testing.T) {
-	args := BuildKubectlArgs("agent-pod", "tenant-a", 39090, 5758)
-	want := []string{"port-forward", "pod/agent-pod", "39090:5758", "-n", "tenant-a"}
+	args := BuildKubectlArgs("fastlet-pod", "tenant-a", 39090, 5758)
+	want := []string{"port-forward", "pod/fastlet-pod", "39090:5758", "-n", "tenant-a"}
 
 	if len(args) != len(want) {
 		t.Fatalf("expected args %v, got %v", want, args)

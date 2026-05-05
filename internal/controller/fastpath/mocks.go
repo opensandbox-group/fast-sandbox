@@ -6,46 +6,46 @@ import (
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
-	"fast-sandbox/internal/controller/agentpool"
+	"fast-sandbox/internal/controller/fastletpool"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// MockRegistryForTest is a mock implementation of AgentRegistry for testing.
+// MockRegistryForTest is a mock implementation of FastletRegistry for testing.
 type MockRegistryForTest struct {
-	AllocateFunc  func(sb *apiv1alpha1.Sandbox) (*agentpool.AgentInfo, error)
-	ReleaseFunc   func(id agentpool.AgentID, sb *apiv1alpha1.Sandbox)
-	AllocatedSb   *apiv1alpha1.Sandbox
-	ReleasedID    agentpool.AgentID
-	ReleasedSb    *apiv1alpha1.Sandbox
-	DefaultAgent  *agentpool.AgentInfo
-	AllocateError error
-	Agents        map[agentpool.AgentID]agentpool.AgentInfo
+	AllocateFunc   func(sb *apiv1alpha1.Sandbox) (*fastletpool.FastletInfo, error)
+	ReleaseFunc    func(id fastletpool.FastletID, sb *apiv1alpha1.Sandbox)
+	AllocatedSb    *apiv1alpha1.Sandbox
+	ReleasedID     fastletpool.FastletID
+	ReleasedSb     *apiv1alpha1.Sandbox
+	DefaultFastlet *fastletpool.FastletInfo
+	AllocateError  error
+	Fastlets       map[fastletpool.FastletID]fastletpool.FastletInfo
 }
 
-func (m *MockRegistryForTest) RegisterOrUpdate(info agentpool.AgentInfo) {
-	if m.Agents == nil {
-		m.Agents = make(map[agentpool.AgentID]agentpool.AgentInfo)
+func (m *MockRegistryForTest) RegisterOrUpdate(info fastletpool.FastletInfo) {
+	if m.Fastlets == nil {
+		m.Fastlets = make(map[fastletpool.FastletID]fastletpool.FastletInfo)
 	}
-	m.Agents[info.ID] = info
+	m.Fastlets[info.ID] = info
 }
 
-func (m *MockRegistryForTest) GetAllAgents() []agentpool.AgentInfo {
-	result := make([]agentpool.AgentInfo, 0, len(m.Agents))
-	for _, a := range m.Agents {
+func (m *MockRegistryForTest) GetAllFastlets() []fastletpool.FastletInfo {
+	result := make([]fastletpool.FastletInfo, 0, len(m.Fastlets))
+	for _, a := range m.Fastlets {
 		result = append(result, a)
 	}
 	return result
 }
 
-func (m *MockRegistryForTest) GetAgentByID(id agentpool.AgentID) (agentpool.AgentInfo, bool) {
-	if a, ok := m.Agents[id]; ok {
+func (m *MockRegistryForTest) GetFastletByID(id fastletpool.FastletID) (fastletpool.FastletInfo, bool) {
+	if a, ok := m.Fastlets[id]; ok {
 		return a, true
 	}
-	return agentpool.AgentInfo{}, false
+	return fastletpool.FastletInfo{}, false
 }
 
-func (m *MockRegistryForTest) Allocate(sb *apiv1alpha1.Sandbox) (*agentpool.AgentInfo, error) {
+func (m *MockRegistryForTest) Allocate(sb *apiv1alpha1.Sandbox) (*fastletpool.FastletInfo, error) {
 	m.AllocatedSb = sb
 	if m.AllocateFunc != nil {
 		return m.AllocateFunc(sb)
@@ -53,22 +53,22 @@ func (m *MockRegistryForTest) Allocate(sb *apiv1alpha1.Sandbox) (*agentpool.Agen
 	if m.AllocateError != nil {
 		return nil, m.AllocateError
 	}
-	if m.DefaultAgent != nil {
-		return m.DefaultAgent, nil
+	if m.DefaultFastlet != nil {
+		return m.DefaultFastlet, nil
 	}
-	return &agentpool.AgentInfo{
-		ID:        "test-agent",
-		PodName:   "test-agent",
-		PodIP:     "10.0.0.1",
-		NodeName:  "test-node",
-		PoolName:  "test-pool",
-		Capacity:  10,
-		Allocated: 0,
+	return &fastletpool.FastletInfo{
+		ID:            "test-fastlet",
+		PodName:       "test-fastlet",
+		PodIP:         "10.0.0.1",
+		NodeName:      "test-node",
+		PoolName:      "test-pool",
+		Capacity:      10,
+		Allocated:     0,
 		LastHeartbeat: time.Now(),
 	}, nil
 }
 
-func (m *MockRegistryForTest) Release(id agentpool.AgentID, sb *apiv1alpha1.Sandbox) {
+func (m *MockRegistryForTest) Release(id fastletpool.FastletID, sb *apiv1alpha1.Sandbox) {
 	m.ReleasedID = id
 	m.ReleasedSb = sb
 	if m.ReleaseFunc != nil {
@@ -80,32 +80,32 @@ func (m *MockRegistryForTest) Restore(ctx context.Context, c client.Reader) erro
 	return nil
 }
 
-func (m *MockRegistryForTest) Remove(id agentpool.AgentID) {
-	if m.Agents != nil {
-		delete(m.Agents, id)
+func (m *MockRegistryForTest) Remove(id fastletpool.FastletID) {
+	if m.Fastlets != nil {
+		delete(m.Fastlets, id)
 	}
 }
 
-func (m *MockRegistryForTest) CleanupStaleAgents(timeout time.Duration) int {
+func (m *MockRegistryForTest) CleanupStaleFastlets(timeout time.Duration) int {
 	return 0
 }
 
-// MockAgentClientForTest is a mock implementation of AgentAPIClient for testing.
-type MockAgentClientForTest struct {
-	CreateSandboxFunc  func(endpoint string, req *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error)
-	DeleteSandboxFunc  func(endpoint string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error)
-	GetAgentStatusFunc func(ctx context.Context, endpoint string) (*api.AgentStatus, error)
-	CreateCalled       bool
-	DeleteCalled       bool
-	LastCreateEndpoint string
-	LastDeleteEndpoint string
-	LastCreateReq      *api.CreateSandboxRequest
-	LastDeleteReq      *api.DeleteSandboxRequest
-	CreateError        error
-	DeleteError        error
+// MockFastletClientForTest is a mock implementation of FastletAPIClient for testing.
+type MockFastletClientForTest struct {
+	CreateSandboxFunc    func(endpoint string, req *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error)
+	DeleteSandboxFunc    func(endpoint string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error)
+	GetFastletStatusFunc func(ctx context.Context, endpoint string) (*api.FastletStatus, error)
+	CreateCalled         bool
+	DeleteCalled         bool
+	LastCreateEndpoint   string
+	LastDeleteEndpoint   string
+	LastCreateReq        *api.CreateSandboxRequest
+	LastDeleteReq        *api.DeleteSandboxRequest
+	CreateError          error
+	DeleteError          error
 }
 
-func (m *MockAgentClientForTest) CreateSandbox(endpoint string, req *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
+func (m *MockFastletClientForTest) CreateSandbox(endpoint string, req *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
 	m.CreateCalled = true
 	m.LastCreateEndpoint = endpoint
 	m.LastCreateReq = req
@@ -122,7 +122,7 @@ func (m *MockAgentClientForTest) CreateSandbox(endpoint string, req *api.CreateS
 	}, nil
 }
 
-func (m *MockAgentClientForTest) DeleteSandbox(endpoint string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error) {
+func (m *MockFastletClientForTest) DeleteSandbox(endpoint string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error) {
 	m.DeleteCalled = true
 	m.LastDeleteEndpoint = endpoint
 	m.LastDeleteReq = req
@@ -137,12 +137,12 @@ func (m *MockAgentClientForTest) DeleteSandbox(endpoint string, req *api.DeleteS
 	}, nil
 }
 
-func (m *MockAgentClientForTest) GetAgentStatus(ctx context.Context, endpoint string) (*api.AgentStatus, error) {
-	if m.GetAgentStatusFunc != nil {
-		return m.GetAgentStatusFunc(ctx, endpoint)
+func (m *MockFastletClientForTest) GetFastletStatus(ctx context.Context, endpoint string) (*api.FastletStatus, error) {
+	if m.GetFastletStatusFunc != nil {
+		return m.GetFastletStatusFunc(ctx, endpoint)
 	}
-	return &api.AgentStatus{
-		AgentID:   "test-agent",
+	return &api.FastletStatus{
+		FastletID: "test-fastlet",
 		NodeName:  "test-node",
 		Capacity:  10,
 		Allocated: 0,

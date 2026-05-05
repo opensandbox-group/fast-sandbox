@@ -32,7 +32,7 @@ spec:
               runtimeType: {type: string}
               runtimeClassName: {type: string}
               containerdRuntimeHandler: {type: string}
-              agentTemplate:
+              fastletTemplate:
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
           status:
@@ -41,9 +41,9 @@ spec:
               observedGeneration: {type: integer}
               currentPods: {type: integer}
               readyPods: {type: integer}
-              totalAgents: {type: integer}
-              idleAgents: {type: integer}
-              busyAgents: {type: integer}
+              totalFastlets: {type: integer}
+              idleFastlets: {type: integer}
+              busyFastlets: {type: integer}
               conditions:
                 type: array
                 items:

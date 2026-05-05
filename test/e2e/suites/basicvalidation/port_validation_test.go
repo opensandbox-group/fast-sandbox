@@ -51,11 +51,11 @@ func TestPortValidation(t *testing.T) {
 					},
 					MaxSandboxesPerPod: 10,
 					RuntimeType:        apiv1alpha1.RuntimeContainer,
-					AgentTemplate: corev1.PodTemplateSpec{
+					FastletTemplate: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
 							Containers: []corev1.Container{{
-								Name:  "agent",
-								Image: suiteenv.AgentImage(),
+								Name:  "fastlet",
+								Image: suiteenv.FastletImage(),
 							}},
 						},
 					},
@@ -64,8 +64,8 @@ func TestPortValidation(t *testing.T) {
 			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
 				t.Fatalf("create sandbox pool: %v", err)
 			}
-			if _, err := fixture.WaitForReadyAgentPods(ctx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(ctx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
 			invalidCases := []struct {
@@ -109,7 +109,7 @@ func TestPortValidation(t *testing.T) {
 					t.Fatalf("create valid sandbox for port %d: %v", port, err)
 				}
 				if _, err := fixture.WaitForSandbox(ctx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-					return sb.Status.AssignedPod != "" &&
+					return sb.Status.AssignedFastlet != "" &&
 						(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
 				}); err != nil {
 					t.Fatalf("wait for valid sandbox assignment on port %d: %v", port, err)

@@ -20,7 +20,7 @@ import (
 
 func TestKataQemuSandbox(t *testing.T) {
 	manager := suiteenv.RequireKataQemu(t)
-	cliBinaryPath := buildFSBCtl(t, manager)
+	cliBinaryPath := buildFastctl(t, manager)
 
 	feature := features.New("kata-qemu-sandbox").
 		WithLabel("suite", "secureruntime").
@@ -41,23 +41,23 @@ func TestKataQemuSandbox(t *testing.T) {
 				t.Fatalf("create kata pool: %v", err)
 			}
 
-			// Wait for ready agent pods
+			// Wait for ready fastlet pods
 			poolWaitCtx, cancelPoolWait := context.WithTimeout(ctx, 120*time.Second) // Kata needs more time
 			defer cancelPoolWait()
-			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
-			waitForAgentRegistrySync(t)
+			waitForFastletRegistrySync(t)
 
-			ctl := newFSBCtlForNamespace(ctx, t, cliBinaryPath, namespace)
-			if output, err := ctl.Run(ctx, "sb-kata-qemu", secureRuntimeFSBCtlConfig(pool.Name)); err != nil {
-				t.Fatalf("fsb-ctl run kata-qemu sandbox: %v\noutput: %s", err, output)
+			ctl := newFastctlForNamespace(ctx, t, cliBinaryPath, namespace)
+			if output, err := ctl.Run(ctx, "sb-kata-qemu", secureRuntimeFastctlConfig(pool.Name)); err != nil {
+				t.Fatalf("fastctl run kata-qemu sandbox: %v\noutput: %s", err, output)
 			}
 
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 120*time.Second)
 			defer cancelRunWait()
 			if _, err := ctl.WaitRunning(runCtx, "sb-kata-qemu"); err != nil {
-				t.Fatalf("wait for kata-qemu sandbox running via fsb-ctl: %v", err)
+				t.Fatalf("wait for kata-qemu sandbox running via fastctl: %v", err)
 			}
 
 			return ctx
@@ -78,7 +78,7 @@ func TestKataFcSandbox(t *testing.T) {
 	}
 
 	manager := suiteenv.RequireKataFc(t)
-	cliBinaryPath := buildFSBCtl(t, manager)
+	cliBinaryPath := buildFastctl(t, manager)
 
 	feature := features.New("kata-fc-sandbox").
 		WithLabel("suite", "secureruntime").
@@ -100,20 +100,20 @@ func TestKataFcSandbox(t *testing.T) {
 
 			poolWaitCtx, cancelPoolWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelPoolWait()
-			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
-			waitForAgentRegistrySync(t)
+			waitForFastletRegistrySync(t)
 
-			ctl := newFSBCtlForNamespace(ctx, t, cliBinaryPath, namespace)
-			if output, err := ctl.Run(ctx, "sb-kata-fc", secureRuntimeFSBCtlConfig(pool.Name)); err != nil {
-				t.Fatalf("fsb-ctl run kata-fc sandbox: %v\noutput: %s", err, output)
+			ctl := newFastctlForNamespace(ctx, t, cliBinaryPath, namespace)
+			if output, err := ctl.Run(ctx, "sb-kata-fc", secureRuntimeFastctlConfig(pool.Name)); err != nil {
+				t.Fatalf("fastctl run kata-fc sandbox: %v\noutput: %s", err, output)
 			}
 
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelRunWait()
 			if _, err := ctl.WaitRunning(runCtx, "sb-kata-fc"); err != nil {
-				t.Fatalf("wait for kata-fc sandbox running via fsb-ctl: %v", err)
+				t.Fatalf("wait for kata-fc sandbox running via fastctl: %v", err)
 			}
 
 			return ctx
@@ -125,7 +125,7 @@ func TestKataFcSandbox(t *testing.T) {
 
 func TestKataClhSandbox(t *testing.T) {
 	manager := suiteenv.RequireKataClh(t)
-	cliBinaryPath := buildFSBCtl(t, manager)
+	cliBinaryPath := buildFastctl(t, manager)
 
 	feature := features.New("kata-clh-sandbox").
 		WithLabel("suite", "secureruntime").
@@ -147,20 +147,20 @@ func TestKataClhSandbox(t *testing.T) {
 
 			poolWaitCtx, cancelPoolWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelPoolWait()
-			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
-			waitForAgentRegistrySync(t)
+			waitForFastletRegistrySync(t)
 
-			ctl := newFSBCtlForNamespace(ctx, t, cliBinaryPath, namespace)
-			if output, err := ctl.Run(ctx, "sb-kata-clh", secureRuntimeFSBCtlConfig(pool.Name)); err != nil {
-				t.Fatalf("fsb-ctl run kata-clh sandbox: %v\noutput: %s", err, output)
+			ctl := newFastctlForNamespace(ctx, t, cliBinaryPath, namespace)
+			if output, err := ctl.Run(ctx, "sb-kata-clh", secureRuntimeFastctlConfig(pool.Name)); err != nil {
+				t.Fatalf("fastctl run kata-clh sandbox: %v\noutput: %s", err, output)
 			}
 
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelRunWait()
 			if _, err := ctl.WaitRunning(runCtx, "sb-kata-clh"); err != nil {
-				t.Fatalf("wait for kata-clh sandbox running via fsb-ctl: %v", err)
+				t.Fatalf("wait for kata-clh sandbox running via fastctl: %v", err)
 			}
 
 			return ctx
@@ -170,17 +170,17 @@ func TestKataClhSandbox(t *testing.T) {
 	testSuite.Env().Test(t, feature)
 }
 
-func buildFSBCtl(t *testing.T, manager *e2eenv.Manager) string {
+func buildFastctl(t *testing.T, manager *e2eenv.Manager) string {
 	t.Helper()
 
-	cliBinaryPath, err := manager.BuildFSBCtl(context.Background())
+	cliBinaryPath, err := manager.BuildFastctl(context.Background())
 	if err != nil {
-		t.Fatalf("build fsb-ctl binary: %v", err)
+		t.Fatalf("build fastctl binary: %v", err)
 	}
 	return cliBinaryPath
 }
 
-func newFSBCtlForNamespace(ctx context.Context, t *testing.T, cliBinaryPath, namespace string) *e2eenv.FSBCtl {
+func newFastctlForNamespace(ctx context.Context, t *testing.T, cliBinaryPath, namespace string) *e2eenv.Fastctl {
 	t.Helper()
 
 	endpoint, pf, err := e2eenv.StartControllerPortForward(ctx, testSuite.ControllerNamespace())
@@ -193,15 +193,15 @@ func newFSBCtlForNamespace(ctx context.Context, t *testing.T, cliBinaryPath, nam
 		}
 	})
 
-	return e2eenv.NewFSBCtl(
-		e2eenv.WithFSBCtlBinary(cliBinaryPath),
-		e2eenv.WithFSBCtlEndpoint(endpoint),
-		e2eenv.WithFSBCtlNamespace(namespace),
+	return e2eenv.NewFastctl(
+		e2eenv.WithFastctlBinary(cliBinaryPath),
+		e2eenv.WithFastctlEndpoint(endpoint),
+		e2eenv.WithFastctlNamespace(namespace),
 	)
 }
 
-func secureRuntimeFSBCtlConfig(poolName string) e2eenv.FSBCtlConfig {
-	return e2eenv.FSBCtlConfig{
+func secureRuntimeFastctlConfig(poolName string) e2eenv.FastctlConfig {
+	return e2eenv.FastctlConfig{
 		Image:           "docker.io/library/alpine:latest",
 		PoolRef:         poolName,
 		ConsistencyMode: "strong",
@@ -210,8 +210,8 @@ func secureRuntimeFSBCtlConfig(poolName string) e2eenv.FSBCtlConfig {
 	}
 }
 
-func waitForAgentRegistrySync(t *testing.T) {
+func waitForFastletRegistrySync(t *testing.T) {
 	t.Helper()
-	t.Log("waiting for agent capacity to sync to controller registry")
+	t.Log("waiting for fastlet capacity to sync to controller registry")
 	time.Sleep(8 * time.Second)
 }

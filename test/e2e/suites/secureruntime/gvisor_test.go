@@ -38,11 +38,11 @@ func TestGVisorSandbox(t *testing.T) {
 				t.Fatalf("create gvisor pool: %v", err)
 			}
 
-			// Wait for ready agent pods
+			// Wait for ready fastlet pods
 			poolWaitCtx, cancelPoolWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelPoolWait()
-			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
 			// Create sandbox
@@ -55,7 +55,7 @@ func TestGVisorSandbox(t *testing.T) {
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 60*time.Second)
 			defer cancelRunWait()
 			_, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedPod != "" &&
+				return sb.Status.AssignedFastlet != "" &&
 					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
 			})
 			if err != nil {
@@ -115,8 +115,8 @@ func TestGVisorIsolation(t *testing.T) {
 
 			poolWaitCtx, cancelPoolWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelPoolWait()
-			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
 			// Create sandbox that outputs kernel info
@@ -142,22 +142,22 @@ func TestGVisorIsolation(t *testing.T) {
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 60*time.Second)
 			defer cancelRunWait()
 			createdSandbox, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedPod != "" &&
+				return sb.Status.AssignedFastlet != "" &&
 					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
 			})
 			if err != nil {
 				t.Fatalf("wait for running sandbox: %v", err)
 			}
 
-			// Get the agent pod where the sandbox runs
-			agentPod := &corev1.Pod{}
-			if err := k8sClient.Get(ctx, types.NamespacedName{Name: createdSandbox.Status.AssignedPod, Namespace: namespace}, agentPod); err != nil {
-				t.Fatalf("get agent pod: %v", err)
+			// Get the fastlet pod where the sandbox runs
+			fastletPod := &corev1.Pod{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: createdSandbox.Status.AssignedFastlet, Namespace: namespace}, fastletPod); err != nil {
+				t.Fatalf("get fastlet pod: %v", err)
 			}
 
 			// Get logs to check kernel release
 			// The log should contain gVisor kernel version like "5.10.0-gvisor" or similar
-			t.Logf("Sandbox %s running on agent pod %s", sandbox.Name, agentPod.Name)
+			t.Logf("Sandbox %s running on fastlet pod %s", sandbox.Name, fastletPod.Name)
 			t.Logf("gVisor isolation verified - sandbox created and running on secure runtime")
 
 			return ctx
@@ -192,8 +192,8 @@ func TestGVisorMultipleSandboxes(t *testing.T) {
 
 			poolWaitCtx, cancelPoolWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelPoolWait()
-			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
 			// Create multiple sandboxes
@@ -210,7 +210,7 @@ func TestGVisorMultipleSandboxes(t *testing.T) {
 			defer cancelRunWait()
 			for _, name := range sandboxNames {
 				_, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-					return sb.Status.AssignedPod != "" &&
+					return sb.Status.AssignedFastlet != "" &&
 						(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
 				})
 				if err != nil {
@@ -243,7 +243,7 @@ func newSecureRuntimePool(namespace, name string, runtimeType apiv1alpha1.Runtim
 			},
 			MaxSandboxesPerPod: 5,
 			RuntimeType:        runtimeType,
-			AgentTemplate: corev1.PodTemplateSpec{
+			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Tolerations: []corev1.Toleration{
 						{
@@ -258,8 +258,8 @@ func newSecureRuntimePool(namespace, name string, runtimeType apiv1alpha1.Runtim
 						},
 					},
 					Containers: []corev1.Container{{
-						Name:  "agent",
-						Image: suiteenv.AgentImage(),
+						Name:  "fastlet",
+						Image: suiteenv.FastletImage(),
 					}},
 				},
 			},

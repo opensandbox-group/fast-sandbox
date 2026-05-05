@@ -8,7 +8,7 @@ import (
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
-	"fast-sandbox/internal/controller/agentpool"
+	"fast-sandbox/internal/controller/fastletpool"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,81 +24,81 @@ import (
 // Mock 结构体
 // ============================================================================
 
-// MockAgentClient 用于模拟 AgentClient 行为
-type MockAgentClient struct {
-	CreateSandboxFunc func(agentIP string, req *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error)
-	DeleteSandboxFunc func(agentIP string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error)
+// MockFastletClient 用于模拟 FastletClient 行为
+type MockFastletClient struct {
+	CreateSandboxFunc func(fastletIP string, req *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error)
+	DeleteSandboxFunc func(fastletIP string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error)
 }
 
-func (m *MockAgentClient) CreateSandbox(agentIP string, req *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
+func (m *MockFastletClient) CreateSandbox(fastletIP string, req *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
 	if m.CreateSandboxFunc != nil {
-		return m.CreateSandboxFunc(agentIP, req)
+		return m.CreateSandboxFunc(fastletIP, req)
 	}
 	return &api.CreateSandboxResponse{}, nil
 }
 
-func (m *MockAgentClient) DeleteSandbox(agentIP string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error) {
+func (m *MockFastletClient) DeleteSandbox(fastletIP string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error) {
 	if m.DeleteSandboxFunc != nil {
-		return m.DeleteSandboxFunc(agentIP, req)
+		return m.DeleteSandboxFunc(fastletIP, req)
 	}
 	return &api.DeleteSandboxResponse{Success: true}, nil
 }
 
-func (m *MockAgentClient) GetAgentStatus(ctx context.Context, agentIP string) (*api.AgentStatus, error) {
+func (m *MockFastletClient) GetFastletStatus(ctx context.Context, fastletIP string) (*api.FastletStatus, error) {
 	return nil, nil
 }
 
 // ConfigurableMockRegistry 可配置的 Registry Mock
 type ConfigurableMockRegistry struct {
 	// 配置项
-	Agents           map[agentpool.AgentID]agentpool.AgentInfo
-	AllocateFunc     func(sb *apiv1alpha1.Sandbox) (*agentpool.AgentInfo, error)
-	AllocateError    error
-	DefaultAgent     *agentpool.AgentInfo
-	ReturnAgentByID  bool // GetAgentByID 是否返回 agent
-	LastHeartbeatAge time.Duration
+	Fastlets          map[fastletpool.FastletID]fastletpool.FastletInfo
+	AllocateFunc      func(sb *apiv1alpha1.Sandbox) (*fastletpool.FastletInfo, error)
+	AllocateError     error
+	DefaultFastlet    *fastletpool.FastletInfo
+	ReturnFastletByID bool // GetFastletByID 是否返回 fastlet
+	LastHeartbeatAge  time.Duration
 
 	// 调用记录
-	ReleaseCalled   bool
-	ReleaseAgentID  agentpool.AgentID
-	ReleaseSandbox  *apiv1alpha1.Sandbox
-	AllocateCalled  bool
-	AllocateSandbox *apiv1alpha1.Sandbox
+	ReleaseCalled    bool
+	ReleaseFastletID fastletpool.FastletID
+	ReleaseSandbox   *apiv1alpha1.Sandbox
+	AllocateCalled   bool
+	AllocateSandbox  *apiv1alpha1.Sandbox
 }
 
 func NewConfigurableMockRegistry() *ConfigurableMockRegistry {
 	return &ConfigurableMockRegistry{
-		Agents:          make(map[agentpool.AgentID]agentpool.AgentInfo),
-		ReturnAgentByID: true,
+		Fastlets:          make(map[fastletpool.FastletID]fastletpool.FastletInfo),
+		ReturnFastletByID: true,
 	}
 }
 
-func (m *ConfigurableMockRegistry) RegisterOrUpdate(info agentpool.AgentInfo) {
-	m.Agents[info.ID] = info
+func (m *ConfigurableMockRegistry) RegisterOrUpdate(info fastletpool.FastletInfo) {
+	m.Fastlets[info.ID] = info
 }
 
-func (m *ConfigurableMockRegistry) GetAllAgents() []agentpool.AgentInfo {
-	out := make([]agentpool.AgentInfo, 0, len(m.Agents))
-	for _, a := range m.Agents {
+func (m *ConfigurableMockRegistry) GetAllFastlets() []fastletpool.FastletInfo {
+	out := make([]fastletpool.FastletInfo, 0, len(m.Fastlets))
+	for _, a := range m.Fastlets {
 		out = append(out, a)
 	}
 	return out
 }
 
-func (m *ConfigurableMockRegistry) GetAgentByID(id agentpool.AgentID) (agentpool.AgentInfo, bool) {
-	if !m.ReturnAgentByID {
-		return agentpool.AgentInfo{}, false
+func (m *ConfigurableMockRegistry) GetFastletByID(id fastletpool.FastletID) (fastletpool.FastletInfo, bool) {
+	if !m.ReturnFastletByID {
+		return fastletpool.FastletInfo{}, false
 	}
-	if a, ok := m.Agents[id]; ok {
+	if a, ok := m.Fastlets[id]; ok {
 		return a, true
 	}
-	// 返回默认 Agent
-	if m.DefaultAgent != nil {
-		agent := *m.DefaultAgent
-		agent.LastHeartbeat = time.Now().Add(-m.LastHeartbeatAge)
-		return agent, true
+	// 返回默认 Fastlet
+	if m.DefaultFastlet != nil {
+		fastlet := *m.DefaultFastlet
+		fastlet.LastHeartbeat = time.Now().Add(-m.LastHeartbeatAge)
+		return fastlet, true
 	}
-	return agentpool.AgentInfo{
+	return fastletpool.FastletInfo{
 		ID:              id,
 		PodName:         string(id),
 		PodIP:           "10.0.0.1",
@@ -107,7 +107,7 @@ func (m *ConfigurableMockRegistry) GetAgentByID(id agentpool.AgentID) (agentpool
 	}, true
 }
 
-func (m *ConfigurableMockRegistry) Allocate(sb *apiv1alpha1.Sandbox) (*agentpool.AgentInfo, error) {
+func (m *ConfigurableMockRegistry) Allocate(sb *apiv1alpha1.Sandbox) (*fastletpool.FastletInfo, error) {
 	m.AllocateCalled = true
 	m.AllocateSandbox = sb
 	if m.AllocateFunc != nil {
@@ -116,20 +116,20 @@ func (m *ConfigurableMockRegistry) Allocate(sb *apiv1alpha1.Sandbox) (*agentpool
 	if m.AllocateError != nil {
 		return nil, m.AllocateError
 	}
-	if m.DefaultAgent != nil {
-		return m.DefaultAgent, nil
+	if m.DefaultFastlet != nil {
+		return m.DefaultFastlet, nil
 	}
-	return &agentpool.AgentInfo{
-		ID:       "test-agent",
-		PodName:  "test-agent",
+	return &fastletpool.FastletInfo{
+		ID:       "test-fastlet",
+		PodName:  "test-fastlet",
 		PodIP:    "10.0.0.1",
 		NodeName: "test-node",
 	}, nil
 }
 
-func (m *ConfigurableMockRegistry) Release(id agentpool.AgentID, sb *apiv1alpha1.Sandbox) {
+func (m *ConfigurableMockRegistry) Release(id fastletpool.FastletID, sb *apiv1alpha1.Sandbox) {
 	m.ReleaseCalled = true
-	m.ReleaseAgentID = id
+	m.ReleaseFastletID = id
 	m.ReleaseSandbox = sb
 }
 
@@ -137,11 +137,11 @@ func (m *ConfigurableMockRegistry) Restore(ctx context.Context, c client.Reader)
 	return nil
 }
 
-func (m *ConfigurableMockRegistry) Remove(id agentpool.AgentID) {
-	delete(m.Agents, id)
+func (m *ConfigurableMockRegistry) Remove(id fastletpool.FastletID) {
+	delete(m.Fastlets, id)
 }
 
-func (m *ConfigurableMockRegistry) CleanupStaleAgents(timeout time.Duration) int {
+func (m *ConfigurableMockRegistry) CleanupStaleFastlets(timeout time.Duration) int {
 	return 0
 }
 
@@ -155,17 +155,17 @@ func newTestScheme(t *testing.T) *runtime.Scheme {
 	return scheme
 }
 
-func newTestReconciler(scheme *runtime.Scheme, objs []client.Object, registry *ConfigurableMockRegistry, agentClient *MockAgentClient) *SandboxReconciler {
+func newTestReconciler(scheme *runtime.Scheme, objs []client.Object, registry *ConfigurableMockRegistry, fastletClient *MockFastletClient) *SandboxReconciler {
 	builder := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(objs...).
 		WithStatusSubresource(&apiv1alpha1.Sandbox{})
 
 	return &SandboxReconciler{
-		Client:      builder.Build(),
-		Scheme:      scheme,
-		Registry:    registry,
-		AgentClient: agentClient,
+		Client:        builder.Build(),
+		Scheme:        scheme,
+		Registry:      registry,
+		FastletClient: fastletClient,
 	}
 }
 
@@ -197,7 +197,7 @@ func withDeletionTimestamp(sb *apiv1alpha1.Sandbox) {
 
 func withAssignedPod(podName string) func(*apiv1alpha1.Sandbox) {
 	return func(sb *apiv1alpha1.Sandbox) {
-		sb.Status.AssignedPod = podName
+		sb.Status.AssignedFastlet = podName
 	}
 }
 
@@ -270,13 +270,13 @@ func sandboxShouldBeDeleted(t *testing.T, r *SandboxReconciler, name string) {
 // ============================================================================
 
 func TestSandbox_Creation_NormalScheduling(t *testing.T) {
-	// C-01: 新建 Sandbox，Registry 有可用 Agent
+	// C-01: 新建 Sandbox，Registry 有可用 Fastlet
 	scheme := newTestScheme(t)
 	sb := newBaseSandbox("test-sb", withFinalizer)
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	// 第一次 Reconcile：调度
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
@@ -286,19 +286,19 @@ func TestSandbox_Creation_NormalScheduling(t *testing.T) {
 
 	// 验证状态更新
 	updated := getSandbox(t, r, "test-sb")
-	assert.Equal(t, "test-agent", updated.Status.AssignedPod)
+	assert.Equal(t, "test-fastlet", updated.Status.AssignedFastlet)
 	assert.Equal(t, "Pending", updated.Status.Phase)
 }
 
-func TestSandbox_Creation_NoAvailableAgent(t *testing.T) {
+func TestSandbox_Creation_NoAvailableFastlet(t *testing.T) {
 	// C-02: Registry 返回容量不足错误
 	scheme := newTestScheme(t)
 	sb := newBaseSandbox("test-sb", withFinalizer)
 	registry := NewConfigurableMockRegistry()
 	registry.AllocateError = errors.New("insufficient capacity")
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -306,19 +306,19 @@ func TestSandbox_Creation_NoAvailableAgent(t *testing.T) {
 
 	// 状态不应更新
 	updated := getSandbox(t, r, "test-sb")
-	assert.Empty(t, updated.Status.AssignedPod)
+	assert.Empty(t, updated.Status.AssignedFastlet)
 }
 
 func TestSandbox_Creation_SchedulingRace(t *testing.T) {
-	// C-03: Allocate 成功但 Status 更新时发现 AssignedPod 已被设置
+	// C-03: Allocate 成功但 Status 更新时发现 AssignedFastlet 已被设置
 	scheme := newTestScheme(t)
-	sb := newBaseSandbox("test-sb", withFinalizer, withAssignedPod("other-agent"))
+	sb := newBaseSandbox("test-sb", withFinalizer, withAssignedPod("other-fastlet"))
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
-	// 因为已经有 AssignedPod，不应该再调用 Allocate
+	// 因为已经有 AssignedFastlet，不应该再调用 Allocate
 	_, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
 	assert.False(t, registry.AllocateCalled, "不应该再次调用 Allocate")
@@ -330,9 +330,9 @@ func TestSandbox_Creation_AddFinalizer(t *testing.T) {
 	sb := newBaseSandbox("test-sb") // 没有 Finalizer
 
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -343,32 +343,32 @@ func TestSandbox_Creation_AddFinalizer(t *testing.T) {
 	assert.Contains(t, updated.Finalizers, "sandbox.fast.io/cleanup")
 }
 
-func TestSandbox_Creation_AgentCreateSuccess(t *testing.T) {
-	// C-05: Phase=Pending，调用 Agent.CreateSandbox 成功
+func TestSandbox_Creation_FastletCreateSuccess(t *testing.T) {
+	// C-05: Phase=Pending，调用 Fastlet.CreateSandbox 成功
 	scheme := newTestScheme(t)
 	testUID := "test-uid-001"
-	sb := newBaseSandbox("test-sb", withFinalizer, withAssignedPod("test-agent"), withPhase("Pending"), withUID(testUID))
+	sb := newBaseSandbox("test-sb", withFinalizer, withAssignedPod("test-fastlet"), withPhase("Pending"), withUID(testUID))
 
 	registry := NewConfigurableMockRegistry()
-	registry.DefaultAgent = &agentpool.AgentInfo{
-		ID:              "test-agent",
-		PodName:         "test-agent",
+	registry.DefaultFastlet = &fastletpool.FastletInfo{
+		ID:              "test-fastlet",
+		PodName:         "test-fastlet",
 		PodIP:           "10.0.0.1",
 		LastHeartbeat:   time.Now(),
 		SandboxStatuses: make(map[string]api.SandboxStatus),
 	}
 
 	createCalled := false
-	agentClient := &MockAgentClient{
-		CreateSandboxFunc: func(agentIP string, req *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
+	fastletClient := &MockFastletClient{
+		CreateSandboxFunc: func(fastletIP string, req *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
 			createCalled = true
-			assert.Equal(t, "10.0.0.1", agentIP)
+			assert.Equal(t, "10.0.0.1", fastletIP)
 			assert.Equal(t, testUID, req.Sandbox.SandboxID)
 			return &api.CreateSandboxResponse{}, nil
 		},
 	}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -380,19 +380,19 @@ func TestSandbox_Creation_AgentCreateSuccess(t *testing.T) {
 	assert.Equal(t, "Bound", updated.Status.Phase)
 }
 
-func TestSandbox_Creation_AgentCreateFailure(t *testing.T) {
+func TestSandbox_Creation_FastletCreateFailure(t *testing.T) {
 	// C-06: CreateSandbox 返回错误
 	scheme := newTestScheme(t)
-	sb := newBaseSandbox("test-sb", withFinalizer, withAssignedPod("test-agent"), withPhase("Pending"))
+	sb := newBaseSandbox("test-sb", withFinalizer, withAssignedPod("test-fastlet"), withPhase("Pending"))
 
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{
-		CreateSandboxFunc: func(agentIP string, req *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
+	fastletClient := &MockFastletClient{
+		CreateSandboxFunc: func(fastletIP string, req *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
 			return nil, errors.New("connection refused")
 		},
 	}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err) // 错误被处理，返回 RequeueAfter
@@ -408,27 +408,27 @@ func TestSandbox_Creation_AgentCreateFailure(t *testing.T) {
 // ============================================================================
 
 func TestSandbox_Deletion_BoundPhase(t *testing.T) {
-	// D-01: DeletionTimestamp 设置，Phase=Bound，调用 Agent 删除
+	// D-01: DeletionTimestamp 设置，Phase=Bound，调用 Fastlet 删除
 	scheme := newTestScheme(t)
 	testUID := "test-uid-002"
-	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withAssignedPod("test-agent"), withPhase("Bound"), withUID(testUID))
+	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withAssignedPod("test-fastlet"), withPhase("Bound"), withUID(testUID))
 
 	registry := NewConfigurableMockRegistry()
 	deleteCalled := false
-	agentClient := &MockAgentClient{
-		DeleteSandboxFunc: func(agentIP string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error) {
+	fastletClient := &MockFastletClient{
+		DeleteSandboxFunc: func(fastletIP string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error) {
 			deleteCalled = true
 			assert.Equal(t, testUID, req.SandboxID)
 			return &api.DeleteSandboxResponse{Success: true}, nil
 		},
 	}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
 	assert.True(t, deleteCalled, "应该调用 DeleteSandbox")
-	assert.Equal(t, 2*time.Second, result.RequeueAfter, "应该等待 Agent 确认")
+	assert.Equal(t, 2*time.Second, result.RequeueAfter, "应该等待 Fastlet 确认")
 
 	// Phase 应该变为 Terminating
 	updated := getSandbox(t, r, "test-sb")
@@ -436,22 +436,22 @@ func TestSandbox_Deletion_BoundPhase(t *testing.T) {
 }
 
 func TestSandbox_Deletion_WaitForTerminated(t *testing.T) {
-	// D-02: Phase=Terminating，Agent 不再上报该 sandbox (已删除完成)
+	// D-02: Phase=Terminating，Fastlet 不再上报该 sandbox (已删除完成)
 	scheme := newTestScheme(t)
-	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withAssignedPod("test-agent"), withPhase("Terminating"))
+	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withAssignedPod("test-fastlet"), withPhase("Terminating"))
 
 	registry := NewConfigurableMockRegistry()
-	registry.DefaultAgent = &agentpool.AgentInfo{
-		ID:            "test-agent",
-		PodName:       "test-agent",
+	registry.DefaultFastlet = &fastletpool.FastletInfo{
+		ID:            "test-fastlet",
+		PodName:       "test-fastlet",
 		PodIP:         "10.0.0.1",
 		LastHeartbeat: time.Now(),
-		// SandboxStatuses 中没有 "test-sb" = Agent 已删除该 sandbox
+		// SandboxStatuses 中没有 "test-sb" = Fastlet 已删除该 sandbox
 		SandboxStatuses: map[string]api.SandboxStatus{},
 	}
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -463,24 +463,24 @@ func TestSandbox_Deletion_WaitForTerminated(t *testing.T) {
 }
 
 func TestSandbox_Deletion_TerminatingWaiting(t *testing.T) {
-	// D-03: Phase=Terminating，Agent 还在上报该 sandbox (还在删除中)
+	// D-03: Phase=Terminating，Fastlet 还在上报该 sandbox (还在删除中)
 	scheme := newTestScheme(t)
 	testUID := "test-uid-003"
-	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withAssignedPod("test-agent"), withPhase("Terminating"), withUID(testUID))
+	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withAssignedPod("test-fastlet"), withPhase("Terminating"), withUID(testUID))
 
 	registry := NewConfigurableMockRegistry()
-	registry.DefaultAgent = &agentpool.AgentInfo{
-		ID:            "test-agent",
-		PodName:       "test-agent",
+	registry.DefaultFastlet = &fastletpool.FastletInfo{
+		ID:            "test-fastlet",
+		PodName:       "test-fastlet",
 		PodIP:         "10.0.0.1",
 		LastHeartbeat: time.Now(),
 		SandboxStatuses: map[string]api.SandboxStatus{
-			testUID: {SandboxID: testUID, Phase: "running"}, // Agent 还在上报 sandbox
+			testUID: {SandboxID: testUID, Phase: "running"}, // Fastlet 还在上报 sandbox
 		},
 	}
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -488,44 +488,44 @@ func TestSandbox_Deletion_TerminatingWaiting(t *testing.T) {
 	assert.False(t, registry.ReleaseCalled, "不应该释放 Registry")
 }
 
-func TestSandbox_Deletion_AgentReportsTerminated(t *testing.T) {
-	// D-03b: Phase=Terminating，Agent 上报 phase="terminated"
-	// 新行为：只有 Agent 不再上报该 sandbox 时才算删除完成
+func TestSandbox_Deletion_FastletReportsTerminated(t *testing.T) {
+	// D-03b: Phase=Terminating，Fastlet 上报 phase="terminated"
+	// 新行为：只有 Fastlet 不再上报该 sandbox 时才算删除完成
 	// 即 phase="terminated" 时仍需等待
 	scheme := newTestScheme(t)
 	testUID := "test-uid-004"
-	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withAssignedPod("test-agent"), withPhase("Terminating"), withUID(testUID))
+	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withAssignedPod("test-fastlet"), withPhase("Terminating"), withUID(testUID))
 
 	registry := NewConfigurableMockRegistry()
-	registry.DefaultAgent = &agentpool.AgentInfo{
-		ID:            "test-agent",
-		PodName:       "test-agent",
+	registry.DefaultFastlet = &fastletpool.FastletInfo{
+		ID:            "test-fastlet",
+		PodName:       "test-fastlet",
 		PodIP:         "10.0.0.1",
 		LastHeartbeat: time.Now(),
 		SandboxStatuses: map[string]api.SandboxStatus{
-			testUID: {SandboxID: testUID, Phase: "terminated"}, // Agent 上报 terminated，但仍需等待直到不再上报
+			testUID: {SandboxID: testUID, Phase: "terminated"}, // Fastlet 上报 terminated，但仍需等待直到不再上报
 		},
 	}
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
-	assert.Equal(t, 2*time.Second, result.RequeueAfter, "应该继续等待，直到 Agent 不再上报该 sandbox")
+	assert.Equal(t, 2*time.Second, result.RequeueAfter, "应该继续等待，直到 Fastlet 不再上报该 sandbox")
 	assert.False(t, registry.ReleaseCalled, "不应该释放 Registry")
 }
 
-func TestSandbox_Deletion_AgentNotFound(t *testing.T) {
-	// D-04: Agent 已从 Registry 移除
+func TestSandbox_Deletion_FastletNotFound(t *testing.T) {
+	// D-04: Fastlet 已从 Registry 移除
 	scheme := newTestScheme(t)
-	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withAssignedPod("unknown-agent"), withPhase("Bound"))
+	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withAssignedPod("unknown-fastlet"), withPhase("Bound"))
 
 	registry := NewConfigurableMockRegistry()
-	registry.ReturnAgentByID = false // GetAgentByID 返回 false
-	agentClient := &MockAgentClient{}
+	registry.ReturnFastletByID = false // GetFastletByID 返回 false
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -536,15 +536,15 @@ func TestSandbox_Deletion_AgentNotFound(t *testing.T) {
 }
 
 func TestSandbox_Deletion_NoAssignedPod(t *testing.T) {
-	// D-05: AssignedPod=""
+	// D-05: AssignedFastlet=""
 	scheme := newTestScheme(t)
 	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withPhase("Pending"))
-	// 没有 AssignedPod
+	// 没有 AssignedFastlet
 
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -554,23 +554,23 @@ func TestSandbox_Deletion_NoAssignedPod(t *testing.T) {
 	sandboxShouldBeDeleted(t, r, "test-sb")
 }
 
-func TestSandbox_Deletion_DeleteFromAgentError(t *testing.T) {
-	// D-06: Agent.DeleteSandbox 返回网络错误
+func TestSandbox_Deletion_DeleteFromFastletError(t *testing.T) {
+	// D-06: Fastlet.DeleteSandbox 返回网络错误
 	scheme := newTestScheme(t)
-	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withAssignedPod("test-agent"), withPhase("Bound"))
+	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withAssignedPod("test-fastlet"), withPhase("Bound"))
 
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{
-		DeleteSandboxFunc: func(agentIP string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error) {
+	fastletClient := &MockFastletClient{
+		DeleteSandboxFunc: func(fastletIP string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error) {
 			return nil, errors.New("network error: connection refused")
 		},
 	}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	_, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	assert.Error(t, err, "应该返回错误触发重试")
-	assert.Contains(t, err.Error(), "failed to delete from agent")
+	assert.Contains(t, err.Error(), "failed to delete from fastlet")
 	assert.False(t, registry.ReleaseCalled, "不应该释放 Registry")
 }
 
@@ -580,9 +580,9 @@ func TestSandbox_Deletion_ExpiredPhase(t *testing.T) {
 	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withPhase("Expired"))
 
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -598,9 +598,9 @@ func TestSandbox_Deletion_OtherPhase(t *testing.T) {
 	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp, withPhase(""))
 
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -615,52 +615,52 @@ func TestSandbox_Deletion_OtherPhase(t *testing.T) {
 // ============================================================================
 
 func TestSandbox_Expiration_Normal(t *testing.T) {
-	// E-01: ExpireTime 已过，Phase != Expired，AssignedPod 存在
+	// E-01: ExpireTime 已过，Phase != Expired，AssignedFastlet 存在
 	scheme := newTestScheme(t)
 	sb := newBaseSandbox("test-sb", withFinalizer,
-		withAssignedPod("test-agent"),
+		withAssignedPod("test-fastlet"),
 		withPhase("Bound"),
 		withExpireTime(time.Now().Add(-1*time.Hour))) // 1小时前过期
 
 	registry := NewConfigurableMockRegistry()
 	deleteCalled := false
-	agentClient := &MockAgentClient{
-		DeleteSandboxFunc: func(agentIP string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error) {
+	fastletClient := &MockFastletClient{
+		DeleteSandboxFunc: func(fastletIP string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error) {
 			deleteCalled = true
 			return &api.DeleteSandboxResponse{Success: true}, nil
 		},
 	}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
 	assert.Empty(t, result, "过期后不需要 Requeue")
-	assert.True(t, deleteCalled, "应该调用 deleteFromAgent")
+	assert.True(t, deleteCalled, "应该调用 deleteFromFastlet")
 	assert.True(t, registry.ReleaseCalled, "应该释放 Registry")
 
 	// Phase 应该变为 Expired
 	updated := getSandbox(t, r, "test-sb")
 	assert.Equal(t, "Expired", updated.Status.Phase)
-	assert.Empty(t, updated.Status.AssignedPod, "AssignedPod 应该清空")
+	assert.Empty(t, updated.Status.AssignedFastlet, "AssignedFastlet 应该清空")
 }
 
 func TestSandbox_Expiration_NoAssignedPod(t *testing.T) {
-	// E-02: ExpireTime 已过，AssignedPod=""
+	// E-02: ExpireTime 已过，AssignedFastlet=""
 	scheme := newTestScheme(t)
 	sb := newBaseSandbox("test-sb", withFinalizer,
 		withPhase("Pending"),
 		withExpireTime(time.Now().Add(-1*time.Hour)))
 
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
 	assert.Empty(t, result)
-	assert.False(t, registry.ReleaseCalled, "没有 AssignedPod 不应该 Release")
+	assert.False(t, registry.ReleaseCalled, "没有 AssignedFastlet 不应该 Release")
 
 	updated := getSandbox(t, r, "test-sb")
 	assert.Equal(t, "Expired", updated.Status.Phase)
@@ -674,9 +674,9 @@ func TestSandbox_Expiration_AlreadyExpired(t *testing.T) {
 		withExpireTime(time.Now().Add(-1*time.Hour)))
 
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -689,13 +689,13 @@ func TestSandbox_Expiration_SoonExpiring(t *testing.T) {
 	remainingTime := 10 * time.Second
 	sb := newBaseSandbox("test-sb", withFinalizer,
 		withPhase("Bound"),
-		withAssignedPod("test-agent"),
+		withAssignedPod("test-fastlet"),
 		withExpireTime(time.Now().Add(remainingTime)))
 
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -708,20 +708,20 @@ func TestSandbox_Expiration_SkipWhenDeleting(t *testing.T) {
 	// E-07: DeletionTimestamp 已设置，即使 ExpireTime 已过
 	scheme := newTestScheme(t)
 	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp,
-		withAssignedPod("test-agent"),
+		withAssignedPod("test-fastlet"),
 		withPhase("Bound"),
 		withExpireTime(time.Now().Add(-1*time.Hour))) // 已过期
 
 	registry := NewConfigurableMockRegistry()
 	deleteCalled := false
-	agentClient := &MockAgentClient{
-		DeleteSandboxFunc: func(agentIP string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error) {
+	fastletClient := &MockFastletClient{
+		DeleteSandboxFunc: func(fastletIP string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error) {
 			deleteCalled = true
 			return &api.DeleteSandboxResponse{Success: true}, nil
 		},
 	}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -742,22 +742,22 @@ func TestSandbox_Reset_FirstTime(t *testing.T) {
 	scheme := newTestScheme(t)
 	resetTime := time.Now()
 	sb := newBaseSandbox("test-sb", withFinalizer,
-		withAssignedPod("test-agent"),
+		withAssignedPod("test-fastlet"),
 		withPhase("Bound"),
 		withResetRevision(resetTime))
 
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
 	assert.True(t, result.Requeue, "应该 Requeue 重新调度")
-	assert.True(t, registry.ReleaseCalled, "应该释放旧 Agent")
+	assert.True(t, registry.ReleaseCalled, "应该释放旧 Fastlet")
 
 	updated := getSandbox(t, r, "test-sb")
-	assert.Empty(t, updated.Status.AssignedPod, "AssignedPod 应该清空")
+	assert.Empty(t, updated.Status.AssignedFastlet, "AssignedFastlet 应该清空")
 	assert.Equal(t, "Pending", updated.Status.Phase, "Phase 应该变为 Pending")
 	assert.NotNil(t, updated.Status.AcceptedResetRevision)
 }
@@ -768,15 +768,15 @@ func TestSandbox_Reset_NewRevision(t *testing.T) {
 	oldReset := time.Now().Add(-1 * time.Hour)
 	newReset := time.Now()
 	sb := newBaseSandbox("test-sb", withFinalizer,
-		withAssignedPod("test-agent"),
+		withAssignedPod("test-fastlet"),
 		withPhase("Bound"),
 		withResetRevision(newReset),
 		withAcceptedResetRevision(oldReset))
 
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -792,15 +792,15 @@ func TestSandbox_Reset_SameRevision(t *testing.T) {
 	scheme := newTestScheme(t)
 	resetTime := time.Now()
 	sb := newBaseSandbox("test-sb", withFinalizer,
-		withAssignedPod("test-agent"),
+		withAssignedPod("test-fastlet"),
 		withPhase("Bound"),
 		withResetRevision(resetTime),
 		withAcceptedResetRevision(resetTime)) // 相同时间
 
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	_, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -809,27 +809,27 @@ func TestSandbox_Reset_SameRevision(t *testing.T) {
 	// Phase 应该保持不变
 	updated := getSandbox(t, r, "test-sb")
 	assert.Equal(t, "Bound", updated.Status.Phase)
-	assert.Equal(t, "test-agent", updated.Status.AssignedPod)
+	assert.Equal(t, "test-fastlet", updated.Status.AssignedFastlet)
 }
 
 func TestSandbox_Reset_NoAssignedPod(t *testing.T) {
-	// R-04: AssignedPod="" 时触发 Reset
+	// R-04: AssignedFastlet="" 时触发 Reset
 	scheme := newTestScheme(t)
 	resetTime := time.Now()
 	sb := newBaseSandbox("test-sb", withFinalizer,
 		withPhase("Pending"),
 		withResetRevision(resetTime))
-	// AssignedPod 为空
+	// AssignedFastlet 为空
 
 	registry := NewConfigurableMockRegistry()
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
 	assert.True(t, result.Requeue)
-	assert.False(t, registry.ReleaseCalled, "没有 AssignedPod 不需要 Release")
+	assert.False(t, registry.ReleaseCalled, "没有 AssignedFastlet 不需要 Release")
 
 	updated := getSandbox(t, r, "test-sb")
 	assert.Equal(t, "Pending", updated.Status.Phase)
@@ -841,41 +841,41 @@ func TestSandbox_Reset_NoAssignedPod(t *testing.T) {
 // ============================================================================
 
 func TestSandbox_FailurePolicy_AutoRecreate(t *testing.T) {
-	// F-01: FailurePolicy=AutoRecreate，Agent 不在 Registry
+	// F-01: FailurePolicy=AutoRecreate，Fastlet 不在 Registry
 	scheme := newTestScheme(t)
 	sb := newBaseSandbox("test-sb", withFinalizer,
-		withAssignedPod("dead-agent"),
+		withAssignedPod("dead-fastlet"),
 		withPhase("Bound"),
 		withFailurePolicy(apiv1alpha1.FailurePolicyAutoRecreate))
 
 	registry := NewConfigurableMockRegistry()
-	registry.ReturnAgentByID = false // Agent 不存在
-	agentClient := &MockAgentClient{}
+	registry.ReturnFastletByID = false // Fastlet 不存在
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
 	assert.True(t, result.Requeue, "应该 Requeue 重新调度")
 
 	updated := getSandbox(t, r, "test-sb")
-	assert.Empty(t, updated.Status.AssignedPod, "AssignedPod 应该清空")
+	assert.Empty(t, updated.Status.AssignedFastlet, "AssignedFastlet 应该清空")
 	assert.Equal(t, "Pending", updated.Status.Phase, "Phase 应该变为 Pending")
 }
 
 func TestSandbox_FailurePolicy_Manual(t *testing.T) {
-	// F-03: FailurePolicy=Manual，Agent 不在 Registry
+	// F-03: FailurePolicy=Manual，Fastlet 不在 Registry
 	scheme := newTestScheme(t)
 	sb := newBaseSandbox("test-sb", withFinalizer,
-		withAssignedPod("dead-agent"),
+		withAssignedPod("dead-fastlet"),
 		withPhase("Bound"),
 		withFailurePolicy(apiv1alpha1.FailurePolicyManual))
 
 	registry := NewConfigurableMockRegistry()
-	registry.ReturnAgentByID = false // Agent 不存在
-	agentClient := &MockAgentClient{}
+	registry.ReturnFastletByID = false // Fastlet 不存在
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -883,7 +883,7 @@ func TestSandbox_FailurePolicy_Manual(t *testing.T) {
 
 	// 状态不应改变
 	updated := getSandbox(t, r, "test-sb")
-	assert.Equal(t, "", updated.Status.AssignedPod)
+	assert.Equal(t, "", updated.Status.AssignedFastlet)
 	assert.Equal(t, "Lost", updated.Status.Phase)
 }
 
@@ -892,29 +892,29 @@ func TestSandbox_HeartbeatNormal(t *testing.T) {
 	scheme := newTestScheme(t)
 	testUID := "test-uid-005"
 	sb := newBaseSandbox("test-sb", withFinalizer,
-		withAssignedPod("test-agent"),
+		withAssignedPod("test-fastlet"),
 		withPhase("Bound"),
 		withUID(testUID))
 
 	registry := NewConfigurableMockRegistry()
-	registry.DefaultAgent = &agentpool.AgentInfo{
-		ID:            "test-agent",
-		PodName:       "test-agent",
+	registry.DefaultFastlet = &fastletpool.FastletInfo{
+		ID:            "test-fastlet",
+		PodName:       "test-fastlet",
 		PodIP:         "10.0.0.1",
 		LastHeartbeat: time.Now(), // 刚刚心跳
 		SandboxStatuses: map[string]api.SandboxStatus{
 			testUID: {SandboxID: testUID, Phase: "running"},
 		},
 	}
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
 	assert.Equal(t, 5*time.Second, result.RequeueAfter, "应该定期同步状态")
 
-	// 应该同步 Agent 状态到 CRD
+	// 应该同步 Fastlet 状态到 CRD
 	updated := getSandbox(t, r, "test-sb")
 	assert.Equal(t, "Running", updated.Status.Phase)
 	assert.Equal(t, testUID, updated.Status.SandboxID)
@@ -924,14 +924,14 @@ func TestSandbox_HeartbeatTimeout(t *testing.T) {
 	// F-06: 心跳超时 (LastHeartbeat > 10s)
 	scheme := newTestScheme(t)
 	sb := newBaseSandbox("test-sb", withFinalizer,
-		withAssignedPod("test-agent"),
+		withAssignedPod("test-fastlet"),
 		withPhase("Bound"))
 
 	registry := NewConfigurableMockRegistry()
 	registry.LastHeartbeatAge = 15 * time.Second // 心跳超时
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	result, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -943,27 +943,27 @@ func TestSandbox_HeartbeatTimeout(t *testing.T) {
 // ============================================================================
 
 func TestSandbox_StatusSync_FromRegistry(t *testing.T) {
-	// S-01: 同步 Agent 状态
+	// S-01: 同步 Fastlet 状态
 	scheme := newTestScheme(t)
 	testUID := "container-abc123"
 	sb := newBaseSandbox("test-sb", withFinalizer,
-		withAssignedPod("test-agent"),
+		withAssignedPod("test-fastlet"),
 		withPhase("Bound"),
 		withUID(testUID))
 
 	registry := NewConfigurableMockRegistry()
-	registry.DefaultAgent = &agentpool.AgentInfo{
-		ID:            "test-agent",
-		PodName:       "test-agent",
+	registry.DefaultFastlet = &fastletpool.FastletInfo{
+		ID:            "test-fastlet",
+		PodName:       "test-fastlet",
 		PodIP:         "10.0.0.1",
 		LastHeartbeat: time.Now(),
 		SandboxStatuses: map[string]api.SandboxStatus{
 			testUID: {SandboxID: testUID, Phase: "running"},
 		},
 	}
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	_, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -978,24 +978,24 @@ func TestSandbox_StatusSync_Endpoints(t *testing.T) {
 	scheme := newTestScheme(t)
 	testUID := "test-uid-006"
 	sb := newBaseSandbox("test-sb", withFinalizer,
-		withAssignedPod("test-agent"),
+		withAssignedPod("test-fastlet"),
 		withPhase("Bound"),
 		withExposedPorts(8080, 9090),
 		withUID(testUID))
 
 	registry := NewConfigurableMockRegistry()
-	registry.DefaultAgent = &agentpool.AgentInfo{
-		ID:            "test-agent",
-		PodName:       "test-agent",
+	registry.DefaultFastlet = &fastletpool.FastletInfo{
+		ID:            "test-fastlet",
+		PodName:       "test-fastlet",
 		PodIP:         "10.0.0.99",
 		LastHeartbeat: time.Now(),
 		SandboxStatuses: map[string]api.SandboxStatus{
 			testUID: {SandboxID: testUID, Phase: "running"},
 		},
 	}
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	_, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -1009,49 +1009,49 @@ func TestSandbox_StatusSync_NoChange(t *testing.T) {
 	// S-03: 状态无变化
 	scheme := newTestScheme(t)
 	sb := newBaseSandbox("test-sb", withFinalizer,
-		withAssignedPod("test-agent"),
+		withAssignedPod("test-fastlet"),
 		withPhase("running"))
 	sb.Status.SandboxID = "sb-123"
 
 	registry := NewConfigurableMockRegistry()
-	registry.DefaultAgent = &agentpool.AgentInfo{
-		ID:            "test-agent",
-		PodName:       "test-agent",
+	registry.DefaultFastlet = &fastletpool.FastletInfo{
+		ID:            "test-fastlet",
+		PodName:       "test-fastlet",
 		PodIP:         "10.0.0.1",
 		LastHeartbeat: time.Now(),
 		SandboxStatuses: map[string]api.SandboxStatus{
 			"test-sb": {Phase: "running", SandboxID: "sb-123"}, // 相同状态
 		},
 	}
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	_, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
 	// 不触发更新（测试无副作用）
 }
 
-func TestSandbox_StatusSync_AgentStatusMissing(t *testing.T) {
-	// S-04: Agent 存在但无此 Sandbox 的状态
+func TestSandbox_StatusSync_FastletStatusMissing(t *testing.T) {
+	// S-04: Fastlet 存在但无此 Sandbox 的状态
 	scheme := newTestScheme(t)
 	sb := newBaseSandbox("test-sb", withFinalizer,
-		withAssignedPod("test-agent"),
+		withAssignedPod("test-fastlet"),
 		withPhase("Bound"))
 
 	registry := NewConfigurableMockRegistry()
-	registry.DefaultAgent = &agentpool.AgentInfo{
-		ID:            "test-agent",
-		PodName:       "test-agent",
+	registry.DefaultFastlet = &fastletpool.FastletInfo{
+		ID:            "test-fastlet",
+		PodName:       "test-fastlet",
 		PodIP:         "10.0.0.1",
 		LastHeartbeat: time.Now(),
 		SandboxStatuses: map[string]api.SandboxStatus{
 			"other-sb": {Phase: "running"}, // 不是我们的 sandbox
 		},
 	}
-	agentClient := &MockAgentClient{}
+	fastletClient := &MockFastletClient{}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	_, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
@@ -1070,54 +1070,54 @@ func TestBug01_DeletionWithRunningPhase(t *testing.T) {
 	// 当前代码只处理 Bound/Terminating，Running 会走默认分支
 	scheme := newTestScheme(t)
 	sb := newBaseSandbox("test-sb", withFinalizer, withDeletionTimestamp,
-		withAssignedPod("test-agent"),
+		withAssignedPod("test-fastlet"),
 		withPhase("Running")) // 注意是 Running 而非 Bound
 
 	registry := NewConfigurableMockRegistry()
 	deleteCalled := false
-	agentClient := &MockAgentClient{
+	fastletClient := &MockFastletClient{
 		DeleteSandboxFunc: func(endpoint string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error) {
 			deleteCalled = true
 			return &api.DeleteSandboxResponse{Success: true}, nil
 		},
 	}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	_, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
 
 	// 这个测试可能会失败，因为 Running 不在处理分支中
-	// 当前行为：Phase=Running 会直接移除 Finalizer，不调用 Agent 删除
-	// 预期行为：应该调用 Agent 删除
+	// 当前行为：Phase=Running 会直接移除 Finalizer，不调用 Fastlet 删除
+	// 预期行为：应该调用 Fastlet 删除
 	t.Logf("Delete called: %v (如果为 false 则确认 Bug 存在)", deleteCalled)
 }
 
-func TestBug03_ResetWithoutDeleteFromAgent(t *testing.T) {
-	// BUG-03: Reset 时未调用 deleteFromAgent
+func TestBug03_ResetWithoutDeleteFromFastlet(t *testing.T) {
+	// BUG-03: Reset 时未调用 deleteFromFastlet
 	scheme := newTestScheme(t)
 	resetTime := time.Now()
 	sb := newBaseSandbox("test-sb", withFinalizer,
-		withAssignedPod("test-agent"),
+		withAssignedPod("test-fastlet"),
 		withPhase("Bound"),
 		withResetRevision(resetTime))
 
 	registry := NewConfigurableMockRegistry()
 	deleteCalled := false
-	agentClient := &MockAgentClient{
+	fastletClient := &MockFastletClient{
 		DeleteSandboxFunc: func(endpoint string, req *api.DeleteSandboxRequest) (*api.DeleteSandboxResponse, error) {
 			deleteCalled = true
 			return &api.DeleteSandboxResponse{Success: true}, nil
 		},
 	}
 
-	r := newTestReconciler(scheme, []client.Object{sb}, registry, agentClient)
+	r := newTestReconciler(scheme, []client.Object{sb}, registry, fastletClient)
 
 	_, err := r.Reconcile(context.Background(), reconcileRequest("test-sb"))
 	require.NoError(t, err)
 
-	// 验证是否调用了 deleteFromAgent
-	// 当前行为：只 Release Registry，不调用 Agent 删除
+	// 验证是否调用了 deleteFromFastlet
+	// 当前行为：只 Release Registry，不调用 Fastlet 删除
 	t.Logf("Delete called: %v (如果为 false 则确认 Bug 存在)", deleteCalled)
 	assert.True(t, registry.ReleaseCalled, "应该释放 Registry")
 }

@@ -34,7 +34,7 @@ type Janitor struct {
 
 type CleanupTask struct {
 	ContainerID     string
-	AgentUID        string
+	FastletUID      string
 	PodName         string
 	Namespace       string
 	SandboxName     string

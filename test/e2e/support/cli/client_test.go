@@ -6,7 +6,7 @@ import (
 )
 
 func TestCommandUsesConfiguredEndpointAndNamespace(t *testing.T) {
-	client := New("/tmp/fsb-ctl", WithEndpoint("127.0.0.1:19090"), WithNamespace("tenant-a"))
+	client := New("/tmp/fastctl", WithEndpoint("127.0.0.1:19090"), WithNamespace("tenant-a"))
 
 	cmd := client.Command(context.Background(), "logs", "sandbox-a")
 
@@ -15,7 +15,7 @@ func TestCommandUsesConfiguredEndpointAndNamespace(t *testing.T) {
 }
 
 func TestCommandOmitsNamespaceWhenEmpty(t *testing.T) {
-	client := New("/tmp/fsb-ctl", WithEndpoint("127.0.0.1:19090"))
+	client := New("/tmp/fastctl", WithEndpoint("127.0.0.1:19090"))
 
 	cmd := client.Command(context.Background(), "list")
 

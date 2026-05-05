@@ -1,6 +1,6 @@
 # Fast Sandbox E2E 测试
 
-`test/e2e` 包含 Fast Sandbox 的端到端测试。这些测试会创建真实的 Kubernetes 资源，构建并加载项目镜像，并在 kind 集群中验证 controller、agent、`fsb-ctl`、gVisor 和 Kata 的行为。
+`test/e2e` 包含 Fast Sandbox 的端到端测试。这些测试会创建真实的 Kubernetes 资源，构建并加载项目镜像，并在 kind 集群中验证 controller、fastlet、`fastctl`、gVisor 和 Kata 的行为。
 
 所有可执行的 e2e 测试用例均位于 `test/e2e/suites`。Go 测试会自动准备对应的运行环境，因此可以从 IDE 或命令行直接执行单个测试用例，无需预先手动执行 setup 脚本。
 
@@ -13,13 +13,13 @@
 | `suites/scheduling` | `basic` | 端口互斥、资源槽容量、自动扩缩容 |
 | `suites/cleanupjanitor` | `basic` | namespace 感知清理、janitor 恢复 |
 | `suites/advancedfeatures` | `basic` | infra 注入 |
-| `suites/cliintegration` | `basic` | `fsb-ctl update`、`reset`、`logs`、`run` |
+| `suites/cliintegration` | `basic` | `fastctl update`、`reset`、`logs`、`run` |
 | `suites/faultrecovery` | `basic` | 自动过期、内存泄漏防护、受控恢复、Pod 存在性检查 |
 | `suites/secureruntime` | `basic`、`gvisor`、`kata-qemu`、`kata-clh`、`kata-fc` | RuntimeClass 校验、gVisor、Kata QEMU、Kata Cloud Hypervisor、Firecracker 调查 |
 
 支撑代码组织如下：
 
-- `env`: profile 自动 setup、kind 集群准备、runtime 配置、镜像加载、组件部署、`fsb-ctl` 封装
+- `env`: profile 自动 setup、kind 集群准备、runtime 配置、镜像加载、组件部署、`fastctl` 封装
 - `manifests`: profile 使用的 kind 和 RuntimeClass manifest
 - `support`: fixture、CLI client、诊断、port-forward、suite 环境工具
 
@@ -39,14 +39,14 @@
 
 ```bash
 fast-sandbox/controller:dev
-fast-sandbox/agent:dev
+fast-sandbox/fastlet:dev
 fast-sandbox/janitor:dev
 ```
 
-可以通过以下环境变量覆盖 sandbox pool 使用的 agent 镜像：
+可以通过以下环境变量覆盖 sandbox pool 使用的 fastlet 镜像：
 
 ```bash
-FAST_SANDBOX_AGENT_IMAGE=my-registry/agent:tag
+FAST_SANDBOX_FASTLET_IMAGE=my-registry/fastlet:tag
 ```
 
 ## 运行测试
@@ -218,4 +218,4 @@ suiteenv.RequireKataClh(t)
 suiteenv.RequireKataFc(t)
 ```
 
-创建 sandbox 的用户路径应优先使用 `fsb-ctl`。只有当测试用例明确验证 CRD 或 controller 内部行为时，才直接使用 Kubernetes client fixture。
+创建 sandbox 的用户路径应优先使用 `fastctl`。只有当测试用例明确验证 CRD 或 controller 内部行为时，才直接使用 Kubernetes client fixture。

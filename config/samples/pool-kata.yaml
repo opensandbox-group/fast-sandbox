@@ -10,13 +10,13 @@ spec:
     poolMax: 3
     bufferMin: 0
   maxSandboxesPerPod: 5
-  agentTemplate:
+  fastletTemplate:
     spec:
       containers:
-      - name: agent
-        image: fast-sandbox-agent:latest
+      - name: fastlet
+        image: fast-sandbox-fastlet:latest
         imagePullPolicy: IfNotPresent
-        command: ["/agent"]
+        command: ["/fastlet"]
         resources:
           requests:
             cpu: "500m"

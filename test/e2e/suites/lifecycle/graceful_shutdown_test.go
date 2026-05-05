@@ -48,11 +48,11 @@ func TestGracefulShutdown(t *testing.T) {
 					},
 					MaxSandboxesPerPod: 5,
 					RuntimeType:        apiv1alpha1.RuntimeContainer,
-					AgentTemplate: corev1.PodTemplateSpec{
+					FastletTemplate: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
 							Containers: []corev1.Container{{
-								Name:  "agent",
-								Image: suiteenv.AgentImage(),
+								Name:  "fastlet",
+								Image: suiteenv.FastletImage(),
 							}},
 						},
 					},
@@ -64,8 +64,8 @@ func TestGracefulShutdown(t *testing.T) {
 
 			poolWaitCtx, cancelPoolWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelPoolWait()
-			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
 			sandbox := &apiv1alpha1.Sandbox{
@@ -97,13 +97,13 @@ done
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 60*time.Second)
 			defer cancelRunWait()
 			assignedSandbox, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedPod != "" &&
+				return sb.Status.AssignedFastlet != "" &&
 					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
 			})
 			if err != nil {
 				t.Fatalf("wait for running sandbox: %v", err)
 			}
-			if assignedSandbox.Status.AssignedPod == "" {
+			if assignedSandbox.Status.AssignedFastlet == "" {
 				t.Fatalf("sandbox assigned pod is empty")
 			}
 
@@ -115,7 +115,7 @@ done
 			}
 
 			// Wait for sandbox to transition to Terminating
-			// Give controller more time to process deletion and call Agent
+			// Give controller more time to process deletion and call Fastlet
 			termCtx, cancelTermWait := context.WithTimeout(ctx, 90*time.Second) // Increased from 45s
 			defer cancelTermWait()
 			terminatingSandbox, err := fixture.WaitForSandbox(termCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
@@ -125,15 +125,15 @@ done
 				// Log current state for debugging
 				currentSandbox := &apiv1alpha1.Sandbox{}
 				if getErr := k8sClient.Get(ctx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, currentSandbox); getErr == nil {
-					t.Logf("Sandbox state at timeout: phase=%s, deletionTimestamp=%v, assignedPod=%s",
-						currentSandbox.Status.Phase, currentSandbox.DeletionTimestamp, currentSandbox.Status.AssignedPod)
+					t.Logf("Sandbox state at timeout: phase=%s, deletionTimestamp=%v, assignedFastlet=%s",
+						currentSandbox.Status.Phase, currentSandbox.DeletionTimestamp, currentSandbox.Status.AssignedFastlet)
 				}
 				t.Fatalf("wait for sandbox terminating: %v", err)
 			}
 			if terminatingSandbox.DeletionTimestamp == nil {
 				t.Fatalf("sandbox deletion timestamp is nil after delete")
 			}
-			if terminatingSandbox.Status.AssignedPod == "" {
+			if terminatingSandbox.Status.AssignedFastlet == "" {
 				t.Fatalf("sandbox assigned pod cleared too early")
 			}
 

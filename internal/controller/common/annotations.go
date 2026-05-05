@@ -19,17 +19,17 @@ const (
 
 // AllocationInfo 临时分配信息
 type AllocationInfo struct {
-	AssignedPod  string `json:"assignedPod"`  // 分配的 Agent Pod
-	AssignedNode string `json:"assignedNode"` // 分配的 Node
-	AllocatedAt  string `json:"allocatedAt"`  // RFC3339 时间戳
+	AssignedFastlet string `json:"assignedFastlet"` // 分配的 Fastlet Pod
+	AssignedNode    string `json:"assignedNode"`    // 分配的 Node
+	AllocatedAt     string `json:"allocatedAt"`     // RFC3339 时间戳
 }
 
 // BuildAllocationJSON 构建 allocation JSON
-func BuildAllocationJSON(assignedPod, assignedNode string) string {
+func BuildAllocationJSON(assignedFastlet, assignedNode string) string {
 	info := AllocationInfo{
-		AssignedPod:  assignedPod,
-		AssignedNode: assignedNode,
-		AllocatedAt:  time.Now().Format(time.RFC3339Nano),
+		AssignedFastlet: assignedFastlet,
+		AssignedNode:    assignedNode,
+		AllocatedAt:     time.Now().Format(time.RFC3339Nano),
 	}
 	data, _ := json.Marshal(info)
 	return string(data)

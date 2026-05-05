@@ -100,7 +100,7 @@ func (f *FixtureClient) EnsureSandboxRemainsUnassigned(ctx context.Context, name
 			}
 			return err
 		}
-		if sandbox.Status.AssignedPod != "" || sandbox.Status.SandboxID != "" {
+		if sandbox.Status.AssignedFastlet != "" || sandbox.Status.SandboxID != "" {
 			return fmt.Errorf("sandbox %s/%s was assigned unexpectedly", name.Namespace, name.Name)
 		}
 

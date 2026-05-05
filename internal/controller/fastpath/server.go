@@ -9,8 +9,8 @@ import (
 	fastpathv1 "fast-sandbox/api/proto/v1"
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
-	"fast-sandbox/internal/controller/agentpool"
 	"fast-sandbox/internal/controller/common"
+	"fast-sandbox/internal/controller/fastletpool"
 	"fast-sandbox/pkg/util/idgen"
 
 	corev1 "k8s.io/api/core/v1"
@@ -36,8 +36,8 @@ func envMapToEnvVar(envs map[string]string) []corev1.EnvVar {
 type Server struct {
 	fastpathv1.UnimplementedFastPathServiceServer
 	K8sClient              client.Client
-	Registry               agentpool.AgentRegistry
-	AgentClient            *api.AgentClient
+	Registry               fastletpool.FastletRegistry
+	FastletClient          *api.FastletClient
 	DefaultConsistencyMode api.ConsistencyMode
 }
 
@@ -75,21 +75,21 @@ func (s *Server) CreateSandbox(ctx context.Context, req *fastpathv1.CreateReques
 		},
 	}
 
-	agent, err := s.Registry.Allocate(tempSB)
+	fastlet, err := s.Registry.Allocate(tempSB)
 	if err != nil {
-		klog.Error(err, "Failed to allocate agent for sandbox", "name", sandboxName, "namespace", req.Namespace)
+		klog.Error(err, "Failed to allocate fastlet for sandbox", "name", sandboxName, "namespace", req.Namespace)
 		return nil, err
 	}
 
-	klog.InfoS("Agent allocated", "agentID", agent.ID, "duration", time.Since(start))
+	klog.InfoS("Fastlet allocated", "fastletID", fastlet.ID, "duration", time.Since(start))
 
 	if mode == api.ConsistencyModeStrong {
-		return s.createStrong(ctx, tempSB, agent, req)
+		return s.createStrong(ctx, tempSB, fastlet, req)
 	}
-	return s.createFast(tempSB, agent, req)
+	return s.createFast(tempSB, fastlet, req)
 }
 
-func (s *Server) createFast(tempSB *apiv1alpha1.Sandbox, agent *agentpool.AgentInfo, req *fastpathv1.CreateRequest) (*fastpathv1.CreateResponse, error) {
+func (s *Server) createFast(tempSB *apiv1alpha1.Sandbox, fastlet *fastletpool.FastletInfo, req *fastpathv1.CreateRequest) (*fastpathv1.CreateResponse, error) {
 	start := time.Now()
 	var err error
 	defer func() {
@@ -108,9 +108,9 @@ func (s *Server) createFast(tempSB *apiv1alpha1.Sandbox, agent *agentpool.AgentI
 	createTimestamp := time.Now().UnixNano()
 	sandboxID := idgen.GenerateHashID(tempSB.Name, tempSB.Namespace, createTimestamp)
 
-	klog.InfoS("Creating sandbox via agent (fast mode)", "name", tempSB.Name, "namespace", tempSB.Namespace, "agentPodIP", agent.PodIP, "agentPod", agent.PodName, "sandboxID", sandboxID)
+	klog.InfoS("Creating sandbox via fastlet (fast mode)", "name", tempSB.Name, "namespace", tempSB.Namespace, "fastletPodIP", fastlet.PodIP, "fastletPod", fastlet.PodName, "sandboxID", sandboxID)
 
-	_, err = s.AgentClient.CreateSandbox(agent.PodIP, &api.CreateSandboxRequest{
+	_, err = s.FastletClient.CreateSandbox(fastlet.PodIP, &api.CreateSandboxRequest{
 		Sandbox: api.SandboxSpec{
 			SandboxID:  sandboxID,
 			ClaimName:  tempSB.Name,
@@ -122,12 +122,12 @@ func (s *Server) createFast(tempSB *apiv1alpha1.Sandbox, agent *agentpool.AgentI
 		},
 	})
 	if err != nil {
-		klog.ErrorS(err, "Failed to create sandbox on agent", "name", tempSB.Name, "namespace", tempSB.Namespace, "agentPodIP", agent.PodIP)
-		s.Registry.Release(agent.ID, tempSB)
+		klog.ErrorS(err, "Failed to create sandbox on fastlet", "name", tempSB.Name, "namespace", tempSB.Namespace, "fastletPodIP", fastlet.PodIP)
+		s.Registry.Release(fastlet.ID, tempSB)
 		return nil, err
 	}
 
-	klog.InfoS("Sandbox created on agent, setting label and annotations", "name", tempSB.Name, "namespace", tempSB.Namespace, "agentPod", agent.PodName, "node", agent.NodeName, "sandboxID", sandboxID)
+	klog.InfoS("Sandbox created on fastlet, setting label and annotations", "name", tempSB.Name, "namespace", tempSB.Namespace, "fastletPod", fastlet.PodName, "node", fastlet.NodeName, "sandboxID", sandboxID)
 
 	// 设置 label 标识 Fast 模式创建
 	tempSB.SetLabels(map[string]string{
@@ -135,16 +135,16 @@ func (s *Server) createFast(tempSB *apiv1alpha1.Sandbox, agent *agentpool.AgentI
 	})
 	// 设置 annotations：allocation 和 createTimestamp（用于重新生成 sandboxID）
 	tempSB.SetAnnotations(map[string]string{
-		common.AnnotationAllocation:      common.BuildAllocationJSON(agent.PodName, agent.NodeName),
+		common.AnnotationAllocation:      common.BuildAllocationJSON(fastlet.PodName, fastlet.NodeName),
 		common.AnnotationCreateTimestamp: strconv.FormatInt(createTimestamp, 10),
 	})
 
 	asyncCtx, _ := context.WithTimeout(context.Background(), 30*time.Second)
 	go s.asyncCreateCRDWithRetry(asyncCtx, tempSB)
-	return &fastpathv1.CreateResponse{SandboxId: sandboxID, SandboxName: tempSB.Name, AgentPod: agent.PodName, Endpoints: s.getEndpoints(agent.PodIP, tempSB)}, nil
+	return &fastpathv1.CreateResponse{SandboxId: sandboxID, SandboxName: tempSB.Name, FastletPod: fastlet.PodName, Endpoints: s.getEndpoints(fastlet.PodIP, tempSB)}, nil
 }
 
-func (s *Server) createStrong(ctx context.Context, tempSB *apiv1alpha1.Sandbox, agent *agentpool.AgentInfo, req *fastpathv1.CreateRequest) (*fastpathv1.CreateResponse, error) {
+func (s *Server) createStrong(ctx context.Context, tempSB *apiv1alpha1.Sandbox, fastlet *fastletpool.FastletInfo, req *fastpathv1.CreateRequest) (*fastpathv1.CreateResponse, error) {
 	start := time.Now()
 	var err error
 	defer func() {
@@ -159,27 +159,27 @@ func (s *Server) createStrong(ctx context.Context, tempSB *apiv1alpha1.Sandbox, 
 		createSandboxDuration.WithLabelValues("strong", success).Observe(duration)
 	}()
 
-	klog.InfoS("Creating sandbox CRD first (strong mode)", "name", tempSB.Name, "namespace", tempSB.Namespace, "agentPod", agent.PodName, "node", agent.NodeName)
+	klog.InfoS("Creating sandbox CRD first (strong mode)", "name", tempSB.Name, "namespace", tempSB.Namespace, "fastletPod", fastlet.PodName, "node", fastlet.NodeName)
 
 	// 设置 allocation annotation，与 CRD 创建同步
 	tempSB.SetAnnotations(map[string]string{
-		common.AnnotationAllocation: common.BuildAllocationJSON(agent.PodName, agent.NodeName),
+		common.AnnotationAllocation: common.BuildAllocationJSON(fastlet.PodName, fastlet.NodeName),
 	})
 	// Status 留空，由 Controller 从 annotation 同步
 
 	if err = s.K8sClient.Create(ctx, tempSB); err != nil {
 		klog.ErrorS(err, "Failed to create sandbox CRD", "name", tempSB.Name, "namespace", tempSB.Namespace)
-		s.Registry.Release(agent.ID, tempSB)
+		s.Registry.Release(fastlet.ID, tempSB)
 		return nil, err
 	}
 
-	klog.InfoS("Sandbox CRD created, proceeding to create on agent", "name", tempSB.Name, "namespace", tempSB.Namespace, "uid", tempSB.UID)
+	klog.InfoS("Sandbox CRD created, proceeding to create on fastlet", "name", tempSB.Name, "namespace", tempSB.Namespace, "uid", tempSB.UID)
 
 	// Use UID as sandboxID
 	sandboxID := string(tempSB.UID)
 	tempSB.Status.SandboxID = sandboxID
 
-	_, err = s.AgentClient.CreateSandbox(agent.PodIP, &api.CreateSandboxRequest{
+	_, err = s.FastletClient.CreateSandbox(fastlet.PodIP, &api.CreateSandboxRequest{
 		Sandbox: api.SandboxSpec{
 			SandboxID:  sandboxID, // Changed from tempSB.Name to use UID
 			ClaimUID:   string(tempSB.UID),
@@ -192,21 +192,21 @@ func (s *Server) createStrong(ctx context.Context, tempSB *apiv1alpha1.Sandbox, 
 		},
 	})
 	if err != nil {
-		klog.ErrorS(err, "Failed to create sandbox on agent, rolling back CRD", "name", tempSB.Name, "namespace", tempSB.Namespace, "agentPodIP", agent.PodIP)
+		klog.ErrorS(err, "Failed to create sandbox on fastlet, rolling back CRD", "name", tempSB.Name, "namespace", tempSB.Namespace, "fastletPodIP", fastlet.PodIP)
 		s.K8sClient.Delete(ctx, tempSB)
-		s.Registry.Release(agent.ID, tempSB)
+		s.Registry.Release(fastlet.ID, tempSB)
 		return nil, err
 	}
 
-	// After Agent call succeeds, update CRD status with sandboxID
+	// After Fastlet call succeeds, update CRD status with sandboxID
 	if err := s.K8sClient.Status().Update(ctx, tempSB); err != nil {
 		klog.ErrorS(err, "Failed to update CRD status with sandboxID", "name", tempSB.Name, "sandboxID", sandboxID)
 		// Non-fatal error, continue
 	}
 
-	klog.InfoS("Sandbox created on agent, Controller will sync allocation from annotation to status", "name", tempSB.Name, "namespace", tempSB.Namespace, "assignedPod", agent.PodName, "nodeName", agent.NodeName, "sandboxID", sandboxID)
+	klog.InfoS("Sandbox created on fastlet, Controller will sync allocation from annotation to status", "name", tempSB.Name, "namespace", tempSB.Namespace, "assignedFastlet", fastlet.PodName, "nodeName", fastlet.NodeName, "sandboxID", sandboxID)
 
-	return &fastpathv1.CreateResponse{SandboxId: sandboxID, SandboxName: tempSB.Name, AgentPod: agent.PodName, Endpoints: s.getEndpoints(agent.PodIP, tempSB)}, nil
+	return &fastpathv1.CreateResponse{SandboxId: sandboxID, SandboxName: tempSB.Name, FastletPod: fastlet.PodName, Endpoints: s.getEndpoints(fastlet.PodIP, tempSB)}, nil
 }
 
 // asyncCreateCRDWithRetry 异步创建 CRD，分配信息已在 annotation 中
@@ -249,7 +249,7 @@ func (s *Server) ListSandboxes(ctx context.Context, req *fastpathv1.ListRequest)
 			SandboxId:   sb.Status.SandboxID,
 			SandboxName: sb.Name,
 			Phase:       sb.Status.Phase,
-			AgentPod:    sb.Status.AssignedPod,
+			FastletPod:  sb.Status.AssignedFastlet,
 			Endpoints:   sb.Status.Endpoints,
 			Image:       sb.Spec.Image,
 			PoolRef:     sb.Spec.PoolRef,
@@ -275,7 +275,7 @@ func (s *Server) GetSandbox(ctx context.Context, req *fastpathv1.GetRequest) (*f
 		SandboxId:   sb.Status.SandboxID,
 		SandboxName: sb.Name,
 		Phase:       sb.Status.Phase,
-		AgentPod:    sb.Status.AssignedPod,
+		FastletPod:  sb.Status.AssignedFastlet,
 		Endpoints:   sb.Status.Endpoints,
 		Image:       sb.Spec.Image,
 		PoolRef:     sb.Spec.PoolRef,
@@ -372,7 +372,7 @@ func (s *Server) UpdateSandbox(ctx context.Context, req *fastpathv1.UpdateReques
 			SandboxId:   sb.Status.SandboxID,
 			SandboxName: sb.Name,
 			Phase:       sb.Status.Phase,
-			AgentPod:    sb.Status.AssignedPod,
+			FastletPod:  sb.Status.AssignedFastlet,
 			Endpoints:   sb.Status.Endpoints,
 			Image:       sb.Spec.Image,
 			PoolRef:     sb.Spec.PoolRef,

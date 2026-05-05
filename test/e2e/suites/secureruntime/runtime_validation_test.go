@@ -50,7 +50,7 @@ func TestInvalidRuntimeClass(t *testing.T) {
 					MaxSandboxesPerPod: 5,
 					RuntimeType:        apiv1alpha1.RuntimeGVisor,
 					RuntimeClassName:   "non-existent-runtime",
-					AgentTemplate: corev1.PodTemplateSpec{
+					FastletTemplate: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
 							Tolerations: []corev1.Toleration{
 								{
@@ -65,8 +65,8 @@ func TestInvalidRuntimeClass(t *testing.T) {
 								},
 							},
 							Containers: []corev1.Container{{
-								Name:  "agent",
-								Image: suiteenv.AgentImage(),
+								Name:  "fastlet",
+								Image: suiteenv.FastletImage(),
 							}},
 						},
 					},
@@ -143,11 +143,11 @@ func TestContainerRuntimeDefault(t *testing.T) {
 				t.Fatalf("create container pool: %v", err)
 			}
 
-			// Wait for ready agent pods
+			// Wait for ready fastlet pods
 			poolWaitCtx, cancelPoolWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelPoolWait()
-			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
 			// Create sandbox
@@ -160,7 +160,7 @@ func TestContainerRuntimeDefault(t *testing.T) {
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 60*time.Second)
 			defer cancelRunWait()
 			_, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedPod != "" &&
+				return sb.Status.AssignedFastlet != "" &&
 					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
 			})
 			if err != nil {

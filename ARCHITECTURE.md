@@ -8,7 +8,7 @@ The core design philosophy is: **Fast-Path First** + **Resource Pooling** + **Im
 
 ## 2. Core Architecture
 
-The system uses a **Controller-Agent** separation architecture built on Kubernetes.
+The system uses a **Controller-Fastlet** separation architecture built on Kubernetes.
 
 ![ARCHITECTURE](ARCHITECTURE.png)
 
@@ -17,8 +17,8 @@ The system uses a **Controller-Agent** separation architecture built on Kubernet
 | Channel | Protocol | Purpose |
 |---------|----------|---------|
 | **CLI → Controller** | gRPC | Fast-Path API for <50ms latency |
-| **Controller → Agent** | HTTP | Sandbox create/delete requests |
-| **CLI → Agent** | HTTP (tunneled) | Log streaming, future exec |
+| **Controller → Fastlet** | HTTP | Sandbox create/delete requests |
+| **CLI → Fastlet** | HTTP (tunneled) | Log streaming, future exec |
 | **Control Plane** | K8s CRD | Persistent storage and eventual consistency |
 
 ## 3. Core Components
@@ -37,24 +37,24 @@ The system uses a **Controller-Agent** separation architecture built on Kubernet
 - `GetSandbox` - Get sandbox details
 
 **Consistency Modes**:
-- **FAST** (default): Agent creates first → async CRD write. Latency <50ms
-- **STRONG**: Write CRD (Pending) → Watch triggers → Agent creates. Latency ~200ms
+- **FAST** (default): Fastlet creates first → async CRD write. Latency <50ms
+- **STRONG**: Write CRD (Pending) → Watch triggers → Fastlet creates. Latency ~200ms
 
 ### 3.2 Registry (In-Memory State)
 
-**Location**: `internal/controller/agentpool/registry.go`
+**Location**: `internal/controller/fastletpool/registry.go`
 
 **Responsibilities**:
-- Maintain real-time Agent status (capacity, allocated, images, ports)
+- Maintain real-time Fastlet status (capacity, allocated, images, ports)
 - Atomic allocation with mutex locks
-- Image affinity scoring (prefers agents with cached images)
+- Image affinity scoring (prefers fastlets with cached images)
 
 **Allocation Algorithm**:
 1. Filter candidates by pool, namespace, capacity, port conflicts
 2. Score candidates: `score = allocated + (no_image ? 1000 : 0)`
 3. Select lowest score (image hit wins ties)
 
-**Performance**: ~1.3ms for 100 agents, ~14ms for 1000 agents
+**Performance**: ~1.3ms for 100 fastlets, ~14ms for 1000 fastlets
 
 ### 3.3 SandboxController
 
@@ -78,13 +78,13 @@ Pending → Creating → Running → Deleting → Gone
 **Location**: `internal/controller/sandboxpool_controller.go`
 
 **Responsibilities**:
-- Manage Agent Pod lifecycle (Min/Max capacity)
+- Manage Fastlet Pod lifecycle (Min/Max capacity)
 - Inject privileged configuration for Containerd access
 - Maintain Registry state via heartbeats
 
-### 3.5 Agent (Data Plane)
+### 3.5 Fastlet (Data Plane)
 
-**Location**: `internal/agent/`
+**Location**: `internal/fastlet/`
 
 **Components**:
 - **Sandbox Manager**: Lifecycle management (create/delete/status)
@@ -93,10 +93,10 @@ Pending → Creating → Running → Deleting → Gone
 
 **HTTP Endpoints**:
 ```
-POST /api/v1/agent/create
-POST /api/v1/agent/delete
-GET  /api/v1/agent/status
-GET  /api/v1/agent/logs?follow=true
+POST /api/v1/fastlet/create
+POST /api/v1/fastlet/delete
+GET  /api/v1/fastlet/status
+GET  /api/v1/fastlet/logs?follow=true
 ```
 
 **Key Features**:
@@ -110,23 +110,23 @@ GET  /api/v1/agent/logs?follow=true
 
 **Responsibilities**:
 - Scan for orphan containers (no matching CRD)
-- Cleanup when Agent Pod disappears
+- Cleanup when Fastlet Pod disappears
 - Remove FIFO files and containerd snapshots
 
 **Orphan Detection Criteria**:
-1. Agent Pod disappeared (UID not in pod lister)
+1. Fastlet Pod disappeared (UID not in pod lister)
 2. Sandbox CRD not found
 3. UID mismatch between container and CRD
 
 **Protection Window**: 10 seconds (configurable) for Fast-Path async CRD writes
 
-### 3.7 CLI (fsb-ctl)
+### 3.7 CLI (fastctl)
 
-**Location**: `cmd/fsb-ctl/`
+**Location**: `cmd/fastctl/`
 
 **Features**:
 - Interactive YAML editing for sandbox creation
-- Auto port-forward tunneling to Agent Pods
+- Auto port-forward tunneling to Fastlet Pods
 - Streaming log viewing
 - Configuration layers: Flags > File > Interactive
 
@@ -135,14 +135,14 @@ GET  /api/v1/agent/logs?follow=true
 ### 4.1 Create Sandbox (Fast Mode)
 
 ```
-User                    Controller                  Agent
+User                    Controller                  Fastlet
   │                         │                         │
   ├─ run my-sb ────────────>│                         │
   │                         │                         │
   │                         ├─ Allocate() ──────────>│
   │                         │  (Registry selects)     │
   │                         │<────────────────────────┤
-  │                         │  (Agent selected)       │
+  │                         │  (Fastlet selected)       │
   │                         │                         │
   │                         ├─ HTTP POST /create ───>│
   │                         │                         │
@@ -158,15 +158,15 @@ User                    Controller                  Agent
 ```
 
 **Latency Breakdown**:
-- Registry Allocate: ~1.3ms (100 agents)
-- Agent HTTP RPC: ~10-30ms
+- Registry Allocate: ~1.3ms (100 fastlets)
+- Fastlet HTTP RPC: ~10-30ms
 - Containerd create: <10ms (cached image)
 - **Total**: <50ms
 
 ### 4.2 Create Sandbox (Strong Mode)
 
 ```
-User                    Controller              K8s                 Agent
+User                    Controller              K8s                 Fastlet
   │                         │                    │                    │
   ├─ run my-sb ────────────>│                    │                    │
   │                         │                    │                    │
@@ -194,15 +194,15 @@ User                    Controller              K8s                 Agent
 ### 4.3 Log Streaming
 
 ```
-CLI                      Controller                Agent
+CLI                      Controller                Fastlet
   │                         │                      │
   ├─ logs my-sb ───────────>│                      │
   │                         │                      │
-  │<─ Agent Pod IP ──────────┤                      │
+  │<─ Fastlet Pod IP ──────────┤                      │
   │                         │                      │
   ├─ kubectl port-forward ──────────────────────────>│
   │                         │                      │
-  ├─ GET /api/v1/agent/logs?follow=true ────────────>│
+  ├─ GET /api/v1/fastlet/logs?follow=true ────────────>│
   │<─ Chunked log stream ─────────────────────────────┤
 ```
 
@@ -212,17 +212,17 @@ CLI                      Controller                Agent
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--agent-port` | `5758` | Agent HTTP server port |
+| `--fastlet-port` | `5758` | Fastlet HTTP server port |
 | `--metrics-bind-address` | `:9091` | Prometheus metrics endpoint |
 | `--health-probe-bind-address` | `:5758` | Health check endpoint |
 | `--fastpath-consistency-mode` | `fast` | Consistency mode: fast/strong |
 | `--fastpath-orphan-timeout` | `10s` | Fast mode orphan cleanup timeout |
 
-### 5.2 Agent Environment Variables
+### 5.2 Fastlet Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `AGENT_CAPACITY` | `5` | Max sandboxes per agent |
+| `FASTLET_CAPACITY` | `5` | Max sandboxes per fastlet |
 | `CONTAINERD_SOCKET` | `/run/containerd/containerd.sock` | Containerd socket path |
 
 ### 5.3 Sandbox CRD Spec
@@ -280,9 +280,9 @@ Fast Sandbox uses [klog](https://github.com/kubernetes/klog), the Kubernetes eco
 # Controller
 ./bin/controller -v=2
 
-# Agent
-./bin/agent -v=4
+# Fastlet
+./bin/fastlet -v=4
 
 # CLI
-fsb-ctl -v=4 list
+fastctl -v=4 list
 ```

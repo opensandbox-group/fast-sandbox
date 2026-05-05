@@ -39,8 +39,8 @@ func TestBasicLifecycleRecreateSameName(t *testing.T) {
 
 			poolWaitCtx, cancelPoolWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelPoolWait()
-			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
 			var previousSandboxID string
@@ -52,7 +52,7 @@ func TestBasicLifecycleRecreateSameName(t *testing.T) {
 
 				runCtx, cancelRunWait := context.WithTimeout(ctx, 60*time.Second)
 				assignedSandbox, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-					return sb.Status.AssignedPod != "" &&
+					return sb.Status.AssignedFastlet != "" &&
 						(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
 				})
 				cancelRunWait()
@@ -106,11 +106,11 @@ func newLifecyclePool(namespace, name string, min, max int32) *apiv1alpha1.Sandb
 			},
 			MaxSandboxesPerPod: 5,
 			RuntimeType:        apiv1alpha1.RuntimeContainer,
-			AgentTemplate: corev1.PodTemplateSpec{
+			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
-						Name:  "agent",
-						Image: suiteenv.AgentImage(),
+						Name:  "fastlet",
+						Image: suiteenv.FastletImage(),
 					}},
 				},
 			},

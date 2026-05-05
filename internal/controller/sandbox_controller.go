@@ -8,8 +8,8 @@ import (
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
-	"fast-sandbox/internal/controller/agentpool"
 	"fast-sandbox/internal/controller/common"
+	"fast-sandbox/internal/controller/fastletpool"
 	"fast-sandbox/pkg/util/idgen"
 
 	corev1 "k8s.io/api/core/v1"
@@ -27,7 +27,7 @@ const (
 	// FinalizerName is the finalizer used to ensure cleanup before deletion
 	FinalizerName = "sandbox.fast.io/cleanup"
 
-	// HeartbeatTimeout is the duration after which an agent is considered unhealthy
+	// HeartbeatTimeout is the duration after which an fastlet is considered unhealthy
 	HeartbeatTimeout = 10 * time.Second
 
 	// DefaultRequeueInterval is the default interval for periodic reconciliation
@@ -43,9 +43,9 @@ const (
 // SandboxReconciler reconciles a Sandbox object
 type SandboxReconciler struct {
 	client.Client
-	Scheme      *runtime.Scheme
-	Registry    agentpool.AgentRegistry
-	AgentClient api.AgentAPIClient
+	Scheme        *runtime.Scheme
+	Registry      fastletpool.FastletRegistry
+	FastletClient api.FastletAPIClient
 }
 
 // Reconcile is the main entry point for the Sandbox controller.
@@ -105,7 +105,7 @@ func (r *SandboxReconciler) ensureFinalizer(ctx context.Context, sandbox *apiv1a
 	return err
 }
 
-// getSandboxID returns the sandboxID to use when calling Agent API.
+// getSandboxID returns the sandboxID to use when calling Fastlet API.
 // Logic:
 // 1. If status.sandboxID is set, use it (Strong mode or already synced)
 // 2. If label "fastpath-fast" exists, regenerate from annotation timestamp
@@ -134,7 +134,7 @@ func (r *SandboxReconciler) getSandboxID(sandbox *apiv1alpha1.Sandbox) string {
 // ============================================================================
 
 // handleDeletion processes the Sandbox deletion workflow.
-// State transitions: Bound/Running → Terminating → (Agent confirms) → Removed
+// State transitions: Bound/Running → Terminating → (Fastlet confirms) → Removed
 func (r *SandboxReconciler) handleDeletion(ctx context.Context, sandbox *apiv1alpha1.Sandbox) (ctrl.Result, error) {
 	klog.Info("[SIMPLE-LOG] handleDeletion called for", "sandbox:", sandbox.Name)
 	logger := klog.FromContext(ctx)
@@ -152,16 +152,16 @@ func (r *SandboxReconciler) handleDeletion(ctx context.Context, sandbox *apiv1al
 		return r.removeFinalizer(ctx, sandbox)
 
 	case apiv1alpha1.PhaseBound, apiv1alpha1.PhaseRunning:
-		// Active sandbox - need to cleanup Agent resources
+		// Active sandbox - need to cleanup Fastlet resources
 		return r.handleActiveDeletion(ctx, sandbox)
 
 	case apiv1alpha1.PhaseTerminating:
-		// Already terminating - wait for Agent confirmation
+		// Already terminating - wait for Fastlet confirmation
 		return r.handleTerminatingDeletion(ctx, sandbox)
 
 	default:
-		// Pending, Failed, or unknown phase - no Agent resources to cleanup
-		logger.V(1).Info("Removing finalizer for sandbox without Agent resources", "phase", phase)
+		// Pending, Failed, or unknown phase - no Fastlet resources to cleanup
+		logger.V(1).Info("Removing finalizer for sandbox without Fastlet resources", "phase", phase)
 		return r.removeFinalizer(ctx, sandbox)
 	}
 }
@@ -172,31 +172,31 @@ func (r *SandboxReconciler) handleActiveDeletion(ctx context.Context, sandbox *a
 
 	logger.Info("[DEBUG-ACTIVE-DEL] handleActiveDeletion ENTER",
 		"sandbox", sandbox.Name,
-		"assignedPod", sandbox.Status.AssignedPod,
+		"assignedFastlet", sandbox.Status.AssignedFastlet,
 		"phase", sandbox.Status.Phase)
 
-	// Check if Agent exists
-	if sandbox.Status.AssignedPod == "" {
+	// Check if Fastlet exists
+	if sandbox.Status.AssignedFastlet == "" {
 		logger.Info("[DEBUG-ACTIVE-DEL] No assigned pod, removing finalizer directly")
 		return r.removeFinalizer(ctx, sandbox)
 	}
 
-	_, agentExists := r.Registry.GetAgentByID(agentpool.AgentID(sandbox.Status.AssignedPod))
-	if !agentExists {
-		// Agent doesn't exist - still try to release the allocated slot
-		// This fixes the bug where Allocated was never decreased when Agent disappeared
-		logger.Info("[BUG-FIX] Agent not found in registry during active deletion - attempting Release to free Allocated slot",
-			"agent", sandbox.Status.AssignedPod)
-		r.Registry.Release(agentpool.AgentID(sandbox.Status.AssignedPod), sandbox)
+	_, fastletExists := r.Registry.GetFastletByID(fastletpool.FastletID(sandbox.Status.AssignedFastlet))
+	if !fastletExists {
+		// Fastlet doesn't exist - still try to release the allocated slot
+		// This fixes the bug where Allocated was never decreased when Fastlet disappeared
+		logger.Info("[BUG-FIX] Fastlet not found in registry during active deletion - attempting Release to free Allocated slot",
+			"fastlet", sandbox.Status.AssignedFastlet)
+		r.Registry.Release(fastletpool.FastletID(sandbox.Status.AssignedFastlet), sandbox)
 		return r.removeFinalizer(ctx, sandbox)
 	}
 
-	logger.Info("[DEBUG-ACTIVE-DEL] Agent exists, calling deleteFromAgent",
-		"agentID", agentpool.AgentID(sandbox.Status.AssignedPod))
+	logger.Info("[DEBUG-ACTIVE-DEL] Fastlet exists, calling deleteFromFastlet",
+		"fastletID", fastletpool.FastletID(sandbox.Status.AssignedFastlet))
 
-	// Call Agent to delete the sandbox
-	if err := r.deleteFromAgent(ctx, sandbox); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to delete from agent: %w", err)
+	// Call Fastlet to delete the sandbox
+	if err := r.deleteFromFastlet(ctx, sandbox); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to delete from fastlet: %w", err)
 	}
 
 	// Transition to Terminating phase
@@ -214,7 +214,7 @@ func (r *SandboxReconciler) handleTerminatingDeletion(ctx context.Context, sandb
 
 	logger.Info("[DEBUG-TERM] handleTerminatingDeletion ENTER",
 		"sandbox", sandbox.Name,
-		"assignedPod", sandbox.Status.AssignedPod,
+		"assignedFastlet", sandbox.Status.AssignedFastlet,
 		"deletionTimestamp", sandbox.DeletionTimestamp)
 
 	// Check for reset request - reset takes priority over graceful shutdown
@@ -229,7 +229,7 @@ func (r *SandboxReconciler) handleTerminatingDeletion(ctx context.Context, sandb
 				if err := r.Get(ctx, client.ObjectKeyFromObject(sandbox), latest); err != nil {
 					return err
 				}
-				latest.Status.AssignedPod = ""
+				latest.Status.AssignedFastlet = ""
 				latest.Status.SandboxID = ""
 				latest.Status.Phase = string(apiv1alpha1.PhasePending)
 				latest.Status.AcceptedResetRevision = sandbox.Spec.ResetRevision
@@ -238,54 +238,54 @@ func (r *SandboxReconciler) handleTerminatingDeletion(ctx context.Context, sandb
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			// Release the old agent resource
-			r.Registry.Release(agentpool.AgentID(sandbox.Status.AssignedPod), sandbox)
+			// Release the old fastlet resource
+			r.Registry.Release(fastletpool.FastletID(sandbox.Status.AssignedFastlet), sandbox)
 			logger.Info("[DEBUG-TERM] Reset processed successfully, sandbox transitioning to Pending")
 			return ctrl.Result{Requeue: true}, nil
 		}
 	}
 
-	// Check if Agent still exists
-	agent, agentExists := r.Registry.GetAgentByID(agentpool.AgentID(sandbox.Status.AssignedPod))
-	logger.Info("[DEBUG-TERM] Agent existence check",
-		"agentID", agentpool.AgentID(sandbox.Status.AssignedPod),
-		"agentExists", agentExists)
+	// Check if Fastlet still exists
+	fastlet, fastletExists := r.Registry.GetFastletByID(fastletpool.FastletID(sandbox.Status.AssignedFastlet))
+	logger.Info("[DEBUG-TERM] Fastlet existence check",
+		"fastletID", fastletpool.FastletID(sandbox.Status.AssignedFastlet),
+		"fastletExists", fastletExists)
 
-	if !agentExists {
-		// Agent gone - still try to release in case the slot still exists
+	if !fastletExists {
+		// Fastlet gone - still try to release in case the slot still exists
 		// The Release function handles the case where the slot doesn't exist (no-op)
-		// This fixes the bug where Allocated was never decreased when Agent disappeared
-		logger.Info("[BUG-FIX] Agent disappeared during termination - attempting Release to free Allocated slot",
-			"agentID", agentpool.AgentID(sandbox.Status.AssignedPod))
-		r.Registry.Release(agentpool.AgentID(sandbox.Status.AssignedPod), sandbox)
+		// This fixes the bug where Allocated was never decreased when Fastlet disappeared
+		logger.Info("[BUG-FIX] Fastlet disappeared during termination - attempting Release to free Allocated slot",
+			"fastletID", fastletpool.FastletID(sandbox.Status.AssignedFastlet))
+		r.Registry.Release(fastletpool.FastletID(sandbox.Status.AssignedFastlet), sandbox)
 		return r.removeFinalizer(ctx, sandbox)
 	}
 
-	// Check Agent-reported status
-	agentStatus, hasStatus := agent.SandboxStatuses[r.getSandboxID(sandbox)]
-	logger.Info("[DEBUG-TERM] Agent status check",
+	// Check Fastlet-reported status
+	fastletStatus, hasStatus := fastlet.SandboxStatuses[r.getSandboxID(sandbox)]
+	logger.Info("[DEBUG-TERM] Fastlet status check",
 		"hasStatus", hasStatus,
 		"phase", func() string {
 			if hasStatus {
-				return agentStatus.Phase
+				return fastletStatus.Phase
 			} else {
 				return "<none>"
 			}
 		}(),
-		"agentAllocated", agent.Allocated)
+		"fastletAllocated", fastlet.Allocated)
 
 	if !hasStatus {
-		// Agent no longer reports this sandbox = deletion confirmed
+		// Fastlet no longer reports this sandbox = deletion confirmed
 		// Release resources and remove finalizer
-		logger.Info("[DEBUG-TERM] Agent no longer reports sandbox - deletion confirmed, calling Registry.Release",
-			"agentAllocatedBefore", agent.Allocated)
-		r.Registry.Release(agentpool.AgentID(sandbox.Status.AssignedPod), sandbox)
+		logger.Info("[DEBUG-TERM] Fastlet no longer reports sandbox - deletion confirmed, calling Registry.Release",
+			"fastletAllocatedBefore", fastlet.Allocated)
+		r.Registry.Release(fastletpool.FastletID(sandbox.Status.AssignedFastlet), sandbox)
 		return r.removeFinalizer(ctx, sandbox)
 	}
 
 	// Still terminating - continue waiting
-	logger.Info("[DEBUG-TERM] Still waiting for Agent termination",
-		"currentPhase", agentStatus.Phase,
+	logger.Info("[DEBUG-TERM] Still waiting for Fastlet termination",
+		"currentPhase", fastletStatus.Phase,
 		"willRequeueAfter", DeletionPollInterval)
 	return ctrl.Result{RequeueAfter: DeletionPollInterval}, nil
 }
@@ -342,12 +342,12 @@ func (r *SandboxReconciler) processExpiration(ctx context.Context, sandbox *apiv
 	logger := klog.FromContext(ctx)
 	logger.Info("Processing sandbox expiration")
 
-	// Delete runtime from Agent if assigned
-	if sandbox.Status.AssignedPod != "" {
-		if err := r.deleteFromAgent(ctx, sandbox); err != nil {
-			return ctrl.Result{}, fmt.Errorf("failed to delete expired sandbox from agent: %w", err), true
+	// Delete runtime from Fastlet if assigned
+	if sandbox.Status.AssignedFastlet != "" {
+		if err := r.deleteFromFastlet(ctx, sandbox); err != nil {
+			return ctrl.Result{}, fmt.Errorf("failed to delete expired sandbox from fastlet: %w", err), true
 		}
-		r.Registry.Release(agentpool.AgentID(sandbox.Status.AssignedPod), sandbox)
+		r.Registry.Release(fastletpool.FastletID(sandbox.Status.AssignedFastlet), sandbox)
 	}
 
 	// Update status to Expired
@@ -357,7 +357,7 @@ func (r *SandboxReconciler) processExpiration(ctx context.Context, sandbox *apiv
 			return err
 		}
 		latest.Status.Phase = string(apiv1alpha1.PhaseExpired)
-		latest.Status.AssignedPod = ""
+		latest.Status.AssignedFastlet = ""
 		latest.Status.SandboxID = ""
 		return r.Status().Update(ctx, latest)
 	})
@@ -387,14 +387,14 @@ func (r *SandboxReconciler) handleReset(ctx context.Context, sandbox *apiv1alpha
 	logger := klog.FromContext(ctx)
 	logger.Info("Processing reset request")
 
-	// Clean up existing Agent resources
-	if sandbox.Status.AssignedPod != "" {
-		// Delete from Agent first (fix for BUG-03)
-		if err := r.deleteFromAgent(ctx, sandbox); err != nil {
+	// Clean up existing Fastlet resources
+	if sandbox.Status.AssignedFastlet != "" {
+		// Delete from Fastlet first (fix for BUG-03)
+		if err := r.deleteFromFastlet(ctx, sandbox); err != nil {
 			// Log but don't block - reset takes priority
-			logger.Error(err, "Failed to delete old sandbox from agent during reset")
+			logger.Error(err, "Failed to delete old sandbox from fastlet during reset")
 		}
-		r.Registry.Release(agentpool.AgentID(sandbox.Status.AssignedPod), sandbox)
+		r.Registry.Release(fastletpool.FastletID(sandbox.Status.AssignedFastlet), sandbox)
 	}
 
 	// Reset status to Pending for rescheduling
@@ -403,7 +403,7 @@ func (r *SandboxReconciler) handleReset(ctx context.Context, sandbox *apiv1alpha
 		if err := r.Get(ctx, client.ObjectKeyFromObject(sandbox), latest); err != nil {
 			return err
 		}
-		latest.Status.AssignedPod = ""
+		latest.Status.AssignedFastlet = ""
 		latest.Status.SandboxID = ""
 		latest.Status.Phase = string(apiv1alpha1.PhasePending)
 		latest.Status.AcceptedResetRevision = sandbox.Spec.ResetRevision
@@ -438,8 +438,8 @@ func (r *SandboxReconciler) reconcilePhase(ctx context.Context, sandbox *apiv1al
 		return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 
 	case apiv1alpha1.PhaseLost:
-		// Lost phase - Agent was lost under Manual policy, waiting for user intervention
-		// Check if a new Agent is available for rescheduling
+		// Lost phase - Fastlet was lost under Manual policy, waiting for user intervention
+		// Check if a new Fastlet is available for rescheduling
 		return r.reconcileLost(ctx, sandbox)
 
 	default:
@@ -449,7 +449,7 @@ func (r *SandboxReconciler) reconcilePhase(ctx context.Context, sandbox *apiv1al
 }
 
 // reconcilePending handles sandboxes in Pending phase.
-// Workflow: Schedule → Create on Agent → Transition to Bound
+// Workflow: Schedule → Create on Fastlet → Transition to Bound
 func (r *SandboxReconciler) reconcilePending(ctx context.Context, sandbox *apiv1alpha1.Sandbox) (ctrl.Result, error) {
 	logger := klog.FromContext(ctx)
 
@@ -462,7 +462,7 @@ func (r *SandboxReconciler) reconcilePending(ctx context.Context, sandbox *apiv1
 	}
 	if allocInfo != nil {
 		logger.Info("Found allocation annotation from FastPath, moving to status",
-			"assignedPod", allocInfo.AssignedPod, "assignedNode", allocInfo.AssignedNode)
+			"assignedFastlet", allocInfo.AssignedFastlet, "assignedNode", allocInfo.AssignedNode)
 
 		if err := r.moveAllocationToStatus(ctx, sandbox, allocInfo); err != nil {
 			logger.Error(err, "Failed to move allocation to status")
@@ -475,26 +475,26 @@ func (r *SandboxReconciler) reconcilePending(ctx context.Context, sandbox *apiv1
 
 	// === 原有逻辑保持不变 ===
 	// Step 1: Scheduling (if not yet assigned)
-	if sandbox.Status.AssignedPod == "" {
+	if sandbox.Status.AssignedFastlet == "" {
 		return r.handleScheduling(ctx, sandbox)
 	}
 
-	// Step 2: Validate Agent availability
-	agent, agentExists := r.Registry.GetAgentByID(agentpool.AgentID(sandbox.Status.AssignedPod))
-	if !agentExists {
-		return r.handleAgentLost(ctx, sandbox)
+	// Step 2: Validate Fastlet availability
+	fastlet, fastletExists := r.Registry.GetFastletByID(fastletpool.FastletID(sandbox.Status.AssignedFastlet))
+	if !fastletExists {
+		return r.handleFastletLost(ctx, sandbox)
 	}
 
-	// Step 3: Check Agent heartbeat
-	heartbeatAge := time.Since(agent.LastHeartbeat)
+	// Step 3: Check Fastlet heartbeat
+	heartbeatAge := time.Since(fastlet.LastHeartbeat)
 	if heartbeatAge >= HeartbeatTimeout {
-		logger.V(1).Info("Agent heartbeat timeout, waiting for cleanup", "age", heartbeatAge)
+		logger.V(1).Info("Fastlet heartbeat timeout, waiting for cleanup", "age", heartbeatAge)
 		return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 	}
 
-	// Step 4: Create sandbox on Agent
-	if err := r.handleCreateOnAgent(ctx, sandbox); err != nil {
-		logger.Error(err, "Failed to create sandbox on agent")
+	// Step 4: Create sandbox on Fastlet
+	if err := r.handleCreateOnFastlet(ctx, sandbox); err != nil {
+		logger.Error(err, "Failed to create sandbox on fastlet")
 		return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 	}
 
@@ -503,30 +503,30 @@ func (r *SandboxReconciler) reconcilePending(ctx context.Context, sandbox *apiv1
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Sandbox created on agent, transitioning to Bound", "sandbox", sandbox.Name)
+	logger.Info("Sandbox created on fastlet, transitioning to Bound", "sandbox", sandbox.Name)
 	return ctrl.Result{RequeueAfter: 0}, nil
 }
 
 // reconcileRunning handles sandboxes in Bound/Running phase.
-// Workflow: Sync status from Agent, handle Agent loss
+// Workflow: Sync status from Fastlet, handle Fastlet loss
 func (r *SandboxReconciler) reconcileRunning(ctx context.Context, sandbox *apiv1alpha1.Sandbox) (ctrl.Result, error) {
 	logger := klog.FromContext(ctx)
 
-	// Validate Agent exists
-	agent, agentExists := r.Registry.GetAgentByID(agentpool.AgentID(sandbox.Status.AssignedPod))
-	if !agentExists {
-		return r.handleAgentLost(ctx, sandbox)
+	// Validate Fastlet exists
+	fastlet, fastletExists := r.Registry.GetFastletByID(fastletpool.FastletID(sandbox.Status.AssignedFastlet))
+	if !fastletExists {
+		return r.handleFastletLost(ctx, sandbox)
 	}
 
 	// Check heartbeat
-	heartbeatAge := time.Since(agent.LastHeartbeat)
+	heartbeatAge := time.Since(fastlet.LastHeartbeat)
 	if heartbeatAge >= HeartbeatTimeout {
-		logger.V(1).Info("Agent heartbeat timeout, waiting for cleanup", "age", heartbeatAge)
+		logger.V(1).Info("Fastlet heartbeat timeout, waiting for cleanup", "age", heartbeatAge)
 		return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 	}
 
-	// Sync status from Agent
-	if err := r.syncStatusFromAgent(ctx, sandbox, &agent); err != nil {
+	// Sync status from Fastlet
+	if err := r.syncStatusFromFastlet(ctx, sandbox, &fastlet); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -534,19 +534,19 @@ func (r *SandboxReconciler) reconcileRunning(ctx context.Context, sandbox *apiv1
 }
 
 // reconcileLost handles sandboxes in Lost phase.
-// Workflow: Wait for new Agent to become available, then transition to Pending for rescheduling.
+// Workflow: Wait for new Fastlet to become available, then transition to Pending for rescheduling.
 func (r *SandboxReconciler) reconcileLost(ctx context.Context, sandbox *apiv1alpha1.Sandbox) (ctrl.Result, error) {
 	logger := klog.FromContext(ctx)
 
-	// Check if any Agent is available for the sandbox's pool
-	agent, err := r.Registry.Allocate(sandbox)
+	// Check if any Fastlet is available for the sandbox's pool
+	fastlet, err := r.Registry.Allocate(sandbox)
 	if err != nil {
-		// No agent available yet, continue waiting
-		logger.V(1).Info("Waiting for available agent for rescheduling", "error", err)
+		// No fastlet available yet, continue waiting
+		logger.V(1).Info("Waiting for available fastlet for rescheduling", "error", err)
 		return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 	}
 
-	// Agent available - transition to Pending for rescheduling
+	// Fastlet available - transition to Pending for rescheduling
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &apiv1alpha1.Sandbox{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(sandbox), latest); err != nil {
@@ -556,19 +556,19 @@ func (r *SandboxReconciler) reconcileLost(ctx context.Context, sandbox *apiv1alp
 		if latest.Status.Phase != string(apiv1alpha1.PhaseLost) {
 			return fmt.Errorf("sandbox phase changed from Lost, aborting reschedule")
 		}
-		latest.Status.AssignedPod = agent.PodName
-		latest.Status.NodeName = agent.NodeName
+		latest.Status.AssignedFastlet = fastlet.PodName
+		latest.Status.NodeName = fastlet.NodeName
 		latest.Status.Phase = string(apiv1alpha1.PhasePending)
 		return r.Status().Update(ctx, latest)
 	})
 
 	if err != nil {
 		// Scheduling failed - release the allocation
-		r.Registry.Release(agent.ID, sandbox)
+		r.Registry.Release(fastlet.ID, sandbox)
 		return ctrl.Result{}, err
 	}
 
-	logger.Info("Agent available for rescheduling, transitioning from Lost to Pending", "agent", agent.PodName)
+	logger.Info("Fastlet available for rescheduling, transitioning from Lost to Pending", "fastlet", fastlet.PodName)
 	return ctrl.Result{Requeue: true}, nil
 }
 
@@ -576,13 +576,13 @@ func (r *SandboxReconciler) reconcileLost(ctx context.Context, sandbox *apiv1alp
 // Scheduling
 // ============================================================================
 
-// handleScheduling allocates an Agent for the Sandbox.
+// handleScheduling allocates an Fastlet for the Sandbox.
 func (r *SandboxReconciler) handleScheduling(ctx context.Context, sandbox *apiv1alpha1.Sandbox) (ctrl.Result, error) {
 	logger := klog.FromContext(ctx)
 
-	agent, err := r.Registry.Allocate(sandbox)
+	fastlet, err := r.Registry.Allocate(sandbox)
 	if err != nil {
-		logger.V(1).Info("No available agent for scheduling", "error", err)
+		logger.V(1).Info("No available fastlet for scheduling", "error", err)
 		return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 	}
 
@@ -593,33 +593,33 @@ func (r *SandboxReconciler) handleScheduling(ctx context.Context, sandbox *apiv1
 			return err
 		}
 		// Guard against concurrent scheduling
-		if latest.Status.AssignedPod != "" {
-			return fmt.Errorf("sandbox already scheduled to %s", latest.Status.AssignedPod)
+		if latest.Status.AssignedFastlet != "" {
+			return fmt.Errorf("sandbox already scheduled to %s", latest.Status.AssignedFastlet)
 		}
-		latest.Status.AssignedPod = agent.PodName
-		latest.Status.NodeName = agent.NodeName
+		latest.Status.AssignedFastlet = fastlet.PodName
+		latest.Status.NodeName = fastlet.NodeName
 		latest.Status.Phase = string(apiv1alpha1.PhasePending)
 		return r.Status().Update(ctx, latest)
 	})
 
 	if err != nil {
 		// Scheduling failed - release the allocation
-		r.Registry.Release(agent.ID, sandbox)
+		r.Registry.Release(fastlet.ID, sandbox)
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	logger.Info("Sandbox scheduled to agent", "agent", agent.PodName, "node", agent.NodeName)
+	logger.Info("Sandbox scheduled to fastlet", "fastlet", fastlet.PodName, "node", fastlet.NodeName)
 	return ctrl.Result{Requeue: true}, nil
 }
 
 // ============================================================================
-// Agent Interaction
+// Fastlet Interaction
 // ============================================================================
 
-// handleAgentLost handles the case when the assigned Agent is no longer available.
-func (r *SandboxReconciler) handleAgentLost(ctx context.Context, sandbox *apiv1alpha1.Sandbox) (ctrl.Result, error) {
+// handleFastletLost handles the case when the assigned Fastlet is no longer available.
+func (r *SandboxReconciler) handleFastletLost(ctx context.Context, sandbox *apiv1alpha1.Sandbox) (ctrl.Result, error) {
 	logger := klog.FromContext(ctx)
-	logger.Info("Assigned agent lost", "agent", sandbox.Status.AssignedPod)
+	logger.Info("Assigned fastlet lost", "fastlet", sandbox.Status.AssignedFastlet)
 
 	if sandbox.Spec.FailurePolicy == apiv1alpha1.FailurePolicyAutoRecreate {
 		// AutoRecreate: clear assignment and reschedule
@@ -629,20 +629,20 @@ func (r *SandboxReconciler) handleAgentLost(ctx context.Context, sandbox *apiv1a
 				return err
 			}
 			// Guard against concurrent updates
-			if latest.Status.AssignedPod != sandbox.Status.AssignedPod {
+			if latest.Status.AssignedFastlet != sandbox.Status.AssignedFastlet {
 				return nil // Another reconcile already handled this
 			}
-			latest.Status.AssignedPod = ""
+			latest.Status.AssignedFastlet = ""
 			latest.Status.SandboxID = ""
 			latest.Status.Phase = string(apiv1alpha1.PhasePending)
 			return r.Status().Update(ctx, latest)
 		})
 
-		logger.Info("Agent lost - triggering AutoRecreate")
+		logger.Info("Fastlet lost - triggering AutoRecreate")
 		return ctrl.Result{Requeue: true}, err
 	}
 
-	// Manual policy: transition to Lost phase to explicitly indicate agent loss
+	// Manual policy: transition to Lost phase to explicitly indicate fastlet loss
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &apiv1alpha1.Sandbox{}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(sandbox), latest); err != nil {
@@ -653,23 +653,23 @@ func (r *SandboxReconciler) handleAgentLost(ctx context.Context, sandbox *apiv1a
 			return nil // Already in Lost phase
 		}
 		latest.Status.Phase = string(apiv1alpha1.PhaseLost)
-		latest.Status.AssignedPod = ""
+		latest.Status.AssignedFastlet = ""
 		latest.Status.SandboxID = ""
 		return r.Status().Update(ctx, latest)
 	})
 
-	logger.Info("Agent lost - Manual policy, transitioning to Lost phase")
+	logger.Info("Fastlet lost - Manual policy, transitioning to Lost phase")
 	return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, err
 }
 
-// handleCreateOnAgent sends a create request to the Agent.
-func (r *SandboxReconciler) handleCreateOnAgent(ctx context.Context, sandbox *apiv1alpha1.Sandbox) error {
-	agent, ok := r.Registry.GetAgentByID(agentpool.AgentID(sandbox.Status.AssignedPod))
+// handleCreateOnFastlet sends a create request to the Fastlet.
+func (r *SandboxReconciler) handleCreateOnFastlet(ctx context.Context, sandbox *apiv1alpha1.Sandbox) error {
+	fastlet, ok := r.Registry.GetFastletByID(fastletpool.FastletID(sandbox.Status.AssignedFastlet))
 	if !ok {
-		return fmt.Errorf("agent %s not found in registry", sandbox.Status.AssignedPod)
+		return fmt.Errorf("fastlet %s not found in registry", sandbox.Status.AssignedFastlet)
 	}
 
-	_, err := r.AgentClient.CreateSandbox(agent.PodIP, &api.CreateSandboxRequest{
+	_, err := r.FastletClient.CreateSandbox(fastlet.PodIP, &api.CreateSandboxRequest{
 		Sandbox: api.SandboxSpec{
 			SandboxID:  r.getSandboxID(sandbox),
 			ClaimName:  sandbox.Name,
@@ -681,55 +681,55 @@ func (r *SandboxReconciler) handleCreateOnAgent(ctx context.Context, sandbox *ap
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create sandbox on agent %s: %w", agent.PodIP, err)
+		return fmt.Errorf("failed to create sandbox on fastlet %s: %w", fastlet.PodIP, err)
 	}
 	return nil
 }
 
-// deleteFromAgent sends a delete request to the Agent.
-func (r *SandboxReconciler) deleteFromAgent(ctx context.Context, sandbox *apiv1alpha1.Sandbox) error {
-	klog.Info("[DEBUG-DELETE-FROM-AGENT] ENTER",
+// deleteFromFastlet sends a delete request to the Fastlet.
+func (r *SandboxReconciler) deleteFromFastlet(ctx context.Context, sandbox *apiv1alpha1.Sandbox) error {
+	klog.Info("[DEBUG-DELETE-FROM-FASTLET] ENTER",
 		"sandbox", sandbox.Name,
-		"assignedPod", sandbox.Status.AssignedPod)
+		"assignedFastlet", sandbox.Status.AssignedFastlet)
 
-	agent, ok := r.Registry.GetAgentByID(agentpool.AgentID(sandbox.Status.AssignedPod))
+	fastlet, ok := r.Registry.GetFastletByID(fastletpool.FastletID(sandbox.Status.AssignedFastlet))
 	if !ok {
-		// Agent not found - nothing to delete
-		klog.Warning("[DEBUG-DELETE-FROM-AGENT] Agent not found in registry",
-			"agentID", agentpool.AgentID(sandbox.Status.AssignedPod))
+		// Fastlet not found - nothing to delete
+		klog.Warning("[DEBUG-DELETE-FROM-FASTLET] Fastlet not found in registry",
+			"fastletID", fastletpool.FastletID(sandbox.Status.AssignedFastlet))
 		return nil
 	}
 
-	klog.Info("[DEBUG-DELETE-FROM-AGENT] Calling Agent DeleteSandbox API",
-		"agentPodIP", agent.PodIP,
+	klog.Info("[DEBUG-DELETE-FROM-FASTLET] Calling Fastlet DeleteSandbox API",
+		"fastletPodIP", fastlet.PodIP,
 		"name", sandbox.Name,
 		"sandboxID", r.getSandboxID(sandbox))
 
-	_, err := r.AgentClient.DeleteSandbox(agent.PodIP, &api.DeleteSandboxRequest{
+	_, err := r.FastletClient.DeleteSandbox(fastlet.PodIP, &api.DeleteSandboxRequest{
 		SandboxID: r.getSandboxID(sandbox),
 	})
 	if err != nil {
-		klog.Error("[DEBUG-DELETE-FROM-AGENT] DeleteSandbox API failed", "err", err)
-		return fmt.Errorf("failed to delete sandbox from agent %s: %w", agent.PodIP, err)
+		klog.Error("[DEBUG-DELETE-FROM-FASTLET] DeleteSandbox API failed", "err", err)
+		return fmt.Errorf("failed to delete sandbox from fastlet %s: %w", fastlet.PodIP, err)
 	}
 
-	klog.Info("[DEBUG-DELETE-FROM-AGENT] DeleteSandbox API called successfully")
+	klog.Info("[DEBUG-DELETE-FROM-FASTLET] DeleteSandbox API called successfully")
 	return nil
 }
 
-// syncStatusFromAgent synchronizes sandbox status from Agent's reported status.
-func (r *SandboxReconciler) syncStatusFromAgent(ctx context.Context, sandbox *apiv1alpha1.Sandbox, agent *agentpool.AgentInfo) error {
-	// Agent statuses are keyed by SandboxID (hash or UID), not by name
-	status, hasStatus := agent.SandboxStatuses[r.getSandboxID(sandbox)]
+// syncStatusFromFastlet synchronizes sandbox status from Fastlet's reported status.
+func (r *SandboxReconciler) syncStatusFromFastlet(ctx context.Context, sandbox *apiv1alpha1.Sandbox, fastlet *fastletpool.FastletInfo) error {
+	// Fastlet statuses are keyed by SandboxID (hash or UID), not by name
+	status, hasStatus := fastlet.SandboxStatuses[r.getSandboxID(sandbox)]
 	if !hasStatus {
 		return nil
 	}
 
-	// Map Agent phase to Controller phase
-	controllerPhase := mapAgentPhaseToController(status.Phase)
+	// Map Fastlet phase to Controller phase
+	controllerPhase := mapFastletPhaseToController(status.Phase)
 
 	// Skip status sync if sandbox has been reset (AcceptedResetRevision is set)
-	// This prevents Agent-reported Terminated state from overwriting the reset state
+	// This prevents Fastlet-reported Terminated state from overwriting the reset state
 	if sandbox.Status.AcceptedResetRevision != nil {
 		return nil
 	}
@@ -749,10 +749,10 @@ func (r *SandboxReconciler) syncStatusFromAgent(ctx context.Context, sandbox *ap
 		latest.Status.SandboxID = status.SandboxID
 
 		// Update endpoints if ports are exposed
-		if len(latest.Spec.ExposedPorts) > 0 && agent.PodIP != "" {
+		if len(latest.Spec.ExposedPorts) > 0 && fastlet.PodIP != "" {
 			endpoints := make([]string, 0, len(latest.Spec.ExposedPorts))
 			for _, port := range latest.Spec.ExposedPorts {
-				endpoints = append(endpoints, fmt.Sprintf("%s:%d", agent.PodIP, port))
+				endpoints = append(endpoints, fmt.Sprintf("%s:%d", fastlet.PodIP, port))
 			}
 			latest.Status.Endpoints = endpoints
 		}
@@ -761,24 +761,24 @@ func (r *SandboxReconciler) syncStatusFromAgent(ctx context.Context, sandbox *ap
 	})
 }
 
-// mapAgentPhaseToController maps Agent-reported phase to Controller standard phase.
-// Agent uses lowercase (running, terminated), Controller uses TitleCase (Running, Terminated).
-func mapAgentPhaseToController(agentPhase string) apiv1alpha1.SandboxPhase {
-	switch apiv1alpha1.AgentSandboxPhase(agentPhase) {
-	case apiv1alpha1.AgentPhaseRunning:
+// mapFastletPhaseToController maps Fastlet-reported phase to Controller standard phase.
+// Fastlet uses lowercase (running, terminated), Controller uses TitleCase (Running, Terminated).
+func mapFastletPhaseToController(fastletPhase string) apiv1alpha1.SandboxPhase {
+	switch apiv1alpha1.FastletSandboxPhase(fastletPhase) {
+	case apiv1alpha1.FastletPhaseRunning:
 		return apiv1alpha1.PhaseRunning
-	case apiv1alpha1.AgentPhaseCreating:
+	case apiv1alpha1.FastletPhaseCreating:
 		return apiv1alpha1.PhaseBound // Still creating, keep as Bound
-	case apiv1alpha1.AgentPhaseFailed:
+	case apiv1alpha1.FastletPhaseFailed:
 		return apiv1alpha1.PhaseFailed
-	case apiv1alpha1.AgentPhaseStopped:
+	case apiv1alpha1.FastletPhaseStopped:
 		return apiv1alpha1.PhaseFailed // Stopped unexpectedly
-	case apiv1alpha1.AgentPhaseTerminated:
+	case apiv1alpha1.FastletPhaseTerminated:
 		return apiv1alpha1.PhaseTerminating // Being deleted
 	default:
 		// Unknown phase - return as-is converted to SandboxPhase
 		// This handles any future phases gracefully
-		return apiv1alpha1.SandboxPhase(agentPhase)
+		return apiv1alpha1.SandboxPhase(fastletPhase)
 	}
 }
 
@@ -815,7 +815,7 @@ func (r *SandboxReconciler) moveAllocationToStatus(ctx context.Context, sandbox 
 			return err
 		}
 
-		latest.Status.AssignedPod = allocInfo.AssignedPod
+		latest.Status.AssignedFastlet = allocInfo.AssignedFastlet
 		latest.Status.NodeName = allocInfo.AssignedNode
 		latest.Status.Phase = string(apiv1alpha1.PhaseBound)
 		return r.Status().Update(ctx, latest)
@@ -846,9 +846,9 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(
 		context.Background(),
 		&apiv1alpha1.Sandbox{},
-		"status.assignedPod",
+		"status.assignedFastlet",
 		func(o client.Object) []string {
-			return []string{o.(*apiv1alpha1.Sandbox).Status.AssignedPod}
+			return []string{o.(*apiv1alpha1.Sandbox).Status.AssignedFastlet}
 		},
 	); err != nil {
 		return err
@@ -863,18 +863,18 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// mapPodToSandboxes returns reconcile requests for unassigned sandboxes when an agent pod becomes ready.
+// mapPodToSandboxes returns reconcile requests for unassigned sandboxes when an fastlet pod becomes ready.
 func (r *SandboxReconciler) mapPodToSandboxes(ctx context.Context, obj client.Object) []ctrl.Request {
 	pod := obj.(*corev1.Pod)
 
-	// Only trigger for running agent pods
-	if pod.Labels["app"] != "sandbox-agent" || pod.Status.Phase != corev1.PodRunning {
+	// Only trigger for running fastlet pods
+	if pod.Labels["app"] != "sandbox-fastlet" || pod.Status.Phase != corev1.PodRunning {
 		return nil
 	}
 
 	// Request reconciliation for all unassigned sandboxes
 	var sandboxList apiv1alpha1.SandboxList
-	if err := r.List(ctx, &sandboxList, client.MatchingFields{"status.assignedPod": ""}); err != nil {
+	if err := r.List(ctx, &sandboxList, client.MatchingFields{"status.assignedFastlet": ""}); err != nil {
 		return nil
 	}
 

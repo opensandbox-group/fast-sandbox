@@ -29,13 +29,13 @@ func (j *Janitor) Scan(ctx context.Context) {
 			continue
 		}
 
-		agentUID := labelsMap["fast-sandbox.io/agent-uid"]
-		agentName := labelsMap["fast-sandbox.io/agent-name"]
+		fastletUID := labelsMap["fast-sandbox.io/fastlet-uid"]
+		fastletName := labelsMap["fast-sandbox.io/fastlet-name"]
 		sandboxName := labelsMap["fast-sandbox.io/sandbox-name"]
 		sandboxNamespace := labelsMap["fast-sandbox.io/namespace"]
 		claimUID := labelsMap["fast-sandbox.io/claim-uid"]
 
-		if agentUID == "" || sandboxName == "" || sandboxNamespace == "" {
+		if fastletUID == "" || sandboxName == "" || sandboxNamespace == "" {
 			continue
 		}
 
@@ -51,9 +51,9 @@ func (j *Janitor) Scan(ctx context.Context) {
 		shouldCleanup := false
 		reason := ""
 
-		if !j.podExists(agentUID) {
+		if !j.podExists(fastletUID) {
 			shouldCleanup = true
-			reason = "AgentPodDisappeared"
+			reason = "FastletPodDisappeared"
 		}
 
 		sandboxNotFound := false
@@ -82,8 +82,8 @@ func (j *Janitor) Scan(ctx context.Context) {
 				"reason", reason)
 			j.queue.Add(CleanupTask{
 				ContainerID:     c.ID(),
-				AgentUID:        agentUID,
-				PodName:         agentName,
+				FastletUID:      fastletUID,
+				PodName:         fastletName,
 				Namespace:       sandboxNamespace,
 				SandboxName:     sandboxName,
 				SandboxNotFound: sandboxNotFound,
@@ -97,8 +97,8 @@ func (j *Janitor) podExists(uid string) bool {
 	if err != nil {
 		// Lister 失败时记录错误，返回 false 允许清理
 		// 这样即使 Lister 出问题，orphan 容器也能被清理
-		// 实际清理前还会再次验证 Agent Pod 状态
-		klog.ErrorS(err, "Failed to list pods for orphan detection", "agent-uid", uid)
+		// 实际清理前还会再次验证 Fastlet Pod 状态
+		klog.ErrorS(err, "Failed to list pods for orphan detection", "fastlet-uid", uid)
 		return false
 	}
 	for _, p := range pods {
@@ -112,17 +112,17 @@ func (j *Janitor) podExists(uid string) bool {
 func (j *Janitor) enqueueOrphansByUID(ctx context.Context, uid string, name string, ns string) {
 	ctx = namespaces.WithNamespace(ctx, "k8s.io")
 
-	filter := fmt.Sprintf("labels.\"fast-sandbox.io/agent-uid\"==\"%s\"", uid)
+	filter := fmt.Sprintf("labels.\"fast-sandbox.io/fastlet-uid\"==\"%s\"", uid)
 	containers, err := j.ctrdClient.Containers(ctx, filter)
 	if err != nil {
 		return
 	}
 
 	for _, c := range containers {
-		klog.InfoS("Enqueuing orphan container for cleanup", "container", c.ID(), "agent", name)
+		klog.InfoS("Enqueuing orphan container for cleanup", "container", c.ID(), "fastlet", name)
 		j.queue.Add(CleanupTask{
 			ContainerID: c.ID(),
-			AgentUID:    uid,
+			FastletUID:  uid,
 			PodName:     name,
 			Namespace:   ns,
 		})

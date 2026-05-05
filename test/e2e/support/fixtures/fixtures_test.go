@@ -115,7 +115,7 @@ func TestWaitForSandboxUsesPredicate(t *testing.T) {
 			return
 		}
 		current.Status.Phase = string(apiv1alpha1.PhaseRunning)
-		current.Status.AssignedPod = "agent-a"
+		current.Status.AssignedFastlet = "fastlet-a"
 		_ = fixture.client.Update(context.Background(), current)
 	}()
 
@@ -123,13 +123,13 @@ func TestWaitForSandboxUsesPredicate(t *testing.T) {
 	defer cancel()
 
 	got, err := fixture.WaitForSandbox(ctx, types.NamespacedName{Name: "sb-predicate", Namespace: "tenant-a"}, func(sb *apiv1alpha1.Sandbox) bool {
-		return sb.Status.AssignedPod != "" && sb.Status.Phase == string(apiv1alpha1.PhaseRunning)
+		return sb.Status.AssignedFastlet != "" && sb.Status.Phase == string(apiv1alpha1.PhaseRunning)
 	})
 	if err != nil {
 		t.Fatalf("expected predicate wait to succeed, got error: %v", err)
 	}
-	if got.Status.AssignedPod != "agent-a" {
-		t.Fatalf("expected assigned pod to be observed, got %q", got.Status.AssignedPod)
+	if got.Status.AssignedFastlet != "fastlet-a" {
+		t.Fatalf("expected assigned pod to be observed, got %q", got.Status.AssignedFastlet)
 	}
 }
 
@@ -152,7 +152,7 @@ func TestEnsureSandboxRemainsUnassignedFailsOnAssignment(t *testing.T) {
 		if err := fixture.client.Get(context.Background(), types.NamespacedName{Name: "sb-assigned", Namespace: "tenant-a"}, current); err != nil {
 			return
 		}
-		current.Status.AssignedPod = "agent-a"
+		current.Status.AssignedFastlet = "fastlet-a"
 		current.Status.SandboxID = "sandbox-a"
 		_ = fixture.client.Update(context.Background(), current)
 	}()
@@ -165,7 +165,7 @@ func TestEnsureSandboxRemainsUnassignedFailsOnAssignment(t *testing.T) {
 	}
 }
 
-func TestWaitForReadyAgentPodsReturnsReadyPods(t *testing.T) {
+func TestWaitForReadyFastletPodsReturnsReadyPods(t *testing.T) {
 	fixture := newFixtureHarness(t)
 	pool := &apiv1alpha1.SandboxPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-ready", Namespace: "tenant-a"},
@@ -190,7 +190,7 @@ func TestWaitForReadyAgentPodsReturnsReadyPods(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	got, err := fixture.WaitForReadyAgentPods(ctx, types.NamespacedName{Name: "pool-ready", Namespace: "tenant-a"}, 1)
+	got, err := fixture.WaitForReadyFastletPods(ctx, types.NamespacedName{Name: "pool-ready", Namespace: "tenant-a"}, 1)
 	if err != nil {
 		t.Fatalf("expected ready pod wait to succeed, got error: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestWaitForReadyAgentPodsReturnsReadyPods(t *testing.T) {
 	}
 }
 
-func TestWaitForReadyAgentPodsFallsBackToReadyAgentPods(t *testing.T) {
+func TestWaitForReadyFastletPodsFallsBackToReadyFastletPods(t *testing.T) {
 	fixture := newFixtureHarness(t)
 	pool := &apiv1alpha1.SandboxPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-fallback", Namespace: "tenant-a"},
@@ -209,7 +209,7 @@ func TestWaitForReadyAgentPodsFallsBackToReadyAgentPods(t *testing.T) {
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "pool-fallback-agent",
+			Name:      "pool-fallback-fastlet",
 			Namespace: "tenant-a",
 			Labels: map[string]string{
 				"fast-sandbox.io/pool": "pool-fallback",
@@ -232,7 +232,7 @@ func TestWaitForReadyAgentPodsFallsBackToReadyAgentPods(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	got, err := fixture.WaitForReadyAgentPods(ctx, types.NamespacedName{Name: "pool-fallback", Namespace: "tenant-a"}, 1)
+	got, err := fixture.WaitForReadyFastletPods(ctx, types.NamespacedName{Name: "pool-fallback", Namespace: "tenant-a"}, 1)
 	if err != nil {
 		t.Fatalf("expected ready pod wait to succeed via pod fallback, got error: %v", err)
 	}

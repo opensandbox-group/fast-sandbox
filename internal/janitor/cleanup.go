@@ -14,11 +14,11 @@ import (
 )
 
 func (j *Janitor) doCleanup(ctx context.Context, task CleanupTask) error {
-	klog.InfoS("Starting cleanup of orphan sandbox", "container", task.ContainerID, "agent", task.PodName)
+	klog.InfoS("Starting cleanup of orphan sandbox", "container", task.ContainerID, "fastlet", task.PodName)
 
-	if !task.SandboxNotFound && j.verifyPodExists(ctx, task.AgentUID, task.PodName, task.Namespace) {
+	if !task.SandboxNotFound && j.verifyPodExists(ctx, task.FastletUID, task.PodName, task.Namespace) {
 		klog.InfoS("Pod still exists via direct API check, aborting cleanup",
-			"pod-name", task.PodName, "agent-uid", task.AgentUID, "namespace", task.Namespace)
+			"pod-name", task.PodName, "fastlet-uid", task.FastletUID, "namespace", task.Namespace)
 		return nil
 	}
 
@@ -78,9 +78,9 @@ func (j *Janitor) verifyPodExists(ctx context.Context, podUID, podName, namespac
 	if j.kubeClient == nil {
 		return false
 	}
-	agentPod, err := j.kubeClient.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
-	if agentPod != nil && string(agentPod.UID) == podUID {
-		if agentPod.DeletionTimestamp != nil {
+	fastletPod, err := j.kubeClient.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if fastletPod != nil && string(fastletPod.UID) == podUID {
+		if fastletPod.DeletionTimestamp != nil {
 			klog.InfoS("Pod is being deleted, allowing container cleanup", "pod", podName, "namespace", namespace)
 			return false
 		}

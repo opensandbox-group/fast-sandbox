@@ -70,14 +70,14 @@ func TestPodExists_Found(t *testing.T) {
 	pods := []*corev1.Pod{
 		{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "agent-1",
+				Name:      "fastlet-1",
 				Namespace: "default",
 				UID:       targetUID,
 			},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "agent-2",
+				Name:      "fastlet-2",
 				Namespace: "default",
 				UID:       "other-uid",
 			},
@@ -100,14 +100,14 @@ func TestPodExists_NotFound(t *testing.T) {
 	pods := []*corev1.Pod{
 		{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "agent-1",
+				Name:      "fastlet-1",
 				Namespace: "default",
 				UID:       "uid-1",
 			},
 		},
 		{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "agent-2",
+				Name:      "fastlet-2",
 				Namespace: "default",
 				UID:       "uid-2",
 			},
@@ -161,14 +161,14 @@ func TestCleanupTask_Creation(t *testing.T) {
 	// RED: 测试 CleanupTask 结构体创建
 	task := CleanupTask{
 		ContainerID: "container-123",
-		AgentUID:    "agent-uid-456",
-		PodName:     "agent-pod",
+		FastletUID:  "fastlet-uid-456",
+		PodName:     "fastlet-pod",
 		Namespace:   "default",
 	}
 
 	assert.Equal(t, "container-123", task.ContainerID)
-	assert.Equal(t, "agent-uid-456", task.AgentUID)
-	assert.Equal(t, "agent-pod", task.PodName)
+	assert.Equal(t, "fastlet-uid-456", task.FastletUID)
+	assert.Equal(t, "fastlet-pod", task.PodName)
 	assert.Equal(t, "default", task.Namespace)
 }
 
@@ -226,9 +226,9 @@ func TestScan_CustomTimeout(t *testing.T) {
 // Orphan Detection Tests
 // ============================================================================
 
-func TestOrphanDetection_AgentPodDisappeared(t *testing.T) {
-	// RED: 测试当 Agent Pod 消失时检测到孤儿
-	agentUID := "disappeared-agent-uid"
+func TestOrphanDetection_FastletPodDisappeared(t *testing.T) {
+	// RED: 测试当 Fastlet Pod 消失时检测到孤儿
+	fastletUID := "disappeared-fastlet-uid"
 
 	// 没有匹配的 Pod
 	j := &Janitor{
@@ -237,9 +237,9 @@ func TestOrphanDetection_AgentPodDisappeared(t *testing.T) {
 		},
 	}
 
-	exists := j.podExists(agentUID)
+	exists := j.podExists(fastletUID)
 
-	assert.False(t, exists, "Agent Pod 消失时应返回 false，触发孤儿清理")
+	assert.False(t, exists, "Fastlet Pod 消失时应返回 false，触发孤儿清理")
 }
 
 func TestOrphanDetection_SandboxCRDNotFound(t *testing.T) {

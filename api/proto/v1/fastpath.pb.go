@@ -25,10 +25,10 @@ const (
 type ConsistencyMode int32
 
 const (
-	// FAST 模式：先创建 Agent，后写 CRD（默认）
+	// FAST 模式：先创建 Fastlet，后写 CRD（默认）
 	// 最低延迟，但 CRD 写入失败可能导致正在使用的 sandbox 被清理
 	ConsistencyMode_FAST ConsistencyMode = 0
-	// STRONG 模式：先写 CRD，后创建 Agent
+	// STRONG 模式：先写 CRD，后创建 Fastlet
 	// 延迟略高，但保证强一致性
 	ConsistencyMode_STRONG ConsistencyMode = 1
 )
@@ -264,7 +264,7 @@ type SandboxInfo struct {
 	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`       // container ID (md5 hash or UID)
 	SandboxName   string                 `protobuf:"bytes,8,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"` // CRD name (user-provided)
 	Phase         string                 `protobuf:"bytes,2,opt,name=phase,proto3" json:"phase,omitempty"`
-	AgentPod      string                 `protobuf:"bytes,3,opt,name=agent_pod,json=agentPod,proto3" json:"agent_pod,omitempty"`
+	FastletPod    string                 `protobuf:"bytes,3,opt,name=fastlet_pod,json=fastletPod,proto3" json:"fastlet_pod,omitempty"`
 	Endpoints     []string               `protobuf:"bytes,4,rep,name=endpoints,proto3" json:"endpoints,omitempty"`
 	CreatedAt     int64                  `protobuf:"varint,5,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	Image         string                 `protobuf:"bytes,6,opt,name=image,proto3" json:"image,omitempty"`
@@ -324,9 +324,9 @@ func (x *SandboxInfo) GetPhase() string {
 	return ""
 }
 
-func (x *SandboxInfo) GetAgentPod() string {
+func (x *SandboxInfo) GetFastletPod() string {
 	if x != nil {
-		return x.AgentPod
+		return x.FastletPod
 	}
 	return ""
 }
@@ -479,7 +479,7 @@ type CreateResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`       // container ID (md5 hash or UID)
 	SandboxName   string                 `protobuf:"bytes,4,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"` // CRD name (user-provided)
-	AgentPod      string                 `protobuf:"bytes,2,opt,name=agent_pod,json=agentPod,proto3" json:"agent_pod,omitempty"`
+	FastletPod    string                 `protobuf:"bytes,2,opt,name=fastlet_pod,json=fastletPod,proto3" json:"fastlet_pod,omitempty"`
 	Endpoints     []string               `protobuf:"bytes,3,rep,name=endpoints,proto3" json:"endpoints,omitempty"` // IP:Port 列表
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -529,9 +529,9 @@ func (x *CreateResponse) GetSandboxName() string {
 	return ""
 }
 
-func (x *CreateResponse) GetAgentPod() string {
+func (x *CreateResponse) GetFastletPod() string {
 	if x != nil {
-		return x.AgentPod
+		return x.FastletPod
 	}
 	return ""
 }
@@ -852,13 +852,14 @@ const file_api_proto_v1_fastpath_proto_rawDesc = "" +
 	"\n" +
 	"GetRequest\x12!\n" +
 	"\fsandbox_name\x18\x01 \x01(\tR\vsandboxName\x12\x1c\n" +
-	"\tnamespace\x18\x02 \x01(\tR\tnamespace\"\xf0\x01\n" +
+	"\tnamespace\x18\x02 \x01(\tR\tnamespace\"\xf4\x01\n" +
 	"\vSandboxInfo\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +
 	"\fsandbox_name\x18\b \x01(\tR\vsandboxName\x12\x14\n" +
-	"\x05phase\x18\x02 \x01(\tR\x05phase\x12\x1b\n" +
-	"\tagent_pod\x18\x03 \x01(\tR\bagentPod\x12\x1c\n" +
+	"\x05phase\x18\x02 \x01(\tR\x05phase\x12\x1f\n" +
+	"\vfastlet_pod\x18\x03 \x01(\tR\n" +
+	"fastletPod\x12\x1c\n" +
 	"\tendpoints\x18\x04 \x03(\tR\tendpoints\x12\x1d\n" +
 	"\n" +
 	"created_at\x18\x05 \x01(\x03R\tcreatedAt\x12\x14\n" +
@@ -879,12 +880,13 @@ const file_api_proto_v1_fastpath_proto_rawDesc = "" +
 	"workingDir\x1a7\n" +
 	"\tEnvsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x8d\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x91\x01\n" +
 	"\x0eCreateResponse\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +
-	"\fsandbox_name\x18\x04 \x01(\tR\vsandboxName\x12\x1b\n" +
-	"\tagent_pod\x18\x02 \x01(\tR\bagentPod\x12\x1c\n" +
+	"\fsandbox_name\x18\x04 \x01(\tR\vsandboxName\x12\x1f\n" +
+	"\vfastlet_pod\x18\x02 \x01(\tR\n" +
+	"fastletPod\x12\x1c\n" +
 	"\tendpoints\x18\x03 \x03(\tR\tendpoints\"P\n" +
 	"\rDeleteRequest\x12!\n" +
 	"\fsandbox_name\x18\x01 \x01(\tR\vsandboxName\x12\x1c\n" +

@@ -79,21 +79,21 @@ func TestRunCleanupsReturnsFirstError(t *testing.T) {
 	}
 }
 
-func TestAgentImageUsesDefaultWhenUnset(t *testing.T) {
-	t.Setenv("FAST_SANDBOX_AGENT_IMAGE", "")
-	t.Setenv("AGENT_IMAGE", "")
+func TestFastletImageUsesDefaultWhenUnset(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_FASTLET_IMAGE", "")
+	t.Setenv("FASTLET_IMAGE", "")
 
-	if got := AgentImage(); got != "fast-sandbox/agent:dev" {
-		t.Fatalf("expected default agent image, got %q", got)
+	if got := FastletImage(); got != "fast-sandbox/fastlet:dev" {
+		t.Fatalf("expected default fastlet image, got %q", got)
 	}
 }
 
-func TestAgentImagePrefersFastSandboxSpecificEnv(t *testing.T) {
-	t.Setenv("AGENT_IMAGE", "fallback:dev")
-	t.Setenv("FAST_SANDBOX_AGENT_IMAGE", "preferred:dev")
+func TestFastletImagePrefersFastSandboxSpecificEnv(t *testing.T) {
+	t.Setenv("FASTLET_IMAGE", "fallback:dev")
+	t.Setenv("FAST_SANDBOX_FASTLET_IMAGE", "preferred:dev")
 
-	if got := AgentImage(); got != "preferred:dev" {
-		t.Fatalf("expected FAST_SANDBOX_AGENT_IMAGE to win, got %q", got)
+	if got := FastletImage(); got != "preferred:dev" {
+		t.Fatalf("expected FAST_SANDBOX_FASTLET_IMAGE to win, got %q", got)
 	}
 }
 

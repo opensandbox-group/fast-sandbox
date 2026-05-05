@@ -57,10 +57,12 @@ func TestManagerEnsureBasicCreatesMissingClusterAndDeploys(t *testing.T) {
 
 	assertCommand(t, runner.commands, "kind", "create", "cluster", "--name", "fsb-e2e-basic", "--image", "kindest/node:v1.27.3")
 	assertCommand(t, runner.commands, "kubectl", "config", "use-context", "kind-fsb-e2e-basic")
-	assertCommand(t, runner.commands, "make", "docker-controller", "docker-agent", "docker-janitor")
+	assertCommand(t, runner.commands, "make", "docker-controller", "docker-fastlet", "docker-janitor")
 	assertCommand(t, runner.commands, "kind", "load", "docker-image", "fast-sandbox/controller:dev", "--name", "fsb-e2e-basic")
 	assertCommand(t, runner.commands, "kubectl", "apply", "-f", "config/crd/")
+	assertCommand(t, runner.commands, "kubectl", "rollout", "restart", "deployment/fast-sandbox-controller")
 	assertCommand(t, runner.commands, "kubectl", "rollout", "status", "deployment/fast-sandbox-controller", "--timeout=120s")
+	assertCommand(t, runner.commands, "kubectl", "rollout", "restart", "ds/fast-sandbox-janitor")
 }
 
 func TestManagerEnsureBasicReusesExistingCluster(t *testing.T) {
@@ -111,7 +113,7 @@ func TestManagerEnsureWaitsForKubeSystemBeforeDeploy(t *testing.T) {
 	}
 
 	kubeProxyIndex := commandIndex(runner.commands, "kubectl", "rollout", "status", "ds/kube-proxy", "-n", "kube-system", "--timeout=120s")
-	buildIndex := commandIndex(runner.commands, "make", "docker-controller", "docker-agent", "docker-janitor")
+	buildIndex := commandIndex(runner.commands, "make", "docker-controller", "docker-fastlet", "docker-janitor")
 	if kubeProxyIndex == -1 {
 		t.Fatalf("missing kube-proxy rollout wait: %#v", runner.commands)
 	}
@@ -364,7 +366,7 @@ func TestKataInstallScriptOnlySkipsCompleteInstallation(t *testing.T) {
 	}
 }
 
-func TestManagerBuildFSBCtlInvokesGoBuild(t *testing.T) {
+func TestManagerBuildFastctlInvokesGoBuild(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string]string{},
 		errs:    map[string]error{},
@@ -378,15 +380,15 @@ func TestManagerBuildFSBCtlInvokesGoBuild(t *testing.T) {
 		t.Fatalf("NewManager returned error: %v", err)
 	}
 
-	binaryPath, err := manager.BuildFSBCtl(context.Background())
+	binaryPath, err := manager.BuildFastctl(context.Background())
 	if err != nil {
-		t.Fatalf("BuildFSBCtl returned error: %v", err)
+		t.Fatalf("BuildFastctl returned error: %v", err)
 	}
-	if binaryPath != "/repo/bin/fsb-ctl" {
-		t.Fatalf("binary path = %q, want /repo/bin/fsb-ctl", binaryPath)
+	if binaryPath != "/repo/bin/fastctl" {
+		t.Fatalf("binary path = %q, want /repo/bin/fastctl", binaryPath)
 	}
 
-	assertCommand(t, runner.commands, "go", "build", "-o", "/repo/bin/fsb-ctl", "./cmd/fsb-ctl")
+	assertCommand(t, runner.commands, "go", "build", "-o", "/repo/bin/fastctl", "./cmd/fastctl")
 }
 
 func TestManagerEnsureRejectsNonLinuxHost(t *testing.T) {

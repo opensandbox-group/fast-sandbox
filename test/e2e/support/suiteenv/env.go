@@ -25,7 +25,7 @@ const (
 	DefaultControllerNamespace = "default"
 	defaultNamespacePrefix     = "fsb-e2e"
 	maxNamespaceLength         = 63
-	defaultAgentImage          = "fast-sandbox/agent:dev"
+	defaultFastletImage        = "fast-sandbox/fastlet:dev"
 )
 
 var requireProfile = e2eenv.Require
@@ -197,13 +197,13 @@ func DeleteNamespace(ctx context.Context, t *testing.T, kubeClient client.Client
 	}
 }
 
-func AgentImage() string {
-	for _, key := range []string{"FAST_SANDBOX_AGENT_IMAGE", "AGENT_IMAGE"} {
+func FastletImage() string {
+	for _, key := range []string{"FAST_SANDBOX_FASTLET_IMAGE", "FASTLET_IMAGE"} {
 		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 			return value
 		}
 	}
-	return defaultAgentImage
+	return defaultFastletImage
 }
 
 func sanitizeDNSLabel(value string) string {

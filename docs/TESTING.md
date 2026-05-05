@@ -4,7 +4,7 @@
 
 | Module | Target | Current | Status |
 |--------|--------|---------|--------|
-| agentpool | 90% | 81.7% | 🟡 Approaching |
+| fastletpool | 90% | 81.7% | 🟡 Approaching |
 | fastpath | 85% | 48.5% | 🔴 Needs Work |
 | runtime | 75% | 32.7% | 🔴 Needs Work |
 | janitor | 80% | 6.8% | 🔴 Needs Work |
@@ -30,14 +30,14 @@ go tool cover -html=coverage.out -o coverage.html
 
 ### Module-Specific Tests
 ```bash
-# Registry (agent allocation logic)
-go test ./internal/controller/agentpool/ -v
+# Registry (fastlet allocation logic)
+go test ./internal/controller/fastletpool/ -v
 
 # FastPath (gRPC server)
 go test ./internal/controller/fastpath/ -v
 
 # Runtime (containerd operations)
-go test ./internal/agent/runtime/ -v
+go test ./internal/fastlet/runtime/ -v
 
 # Janitor (orphan cleanup)
 go test ./internal/janitor/ -v
@@ -60,13 +60,13 @@ go test ./... -short
 
 | Module | Test File | Tests |
 |--------|-----------|-------|
-| agentpool | `internal/controller/agentpool/registry_test.go` | 30 |
+| fastletpool | `internal/controller/fastletpool/registry_test.go` | 30 |
 | fastpath | `internal/controller/fastpath/server_test.go` | 19 |
-| runtime | `internal/agent/runtime/containerd_runtime_test.go` | 18 |
-| runtime | `internal/agent/runtime/sandbox_manager_test.go` | 26 |
+| runtime | `internal/fastlet/runtime/containerd_runtime_test.go` | 18 |
+| runtime | `internal/fastlet/runtime/sandbox_manager_test.go` | 26 |
 | janitor | `internal/janitor/cleanup_test.go` | 4 |
 | janitor | `internal/janitor/scanner_test.go` | 9 |
-| api | `internal/api/agent_client_test.go` | 18 |
+| api | `internal/api/fastlet_client_test.go` | 18 |
 
 **Total: 124 unit tests**
 
@@ -75,14 +75,14 @@ go test ./... -short
 Registry allocation benchmarks are available:
 
 ```bash
-go test ./internal/controller/agentpool/ -bench=. -benchmem
+go test ./internal/controller/fastletpool/ -bench=. -benchmem
 ```
 
 | Benchmark | ns/op | Description |
 |-----------|-------|-------------|
-| BenchmarkRegistryAllocate | 1312 | Standard allocation (100 agents) |
+| BenchmarkRegistryAllocate | 1312 | Standard allocation (100 fastlets) |
 | BenchmarkRegistryAllocateWithPorts | 1469 | With port constraints |
-| BenchmarkRegistryAllocateLargePool | 14613 | Large pool (1000 agents) |
+| BenchmarkRegistryAllocateLargePool | 14613 | Large pool (1000 fastlets) |
 
 ## Performance Profiling
 

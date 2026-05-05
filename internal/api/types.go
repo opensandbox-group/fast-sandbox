@@ -4,16 +4,16 @@ package api
 type ConsistencyMode string
 
 const (
-	// ConsistencyModeFast creates sandbox on agent first, then writes CRD asynchronously.
+	// ConsistencyModeFast creates sandbox on fastlet first, then writes CRD asynchronously.
 	// Lowest latency, but CRD write failure may cause running sandbox to be cleaned up.
 	ConsistencyModeFast ConsistencyMode = "fast"
 
-	// ConsistencyModeStrong writes CRD first, then creates sandbox on agent.
+	// ConsistencyModeStrong writes CRD first, then creates sandbox on fastlet.
 	// Higher latency, but guarantees strong consistency.
 	ConsistencyModeStrong ConsistencyMode = "strong"
 )
 
-// SandboxSpec describes the desired state of a sandbox on an agent.
+// SandboxSpec describes the desired state of a sandbox on a fastlet.
 type SandboxSpec struct {
 	SandboxID  string            `json:"sandboxId"`
 	ClaimUID   string            `json:"claimUid"`
@@ -27,7 +27,7 @@ type SandboxSpec struct {
 	WorkingDir string            `json:"workingDir,omitempty"`
 }
 
-// SandboxStatus represents the observed state of a sandbox on an agent.
+// SandboxStatus represents the observed state of a sandbox on a fastlet.
 type SandboxStatus struct {
 	SandboxID string `json:"sandboxId"`
 	ClaimUID  string `json:"claimUid"`
@@ -36,7 +36,7 @@ type SandboxStatus struct {
 	CreatedAt int64  `json:"createdAt"` // Unix timestamp for orphan cleanup
 }
 
-// CreateSandboxRequest is sent to create a single sandbox on an agent.
+// CreateSandboxRequest is sent to create a single sandbox on a fastlet.
 type CreateSandboxRequest struct {
 	Sandbox SandboxSpec `json:"sandbox"`
 }
@@ -49,7 +49,7 @@ type CreateSandboxResponse struct {
 	CreatedAt int64  `json:"createdAt"` // Unix timestamp when sandbox was created
 }
 
-// DeleteSandboxRequest is sent to delete a single sandbox from an agent.
+// DeleteSandboxRequest is sent to delete a single sandbox from a fastlet.
 type DeleteSandboxRequest struct {
 	SandboxID string `json:"sandboxId"`
 }
@@ -60,9 +60,9 @@ type DeleteSandboxResponse struct {
 	Message string `json:"message,omitempty"`
 }
 
-// AgentStatus represents the current status of an agent (internal use).
-type AgentStatus struct {
-	AgentID         string          `json:"agentId"`
+// FastletStatus represents the current status of a fastlet (internal use).
+type FastletStatus struct {
+	FastletID       string          `json:"fastletId"`
 	NodeName        string          `json:"nodeName"`
 	Capacity        int             `json:"capacity"`
 	Allocated       int             `json:"allocated"`

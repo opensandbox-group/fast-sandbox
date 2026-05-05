@@ -124,13 +124,13 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	return nil
 }
 
-func (m *Manager) FSBCtlBinaryPath() string {
-	return filepath.Join(m.rootDir, "bin", "fsb-ctl")
+func (m *Manager) FastctlBinaryPath() string {
+	return filepath.Join(m.rootDir, "bin", "fastctl")
 }
 
-func (m *Manager) BuildFSBCtl(ctx context.Context) (string, error) {
-	binaryPath := m.FSBCtlBinaryPath()
-	if _, err := m.run(ctx, "go", "build", "-o", binaryPath, "./cmd/fsb-ctl"); err != nil {
+func (m *Manager) BuildFastctl(ctx context.Context) (string, error) {
+	binaryPath := m.FastctlBinaryPath()
+	if _, err := m.run(ctx, "go", "build", "-o", binaryPath, "./cmd/fastctl"); err != nil {
 		return "", err
 	}
 	return binaryPath, nil
@@ -593,17 +593,19 @@ func (m *Manager) deployFastSandbox(ctx context.Context) error {
 		name string
 		args []string
 	}{
-		{name: "make", args: []string{"docker-controller", "docker-agent", "docker-janitor"}},
+		{name: "make", args: []string{"docker-controller", "docker-fastlet", "docker-janitor"}},
 		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/controller:dev", "--name", m.settings.ClusterName}},
-		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/agent:dev", "--name", m.settings.ClusterName}},
+		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/fastlet:dev", "--name", m.settings.ClusterName}},
 		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/janitor:dev", "--name", m.settings.ClusterName}},
 		{name: "kubectl", args: []string{"apply", "-f", "config/crd/"}},
 		{name: "kubectl", args: []string{"wait", "--for=condition=Established", "crd/sandboxes.sandbox.fast.io", "--timeout=30s"}},
 		{name: "kubectl", args: []string{"wait", "--for=condition=Established", "crd/sandboxpools.sandbox.fast.io", "--timeout=30s"}},
 		{name: "kubectl", args: []string{"apply", "-f", "config/rbac/base.yaml"}},
 		{name: "kubectl", args: []string{"apply", "-f", "config/manager/controller.yaml"}},
+		{name: "kubectl", args: []string{"rollout", "restart", "deployment/fast-sandbox-controller"}},
 		{name: "kubectl", args: []string{"rollout", "status", "deployment/fast-sandbox-controller", "--timeout=120s"}},
 		{name: "kubectl", args: []string{"apply", "-f", "config/janitor/janitor.yaml"}},
+		{name: "kubectl", args: []string{"rollout", "restart", "ds/fast-sandbox-janitor"}},
 		{name: "kubectl", args: []string{"rollout", "status", "ds/fast-sandbox-janitor", "--timeout=60s"}},
 	}
 

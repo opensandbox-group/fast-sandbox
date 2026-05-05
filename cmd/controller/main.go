@@ -22,8 +22,8 @@ import (
 	fastpathv1 "fast-sandbox/api/proto/v1"
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/controller"
-	"fast-sandbox/internal/controller/agentcontrol"
-	"fast-sandbox/internal/controller/agentpool"
+	"fast-sandbox/internal/controller/fastletcontrol"
+	"fast-sandbox/internal/controller/fastletpool"
 	"fast-sandbox/internal/controller/fastpath"
 
 	"google.golang.org/grpc"
@@ -41,10 +41,10 @@ func init() {
 func main() {
 	var metricsAddr string
 	var probeAddr string
-	var agentPort int
+	var fastletPort int
 	var fastpathConsistencyMode string
 	var fastpathOrphanTimeout time.Duration
-	flag.IntVar(&agentPort, "agent-port", 5758, "The port the agent server binds to.")
+	flag.IntVar(&fastletPort, "fastlet-port", 5758, "The port the fastlet server binds to.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":9091", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":5758", "The address the probe endpoint binds to.")
 	flag.StringVar(&fastpathConsistencyMode, "fastpath-consistency-mode", "fast", "Fast-Path consistency mode: fast (default) or strong")
@@ -64,13 +64,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	reg := agentpool.NewInMemoryRegistry()
-	agentHTTPClient := api.NewAgentClient(agentPort)
+	reg := fastletpool.NewInMemoryRegistry()
+	fastletHTTPClient := api.NewFastletClient(fastletPort)
 	if err = (&controller.SandboxReconciler{
-		Client:      mgr.GetClient(),
-		Scheme:      mgr.GetScheme(),
-		Registry:    reg,
-		AgentClient: agentHTTPClient,
+		Client:        mgr.GetClient(),
+		Scheme:        mgr.GetScheme(),
+		Registry:      reg,
+		FastletClient: fastletHTTPClient,
 	}).SetupWithManager(mgr); err != nil {
 		klog.ErrorS(err, "unable to create controller", "controller", "Sandbox")
 		os.Exit(1)
@@ -86,7 +86,7 @@ func main() {
 	}
 
 	ctx := ctrl.SetupSignalHandler()
-	loop := agentcontrol.NewLoop(mgr.GetClient(), reg, agentHTTPClient)
+	loop := fastletcontrol.NewLoop(mgr.GetClient(), reg, fastletHTTPClient)
 	go loop.Start(ctx)
 
 	lis, err := net.Listen("tcp", ":9090")
@@ -104,7 +104,7 @@ func main() {
 	fastpathv1.RegisterFastPathServiceServer(grpcServer, &fastpath.Server{
 		K8sClient:              mgr.GetClient(),
 		Registry:               reg,
-		AgentClient:            agentHTTPClient,
+		FastletClient:          fastletHTTPClient,
 		DefaultConsistencyMode: consistencyMode,
 	})
 	klog.InfoS("Starting Fast-Path gRPC server V2", "port", 9090, "consistency-mode", consistencyMode, "orphan-timeout", fastpathOrphanTimeout)

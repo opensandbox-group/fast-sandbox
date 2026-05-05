@@ -14,7 +14,7 @@ var (
 	AddToScheme   = SchemeBuilder.AddToScheme
 )
 
-// FailurePolicy defines the action to take when the agent becomes unreachable.
+// FailurePolicy defines the action to take when the fastlet becomes unreachable.
 type FailurePolicy string
 
 const (
@@ -29,36 +29,36 @@ const (
 type SandboxPhase string
 
 const (
-	// PhasePending - Sandbox has been scheduled to an Agent but container not yet created.
+	// PhasePending - Sandbox has been scheduled to a Fastlet but container not yet created.
 	PhasePending SandboxPhase = "Pending"
-	// PhaseBound - Container creation request sent to Agent, waiting for confirmation.
+	// PhaseBound - Container creation request sent to Fastlet, waiting for confirmation.
 	PhaseBound SandboxPhase = "Bound"
-	// PhaseRunning - Container is running on the Agent (synced from Agent status).
+	// PhaseRunning - Container is running on the Fastlet (synced from Fastlet status).
 	PhaseRunning SandboxPhase = "Running"
-	// PhaseTerminating - Sandbox is being deleted, waiting for Agent to confirm cleanup.
+	// PhaseTerminating - Sandbox is being deleted, waiting for Fastlet to confirm cleanup.
 	PhaseTerminating SandboxPhase = "Terminating"
 	// PhaseExpired - Sandbox has expired, runtime resources cleaned but CRD preserved.
 	PhaseExpired SandboxPhase = "Expired"
 	// PhaseFailed - Sandbox creation or operation failed.
 	PhaseFailed SandboxPhase = "Failed"
-	// PhaseLost - Agent Pod was lost under Manual failure policy, waiting for user intervention.
+	// PhaseLost - Fastlet Pod was lost under Manual failure policy, waiting for user intervention.
 	PhaseLost SandboxPhase = "Lost"
 )
 
-// AgentSandboxPhase defines the lifecycle phase reported by the Agent.
-type AgentSandboxPhase string
+// FastletSandboxPhase defines the lifecycle phase reported by the Fastlet.
+type FastletSandboxPhase string
 
 const (
-	// AgentPhaseCreating - Agent is creating the container.
-	AgentPhaseCreating AgentSandboxPhase = "creating"
-	// AgentPhaseRunning - Container is running.
-	AgentPhaseRunning AgentSandboxPhase = "running"
-	// AgentPhaseStopped - Container has stopped.
-	AgentPhaseStopped AgentSandboxPhase = "stopped"
-	// AgentPhaseFailed - Container creation or execution failed.
-	AgentPhaseFailed AgentSandboxPhase = "failed"
-	// AgentPhaseTerminated - Container has been deleted and cleaned up.
-	AgentPhaseTerminated AgentSandboxPhase = "terminated"
+	// FastletPhaseCreating - Fastlet is creating the container.
+	FastletPhaseCreating FastletSandboxPhase = "creating"
+	// FastletPhaseRunning - Container is running.
+	FastletPhaseRunning FastletSandboxPhase = "running"
+	// FastletPhaseStopped - Container has stopped.
+	FastletPhaseStopped FastletSandboxPhase = "stopped"
+	// FastletPhaseFailed - Container creation or execution failed.
+	FastletPhaseFailed FastletSandboxPhase = "failed"
+	// FastletPhaseTerminated - Container has been deleted and cleaned up.
+	FastletPhaseTerminated FastletSandboxPhase = "terminated"
 )
 
 // SandboxSpec defines the desired state of Sandbox.
@@ -74,15 +74,15 @@ type SandboxSpec struct {
 	ExpireTime *metav1.Time `json:"expireTime,omitempty"`
 
 	// ExposedPorts specifies the ports that the sandbox application will listen on.
-	// The controller ensures no port conflicts on the same Agent Pod during scheduling.
+	// The controller ensures no port conflicts on the same Fastlet Pod during scheduling.
 	ExposedPorts []int32 `json:"exposedPorts,omitempty"`
 
-	// FailurePolicy defines the recovery strategy when the agent is lost.
+	// FailurePolicy defines the recovery strategy when the fastlet is lost.
 	// Defaults to "Manual".
 	// +kubebuilder:default="Manual"
 	FailurePolicy FailurePolicy `json:"failurePolicy,omitempty"`
 
-	// RecoveryTimeoutSeconds is the duration to wait before taking action after losing contact with agent.
+	// RecoveryTimeoutSeconds is the duration to wait before taking action after losing contact with fastlet.
 	// Defaults to 60 seconds.
 	// +kubebuilder:default=60
 	RecoveryTimeoutSeconds int32 `json:"recoveryTimeoutSeconds,omitempty"`
@@ -99,12 +99,12 @@ type SandboxSpec struct {
 
 // SandboxStatus defines the observed state of Sandbox.
 type SandboxStatus struct {
-	Phase       string             `json:"phase,omitempty"`
-	AssignedPod string             `json:"assignedPod,omitempty"`
-	NodeName    string             `json:"nodeName,omitempty"`
-	SandboxID   string             `json:"sandboxID,omitempty"`
-	Endpoints   []string           `json:"endpoints,omitempty"`
-	Conditions  []metav1.Condition `json:"conditions,omitempty"`
+	Phase           string             `json:"phase,omitempty"`
+	AssignedFastlet string             `json:"assignedFastlet,omitempty"`
+	NodeName        string             `json:"nodeName,omitempty"`
+	SandboxID       string             `json:"sandboxID,omitempty"`
+	Endpoints       []string           `json:"endpoints,omitempty"`
+	Conditions      []metav1.Condition `json:"conditions,omitempty"`
 
 	// AcceptedResetRevision reflects the latest reset revision that was processed by the controller.
 	AcceptedResetRevision *metav1.Time `json:"acceptedResetRevision,omitempty"`

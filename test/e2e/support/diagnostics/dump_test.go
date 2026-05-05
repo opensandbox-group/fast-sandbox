@@ -16,10 +16,10 @@ func TestControllerLogsCommandUsesDefaultNamespace(t *testing.T) {
 func TestPodLogsCommandBuildsKubectlInvocation(t *testing.T) {
 	cmd := PodLogsCommand(Target{
 		Namespace: "tenant-a",
-		PodName:   "agent-pod",
+		PodName:   "fastlet-pod",
 	}, 50)
 
-	want := []string{"logs", "agent-pod", "-n", "tenant-a", "--tail=50"}
+	want := []string{"logs", "fastlet-pod", "-n", "tenant-a", "--tail=50"}
 	if len(cmd) != len(want) {
 		t.Fatalf("expected command %v, got %v", want, cmd)
 	}

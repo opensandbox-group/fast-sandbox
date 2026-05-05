@@ -6,8 +6,8 @@ import (
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
-	agentruntime "fast-sandbox/internal/agent/runtime"
-	"fast-sandbox/internal/controller/agentpool"
+	"fast-sandbox/internal/controller/fastletpool"
+	fastletruntime "fast-sandbox/internal/fastlet/runtime"
 
 	corev1 "k8s.io/api/core/v1"
 	nodev1 "k8s.io/api/node/v1"
@@ -24,10 +24,10 @@ import (
 type SandboxPoolReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
-	Registry agentpool.AgentRegistry
+	Registry fastletpool.FastletRegistry
 }
 
-// Reconcile manages the lifecycle of Agent Pods based on the demand from Sandboxes.
+// Reconcile manages the lifecycle of Fastlet Pods based on the demand from Sandboxes.
 func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := klog.FromContext(ctx)
 
@@ -70,7 +70,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	var activeCount, pendingCount int32
 	for _, sb := range allSandboxes.Items {
 		if sb.Spec.PoolRef == pool.Name {
-			if sb.Status.AssignedPod != "" {
+			if sb.Status.AssignedFastlet != "" {
 				activeCount++
 			} else {
 				pendingCount++
@@ -78,7 +78,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 
-	maxPerPod := getAgentCapacity(&pool)
+	maxPerPod := getFastletCapacity(&pool)
 	if maxPerPod <= 0 {
 		maxPerPod = 1
 	}
@@ -97,28 +97,28 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	if currentCount < desiredPods {
 		diff := desiredPods - currentCount
-		logger.Info("Scaling up agent pool", "diff", diff)
+		logger.Info("Scaling up fastlet pool", "diff", diff)
 		for i := int32(0); i < diff; i++ {
 			pod := r.constructPod(&pool)
 			if err := r.Create(ctx, pod); err != nil {
-				logger.Error(err, "Failed to create agent pod")
+				logger.Error(err, "Failed to create fastlet pod")
 				return ctrl.Result{}, err
 			}
 		}
 	} else if currentCount > desiredPods {
 		diff := currentCount - desiredPods
-		logger.Info("Scaling down agent pool", "diff", diff)
+		logger.Info("Scaling down fastlet pool", "diff", diff)
 		for i := int32(0); i < diff; i++ {
 			pod := childPods.Items[i]
 			if err := r.Delete(ctx, &pod); err != nil {
-				logger.Error(err, "Failed to delete agent pod", "pod", pod.Name)
+				logger.Error(err, "Failed to delete fastlet pod", "pod", pod.Name)
 				return ctrl.Result{}, err
 			}
 		}
 	}
 
 	pool.Status.CurrentPods = currentCount
-	pool.Status.TotalAgents = currentCount
+	pool.Status.TotalFastlets = currentCount
 	if err := r.Status().Update(ctx, &pool); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -126,17 +126,17 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-// constructPod builds an Agent Pod from the template with necessary runtime configurations injected.
+// constructPod builds an Fastlet Pod from the template with necessary runtime configurations injected.
 func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool) *corev1.Pod {
 	labels := make(map[string]string)
-	for k, v := range pool.Spec.AgentTemplate.ObjectMeta.Labels {
+	for k, v := range pool.Spec.FastletTemplate.ObjectMeta.Labels {
 		labels[k] = v
 	}
 	for k, v := range poolLabels(pool.Name) {
 		labels[k] = v
 	}
 
-	podSpec := pool.Spec.AgentTemplate.Spec.DeepCopy()
+	podSpec := pool.Spec.FastletTemplate.Spec.DeepCopy()
 	podSpec.HostNetwork = false
 	podSpec.HostPID = false
 
@@ -170,15 +170,15 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool) *cor
 			},
 			corev1.EnvVar{
 				Name:      "CPU_LIMIT",
-				ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{ContainerName: "agent", Resource: "limits.cpu"}},
+				ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{ContainerName: "fastlet", Resource: "limits.cpu"}},
 			},
 			corev1.EnvVar{
 				Name:      "MEMORY_LIMIT",
-				ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{ContainerName: "agent", Resource: "limits.memory"}},
+				ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{ContainerName: "fastlet", Resource: "limits.memory"}},
 			},
 			corev1.EnvVar{
-				Name:  "AGENT_CAPACITY",
-				Value: fmt.Sprintf("%d", getAgentCapacity(pool)),
+				Name:  "FASTLET_CAPACITY",
+				Value: fmt.Sprintf("%d", getFastletCapacity(pool)),
 			},
 			corev1.EnvVar{
 				Name:  "RUNTIME_TYPE",
@@ -236,7 +236,7 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool) *cor
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			GenerateName: pool.Name + "-agent-",
+			GenerateName: pool.Name + "-fastlet-",
 			Namespace:    pool.Namespace,
 			Labels:       labels,
 		},
@@ -250,11 +250,11 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool) *cor
 func poolLabels(poolName string) map[string]string {
 	return map[string]string{
 		"fast-sandbox.io/pool": poolName,
-		"app":                  "sandbox-agent",
+		"app":                  "sandbox-fastlet",
 	}
 }
 
-func getAgentCapacity(pool *apiv1alpha1.SandboxPool) int32 {
+func getFastletCapacity(pool *apiv1alpha1.SandboxPool) int32 {
 	if pool.Spec.MaxSandboxesPerPod > 0 {
 		return pool.Spec.MaxSandboxesPerPod
 	}
@@ -285,7 +285,7 @@ func getContainerdRuntimeHandler(pool *apiv1alpha1.SandboxPool) string {
 	if pool.Spec.ContainerdRuntimeHandler != "" {
 		return pool.Spec.ContainerdRuntimeHandler
 	}
-	return agentruntime.GetRuntimeHandler(agentruntime.RuntimeType(pool.Spec.RuntimeType))
+	return fastletruntime.GetRuntimeHandler(fastletruntime.RuntimeType(pool.Spec.RuntimeType))
 }
 
 // validateRuntimeClass checks if the specified RuntimeClass exists.

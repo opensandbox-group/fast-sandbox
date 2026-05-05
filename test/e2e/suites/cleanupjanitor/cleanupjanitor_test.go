@@ -39,8 +39,8 @@ func TestNamespaceAware(t *testing.T) {
 
 			poolWaitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 			defer cancel()
-			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
 			sandbox := createCleanupSandbox(namespace, "sb-ns-test", pool.Name, []int32{8080})
@@ -49,7 +49,7 @@ func TestNamespaceAware(t *testing.T) {
 			}
 
 			assigned := waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-ns-test")
-			if assigned.Status.AssignedPod == "" {
+			if assigned.Status.AssignedFastlet == "" {
 				t.Fatalf("sandbox not assigned")
 			}
 
@@ -96,8 +96,8 @@ func TestJanitorRecovery(t *testing.T) {
 
 			poolWaitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 			defer cancel()
-			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
-				t.Fatalf("wait for ready agent pods: %v", err)
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
 			sandbox := createCleanupSandbox(namespace, "sb-orphan", pool.Name, nil)
@@ -167,11 +167,11 @@ func createCleanupPool(namespace, name string) *apiv1alpha1.SandboxPool {
 			},
 			MaxSandboxesPerPod: 2,
 			RuntimeType:        apiv1alpha1.RuntimeContainer,
-			AgentTemplate: corev1.PodTemplateSpec{
+			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
-						Name:  "agent",
-						Image: suiteenv.AgentImage(),
+						Name:  "fastlet",
+						Image: suiteenv.FastletImage(),
 					}},
 				},
 			},
@@ -204,7 +204,7 @@ func waitForAssignedSandbox(ctx context.Context, t *testing.T, fixture *fixtures
 	defer cancel()
 
 	sandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-		return sb.Status.AssignedPod != "" &&
+		return sb.Status.AssignedFastlet != "" &&
 			(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
 	})
 	if err != nil {

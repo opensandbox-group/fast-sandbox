@@ -72,7 +72,7 @@ func TestSandboxEnvAndWorkingDir(t *testing.T) {
 			}
 
 			assignedEnvSandbox := waitForAssignedSandbox(ctx, t, fixture, namespace, envSandbox.Name)
-			envLog := waitForSandboxLog(ctx, t, namespace, assignedEnvSandbox.Status.AssignedPod, sandboxIdentifier(assignedEnvSandbox),
+			envLog := waitForSandboxLog(ctx, t, namespace, assignedEnvSandbox.Status.AssignedFastlet, sandboxIdentifier(assignedEnvSandbox),
 				"TEST_VAR=test_value_123",
 				"ANOTHER_VAR=another_value_456",
 			)
@@ -101,7 +101,7 @@ func TestSandboxEnvAndWorkingDir(t *testing.T) {
 			}
 
 			assignedWorkdirSandbox := waitForAssignedSandbox(ctx, t, fixture, namespace, workdirSandbox.Name)
-			workdirLog := waitForSandboxLog(ctx, t, namespace, assignedWorkdirSandbox.Status.AssignedPod, sandboxIdentifier(assignedWorkdirSandbox), "PWD=/tmp")
+			workdirLog := waitForSandboxLog(ctx, t, namespace, assignedWorkdirSandbox.Status.AssignedFastlet, sandboxIdentifier(assignedWorkdirSandbox), "PWD=/tmp")
 			if !strings.Contains(workdirLog, "PWD=/tmp") {
 				t.Fatalf("unexpected working-dir sandbox log: %q", workdirLog)
 			}
@@ -133,9 +133,9 @@ func TestFastPathEnvAndWorkingDir(t *testing.T) {
 			}
 			waitForPoolReady(ctx, t, fixture, namespace, pool.Name)
 
-			// Wait for agent capacity to sync to controller registry
-			// Agent control loop runs every 2s, give it time to register capacity
-			t.Log("Waiting for agent capacity to sync...")
+			// Wait for fastlet capacity to sync to controller registry
+			// Fastlet control loop runs every 2s, give it time to register capacity
+			t.Log("Waiting for fastlet capacity to sync...")
 			time.Sleep(5 * time.Second)
 
 			controllerNamespace := discoverControllerNamespace(ctx, t, k8sClient)
@@ -189,8 +189,8 @@ func TestFastPathEnvAndWorkingDir(t *testing.T) {
 			if err != nil {
 				t.Fatalf("create fast-path sandbox: %v", err)
 			}
-			if resp.AgentPod == "" {
-				t.Fatalf("create fast-path sandbox returned empty agent pod")
+			if resp.FastletPod == "" {
+				t.Fatalf("create fast-path sandbox returned empty fastlet pod")
 			}
 			if resp.SandboxId == "" {
 				t.Fatalf("create fast-path sandbox returned empty sandbox ID")
@@ -199,12 +199,12 @@ func TestFastPathEnvAndWorkingDir(t *testing.T) {
 			waitCtx, cancelWait := context.WithTimeout(ctx, 30*time.Second)
 			defer cancelWait()
 			if _, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: resp.SandboxName, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedPod != "" || string(sb.UID) != ""
+				return sb.Status.AssignedFastlet != "" || string(sb.UID) != ""
 			}); err != nil {
 				t.Fatalf("wait for fast-path sandbox CRD: %v", err)
 			}
 
-			fastpathLog := waitForSandboxLog(ctx, t, namespace, resp.AgentPod, resp.SandboxId,
+			fastpathLog := waitForSandboxLog(ctx, t, namespace, resp.FastletPod, resp.SandboxId,
 				"FASTPATH_VAR=hello_from_fastpath",
 				"PWD=/app",
 			)
@@ -243,11 +243,11 @@ func createValidationPool(namespace, name string) *apiv1alpha1.SandboxPool {
 			},
 			MaxSandboxesPerPod: 20, // Increased capacity
 			RuntimeType:        apiv1alpha1.RuntimeContainer,
-			AgentTemplate: corev1.PodTemplateSpec{
+			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
-						Name:  "agent",
-						Image: suiteenv.AgentImage(),
+						Name:  "fastlet",
+						Image: suiteenv.FastletImage(),
 					}},
 				},
 			},
@@ -260,8 +260,8 @@ func waitForPoolReady(ctx context.Context, t *testing.T, fixture *fixtures.Fixtu
 	waitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 
-	if _, err := fixture.WaitForReadyAgentPods(waitCtx, types.NamespacedName{Name: name, Namespace: namespace}, 1); err != nil {
-		t.Fatalf("wait for ready agent pods for pool %s/%s: %v", namespace, name, err)
+	if _, err := fixture.WaitForReadyFastletPods(waitCtx, types.NamespacedName{Name: name, Namespace: namespace}, 1); err != nil {
+		t.Fatalf("wait for ready fastlet pods for pool %s/%s: %v", namespace, name, err)
 	}
 }
 
@@ -271,7 +271,7 @@ func waitForAssignedSandbox(ctx context.Context, t *testing.T, fixture *fixtures
 	defer cancel()
 
 	sandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-		return sb.Status.AssignedPod != "" &&
+		return sb.Status.AssignedFastlet != "" &&
 			(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
 	})
 	if err != nil {
@@ -290,7 +290,7 @@ func sandboxIdentifier(sandbox *apiv1alpha1.Sandbox) string {
 	return string(sandbox.UID)
 }
 
-func waitForSandboxLog(ctx context.Context, t *testing.T, namespace, agentPod, sandboxID string, want ...string) string {
+func waitForSandboxLog(ctx context.Context, t *testing.T, namespace, fastletPod, sandboxID string, want ...string) string {
 	t.Helper()
 
 	waitCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
@@ -300,7 +300,7 @@ func waitForSandboxLog(ctx context.Context, t *testing.T, namespace, agentPod, s
 
 	var lastLog string
 	for {
-		logOutput, err := readSandboxLog(waitCtx, namespace, agentPod, sandboxID)
+		logOutput, err := readSandboxLog(waitCtx, namespace, fastletPod, sandboxID)
 		if err == nil {
 			lastLog = logOutput
 			matched := true
@@ -317,14 +317,14 @@ func waitForSandboxLog(ctx context.Context, t *testing.T, namespace, agentPod, s
 
 		select {
 		case <-waitCtx.Done():
-			t.Fatalf("wait for sandbox log %s/%s id=%s containing %v: %v; last log=%q", namespace, agentPod, sandboxID, want, waitCtx.Err(), lastLog)
+			t.Fatalf("wait for sandbox log %s/%s id=%s containing %v: %v; last log=%q", namespace, fastletPod, sandboxID, want, waitCtx.Err(), lastLog)
 		case <-ticker.C:
 		}
 	}
 }
 
-func readSandboxLog(ctx context.Context, namespace, agentPod, sandboxID string) (string, error) {
-	cmd := exec.CommandContext(ctx, "kubectl", "exec", "-n", namespace, agentPod, "--", "cat", fmt.Sprintf("/var/log/fast-sandbox/%s.log", sandboxID))
+func readSandboxLog(ctx context.Context, namespace, fastletPod, sandboxID string) (string, error) {
+	cmd := exec.CommandContext(ctx, "kubectl", "exec", "-n", namespace, fastletPod, "--", "cat", fmt.Sprintf("/var/log/fast-sandbox/%s.log", sandboxID))
 	output, err := cmd.CombinedOutput()
 	return string(output), err
 }

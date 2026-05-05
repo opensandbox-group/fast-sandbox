@@ -10,8 +10,8 @@ import (
 	fastpathv1 "fast-sandbox/api/proto/v1"
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
-	"fast-sandbox/internal/controller/agentpool"
 	"fast-sandbox/internal/controller/common"
+	"fast-sandbox/internal/controller/fastletpool"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,20 +29,20 @@ func setupTestScheme(t *testing.T) *runtime.Scheme {
 }
 
 // newTestServer creates a test Server with mocked dependencies.
-func newTestServer(t *testing.T, registry *MockRegistryForTest, agentClient *MockAgentClientForTest) *Server {
+func newTestServer(t *testing.T, registry *MockRegistryForTest, fastletClient *MockFastletClientForTest) *Server {
 	scheme := setupTestScheme(t)
 	return &Server{
 		K8sClient:              fake.NewClientBuilder().WithScheme(scheme).Build(),
 		Registry:               registry,
-		AgentClient:            api.NewAgentClient(5758),
+		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
 	}
 }
 
-// wrapAgentClient wraps the mock to implement the interface properly for testing.
-func wrapAgentClient(mock *MockAgentClientForTest) *api.AgentClient {
+// wrapFastletClient wraps the mock to implement the interface properly for testing.
+func wrapFastletClient(mock *MockFastletClientForTest) *api.FastletClient {
 	// For testing purposes, we need to use a wrapper or adjust the server
-	// Since AgentClient is a concrete type, we'll use the test pattern
+	// Since FastletClient is a concrete type, we'll use the test pattern
 	// where we monkey-patch the CreateSandbox method for testing
 	return nil // This will be handled differently
 }
@@ -53,15 +53,15 @@ func wrapAgentClient(mock *MockAgentClientForTest) *api.AgentClient {
 
 func TestServer_CreateSandbox_FastMode_Success(t *testing.T) {
 	// Test successful sandbox creation in Fast mode:
-	// 1. Allocate returns an agent
-	// 2. AgentClient.CreateSandbox succeeds
-	// 3. Response contains sandbox ID, agent pod, and endpoints
+	// 1. Allocate returns an fastlet
+	// 2. FastletClient.CreateSandbox succeeds
+	// 3. Response contains sandbox ID, fastlet pod, and endpoints
 	// 4. CRD creation happens asynchronously (not verified in this test)
 
 	registry := &MockRegistryForTest{
-		DefaultAgent: &agentpool.AgentInfo{
-			ID:            "agent-1",
-			PodName:       "agent-pod-1",
+		DefaultFastlet: &fastletpool.FastletInfo{
+			ID:            "fastlet-1",
+			PodName:       "fastlet-pod-1",
 			PodIP:         "10.0.0.5",
 			NodeName:      "node-1",
 			PoolName:      "test-pool",
@@ -71,17 +71,17 @@ func TestServer_CreateSandbox_FastMode_Success(t *testing.T) {
 		},
 	}
 
-	agentClient := &api.AgentClient{}
+	fastletClient := &api.FastletClient{}
 
 	server := &Server{
 		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
 		Registry:               registry,
-		AgentClient:            agentClient,
+		FastletClient:          fastletClient,
 		DefaultConsistencyMode: api.ConsistencyModeFast,
 	}
 
-	// Since we can't easily mock AgentClient, we'll need to use a different approach
-	// For this test, we'll verify the happy path logic with a real agent client
+	// Since we can't easily mock FastletClient, we'll need to use a different approach
+	// For this test, we'll verify the happy path logic with a real fastlet client
 	// and mock the registry allocation
 
 	req := &fastpathv1.CreateRequest{
@@ -96,7 +96,7 @@ func TestServer_CreateSandbox_FastMode_Success(t *testing.T) {
 	}
 
 	// This test will require either:
-	// 1. An interface for AgentClient (refactoring)
+	// 1. An interface for FastletClient (refactoring)
 	// 2. Using httptest to mock the HTTP server
 	// For now, we'll test the error handling paths which are easier to verify
 
@@ -109,7 +109,7 @@ func TestServer_CreateSandbox_FastMode_AllocateFailure(t *testing.T) {
 	// Test allocation failure handling in Fast mode:
 	// 1. Registry.Allocate returns an error
 	// 2. CreateSandbox returns the error
-	// 3. No agent RPC is made
+	// 3. No fastlet RPC is made
 	// 4. No CRD is created
 
 	registry := &MockRegistryForTest{
@@ -119,7 +119,7 @@ func TestServer_CreateSandbox_FastMode_AllocateFailure(t *testing.T) {
 	server := &Server{
 		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
 		Registry:               registry,
-		AgentClient:            api.NewAgentClient(5758),
+		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
 	}
 
@@ -137,18 +137,18 @@ func TestServer_CreateSandbox_FastMode_AllocateFailure(t *testing.T) {
 	assert.NotNil(t, registry.AllocatedSb, "Allocate should have been called")
 }
 
-func TestServer_CreateSandbox_FastMode_AgentRPCFailure(t *testing.T) {
-	// Test agent RPC failure handling in Fast mode:
+func TestServer_CreateSandbox_FastMode_FastletRPCFailure(t *testing.T) {
+	// Test fastlet RPC failure handling in Fast mode:
 	// 1. Registry.Allocate succeeds
-	// 2. AgentClient.CreateSandbox fails
+	// 2. FastletClient.CreateSandbox fails
 	// 3. Registry.Release is called
 	// 4. Error is returned
 	// 5. No CRD is created
 
 	registry := &MockRegistryForTest{
-		DefaultAgent: &agentpool.AgentInfo{
-			ID:            "agent-1",
-			PodName:       "agent-pod-1",
+		DefaultFastlet: &fastletpool.FastletInfo{
+			ID:            "fastlet-1",
+			PodName:       "fastlet-pod-1",
 			PodIP:         "10.0.0.5",
 			NodeName:      "node-1",
 			PoolName:      "test-pool",
@@ -161,7 +161,7 @@ func TestServer_CreateSandbox_FastMode_AgentRPCFailure(t *testing.T) {
 	server := &Server{
 		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
 		Registry:               registry,
-		AgentClient:            api.NewAgentClient(5758),
+		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
 	}
 
@@ -172,7 +172,7 @@ func TestServer_CreateSandbox_FastMode_AgentRPCFailure(t *testing.T) {
 	}
 
 	// Using an invalid PodIP (empty) to cause RPC failure
-	registry.DefaultAgent.PodIP = ""
+	registry.DefaultFastlet.PodIP = ""
 
 	resp, err := server.CreateSandbox(context.Background(), req)
 
@@ -192,14 +192,14 @@ func TestServer_CreateSandbox_StrongMode_Success(t *testing.T) {
 	// Test successful sandbox creation in Strong mode:
 	// 1. Registry.Allocate succeeds
 	// 2. K8sClient.Create succeeds (creates CRD)
-	// 3. AgentClient.CreateSandbox succeeds
+	// 3. FastletClient.CreateSandbox succeeds
 	// 4. Status update succeeds
 	// 5. Response contains correct information
 
 	registry := &MockRegistryForTest{
-		DefaultAgent: &agentpool.AgentInfo{
-			ID:            "agent-1",
-			PodName:       "agent-pod-1",
+		DefaultFastlet: &fastletpool.FastletInfo{
+			ID:            "fastlet-1",
+			PodName:       "fastlet-pod-1",
 			PodIP:         "10.0.0.5",
 			NodeName:      "node-1",
 			PoolName:      "test-pool",
@@ -212,7 +212,7 @@ func TestServer_CreateSandbox_StrongMode_Success(t *testing.T) {
 	server := &Server{
 		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
 		Registry:               registry,
-		AgentClient:            api.NewAgentClient(5758),
+		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
 	}
 
@@ -236,12 +236,12 @@ func TestServer_CreateSandbox_StrongMode_K8sError(t *testing.T) {
 	// 2. K8sClient.Create fails (e.g., conflict, validation error)
 	// 3. Registry.Release is called
 	// 4. Error is returned
-	// 5. No agent RPC is made
+	// 5. No fastlet RPC is made
 
 	registry := &MockRegistryForTest{
-		DefaultAgent: &agentpool.AgentInfo{
-			ID:            "agent-1",
-			PodName:       "agent-pod-1",
+		DefaultFastlet: &fastletpool.FastletInfo{
+			ID:            "fastlet-1",
+			PodName:       "fastlet-pod-1",
 			PodIP:         "10.0.0.5",
 			NodeName:      "node-1",
 			PoolName:      "test-pool",
@@ -258,7 +258,7 @@ func TestServer_CreateSandbox_StrongMode_K8sError(t *testing.T) {
 	server := &Server{
 		K8sClient:              k8sClient,
 		Registry:               registry,
-		AgentClient:            api.NewAgentClient(5758),
+		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
 	}
 
@@ -321,7 +321,7 @@ func TestServer_CreateSandbox_InvalidRequest(t *testing.T) {
 				Name:         "my-sandbox",
 				ExposedPorts: []int32{80},
 			},
-			expectError:    true, // Will fail due to no real agent
+			expectError:    true, // Will fail due to no real fastlet
 			errorContains:  "",
 			validateResult: nil,
 		},
@@ -413,9 +413,9 @@ func TestServer_CreateSandbox_InvalidRequest(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			registry := &MockRegistryForTest{
-				DefaultAgent: &agentpool.AgentInfo{
-					ID:            "agent-1",
-					PodName:       "agent-pod-1",
+				DefaultFastlet: &fastletpool.FastletInfo{
+					ID:            "fastlet-1",
+					PodName:       "fastlet-pod-1",
 					PodIP:         "10.0.0.5",
 					NodeName:      "node-1",
 					PoolName:      tt.req.PoolRef,
@@ -428,7 +428,7 @@ func TestServer_CreateSandbox_InvalidRequest(t *testing.T) {
 			server := &Server{
 				K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
 				Registry:               registry,
-				AgentClient:            api.NewAgentClient(5758),
+				FastletClient:          api.NewFastletClient(5758),
 				DefaultConsistencyMode: api.ConsistencyModeFast,
 			}
 
@@ -580,11 +580,11 @@ func TestServer_CreateSandbox_AllocateCalledWithCorrectSandbox(t *testing.T) {
 
 	var allocatedSandbox *apiv1alpha1.Sandbox
 	registry := &MockRegistryForTest{
-		AllocateFunc: func(sb *apiv1alpha1.Sandbox) (*agentpool.AgentInfo, error) {
+		AllocateFunc: func(sb *apiv1alpha1.Sandbox) (*fastletpool.FastletInfo, error) {
 			allocatedSandbox = sb
-			return &agentpool.AgentInfo{
-				ID:            "agent-1",
-				PodName:       "agent-pod-1",
+			return &fastletpool.FastletInfo{
+				ID:            "fastlet-1",
+				PodName:       "fastlet-pod-1",
 				PodIP:         "10.0.0.5",
 				NodeName:      "node-1",
 				PoolName:      sb.Spec.PoolRef,
@@ -598,7 +598,7 @@ func TestServer_CreateSandbox_AllocateCalledWithCorrectSandbox(t *testing.T) {
 	server := &Server{
 		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
 		Registry:               registry,
-		AgentClient:            api.NewAgentClient(5758),
+		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
 	}
 
@@ -642,7 +642,7 @@ func TestServer_CreateSandbox_ReleaseCalledOnAllocateError(t *testing.T) {
 	var released bool
 	registry := &MockRegistryForTest{
 		AllocateError: errors.New("no capacity"),
-		ReleaseFunc: func(id agentpool.AgentID, sb *apiv1alpha1.Sandbox) {
+		ReleaseFunc: func(id fastletpool.FastletID, sb *apiv1alpha1.Sandbox) {
 			released = true
 		},
 	}
@@ -650,7 +650,7 @@ func TestServer_CreateSandbox_ReleaseCalledOnAllocateError(t *testing.T) {
 	server := &Server{
 		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
 		Registry:               registry,
-		AgentClient:            api.NewAgentClient(5758),
+		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
 	}
 
@@ -671,11 +671,11 @@ func TestServer_CreateSandbox_NameGeneration(t *testing.T) {
 
 	var allocatedSandbox *apiv1alpha1.Sandbox
 	registry := &MockRegistryForTest{
-		AllocateFunc: func(sb *apiv1alpha1.Sandbox) (*agentpool.AgentInfo, error) {
+		AllocateFunc: func(sb *apiv1alpha1.Sandbox) (*fastletpool.FastletInfo, error) {
 			allocatedSandbox = sb
-			return &agentpool.AgentInfo{
-				ID:            "agent-1",
-				PodName:       "agent-pod-1",
+			return &fastletpool.FastletInfo{
+				ID:            "fastlet-1",
+				PodName:       "fastlet-pod-1",
 				PodIP:         "10.0.0.5",
 				NodeName:      "node-1",
 				PoolName:      sb.Spec.PoolRef,
@@ -689,7 +689,7 @@ func TestServer_CreateSandbox_NameGeneration(t *testing.T) {
 	server := &Server{
 		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
 		Registry:               registry,
-		AgentClient:            api.NewAgentClient(5758),
+		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
 	}
 
@@ -747,10 +747,10 @@ func TestServer_CreateSandbox_ConsistencyMode(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			registry := &MockRegistryForTest{
-				AllocateFunc: func(sb *apiv1alpha1.Sandbox) (*agentpool.AgentInfo, error) {
-					return &agentpool.AgentInfo{
-						ID:            "agent-1",
-						PodName:       "agent-pod-1",
+				AllocateFunc: func(sb *apiv1alpha1.Sandbox) (*fastletpool.FastletInfo, error) {
+					return &fastletpool.FastletInfo{
+						ID:            "fastlet-1",
+						PodName:       "fastlet-pod-1",
 						PodIP:         "10.0.0.5",
 						NodeName:      "node-1",
 						PoolName:      sb.Spec.PoolRef,
@@ -764,7 +764,7 @@ func TestServer_CreateSandbox_ConsistencyMode(t *testing.T) {
 			server := &Server{
 				K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
 				Registry:               registry,
-				AgentClient:            api.NewAgentClient(5758),
+				FastletClient:          api.NewFastletClient(5758),
 				DefaultConsistencyMode: tt.serverMode,
 			}
 
@@ -787,13 +787,13 @@ func TestServer_CreateSandbox_ConsistencyMode(t *testing.T) {
 }
 
 func TestServer_CreateSandbox_StrongMode_CRDCreated(t *testing.T) {
-	// Test that in Strong mode, CRD is created before agent call
-	// and if CRD creation fails, agent is not called
+	// Test that in Strong mode, CRD is created before fastlet call
+	// and if CRD creation fails, fastlet is not called
 
 	registry := &MockRegistryForTest{
-		DefaultAgent: &agentpool.AgentInfo{
-			ID:            "agent-1",
-			PodName:       "agent-pod-1",
+		DefaultFastlet: &fastletpool.FastletInfo{
+			ID:            "fastlet-1",
+			PodName:       "fastlet-pod-1",
 			PodIP:         "10.0.0.5",
 			NodeName:      "node-1",
 			PoolName:      "test-pool",
@@ -809,7 +809,7 @@ func TestServer_CreateSandbox_StrongMode_CRDCreated(t *testing.T) {
 	server := &Server{
 		K8sClient:              k8sClient,
 		Registry:               registry,
-		AgentClient:            api.NewAgentClient(5758),
+		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
 	}
 
@@ -864,10 +864,10 @@ func TestServer_ListSandboxes(t *testing.T) {
 			PoolRef: "pool-1",
 		},
 		Status: apiv1alpha1.SandboxStatus{
-			SandboxID:   "container-sb1",
-			Phase:       "Bound",
-			AssignedPod: "agent-1",
-			Endpoints:   []string{"10.0.0.1:80"},
+			SandboxID:       "container-sb1",
+			Phase:           "Bound",
+			AssignedFastlet: "fastlet-1",
+			Endpoints:       []string{"10.0.0.1:80"},
 		},
 	}
 
@@ -882,9 +882,9 @@ func TestServer_ListSandboxes(t *testing.T) {
 			PoolRef: "pool-2",
 		},
 		Status: apiv1alpha1.SandboxStatus{
-			SandboxID:   "container-sb2",
-			Phase:       "Pending",
-			AssignedPod: "",
+			SandboxID:       "container-sb2",
+			Phase:           "Pending",
+			AssignedFastlet: "",
 		},
 	}
 
@@ -913,7 +913,7 @@ func TestServer_ListSandboxes(t *testing.T) {
 	}
 	require.NotNil(t, sb1Info, "sb-1 should be in response")
 	assert.Equal(t, "Bound", sb1Info.Phase, "Phase should match")
-	assert.Equal(t, "agent-1", sb1Info.AgentPod, "AgentPod should match")
+	assert.Equal(t, "fastlet-1", sb1Info.FastletPod, "FastletPod should match")
 	assert.Equal(t, "nginx", sb1Info.Image, "Image should match")
 	assert.Equal(t, "pool-1", sb1Info.PoolRef, "PoolRef should match")
 }
@@ -934,10 +934,10 @@ func TestServer_GetSandbox(t *testing.T) {
 			PoolRef: "pool-1",
 		},
 		Status: apiv1alpha1.SandboxStatus{
-			SandboxID:   "container-12345",
-			Phase:       "Bound",
-			AssignedPod: "agent-1",
-			Endpoints:   []string{"10.0.0.1:80"},
+			SandboxID:       "container-12345",
+			Phase:           "Bound",
+			AssignedFastlet: "fastlet-1",
+			Endpoints:       []string{"10.0.0.1:80"},
 		},
 	}
 
@@ -958,7 +958,7 @@ func TestServer_GetSandbox(t *testing.T) {
 	assert.Equal(t, "container-12345", resp.SandboxId, "SandboxId should match Status.SandboxID")
 	assert.Equal(t, "test-sb", resp.SandboxName, "SandboxName should match CRD name")
 	assert.Equal(t, "Bound", resp.Phase)
-	assert.Equal(t, "agent-1", resp.AgentPod)
+	assert.Equal(t, "fastlet-1", resp.FastletPod)
 	assert.Equal(t, "nginx", resp.Image)
 	assert.Equal(t, "pool-1", resp.PoolRef)
 	assert.Len(t, resp.Endpoints, 1)
@@ -1054,9 +1054,9 @@ func TestServer_DeleteSandbox_NotFound(t *testing.T) {
 func TestServer_createFast_SetsAllocationAnnotation(t *testing.T) {
 	// Test that createFast sets the allocation annotation on tempSB
 	registry := &MockRegistryForTest{
-		DefaultAgent: &agentpool.AgentInfo{
-			ID:       "agent-1",
-			PodName:  "test-agent-pod",
+		DefaultFastlet: &fastletpool.FastletInfo{
+			ID:       "fastlet-1",
+			PodName:  "test-fastlet-pod",
 			PodIP:    "10.0.0.5",
 			NodeName: "test-node",
 			PoolName: "test-pool",
@@ -1066,7 +1066,7 @@ func TestServer_createFast_SetsAllocationAnnotation(t *testing.T) {
 	server := &Server{
 		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
 		Registry:               registry,
-		AgentClient:            api.NewAgentClient(5758),
+		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
 	}
 
@@ -1088,20 +1088,20 @@ func TestServer_createFast_SetsAllocationAnnotation(t *testing.T) {
 		Name:      "test-sb",
 	}
 
-	// 由于 AgentClient.CreateSandbox 会调用真实 HTTP，它会失败
+	// 由于 FastletClient.CreateSandbox 会调用真实 HTTP，它会失败
 	// 但我们仍然可以验证 annotation 被设置的逻辑（在失败前）
-	// 实际上，在 createFast 中，annotation 是在 Agent API 成功后才设置的
+	// 实际上，在 createFast 中，annotation 是在 Fastlet API 成功后才设置的
 	// 所以这里我们测试失败场景，验证不会设置 annotation
-	registry.DefaultAgent.PodIP = ""
+	registry.DefaultFastlet.PodIP = ""
 
-	resp, err := server.createFast(tempSB, registry.DefaultAgent, req)
+	resp, err := server.createFast(tempSB, registry.DefaultFastlet, req)
 
 	// 验证调用失败
 	assert.Error(t, err)
 	assert.Nil(t, resp)
 
 	// 由于失败，annotation 不应该被设置（这是正确的行为）
-	// 在实际场景中，Agent API 成功后才会设置 annotation
+	// 在实际场景中，Fastlet API 成功后才会设置 annotation
 	annotations := tempSB.GetAnnotations()
 	// annotation 为空或不存在是失败场景的预期行为
 	if annotations != nil {
@@ -1117,9 +1117,9 @@ func TestServer_createStrong_SetsAllocationAnnotation(t *testing.T) {
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 
 	registry := &MockRegistryForTest{
-		DefaultAgent: &agentpool.AgentInfo{
-			ID:       "agent-1",
-			PodName:  "test-agent-pod",
+		DefaultFastlet: &fastletpool.FastletInfo{
+			ID:       "fastlet-1",
+			PodName:  "test-fastlet-pod",
 			PodIP:    "10.0.0.5",
 			NodeName: "test-node",
 			PoolName: "test-pool",
@@ -1129,7 +1129,7 @@ func TestServer_createStrong_SetsAllocationAnnotation(t *testing.T) {
 	server := &Server{
 		K8sClient:              k8sClient,
 		Registry:               registry,
-		AgentClient:            api.NewAgentClient(5758),
+		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeStrong,
 	}
 
@@ -1154,10 +1154,10 @@ func TestServer_createStrong_SetsAllocationAnnotation(t *testing.T) {
 
 	// 调用 createStrong，验证 annotation 被设置（即使后续会失败）
 	// 先设置一个已经存在的 CRD 会导致冲突，但我们只需要验证 annotation 设置
-	// 使用无效的 PodIP 来让 agent 调用失败，但 annotation 已经在 tempSB 上设置了
-	registry.DefaultAgent.PodIP = ""
+	// 使用无效的 PodIP 来让 fastlet 调用失败，但 annotation 已经在 tempSB 上设置了
+	registry.DefaultFastlet.PodIP = ""
 
-	_, _ = server.createStrong(context.Background(), tempSB, registry.DefaultAgent, req)
+	_, _ = server.createStrong(context.Background(), tempSB, registry.DefaultFastlet, req)
 
 	// 验证 annotation 已被设置
 	annotations := tempSB.GetAnnotations()
@@ -1166,17 +1166,17 @@ func TestServer_createStrong_SetsAllocationAnnotation(t *testing.T) {
 
 	// 验证 annotation 内容
 	allocJSON := annotations["sandbox.fast.io/allocation"]
-	assert.Contains(t, allocJSON, "test-agent-pod", "Annotation should contain assignedPod")
+	assert.Contains(t, allocJSON, "test-fastlet-pod", "Annotation should contain assignedFastlet")
 	assert.Contains(t, allocJSON, "test-node", "Annotation should contain assignedNode")
 }
 
 func TestServer_AllocationAnnotationFormat(t *testing.T) {
 	// Test that the allocation annotation has the correct format
 	// 直接调用 common.BuildAllocationJSON 来测试格式
-	assignedPod := "my-agent"
+	assignedFastlet := "my-fastlet"
 	assignedNode := "my-node"
 
-	allocJSON := common.BuildAllocationJSON(assignedPod, assignedNode)
+	allocJSON := common.BuildAllocationJSON(assignedFastlet, assignedNode)
 	assert.NotEmpty(t, allocJSON, "Allocation JSON should be generated")
 
 	// 验证可以解析为 JSON
@@ -1185,7 +1185,7 @@ func TestServer_AllocationAnnotationFormat(t *testing.T) {
 	require.NoError(t, err, "Allocation JSON should be valid JSON")
 
 	// 验证必需字段
-	assert.Equal(t, assignedPod, allocInfo["assignedPod"])
+	assert.Equal(t, assignedFastlet, allocInfo["assignedFastlet"])
 	assert.Equal(t, assignedNode, allocInfo["assignedNode"])
 	assert.NotEmpty(t, allocInfo["allocatedAt"])
 }

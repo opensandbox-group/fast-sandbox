@@ -20,7 +20,7 @@ func (f *FixtureClient) CreateSandboxPool(ctx context.Context, namespace string,
 	return pool, nil
 }
 
-func (f *FixtureClient) WaitForReadyAgentPods(ctx context.Context, name types.NamespacedName, minReady int32) (*apiv1alpha1.SandboxPool, error) {
+func (f *FixtureClient) WaitForReadyFastletPods(ctx context.Context, name types.NamespacedName, minReady int32) (*apiv1alpha1.SandboxPool, error) {
 	ticker := time.NewTicker(f.pollInterval)
 	defer ticker.Stop()
 
@@ -30,7 +30,7 @@ func (f *FixtureClient) WaitForReadyAgentPods(ctx context.Context, name types.Na
 			if pool.Status.ReadyPods >= minReady {
 				return pool, nil
 			}
-			readyPods, err := f.countReadyAgentPods(ctx, name)
+			readyPods, err := f.countReadyFastletPods(ctx, name)
 			if err == nil && readyPods >= minReady {
 				return pool, nil
 			}
@@ -44,7 +44,7 @@ func (f *FixtureClient) WaitForReadyAgentPods(ctx context.Context, name types.Na
 	}
 }
 
-func (f *FixtureClient) countReadyAgentPods(ctx context.Context, name types.NamespacedName) (int32, error) {
+func (f *FixtureClient) countReadyFastletPods(ctx context.Context, name types.NamespacedName) (int32, error) {
 	podList := &corev1.PodList{}
 	if err := f.client.List(ctx, podList,
 		client.InNamespace(name.Namespace),

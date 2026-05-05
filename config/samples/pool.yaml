@@ -4,12 +4,12 @@ metadata:
   name: default-pool
   namespace: default
 spec:
-  agentTemplate:
+  fastletTemplate:
     spec:
       containers:
-      - image: fast-sandbox/agent:dev
+      - image: fast-sandbox/fastlet:dev
         imagePullPolicy: IfNotPresent
-        name: agent
+        name: fastlet
   capacity:
     poolMax: 1
     poolMin: 1
@@ -23,12 +23,12 @@ metadata:
   name: gvisor-pool
   namespace: default
 spec:
-  agentTemplate:
+  fastletTemplate:
     spec:
       containers:
-      - image: fast-sandbox/agent:dev
+      - image: fast-sandbox/fastlet:dev
         imagePullPolicy: IfNotPresent
-        name: agent
+        name: fastlet
   capacity:
     poolMax: 3
     poolMin: 1
@@ -42,12 +42,12 @@ metadata:
   name: kata-pool
   namespace: default
 spec:
-  agentTemplate:
+  fastletTemplate:
     spec:
       containers:
-      - image: fast-sandbox/agent:dev
+      - image: fast-sandbox/fastlet:dev
         imagePullPolicy: IfNotPresent
-        name: agent
+        name: fastlet
   capacity:
     poolMax: 2
     poolMin: 1
