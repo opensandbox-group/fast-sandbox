@@ -15,3 +15,41 @@ spec:
     poolMin: 1
   maxSandboxesPerPod: 5
   runtimeType: container
+---
+# Example: gVisor pool for untrusted code execution
+apiVersion: sandbox.fast.io/v1alpha1
+kind: SandboxPool
+metadata:
+  name: gvisor-pool
+  namespace: default
+spec:
+  agentTemplate:
+    spec:
+      containers:
+      - image: fast-sandbox/agent:dev
+        imagePullPolicy: IfNotPresent
+        name: agent
+  capacity:
+    poolMax: 3
+    poolMin: 1
+  maxSandboxesPerPod: 5
+  runtimeType: gvisor
+---
+# Example: Kata QEMU pool for maximum isolation
+apiVersion: sandbox.fast.io/v1alpha1
+kind: SandboxPool
+metadata:
+  name: kata-pool
+  namespace: default
+spec:
+  agentTemplate:
+    spec:
+      containers:
+      - image: fast-sandbox/agent:dev
+        imagePullPolicy: IfNotPresent
+        name: agent
+  capacity:
+    poolMax: 2
+    poolMin: 1
+  maxSandboxesPerPod: 3
+  runtimeType: kata-qemu

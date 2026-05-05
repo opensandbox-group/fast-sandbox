@@ -81,7 +81,14 @@ func (m *SandboxManager) DeleteSandbox(sandboxID string) (*api.DeleteSandboxResp
 	klog.InfoS("[DEBUG-AGENT] DeleteSandbox ENTER", "sandboxID", sandboxID)
 	m.mu.Lock()
 	sandbox, ok := m.sandboxes[sandboxID]
-	if ok && sandbox.Phase == "terminating" {
+	if !ok {
+		m.mu.Unlock()
+		klog.InfoS("[DEBUG-AGENT] DeleteSandbox: sandbox not found, idempotent success", "sandboxID", sandboxID)
+		return &api.DeleteSandboxResponse{
+			Success: true,
+		}, nil
+	}
+	if sandbox.Phase == "terminating" {
 		m.mu.Unlock()
 		klog.InfoS("[DEBUG-AGENT] DeleteSandbox: already terminating, idempotent", "sandboxID", sandboxID)
 		return &api.DeleteSandboxResponse{

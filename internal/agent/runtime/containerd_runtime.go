@@ -14,6 +14,7 @@ import (
 	"fast-sandbox/internal/agent/infra"
 	"fast-sandbox/internal/api"
 
+	runtimeoptions "github.com/containerd/containerd/api/types/runtimeoptions/v1"
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
@@ -32,17 +33,27 @@ type ContainerdRuntime struct {
 	agentNamespace     string
 	infraMgr           *infra.Manager
 	allowedPluginPaths []string
-	runtimeHandler     string
+	runtimeType        RuntimeType   // runtime type identifier
+	config             RuntimeConfig // cached runtime configuration
 }
 
 const (
-	defaultOperationTimeout = 30 * time.Second
+	// defaultOperationTimeout is the timeout for container operations.
+	// Set to 120s to accommodate secure runtimes (gVisor, Kata) which may take
+	// longer to create/start sandbox containers than standard runc.
+	// gVisor in particular can take 60-90 seconds in nested virtualization environments.
+	defaultOperationTimeout = 120 * time.Second
 	waitStopTimeout         = 10 * time.Second
 )
 
-func newContainerdRuntime(runtimeHandler string) Runtime {
+func newContainerdRuntime(rt RuntimeType) Runtime {
+	return newContainerdRuntimeWithConfig(rt, GetRuntimeConfig(rt))
+}
+
+func newContainerdRuntimeWithConfig(rt RuntimeType, cfg RuntimeConfig) Runtime {
 	return &ContainerdRuntime{
-		runtimeHandler: runtimeHandler,
+		runtimeType: rt,
+		config:      cfg,
 	}
 }
 
@@ -52,7 +63,7 @@ func (r *ContainerdRuntime) Initialize(ctx context.Context, socketPath string) e
 	if r.socketPath == "" {
 		r.socketPath = "/run/containerd/containerd.sock"
 	}
-	klog.InfoS("Initializing runtime", "handler", r.runtimeHandler)
+	klog.InfoS("Initializing runtime", "handler", r.config.Handler)
 
 	ctx, cancel := context.WithTimeout(ctx, defaultOperationTimeout)
 	defer cancel()
@@ -156,7 +167,7 @@ func (r *ContainerdRuntime) discoverNetNSPath(ctx context.Context) error {
 func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.SandboxSpec) (*SandboxMetadata, error) {
 	totalStart := time.Now()
 
-	klog.InfoS("Creating sandbox", "sandbox", config.SandboxID, "image", config.Image, "runtime", r.runtimeHandler, "netns", r.netnsPath)
+	klog.InfoS("Creating sandbox", "sandbox", config.SandboxID, "image", config.Image, "runtime", r.config.Handler, "netns", r.netnsPath)
 	ctx, cancel := context.WithTimeout(ctx, defaultOperationTimeout)
 	defer cancel()
 	ctx = namespaces.WithNamespace(ctx, "k8s.io")
@@ -177,12 +188,13 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 	// 2. Create container
 	createStart := time.Now()
 	klog.InfoS("Creating containerd container object", "sandbox", containerID)
+
 	container, err := r.client.NewContainer(
 		ctx,
 		containerID,
 		containerd.WithImage(image),
 		containerd.WithNewSnapshot(snapShotName(containerID), image),
-		containerd.WithRuntime(r.runtimeHandler, nil), // 使用配置的 Runtime
+		containerd.WithRuntime(r.config.Handler, r.getRuntimeOptions()),
 		containerd.WithNewSpec(specOpts...),
 		containerd.WithContainerLabels(labels),
 	)
@@ -206,7 +218,20 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 	// 3. Start container
 	startStart := time.Now()
 	klog.InfoS("Creating containerd task", "sandbox", containerID)
-	task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStreams(nil, logFile, logFile)))
+
+	// Build CIO options based on runtime configuration
+	var cioOpts []cio.Opt
+	if r.config.NeedsTTY {
+		cioOpts = append(cioOpts, cio.WithTerminal)
+	}
+	cioOpts = append(cioOpts, cio.WithStreams(nil, logFile, logFile))
+
+	var taskOpts []containerd.NewTaskOpts
+	if r.config.RuntimePath != "" {
+		taskOpts = append(taskOpts, containerd.WithRuntimePath(r.config.RuntimePath))
+	}
+
+	task, err := container.NewTask(ctx, cio.NewCreator(cioOpts...), taskOpts...)
 	if err != nil {
 		klog.ErrorS(err, "Failed to create containerd task", "sandbox", containerID, "logPath", logPath)
 		logFile.Close()
@@ -261,41 +286,46 @@ func (r *ContainerdRuntime) prepareSpecOpts(config *api.SandboxSpec, image conta
 	finalArgs := originalArgs
 
 	if r.infraMgr != nil {
-		plugins := r.infraMgr.GetPlugins()
-		for _, p := range plugins {
-			hostPath := r.infraMgr.GetHostPath(p.BinName)
-			if hostPath == "" {
-				continue
-			}
-
-			if !r.isPluginPathAllowed(hostPath) {
-				klog.InfoS("SECURITY: Plugin path is not in allowed paths, skipping", "path", hostPath)
-				continue
-			}
-
-			if _, err := os.Stat(hostPath); err != nil {
-				klog.InfoS("Warning: Plugin binary not accessible", "path", hostPath, "err", err)
-				continue
-			}
-
-			mounts = append(mounts, specs.Mount{
-				Source:      hostPath,
-				Destination: p.ContainerPath,
-				Type:        "bind",
-				Options:     []string{"ro", "rbind", "nosuid", "nodev"}, // 只读绑定，添加安全选项
-			})
-
-			if p.IsWrapper {
-				wrapped := []string{p.ContainerPath, "--"}
-				finalArgs = append(wrapped, finalArgs...)
-			}
-		}
+		//plugins := r.infraMgr.GetPlugins()
+		//for _, p := range plugins {
+		//	hostPath := r.infraMgr.GetHostPath(p.BinName)
+		//	if hostPath == "" {
+		//		continue
+		//	}
+		//
+		//	if !r.isPluginPathAllowed(hostPath) {
+		//		klog.InfoS("SECURITY: Plugin path is not in allowed paths, skipping", "path", hostPath)
+		//		continue
+		//	}
+		//
+		//	if _, err := os.Stat(hostPath); err != nil {
+		//		klog.InfoS("Warning: Plugin binary not accessible", "path", hostPath, "err", err)
+		//		continue
+		//	}
+		//
+		//	mounts = append(mounts, specs.Mount{
+		//		Source:      hostPath,
+		//		Destination: p.ContainerPath,
+		//		Type:        "bind",
+		//		Options:     []string{"ro", "rbind", "nosuid", "nodev"}, // 只读绑定，添加安全选项
+		//	})
+		//
+		//	if p.IsWrapper {
+		//		wrapped := []string{p.ContainerPath, "--"}
+		//		finalArgs = append(wrapped, finalArgs...)
+		//	}
+		//}
 	}
 
 	specOpts := []oci.SpecOpts{
 		oci.WithImageConfig(image),
 		oci.WithProcessArgs(finalArgs...),
 		oci.WithEnv(envMapToSlice(config.Env)),
+	}
+
+	// Add TTY option if required by runtime (e.g., gVisor)
+	if r.config.NeedsTTY {
+		specOpts = append(specOpts, oci.WithTTY)
 	}
 
 	if config.WorkingDir != "" {
@@ -306,12 +336,24 @@ func (r *ContainerdRuntime) prepareSpecOpts(config *api.SandboxSpec, image conta
 		specOpts = append(specOpts, oci.WithMounts(mounts))
 	}
 
-	if r.netnsPath != "" {
-		specOpts = append(specOpts, oci.WithLinuxNamespace(specs.LinuxNamespace{
-			Type: specs.NetworkNamespace,
-			Path: r.netnsPath,
-		}))
-	}
+	// Always add network namespace - gVisor requires it.
+	// If netnsPath is set, use the host's network namespace (for sharing with agent).
+	// If netnsPath is empty, create a new isolated network namespace.
+	specOpts = append(specOpts, oci.WithLinuxNamespace(specs.LinuxNamespace{
+		Type: specs.NetworkNamespace,
+	}))
+
+	//if r.netnsPath != "" {
+	//	specOpts = append(specOpts, oci.WithLinuxNamespace(specs.LinuxNamespace{
+	//		Type: specs.NetworkNamespace,
+	//		Path: r.netnsPath,
+	//	}))
+	//} else {
+	//	// Create a new network namespace for isolation
+	//	specOpts = append(specOpts, oci.WithLinuxNamespace(specs.LinuxNamespace{
+	//		Type: specs.NetworkNamespace,
+	//	}))
+	//}
 
 	return specOpts
 }
@@ -329,6 +371,27 @@ func (r *ContainerdRuntime) isPluginPathAllowed(pluginPath string) bool {
 		}
 	}
 	return false
+}
+
+// getRuntimeOptions returns runtime-specific options for containerd.
+// It uses config.OptionsType and config.ConfigPath to build the options.
+func (r *ContainerdRuntime) getRuntimeOptions() *runtimeoptions.Options {
+	// If OptionsType is set, include TypeUrl (required for gVisor)
+	if r.config.OptionsType != "" {
+		return &runtimeoptions.Options{
+			TypeUrl:    r.config.OptionsType,
+			ConfigPath: r.config.ConfigPath,
+		}
+	}
+
+	// For other runtimes, only include ConfigPath if set
+	if r.config.ConfigPath != "" {
+		return &runtimeoptions.Options{
+			ConfigPath: r.config.ConfigPath,
+		}
+	}
+
+	return nil
 }
 
 func (r *ContainerdRuntime) prepareLabels(config *api.SandboxSpec) map[string]string {

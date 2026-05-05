@@ -1,0 +1,26 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  extraMounts:
+  # KVM device for Kata Containers
+  - hostPath: /dev/kvm
+    containerPath: /dev/kvm
+  # Required for KVM access inside container
+  - hostPath: /sys/devices/virtual/misc/kvm
+    containerPath: /sys/devices/virtual/misc/kvm
+  # QEMU/Firecracker need these devices for vsock, vhost networking, and TAP.
+  - hostPath: /dev/vhost-vsock
+    containerPath: /dev/vhost-vsock
+  - hostPath: /sys/devices/virtual/misc/vhost-vsock
+    containerPath: /sys/devices/virtual/misc/vhost-vsock
+  - hostPath: /dev/vhost-net
+    containerPath: /dev/vhost-net
+  - hostPath: /sys/devices/virtual/misc/vhost-net
+    containerPath: /sys/devices/virtual/misc/vhost-net
+  - hostPath: /dev/net/tun
+    containerPath: /dev/net/tun
+  # QEMU uses /dev/shm for guest memory backends. Docker's default 64MiB
+  # shm causes SIGBUS/kvm "Bad address" failures for kata-qemu.
+  - hostPath: /dev/shm
+    containerPath: /dev/shm

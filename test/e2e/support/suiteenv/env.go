@@ -9,14 +9,15 @@ import (
 	"testing"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
+	e2eenv "fast-sandbox/test/e2e/env"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	envpkg "sigs.k8s.io/e2e-framework/pkg/env"
 	"sigs.k8s.io/e2e-framework/klient/conf"
+	envpkg "sigs.k8s.io/e2e-framework/pkg/env"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 )
 
@@ -26,6 +27,8 @@ const (
 	maxNamespaceLength         = 63
 	defaultAgentImage          = "fast-sandbox/agent:dev"
 )
+
+var requireProfile = e2eenv.Require
 
 type CleanupFunc func(context.Context) error
 
@@ -136,20 +139,29 @@ func (e *SuiteEnv) RunCleanups(ctx context.Context) error {
 	return firstErr
 }
 
-func Enabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("FAST_SANDBOX_E2E"))) {
-	case "1", "true", "yes":
-		return true
-	default:
-		return false
-	}
+func RequireBasic(t testing.TB) *e2eenv.Manager {
+	t.Helper()
+	return requireProfile(t, e2eenv.ProfileBasic)
 }
 
-func SkipUnlessEnabled(t *testing.T) {
+func RequireGVisor(t testing.TB) *e2eenv.Manager {
 	t.Helper()
-	if !Enabled() {
-		t.Skip("set FAST_SANDBOX_E2E=1 to run live e2e suites")
-	}
+	return requireProfile(t, e2eenv.ProfileGVisor)
+}
+
+func RequireKataQemu(t testing.TB) *e2eenv.Manager {
+	t.Helper()
+	return requireProfile(t, e2eenv.ProfileKataQemu)
+}
+
+func RequireKataClh(t testing.TB) *e2eenv.Manager {
+	t.Helper()
+	return requireProfile(t, e2eenv.ProfileKataClh)
+}
+
+func RequireKataFc(t testing.TB) *e2eenv.Manager {
+	t.Helper()
+	return requireProfile(t, e2eenv.ProfileKataFc)
 }
 
 func (e *SuiteEnv) MustKubeClient(t *testing.T) client.Client {

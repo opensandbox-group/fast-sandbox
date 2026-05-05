@@ -17,7 +17,7 @@ import (
 )
 
 func TestPortMutualExclusion(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("port-mutual-exclusion").
 		WithLabel("suite", "scheduling").
@@ -84,7 +84,7 @@ func TestPortMutualExclusion(t *testing.T) {
 }
 
 func TestResourceSlotCapacity(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("resource-slot-capacity").
 		WithLabel("suite", "scheduling").
@@ -142,7 +142,7 @@ func TestResourceSlotCapacity(t *testing.T) {
 }
 
 func TestAutoScaling(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("auto-scaling").
 		WithLabel("suite", "scheduling").

@@ -19,7 +19,7 @@ import (
 )
 
 func TestAutoExpiry(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("auto-expiry").
 		WithLabel("suite", "faultrecovery").
@@ -124,7 +124,7 @@ func TestAutoExpiry(t *testing.T) {
 }
 
 func TestMemoryLeak(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("memory-leak").
 		WithLabel("suite", "faultrecovery").
@@ -212,7 +212,7 @@ func TestMemoryLeak(t *testing.T) {
 }
 
 func TestControlledRecovery(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("controlled-recovery").
 		WithLabel("suite", "faultrecovery").
@@ -352,7 +352,7 @@ func TestControlledRecovery(t *testing.T) {
 }
 
 func TestPodExistence(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("pod-existence").
 		WithLabel("suite", "faultrecovery").

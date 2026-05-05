@@ -17,7 +17,7 @@ import (
 )
 
 func TestBasicLifecycleRecreateSameName(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("basic-lifecycle-recreate-same-name").
 		WithLabel("suite", "lifecycle").

@@ -18,31 +18,57 @@ import (
 // 1. TestNewContainerdRuntime
 // ============================================================================
 
-func TestNewContainerdRuntime(t *testing.T) {
-	// N-01: Constructor creates runtime with correct runtime handler
-	runtime := newContainerdRuntime("io.containerd.runc.v2")
-
-	require.NotNil(t, runtime, "Runtime should not be nil")
-
-	cr, ok := runtime.(*ContainerdRuntime)
-	require.True(t, ok, "Runtime should be *ContainerdRuntime type")
-
-	assert.Equal(t, "io.containerd.runc.v2", cr.runtimeHandler, "Runtime handler should be set correctly")
-	assert.Equal(t, "", cr.socketPath, "Socket path should be empty before initialization")
-	assert.Nil(t, cr.client, "Client should be nil before initialization")
-	assert.Empty(t, cr.allowedPluginPaths, "Allowed plugin paths should be empty before initialization")
-}
-
 func TestNewContainerdRuntime_GVisor(t *testing.T) {
 	// N-02: Constructor creates gVisor runtime with correct handler
-	runtime := newContainerdRuntime("io.containerd.runsc.v1")
+	runtime := newContainerdRuntime("gvisor")
 
 	require.NotNil(t, runtime, "Runtime should not be nil")
 
 	cr, ok := runtime.(*ContainerdRuntime)
 	require.True(t, ok, "Runtime should be *ContainerdRuntime type")
 
-	assert.Equal(t, "io.containerd.runsc.v1", cr.runtimeHandler, "Runtime handler should be runsc for gVisor")
+	assert.Equal(t, "io.containerd.runsc.v1", cr.config.Handler, "Runtime handler should be runsc for gVisor")
+}
+
+func TestRuntimeConfig_KataVariantsUseKataV2Runtime(t *testing.T) {
+	tests := []struct {
+		name       string
+		runtime    RuntimeType
+		configPath string
+	}{
+		{
+			name:       "kata qemu",
+			runtime:    RuntimeTypeKataQemu,
+			configPath: "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml",
+		},
+		{
+			name:       "kata firecracker",
+			runtime:    RuntimeTypeKataFc,
+			configPath: "/opt/kata/share/defaults/kata-containers/configuration-fc.toml",
+		},
+		{
+			name:       "kata cloud hypervisor",
+			runtime:    RuntimeTypeKataClh,
+			configPath: "/opt/kata/share/defaults/kata-containers/configuration-clh.toml",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := GetRuntimeConfig(tt.runtime)
+			assert.Equal(t, "io.containerd.kata.v2", cfg.Handler)
+			assert.Equal(t, tt.configPath, cfg.ConfigPath)
+		})
+	}
+}
+
+func TestRuntimeConfig_OverrideHandler(t *testing.T) {
+	cfg, err := ResolveRuntimeConfig(RuntimeTypeGVisor, "custom.handler.v2")
+
+	require.NoError(t, err)
+	assert.Equal(t, "custom.handler.v2", cfg.Handler)
+	assert.Equal(t, "/etc/containerd/runsc.toml", cfg.ConfigPath)
+	assert.True(t, cfg.NeedsTTY)
 }
 
 // ============================================================================

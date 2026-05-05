@@ -21,16 +21,17 @@ func main() {
 	namespace := getEnv("NAMESPACE", "")
 	agentPort := getEnv("AGENT_PORT", ":5758")
 	runtimeTypeStr := getEnv("RUNTIME_TYPE", "container")
+	runtimeHandler := getEnv("RUNTIME_HANDLER", "")
 	runtimeSocket := getEnv("RUNTIME_SOCKET", "")
 
 	klog.InfoS("Agent Info", "PodName", podName, "PodIP", podIP, "NodeName", nodeName, "Namespace", namespace)
-	klog.InfoS("Runtime", "Type", runtimeTypeStr, "Socket", runtimeSocket)
+	klog.InfoS("Runtime", "Type", runtimeTypeStr, "Handler", runtimeHandler, "Socket", runtimeSocket)
 
 	ctx := context.Background()
 	var rt runtime.Runtime
 	var err error
 
-	rt, err = runtime.NewRuntime(ctx, runtime.RuntimeType(runtimeTypeStr), runtimeSocket)
+	rt, err = runtime.NewRuntimeWithHandler(ctx, runtime.RuntimeType(runtimeTypeStr), runtimeSocket, runtimeHandler)
 
 	if err != nil {
 		klog.ErrorS(err, "Failed to initialize runtime")

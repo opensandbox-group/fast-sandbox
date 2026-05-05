@@ -1,0 +1,42 @@
+apiVersion: sandbox.fast.io/v1alpha1
+kind: SandboxPool
+metadata:
+  name: kata-clh-pool
+spec:
+  runtimeType: kata-clh
+  runtimeClassName: kata-clh
+  capacity:
+    poolMin: 1
+    poolMax: 3
+    bufferMin: 0
+  maxSandboxesPerPod: 5
+  agentTemplate:
+    spec:
+      containers:
+      - name: agent
+        image: fast-sandbox-agent:latest
+        imagePullPolicy: IfNotPresent
+        command: ["/agent"]
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "2"
+            memory: "2Gi"
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: containerd-run
+          mountPath: /run/containerd
+        - name: containerd-root
+          mountPath: /var/lib/containerd
+      volumes:
+      - name: containerd-run
+        hostPath:
+          path: /run/containerd
+          type: Directory
+      - name: containerd-root
+        hostPath:
+          path: /var/lib/containerd
+          type: Directory
