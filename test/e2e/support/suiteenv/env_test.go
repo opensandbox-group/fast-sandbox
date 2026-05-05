@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	e2eenv "fast-sandbox/test/e2e/env"
 )
 
 func TestNewUsesExplicitKubeconfig(t *testing.T) {
@@ -92,6 +94,77 @@ func TestAgentImagePrefersFastSandboxSpecificEnv(t *testing.T) {
 
 	if got := AgentImage(); got != "preferred:dev" {
 		t.Fatalf("expected FAST_SANDBOX_AGENT_IMAGE to win, got %q", got)
+	}
+}
+
+func TestRequireBasicUsesBasicProfile(t *testing.T) {
+	original := requireProfile
+	t.Cleanup(func() {
+		requireProfile = original
+	})
+
+	var got e2eenv.Profile
+	requireProfile = func(t testing.TB, profile e2eenv.Profile) *e2eenv.Manager {
+		got = profile
+		return nil
+	}
+
+	RequireBasic(t)
+
+	if got != e2eenv.ProfileBasic {
+		t.Fatalf("profile = %q, want %q", got, e2eenv.ProfileBasic)
+	}
+}
+
+func TestRequireGVisorUsesGVisorProfile(t *testing.T) {
+	original := requireProfile
+	t.Cleanup(func() {
+		requireProfile = original
+	})
+
+	var got e2eenv.Profile
+	requireProfile = func(t testing.TB, profile e2eenv.Profile) *e2eenv.Manager {
+		got = profile
+		return nil
+	}
+
+	RequireGVisor(t)
+
+	if got != e2eenv.ProfileGVisor {
+		t.Fatalf("profile = %q, want %q", got, e2eenv.ProfileGVisor)
+	}
+}
+
+func TestRequireKataProfiles(t *testing.T) {
+	tests := []struct {
+		name    string
+		require func(testing.TB) *e2eenv.Manager
+		want    e2eenv.Profile
+	}{
+		{name: "qemu", require: RequireKataQemu, want: e2eenv.ProfileKataQemu},
+		{name: "clh", require: RequireKataClh, want: e2eenv.ProfileKataClh},
+		{name: "fc", require: RequireKataFc, want: e2eenv.ProfileKataFc},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			original := requireProfile
+			t.Cleanup(func() {
+				requireProfile = original
+			})
+
+			var got e2eenv.Profile
+			requireProfile = func(t testing.TB, profile e2eenv.Profile) *e2eenv.Manager {
+				got = profile
+				return nil
+			}
+
+			tt.require(t)
+
+			if got != tt.want {
+				t.Fatalf("profile = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

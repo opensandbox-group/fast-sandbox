@@ -18,7 +18,7 @@ import (
 )
 
 func TestInfraInjection(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("infra-injection").
 		WithLabel("suite", "advancedfeatures").

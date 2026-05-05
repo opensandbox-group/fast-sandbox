@@ -29,7 +29,7 @@ import (
 )
 
 func TestSandboxEnvAndWorkingDir(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("sandbox-env-working-dir").
 		WithLabel("suite", "basicvalidation").
@@ -114,7 +114,7 @@ func TestSandboxEnvAndWorkingDir(t *testing.T) {
 }
 
 func TestFastPathEnvAndWorkingDir(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("fastpath-env-working-dir").
 		WithLabel("suite", "basicvalidation").

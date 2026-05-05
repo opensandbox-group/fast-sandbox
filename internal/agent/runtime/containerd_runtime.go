@@ -47,9 +47,13 @@ const (
 )
 
 func newContainerdRuntime(rt RuntimeType) Runtime {
+	return newContainerdRuntimeWithConfig(rt, GetRuntimeConfig(rt))
+}
+
+func newContainerdRuntimeWithConfig(rt RuntimeType, cfg RuntimeConfig) Runtime {
 	return &ContainerdRuntime{
 		runtimeType: rt,
-		config:      GetRuntimeConfig(rt),
+		config:      cfg,
 	}
 }
 
@@ -222,7 +226,12 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 	}
 	cioOpts = append(cioOpts, cio.WithStreams(nil, logFile, logFile))
 
-	task, err := container.NewTask(ctx, cio.NewCreator(cioOpts...))
+	var taskOpts []containerd.NewTaskOpts
+	if r.config.RuntimePath != "" {
+		taskOpts = append(taskOpts, containerd.WithRuntimePath(r.config.RuntimePath))
+	}
+
+	task, err := container.NewTask(ctx, cio.NewCreator(cioOpts...), taskOpts...)
 	if err != nil {
 		klog.ErrorS(err, "Failed to create containerd task", "sandbox", containerID, "logPath", logPath)
 		logFile.Close()
@@ -277,35 +286,35 @@ func (r *ContainerdRuntime) prepareSpecOpts(config *api.SandboxSpec, image conta
 	finalArgs := originalArgs
 
 	if r.infraMgr != nil {
-		plugins := r.infraMgr.GetPlugins()
-		for _, p := range plugins {
-			hostPath := r.infraMgr.GetHostPath(p.BinName)
-			if hostPath == "" {
-				continue
-			}
-
-			if !r.isPluginPathAllowed(hostPath) {
-				klog.InfoS("SECURITY: Plugin path is not in allowed paths, skipping", "path", hostPath)
-				continue
-			}
-
-			if _, err := os.Stat(hostPath); err != nil {
-				klog.InfoS("Warning: Plugin binary not accessible", "path", hostPath, "err", err)
-				continue
-			}
-
-			mounts = append(mounts, specs.Mount{
-				Source:      hostPath,
-				Destination: p.ContainerPath,
-				Type:        "bind",
-				Options:     []string{"ro", "rbind", "nosuid", "nodev"}, // 只读绑定，添加安全选项
-			})
-
-			if p.IsWrapper {
-				wrapped := []string{p.ContainerPath, "--"}
-				finalArgs = append(wrapped, finalArgs...)
-			}
-		}
+		//plugins := r.infraMgr.GetPlugins()
+		//for _, p := range plugins {
+		//	hostPath := r.infraMgr.GetHostPath(p.BinName)
+		//	if hostPath == "" {
+		//		continue
+		//	}
+		//
+		//	if !r.isPluginPathAllowed(hostPath) {
+		//		klog.InfoS("SECURITY: Plugin path is not in allowed paths, skipping", "path", hostPath)
+		//		continue
+		//	}
+		//
+		//	if _, err := os.Stat(hostPath); err != nil {
+		//		klog.InfoS("Warning: Plugin binary not accessible", "path", hostPath, "err", err)
+		//		continue
+		//	}
+		//
+		//	mounts = append(mounts, specs.Mount{
+		//		Source:      hostPath,
+		//		Destination: p.ContainerPath,
+		//		Type:        "bind",
+		//		Options:     []string{"ro", "rbind", "nosuid", "nodev"}, // 只读绑定，添加安全选项
+		//	})
+		//
+		//	if p.IsWrapper {
+		//		wrapped := []string{p.ContainerPath, "--"}
+		//		finalArgs = append(wrapped, finalArgs...)
+		//	}
+		//}
 	}
 
 	specOpts := []oci.SpecOpts{
@@ -330,17 +339,21 @@ func (r *ContainerdRuntime) prepareSpecOpts(config *api.SandboxSpec, image conta
 	// Always add network namespace - gVisor requires it.
 	// If netnsPath is set, use the host's network namespace (for sharing with agent).
 	// If netnsPath is empty, create a new isolated network namespace.
-	if r.netnsPath != "" {
-		specOpts = append(specOpts, oci.WithLinuxNamespace(specs.LinuxNamespace{
-			Type: specs.NetworkNamespace,
-			Path: r.netnsPath,
-		}))
-	} else {
-		// Create a new network namespace for isolation
-		specOpts = append(specOpts, oci.WithLinuxNamespace(specs.LinuxNamespace{
-			Type: specs.NetworkNamespace,
-		}))
-	}
+	specOpts = append(specOpts, oci.WithLinuxNamespace(specs.LinuxNamespace{
+		Type: specs.NetworkNamespace,
+	}))
+
+	//if r.netnsPath != "" {
+	//	specOpts = append(specOpts, oci.WithLinuxNamespace(specs.LinuxNamespace{
+	//		Type: specs.NetworkNamespace,
+	//		Path: r.netnsPath,
+	//	}))
+	//} else {
+	//	// Create a new network namespace for isolation
+	//	specOpts = append(specOpts, oci.WithLinuxNamespace(specs.LinuxNamespace{
+	//		Type: specs.NetworkNamespace,
+	//	}))
+	//}
 
 	return specOpts
 }

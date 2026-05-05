@@ -17,7 +17,7 @@ import (
 )
 
 func TestGracefulShutdown(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("graceful-shutdown").
 		WithLabel("suite", "lifecycle").

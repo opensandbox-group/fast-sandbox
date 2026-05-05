@@ -1,20 +1,16 @@
-# gVisor Kind cluster configuration
-# This config mounts host's gVisor binaries into Kind nodes
+# gVisor Kind cluster configuration template.
 #
 # Prerequisites:
-#   - runsc installed on host (e.g., /usr/bin/runsc)
-#   - containerd-shim-runsc-v1 installed on host (e.g., /usr/local/bin/containerd-shim-runsc-v1)
+#   - runsc installed on host, for example /usr/bin/runsc
+#   - containerd-shim-runsc-v1 installed on host
 #
 # Usage:
-#   GVISOR_KIND_CLUSTER=gvisor-sandbox PWD=$(pwd) envsubst < kind-config-gvisor.yaml | kind create cluster --config -
-#
-# Or use setup-kind-gvisor.sh script
+#   GVISOR_KIND_CLUSTER=gvisor-sandbox PWD=$(pwd) envsubst < test/e2e/manifests/kind/gvisor.yaml | kind create cluster --config -
 
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: ${GVISOR_KIND_CLUSTER}
 
-# Configure containerd to use gVisor runsc runtime
 containerdConfigPatches:
   - |-
     [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runsc]
@@ -27,7 +23,6 @@ nodes:
   - role: control-plane
     image: ${GVISOR_KIND_IMAGE}
     extraMounts:
-      # Mount gVisor binaries from host
       - hostPath: ${GVISOR_RUNSC_BIN}
         containerPath: /usr/bin/runsc
         readOnly: true

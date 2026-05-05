@@ -48,6 +48,7 @@ const (
 // RuntimeConfig defines the configuration for each runtime type.
 type RuntimeConfig struct {
 	Handler     string // containerd runtime handler name
+	RuntimePath string // optional absolute path to shim binary
 	ConfigPath  string // configuration file path (optional)
 	NeedsTTY    bool   // whether TTY is required for this runtime
 	OptionsType string // TypeUrl for runtime options (optional, e.g., gVisor)
@@ -66,16 +67,19 @@ var runtimeConfigs = map[RuntimeType]RuntimeConfig{
 		OptionsType: "io.containerd.runsc.v1.options",
 	},
 	RuntimeTypeKataQemu: {
-		Handler:    "/opt/kata/bin/containerd-shim-kata-v2",
-		ConfigPath: "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml",
+		Handler:     "io.containerd.kata.v2",
+		RuntimePath: "/opt/kata/bin/containerd-shim-kata-v2",
+		ConfigPath:  "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml",
 	},
 	RuntimeTypeKataFc: {
-		Handler:    "/opt/kata/bin/containerd-shim-kata-v2",
-		ConfigPath: "/opt/kata/share/defaults/kata-containers/configuration-fc.toml",
+		Handler:     "io.containerd.kata.v2",
+		RuntimePath: "/opt/kata/bin/containerd-shim-kata-v2",
+		ConfigPath:  "/opt/kata/share/defaults/kata-containers/configuration-fc.toml",
 	},
 	RuntimeTypeKataClh: {
-		Handler:    "/opt/kata/bin/containerd-shim-kata-v2",
-		ConfigPath: "/opt/kata/share/defaults/kata-containers/configuration-clh.toml",
+		Handler:     "io.containerd.kata.v2",
+		RuntimePath: "/opt/kata/bin/containerd-shim-kata-v2",
+		ConfigPath:  "/opt/kata/share/defaults/kata-containers/configuration-clh.toml",
 	},
 }
 
@@ -89,22 +93,39 @@ func GetRuntimeHandler(rt RuntimeType) string {
 
 // GetRuntimeConfig returns the full RuntimeConfig for the given type.
 func GetRuntimeConfig(rt RuntimeType) RuntimeConfig {
-	if cfg, ok := runtimeConfigs[rt]; ok {
-		return cfg
+	cfg, err := ResolveRuntimeConfig(rt, "")
+	if err != nil {
+		return runtimeConfigs[RuntimeTypeContainer]
 	}
-	return runtimeConfigs[RuntimeTypeContainer]
+	return cfg
+}
+
+func ResolveRuntimeConfig(rt RuntimeType, handlerOverride string) (RuntimeConfig, error) {
+	cfg, ok := runtimeConfigs[rt]
+	if !ok {
+		return RuntimeConfig{}, ErrUnsupportedRuntime
+	}
+	if handlerOverride != "" {
+		cfg.Handler = handlerOverride
+	}
+	return cfg, nil
 }
 
 func NewRuntime(ctx context.Context, runtimeType RuntimeType, socketPath string) (Runtime, error) {
-	if _, ok := runtimeConfigs[runtimeType]; !ok {
-		return nil, ErrUnsupportedRuntime
+	return NewRuntimeWithHandler(ctx, runtimeType, socketPath, "")
+}
+
+func NewRuntimeWithHandler(ctx context.Context, runtimeType RuntimeType, socketPath, handlerOverride string) (Runtime, error) {
+	cfg, err := ResolveRuntimeConfig(runtimeType, handlerOverride)
+	if err != nil {
+		return nil, err
 	}
 
 	var rt Runtime
 	switch runtimeType {
 	case RuntimeTypeContainer, RuntimeTypeGVisor,
 		RuntimeTypeKataQemu, RuntimeTypeKataFc, RuntimeTypeKataClh:
-		rt = newContainerdRuntime(runtimeType)
+		rt = newContainerdRuntimeWithConfig(runtimeType, cfg)
 	default:
 		return nil, ErrUnsupportedRuntime
 	}

@@ -2,18 +2,13 @@ package cliintegration
 
 import (
 	"context"
-	"fmt"
-	"net"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
+	e2eenv "fast-sandbox/test/e2e/env"
 	"fast-sandbox/test/e2e/support/fixtures"
-	"fast-sandbox/test/e2e/support/portforward"
 	"fast-sandbox/test/e2e/support/suiteenv"
 
 	corev1 "k8s.io/api/core/v1"
@@ -23,103 +18,9 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/features"
 )
 
-var cliBinaryPath string
-
-func init() {
-	// Find project root and set CLI binary path
-	wd, _ := os.Getwd()
-	for {
-		if _, err := os.Stat(filepath.Join(wd, "go.mod")); err == nil {
-			cliBinaryPath = filepath.Join(wd, "bin", "fsb-ctl")
-			break
-		}
-		parent := filepath.Dir(wd)
-		if parent == wd {
-			break
-		}
-		wd = parent
-	}
-}
-
-func buildCLIBinary(t *testing.T) error {
-	t.Helper()
-
-	// Check if already exists
-	if _, err := os.Stat(cliBinaryPath); err == nil {
-		return nil
-	}
-
-	// Build the binary
-	t.Logf("Building fsb-ctl binary...")
-	wd, _ := os.Getwd()
-	projectRoot := filepath.Dir(filepath.Dir(filepath.Dir(filepath.Dir(wd))))
-
-	cmd := exec.Command("go", "build", "-o", cliBinaryPath, "./cmd/fsb-ctl")
-	cmd.Dir = projectRoot
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("build fsb-ctl: %v\n%s", err, output)
-	}
-
-	t.Logf("Built fsb-ctl at %s", cliBinaryPath)
-	return nil
-}
-
-func startControllerPortForward(ctx context.Context, t *testing.T, namespace string) (int, *portforward.ManagedProcess, error) {
-	t.Helper()
-
-	// Get a free local port
-	l, err := net.Listen("tcp", ":0")
-	if err != nil {
-		return 0, nil, fmt.Errorf("get free port: %v", err)
-	}
-	localPort := l.Addr().(*net.TCPAddr).Port
-	l.Close()
-
-	args := portforward.BuildKubectlArgs("fast-sandbox-controller-manager-0", namespace, localPort, 9090)
-	// Use deployment instead of pod for more reliability
-	args = []string{
-		"port-forward",
-		fmt.Sprintf("deployment/fast-sandbox-controller"),
-		fmt.Sprintf("%d:9090", localPort),
-		"-n", namespace,
-	}
-
-	cmd := exec.CommandContext(ctx, "kubectl", args...)
-	if err := cmd.Start(); err != nil {
-		return 0, nil, fmt.Errorf("start port-forward: %v", err)
-	}
-
-	managed := &portforward.ManagedProcess{Cmd: cmd}
-
-	// Wait for port to be ready
-	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-
-	if err := portforward.WaitForReady(waitCtx, fmt.Sprintf("localhost:%d", localPort), 100*time.Millisecond); err != nil {
-		managed.Cleanup()
-		return 0, nil, fmt.Errorf("wait for port-forward: %v", err)
-	}
-
-	t.Logf("Controller port-forward established on localhost:%d", localPort)
-	return localPort, managed, nil
-}
-
-func runCLI(ctx context.Context, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, cliBinaryPath, args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return string(output), fmt.Errorf("CLI command failed: %v, output: %s", err, string(output))
-	}
-	return string(output), nil
-}
-
 func TestUpdateReset(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
-
-	if err := buildCLIBinary(t); err != nil {
-		t.Fatalf("build CLI binary: %v", err)
-	}
+	manager := e2eenv.Require(t, e2eenv.ProfileBasic)
+	cliBinaryPath := buildFSBCtl(t, manager)
 
 	feature := features.New("cli-update-reset").
 		WithLabel("suite", "cliintegration").
@@ -153,79 +54,71 @@ func TestUpdateReset(t *testing.T) {
 
 			// Start port-forward to controller
 			ctrlNS := testSuite.ControllerNamespace()
-			localPort, pf, err := startControllerPortForward(ctx, t, ctrlNS)
+			endpoint, pf, err := e2eenv.StartControllerPortForward(ctx, ctrlNS)
 			if err != nil {
 				t.Fatalf("start controller port-forward: %v", err)
 			}
 			defer pf.Cleanup()
+			t.Logf("Controller port-forward established on %s", endpoint)
 
-			// Create sandbox using kubectl (to avoid CLI run complexity)
-			sandbox := &apiv1alpha1.Sandbox{
-				TypeMeta: metav1.TypeMeta{
-					APIVersion: apiv1alpha1.GroupVersion.String(),
-					Kind:       "Sandbox",
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "sb-update-test",
-					Namespace: namespace,
-				},
-				Spec: apiv1alpha1.SandboxSpec{
-					Image:   "docker.io/library/alpine:latest",
-					Command: []string{"/bin/sleep", "3600"},
-					PoolRef: pool.Name,
-				},
-			}
-			if err := k8sClient.Create(ctx, sandbox); err != nil {
-				t.Fatalf("create sandbox: %v", err)
+			ctl := e2eenv.NewFSBCtl(
+				e2eenv.WithFSBCtlBinary(cliBinaryPath),
+				e2eenv.WithFSBCtlEndpoint(endpoint),
+				e2eenv.WithFSBCtlNamespace(namespace),
+			)
+
+			t.Log("Creating sandbox through fsb-ctl run...")
+			if output, err := ctl.Run(ctx, "sb-update-test", e2eenv.FSBCtlConfig{
+				Image:           "docker.io/library/alpine:latest",
+				PoolRef:         pool.Name,
+				ConsistencyMode: "strong",
+				Command:         []string{"/bin/sleep"},
+				Args:            []string{"3600"},
+			}); err != nil {
+				t.Fatalf("fsb-ctl run failed: %v\noutput: %s", err, output)
 			}
 
-			// Wait for sandbox to be assigned
 			waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
-			if _, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: "sb-update-test", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedPod != "" &&
-					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
-			}); err != nil {
-				t.Fatalf("wait for sandbox to be assigned: %v", err)
+			if _, err := ctl.WaitRunning(waitCtx, "sb-update-test"); err != nil {
+				t.Fatalf("wait for sandbox running via fsb-ctl: %v", err)
 			}
 
 			// Test 1: fsb-ctl get command
 			t.Log("Testing fsb-ctl get command...")
-			output, err := runCLI(ctx, "get", "sb-update-test", "-n", namespace, "--endpoint", fmt.Sprintf("localhost:%d", localPort))
+			info, err := ctl.GetJSON(ctx, "sb-update-test")
 			if err != nil {
-				t.Fatalf("fsb-ctl get failed: %v\noutput: %s", err, output)
+				t.Fatalf("fsb-ctl get failed: %v", err)
 			}
-			if !strings.Contains(output, "sb-update-test") && !strings.Contains(output, "Phase") {
-				t.Fatalf("fsb-ctl get output missing expected content: %s", output)
+			if info.Phase == "" {
+				t.Fatalf("fsb-ctl get output missing phase: %+v", info)
 			}
 			t.Log("✓ fsb-ctl get command works")
 
 			// Test 2: fsb-ctl update --labels
 			t.Log("Testing fsb-ctl update --labels...")
-			output, err = runCLI(ctx, "update", "sb-update-test", "-n", namespace, "--endpoint", fmt.Sprintf("localhost:%d", localPort), "--labels", "test=e2e,env=cli")
-			if err != nil {
-				// Some update operations may fail due to gRPC timing, log but don't fail
-				t.Logf("Warning: fsb-ctl update labels failed: %v\noutput: %s", err, output)
-			} else if strings.Contains(output, "updated successfully") {
-				t.Log("✓ fsb-ctl update --labels works")
+			output, err := ctl.UpdateLabels(ctx, "sb-update-test", "test=e2e", "env=cli")
+			if err != nil || !strings.Contains(string(output), "updated successfully") {
+				t.Fatalf("fsb-ctl update labels failed: %v\noutput: %s", err, output)
 			}
+			t.Log("✓ fsb-ctl update --labels works")
 
 			// Test 3: fsb-ctl reset command
 			t.Log("Testing fsb-ctl reset command...")
-			output, err = runCLI(ctx, "reset", "sb-update-test", "-n", namespace, "--endpoint", fmt.Sprintf("localhost:%d", localPort))
-			if err != nil {
-				t.Logf("Warning: fsb-ctl reset failed: %v\noutput: %s", err, output)
-			} else if strings.Contains(output, "reset triggered") {
-				t.Log("✓ fsb-ctl reset command works")
-
-				// Verify reset revision was set
-				updatedSandbox := &apiv1alpha1.Sandbox{}
-				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "sb-update-test", Namespace: namespace}, updatedSandbox); err == nil {
-					if updatedSandbox.Spec.ResetRevision != nil {
-						t.Log("✓ ResetRevision was set correctly")
-					}
-				}
+			output, err = ctl.Reset(ctx, "sb-update-test")
+			if err != nil || !strings.Contains(string(output), "reset triggered") {
+				t.Fatalf("fsb-ctl reset failed: %v\noutput: %s", err, output)
 			}
+			t.Log("✓ fsb-ctl reset command works")
+
+			resetWaitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			if _, err := fixture.WaitForSandbox(resetWaitCtx, types.NamespacedName{Name: "sb-update-test", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
+				return sb.Spec.ResetRevision != nil
+			}); err != nil {
+				t.Fatalf("wait for reset revision: %v", err)
+			}
+			t.Log("✓ ResetRevision was set correctly")
 
 			return ctx
 		}).
@@ -235,11 +128,8 @@ func TestUpdateReset(t *testing.T) {
 }
 
 func TestCLILogs(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
-
-	if err := buildCLIBinary(t); err != nil {
-		t.Fatalf("build CLI binary: %v", err)
-	}
+	manager := e2eenv.Require(t, e2eenv.ProfileBasic)
+	cliBinaryPath := buildFSBCtl(t, manager)
 
 	feature := features.New("cli-logs").
 		WithLabel("suite", "cliintegration").
@@ -273,48 +163,49 @@ func TestCLILogs(t *testing.T) {
 
 			// Start port-forward to controller
 			ctrlNS := testSuite.ControllerNamespace()
-			_, pf, err := startControllerPortForward(ctx, t, ctrlNS)
+			endpoint, pf, err := e2eenv.StartControllerPortForward(ctx, ctrlNS)
 			if err != nil {
 				t.Fatalf("start controller port-forward: %v", err)
 			}
 			defer pf.Cleanup()
+			t.Logf("Controller port-forward established on %s", endpoint)
 
-			// Create sandbox that produces logs
-			sandbox := &apiv1alpha1.Sandbox{
-				TypeMeta: metav1.TypeMeta{
-					APIVersion: apiv1alpha1.GroupVersion.String(),
-					Kind:       "Sandbox",
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "sb-logs-test",
-					Namespace: namespace,
-				},
-				Spec: apiv1alpha1.SandboxSpec{
-					Image:   "docker.io/library/alpine:latest",
-					Command: []string{"/bin/sh"},
-					Args:    []string{"-c", "echo 'Log-Test-Line-1' && sleep 1 && echo 'Log-Test-Line-2' && sleep 3600"},
-					PoolRef: pool.Name,
-				},
-			}
-			if err := k8sClient.Create(ctx, sandbox); err != nil {
-				t.Fatalf("create sandbox: %v", err)
+			ctl := e2eenv.NewFSBCtl(
+				e2eenv.WithFSBCtlBinary(cliBinaryPath),
+				e2eenv.WithFSBCtlEndpoint(endpoint),
+				e2eenv.WithFSBCtlNamespace(namespace),
+			)
+
+			t.Log("Creating sandbox through fsb-ctl run...")
+			if output, err := ctl.Run(ctx, "sb-logs-test", e2eenv.FSBCtlConfig{
+				Image:           "docker.io/library/alpine:latest",
+				PoolRef:         pool.Name,
+				ConsistencyMode: "strong",
+				Command:         []string{"/bin/sh"},
+				Args:            []string{"-c", "echo 'Log-Test-Line-1' && sleep 1 && echo 'Log-Test-Line-2' && sleep 3600"},
+			}); err != nil {
+				t.Fatalf("fsb-ctl run failed: %v\noutput: %s", err, output)
 			}
 
-			// Wait for sandbox to be running
 			waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
-			if _, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: "sb-logs-test", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedPod != "" &&
-					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
-			}); err != nil {
-				t.Fatalf("wait for sandbox to be assigned: %v", err)
+			if _, err := ctl.WaitRunning(waitCtx, "sb-logs-test"); err != nil {
+				t.Fatalf("wait for sandbox running via fsb-ctl: %v", err)
 			}
 
 			// Wait for logs to be produced
 			time.Sleep(3 * time.Second)
 
-			// Test fsb-ctl logs command - skip for now due to port-forward complexity
-			t.Log("Skipping logs test - port-forward cleanup issues in test harness")
+			logsCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			logs, err := ctl.Logs(logsCtx, "sb-logs-test")
+			if err != nil {
+				t.Fatalf("fsb-ctl logs failed: %v\nlogs: %s", err, logs)
+			}
+			if !strings.Contains(logs, "Log-Test-Line-1") || !strings.Contains(logs, "Log-Test-Line-2") {
+				t.Fatalf("fsb-ctl logs output missing expected lines:\n%s", logs)
+			}
+			t.Log("✓ fsb-ctl logs command works")
 
 			return ctx
 		}).
@@ -324,11 +215,8 @@ func TestCLILogs(t *testing.T) {
 }
 
 func TestCLIRun(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
-
-	if err := buildCLIBinary(t); err != nil {
-		t.Fatalf("build CLI binary: %v", err)
-	}
+	manager := e2eenv.Require(t, e2eenv.ProfileBasic)
+	cliBinaryPath := buildFSBCtl(t, manager)
 
 	feature := features.New("cli-run").
 		WithLabel("suite", "cliintegration").
@@ -362,68 +250,38 @@ func TestCLIRun(t *testing.T) {
 
 			// Start port-forward to controller
 			ctrlNS := testSuite.ControllerNamespace()
-			localPort, pf, err := startControllerPortForward(ctx, t, ctrlNS)
+			endpoint, pf, err := e2eenv.StartControllerPortForward(ctx, ctrlNS)
 			if err != nil {
 				t.Fatalf("start controller port-forward: %v", err)
 			}
 			defer pf.Cleanup()
+			t.Logf("Controller port-forward established on %s", endpoint)
 
-			// Create a config file for fsb-ctl run
-			configFile, err := os.CreateTemp("", "fsb-run-config-*.yaml")
-			if err != nil {
-				t.Fatalf("create temp config file: %v", err)
-			}
-			defer os.Remove(configFile.Name())
+			ctl := e2eenv.NewFSBCtl(
+				e2eenv.WithFSBCtlBinary(cliBinaryPath),
+				e2eenv.WithFSBCtlEndpoint(endpoint),
+				e2eenv.WithFSBCtlNamespace(namespace),
+			)
 
-			configContent := fmt.Sprintf(`image: docker.io/library/alpine:latest
-pool_ref: %s
-consistency_mode: strong
-command: ["/bin/sh"]
-args: ["-c", "echo 'Hello from fsb-ctl' && sleep 30"]
-`, pool.Name)
-
-			if _, err := configFile.WriteString(configContent); err != nil {
-				t.Fatalf("write config file: %v", err)
-			}
-			configFile.Close()
-
-			// Test fsb-ctl run command
 			t.Log("Testing fsb-ctl run command...")
-			output, err := runCLI(ctx, "run", "sb-run-test", "-n", namespace, "--endpoint", fmt.Sprintf("localhost:%d", localPort), "-f", configFile.Name())
+			output, err := ctl.Run(ctx, "sb-run-test", e2eenv.FSBCtlConfig{
+				Image:           "docker.io/library/alpine:latest",
+				PoolRef:         pool.Name,
+				ConsistencyMode: "strong",
+				Command:         []string{"/bin/sh"},
+				Args:            []string{"-c", "echo 'Hello from fsb-ctl' && sleep 30"},
+			})
 			if err != nil {
-				// Run may fail due to pool capacity or timing, check if sandbox was created anyway
-				t.Logf("fsb-ctl run returned error (may be expected): %v\noutput: %s", err, output)
-
-				// Check if sandbox CRD was created despite error
-				checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-				defer cancel()
-				existingSandbox := &apiv1alpha1.Sandbox{}
-				if getErr := k8sClient.Get(checkCtx, types.NamespacedName{Name: "sb-run-test", Namespace: namespace}, existingSandbox); getErr == nil {
-					t.Log("Sandbox CRD was created, waiting for assignment...")
-					waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-					defer cancel()
-					if _, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: "sb-run-test", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-						return sb.Status.AssignedPod != ""
-					}); err != nil {
-						t.Logf("Warning: sandbox not assigned in time: %v", err)
-					} else {
-						t.Log("✓ Sandbox was assigned successfully")
-						return ctx
-					}
-				}
-				t.Fatalf("fsb-ctl run failed and no sandbox created: %v\noutput: %s", err, output)
+				t.Fatalf("fsb-ctl run failed: %v\noutput: %s", err, output)
 			}
 
-			if strings.Contains(output, "created successfully") || strings.Contains(output, "ID:") {
+			if strings.Contains(string(output), "created successfully") || strings.Contains(string(output), "ID:") {
 				t.Log("✓ fsb-ctl run command works")
 
-				// Wait for sandbox to be assigned
 				waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 				defer cancel()
-				if _, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: "sb-run-test", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-					return sb.Status.AssignedPod != ""
-				}); err != nil {
-					t.Logf("Warning: sandbox not assigned in time: %v", err)
+				if _, err := ctl.WaitRunning(waitCtx, "sb-run-test"); err != nil {
+					t.Fatalf("wait for sandbox running via fsb-ctl: %v", err)
 				}
 			} else {
 				t.Fatalf("fsb-ctl run unexpected output: %s", output)
@@ -434,6 +292,17 @@ args: ["-c", "echo 'Hello from fsb-ctl' && sleep 30"]
 		Feature()
 
 	testSuite.Env().Test(t, feature)
+}
+
+func buildFSBCtl(t *testing.T, manager *e2eenv.Manager) string {
+	t.Helper()
+
+	cliBinaryPath, err := manager.BuildFSBCtl(context.Background())
+	if err != nil {
+		t.Fatalf("build fsb-ctl binary: %v", err)
+	}
+	t.Logf("Built fsb-ctl at %s", cliBinaryPath)
+	return cliBinaryPath
 }
 
 func createCLIPool(namespace, name string) *apiv1alpha1.SandboxPool {

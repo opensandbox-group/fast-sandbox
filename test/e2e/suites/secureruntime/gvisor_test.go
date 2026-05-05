@@ -6,7 +6,6 @@ import (
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
-	"fast-sandbox/test/e2e/support/envcheck"
 	"fast-sandbox/test/e2e/support/fixtures"
 	"fast-sandbox/test/e2e/support/suiteenv"
 
@@ -17,31 +16,13 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/features"
 )
 
-// getEnvChecker returns the global environment checker for gVisor tests.
-func getGVisorEnvChecker(t *testing.T) *envcheck.Checker {
-	t.Helper()
-	checker, err := envcheck.GetChecker()
-	if err != nil {
-		t.Fatalf("create env checker: %v", err)
-	}
-	return checker
-}
-
 func TestGVisorSandbox(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireGVisor(t)
 
 	feature := features.New("gvisor-sandbox").
 		WithLabel("suite", "secureruntime").
 		WithLabel("runtime", "gvisor").
 		Assess("gVisor pool creates sandbox successfully", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
-			// Check if gVisor should run in this environment
-			checker := getGVisorEnvChecker(t)
-			shouldRun, reason := checker.ShouldRunGVisor(ctx)
-			if !shouldRun {
-				t.Skipf("gVisor test skipped: %s", reason)
-			}
-			t.Logf("Running gVisor test: %s", reason)
-
 			k8sClient := testSuite.MustKubeClient(t)
 			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
 
@@ -111,20 +92,12 @@ func TestGVisorSandbox(t *testing.T) {
 // 1. /proc/sys/kernel/osrelease contains "gVisor" or shows a different kernel
 // 2. runsc-sandbox process exists on the host node
 func TestGVisorIsolation(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireGVisor(t)
 
 	feature := features.New("gvisor-isolation").
 		WithLabel("suite", "secureruntime").
 		WithLabel("runtime", "gvisor").
 		Assess("gVisor sandbox shows proper isolation markers", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
-			// Check if gVisor should run in this environment
-			checker := getGVisorEnvChecker(t)
-			shouldRun, reason := checker.ShouldRunGVisor(ctx)
-			if !shouldRun {
-				t.Skipf("gVisor test skipped: %s", reason)
-			}
-			t.Logf("Running gVisor isolation test: %s", reason)
-
 			k8sClient := testSuite.MustKubeClient(t)
 			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
 
@@ -196,20 +169,12 @@ func TestGVisorIsolation(t *testing.T) {
 
 // TestGVisorMultipleSandboxes tests creating multiple sandboxes in the same pool.
 func TestGVisorMultipleSandboxes(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireGVisor(t)
 
 	feature := features.New("gvisor-multiple").
 		WithLabel("suite", "secureruntime").
 		WithLabel("runtime", "gvisor").
 		Assess("gVisor pool handles multiple sandboxes", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
-			// Check if gVisor should run in this environment
-			checker := getGVisorEnvChecker(t)
-			shouldRun, reason := checker.ShouldRunGVisor(ctx)
-			if !shouldRun {
-				t.Skipf("gVisor test skipped: %s", reason)
-			}
-			t.Logf("Running gVisor multiple sandboxes test: %s", reason)
-
 			k8sClient := testSuite.MustKubeClient(t)
 			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
 

@@ -183,6 +183,8 @@ env/
 ENV/
 env.bak/
 venv.bak/
+!test/e2e/env/
+!test/e2e/env/**
 
 # Docker
 *.pid

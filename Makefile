@@ -8,9 +8,8 @@ JANITOR_IMAGE ?= $(REGISTRY)/janitor:dev
 KIND_CLUSTER_NAME ?= fast-sandbox
 
 # E2E test settings
-E2E_SUITE ?=
-FAST_SANDBOX_E2E ?= 1
-E2E_KEEP_CLUSTER ?= 0
+E2E_PROFILE ?= basic
+E2E_TEST_TIMEOUT ?= 30m
 
 # Go settings
 GO ?= go
@@ -32,26 +31,26 @@ help:
 	@echo "  make docker-janitor         - build janitor image"
 	@echo ""
 	@echo "E2E targets:"
-	@echo "  make setup-e2e              - setup fresh kind cluster + deploy components"
-	@echo "  make test-e2e               - full e2e: setup + run all tests"
-	@echo "  make test-e2e-<suite>       - run specific suite (env must be ready)"
+	@echo "  make setup-e2e              - prepare one e2e profile, default E2E_PROFILE=basic"
+	@echo "  make test-e2e               - run all e2e suites; tests prepare their own profiles"
+	@echo "  make test-e2e-<suite>       - run a specific suite"
 	@echo ""
 	@echo "E2E settings:"
-	@echo "  E2E_KEEP_CLUSTER=1          - keep cluster after test failure for debugging (default: 0)"
+	@echo "  E2E_PROFILE=basic|gvisor|kata-qemu|kata-clh|kata-fc"
+	@echo "  E2E_TEST_TIMEOUT=30m"
 	@echo ""
 	@echo "E2E test suites:"
 	@echo "  basicvalidation, lifecycle, scheduling, cleanupjanitor"
-	@echo "  advancedfeatures, cliintegration, faultrecovery"
+	@echo "  advancedfeatures, cliintegration, faultrecovery, secureruntime"
 	@echo ""
 	@echo "E2E examples:"
-	@echo "  # Full verification (fresh env + all tests)"
+	@echo "  # Full verification"
 	@echo "  make test-e2e"
 	@echo ""
-	@echo "  # Keep cluster on failure for debugging"
-	@echo "  E2E_KEEP_CLUSTER=1 make test-e2e"
+	@echo "  # Prepare one profile explicitly"
+	@echo "  E2E_PROFILE=kata-qemu make setup-e2e"
 	@echo ""
-	@echo "  # Quick iteration (setup once, run multiple times)"
-	@echo "  make setup-e2e"
+	@echo "  # Quick iteration"
 	@echo "  make test-e2e-basicvalidation"
 	@echo "  make test-e2e-lifecycle"
 
@@ -92,6 +91,8 @@ test:
 tidy:
 	$(GO) mod tidy
 
+e2e: test-e2e
+
 docker-agent: build-agent-linux
 	docker build -t $(AGENT_IMAGE) -f build/Dockerfile.agent .
 
@@ -110,46 +111,27 @@ kind-load-controller: docker-controller
 kind-load-janitor: docker-janitor
 	kind load docker-image $(JANITOR_IMAGE) --name fast-sandbox
 
-# E2E test - setup environment (fresh kind cluster with all components)
+# E2E test - prepare one environment profile
 setup-e2e:
-	@echo "=== Setting up E2E environment ==="
-	@echo "Cluster name: $(KIND_CLUSTER_NAME)"
-	@echo ""
-	@if kind get clusters 2>/dev/null | grep -q "^$(KIND_CLUSTER_NAME)$$"; then \
-		echo "Deleting existing kind cluster '$(KIND_CLUSTER_NAME)'..."; \
-		kind delete cluster --name $(KIND_CLUSTER_NAME); \
-	fi
-	@echo "Creating fresh kind cluster and deploying components..."
-	@FORCE_RECREATE_CLUSTER=true ./test/e2e/setup-kind.sh
+	@echo "=== Preparing E2E environment ==="
+	@echo "Profile: $(E2E_PROFILE)"
+	@FAST_SANDBOX_AGENT_IMAGE=$(AGENT_IMAGE) \
+		$(GO) run ./test/e2e/env/cmd/setup -profile $(E2E_PROFILE) -timeout $(E2E_TEST_TIMEOUT)
 	@echo ""
 	@echo "=== E2E environment ready ==="
-	@echo "Run tests with: make test-e2e-<suite>"
+	@echo "Run tests with: make test-e2e-<suite> or go test ./test/e2e/suites/<suite>"
 
-# E2E test - full test with fresh environment (setup + test)
-test-e2e: setup-e2e
+# E2E test - full test. Each test prepares the profile it needs.
+test-e2e:
 	@echo ""
 	@echo "=== Running all E2E tests ==="
-	@FAST_SANDBOX_E2E=1 FAST_SANDBOX_AGENT_IMAGE=$(AGENT_IMAGE) \
-		$(GO) test ./test/e2e/suites/... -v -count=1 -failfast || \
-		(if [ "$(E2E_KEEP_CLUSTER)" = "1" ]; then \
-			echo ""; \
-			echo "❌ E2E tests failed, keeping cluster for debugging..."; \
-			echo "Run 'kind delete cluster --name $(KIND_CLUSTER_NAME)' when done debugging"; \
-		else \
-			echo ""; \
-			echo "❌ E2E tests failed, cleaning up cluster..."; \
-			kind delete cluster --name $(KIND_CLUSTER_NAME); \
-		fi; \
-		exit 1)
+	@FAST_SANDBOX_AGENT_IMAGE=$(AGENT_IMAGE) \
+		$(GO) test ./test/e2e/suites/... -v -count=1 -failfast -timeout $(E2E_TEST_TIMEOUT)
 	@echo ""
-	@echo "✅ All E2E tests passed"
-	@if [ "$(E2E_KEEP_CLUSTER)" = "0" ]; then \
-		echo "Cleaning up kind cluster..."; \
-		kind delete cluster --name $(KIND_CLUSTER_NAME); \
-	fi
+	@echo "All E2E tests passed"
 
-# E2E test - run specific suite (assumes environment is already setup)
-test-e2e-basicvalidation test-e2e-lifecycle test-e2e-scheduling test-e2e-cleanupjanitor test-e2e-advancedfeatures test-e2e-cliintegration test-e2e-faultrecovery:
+# E2E test - run specific suite
+test-e2e-basicvalidation test-e2e-lifecycle test-e2e-scheduling test-e2e-cleanupjanitor test-e2e-advancedfeatures test-e2e-cliintegration test-e2e-faultrecovery test-e2e-secureruntime:
 	@echo "=== Running E2E test: $@ ==="
-	@FAST_SANDBOX_E2E=1 FAST_SANDBOX_AGENT_IMAGE=$(AGENT_IMAGE) \
-		$(GO) test ./test/e2e/suites/$(subst test-e2e-,,$@)/... -v -count=1
+	@FAST_SANDBOX_AGENT_IMAGE=$(AGENT_IMAGE) \
+		$(GO) test ./test/e2e/suites/$(subst test-e2e-,,$@)/... -v -count=1 -timeout $(E2E_TEST_TIMEOUT)

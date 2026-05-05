@@ -17,7 +17,7 @@ import (
 )
 
 func TestNamespaceIsolation(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("namespace-isolation").
 		WithLabel("suite", "basicvalidation").

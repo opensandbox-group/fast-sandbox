@@ -50,6 +50,10 @@ var logsCmd = &cobra.Command{
 			klog.ErrorS(nil, "Sandbox not assigned to any agent", "name", name)
 			log.Fatal("Sandbox is not assigned to any agent yet.")
 		}
+		if info.SandboxId == "" {
+			klog.ErrorS(nil, "Sandbox ID is not available yet", "name", name)
+			log.Fatal("Sandbox ID is not available yet.")
+		}
 		klog.V(4).InfoS("Sandbox agent pod", "name", name, "agentPod", info.AgentPod)
 
 		// todo add proxy for agent
@@ -61,14 +65,27 @@ var logsCmd = &cobra.Command{
 		klog.V(4).InfoS("Port-forward started", "localPort", localPort, "agentPod", info.AgentPod)
 		defer func() {
 			if pfCmd != nil && pfCmd.Process != nil {
-				pfCmd.Process.Kill()
+				_ = pfCmd.Process.Kill()
+				_ = pfCmd.Wait()
 			}
 		}()
 
 		// Use the actual sandboxID (hash) instead of name for Agent API
 		url := fmt.Sprintf("http://localhost:%d/api/v1/agent/logs?sandboxId=%s&follow=%t", localPort, info.SandboxId, follow)
 		klog.InfoS("Fetching logs from agent", "sandboxID", info.SandboxId, "url", url)
-		resp, err := http.Get(url)
+		reqCtx := context.Background()
+		cancel := func() {}
+		if !follow {
+			reqCtx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+		}
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+		if err != nil {
+			klog.ErrorS(err, "Failed to create logs request", "url", url)
+			log.Fatalf("Failed to create logs request: %v", err)
+		}
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			klog.ErrorS(err, "Failed to connect to agent", "url", url)
 			log.Fatalf("Failed to connect to agent: %v", err)
@@ -86,7 +103,6 @@ var logsCmd = &cobra.Command{
 			signal.Notify(sigCh, os.Interrupt)
 			<-sigCh
 			resp.Body.Close()
-			os.Exit(0)
 		}()
 
 		if _, err := io.Copy(os.Stdout, resp.Body); err != nil {
@@ -116,9 +132,7 @@ func startPortForward(podName, namespace string) (int, *exec.Cmd, error) {
 	fmt.Printf("Forwarding local port %d to pod %s...\n", port, podName)
 
 	// todo change port
-	cmd := exec.Command("kubectl", "port-forward", fmt.Sprintf("pod/%s", podName), fmt.Sprintf("%d:5758", port), "-n", namespace)
-	cmd.Stdout = os.Stdout // Debug usage
-	cmd.Stderr = os.Stderr
+	cmd := newPortForwardCommand(podName, namespace, port)
 
 	if err := cmd.Start(); err != nil {
 		return 0, nil, err
@@ -135,4 +149,11 @@ func startPortForward(podName, namespace string) (int, *exec.Cmd, error) {
 
 	cmd.Process.Kill()
 	return 0, nil, fmt.Errorf("timed out waiting for port-forward")
+}
+
+func newPortForwardCommand(podName, namespace string, port int) *exec.Cmd {
+	cmd := exec.Command("kubectl", "port-forward", fmt.Sprintf("pod/%s", podName), fmt.Sprintf("%d:5758", port), "-n", namespace)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd
 }

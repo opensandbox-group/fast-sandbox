@@ -2,11 +2,12 @@ package secureruntime
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
-	"fast-sandbox/test/e2e/support/envcheck"
+	e2eenv "fast-sandbox/test/e2e/env"
 	"fast-sandbox/test/e2e/support/fixtures"
 	"fast-sandbox/test/e2e/support/suiteenv"
 
@@ -17,31 +18,14 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/features"
 )
 
-// getEnvChecker returns the global environment checker.
-func getEnvChecker(t *testing.T) *envcheck.Checker {
-	t.Helper()
-	checker, err := envcheck.GetChecker()
-	if err != nil {
-		t.Fatalf("create env checker: %v", err)
-	}
-	return checker
-}
-
 func TestKataQemuSandbox(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	manager := suiteenv.RequireKataQemu(t)
+	cliBinaryPath := buildFSBCtl(t, manager)
 
 	feature := features.New("kata-qemu-sandbox").
 		WithLabel("suite", "secureruntime").
 		WithLabel("runtime", "kata").
 		Assess("Kata QEMU pool creates sandbox successfully", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
-			// Check if kata-qemu should run in this environment
-			checker := getEnvChecker(t)
-			shouldRun, reason := checker.ShouldRunKataQemu(ctx)
-			if !shouldRun {
-				t.Skipf("kata-qemu test skipped: %s", reason)
-			}
-			t.Logf("Running kata-qemu test: %s", reason)
-
 			k8sClient := testSuite.MustKubeClient(t)
 			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
 
@@ -63,22 +47,17 @@ func TestKataQemuSandbox(t *testing.T) {
 			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
 				t.Fatalf("wait for ready agent pods: %v", err)
 			}
+			waitForAgentRegistrySync(t)
 
-			// Create sandbox
-			sandbox := newSecureRuntimeSandbox(namespace, "sb-kata-qemu", pool.Name)
-			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox); err != nil {
-				t.Fatalf("create sandbox: %v", err)
+			ctl := newFSBCtlForNamespace(ctx, t, cliBinaryPath, namespace)
+			if output, err := ctl.Run(ctx, "sb-kata-qemu", secureRuntimeFSBCtlConfig(pool.Name)); err != nil {
+				t.Fatalf("fsb-ctl run kata-qemu sandbox: %v\noutput: %s", err, output)
 			}
 
-			// Wait for sandbox running (Kata takes longer)
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 120*time.Second)
 			defer cancelRunWait()
-			_, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedPod != "" &&
-					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
-			})
-			if err != nil {
-				t.Fatalf("wait for running sandbox: %v", err)
+			if _, err := ctl.WaitRunning(runCtx, "sb-kata-qemu"); err != nil {
+				t.Fatalf("wait for kata-qemu sandbox running via fsb-ctl: %v", err)
 			}
 
 			return ctx
@@ -89,20 +68,22 @@ func TestKataQemuSandbox(t *testing.T) {
 }
 
 func TestKataFcSandbox(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	// TODO(kata-fc): Enable this by default after the remote kind/Firecracker
+	// environment can boot a plain RuntimeClass=kata-fc pod. On 2026-05-04 the
+	// minimal pod failed before fast-sandbox with FailedCreatePodSandBox:
+	// "timed out connecting to hybrid vsocket .../root/kata.hvsock". Real
+	// kernel/image paths, disabling jailer, and dial_timeout=120 did not fix it.
+	if os.Getenv("FAST_SANDBOX_E2E_KATA_FC") != "1" {
+		t.Skip("TODO(kata-fc): Firecracker profile is currently opt-in; set FAST_SANDBOX_E2E_KATA_FC=1 to investigate the hvsock boot issue")
+	}
+
+	manager := suiteenv.RequireKataFc(t)
+	cliBinaryPath := buildFSBCtl(t, manager)
 
 	feature := features.New("kata-fc-sandbox").
 		WithLabel("suite", "secureruntime").
 		WithLabel("runtime", "kata-fc").
 		Assess("Kata Firecracker pool creates sandbox successfully", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
-			// Check if kata-fc should run in this environment
-			checker := getEnvChecker(t)
-			shouldRun, reason := checker.ShouldRunKataFc(ctx)
-			if !shouldRun {
-				t.Skipf("kata-fc test skipped: %s", reason)
-			}
-			t.Logf("Running kata-fc test: %s", reason)
-
 			k8sClient := testSuite.MustKubeClient(t)
 			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
 
@@ -122,20 +103,17 @@ func TestKataFcSandbox(t *testing.T) {
 			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
 				t.Fatalf("wait for ready agent pods: %v", err)
 			}
+			waitForAgentRegistrySync(t)
 
-			sandbox := newSecureRuntimeSandbox(namespace, "sb-kata-fc", pool.Name)
-			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox); err != nil {
-				t.Fatalf("create sandbox: %v", err)
+			ctl := newFSBCtlForNamespace(ctx, t, cliBinaryPath, namespace)
+			if output, err := ctl.Run(ctx, "sb-kata-fc", secureRuntimeFSBCtlConfig(pool.Name)); err != nil {
+				t.Fatalf("fsb-ctl run kata-fc sandbox: %v\noutput: %s", err, output)
 			}
 
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelRunWait()
-			_, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedPod != "" &&
-					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
-			})
-			if err != nil {
-				t.Fatalf("wait for running sandbox: %v", err)
+			if _, err := ctl.WaitRunning(runCtx, "sb-kata-fc"); err != nil {
+				t.Fatalf("wait for kata-fc sandbox running via fsb-ctl: %v", err)
 			}
 
 			return ctx
@@ -146,20 +124,13 @@ func TestKataFcSandbox(t *testing.T) {
 }
 
 func TestKataClhSandbox(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	manager := suiteenv.RequireKataClh(t)
+	cliBinaryPath := buildFSBCtl(t, manager)
 
 	feature := features.New("kata-clh-sandbox").
 		WithLabel("suite", "secureruntime").
 		WithLabel("runtime", "kata-clh").
 		Assess("Kata Cloud Hypervisor pool creates sandbox successfully", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
-			// Check if kata-clh should run in this environment
-			checker := getEnvChecker(t)
-			shouldRun, reason := checker.ShouldRunKataClh(ctx)
-			if !shouldRun {
-				t.Skipf("kata-clh test skipped: %s", reason)
-			}
-			t.Logf("Running kata-clh test: %s", reason)
-
 			k8sClient := testSuite.MustKubeClient(t)
 			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
 
@@ -179,20 +150,17 @@ func TestKataClhSandbox(t *testing.T) {
 			if _, err := fixture.WaitForReadyAgentPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
 				t.Fatalf("wait for ready agent pods: %v", err)
 			}
+			waitForAgentRegistrySync(t)
 
-			sandbox := newSecureRuntimeSandbox(namespace, "sb-kata-clh", pool.Name)
-			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox); err != nil {
-				t.Fatalf("create sandbox: %v", err)
+			ctl := newFSBCtlForNamespace(ctx, t, cliBinaryPath, namespace)
+			if output, err := ctl.Run(ctx, "sb-kata-clh", secureRuntimeFSBCtlConfig(pool.Name)); err != nil {
+				t.Fatalf("fsb-ctl run kata-clh sandbox: %v\noutput: %s", err, output)
 			}
 
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelRunWait()
-			_, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedPod != "" &&
-					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
-			})
-			if err != nil {
-				t.Fatalf("wait for running sandbox: %v", err)
+			if _, err := ctl.WaitRunning(runCtx, "sb-kata-clh"); err != nil {
+				t.Fatalf("wait for kata-clh sandbox running via fsb-ctl: %v", err)
 			}
 
 			return ctx
@@ -200,4 +168,50 @@ func TestKataClhSandbox(t *testing.T) {
 		Feature()
 
 	testSuite.Env().Test(t, feature)
+}
+
+func buildFSBCtl(t *testing.T, manager *e2eenv.Manager) string {
+	t.Helper()
+
+	cliBinaryPath, err := manager.BuildFSBCtl(context.Background())
+	if err != nil {
+		t.Fatalf("build fsb-ctl binary: %v", err)
+	}
+	return cliBinaryPath
+}
+
+func newFSBCtlForNamespace(ctx context.Context, t *testing.T, cliBinaryPath, namespace string) *e2eenv.FSBCtl {
+	t.Helper()
+
+	endpoint, pf, err := e2eenv.StartControllerPortForward(ctx, testSuite.ControllerNamespace())
+	if err != nil {
+		t.Fatalf("start controller port-forward: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := pf.Cleanup(); err != nil {
+			t.Logf("cleanup controller port-forward: %v", err)
+		}
+	})
+
+	return e2eenv.NewFSBCtl(
+		e2eenv.WithFSBCtlBinary(cliBinaryPath),
+		e2eenv.WithFSBCtlEndpoint(endpoint),
+		e2eenv.WithFSBCtlNamespace(namespace),
+	)
+}
+
+func secureRuntimeFSBCtlConfig(poolName string) e2eenv.FSBCtlConfig {
+	return e2eenv.FSBCtlConfig{
+		Image:           "docker.io/library/alpine:latest",
+		PoolRef:         poolName,
+		ConsistencyMode: "strong",
+		Command:         []string{"/bin/sleep"},
+		Args:            []string{"60"},
+	}
+}
+
+func waitForAgentRegistrySync(t *testing.T) {
+	t.Helper()
+	t.Log("waiting for agent capacity to sync to controller registry")
+	time.Sleep(8 * time.Second)
 }

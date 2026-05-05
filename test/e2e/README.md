@@ -1,123 +1,221 @@
-# Fast Sandbox E2E Tests
+# Fast Sandbox E2E 测试
 
-`test/e2e` 正在重构为标准的 Kubernetes 风格 E2E 结构。
+`test/e2e` 包含 Fast Sandbox 的端到端测试。这些测试会创建真实的 Kubernetes 资源，构建并加载项目镜像，并在 kind 集群中验证 controller、agent、`fsb-ctl`、gVisor 和 Kata 的行为。
 
-目标边界很明确：
+所有可执行的 e2e 测试用例均位于 `test/e2e/suites`。Go 测试会自动准备对应的运行环境，因此可以从 IDE 或命令行直接执行单个测试用例，无需预先手动执行 setup 脚本。
 
-- `hack/` 只负责环境准备
-- `suites/` 是唯一的可执行 E2E 入口
-- `support/` 放 fast-sandbox 领域的 E2E 支撑代码
-- `legacy/` 只保留旧 shell case 作为参考
+## 测试目录
 
-## 目录职责
+| 目录 | Profile | 覆盖内容 |
+| --- | --- | --- |
+| `suites/basicvalidation` | `basic` | CRD 校验、namespace 隔离、端口、环境变量、工作目录、fast-path 环境传递 |
+| `suites/lifecycle` | `basic` | sandbox 生命周期、优雅关闭 |
+| `suites/scheduling` | `basic` | 端口互斥、资源槽容量、自动扩缩容 |
+| `suites/cleanupjanitor` | `basic` | namespace 感知清理、janitor 恢复 |
+| `suites/advancedfeatures` | `basic` | infra 注入 |
+| `suites/cliintegration` | `basic` | `fsb-ctl update`、`reset`、`logs`、`run` |
+| `suites/faultrecovery` | `basic` | 自动过期、内存泄漏防护、受控恢复、Pod 存在性检查 |
+| `suites/secureruntime` | `basic`、`gvisor`、`kata-qemu`、`kata-clh`、`kata-fc` | RuntimeClass 校验、gVisor、Kata QEMU、Kata Cloud Hypervisor、Firecracker 调查 |
 
-### `test/e2e/hack/`
+支撑代码组织如下：
 
-Shell 脚本只做这些事：
+- `env`: profile 自动 setup、kind 集群准备、runtime 配置、镜像加载、组件部署、`fsb-ctl` 封装
+- `manifests`: profile 使用的 kind 和 RuntimeClass manifest
+- `support`: fixture、CLI client、诊断、port-forward、suite 环境工具
 
-- kind 集群创建和销毁
-- 镜像构建和加载
-- controller / agent / janitor 安装
-- webhook 或 chaos 辅助环境准备
+## 运行要求
 
-Shell 不再承载业务断言。
+执行这些测试需要 Linux 开发机，并安装以下工具：
 
-### `test/e2e/suites/`
+- Go
+- Docker
+- kind
+- kubectl
+- make
 
-所有真正的 E2E case 都应放在这里，并使用 Go 编写。这里会逐步切换到 `sigs.k8s.io/e2e-framework` 风格的 suite。
+如果在 macOS 上开发，不应在本地直接执行 kind、gVisor、Kata 或 container runtime 相关测试。请按照仓库根目录 `AGENTS.md` 的说明，通过远端 Linux VM 运行。
 
-当前已迁移的测试套件：
-
-| Suite | Tests | Description |
-|-------|-------|-------------|
-| `basicvalidation` | 5 | CRD 验证、namespace 隔离、端口验证、环境变量/工作目录 |
-| `lifecycle` | 2 | 基础生命周期、优雅关闭 |
-| `scheduling` | 3 | 端口互斥、资源槽容量、自动扩缩容 |
-| `cleanupjanitor` | 2 | Namespace 感知、Janitor 恢复 |
-| `advancedfeatures` | 1 | Infra 注入验证 |
-| `cliintegration` | 3 | fsb-ctl update/reset/logs 命令测试 |
-| `faultrecovery` | 4 | 自动过期、内存泄漏防护、受控恢复、Pod 存在性检查 |
-
-### `test/e2e/support/`
-
-这里放仓库专用的 E2E 支撑能力，例如：
-
-- `SandboxPool` / `Sandbox` fixture
-- CLI 调用封装
-- port-forward 管理
-- diagnostics 转储
-- suite 级环境 bootstrap
-
-### 旧 shell 目录
-
-当前 `01-basic-validation` 到 `07-fault-recovery` 仍然存在，但它们会被逐步降级为 legacy source。新的行为实现不应该继续写进这些目录。
-
-## 运行入口
-
-### 前置条件
-
-1. **Kubernetes 集群**：需要有可访问的 K8s 集群，并配置好 kubeconfig
-2. **Controller 已部署**：fast-sandbox-controller 需要运行在集群中
-3. **环境变量**：
-   - `FAST_SANDBOX_E2E=1` - 必须，否则测试会跳过
-   - `FAST_SANDBOX_AGENT_IMAGE` 或 `AGENT_IMAGE` - Agent 镜像地址（默认 `fast-sandbox/agent:dev`）
-   - `KUBECONFIG` - kubeconfig 文件路径（可选，默认使用 `~/.kube/config`）
-
-### 运行所有测试
+测试默认构建并加载这些镜像：
 
 ```bash
-# 设置环境变量
-export FAST_SANDBOX_E2E=1
-export FAST_SANDBOX_AGENT_IMAGE=fast-sandbox/agent:dev
-
-# 运行所有测试套件
-go test ./test/e2e/suites/... -v
-
-# 运行特定套件
-go test ./test/e2e/suites/basicvalidation/... -v
-go test ./test/e2e/suites/lifecycle/... -v
-go test ./test/e2e/suites/scheduling/... -v
-go test ./test/e2e/suites/cleanupjanitor/... -v
-go test ./test/e2e/suites/advancedfeatures/... -v
-go test ./test/e2e/suites/cliintegration/... -v
-go test ./test/e2e/suites/faultrecovery/... -v
-
-# 运行单个测试
-go test ./test/e2e/suites/basicvalidation/... -v -run TestCRDValidation
+fast-sandbox/controller:dev
+fast-sandbox/agent:dev
+fast-sandbox/janitor:dev
 ```
 
-### 运行特定标签的测试
+可以通过以下环境变量覆盖 sandbox pool 使用的 agent 镜像：
 
 ```bash
-# 只运行 smoke 级别的测试
-go test ./test/e2e/suites/... -v --label-filter=tier=smoke
+FAST_SANDBOX_AGENT_IMAGE=my-registry/agent:tag
 ```
 
-### Makefile 目标（如果已配置）
+## 运行测试
+
+运行所有 suite：
 
 ```bash
-make e2e-smoke
-make e2e-cli
+go test ./test/e2e/suites/... -v -count=1 -timeout 30m
 ```
 
-当前仓库仍保留旧 shell 结构，但新的权威方向已经是 `hack + suites + support`。
-
-## 调试技巧
-
-查看 Controller 日志：
+运行单个 suite：
 
 ```bash
-kubectl logs -l app=fast-sandbox-controller -n fast-sandbox-system --tail=50
+go test ./test/e2e/suites/basicvalidation/... -v -count=1
+go test ./test/e2e/suites/cliintegration/... -v -count=1
+go test ./test/e2e/suites/secureruntime/... -v -count=1 -timeout 30m
 ```
 
-查看 Agent 日志：
+运行单个测试用例：
 
 ```bash
-kubectl logs -l app=sandbox-agent -n <namespace> --all-containers --tail=50
+go test ./test/e2e/suites/basicvalidation/... -run 'TestSandboxCRDValidation$' -v -count=1
+go test ./test/e2e/suites/secureruntime/... -run 'TestKataQemuSandbox$' -v -count=1 -timeout 30m
+go test ./test/e2e/suites/secureruntime/... -run 'TestGVisorSandbox$' -v -count=1 -timeout 30m
 ```
 
-查看 Sandbox 状态：
+也可以使用 Makefile 入口：
 
 ```bash
-kubectl get sandbox <name> -n <namespace> -o yaml
+make test-e2e
+make test-e2e-basicvalidation
+make test-e2e-cliintegration
+make test-e2e-secureruntime
 ```
+
+## 单独准备环境
+
+默认情况下无需提前准备环境。测试中的 `suiteenv.Require*` 会自动完成 setup。如需单独准备某个 profile，可以执行：
+
+```bash
+go run ./test/e2e/env/cmd/setup -profile basic
+go run ./test/e2e/env/cmd/setup -profile gvisor
+go run ./test/e2e/env/cmd/setup -profile kata-qemu
+go run ./test/e2e/env/cmd/setup -profile kata-clh
+```
+
+Makefile 入口：
+
+```bash
+E2E_PROFILE=basic make setup-e2e
+E2E_PROFILE=kata-qemu make setup-e2e
+```
+
+Profile 与 kind 集群对应关系：
+
+| Profile | 集群 | 说明 |
+| --- | --- | --- |
+| `basic` | `fsb-e2e-basic` | 默认 container runtime |
+| `gvisor` | `fsb-e2e-gvisor` | 配置 `runsc` RuntimeClass |
+| `kata-qemu` | `fsb-e2e-kata` | 配置 Kata QEMU RuntimeClass |
+| `kata-clh` | `fsb-e2e-kata` | 配置 Kata Cloud Hypervisor RuntimeClass |
+| `kata-fc` | `fsb-e2e-kata` | Firecracker 目前为 opt-in 调查项 |
+
+## 在 IDE 里调试
+
+可以打开 `test/e2e/suites` 下的任意测试文件，并在 IDE 中运行或调试单个 `Test*`。测试进入用例主体前会调用：
+
+```go
+suiteenv.RequireBasic(t)
+suiteenv.RequireGVisor(t)
+suiteenv.RequireKataQemu(t)
+suiteenv.RequireKataClh(t)
+suiteenv.RequireKataFc(t)
+```
+
+如果缺少命令、宿主机设备或 runtime 二进制，测试会在 setup 阶段返回明确错误。gVisor 或 Kata 缺少 RuntimeClass 会被视为环境准备失败，不会被静默跳过。
+
+## Secure Runtime 说明
+
+gVisor 需要宿主机提供以下可执行文件。默认路径：
+
+```bash
+/usr/local/bin/runsc
+/usr/local/bin/containerd-shim-runsc-v1
+```
+
+需要覆盖默认路径时：
+
+```bash
+GVISOR_RUNSC_BIN=/path/to/runsc \
+GVISOR_SHIM_BIN=/path/to/containerd-shim-runsc-v1 \
+go test ./test/e2e/suites/secureruntime/... -run 'TestGVisorSandbox$' -v -count=1
+```
+
+Kata profile 需要宿主机支持 nested virtualization，并提供以下路径：
+
+```text
+/dev/kvm
+/sys/devices/virtual/misc/kvm
+/dev/vhost-vsock
+/sys/devices/virtual/misc/vhost-vsock
+/dev/vhost-net
+/sys/devices/virtual/misc/vhost-net
+/dev/net/tun
+/dev/shm
+```
+
+Kata 静态包默认配置：
+
+```bash
+KATA_VERSION=3.27.0
+KATA_ARCH=amd64
+KATA_CACHE_DIR=$HOME/.cache
+DATA_DIR=$HOME/data
+```
+
+`kata-fc` 当前默认跳过。2026-05-04 在远端 kind 环境中，最小 `RuntimeClass=kata-fc` pod 在 Fast Sandbox 介入前即失败，表现为 Firecracker hybrid vsock `/root/kata.hvsock` 连接超时。如需显式调查：
+
+```bash
+FAST_SANDBOX_E2E_KATA_FC=1 \
+go test ./test/e2e/suites/secureruntime/... -run 'TestKataFcSandbox$' -v -count=1 -timeout 30m
+```
+
+## 故障排查
+
+查看当前 context 和 Pod 状态：
+
+```bash
+kubectl config current-context
+kubectl get pods -A -o wide
+```
+
+如果 kube-proxy 或 kind node systemd 出现 `Too many open files`，需要调大 Linux 宿主机的 inotify 限制：
+
+```bash
+sudo sysctl -w fs.inotify.max_user_instances=1024
+```
+
+查看 controller 日志：
+
+```bash
+kubectl logs deployment/fast-sandbox-controller --tail=120
+```
+
+查看资源状态：
+
+```bash
+kubectl get sandbox -A
+kubectl get sandboxpool -A
+```
+
+如需完全重置某个 profile，可以删除对应的 kind 集群：
+
+```bash
+kind delete cluster --name fsb-e2e-basic
+kind delete cluster --name fsb-e2e-gvisor
+kind delete cluster --name fsb-e2e-kata
+```
+
+## 新增测试规范
+
+新增面向用户行为的 e2e 测试用例时，应放置在 `test/e2e/suites/<suite>`。在测试入口选择所需 profile：
+
+```go
+suiteenv.RequireBasic(t)
+suiteenv.RequireGVisor(t)
+suiteenv.RequireKataQemu(t)
+suiteenv.RequireKataClh(t)
+suiteenv.RequireKataFc(t)
+```
+
+创建 sandbox 的用户路径应优先使用 `fsb-ctl`。只有当测试用例明确验证 CRD 或 controller 内部行为时，才直接使用 Kubernetes client fixture。

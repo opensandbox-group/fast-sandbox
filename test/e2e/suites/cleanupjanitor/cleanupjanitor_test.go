@@ -17,7 +17,7 @@ import (
 )
 
 func TestNamespaceAware(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("namespace-aware").
 		WithLabel("suite", "cleanupjanitor").
@@ -74,7 +74,7 @@ func TestNamespaceAware(t *testing.T) {
 }
 
 func TestJanitorRecovery(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("janitor-recovery").
 		WithLabel("suite", "cleanupjanitor").

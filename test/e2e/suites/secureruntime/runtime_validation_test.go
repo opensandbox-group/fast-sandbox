@@ -17,7 +17,7 @@ import (
 )
 
 func TestInvalidRuntimeClass(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("invalid-runtime-class").
 		WithLabel("suite", "secureruntime").
@@ -122,7 +122,7 @@ func TestInvalidRuntimeClass(t *testing.T) {
 }
 
 func TestContainerRuntimeDefault(t *testing.T) {
-	suiteenv.SkipUnlessEnabled(t)
+	suiteenv.RequireBasic(t)
 
 	feature := features.New("container-runtime-default").
 		WithLabel("suite", "secureruntime").

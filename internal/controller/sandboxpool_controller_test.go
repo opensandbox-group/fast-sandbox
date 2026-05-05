@@ -104,25 +104,25 @@ func TestGetContainerdRuntimeHandler(t *testing.T) {
 			expected: "io.containerd.runsc.v1",
 		},
 		{
-			name: "kata-qemu returns kata-qemu handler",
+			name: "kata-qemu returns kata v2 runtime",
 			pool: &apiv1alpha1.SandboxPool{
 				Spec: apiv1alpha1.SandboxPoolSpec{RuntimeType: apiv1alpha1.RuntimeKataQemu},
 			},
-			expected: "io.containerd.kata-qemu.v2",
+			expected: "io.containerd.kata.v2",
 		},
 		{
-			name: "kata-fc returns kata-fc handler",
+			name: "kata-fc returns kata v2 runtime",
 			pool: &apiv1alpha1.SandboxPool{
 				Spec: apiv1alpha1.SandboxPoolSpec{RuntimeType: apiv1alpha1.RuntimeKataFc},
 			},
-			expected: "io.containerd.kata-fc.v2",
+			expected: "io.containerd.kata.v2",
 		},
 		{
-			name: "kata-clh returns kata-clh handler",
+			name: "kata-clh returns kata v2 runtime",
 			pool: &apiv1alpha1.SandboxPool{
 				Spec: apiv1alpha1.SandboxPoolSpec{RuntimeType: apiv1alpha1.RuntimeKataClh},
 			},
-			expected: "io.containerd.kata-clh.v2",
+			expected: "io.containerd.kata.v2",
 		},
 		{
 			name: "custom handler overrides default",
