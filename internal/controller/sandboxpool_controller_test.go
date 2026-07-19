@@ -323,6 +323,76 @@ func TestConstructPodAddsKVMWithoutRuntimeClass(t *testing.T) {
 	require.True(t, hasHostPath(pod, "/opt/kata"))
 }
 
+func TestConstructPodInjectsBoxLiteRuntimeSidecarAsResourceOwner(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha1.AddToScheme(scheme))
+	reconciler := &SandboxPoolReconciler{
+		Scheme: scheme, Catalog: runtimecatalog.Builtin(),
+		FastletProxyImage: "fastlet-proxy:test", BoxLiteRuntimeImage: "boxlite-runtime:test",
+	}
+	pool := &apiv1alpha1.SandboxPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "boxlite-pool", Namespace: "default", UID: types.UID("pool-uid")},
+		Spec: apiv1alpha1.SandboxPoolSpec{
+			Runtime: apiv1alpha1.RuntimeBoxLite, MaxSandboxesPerPod: 3,
+			SandboxResources: apiv1alpha1.SandboxResourceProfile{
+				CPU: resource.MustParse("1"), Memory: resource.MustParse("1Gi"), PIDs: 128,
+			},
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}},
+			}},
+		},
+	}
+	profile, err := reconciler.resolveRuntimeProfile(pool)
+	require.NoError(t, err)
+	pod, err := reconciler.constructPod(pool, profile)
+	require.NoError(t, err)
+	require.Len(t, pod.Spec.Containers, 3)
+
+	fastlet := containerForName(t, pod, "fastlet")
+	boxLite := containerForName(t, pod, "boxlite-runtime")
+	require.Equal(t, "boxlite-runtime:test", boxLite.Image)
+	require.False(t, *fastlet.SecurityContext.Privileged)
+	require.True(t, *boxLite.SecurityContext.Privileged)
+	require.Empty(t, fastlet.Resources.Requests)
+	cpu := boxLite.Resources.Requests[corev1.ResourceCPU]
+	memory := boxLite.Resources.Requests[corev1.ResourceMemory]
+	require.Equal(t, "3200m", cpu.String())
+	require.Equal(t, "3328Mi", memory.String())
+	require.Equal(t, "boxlite-runtime", resourceFieldContainer(fastlet.Env, "CPU_LIMIT"))
+	require.Equal(t, "boxlite-runtime", resourceFieldContainer(fastlet.Env, "MEMORY_LIMIT"))
+	require.Equal(t, "/run/fast-sandbox/boxlite/runtime.sock", envValueFromArgs(boxLite.Args, "--socket"))
+	require.Equal(t, "/var/lib/fast-sandbox/boxlite", envValueFromArgs(boxLite.Args, "--state-root"))
+	require.Equal(t, []string{
+		"/usr/local/bin/boxlite-runtime", "--probe-socket", "/run/fast-sandbox/boxlite/runtime.sock",
+	}, boxLite.ReadinessProbe.Exec.Command)
+	require.NotNil(t, volumeMountForNamedContainer(t, pod, "fastlet", "boxlite-control"))
+	require.NotNil(t, volumeMountForNamedContainer(t, pod, "boxlite-runtime", "boxlite-control"))
+	require.True(t, volumeMountForNamedContainer(t, pod, "boxlite-runtime", "infra-tools").ReadOnly)
+	require.NotNil(t, volumeMountForNamedContainer(t, pod, "boxlite-runtime", "dev-kvm"))
+	require.NotNil(t, volumeMountForNamedContainer(t, pod, "boxlite-runtime", "boxlite-state"))
+	require.Nil(t, volumeMountForNamedContainer(t, pod, "fastlet", "dev-kvm"))
+}
+
+func TestConstructPodRejectsPlatformBoxLiteSidecarOverride(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha1.AddToScheme(scheme))
+	reconciler := &SandboxPoolReconciler{Scheme: scheme, Catalog: runtimecatalog.Builtin()}
+	pool := &apiv1alpha1.SandboxPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default", UID: types.UID("pool-uid")},
+		Spec: apiv1alpha1.SandboxPoolSpec{
+			Runtime: apiv1alpha1.RuntimeContainer,
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
+				{Name: "fastlet", Image: "fastlet:test"},
+				{Name: "boxlite-runtime", Image: "user-controlled:test"},
+			}}},
+		},
+	}
+	profile, err := reconciler.resolveRuntimeProfile(pool)
+	require.NoError(t, err)
+	_, err = reconciler.constructPod(pool, profile)
+	require.ErrorContains(t, err, "platform-owned sidecar name")
+}
+
 func TestConstructPodRejectsInfraArtifactStorageOverride(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, apiv1alpha1.AddToScheme(scheme))
@@ -385,4 +455,44 @@ func volumeMountForContainer(pod *corev1.Pod, container int, name string) *corev
 		}
 	}
 	return nil
+}
+
+func containerForName(t *testing.T, pod *corev1.Pod, name string) *corev1.Container {
+	t.Helper()
+	for index := range pod.Spec.Containers {
+		if pod.Spec.Containers[index].Name == name {
+			return &pod.Spec.Containers[index]
+		}
+	}
+	t.Fatalf("container %q was not found", name)
+	return nil
+}
+
+func volumeMountForNamedContainer(t *testing.T, pod *corev1.Pod, containerName, volumeName string) *corev1.VolumeMount {
+	t.Helper()
+	container := containerForName(t, pod, containerName)
+	for index := range container.VolumeMounts {
+		if container.VolumeMounts[index].Name == volumeName {
+			return &container.VolumeMounts[index]
+		}
+	}
+	return nil
+}
+
+func resourceFieldContainer(env []corev1.EnvVar, name string) string {
+	for _, item := range env {
+		if item.Name == name && item.ValueFrom != nil && item.ValueFrom.ResourceFieldRef != nil {
+			return item.ValueFrom.ResourceFieldRef.ContainerName
+		}
+	}
+	return ""
+}
+
+func envValueFromArgs(args []string, name string) string {
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == name {
+			return args[index+1]
+		}
+	}
+	return ""
 }

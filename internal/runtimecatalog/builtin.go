@@ -59,15 +59,15 @@ func builtinProfiles() map[apiv1alpha1.RuntimeName]RuntimeProfile {
 				DefaultVCPUs: 1, DefaultMemory: "1Gi",
 			},
 			Deployment: DeploymentRequirements{
-				Privileged: true, RequiresKVM: true, Overhead: overhead("200m", "256Mi"),
+				Privileged: true, RequiresKVM: true, Sidecar: "boxlite-runtime", ResourceOwner: "boxlite-runtime", Overhead: overhead("200m", "256Mi"),
 				HostPaths: []HostPathRequirement{
 					{Name: "dev-kvm", HostPath: "/dev/kvm", MountPath: "/dev/kvm", Type: corev1.HostPathCharDev},
 					{Name: "boxlite-state", HostPath: "/var/lib/fast-sandbox/boxlite", MountPath: "/var/lib/fast-sandbox/boxlite", Type: corev1.HostPathDirectoryOrCreate},
 				},
 			},
-			Capabilities:       Capabilities{DefaultState: CapabilityUnsupported, SupportsNetwork: true, SupportsRecovery: true, Reason: "BoxLiteRuntimeSidecarNotPackaged"},
+			Capabilities:       Capabilities{DefaultState: CapabilityUnsupported, SupportsNetwork: true, SupportsRecovery: true, Reason: "BoxLiteResourceEnforcementIncomplete"},
 			NetworkMode:        NetworkModeBoxLite,
-			InfraDeliveryModes: []InfraDeliveryMode{InfraDeliveryTemplateBake, InfraDeliveryPreinstalled, InfraDeliveryGuestCopy},
+			InfraDeliveryModes: []InfraDeliveryMode{InfraDeliveryTemplateBake, InfraDeliveryPreinstalled, InfraDeliveryArtifactVolume},
 		},
 	}
 }

@@ -34,11 +34,12 @@ const (
 type InfraDeliveryMode string
 
 const (
-	InfraDeliveryBindMount    InfraDeliveryMode = "bind-mount"
-	InfraDeliveryImageLayer   InfraDeliveryMode = "image-layer"
-	InfraDeliveryPreinstalled InfraDeliveryMode = "preinstalled"
-	InfraDeliveryTemplateBake InfraDeliveryMode = "template-bake"
-	InfraDeliveryGuestCopy    InfraDeliveryMode = "guest-copy"
+	InfraDeliveryBindMount      InfraDeliveryMode = "bind-mount"
+	InfraDeliveryImageLayer     InfraDeliveryMode = "image-layer"
+	InfraDeliveryPreinstalled   InfraDeliveryMode = "preinstalled"
+	InfraDeliveryTemplateBake   InfraDeliveryMode = "template-bake"
+	InfraDeliveryGuestCopy      InfraDeliveryMode = "guest-copy"
+	InfraDeliveryArtifactVolume InfraDeliveryMode = "artifact-volume"
 )
 
 type CapabilityState string
@@ -80,11 +81,13 @@ type HostPathRequirement struct {
 }
 
 type DeploymentRequirements struct {
-	Privileged   bool                  `json:"privileged"`
-	RequiresKVM  bool                  `json:"requiresKVM,omitempty"`
-	NodeSelector map[string]string     `json:"nodeSelector,omitempty"`
-	HostPaths    []HostPathRequirement `json:"hostPaths,omitempty"`
-	Overhead     corev1.ResourceList   `json:"overhead,omitempty"`
+	Privileged    bool                  `json:"privileged"`
+	RequiresKVM   bool                  `json:"requiresKVM,omitempty"`
+	Sidecar       string                `json:"sidecar,omitempty"`
+	ResourceOwner string                `json:"resourceOwner,omitempty"`
+	NodeSelector  map[string]string     `json:"nodeSelector,omitempty"`
+	HostPaths     []HostPathRequirement `json:"hostPaths,omitempty"`
+	Overhead      corev1.ResourceList   `json:"overhead,omitempty"`
 }
 
 type Capabilities struct {

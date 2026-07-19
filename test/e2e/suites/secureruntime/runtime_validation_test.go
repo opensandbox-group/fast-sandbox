@@ -26,7 +26,7 @@ func TestRuntimeValidationUnsupportedBoxLite(t *testing.T) {
 	feature := features.New("boxlite-sidecar-capability-gate").
 		WithLabel("suite", "secureruntime").
 		WithLabel("tier", "validation").
-		Assess("BoxLite remains fail closed until its runtime sidecar is packaged", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+		Assess("BoxLite remains fail closed until required resource limits are enforced", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
 			k8sClient := testSuite.MustKubeClient(t)
 			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
 
@@ -37,7 +37,7 @@ func TestRuntimeValidationUnsupportedBoxLite(t *testing.T) {
 			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
 
 			// BoxLite has an independent pure-Go RuntimeDriver client, but remains
-			// unsupported until the native sidecar and guest tunnel are packaged.
+			// unsupported until the Sidecar can enforce the full resource contract.
 			pool := &apiv1alpha1.SandboxPool{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: apiv1alpha1.GroupVersion.String(),
@@ -115,7 +115,7 @@ func TestRuntimeValidationUnsupportedBoxLite(t *testing.T) {
 			if runtimeReady.Reason != apiv1alpha1.ReasonRuntimeUnsupported {
 				t.Errorf("expected Reason to be RuntimeUnsupported, got: %v", runtimeReady.Reason)
 			}
-			if runtimeReady.Message != "BoxLiteRuntimeSidecarNotPackaged" {
+			if runtimeReady.Message != "BoxLiteResourceEnforcementIncomplete" {
 				t.Errorf("unexpected BoxLite capability message: %q", runtimeReady.Message)
 			}
 

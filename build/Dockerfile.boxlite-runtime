@@ -1,0 +1,40 @@
+FROM golang:1.25-bookworm AS builder
+
+ARG GOPROXY=https://proxy.golang.org,direct
+ARG BOXLITE_SDK_VERSION=v0.9.7
+ARG BOXLITE_NATIVE_URL=https://github.com/boxlite-ai/boxlite/releases/download/v0.9.7/boxlite-c-v0.9.7-linux-x64-gnu.tar.gz
+ARG BOXLITE_LIB_SHA256=f94820be26b75d0e60b356ac7f9cea032f5407fe3a54f86128875de09b5eee03
+ARG BOXLITE_HEADER_SHA256=d93bbaccf35a7ac596f1f8d97fe9438953fde36c95ab2ac6429aa72ee6d17d3e
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY go.mod go.sum ./
+RUN GOPROXY=${GOPROXY} go mod download github.com/boxlite-ai/boxlite/sdks/go@${BOXLITE_SDK_VERSION}
+RUN curl --fail --location --retry 3 --output /tmp/boxlite-native.tar.gz "${BOXLITE_NATIVE_URL}" \
+    && mkdir -p /tmp/boxlite-native \
+    && tar -xzf /tmp/boxlite-native.tar.gz -C /tmp/boxlite-native \
+    && lib_path=$(find /tmp/boxlite-native -path '*/lib/libboxlite.a' -print -quit) \
+    && header_path=$(find /tmp/boxlite-native -path '*/include/boxlite.h' -print -quit) \
+    && test -n "${lib_path}" && test -n "${header_path}" \
+    && echo "${BOXLITE_LIB_SHA256}  ${lib_path}" | sha256sum -c - \
+    && echo "${BOXLITE_HEADER_SHA256}  ${header_path}" | sha256sum -c - \
+    && module_dir="$(go env GOMODCACHE)/github.com/boxlite-ai/boxlite/sdks/go@${BOXLITE_SDK_VERSION}" \
+    && chmod u+w "${module_dir}" \
+    && mkdir -p "${module_dir}/include" \
+    && cp "${lib_path}" "${module_dir}/libboxlite.a" \
+    && cp "${header_path}" "${module_dir}/include/boxlite.h" \
+    && chmod -R a-w "${module_dir}" \
+    && rm -rf /tmp/boxlite-native /tmp/boxlite-native.tar.gz
+
+COPY . .
+RUN GOPROXY=${GOPROXY} CGO_ENABLED=1 go build -tags boxlite_native -ldflags='-s -w' -o /out/boxlite-runtime ./cmd/boxlite-runtime
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /out/boxlite-runtime /usr/local/bin/boxlite-runtime
+ENTRYPOINT ["/usr/local/bin/boxlite-runtime"]

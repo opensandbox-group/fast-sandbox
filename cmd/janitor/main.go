@@ -29,6 +29,7 @@ func main() {
 	var orphanTimeout time.Duration
 	var scanInterval time.Duration
 	var networkStateRoot string
+	var boxLiteStateRoot string
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Name of the node this janitor is running on")
@@ -36,6 +37,7 @@ func main() {
 	flag.DurationVar(&orphanTimeout, "orphan-timeout", 30*time.Second, "Minimum age before an orphan resource can be cleaned")
 	flag.DurationVar(&scanInterval, "scan-interval", 2*time.Minute, "Interval for full container scan")
 	flag.StringVar(&networkStateRoot, "network-state-root", "/run/fast-sandbox/network", "Host-mounted Fastlet Linux network state root")
+	flag.StringVar(&boxLiteStateRoot, "boxlite-state-root", "/var/lib/fast-sandbox/boxlite", "Host-mounted BoxLite state root")
 
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -90,6 +92,7 @@ func main() {
 
 	j := janitor.NewJanitor(clientset, ctrdClient, nodeName)
 	j.AddBackend(janitor.NewLinuxNetworkBackend(networkStateRoot, fastletnetwork.NewLinuxNetNSDriver(fastletnetwork.LinuxDriverConfig{})))
+	j.AddBackend(janitor.NewBoxLiteBackend(boxLiteStateRoot))
 	j.K8sClient = k8sClient
 	j.OrphanTimeout = orphanTimeout
 	j.ScanInterval = scanInterval

@@ -1,0 +1,12 @@
+.git
+.idea
+.tools
+.DS_Store
+.remote-dev-run.env
+bin
+config
+docs
+sdk
+test
+vendor
+*.png

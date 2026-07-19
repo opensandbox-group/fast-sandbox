@@ -11,7 +11,7 @@ Sidecar 内部使用 BoxLite Go SDK 的 in-process Runtime。一个长期 Runtim
 
 上游 `boxlite serve` 不能直接作为该 Sidecar。v0.9.7 的 REST create schema 没有 volume 和 port mapping 字段，并且拒绝未知字段；port mapping 只能在 Box 创建时通过 in-process SDK 设置，不能动态增删。它因此无法同时满足 Infra Component 注入和任意 target port 透明代理。
 
-在 Sidecar、guest tunnel 和远端 E2E 完成前，内置 `boxlite` profile 必须保持 fail closed：`RuntimeReady=False/RuntimeUnsupported`，不能只因为节点存在 `/dev/kvm` 或 `boxlite` CLI 就报告 Ready。
+在 Sidecar 能完整执行资源限制并通过远端 E2E 前，内置 `boxlite` profile 必须保持 fail closed：`RuntimeReady=False/RuntimeUnsupported`，不能只因为节点存在 `/dev/kvm`、已打包 Sidecar/guest tunnel 或 `boxlite` CLI 就报告 Ready。
 
 ## 2. 原型比较
 
@@ -48,7 +48,7 @@ Box guest
 Fastlet 与 Sidecar 共享：
 
 - `/run/fast-sandbox/boxlite`：控制 UDS；
-- `/opt/fast-sandbox/infra`：待 GuestCopy 的只读 artifact；
+- `/opt/fast-sandbox/infra`：Sidecar 可见的只读 artifact store；
 - 当前 Pod UID 对应的 BoxLite state 目录。
 
 ## 4. 生命周期协议
@@ -59,6 +59,7 @@ Sidecar UDS protocol 只暴露以下 runtime primitive：
 Probe(version, capabilities)
 EnsureBox(identity, image, process, env, resources, artifacts, tunnel)
 InspectBox(sandboxUID)
+RecoverBox(sandboxUID)
 DeleteBox(identity)
 ListBoxes(ownerFastletPodUID)
 ListImages / PullImage
@@ -71,7 +72,7 @@ ListImages / PullImage
 3. 已存在 Box 的 immutable create spec 不一致时返回 Conflict，不覆盖；
 4. Fastlet 进程重启后重新连接 Sidecar并通过 `ListBoxes` 恢复；
 5. Fastlet Pod UID 改变时禁止接管旧 Box；旧资源只进入 Janitor；
-6. Sidecar 重启时从自己的唯一 `BOXLITE_HOME` 恢复 Runtime，再接受 Fastlet admission；
+6. Sidecar 重启时从自己的唯一 `BOXLITE_HOME` 恢复 Runtime；Fastlet 在发布 Route 前显式调用 `RecoverBox` 重建/确认 guest tunnel；
 7. PIDs 是 Fastlet admission 和 guest policy 的约束。BoxLite v0.9.7 SDK 没有等价 PIDs knob，因此在该约束可验证前 profile 不能宣称资源语义完整。
 
 ## 5. 任意端口的 LocalForward
@@ -92,25 +93,28 @@ ListImages / PullImage
 - 不同 Fastlet Pod 有独立网络 namespace，可以复用同一组 tunnel host ports。
 
 LocalForward 建立失败、preamble 被拒绝或 guest tunnel 未 Ready 都必须使 `DataPlaneReady=False`，不能回退成 PodIP 或预声明用户端口。
+Sidecar/guest tunnel 收到终止信号时会关闭 active relay；长期 HTTP、WebSocket 或 SSE 连接不能阻塞 Runtime 回收。
+
+v0.9.7 还有一个必须显式门禁的限制：Go SDK 会拒绝非空 `HostIP`，native port forward 固定绑定所有 host interfaces。因此把 AccessDescriptor 写成 `127.0.0.1:<port>` 并不能阻止其他 Pod 直接访问 Fastlet PodIP 上的同一端口。当前功能 spike 已证明动态转发可行，但 `local-forward-v1=false`；生产实现必须增加每 Box 不可猜测的 tunnel authentication（并防止跨 Box 复用），或在 Pod network namespace 建立经过测试的非 loopback DROP policy，且由 recovery/Janitor 一并管理。该门禁解除前不能开放 Route。
 
 ## 6. Infra Component 注入
 
-BoxLite 首个实现采用 `GuestCopy`：
+实现阶段验证了一个重要的生命周期约束：`sandbox-init` 和 `sandbox-tunnel` 必须在用户 entrypoint 与 tunnel readiness 之前已经存在，而 BoxLite `CopyInto` 只能在 Box 已可执行后使用。因此首个实现不再把 create-time bootstrap 误称为 `GuestCopy`，而是明确采用 `ArtifactVolume`：
 
-1. Fastlet 继续用 Infra Catalog 解析 digest 并把 artifact 放入共享只读 store；
-2. Fastlet 把 prepared plan 和 host artifact path 发送给 Sidecar；
-3. Sidecar 创建并启动 Box 后，使用 SDK copy API 把 `sandbox-init`、`sandbox-tunnel`、组件二进制和 instance config 写入 guest；
-4. Sidecar通过 Box execution 启动 supervisor/tunnel，并等待 required readiness；
-5. 所有 required component Ready 后，`EnsureBox` 才成功，Fastlet 才发布 Route。
+1. Fastlet 用 Infra Catalog 解析 digest，并把 artifact 放入 Pod 共享的只读 store；
+2. Fastlet 把 immutable prepared plan 和 Sidecar 可见的 artifact path 发送给 Sidecar；
+3. Sidecar只接受共享 store 根目录内、目标位于 `/.fast` 下的 regular file，复制成按 create-spec hash 隔离的只读 bundle；
+4. Box 创建时通过 SDK `WithVolumeReadOnly(bundle, "/.fast")` 挂入 guest，保证 `sandbox-init`、`sandbox-tunnel`、组件和 instance config 在用户进程启动前可见；
+5. Sidecar通过 Box execution 启动 tunnel，并等待协议级 health handshake；Fastlet 再通过 LocalForward 完成 required Infra readiness，最后发布 Route。
 
-后续可增加 TemplateBake 减少 copy 和启动开销，但不能改变 InfraProfile identity、digest 校验和 readiness 语义。Preinstalled 只能在镜像明确声明兼容版本时使用。
+该模式对 Fastlet 的统一抽象仍是 artifact delivery，不暴露 BoxLite SDK。后续可用 TemplateBake/Preinstalled 降低逐 Sandbox bundle 成本；`CopyInto` 只适合启动后的增量更新，不能承担 boot-critical artifact。任何实现都不能改变 InfraProfile identity、digest 校验和 readiness 语义。
 
 ## 7. Cache、恢复和 Janitor
 
 - Sidecar 的 `ListImages` 和 `PullImage` 对应 Fastlet `RuntimeArtifactCache`，Heartbeat/Top-K 仍只消费统一 image inventory；
 - warmImages 异步拉取，不阻塞新 Fastlet 进入 Ready；
-- Box metadata 必须持久化 Sandbox UID、Fastlet Pod UID、instance generation、assignment attempt、leased tunnel port 和 create-spec hash；
-- BoxLiteJanitor 扫描 `/var/lib/fast-sandbox/boxlite/<podUID>`、shim PID/state 和 tunnel lease，先查询 Pod UID 是否仍存活，再以 owner fence 二次校验后清理；
+- Box metadata 持久化 Sandbox UID、Fastlet Pod UID、instance generation、assignment attempt、leased tunnel port 和 create-spec hash；每个 home 另有不可逆目录名之外的 owner fence 文件；Sidecar 加载时同时校验 owner Pod UID、record filename、spec hash 和 bundle root，损坏或跨 Pod 的记录 fail closed；
+- BoxLiteJanitor 扫描 `/var/lib/fast-sandbox/boxlite/<hash(podUID)>` 的 owner/record/bundle/state，先查询 Pod UID 是否仍存活，再以 record fence 和 Runtime `.lock` 二次校验；仍被 Runtime 持锁时 fail closed，最后一个 record 消失后才回收该 Pod 的 image/base/db home；
 - Janitor 不通过 containerd scanner 猜测 BoxLite 资源；
 - Pod 删除模型仍是“所属 Sandbox 全部 Lost/重建”，不允许新 Fastlet Pod 接管旧 Box。
 
@@ -121,10 +125,11 @@ BoxLite 首个实现采用 `GuestCopy`：
 1. Sidecar protocol version 与 Fastlet catalog 匹配；
 2. `/dev/kvm`、native SDK、gvproxy、state root 和 UDS 全部可用；
 3. Sidecar能验证 `GetOrCreate/List/Inspect/Delete/Recover`；
-4. guest tunnel 和 GuestCopy 通过版本/摘要校验；
+4. guest tunnel 和 ArtifactVolume 通过版本、路径边界和摘要校验；
 5. CPU/memory/PIDs 的产品语义都有可执行证据；
-6. BoxLiteJanitor 已接入真实 scanner；
-7. 远端 E2E 覆盖双 Box 同 guest port、任意 target port、Infra readiness、Fastlet 重启、Pod 丢失和 cache heartbeat。
+6. host forward 不能从 Fastlet Pod loopback 之外绕过 route credential；
+7. BoxLiteJanitor 已接入真实 scanner；
+8. 远端 E2E 覆盖双 Box 同 guest port、任意 target port、Infra readiness、Fastlet 重启、Pod 丢失和 cache heartbeat。
 
 当前 `make test-e2e-runtime-boxlite` 是显式的 fail-closed capability gate，不是 BoxLite 支持完成的证据。它的存在是为了避免 CI skip 或误报 Ready。
 
@@ -135,7 +140,7 @@ BoxLite 首个实现采用 `GuestCopy`：
 1. 定义并生成 Sidecar UDS protocol，完成 fake server contract tests；
 2. 实现 `AccessKindLocalForward` 和 tunnel transport 的 unit/integration tests；
 3. 建立独立 Sidecar build（Go 1.24+、CGO、固定 BoxLite SDK/native artifact 版本）；
-4. 实现 `sandbox-tunnel` 和 GuestCopy，接入 Infra readiness；
+4. 实现 `sandbox-tunnel` 和 ArtifactVolume，接入 Infra readiness；
 5. Controller按 RuntimeProfile 注入平台-owned Sidecar、volume 和 security context；
 6. 实现 BoxLiteDriver lifecycle/cache/recovery；
 7. 实现 BoxLiteJanitor scanner；

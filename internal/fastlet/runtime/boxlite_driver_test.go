@@ -13,6 +13,7 @@ import (
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
+	"fast-sandbox/internal/boxlitewire"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/runtimecatalog"
 
@@ -24,6 +25,7 @@ func TestBoxLiteDriverSidecarContract(t *testing.T) {
 	var ensured boxLiteEnsureRequest
 	var pulled string
 	deleted := false
+	recovered := false
 	handler := http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/v1/capabilities":
@@ -39,6 +41,14 @@ func TestBoxLiteDriverSidecarContract(t *testing.T) {
 				Access: fastletnetwork.AccessDescriptor{Kind: fastletnetwork.AccessKindLocalForward, Address: "127.0.0.1:21000"},
 			})
 		case request.Method == http.MethodGet && request.URL.Path == "/v1/boxes/uid-a":
+			writeBoxLiteTestJSON(t, writer, boxLiteBox{
+				Sandbox: ensured.Sandbox, BoxID: "box-a", PID: 42, Phase: "running", CreatedAt: 1700000000,
+				Access: fastletnetwork.AccessDescriptor{Kind: fastletnetwork.AccessKindLocalForward, Address: "127.0.0.1:21000"},
+			})
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/boxes/uid-a":
+			mu.Lock()
+			recovered = true
+			mu.Unlock()
 			writeBoxLiteTestJSON(t, writer, boxLiteBox{
 				Sandbox: ensured.Sandbox, BoxID: "box-a", PID: 42, Phase: "running", CreatedAt: 1700000000,
 				Access: fastletnetwork.AccessDescriptor{Kind: fastletnetwork.AccessKindLocalForward, Address: "127.0.0.1:21000"},
@@ -96,6 +106,10 @@ func TestBoxLiteDriverSidecarContract(t *testing.T) {
 	managed, err := driver.ListManagedSandboxes(context.Background())
 	require.NoError(t, err)
 	require.Len(t, managed, 1)
+	require.NoError(t, driver.RecoverRuntimeResources(context.Background(), managed))
+	mu.Lock()
+	require.True(t, recovered)
+	mu.Unlock()
 
 	images, err := driver.ListImages(context.Background())
 	require.NoError(t, err)
@@ -122,7 +136,7 @@ func TestBoxLiteDriverCapabilityAndIdentityFailClosed(t *testing.T) {
 			})
 		case "/v1/boxes/uid-conflict":
 			writer.WriteHeader(http.StatusConflict)
-			writeBoxLiteTestJSON(t, writer, boxLiteErrorResponse{Code: "ImmutableSpecConflict", Message: "resource hash changed"})
+			writeBoxLiteTestJSON(t, writer, boxLiteErrorResponse{Code: boxlitewire.ErrorImmutableSpecConflict, Message: "resource hash changed"})
 		default:
 			http.NotFound(writer, request)
 		}

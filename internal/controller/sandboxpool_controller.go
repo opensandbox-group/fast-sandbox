@@ -38,6 +38,7 @@ type SandboxPoolReconciler struct {
 	InfraCatalog         *infracatalog.Catalog
 	FastletDrainer       FastletDrainer
 	FastletProxyImage    string
+	BoxLiteRuntimeImage  string
 	RouteVerifyPublicKey string
 	DrainTimeout         time.Duration
 	Now                  func() time.Time
@@ -462,8 +463,8 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 		return nil, errors.New("fastletTemplate.spec.containers must contain the fastlet container")
 	}
 	for _, container := range podSpec.Containers[1:] {
-		if container.Name == "fastlet-proxy" {
-			return nil, errors.New("fastlet-proxy is a platform-owned sidecar name")
+		if container.Name == "fastlet-proxy" || container.Name == "boxlite-runtime" {
+			return nil, fmt.Errorf("%s is a platform-owned sidecar name", container.Name)
 		}
 	}
 	if err := validatePlatformOwnedStorage(podSpec); err != nil {
@@ -473,12 +474,16 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 		return nil, err
 	}
 
+	runtimeResourceOwner := podSpec.Containers[0].Name
+	if profile.Deployment.ResourceOwner != "" {
+		runtimeResourceOwner = profile.Deployment.ResourceOwner
+	}
 	if len(podSpec.Containers) > 0 {
 		c := &podSpec.Containers[0]
 		if c.SecurityContext == nil {
 			c.SecurityContext = &corev1.SecurityContext{}
 		}
-		c.SecurityContext.Privileged = boolPtr(profile.Deployment.Privileged)
+		c.SecurityContext.Privileged = boolPtr(profile.Deployment.Privileged && profile.Deployment.Sidecar == "")
 		c.Env = removeRuntimeOwnedEnv(c.Env)
 
 		c.Env = append(c.Env,
@@ -507,11 +512,11 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 			},
 			corev1.EnvVar{
 				Name:      "CPU_LIMIT",
-				ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{ContainerName: "fastlet", Resource: "limits.cpu"}},
+				ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{ContainerName: runtimeResourceOwner, Resource: "limits.cpu"}},
 			},
 			corev1.EnvVar{
 				Name:      "MEMORY_LIMIT",
-				ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{ContainerName: "fastlet", Resource: "limits.memory"}},
+				ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{ContainerName: runtimeResourceOwner, Resource: "limits.memory"}},
 			},
 			corev1.EnvVar{
 				Name:  "FASTLET_CAPACITY",
@@ -539,8 +544,10 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 			corev1.VolumeMount{Name: "infra-tools", MountPath: "/opt/fast-sandbox/infra"},
 			corev1.VolumeMount{Name: "proxy-control", MountPath: "/run/fast-sandbox/proxy"},
 		)
-		if err := applyFastletResources(c, profile.Deployment.Overhead, sandboxResources, getFastletCapacity(pool)); err != nil {
-			return nil, err
+		if runtimeResourceOwner == c.Name {
+			if err := applyFastletResources(c, profile.Deployment.Overhead, sandboxResources, getFastletCapacity(pool)); err != nil {
+				return nil, err
+			}
 		}
 		c.ReadinessProbe = &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
@@ -570,6 +577,21 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 			InitialDelaySeconds: 0, PeriodSeconds: 2, TimeoutSeconds: 1, FailureThreshold: 1,
 		},
 	})
+	if profile.Deployment.Sidecar != "" {
+		if profile.Deployment.Sidecar != "boxlite-runtime" || profile.BoxLite == nil {
+			return nil, fmt.Errorf("runtime profile %q requests unknown platform sidecar %q", profile.Name, profile.Deployment.Sidecar)
+		}
+		podSpec.Containers[0].VolumeMounts = append(podSpec.Containers[0].VolumeMounts,
+			corev1.VolumeMount{Name: "boxlite-control", MountPath: "/run/fast-sandbox/boxlite"},
+		)
+		podSpec.Containers = append(podSpec.Containers, r.boxLiteRuntimeContainer(*profile.BoxLite))
+		if runtimeResourceOwner != "boxlite-runtime" {
+			return nil, fmt.Errorf("BoxLite runtime resource owner must be boxlite-runtime, got %q", runtimeResourceOwner)
+		}
+		if err := applyFastletResources(&podSpec.Containers[len(podSpec.Containers)-1], profile.Deployment.Overhead, sandboxResources, getFastletCapacity(pool)); err != nil {
+			return nil, err
+		}
+	}
 
 	hostPathDirectory := corev1.HostPathDirectory
 
@@ -586,7 +608,14 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 		},
 		corev1.Volume{Name: "proxy-control", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 	)
-	if err := mergeRuntimeHostPaths(podSpec, &podSpec.Containers[0], profile.Deployment.HostPaths); err != nil {
+	runtimeContainer := &podSpec.Containers[0]
+	if profile.Deployment.Sidecar != "" {
+		podSpec.Volumes = append(podSpec.Volumes,
+			corev1.Volume{Name: "boxlite-control", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		)
+		runtimeContainer = &podSpec.Containers[len(podSpec.Containers)-1]
+	}
+	if err := mergeRuntimeHostPaths(podSpec, runtimeContainer, profile.Deployment.HostPaths); err != nil {
 		return nil, err
 	}
 
@@ -606,11 +635,46 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 	return pod, nil
 }
 
+func (r *SandboxPoolReconciler) boxLiteRuntimeContainer(config runtimecatalog.BoxLiteConfig) corev1.Container {
+	image := r.BoxLiteRuntimeImage
+	if image == "" {
+		image = "fast-sandbox/boxlite-runtime:dev"
+	}
+	return corev1.Container{
+		Name:            "boxlite-runtime",
+		Image:           image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Args: []string{
+			"--socket", config.ControlSocket,
+			"--state-root", config.StateRoot,
+		},
+		Env: []corev1.EnvVar{
+			{
+				Name:      "POD_UID",
+				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}},
+			},
+			{Name: "FAST_SANDBOX_INFRA_STORE_ROOT", Value: "/opt/fast-sandbox/infra"},
+		},
+		SecurityContext: &corev1.SecurityContext{Privileged: boolPtr(true)},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "boxlite-control", MountPath: "/run/fast-sandbox/boxlite"},
+			{Name: "infra-tools", MountPath: "/opt/fast-sandbox/infra", ReadOnly: true},
+		},
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{
+				"/usr/local/bin/boxlite-runtime", "--probe-socket", config.ControlSocket,
+			}}},
+			InitialDelaySeconds: 0, PeriodSeconds: 2, TimeoutSeconds: 4, FailureThreshold: 1,
+		},
+	}
+}
+
 func validatePlatformOwnedStorage(podSpec *corev1.PodSpec) error {
 	reservedVolumes := map[string]string{
-		"tmp":           "/tmp",
-		"infra-tools":   "/opt/fast-sandbox/infra",
-		"proxy-control": "/run/fast-sandbox/proxy",
+		"tmp":             "/tmp",
+		"infra-tools":     "/opt/fast-sandbox/infra",
+		"proxy-control":   "/run/fast-sandbox/proxy",
+		"boxlite-control": "/run/fast-sandbox/boxlite",
 	}
 	for _, volume := range podSpec.Volumes {
 		if _, reserved := reservedVolumes[volume.Name]; reserved {
@@ -737,7 +801,7 @@ func applyFastletResources(container *corev1.Container, overhead corev1.Resource
 			container.Resources.Requests[name] = quantity.DeepCopy()
 		}
 		if limit, ok := container.Resources.Limits[name]; ok && !limit.IsZero() && limit.Cmp(quantity) < 0 {
-			return fmt.Errorf("fastlet container limit %s=%s is below runtime requirement %s", name, limit.String(), quantity.String())
+			return fmt.Errorf("runtime owner container %q limit %s=%s is below runtime requirement %s", container.Name, name, limit.String(), quantity.String())
 		}
 	}
 	return nil

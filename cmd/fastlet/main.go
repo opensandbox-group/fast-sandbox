@@ -204,7 +204,8 @@ func newInfraManager(podUID string, runtimeProfile runtimecatalog.RuntimeProfile
 	return fastletinfra.NewManagerWithConfig(fastletinfra.ManagerConfig{
 		Catalog: infracatalog.Builtin(), RuntimeProfile: runtimeProfile, ProfileName: profileName,
 		ExpectedProfileHash: expectedHash, Store: store, Resolver: fastletinfra.NewPlatformResolver(staticRoots),
-		SandboxInitPath: getEnv("FAST_SANDBOX_SANDBOX_INIT_PATH", "/opt/fast-sandbox/bin/sandbox-init"),
+		SandboxInitPath:   getEnv("FAST_SANDBOX_SANDBOX_INIT_PATH", "/opt/fast-sandbox/bin/sandbox-init"),
+		SandboxTunnelPath: getEnv("FAST_SANDBOX_SANDBOX_TUNNEL_PATH", "/opt/fast-sandbox/bin/sandbox-tunnel"),
 	})
 }
 

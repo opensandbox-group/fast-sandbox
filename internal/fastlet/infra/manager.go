@@ -21,6 +21,7 @@ type PreparedComponent struct {
 type PreparedPlan struct {
 	infracatalog.Plan
 	Supervisor *PreparedArtifact   `json:"supervisor,omitempty"`
+	Tunnel     *PreparedArtifact   `json:"tunnel,omitempty"`
 	Components []PreparedComponent `json:"preparedComponents,omitempty"`
 }
 
@@ -32,6 +33,7 @@ type ManagerConfig struct {
 	Store               *ArtifactStore
 	Resolver            ArtifactResolver
 	SandboxInitPath     string
+	SandboxTunnelPath   string
 }
 
 // Manager prepares immutable profile artifacts outside the Sandbox create
@@ -74,7 +76,7 @@ func (m *Manager) Prepare(ctx context.Context) error {
 	for _, componentPlan := range m.plan.Plan.Components {
 		component := PreparedComponent{Plan: componentPlan}
 		switch componentPlan.DeliveryMode {
-		case runtimecatalog.InfraDeliveryBindMount, runtimecatalog.InfraDeliveryGuestCopy:
+		case runtimecatalog.InfraDeliveryBindMount, runtimecatalog.InfraDeliveryGuestCopy, runtimecatalog.InfraDeliveryArtifactVolume:
 			artifact := componentPlan.Component.Artifact
 			staged, err := m.config.Store.Stage(ctx, artifact.Digest, artifact.Executable, func() (io.ReadCloser, error) {
 				return m.config.Resolver.Open(ctx, artifact)
@@ -112,6 +114,24 @@ func (m *Manager) Prepare(ctx context.Context) error {
 		}
 		prepared.Supervisor = &staged
 	}
+	if m.config.RuntimeProfile.NetworkMode == runtimecatalog.NetworkModeBoxLite {
+		if m.config.SandboxTunnelPath == "" {
+			m.err = errors.New("sandbox-tunnel path is required by the BoxLite runtime profile")
+			return m.err
+		}
+		file, err := os.Open(m.config.SandboxTunnelPath)
+		if err != nil {
+			m.err = fmt.Errorf("open sandbox-tunnel: %w", err)
+			return m.err
+		}
+		staged, stageErr := m.config.Store.ImportTrusted(ctx, file, true)
+		closeErr := file.Close()
+		if stageErr != nil || closeErr != nil {
+			m.err = errors.Join(stageErr, closeErr)
+			return m.err
+		}
+		prepared.Tunnel = &staged
+	}
 	m.plan = prepared
 	m.prepared = true
 	return nil
@@ -137,9 +157,12 @@ func (m *Manager) ArtifactReferences() []string {
 	if err != nil {
 		return nil
 	}
-	references := make([]string, 0, len(plan.Components)+1)
+	references := make([]string, 0, len(plan.Components)+2)
 	if plan.Supervisor != nil {
 		references = append(references, plan.Supervisor.Digest)
+	}
+	if plan.Tunnel != nil {
+		references = append(references, plan.Tunnel.Digest)
 	}
 	for _, component := range plan.Components {
 		if component.Artifact != nil {
@@ -155,6 +178,10 @@ func clonePreparedPlan(plan PreparedPlan) PreparedPlan {
 	if plan.Supervisor != nil {
 		value := *plan.Supervisor
 		clone.Supervisor = &value
+	}
+	if plan.Tunnel != nil {
+		value := *plan.Tunnel
+		clone.Tunnel = &value
 	}
 	for index := range clone.Components {
 		if clone.Components[index].Artifact != nil {

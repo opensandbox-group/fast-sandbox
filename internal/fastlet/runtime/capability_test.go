@@ -31,7 +31,7 @@ func TestHostCapabilityProberFailsClosed(t *testing.T) {
 	require.NoError(t, err)
 	report := NewHostCapabilityProber().Probe(context.Background(), boxlite, "")
 	require.Equal(t, runtimecatalog.CapabilityUnsupported, report.State)
-	require.Equal(t, "BoxLiteRuntimeSidecarNotPackaged", report.Reason)
+	require.Equal(t, "BoxLiteResourceEnforcementIncomplete", report.Reason)
 
 	kata, err := catalog.Resolve(apiv1alpha1.RuntimeKataQemu)
 	require.NoError(t, err)

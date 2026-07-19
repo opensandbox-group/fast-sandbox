@@ -62,16 +62,18 @@ func TestManagerRetriesTransientArtifactPreparationFailure(t *testing.T) {
 	require.Equal(t, 2, resolver.calls)
 }
 
-func TestManagerStagesGuestCopyArtifactForBoxLiteSidecar(t *testing.T) {
+func TestManagerStagesArtifactVolumeForBoxLiteSidecar(t *testing.T) {
 	root := t.TempDir()
 	store, err := NewArtifactStore(filepath.Join(root, "pod"), filepath.Join(root, "host"))
 	require.NoError(t, err)
 	sandboxInit := filepath.Join(root, "sandbox-init")
 	require.NoError(t, os.WriteFile(sandboxInit, []byte("sandbox-init"), 0555))
+	sandboxTunnel := filepath.Join(root, "sandbox-tunnel")
+	require.NoError(t, os.WriteFile(sandboxTunnel, []byte("sandbox-tunnel"), 0555))
 	runtimeProfile, err := runtimecatalog.Builtin().Resolve(apiv1alpha1.RuntimeBoxLite)
 	require.NoError(t, err)
 	catalog, err := infracatalog.New([]infracatalog.Profile{{
-		Name: "boxlite-guest-copy", Version: "v1", Configured: true,
+		Name: "boxlite-artifact-volume", Version: "v1", Configured: true,
 		AllowedRuntimes: []apiv1alpha1.RuntimeName{apiv1alpha1.RuntimeBoxLite},
 		Components: []infracatalog.Component{{
 			Name: "helper", Artifact: infracatalog.Artifact{
@@ -79,7 +81,7 @@ func TestManagerStagesGuestCopyArtifactForBoxLiteSidecar(t *testing.T) {
 				Digest: infracatalog.TestInfraDigest(), Executable: true,
 			},
 			ContainerPath: "/.fast/infra/helper",
-			DeliveryModes: []runtimecatalog.InfraDeliveryMode{runtimecatalog.InfraDeliveryGuestCopy},
+			DeliveryModes: []runtimecatalog.InfraDeliveryMode{runtimecatalog.InfraDeliveryArtifactVolume},
 			Activation: infracatalog.Activation{
 				Mode: infracatalog.ActivationComponentBootstrap, Command: "/.fast/infra/helper",
 			},
@@ -88,18 +90,21 @@ func TestManagerStagesGuestCopyArtifactForBoxLiteSidecar(t *testing.T) {
 	}})
 	require.NoError(t, err)
 	manager, err := NewManagerWithConfig(ManagerConfig{
-		Catalog: catalog, RuntimeProfile: runtimeProfile, ProfileName: "boxlite-guest-copy",
-		Store: store, Resolver: NewPlatformResolver(nil), SandboxInitPath: sandboxInit,
+		Catalog: catalog, RuntimeProfile: runtimeProfile, ProfileName: "boxlite-artifact-volume",
+		Store: store, Resolver: NewPlatformResolver(nil), SandboxInitPath: sandboxInit, SandboxTunnelPath: sandboxTunnel,
 	})
 	require.NoError(t, err)
 	require.NoError(t, manager.Prepare(context.Background()))
 	plan, err := manager.Plan()
 	require.NoError(t, err)
 	require.Len(t, plan.Components, 1)
-	require.Equal(t, runtimecatalog.InfraDeliveryGuestCopy, plan.Components[0].Plan.DeliveryMode)
+	require.Equal(t, runtimecatalog.InfraDeliveryArtifactVolume, plan.Components[0].Plan.DeliveryMode)
 	require.NotNil(t, plan.Components[0].Artifact)
 	require.FileExists(t, plan.Components[0].Artifact.PodPath)
 	require.NotNil(t, plan.Supervisor)
+	require.NotNil(t, plan.Tunnel)
+	require.FileExists(t, plan.Tunnel.PodPath)
+	require.Len(t, manager.ArtifactReferences(), 3)
 }
 
 type transientResolver struct {

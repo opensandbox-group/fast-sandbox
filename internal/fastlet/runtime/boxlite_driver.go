@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"fast-sandbox/internal/api"
+	"fast-sandbox/internal/boxlitewire"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/runtimecatalog"
@@ -22,14 +23,7 @@ import (
 
 const boxLiteMaxResponseBytes = 4 << 20
 
-var requiredBoxLiteSidecarCapabilities = []string{
-	"owner-fence-v1",
-	"guest-copy-v1",
-	"local-forward-v1",
-	"resource-limits-v1",
-	"recovery-v1",
-	"image-cache-v1",
-}
+var requiredBoxLiteSidecarCapabilities = boxlitewire.RequiredCapabilities
 
 // BoxLiteDriver is intentionally a pure-Go client. Native BoxLite code lives
 // in a dedicated Pod sidecar and is reached only through a versioned UDS API.
@@ -44,55 +38,14 @@ type BoxLiteDriver struct {
 	accessByID map[string]fastletnetwork.AccessDescriptor
 }
 
-type boxLiteCapabilities struct {
-	ProtocolVersion string          `json:"protocolVersion"`
-	Ready           bool            `json:"ready"`
-	Reason          string          `json:"reason,omitempty"`
-	Message         string          `json:"message,omitempty"`
-	Capabilities    map[string]bool `json:"capabilities"`
-}
-
-type boxLiteArtifact struct {
-	Source      string   `json:"source"`
-	Destination string   `json:"destination"`
-	Options     []string `json:"options,omitempty"`
-}
-
-type boxLiteEnsureRequest struct {
-	Namespace       string            `json:"namespace"`
-	Sandbox         api.SandboxSpec   `json:"sandbox"`
-	TunnelGuestPort uint32            `json:"tunnelGuestPort"`
-	Artifacts       []boxLiteArtifact `json:"artifacts,omitempty"`
-}
-
-type boxLiteBox struct {
-	Sandbox                    api.SandboxSpec                    `json:"sandbox"`
-	BoxID                      string                             `json:"boxId"`
-	PID                        int                                `json:"pid,omitempty"`
-	Phase                      string                             `json:"phase"`
-	CreatedAt                  int64                              `json:"createdAt"`
-	Access                     fastletnetwork.AccessDescriptor    `json:"access"`
-	InfraServices              []fastletinfra.ServiceEndpoint     `json:"infraServices,omitempty"`
-	InfraUpstreamHeadersByPort map[uint32]map[string]string       `json:"infraUpstreamHeadersByPort,omitempty"`
-	InfraDiagnostics           []fastletinfra.ComponentDiagnostic `json:"infraDiagnostics,omitempty"`
-}
-
-type boxLiteListResponse struct {
-	Boxes []boxLiteBox `json:"boxes"`
-}
-
-type boxLiteImagesResponse struct {
-	Images []string `json:"images"`
-}
-
-type boxLitePullRequest struct {
-	Image string `json:"image"`
-}
-
-type boxLiteErrorResponse struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
+type boxLiteCapabilities = boxlitewire.Capabilities
+type boxLiteArtifact = boxlitewire.Artifact
+type boxLiteEnsureRequest = boxlitewire.EnsureRequest
+type boxLiteBox = boxlitewire.Box
+type boxLiteListResponse = boxlitewire.ListResponse
+type boxLiteImagesResponse = boxlitewire.ImagesResponse
+type boxLitePullRequest = boxlitewire.PullRequest
+type boxLiteErrorResponse = boxlitewire.ErrorResponse
 
 func newBoxLiteDriver(profile runtimecatalog.RuntimeProfile) *BoxLiteDriver {
 	return &BoxLiteDriver{
@@ -190,8 +143,12 @@ func (d *BoxLiteDriver) EnsureSandbox(ctx context.Context, config *api.SandboxSp
 			return nil, fmt.Errorf("%w: prepare BoxLite InfraProfile instance: %v", ErrInfraUnavailable, err)
 		}
 		for _, mount := range instance.Mounts {
+			source := mount.GuestSource
+			if source == "" {
+				source = mount.Source
+			}
 			request.Artifacts = append(request.Artifacts, boxLiteArtifact{
-				Source: mount.Source, Destination: mount.Destination, Options: append([]string(nil), mount.Options...),
+				Source: source, Destination: mount.Destination, Options: append([]string(nil), mount.Options...),
 			})
 		}
 	}
@@ -260,6 +217,25 @@ func (d *BoxLiteDriver) ListManagedSandboxes(ctx context.Context) ([]*SandboxMet
 		managed = append(managed, metadata)
 	}
 	return managed, nil
+}
+
+// RecoverRuntimeResources reattaches the Sidecar to each durable Box and
+// restores the guest LocalForward tunnel before Fastlet routes are published.
+func (d *BoxLiteDriver) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata) error {
+	for _, metadata := range managed {
+		if metadata == nil || metadata.SandboxID == "" {
+			continue
+		}
+		var box boxLiteBox
+		if err := d.doJSON(ctx, http.MethodPost, "/v1/boxes/"+url.PathEscape(metadata.SandboxID), nil, &box); err != nil {
+			return fmt.Errorf("recover BoxLite Sandbox %s: %w", metadata.SandboxID, err)
+		}
+		if box.Sandbox.SandboxID != metadata.SandboxID {
+			return fmt.Errorf("%w: recovered BoxLite Sandbox identity mismatch", ErrSandboxProfileMismatch)
+		}
+		d.rememberAccess(metadata.SandboxID, box.Access)
+	}
+	return nil
 }
 
 func (d *BoxLiteDriver) GetAccessDescriptor(sandboxID string) (fastletnetwork.AccessDescriptor, error) {
@@ -360,7 +336,7 @@ func (d *BoxLiteDriver) doJSON(ctx context.Context, method, path string, input, 
 		switch {
 		case response.StatusCode == http.StatusNotFound:
 			return fmt.Errorf("%w: %s", ErrSandboxNotFound, wireError.Message)
-		case response.StatusCode == http.StatusConflict && wireError.Code == "ImmutableSpecConflict":
+		case response.StatusCode == http.StatusConflict && wireError.Code == boxlitewire.ErrorImmutableSpecConflict:
 			return fmt.Errorf("%w: %s", ErrSandboxProfileMismatch, wireError.Message)
 		case response.StatusCode == http.StatusConflict:
 			return fmt.Errorf("%w: %s", ErrSandboxAlreadyExists, wireError.Message)

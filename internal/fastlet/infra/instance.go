@@ -19,13 +19,15 @@ import (
 )
 
 const (
-	SandboxInitContainerPath = "/.fast/bin/sandbox-init"
-	InstanceConfigPath       = "/.fast/run/infra.json"
-	UpstreamTokenHeader      = "X-Fast-Sandbox-Infra-Token"
+	SandboxInitContainerPath   = "/.fast/bin/sandbox-init"
+	SandboxTunnelContainerPath = "/.fast/bin/sandbox-tunnel"
+	InstanceConfigPath         = "/.fast/run/infra.json"
+	UpstreamTokenHeader        = "X-Fast-Sandbox-Infra-Token"
 )
 
 type Mount struct {
 	Source      string   `json:"source"`
+	GuestSource string   `json:"guestSource,omitempty"`
 	Destination string   `json:"destination"`
 	Options     []string `json:"options"`
 }
@@ -82,23 +84,30 @@ func (m *Manager) PrepareInstance(ctx context.Context, spec *api.SandboxSpec) (P
 	if plan.ProfileName != spec.InfraProfile || plan.ProfileHash != spec.InfraProfileHash {
 		return PreparedInstance{}, fmt.Errorf("Sandbox InfraProfile identity does not match prepared plan")
 	}
-	if len(plan.Components) == 0 {
+	if len(plan.Components) == 0 && plan.Tunnel == nil {
 		return PreparedInstance{SandboxUID: spec.SandboxID}, nil
+	}
+	result := PreparedInstance{SandboxUID: spec.SandboxID}
+	if plan.Tunnel != nil {
+		result.Mounts = append(result.Mounts, Mount{
+			Source: plan.Tunnel.HostPath, GuestSource: plan.Tunnel.PodPath, Destination: SandboxTunnelContainerPath,
+			Options: []string{"ro", "nosuid", "nodev"},
+		})
+	}
+	if len(plan.Components) == 0 {
+		return result, nil
 	}
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
 		return PreparedInstance{}, fmt.Errorf("generate Infra instance token: %w", err)
 	}
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
-	result := PreparedInstance{
-		SandboxUID:      spec.SandboxID,
-		UpstreamHeaders: map[string]string{UpstreamTokenHeader: token},
-	}
+	result.UpstreamHeaders = map[string]string{UpstreamTokenHeader: token}
 	initConfig := sandboxinit.Config{Version: sandboxinit.ConfigVersion, SandboxUID: spec.SandboxID}
 	if plan.Supervisor != nil {
 		result.WrapperRequired = true
 		result.Mounts = append(result.Mounts, Mount{
-			Source: plan.Supervisor.HostPath, Destination: SandboxInitContainerPath,
+			Source: plan.Supervisor.HostPath, GuestSource: plan.Supervisor.PodPath, Destination: SandboxInitContainerPath,
 			Options: []string{"ro", "rbind", "nosuid", "nodev"},
 		})
 	}
@@ -106,7 +115,7 @@ func (m *Manager) PrepareInstance(ctx context.Context, spec *api.SandboxSpec) (P
 		component := preparedComponent.Plan.Component
 		if preparedComponent.Artifact != nil {
 			result.Mounts = append(result.Mounts, Mount{
-				Source: preparedComponent.Artifact.HostPath, Destination: component.ContainerPath,
+				Source: preparedComponent.Artifact.HostPath, GuestSource: preparedComponent.Artifact.PodPath, Destination: component.ContainerPath,
 				Options: []string{"ro", "rbind", "nosuid", "nodev"},
 			})
 		}
@@ -148,7 +157,7 @@ func (m *Manager) PrepareInstance(ctx context.Context, spec *api.SandboxSpec) (P
 	result.ConfigPodPath = podPath
 	result.ConfigHostPath = hostPath
 	result.Mounts = append(result.Mounts, Mount{
-		Source: hostPath, Destination: InstanceConfigPath,
+		Source: hostPath, GuestSource: podPath, Destination: InstanceConfigPath,
 		Options: []string{"ro", "rbind", "nosuid", "nodev", "noexec"},
 	})
 	// Persist final paths and mounts as the recovery source.

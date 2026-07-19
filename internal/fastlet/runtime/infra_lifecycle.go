@@ -4,15 +4,51 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
+	fastletnetwork "fast-sandbox/internal/fastlet/network"
 )
 
 func (m *SandboxManager) initializeInfraInstance(ctx context.Context, metadata *SandboxMetadata) error {
 	if m.infraManager == nil {
 		return nil
 	}
-	instance, err := m.infraManager.InitializeInstance(ctx, &metadata.SandboxSpec, metadata.NetworkIP)
+	var instance fastletinfra.PreparedInstance
+	var err error
+	if metadata.NetworkIP != "" {
+		instance, err = m.infraManager.InitializeInstance(ctx, &metadata.SandboxSpec, metadata.NetworkIP)
+	} else if provider, ok := m.runtime.(AccessDescriptorProvider); ok {
+		var access fastletnetwork.AccessDescriptor
+		access, err = provider.GetAccessDescriptor(metadata.SandboxID)
+		if err == nil {
+			switch access.Kind {
+			case fastletnetwork.AccessKindDirectIP:
+				instance, err = m.infraManager.InitializeInstance(ctx, &metadata.SandboxSpec, access.Address)
+			case fastletnetwork.AccessKindLocalForward:
+				endpoint := access.Address
+				instance, err = m.infraManager.InitializeInstanceWithDialer(ctx, &metadata.SandboxSpec, func(ctx context.Context, targetPort uint32) (net.Conn, error) {
+					connection, dialErr := (&net.Dialer{}).DialContext(ctx, "tcp", endpoint)
+					if dialErr != nil {
+						return nil, dialErr
+					}
+					preamble, encodeErr := fastletnetwork.EncodeLocalForwardPreamble(targetPort)
+					if encodeErr == nil {
+						encodeErr = fastletnetwork.WriteLocalForwardPreamble(connection, preamble)
+					}
+					if encodeErr != nil {
+						_ = connection.Close()
+						return nil, encodeErr
+					}
+					return connection, nil
+				})
+			default:
+				err = fmt.Errorf("unsupported Infra access kind %q", access.Kind)
+			}
+		}
+	} else {
+		err = errors.New("runtime did not provide an Infra access descriptor")
+	}
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInfraUnavailable, err)
 	}

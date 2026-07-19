@@ -55,6 +55,7 @@ func main() {
 	var deprecatedConsistency string
 	var deprecatedOrphanTimeout time.Duration
 	var fastletProxyImage string
+	var boxLiteRuntimeImage string
 	var routeVerifyPublicKey string
 	var routeSigningPrivateKey string
 	var routeCredentialTTL time.Duration
@@ -72,6 +73,7 @@ func main() {
 	flag.StringVar(&deprecatedConsistency, "fastpath-consistency-mode", "", "Deprecated and ignored; Create always uses reservation -> CRD CAS -> Ensure.")
 	flag.DurationVar(&deprecatedOrphanTimeout, "fastpath-orphan-timeout", 0, "Deprecated and ignored; CRD reconciliation owns recovery.")
 	flag.StringVar(&fastletProxyImage, "fastlet-proxy-image", envOrDefault("FASTLET_PROXY_IMAGE", "fast-sandbox/fastlet-proxy:dev"), "Image injected as the platform-owned Fastlet Proxy sidecar.")
+	flag.StringVar(&boxLiteRuntimeImage, "boxlite-runtime-image", envOrDefault("BOXLITE_RUNTIME_IMAGE", "fast-sandbox/boxlite-runtime:dev"), "Image injected as the platform-owned BoxLite runtime sidecar.")
 	flag.StringVar(&routeVerifyPublicKey, "route-verify-public-key", os.Getenv("FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY"), "Comma-separated base64 Ed25519 public keys injected into data-plane proxies.")
 	flag.StringVar(&routeSigningPrivateKey, "route-signing-private-key", os.Getenv("FAST_SANDBOX_ROUTE_SIGNING_PRIVATE_KEY"), "Base64 Ed25519 seed/private key used only by FastPath.")
 	flag.DurationVar(&routeCredentialTTL, "route-credential-ttl", 5*time.Minute, "Lifetime of a Sandbox route credential.")
@@ -160,7 +162,7 @@ func main() {
 		if err := (&controller.SandboxPoolReconciler{
 			Client: manager.GetClient(), DurableReader: durableClient, Scheme: manager.GetScheme(), Registry: registry, Catalog: catalog, InfraCatalog: infraCatalog,
 			FastletDrainer: fastletClient, DrainTimeout: fastletDrainTimeout,
-			FastletProxyImage: fastletProxyImage, RouteVerifyPublicKey: routeVerifyPublicKey,
+			FastletProxyImage: fastletProxyImage, BoxLiteRuntimeImage: boxLiteRuntimeImage, RouteVerifyPublicKey: routeVerifyPublicKey,
 		}).SetupWithManager(manager); err != nil {
 			klog.ErrorS(err, "Register SandboxPool controller")
 			os.Exit(1)

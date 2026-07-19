@@ -5,6 +5,7 @@ FASTLET_PROXY_IMAGE ?= $(REGISTRY)/fastlet-proxy:dev
 SANDBOX_PROXY_IMAGE ?= $(REGISTRY)/sandbox-proxy:dev
 CONTROLLER_IMAGE ?= $(REGISTRY)/controller:dev
 JANITOR_IMAGE ?= $(REGISTRY)/janitor:dev
+BOXLITE_RUNTIME_IMAGE ?= $(REGISTRY)/boxlite-runtime:dev
 
 # Kind cluster name
 KIND_CLUSTER_NAME ?= fast-sandbox
@@ -32,7 +33,7 @@ PROTOC_GEN_GO_GRPC_VERSION := v1.6.0
 CONTROLLER_GEN_VERSION := v0.20.1
 CONTROLLER_GEN := $(TOOLS_BIN)/controller-gen
 
-.PHONY: all build build-controller build-fastlet build-sandbox-init build-fastlet-proxy build-sandbox-proxy build-janitor build-fastlet-linux build-sandbox-init-linux build-fastlet-proxy-linux build-sandbox-proxy-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-python-proto generate-deepcopy manifests verify-generated test test-unit test-python-sdk test-race test-network-integration test-e2e test-e2e-controlplane test-e2e-network test-e2e-proxy test-e2e-infra test-e2e-sdk test-e2e-runtime test-e2e-runtime-container test-e2e-runtime-gvisor test-e2e-runtime-kata test-e2e-runtime-boxlite test-e2e-drain verify setup-e2e tidy e2e docker-fastlet docker-fastlet-proxy docker-sandbox-proxy docker-controller docker-janitor kind-load-fastlet kind-load-fastlet-proxy kind-load-sandbox-proxy kind-load-controller kind-load-janitor help
+.PHONY: all build build-controller build-fastlet build-sandbox-init build-sandbox-tunnel build-fastlet-proxy build-sandbox-proxy build-janitor build-fastlet-linux build-sandbox-init-linux build-sandbox-tunnel-linux build-fastlet-proxy-linux build-sandbox-proxy-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-python-proto generate-deepcopy manifests verify-generated test test-unit test-python-sdk test-race test-network-integration test-e2e test-e2e-controlplane test-e2e-network test-e2e-proxy test-e2e-infra test-e2e-sdk test-e2e-runtime test-e2e-runtime-container test-e2e-runtime-gvisor test-e2e-runtime-kata test-e2e-runtime-boxlite test-e2e-drain verify setup-e2e tidy e2e docker-fastlet docker-fastlet-proxy docker-sandbox-proxy docker-controller docker-janitor docker-boxlite-runtime kind-load-fastlet kind-load-fastlet-proxy kind-load-sandbox-proxy kind-load-controller kind-load-janitor help
 
 all: build
 
@@ -59,6 +60,7 @@ help:
 	@echo "  make docker-fastlet         - build fastlet image"
 	@echo "  make docker-controller      - build controller image"
 	@echo "  make docker-janitor         - build janitor image"
+	@echo "  make docker-boxlite-runtime - build native BoxLite runtime Sidecar image"
 	@echo ""
 	@echo "E2E targets:"
 	@echo "  make setup-e2e              - prepare one e2e profile, default E2E_PROFILE=basic"
@@ -84,7 +86,7 @@ help:
 	@echo "  make test-e2e-basicvalidation"
 	@echo "  make test-e2e-lifecycle"
 
-build: build-controller build-fastlet build-sandbox-init build-fastlet-proxy build-sandbox-proxy build-janitor build-fastctl
+build: build-controller build-fastlet build-sandbox-init build-sandbox-tunnel build-fastlet-proxy build-sandbox-proxy build-janitor build-fastctl
 
 build-controller:
 	$(GO) build $(GOFLAGS) -o bin/controller ./cmd/controller
@@ -94,6 +96,9 @@ build-fastlet:
 
 build-sandbox-init:
 	$(GO) build $(GOFLAGS) -o bin/sandbox-init ./cmd/sandbox-init
+
+build-sandbox-tunnel:
+	$(GO) build $(GOFLAGS) -o bin/sandbox-tunnel ./cmd/sandbox-tunnel
 
 build-fastlet-proxy:
 	$(GO) build $(GOFLAGS) -o bin/fastlet-proxy ./cmd/fastlet-proxy
@@ -115,6 +120,10 @@ build-fastlet-linux:
 build-sandbox-init-linux:
 	@mkdir -p bin
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/sandbox-init ./cmd/sandbox-init
+
+build-sandbox-tunnel-linux:
+	@mkdir -p bin
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/sandbox-tunnel ./cmd/sandbox-tunnel
 
 build-fastlet-proxy-linux:
 	@mkdir -p bin
@@ -207,7 +216,7 @@ tidy:
 
 e2e: test-e2e
 
-docker-fastlet: build-fastlet-linux build-sandbox-init-linux
+docker-fastlet: build-fastlet-linux build-sandbox-init-linux build-sandbox-tunnel-linux
 	docker build $(DOCKER_BUILD_FLAGS) -t $(FASTLET_IMAGE) -f build/Dockerfile.fastlet .
 
 docker-fastlet-proxy: build-fastlet-proxy-linux
@@ -221,6 +230,9 @@ docker-controller: build-controller-linux
 
 docker-janitor: build-janitor-linux
 	docker build -t $(JANITOR_IMAGE) -f build/Dockerfile.janitor .
+
+docker-boxlite-runtime:
+	docker build $(DOCKER_BUILD_FLAGS) -t $(BOXLITE_RUNTIME_IMAGE) -f build/Dockerfile.boxlite-runtime .
 
 kind-load-fastlet: docker-fastlet
 	kind load docker-image $(FASTLET_IMAGE) --name fast-sandbox
@@ -292,9 +304,9 @@ test-e2e-runtime-kata:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
 		$(GO) test -p 1 ./test/e2e/suites/secureruntime/... -run '^TestKata(QemuSandbox|ClhSandbox|FcSandbox)$$' -v -count=1 -failfast -timeout $(E2E_TEST_TIMEOUT)
 
-# BoxLite is a first-class capability gate. Until the Fast Sandbox tunnel
-# extension is packaged, this target proves fail-closed behavior rather than
-# silently skipping or claiming the upstream REST surface is sufficient.
+# BoxLite is a first-class capability gate. Until all required resource limits
+# can be enforced, this target proves fail-closed behavior rather than silently
+# skipping or claiming the packaged Sidecar/tunnel is production-ready.
 test-e2e-runtime-boxlite:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
 		$(GO) test ./test/e2e/suites/secureruntime/... -run '^TestRuntimeValidationUnsupportedBoxLite$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
