@@ -194,6 +194,10 @@ func (e *SuiteEnv) MustKubeClient(t *testing.T) client.Client {
 
 func DeleteNamespace(ctx context.Context, t *testing.T, kubeClient client.Client, namespace string) {
 	t.Helper()
+	if strings.TrimSpace(os.Getenv("FAST_SANDBOX_E2E_PRESERVE_NAMESPACE")) == "1" {
+		t.Logf("preserving e2e namespace %s because FAST_SANDBOX_E2E_PRESERVE_NAMESPACE=1", namespace)
+		return
+	}
 
 	ns := &corev1.Namespace{}
 	ns.Name = namespace

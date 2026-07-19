@@ -74,7 +74,7 @@ func (m *Manager) Prepare(ctx context.Context) error {
 	for _, componentPlan := range m.plan.Plan.Components {
 		component := PreparedComponent{Plan: componentPlan}
 		switch componentPlan.DeliveryMode {
-		case runtimecatalog.InfraDeliveryBindMount:
+		case runtimecatalog.InfraDeliveryBindMount, runtimecatalog.InfraDeliveryGuestCopy:
 			artifact := componentPlan.Component.Artifact
 			staged, err := m.config.Store.Stage(ctx, artifact.Digest, artifact.Executable, func() (io.ReadCloser, error) {
 				return m.config.Resolver.Open(ctx, artifact)

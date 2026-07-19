@@ -2,10 +2,10 @@ package runtime
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/runtimecatalog"
@@ -31,9 +31,9 @@ func TestHostCapabilityProberFailsClosed(t *testing.T) {
 	require.NoError(t, err)
 	report := NewHostCapabilityProber().Probe(context.Background(), boxlite, "")
 	require.Equal(t, runtimecatalog.CapabilityUnsupported, report.State)
-	require.Equal(t, "BoxLiteDriverNotImplemented", report.Reason)
+	require.Equal(t, "BoxLiteRuntimeSidecarNotPackaged", report.Reason)
 
-	kata, err := catalog.Resolve(apiv1alpha1.RuntimeKataFc)
+	kata, err := catalog.Resolve(apiv1alpha1.RuntimeKataQemu)
 	require.NoError(t, err)
 	prober := NewHostCapabilityProber()
 	prober.stat = func(path string) (os.FileInfo, error) { return nil, os.ErrNotExist }
@@ -43,6 +43,44 @@ func TestHostCapabilityProberFailsClosed(t *testing.T) {
 	require.Contains(t, report.Missing, "/dev/kvm")
 	require.Contains(t, report.Missing, kata.Containerd.ConfigPath)
 }
+
+func TestHostCapabilityProberRejectsUnvalidatedFirecrackerProfile(t *testing.T) {
+	profile, err := runtimecatalog.Builtin().Resolve(apiv1alpha1.RuntimeKataFc)
+	require.NoError(t, err)
+	report := NewHostCapabilityProber().Probe(context.Background(), profile, "/run/containerd/containerd.sock")
+	require.Equal(t, runtimecatalog.CapabilityDegraded, report.State)
+	require.Equal(t, "KataFirecrackerNotValidated", report.Reason)
+}
+
+func TestHostCapabilityProberRequiresFastSandboxCLHCgroupMode(t *testing.T) {
+	profile, err := runtimecatalog.Builtin().Resolve(apiv1alpha1.RuntimeKataClh)
+	require.NoError(t, err)
+
+	prober := NewHostCapabilityProber()
+	prober.stat = func(string) (os.FileInfo, error) { return fakeFileInfo{}, nil }
+	prober.readFile = func(string) ([]byte, error) {
+		return []byte("sandbox_cgroup_only = false\n"), nil
+	}
+	report := prober.Probe(context.Background(), profile, "/run/containerd/containerd.sock")
+	require.Equal(t, runtimecatalog.CapabilityDegraded, report.State)
+	require.Equal(t, "RuntimeConfigIncompatible", report.Reason)
+	require.Contains(t, report.Missing, profile.Containerd.ConfigPath+":sandbox_cgroup_only=true")
+
+	prober.readFile = func(string) ([]byte, error) {
+		return []byte("# sandbox_cgroup_only = false\nsandbox_cgroup_only = true\n"), nil
+	}
+	report = prober.Probe(context.Background(), profile, "/run/containerd/containerd.sock")
+	require.Equal(t, runtimecatalog.CapabilityAvailable, report.State)
+}
+
+type fakeFileInfo struct{}
+
+func (fakeFileInfo) Name() string       { return "runtime-capability" }
+func (fakeFileInfo) Size() int64        { return 0 }
+func (fakeFileInfo) Mode() os.FileMode  { return 0 }
+func (fakeFileInfo) ModTime() time.Time { return time.Time{} }
+func (fakeFileInfo) IsDir() bool        { return false }
+func (fakeFileInfo) Sys() any           { return nil }
 
 func TestBuildRuntimeDriverSelection(t *testing.T) {
 	catalog := runtimecatalog.Builtin()
@@ -55,6 +93,6 @@ func TestBuildRuntimeDriverSelection(t *testing.T) {
 	boxlite, err := catalog.Resolve(apiv1alpha1.RuntimeBoxLite)
 	require.NoError(t, err)
 	driver, err = buildRuntimeDriver(boxlite)
-	require.Nil(t, driver)
-	require.True(t, errors.Is(err, ErrUnsupportedRuntime))
+	require.NoError(t, err)
+	require.IsType(t, &BoxLiteDriver{}, driver)
 }

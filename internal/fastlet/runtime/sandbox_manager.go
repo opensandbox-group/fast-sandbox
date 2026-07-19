@@ -200,11 +200,25 @@ func (m *SandboxManager) PrepareInfra(ctx context.Context) error {
 	for _, reference := range m.infraManager.ArtifactReferences() {
 		m.cacheProtection.Protect(reference, fastletcache.ProtectInfra)
 	}
+	if err := m.ReconcilePendingInfra(ctx); err != nil {
+		m.mu.Lock()
+		m.infraReady = false
+		m.infraMessage = err.Error()
+		m.mu.Unlock()
+		return err
+	}
+	if err := m.ReconcileProxyRoutes(ctx); err != nil {
+		m.mu.Lock()
+		m.infraReady = false
+		m.infraMessage = err.Error()
+		m.mu.Unlock()
+		return err
+	}
 	m.mu.Lock()
 	m.infraReady = true
 	m.infraMessage = ""
 	m.mu.Unlock()
-	return m.ReconcilePendingInfra(ctx)
+	return nil
 }
 
 func (m *SandboxManager) InfraStatus() (string, string, bool, []string, string) {

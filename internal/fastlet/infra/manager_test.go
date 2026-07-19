@@ -62,6 +62,46 @@ func TestManagerRetriesTransientArtifactPreparationFailure(t *testing.T) {
 	require.Equal(t, 2, resolver.calls)
 }
 
+func TestManagerStagesGuestCopyArtifactForBoxLiteSidecar(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewArtifactStore(filepath.Join(root, "pod"), filepath.Join(root, "host"))
+	require.NoError(t, err)
+	sandboxInit := filepath.Join(root, "sandbox-init")
+	require.NoError(t, os.WriteFile(sandboxInit, []byte("sandbox-init"), 0555))
+	runtimeProfile, err := runtimecatalog.Builtin().Resolve(apiv1alpha1.RuntimeBoxLite)
+	require.NoError(t, err)
+	catalog, err := infracatalog.New([]infracatalog.Profile{{
+		Name: "boxlite-guest-copy", Version: "v1", Configured: true,
+		AllowedRuntimes: []apiv1alpha1.RuntimeName{apiv1alpha1.RuntimeBoxLite},
+		Components: []infracatalog.Component{{
+			Name: "helper", Artifact: infracatalog.Artifact{
+				SourceType: infracatalog.SourceEmbedded, Reference: "embedded://test-infra/v1",
+				Digest: infracatalog.TestInfraDigest(), Executable: true,
+			},
+			ContainerPath: "/.fast/infra/helper",
+			DeliveryModes: []runtimecatalog.InfraDeliveryMode{runtimecatalog.InfraDeliveryGuestCopy},
+			Activation: infracatalog.Activation{
+				Mode: infracatalog.ActivationComponentBootstrap, Command: "/.fast/infra/helper",
+			},
+			Required: true,
+		}},
+	}})
+	require.NoError(t, err)
+	manager, err := NewManagerWithConfig(ManagerConfig{
+		Catalog: catalog, RuntimeProfile: runtimeProfile, ProfileName: "boxlite-guest-copy",
+		Store: store, Resolver: NewPlatformResolver(nil), SandboxInitPath: sandboxInit,
+	})
+	require.NoError(t, err)
+	require.NoError(t, manager.Prepare(context.Background()))
+	plan, err := manager.Plan()
+	require.NoError(t, err)
+	require.Len(t, plan.Components, 1)
+	require.Equal(t, runtimecatalog.InfraDeliveryGuestCopy, plan.Components[0].Plan.DeliveryMode)
+	require.NotNil(t, plan.Components[0].Artifact)
+	require.FileExists(t, plan.Components[0].Artifact.PodPath)
+	require.NotNil(t, plan.Supervisor)
+}
+
 type transientResolver struct {
 	delegate ArtifactResolver
 	calls    int

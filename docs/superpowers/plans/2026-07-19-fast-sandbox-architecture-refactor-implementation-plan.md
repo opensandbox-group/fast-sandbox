@@ -1,7 +1,7 @@
 # Fast Sandbox 架构重构开发计划
 
 **日期**：2026-07-19  
-**状态**：执行中（阶段 0～10 完成，阶段 11 待执行）
+**状态**：执行中（阶段 0～10 完成；阶段 11 的 container、gVisor、Kata 已完成，BoxLite 生产能力门禁待解除）
 **代码基线**：`master@f92d8e34288365be227d2ee8a6f952687dc7be00`  
 **本地仓库**：`/Users/fengjianhui/WorkSpaceL/fast-sandbox`  
 **远端开发机**：SSH alias `fast`  
@@ -1378,6 +1378,19 @@ boxlite serve sidecar
 bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_exec.sh \
   'make test-e2e-runtime-container && make test-e2e-runtime-gvisor && make test-e2e-runtime-kata && make test-e2e-runtime-boxlite'
 ```
+
+### 16.6 实施结果（2026-07-19）
+
+- container reference gate 已覆盖默认 runtime 的实际资源限制和 lifecycle 基线。远端命令 `E2E_TEST_TIMEOUT=20m DOCKER_BUILD_FLAGS=--network=host make test-e2e-runtime-container`，退出状态 `0`，总耗时 `90.883s`，核心断言 `2.51s`；
+- gVisor kind 节点准备流程补齐 runsc host binary、SHA-512 校验和 `/etc/containerd/runsc.toml`；Pool `RuntimeReady` 只接受对应 Fastlet Pod UID 的 capability heartbeat。恢复阶段若 runtime 已存在但 Infra 尚未恢复，RouteLifecycle 不再提前删除 route tombstone；
+- gVisor 远端命令 `E2E_TEST_TIMEOUT=40m DOCKER_BUILD_FLAGS=--network=host make test-e2e-runtime-gvisor`，退出状态 `0`，总耗时 `170.957s`。用例覆盖单 Sandbox、guest/host kernel 隔离、DNS、私网、Fastlet Proxy/Sandbox Proxy、Fastlet 重启恢复，以及三个并发 Sandbox；guest kernel 为 `4.19.0-gvisor`，host kernel 为 `5.15.0-173-generic`；
+- Kata QEMU 和 Cloud Hypervisor 使用 Fastlet 创建并持久化的 Linux netns。CLH capability probe 强制校验 `sandbox_cgroup_only = true`；资源验收从 containerd OCI spec 验证 Fastlet 的最终执行边界，CPU `25000/100000`、memory `268435456`、PIDs `128`；
+- Kata 聚合远端命令 `E2E_TEST_TIMEOUT=40m DOCKER_BUILD_FLAGS=--network=host make test-e2e-runtime-kata`，退出状态 `0`，总耗时 `223.169s`。QEMU 核心断言 `27.80s`、guest kernel `6.18.12`、private IP `172.30.0.3`；CLH 核心断言 `26.02s`、guest kernel `6.18.12`、private IP `172.30.0.5`；两者均验证隔离、资源、私网、代理链路和 Fastlet recovery；
+- Firecracker 在当前远端环境中曾出现 CRD 已 Running 后 VM/shim 消失，不能声明支持。内置 `kata-fc` profile 现在明确 `CapabilityDegraded/KataFirecrackerNotValidated`，Pool `RuntimeReady=False/RuntimeUnavailable` 且不创建 Fastlet Pod；同一 Kata 聚合 gate 对此 fail-close 行为完成验证；
+- BoxLite spike 结论固化到 [BoxLite Runtime Adapter ADR](../specs/2026-07-19-boxlite-runtime-adapter-adr.md)：采用独立 native Runtime Sidecar + 纯 Go Fastlet UDS client；上游 `boxlite serve` 因缺少 volume/port mapping surface 不能直接使用。一个长期 Runtime 管理当前 Fastlet Pod 的多个 Box，Sandbox UID 是稳定 Box name；
+- 已实现版本化 Sidecar lifecycle/cache contract、owner fence、profile conflict、recovery、GuestCopy artifact plan、`AccessKindLocalForward` 和 Fastlet Proxy 8-byte target-port preamble；这些边界有 fake sidecar 和透明代理 unit/integration test；
+- BoxLite native Sidecar、guest `sandbox-tunnel`、Controller sidecar 注入、真实 Janitor scanner 及完整资源/恢复 E2E 尚未实现，因此内置 `boxlite` 继续 `RuntimeReady=False/RuntimeUnsupported`。远端命令 `E2E_PROFILE=basic E2E_TEST_TIMEOUT=20m DOCKER_BUILD_FLAGS=--network=host make test-e2e-runtime-boxlite`，退出状态 `0`，总耗时 `41.362s`；该结果只证明 fail closed，不是 BoxLite 已支持；
+- 本阶段远端完整 `make test-unit` 和 `make test-race` 均退出 `0`。远端 `make verify` 已完成生成步骤；由于远端 Git 索引仍是 `master`，其 `git diff --exit-code` 会把阶段 1～10 的分支生成物识别为差异，不能作为分支 gate；把远端重新生成的 protobuf、DeepCopy 和 CRD 同步回本地分支后，受检路径 `git diff --exit-code` 为 `0`，随后再次运行完整 `make test-unit` 退出 `0`。阶段 11 只有在 BoxLite Sidecar/tunnel/native packaging、Janitor 和 16.5 全部验收通过后才能标记完成。
 
 ## 17. 阶段 12：可观测性、性能、迁移和最终发布
 

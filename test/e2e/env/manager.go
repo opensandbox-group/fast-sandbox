@@ -145,10 +145,50 @@ func (m *Manager) preflight(ctx context.Context) error {
 	if err := m.preflightInotify(ctx); err != nil {
 		return err
 	}
+	if err := m.prepareRuntimeDependencies(ctx); err != nil {
+		return err
+	}
 	if err := m.preflightRuntime(ctx); err != nil {
 		return err
 	}
 	return nil
+}
+
+func (m *Manager) prepareRuntimeDependencies(ctx context.Context) error {
+	if m.settings.Runtime != RuntimeGVisor {
+		return nil
+	}
+	return m.ensureGVisorHostBinaries(ctx)
+}
+
+func (m *Manager) ensureGVisorHostBinaries(ctx context.Context) error {
+	runscPath := gvisorRunscBin()
+	shimPath := gvisorShimBin()
+	if _, err := m.run(ctx, "sh", "-c", "test -x "+shellQuote(runscPath)+" -a -x "+shellQuote(shimPath)); err == nil {
+		return nil
+	}
+	cacheDir := filepath.Dir(runscPath)
+	if filepath.Dir(shimPath) != cacheDir {
+		return fmt.Errorf("GVISOR_RUNSC_BIN and GVISOR_SHIM_BIN must use one cache directory for automatic installation")
+	}
+	if _, err := m.run(ctx, "mkdir", "-p", cacheDir); err != nil {
+		return err
+	}
+	for _, name := range []string{"runsc", "containerd-shim-runsc-v1"} {
+		binary := filepath.Join(cacheDir, name)
+		checksum := binary + ".sha512"
+		if _, err := m.run(ctx, "wget", "-q", "--show-progress", gvisorReleaseURL()+"/"+name, "-O", binary); err != nil {
+			return err
+		}
+		if _, err := m.run(ctx, "wget", "-q", "--show-progress", gvisorReleaseURL()+"/"+name+".sha512", "-O", checksum); err != nil {
+			return err
+		}
+	}
+	if _, err := m.run(ctx, "sh", "-c", "cd "+shellQuote(cacheDir)+" && sha512sum -c runsc.sha512 -c containerd-shim-runsc-v1.sha512"); err != nil {
+		return err
+	}
+	_, err := m.run(ctx, "chmod", "a+rx", runscPath, shimPath)
+	return err
 }
 
 func (m *Manager) preflightRuntime(ctx context.Context) error {
@@ -334,6 +374,9 @@ func (m *Manager) ensureKataRuntime(ctx context.Context) error {
 		if err := m.ensureKataInstalled(ctx, node); err != nil {
 			return err
 		}
+		if _, err := m.run(ctx, "docker", "exec", node, "bash", "-c", kataFastSandboxConfigScript()); err != nil {
+			return err
+		}
 		if _, err := m.run(ctx, "docker", "exec", node, "bash", "-c", kataContainerdConfiguredScript()); err != nil {
 			if _, err := m.run(ctx, "docker", "exec", node, "bash", "-c", kataConfigureContainerdScript()); err != nil {
 				return err
@@ -454,6 +497,13 @@ func kataRequiredHostPaths() []string {
 
 func kataInstalledScript() string {
 	return "test -x /opt/kata/bin/containerd-shim-kata-v2 && test -f /opt/kata/share/defaults/kata-containers/configuration-clh.toml && test -f /opt/kata/share/defaults/kata-containers/configuration-qemu.toml && test -f /opt/kata/share/defaults/kata-containers/configuration-fc.toml"
+}
+
+func kataFastSandboxConfigScript() string {
+	return `set -e
+config=/opt/kata/share/defaults/kata-containers/configuration-clh.toml
+sed -i 's/^sandbox_cgroup_only = false$/sandbox_cgroup_only = true/' "$config"
+grep -q '^sandbox_cgroup_only = true$' "$config"`
 }
 
 func kataInstallScript() string {
@@ -678,11 +728,37 @@ func nonEmptyLines(output string) []string {
 }
 
 func gvisorRunscBin() string {
-	return firstNonEmpty(os.Getenv("GVISOR_RUNSC_BIN"), "/usr/local/bin/runsc")
+	return firstNonEmpty(os.Getenv("GVISOR_RUNSC_BIN"), filepath.Join(gvisorCacheDir(), "runsc"))
 }
 
 func gvisorShimBin() string {
-	return firstNonEmpty(os.Getenv("GVISOR_SHIM_BIN"), "/usr/local/bin/containerd-shim-runsc-v1")
+	return firstNonEmpty(os.Getenv("GVISOR_SHIM_BIN"), filepath.Join(gvisorCacheDir(), "containerd-shim-runsc-v1"))
+}
+
+func gvisorCacheDir() string {
+	return filepath.Join(homeDir(), ".cache", "fast-sandbox", "gvisor", gvisorRelease(), gvisorArch())
+}
+
+func gvisorRelease() string {
+	return firstNonEmpty(os.Getenv("GVISOR_RELEASE"), "latest")
+}
+
+func gvisorArch() string {
+	if value := os.Getenv("GVISOR_ARCH"); value != "" {
+		return value
+	}
+	switch goruntime.GOARCH {
+	case "amd64":
+		return "x86_64"
+	case "arm64":
+		return "aarch64"
+	default:
+		return goruntime.GOARCH
+	}
+}
+
+func gvisorReleaseURL() string {
+	return "https://storage.googleapis.com/gvisor/releases/release/" + gvisorRelease() + "/" + gvisorArch()
 }
 
 func firstNonEmpty(values ...string) string {

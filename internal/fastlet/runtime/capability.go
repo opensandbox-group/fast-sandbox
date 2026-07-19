@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/runtimecatalog"
@@ -35,10 +36,11 @@ type CapabilityProber interface {
 type HostCapabilityProber struct {
 	stat     func(string) (os.FileInfo, error)
 	lookPath func(string) (string, error)
+	readFile func(string) ([]byte, error)
 }
 
 func NewHostCapabilityProber() *HostCapabilityProber {
-	return &HostCapabilityProber{stat: os.Stat, lookPath: exec.LookPath}
+	return &HostCapabilityProber{stat: os.Stat, lookPath: exec.LookPath, readFile: os.ReadFile}
 }
 
 func (p *HostCapabilityProber) Probe(_ context.Context, profile runtimecatalog.RuntimeProfile, socketPath string) CapabilityReport {
@@ -49,7 +51,13 @@ func (p *HostCapabilityProber) Probe(_ context.Context, profile runtimecatalog.R
 	if profile.Capabilities.DefaultState == runtimecatalog.CapabilityUnsupported {
 		report.State = runtimecatalog.CapabilityUnsupported
 		report.Reason = profile.Capabilities.Reason
-		report.Message = "runtime profile is registered but its driver is not implemented"
+		report.Message = "runtime profile is registered but its production capability gate is not enabled"
+		return report
+	}
+	if profile.Capabilities.DefaultState == runtimecatalog.CapabilityDegraded {
+		report.State = runtimecatalog.CapabilityDegraded
+		report.Reason = profile.Capabilities.Reason
+		report.Message = "runtime profile is registered but has not passed the platform validation gate"
 		return report
 	}
 
@@ -70,6 +78,12 @@ func (p *HostCapabilityProber) Probe(_ context.Context, profile runtimecatalog.R
 		if profile.Containerd.ConfigPath != "" {
 			p.requirePath(&report, profile.Containerd.ConfigPath, "RuntimeConfigUnavailable")
 		}
+		if profile.Name == apiv1alpha1.RuntimeKataClh && profile.Containerd.ConfigPath != "" {
+			contents, err := p.readFile(profile.Containerd.ConfigPath)
+			if err == nil && !hasActiveTOMLSetting(string(contents), "sandbox_cgroup_only", "true") {
+				p.missing(&report, profile.Containerd.ConfigPath+":sandbox_cgroup_only=true", "RuntimeConfigIncompatible")
+			}
+		}
 		if profile.Containerd.RuntimePath != "" {
 			p.requirePath(&report, profile.Containerd.RuntimePath, "RuntimeBinaryUnavailable")
 		}
@@ -83,10 +97,11 @@ func (p *HostCapabilityProber) Probe(_ context.Context, profile runtimecatalog.R
 			p.missing(&report, "boxlite runtime configuration", "RuntimeProfileInvalid")
 			break
 		}
-		p.requirePath(&report, profile.BoxLite.BinaryPath, "RuntimeBinaryUnavailable")
-		if _, err := p.lookPath(profile.BoxLite.ProxyBinary); err != nil {
-			p.missing(&report, profile.BoxLite.ProxyBinary, "RuntimeBinaryUnavailable")
+		if profile.BoxLite.ControlSocket == "" || profile.BoxLite.ProtocolVersion == "" || profile.BoxLite.TunnelGuestPort == 0 {
+			p.missing(&report, "BoxLite sidecar protocol configuration", "RuntimeProfileInvalid")
+			break
 		}
+		p.requirePath(&report, profile.BoxLite.ControlSocket, "BoxLiteSidecarUnavailable")
 	default:
 		p.missing(&report, string(profile.Driver), "RuntimeDriverUnsupported")
 	}
@@ -96,6 +111,20 @@ func (p *HostCapabilityProber) Probe(_ context.Context, profile runtimecatalog.R
 		report.Message = fmt.Sprintf("runtime dependencies are unavailable: %v", report.Missing)
 	}
 	return report
+}
+
+func hasActiveTOMLSetting(contents, key, value string) bool {
+	want := key + " = " + value
+	for _, line := range strings.Split(contents, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if line == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *HostCapabilityProber) requirePath(report *CapabilityReport, path, reason string) {

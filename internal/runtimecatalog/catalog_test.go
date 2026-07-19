@@ -35,22 +35,51 @@ func TestBuiltinCatalogProfiles(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, DriverKindBoxLite, boxlite.Driver)
 	require.Equal(t, CapabilityUnsupported, boxlite.Capabilities.DefaultState)
+	require.Equal(t, "BoxLiteRuntimeSidecarNotPackaged", boxlite.Capabilities.Reason)
+	require.Equal(t, "/run/fast-sandbox/boxlite/runtime.sock", boxlite.BoxLite.ControlSocket)
+	require.Equal(t, "v1", boxlite.BoxLite.ProtocolVersion)
+	require.Equal(t, uint32(19090), boxlite.BoxLite.TunnelGuestPort)
 
 	kata, err := catalog.Resolve(apiv1alpha1.RuntimeKataFc)
 	require.NoError(t, err)
 	require.Equal(t, DriverKindContainerd, kata.Driver)
 	require.True(t, kata.Deployment.RequiresKVM)
 	require.Contains(t, kata.Containerd.ConfigPath, "configuration-fc.toml")
+	require.Equal(t, CapabilityDegraded, kata.Capabilities.DefaultState)
+	require.Equal(t, "KataFirecrackerNotValidated", kata.Capabilities.Reason)
 
 	gvisor, err := catalog.Resolve(apiv1alpha1.RuntimeGVisor)
 	require.NoError(t, err)
 	require.True(t, hasHostPath(gvisor.Deployment.HostPaths, "/usr/local/bin/runsc"))
 	require.True(t, hasHostPath(gvisor.Deployment.HostPaths, "/usr/local/bin/containerd-shim-runsc-v1"))
+	require.True(t, hasHostPath(gvisor.Deployment.HostPaths, "/etc/containerd/runsc.toml"))
+	require.True(t, hostPath(gvisor.Deployment.HostPaths, "/etc/containerd/runsc.toml").ReadOnly)
 
 	container, err := catalog.Resolve(apiv1alpha1.RuntimeContainer)
 	require.NoError(t, err)
 	require.Equal(t, corev1.MountPropagationBidirectional, hostPath(container.Deployment.HostPaths, "/run/fast-sandbox/netns").MountPropagation)
 	require.Equal(t, "/run/netns", hostPath(container.Deployment.HostPaths, "/run/fast-sandbox/netns").MountPath)
+}
+
+func TestRuntimeProfilesUsingFastletNetworkHaveRequiredMounts(t *testing.T) {
+	catalog := Builtin()
+	for _, name := range []apiv1alpha1.RuntimeName{
+		apiv1alpha1.RuntimeContainer,
+		apiv1alpha1.RuntimeGVisor,
+		apiv1alpha1.RuntimeKataQemu,
+		apiv1alpha1.RuntimeKataClh,
+		apiv1alpha1.RuntimeKataFc,
+	} {
+		profile, err := catalog.Resolve(name)
+		require.NoError(t, err)
+		require.True(t, profile.UsesFastletNetNS(), "%s must use a Fastlet-owned netns", name)
+		require.True(t, hasHostPath(profile.Deployment.HostPaths, "/run/fast-sandbox/netns"), "%s is missing the named-netns mount", name)
+		require.True(t, hasHostPath(profile.Deployment.HostPaths, "/run/fast-sandbox/network"), "%s is missing the network-state mount", name)
+	}
+
+	boxlite, err := catalog.Resolve(apiv1alpha1.RuntimeBoxLite)
+	require.NoError(t, err)
+	require.False(t, boxlite.UsesFastletNetNS())
 }
 
 func hostPath(requirements []HostPathRequirement, path string) HostPathRequirement {

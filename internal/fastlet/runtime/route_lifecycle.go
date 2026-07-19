@@ -14,14 +14,22 @@ func (m *SandboxManager) ReconcileProxyRoutes(ctx context.Context) error {
 	}
 	m.mu.RLock()
 	metadata := make([]SandboxMetadata, 0, len(m.sandboxes))
+	pendingInfra := false
 	for _, sandbox := range m.sandboxes {
 		switch sandbox.Phase {
 		case "terminating", "deleting", "delete-failed", "infra-pending", "initializing-infra":
+			if sandbox.Phase == "infra-pending" || sandbox.Phase == "initializing-infra" {
+				pendingInfra = true
+			}
 			continue
 		}
 		metadata = append(metadata, *sandbox)
 	}
 	m.mu.RUnlock()
+	if pendingInfra {
+		m.MarkProxyRouteUnavailable()
+		return fmt.Errorf("reconcile proxy routes: %w", ErrInfraUnavailable)
+	}
 	publications := make([]RoutePublication, 0, len(metadata))
 	for index := range metadata {
 		publication, err := m.routePublication(&metadata[index])

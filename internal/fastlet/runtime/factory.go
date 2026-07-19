@@ -68,7 +68,10 @@ func buildRuntimeDriver(profile runtimecatalog.RuntimeProfile) (RuntimeDriver, e
 		}
 		return newContainerdRuntimeWithConfig(profile.Name, cfg), nil
 	case runtimecatalog.DriverKindBoxLite:
-		return nil, fmt.Errorf("%w: BoxLiteDriverNotImplemented", ErrUnsupportedRuntime)
+		if profile.BoxLite == nil {
+			return nil, fmt.Errorf("BoxLite runtime profile %q has no private configuration", profile.Name)
+		}
+		return newBoxLiteDriver(profile), nil
 	default:
 		return nil, fmt.Errorf("%w: driver kind %q", ErrUnsupportedRuntime, profile.Driver)
 	}

@@ -43,6 +43,9 @@ func (r Route) validate() error {
 		r.AssignmentAttempt <= 0 || r.RouteGeneration <= 0 || r.Access.Kind == "" {
 		return fmt.Errorf("%w: incomplete route identity", ErrRouteConflict)
 	}
+	if err := r.Access.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrRouteConflict, err)
+	}
 	if r.State == "" {
 		r.State = RouteReady
 	}

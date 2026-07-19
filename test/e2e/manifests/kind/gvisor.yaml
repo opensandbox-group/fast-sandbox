@@ -24,8 +24,8 @@ nodes:
     image: ${GVISOR_KIND_IMAGE}
     extraMounts:
       - hostPath: ${GVISOR_RUNSC_BIN}
-        containerPath: /usr/bin/runsc
+        containerPath: /usr/local/bin/runsc
         readOnly: true
       - hostPath: ${GVISOR_SHIM_BIN}
-        containerPath: /usr/bin/containerd-shim-runsc-v1
+        containerPath: /usr/local/bin/containerd-shim-runsc-v1
         readOnly: true

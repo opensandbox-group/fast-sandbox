@@ -60,11 +60,14 @@ type ContainerdConfig struct {
 }
 
 type BoxLiteConfig struct {
-	StateRoot     string `json:"stateRoot"`
-	BinaryPath    string `json:"binaryPath"`
-	ProxyBinary   string `json:"proxyBinary"`
-	DefaultVCPUs  int32  `json:"defaultVCPUs"`
-	DefaultMemory string `json:"defaultMemory"`
+	StateRoot       string `json:"stateRoot"`
+	BinaryPath      string `json:"binaryPath"`
+	ProxyBinary     string `json:"proxyBinary"`
+	ControlSocket   string `json:"controlSocket"`
+	ProtocolVersion string `json:"protocolVersion"`
+	TunnelGuestPort uint32 `json:"tunnelGuestPort"`
+	DefaultVCPUs    int32  `json:"defaultVCPUs"`
+	DefaultMemory   string `json:"defaultMemory"`
 }
 
 type HostPathRequirement struct {
@@ -103,6 +106,14 @@ type RuntimeProfile struct {
 	Capabilities       Capabilities            `json:"capabilities"`
 	NetworkMode        NetworkMode             `json:"networkMode"`
 	InfraDeliveryModes []InfraDeliveryMode     `json:"infraDeliveryModes"`
+}
+
+// UsesFastletNetNS reports whether the runtime consumes a Fastlet-owned Linux
+// network namespace. Kata keeps a distinct NetworkMode because its shim turns
+// that namespace into a guest NIC, but it still needs the same slot lifecycle
+// and DirectIP access contract as the container and gVisor profiles.
+func (p RuntimeProfile) UsesFastletNetNS() bool {
+	return p.NetworkMode == NetworkModeLinuxNetNS || p.NetworkMode == NetworkModeKata
 }
 
 var ErrRuntimeNotFound = errors.New("runtime profile not found")

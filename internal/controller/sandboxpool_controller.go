@@ -17,6 +17,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -80,6 +81,15 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		})
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
+	if profile.Capabilities.DefaultState == runtimecatalog.CapabilityDegraded {
+		_ = r.updatePoolCondition(ctx, &pool, metav1.Condition{
+			Type:    apiv1alpha1.PoolConditionRuntimeReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  apiv1alpha1.ReasonRuntimeUnavailable,
+			Message: profile.Capabilities.Reason,
+		})
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
 	if _, err := pool.Spec.EffectiveSandboxResources(); err != nil {
 		_ = r.updatePoolCondition(ctx, &pool, metav1.Condition{
 			Type:    apiv1alpha1.PoolConditionRuntimeReady,
@@ -104,6 +114,10 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	var childPods corev1.PodList
 	if err := r.durableReader().List(ctx, &childPods, client.InNamespace(req.Namespace), client.MatchingLabels(poolLabels(pool.Name))); err != nil {
+		return ctrl.Result{}, err
+	}
+	runtimeCondition, readyPods := r.runtimeCapabilityCondition(&pool, childPods.Items)
+	if err := r.updatePoolCondition(ctx, &pool, runtimeCondition); err != nil {
 		return ctrl.Result{}, err
 	}
 	var allSandboxes apiv1alpha1.SandboxList
@@ -160,9 +174,10 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			}
 		}
 	}
-	if pool.Status.CurrentPods != currentCount || pool.Status.TotalFastlets != currentCount {
+	if pool.Status.CurrentPods != currentCount || pool.Status.TotalFastlets != currentCount || pool.Status.ReadyPods != readyPods {
 		pool.Status.CurrentPods = currentCount
 		pool.Status.TotalFastlets = currentCount
+		pool.Status.ReadyPods = readyPods
 		if err := r.Status().Update(ctx, &pool); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -174,6 +189,49 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+func (r *SandboxPoolReconciler) runtimeCapabilityCondition(pool *apiv1alpha1.SandboxPool, pods []corev1.Pod) (metav1.Condition, int32) {
+	condition := metav1.Condition{
+		Type:               apiv1alpha1.PoolConditionRuntimeReady,
+		Status:             metav1.ConditionFalse,
+		Reason:             apiv1alpha1.ReasonRuntimeCapabilityPending,
+		Message:            "Waiting for a child Fastlet heartbeat with a ready runtime",
+		ObservedGeneration: pool.Generation,
+	}
+	if r.Registry == nil {
+		return condition, 0
+	}
+
+	children := make(map[string]struct{}, len(pods))
+	for index := range pods {
+		children[podIdentity(&pods[index])] = struct{}{}
+	}
+	var ready int32
+	observedHeartbeat := false
+	for _, info := range r.Registry.GetAllFastlets() {
+		if info.Namespace != pool.Namespace || info.PoolName != pool.Name {
+			continue
+		}
+		if _, exists := children[info.PodName+"/"+info.PodUID]; !exists {
+			continue
+		}
+		if !info.LastHeartbeat.IsZero() {
+			observedHeartbeat = true
+		}
+		if info.PodReady && info.RuntimeReady {
+			ready++
+		}
+	}
+	if ready > 0 {
+		condition.Status = metav1.ConditionTrue
+		condition.Reason = apiv1alpha1.ReasonRuntimeAvailable
+		condition.Message = fmt.Sprintf("%d child Fastlet pod(s) report the runtime ready", ready)
+	} else if observedHeartbeat {
+		condition.Reason = apiv1alpha1.ReasonRuntimeUnavailable
+		condition.Message = "Child Fastlet heartbeats report no ready runtime"
+	}
+	return condition, ready
 }
 
 func (r *SandboxPoolReconciler) reconcileDraining(
@@ -751,20 +809,13 @@ func mountPropagation(value *corev1.MountPropagationMode) corev1.MountPropagatio
 
 // updatePoolCondition updates a condition on the pool status.
 func (r *SandboxPoolReconciler) updatePoolCondition(ctx context.Context, pool *apiv1alpha1.SandboxPool, condition metav1.Condition) error {
-	condition.LastTransitionTime = metav1.Now()
-
-	found := false
-	for i, c := range pool.Status.Conditions {
-		if c.Type == condition.Type {
-			pool.Status.Conditions[i] = condition
-			found = true
-			break
-		}
+	condition.ObservedGeneration = pool.Generation
+	existing := apiMeta.FindStatusCondition(pool.Status.Conditions, condition.Type)
+	if existing != nil && existing.Status == condition.Status && existing.Reason == condition.Reason &&
+		existing.Message == condition.Message && existing.ObservedGeneration == condition.ObservedGeneration {
+		return nil
 	}
-	if !found {
-		pool.Status.Conditions = append(pool.Status.Conditions, condition)
-	}
-
+	apiMeta.SetStatusCondition(&pool.Status.Conditions, condition)
 	return r.Status().Update(ctx, pool)
 }
 

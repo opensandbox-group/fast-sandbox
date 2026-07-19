@@ -23,8 +23,9 @@ func builtinProfiles() map[apiv1alpha1.RuntimeName]RuntimeProfile {
 	gvisorPaths = append(gvisorPaths,
 		HostPathRequirement{Name: "gvisor-runsc", HostPath: "/usr/local/bin/runsc", MountPath: "/usr/local/bin/runsc", Type: corev1.HostPathFile, ReadOnly: true},
 		HostPathRequirement{Name: "gvisor-shim", HostPath: "/usr/local/bin/containerd-shim-runsc-v1", MountPath: "/usr/local/bin/containerd-shim-runsc-v1", Type: corev1.HostPathFile, ReadOnly: true},
+		HostPathRequirement{Name: "gvisor-config", HostPath: "/etc/containerd/runsc.toml", MountPath: "/etc/containerd/runsc.toml", Type: corev1.HostPathFile, ReadOnly: true},
 	)
-	kataPaths := append([]HostPathRequirement{}, containerdPaths...)
+	kataPaths := append(append([]HostPathRequirement{}, containerdPaths...), linuxNetworkPaths...)
 	kataPaths = append(kataPaths,
 		HostPathRequirement{Name: "dev-kvm", HostPath: "/dev/kvm", MountPath: "/dev/kvm", Type: corev1.HostPathCharDev},
 		HostPathRequirement{Name: "kata-runtime", HostPath: "/opt/kata", MountPath: "/opt/kata", Type: corev1.HostPathDirectory, ReadOnly: true},
@@ -49,10 +50,14 @@ func builtinProfiles() map[apiv1alpha1.RuntimeName]RuntimeProfile {
 		},
 		apiv1alpha1.RuntimeKataQemu: kataProfile(apiv1alpha1.RuntimeKataQemu, "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml", kataPaths),
 		apiv1alpha1.RuntimeKataClh:  kataProfile(apiv1alpha1.RuntimeKataClh, "/opt/kata/share/defaults/kata-containers/configuration-clh.toml", kataPaths),
-		apiv1alpha1.RuntimeKataFc:   kataProfile(apiv1alpha1.RuntimeKataFc, "/opt/kata/share/defaults/kata-containers/configuration-fc.toml", kataPaths),
+		apiv1alpha1.RuntimeKataFc:   unavailableKataProfile(apiv1alpha1.RuntimeKataFc, "/opt/kata/share/defaults/kata-containers/configuration-fc.toml", kataPaths, "KataFirecrackerNotValidated"),
 		apiv1alpha1.RuntimeBoxLite: {
 			Name: apiv1alpha1.RuntimeBoxLite, Version: builtinProfileVersion, Driver: DriverKindBoxLite,
-			BoxLite: &BoxLiteConfig{StateRoot: "/var/lib/fast-sandbox/boxlite", BinaryPath: "/usr/local/bin/boxlite", ProxyBinary: "gvproxy", DefaultVCPUs: 1, DefaultMemory: "1Gi"},
+			BoxLite: &BoxLiteConfig{
+				StateRoot: "/var/lib/fast-sandbox/boxlite", BinaryPath: "/usr/local/bin/boxlite", ProxyBinary: "gvproxy",
+				ControlSocket: "/run/fast-sandbox/boxlite/runtime.sock", ProtocolVersion: "v1", TunnelGuestPort: 19090,
+				DefaultVCPUs: 1, DefaultMemory: "1Gi",
+			},
 			Deployment: DeploymentRequirements{
 				Privileged: true, RequiresKVM: true, Overhead: overhead("200m", "256Mi"),
 				HostPaths: []HostPathRequirement{
@@ -60,11 +65,18 @@ func builtinProfiles() map[apiv1alpha1.RuntimeName]RuntimeProfile {
 					{Name: "boxlite-state", HostPath: "/var/lib/fast-sandbox/boxlite", MountPath: "/var/lib/fast-sandbox/boxlite", Type: corev1.HostPathDirectoryOrCreate},
 				},
 			},
-			Capabilities:       Capabilities{DefaultState: CapabilityUnsupported, SupportsNetwork: true, SupportsRecovery: true, Reason: "BoxLiteDriverNotImplemented"},
+			Capabilities:       Capabilities{DefaultState: CapabilityUnsupported, SupportsNetwork: true, SupportsRecovery: true, Reason: "BoxLiteRuntimeSidecarNotPackaged"},
 			NetworkMode:        NetworkModeBoxLite,
 			InfraDeliveryModes: []InfraDeliveryMode{InfraDeliveryTemplateBake, InfraDeliveryPreinstalled, InfraDeliveryGuestCopy},
 		},
 	}
+}
+
+func unavailableKataProfile(name apiv1alpha1.RuntimeName, configPath string, paths []HostPathRequirement, reason string) RuntimeProfile {
+	profile := kataProfile(name, configPath, paths)
+	profile.Capabilities.DefaultState = CapabilityDegraded
+	profile.Capabilities.Reason = reason
+	return profile
 }
 
 func kataProfile(name apiv1alpha1.RuntimeName, configPath string, paths []HostPathRequirement) RuntimeProfile {

@@ -210,6 +210,33 @@ func TestManagerEnsureRendersGVisorKindConfigTemplate(t *testing.T) {
 	}
 }
 
+func TestManagerDownloadsAndVerifiesGVisorBinariesWhenMissing(t *testing.T) {
+	t.Setenv("HOME", "/home/test")
+	t.Setenv("GVISOR_RELEASE", "20260713")
+	t.Setenv("GVISOR_ARCH", "x86_64")
+	runsc := "/home/test/.cache/fast-sandbox/gvisor/20260713/x86_64/runsc"
+	shim := "/home/test/.cache/fast-sandbox/gvisor/20260713/x86_64/containerd-shim-runsc-v1"
+	runner := &fakeRunner{
+		outputs: map[string]string{},
+		errs: map[string]error{
+			commandKey("sh", "-c", "test -x "+runsc+" -a -x "+shim): errors.New("missing"),
+		},
+	}
+	manager, err := NewManager(ProfileGVisor, WithRunner(runner), WithRootDir("/repo"), WithHostOS("linux"))
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+	if err := manager.ensureGVisorHostBinaries(context.Background()); err != nil {
+		t.Fatalf("ensureGVisorHostBinaries returned error: %v", err)
+	}
+
+	baseURL := "https://storage.googleapis.com/gvisor/releases/release/20260713/x86_64"
+	assertCommand(t, runner.commands, "wget", "-q", "--show-progress", baseURL+"/runsc", "-O", runsc)
+	assertCommand(t, runner.commands, "wget", "-q", "--show-progress", baseURL+"/containerd-shim-runsc-v1.sha512", "-O", shim+".sha512")
+	assertCommandContaining(t, runner.commands, "sh -c", "sha512sum -c runsc.sha512 -c containerd-shim-runsc-v1.sha512")
+	assertCommand(t, runner.commands, "chmod", "a+rx", runsc, shim)
+}
+
 func TestManagerEnsureGVisorConfiguresRuntimeOnKindNodes(t *testing.T) {
 	t.Setenv("GVISOR_RUNSC_BIN", "/opt/gvisor/runsc")
 	t.Setenv("GVISOR_SHIM_BIN", "/opt/gvisor/containerd-shim-runsc-v1")
@@ -321,6 +348,7 @@ func TestManagerEnsureKataInstallsRuntimeAndAppliesRuntimeClasses(t *testing.T) 
 	assertCommand(t, runner.commands, "cp", "/home/test/.cache/kata-static-3.27.0-amd64.tar.zst", "/data/kata-static-3.27.0-amd64.tar.zst")
 	assertCommand(t, runner.commands, "docker", "cp", "/data/kata-static-3.27.0-amd64.tar.zst", node+":/root/kata.tar.zst")
 	assertCommandContaining(t, runner.commands, "docker exec "+node+" bash -c", "tar -xf /root/kata.tar -C /")
+	assertCommandContaining(t, runner.commands, "docker exec "+node+" bash -c", "sandbox_cgroup_only = true")
 	assertCommandContaining(t, runner.commands, "docker exec "+node+" bash -c", "runtimes.kata-clh")
 	assertCommandContaining(t, runner.commands, "docker exec "+node+" bash -c", "systemctl restart containerd")
 	assertCommandContaining(t, runner.commands, "docker exec "+node+" bash -c", "ctr -n k8s.io image tag")
@@ -355,6 +383,7 @@ func TestManagerEnsureKataSkipsInstallAndRestartWhenAlreadyConfigured(t *testing
 	if hasCommand(runner.commands, "docker", "exec", node, "bash", "-c", kataRestartContainerdScript()) {
 		t.Fatalf("expected existing Kata containerd config to skip restart, commands: %#v", runner.commands)
 	}
+	assertCommandContaining(t, runner.commands, "docker exec "+node+" bash -c", "sandbox_cgroup_only = true")
 	assertCommand(t, runner.commands, "kubectl", "apply", "-f", "test/e2e/manifests/runtimeclass/kata.yaml")
 }
 

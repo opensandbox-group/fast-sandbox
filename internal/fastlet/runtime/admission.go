@@ -457,8 +457,10 @@ func (m *SandboxManager) Recover(ctx context.Context) error {
 		return fmt.Errorf("recovered %d Sandboxes exceeds Fastlet capacity %d", len(recovered), m.capacity)
 	}
 	publications := make([]RoutePublication, 0, len(recovered))
+	pendingInfra := false
 	for _, metadata := range recovered {
 		if m.infraManager != nil {
+			pendingInfra = true
 			continue
 		}
 		publication, err := m.routePublication(metadata)
@@ -469,7 +471,7 @@ func (m *SandboxManager) Recover(ctx context.Context) error {
 			publications = append(publications, publication)
 		}
 	}
-	if m.routePublisher != nil {
+	if m.routePublisher != nil && !pendingInfra {
 		if err := m.routePublisher.ReconcileRoutes(ctx, publications); err != nil {
 			return fmt.Errorf("reconcile Fastlet Proxy routes: %w", err)
 		}
@@ -483,7 +485,7 @@ func (m *SandboxManager) Recover(ctx context.Context) error {
 	m.sandboxes = recovered
 	m.recovering = false
 	m.runtimeReady = true
-	m.routeReady = true
+	m.routeReady = m.routePublisher == nil || !pendingInfra
 	m.mu.Unlock()
 	return nil
 }

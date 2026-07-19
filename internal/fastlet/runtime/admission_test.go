@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"fast-sandbox/internal/api"
+	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/runtimecatalog"
 
@@ -576,6 +577,41 @@ func TestRecoveryReconcilesRoutesBeforeReadiness(t *testing.T) {
 	publisher.mu.Lock()
 	require.Len(t, publisher.reconciled, 2)
 	require.Equal(t, int64(3), publisher.reconciled[1][0].RouteGeneration)
+	publisher.mu.Unlock()
+}
+
+func TestRecoveryDefersDestructiveRouteReconcileUntilInfraIsRestored(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	runtime.managed = []*SandboxMetadata{{SandboxSpec: api.SandboxSpec{
+		SandboxID: "sandbox-a", ClaimUID: "claim-a", ClaimNamespace: "default", FastletPodUID: "pod-uid-a",
+		InstanceGeneration: 1, AssignmentAttempt: 2, RouteGeneration: 3,
+	}, Phase: "running"}}
+	publisher := &admissionRoutePublisher{}
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-uid-a", RecoverOnStart: true, RoutePublisher: publisher,
+		InfraManager: &fastletinfra.Manager{},
+	})
+	require.NoError(t, err)
+	require.NoError(t, manager.Recover(context.Background()))
+	require.False(t, manager.Ready(), "pending Infra must keep route readiness closed")
+	publisher.mu.Lock()
+	require.Empty(t, publisher.reconciled, "an empty desired set would tombstone the live sidecar route")
+	publisher.mu.Unlock()
+
+	require.ErrorIs(t, manager.ReconcileProxyRoutes(context.Background()), ErrInfraUnavailable)
+	publisher.mu.Lock()
+	require.Empty(t, publisher.reconciled)
+	publisher.mu.Unlock()
+
+	manager.mu.Lock()
+	manager.sandboxes["sandbox-a"].Phase = "running"
+	manager.mu.Unlock()
+	require.NoError(t, manager.ReconcileProxyRoutes(context.Background()))
+	require.True(t, manager.Ready())
+	publisher.mu.Lock()
+	require.Len(t, publisher.reconciled, 1)
+	require.Len(t, publisher.reconciled[0], 1)
+	require.Equal(t, int64(3), publisher.reconciled[0][0].RouteGeneration)
 	publisher.mu.Unlock()
 }
 

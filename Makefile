@@ -32,7 +32,7 @@ PROTOC_GEN_GO_GRPC_VERSION := v1.6.0
 CONTROLLER_GEN_VERSION := v0.20.1
 CONTROLLER_GEN := $(TOOLS_BIN)/controller-gen
 
-.PHONY: all build build-controller build-fastlet build-sandbox-init build-fastlet-proxy build-sandbox-proxy build-janitor build-fastlet-linux build-sandbox-init-linux build-fastlet-proxy-linux build-sandbox-proxy-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-python-proto generate-deepcopy manifests verify-generated test test-unit test-python-sdk test-race test-network-integration test-e2e test-e2e-controlplane test-e2e-network test-e2e-proxy test-e2e-infra test-e2e-sdk test-e2e-runtime test-e2e-drain verify setup-e2e tidy e2e docker-fastlet docker-fastlet-proxy docker-sandbox-proxy docker-controller docker-janitor kind-load-fastlet kind-load-fastlet-proxy kind-load-sandbox-proxy kind-load-controller kind-load-janitor help
+.PHONY: all build build-controller build-fastlet build-sandbox-init build-fastlet-proxy build-sandbox-proxy build-janitor build-fastlet-linux build-sandbox-init-linux build-fastlet-proxy-linux build-sandbox-proxy-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-python-proto generate-deepcopy manifests verify-generated test test-unit test-python-sdk test-race test-network-integration test-e2e test-e2e-controlplane test-e2e-network test-e2e-proxy test-e2e-infra test-e2e-sdk test-e2e-runtime test-e2e-runtime-container test-e2e-runtime-gvisor test-e2e-runtime-kata test-e2e-runtime-boxlite test-e2e-drain verify setup-e2e tidy e2e docker-fastlet docker-fastlet-proxy docker-sandbox-proxy docker-controller docker-janitor kind-load-fastlet kind-load-fastlet-proxy kind-load-sandbox-proxy kind-load-controller kind-load-janitor help
 
 all: build
 
@@ -49,6 +49,7 @@ help:
 	@echo "  make test-e2e-proxy         - run the focused Sandbox/Fastlet Proxy data-plane e2e"
 	@echo "  make test-e2e-infra         - run the focused Infra runtime-augmentation e2e"
 	@echo "  make test-e2e-sdk           - run the focused SDK Adapter data-plane e2e"
+	@echo "  make test-e2e-runtime-*     - run container, gVisor, Kata, or BoxLite capability gates"
 	@echo "  make test-e2e-drain         - run the focused durable Pool Drain e2e"
 	@echo "  make test-python-sdk        - run Python SDK unit tests in the active Python environment"
 	@echo "  make generate               - regenerate protobuf and deepcopy code"
@@ -278,6 +279,25 @@ test-e2e-sdk:
 test-e2e-runtime:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
 		$(GO) test -p 1 ./test/e2e/suites/secureruntime/... -v -count=1 -failfast -timeout $(E2E_TEST_TIMEOUT)
+
+test-e2e-runtime-container:
+	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
+		$(GO) test ./test/e2e/suites/secureruntime/... -run '^TestRuntimeValidationContainerDefault$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
+
+test-e2e-runtime-gvisor:
+	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
+		$(GO) test ./test/e2e/suites/secureruntime/... -run '^TestGVisor' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
+
+test-e2e-runtime-kata:
+	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
+		$(GO) test -p 1 ./test/e2e/suites/secureruntime/... -run '^TestKata(QemuSandbox|ClhSandbox|FcSandbox)$$' -v -count=1 -failfast -timeout $(E2E_TEST_TIMEOUT)
+
+# BoxLite is a first-class capability gate. Until the Fast Sandbox tunnel
+# extension is packaged, this target proves fail-closed behavior rather than
+# silently skipping or claiming the upstream REST surface is sufficient.
+test-e2e-runtime-boxlite:
+	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
+		$(GO) test ./test/e2e/suites/secureruntime/... -run '^TestRuntimeValidationUnsupportedBoxLite$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
 
 test-e2e-drain:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \

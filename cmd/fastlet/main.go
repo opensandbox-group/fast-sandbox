@@ -70,7 +70,7 @@ func main() {
 	defer rt.Close()
 
 	rt.SetNamespace(namespace)
-	if runtimeProfile.NetworkMode == runtimecatalog.NetworkModeLinuxNetNS {
+	if runtimeProfile.UsesFastletNetNS() {
 		networkManager, err := newNetworkManager(capacityFromEnvironment(), podUID)
 		if err != nil {
 			klog.ErrorS(err, "Failed to configure Fastlet-owned network")

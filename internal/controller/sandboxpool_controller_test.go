@@ -56,6 +56,57 @@ func TestResolveRuntimeProfileUsesCanonicalAndLegacyFields(t *testing.T) {
 	require.ErrorIs(t, err, apiv1alpha1.ErrLegacyRuntimeOverride)
 }
 
+func TestRuntimeCapabilityConditionAggregatesExactChildHeartbeat(t *testing.T) {
+	registry := fastletpool.NewInMemoryRegistry()
+	now := time.Now()
+	registry.RegisterOrUpdate(fastletpool.FastletInfo{
+		ID: "default/fastlet-ready", Namespace: "default", PoolName: "pool-a",
+		PodName: "fastlet-ready", PodUID: "uid-ready", PodReady: true, RuntimeReady: true, LastHeartbeat: now,
+	})
+	registry.RegisterOrUpdate(fastletpool.FastletInfo{
+		ID: "default/fastlet-unready", Namespace: "default", PoolName: "pool-a",
+		PodName: "fastlet-unready", PodUID: "uid-unready", PodReady: true, RuntimeReady: false, LastHeartbeat: now,
+	})
+	registry.RegisterOrUpdate(fastletpool.FastletInfo{
+		ID: "default/stale-identity", Namespace: "default", PoolName: "pool-a",
+		PodName: "fastlet-ready", PodUID: "old-uid", PodReady: true, RuntimeReady: true, LastHeartbeat: now,
+	})
+	reconciler := &SandboxPoolReconciler{Registry: registry}
+	pool := &apiv1alpha1.SandboxPool{ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default", Generation: 7}}
+	pods := []corev1.Pod{
+		{ObjectMeta: metav1.ObjectMeta{Name: "fastlet-ready", Namespace: "default", UID: types.UID("uid-ready")}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "fastlet-unready", Namespace: "default", UID: types.UID("uid-unready")}},
+	}
+
+	condition, ready := reconciler.runtimeCapabilityCondition(pool, pods)
+	require.Equal(t, int32(1), ready)
+	require.Equal(t, metav1.ConditionTrue, condition.Status)
+	require.Equal(t, apiv1alpha1.ReasonRuntimeAvailable, condition.Reason)
+	require.Equal(t, int64(7), condition.ObservedGeneration)
+
+	registry.Remove("default/fastlet-ready")
+	condition, ready = reconciler.runtimeCapabilityCondition(pool, pods)
+	require.Zero(t, ready)
+	require.Equal(t, metav1.ConditionFalse, condition.Status)
+	require.Equal(t, apiv1alpha1.ReasonRuntimeUnavailable, condition.Reason)
+}
+
+func TestRuntimeCapabilityConditionWaitsForHeartbeat(t *testing.T) {
+	registry := fastletpool.NewInMemoryRegistry()
+	registry.RegisterOrUpdate(fastletpool.FastletInfo{
+		ID: "default/fastlet-a", Namespace: "default", PoolName: "pool-a",
+		PodName: "fastlet-a", PodUID: "uid-a", PodReady: true,
+	})
+	reconciler := &SandboxPoolReconciler{Registry: registry}
+	pool := &apiv1alpha1.SandboxPool{ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"}}
+	pods := []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "fastlet-a", Namespace: "default", UID: types.UID("uid-a")}}}
+
+	condition, ready := reconciler.runtimeCapabilityCondition(pool, pods)
+	require.Zero(t, ready)
+	require.Equal(t, metav1.ConditionFalse, condition.Status)
+	require.Equal(t, apiv1alpha1.ReasonRuntimeCapabilityPending, condition.Reason)
+}
+
 func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, apiv1alpha1.AddToScheme(scheme))

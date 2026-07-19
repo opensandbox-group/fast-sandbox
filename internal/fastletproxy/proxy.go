@@ -24,9 +24,10 @@ const (
 )
 
 type Proxy struct {
-	Store     *Store
-	Verifier  *routeauth.Verifier
-	Transport http.RoundTripper
+	Store       *Store
+	Verifier    *routeauth.Verifier
+	Transport   http.RoundTripper
+	DialContext DialContextFunc
 }
 
 func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -65,18 +66,33 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, "route credential rejected", http.StatusForbidden)
 		return
 	}
-	if route.Access.Kind != fastletnetwork.AccessKindDirectIP || net.ParseIP(route.Access.Address) == nil {
+	var upstream string
+	transport := p.Transport
+	switch route.Access.Kind {
+	case fastletnetwork.AccessKindDirectIP:
+		if net.ParseIP(route.Access.Address) == nil {
+			http.Error(writer, "direct IP route address is invalid", http.StatusNotImplemented)
+			return
+		}
+		upstream = net.JoinHostPort(route.Access.Address, strconv.Itoa(int(targetPort)))
+		if transport == nil {
+			transport = &http.Transport{
+				Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: false, DisableCompression: true,
+				MaxIdleConns: 256, MaxIdleConnsPerHost: 32, IdleConnTimeout: 90 * time.Second,
+			}
+		}
+	case fastletnetwork.AccessKindLocalForward:
+		transport, err = newLocalForwardTransport(route.Access.Address, targetPort, p.DialContext)
+		if err != nil {
+			http.Error(writer, "local-forward route is invalid: "+err.Error(), http.StatusNotImplemented)
+			return
+		}
+		// DialContext ignores this logical authority and connects to the
+		// runtime-local endpoint after writing the target-port preamble.
+		upstream = "sandbox.local"
+	default:
 		http.Error(writer, "route access kind is not supported", http.StatusNotImplemented)
 		return
-	}
-
-	upstream := net.JoinHostPort(route.Access.Address, strconv.Itoa(int(targetPort)))
-	transport := p.Transport
-	if transport == nil {
-		transport = &http.Transport{
-			Proxy: http.ProxyFromEnvironment, ForceAttemptHTTP2: false, DisableCompression: true,
-			MaxIdleConns: 256, MaxIdleConnsPerHost: 32, IdleConnTimeout: 90 * time.Second,
-		}
 	}
 	proxy := &httputil.ReverseProxy{
 		Transport:     transport,
