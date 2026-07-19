@@ -32,6 +32,7 @@ Deferred          已明确不属于本轮范围
 | REF-0003 | 0/11 | DecisionPending | 否 | 远端 host 当前未发现 runsc、Kata shim host command 和 BoxLite；Kata RuntimeClass 已存在于 kind 节点 | 阶段 0 只记录 capability；阶段 11 分别准备并验证，不用 skip 作为支持证据 |
 | REF-0004 | 1 | Resolved | 否 | 专题文档中仍存在 service-name route、RuntimeDriver Exec/File 等被跨模块文档覆盖的旧表述 | 已统一为 target-port route、无公共 Exec/File RuntimeDriver，以及 reservation-before-CRD Create 流程 |
 | REF-0005 | 0/1 | Resolved | 否 | master 的 `make test` 实际包含所有 e2e 包，Go 会并行运行多个 Suite 并同时操作同一个 kind 集群 | 阶段 1 将 `test`/`test-unit` 限定为纯单测，e2e 继续通过 `-p 1` 的独立目标串行执行 |
+| REF-0006 | 2 | Resolved | 否 | Pool immutable schema e2e 首次更新与 Controller status 更新发生 resourceVersion 竞争 | e2e 使用 RetryOnConflict 重新读取后提交；CEL immutable 规则验证通过，产品语义不变 |
 
 ## 详细记录
 
@@ -114,3 +115,14 @@ kind load docker-image fast-sandbox/fastlet:dev --name fsb-e2e-basic
 **结论**：这是测试入口分层错误，不是产品基线单测失败。`make test` 保持“纯单测”语义，并新增明确的 `test-unit`；所有真实 e2e 仅从独立目标启动，整套 e2e 使用 Go package parallelism `-p 1`。这也是阶段 1 测试骨架的一部分。
 
 **验证证据**：远端执行 `make generate && make manifests && make test-unit`，退出状态 `0`。生成前后 protobuf、DeepCopy 和两份 CRD manifest 的 SHA256 完全一致；纯单测覆盖 api/cmd/internal/pkg 与轻量 e2e support 包，不再启动 kind 或 container runtime。
+
+### REF-0006：CRD immutable e2e 与 status writer 竞争
+
+**证据**：`TestSandboxPoolCRDValidation` 创建 Pool 后，SandboxPoolController 很快更新 status，使测试持有的 `resourceVersion` 失效；首次 immutable runtime update 返回 Kubernetes `Conflict`，尚未到达 CEL validation。
+
+**结论**：这是正常的并发 writer 行为。测试改为 `RetryOnConflict`，每次重新读取对象后只修改目标 spec。随后远端 e2e 验证以下行为均通过：
+
+- `runtime + runtimeType` 同时出现被 CRD 拒绝；
+- 非法 runtime enum 被拒绝；
+- `spec.runtime` 更新被 immutable CEL 拒绝；
+- `spec.sandboxResources` 更新被 immutable CEL 拒绝。

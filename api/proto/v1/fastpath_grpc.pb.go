@@ -19,11 +19,13 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	FastPathService_CreateSandbox_FullMethodName = "/fastpath.v1.FastPathService/CreateSandbox"
-	FastPathService_DeleteSandbox_FullMethodName = "/fastpath.v1.FastPathService/DeleteSandbox"
-	FastPathService_UpdateSandbox_FullMethodName = "/fastpath.v1.FastPathService/UpdateSandbox"
-	FastPathService_ListSandboxes_FullMethodName = "/fastpath.v1.FastPathService/ListSandboxes"
-	FastPathService_GetSandbox_FullMethodName    = "/fastpath.v1.FastPathService/GetSandbox"
+	FastPathService_CreateSandbox_FullMethodName        = "/fastpath.v1.FastPathService/CreateSandbox"
+	FastPathService_DeleteSandbox_FullMethodName        = "/fastpath.v1.FastPathService/DeleteSandbox"
+	FastPathService_UpdateSandbox_FullMethodName        = "/fastpath.v1.FastPathService/UpdateSandbox"
+	FastPathService_ListSandboxes_FullMethodName        = "/fastpath.v1.FastPathService/ListSandboxes"
+	FastPathService_GetSandbox_FullMethodName           = "/fastpath.v1.FastPathService/GetSandbox"
+	FastPathService_ResolveEndpoint_FullMethodName      = "/fastpath.v1.FastPathService/ResolveEndpoint"
+	FastPathService_IssueRouteCredential_FullMethodName = "/fastpath.v1.FastPathService/IssueRouteCredential"
 )
 
 // FastPathServiceClient is the client API for FastPathService service.
@@ -40,6 +42,10 @@ type FastPathServiceClient interface {
 	ListSandboxes(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error)
 	// GetSandbox 获取沙箱详情
 	GetSandbox(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*SandboxInfo, error)
+	// ResolveEndpoint resolves an authenticated proxy route for a target port.
+	ResolveEndpoint(ctx context.Context, in *ResolveEndpointRequest, opts ...grpc.CallOption) (*ResolveEndpointResponse, error)
+	// IssueRouteCredential refreshes a short-lived credential for an existing route.
+	IssueRouteCredential(ctx context.Context, in *IssueRouteCredentialRequest, opts ...grpc.CallOption) (*IssueRouteCredentialResponse, error)
 }
 
 type fastPathServiceClient struct {
@@ -100,6 +106,26 @@ func (c *fastPathServiceClient) GetSandbox(ctx context.Context, in *GetRequest, 
 	return out, nil
 }
 
+func (c *fastPathServiceClient) ResolveEndpoint(ctx context.Context, in *ResolveEndpointRequest, opts ...grpc.CallOption) (*ResolveEndpointResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResolveEndpointResponse)
+	err := c.cc.Invoke(ctx, FastPathService_ResolveEndpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *fastPathServiceClient) IssueRouteCredential(ctx context.Context, in *IssueRouteCredentialRequest, opts ...grpc.CallOption) (*IssueRouteCredentialResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(IssueRouteCredentialResponse)
+	err := c.cc.Invoke(ctx, FastPathService_IssueRouteCredential_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // FastPathServiceServer is the server API for FastPathService service.
 // All implementations must embed UnimplementedFastPathServiceServer
 // for forward compatibility.
@@ -114,6 +140,10 @@ type FastPathServiceServer interface {
 	ListSandboxes(context.Context, *ListRequest) (*ListResponse, error)
 	// GetSandbox 获取沙箱详情
 	GetSandbox(context.Context, *GetRequest) (*SandboxInfo, error)
+	// ResolveEndpoint resolves an authenticated proxy route for a target port.
+	ResolveEndpoint(context.Context, *ResolveEndpointRequest) (*ResolveEndpointResponse, error)
+	// IssueRouteCredential refreshes a short-lived credential for an existing route.
+	IssueRouteCredential(context.Context, *IssueRouteCredentialRequest) (*IssueRouteCredentialResponse, error)
 	mustEmbedUnimplementedFastPathServiceServer()
 }
 
@@ -138,6 +168,12 @@ func (UnimplementedFastPathServiceServer) ListSandboxes(context.Context, *ListRe
 }
 func (UnimplementedFastPathServiceServer) GetSandbox(context.Context, *GetRequest) (*SandboxInfo, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSandbox not implemented")
+}
+func (UnimplementedFastPathServiceServer) ResolveEndpoint(context.Context, *ResolveEndpointRequest) (*ResolveEndpointResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResolveEndpoint not implemented")
+}
+func (UnimplementedFastPathServiceServer) IssueRouteCredential(context.Context, *IssueRouteCredentialRequest) (*IssueRouteCredentialResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method IssueRouteCredential not implemented")
 }
 func (UnimplementedFastPathServiceServer) mustEmbedUnimplementedFastPathServiceServer() {}
 func (UnimplementedFastPathServiceServer) testEmbeddedByValue()                         {}
@@ -250,6 +286,42 @@ func _FastPathService_GetSandbox_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _FastPathService_ResolveEndpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResolveEndpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FastPathServiceServer).ResolveEndpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FastPathService_ResolveEndpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FastPathServiceServer).ResolveEndpoint(ctx, req.(*ResolveEndpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FastPathService_IssueRouteCredential_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(IssueRouteCredentialRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FastPathServiceServer).IssueRouteCredential(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FastPathService_IssueRouteCredential_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FastPathServiceServer).IssueRouteCredential(ctx, req.(*IssueRouteCredentialRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // FastPathService_ServiceDesc is the grpc.ServiceDesc for FastPathService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -276,6 +348,14 @@ var FastPathService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetSandbox",
 			Handler:    _FastPathService_GetSandbox_Handler,
+		},
+		{
+			MethodName: "ResolveEndpoint",
+			Handler:    _FastPathService_ResolveEndpoint_Handler,
+		},
+		{
+			MethodName: "IssueRouteCredential",
+			Handler:    _FastPathService_IssueRouteCredential_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

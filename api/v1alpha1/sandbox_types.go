@@ -3,7 +3,6 @@ package v1alpha1
 import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/scheme"
 )
@@ -15,6 +14,7 @@ var (
 )
 
 // FailurePolicy defines the action to take when the fastlet becomes unreachable.
+// +kubebuilder:validation:Enum=Manual;AutoRecreate
 type FailurePolicy string
 
 const (
@@ -61,8 +61,36 @@ const (
 	FastletPhaseTerminated FastletSandboxPhase = "terminated"
 )
 
+// ObservedState is the independently observed state of a Sandbox subsystem.
+// Phase remains available as a compatibility projection and is not the source
+// of truth for the v2 state machine.
+// +kubebuilder:validation:Enum=Unknown;Pending;Creating;Ready;Draining;Stopped;Failed;Unavailable
+type ObservedState string
+
+const (
+	ObservedStateUnknown     ObservedState = "Unknown"
+	ObservedStatePending     ObservedState = "Pending"
+	ObservedStateCreating    ObservedState = "Creating"
+	ObservedStateReady       ObservedState = "Ready"
+	ObservedStateDraining    ObservedState = "Draining"
+	ObservedStateStopped     ObservedState = "Stopped"
+	ObservedStateFailed      ObservedState = "Failed"
+	ObservedStateUnavailable ObservedState = "Unavailable"
+)
+
+// SandboxAssignment is the authoritative placement selected through a status
+// resourceVersion compare-and-swap. FastletPodUID fences Pod replacement, while
+// Attempt fences reassignment to a different Fastlet.
+type SandboxAssignment struct {
+	FastletName   string `json:"fastletName"`
+	FastletPodUID string `json:"fastletPodUID"`
+	NodeName      string `json:"nodeName,omitempty"`
+	Attempt       int64  `json:"attempt"`
+}
+
 // SandboxSpec defines the desired state of Sandbox.
 type SandboxSpec struct {
+	// +kubebuilder:validation:MinLength=1
 	Image      string          `json:"image"`
 	Command    []string        `json:"command,omitempty"`
 	Args       []string        `json:"args,omitempty"`
@@ -74,7 +102,11 @@ type SandboxSpec struct {
 	ExpireTime *metav1.Time `json:"expireTime,omitempty"`
 
 	// ExposedPorts specifies the ports that the sandbox application will listen on.
-	// The controller ensures no port conflicts on the same Fastlet Pod during scheduling.
+	// Deprecated: private Sandbox networks allow identical internal ports and
+	// routing is resolved by Sandbox UID plus target port.
+	// +deprecated
+	// +kubebuilder:validation:items:Minimum=1
+	// +kubebuilder:validation:items:Maximum=65535
 	ExposedPorts []int32 `json:"exposedPorts,omitempty"`
 
 	// FailurePolicy defines the recovery strategy when the fastlet is lost.
@@ -92,6 +124,7 @@ type SandboxSpec struct {
 	ResetRevision *metav1.Time `json:"resetRevision,omitempty"`
 
 	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
 	// PoolRef specifies which SandboxPool this sandbox should be scheduled to.
 	// This field is required.
 	PoolRef string `json:"poolRef"`
@@ -99,12 +132,31 @@ type SandboxSpec struct {
 
 // SandboxStatus defines the observed state of Sandbox.
 type SandboxStatus struct {
-	Phase           string             `json:"phase,omitempty"`
-	AssignedFastlet string             `json:"assignedFastlet,omitempty"`
-	NodeName        string             `json:"nodeName,omitempty"`
-	SandboxID       string             `json:"sandboxID,omitempty"`
-	Endpoints       []string           `json:"endpoints,omitempty"`
-	Conditions      []metav1.Condition `json:"conditions,omitempty"`
+	// Assignment is the authoritative placement for the active instance.
+	Assignment *SandboxAssignment `json:"assignment,omitempty"`
+
+	// InstanceGeneration fences reset/recreate operations for the same CRD UID.
+	InstanceGeneration int64 `json:"instanceGeneration,omitempty"`
+
+	// RouteGeneration fences stale local and cluster proxy routes.
+	RouteGeneration int64 `json:"routeGeneration,omitempty"`
+
+	RuntimeState     ObservedState `json:"runtimeState,omitempty"`
+	DataPlaneState   ObservedState `json:"dataPlaneState,omitempty"`
+	UserProcessState ObservedState `json:"userProcessState,omitempty"`
+
+	// Deprecated compatibility projection. New reconcilers derive this from the
+	// independent observed states and Conditions.
+	Phase string `json:"phase,omitempty"`
+	// Deprecated: use Assignment.FastletName.
+	AssignedFastlet string `json:"assignedFastlet,omitempty"`
+	// Deprecated: use Assignment.NodeName.
+	NodeName string `json:"nodeName,omitempty"`
+	// Deprecated: runtime identity is the Sandbox CRD UID plus generation.
+	SandboxID string `json:"sandboxID,omitempty"`
+	// Deprecated: use ResolveEndpoint with Sandbox UID and target port.
+	Endpoints  []string           `json:"endpoints,omitempty"`
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
 	// AcceptedResetRevision reflects the latest reset revision that was processed by the controller.
 	AcceptedResetRevision *metav1.Time `json:"acceptedResetRevision,omitempty"`
@@ -129,24 +181,6 @@ type SandboxList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []Sandbox `json:"items"`
-}
-
-func (in *Sandbox) DeepCopyObject() runtime.Object {
-	if in == nil {
-		return nil
-	}
-	out := new(Sandbox)
-	*out = *in
-	return out
-}
-
-func (in *SandboxList) DeepCopyObject() runtime.Object {
-	if in == nil {
-		return nil
-	}
-	out := new(SandboxList)
-	*out = *in
-	return out
 }
 
 func init() {

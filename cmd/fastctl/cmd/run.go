@@ -9,6 +9,7 @@ import (
 	"time"
 
 	fastpathv1 "fast-sandbox/api/proto/v1"
+	"fast-sandbox/pkg/util/idgen"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -34,6 +35,7 @@ var (
 	mode       string
 	ports      []int32
 	image      string
+	requestID  string
 )
 
 // runCmd represents the run command
@@ -114,6 +116,14 @@ Priority: Flags > Config File > Interactive Input
 		}
 
 		start := time.Now()
+		createRequestID := requestID
+		if createRequestID == "" {
+			var err error
+			createRequestID, err = idgen.GenerateRequestID()
+			if err != nil {
+				log.Fatalf("Error: %v", err)
+			}
+		}
 		req := &fastpathv1.CreateRequest{
 			Name:            name,
 			Image:           config.Image,
@@ -125,6 +135,7 @@ Priority: Flags > Config File > Interactive Input
 			Args:            config.Args,
 			Envs:            config.Envs,
 			WorkingDir:      config.WorkingDir,
+			RequestId:       createRequestID,
 		}
 		klog.V(4).InfoS("Sending CreateSandbox request", "name", name, "image", config.Image, "pool", config.PoolRef, "namespace", req.Namespace)
 
@@ -151,6 +162,7 @@ func init() {
 	runCmd.Flags().StringVar(&pool, "pool", "default-pool", "Target SandboxPool")
 	runCmd.Flags().StringVar(&mode, "mode", "fast", "Consistency mode (fast/strong)")
 	runCmd.Flags().Int32SliceVar(&ports, "ports", []int32{}, "Exposed ports")
+	runCmd.Flags().StringVar(&requestID, "request-id", "", "Idempotency key (generated automatically when omitted)")
 }
 
 func runInteractive(name string, config *SandboxConfig) error {

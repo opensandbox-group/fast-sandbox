@@ -15,6 +15,10 @@ const (
 	AnnotationAllocation = "sandbox.fast.io/allocation"
 	// AnnotationCreateTimestamp 存储 Fast 模式创建时的时间戳，用于重新生成 sandboxID
 	AnnotationCreateTimestamp = "sandbox.fast.io/createTimestamp"
+	// AnnotationRequestID stores the FastPath Create idempotency key.
+	AnnotationRequestID = "sandbox.fast.io/request-id"
+	// AnnotationCreateSpecHash binds a request ID to its immutable create intent.
+	AnnotationCreateSpecHash = "sandbox.fast.io/create-spec-hash"
 )
 
 // AllocationInfo 临时分配信息

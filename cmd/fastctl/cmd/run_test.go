@@ -35,6 +35,12 @@ func (m *MockClient) GetSandbox(ctx context.Context, in *fastpathv1.GetRequest, 
 func (m *MockClient) UpdateSandbox(ctx context.Context, in *fastpathv1.UpdateRequest, opts ...grpc.CallOption) (*fastpathv1.UpdateResponse, error) {
 	return &fastpathv1.UpdateResponse{}, nil
 }
+func (m *MockClient) ResolveEndpoint(ctx context.Context, in *fastpathv1.ResolveEndpointRequest, opts ...grpc.CallOption) (*fastpathv1.ResolveEndpointResponse, error) {
+	return &fastpathv1.ResolveEndpointResponse{}, nil
+}
+func (m *MockClient) IssueRouteCredential(ctx context.Context, in *fastpathv1.IssueRouteCredentialRequest, opts ...grpc.CallOption) (*fastpathv1.IssueRouteCredentialResponse, error) {
+	return &fastpathv1.IssueRouteCredentialResponse{}, nil
+}
 
 func TestRunCommand(t *testing.T) {
 	mockClient := &MockClient{}
@@ -73,6 +79,9 @@ func TestRunCommand(t *testing.T) {
 	}
 	if capturedReq.Image != "alpine" {
 		t.Errorf("expected image 'alpine', got '%s'", capturedReq.Image)
+	}
+	if capturedReq.RequestId == "" {
+		t.Error("expected an automatically generated request_id")
 	}
 	// ... other assert
 }

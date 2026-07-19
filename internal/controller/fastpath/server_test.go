@@ -137,6 +137,52 @@ func TestServer_CreateSandbox_FastMode_AllocateFailure(t *testing.T) {
 	assert.NotNil(t, registry.AllocatedSb, "Allocate should have been called")
 }
 
+func TestServer_CreateSandbox_RequestIDReturnsExistingSandbox(t *testing.T) {
+	req := &fastpathv1.CreateRequest{
+		RequestId: "request-123",
+		Name:      "sandbox-existing",
+		Image:     "nginx:latest",
+		PoolRef:   "test-pool",
+		Namespace: "default",
+	}
+	hash, err := CreateSpecHash(req)
+	require.NoError(t, err)
+	existing := &apiv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      req.Name,
+			Namespace: req.Namespace,
+			UID:       types.UID("sandbox-uid"),
+			Annotations: map[string]string{
+				common.AnnotationRequestID:      req.RequestId,
+				common.AnnotationCreateSpecHash: hash,
+			},
+		},
+		Spec: apiv1alpha1.SandboxSpec{Image: req.Image, PoolRef: req.PoolRef},
+		Status: apiv1alpha1.SandboxStatus{
+			SandboxID:       "runtime-id",
+			AssignedFastlet: "fastlet-a",
+		},
+	}
+	registry := &MockRegistryForTest{AllocateError: errors.New("allocation must not be called")}
+	server := &Server{
+		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).WithObjects(existing).Build(),
+		Registry:               registry,
+		FastletClient:          api.NewFastletClient(5758),
+		DefaultConsistencyMode: api.ConsistencyModeFast,
+	}
+
+	resp, err := server.CreateSandbox(context.Background(), req)
+	require.NoError(t, err)
+	require.Equal(t, "sandbox-uid", resp.SandboxUid)
+	require.Equal(t, existing.Name, resp.SandboxName)
+	require.Nil(t, registry.AllocatedSb)
+
+	conflict := *req
+	conflict.Image = "nginx:other"
+	_, err = server.CreateSandbox(context.Background(), &conflict)
+	require.ErrorContains(t, err, "different create spec")
+}
+
 func TestServer_CreateSandbox_FastMode_FastletRPCFailure(t *testing.T) {
 	// Test fastlet RPC failure handling in Fast mode:
 	// 1. Registry.Allocate succeeds

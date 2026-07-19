@@ -46,6 +46,31 @@ var _ fastpathv1.FastPathServiceServer = &Server{}
 
 func (s *Server) CreateSandbox(ctx context.Context, req *fastpathv1.CreateRequest) (*fastpathv1.CreateResponse, error) {
 	start := time.Now()
+	if req.Namespace == "" {
+		req.Namespace = "default"
+	}
+	if req.RequestId == "" {
+		generated, err := idgen.GenerateRequestID()
+		if err != nil {
+			return nil, err
+		}
+		req.RequestId = generated
+	}
+	if err := ValidateRequestID(req.RequestId); err != nil {
+		return nil, err
+	}
+	createSpecHash, err := CreateSpecHash(req)
+	if err != nil {
+		return nil, err
+	}
+	if existing, err := s.findSandboxByRequestID(ctx, req.Namespace, req.RequestId); err != nil {
+		return nil, err
+	} else if existing != nil {
+		if existing.Annotations[common.AnnotationCreateSpecHash] != createSpecHash {
+			return nil, fmt.Errorf("request_id %q is already bound to a different create spec", req.RequestId)
+		}
+		return createResponseFromSandbox(existing), nil
+	}
 
 	mode := s.DefaultConsistencyMode
 	if req.ConsistencyMode == fastpathv1.ConsistencyMode_STRONG {
@@ -63,6 +88,10 @@ func (s *Server) CreateSandbox(ctx context.Context, req *fastpathv1.CreateReques
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sandboxName,
 			Namespace: req.Namespace,
+			Annotations: map[string]string{
+				common.AnnotationRequestID:      req.RequestId,
+				common.AnnotationCreateSpecHash: createSpecHash,
+			},
 		},
 		Spec: apiv1alpha1.SandboxSpec{
 			Image:        req.Image,
@@ -134,7 +163,7 @@ func (s *Server) createFast(tempSB *apiv1alpha1.Sandbox, fastlet *fastletpool.Fa
 		common.LabelCreatedBy: common.CreatedByFastPathFast,
 	})
 	// 设置 annotations：allocation 和 createTimestamp（用于重新生成 sandboxID）
-	tempSB.SetAnnotations(map[string]string{
+	setAnnotations(tempSB, map[string]string{
 		common.AnnotationAllocation:      common.BuildAllocationJSON(fastlet.PodName, fastlet.NodeName),
 		common.AnnotationCreateTimestamp: strconv.FormatInt(createTimestamp, 10),
 	})
@@ -162,7 +191,7 @@ func (s *Server) createStrong(ctx context.Context, tempSB *apiv1alpha1.Sandbox, 
 	klog.InfoS("Creating sandbox CRD first (strong mode)", "name", tempSB.Name, "namespace", tempSB.Namespace, "fastletPod", fastlet.PodName, "node", fastlet.NodeName)
 
 	// 设置 allocation annotation，与 CRD 创建同步
-	tempSB.SetAnnotations(map[string]string{
+	setAnnotations(tempSB, map[string]string{
 		common.AnnotationAllocation: common.BuildAllocationJSON(fastlet.PodName, fastlet.NodeName),
 	})
 	// Status 留空，由 Controller 从 annotation 同步
@@ -206,7 +235,41 @@ func (s *Server) createStrong(ctx context.Context, tempSB *apiv1alpha1.Sandbox, 
 
 	klog.InfoS("Sandbox created on fastlet, Controller will sync allocation from annotation to status", "name", tempSB.Name, "namespace", tempSB.Namespace, "assignedFastlet", fastlet.PodName, "nodeName", fastlet.NodeName, "sandboxID", sandboxID)
 
-	return &fastpathv1.CreateResponse{SandboxId: sandboxID, SandboxName: tempSB.Name, FastletPod: fastlet.PodName, Endpoints: s.getEndpoints(fastlet.PodIP, tempSB)}, nil
+	return &fastpathv1.CreateResponse{SandboxId: sandboxID, SandboxName: tempSB.Name, FastletPod: fastlet.PodName, Endpoints: s.getEndpoints(fastlet.PodIP, tempSB), SandboxUid: string(tempSB.UID)}, nil
+}
+
+func (s *Server) findSandboxByRequestID(ctx context.Context, namespace, requestID string) (*apiv1alpha1.Sandbox, error) {
+	var list apiv1alpha1.SandboxList
+	if err := s.K8sClient.List(ctx, &list, client.InNamespace(namespace)); err != nil {
+		return nil, err
+	}
+	for i := range list.Items {
+		if list.Items[i].Annotations[common.AnnotationRequestID] == requestID {
+			return list.Items[i].DeepCopy(), nil
+		}
+	}
+	return nil, nil
+}
+
+func createResponseFromSandbox(sandbox *apiv1alpha1.Sandbox) *fastpathv1.CreateResponse {
+	return &fastpathv1.CreateResponse{
+		SandboxId:   sandbox.Status.SandboxID,
+		SandboxName: sandbox.Name,
+		SandboxUid:  string(sandbox.UID),
+		FastletPod:  sandbox.Status.AssignedFastlet,
+		Endpoints:   append([]string(nil), sandbox.Status.Endpoints...),
+	}
+}
+
+func setAnnotations(sandbox *apiv1alpha1.Sandbox, values map[string]string) {
+	annotations := sandbox.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string, len(values))
+	}
+	for key, value := range values {
+		annotations[key] = value
+	}
+	sandbox.SetAnnotations(annotations)
 }
 
 // asyncCreateCRDWithRetry 异步创建 CRD，分配信息已在 annotation 中

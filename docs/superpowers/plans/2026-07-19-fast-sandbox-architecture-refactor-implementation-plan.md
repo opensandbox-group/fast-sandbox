@@ -1,7 +1,7 @@
 # Fast Sandbox 架构重构开发计划
 
 **日期**：2026-07-19  
-**状态**：执行中（阶段 0 完成，阶段 1 进行中）  
+**状态**：执行中（阶段 0～2 完成，阶段 3 进行中）
 **代码基线**：`master@f92d8e34288365be227d2ee8a6f952687dc7be00`  
 **本地仓库**：`/Users/fengjianhui/WorkSpaceL/fast-sandbox`  
 **远端开发机**：SSH alias `fast`  
