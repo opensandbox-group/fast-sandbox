@@ -321,7 +321,7 @@ func createCLIPool(namespace, name string) *apiv1alpha1.SandboxPool {
 				PoolMax: 10, // Increased for CLI tests
 			},
 			MaxSandboxesPerPod: 20, // Increased capacity
-			RuntimeType:        apiv1alpha1.RuntimeContainer,
+			Runtime:            apiv1alpha1.RuntimeContainer,
 			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{

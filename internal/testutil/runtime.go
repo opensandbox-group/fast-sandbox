@@ -7,6 +7,7 @@ import (
 
 	"fast-sandbox/internal/api"
 	fastletruntime "fast-sandbox/internal/fastlet/runtime"
+	"fast-sandbox/internal/runtimecatalog"
 )
 
 var _ fastletruntime.Runtime = (*FakeRuntime)(nil)
@@ -29,6 +30,10 @@ type FakeRuntime struct {
 
 func (f *FakeRuntime) Initialize(context.Context, string) error { return nil }
 
+func (f *FakeRuntime) ProbeCapabilities(context.Context) fastletruntime.CapabilityReport {
+	return fastletruntime.CapabilityReport{State: runtimecatalog.CapabilityReady}
+}
+
 func (f *FakeRuntime) SetNamespace(namespace string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -43,6 +48,10 @@ func (f *FakeRuntime) CreateSandbox(ctx context.Context, spec *api.SandboxSpec) 
 		return f.CreateFunc(ctx, spec)
 	}
 	return &fastletruntime.SandboxMetadata{SandboxSpec: *spec, ContainerID: spec.SandboxID, Phase: "running"}, nil
+}
+
+func (f *FakeRuntime) EnsureSandbox(ctx context.Context, spec *api.SandboxSpec) (*fastletruntime.SandboxMetadata, error) {
+	return f.CreateSandbox(ctx, spec)
 }
 
 func (f *FakeRuntime) DeleteSandbox(ctx context.Context, sandboxID string) error {
@@ -71,6 +80,18 @@ func (f *FakeRuntime) GetSandboxStatus(ctx context.Context, sandboxID string) (s
 		return f.StatusFunc(ctx, sandboxID)
 	}
 	return "running", nil
+}
+
+func (f *FakeRuntime) InspectSandbox(ctx context.Context, sandboxID string) (*fastletruntime.SandboxMetadata, error) {
+	status, err := f.GetSandboxStatus(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	return &fastletruntime.SandboxMetadata{SandboxSpec: api.SandboxSpec{SandboxID: sandboxID}, Phase: status}, nil
+}
+
+func (f *FakeRuntime) ListManagedSandboxes(context.Context) ([]*fastletruntime.SandboxMetadata, error) {
+	return nil, nil
 }
 
 func (f *FakeRuntime) Close() error { return nil }

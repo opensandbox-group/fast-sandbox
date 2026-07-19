@@ -10,6 +10,7 @@ import (
 	"fast-sandbox/test/e2e/support/suiteenv"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
@@ -226,7 +227,7 @@ func TestGVisorMultipleSandboxes(t *testing.T) {
 	testSuite.Env().Test(t, feature)
 }
 
-func newSecureRuntimePool(namespace, name string, runtimeType apiv1alpha1.RuntimeType, min, max int32) *apiv1alpha1.SandboxPool {
+func newSecureRuntimePool(namespace, name string, runtimeName apiv1alpha1.RuntimeName, min, max int32) *apiv1alpha1.SandboxPool {
 	return &apiv1alpha1.SandboxPool{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: apiv1alpha1.GroupVersion.String(),
@@ -242,7 +243,10 @@ func newSecureRuntimePool(namespace, name string, runtimeType apiv1alpha1.Runtim
 				PoolMax: max,
 			},
 			MaxSandboxesPerPod: 5,
-			RuntimeType:        runtimeType,
+			Runtime:            runtimeName,
+			SandboxResources: apiv1alpha1.SandboxResourceProfile{
+				CPU: resource.MustParse("250m"), Memory: resource.MustParse("256Mi"), PIDs: 128,
+			},
 			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Tolerations: []corev1.Toleration{

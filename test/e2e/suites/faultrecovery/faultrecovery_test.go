@@ -476,7 +476,7 @@ func createFaultPool(namespace, name string) *apiv1alpha1.SandboxPool {
 				PoolMax: 2,
 			},
 			MaxSandboxesPerPod: 5,
-			RuntimeType:        apiv1alpha1.RuntimeContainer,
+			Runtime:            apiv1alpha1.RuntimeContainer,
 			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{

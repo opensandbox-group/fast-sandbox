@@ -14,7 +14,11 @@ spec:
     poolMax: 1
     poolMin: 1
   maxSandboxesPerPod: 5
-  runtimeType: container
+  runtime: container
+  sandboxResources:
+    cpu: 250m
+    memory: 256Mi
+    pids: 128
 ---
 # Example: gVisor pool for untrusted code execution
 apiVersion: sandbox.fast.io/v1alpha1
@@ -33,7 +37,11 @@ spec:
     poolMax: 3
     poolMin: 1
   maxSandboxesPerPod: 5
-  runtimeType: gvisor
+  runtime: gvisor
+  sandboxResources:
+    cpu: 250m
+    memory: 256Mi
+    pids: 128
 ---
 # Example: Kata QEMU pool for maximum isolation
 apiVersion: sandbox.fast.io/v1alpha1
@@ -52,4 +60,8 @@ spec:
     poolMax: 2
     poolMin: 1
   maxSandboxesPerPod: 3
-  runtimeType: kata-qemu
+  runtime: kata-qemu
+  sandboxResources:
+    cpu: 500m
+    memory: 512Mi
+    pids: 128

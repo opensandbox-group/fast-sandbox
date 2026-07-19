@@ -25,6 +25,7 @@ import (
 	"fast-sandbox/internal/controller/fastletcontrol"
 	"fast-sandbox/internal/controller/fastletpool"
 	"fast-sandbox/internal/controller/fastpath"
+	"fast-sandbox/internal/runtimecatalog"
 
 	"google.golang.org/grpc"
 )
@@ -65,12 +66,14 @@ func main() {
 	}
 
 	reg := fastletpool.NewInMemoryRegistry()
+	runtimeCatalog := runtimecatalog.Builtin()
 	fastletHTTPClient := api.NewFastletClient(fastletPort)
 	if err = (&controller.SandboxReconciler{
 		Client:        mgr.GetClient(),
 		Scheme:        mgr.GetScheme(),
 		Registry:      reg,
 		FastletClient: fastletHTTPClient,
+		Catalog:       runtimeCatalog,
 	}).SetupWithManager(mgr); err != nil {
 		klog.ErrorS(err, "unable to create controller", "controller", "Sandbox")
 		os.Exit(1)
@@ -80,6 +83,7 @@ func main() {
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Registry: reg,
+		Catalog:  runtimeCatalog,
 	}).SetupWithManager(mgr); err != nil {
 		klog.ErrorS(err, "unable to create controller", "controller", "SandboxPool")
 		os.Exit(1)
@@ -106,6 +110,7 @@ func main() {
 		Registry:               reg,
 		FastletClient:          fastletHTTPClient,
 		DefaultConsistencyMode: consistencyMode,
+		Catalog:                runtimeCatalog,
 	})
 	klog.InfoS("Starting Fast-Path gRPC server V2", "port", 9090, "consistency-mode", consistencyMode, "orphan-timeout", fastpathOrphanTimeout)
 	go func() {

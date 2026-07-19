@@ -11,6 +11,7 @@ import (
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/controller/common"
 	"fast-sandbox/internal/controller/fastletpool"
+	"fast-sandbox/internal/runtimecatalog"
 	"fast-sandbox/pkg/util/idgen"
 
 	corev1 "k8s.io/api/core/v1"
@@ -39,6 +40,7 @@ type Server struct {
 	Registry               fastletpool.FastletRegistry
 	FastletClient          *api.FastletClient
 	DefaultConsistencyMode api.ConsistencyMode
+	Catalog                *runtimecatalog.Catalog
 }
 
 // 强制编译时检查接口实现情况
@@ -115,10 +117,10 @@ func (s *Server) CreateSandbox(ctx context.Context, req *fastpathv1.CreateReques
 	if mode == api.ConsistencyModeStrong {
 		return s.createStrong(ctx, tempSB, fastlet, req)
 	}
-	return s.createFast(tempSB, fastlet, req)
+	return s.createFast(ctx, tempSB, fastlet, req)
 }
 
-func (s *Server) createFast(tempSB *apiv1alpha1.Sandbox, fastlet *fastletpool.FastletInfo, req *fastpathv1.CreateRequest) (*fastpathv1.CreateResponse, error) {
+func (s *Server) createFast(ctx context.Context, tempSB *apiv1alpha1.Sandbox, fastlet *fastletpool.FastletInfo, req *fastpathv1.CreateRequest) (*fastpathv1.CreateResponse, error) {
 	start := time.Now()
 	var err error
 	defer func() {
@@ -136,18 +138,28 @@ func (s *Server) createFast(tempSB *apiv1alpha1.Sandbox, fastlet *fastletpool.Fa
 	// Generate sandboxID using md5 hash
 	createTimestamp := time.Now().UnixNano()
 	sandboxID := idgen.GenerateHashID(tempSB.Name, tempSB.Namespace, createTimestamp)
+	runtimeParams, err := s.loadRuntimeParameters(ctx, tempSB)
+	if err != nil {
+		s.Registry.Release(fastlet.ID, tempSB)
+		return nil, err
+	}
 
 	klog.InfoS("Creating sandbox via fastlet (fast mode)", "name", tempSB.Name, "namespace", tempSB.Namespace, "fastletPodIP", fastlet.PodIP, "fastletPod", fastlet.PodName, "sandboxID", sandboxID)
 
 	_, err = s.FastletClient.CreateSandbox(fastlet.PodIP, &api.CreateSandboxRequest{
 		Sandbox: api.SandboxSpec{
-			SandboxID:  sandboxID,
-			ClaimName:  tempSB.Name,
-			Image:      tempSB.Spec.Image,
-			Command:    tempSB.Spec.Command,
-			Args:       tempSB.Spec.Args,
-			Env:        req.Envs,
-			WorkingDir: req.WorkingDir,
+			SandboxID:           sandboxID,
+			ClaimName:           tempSB.Name,
+			Image:               tempSB.Spec.Image,
+			Command:             tempSB.Spec.Command,
+			Args:                tempSB.Spec.Args,
+			Env:                 req.Envs,
+			WorkingDir:          req.WorkingDir,
+			CPU:                 runtimeParams.CPU,
+			Memory:              runtimeParams.Memory,
+			PIDs:                runtimeParams.PIDs,
+			RuntimeProfileHash:  runtimeParams.RuntimeProfileHash,
+			ResourceProfileHash: runtimeParams.ResourceProfileHash,
 		},
 	})
 	if err != nil {
@@ -189,6 +201,11 @@ func (s *Server) createStrong(ctx context.Context, tempSB *apiv1alpha1.Sandbox, 
 	}()
 
 	klog.InfoS("Creating sandbox CRD first (strong mode)", "name", tempSB.Name, "namespace", tempSB.Namespace, "fastletPod", fastlet.PodName, "node", fastlet.NodeName)
+	runtimeParams, err := s.loadRuntimeParameters(ctx, tempSB)
+	if err != nil {
+		s.Registry.Release(fastlet.ID, tempSB)
+		return nil, err
+	}
 
 	// 设置 allocation annotation，与 CRD 创建同步
 	setAnnotations(tempSB, map[string]string{
@@ -210,14 +227,19 @@ func (s *Server) createStrong(ctx context.Context, tempSB *apiv1alpha1.Sandbox, 
 
 	_, err = s.FastletClient.CreateSandbox(fastlet.PodIP, &api.CreateSandboxRequest{
 		Sandbox: api.SandboxSpec{
-			SandboxID:  sandboxID, // Changed from tempSB.Name to use UID
-			ClaimUID:   string(tempSB.UID),
-			ClaimName:  tempSB.Name,
-			Image:      tempSB.Spec.Image,
-			Command:    tempSB.Spec.Command,
-			Args:       tempSB.Spec.Args,
-			Env:        req.Envs,
-			WorkingDir: req.WorkingDir,
+			SandboxID:           sandboxID, // Changed from tempSB.Name to use UID
+			ClaimUID:            string(tempSB.UID),
+			ClaimName:           tempSB.Name,
+			Image:               tempSB.Spec.Image,
+			Command:             tempSB.Spec.Command,
+			Args:                tempSB.Spec.Args,
+			Env:                 req.Envs,
+			WorkingDir:          req.WorkingDir,
+			CPU:                 runtimeParams.CPU,
+			Memory:              runtimeParams.Memory,
+			PIDs:                runtimeParams.PIDs,
+			RuntimeProfileHash:  runtimeParams.RuntimeProfileHash,
+			ResourceProfileHash: runtimeParams.ResourceProfileHash,
 		},
 	})
 	if err != nil {
@@ -270,6 +292,44 @@ func setAnnotations(sandbox *apiv1alpha1.Sandbox, values map[string]string) {
 		annotations[key] = value
 	}
 	sandbox.SetAnnotations(annotations)
+}
+
+type sandboxRuntimeParameters struct {
+	CPU                 string
+	Memory              string
+	PIDs                int64
+	RuntimeProfileHash  string
+	ResourceProfileHash string
+}
+
+func (s *Server) loadRuntimeParameters(ctx context.Context, sandbox *apiv1alpha1.Sandbox) (sandboxRuntimeParameters, error) {
+	var pool apiv1alpha1.SandboxPool
+	if err := s.K8sClient.Get(ctx, client.ObjectKey{Name: sandbox.Spec.PoolRef, Namespace: sandbox.Namespace}, &pool); err != nil {
+		return sandboxRuntimeParameters{}, fmt.Errorf("get SandboxPool %s: %w", sandbox.Spec.PoolRef, err)
+	}
+	runtimeName, err := pool.Spec.EffectiveRuntime()
+	if err != nil {
+		return sandboxRuntimeParameters{}, err
+	}
+	catalog := s.Catalog
+	if catalog == nil {
+		catalog = runtimecatalog.Builtin()
+	}
+	profile, err := catalog.Resolve(runtimeName)
+	if err != nil {
+		return sandboxRuntimeParameters{}, err
+	}
+	sandboxResources, err := pool.Spec.EffectiveSandboxResources()
+	if err != nil {
+		return sandboxRuntimeParameters{}, err
+	}
+	return sandboxRuntimeParameters{
+		CPU:                 sandboxResources.CPU.String(),
+		Memory:              sandboxResources.Memory.String(),
+		PIDs:                sandboxResources.PIDs,
+		RuntimeProfileHash:  profile.ProfileHash,
+		ResourceProfileHash: sandboxResources.Hash(),
+	}, nil
 }
 
 // asyncCreateCRDWithRetry 异步创建 CRD，分配信息已在 annotation 中

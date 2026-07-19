@@ -2,16 +2,17 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/controller/fastletpool"
-	fastletruntime "fast-sandbox/internal/fastlet/runtime"
+	"fast-sandbox/internal/runtimecatalog"
 
 	corev1 "k8s.io/api/core/v1"
-	nodev1 "k8s.io/api/node/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
@@ -25,6 +26,7 @@ type SandboxPoolReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Registry fastletpool.FastletRegistry
+	Catalog  *runtimecatalog.Catalog
 }
 
 // Reconcile manages the lifecycle of Fastlet Pods based on the demand from Sandboxes.
@@ -36,26 +38,34 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Validate RuntimeClass if specified
-	if err := r.validateRuntimeClass(ctx, &pool); err != nil {
-		logger.Error(err, "RuntimeClass validation failed")
+	profile, err := r.resolveRuntimeProfile(&pool)
+	if err != nil {
+		logger.Error(err, "Runtime profile resolution failed")
 		_ = r.updatePoolCondition(ctx, &pool, metav1.Condition{
 			Type:    apiv1alpha1.PoolConditionRuntimeReady,
 			Status:  metav1.ConditionFalse,
-			Reason:  apiv1alpha1.ReasonRuntimeUnavailable,
+			Reason:  apiv1alpha1.ReasonRuntimeProfileInvalid,
 			Message: err.Error(),
 		})
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
-
-	// Update condition to ready if using secure runtime
-	if getRuntimeClassName(&pool) != "" {
+	if profile.Capabilities.DefaultState == runtimecatalog.CapabilityUnsupported {
 		_ = r.updatePoolCondition(ctx, &pool, metav1.Condition{
 			Type:    apiv1alpha1.PoolConditionRuntimeReady,
-			Status:  metav1.ConditionTrue,
-			Reason:  apiv1alpha1.ReasonRuntimeAvailable,
-			Message: fmt.Sprintf("RuntimeClass %s is available", getRuntimeClassName(&pool)),
+			Status:  metav1.ConditionFalse,
+			Reason:  apiv1alpha1.ReasonRuntimeUnsupported,
+			Message: profile.Capabilities.Reason,
 		})
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	if _, err := pool.Spec.EffectiveSandboxResources(); err != nil {
+		_ = r.updatePoolCondition(ctx, &pool, metav1.Condition{
+			Type:    apiv1alpha1.PoolConditionRuntimeReady,
+			Status:  metav1.ConditionFalse,
+			Reason:  apiv1alpha1.ReasonResourceProfileInvalid,
+			Message: err.Error(),
+		})
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	var childPods corev1.PodList
@@ -99,7 +109,10 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		diff := desiredPods - currentCount
 		logger.Info("Scaling up fastlet pool", "diff", diff)
 		for i := int32(0); i < diff; i++ {
-			pod := r.constructPod(&pool)
+			pod, err := r.constructPod(&pool, profile)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
 			if err := r.Create(ctx, pod); err != nil {
 				logger.Error(err, "Failed to create fastlet pod")
 				return ctrl.Result{}, err
@@ -126,8 +139,14 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-// constructPod builds an Fastlet Pod from the template with necessary runtime configurations injected.
-func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool) *corev1.Pod {
+// constructPod builds a Fastlet Pod from the template and a platform-owned
+// RuntimeProfile. RuntimeClass and backend handler overrides are never copied
+// from the Pool into the Pod.
+func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, profile runtimecatalog.RuntimeProfile) (*corev1.Pod, error) {
+	sandboxResources, err := pool.Spec.EffectiveSandboxResources()
+	if err != nil {
+		return nil, err
+	}
 	labels := make(map[string]string)
 	for k, v := range pool.Spec.FastletTemplate.ObjectMeta.Labels {
 		labels[k] = v
@@ -135,17 +154,32 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool) *cor
 	for k, v := range poolLabels(pool.Name) {
 		labels[k] = v
 	}
+	labels["fast-sandbox.io/runtime"] = string(profile.Name)
+	labels["fast-sandbox.io/runtime-profile"] = shortProfileIdentity(profile)
+	annotations := make(map[string]string)
+	for k, v := range pool.Spec.FastletTemplate.ObjectMeta.Annotations {
+		annotations[k] = v
+	}
+	annotations["fast-sandbox.io/runtime-profile-hash"] = profile.ProfileHash
 
 	podSpec := pool.Spec.FastletTemplate.Spec.DeepCopy()
 	podSpec.HostNetwork = false
 	podSpec.HostPID = false
+	podSpec.RuntimeClassName = nil
+	if len(podSpec.Containers) == 0 {
+		return nil, errors.New("fastletTemplate.spec.containers must contain the fastlet container")
+	}
+	if err := mergeNodeSelector(podSpec, profile.Deployment.NodeSelector); err != nil {
+		return nil, err
+	}
 
 	if len(podSpec.Containers) > 0 {
 		c := &podSpec.Containers[0]
 		if c.SecurityContext == nil {
 			c.SecurityContext = &corev1.SecurityContext{}
 		}
-		c.SecurityContext.Privileged = boolPtr(true)
+		c.SecurityContext.Privileged = boolPtr(profile.Deployment.Privileged)
+		c.Env = removeRuntimeOwnedEnv(c.Env)
 
 		c.Env = append(c.Env,
 			corev1.EnvVar{
@@ -181,23 +215,28 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool) *cor
 				Value: fmt.Sprintf("%d", getFastletCapacity(pool)),
 			},
 			corev1.EnvVar{
-				Name:  "RUNTIME_TYPE",
-				Value: string(getRuntimeType(pool)),
+				Name:  "FAST_SANDBOX_RUNTIME",
+				Value: string(profile.Name),
 			},
 			corev1.EnvVar{
-				Name:  "RUNTIME_HANDLER",
-				Value: getContainerdRuntimeHandler(pool),
+				Name:  "FAST_SANDBOX_RUNTIME_PROFILE_HASH",
+				Value: profile.ProfileHash,
 			},
+			corev1.EnvVar{Name: "FAST_SANDBOX_RESOURCE_CPU", Value: sandboxResources.CPU.String()},
+			corev1.EnvVar{Name: "FAST_SANDBOX_RESOURCE_MEMORY", Value: sandboxResources.Memory.String()},
+			corev1.EnvVar{Name: "FAST_SANDBOX_RESOURCE_PIDS", Value: strconv.FormatInt(sandboxResources.PIDs, 10)},
+			corev1.EnvVar{Name: "FAST_SANDBOX_INFRA_PROFILE", Value: pool.Spec.InfraProfile},
 			corev1.EnvVar{Name: "RUNTIME_SOCKET", Value: "/run/containerd/containerd.sock"},
 			corev1.EnvVar{Name: "INFRA_DIR_IN_POD", Value: "/opt/fast-sandbox/infra"},
 		)
 
 		c.VolumeMounts = append(c.VolumeMounts,
-			corev1.VolumeMount{Name: "containerd-run", MountPath: "/run/containerd"},
-			corev1.VolumeMount{Name: "containerd-root", MountPath: "/var/lib/containerd"},
 			corev1.VolumeMount{Name: "tmp", MountPath: "/tmp"},
 			corev1.VolumeMount{Name: "infra-tools", MountPath: "/opt/fast-sandbox/infra"},
 		)
+		if err := applyFastletResources(c, profile.Deployment.Overhead, sandboxResources, getFastletCapacity(pool)); err != nil {
+			return nil, err
+		}
 
 	}
 
@@ -215,14 +254,6 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool) *cor
 
 	podSpec.Volumes = append(podSpec.Volumes,
 		corev1.Volume{
-			Name:         "containerd-run",
-			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/run/containerd", Type: &hostPathDirectory}},
-		},
-		corev1.Volume{
-			Name:         "containerd-root",
-			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/var/lib/containerd", Type: &hostPathDirectory}},
-		},
-		corev1.Volume{
 			Name:         "tmp",
 			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/tmp", Type: &hostPathDirectory}},
 		},
@@ -233,18 +264,32 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool) *cor
 			},
 		},
 	)
+	if err := mergeRuntimeHostPaths(podSpec, &podSpec.Containers[0], profile.Deployment.HostPaths); err != nil {
+		return nil, err
+	}
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: pool.Name + "-fastlet-",
 			Namespace:    pool.Namespace,
 			Labels:       labels,
+			Annotations:  annotations,
 		},
 		Spec: *podSpec,
 	}
 
-	ctrl.SetControllerReference(pool, pod, r.Scheme)
-	return pod
+	if err := ctrl.SetControllerReference(pool, pod, r.Scheme); err != nil {
+		return nil, err
+	}
+	return pod, nil
+}
+
+func shortProfileIdentity(profile runtimecatalog.RuntimeProfile) string {
+	hash := profile.ProfileHash
+	if len(hash) > 12 {
+		hash = hash[:12]
+	}
+	return profile.Version + "-" + hash
 }
 
 func poolLabels(poolName string) map[string]string {
@@ -261,46 +306,122 @@ func getFastletCapacity(pool *apiv1alpha1.SandboxPool) int32 {
 	return 5
 }
 
-func getRuntimeType(pool *apiv1alpha1.SandboxPool) apiv1alpha1.RuntimeType {
-	if pool.Spec.RuntimeType != "" {
-		return pool.Spec.RuntimeType
+func (r *SandboxPoolReconciler) resolveRuntimeProfile(pool *apiv1alpha1.SandboxPool) (runtimecatalog.RuntimeProfile, error) {
+	name, err := pool.Spec.EffectiveRuntime()
+	if err != nil {
+		return runtimecatalog.RuntimeProfile{}, err
 	}
-	return apiv1alpha1.RuntimeContainer
+	catalog := r.Catalog
+	if catalog == nil {
+		catalog = runtimecatalog.Builtin()
+	}
+	return catalog.Resolve(name)
 }
 
-// getRuntimeClassName returns the RuntimeClassName for the pool.
-// Returns empty string for default container runtime.
-func getRuntimeClassName(pool *apiv1alpha1.SandboxPool) string {
-	if pool.Spec.RuntimeType == "" || pool.Spec.RuntimeType == apiv1alpha1.RuntimeContainer {
-		return ""
-	}
-	if pool.Spec.RuntimeClassName != "" {
-		return pool.Spec.RuntimeClassName
-	}
-	return string(pool.Spec.RuntimeType)
+var runtimeOwnedEnv = map[string]struct{}{
+	"RUNTIME_TYPE": {}, "RUNTIME_HANDLER": {},
+	"FAST_SANDBOX_RUNTIME": {}, "FAST_SANDBOX_RUNTIME_PROFILE_HASH": {},
+	"FAST_SANDBOX_RESOURCE_CPU": {}, "FAST_SANDBOX_RESOURCE_MEMORY": {}, "FAST_SANDBOX_RESOURCE_PIDS": {},
+	"FAST_SANDBOX_INFRA_PROFILE": {}, "FASTLET_CAPACITY": {},
+	"RUNTIME_SOCKET": {}, "INFRA_DIR_IN_POD": {},
+	"NODE_NAME": {}, "POD_NAME": {}, "POD_IP": {}, "POD_UID": {}, "NAMESPACE": {},
 }
 
-// getContainerdRuntimeHandler returns the containerd runtime handler for the pool.
-func getContainerdRuntimeHandler(pool *apiv1alpha1.SandboxPool) string {
-	if pool.Spec.ContainerdRuntimeHandler != "" {
-		return pool.Spec.ContainerdRuntimeHandler
-	}
-	return fastletruntime.GetRuntimeHandler(fastletruntime.RuntimeType(pool.Spec.RuntimeType))
-}
-
-// validateRuntimeClass checks if the specified RuntimeClass exists.
-func (r *SandboxPoolReconciler) validateRuntimeClass(ctx context.Context, pool *apiv1alpha1.SandboxPool) error {
-	runtimeClassName := getRuntimeClassName(pool)
-	if runtimeClassName == "" {
-		return nil // No validation needed for default runtime
-	}
-
-	runtimeClass := &nodev1.RuntimeClass{}
-	if err := r.Get(ctx, client.ObjectKey{Name: runtimeClassName}, runtimeClass); err != nil {
-		if errors.IsNotFound(err) {
-			return fmt.Errorf("RuntimeClass %q not found", runtimeClassName)
+func removeRuntimeOwnedEnv(env []corev1.EnvVar) []corev1.EnvVar {
+	result := env[:0]
+	for _, item := range env {
+		if _, owned := runtimeOwnedEnv[item.Name]; owned {
+			continue
 		}
-		return fmt.Errorf("failed to get RuntimeClass %q: %w", runtimeClassName, err)
+		result = append(result, item)
+	}
+	return result
+}
+
+func mergeNodeSelector(podSpec *corev1.PodSpec, required map[string]string) error {
+	if podSpec.NodeSelector == nil && len(required) > 0 {
+		podSpec.NodeSelector = make(map[string]string, len(required))
+	}
+	for key, value := range required {
+		if existing, ok := podSpec.NodeSelector[key]; ok && existing != value {
+			return fmt.Errorf("fastletTemplate nodeSelector %q=%q conflicts with runtime requirement %q", key, existing, value)
+		}
+		podSpec.NodeSelector[key] = value
+	}
+	return nil
+}
+
+func applyFastletResources(container *corev1.Container, overhead corev1.ResourceList, sandbox apiv1alpha1.SandboxResourceProfile, capacity int32) error {
+	required := overhead.DeepCopy()
+	if required == nil {
+		required = corev1.ResourceList{}
+	}
+	addScaledQuantity(required, corev1.ResourceCPU, sandbox.CPU, int64(capacity))
+	addScaledQuantity(required, corev1.ResourceMemory, sandbox.Memory, int64(capacity))
+	if container.Resources.Requests == nil {
+		container.Resources.Requests = corev1.ResourceList{}
+	}
+	for name, quantity := range required {
+		current := container.Resources.Requests[name]
+		if current.IsZero() || current.Cmp(quantity) < 0 {
+			container.Resources.Requests[name] = quantity.DeepCopy()
+		}
+		if limit, ok := container.Resources.Limits[name]; ok && !limit.IsZero() && limit.Cmp(quantity) < 0 {
+			return fmt.Errorf("fastlet container limit %s=%s is below runtime requirement %s", name, limit.String(), quantity.String())
+		}
+	}
+	return nil
+}
+
+func addScaledQuantity(resources corev1.ResourceList, name corev1.ResourceName, quantity resource.Quantity, multiplier int64) {
+	if quantity.IsZero() || multiplier <= 0 {
+		return
+	}
+	scaled := quantity.DeepCopy()
+	scaled.Mul(multiplier)
+	current := resources[name]
+	current.Add(scaled)
+	resources[name] = current
+}
+
+func mergeRuntimeHostPaths(podSpec *corev1.PodSpec, container *corev1.Container, requirements []runtimecatalog.HostPathRequirement) error {
+	for _, requirement := range requirements {
+		volumeFound := false
+		for _, volume := range podSpec.Volumes {
+			if volume.Name != requirement.Name {
+				continue
+			}
+			volumeFound = true
+			if volume.HostPath == nil || volume.HostPath.Path != requirement.HostPath {
+				return fmt.Errorf("fastletTemplate volume %q conflicts with runtime host path %q", requirement.Name, requirement.HostPath)
+			}
+		}
+		if !volumeFound {
+			hostPathType := requirement.Type
+			podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
+				Name: requirement.Name,
+				VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+					Path: requirement.HostPath, Type: &hostPathType,
+				}},
+			})
+		}
+
+		mountFound := false
+		for _, mount := range container.VolumeMounts {
+			if mount.Name == requirement.Name {
+				mountFound = true
+				if mount.MountPath != requirement.MountPath || mount.ReadOnly != requirement.ReadOnly {
+					return fmt.Errorf("fastletTemplate mount %q conflicts with runtime mount %q", requirement.Name, requirement.MountPath)
+				}
+			} else if mount.MountPath == requirement.MountPath {
+				return fmt.Errorf("fastletTemplate mount path %q is reserved by runtime volume %q", requirement.MountPath, requirement.Name)
+			}
+		}
+		if !mountFound {
+			container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+				Name: requirement.Name, MountPath: requirement.MountPath, ReadOnly: requirement.ReadOnly,
+			})
+		}
 	}
 	return nil
 }

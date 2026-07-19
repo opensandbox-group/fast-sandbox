@@ -9,10 +9,13 @@ import (
 	"testing"
 	"time"
 
+	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
+	"fast-sandbox/internal/runtimecatalog"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // ============================================================================
@@ -47,6 +50,10 @@ func (m *MockRuntime) Initialize(ctx context.Context, socketPath string) error {
 	return nil
 }
 
+func (m *MockRuntime) ProbeCapabilities(context.Context) CapabilityReport {
+	return CapabilityReport{State: runtimecatalog.CapabilityReady}
+}
+
 func (m *MockRuntime) SetNamespace(ns string) {}
 
 func (m *MockRuntime) CreateSandbox(ctx context.Context, spec *api.SandboxSpec) (*SandboxMetadata, error) {
@@ -71,6 +78,10 @@ func (m *MockRuntime) CreateSandbox(ctx context.Context, spec *api.SandboxSpec) 
 	return metadata, nil
 }
 
+func (m *MockRuntime) EnsureSandbox(ctx context.Context, spec *api.SandboxSpec) (*SandboxMetadata, error) {
+	return m.CreateSandbox(ctx, spec)
+}
+
 func (m *MockRuntime) DeleteSandbox(ctx context.Context, sandboxID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -91,6 +102,32 @@ func (m *MockRuntime) GetSandboxStatus(ctx context.Context, sandboxID string) (s
 		return sb.Phase, nil
 	}
 	return "unknown", nil
+}
+
+func (m *MockRuntime) InspectSandbox(ctx context.Context, sandboxID string) (*SandboxMetadata, error) {
+	status, err := m.GetSandboxStatus(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if sandbox, ok := m.sandboxes[sandboxID]; ok {
+		copy := *sandbox
+		copy.Phase = status
+		return &copy, nil
+	}
+	return &SandboxMetadata{SandboxSpec: api.SandboxSpec{SandboxID: sandboxID}, Phase: status}, nil
+}
+
+func (m *MockRuntime) ListManagedSandboxes(context.Context) ([]*SandboxMetadata, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make([]*SandboxMetadata, 0, len(m.sandboxes))
+	for _, sandbox := range m.sandboxes {
+		copy := *sandbox
+		result = append(result, &copy)
+	}
+	return result, nil
 }
 
 func (m *MockRuntime) ListImages(ctx context.Context) ([]string, error) {
@@ -223,9 +260,9 @@ func TestNewSandboxManager_CustomCapacity(t *testing.T) {
 			expected: 1,
 		},
 		{
-			name:     "zero capacity defaults to 0",
+			name:     "zero capacity defaults to 5",
 			envValue: "0",
-			expected: 0,
+			expected: 5,
 		},
 	}
 
@@ -264,7 +301,7 @@ func TestNewSandboxManager_InvalidCapacity(t *testing.T) {
 		{
 			name:     "negative value",
 			envValue: "-5",
-			expected: -5, // strconv.Atoi allows negative
+			expected: 5,
 		},
 		{
 			name:     "empty string defaults to 5",
@@ -285,6 +322,36 @@ func TestNewSandboxManager_InvalidCapacity(t *testing.T) {
 			manager := NewSandboxManager(mockRuntime)
 
 			assert.Equal(t, tc.expected, manager.GetCapacity())
+		})
+	}
+}
+
+func TestSandboxManagerRejectsProfileOverrides(t *testing.T) {
+	profile := apiv1alpha1.SandboxResourceProfile{
+		CPU: resource.MustParse("500m"), Memory: resource.MustParse("256Mi"), PIDs: 128,
+	}
+	manager, err := NewSandboxManagerWithConfig(NewMockRuntime(), SandboxManagerConfig{
+		Capacity: 5, RuntimeProfileHash: "runtime-hash", ResourceProfile: &profile,
+	})
+	require.NoError(t, err)
+	valid := &api.SandboxSpec{
+		SandboxID: "sandbox-a", CPU: "500m", Memory: "256Mi", PIDs: 128,
+		RuntimeProfileHash: "runtime-hash", ResourceProfileHash: profile.Hash(),
+	}
+	require.NoError(t, manager.validateProfiles(valid))
+
+	tests := map[string]func(*api.SandboxSpec){
+		"runtime hash":    func(spec *api.SandboxSpec) { spec.RuntimeProfileHash = "other" },
+		"resource hash":   func(spec *api.SandboxSpec) { spec.ResourceProfileHash = "other" },
+		"cpu override":    func(spec *api.SandboxSpec) { spec.CPU = "1" },
+		"memory override": func(spec *api.SandboxSpec) { spec.Memory = "1Gi" },
+		"pids override":   func(spec *api.SandboxSpec) { spec.PIDs = 256 },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			candidate := *valid
+			mutate(&candidate)
+			require.ErrorIs(t, manager.validateProfiles(&candidate), ErrSandboxProfileMismatch)
 		})
 	}
 }

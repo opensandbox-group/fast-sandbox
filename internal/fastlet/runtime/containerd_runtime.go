@@ -3,16 +3,19 @@ package runtime
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/fastlet/infra"
+	"fast-sandbox/internal/runtimecatalog"
 
 	runtimeoptions "github.com/containerd/containerd/api/types/runtimeoptions/v1"
 	containerd "github.com/containerd/containerd/v2/client"
@@ -20,6 +23,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
 )
 
@@ -182,7 +186,10 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 	pullDuration := time.Since(pullStart)
 
 	containerID := config.SandboxID
-	specOpts := r.prepareSpecOpts(config, image)
+	specOpts, err := r.prepareSpecOpts(config, image)
+	if err != nil {
+		return nil, fmt.Errorf("invalid sandbox resource profile: %w", err)
+	}
 	labels := r.prepareLabels(config)
 
 	// 2. Create container
@@ -268,6 +275,31 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 	return metadata, nil
 }
 
+// EnsureSandbox is idempotent for a Sandbox runtime identity. It returns the
+// existing managed runtime when a retry observes an already-created Sandbox.
+func (r *ContainerdRuntime) EnsureSandbox(ctx context.Context, config *api.SandboxSpec) (*SandboxMetadata, error) {
+	existing, err := r.InspectSandbox(ctx, config.SandboxID)
+	if err == nil {
+		if err := validateExistingRuntimeProfile(existing, config); err != nil {
+			return nil, err
+		}
+		return existing, nil
+	}
+	if !errors.Is(err, ErrSandboxNotFound) {
+		return nil, err
+	}
+	return r.CreateSandbox(ctx, config)
+}
+
+func validateExistingRuntimeProfile(existing *SandboxMetadata, requested *api.SandboxSpec) error {
+	if existing.RuntimeProfileHash != requested.RuntimeProfileHash ||
+		existing.ResourceProfileHash != requested.ResourceProfileHash ||
+		existing.CPU != requested.CPU || existing.Memory != requested.Memory || existing.PIDs != requested.PIDs {
+		return fmt.Errorf("%w: existing runtime identity %q has different runtime/resource profile", ErrSandboxProfileMismatch, requested.SandboxID)
+	}
+	return nil
+}
+
 func (r *ContainerdRuntime) prepareImage(ctx context.Context, imageName string) (containerd.Image, error) {
 	image, err := r.client.GetImage(ctx, imageName)
 	if err != nil {
@@ -279,7 +311,7 @@ func (r *ContainerdRuntime) prepareImage(ctx context.Context, imageName string) 
 	return image, nil
 }
 
-func (r *ContainerdRuntime) prepareSpecOpts(config *api.SandboxSpec, image containerd.Image) []oci.SpecOpts {
+func (r *ContainerdRuntime) prepareSpecOpts(config *api.SandboxSpec, image containerd.Image) ([]oci.SpecOpts, error) {
 	originalArgs := append(config.Command, config.Args...)
 
 	var mounts []specs.Mount
@@ -322,6 +354,11 @@ func (r *ContainerdRuntime) prepareSpecOpts(config *api.SandboxSpec, image conta
 		oci.WithProcessArgs(finalArgs...),
 		oci.WithEnv(envMapToSlice(config.Env)),
 	}
+	resourceOpts, err := sandboxResourceSpecOpts(config)
+	if err != nil {
+		return nil, err
+	}
+	specOpts = append(specOpts, resourceOpts...)
 
 	// Add TTY option if required by runtime (e.g., gVisor)
 	if r.config.NeedsTTY {
@@ -355,7 +392,40 @@ func (r *ContainerdRuntime) prepareSpecOpts(config *api.SandboxSpec, image conta
 	//	}))
 	//}
 
-	return specOpts
+	return specOpts, nil
+}
+
+func sandboxResourceSpecOpts(config *api.SandboxSpec) ([]oci.SpecOpts, error) {
+	var opts []oci.SpecOpts
+	if config.CPU != "" {
+		cpu, err := resource.ParseQuantity(config.CPU)
+		if err != nil {
+			return nil, fmt.Errorf("cpu %q: %w", config.CPU, err)
+		}
+		if cpu.Sign() <= 0 {
+			return nil, fmt.Errorf("cpu must be greater than zero")
+		}
+		const period uint64 = 100000
+		quota := cpu.MilliValue() * int64(period) / 1000
+		if quota < 1000 {
+			quota = 1000
+		}
+		opts = append(opts, oci.WithCPUCFS(quota, period))
+	}
+	if config.Memory != "" {
+		memory, err := resource.ParseQuantity(config.Memory)
+		if err != nil {
+			return nil, fmt.Errorf("memory %q: %w", config.Memory, err)
+		}
+		if memory.Sign() <= 0 {
+			return nil, fmt.Errorf("memory must be greater than zero")
+		}
+		opts = append(opts, oci.WithMemoryLimit(uint64(memory.Value())))
+	}
+	if config.PIDs > 0 {
+		opts = append(opts, oci.WithPidsLimit(config.PIDs))
+	}
+	return opts, nil
 }
 
 func (r *ContainerdRuntime) isPluginPathAllowed(pluginPath string) bool {
@@ -396,13 +466,18 @@ func (r *ContainerdRuntime) getRuntimeOptions() *runtimeoptions.Options {
 
 func (r *ContainerdRuntime) prepareLabels(config *api.SandboxSpec) map[string]string {
 	return map[string]string{
-		"fast-sandbox.io/managed":      "true",
-		"fast-sandbox.io/fastlet-name": r.fastletPodName,
-		"fast-sandbox.io/fastlet-uid":  r.fastletPodUID,
-		"fast-sandbox.io/namespace":    r.fastletNamespace,
-		"fast-sandbox.io/id":           config.SandboxID,
-		"fast-sandbox.io/claim-uid":    config.ClaimUID,
-		"fast-sandbox.io/sandbox-name": config.ClaimName,
+		"fast-sandbox.io/managed":               "true",
+		"fast-sandbox.io/fastlet-name":          r.fastletPodName,
+		"fast-sandbox.io/fastlet-uid":           r.fastletPodUID,
+		"fast-sandbox.io/namespace":             r.fastletNamespace,
+		"fast-sandbox.io/id":                    config.SandboxID,
+		"fast-sandbox.io/claim-uid":             config.ClaimUID,
+		"fast-sandbox.io/sandbox-name":          config.ClaimName,
+		"fast-sandbox.io/runtime-profile-hash":  config.RuntimeProfileHash,
+		"fast-sandbox.io/resource-profile-hash": config.ResourceProfileHash,
+		"fast-sandbox.io/resource-cpu":          config.CPU,
+		"fast-sandbox.io/resource-memory":       config.Memory,
+		"fast-sandbox.io/resource-pids":         strconv.FormatInt(config.PIDs, 10),
 	}
 }
 
@@ -493,6 +568,92 @@ func (r *ContainerdRuntime) GetSandboxStatus(ctx context.Context, sandboxID stri
 	}
 
 	return string(status.Status), nil
+}
+
+func (r *ContainerdRuntime) InspectSandbox(ctx context.Context, sandboxID string) (*SandboxMetadata, error) {
+	if r.client == nil {
+		return nil, ErrRuntimeNotInitialized
+	}
+	ctx = namespaces.WithNamespace(ctx, "k8s.io")
+	container, err := r.client.LoadContainer(ctx, sandboxID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrSandboxNotFound, err)
+	}
+	info, err := container.Info(ctx)
+	if err != nil {
+		return nil, err
+	}
+	metadata := &SandboxMetadata{
+		SandboxSpec: api.SandboxSpec{
+			SandboxID:           sandboxID,
+			ClaimUID:            info.Labels["fast-sandbox.io/claim-uid"],
+			ClaimName:           info.Labels["fast-sandbox.io/sandbox-name"],
+			Image:               info.Image,
+			CPU:                 info.Labels["fast-sandbox.io/resource-cpu"],
+			Memory:              info.Labels["fast-sandbox.io/resource-memory"],
+			RuntimeProfileHash:  info.Labels["fast-sandbox.io/runtime-profile-hash"],
+			ResourceProfileHash: info.Labels["fast-sandbox.io/resource-profile-hash"],
+		},
+		ContainerID: sandboxID,
+		CreatedAt:   info.CreatedAt.Unix(),
+		Phase:       "stopped",
+	}
+	metadata.PIDs, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/resource-pids"], 10, 64)
+	if task, taskErr := container.Task(ctx, nil); taskErr == nil {
+		metadata.PID = int(task.Pid())
+		if status, statusErr := task.Status(ctx); statusErr == nil {
+			metadata.Phase = string(status.Status)
+		}
+	}
+	return metadata, nil
+}
+
+func (r *ContainerdRuntime) ListManagedSandboxes(ctx context.Context) ([]*SandboxMetadata, error) {
+	if r.client == nil {
+		return nil, ErrRuntimeNotInitialized
+	}
+	ctx = namespaces.WithNamespace(ctx, "k8s.io")
+	containers, err := r.client.Containers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	managed := make([]*SandboxMetadata, 0, len(containers))
+	for _, container := range containers {
+		info, err := container.Info(ctx)
+		if err != nil || info.Labels["fast-sandbox.io/managed"] != "true" {
+			continue
+		}
+		if r.fastletPodUID != "" && info.Labels["fast-sandbox.io/fastlet-uid"] != r.fastletPodUID {
+			continue
+		}
+		metadata, err := r.InspectSandbox(ctx, container.ID())
+		if err != nil {
+			continue
+		}
+		managed = append(managed, metadata)
+	}
+	return managed, nil
+}
+
+func (r *ContainerdRuntime) ProbeCapabilities(ctx context.Context) CapabilityReport {
+	report := CapabilityReport{Runtime: r.runtimeType, State: runtimecatalog.CapabilityDegraded}
+	if profile, err := sharedRuntimeCatalog.Resolve(r.runtimeType); err == nil {
+		report.ProfileHash = profile.ProfileHash
+	}
+	if r.client == nil {
+		report.Reason = "RuntimeDriverNotInitialized"
+		report.Message = "containerd client is not initialized"
+		return report
+	}
+	if _, err := r.client.Version(ctx); err != nil {
+		report.Reason = "ContainerdUnavailable"
+		report.Message = err.Error()
+		return report
+	}
+	report.State = runtimecatalog.CapabilityReady
+	report.Reason = "RuntimeDriverReady"
+	report.Message = "containerd runtime driver is ready"
+	return report
 }
 
 func (r *ContainerdRuntime) ListImages(ctx context.Context) ([]string, error) {

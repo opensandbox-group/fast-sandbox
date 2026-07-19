@@ -33,6 +33,9 @@ Deferred          已明确不属于本轮范围
 | REF-0004 | 1 | Resolved | 否 | 专题文档中仍存在 service-name route、RuntimeDriver Exec/File 等被跨模块文档覆盖的旧表述 | 已统一为 target-port route、无公共 Exec/File RuntimeDriver，以及 reservation-before-CRD Create 流程 |
 | REF-0005 | 0/1 | Resolved | 否 | master 的 `make test` 实际包含所有 e2e 包，Go 会并行运行多个 Suite 并同时操作同一个 kind 集群 | 阶段 1 将 `test`/`test-unit` 限定为纯单测，e2e 继续通过 `-p 1` 的独立目标串行执行 |
 | REF-0006 | 2 | Resolved | 否 | Pool immutable schema e2e 首次更新与 Controller status 更新发生 resourceVersion 竞争 | e2e 使用 RetryOnConflict 重新读取后提交；CEL immutable 规则验证通过，产品语义不变 |
+| REF-0007 | 3/12 | DecisionPending | 否 | v1alpha1 无法区分“升级前已存在且未写 sandboxResources”的 Pool 与“升级后新建但遗漏字段”的 Pool | 过渡期仅对全字段缺省采用固定兼容 profile；新 sample/fixture 全部显式写入，发布前决定是否通过 v1beta1/转换 webhook 改为必填 |
+| REF-0008 | 3 | Resolved | 否 | SHA-256 RuntimeProfile hash 直接作为 Pod label value 超过 Kubernetes 63 字符限制，导致 Fastlet Pod 无法创建 | label 改为 `version + 12位短 hash`，完整 hash 存 annotation 和 Fastlet env；e2e 继续验证完整 hash 链路 |
+| REF-0009 | 3 | Resolved | 否 | 远端恢复为 master 后，`verify-generated` 会把本地分支已提交但远端 Git 未包含的合法生成物误报为 drift | changed-files 模式下改用远端连续生成前后 hash，并与本地分支 hash 交叉比对；五份生成物完全一致 |
 
 ## 详细记录
 
@@ -126,3 +129,30 @@ kind load docker-image fast-sandbox/fastlet:dev --name fsb-e2e-basic
 - 非法 runtime enum 被拒绝；
 - `spec.runtime` 更新被 immutable CEL 拒绝；
 - `spec.sandboxResources` 更新被 immutable CEL 拒绝。
+
+### REF-0007：旧 Pool 缺省 ResourceProfile 的迁移语义
+
+**证据**：`sandboxResources` 是新增字段；Kubernetes 读取旧 v1alpha1 对象与新建但遗漏该字段的对象时，Go API 都呈现为 CPU/memory/PIDs 全零，当前单版本 API 无法可靠区分两者。
+
+**影响**：直接将字段改为 required 会使存量 Pool 在 CRD 升级后不可更新；继续把全零传给 Fastlet 又会违反“Fastlet 必须实际执行固定资源限制”的已确认语义。
+
+**当前过渡方案**：
+
+- CPU/memory/PIDs 全部缺省时解析为固定兼容 profile：`1 CPU / 512Mi / 256 PIDs`；
+- 只填写部分字段或任何字段非正数时 fail closed；
+- hash、Fastlet Pod request 和 Ensure 请求统一基于解析后的 effective profile；
+- 所有新 sample 和测试 fixture 改为显式 canonical `spec.runtime`，关键 fixture 显式写 `sandboxResources`。
+
+**发布前决策**：进入 v1beta1 时选择“字段 required”或由转换/defaulting webhook 显式落盘默认值；不能长期依赖读取时隐式默认。
+
+### REF-0008：RuntimeProfile hash 不能直接作为 label value
+
+**证据**：阶段 3 container e2e 中 API Server 拒绝 Fastlet Pod：64 位 SHA-256 label value 超过 63 字符上限，Controller 因此持续重试 scale-up。
+
+**结论**：Pod label `fast-sandbox.io/runtime-profile` 只承载可索引的 `profileVersion + 12位短 hash`；完整 SHA-256 保存在 annotation `fast-sandbox.io/runtime-profile-hash`，并继续通过 `FAST_SANDBOX_RUNTIME_PROFILE_HASH` 和 Ensure 请求传给 Fastlet 做严格校验。短值只用于查询，不参与安全或一致性判断。
+
+### REF-0009：changed-files 远端镜像与 `verify-generated`
+
+**证据**：用户将远端仓库恢复为 master 后，本地 Phase 2 commit 不存在于远端 Git object/baseline。`make generate && make manifests` 生成内容正确，但 `verify-generated` 内部的 `git diff --exit-code` 必然把 Phase 2 的 protobuf/CRD 变更视为未提交差异。
+
+**结论**：本地分支仍执行正常 Git diff 审核；远端 changed-files 镜像采用“生成前 SHA-256 -> generate/manifests -> 生成后 SHA-256”，并将结果与本地分支交叉比对。阶段 3 的五份生成物前后及本地/远端 hash 均完全一致，随后 `make test-unit` 退出状态为 `0`。如果以后把本地 commit 同步为远端同名分支，可恢复直接使用 `make verify-generated`。

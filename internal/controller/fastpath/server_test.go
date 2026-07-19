@@ -15,9 +15,11 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -28,11 +30,29 @@ func setupTestScheme(t *testing.T) *runtime.Scheme {
 	return scheme
 }
 
+func newFastpathTestClientBuilder(scheme *runtime.Scheme) *fake.ClientBuilder {
+	objects := make([]client.Object, 0, 4)
+	for _, namespace := range []string{"default", "test-ns"} {
+		for _, name := range []string{"test-pool", "cache-pool", "db-pool"} {
+			objects = append(objects, &apiv1alpha1.SandboxPool{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+				Spec: apiv1alpha1.SandboxPoolSpec{
+					Runtime: apiv1alpha1.RuntimeContainer,
+					SandboxResources: apiv1alpha1.SandboxResourceProfile{
+						CPU: resource.MustParse("500m"), Memory: resource.MustParse("256Mi"), PIDs: 128,
+					},
+				},
+			})
+		}
+	}
+	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...)
+}
+
 // newTestServer creates a test Server with mocked dependencies.
 func newTestServer(t *testing.T, registry *MockRegistryForTest, fastletClient *MockFastletClientForTest) *Server {
 	scheme := setupTestScheme(t)
 	return &Server{
-		K8sClient:              fake.NewClientBuilder().WithScheme(scheme).Build(),
+		K8sClient:              newFastpathTestClientBuilder(scheme).Build(),
 		Registry:               registry,
 		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
@@ -74,7 +94,7 @@ func TestServer_CreateSandbox_FastMode_Success(t *testing.T) {
 	fastletClient := &api.FastletClient{}
 
 	server := &Server{
-		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
+		K8sClient:              newFastpathTestClientBuilder(setupTestScheme(t)).Build(),
 		Registry:               registry,
 		FastletClient:          fastletClient,
 		DefaultConsistencyMode: api.ConsistencyModeFast,
@@ -117,7 +137,7 @@ func TestServer_CreateSandbox_FastMode_AllocateFailure(t *testing.T) {
 	}
 
 	server := &Server{
-		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
+		K8sClient:              newFastpathTestClientBuilder(setupTestScheme(t)).Build(),
 		Registry:               registry,
 		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
@@ -165,7 +185,7 @@ func TestServer_CreateSandbox_RequestIDReturnsExistingSandbox(t *testing.T) {
 	}
 	registry := &MockRegistryForTest{AllocateError: errors.New("allocation must not be called")}
 	server := &Server{
-		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).WithObjects(existing).Build(),
+		K8sClient:              newFastpathTestClientBuilder(setupTestScheme(t)).WithObjects(existing).Build(),
 		Registry:               registry,
 		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
@@ -205,7 +225,7 @@ func TestServer_CreateSandbox_FastMode_FastletRPCFailure(t *testing.T) {
 	}
 
 	server := &Server{
-		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
+		K8sClient:              newFastpathTestClientBuilder(setupTestScheme(t)).Build(),
 		Registry:               registry,
 		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
@@ -256,7 +276,7 @@ func TestServer_CreateSandbox_StrongMode_Success(t *testing.T) {
 	}
 
 	server := &Server{
-		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
+		K8sClient:              newFastpathTestClientBuilder(setupTestScheme(t)).Build(),
 		Registry:               registry,
 		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
@@ -298,7 +318,7 @@ func TestServer_CreateSandbox_StrongMode_K8sError(t *testing.T) {
 	}
 
 	scheme := setupTestScheme(t)
-	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	k8sClient := newFastpathTestClientBuilder(scheme).Build()
 
 	// Create a sandbox with invalid name to cause K8s validation error
 	server := &Server{
@@ -472,7 +492,7 @@ func TestServer_CreateSandbox_InvalidRequest(t *testing.T) {
 			}
 
 			server := &Server{
-				K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
+				K8sClient:              newFastpathTestClientBuilder(setupTestScheme(t)).Build(),
 				Registry:               registry,
 				FastletClient:          api.NewFastletClient(5758),
 				DefaultConsistencyMode: api.ConsistencyModeFast,
@@ -568,6 +588,21 @@ func TestEnvMapToEnvVar(t *testing.T) {
 	}
 }
 
+func TestServer_loadRuntimeParameters_UsesPoolProfiles(t *testing.T) {
+	server := &Server{K8sClient: newFastpathTestClientBuilder(setupTestScheme(t)).Build()}
+	params, err := server.loadRuntimeParameters(context.Background(), &apiv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sandbox-a", Namespace: "default"},
+		Spec:       apiv1alpha1.SandboxSpec{PoolRef: "test-pool"},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, "500m", params.CPU)
+	assert.Equal(t, "256Mi", params.Memory)
+	assert.Equal(t, int64(128), params.PIDs)
+	assert.NotEmpty(t, params.RuntimeProfileHash)
+	assert.NotEmpty(t, params.ResourceProfileHash)
+}
+
 func TestServer_GetEndpoints(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -642,7 +677,7 @@ func TestServer_CreateSandbox_AllocateCalledWithCorrectSandbox(t *testing.T) {
 	}
 
 	server := &Server{
-		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
+		K8sClient:              newFastpathTestClientBuilder(setupTestScheme(t)).Build(),
 		Registry:               registry,
 		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
@@ -694,7 +729,7 @@ func TestServer_CreateSandbox_ReleaseCalledOnAllocateError(t *testing.T) {
 	}
 
 	server := &Server{
-		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
+		K8sClient:              newFastpathTestClientBuilder(setupTestScheme(t)).Build(),
 		Registry:               registry,
 		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
@@ -733,7 +768,7 @@ func TestServer_CreateSandbox_NameGeneration(t *testing.T) {
 	}
 
 	server := &Server{
-		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
+		K8sClient:              newFastpathTestClientBuilder(setupTestScheme(t)).Build(),
 		Registry:               registry,
 		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
@@ -808,7 +843,7 @@ func TestServer_CreateSandbox_ConsistencyMode(t *testing.T) {
 			}
 
 			server := &Server{
-				K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
+				K8sClient:              newFastpathTestClientBuilder(setupTestScheme(t)).Build(),
 				Registry:               registry,
 				FastletClient:          api.NewFastletClient(5758),
 				DefaultConsistencyMode: tt.serverMode,
@@ -850,7 +885,7 @@ func TestServer_CreateSandbox_StrongMode_CRDCreated(t *testing.T) {
 	}
 
 	scheme := setupTestScheme(t)
-	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	k8sClient := newFastpathTestClientBuilder(scheme).Build()
 
 	server := &Server{
 		K8sClient:              k8sClient,
@@ -1015,7 +1050,7 @@ func TestServer_GetSandbox_NotFound(t *testing.T) {
 	// Test GetSandbox with non-existent sandbox
 
 	scheme := setupTestScheme(t)
-	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	k8sClient := newFastpathTestClientBuilder(scheme).Build()
 
 	server := &Server{
 		K8sClient: k8sClient,
@@ -1074,7 +1109,7 @@ func TestServer_DeleteSandbox_NotFound(t *testing.T) {
 	// Test DeleteSandbox with non-existent sandbox
 
 	scheme := setupTestScheme(t)
-	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	k8sClient := newFastpathTestClientBuilder(scheme).Build()
 
 	server := &Server{
 		K8sClient: k8sClient,
@@ -1110,7 +1145,7 @@ func TestServer_createFast_SetsAllocationAnnotation(t *testing.T) {
 	}
 
 	server := &Server{
-		K8sClient:              fake.NewClientBuilder().WithScheme(setupTestScheme(t)).Build(),
+		K8sClient:              newFastpathTestClientBuilder(setupTestScheme(t)).Build(),
 		Registry:               registry,
 		FastletClient:          api.NewFastletClient(5758),
 		DefaultConsistencyMode: api.ConsistencyModeFast,
@@ -1140,7 +1175,7 @@ func TestServer_createFast_SetsAllocationAnnotation(t *testing.T) {
 	// 所以这里我们测试失败场景，验证不会设置 annotation
 	registry.DefaultFastlet.PodIP = ""
 
-	resp, err := server.createFast(tempSB, registry.DefaultFastlet, req)
+	resp, err := server.createFast(context.Background(), tempSB, registry.DefaultFastlet, req)
 
 	// 验证调用失败
 	assert.Error(t, err)
@@ -1160,7 +1195,7 @@ func TestServer_createFast_SetsAllocationAnnotation(t *testing.T) {
 func TestServer_createStrong_SetsAllocationAnnotation(t *testing.T) {
 	// Test that createStrong sets the allocation annotation before creating CRD
 	scheme := setupTestScheme(t)
-	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	k8sClient := newFastpathTestClientBuilder(scheme).Build()
 
 	registry := &MockRegistryForTest{
 		DefaultFastlet: &fastletpool.FastletInfo{

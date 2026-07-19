@@ -10,6 +10,7 @@ import (
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/controller/common"
 	"fast-sandbox/internal/controller/fastletpool"
+	"fast-sandbox/internal/runtimecatalog"
 	"fast-sandbox/pkg/util/idgen"
 
 	corev1 "k8s.io/api/core/v1"
@@ -46,6 +47,7 @@ type SandboxReconciler struct {
 	Scheme        *runtime.Scheme
 	Registry      fastletpool.FastletRegistry
 	FastletClient api.FastletAPIClient
+	Catalog       *runtimecatalog.Catalog
 }
 
 // Reconcile is the main entry point for the Sandbox controller.
@@ -669,15 +671,41 @@ func (r *SandboxReconciler) handleCreateOnFastlet(ctx context.Context, sandbox *
 		return fmt.Errorf("fastlet %s not found in registry", sandbox.Status.AssignedFastlet)
 	}
 
-	_, err := r.FastletClient.CreateSandbox(fastlet.PodIP, &api.CreateSandboxRequest{
+	var pool apiv1alpha1.SandboxPool
+	if err := r.Get(ctx, client.ObjectKey{Name: sandbox.Spec.PoolRef, Namespace: sandbox.Namespace}, &pool); err != nil {
+		return fmt.Errorf("get SandboxPool %s: %w", sandbox.Spec.PoolRef, err)
+	}
+	runtimeName, err := pool.Spec.EffectiveRuntime()
+	if err != nil {
+		return fmt.Errorf("resolve Pool runtime: %w", err)
+	}
+	catalog := r.Catalog
+	if catalog == nil {
+		catalog = runtimecatalog.Builtin()
+	}
+	profile, err := catalog.Resolve(runtimeName)
+	if err != nil {
+		return fmt.Errorf("resolve runtime profile: %w", err)
+	}
+	sandboxResources, err := pool.Spec.EffectiveSandboxResources()
+	if err != nil {
+		return err
+	}
+
+	_, err = r.FastletClient.CreateSandbox(fastlet.PodIP, &api.CreateSandboxRequest{
 		Sandbox: api.SandboxSpec{
-			SandboxID:  r.getSandboxID(sandbox),
-			ClaimName:  sandbox.Name,
-			Image:      sandbox.Spec.Image,
-			Command:    sandbox.Spec.Command,
-			Args:       sandbox.Spec.Args,
-			Env:        envVarToMap(sandbox.Spec.Envs),
-			WorkingDir: sandbox.Spec.WorkingDir,
+			SandboxID:           r.getSandboxID(sandbox),
+			ClaimName:           sandbox.Name,
+			Image:               sandbox.Spec.Image,
+			Command:             sandbox.Spec.Command,
+			Args:                sandbox.Spec.Args,
+			Env:                 envVarToMap(sandbox.Spec.Envs),
+			WorkingDir:          sandbox.Spec.WorkingDir,
+			CPU:                 sandboxResources.CPU.String(),
+			Memory:              sandboxResources.Memory.String(),
+			PIDs:                sandboxResources.PIDs,
+			RuntimeProfileHash:  profile.ProfileHash,
+			ResourceProfileHash: sandboxResources.Hash(),
 		},
 	})
 	if err != nil {

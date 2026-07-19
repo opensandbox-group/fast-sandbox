@@ -9,41 +9,81 @@ import (
 	"sync"
 	"time"
 
+	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
 )
 
+type SandboxManagerConfig struct {
+	Capacity           int
+	RuntimeProfileHash string
+	ResourceProfile    *apiv1alpha1.SandboxResourceProfile
+}
+
 type SandboxManager struct {
-	mu       sync.RWMutex
-	runtime  Runtime
-	capacity int
+	mu                  sync.RWMutex
+	runtime             Runtime
+	capacity            int
+	runtimeProfileHash  string
+	resourceProfile     *apiv1alpha1.SandboxResourceProfile
+	resourceProfileHash string
 	// sandboxes  sandboxID -> metadata
 	sandboxes map[string]*SandboxMetadata
 }
 
 func NewSandboxManager(runtime Runtime) *SandboxManager {
+	manager, _ := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{Capacity: capacityFromEnvironment()})
+	return manager
+}
+
+func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerConfig) (*SandboxManager, error) {
+	if runtime == nil {
+		return nil, ErrRuntimeNotInitialized
+	}
+	if config.Capacity <= 0 {
+		return nil, fmt.Errorf("%w: capacity must be greater than zero", ErrInvalidConfig)
+	}
+	var profile *apiv1alpha1.SandboxResourceProfile
+	resourceHash := ""
+	if config.ResourceProfile != nil {
+		effective, err := (apiv1alpha1.SandboxPoolSpec{SandboxResources: *config.ResourceProfile}).EffectiveSandboxResources()
+		if err != nil {
+			return nil, err
+		}
+		profile = &effective
+		resourceHash = effective.Hash()
+	}
+	return &SandboxManager{
+		runtime: runtime, capacity: config.Capacity,
+		runtimeProfileHash: config.RuntimeProfileHash,
+		resourceProfile:    profile, resourceProfileHash: resourceHash,
+		sandboxes: make(map[string]*SandboxMetadata),
+	}, nil
+}
+
+func capacityFromEnvironment() int {
 	capVal := 5
 	if capStr := os.Getenv("FASTLET_CAPACITY"); capStr == "" {
 		capStr = os.Getenv("AGENT_CAPACITY")
 		if capStr != "" {
-			if v, err := strconv.Atoi(capStr); err == nil {
+			if v, err := strconv.Atoi(capStr); err == nil && v > 0 {
 				capVal = v
 			}
 		}
 	} else {
-		if v, err := strconv.Atoi(capStr); err == nil {
+		if v, err := strconv.Atoi(capStr); err == nil && v > 0 {
 			capVal = v
 		}
 	}
-	return &SandboxManager{
-		runtime:   runtime,
-		capacity:  capVal,
-		sandboxes: make(map[string]*SandboxMetadata),
-	}
+	return capVal
 }
 
 func (m *SandboxManager) CreateSandbox(ctx context.Context, spec *api.SandboxSpec) (*api.CreateSandboxResponse, error) {
+	if err := m.validateProfiles(spec); err != nil {
+		return &api.CreateSandboxResponse{Success: false, Message: err.Error()}, err
+	}
 	m.mu.Lock()
 	if _, exists := m.sandboxes[spec.SandboxID]; exists {
 		m.mu.Unlock()
@@ -60,7 +100,7 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, spec *api.SandboxSpe
 	m.mu.Unlock()
 
 	createdAt := time.Now().Unix()
-	metadata, err := m.runtime.CreateSandbox(ctx, spec)
+	metadata, err := m.runtime.EnsureSandbox(ctx, spec)
 	if err != nil {
 		// Clean up the "creating" placeholder on failure
 		m.mu.Lock()
@@ -82,6 +122,30 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, spec *api.SandboxSpe
 		SandboxID: spec.SandboxID,
 		CreatedAt: createdAt,
 	}, nil
+}
+
+func (m *SandboxManager) validateProfiles(spec *api.SandboxSpec) error {
+	if m.runtimeProfileHash != "" && spec.RuntimeProfileHash != m.runtimeProfileHash {
+		return fmt.Errorf("%w: runtime profile hash %q does not match Fastlet profile %q", ErrSandboxProfileMismatch, spec.RuntimeProfileHash, m.runtimeProfileHash)
+	}
+	if m.resourceProfile == nil {
+		return nil
+	}
+	if spec.ResourceProfileHash != m.resourceProfileHash {
+		return fmt.Errorf("%w: resource profile hash %q does not match Fastlet profile %q", ErrSandboxProfileMismatch, spec.ResourceProfileHash, m.resourceProfileHash)
+	}
+	cpu, err := resource.ParseQuantity(spec.CPU)
+	if err != nil || cpu.Cmp(m.resourceProfile.CPU) != 0 {
+		return fmt.Errorf("%w: cpu %q does not match %s", ErrSandboxProfileMismatch, spec.CPU, m.resourceProfile.CPU.String())
+	}
+	memory, err := resource.ParseQuantity(spec.Memory)
+	if err != nil || memory.Cmp(m.resourceProfile.Memory) != 0 {
+		return fmt.Errorf("%w: memory %q does not match %s", ErrSandboxProfileMismatch, spec.Memory, m.resourceProfile.Memory.String())
+	}
+	if spec.PIDs != m.resourceProfile.PIDs {
+		return fmt.Errorf("%w: pids %d does not match %d", ErrSandboxProfileMismatch, spec.PIDs, m.resourceProfile.PIDs)
+	}
+	return nil
 }
 
 func (m *SandboxManager) DeleteSandbox(sandboxID string) (*api.DeleteSandboxResponse, error) {
@@ -131,10 +195,18 @@ func (m *SandboxManager) asyncDelete(sandboxID string) {
 }
 
 func (m *SandboxManager) GetLogs(ctx context.Context, sandboxID string, follow bool, w io.Writer) error {
-	return m.runtime.GetSandboxLogs(ctx, sandboxID, follow, w)
+	reader, ok := m.runtime.(RuntimeLogReader)
+	if !ok {
+		return ErrUnsupportedRuntime
+	}
+	return reader.GetSandboxLogs(ctx, sandboxID, follow, w)
 }
 func (m *SandboxManager) ListImages(ctx context.Context) ([]string, error) {
-	return m.runtime.ListImages(ctx)
+	cache, ok := m.runtime.(RuntimeArtifactCache)
+	if !ok {
+		return nil, ErrUnsupportedRuntime
+	}
+	return cache.ListImages(ctx)
 }
 
 func (m *SandboxManager) GetCapacity() int {
@@ -149,7 +221,10 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []api.SandboxSt
 
 	// Add active sandboxes
 	for sandboxID, meta := range m.sandboxes {
-		runtimeStatus, _ := m.runtime.GetSandboxStatus(ctx, sandboxID)
+		runtimeStatus := "unknown"
+		if inspected, err := m.runtime.InspectSandbox(ctx, sandboxID); err == nil {
+			runtimeStatus = inspected.Phase
+		}
 		result = append(result, api.SandboxStatus{
 			SandboxID: sandboxID,
 			ClaimUID:  meta.ClaimUID,

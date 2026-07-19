@@ -48,7 +48,7 @@ func TestInfraInjection(t *testing.T) {
 						PoolMax: 1,
 					},
 					MaxSandboxesPerPod: 5,
-					RuntimeType:        apiv1alpha1.RuntimeContainer,
+			Runtime:            apiv1alpha1.RuntimeContainer,
 					FastletTemplate: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
 							Containers: []corev1.Container{{

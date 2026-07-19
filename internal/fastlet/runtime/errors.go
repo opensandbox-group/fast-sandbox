@@ -18,6 +18,14 @@ var (
 	// ErrRuntimeNotInitialized 运行时未初始化
 	ErrRuntimeNotInitialized = errors.New("runtime not initialized")
 
+	// ErrRuntimeCapabilityUnavailable indicates that a configured runtime cannot
+	// safely accept Sandboxes on the current node.
+	ErrRuntimeCapabilityUnavailable = errors.New("runtime capability unavailable")
+
+	// ErrSandboxProfileMismatch rejects a request that attempts to override the
+	// RuntimeProfile or fixed Pool ResourceProfile assigned to this Fastlet.
+	ErrSandboxProfileMismatch = errors.New("sandbox profile mismatch")
+
 	// ErrInvalidConfig 无效的配置
 	ErrInvalidConfig = errors.New("invalid sandbox config")
 )

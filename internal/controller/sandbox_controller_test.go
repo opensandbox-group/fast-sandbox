@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -156,9 +157,20 @@ func newTestScheme(t *testing.T) *runtime.Scheme {
 }
 
 func newTestReconciler(scheme *runtime.Scheme, objs []client.Object, registry *ConfigurableMockRegistry, fastletClient *MockFastletClient) *SandboxReconciler {
+	pool := &apiv1alpha1.SandboxPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-pool", Namespace: "default"},
+		Spec: apiv1alpha1.SandboxPoolSpec{
+			Runtime: apiv1alpha1.RuntimeContainer,
+			SandboxResources: apiv1alpha1.SandboxResourceProfile{
+				CPU: resource.MustParse("500m"), Memory: resource.MustParse("256Mi"), PIDs: 128,
+			},
+		},
+	}
+	objects := append([]client.Object{}, objs...)
+	objects = append(objects, pool)
 	builder := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(objs...).
+		WithObjects(objects...).
 		WithStatusSubresource(&apiv1alpha1.Sandbox{})
 
 	return &SandboxReconciler{
@@ -364,6 +376,11 @@ func TestSandbox_Creation_FastletCreateSuccess(t *testing.T) {
 			createCalled = true
 			assert.Equal(t, "10.0.0.1", fastletIP)
 			assert.Equal(t, testUID, req.Sandbox.SandboxID)
+			assert.Equal(t, "500m", req.Sandbox.CPU)
+			assert.Equal(t, "256Mi", req.Sandbox.Memory)
+			assert.Equal(t, int64(128), req.Sandbox.PIDs)
+			assert.NotEmpty(t, req.Sandbox.RuntimeProfileHash)
+			assert.NotEmpty(t, req.Sandbox.ResourceProfileHash)
 			return &api.CreateSandboxResponse{}, nil
 		},
 	}

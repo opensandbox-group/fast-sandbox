@@ -8,9 +8,10 @@ import (
 const InitialInstanceGeneration int64 = 1
 
 var (
-	ErrRuntimeFieldConflict = errors.New("spec.runtime cannot be combined with deprecated runtime fields")
-	ErrRuntimeImmutable     = errors.New("spec.runtime is immutable")
-	ErrResourcesImmutable   = errors.New("spec.sandboxResources is immutable")
+	ErrRuntimeFieldConflict  = errors.New("spec.runtime cannot be combined with deprecated runtime fields")
+	ErrRuntimeImmutable      = errors.New("spec.runtime is immutable")
+	ErrResourcesImmutable    = errors.New("spec.sandboxResources is immutable")
+	ErrLegacyRuntimeOverride = errors.New("deprecated runtime override does not match the built-in runtime profile")
 )
 
 // IsRuntimeName reports whether name identifies a built-in runtime profile.
@@ -42,6 +43,19 @@ func (s *SandboxPoolSpec) EffectiveRuntime() (RuntimeName, error) {
 	}
 	if !IsRuntimeName(legacy) {
 		return "", fmt.Errorf("unsupported legacy runtime %q", legacy)
+	}
+	if s.RuntimeClassName != "" && s.RuntimeClassName != string(legacy) {
+		return "", fmt.Errorf("%w: runtimeClassName %q", ErrLegacyRuntimeOverride, s.RuntimeClassName)
+	}
+	defaultHandlers := map[RuntimeName]string{
+		RuntimeContainer: "io.containerd.runc.v2",
+		RuntimeGVisor:    "io.containerd.runsc.v1",
+		RuntimeKataQemu:  "io.containerd.kata.v2",
+		RuntimeKataClh:   "io.containerd.kata.v2",
+		RuntimeKataFc:    "io.containerd.kata.v2",
+	}
+	if s.ContainerdRuntimeHandler != "" && s.ContainerdRuntimeHandler != defaultHandlers[legacy] {
+		return "", fmt.Errorf("%w: containerdRuntimeHandler %q", ErrLegacyRuntimeOverride, s.ContainerdRuntimeHandler)
 	}
 	return legacy, nil
 }

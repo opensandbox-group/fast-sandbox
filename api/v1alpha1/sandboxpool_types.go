@@ -116,8 +116,12 @@ const (
 
 // Pool condition reasons
 const (
-	ReasonRuntimeAvailable   = "RuntimeAvailable"
-	ReasonRuntimeUnavailable = "RuntimeUnavailable"
+	ReasonRuntimeAvailable         = "RuntimeAvailable"
+	ReasonRuntimeUnavailable       = "RuntimeUnavailable"
+	ReasonRuntimeProfileInvalid    = "RuntimeProfileInvalid"
+	ReasonRuntimeCapabilityPending = "RuntimeCapabilityPending"
+	ReasonRuntimeUnsupported       = "RuntimeUnsupported"
+	ReasonResourceProfileInvalid   = "ResourceProfileInvalid"
 )
 
 // +kubebuilder:object:root=true

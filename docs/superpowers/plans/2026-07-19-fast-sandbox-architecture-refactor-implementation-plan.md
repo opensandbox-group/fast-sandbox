@@ -1,7 +1,7 @@
 # Fast Sandbox 架构重构开发计划
 
 **日期**：2026-07-19  
-**状态**：执行中（阶段 0～2 完成，阶段 3 进行中）
+**状态**：执行中（阶段 0～3 完成，阶段 4 准备中）
 **代码基线**：`master@f92d8e34288365be227d2ee8a6f952687dc7be00`  
 **本地仓库**：`/Users/fengjianhui/WorkSpaceL/fast-sandbox`  
 **远端开发机**：SSH alias `fast`  
@@ -519,6 +519,19 @@ bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_
 - 缺少 KVM/shim/config 时 RuntimeReady=False；
 - container Sandbox 的实际 cgroup CPU/memory 与 Pool Profile 一致；
 - 单次 Create 不能覆盖 Pool 资源。
+
+### 8.6 实施结果（2026-07-19）
+
+- Controller/Fastlet 共用六个 canonical RuntimeProfile；BoxLite 已注册但明确 Unsupported；
+- Fastlet Pod 不设置 Sandbox RuntimeClass，只接收 canonical runtime/profile/resource 输入；
+- RuntimeDriver factory 在实际节点检查 socket、config、binary 和 KVM，初始化后才报告 Ready；
+- RuntimeDriver 公共边界不再包含 Exec/File，日志和 artifact cache 仅保留为迁移期私有可选接口；
+- ContainerdDriver 将 CPU、memory、PIDs 编译到 OCI spec，并通过 Ensure 提供 runtime identity 幂等入口；
+- Fastlet 启动及每次 Ensure 严格校验完整 runtime/resource profile hash 和 CPU/memory/PIDs，单请求不能覆盖 Pool profile；
+- 远端 unit gate：`make test-unit`，退出状态 `0`；
+- 远端 runtime e2e：BoxLite `RuntimeReady=False/RuntimeUnsupported`；container Fastlet Pod 无 RuntimeClass；
+- 远端实际 cgroup v2：`250m / 256Mi / 128 PIDs` 分别得到 `cpu.max=25000 100000`、`memory.max=268435456`、`pids.max=128`；
+- protobuf、DeepCopy 与两份 CRD manifest 连续生成前后 SHA-256 不变，并与本地分支完全一致。
 
 ## 9. 阶段 4：Fastlet Core v2——Admission、Ensure、Fencing 和恢复
 

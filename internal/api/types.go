@@ -15,16 +15,19 @@ const (
 
 // SandboxSpec describes the desired state of a sandbox on a fastlet.
 type SandboxSpec struct {
-	SandboxID  string            `json:"sandboxId"`
-	ClaimUID   string            `json:"claimUid"`
-	ClaimName  string            `json:"claimName"`
-	Image      string            `json:"image"`
-	CPU        string            `json:"cpu,omitempty"`
-	Memory     string            `json:"memory,omitempty"`
-	Command    []string          `json:"command,omitempty"`
-	Args       []string          `json:"args,omitempty"`
-	Env        map[string]string `json:"env,omitempty"`
-	WorkingDir string            `json:"workingDir,omitempty"`
+	SandboxID           string            `json:"sandboxId"`
+	ClaimUID            string            `json:"claimUid"`
+	ClaimName           string            `json:"claimName"`
+	Image               string            `json:"image"`
+	CPU                 string            `json:"cpu,omitempty"`
+	Memory              string            `json:"memory,omitempty"`
+	PIDs                int64             `json:"pids,omitempty"`
+	RuntimeProfileHash  string            `json:"runtimeProfileHash,omitempty"`
+	ResourceProfileHash string            `json:"resourceProfileHash,omitempty"`
+	Command             []string          `json:"command,omitempty"`
+	Args                []string          `json:"args,omitempty"`
+	Env                 map[string]string `json:"env,omitempty"`
+	WorkingDir          string            `json:"workingDir,omitempty"`
 }
 
 // SandboxStatus represents the observed state of a sandbox on a fastlet.

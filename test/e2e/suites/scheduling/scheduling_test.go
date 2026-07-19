@@ -214,7 +214,7 @@ func createSchedulingPool(namespace, name string, min, max, maxPerPod int32) *ap
 				PoolMax: max,
 			},
 			MaxSandboxesPerPod: maxPerPod,
-			RuntimeType:        apiv1alpha1.RuntimeContainer,
+			Runtime:            apiv1alpha1.RuntimeContainer,
 			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{

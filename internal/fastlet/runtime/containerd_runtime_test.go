@@ -10,6 +10,7 @@ import (
 
 	"fast-sandbox/internal/api"
 
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -69,6 +70,38 @@ func TestRuntimeConfig_OverrideHandler(t *testing.T) {
 	assert.Equal(t, "custom.handler.v2", cfg.Handler)
 	assert.Equal(t, "/etc/containerd/runsc.toml", cfg.ConfigPath)
 	assert.True(t, cfg.NeedsTTY)
+}
+
+func TestSandboxResourceSpecOptsEnforceCPUAndMemory(t *testing.T) {
+	opts, err := sandboxResourceSpecOpts(&api.SandboxSpec{CPU: "500m", Memory: "256Mi", PIDs: 128})
+	require.NoError(t, err)
+	spec := &specs.Spec{Linux: &specs.Linux{}}
+	for _, opt := range opts {
+		require.NoError(t, opt(context.Background(), nil, nil, spec))
+	}
+	require.NotNil(t, spec.Linux.Resources)
+	require.Equal(t, int64(50000), *spec.Linux.Resources.CPU.Quota)
+	require.Equal(t, uint64(100000), *spec.Linux.Resources.CPU.Period)
+	require.Equal(t, int64(256*1024*1024), *spec.Linux.Resources.Memory.Limit)
+	require.Equal(t, int64(128), *spec.Linux.Resources.Pids.Limit)
+}
+
+func TestSandboxResourceSpecOptsRejectInvalidValues(t *testing.T) {
+	_, err := sandboxResourceSpecOpts(&api.SandboxSpec{CPU: "not-cpu"})
+	require.Error(t, err)
+	_, err = sandboxResourceSpecOpts(&api.SandboxSpec{Memory: "0"})
+	require.Error(t, err)
+}
+
+func TestValidateExistingRuntimeProfile(t *testing.T) {
+	existing := &SandboxMetadata{SandboxSpec: api.SandboxSpec{
+		SandboxID: "sandbox-a", CPU: "500m", Memory: "256Mi", PIDs: 128,
+		RuntimeProfileHash: "runtime-hash", ResourceProfileHash: "resource-hash",
+	}}
+	requested := existing.SandboxSpec
+	require.NoError(t, validateExistingRuntimeProfile(existing, &requested))
+	requested.CPU = "1"
+	require.ErrorIs(t, validateExistingRuntimeProfile(existing, &requested), ErrSandboxProfileMismatch)
 }
 
 // ============================================================================
@@ -403,22 +436,26 @@ func TestContainerdRuntime_prepareLabels(t *testing.T) {
 	}
 
 	config := &api.SandboxSpec{
-		SandboxID: "sb-123",
-		ClaimUID:  "claim-456",
-		ClaimName: "test-claim",
-		Image:     "alpine:latest",
+		SandboxID: "sb-123", ClaimUID: "claim-456", ClaimName: "test-claim", Image: "alpine:latest",
+		CPU: "500m", Memory: "256Mi", PIDs: 128,
+		RuntimeProfileHash: "runtime-hash", ResourceProfileHash: "resource-hash",
 	}
 
 	labels := cr.prepareLabels(config)
 
 	expectedLabels := map[string]string{
-		"fast-sandbox.io/managed":      "true",
-		"fast-sandbox.io/fastlet-name": "test-fastlet",
-		"fast-sandbox.io/fastlet-uid":  "fastlet-uid-123",
-		"fast-sandbox.io/namespace":    "default-ns",
-		"fast-sandbox.io/id":           "sb-123",
-		"fast-sandbox.io/claim-uid":    "claim-456",
-		"fast-sandbox.io/sandbox-name": "test-claim",
+		"fast-sandbox.io/managed":               "true",
+		"fast-sandbox.io/fastlet-name":          "test-fastlet",
+		"fast-sandbox.io/fastlet-uid":           "fastlet-uid-123",
+		"fast-sandbox.io/namespace":             "default-ns",
+		"fast-sandbox.io/id":                    "sb-123",
+		"fast-sandbox.io/claim-uid":             "claim-456",
+		"fast-sandbox.io/sandbox-name":          "test-claim",
+		"fast-sandbox.io/runtime-profile-hash":  "runtime-hash",
+		"fast-sandbox.io/resource-profile-hash": "resource-hash",
+		"fast-sandbox.io/resource-cpu":          "500m",
+		"fast-sandbox.io/resource-memory":       "256Mi",
+		"fast-sandbox.io/resource-pids":         "128",
 	}
 
 	assert.Equal(t, expectedLabels, labels)
