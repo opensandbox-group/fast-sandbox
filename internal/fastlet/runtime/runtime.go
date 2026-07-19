@@ -7,16 +7,20 @@ import (
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
+	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/runtimecatalog"
 )
 
 type SandboxMetadata struct {
 	api.SandboxSpec
-	ContainerID string
-	PID         int
-	Phase       string
-	CreatedAt   int64
+	ContainerID                string
+	PID                        int
+	Phase                      string
+	CreatedAt                  int64
+	InfraServices              []fastletinfra.ServiceEndpoint
+	InfraUpstreamHeadersByPort map[uint32]map[string]string
+	InfraDiagnostics           []fastletinfra.ComponentDiagnostic
 }
 
 // RuntimeDriver is the runtime-neutral lifecycle boundary used by Fastlet.
@@ -68,17 +72,24 @@ type NetworkConfigurable interface {
 	SetNetworkManager(manager *fastletnetwork.Manager)
 }
 
+// InfraConfigurable is implemented by drivers that compile a prepared
+// Runtime Augmentation plan into their native runtime spec.
+type InfraConfigurable interface {
+	SetInfraManager(manager *fastletinfra.Manager)
+}
+
 type AccessDescriptorProvider interface {
 	GetAccessDescriptor(sandboxID string) (fastletnetwork.AccessDescriptor, error)
 }
 
 type RoutePublication struct {
-	Namespace         string
-	SandboxUID        string
-	FastletPodUID     string
-	AssignmentAttempt int64
-	RouteGeneration   int64
-	Access            fastletnetwork.AccessDescriptor
+	Namespace             string
+	SandboxUID            string
+	FastletPodUID         string
+	AssignmentAttempt     int64
+	RouteGeneration       int64
+	Access                fastletnetwork.AccessDescriptor
+	UpstreamHeadersByPort map[uint32]map[string]string
 }
 
 // RoutePublisher is the only lifecycle-facing data-plane boundary. The

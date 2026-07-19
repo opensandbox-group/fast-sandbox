@@ -14,6 +14,7 @@ import (
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
 	fastletcache "fast-sandbox/internal/fastlet/cache"
+	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	"fast-sandbox/pkg/util/idgen"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -32,6 +33,9 @@ type SandboxManagerConfig struct {
 	CacheEpoch         string
 	WarmImages         []string
 	RoutePublisher     RoutePublisher
+	InfraProfile       string
+	InfraProfileHash   string
+	InfraManager       *fastletinfra.Manager
 }
 
 type SandboxManager struct {
@@ -41,6 +45,11 @@ type SandboxManager struct {
 	runtimeProfileHash  string
 	resourceProfile     *apiv1alpha1.SandboxResourceProfile
 	resourceProfileHash string
+	infraProfile        string
+	infraProfileHash    string
+	infraManager        *fastletinfra.Manager
+	infraReady          bool
+	infraMessage        string
 	fastletPodUID       string
 	reservationTTL      time.Duration
 	clock               Clock
@@ -107,10 +116,20 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 	for _, image := range config.WarmImages {
 		protection.Protect(image, fastletcache.ProtectWarm)
 	}
+	if config.InfraManager != nil {
+		if config.InfraProfile != "" && config.InfraManager.ProfileName() != config.InfraProfile {
+			return nil, fmt.Errorf("InfraProfile %s does not match manager profile %s", config.InfraProfile, config.InfraManager.ProfileName())
+		}
+		if config.InfraProfileHash != "" && config.InfraManager.ProfileHash() != config.InfraProfileHash {
+			return nil, fmt.Errorf("InfraProfile hash %s does not match manager hash %s", config.InfraProfileHash, config.InfraManager.ProfileHash())
+		}
+	}
 	return &SandboxManager{
 		runtime: runtime, capacity: config.Capacity,
 		runtimeProfileHash: config.RuntimeProfileHash,
 		resourceProfile:    profile, resourceProfileHash: resourceHash,
+		infraProfile: config.InfraProfile, infraProfileHash: config.InfraProfileHash,
+		infraManager: config.InfraManager, infraReady: config.InfraManager == nil,
 		fastletPodUID:  config.FastletPodUID,
 		reservationTTL: config.ReservationTTL, clock: config.Clock, tokenGenerator: config.TokenGenerator,
 		recovering: config.RecoverOnStart, runtimeReady: !config.RecoverOnStart,
@@ -158,6 +177,44 @@ func (m *SandboxManager) WarmCache(ctx context.Context) error {
 	}
 	group.Wait()
 	return result
+}
+
+// PrepareInfra resolves and verifies the selected profile independently from
+// ordinary warmImages. Kubernetes Pod readiness may become true before this
+// completes; Registry hard-filtering and Fastlet admission use InfraReady.
+func (m *SandboxManager) PrepareInfra(ctx context.Context) error {
+	if m.infraManager == nil {
+		m.mu.Lock()
+		m.infraReady = true
+		m.infraMessage = ""
+		m.mu.Unlock()
+		return nil
+	}
+	if err := m.infraManager.Prepare(ctx); err != nil {
+		m.mu.Lock()
+		m.infraReady = false
+		m.infraMessage = err.Error()
+		m.mu.Unlock()
+		return err
+	}
+	for _, reference := range m.infraManager.ArtifactReferences() {
+		m.cacheProtection.Protect(reference, fastletcache.ProtectInfra)
+	}
+	m.mu.Lock()
+	m.infraReady = true
+	m.infraMessage = ""
+	m.mu.Unlock()
+	return m.ReconcilePendingInfra(ctx)
+}
+
+func (m *SandboxManager) InfraStatus() (string, string, bool, []string, string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	artifacts := []string(nil)
+	if m.infraManager != nil && m.infraReady {
+		artifacts = m.infraManager.ArtifactReferences()
+	}
+	return m.infraProfile, m.infraProfileHash, m.infraReady, artifacts, m.infraMessage
 }
 
 func (m *SandboxManager) PlanCacheEviction(candidates []string) []string {
@@ -235,7 +292,7 @@ func (m *SandboxManager) validateProfiles(spec *api.SandboxSpec) error {
 		return fmt.Errorf("%w: runtime profile hash %q does not match Fastlet profile %q", ErrSandboxProfileMismatch, spec.RuntimeProfileHash, m.runtimeProfileHash)
 	}
 	if m.resourceProfile == nil {
-		return nil
+		return m.validateInfraProfile(spec)
 	}
 	if spec.ResourceProfileHash != m.resourceProfileHash {
 		return fmt.Errorf("%w: resource profile hash %q does not match Fastlet profile %q", ErrSandboxProfileMismatch, spec.ResourceProfileHash, m.resourceProfileHash)
@@ -250,6 +307,16 @@ func (m *SandboxManager) validateProfiles(spec *api.SandboxSpec) error {
 	}
 	if spec.PIDs != m.resourceProfile.PIDs {
 		return fmt.Errorf("%w: pids %d does not match %d", ErrSandboxProfileMismatch, spec.PIDs, m.resourceProfile.PIDs)
+	}
+	return m.validateInfraProfile(spec)
+}
+
+func (m *SandboxManager) validateInfraProfile(spec *api.SandboxSpec) error {
+	if m.infraProfile != "" && spec.InfraProfile != m.infraProfile {
+		return fmt.Errorf("%w: InfraProfile %q does not match Fastlet profile %q", ErrSandboxProfileMismatch, spec.InfraProfile, m.infraProfile)
+	}
+	if m.infraProfileHash != "" && spec.InfraProfileHash != m.infraProfileHash {
+		return fmt.Errorf("%w: InfraProfile hash %q does not match Fastlet profile %q", ErrSandboxProfileMismatch, spec.InfraProfileHash, m.infraProfileHash)
 	}
 	return nil
 }
@@ -366,6 +433,7 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []api.SandboxSt
 			AssignmentAttempt:  meta.AssignmentAttempt,
 			Phase:              meta.Phase,
 			Message:            runtimeStatus,
+			InfraDiagnostics:   apiInfraDiagnostics(meta.InfraDiagnostics),
 			CreatedAt:          meta.CreatedAt,
 		})
 	}
@@ -375,11 +443,17 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []api.SandboxSt
 
 func (m *SandboxManager) RuntimeDiagnostics(ctx context.Context) api.RuntimeDiagnostics {
 	report := m.runtime.ProbeCapabilities(ctx)
+	infraProfile, infraHash, infraReady, _, infraMessage := m.InfraStatus()
+	infraState := "Preparing"
+	if infraReady {
+		infraState = "Ready"
+	}
 	return api.RuntimeDiagnostics{
 		RuntimeProfileHash: m.runtimeProfileHash,
-		State:              string(report.State),
-		Reason:             report.Reason,
-		Message:            report.Message,
+		InfraProfile:       infraProfile, InfraProfileHash: infraHash, InfraState: infraState, InfraMessage: infraMessage,
+		State:   string(report.State),
+		Reason:  report.Reason,
+		Message: report.Message,
 	}
 }
 

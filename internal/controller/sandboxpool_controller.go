@@ -10,6 +10,7 @@ import (
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/controller/fastletpool"
+	"fast-sandbox/internal/infracatalog"
 	"fast-sandbox/internal/runtimecatalog"
 
 	corev1 "k8s.io/api/core/v1"
@@ -29,6 +30,7 @@ type SandboxPoolReconciler struct {
 	Scheme               *runtime.Scheme
 	Registry             fastletpool.FastletRegistry
 	Catalog              *runtimecatalog.Catalog
+	InfraCatalog         *infracatalog.Catalog
 	FastletProxyImage    string
 	RouteVerifyPublicKey string
 }
@@ -71,6 +73,18 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		})
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
+	_, err = r.resolveInfraPlan(&pool, profile)
+	if err != nil {
+		_ = r.updatePoolCondition(ctx, &pool, metav1.Condition{
+			Type: apiv1alpha1.PoolConditionInfraReady, Status: metav1.ConditionFalse,
+			Reason: apiv1alpha1.ReasonInfraProfileInvalid, Message: err.Error(),
+		})
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	_ = r.updatePoolCondition(ctx, &pool, metav1.Condition{
+		Type: apiv1alpha1.PoolConditionInfraReady, Status: metav1.ConditionTrue,
+		Reason: apiv1alpha1.ReasonInfraProfileAvailable, Message: "InfraProfile is compatible with the selected runtime",
+	})
 
 	var childPods corev1.PodList
 	if err := r.List(ctx, &childPods, client.InNamespace(req.Namespace), client.MatchingLabels(poolLabels(pool.Name))); err != nil {
@@ -151,6 +165,10 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 	if err != nil {
 		return nil, err
 	}
+	infraPlan, err := r.resolveInfraPlan(pool, profile)
+	if err != nil {
+		return nil, err
+	}
 	labels := make(map[string]string)
 	for k, v := range pool.Spec.FastletTemplate.ObjectMeta.Labels {
 		labels[k] = v
@@ -160,12 +178,14 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 	}
 	labels["fast-sandbox.io/runtime"] = string(profile.Name)
 	labels["fast-sandbox.io/runtime-profile"] = shortProfileIdentity(profile)
+	labels["fast-sandbox.io/infra-profile"] = infraPlan.ProfileName
 	annotations := make(map[string]string)
 	for k, v := range pool.Spec.FastletTemplate.ObjectMeta.Annotations {
 		annotations[k] = v
 	}
 	annotations["fast-sandbox.io/runtime-profile-hash"] = profile.ProfileHash
 	annotations["fast-sandbox.io/resource-profile-hash"] = sandboxResources.Hash()
+	annotations["fast-sandbox.io/infra-profile-hash"] = infraPlan.ProfileHash
 	warmImagesJSON, err := json.Marshal(uniqueWarmImages(pool.Spec.WarmImages))
 	if err != nil {
 		return nil, fmt.Errorf("encode warmImages: %w", err)
@@ -183,15 +203,8 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 			return nil, errors.New("fastlet-proxy is a platform-owned sidecar name")
 		}
 	}
-	for _, volume := range podSpec.Volumes {
-		if volume.Name == "proxy-control" {
-			return nil, errors.New("proxy-control is a platform-owned volume name")
-		}
-	}
-	for _, mount := range podSpec.Containers[0].VolumeMounts {
-		if mount.Name == "proxy-control" || mount.MountPath == "/run/fast-sandbox/proxy" {
-			return nil, errors.New("/run/fast-sandbox/proxy is reserved for Fastlet Proxy control")
-		}
+	if err := validatePlatformOwnedStorage(podSpec); err != nil {
+		return nil, err
 	}
 	if err := mergeNodeSelector(podSpec, profile.Deployment.NodeSelector); err != nil {
 		return nil, err
@@ -252,7 +265,8 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 			corev1.EnvVar{Name: "FAST_SANDBOX_RESOURCE_CPU", Value: sandboxResources.CPU.String()},
 			corev1.EnvVar{Name: "FAST_SANDBOX_RESOURCE_MEMORY", Value: sandboxResources.Memory.String()},
 			corev1.EnvVar{Name: "FAST_SANDBOX_RESOURCE_PIDS", Value: strconv.FormatInt(sandboxResources.PIDs, 10)},
-			corev1.EnvVar{Name: "FAST_SANDBOX_INFRA_PROFILE", Value: pool.Spec.InfraProfile},
+			corev1.EnvVar{Name: "FAST_SANDBOX_INFRA_PROFILE", Value: infraPlan.ProfileName},
+			corev1.EnvVar{Name: "FAST_SANDBOX_INFRA_PROFILE_HASH", Value: infraPlan.ProfileHash},
 			corev1.EnvVar{Name: "RUNTIME_SOCKET", Value: "/run/containerd/containerd.sock"},
 			corev1.EnvVar{Name: "INFRA_DIR_IN_POD", Value: "/opt/fast-sandbox/infra"},
 		)
@@ -294,16 +308,6 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 		},
 	})
 
-	podSpec.InitContainers = append(podSpec.InitContainers, corev1.Container{
-		Name:            "infra-init",
-		Image:           "alpine:latest",
-		ImagePullPolicy: corev1.PullIfNotPresent,
-		Command:         []string{"sh", "-c", "cat <<'EOF' > /opt/fast-sandbox/infra/fs-helper\n#!/bin/sh\necho [FS-INFRA] Helper Initiated\nexec \"$@\"\nEOF\nchmod +x /opt/fast-sandbox/infra/fs-helper"},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: "infra-tools", MountPath: "/opt/fast-sandbox/infra"},
-		},
-	})
-
 	hostPathDirectory := corev1.HostPathDirectory
 
 	podSpec.Volumes = append(podSpec.Volumes,
@@ -337,6 +341,27 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 		return nil, err
 	}
 	return pod, nil
+}
+
+func validatePlatformOwnedStorage(podSpec *corev1.PodSpec) error {
+	reservedVolumes := map[string]string{
+		"tmp":           "/tmp",
+		"infra-tools":   "/opt/fast-sandbox/infra",
+		"proxy-control": "/run/fast-sandbox/proxy",
+	}
+	for _, volume := range podSpec.Volumes {
+		if _, reserved := reservedVolumes[volume.Name]; reserved {
+			return fmt.Errorf("%s is a platform-owned volume name", volume.Name)
+		}
+	}
+	for _, mount := range podSpec.Containers[0].VolumeMounts {
+		for name, path := range reservedVolumes {
+			if mount.Name == name || mount.MountPath == path {
+				return fmt.Errorf("volume name %s and mount path %s are reserved by the platform", name, path)
+			}
+		}
+	}
+	return nil
 }
 
 func shortProfileIdentity(profile runtimecatalog.RuntimeProfile) string {
@@ -389,11 +414,19 @@ func (r *SandboxPoolReconciler) resolveRuntimeProfile(pool *apiv1alpha1.SandboxP
 	return catalog.Resolve(name)
 }
 
+func (r *SandboxPoolReconciler) resolveInfraPlan(pool *apiv1alpha1.SandboxPool, runtimeProfile runtimecatalog.RuntimeProfile) (infracatalog.Plan, error) {
+	catalog := r.InfraCatalog
+	if catalog == nil {
+		catalog = infracatalog.Builtin()
+	}
+	return catalog.Compile(pool.Spec.InfraProfile, runtimeProfile)
+}
+
 var runtimeOwnedEnv = map[string]struct{}{
 	"RUNTIME_TYPE": {}, "RUNTIME_HANDLER": {},
 	"FAST_SANDBOX_RUNTIME": {}, "FAST_SANDBOX_RUNTIME_PROFILE_HASH": {},
 	"FAST_SANDBOX_RESOURCE_CPU": {}, "FAST_SANDBOX_RESOURCE_MEMORY": {}, "FAST_SANDBOX_RESOURCE_PIDS": {},
-	"FAST_SANDBOX_INFRA_PROFILE": {}, "FASTLET_CAPACITY": {},
+	"FAST_SANDBOX_INFRA_PROFILE": {}, "FAST_SANDBOX_INFRA_PROFILE_HASH": {}, "FASTLET_CAPACITY": {},
 	"RUNTIME_SOCKET": {}, "INFRA_DIR_IN_POD": {},
 	"FASTLET_CONTROL_PORT": {}, "AGENT_PORT": {},
 	"FASTLET_PROXY_CONTROL_SOCKET": {},

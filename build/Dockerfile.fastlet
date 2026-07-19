@@ -14,6 +14,7 @@ FROM golang:1.25-alpine
 WORKDIR /workspace
 RUN apk add --no-cache iproute2 iptables
 COPY --from=builder /workspace/fastlet .
+COPY bin/sandbox-init /opt/fast-sandbox/bin/sandbox-init
 
 # Default envs; can be overridden by Pod spec
 ENV FASTLET_CONTROL_PORT=":5758"

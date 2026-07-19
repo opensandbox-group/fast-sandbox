@@ -167,6 +167,8 @@ func fastletInfoFromPod(pod *corev1.Pod) fastletpool.FastletInfo {
 		RuntimeName:         apiv1alpha1.RuntimeName(pod.Labels["fast-sandbox.io/runtime"]),
 		RuntimeProfileHash:  pod.Annotations["fast-sandbox.io/runtime-profile-hash"],
 		ResourceProfileHash: pod.Annotations["fast-sandbox.io/resource-profile-hash"],
+		InfraProfile:        pod.Labels["fast-sandbox.io/infra-profile"],
+		InfraProfileHash:    pod.Annotations["fast-sandbox.io/infra-profile-hash"],
 		PodReady:            pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" && podConditionTrue(pod.Status.Conditions, corev1.PodReady),
 		PodObservedAt:       time.Now(),
 	}

@@ -16,7 +16,7 @@ func (m *SandboxManager) ReconcileProxyRoutes(ctx context.Context) error {
 	metadata := make([]SandboxMetadata, 0, len(m.sandboxes))
 	for _, sandbox := range m.sandboxes {
 		switch sandbox.Phase {
-		case "terminating", "deleting", "delete-failed":
+		case "terminating", "deleting", "delete-failed", "infra-pending", "initializing-infra":
 			continue
 		}
 		metadata = append(metadata, *sandbox)
@@ -78,7 +78,19 @@ func (m *SandboxManager) routePublication(metadata *SandboxMetadata) (RoutePubli
 		Namespace: metadata.ClaimNamespace, SandboxUID: metadata.SandboxID,
 		FastletPodUID: metadata.FastletPodUID, AssignmentAttempt: metadata.AssignmentAttempt,
 		RouteGeneration: routeGeneration, Access: access,
+		UpstreamHeadersByPort: cloneHeadersByPort(metadata.InfraUpstreamHeadersByPort),
 	}, nil
+}
+
+func cloneHeadersByPort(headers map[uint32]map[string]string) map[uint32]map[string]string {
+	if headers == nil {
+		return nil
+	}
+	clone := make(map[uint32]map[string]string, len(headers))
+	for port, values := range headers {
+		clone[port] = cloneStringMap(values)
+	}
+	return clone
 }
 
 func (m *SandboxManager) publishRoute(ctx context.Context, metadata *SandboxMetadata) error {

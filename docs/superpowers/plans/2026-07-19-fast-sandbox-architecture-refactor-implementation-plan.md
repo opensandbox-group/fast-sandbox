@@ -1,7 +1,7 @@
 # Fast Sandbox 架构重构开发计划
 
 **日期**：2026-07-19  
-**状态**：执行中（阶段 0～8 完成，阶段 9 进行中）
+**状态**：执行中（阶段 0～9 完成，阶段 10 待执行）
 **代码基线**：`master@f92d8e34288365be227d2ee8a6f952687dc7be00`  
 **本地仓库**：`/Users/fengjianhui/WorkSpaceL/fast-sandbox`  
 **远端开发机**：SSH alias `fast`  
@@ -1187,7 +1187,8 @@ fastctl：
 - required Infra 失败导致 DataPlaneReady=False；
 - optional Infra 失败不阻塞 Create；
 - reset 后重新 InstanceInit，旧 token 无效；
-- fastctl/Python SDK exec、files、SSE/PTY 通过 ExecdAdapter；
+- fastctl/Python SDK exec、files 和 command SSE 通过 ExecdAdapter；
+- PTY 仅在所选 Infra Component 明确声明兼容的 WebSocket 扩展时由对应 Adapter 提供；OpenSandbox 公共 Execd 契约未声明 PTY 时必须 fail closed，Fast Sandbox Core 不补充私有 PTY 协议；
 - FastPath/Fastlet Control 抓包或 handler 列表中不存在公共 Exec/File API。
 
 远端：
@@ -1196,6 +1197,23 @@ fastctl：
 bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_exec.sh \
   'go test -race ./internal/fastlet/infra/... ./internal/sandboxinit/... ./cmd/fastctl/... && make test-e2e-infra && make test-e2e-sdk'
 ```
+
+### 14.7 实施结果（2026-07-19）
+
+- 新增平台所有的 `infracatalog`，内置 `minimal`、`test-infra`、`opensandbox-execd` 和 `e2b-envd`。Profile hash 覆盖完整不可变配置和 artifact digest；Pool `infraProfile` 设为不可变，Controller 同时将规范化 profile 名与 hash 注入 Fastlet Pod，Registry heartbeat、reservation 和 Fastlet admission 全链路校验同一 hash；
+- `opensandbox-execd` 在生产 artifact release binding、OCI opener 和签名策略尚未配置时保持 `Configured=false`，Pool 在创建 Fastlet 前 fail closed；`e2b-envd` 只描述支持 runtime 的 TemplateBake/Preinstalled + SystemService 契约，SDK 只向官方 E2B Connect client 交付 route URL/header，不复制 envd protobuf；
+- 新增 Fastlet 本地 content-addressed Artifact Store：cache hit 不重新打开 registry/static source，写入前做大小限制和 sha256 校验，原子发布后按 data/executable 变体分别固定为 `0444/0555`，损坏和 digest mismatch 均 fail closed；Static resolver 限制在平台 root，OCI opener 和签名/attestation verifier 为显式注入点；已 Prepared 的 supervisor/component digest 进入 `InfraArtifact` GC 保护索引和 heartbeat；
+- artifact preparation 与 warmImages、Pod Ready 解耦。Fastlet 可先完成 Kubernetes readiness，但 `InfraReady=false` 时 Registry hard filter 和 Fastlet reservation/ensure 都拒绝该 Profile；required artifact 准备支持原地重试，声明式路径保持 pending；
+- 新增 `sandbox-init` 最小 supervisor。它保留用户 entrypoint/args/env/cwd/退出码，默认让 Infra 和用户进程并行，支持 `startBeforeUser`、依赖拓扑、restart policy、readiness、进程组信号转发和子进程回收；平台 supervisor 以容器 root 读取 `0400` 实例配置，再按 OCI 原始 UID/GID/附加组降权启动用户进程，因而兼容非 root 用户镜像且不把内部 token 放进用户环境；
+- 每个 instance generation/assignment attempt 生成独立 token 和只读配置；reset 生成新 token，恢复只接受完全匹配的持久化 identity。required init/readiness 失败保持 `infra-pending` 且不发布 route，optional 失败进入 component diagnostics 但不阻塞 Create；Create 最终成功 gate 为 runtime、required Infra、route publication 全部完成；
+- Fastlet Proxy 的 upstream credential 改为按 target port 作用域保存。转发前剥离调用方伪造的所有平台 upstream header，只向对应 Infra service 端口注入真实值；真实 e2e 同时验证 Infra 端口能鉴权、同 Sandbox 的普通用户端口收不到内部 token；
+- 新增公共 Go `pkg/sandboxclient` 和 Python SDK：生命周期调用 FastPath，`EndpointResolver` 获取短期、generation-fenced Sandbox Proxy route；OpenSandbox ExecdAdapter 实现 `/command` SSE 与 file API，Go/Python 文件下载均支持流式传输；EnvdAdapter 仅提供 native client hand-off。fastctl 新增 `exec/cp/files`、`--proxy-endpoint` 和 `--adapter`，`run` 自动生成或接受显式 request ID，`logs` 明确为 runtime diagnostics；
+- FastPath proto compatibility test 明确禁止公共 Exec/File/PTY 方法。当前 Execd 公共契约没有 PTY 时，fastctl/Python 对 stdin/TTY fail closed；透明代理已能承载 WebSocket，但只有未来明确声明兼容扩展的 Adapter 才开放 PTY；
+- 远端目标 race gate：`go test -race ./api/proto/v1 ./internal/fastlet/infra/... ./internal/sandboxinit/... ./internal/infracatalog/... ./internal/fastlet/runtime/... ./internal/fastletproxy/... ./internal/controller/fastletpool/... ./internal/controller/sandboxorchestrator/... ./pkg/sandboxclient/... ./cmd/fastctl/... ./cmd/sandbox-init`，退出状态 `0`；
+- 远端完整 unit gate：`make test-unit`，退出状态 `0`；`make manifests` 使用固定远端工具链重新生成 CRD，退出状态 `0`；本地 `generate_proto.sh` 可重复生成 Python stub，`git diff --check` 通过；
+- 远端 Infra e2e：`E2E_TEST_TIMEOUT=35m DOCKER_BUILD_FLAGS=--network=host make test-e2e-infra`，退出状态 `0`，总耗时 `59.879s`；
+- 远端 SDK Adapter e2e：`E2E_TEST_TIMEOUT=35m DOCKER_BUILD_FLAGS=--network=host make test-e2e-sdk`，验证 `Adapter -> Sandbox Proxy -> Fastlet Proxy -> injected component` 的 command SSE 与 file download，退出状态 `0`，总耗时 `22.821s`；
+- Python 3.12 SDK unit：`python -m unittest discover -s sdk/python/tests -v`，3 个用例全部通过，覆盖 request ID、Execd route/SSE/files/streaming download 和 envd hand-off，退出状态 `0`。
 
 ## 15. 阶段 10：Drain、PodLost 和 Janitor 扩展
 

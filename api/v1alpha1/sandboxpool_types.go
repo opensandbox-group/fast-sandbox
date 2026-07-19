@@ -62,6 +62,7 @@ type SandboxPoolSpec struct {
 
 	// InfraProfile selects a platform-controlled Runtime Augmentation profile.
 	// +kubebuilder:default=minimal
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="infraProfile is immutable"
 	InfraProfile string `json:"infraProfile,omitempty"`
 
 	// RuntimeType is the deprecated runtime field accepted only for old objects.
@@ -113,6 +114,7 @@ type SandboxPoolStatus struct {
 // Pool condition types
 const (
 	PoolConditionRuntimeReady = "RuntimeReady"
+	PoolConditionInfraReady   = "InfraReady"
 )
 
 // Pool condition reasons
@@ -123,6 +125,8 @@ const (
 	ReasonRuntimeCapabilityPending = "RuntimeCapabilityPending"
 	ReasonRuntimeUnsupported       = "RuntimeUnsupported"
 	ReasonResourceProfileInvalid   = "ResourceProfileInvalid"
+	ReasonInfraProfileInvalid      = "InfraProfileInvalid"
+	ReasonInfraProfileAvailable    = "InfraProfileAvailable"
 )
 
 // +kubebuilder:object:root=true

@@ -20,6 +20,7 @@ import (
 
 	runtimeoptions "github.com/containerd/containerd/api/types/runtimeoptions/v1"
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
@@ -30,16 +31,15 @@ import (
 )
 
 type ContainerdRuntime struct {
-	socketPath         string
-	client             *containerd.Client
-	fastletPodName     string
-	fastletPodUID      string
-	fastletNamespace   string
-	infraMgr           *infra.Manager
-	allowedPluginPaths []string
-	runtimeType        RuntimeType   // runtime type identifier
-	config             RuntimeConfig // cached runtime configuration
-	networkManager     *fastletnetwork.Manager
+	socketPath       string
+	client           *containerd.Client
+	fastletPodName   string
+	fastletPodUID    string
+	fastletNamespace string
+	infraMgr         *infra.Manager
+	runtimeType      RuntimeType   // runtime type identifier
+	config           RuntimeConfig // cached runtime configuration
+	networkManager   *fastletnetwork.Manager
 }
 
 const (
@@ -82,23 +82,6 @@ func (r *ContainerdRuntime) Initialize(ctx context.Context, socketPath string) e
 	r.fastletPodName = os.Getenv("POD_NAME")
 	r.fastletPodUID = os.Getenv("POD_UID")
 
-	allowedPaths := os.Getenv("ALLOWED_PLUGIN_PATHS")
-	if allowedPaths != "" {
-		r.allowedPluginPaths = strings.Split(allowedPaths, ":")
-	} else {
-		infraPodPath := os.Getenv("INFRA_DIR_IN_POD")
-		if infraPodPath == "" {
-			infraPodPath = "/opt/fast-sandbox/infra"
-		}
-		r.allowedPluginPaths = []string{infraPodPath}
-	}
-
-	infraPodPath := os.Getenv("INFRA_DIR_IN_POD")
-	if infraPodPath == "" {
-		infraPodPath = "/opt/fast-sandbox/infra"
-	}
-	r.infraMgr = infra.NewManager(infraPodPath)
-
 	return nil
 }
 
@@ -120,9 +103,17 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 	pullDuration := time.Since(pullStart)
 
 	containerID := config.SandboxID
-	specOpts, err := r.prepareSpecOpts(config, image)
+	specOpts, infraInstance, err := r.prepareSpecOpts(ctx, config, image)
 	if err != nil {
 		return nil, fmt.Errorf("invalid sandbox resource profile: %w", err)
+	}
+	created := false
+	if infraInstance != nil {
+		defer func() {
+			if !created {
+				_ = r.infraMgr.RemoveInstance(config)
+			}
+		}()
 	}
 	labels := r.prepareLabels(config)
 
@@ -205,6 +196,11 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 		CreatedAt:   time.Now().Unix(),
 		PID:         int(task.Pid()),
 	}
+	if infraInstance != nil {
+		metadata.InfraServices = append([]infra.ServiceEndpoint(nil), infraInstance.Services...)
+		metadata.InfraUpstreamHeadersByPort = upstreamHeadersByServicePort(infraInstance.Services, infraInstance.UpstreamHeaders)
+	}
+	created = true
 	klog.InfoS("Sandbox created successfully", "sandbox", containerID, "pid", task.Pid())
 	return metadata, nil
 }
@@ -247,6 +243,7 @@ func (r *ContainerdRuntime) EnsureSandbox(ctx context.Context, config *api.Sandb
 func validateExistingRuntimeProfile(existing *SandboxMetadata, requested *api.SandboxSpec) error {
 	if existing.RuntimeProfileHash != requested.RuntimeProfileHash ||
 		existing.ResourceProfileHash != requested.ResourceProfileHash ||
+		existing.InfraProfile != requested.InfraProfile || existing.InfraProfileHash != requested.InfraProfileHash ||
 		existing.CPU != requested.CPU || existing.Memory != requested.Memory || existing.PIDs != requested.PIDs {
 		return fmt.Errorf("%w: existing runtime identity %q has different runtime/resource profile", ErrSandboxProfileMismatch, requested.SandboxID)
 	}
@@ -264,52 +261,32 @@ func (r *ContainerdRuntime) prepareImage(ctx context.Context, imageName string) 
 	return image, nil
 }
 
-func (r *ContainerdRuntime) prepareSpecOpts(config *api.SandboxSpec, image containerd.Image) ([]oci.SpecOpts, error) {
+func (r *ContainerdRuntime) prepareSpecOpts(ctx context.Context, config *api.SandboxSpec, image containerd.Image) ([]oci.SpecOpts, *infra.PreparedInstance, error) {
 	originalArgs := append(config.Command, config.Args...)
 
 	var mounts []specs.Mount
-	finalArgs := originalArgs
-
+	var infraInstance *infra.PreparedInstance
 	if r.infraMgr != nil {
-		//plugins := r.infraMgr.GetPlugins()
-		//for _, p := range plugins {
-		//	hostPath := r.infraMgr.GetHostPath(p.BinName)
-		//	if hostPath == "" {
-		//		continue
-		//	}
-		//
-		//	if !r.isPluginPathAllowed(hostPath) {
-		//		klog.InfoS("SECURITY: Plugin path is not in allowed paths, skipping", "path", hostPath)
-		//		continue
-		//	}
-		//
-		//	if _, err := os.Stat(hostPath); err != nil {
-		//		klog.InfoS("Warning: Plugin binary not accessible", "path", hostPath, "err", err)
-		//		continue
-		//	}
-		//
-		//	mounts = append(mounts, specs.Mount{
-		//		Source:      hostPath,
-		//		Destination: p.ContainerPath,
-		//		Type:        "bind",
-		//		Options:     []string{"ro", "rbind", "nosuid", "nodev"}, // 只读绑定，添加安全选项
-		//	})
-		//
-		//	if p.IsWrapper {
-		//		wrapped := []string{p.ContainerPath, "--"}
-		//		finalArgs = append(wrapped, finalArgs...)
-		//	}
-		//}
+		prepared, err := r.infraMgr.PrepareInstance(ctx, config)
+		if err != nil {
+			return nil, nil, fmt.Errorf("prepare InfraProfile instance: %w", err)
+		}
+		infraInstance = &prepared
+		for _, mount := range prepared.Mounts {
+			mounts = append(mounts, specs.Mount{Source: mount.Source, Destination: mount.Destination, Type: "bind", Options: append([]string(nil), mount.Options...)})
+		}
 	}
 
 	specOpts := []oci.SpecOpts{
 		oci.WithImageConfig(image),
-		oci.WithProcessArgs(finalArgs...),
 		oci.WithEnv(envMapToSlice(config.Env)),
+	}
+	if len(originalArgs) > 0 {
+		specOpts = append(specOpts, oci.WithProcessArgs(originalArgs...))
 	}
 	resourceOpts, err := sandboxResourceSpecOpts(config)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	specOpts = append(specOpts, resourceOpts...)
 
@@ -331,11 +308,53 @@ func (r *ContainerdRuntime) prepareSpecOpts(config *api.SandboxSpec, image conta
 	if len(mounts) > 0 {
 		specOpts = append(specOpts, oci.WithMounts(mounts))
 	}
+	if infraInstance != nil && infraInstance.WrapperRequired {
+		specOpts = append(specOpts, withSandboxInit())
+	}
 
 	networkNamespace := specs.LinuxNamespace{Type: specs.NetworkNamespace, Path: config.NetworkNamespacePath}
 	specOpts = append(specOpts, oci.WithLinuxNamespace(networkNamespace))
 
-	return specOpts, nil
+	return specOpts, infraInstance, nil
+}
+
+func withSandboxInit() oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, spec *oci.Spec) error {
+		if spec.Process == nil || len(spec.Process.Args) == 0 || spec.Process.Args[0] == "" {
+			return errors.New("user image has no entrypoint for sandbox-init to supervise")
+		}
+		original := append([]string(nil), spec.Process.Args...)
+		originalUser := spec.Process.User
+		wrapper := []string{
+			infra.SandboxInitContainerPath, "--config", infra.InstanceConfigPath,
+			"--user-uid", strconv.FormatUint(uint64(originalUser.UID), 10),
+			"--user-gid", strconv.FormatUint(uint64(originalUser.GID), 10),
+		}
+		if len(originalUser.AdditionalGids) > 0 {
+			groups := make([]string, len(originalUser.AdditionalGids))
+			for index, group := range originalUser.AdditionalGids {
+				groups[index] = strconv.FormatUint(uint64(group), 10)
+			}
+			wrapper = append(wrapper, "--user-additional-gids", strings.Join(groups, ","))
+		}
+		wrapper = append(wrapper, "--")
+		spec.Process.Args = append(wrapper, original...)
+		// The supervisor must read the root-only per-instance configuration.
+		// It restores originalUser only on the user child process.
+		spec.Process.User = specs.User{}
+		return nil
+	}
+}
+
+func cloneStringMap(input map[string]string) map[string]string {
+	if input == nil {
+		return nil
+	}
+	result := make(map[string]string, len(input))
+	for key, value := range input {
+		result[key] = value
+	}
+	return result
 }
 
 func sandboxResourceSpecOpts(config *api.SandboxSpec) ([]oci.SpecOpts, error) {
@@ -369,21 +388,6 @@ func sandboxResourceSpecOpts(config *api.SandboxSpec) ([]oci.SpecOpts, error) {
 		opts = append(opts, oci.WithPidsLimit(config.PIDs))
 	}
 	return opts, nil
-}
-
-func (r *ContainerdRuntime) isPluginPathAllowed(pluginPath string) bool {
-	resolvedPath, err := filepath.EvalSymlinks(pluginPath)
-	if err != nil {
-		return false
-	}
-
-	for _, allowedPath := range r.allowedPluginPaths {
-		cleanAllowed := filepath.Clean(allowedPath)
-		if strings.HasPrefix(resolvedPath, cleanAllowed+string(filepath.Separator)) || resolvedPath == cleanAllowed {
-			return true
-		}
-	}
-	return false
 }
 
 // getRuntimeOptions returns runtime-specific options for containerd.
@@ -423,6 +427,8 @@ func (r *ContainerdRuntime) prepareLabels(config *api.SandboxSpec) map[string]st
 		"fast-sandbox.io/sandbox-name":          config.ClaimName,
 		"fast-sandbox.io/runtime-profile-hash":  config.RuntimeProfileHash,
 		"fast-sandbox.io/resource-profile-hash": config.ResourceProfileHash,
+		"fast-sandbox.io/infra-profile":         config.InfraProfile,
+		"fast-sandbox.io/infra-profile-hash":    config.InfraProfileHash,
 		"fast-sandbox.io/resource-cpu":          config.CPU,
 		"fast-sandbox.io/resource-memory":       config.Memory,
 		"fast-sandbox.io/resource-pids":         strconv.FormatInt(config.PIDs, 10),
@@ -442,6 +448,10 @@ func (r *ContainerdRuntime) SetNetworkManager(manager *fastletnetwork.Manager) {
 	r.networkManager = manager
 }
 
+func (r *ContainerdRuntime) SetInfraManager(manager *infra.Manager) {
+	r.infraMgr = manager
+}
+
 func (r *ContainerdRuntime) SetNamespace(ns string) {
 	r.fastletNamespace = ns
 }
@@ -456,12 +466,19 @@ func (r *ContainerdRuntime) DeleteSandbox(ctx context.Context, sandboxID string)
 	if err := r.deleteContainerdSandbox(ctx, sandboxID); err != nil {
 		return err
 	}
-	if r.networkManager != nil && owner.SandboxUID != "" {
-		if err := r.networkManager.Release(ctx, owner); err != nil {
-			return fmt.Errorf("release network slot: %w", err)
+	var infraErr error
+	if r.infraMgr != nil {
+		if err := r.infraMgr.RemoveSandboxInstances(sandboxID); err != nil {
+			infraErr = fmt.Errorf("remove Infra instance state: %w", err)
 		}
 	}
-	return nil
+	var networkErr error
+	if r.networkManager != nil && owner.SandboxUID != "" {
+		if err := r.networkManager.Release(ctx, owner); err != nil {
+			networkErr = fmt.Errorf("release network slot: %w", err)
+		}
+	}
+	return JoinErrors(infraErr, networkErr)
 }
 
 func (r *ContainerdRuntime) deleteContainerdSandbox(ctx context.Context, sandboxID string) error {
@@ -578,6 +595,8 @@ func (r *ContainerdRuntime) InspectSandbox(ctx context.Context, sandboxID string
 			Memory:               info.Labels["fast-sandbox.io/resource-memory"],
 			RuntimeProfileHash:   info.Labels["fast-sandbox.io/runtime-profile-hash"],
 			ResourceProfileHash:  info.Labels["fast-sandbox.io/resource-profile-hash"],
+			InfraProfile:         info.Labels["fast-sandbox.io/infra-profile"],
+			InfraProfileHash:     info.Labels["fast-sandbox.io/infra-profile-hash"],
 			NetworkSlotID:        info.Labels["fast-sandbox.io/network-slot-id"],
 			NetworkNamespacePath: info.Labels["fast-sandbox.io/network-netns-path"],
 			NetworkIP:            info.Labels["fast-sandbox.io/network-ip"],

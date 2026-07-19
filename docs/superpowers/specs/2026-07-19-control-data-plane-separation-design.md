@@ -431,6 +431,8 @@ RuntimeExec
 - 将组件启动和退出状态提供给 Fastlet diagnostics；
 - 停止 Sandbox 时清理 Infra Component。
 
+当实例配置含 root-only token 或 CA 时，`sandbox-init` 不能直接继承用户镜像的非 root `USER`，否则它无法读取平台配置。普通容器的实现应让 supervisor 以平台身份启动，仅由它读取受保护配置；随后按最终 OCI Spec 中保存的原始 UID、GID 和 supplementary groups 降权启动用户 entrypoint。Infra Component 可保持平台组件身份，内部凭证不进入用户进程环境。
+
 默认允许 Infra Component 与用户进程并行启动，减少 `UserProcessStartLatency`：
 
 ```text
@@ -892,7 +894,7 @@ expiration
 
 Sandbox Proxy 和 Fastlet Proxy 应能本地验签，正常请求不逐次回查 Fast-Path Server。
 
-Infra Component 的 upstream credential 由 Fastlet 生成并注入。Fastlet Proxy 可以根据 route metadata 注入 upstream header，避免把真实内部凭证直接暴露给客户端。
+Infra Component 的 upstream credential 由 Fastlet 生成并注入。Fastlet Proxy 根据 `Sandbox UID + target port` 作用域的 route metadata 注入 upstream header，避免把真实内部凭证直接暴露给客户端或同一 Sandbox 的其他用户端口。代理在注入前必须剥离调用方提供的同名平台 header，防止伪造或跨端口泄漏。
 
 具体 token 格式、密钥分发和 rotation 在实施阶段确定。
 
@@ -913,6 +915,8 @@ Sandbox Proxy 和 Fastlet Proxy 不反序列化 Infra Component payload。第一
 - Header allowlist/denylist。
 
 HTTP/2、gRPC 和 raw TCP 根据实际 Infra Component 协议后续扩展。
+
+这里的 PTY 指代理能够透明承载由上游 Infra Component 声明的 WebSocket/PTY 扩展，不表示 Fast Sandbox Core 或通用 ExecdAdapter 定义 PTY 协议。若所选 Profile/Adapter 没有声明该扩展，SDK 和 fastctl 必须 fail closed。
 
 ## 12. Logs 边界
 

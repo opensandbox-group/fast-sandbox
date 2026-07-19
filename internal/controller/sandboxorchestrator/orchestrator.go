@@ -11,6 +11,7 @@ import (
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/controller/common"
 	"fast-sandbox/internal/controller/fastletpool"
+	"fast-sandbox/internal/infracatalog"
 	"fast-sandbox/internal/runtimecatalog"
 
 	corev1 "k8s.io/api/core/v1"
@@ -53,6 +54,7 @@ type Orchestrator struct {
 	Registry      Registry
 	FastletClient FastletClient
 	Catalog       *runtimecatalog.Catalog
+	InfraCatalog  *infracatalog.Catalog
 	TopK          int
 	Now           func() time.Time
 }
@@ -61,6 +63,8 @@ type RuntimeParameters struct {
 	RuntimeName         apiv1alpha1.RuntimeName
 	RuntimeProfileHash  string
 	ResourceProfileHash string
+	InfraProfile        string
+	InfraProfileHash    string
 	CPU                 string
 	Memory              string
 	PIDs                int64
@@ -99,10 +103,19 @@ func (o *Orchestrator) ResolveRuntime(ctx context.Context, sandbox *apiv1alpha1.
 	if err != nil {
 		return RuntimeParameters{}, fmt.Errorf("resolve Sandbox resources: %w", err)
 	}
+	infraCatalog := o.InfraCatalog
+	if infraCatalog == nil {
+		infraCatalog = infracatalog.Builtin()
+	}
+	infraPlan, err := infraCatalog.Compile(pool.Spec.InfraProfile, profile)
+	if err != nil {
+		return RuntimeParameters{}, fmt.Errorf("resolve InfraProfile: %w", err)
+	}
 	return RuntimeParameters{
 		RuntimeName: runtimeName, RuntimeProfileHash: profile.ProfileHash,
 		ResourceProfileHash: resources.Hash(), CPU: resources.CPU.String(),
 		Memory: resources.Memory.String(), PIDs: resources.PIDs,
+		InfraProfile: infraPlan.ProfileName, InfraProfileHash: infraPlan.ProfileHash,
 	}, nil
 }
 
@@ -123,7 +136,8 @@ func (o *Orchestrator) Candidates(ctx context.Context, sandbox *apiv1alpha1.Sand
 		Namespace: sandbox.Namespace, PoolName: sandbox.Spec.PoolRef,
 		RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
 		ResourceProfileHash: parameters.ResourceProfileHash, Image: sandbox.Spec.Image,
-		StableKey: stableKey, Now: now,
+		InfraProfileHash: parameters.InfraProfileHash,
+		StableKey:        stableKey, Now: now,
 	}, k)
 	if len(candidates) == 0 {
 		return nil, parameters, ErrNoCandidate
@@ -142,6 +156,7 @@ func (o *Orchestrator) ReserveForCreate(ctx context.Context, sandbox *apiv1alpha
 			RequestID: requestID, CreateSpecHash: createSpecHash,
 			ClaimNamespace: sandbox.Namespace, ClaimName: sandbox.Name, FastletPodUID: candidate.PodUID,
 			RuntimeProfileHash: parameters.RuntimeProfileHash, ResourceProfileHash: parameters.ResourceProfileHash,
+			InfraProfileHash: parameters.InfraProfileHash,
 		})
 		if reserveErr == nil && response != nil && response.ReservationToken != "" && response.FastletPodUID == candidate.PodUID {
 			return &Reservation{
@@ -232,6 +247,7 @@ func (o *Orchestrator) EnsureRuntime(ctx context.Context, sandbox *apiv1alpha1.S
 			RouteGeneration: identity.RouteGeneration,
 			Image:           sandbox.Spec.Image, CPU: parameters.CPU, Memory: parameters.Memory, PIDs: parameters.PIDs,
 			RuntimeProfileHash: parameters.RuntimeProfileHash, ResourceProfileHash: parameters.ResourceProfileHash,
+			InfraProfile: parameters.InfraProfile, InfraProfileHash: parameters.InfraProfileHash,
 			Command: sandbox.Spec.Command, Args: sandbox.Spec.Args, Env: envMap(sandbox.Spec.Envs), WorkingDir: sandbox.Spec.WorkingDir,
 		},
 	}
@@ -281,7 +297,7 @@ func (o *Orchestrator) ObserveRuntime(ctx context.Context, sandbox *apiv1alpha1.
 	switch response.Sandbox.Phase {
 	case "running":
 		return o.MarkReady(ctx, sandbox)
-	case "creating", "route-pending", "publishing-route":
+	case "creating", "infra-pending", "initializing-infra", "route-pending", "publishing-route":
 		_ = o.MarkCreating(ctx, sandbox, "Fastlet is still creating the runtime")
 		return ErrRuntimeInProgress
 	default:

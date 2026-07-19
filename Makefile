@@ -32,7 +32,7 @@ PROTOC_GEN_GO_GRPC_VERSION := v1.6.0
 CONTROLLER_GEN_VERSION := v0.20.1
 CONTROLLER_GEN := $(TOOLS_BIN)/controller-gen
 
-.PHONY: all build build-controller build-fastlet build-fastlet-proxy build-sandbox-proxy build-janitor build-fastlet-linux build-fastlet-proxy-linux build-sandbox-proxy-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-deepcopy manifests verify-generated test test-unit test-race test-network-integration test-e2e test-e2e-controlplane test-e2e-network test-e2e-proxy test-e2e-runtime verify setup-e2e tidy e2e docker-fastlet docker-fastlet-proxy docker-sandbox-proxy docker-controller docker-janitor kind-load-fastlet kind-load-fastlet-proxy kind-load-sandbox-proxy kind-load-controller kind-load-janitor help
+.PHONY: all build build-controller build-fastlet build-sandbox-init build-fastlet-proxy build-sandbox-proxy build-janitor build-fastlet-linux build-sandbox-init-linux build-fastlet-proxy-linux build-sandbox-proxy-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-python-proto generate-deepcopy manifests verify-generated test test-unit test-python-sdk test-race test-network-integration test-e2e test-e2e-controlplane test-e2e-network test-e2e-proxy test-e2e-infra test-e2e-sdk test-e2e-runtime verify setup-e2e tidy e2e docker-fastlet docker-fastlet-proxy docker-sandbox-proxy docker-controller docker-janitor kind-load-fastlet kind-load-fastlet-proxy kind-load-sandbox-proxy kind-load-controller kind-load-janitor help
 
 all: build
 
@@ -47,6 +47,9 @@ help:
 	@echo "  make test-race              - run unit tests with the race detector"
 	@echo "  make test-network-integration - run privileged Linux netns/veth/NAT validation in Docker"
 	@echo "  make test-e2e-proxy         - run the focused Sandbox/Fastlet Proxy data-plane e2e"
+	@echo "  make test-e2e-infra         - run the focused Infra runtime-augmentation e2e"
+	@echo "  make test-e2e-sdk           - run the focused SDK Adapter data-plane e2e"
+	@echo "  make test-python-sdk        - run Python SDK unit tests in the active Python environment"
 	@echo "  make generate               - regenerate protobuf and deepcopy code"
 	@echo "  make manifests              - regenerate CRD manifests"
 	@echo "  make verify-generated       - fail if generated files are stale"
@@ -79,13 +82,16 @@ help:
 	@echo "  make test-e2e-basicvalidation"
 	@echo "  make test-e2e-lifecycle"
 
-build: build-controller build-fastlet build-fastlet-proxy build-sandbox-proxy build-janitor build-fastctl
+build: build-controller build-fastlet build-sandbox-init build-fastlet-proxy build-sandbox-proxy build-janitor build-fastctl
 
 build-controller:
 	$(GO) build $(GOFLAGS) -o bin/controller ./cmd/controller
 
 build-fastlet:
 	$(GO) build $(GOFLAGS) -o bin/fastlet ./cmd/fastlet
+
+build-sandbox-init:
+	$(GO) build $(GOFLAGS) -o bin/sandbox-init ./cmd/sandbox-init
 
 build-fastlet-proxy:
 	$(GO) build $(GOFLAGS) -o bin/fastlet-proxy ./cmd/fastlet-proxy
@@ -103,6 +109,10 @@ build-fastctl:
 build-fastlet-linux:
 	@mkdir -p bin
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/fastlet ./cmd/fastlet
+
+build-sandbox-init-linux:
+	@mkdir -p bin
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/sandbox-init ./cmd/sandbox-init
 
 build-fastlet-proxy-linux:
 	@mkdir -p bin
@@ -128,6 +138,9 @@ test: test-unit
 
 test-unit:
 	$(GO) test $(GOFLAGS) $(UNIT_PACKAGES)
+
+test-python-sdk:
+	PYTHONPATH=sdk/python python3 -m unittest discover -s sdk/python/tests -v
 
 test-race:
 	$(GO) test -race $(UNIT_PACKAGES)
@@ -170,6 +183,9 @@ $(CONTROLLER_GEN):
 
 generate: generate-proto generate-deepcopy
 
+generate-python-proto:
+	bash sdk/python/generate_proto.sh
+
 generate-proto: tools
 	@PATH=$(TOOLS_BIN):$$PATH $(PROTOC) -I . --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative api/proto/v1/fastpath.proto
 
@@ -189,7 +205,7 @@ tidy:
 
 e2e: test-e2e
 
-docker-fastlet: build-fastlet-linux
+docker-fastlet: build-fastlet-linux build-sandbox-init-linux
 	docker build $(DOCKER_BUILD_FLAGS) -t $(FASTLET_IMAGE) -f build/Dockerfile.fastlet .
 
 docker-fastlet-proxy: build-fastlet-proxy-linux
@@ -249,6 +265,14 @@ test-e2e-network:
 test-e2e-proxy:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
 		$(GO) test ./test/e2e/suites/basicvalidation/... -run '^TestSandboxProxyDataPlane$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
+
+test-e2e-infra:
+	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
+		$(GO) test ./test/e2e/suites/basicvalidation/... -run '^TestInfraRuntimeAugmentation$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
+
+test-e2e-sdk:
+	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
+		$(GO) test ./test/e2e/suites/basicvalidation/... -run '^TestSDKAdapterDataPlane$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
 
 test-e2e-runtime:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \

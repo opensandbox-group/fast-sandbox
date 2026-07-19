@@ -1,0 +1,1 @@
+"""Generated FastPath protobuf bindings."""

@@ -10,10 +10,12 @@ import (
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
+	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/fastlet/runtime"
 	"fast-sandbox/internal/fastlet/server"
 	"fast-sandbox/internal/fastletproxy"
+	"fast-sandbox/internal/infracatalog"
 	"fast-sandbox/internal/runtimecatalog"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -86,6 +88,19 @@ func main() {
 		configurable.SetNetworkManager(networkManager)
 		klog.InfoS("Fastlet-owned network initialized", "capacity", networkManager.Snapshot().Capacity, "cleanSlots", networkManager.Snapshot().Clean)
 	}
+	infraProfileName := getEnv("FAST_SANDBOX_INFRA_PROFILE", "minimal")
+	infraProfileHash := getEnv("FAST_SANDBOX_INFRA_PROFILE_HASH", "")
+	infraManager, err := newInfraManager(podUID, runtimeProfile, infraProfileName, infraProfileHash)
+	if err != nil {
+		klog.ErrorS(err, "Failed to configure InfraProfile")
+		os.Exit(1)
+	}
+	infraConfigurable, ok := rt.(runtime.InfraConfigurable)
+	if !ok {
+		klog.ErrorS(runtime.ErrUnsupportedRuntime, "Runtime driver cannot accept an InfraProfile augmentation plan")
+		os.Exit(1)
+	}
+	infraConfigurable.SetInfraManager(infraManager)
 
 	klog.InfoS("Runtime initialized successfully", "type", runtimeTypeStr)
 
@@ -95,6 +110,7 @@ func main() {
 		FastletPodUID: podUID, RecoverOnStart: true,
 		WarmImages:     warmImages,
 		RoutePublisher: fastletproxy.NewRoutePublisher(proxyControlClient),
+		InfraProfile:   infraProfileName, InfraProfileHash: infraManager.ProfileHash(), InfraManager: infraManager,
 	})
 	if err != nil {
 		klog.ErrorS(err, "Failed to initialize Sandbox manager")
@@ -138,6 +154,7 @@ func recoverUntilReady(ctx context.Context, manager *runtime.SandboxManager, pro
 					klog.ErrorS(err, "Asynchronous warmImages preparation failed")
 				}
 			}()
+			go prepareInfraUntilReady(ctx, manager)
 			go watchProxyRoutes(ctx, manager, proxyClient)
 			return
 		} else {
@@ -149,6 +166,44 @@ func recoverUntilReady(ctx context.Context, manager *runtime.SandboxManager, pro
 		case <-time.After(2 * time.Second):
 		}
 	}
+}
+
+func prepareInfraUntilReady(ctx context.Context, manager *runtime.SandboxManager) {
+	for ctx.Err() == nil {
+		if err := manager.PrepareInfra(ctx); err == nil {
+			klog.Info("Fastlet InfraProfile preparation completed")
+			return
+		} else {
+			klog.ErrorS(err, "Fastlet InfraProfile preparation failed; profile admission remains disabled")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func newInfraManager(podUID string, runtimeProfile runtimecatalog.RuntimeProfile, profileName, expectedHash string) (*fastletinfra.Manager, error) {
+	podRoot, hostRoot, err := fastletinfra.DefaultStorePaths(podUID)
+	if err != nil {
+		return nil, err
+	}
+	podRoot = getEnv("FAST_SANDBOX_INFRA_STORE_ROOT", podRoot)
+	hostRoot = getEnv("FAST_SANDBOX_INFRA_HOST_ROOT", hostRoot)
+	store, err := fastletinfra.NewArtifactStore(podRoot, hostRoot)
+	if err != nil {
+		return nil, err
+	}
+	staticRoots := []string(nil)
+	if value := getEnv("FAST_SANDBOX_INFRA_STATIC_ROOTS", ""); value != "" {
+		staticRoots = filepath.SplitList(value)
+	}
+	return fastletinfra.NewManagerWithConfig(fastletinfra.ManagerConfig{
+		Catalog: infracatalog.Builtin(), RuntimeProfile: runtimeProfile, ProfileName: profileName,
+		ExpectedProfileHash: expectedHash, Store: store, Resolver: fastletinfra.NewPlatformResolver(staticRoots),
+		SandboxInitPath: getEnv("FAST_SANDBOX_SANDBOX_INIT_PATH", "/opt/fast-sandbox/bin/sandbox-init"),
+	})
 }
 
 func watchProxyRoutes(ctx context.Context, manager *runtime.SandboxManager, proxyClient *fastletproxy.ControlClient) {

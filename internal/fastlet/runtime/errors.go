@@ -26,6 +26,10 @@ var (
 	// runtime network resource available for a new Sandbox.
 	ErrNetworkUnavailable = errors.New("sandbox network unavailable")
 
+	// ErrInfraUnavailable indicates that the selected Runtime Augmentation
+	// profile or one of its required components is not prepared/ready.
+	ErrInfraUnavailable = errors.New("sandbox InfraProfile unavailable")
+
 	// ErrSandboxProfileMismatch rejects a request that attempts to override the
 	// RuntimeProfile or fixed Pool ResourceProfile assigned to this Fastlet.
 	ErrSandboxProfileMismatch = errors.New("sandbox profile mismatch")

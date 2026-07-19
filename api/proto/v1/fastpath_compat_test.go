@@ -28,4 +28,9 @@ func TestFastPathServiceExposesRouteResolution(t *testing.T) {
 	methods := File_api_proto_v1_fastpath_proto.Services().ByName("FastPathService").Methods()
 	require.NotNil(t, methods.ByName("ResolveEndpoint"))
 	require.NotNil(t, methods.ByName("IssueRouteCredential"))
+	for _, forbidden := range []protoreflect.Name{
+		"Exec", "ExecStream", "FileStat", "FileList", "FileRead", "FileWrite", "FileMkdir", "FileDelete", "PTY",
+	} {
+		require.Nilf(t, methods.ByName(forbidden), "FastPath must not expose the injected component method %s", forbidden)
+	}
 }

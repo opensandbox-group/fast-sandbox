@@ -28,14 +28,14 @@ var (
 // are deliberately absent: one AccessDescriptor admits arbitrary validated
 // ports and the signed credential narrows each external request.
 type Route struct {
-	Namespace         string                          `json:"namespace"`
-	SandboxUID        string                          `json:"sandboxUid"`
-	FastletPodUID     string                          `json:"fastletPodUid"`
-	AssignmentAttempt int64                           `json:"assignmentAttempt"`
-	RouteGeneration   int64                           `json:"routeGeneration"`
-	Access            fastletnetwork.AccessDescriptor `json:"access"`
-	State             RouteState                      `json:"state"`
-	UpstreamHeaders   map[string]string               `json:"upstreamHeaders,omitempty"`
+	Namespace             string                          `json:"namespace"`
+	SandboxUID            string                          `json:"sandboxUid"`
+	FastletPodUID         string                          `json:"fastletPodUid"`
+	AssignmentAttempt     int64                           `json:"assignmentAttempt"`
+	RouteGeneration       int64                           `json:"routeGeneration"`
+	Access                fastletnetwork.AccessDescriptor `json:"access"`
+	State                 RouteState                      `json:"state"`
+	UpstreamHeadersByPort map[uint32]map[string]string    `json:"upstreamHeadersByPort,omitempty"`
 }
 
 func (r Route) validate() error {
@@ -223,10 +223,13 @@ func (s *Store) publishLocked(event Event) {
 
 func cloneRoute(route Route) Route {
 	clone := route
-	if route.UpstreamHeaders != nil {
-		clone.UpstreamHeaders = make(map[string]string, len(route.UpstreamHeaders))
-		for key, value := range route.UpstreamHeaders {
-			clone.UpstreamHeaders[key] = value
+	if route.UpstreamHeadersByPort != nil {
+		clone.UpstreamHeadersByPort = make(map[uint32]map[string]string, len(route.UpstreamHeadersByPort))
+		for port, headers := range route.UpstreamHeadersByPort {
+			clone.UpstreamHeadersByPort[port] = make(map[string]string, len(headers))
+			for key, value := range headers {
+				clone.UpstreamHeadersByPort[port][key] = value
+			}
 		}
 	}
 	return clone

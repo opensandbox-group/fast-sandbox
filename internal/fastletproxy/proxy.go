@@ -88,7 +88,8 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			proxyRequest.Out.URL.RawPath = ""
 			proxyRequest.Out.Host = proxyRequest.In.Host
 			stripRouteHeaders(proxyRequest.Out.Header)
-			for name, value := range route.UpstreamHeaders {
+			stripUpstreamHeaders(proxyRequest.Out.Header, route.UpstreamHeadersByPort)
+			for name, value := range route.UpstreamHeadersByPort[targetPort] {
 				proxyRequest.Out.Header.Set(name, value)
 			}
 		},
@@ -153,6 +154,14 @@ func stripRouteHeaders(headers http.Header) {
 	headers.Del(HeaderAssignmentAttempt)
 	headers.Del(HeaderRouteGeneration)
 	headers.Del(HeaderForwardedNamespace)
+}
+
+func stripUpstreamHeaders(headers http.Header, byPort map[uint32]map[string]string) {
+	for _, scoped := range byPort {
+		for name := range scoped {
+			headers.Del(name)
+		}
+	}
 }
 
 func RouteHeaders(route Route) http.Header {

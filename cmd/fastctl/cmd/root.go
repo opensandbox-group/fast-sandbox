@@ -15,9 +15,11 @@ import (
 )
 
 var (
-	cfgFile   string
-	endpoint  string
-	namespace string
+	cfgFile       string
+	endpoint      string
+	namespace     string
+	proxyEndpoint string
+	infraAdapter  string
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -42,9 +44,13 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is ./.fastctl/config.json)")
 	rootCmd.PersistentFlags().StringVar(&endpoint, "endpoint", "localhost:9090", "Controller gRPC endpoint")
 	rootCmd.PersistentFlags().StringVarP(&namespace, "namespace", "n", "default", "Kubernetes namespace")
+	rootCmd.PersistentFlags().StringVar(&proxyEndpoint, "proxy-endpoint", "", "Override the Sandbox Proxy authority (for example, a local port-forward)")
+	rootCmd.PersistentFlags().StringVar(&infraAdapter, "adapter", "execd", "Injected Infra Component protocol adapter")
 
 	viper.BindPFlag("endpoint", rootCmd.PersistentFlags().Lookup("endpoint"))
 	viper.BindPFlag("namespace", rootCmd.PersistentFlags().Lookup("namespace"))
+	viper.BindPFlag("proxy-endpoint", rootCmd.PersistentFlags().Lookup("proxy-endpoint"))
+	viper.BindPFlag("adapter", rootCmd.PersistentFlags().Lookup("adapter"))
 }
 
 // initConfig reads in config file and ENV variables if set.

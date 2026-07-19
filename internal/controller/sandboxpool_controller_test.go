@@ -50,7 +50,7 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 		Spec: apiv1alpha1.SandboxPoolSpec{
 			Runtime:            apiv1alpha1.RuntimeContainer,
 			MaxSandboxesPerPod: 5,
-			InfraProfile:       "opensandbox",
+			InfraProfile:       "test-infra",
 			WarmImages:         []string{"alpine:latest", "ubuntu:24.04"},
 			SandboxResources: apiv1alpha1.SandboxResourceProfile{
 				CPU: resource.MustParse("1"), Memory: resource.MustParse("1Gi"), PIDs: 256,
@@ -84,7 +84,10 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	require.Equal(t, "5", envValue(pod.Spec.Containers[0].Env, "FASTLET_CAPACITY"))
 	require.Equal(t, "1", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RESOURCE_CPU"))
 	require.Equal(t, "1Gi", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RESOURCE_MEMORY"))
-	require.Equal(t, "opensandbox", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_PROFILE"))
+	require.Equal(t, "test-infra", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_PROFILE"))
+	require.NotEmpty(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_PROFILE_HASH"))
+	require.Equal(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_PROFILE_HASH"), pod.Annotations["fast-sandbox.io/infra-profile-hash"])
+	require.Equal(t, "test-infra", pod.Labels["fast-sandbox.io/infra-profile"])
 	require.Equal(t, ":5758", envValue(pod.Spec.Containers[0].Env, "FASTLET_CONTROL_PORT"))
 	require.JSONEq(t, `["alpine:latest","ubuntu:24.04"]`, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_WARM_IMAGES"))
 	require.NotNil(t, pod.Spec.Containers[0].ReadinessProbe)
@@ -131,6 +134,28 @@ func TestConstructPodAddsKVMWithoutRuntimeClass(t *testing.T) {
 	require.Nil(t, pod.Spec.RuntimeClassName)
 	require.True(t, hasHostPath(pod, "/dev/kvm"))
 	require.True(t, hasHostPath(pod, "/opt/kata"))
+}
+
+func TestConstructPodRejectsInfraArtifactStorageOverride(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha1.AddToScheme(scheme))
+	reconciler := &SandboxPoolReconciler{Scheme: scheme, Catalog: runtimecatalog.Builtin()}
+	pool := &apiv1alpha1.SandboxPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default", UID: types.UID("pool-uid")},
+		Spec: apiv1alpha1.SandboxPoolSpec{
+			Runtime: apiv1alpha1.RuntimeContainer,
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{
+					Name: "fastlet", Image: "fastlet:test",
+					VolumeMounts: []corev1.VolumeMount{{Name: "user-data", MountPath: "/opt/fast-sandbox/infra"}},
+				}},
+			}},
+		},
+	}
+	profile, err := reconciler.resolveRuntimeProfile(pool)
+	require.NoError(t, err)
+	_, err = reconciler.constructPod(pool, profile)
+	require.ErrorContains(t, err, "reserved by the platform")
 }
 
 func TestUniqueWarmImagesPreservesFirstOccurrence(t *testing.T) {

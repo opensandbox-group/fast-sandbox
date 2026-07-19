@@ -32,6 +32,8 @@ type SandboxSpec struct {
 	PIDs                int64             `json:"pids,omitempty"`
 	RuntimeProfileHash  string            `json:"runtimeProfileHash,omitempty"`
 	ResourceProfileHash string            `json:"resourceProfileHash,omitempty"`
+	InfraProfile        string            `json:"infraProfile,omitempty"`
+	InfraProfileHash    string            `json:"infraProfileHash,omitempty"`
 	Command             []string          `json:"command,omitempty"`
 	Args                []string          `json:"args,omitempty"`
 	Env                 map[string]string `json:"env,omitempty"`
@@ -47,14 +49,23 @@ type SandboxSpec struct {
 
 // SandboxStatus represents the observed state of a sandbox on a fastlet.
 type SandboxStatus struct {
-	SandboxID          string `json:"sandboxId"`
-	ClaimUID           string `json:"claimUid"`
-	InstanceGeneration int64  `json:"instanceGeneration,omitempty"`
-	AssignmentAttempt  int64  `json:"assignmentAttempt,omitempty"`
-	RouteGeneration    int64  `json:"routeGeneration,omitempty"`
-	Phase              string `json:"phase"`
-	Message            string `json:"message,omitempty"`
-	CreatedAt          int64  `json:"createdAt"` // Unix timestamp for orphan cleanup
+	SandboxID          string                     `json:"sandboxId"`
+	ClaimUID           string                     `json:"claimUid"`
+	InstanceGeneration int64                      `json:"instanceGeneration,omitempty"`
+	AssignmentAttempt  int64                      `json:"assignmentAttempt,omitempty"`
+	RouteGeneration    int64                      `json:"routeGeneration,omitempty"`
+	Phase              string                     `json:"phase"`
+	Message            string                     `json:"message,omitempty"`
+	InfraDiagnostics   []InfraComponentDiagnostic `json:"infraDiagnostics,omitempty"`
+	CreatedAt          int64                      `json:"createdAt"` // Unix timestamp for orphan cleanup
+}
+
+type InfraComponentDiagnostic struct {
+	Component string `json:"component"`
+	Service   string `json:"service"`
+	Required  bool   `json:"required"`
+	State     string `json:"state"`
+	Message   string `json:"message,omitempty"`
 }
 
 // CreateSandboxRequest is sent to create a single sandbox on a fastlet.
@@ -95,6 +106,10 @@ type FastletStatus struct {
 	Draining            bool            `json:"draining"`
 	FastletPodUID       string          `json:"fastletPodUid,omitempty"`
 	ResourceProfileHash string          `json:"resourceProfileHash,omitempty"`
+	InfraProfile        string          `json:"infraProfile,omitempty"`
+	InfraProfileHash    string          `json:"infraProfileHash,omitempty"`
+	InfraReady          bool            `json:"infraReady"`
+	PreparedArtifacts   []string        `json:"preparedArtifacts,omitempty"`
 }
 
 type FastletErrorCode string
@@ -160,6 +175,7 @@ type ReserveSandboxRequest struct {
 	FastletPodUID       string `json:"fastletPodUid"`
 	RuntimeProfileHash  string `json:"runtimeProfileHash"`
 	ResourceProfileHash string `json:"resourceProfileHash"`
+	InfraProfileHash    string `json:"infraProfileHash"`
 }
 
 type ReserveSandboxResponse struct {
@@ -225,6 +241,10 @@ type SetDrainingResponse struct {
 
 type RuntimeDiagnostics struct {
 	RuntimeProfileHash string `json:"runtimeProfileHash"`
+	InfraProfile       string `json:"infraProfile,omitempty"`
+	InfraProfileHash   string `json:"infraProfileHash,omitempty"`
+	InfraState         string `json:"infraState,omitempty"`
+	InfraMessage       string `json:"infraMessage,omitempty"`
 	State              string `json:"state"`
 	Reason             string `json:"reason,omitempty"`
 	Message            string `json:"message,omitempty"`

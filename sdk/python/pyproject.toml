@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77.0.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fast-sandbox"
+version = "0.2.0"
+description = "Fast Sandbox lifecycle SDK with injected Infra Component adapters"
+requires-python = ">=3.10"
+dependencies = [
+  "grpcio>=1.76.0,<2",
+  "httpx>=0.27,<1",
+  "protobuf>=6.33.5,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "grpcio-tools==1.76.0",
+  "pytest>=8,<10",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

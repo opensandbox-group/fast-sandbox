@@ -314,6 +314,7 @@ func (s *FastletServer) heartbeat(r *http.Request, cursor api.CacheCursor) api.H
 	sbStatuses := s.sandboxManager.GetSandboxStatuses(r.Context())
 	nodeName := os.Getenv("NODE_NAME")
 	admission, recovering, draining := s.sandboxManager.State()
+	infraProfile, infraProfileHash, infraReady, preparedArtifacts, _ := s.sandboxManager.InfraStatus()
 	status := api.FastletStatus{
 		FastletID:           os.Getenv("POD_NAME"), // Use Pod Name as Fastlet ID
 		NodeName:            nodeName,
@@ -326,6 +327,8 @@ func (s *FastletServer) heartbeat(r *http.Request, cursor api.CacheCursor) api.H
 		Draining:            draining,
 		FastletPodUID:       s.sandboxManager.FastletPodUID(),
 		ResourceProfileHash: s.sandboxManager.ResourceProfileHash(),
+		InfraProfile:        infraProfile, InfraProfileHash: infraProfileHash,
+		InfraReady: infraReady, PreparedArtifacts: preparedArtifacts,
 	}
 	return api.HeartbeatResponse{
 		FastletStatus: status,

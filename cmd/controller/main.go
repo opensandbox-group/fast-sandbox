@@ -20,6 +20,7 @@ import (
 	"fast-sandbox/internal/controller/fastletpool"
 	"fast-sandbox/internal/controller/fastpath"
 	"fast-sandbox/internal/controller/sandboxorchestrator"
+	"fast-sandbox/internal/infracatalog"
 	"fast-sandbox/internal/routeauth"
 	"fast-sandbox/internal/runtimecatalog"
 
@@ -141,9 +142,10 @@ func main() {
 
 	registry := fastletpool.NewInMemoryRegistry()
 	catalog := runtimecatalog.Builtin()
+	infraCatalog := infracatalog.Builtin()
 	fastletClient := api.NewFastletClient(fastletPort)
 	orchestrator := &sandboxorchestrator.Orchestrator{
-		Client: durableClient, Registry: registry, FastletClient: fastletClient, Catalog: catalog,
+		Client: durableClient, Registry: registry, FastletClient: fastletClient, Catalog: catalog, InfraCatalog: infraCatalog,
 	}
 
 	if role.RunsControllers() {
@@ -154,7 +156,7 @@ func main() {
 			os.Exit(1)
 		}
 		if err := (&controller.SandboxPoolReconciler{
-			Client: manager.GetClient(), Scheme: manager.GetScheme(), Registry: registry, Catalog: catalog,
+			Client: manager.GetClient(), Scheme: manager.GetScheme(), Registry: registry, Catalog: catalog, InfraCatalog: infraCatalog,
 			FastletProxyImage: fastletProxyImage, RouteVerifyPublicKey: routeVerifyPublicKey,
 		}).SetupWithManager(manager); err != nil {
 			klog.ErrorS(err, "Register SandboxPool controller")

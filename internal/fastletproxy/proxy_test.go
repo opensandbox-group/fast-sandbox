@@ -41,7 +41,9 @@ func TestProxyForwardsArbitraryPortAndStripsRouteAuthority(t *testing.T) {
 	route := Route{
 		Namespace: "default", SandboxUID: "uid-a", FastletPodUID: "pod-a", AssignmentAttempt: 4, RouteGeneration: 7,
 		Access: fastletnetwork.AccessDescriptor{Kind: fastletnetwork.AccessKindDirectIP, Address: upstreamURL.Hostname()},
-		State:  RouteReady, UpstreamHeaders: map[string]string{"X-Upstream-Auth": "internal-secret"},
+		State:  RouteReady, UpstreamHeadersByPort: map[uint32]map[string]string{
+			portNumber: {"X-Upstream-Auth": "internal-secret"},
+		},
 	}
 	store := NewStore()
 	_, err = store.Apply(route)
@@ -67,6 +69,50 @@ func TestProxyForwardsArbitraryPortAndStripsRouteAuthority(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, response.StatusCode)
 	require.Equal(t, "data: ready\n\n", string(body))
+}
+
+func TestProxyDoesNotInjectInfraCredentialIntoAnotherSandboxPort(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		require.Empty(t, request.Header.Get("X-Upstream-Auth"))
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	upstreamURL, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	userPort, err := parseTestPort(upstreamURL.Port())
+	require.NoError(t, err)
+
+	publicKey, privateKey, err := ed25519.GenerateKey(nil)
+	require.NoError(t, err)
+	issuer, err := routeauth.NewIssuer(privateKey, time.Minute, time.Now)
+	require.NoError(t, err)
+	verifier, err := routeauth.NewVerifier(publicKey, time.Now)
+	require.NoError(t, err)
+	route := Route{
+		Namespace: "default", SandboxUID: "uid-a", FastletPodUID: "pod-a", AssignmentAttempt: 4, RouteGeneration: 7,
+		Access: fastletnetwork.AccessDescriptor{Kind: fastletnetwork.AccessKindDirectIP, Address: upstreamURL.Hostname()},
+		State:  RouteReady, UpstreamHeadersByPort: map[uint32]map[string]string{
+			44772: {"X-Upstream-Auth": "internal-secret"},
+		},
+	}
+	store := NewStore()
+	_, err = store.Apply(route)
+	require.NoError(t, err)
+	token, _, err := issuer.Issue(routeauth.Claims{
+		Namespace: route.Namespace, SandboxUID: route.SandboxUID, TargetPort: userPort,
+		FastletPodUID: route.FastletPodUID, AssignmentAttempt: route.AssignmentAttempt, RouteGeneration: route.RouteGeneration,
+	})
+	require.NoError(t, err)
+
+	request := httptest.NewRequest(http.MethodGet, RoutePath(route.SandboxUID, userPort), nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("X-Upstream-Auth", "caller-controlled")
+	for name, values := range RouteHeaders(route) {
+		request.Header[name] = values
+	}
+	response := httptest.NewRecorder()
+	(&Proxy{Store: store, Verifier: verifier}).ServeHTTP(response, request)
+	require.Equal(t, http.StatusNoContent, response.Code)
 }
 
 func TestProxyRejectsStaleCredentialAndFenceHeader(t *testing.T) {

@@ -26,7 +26,11 @@ func (p *RoutePublisher) RemoveRoute(ctx context.Context, publication fastletrun
 	if err != nil && (!errors.As(err, &controlError) || controlError.StatusCode != http.StatusNotFound) {
 		return err
 	}
-	return p.client.Delete(ctx, publication.SandboxUID, publication.RouteGeneration)
+	err = p.client.Delete(ctx, publication.SandboxUID, publication.RouteGeneration)
+	if errors.As(err, &controlError) && controlError.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	return err
 }
 
 func (p *RoutePublisher) ReconcileRoutes(ctx context.Context, publications []fastletruntime.RoutePublication) error {
@@ -59,6 +63,7 @@ func routeFromPublication(publication fastletruntime.RoutePublication) Route {
 		Namespace: publication.Namespace, SandboxUID: publication.SandboxUID,
 		FastletPodUID: publication.FastletPodUID, AssignmentAttempt: publication.AssignmentAttempt,
 		RouteGeneration: publication.RouteGeneration, Access: publication.Access, State: RouteReady,
+		UpstreamHeadersByPort: publication.UpstreamHeadersByPort,
 	}
 }
 

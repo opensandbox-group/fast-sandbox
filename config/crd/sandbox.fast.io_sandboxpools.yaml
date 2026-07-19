@@ -80,6 +80,9 @@ spec:
                 description: InfraProfile selects a platform-controlled Runtime Augmentation
                   profile.
                 type: string
+                x-kubernetes-validations:
+                - message: infraProfile is immutable
+                  rule: self == oldSelf
               maxSandboxesPerPod:
                 format: int32
                 minimum: 1

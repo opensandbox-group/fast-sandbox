@@ -4,12 +4,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 
 	"fast-sandbox/internal/api"
 
+	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -61,6 +61,38 @@ func TestRuntimeConfig_KataVariantsUseKataV2Runtime(t *testing.T) {
 			assert.Equal(t, tt.configPath, cfg.ConfigPath)
 		})
 	}
+}
+
+func TestWithSandboxInitPreservesImageProcessConfiguration(t *testing.T) {
+	spec := &oci.Spec{Process: &specs.Process{
+		Args: []string{"/usr/bin/python", "app.py"},
+		Env:  []string{"A=B"}, Cwd: "/workspace", User: specs.User{UID: 1000, GID: 1000},
+	}}
+	require.NoError(t, withSandboxInit()(context.Background(), nil, nil, spec))
+	require.Equal(t, []string{
+		"/.fast/bin/sandbox-init", "--config", "/.fast/run/infra.json",
+		"--user-uid", "1000", "--user-gid", "1000", "--", "/usr/bin/python", "app.py",
+	}, spec.Process.Args)
+	require.Equal(t, []string{"A=B"}, spec.Process.Env)
+	require.Equal(t, "/workspace", spec.Process.Cwd)
+	require.Zero(t, spec.Process.User.UID, "sandbox-init must be able to read the root-only instance config")
+	require.Zero(t, spec.Process.User.GID)
+}
+
+func TestWithSandboxInitCarriesAdditionalGroupsToUserChild(t *testing.T) {
+	spec := &oci.Spec{Process: &specs.Process{
+		Args: []string{"/bin/true"}, User: specs.User{UID: 1000, GID: 1001, AdditionalGids: []uint32{10, 20}},
+	}}
+	require.NoError(t, withSandboxInit()(context.Background(), nil, nil, spec))
+	require.Equal(t, []string{
+		"/.fast/bin/sandbox-init", "--config", "/.fast/run/infra.json",
+		"--user-uid", "1000", "--user-gid", "1001", "--user-additional-gids", "10,20", "--", "/bin/true",
+	}, spec.Process.Args)
+}
+
+func TestWithSandboxInitRejectsImageWithoutEntrypoint(t *testing.T) {
+	spec := &oci.Spec{Process: &specs.Process{}}
+	require.Error(t, withSandboxInit()(context.Background(), nil, nil, spec))
 }
 
 func TestRuntimeConfig_OverrideHandler(t *testing.T) {
@@ -296,18 +328,11 @@ func TestContainerdRuntime_Initialize_EnvVars(t *testing.T) {
 	// Set up test environment variables
 	testPodName := "test-fastlet-pod"
 	testPodUID := "test-uid-12345"
-	testAllowedPaths := "/opt/path1:/opt/path2"
-	testInfraDir := "/custom/infra/dir"
-
 	os.Setenv("POD_NAME", testPodName)
 	os.Setenv("POD_UID", testPodUID)
-	os.Setenv("ALLOWED_PLUGIN_PATHS", testAllowedPaths)
-	os.Setenv("INFRA_DIR_IN_POD", testInfraDir)
 	defer func() {
 		os.Unsetenv("POD_NAME")
 		os.Unsetenv("POD_UID")
-		os.Unsetenv("ALLOWED_PLUGIN_PATHS")
-		os.Unsetenv("INFRA_DIR_IN_POD")
 	}()
 
 	if testing.Short() {
@@ -322,8 +347,7 @@ func TestContainerdRuntime_Initialize_EnvVars(t *testing.T) {
 	// Verify environment variables were read
 	assert.Equal(t, testPodName, cr.fastletPodName)
 	assert.Equal(t, testPodUID, cr.fastletPodUID)
-	assert.Equal(t, []string{"/opt/path1", "/opt/path2"}, cr.allowedPluginPaths)
-	assert.NotNil(t, cr.infraMgr, "Infra manager should be initialized")
+	assert.Nil(t, cr.infraMgr, "Infra manager is injected by Fastlet composition after runtime initialization")
 }
 
 // ============================================================================
@@ -440,6 +464,7 @@ func TestContainerdRuntime_prepareLabels(t *testing.T) {
 		RequestID: "request-1", InstanceGeneration: 2, AssignmentAttempt: 3,
 		CPU: "500m", Memory: "256Mi", PIDs: 128,
 		RuntimeProfileHash: "runtime-hash", ResourceProfileHash: "resource-hash",
+		InfraProfile: "test-infra", InfraProfileHash: "infra-hash",
 		NetworkSlotID: "slot-1", NetworkNamespacePath: "/run/fast-sandbox/netns/fsb1",
 		NetworkIP: "172.30.0.2", NetworkGateway: "172.30.0.1", NetworkDNSPath: "/run/fast-sandbox/network/pod/slot-1.resolv.conf",
 	}
@@ -457,6 +482,8 @@ func TestContainerdRuntime_prepareLabels(t *testing.T) {
 		"fast-sandbox.io/sandbox-name":          "test-claim",
 		"fast-sandbox.io/runtime-profile-hash":  "runtime-hash",
 		"fast-sandbox.io/resource-profile-hash": "resource-hash",
+		"fast-sandbox.io/infra-profile":         "test-infra",
+		"fast-sandbox.io/infra-profile-hash":    "infra-hash",
 		"fast-sandbox.io/resource-cpu":          "500m",
 		"fast-sandbox.io/resource-memory":       "256Mi",
 		"fast-sandbox.io/resource-pids":         "128",
@@ -499,244 +526,6 @@ func TestContainerdRuntime_prepareLabels_EmptyFastletFields(t *testing.T) {
 	assert.Equal(t, "", labels["fast-sandbox.io/request-id"])
 	assert.Equal(t, "0", labels["fast-sandbox.io/instance-generation"])
 	assert.Equal(t, "0", labels["fast-sandbox.io/assignment-attempt"])
-}
-
-// ============================================================================
-// 7. Test isPluginPathAllowed
-// ============================================================================
-
-func TestContainerdRuntime_isPluginPathAllowed(t *testing.T) {
-	// PA-01: Validates plugin path against allowed paths
-	// NOTE: On macOS (darwin), /var is a symlink to /private/var, so EvalSymlinks
-	// returns paths with /private/var prefix. This causes these tests to fail on macOS.
-	// The production code has a bug where it doesn't normalize allowed paths the same way.
-	if runtime.GOOS == "darwin" {
-		t.Skip("Skipping on macOS due to /var -> /private/var symlink issue in isPluginPathAllowed")
-	}
-
-	// Note: filepath.EvalSymlinks requires the file to exist, so we create temp files
-	tests := []struct {
-		name          string
-		pluginPath    string
-		allowedPaths  []string
-		setupFiles    map[string]string // path -> content (empty for directories)
-		expectAllowed bool
-	}{
-		{
-			name:         "exact match with allowed path",
-			pluginPath:   "/opt/fast-sandbox/infra/plugin",
-			allowedPaths: []string{"/opt/fast-sandbox/infra"},
-			setupFiles: map[string]string{
-				"/opt/fast-sandbox/infra":        "",
-				"/opt/fast-sandbox/infra/plugin": "content",
-			},
-			expectAllowed: true,
-		},
-		{
-			name:         "path within allowed directory",
-			pluginPath:   "/opt/fast-sandbox/infra/subdir/plugin",
-			allowedPaths: []string{"/opt/fast-sandbox/infra"},
-			setupFiles: map[string]string{
-				"/opt/fast-sandbox/infra":               "",
-				"/opt/fast-sandbox/infra/subdir":        "",
-				"/opt/fast-sandbox/infra/subdir/plugin": "content",
-			},
-			expectAllowed: true,
-		},
-		{
-			name:         "path outside allowed directory",
-			pluginPath:   "/usr/bin/plugin",
-			allowedPaths: []string{"/opt/fast-sandbox/infra"},
-			setupFiles: map[string]string{
-				"/usr/bin":                "",
-				"/usr/bin/plugin":         "content",
-				"/opt/fast-sandbox/infra": "",
-			},
-			expectAllowed: false,
-		},
-		{
-			name:         "plugin path exactly equals allowed path",
-			pluginPath:   "/opt/fast-sandbox/infra",
-			allowedPaths: []string{"/opt/fast-sandbox/infra"},
-			setupFiles: map[string]string{
-				"/opt/fast-sandbox/infra": "",
-			},
-			expectAllowed: true,
-		},
-		{
-			name:         "trailing slash in allowed path",
-			pluginPath:   "/opt/fast-sandbox/infra/plugin",
-			allowedPaths: []string{"/opt/fast-sandbox/infra/"},
-			setupFiles: map[string]string{
-				"/opt/fast-sandbox/infra/":       "",
-				"/opt/fast-sandbox/infra/plugin": "content",
-			},
-			expectAllowed: true, // filepath.Clean removes trailing slash
-		},
-		{
-			name:         "multiple allowed paths",
-			pluginPath:   "/usr/local/bin/plugin",
-			allowedPaths: []string{"/opt/fast-sandbox/infra", "/usr/local/bin"},
-			setupFiles: map[string]string{
-				"/opt/fast-sandbox/infra": "",
-				"/usr/local/bin":          "",
-				"/usr/local/bin/plugin":   "content",
-			},
-			expectAllowed: true,
-		},
-		{
-			name:         "path traversal attempt",
-			pluginPath:   "/opt/fast-sandbox/infra/../etc/passwd",
-			allowedPaths: []string{"/opt/fast-sandbox/infra"},
-			setupFiles: map[string]string{
-				"/opt/fast-sandbox/infra": "",
-				"/etc":                    "",
-				"/etc/passwd":             "content",
-			},
-			expectAllowed: false, // Resolved path /etc/passwd is not under /opt/fast-sandbox/infra
-		},
-		{
-			name:         "non-existent file returns false",
-			pluginPath:   "/opt/fast-sandbox/infra/nonexistent",
-			allowedPaths: []string{"/opt/fast-sandbox/infra"},
-			setupFiles: map[string]string{
-				"/opt/fast-sandbox/infra": "",
-			},
-			expectAllowed: false, // EvalSymlinks fails on non-existent file
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Create temp directory structure
-			tmpDir := t.TempDir()
-
-			// Create all required files and directories
-			for path, content := range tt.setupFiles {
-				// Strip leading and trailing slashes to make path relative for joining
-				relPath := strings.Trim(path, "/")
-				fullPath := filepath.Join(tmpDir, relPath)
-				if content == "" {
-					require.NoError(t, os.MkdirAll(fullPath, 0755), "Failed to create directory: %s", path)
-				} else {
-					require.NoError(t, os.MkdirAll(filepath.Dir(fullPath), 0755), "Failed to create parent directory")
-					require.NoError(t, os.WriteFile(fullPath, []byte(content), 0644), "Failed to create file: %s", path)
-				}
-			}
-
-			// Convert allowedPaths to tmpDir paths
-			allowedPaths := make([]string, len(tt.allowedPaths))
-			for i, ap := range tt.allowedPaths {
-				// Strip leading and trailing slashes to make path relative for joining
-				relPath := strings.Trim(ap, "/")
-				allowedPaths[i] = filepath.Join(tmpDir, relPath)
-			}
-
-			cr := &ContainerdRuntime{
-				allowedPluginPaths: allowedPaths,
-			}
-
-			// Convert pluginPath to tmpDir path
-			relPluginPath := strings.Trim(tt.pluginPath, "/")
-			pluginFullPath := filepath.Join(tmpDir, relPluginPath)
-			result := cr.isPluginPathAllowed(pluginFullPath)
-
-			assert.Equal(t, tt.expectAllowed, result,
-				"isPluginPathAllowed(%q) with allowed paths %v should return %v, got %v",
-				tt.pluginPath, tt.allowedPaths, tt.expectAllowed, result)
-		})
-	}
-}
-
-func TestContainerdRuntime_isPluginPathAllowed_Debug(t *testing.T) {
-	// Debug test to understand path matching
-	// NOTE: On macOS (darwin), /var is a symlink to /private/var, so EvalSymlinks
-	// returns paths with /private/var prefix. This test documents this behavior.
-	if runtime.GOOS == "darwin" {
-		t.Skip("Skipping on macOS due to /var -> /private/var symlink issue")
-	}
-
-	tmpDir := t.TempDir()
-
-	// Create: /opt/fast-sandbox/infra/plugin
-	baseDir := filepath.Join(tmpDir, "opt", "fast-sandbox", "infra")
-	pluginPath := filepath.Join(baseDir, "plugin")
-
-	require.NoError(t, os.MkdirAll(baseDir, 0755))
-	require.NoError(t, os.WriteFile(pluginPath, []byte("content"), 0644))
-
-	allowedPaths := []string{baseDir}
-
-	cr := &ContainerdRuntime{
-		allowedPluginPaths: allowedPaths,
-	}
-
-	result := cr.isPluginPathAllowed(pluginPath)
-
-	// This should pass
-	assert.True(t, result, "Plugin path should be allowed")
-}
-
-func TestContainerdRuntime_isPluginPathAllowed_Symlink(t *testing.T) {
-	// PA-02: Resolves symlinks before validation
-	if testing.Short() {
-		t.Skip("Skipping symlink test in short mode")
-	}
-	if runtime.GOOS == "darwin" {
-		t.Skip("Skipping on macOS due to /var -> /private/var symlink issue in isPluginPathAllowed")
-	}
-
-	tmpDir := t.TempDir()
-
-	// Create a directory structure
-	allowedDir := filepath.Join(tmpDir, "allowed")
-	pluginDir := filepath.Join(tmpDir, "plugins")
-	require.NoError(t, os.MkdirAll(allowedDir, 0755))
-	require.NoError(t, os.MkdirAll(pluginDir, 0755))
-
-	// Create a real plugin file in allowed directory
-	realPlugin := filepath.Join(allowedDir, "real-plugin")
-	require.NoError(t, os.WriteFile(realPlugin, []byte("plugin content"), 0755))
-
-	// Create a symlink to the plugin
-	symlinkPath := filepath.Join(pluginDir, "plugin-link")
-	err := os.Symlink(realPlugin, symlinkPath)
-	if err != nil {
-		t.Skip("Cannot create symlink, skipping test")
-	}
-
-	cr := &ContainerdRuntime{
-		allowedPluginPaths: []string{allowedDir},
-	}
-
-	// Symlink should be resolved and checked against allowed path
-	result := cr.isPluginPathAllowed(symlinkPath)
-	assert.True(t, result, "Resolved symlink target should be allowed")
-}
-
-func TestContainerdRuntime_isPluginPathAllowed_BrokenSymlink(t *testing.T) {
-	// PA-03: Handles broken symlinks gracefully
-	if testing.Short() {
-		t.Skip("Skipping symlink test in short mode")
-	}
-
-	tmpDir := t.TempDir()
-
-	// Create a broken symlink
-	brokenSymlink := filepath.Join(tmpDir, "broken-link")
-	nonExistentTarget := filepath.Join(tmpDir, "does-not-exist")
-	err := os.Symlink(nonExistentTarget, brokenSymlink)
-	if err != nil {
-		t.Skip("Cannot create symlink, skipping test")
-	}
-
-	cr := &ContainerdRuntime{
-		allowedPluginPaths: []string{tmpDir},
-	}
-
-	// Broken symlink should not be allowed
-	result := cr.isPluginPathAllowed(brokenSymlink)
-	assert.False(t, result, "Broken symlink should not be allowed")
 }
 
 // ============================================================================

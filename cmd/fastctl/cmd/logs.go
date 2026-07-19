@@ -24,7 +24,8 @@ var follow bool
 
 var logsCmd = &cobra.Command{
 	Use:   "logs <sandbox-name> [-f]",
-	Short: "Stream sandbox logs",
+	Short: "Stream Fastlet runtime diagnostics",
+	Long:  "Stream the Sandbox user-process/runtime log captured by Fastlet. Execd command output is streamed by fastctl exec and is not served by this diagnostics endpoint.",
 	Args:  cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		name := args[0]
