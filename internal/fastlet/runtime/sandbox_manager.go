@@ -31,6 +31,7 @@ type SandboxManagerConfig struct {
 	RecoverOnStart     bool
 	CacheEpoch         string
 	WarmImages         []string
+	RoutePublisher     RoutePublisher
 }
 
 type SandboxManager struct {
@@ -46,6 +47,7 @@ type SandboxManager struct {
 	tokenGenerator      func() (string, error)
 	recovering          bool
 	runtimeReady        bool
+	routeReady          bool
 	draining            bool
 	drainReason         string
 	reservations        map[string]*reservation
@@ -53,6 +55,7 @@ type SandboxManager struct {
 	cacheTracker        *fastletcache.Tracker
 	cacheProtection     *fastletcache.ProtectionIndex
 	warmImages          []string
+	routePublisher      RoutePublisher
 	heartbeatSequence   atomic.Uint64
 	// sandboxes  sandboxID -> metadata
 	sandboxes map[string]*SandboxMetadata
@@ -111,10 +114,12 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		fastletPodUID:  config.FastletPodUID,
 		reservationTTL: config.ReservationTTL, clock: config.Clock, tokenGenerator: config.TokenGenerator,
 		recovering: config.RecoverOnStart, runtimeReady: !config.RecoverOnStart,
+		routeReady:   config.RoutePublisher == nil || !config.RecoverOnStart,
 		reservations: make(map[string]*reservation), requestReservations: make(map[string]string),
 		cacheTracker:    fastletcache.NewTracker(cacheSource, config.CacheEpoch, fastletcache.DefaultMaxInventory),
 		cacheProtection: protection, warmImages: append([]string(nil), config.WarmImages...),
-		sandboxes: make(map[string]*SandboxMetadata),
+		routePublisher: config.RoutePublisher,
+		sandboxes:      make(map[string]*SandboxMetadata),
 	}, nil
 }
 
@@ -192,13 +197,17 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, spec *api.SandboxSpe
 	identity := api.SandboxIdentity{
 		RequestID: spec.RequestID, SandboxUID: spec.SandboxID,
 		InstanceGeneration: spec.InstanceGeneration, AssignmentAttempt: spec.AssignmentAttempt,
-		FastletPodUID: spec.FastletPodUID,
+		RouteGeneration: spec.RouteGeneration,
+		FastletPodUID:   spec.FastletPodUID,
 	}
 	if identity.InstanceGeneration <= 0 {
 		identity.InstanceGeneration = 1
 	}
 	if identity.AssignmentAttempt <= 0 {
 		identity.AssignmentAttempt = 1
+	}
+	if identity.RouteGeneration <= 0 {
+		identity.RouteGeneration = 1
 	}
 	if identity.FastletPodUID == "" {
 		identity.FastletPodUID = m.fastletPodUID
@@ -283,6 +292,15 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 	const gracefulTimeout = 10 * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), gracefulTimeout+5*time.Second)
 	defer cancel()
+	if err := m.removeRoute(ctx, expected); err != nil {
+		m.mu.Lock()
+		if m.sandboxes[sandboxID] == expected {
+			expected.Phase = "delete-failed"
+		}
+		m.mu.Unlock()
+		klog.ErrorS(err, "Fastlet Proxy route removal failed; runtime retained", "sandboxID", sandboxID)
+		return
+	}
 	klog.InfoS("[DEBUG-FASTLET] asyncDelete: calling runtime.DeleteSandbox", "sandboxID", sandboxID)
 	err := m.runtime.DeleteSandbox(ctx, sandboxID)
 	klog.InfoS("[DEBUG-FASTLET] asyncDelete: runtime.DeleteSandbox completed",

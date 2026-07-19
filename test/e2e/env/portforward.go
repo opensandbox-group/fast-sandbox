@@ -11,14 +11,50 @@ import (
 )
 
 func StartControllerPortForward(ctx context.Context, namespace string) (string, *portforward.ManagedProcess, error) {
+	endpoint, managed, err := startServicePortForward(ctx, namespace, "fast-sandbox-fastpath", 9090)
+	if err != nil {
+		return "", nil, err
+	}
+	return endpoint, managed, nil
+}
+
+func StartSandboxProxyPortForward(ctx context.Context, namespace string) (string, *portforward.ManagedProcess, error) {
+	endpoint, managed, err := startServicePortForward(ctx, namespace, "fast-sandbox-proxy", 8080)
+	if err != nil {
+		return "", nil, err
+	}
+	return "http://" + endpoint, managed, nil
+}
+
+func StartPodPortForward(ctx context.Context, namespace, pod string, remotePort int) (string, *portforward.ManagedProcess, error) {
+	localPort, err := reserveLocalPort()
+	if err != nil {
+		return "", nil, err
+	}
+	cmd := exec.CommandContext(ctx, "kubectl", portforward.BuildKubectlArgs(pod, namespace, localPort, remotePort)...)
+	if err := cmd.Start(); err != nil {
+		return "", nil, fmt.Errorf("start Pod %s port-forward: %w", pod, err)
+	}
+	managed := &portforward.ManagedProcess{Cmd: cmd}
+	endpoint := fmt.Sprintf("localhost:%d", localPort)
+	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := portforward.WaitForReady(waitCtx, endpoint, 100*time.Millisecond); err != nil {
+		_ = managed.Cleanup()
+		return "", nil, fmt.Errorf("wait for Pod %s port-forward: %w", pod, err)
+	}
+	return "http://" + endpoint, managed, nil
+}
+
+func startServicePortForward(ctx context.Context, namespace, service string, remotePort int) (string, *portforward.ManagedProcess, error) {
 	localPort, err := reserveLocalPort()
 	if err != nil {
 		return "", nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, "kubectl", controllerPortForwardArgs(namespace, localPort)...)
+	cmd := exec.CommandContext(ctx, "kubectl", servicePortForwardArgs(namespace, service, localPort, remotePort)...)
 	if err := cmd.Start(); err != nil {
-		return "", nil, fmt.Errorf("start controller port-forward: %w", err)
+		return "", nil, fmt.Errorf("start %s port-forward: %w", service, err)
 	}
 
 	managed := &portforward.ManagedProcess{Cmd: cmd}
@@ -28,17 +64,21 @@ func StartControllerPortForward(ctx context.Context, namespace string) (string, 
 	defer cancel()
 	if err := portforward.WaitForReady(waitCtx, endpoint, 100*time.Millisecond); err != nil {
 		_ = managed.Cleanup()
-		return "", nil, fmt.Errorf("wait for controller port-forward: %w", err)
+		return "", nil, fmt.Errorf("wait for %s port-forward: %w", service, err)
 	}
 
 	return endpoint, managed, nil
 }
 
 func controllerPortForwardArgs(namespace string, localPort int) []string {
+	return servicePortForwardArgs(namespace, "fast-sandbox-fastpath", localPort, 9090)
+}
+
+func servicePortForwardArgs(namespace, service string, localPort, remotePort int) []string {
 	return []string{
 		"port-forward",
-		"service/fast-sandbox-fastpath",
-		fmt.Sprintf("%d:9090", localPort),
+		"service/" + service,
+		fmt.Sprintf("%d:%d", localPort, remotePort),
 		"-n",
 		namespace,
 	}

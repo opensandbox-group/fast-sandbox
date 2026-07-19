@@ -39,7 +39,10 @@ func TestResolveRuntimeProfileUsesCanonicalAndLegacyFields(t *testing.T) {
 func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, apiv1alpha1.AddToScheme(scheme))
-	reconciler := &SandboxPoolReconciler{Scheme: scheme, Catalog: runtimecatalog.Builtin()}
+	reconciler := &SandboxPoolReconciler{
+		Scheme: scheme, Catalog: runtimecatalog.Builtin(),
+		FastletProxyImage: "fastlet-proxy:test", RouteVerifyPublicKey: "test-public-key",
+	}
 	runtimeClass := "must-not-leak"
 	pool := &apiv1alpha1.SandboxPool{
 		TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha1.GroupVersion.String(), Kind: "SandboxPool"},
@@ -87,6 +90,14 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	require.NotNil(t, pod.Spec.Containers[0].ReadinessProbe)
 	require.Equal(t, "/readyz", pod.Spec.Containers[0].ReadinessProbe.HTTPGet.Path)
 	require.Equal(t, int32(5758), pod.Spec.Containers[0].ReadinessProbe.HTTPGet.Port.IntVal)
+	require.Len(t, pod.Spec.Containers, 2)
+	require.Equal(t, "fastlet-proxy", pod.Spec.Containers[1].Name)
+	require.Equal(t, "fastlet-proxy:test", pod.Spec.Containers[1].Image)
+	require.Equal(t, "test-public-key", envValue(pod.Spec.Containers[1].Env, "FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY"))
+	require.Equal(t, int32(5780), pod.Spec.Containers[1].ReadinessProbe.HTTPGet.Port.IntVal)
+	require.Equal(t, "/run/fast-sandbox/proxy/control.sock", envValue(pod.Spec.Containers[0].Env, "FASTLET_PROXY_CONTROL_SOCKET"))
+	require.NotNil(t, volumeMountForContainer(pod, 0, "proxy-control"))
+	require.NotNil(t, volumeMountForContainer(pod, 1, "proxy-control"))
 
 	cpu := pod.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU]
 	memory := pod.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory]
@@ -150,6 +161,15 @@ func volumeMount(pod *corev1.Pod, name string) *corev1.MountPropagationMode {
 	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
 		if mount.Name == name {
 			return mount.MountPropagation
+		}
+	}
+	return nil
+}
+
+func volumeMountForContainer(pod *corev1.Pod, container int, name string) *corev1.VolumeMount {
+	for index := range pod.Spec.Containers[container].VolumeMounts {
+		if pod.Spec.Containers[container].VolumeMounts[index].Name == name {
+			return &pod.Spec.Containers[container].VolumeMounts[index]
 		}
 	}
 	return nil

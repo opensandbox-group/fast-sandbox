@@ -1,7 +1,7 @@
 # Fast Sandbox 架构重构开发计划
 
 **日期**：2026-07-19  
-**状态**：执行中（阶段 0～7 完成，阶段 8 进行中）
+**状态**：执行中（阶段 0～8 完成，阶段 9 进行中）
 **代码基线**：`master@f92d8e34288365be227d2ee8a6f952687dc7be00`  
 **本地仓库**：`/Users/fengjianhui/WorkSpaceL/fast-sandbox`  
 **远端开发机**：SSH alias `fast`  
@@ -1061,6 +1061,24 @@ e2e：
 bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_exec.sh \
   'go test -race ./internal/fastletproxy/... ./internal/sandboxproxy/... && make test-e2e-proxy'
 ```
+
+### 13.5 实施结果（2026-07-19）
+
+- 新增独立 `cmd/fastlet-proxy` 和 `cmd/sandbox-proxy` 二进制及镜像。Sandbox Proxy 以 2 副本 Deployment + Service 运行；PoolController 为每个 Fastlet Pod 注入平台所有的 Fastlet Proxy sidecar、共享 UDS EmptyDir、独立 `5780` 数据端口和 readiness；Fastlet Control `5758` 不承载用户代理流量；
+- Fastlet Proxy `RouteStore` 保存 `Sandbox UID -> assignment attempt / route generation / AccessDescriptor / state`，并在删除后保留 generation tombstone；旧 Apply、旧 Delete、冲突的同 generation route 均 fail closed。控制 UDS 提供 Apply/Delete/MarkDraining/Snapshot/Watch；
+- Fastlet SandboxManager 将 route publication 作为 Create 的最后一步。route 暂时发布失败进入 `route-pending` 并原地重试，不清除 assignment、不重复创建 runtime；Delete 先 MarkDraining/DeleteRoute，再删除 runtime/network；恢复先用 runtime inventory + NetworkState 重建 RouteStore，再开放 Fastlet Ready；
+- Fastlet Control 对 UDS Watch 保持长连接。Fastlet Proxy sidecar 单独重启导致 Watch 断开时立即撤销 route readiness，重新连接后用 Snapshot/Reconcile 全量恢复；真实 e2e 验证 Fastlet Proxy container restart 后原 Sandbox route 自动恢复；
+- 新增 Ed25519 短期 route credential，绑定 namespace、Sandbox UID、target port、Fastlet Pod UID、assignment attempt、route generation、expiration 和随机 nonce。签名私钥只进入 FastPath，Sandbox Proxy/Fastlet Proxy 只持有公钥集合；验签器支持 `old,new` 重叠公钥窗口，覆盖“先发布双公钥、再切 signer、等待最大 TTL、最后移除旧公钥”的无中断轮换。缺 key 或非法 key 时三个生产二进制均 fail closed。仓库的固定 RFC 8032 key 只存在于显式 `development-only` e2e Secret；
+- FastPath 实现 `ResolveEndpoint` 和 `IssueRouteCredential`。稳态 UID 查询使用 informer field index，cache miss 才进行一次 direct API fallback；Sandbox Proxy 通过 Sandbox/Pod Watch 维护路由，cache miss 或 token 与缓存 generation 不匹配时只进行一次权威补查，不持续轮询；Pod informer 只 Watch `app=sandbox-fastlet`；
+- Sandbox Proxy 只根据 UID + target port 选择 assigned Fastlet Pod IP:5780，覆盖用户伪造的内部 fencing headers；Fastlet Proxy 再同时校验 fencing headers、签名 credential 和最终 Local RouteStore，通过 runtime-neutral DirectIP AccessDescriptor 连接 Sandbox 私网。两个 proxy 均不解析 execd/envd payload；
+- HTTP reverse proxy 使用 streaming request/response、禁用整包缓冲并保留 backpressure/cancellation；单测真实覆盖 keep-alive 基础路径、chunked 2MiB response、SSE、WebSocket upgrade、request cancellation、任意 target port、outer credential/header 剥离和 upstream internal header 注入；第一阶段明确只开放 HTTP/1.1 + SSE + WebSocket，raw TCP、HTTP/2 和 gRPC 留给声明该协议需求的后续 profile；
+- 修复 FastPath 与 Controller 在 CRD Create 后竞争 assignment 的边界：若 Controller 抢先选择的 Fastlet admission 明确拒绝，而 FastPath 已在另一 Fastlet 持有 reservation，则先 CAS 清除被拒绝 assignment，再消费原 reservation；回归单测验证 assignment attempt 和 route generation 均前进且不向用户泄漏可恢复的 CapacityRejected；
+- 远端 unit gate：`make test-unit`，退出状态 `0`；目标 race gate：`go test -race ./internal/routeauth ./internal/fastletproxy ./internal/sandboxproxy ./internal/fastlet/runtime ./internal/controller/fastpath ./internal/controller/sandboxorchestrator ./internal/controller ./test/e2e/env`，退出状态 `0`；
+- 远端 focused e2e：逐个访问两个 Sandbox Proxy 副本；两个容量为 1、位于不同 Fastlet 的 Sandbox 分别监听 8080/18080，无需 exposedPorts；Create 后有界重试可访问正确实例；Fastlet Proxy restart 后恢复；reset/delete 后旧 token/route 拒绝，退出状态 `0`；
+- 新增可重复执行的 `make test-e2e-proxy` 专项门禁；远端执行 `E2E_TEST_TIMEOUT=25m DOCKER_BUILD_FLAGS=--network=host make test-e2e-proxy`，退出状态 `0`，总耗时 `113.523s`；
+- 远端 lifecycle 回归：`E2E_TEST_TIMEOUT=25m DOCKER_BUILD_FLAGS=--network=host make test-e2e-lifecycle`，同名删除后立即重建和 Terminating 删除流程均通过，退出状态 `0`，总耗时 `103.092s`；
+- 远端完整 basicvalidation gate：`E2E_TEST_TIMEOUT=35m DOCKER_BUILD_FLAGS=--network=host make test-e2e-network`，包含 CRD validation、env/workingDir、namespace isolation、private network 和 proxy data plane，退出状态 `0`，总耗时 `385.442s`；
+- `verify-generated` 按 REF-0009 的 changed-files 远端基线规则执行：远端固定工具生成后，将 protobuf/CRD canonical 文件与本地分支交叉同步；本地 `git status` 对五份生成物无差异。远端仓库 HEAD 仍是 master，因此不把其 `git diff --exit-code` 对已提交 Phase 2～8 变更的预期差异误报为 drift。
 
 ## 14. 阶段 9：Infra Component Runtime Augmentation 和 SDK Adapter
 

@@ -24,6 +24,7 @@ type SandboxSpec struct {
 	ClaimName           string            `json:"claimName"`
 	InstanceGeneration  int64             `json:"instanceGeneration,omitempty"`
 	AssignmentAttempt   int64             `json:"assignmentAttempt,omitempty"`
+	RouteGeneration     int64             `json:"routeGeneration,omitempty"`
 	FastletPodUID       string            `json:"fastletPodUid,omitempty"`
 	Image               string            `json:"image"`
 	CPU                 string            `json:"cpu,omitempty"`
@@ -50,6 +51,7 @@ type SandboxStatus struct {
 	ClaimUID           string `json:"claimUid"`
 	InstanceGeneration int64  `json:"instanceGeneration,omitempty"`
 	AssignmentAttempt  int64  `json:"assignmentAttempt,omitempty"`
+	RouteGeneration    int64  `json:"routeGeneration,omitempty"`
 	Phase              string `json:"phase"`
 	Message            string `json:"message,omitempty"`
 	CreatedAt          int64  `json:"createdAt"` // Unix timestamp for orphan cleanup
@@ -137,6 +139,7 @@ type SandboxIdentity struct {
 	SandboxUID         string `json:"sandboxUid"`
 	InstanceGeneration int64  `json:"instanceGeneration"`
 	AssignmentAttempt  int64  `json:"assignmentAttempt"`
+	RouteGeneration    int64  `json:"routeGeneration,omitempty"`
 	FastletPodUID      string `json:"fastletPodUid"`
 }
 

@@ -13,6 +13,12 @@ metadata:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
+  name: fast-sandbox-proxy
+  namespace: default
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
   name: fast-sandbox-janitor
   namespace: default
 ---
@@ -55,6 +61,18 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
+  name: fast-sandbox-proxy
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["sandbox.fast.io"]
+  resources: ["sandboxes"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
   name: fast-sandbox-janitor
 rules:
 - apiGroups: [""]
@@ -79,6 +97,14 @@ metadata:
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: fast-sandbox-fastpath}
 subjects:
 - {kind: ServiceAccount, name: fast-sandbox-fastpath, namespace: default}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fast-sandbox-proxy
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: fast-sandbox-proxy}
+subjects:
+- {kind: ServiceAccount, name: fast-sandbox-proxy, namespace: default}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

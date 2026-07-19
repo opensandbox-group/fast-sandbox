@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"fast-sandbox/internal/controller/fastletpool"
 	"fast-sandbox/internal/controller/fastpath"
 	"fast-sandbox/internal/controller/sandboxorchestrator"
+	"fast-sandbox/internal/routeauth"
 	"fast-sandbox/internal/runtimecatalog"
 
 	"google.golang.org/grpc"
@@ -50,6 +52,11 @@ func main() {
 	var heartbeatConcurrency int
 	var deprecatedConsistency string
 	var deprecatedOrphanTimeout time.Duration
+	var fastletProxyImage string
+	var routeVerifyPublicKey string
+	var routeSigningPrivateKey string
+	var routeCredentialTTL time.Duration
+	var sandboxProxyBaseURL string
 
 	flag.StringVar(&roleValue, "role", "all", "Control-plane role: fastpath, controller, or all.")
 	flag.StringVar(&metricsAddress, "metrics-bind-address", ":9091", "Metrics listen address.")
@@ -61,6 +68,11 @@ func main() {
 	flag.IntVar(&heartbeatConcurrency, "fastlet-heartbeat-concurrency", 8, "Maximum concurrent Fastlet heartbeat requests.")
 	flag.StringVar(&deprecatedConsistency, "fastpath-consistency-mode", "", "Deprecated and ignored; Create always uses reservation -> CRD CAS -> Ensure.")
 	flag.DurationVar(&deprecatedOrphanTimeout, "fastpath-orphan-timeout", 0, "Deprecated and ignored; CRD reconciliation owns recovery.")
+	flag.StringVar(&fastletProxyImage, "fastlet-proxy-image", envOrDefault("FASTLET_PROXY_IMAGE", "fast-sandbox/fastlet-proxy:dev"), "Image injected as the platform-owned Fastlet Proxy sidecar.")
+	flag.StringVar(&routeVerifyPublicKey, "route-verify-public-key", os.Getenv("FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY"), "Comma-separated base64 Ed25519 public keys injected into data-plane proxies.")
+	flag.StringVar(&routeSigningPrivateKey, "route-signing-private-key", os.Getenv("FAST_SANDBOX_ROUTE_SIGNING_PRIVATE_KEY"), "Base64 Ed25519 seed/private key used only by FastPath.")
+	flag.DurationVar(&routeCredentialTTL, "route-credential-ttl", 5*time.Minute, "Lifetime of a Sandbox route credential.")
+	flag.StringVar(&sandboxProxyBaseURL, "sandbox-proxy-base-url", envOrDefault("FAST_SANDBOX_PROXY_BASE_URL", "http://fast-sandbox-proxy.default.svc:8080"), "Client-visible Sandbox Proxy base URL.")
 	flag.Parse()
 
 	role, err := controlplane.ParseRole(roleValue)
@@ -71,6 +83,29 @@ func main() {
 	if heartbeatInterval <= 0 || heartbeatTimeout <= 0 || heartbeatConcurrency <= 0 {
 		klog.ErrorS(nil, "Heartbeat interval, timeout, and concurrency must be positive")
 		os.Exit(1)
+	}
+	if role.RunsControllers() && routeVerifyPublicKey == "" {
+		klog.ErrorS(nil, "route-verify-public-key is required for controller roles; data plane fails closed")
+		os.Exit(1)
+	}
+	if role.RunsControllers() {
+		if _, parseErr := routeauth.ParsePublicKeySet(routeVerifyPublicKey); parseErr != nil {
+			klog.ErrorS(parseErr, "route-verify-public-key is invalid; data plane fails closed")
+			os.Exit(1)
+		}
+	}
+	var credentialIssuer *routeauth.Issuer
+	if role.RunsFastPath() {
+		privateKey, parseErr := routeauth.ParsePrivateKey(routeSigningPrivateKey)
+		if parseErr != nil {
+			klog.ErrorS(parseErr, "route-signing-private-key is required for FastPath roles; credential issuance fails closed")
+			os.Exit(1)
+		}
+		credentialIssuer, err = routeauth.NewIssuer(privateKey, routeCredentialTTL, time.Now)
+		if err != nil {
+			klog.ErrorS(err, "Configure route credential issuer")
+			os.Exit(1)
+		}
 	}
 	if deprecatedConsistency != "" || deprecatedOrphanTimeout != 0 {
 		klog.InfoS("Deprecated Fast/Strong flags are ignored", "consistency", deprecatedConsistency, "orphanTimeout", deprecatedOrphanTimeout)
@@ -87,6 +122,15 @@ func main() {
 	})
 	if err != nil {
 		klog.ErrorS(err, "Create controller-runtime manager")
+		os.Exit(1)
+	}
+	if err := manager.GetFieldIndexer().IndexField(context.Background(), &apiv1alpha1.Sandbox{}, fastpath.SandboxUIDIndexField, func(object client.Object) []string {
+		if object.GetUID() == "" {
+			return nil
+		}
+		return []string{string(object.GetUID())}
+	}); err != nil {
+		klog.ErrorS(err, "Register Sandbox UID route index")
 		os.Exit(1)
 	}
 	durableClient, err := client.New(manager.GetConfig(), client.Options{Scheme: manager.GetScheme()})
@@ -111,6 +155,7 @@ func main() {
 		}
 		if err := (&controller.SandboxPoolReconciler{
 			Client: manager.GetClient(), Scheme: manager.GetScheme(), Registry: registry, Catalog: catalog,
+			FastletProxyImage: fastletProxyImage, RouteVerifyPublicKey: routeVerifyPublicKey,
 		}).SetupWithManager(manager); err != nil {
 			klog.ErrorS(err, "Register SandboxPool controller")
 			os.Exit(1)
@@ -152,7 +197,8 @@ func main() {
 		}
 		grpcServer := grpc.NewServer()
 		fastpathv1.RegisterFastPathServiceServer(grpcServer, &fastpath.Server{
-			K8sClient: durableClient, Orchestrator: orchestrator,
+			K8sClient: durableClient, RouteCache: manager.GetClient(), Orchestrator: orchestrator,
+			CredentialIssuer: credentialIssuer, SandboxProxyBaseURL: sandboxProxyBaseURL,
 		})
 		go func() {
 			<-runContext.Done()
@@ -174,4 +220,11 @@ func main() {
 		klog.ErrorS(err, "Control-plane manager exited")
 		os.Exit(1)
 	}
+}
+
+func envOrDefault(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	fastpathv1 "fast-sandbox/api/proto/v1"
@@ -13,6 +14,8 @@ import (
 	"fast-sandbox/internal/controller/common"
 	"fast-sandbox/internal/controller/fastletpool"
 	"fast-sandbox/internal/controller/sandboxorchestrator"
+	"fast-sandbox/internal/fastletproxy"
+	"fast-sandbox/internal/routeauth"
 	"fast-sandbox/internal/runtimecatalog"
 	"fast-sandbox/pkg/util/idgen"
 
@@ -29,8 +32,11 @@ import (
 
 type Server struct {
 	fastpathv1.UnimplementedFastPathServiceServer
-	K8sClient    client.Client
-	Orchestrator *sandboxorchestrator.Orchestrator
+	K8sClient           client.Client
+	RouteCache          client.Client
+	Orchestrator        *sandboxorchestrator.Orchestrator
+	CredentialIssuer    *routeauth.Issuer
+	SandboxProxyBaseURL string
 
 	// Deprecated construction fields retained for source compatibility while
 	// deployments migrate to Orchestrator. Fast/Strong no longer select a path.
@@ -41,6 +47,99 @@ type Server struct {
 }
 
 var _ fastpathv1.FastPathServiceServer = &Server{}
+
+func (s *Server) ResolveEndpoint(ctx context.Context, request *fastpathv1.ResolveEndpointRequest) (*fastpathv1.ResolveEndpointResponse, error) {
+	if request == nil || request.SandboxUid == "" || request.TargetPort == 0 || request.TargetPort > 65535 {
+		return nil, status.Error(codes.InvalidArgument, "sandbox_uid and target_port between 1 and 65535 are required")
+	}
+	protocol := strings.ToLower(request.Protocol)
+	if protocol == "" {
+		protocol = "http"
+	}
+	if protocol != "http" {
+		return nil, status.Error(codes.Unimplemented, "the initial transparent proxy supports HTTP/SSE/WebSocket over HTTP only")
+	}
+	credential, claims, err := s.issueRouteCredential(ctx, request.SandboxUid, request.TargetPort)
+	if err != nil {
+		return nil, err
+	}
+	if s.SandboxProxyBaseURL == "" {
+		return nil, status.Error(codes.FailedPrecondition, "Sandbox Proxy base URL is not configured")
+	}
+	return &fastpathv1.ResolveEndpointResponse{
+		SandboxUid: request.SandboxUid, TargetPort: request.TargetPort,
+		ProxyEndpoint:   strings.TrimRight(s.SandboxProxyBaseURL, "/") + fastletproxy.RoutePath(request.SandboxUid, request.TargetPort),
+		RequiredHeaders: map[string]string{"Authorization": "Bearer " + credential},
+		RouteGeneration: claims.RouteGeneration, ExpiresAtUnixSeconds: claims.ExpiresAt,
+	}, nil
+}
+
+func (s *Server) IssueRouteCredential(ctx context.Context, request *fastpathv1.IssueRouteCredentialRequest) (*fastpathv1.IssueRouteCredentialResponse, error) {
+	if request == nil || request.SandboxUid == "" || request.TargetPort == 0 || request.TargetPort > 65535 {
+		return nil, status.Error(codes.InvalidArgument, "sandbox_uid and target_port between 1 and 65535 are required")
+	}
+	credential, claims, err := s.issueRouteCredential(ctx, request.SandboxUid, request.TargetPort)
+	if err != nil {
+		return nil, err
+	}
+	return &fastpathv1.IssueRouteCredentialResponse{
+		Credential: credential, ExpiresAtUnixSeconds: claims.ExpiresAt, RouteGeneration: claims.RouteGeneration,
+	}, nil
+}
+
+func (s *Server) issueRouteCredential(ctx context.Context, sandboxUID string, targetPort uint32) (string, routeauth.Claims, error) {
+	if s.CredentialIssuer == nil {
+		return "", routeauth.Claims{}, status.Error(codes.FailedPrecondition, "route credential issuer is not configured")
+	}
+	sandbox, err := s.findSandboxByUID(ctx, sandboxUID)
+	if err != nil {
+		return "", routeauth.Claims{}, err
+	}
+	if sandbox.Status.Assignment == nil || sandbox.Status.RuntimeState != apiv1alpha1.ObservedStateReady ||
+		sandbox.Status.DataPlaneState != apiv1alpha1.ObservedStateReady {
+		return "", routeauth.Claims{}, status.Error(codes.Unavailable, "Sandbox data plane is not ready")
+	}
+	routeGeneration := sandbox.Status.RouteGeneration
+	if routeGeneration <= 0 {
+		routeGeneration = 1
+	}
+	credential, claims, err := s.CredentialIssuer.Issue(routeauth.Claims{
+		Namespace: sandbox.Namespace, SandboxUID: string(sandbox.UID), TargetPort: targetPort,
+		FastletPodUID: sandbox.Status.Assignment.FastletPodUID, AssignmentAttempt: sandbox.Status.Assignment.Attempt,
+		RouteGeneration: routeGeneration,
+	})
+	if err != nil {
+		return "", routeauth.Claims{}, status.Errorf(codes.Internal, "issue route credential: %v", err)
+	}
+	return credential, claims, nil
+}
+
+func (s *Server) findSandboxByUID(ctx context.Context, sandboxUID string) (*apiv1alpha1.Sandbox, error) {
+	if s.RouteCache != nil {
+		var cached apiv1alpha1.SandboxList
+		if err := s.RouteCache.List(ctx, &cached, client.MatchingFields{SandboxUIDIndexField: sandboxUID}); err != nil {
+			return nil, status.Errorf(codes.Internal, "read Sandbox UID index: %v", err)
+		}
+		if len(cached.Items) == 1 {
+			return cached.Items[0].DeepCopy(), nil
+		}
+		if len(cached.Items) > 1 {
+			return nil, status.Error(codes.Internal, "Sandbox UID index returned duplicate objects")
+		}
+	}
+	var list apiv1alpha1.SandboxList
+	if err := s.K8sClient.List(ctx, &list); err != nil {
+		return nil, status.Errorf(codes.Internal, "list Sandboxes: %v", err)
+	}
+	for index := range list.Items {
+		if string(list.Items[index].UID) == sandboxUID {
+			return list.Items[index].DeepCopy(), nil
+		}
+	}
+	return nil, status.Error(codes.NotFound, "Sandbox UID not found")
+}
+
+const SandboxUIDIndexField = "metadata.uid"
 
 func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRequest) (_ *fastpathv1.CreateResponse, resultErr error) {
 	started := time.Now()
@@ -129,12 +228,34 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRe
 	if err != nil {
 		return nil, err
 	}
+	runtimeReservation := reservation
 	if !won && assigned.Status.Assignment.FastletPodUID != reservation.Fastlet.PodUID {
 		// Another active FastPath replica won the CRD CAS. Its durable assignment
-		// is authoritative; our reservation is canceled by the deferred cleanup.
-		reservation = nil
+		// is authoritative for the first attempt. Keep our reservation alive until
+		// that winner either succeeds or explicitly rejects admission.
+		runtimeReservation = nil
 	}
-	if err := orchestrator.EnsureRuntime(ctx, assigned, reservation); err != nil {
+	ensureErr := orchestrator.EnsureRuntime(ctx, assigned, runtimeReservation)
+	if ensureErr != nil && runtimeReservation == nil && isAdmissionReschedule(ensureErr) {
+		// Controller can race the FastPath between CRD Create and assignment CAS.
+		// If it picked a stale/full Fastlet while this request already owns a valid
+		// reservation elsewhere, move only the rejected assignment and consume the
+		// reservation instead of leaking a retryable capacity error to the caller.
+		cleared, clearErr := orchestrator.ClearAssignment(ctx, assigned, false)
+		if clearErr != nil {
+			return nil, errors.Join(ensureErr, clearErr)
+		}
+		assigned, _, clearErr = orchestrator.EnsureAssignment(ctx, cleared, ownedReservation.Fastlet)
+		if clearErr != nil {
+			return nil, errors.Join(ensureErr, clearErr)
+		}
+		if assigned.Status.Assignment != nil && assigned.Status.Assignment.FastletPodUID == ownedReservation.Fastlet.PodUID {
+			runtimeReservation = ownedReservation
+		}
+		ensureErr = orchestrator.EnsureRuntime(ctx, assigned, runtimeReservation)
+	}
+	if ensureErr != nil {
+		err := ensureErr
 		if !errors.Is(err, sandboxorchestrator.ErrRuntimeInProgress) && !errors.Is(err, sandboxorchestrator.ErrUnknownFastletOutcome) {
 			return nil, err
 		}
@@ -146,6 +267,19 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRe
 		return nil, err
 	}
 	return createResponseFromSandbox(assigned), nil
+}
+
+func isAdmissionReschedule(err error) bool {
+	var failure *api.FastletError
+	if !errors.As(err, &failure) {
+		return false
+	}
+	switch failure.Code {
+	case api.ErrorCapacityRejected, api.ErrorDraining, api.ErrorRuntimeUnavailable, api.ErrorNetworkUnavailable, api.ErrorInfraUnavailable:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) ensureExisting(ctx context.Context, orchestrator *sandboxorchestrator.Orchestrator, sandbox *apiv1alpha1.Sandbox) error {

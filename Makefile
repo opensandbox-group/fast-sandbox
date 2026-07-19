@@ -1,6 +1,8 @@
 # Default registry and images
 REGISTRY ?= fast-sandbox
 FASTLET_IMAGE ?= $(REGISTRY)/fastlet:dev
+FASTLET_PROXY_IMAGE ?= $(REGISTRY)/fastlet-proxy:dev
+SANDBOX_PROXY_IMAGE ?= $(REGISTRY)/sandbox-proxy:dev
 CONTROLLER_IMAGE ?= $(REGISTRY)/controller:dev
 JANITOR_IMAGE ?= $(REGISTRY)/janitor:dev
 
@@ -30,7 +32,7 @@ PROTOC_GEN_GO_GRPC_VERSION := v1.6.0
 CONTROLLER_GEN_VERSION := v0.20.1
 CONTROLLER_GEN := $(TOOLS_BIN)/controller-gen
 
-.PHONY: all build build-controller build-fastlet build-janitor build-fastlet-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-deepcopy manifests verify-generated test test-unit test-race test-network-integration test-e2e test-e2e-controlplane test-e2e-network test-e2e-runtime verify setup-e2e tidy e2e docker-fastlet docker-controller docker-janitor kind-load-fastlet kind-load-controller kind-load-janitor help
+.PHONY: all build build-controller build-fastlet build-fastlet-proxy build-sandbox-proxy build-janitor build-fastlet-linux build-fastlet-proxy-linux build-sandbox-proxy-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-deepcopy manifests verify-generated test test-unit test-race test-network-integration test-e2e test-e2e-controlplane test-e2e-network test-e2e-proxy test-e2e-runtime verify setup-e2e tidy e2e docker-fastlet docker-fastlet-proxy docker-sandbox-proxy docker-controller docker-janitor kind-load-fastlet kind-load-fastlet-proxy kind-load-sandbox-proxy kind-load-controller kind-load-janitor help
 
 all: build
 
@@ -44,6 +46,7 @@ help:
 	@echo "  make test-unit              - run tests that require no live runtime"
 	@echo "  make test-race              - run unit tests with the race detector"
 	@echo "  make test-network-integration - run privileged Linux netns/veth/NAT validation in Docker"
+	@echo "  make test-e2e-proxy         - run the focused Sandbox/Fastlet Proxy data-plane e2e"
 	@echo "  make generate               - regenerate protobuf and deepcopy code"
 	@echo "  make manifests              - regenerate CRD manifests"
 	@echo "  make verify-generated       - fail if generated files are stale"
@@ -76,13 +79,19 @@ help:
 	@echo "  make test-e2e-basicvalidation"
 	@echo "  make test-e2e-lifecycle"
 
-build: build-controller build-fastlet build-janitor build-fastctl
+build: build-controller build-fastlet build-fastlet-proxy build-sandbox-proxy build-janitor build-fastctl
 
 build-controller:
 	$(GO) build $(GOFLAGS) -o bin/controller ./cmd/controller
 
 build-fastlet:
 	$(GO) build $(GOFLAGS) -o bin/fastlet ./cmd/fastlet
+
+build-fastlet-proxy:
+	$(GO) build $(GOFLAGS) -o bin/fastlet-proxy ./cmd/fastlet-proxy
+
+build-sandbox-proxy:
+	$(GO) build $(GOFLAGS) -o bin/sandbox-proxy ./cmd/sandbox-proxy
 
 build-janitor:
 	$(GO) build $(GOFLAGS) -o bin/janitor ./cmd/janitor
@@ -94,6 +103,14 @@ build-fastctl:
 build-fastlet-linux:
 	@mkdir -p bin
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/fastlet ./cmd/fastlet
+
+build-fastlet-proxy-linux:
+	@mkdir -p bin
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/fastlet-proxy ./cmd/fastlet-proxy
+
+build-sandbox-proxy-linux:
+	@mkdir -p bin
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/sandbox-proxy ./cmd/sandbox-proxy
 
 build-controller-linux:
 	@mkdir -p bin
@@ -175,6 +192,12 @@ e2e: test-e2e
 docker-fastlet: build-fastlet-linux
 	docker build $(DOCKER_BUILD_FLAGS) -t $(FASTLET_IMAGE) -f build/Dockerfile.fastlet .
 
+docker-fastlet-proxy: build-fastlet-proxy-linux
+	docker build $(DOCKER_BUILD_FLAGS) -t $(FASTLET_PROXY_IMAGE) -f build/Dockerfile.fastlet-proxy .
+
+docker-sandbox-proxy: build-sandbox-proxy-linux
+	docker build $(DOCKER_BUILD_FLAGS) -t $(SANDBOX_PROXY_IMAGE) -f build/Dockerfile.sandbox-proxy .
+
 docker-controller: build-controller-linux
 	docker build -t $(CONTROLLER_IMAGE) -f build/Dockerfile.controller .
 
@@ -183,6 +206,12 @@ docker-janitor: build-janitor-linux
 
 kind-load-fastlet: docker-fastlet
 	kind load docker-image $(FASTLET_IMAGE) --name fast-sandbox
+
+kind-load-fastlet-proxy: docker-fastlet-proxy
+	kind load docker-image $(FASTLET_PROXY_IMAGE) --name fast-sandbox
+
+kind-load-sandbox-proxy: docker-sandbox-proxy
+	kind load docker-image $(SANDBOX_PROXY_IMAGE) --name fast-sandbox
 
 kind-load-controller: docker-controller
 	kind load docker-image $(CONTROLLER_IMAGE) --name fast-sandbox
@@ -216,6 +245,10 @@ test-e2e-controlplane:
 test-e2e-network:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
 		$(GO) test -p 1 ./test/e2e/suites/basicvalidation/... -v -count=1 -failfast -timeout $(E2E_TEST_TIMEOUT)
+
+test-e2e-proxy:
+	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
+		$(GO) test ./test/e2e/suites/basicvalidation/... -run '^TestSandboxProxyDataPlane$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
 
 test-e2e-runtime:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \

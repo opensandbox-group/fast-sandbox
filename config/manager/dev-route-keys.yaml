@@ -1,0 +1,14 @@
+# Development/e2e-only RFC 8032 test key. Production installations must
+# provision fast-sandbox-route-keys from their secret manager and must not
+# apply this manifest.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fast-sandbox-route-keys
+  namespace: default
+  labels:
+    fast-sandbox.io/development-only: "true"
+type: Opaque
+stringData:
+  private-key: nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A=
+  public-key: 11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=

@@ -113,6 +113,10 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 	spec.RequestID = req.Identity.RequestID
 	spec.InstanceGeneration = req.Identity.InstanceGeneration
 	spec.AssignmentAttempt = req.Identity.AssignmentAttempt
+	spec.RouteGeneration = req.Identity.RouteGeneration
+	if spec.RouteGeneration <= 0 {
+		spec.RouteGeneration = 1
+	}
 	spec.FastletPodUID = req.Identity.FastletPodUID
 	if err := m.validateProfiles(&spec); err != nil {
 		return ensureFailure(fastletError(api.ErrorConflict, err.Error(), false), api.AdmissionStatus{})
@@ -131,6 +135,43 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 		return response, err
 	}
 	if existing := m.sandboxes[spec.SandboxID]; existing != nil {
+		if existing.Phase == "route-pending" {
+			identity := api.SandboxIdentity{
+				RequestID: spec.RequestID, SandboxUID: spec.SandboxID,
+				InstanceGeneration: spec.InstanceGeneration, AssignmentAttempt: spec.AssignmentAttempt,
+				RouteGeneration: spec.RouteGeneration, FastletPodUID: spec.FastletPodUID,
+			}
+			if failure := validateIdentityFence(m.fastletPodUID, existing, identity); failure != nil {
+				response, err := ensureFailure(failure, m.admissionStatusLocked())
+				m.mu.Unlock()
+				return response, err
+			}
+			if !sameSandboxClaim(existing, &spec) {
+				response, err := ensureFailure(fastletError(api.ErrorConflict, "Sandbox UID is already bound to a different claim/profile", false), m.admissionStatusLocked())
+				m.mu.Unlock()
+				return response, err
+			}
+			existing.Phase = "publishing-route"
+			m.mu.Unlock()
+			publishErr := m.publishRoute(ctx, existing)
+			m.mu.Lock()
+			if m.sandboxes[spec.SandboxID] != existing || existing.Phase != "publishing-route" {
+				admission := m.admissionStatusLocked()
+				m.mu.Unlock()
+				return ensureFailure(fastletError(api.ErrorConflict, "Sandbox changed while its route was being published", true), admission)
+			}
+			if publishErr != nil {
+				existing.Phase = "route-pending"
+				admission := m.admissionStatusLocked()
+				m.mu.Unlock()
+				return ensureFailure(fastletErrorWithCause(api.ErrorInProgress, publishErr.Error(), true, publishErr), admission)
+			}
+			existing.Phase = "running"
+			status := sandboxStatus(existing)
+			admission := m.admissionStatusLocked()
+			m.mu.Unlock()
+			return &api.EnsureSandboxResponse{Accepted: true, Created: false, Sandbox: &status, Admission: admission}, nil
+		}
 		response, err := m.ensureExistingLocked(existing, &spec)
 		m.mu.Unlock()
 		return response, err
@@ -186,7 +227,7 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 		}
 		return ensureFailure(fastletErrorWithCause(code, err.Error(), true, err), admission)
 	}
-	metadata.Phase = "running"
+	metadata.Phase = "route-pending"
 	metadata.SandboxSpec = spec
 	m.cacheProtection.Protect(spec.Image, fastletcache.ProtectActive)
 	m.mu.Lock()
@@ -199,6 +240,24 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 		return ensureFailure(fastletError(api.ErrorConflict, "Sandbox was deleted while creation was in progress", false), admission)
 	}
 	m.sandboxes[spec.SandboxID] = metadata
+	m.mu.Unlock()
+
+	if err := m.publishRoute(ctx, metadata); err != nil {
+		m.mu.Lock()
+		if m.sandboxes[spec.SandboxID] == metadata && metadata.Phase == "route-pending" {
+			admission = m.admissionStatusLocked()
+		}
+		m.mu.Unlock()
+		return ensureFailure(fastletErrorWithCause(api.ErrorInProgress, err.Error(), true, err), admission)
+	}
+
+	m.mu.Lock()
+	if m.sandboxes[spec.SandboxID] != metadata || metadata.Phase != "route-pending" {
+		admission = m.admissionStatusLocked()
+		m.mu.Unlock()
+		return ensureFailure(fastletError(api.ErrorConflict, "Sandbox changed while its route was being published", true), admission)
+	}
+	metadata.Phase = "running"
 	status := sandboxStatus(metadata)
 	admission = m.admissionStatusLocked()
 	m.mu.Unlock()
@@ -247,6 +306,7 @@ func (m *SandboxManager) Recover(ctx context.Context) error {
 	m.mu.Lock()
 	m.recovering = true
 	m.runtimeReady = false
+	m.routeReady = m.routePublisher == nil
 	m.mu.Unlock()
 
 	managed, err := m.runtime.ListManagedSandboxes(ctx)
@@ -276,6 +336,9 @@ func (m *SandboxManager) Recover(ctx context.Context) error {
 		if metadata.AssignmentAttempt <= 0 {
 			metadata.AssignmentAttempt = 1
 		}
+		if metadata.RouteGeneration <= 0 {
+			metadata.RouteGeneration = 1
+		}
 		if metadata.Phase == "" {
 			metadata.Phase = "unknown"
 		}
@@ -283,6 +346,21 @@ func (m *SandboxManager) Recover(ctx context.Context) error {
 	}
 	if len(recovered) > m.capacity {
 		return fmt.Errorf("recovered %d Sandboxes exceeds Fastlet capacity %d", len(recovered), m.capacity)
+	}
+	publications := make([]RoutePublication, 0, len(recovered))
+	for _, metadata := range recovered {
+		publication, err := m.routePublication(metadata)
+		if err != nil {
+			return fmt.Errorf("recover route for Sandbox %s: %w", metadata.SandboxID, err)
+		}
+		if m.routePublisher != nil {
+			publications = append(publications, publication)
+		}
+	}
+	if m.routePublisher != nil {
+		if err := m.routePublisher.ReconcileRoutes(ctx, publications); err != nil {
+			return fmt.Errorf("reconcile Fastlet Proxy routes: %w", err)
+		}
 	}
 	activeImages := make([]string, 0, len(recovered))
 	for _, metadata := range recovered {
@@ -293,6 +371,7 @@ func (m *SandboxManager) Recover(ctx context.Context) error {
 	m.sandboxes = recovered
 	m.recovering = false
 	m.runtimeReady = true
+	m.routeReady = true
 	m.mu.Unlock()
 	return nil
 }
@@ -312,7 +391,7 @@ func (m *SandboxManager) SetDraining(draining bool, reason string) {
 func (m *SandboxManager) Ready() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return !m.recovering && m.runtimeReady && !m.draining
+	return !m.recovering && m.runtimeReady && m.routeReady && !m.draining
 }
 
 func (m *SandboxManager) RuntimeReady() bool {
@@ -332,18 +411,16 @@ func (m *SandboxManager) ensureExistingLocked(existing *SandboxMetadata, request
 	identity := api.SandboxIdentity{
 		RequestID: requested.RequestID, SandboxUID: requested.SandboxID,
 		InstanceGeneration: requested.InstanceGeneration, AssignmentAttempt: requested.AssignmentAttempt,
-		FastletPodUID: requested.FastletPodUID,
+		RouteGeneration: requested.RouteGeneration, FastletPodUID: requested.FastletPodUID,
 	}
 	if failure := validateIdentityFence(m.fastletPodUID, existing, identity); failure != nil {
 		return ensureFailure(failure, m.admissionStatusLocked())
 	}
-	if existing.ClaimUID != requested.ClaimUID || existing.ClaimNamespace != requested.ClaimNamespace || existing.ClaimName != requested.ClaimName ||
-		existing.RuntimeProfileHash != requested.RuntimeProfileHash ||
-		existing.ResourceProfileHash != requested.ResourceProfileHash {
+	if !sameSandboxClaim(existing, requested) {
 		return ensureFailure(fastletError(api.ErrorConflict, "Sandbox UID is already bound to a different claim/profile", false), m.admissionStatusLocked())
 	}
 	status := sandboxStatus(existing)
-	if existing.Phase == "creating" {
+	if existing.Phase == "creating" || existing.Phase == "publishing-route" {
 		failure := fastletError(api.ErrorInProgress, "Sandbox creation is already in progress", true)
 		return &api.EnsureSandboxResponse{Accepted: true, InProgress: true, Sandbox: &status, Admission: m.admissionStatusLocked(), Error: failure}, failure
 	}
@@ -391,7 +468,22 @@ func validateIdentityFence(expectedPodUID string, existing *SandboxMetadata, req
 	if requested.InstanceGeneration > existing.InstanceGeneration || requested.AssignmentAttempt > existing.AssignmentAttempt {
 		return fastletError(api.ErrorConflict, "newer generation/assignment requires the old runtime to be deleted first", true)
 	}
+	requestedRouteGeneration := requested.RouteGeneration
+	if requestedRouteGeneration <= 0 {
+		requestedRouteGeneration = existing.RouteGeneration
+	}
+	if requestedRouteGeneration < existing.RouteGeneration {
+		return fastletError(api.ErrorStaleGeneration, "request route generation is older than the managed Sandbox", false)
+	}
+	if requestedRouteGeneration > existing.RouteGeneration {
+		return fastletError(api.ErrorConflict, "newer route generation requires the old runtime to be deleted first", true)
+	}
 	return nil
+}
+
+func sameSandboxClaim(existing *SandboxMetadata, requested *api.SandboxSpec) bool {
+	return existing.ClaimUID == requested.ClaimUID && existing.ClaimNamespace == requested.ClaimNamespace && existing.ClaimName == requested.ClaimName &&
+		existing.RuntimeProfileHash == requested.RuntimeProfileHash && existing.ResourceProfileHash == requested.ResourceProfileHash
 }
 
 func (m *SandboxManager) validateEnsureRequest(req *api.EnsureSandboxRequest) *api.FastletError {
@@ -458,7 +550,8 @@ func sandboxStatus(metadata *SandboxMetadata) api.SandboxStatus {
 	return api.SandboxStatus{
 		SandboxID: metadata.SandboxID, ClaimUID: metadata.ClaimUID,
 		InstanceGeneration: metadata.InstanceGeneration, AssignmentAttempt: metadata.AssignmentAttempt,
-		Phase: metadata.Phase, CreatedAt: metadata.CreatedAt,
+		RouteGeneration: metadata.RouteGeneration,
+		Phase:           metadata.Phase, CreatedAt: metadata.CreatedAt,
 	}
 }
 

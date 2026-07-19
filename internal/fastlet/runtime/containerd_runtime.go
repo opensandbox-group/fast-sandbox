@@ -408,6 +408,10 @@ func (r *ContainerdRuntime) getRuntimeOptions() *runtimeoptions.Options {
 }
 
 func (r *ContainerdRuntime) prepareLabels(config *api.SandboxSpec) map[string]string {
+	routeGeneration := config.RouteGeneration
+	if routeGeneration <= 0 {
+		routeGeneration = 1
+	}
 	return map[string]string{
 		"fast-sandbox.io/managed":               "true",
 		"fast-sandbox.io/fastlet-name":          r.fastletPodName,
@@ -425,6 +429,7 @@ func (r *ContainerdRuntime) prepareLabels(config *api.SandboxSpec) map[string]st
 		"fast-sandbox.io/request-id":            config.RequestID,
 		"fast-sandbox.io/instance-generation":   strconv.FormatInt(config.InstanceGeneration, 10),
 		"fast-sandbox.io/assignment-attempt":    strconv.FormatInt(config.AssignmentAttempt, 10),
+		"fast-sandbox.io/route-generation":      strconv.FormatInt(routeGeneration, 10),
 		"fast-sandbox.io/network-slot-id":       config.NetworkSlotID,
 		"fast-sandbox.io/network-netns-path":    config.NetworkNamespacePath,
 		"fast-sandbox.io/network-ip":            config.NetworkIP,
@@ -586,6 +591,7 @@ func (r *ContainerdRuntime) InspectSandbox(ctx context.Context, sandboxID string
 	metadata.PIDs, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/resource-pids"], 10, 64)
 	metadata.InstanceGeneration, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/instance-generation"], 10, 64)
 	metadata.AssignmentAttempt, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/assignment-attempt"], 10, 64)
+	metadata.RouteGeneration, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/route-generation"], 10, 64)
 	if task, taskErr := container.Task(ctx, nil); taskErr == nil {
 		metadata.PID = int(task.Pid())
 		if status, statusErr := task.Status(ctx); statusErr == nil {

@@ -29,6 +29,10 @@ spec:
         - --role=controller
         - --metrics-bind-address=:9091
         - --health-probe-bind-address=:5758
+        env:
+        - name: FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY
+          valueFrom:
+            secretKeyRef: {name: fast-sandbox-route-keys, key: public-key}
         ports:
         - {name: health, containerPort: 5758}
         - {name: metrics, containerPort: 9091}
@@ -71,6 +75,10 @@ spec:
         - --metrics-bind-address=:9091
         - --health-probe-bind-address=:5758
         - --fastpath-bind-address=:9090
+        env:
+        - name: FAST_SANDBOX_ROUTE_SIGNING_PRIVATE_KEY
+          valueFrom:
+            secretKeyRef: {name: fast-sandbox-route-keys, key: private-key}
         ports:
         - {name: grpc, containerPort: 9090}
         - {name: health, containerPort: 5758}
@@ -97,6 +105,50 @@ spec:
     port: 9090
     targetPort: grpc
 ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fast-sandbox-proxy
+  namespace: default
+  labels: {app: fast-sandbox-proxy}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: fast-sandbox-proxy}
+  template:
+    metadata:
+      labels: {app: fast-sandbox-proxy}
+    spec:
+      serviceAccountName: fast-sandbox-proxy
+      containers:
+      - name: proxy
+        image: fast-sandbox/sandbox-proxy:dev
+        imagePullPolicy: IfNotPresent
+        args: ["--bind-address=:8080", "--fastlet-proxy-port=5780"]
+        env:
+        - name: FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY
+          valueFrom:
+            secretKeyRef: {name: fast-sandbox-route-keys, key: public-key}
+        ports:
+        - {name: http, containerPort: 8080}
+        readinessProbe:
+          httpGet: {path: /readyz, port: http}
+        livenessProbe:
+          httpGet: {path: /healthz, port: http}
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits: {cpu: "1", memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fast-sandbox-proxy
+  namespace: default
+spec:
+  selector: {app: fast-sandbox-proxy}
+  ports:
+  - {name: http, port: 8080, targetPort: http}
+---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -120,6 +172,16 @@ spec:
     matchLabels:
       app: fast-sandbox-fastpath
       fast-sandbox.io/control-plane-role: fastpath
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fast-sandbox-proxy
+  namespace: default
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app: fast-sandbox-proxy}
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler

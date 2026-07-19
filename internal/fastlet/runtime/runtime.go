@@ -72,6 +72,24 @@ type AccessDescriptorProvider interface {
 	GetAccessDescriptor(sandboxID string) (fastletnetwork.AccessDescriptor, error)
 }
 
+type RoutePublication struct {
+	Namespace         string
+	SandboxUID        string
+	FastletPodUID     string
+	AssignmentAttempt int64
+	RouteGeneration   int64
+	Access            fastletnetwork.AccessDescriptor
+}
+
+// RoutePublisher is the only lifecycle-facing data-plane boundary. The
+// concrete implementation talks to the separate Fastlet Proxy over the shared
+// Pod-local UDS; runtime drivers remain unaware of proxy protocols.
+type RoutePublisher interface {
+	ApplyRoute(context.Context, RoutePublication) error
+	RemoveRoute(context.Context, RoutePublication) error
+	ReconcileRoutes(context.Context, []RoutePublication) error
+}
+
 type RuntimeType = apiv1alpha1.RuntimeName
 
 const (

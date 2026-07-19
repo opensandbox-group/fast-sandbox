@@ -54,12 +54,17 @@ func EnsureSandboxAssignment(
 		if generation < apiv1alpha1.InitialInstanceGeneration {
 			generation = apiv1alpha1.InitialInstanceGeneration
 		}
+		routeGeneration := current.Status.RouteGeneration
+		if routeGeneration < 1 {
+			routeGeneration = 1
+		}
 		patchBody, err := json.Marshal(map[string]any{
 			"metadata": map[string]any{"resourceVersion": current.ResourceVersion},
 			"status": map[string]any{
 				"assignment":         nextAssignment,
 				"assignmentAttempt":  nextAssignment.Attempt,
 				"instanceGeneration": generation,
+				"routeGeneration":    routeGeneration,
 				"assignedFastlet":    desired.FastletName,
 				"nodeName":           desired.NodeName,
 			},
@@ -118,9 +123,14 @@ func ClearSandboxAssignment(
 			generation = apiv1alpha1.InitialInstanceGeneration
 		}
 		routeGeneration := current.Status.RouteGeneration
+		if routeGeneration < 1 {
+			routeGeneration = 1
+		}
+		// Removing an assignment always fences the local data-plane route,
+		// including a capacity reschedule that retains the runtime generation.
+		routeGeneration++
 		if advanceInstance {
 			generation = apiv1alpha1.NextInstanceGeneration(generation)
-			routeGeneration++
 		}
 		patchBody, err := json.Marshal(map[string]any{
 			"metadata": map[string]any{"resourceVersion": current.ResourceVersion},

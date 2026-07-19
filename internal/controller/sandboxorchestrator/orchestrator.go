@@ -229,7 +229,8 @@ func (o *Orchestrator) EnsureRuntime(ctx context.Context, sandbox *apiv1alpha1.S
 		Sandbox: api.SandboxSpec{
 			SandboxID: string(sandbox.UID), RequestID: requestID, ClaimUID: string(sandbox.UID),
 			ClaimNamespace: sandbox.Namespace, ClaimName: sandbox.Name,
-			Image: sandbox.Spec.Image, CPU: parameters.CPU, Memory: parameters.Memory, PIDs: parameters.PIDs,
+			RouteGeneration: identity.RouteGeneration,
+			Image:           sandbox.Spec.Image, CPU: parameters.CPU, Memory: parameters.Memory, PIDs: parameters.PIDs,
 			RuntimeProfileHash: parameters.RuntimeProfileHash, ResourceProfileHash: parameters.ResourceProfileHash,
 			Command: sandbox.Spec.Command, Args: sandbox.Spec.Args, Env: envMap(sandbox.Spec.Envs), WorkingDir: sandbox.Spec.WorkingDir,
 		},
@@ -280,7 +281,7 @@ func (o *Orchestrator) ObserveRuntime(ctx context.Context, sandbox *apiv1alpha1.
 	switch response.Sandbox.Phase {
 	case "running":
 		return o.MarkReady(ctx, sandbox)
-	case "creating":
+	case "creating", "route-pending", "publishing-route":
 		_ = o.MarkCreating(ctx, sandbox, "Fastlet is still creating the runtime")
 		return ErrRuntimeInProgress
 	default:
@@ -344,11 +345,9 @@ func (o *Orchestrator) MarkReady(ctx context.Context, sandbox *apiv1alpha1.Sandb
 		status.Phase = string(apiv1alpha1.PhaseRunning)
 		status.SandboxID = string(sandbox.UID)
 		status.RuntimeState = apiv1alpha1.ObservedStateReady
-		// Compatibility adapter until the private network/proxy stages provide a
-		// real DataPlane observation. No endpoint is fabricated here.
 		status.DataPlaneState = apiv1alpha1.ObservedStateReady
 		setCondition(status, ConditionRuntimeReady, metav1.ConditionTrue, "RuntimeRunning", "Fastlet reports the runtime running")
-		setCondition(status, ConditionDataPlaneReady, metav1.ConditionTrue, "CompatibilityAdapterReady", "legacy data-plane adapter is available")
+		setCondition(status, ConditionDataPlaneReady, metav1.ConditionTrue, "FastletRouteReady", "Fastlet reports the instance-fenced local proxy route published")
 	})
 }
 
@@ -388,8 +387,16 @@ func identityFor(sandbox *apiv1alpha1.Sandbox) api.SandboxIdentity {
 	return api.SandboxIdentity{
 		RequestID: sandbox.Annotations[common.AnnotationRequestID], SandboxUID: string(sandbox.UID),
 		InstanceGeneration: generation, AssignmentAttempt: sandbox.Status.Assignment.Attempt,
-		FastletPodUID: sandbox.Status.Assignment.FastletPodUID,
+		RouteGeneration: routeGenerationFor(sandbox),
+		FastletPodUID:   sandbox.Status.Assignment.FastletPodUID,
 	}
+}
+
+func routeGenerationFor(sandbox *apiv1alpha1.Sandbox) int64 {
+	if sandbox.Status.RouteGeneration > 0 {
+		return sandbox.Status.RouteGeneration
+	}
+	return 1
 }
 
 func envMap(values []corev1.EnvVar) map[string]string {

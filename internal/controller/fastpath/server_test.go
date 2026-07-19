@@ -55,6 +55,7 @@ type fastpathFastlet struct {
 	mu              sync.Mutex
 	rejectReserve   bool
 	ensureFailure   error
+	ensureFailures  map[string]error
 	ensureRequests  []*api.EnsureSandboxRequest
 	reserveRequests []*api.ReserveSandboxRequest
 }
@@ -74,12 +75,15 @@ func (*fastpathFastlet) CancelReservation(context.Context, string, *api.CancelRe
 	return &api.CancelReservationResponse{Canceled: true}, nil
 }
 
-func (f *fastpathFastlet) EnsureSandbox(_ context.Context, _ string, request *api.EnsureSandboxRequest) (*api.EnsureSandboxResponse, error) {
+func (f *fastpathFastlet) EnsureSandbox(_ context.Context, fastletIP string, request *api.EnsureSandboxRequest) (*api.EnsureSandboxResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ensureRequests = append(f.ensureRequests, request)
 	if f.ensureFailure != nil {
 		return &api.EnsureSandboxResponse{}, f.ensureFailure
+	}
+	if failure := f.ensureFailures[fastletIP]; failure != nil {
+		return &api.EnsureSandboxResponse{}, failure
 	}
 	return &api.EnsureSandboxResponse{Accepted: true, Created: true, Sandbox: &api.SandboxStatus{SandboxID: request.Identity.SandboxUID, Phase: "running"}}, nil
 }
@@ -94,7 +98,8 @@ func (*fastpathFastlet) DeleteSandboxV2(context.Context, string, *api.DeleteSand
 
 type assigningUIDClient struct {
 	client.Client
-	mu sync.Mutex
+	mu                 sync.Mutex
+	assignmentOnCreate *apiv1alpha1.SandboxAssignment
 }
 
 func (c *assigningUIDClient) Create(ctx context.Context, object client.Object, options ...client.CreateOption) error {
@@ -103,7 +108,19 @@ func (c *assigningUIDClient) Create(ctx context.Context, object client.Object, o
 	if sandbox, ok := object.(*apiv1alpha1.Sandbox); ok && sandbox.UID == "" {
 		sandbox.UID = types.UID("uid-" + sandbox.Name)
 	}
-	return c.Client.Create(ctx, object, options...)
+	if err := c.Client.Create(ctx, object, options...); err != nil {
+		return err
+	}
+	if sandbox, ok := object.(*apiv1alpha1.Sandbox); ok && c.assignmentOnCreate != nil {
+		sandbox.Status.Assignment = c.assignmentOnCreate.DeepCopy()
+		sandbox.Status.AssignmentAttempt = c.assignmentOnCreate.Attempt
+		sandbox.Status.InstanceGeneration = 1
+		sandbox.Status.RouteGeneration = 1
+		sandbox.Status.AssignedFastlet = c.assignmentOnCreate.FastletName
+		sandbox.Status.NodeName = c.assignmentOnCreate.NodeName
+		return c.Client.Status().Update(ctx, sandbox)
+	}
+	return nil
 }
 
 func TestCreateFastFailureDoesNotPersistCRD(t *testing.T) {
@@ -170,6 +187,35 @@ func TestCreateCommitSurvivesFastPathFailureAndRetryContinuesSameCRD(t *testing.
 
 	require.NoError(t, k8sClient.List(context.Background(), &list))
 	require.Len(t, list.Items, 1)
+}
+
+func TestCreateConsumesReservationAfterControllerWinsWithRejectedAssignment(t *testing.T) {
+	server, k8sClient, registry, fastlet := newV2Server(t)
+	controllerWinner := fastletpool.FastletInfo{ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", PodIP: "10.0.0.1", NodeName: "node-a"}
+	reserved := fastletpool.FastletInfo{ID: "fastlet-b", PodName: "fastlet-b", PodUID: "pod-b", PodIP: "10.0.0.2", NodeName: "node-b"}
+	registry.candidates = []fastletpool.FastletInfo{reserved}
+	registry.fastlets[reserved.ID] = reserved
+	k8sClient.(*assigningUIDClient).assignmentOnCreate = &apiv1alpha1.SandboxAssignment{
+		FastletName: controllerWinner.PodName, FastletPodUID: controllerWinner.PodUID, NodeName: controllerWinner.NodeName, Attempt: 1,
+	}
+	fastlet.ensureFailures = map[string]error{
+		controllerWinner.PodIP: &api.FastletError{Code: api.ErrorCapacityRejected, Message: "full", Retryable: true},
+	}
+
+	response, err := server.CreateSandbox(context.Background(), createRequest("controller-race"))
+	require.NoError(t, err)
+	require.NotEmpty(t, response.SandboxUid)
+	var sandbox apiv1alpha1.Sandbox
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: response.SandboxName}, &sandbox))
+	require.NotNil(t, sandbox.Status.Assignment)
+	require.Equal(t, "pod-b", sandbox.Status.Assignment.FastletPodUID)
+	require.Equal(t, int64(2), sandbox.Status.Assignment.Attempt)
+	require.Equal(t, int64(2), sandbox.Status.RouteGeneration)
+	fastlet.mu.Lock()
+	require.Len(t, fastlet.ensureRequests, 2)
+	require.Empty(t, fastlet.ensureRequests[0].ReservationToken)
+	require.NotEmpty(t, fastlet.ensureRequests[1].ReservationToken)
+	fastlet.mu.Unlock()
 }
 
 func TestConcurrentSameRequestConvergesToOneCRDAndUID(t *testing.T) {

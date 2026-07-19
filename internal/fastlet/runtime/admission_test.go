@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"fast-sandbox/internal/api"
+	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/runtimecatalog"
 
 	"github.com/stretchr/testify/require"
@@ -35,6 +36,15 @@ type admissionRuntime struct {
 
 func (r *admissionRuntime) RuntimeResourceAvailable() bool {
 	return r.resourceReady == nil || *r.resourceReady
+}
+
+func (r *admissionRuntime) GetAccessDescriptor(sandboxID string) (fastletnetwork.AccessDescriptor, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.sandboxes[sandboxID] == nil && r.managed == nil {
+		return fastletnetwork.AccessDescriptor{}, ErrSandboxNotFound
+	}
+	return fastletnetwork.AccessDescriptor{Kind: fastletnetwork.AccessKindDirectIP, Address: "10.42.0.2"}, nil
 }
 
 func newAdmissionRuntime() *admissionRuntime {
@@ -184,10 +194,41 @@ func ensureRequest(uid string, generation, attempt int64) *api.EnsureSandboxRequ
 	return &api.EnsureSandboxRequest{
 		Identity: api.SandboxIdentity{
 			RequestID: "request-" + uid, SandboxUID: uid,
-			InstanceGeneration: generation, AssignmentAttempt: attempt, FastletPodUID: "pod-uid-a",
+			InstanceGeneration: generation, AssignmentAttempt: attempt, RouteGeneration: 1, FastletPodUID: "pod-uid-a",
 		},
 		Sandbox: api.SandboxSpec{ClaimUID: "claim-" + uid, ClaimNamespace: "default", ClaimName: uid, Image: "alpine:latest"},
 	}
+}
+
+type admissionRoutePublisher struct {
+	mu             sync.Mutex
+	applied        []RoutePublication
+	removed        []RoutePublication
+	reconciled     [][]RoutePublication
+	applyError     error
+	removeError    error
+	reconcileError error
+}
+
+func (p *admissionRoutePublisher) ApplyRoute(_ context.Context, route RoutePublication) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.applied = append(p.applied, route)
+	return p.applyError
+}
+
+func (p *admissionRoutePublisher) RemoveRoute(_ context.Context, route RoutePublication) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.removed = append(p.removed, route)
+	return p.removeError
+}
+
+func (p *admissionRoutePublisher) ReconcileRoutes(_ context.Context, routes []RoutePublication) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reconciled = append(p.reconciled, append([]RoutePublication(nil), routes...))
+	return p.reconcileError
 }
 
 func reserveRequest(requestID, createSpecHash string) *api.ReserveSandboxRequest {
@@ -431,6 +472,111 @@ func TestRecoveryBlocksReadinessAndRestoresCapacity(t *testing.T) {
 	require.Equal(t, 1, admission.Running)
 	_, err = manager.EnsureSandboxV2(context.Background(), ensureRequest("sandbox-b", 1, 1))
 	requireFastletCode(t, err, api.ErrorCapacityRejected)
+}
+
+func TestRoutePublicationGatesCreateAndRetriesWithoutRecreatingRuntime(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	publisher := &admissionRoutePublisher{applyError: errors.New("proxy control unavailable")}
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-uid-a", RoutePublisher: publisher,
+	})
+	require.NoError(t, err)
+	request := ensureRequest("sandbox-a", 1, 2)
+
+	_, err = manager.EnsureSandboxV2(context.Background(), request)
+	requireFastletCode(t, err, api.ErrorInProgress)
+	ensures, _ := runtime.counts()
+	require.Equal(t, 1, ensures)
+
+	publisher.mu.Lock()
+	publisher.applyError = nil
+	publisher.mu.Unlock()
+	response, err := manager.EnsureSandboxV2(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, "running", response.Sandbox.Phase)
+	ensures, _ = runtime.counts()
+	require.Equal(t, 1, ensures, "route retry must not create a second runtime")
+	publisher.mu.Lock()
+	require.Len(t, publisher.applied, 2)
+	require.Equal(t, int64(1), publisher.applied[1].RouteGeneration)
+	require.Equal(t, int64(2), publisher.applied[1].AssignmentAttempt)
+	publisher.mu.Unlock()
+}
+
+func TestRouteRemovalPrecedesAndGatesRuntimeDeletion(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	publisher := &admissionRoutePublisher{removeError: errors.New("proxy control unavailable")}
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-uid-a", RoutePublisher: publisher,
+	})
+	require.NoError(t, err)
+	request := ensureRequest("sandbox-a", 1, 1)
+	_, err = manager.EnsureSandboxV2(context.Background(), request)
+	require.NoError(t, err)
+	_, err = manager.DeleteSandboxV2(&api.DeleteSandboxV2Request{Identity: request.Identity})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		publisher.mu.Lock()
+		removals := len(publisher.removed)
+		publisher.mu.Unlock()
+		_, deletes := runtime.counts()
+		return removals == 1 && deletes == 0
+	}, time.Second, 10*time.Millisecond)
+
+	publisher.mu.Lock()
+	publisher.removeError = nil
+	publisher.mu.Unlock()
+	_, err = manager.DeleteSandboxV2(&api.DeleteSandboxV2Request{Identity: request.Identity})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		_, deletes := runtime.counts()
+		return deletes == 1
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestRecoveryReconcilesRoutesBeforeReadiness(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	runtime.managed = []*SandboxMetadata{{SandboxSpec: api.SandboxSpec{
+		SandboxID: "sandbox-a", ClaimUID: "claim-a", ClaimNamespace: "default", FastletPodUID: "pod-uid-a",
+		InstanceGeneration: 1, AssignmentAttempt: 2, RouteGeneration: 3,
+	}, Phase: "running"}}
+	publisher := &admissionRoutePublisher{reconcileError: errors.New("proxy recovery pending")}
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-uid-a", RecoverOnStart: true, RoutePublisher: publisher,
+	})
+	require.NoError(t, err)
+	require.Error(t, manager.Recover(context.Background()))
+	require.False(t, manager.Ready())
+	publisher.mu.Lock()
+	publisher.reconcileError = nil
+	publisher.mu.Unlock()
+	require.NoError(t, manager.Recover(context.Background()))
+	require.True(t, manager.Ready())
+	publisher.mu.Lock()
+	require.Len(t, publisher.reconciled, 2)
+	require.Equal(t, int64(3), publisher.reconciled[1][0].RouteGeneration)
+	publisher.mu.Unlock()
+}
+
+func TestProxyControlReconnectRevokesAndRestoresReadiness(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	publisher := &admissionRoutePublisher{}
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-uid-a", RoutePublisher: publisher,
+	})
+	require.NoError(t, err)
+	_, err = manager.EnsureSandboxV2(context.Background(), ensureRequest("sandbox-a", 1, 1))
+	require.NoError(t, err)
+	require.True(t, manager.Ready())
+
+	manager.MarkProxyRouteUnavailable()
+	require.False(t, manager.Ready())
+	require.NoError(t, manager.ReconcileProxyRoutes(context.Background()))
+	require.True(t, manager.Ready())
+	publisher.mu.Lock()
+	require.Len(t, publisher.reconciled, 1)
+	require.Len(t, publisher.reconciled[0], 1)
+	publisher.mu.Unlock()
 }
 
 func TestWarmImagesAreAsynchronousAndProtectedFromEviction(t *testing.T) {

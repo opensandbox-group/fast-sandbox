@@ -26,9 +26,11 @@ import (
 // SandboxPoolReconciler reconciles SandboxPool resources.
 type SandboxPoolReconciler struct {
 	client.Client
-	Scheme   *runtime.Scheme
-	Registry fastletpool.FastletRegistry
-	Catalog  *runtimecatalog.Catalog
+	Scheme               *runtime.Scheme
+	Registry             fastletpool.FastletRegistry
+	Catalog              *runtimecatalog.Catalog
+	FastletProxyImage    string
+	RouteVerifyPublicKey string
 }
 
 // Reconcile manages the lifecycle of Fastlet Pods based on the demand from Sandboxes.
@@ -176,6 +178,21 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 	if len(podSpec.Containers) == 0 {
 		return nil, errors.New("fastletTemplate.spec.containers must contain the fastlet container")
 	}
+	for _, container := range podSpec.Containers[1:] {
+		if container.Name == "fastlet-proxy" {
+			return nil, errors.New("fastlet-proxy is a platform-owned sidecar name")
+		}
+	}
+	for _, volume := range podSpec.Volumes {
+		if volume.Name == "proxy-control" {
+			return nil, errors.New("proxy-control is a platform-owned volume name")
+		}
+	}
+	for _, mount := range podSpec.Containers[0].VolumeMounts {
+		if mount.Name == "proxy-control" || mount.MountPath == "/run/fast-sandbox/proxy" {
+			return nil, errors.New("/run/fast-sandbox/proxy is reserved for Fastlet Proxy control")
+		}
+	}
 	if err := mergeNodeSelector(podSpec, profile.Deployment.NodeSelector); err != nil {
 		return nil, err
 	}
@@ -190,6 +207,7 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 
 		c.Env = append(c.Env,
 			corev1.EnvVar{Name: "FASTLET_CONTROL_PORT", Value: ":5758"},
+			corev1.EnvVar{Name: "FASTLET_PROXY_CONTROL_SOCKET", Value: "/run/fast-sandbox/proxy/control.sock"},
 			corev1.EnvVar{Name: "FAST_SANDBOX_WARM_IMAGES", Value: string(warmImagesJSON)},
 			corev1.EnvVar{
 				Name:      "NODE_NAME",
@@ -242,6 +260,7 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 		c.VolumeMounts = append(c.VolumeMounts,
 			corev1.VolumeMount{Name: "tmp", MountPath: "/tmp"},
 			corev1.VolumeMount{Name: "infra-tools", MountPath: "/opt/fast-sandbox/infra"},
+			corev1.VolumeMount{Name: "proxy-control", MountPath: "/run/fast-sandbox/proxy"},
 		)
 		if err := applyFastletResources(c, profile.Deployment.Overhead, sandboxResources, getFastletCapacity(pool)); err != nil {
 			return nil, err
@@ -254,6 +273,26 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 		}
 
 	}
+	proxyImage := r.FastletProxyImage
+	if proxyImage == "" {
+		proxyImage = "fast-sandbox/fastlet-proxy:dev"
+	}
+	podSpec.Containers = append(podSpec.Containers, corev1.Container{
+		Name: "fastlet-proxy", Image: proxyImage, ImagePullPolicy: corev1.PullIfNotPresent,
+		Env: []corev1.EnvVar{
+			{Name: "FASTLET_PROXY_CONTROL_SOCKET", Value: "/run/fast-sandbox/proxy/control.sock"},
+			{Name: "FASTLET_PROXY_DATA_ADDRESS", Value: ":5780"},
+			{Name: "FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY", Value: r.RouteVerifyPublicKey},
+		},
+		Ports:        []corev1.ContainerPort{{Name: "data-proxy", ContainerPort: 5780, Protocol: corev1.ProtocolTCP}},
+		VolumeMounts: []corev1.VolumeMount{{Name: "proxy-control", MountPath: "/run/fast-sandbox/proxy"}},
+		ReadinessProbe: &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+				Path: "/readyz", Port: intstr.FromInt32(5780), Scheme: corev1.URISchemeHTTP,
+			}},
+			InitialDelaySeconds: 0, PeriodSeconds: 2, TimeoutSeconds: 1, FailureThreshold: 1,
+		},
+	})
 
 	podSpec.InitContainers = append(podSpec.InitContainers, corev1.Container{
 		Name:            "infra-init",
@@ -278,6 +317,7 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		},
+		corev1.Volume{Name: "proxy-control", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 	)
 	if err := mergeRuntimeHostPaths(podSpec, &podSpec.Containers[0], profile.Deployment.HostPaths); err != nil {
 		return nil, err
@@ -356,8 +396,9 @@ var runtimeOwnedEnv = map[string]struct{}{
 	"FAST_SANDBOX_INFRA_PROFILE": {}, "FASTLET_CAPACITY": {},
 	"RUNTIME_SOCKET": {}, "INFRA_DIR_IN_POD": {},
 	"FASTLET_CONTROL_PORT": {}, "AGENT_PORT": {},
-	"FAST_SANDBOX_WARM_IMAGES": {},
-	"NODE_NAME":                {}, "POD_NAME": {}, "POD_IP": {}, "POD_UID": {}, "NAMESPACE": {},
+	"FASTLET_PROXY_CONTROL_SOCKET": {},
+	"FAST_SANDBOX_WARM_IMAGES":     {},
+	"NODE_NAME":                    {}, "POD_NAME": {}, "POD_IP": {}, "POD_UID": {}, "NAMESPACE": {},
 }
 
 func removeRuntimeOwnedEnv(env []corev1.EnvVar) []corev1.EnvVar {

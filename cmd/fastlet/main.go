@@ -13,6 +13,7 @@ import (
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/fastlet/runtime"
 	"fast-sandbox/internal/fastlet/server"
+	"fast-sandbox/internal/fastletproxy"
 	"fast-sandbox/internal/runtimecatalog"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -88,17 +89,19 @@ func main() {
 
 	klog.InfoS("Runtime initialized successfully", "type", runtimeTypeStr)
 
+	proxyControlClient := fastletproxy.NewControlClient(getEnv("FASTLET_PROXY_CONTROL_SOCKET", fastletproxy.DefaultControlSocket))
 	sandboxManager, err := runtime.NewSandboxManagerWithConfig(rt, runtime.SandboxManagerConfig{
 		Capacity: capacityFromEnvironment(), RuntimeProfileHash: runtimeProfile.ProfileHash, ResourceProfile: &resourceProfile,
 		FastletPodUID: podUID, RecoverOnStart: true,
-		WarmImages: warmImages,
+		WarmImages:     warmImages,
+		RoutePublisher: fastletproxy.NewRoutePublisher(proxyControlClient),
 	})
 	if err != nil {
 		klog.ErrorS(err, "Failed to initialize Sandbox manager")
 		os.Exit(1)
 	}
 	defer sandboxManager.Close()
-	go recoverUntilReady(ctx, sandboxManager)
+	go recoverUntilReady(ctx, sandboxManager, proxyControlClient)
 
 	fastletServer := server.NewFastletServer(fastletPort, sandboxManager)
 	klog.InfoS("Starting Fastlet HTTP Server", "port", fastletPort)
@@ -126,7 +129,7 @@ func newNetworkManager(capacity int, podUID string) (*fastletnetwork.Manager, er
 	return fastletnetwork.NewManager(config, fastletnetwork.NewLinuxNetNSDriver(fastletnetwork.LinuxDriverConfig{}), store)
 }
 
-func recoverUntilReady(ctx context.Context, manager *runtime.SandboxManager) {
+func recoverUntilReady(ctx context.Context, manager *runtime.SandboxManager, proxyClient *fastletproxy.ControlClient) {
 	for {
 		if err := manager.Recover(ctx); err == nil {
 			klog.Info("Fastlet runtime recovery completed")
@@ -135,6 +138,7 @@ func recoverUntilReady(ctx context.Context, manager *runtime.SandboxManager) {
 					klog.ErrorS(err, "Asynchronous warmImages preparation failed")
 				}
 			}()
+			go watchProxyRoutes(ctx, manager, proxyClient)
 			return
 		} else {
 			klog.ErrorS(err, "Fastlet runtime recovery failed; readiness remains false")
@@ -143,6 +147,24 @@ func recoverUntilReady(ctx context.Context, manager *runtime.SandboxManager) {
 		case <-ctx.Done():
 			return
 		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func watchProxyRoutes(ctx context.Context, manager *runtime.SandboxManager, proxyClient *fastletproxy.ControlClient) {
+	for ctx.Err() == nil {
+		if err := manager.ReconcileProxyRoutes(ctx); err != nil {
+			klog.ErrorS(err, "Reconcile Fastlet Proxy routes after control reconnect")
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+				continue
+			}
+		}
+		if err := proxyClient.Watch(ctx, func(fastletproxy.Event) error { return nil }); err != nil && ctx.Err() == nil {
+			manager.MarkProxyRouteUnavailable()
+			klog.ErrorS(err, "Fastlet Proxy control watch disconnected; route readiness revoked")
 		}
 	}
 }

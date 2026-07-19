@@ -463,6 +463,7 @@ func TestContainerdRuntime_prepareLabels(t *testing.T) {
 		"fast-sandbox.io/request-id":            "request-1",
 		"fast-sandbox.io/instance-generation":   "2",
 		"fast-sandbox.io/assignment-attempt":    "3",
+		"fast-sandbox.io/route-generation":      "1",
 		"fast-sandbox.io/network-slot-id":       "slot-1",
 		"fast-sandbox.io/network-netns-path":    "/run/fast-sandbox/netns/fsb1",
 		"fast-sandbox.io/network-ip":            "172.30.0.2",

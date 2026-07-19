@@ -236,3 +236,21 @@ REJECT destination=<private CIDR>
 ```
 
 外部目标仍按默认 allow 出网；Fastlet Proxy 到 Sandbox 的入向连接不经过该 OUTPUT 拒绝；Sandbox 对 gateway 的响应先命中 ACCEPT；Sandbox 到同 Fastlet 的其它私有 IP 命中 REJECT。privileged Docker gate 和双 Sandbox Kubernetes e2e 均已通过。
+
+### REF-0019：FastPath reservation 不能在 Controller 抢先 assignment 后立即丢弃
+
+**证据**：阶段 8 双 Fastlet、每 Pod 容量 1 的真实 e2e 中，第一个 Sandbox 占满 Fastlet A；第二个 FastPath 请求已经在 Fastlet B 获得 reservation，但 Controller 在 CRD Create 和 FastPath assignment CAS 之间抢先把 CRD 指向缓存中仍排名靠前的 Fastlet A。FastPath 看到 CAS loser 后立即丢弃 B 的 reservation，随后 A 返回 `CapacityRejected`，导致一个本可成功的 Create 错误返回上层。
+
+**结论**：CAS winner 仍是第一次 Ensure 的权威目标，但 FastPath 在请求结束前保留自己已获得的 reservation。只有 winner Ensure 成功，才取消多余 reservation；如果 winner 返回明确可重调度的本地 admission 拒绝，则 CAS 清除该 rejected assignment，并尝试把同一 CRD 指向 reservation Fastlet 后消费 token。assignment attempt 和 route generation 都必须前进。任何 unknown outcome 都不得触发迁移，以免创建双 runtime。fake-client 竞态回归和双 Fastlet 真实 e2e 均已通过。
+
+### REF-0020：Fastlet Proxy RouteStore 是可重建的易失状态，sidecar 重启必须主动通知 Fastlet Control
+
+**证据**：Fastlet Control restart 会执行 runtime/network recovery 并重新 ApplyRoute；但 Fastlet Proxy 是独立 sidecar，单独重启时其内存 RouteStore 清空，而 Fastlet Control 进程和 readiness 原本保持不变。此时 Sandbox Status 仍为 DataPlaneReady，所有请求会稳定得到 route not found。
+
+**结论**：RouteStore 不另建第三份持久化真相；Fastlet Control 的 runtime inventory + durable NetworkState/AccessDescriptor 是恢复来源。Control 与 Proxy 通过 UDS `WatchRoutes` 保持长连接：断线立即撤销 Fastlet route readiness，重连后先 Snapshot，删除 orphan route，再全量 Apply 当前 runtime routes，成功后恢复 Ready。Fastlet Proxy 本地 generation tombstone只负责单进程内延迟消息 fencing；进程重启后的安全性来自当前 runtime 全量重建，旧 UDS 连接不会跨进程存活。真实 container restart e2e 已验证原 route 恢复。
+
+### REF-0021：route credential 使用非对称短期签名，开发 key 不进入生产默认路径
+
+**证据**：如果 Fastlet Proxy 持有与 FastPath 相同的 HMAC secret，则任意被攻陷的 Fastlet Pod 都能为其它 Sandbox/Fastlet 伪造 route token；如果代理每次回查 FastPath，则数据面延迟和控制面可用性被绑定。
+
+**结论**：第一阶段使用 Ed25519 本地验签。FastPath 独占私钥；Sandbox Proxy 和所有 Fastlet Proxy 仅获得公钥集合。token 绑定 namespace、Sandbox UID、target port、Fastlet Pod UID、assignment attempt、route generation、expiration 和 nonce，默认 TTL 5 分钟；reset/reassignment 不等待 TTL，而由 generation/attempt 立即失效。缺失或非法 key 时进程启动 fail closed。验签配置接受逗号分隔的公钥集合，rotation 顺序固定为：代理先发布 `old,new`，FastPath 再切换新私钥，等待最大 token TTL 后移除旧公钥。`config/manager/dev-route-keys.yaml` 使用公开 RFC 8032 test vector，标记 `development-only` 且仅由 e2e manager 显式应用；生产必须由 secret manager 提供同名 Secret。
