@@ -15,6 +15,7 @@ import (
 
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/fastlet/infra"
+	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/runtimecatalog"
 
 	runtimeoptions "github.com/containerd/containerd/api/types/runtimeoptions/v1"
@@ -22,6 +23,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/errdefs"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
@@ -30,8 +32,6 @@ import (
 type ContainerdRuntime struct {
 	socketPath         string
 	client             *containerd.Client
-	cgroupPath         string
-	netnsPath          string
 	fastletPodName     string
 	fastletPodUID      string
 	fastletNamespace   string
@@ -39,6 +39,7 @@ type ContainerdRuntime struct {
 	allowedPluginPaths []string
 	runtimeType        RuntimeType   // runtime type identifier
 	config             RuntimeConfig // cached runtime configuration
+	networkManager     *fastletnetwork.Manager
 }
 
 const (
@@ -98,80 +99,13 @@ func (r *ContainerdRuntime) Initialize(ctx context.Context, socketPath string) e
 	}
 	r.infraMgr = infra.NewManager(infraPodPath)
 
-	if err := r.discoverCgroupPath(); err != nil {
-		klog.ErrorS(err, "Failed to discover cgroup path")
-		r.cgroupPath = ""
-	}
-
-	if err := r.discoverNetNSPath(ctx); err != nil {
-		klog.ErrorS(err, "Failed to discover network namespace")
-	}
-
 	return nil
-}
-
-func (r *ContainerdRuntime) discoverCgroupPath() error {
-	data, err := os.ReadFile("/proc/self/cgroup")
-	if err != nil {
-		return err
-	}
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		if strings.HasPrefix(line, "0::") {
-			r.cgroupPath = strings.TrimPrefix(line, "0::")
-			return nil
-		}
-		parts := strings.Split(line, ":")
-		if len(parts) == 3 && (strings.Contains(parts[1], "pids") || strings.Contains(parts[1], "cpu")) {
-			r.cgroupPath = parts[2]
-			return nil
-		}
-	}
-	return fmt.Errorf("cgroup path not found")
-}
-
-func (r *ContainerdRuntime) discoverNetNSPath(ctx context.Context) error {
-	if r.cgroupPath == "" {
-		return fmt.Errorf("cgroup path is required")
-	}
-	var containerID string
-	if strings.Contains(r.cgroupPath, "cri-containerd-") {
-		parts := strings.Split(r.cgroupPath, "cri-containerd-")
-		containerID = strings.Split(parts[1], ".")[0]
-	} else if strings.Contains(r.cgroupPath, "cri-containerd:") {
-		parts := strings.Split(r.cgroupPath, "cri-containerd:")
-		containerID = parts[len(parts)-1]
-	} else if strings.Contains(r.cgroupPath, "kubepods") {
-		parts := strings.Split(strings.Trim(r.cgroupPath, "/"), "/")
-		containerID = parts[len(parts)-1]
-	} else {
-		return fmt.Errorf("could not parse ID")
-	}
-
-	ctx = namespaces.WithNamespace(ctx, "k8s.io")
-	container, err := r.client.LoadContainer(ctx, containerID)
-	if err != nil {
-		return err
-	}
-	spec, err := container.Spec(ctx)
-	if err != nil {
-		return err
-	}
-	for _, ns := range spec.Linux.Namespaces {
-		if ns.Type == specs.NetworkNamespace {
-			if ns.Path != "" {
-				r.netnsPath = ns.Path
-				return nil
-			}
-		}
-	}
-	return fmt.Errorf("netns not found")
 }
 
 func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.SandboxSpec) (*SandboxMetadata, error) {
 	totalStart := time.Now()
 
-	klog.InfoS("Creating sandbox", "sandbox", config.SandboxID, "image", config.Image, "runtime", r.config.Handler, "netns", r.netnsPath)
+	klog.InfoS("Creating sandbox", "sandbox", config.SandboxID, "image", config.Image, "runtime", r.config.Handler, "netns", config.NetworkNamespacePath)
 	ctx, cancel := context.WithTimeout(ctx, defaultOperationTimeout)
 	defer cancel()
 	ctx = namespaces.WithNamespace(ctx, "k8s.io")
@@ -288,7 +222,26 @@ func (r *ContainerdRuntime) EnsureSandbox(ctx context.Context, config *api.Sandb
 	if !errors.Is(err, ErrSandboxNotFound) {
 		return nil, err
 	}
-	return r.CreateSandbox(ctx, config)
+	createConfig := *config
+	var owner fastletnetwork.Owner
+	if r.networkManager != nil {
+		owner = networkOwner(config)
+		slot, acquireErr := r.networkManager.Acquire(ctx, owner)
+		if acquireErr != nil {
+			return nil, fmt.Errorf("%w: %v", ErrNetworkUnavailable, acquireErr)
+		}
+		createConfig.NetworkSlotID = slot.ID
+		createConfig.NetworkNamespacePath = slot.HostNetNSPath
+		createConfig.NetworkIP = slot.IP
+		createConfig.NetworkGateway = slot.Gateway
+		createConfig.NetworkDNSPath = slot.DNSPath
+	}
+	metadata, createErr := r.CreateSandbox(ctx, &createConfig)
+	if createErr != nil && r.networkManager != nil {
+		releaseErr := r.networkManager.Release(ctx, owner)
+		return nil, errors.Join(createErr, releaseErr)
+	}
+	return metadata, createErr
 }
 
 func validateExistingRuntimeProfile(existing *SandboxMetadata, requested *api.SandboxSpec) error {
@@ -369,28 +322,18 @@ func (r *ContainerdRuntime) prepareSpecOpts(config *api.SandboxSpec, image conta
 		specOpts = append(specOpts, oci.WithProcessCwd(config.WorkingDir))
 	}
 
+	if config.NetworkDNSPath != "" {
+		mounts = append(mounts, specs.Mount{
+			Source: config.NetworkDNSPath, Destination: "/etc/resolv.conf", Type: "bind",
+			Options: []string{"ro", "rbind", "nosuid", "nodev", "noexec"},
+		})
+	}
 	if len(mounts) > 0 {
 		specOpts = append(specOpts, oci.WithMounts(mounts))
 	}
 
-	// Always add network namespace - gVisor requires it.
-	// If netnsPath is set, use the host's network namespace (for sharing with fastlet).
-	// If netnsPath is empty, create a new isolated network namespace.
-	specOpts = append(specOpts, oci.WithLinuxNamespace(specs.LinuxNamespace{
-		Type: specs.NetworkNamespace,
-	}))
-
-	//if r.netnsPath != "" {
-	//	specOpts = append(specOpts, oci.WithLinuxNamespace(specs.LinuxNamespace{
-	//		Type: specs.NetworkNamespace,
-	//		Path: r.netnsPath,
-	//	}))
-	//} else {
-	//	// Create a new network namespace for isolation
-	//	specOpts = append(specOpts, oci.WithLinuxNamespace(specs.LinuxNamespace{
-	//		Type: specs.NetworkNamespace,
-	//	}))
-	//}
+	networkNamespace := specs.LinuxNamespace{Type: specs.NetworkNamespace, Path: config.NetworkNamespacePath}
+	specOpts = append(specOpts, oci.WithLinuxNamespace(networkNamespace))
 
 	return specOpts, nil
 }
@@ -482,7 +425,16 @@ func (r *ContainerdRuntime) prepareLabels(config *api.SandboxSpec) map[string]st
 		"fast-sandbox.io/request-id":            config.RequestID,
 		"fast-sandbox.io/instance-generation":   strconv.FormatInt(config.InstanceGeneration, 10),
 		"fast-sandbox.io/assignment-attempt":    strconv.FormatInt(config.AssignmentAttempt, 10),
+		"fast-sandbox.io/network-slot-id":       config.NetworkSlotID,
+		"fast-sandbox.io/network-netns-path":    config.NetworkNamespacePath,
+		"fast-sandbox.io/network-ip":            config.NetworkIP,
+		"fast-sandbox.io/network-gateway":       config.NetworkGateway,
+		"fast-sandbox.io/network-dns-path":      config.NetworkDNSPath,
 	}
+}
+
+func (r *ContainerdRuntime) SetNetworkManager(manager *fastletnetwork.Manager) {
+	r.networkManager = manager
 }
 
 func (r *ContainerdRuntime) SetNamespace(ns string) {
@@ -490,6 +442,24 @@ func (r *ContainerdRuntime) SetNamespace(ns string) {
 }
 
 func (r *ContainerdRuntime) DeleteSandbox(ctx context.Context, sandboxID string) error {
+	var owner fastletnetwork.Owner
+	if r.networkManager != nil {
+		if slot, exists := r.networkManager.Lookup(sandboxID); exists {
+			owner = slot.Owner
+		}
+	}
+	if err := r.deleteContainerdSandbox(ctx, sandboxID); err != nil {
+		return err
+	}
+	if r.networkManager != nil && owner.SandboxUID != "" {
+		if err := r.networkManager.Release(ctx, owner); err != nil {
+			return fmt.Errorf("release network slot: %w", err)
+		}
+	}
+	return nil
+}
+
+func (r *ContainerdRuntime) deleteContainerdSandbox(ctx context.Context, sandboxID string) error {
 	ctx = namespaces.WithNamespace(ctx, "k8s.io")
 	snapshotName := snapShotName(sandboxID)
 
@@ -500,6 +470,9 @@ func (r *ContainerdRuntime) DeleteSandbox(ctx context.Context, sandboxID string)
 		snapErr := r.client.SnapshotService("").Remove(ctx, snapshotName)
 		if snapErr != nil {
 			klog.InfoS("Snapshot cleanup", "sandbox", sandboxID, "err", snapErr)
+		}
+		if errdefs.IsNotFound(err) {
+			return snapErr
 		}
 		return JoinErrors(err, snapErr)
 	}
@@ -589,17 +562,22 @@ func (r *ContainerdRuntime) InspectSandbox(ctx context.Context, sandboxID string
 	}
 	metadata := &SandboxMetadata{
 		SandboxSpec: api.SandboxSpec{
-			SandboxID:           sandboxID,
-			RequestID:           info.Labels["fast-sandbox.io/request-id"],
-			ClaimUID:            info.Labels["fast-sandbox.io/claim-uid"],
-			ClaimNamespace:      info.Labels["fast-sandbox.io/claim-namespace"],
-			ClaimName:           info.Labels["fast-sandbox.io/sandbox-name"],
-			FastletPodUID:       info.Labels["fast-sandbox.io/fastlet-uid"],
-			Image:               info.Image,
-			CPU:                 info.Labels["fast-sandbox.io/resource-cpu"],
-			Memory:              info.Labels["fast-sandbox.io/resource-memory"],
-			RuntimeProfileHash:  info.Labels["fast-sandbox.io/runtime-profile-hash"],
-			ResourceProfileHash: info.Labels["fast-sandbox.io/resource-profile-hash"],
+			SandboxID:            sandboxID,
+			RequestID:            info.Labels["fast-sandbox.io/request-id"],
+			ClaimUID:             info.Labels["fast-sandbox.io/claim-uid"],
+			ClaimNamespace:       info.Labels["fast-sandbox.io/claim-namespace"],
+			ClaimName:            info.Labels["fast-sandbox.io/sandbox-name"],
+			FastletPodUID:        info.Labels["fast-sandbox.io/fastlet-uid"],
+			Image:                info.Image,
+			CPU:                  info.Labels["fast-sandbox.io/resource-cpu"],
+			Memory:               info.Labels["fast-sandbox.io/resource-memory"],
+			RuntimeProfileHash:   info.Labels["fast-sandbox.io/runtime-profile-hash"],
+			ResourceProfileHash:  info.Labels["fast-sandbox.io/resource-profile-hash"],
+			NetworkSlotID:        info.Labels["fast-sandbox.io/network-slot-id"],
+			NetworkNamespacePath: info.Labels["fast-sandbox.io/network-netns-path"],
+			NetworkIP:            info.Labels["fast-sandbox.io/network-ip"],
+			NetworkGateway:       info.Labels["fast-sandbox.io/network-gateway"],
+			NetworkDNSPath:       info.Labels["fast-sandbox.io/network-dns-path"],
 		},
 		ContainerID: sandboxID,
 		CreatedAt:   info.CreatedAt.Unix(),
@@ -615,6 +593,55 @@ func (r *ContainerdRuntime) InspectSandbox(ctx context.Context, sandboxID string
 		}
 	}
 	return metadata, nil
+}
+
+func (r *ContainerdRuntime) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata) error {
+	if r.networkManager == nil {
+		return nil
+	}
+	owners := make([]fastletnetwork.Owner, 0, len(managed))
+	for _, metadata := range managed {
+		if metadata == nil {
+			continue
+		}
+		slot, exists := r.networkManager.Lookup(metadata.SandboxID)
+		if !exists || metadata.NetworkSlotID == "" || metadata.NetworkSlotID != slot.ID ||
+			metadata.NetworkNamespacePath != slot.HostNetNSPath || metadata.NetworkIP != slot.IP {
+			return fmt.Errorf("%w: runtime sandbox %s does not match its durable network descriptor", fastletnetwork.ErrStateInconsistent, metadata.SandboxID)
+		}
+		owners = append(owners, networkOwner(&metadata.SandboxSpec))
+	}
+	return r.networkManager.Reconcile(ctx, owners)
+}
+
+func (r *ContainerdRuntime) RuntimeResourceAvailable() bool {
+	return r.networkManager == nil || r.networkManager.Snapshot().Clean > 0
+}
+
+func (r *ContainerdRuntime) GetAccessDescriptor(sandboxID string) (fastletnetwork.AccessDescriptor, error) {
+	if r.networkManager == nil {
+		return fastletnetwork.AccessDescriptor{}, ErrNetworkUnavailable
+	}
+	slot, exists := r.networkManager.Lookup(sandboxID)
+	if !exists {
+		return fastletnetwork.AccessDescriptor{}, ErrSandboxNotFound
+	}
+	return slot.Access, nil
+}
+
+func networkOwner(config *api.SandboxSpec) fastletnetwork.Owner {
+	generation := config.InstanceGeneration
+	if generation <= 0 {
+		generation = 1
+	}
+	attempt := config.AssignmentAttempt
+	if attempt <= 0 {
+		attempt = 1
+	}
+	return fastletnetwork.Owner{
+		SandboxUID: config.SandboxID, InstanceGeneration: generation,
+		AssignmentAttempt: attempt,
+	}
 }
 
 func (r *ContainerdRuntime) ListManagedSandboxes(ctx context.Context) ([]*SandboxMetadata, error) {

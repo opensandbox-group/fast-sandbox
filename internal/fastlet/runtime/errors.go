@@ -22,6 +22,10 @@ var (
 	// safely accept Sandboxes on the current node.
 	ErrRuntimeCapabilityUnavailable = errors.New("runtime capability unavailable")
 
+	// ErrNetworkUnavailable indicates that Fastlet has no clean, validated
+	// runtime network resource available for a new Sandbox.
+	ErrNetworkUnavailable = errors.New("sandbox network unavailable")
+
 	// ErrSandboxProfileMismatch rejects a request that attempts to override the
 	// RuntimeProfile or fixed Pool ResourceProfile assigned to this Fastlet.
 	ErrSandboxProfileMismatch = errors.New("sandbox profile mismatch")

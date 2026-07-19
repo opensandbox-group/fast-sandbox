@@ -94,6 +94,10 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	require.Equal(t, "5248Mi", memory.String())
 	require.True(t, hasHostPath(pod, "/run/containerd"))
 	require.True(t, hasHostPath(pod, "/var/lib/containerd"))
+	require.True(t, hasHostPath(pod, "/run/fast-sandbox/netns"))
+	propagation := volumeMount(pod, "fast-sandbox-netns")
+	require.NotNil(t, propagation)
+	require.Equal(t, corev1.MountPropagationBidirectional, *propagation)
 }
 
 func TestConstructPodAddsKVMWithoutRuntimeClass(t *testing.T) {
@@ -140,4 +144,13 @@ func hasHostPath(pod *corev1.Pod, path string) bool {
 		}
 	}
 	return false
+}
+
+func volumeMount(pod *corev1.Pod, name string) *corev1.MountPropagationMode {
+	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+		if mount.Name == name {
+			return mount.MountPropagation
+		}
+	}
+	return nil
 }

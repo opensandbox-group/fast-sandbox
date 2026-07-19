@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"flag"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
+	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/fastlet/runtime"
 	"fast-sandbox/internal/fastlet/server"
 	"fast-sandbox/internal/runtimecatalog"
@@ -65,6 +67,24 @@ func main() {
 	defer rt.Close()
 
 	rt.SetNamespace(namespace)
+	if runtimeProfile.NetworkMode == runtimecatalog.NetworkModeLinuxNetNS {
+		networkManager, err := newNetworkManager(capacityFromEnvironment(), podUID)
+		if err != nil {
+			klog.ErrorS(err, "Failed to configure Fastlet-owned network")
+			os.Exit(1)
+		}
+		if err := networkManager.Initialize(ctx); err != nil {
+			klog.ErrorS(err, "Failed to initialize Fastlet-owned network")
+			os.Exit(1)
+		}
+		configurable, ok := rt.(runtime.NetworkConfigurable)
+		if !ok {
+			klog.ErrorS(runtime.ErrUnsupportedRuntime, "Runtime profile requires Linux netns but driver is not network configurable")
+			os.Exit(1)
+		}
+		configurable.SetNetworkManager(networkManager)
+		klog.InfoS("Fastlet-owned network initialized", "capacity", networkManager.Snapshot().Capacity, "cleanSlots", networkManager.Snapshot().Clean)
+	}
 
 	klog.InfoS("Runtime initialized successfully", "type", runtimeTypeStr)
 
@@ -87,6 +107,23 @@ func main() {
 		klog.ErrorS(err, "Fastlet server failed")
 		os.Exit(1)
 	}
+}
+
+func newNetworkManager(capacity int, podUID string) (*fastletnetwork.Manager, error) {
+	config := fastletnetwork.DefaultConfig(capacity, podUID)
+	config.PrivateCIDR = getEnv("FAST_SANDBOX_NETWORK_CIDR", config.PrivateCIDR)
+	config.Bridge = getEnv("FAST_SANDBOX_NETWORK_BRIDGE", config.Bridge)
+	config.EgressDevice = getEnv("FAST_SANDBOX_NETWORK_EGRESS_DEVICE", "")
+	config.StateRoot = getEnv("FAST_SANDBOX_NETWORK_STATE_ROOT", config.StateRoot)
+	config.NetNSRoot = getEnv("FAST_SANDBOX_NETWORK_NETNS_ROOT", config.NetNSRoot)
+	config.HostNetNSRoot = getEnv("FAST_SANDBOX_NETWORK_HOST_NETNS_ROOT", config.HostNetNSRoot)
+	mtu, err := strconv.Atoi(getEnv("FAST_SANDBOX_NETWORK_MTU", strconv.Itoa(config.MTU)))
+	if err != nil || mtu <= 0 {
+		return nil, runtime.ErrInvalidConfig
+	}
+	config.MTU = mtu
+	store := fastletnetwork.NewFileStateStore(filepath.Join(config.StateRoot, podUID))
+	return fastletnetwork.NewManager(config, fastletnetwork.NewLinuxNetNSDriver(fastletnetwork.LinuxDriverConfig{}), store)
 }
 
 func recoverUntilReady(ctx context.Context, manager *runtime.SandboxManager) {

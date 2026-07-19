@@ -68,11 +68,12 @@ type BoxLiteConfig struct {
 }
 
 type HostPathRequirement struct {
-	Name      string              `json:"name"`
-	HostPath  string              `json:"hostPath"`
-	MountPath string              `json:"mountPath"`
-	Type      corev1.HostPathType `json:"type"`
-	ReadOnly  bool                `json:"readOnly,omitempty"`
+	Name             string                      `json:"name"`
+	HostPath         string                      `json:"hostPath"`
+	MountPath        string                      `json:"mountPath"`
+	Type             corev1.HostPathType         `json:"type"`
+	ReadOnly         bool                        `json:"readOnly,omitempty"`
+	MountPropagation corev1.MountPropagationMode `json:"mountPropagation,omitempty"`
 }
 
 type DeploymentRequirements struct {

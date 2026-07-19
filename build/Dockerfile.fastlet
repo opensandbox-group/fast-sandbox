@@ -4,13 +4,15 @@ WORKDIR /workspace
 COPY bin/fastlet .
 
 # Final stage
-#FROM alpine:3.19
-FROM golang:1.25
+# Keep the Go toolchain in the development image for the existing debugging
+# workflow, while using Alpine's small network tooling layer.
+FROM golang:1.25-alpine
 # for debug
 # RUN GOPROXY=https://goproxy.cn,direct go install github.com/go-delve/delve/cmd/dlv@latest
 # EXPOSE 2345
 
 WORKDIR /workspace
+RUN apk add --no-cache iproute2 iptables
 COPY --from=builder /workspace/fastlet .
 
 # Default envs; can be overridden by Pod spec

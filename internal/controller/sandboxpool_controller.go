@@ -443,7 +443,8 @@ func mergeRuntimeHostPaths(podSpec *corev1.PodSpec, container *corev1.Container,
 		for _, mount := range container.VolumeMounts {
 			if mount.Name == requirement.Name {
 				mountFound = true
-				if mount.MountPath != requirement.MountPath || mount.ReadOnly != requirement.ReadOnly {
+				if mount.MountPath != requirement.MountPath || mount.ReadOnly != requirement.ReadOnly ||
+					mountPropagation(mount.MountPropagation) != requirement.MountPropagation {
 					return fmt.Errorf("fastletTemplate mount %q conflicts with runtime mount %q", requirement.Name, requirement.MountPath)
 				}
 			} else if mount.MountPath == requirement.MountPath {
@@ -451,12 +452,22 @@ func mergeRuntimeHostPaths(podSpec *corev1.PodSpec, container *corev1.Container,
 			}
 		}
 		if !mountFound {
-			container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
-				Name: requirement.Name, MountPath: requirement.MountPath, ReadOnly: requirement.ReadOnly,
-			})
+			mount := corev1.VolumeMount{Name: requirement.Name, MountPath: requirement.MountPath, ReadOnly: requirement.ReadOnly}
+			if requirement.MountPropagation != "" {
+				propagation := requirement.MountPropagation
+				mount.MountPropagation = &propagation
+			}
+			container.VolumeMounts = append(container.VolumeMounts, mount)
 		}
 	}
 	return nil
+}
+
+func mountPropagation(value *corev1.MountPropagationMode) corev1.MountPropagationMode {
+	if value == nil {
+		return ""
+	}
+	return *value
 }
 
 // updatePoolCondition updates a condition on the pool status.

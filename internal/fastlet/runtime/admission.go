@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -64,6 +65,9 @@ func (m *SandboxManager) ReserveSandbox(req *api.ReserveSandboxRequest) (*api.Re
 	}
 	if m.usedLocked() >= m.capacity {
 		return reserveFailureWithAdmission(api.ErrorCapacityRejected, "Fastlet admission capacity is exhausted", true, m.admissionStatusLocked())
+	}
+	if !m.runtimeResourceAvailable() {
+		return reserveFailureWithAdmission(api.ErrorNetworkUnavailable, "Fastlet has no clean network slot available", true, m.admissionStatusLocked())
 	}
 	token, err := m.tokenGenerator()
 	if err != nil {
@@ -176,7 +180,11 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 		}
 		admission = m.admissionStatusLocked()
 		m.mu.Unlock()
-		return ensureFailure(fastletErrorWithCause(api.ErrorRuntimeUnavailable, err.Error(), true, err), admission)
+		code := api.ErrorRuntimeUnavailable
+		if errors.Is(err, ErrNetworkUnavailable) {
+			code = api.ErrorNetworkUnavailable
+		}
+		return ensureFailure(fastletErrorWithCause(code, err.Error(), true, err), admission)
 	}
 	metadata.Phase = "running"
 	metadata.SandboxSpec = spec
@@ -249,6 +257,11 @@ func (m *SandboxManager) Recover(ctx context.Context) error {
 	if report.State != runtimecatalog.CapabilityReady {
 		return fmt.Errorf("runtime capability is not ready: %s: %s", report.Reason, report.Message)
 	}
+	if recoverer, ok := m.runtime.(RuntimeResourceRecoverer); ok {
+		if err := recoverer.RecoverRuntimeResources(ctx, managed); err != nil {
+			return fmt.Errorf("recover runtime resources: %w", err)
+		}
+	}
 	recovered := make(map[string]*SandboxMetadata, len(managed))
 	for _, metadata := range managed {
 		if metadata == nil || metadata.SandboxID == "" {
@@ -282,6 +295,11 @@ func (m *SandboxManager) Recover(ctx context.Context) error {
 	m.runtimeReady = true
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *SandboxManager) runtimeResourceAvailable() bool {
+	admission, ok := m.runtime.(RuntimeResourceAdmission)
+	return !ok || admission.RuntimeResourceAvailable()
 }
 
 func (m *SandboxManager) SetDraining(draining bool, reason string) {

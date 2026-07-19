@@ -12,6 +12,7 @@ import (
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/fastlet/runtime"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/klog/v2"
 )
 
@@ -41,6 +42,7 @@ func (s *FastletServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("/readyz", s.handleReady)
+	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/api/v1/fastlet/create", s.handleCreate)
 	mux.HandleFunc("/api/v1/fastlet/delete", s.handleDelete)
 	mux.HandleFunc("/api/v1/fastlet/status", s.handleStatus)

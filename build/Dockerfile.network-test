@@ -1,0 +1,4 @@
+ARG FASTLET_IMAGE=fast-sandbox/fastlet:dev
+FROM ${FASTLET_IMAGE}
+COPY bin/network.test /network.test
+ENTRYPOINT ["/network.test"]

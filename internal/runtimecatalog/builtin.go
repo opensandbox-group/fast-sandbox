@@ -14,7 +14,12 @@ func builtinProfiles() map[apiv1alpha1.RuntimeName]RuntimeProfile {
 		{Name: "containerd-run", HostPath: "/run/containerd", MountPath: "/run/containerd", Type: corev1.HostPathDirectory},
 		{Name: "containerd-root", HostPath: "/var/lib/containerd", MountPath: "/var/lib/containerd", Type: corev1.HostPathDirectory},
 	}
-	gvisorPaths := append([]HostPathRequirement{}, containerdPaths...)
+	linuxNetworkPaths := []HostPathRequirement{
+		{Name: "fast-sandbox-netns", HostPath: "/run/fast-sandbox/netns", MountPath: "/run/netns", Type: corev1.HostPathDirectoryOrCreate, MountPropagation: corev1.MountPropagationBidirectional},
+		{Name: "fast-sandbox-network", HostPath: "/run/fast-sandbox/network", MountPath: "/run/fast-sandbox/network", Type: corev1.HostPathDirectoryOrCreate},
+	}
+	containerPaths := append(append([]HostPathRequirement{}, containerdPaths...), linuxNetworkPaths...)
+	gvisorPaths := append([]HostPathRequirement{}, containerPaths...)
 	gvisorPaths = append(gvisorPaths,
 		HostPathRequirement{Name: "gvisor-runsc", HostPath: "/usr/local/bin/runsc", MountPath: "/usr/local/bin/runsc", Type: corev1.HostPathFile, ReadOnly: true},
 		HostPathRequirement{Name: "gvisor-shim", HostPath: "/usr/local/bin/containerd-shim-runsc-v1", MountPath: "/usr/local/bin/containerd-shim-runsc-v1", Type: corev1.HostPathFile, ReadOnly: true},
@@ -29,7 +34,7 @@ func builtinProfiles() map[apiv1alpha1.RuntimeName]RuntimeProfile {
 		apiv1alpha1.RuntimeContainer: {
 			Name: apiv1alpha1.RuntimeContainer, Version: builtinProfileVersion, Driver: DriverKindContainerd,
 			Containerd:         &ContainerdConfig{Handler: "io.containerd.runc.v2"},
-			Deployment:         DeploymentRequirements{Privileged: true, HostPaths: containerdPaths, Overhead: overhead("100m", "128Mi")},
+			Deployment:         DeploymentRequirements{Privileged: true, HostPaths: containerPaths, Overhead: overhead("100m", "128Mi")},
 			Capabilities:       Capabilities{DefaultState: CapabilityConfigured, SupportsNetwork: true, SupportsCache: true, SupportsRecovery: true},
 			NetworkMode:        NetworkModeLinuxNetNS,
 			InfraDeliveryModes: []InfraDeliveryMode{InfraDeliveryBindMount, InfraDeliveryImageLayer, InfraDeliveryPreinstalled},

@@ -43,6 +43,8 @@ Deferred          已明确不属于本轮范围
 | REF-0014 | 6 | Resolved | 否 | informer cache 不保证 FastPath CRD Create/status Patch 后立即读到 UID/assignment | 持久化状态机使用 direct API client；request ID 通过哈希 label 查询并用完整 annotation 复核 |
 | REF-0015 | 6 | Resolved | 否 | Controller 与 FastPath 并发 Ensure 会让无 token Controller 被已有 reservation 拒绝，并触发旧 attempt 重用 | durable claim 可接管完全匹配 reservation；attempt 只由 CAS 内部根据高水位分配 |
 | REF-0016 | 6 | Resolved | 否 | 不同 e2e 进程重置 namespace 计数，会撞到上一轮仍在 Terminating 的同名 namespace | namespace 加每个 test process 的随机 run ID 和进程内计数 |
+| REF-0017 | 7 | Resolved | 否 | Fastlet 容器内创建的普通 `/run/netns` 路径对宿主 containerd 不可见 | 使用 hostPath 双向传播 `/run/fast-sandbox/netns -> /run/netns`，descriptor 同时记录 Fastlet path 和 host path |
+| REF-0018 | 7 | Resolved | 否 | 单条 iptables 规则不能同时用两个 destination 表达“私网拒绝但 gateway 例外” | 在 Sandbox netns OUTPUT 中先 ACCEPT gateway，再 REJECT 私网 CIDR；privileged Linux gate 验证真实语法与顺序 |
 
 ## 详细记录
 
@@ -209,3 +211,28 @@ kind load docker-image fast-sandbox/fastlet:dev --name fsb-e2e-basic
 **证据**：单独运行 `TestPortValidation` 后立即运行完整 gate，两个独立 Go test process 都分配 `fsb-e2e-port-7`；前一次 defer 只提交 namespace 删除，新一次在其 Terminating 期间创建对象被 apiserver Forbidden。
 
 **结论**：SuiteEnv 在每个 test process 初始化 8 位随机 run ID，namespace 结构变为 `prefix-name-runID-counter`，并在 63 字符裁剪时保留唯一后缀。单测覆盖跨 SuiteEnv 实例不复用；完整 control-plane gate 随后通过。
+
+### REF-0017：host containerd 的 netns 可见性
+
+**证据**：Fastlet 在 Pod mount namespace 内执行 `ip netns add` 时，默认只在容器自身的 `/run/netns` 创建 bind mount；节点上的 containerd/runc 无法用该容器私有路径加入目标 netns。仅把 netns 元数据写入 CRD 或使用空 network namespace 都不能建立可恢复的真实数据面。
+
+**结论**：container/gVisor RuntimeProfile 注入 hostPath `/run/fast-sandbox/netns`，在 Fastlet 内挂载为 `/run/netns` 并使用 `Bidirectional` mount propagation。NetworkSlot 同时保存 `/run/netns/<name>` 与宿主 `/run/fast-sandbox/netns/<name>`；Fastlet 用前者配置网络，containerd OCI spec 使用后者。状态目录 `/run/fast-sandbox/network` 以同路径 hostPath 挂载，使 resolver 和 descriptor 同时对 Fastlet、containerd 与后续 Janitor 可见。真实 kind e2e 已创建两个使用该路径的 containerd task，并在 Fastlet container restart 后恢复成功。
+
+### REF-0018：Sandbox 私网隔离规则必须使用两条有序规则
+
+**证据**：首次 privileged Linux integration gate 返回：
+
+```text
+iptables v1.8.13 (nf_tables): multiple --destination options not allowed
+```
+
+原表达式试图在一条 OUTPUT 规则中同时匹配 private CIDR 并排除 gateway。
+
+**结论**：每个 Sandbox netns 中按顺序写入：
+
+```text
+ACCEPT destination=<gateway>/32
+REJECT destination=<private CIDR>
+```
+
+外部目标仍按默认 allow 出网；Fastlet Proxy 到 Sandbox 的入向连接不经过该 OUTPUT 拒绝；Sandbox 对 gateway 的响应先命中 ACCEPT；Sandbox 到同 Fastlet 的其它私有 IP 命中 REJECT。privileged Docker gate 和双 Sandbox Kubernetes e2e 均已通过。

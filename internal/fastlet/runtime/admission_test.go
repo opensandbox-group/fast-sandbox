@@ -30,6 +30,11 @@ type admissionRuntime struct {
 	pullBlock     chan struct{}
 	pulledImages  []string
 	images        []string
+	resourceReady *bool
+}
+
+func (r *admissionRuntime) RuntimeResourceAvailable() bool {
+	return r.resourceReady == nil || *r.resourceReady
 }
 
 func newAdmissionRuntime() *admissionRuntime {
@@ -298,6 +303,19 @@ func TestReservationTTLAndCancelReleaseCapacity(t *testing.T) {
 	_, err = manager.CancelReservation(&api.CancelReservationRequest{RequestID: "request-b", ReservationToken: second.ReservationToken})
 	require.NoError(t, err)
 	_, err = manager.ReserveSandbox(reserveRequest("request-c", "spec-c"))
+	require.NoError(t, err)
+}
+
+func TestReservationRejectsUnavailableNetworkResource(t *testing.T) {
+	available := false
+	runtime := newAdmissionRuntime()
+	runtime.resourceReady = &available
+	manager := newAdmissionManager(t, runtime, 1)
+	_, err := manager.ReserveSandbox(reserveRequest("request-a", "spec-a"))
+	requireFastletCode(t, err, api.ErrorNetworkUnavailable)
+
+	available = true
+	_, err = manager.ReserveSandbox(reserveRequest("request-a", "spec-a"))
 	require.NoError(t, err)
 }
 

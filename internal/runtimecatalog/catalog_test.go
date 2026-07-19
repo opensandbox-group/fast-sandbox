@@ -7,6 +7,7 @@ import (
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 )
 
 func TestBuiltinCatalogProfiles(t *testing.T) {
@@ -45,6 +46,20 @@ func TestBuiltinCatalogProfiles(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, hasHostPath(gvisor.Deployment.HostPaths, "/usr/local/bin/runsc"))
 	require.True(t, hasHostPath(gvisor.Deployment.HostPaths, "/usr/local/bin/containerd-shim-runsc-v1"))
+
+	container, err := catalog.Resolve(apiv1alpha1.RuntimeContainer)
+	require.NoError(t, err)
+	require.Equal(t, corev1.MountPropagationBidirectional, hostPath(container.Deployment.HostPaths, "/run/fast-sandbox/netns").MountPropagation)
+	require.Equal(t, "/run/netns", hostPath(container.Deployment.HostPaths, "/run/fast-sandbox/netns").MountPath)
+}
+
+func hostPath(requirements []HostPathRequirement, path string) HostPathRequirement {
+	for _, requirement := range requirements {
+		if requirement.HostPath == path {
+			return requirement
+		}
+	}
+	return HostPathRequirement{}
 }
 
 func hasHostPath(requirements []HostPathRequirement, path string) bool {

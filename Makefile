@@ -15,6 +15,7 @@ UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./test/e2e/env/...
 # Go settings
 GO ?= go
 GOFLAGS ?= -gcflags="all=-N -l"
+DOCKER_BUILD_FLAGS ?=
 
 # Pinned code-generation tools. They are installed under the repository-local
 # .tools directory so generation does not depend on developer machine state.
@@ -29,7 +30,7 @@ PROTOC_GEN_GO_GRPC_VERSION := v1.6.0
 CONTROLLER_GEN_VERSION := v0.20.1
 CONTROLLER_GEN := $(TOOLS_BIN)/controller-gen
 
-.PHONY: all build build-controller build-fastlet build-janitor build-fastlet-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-deepcopy manifests verify-generated test test-unit test-race test-e2e test-e2e-controlplane test-e2e-network test-e2e-runtime verify setup-e2e tidy e2e docker-fastlet docker-controller docker-janitor kind-load-fastlet kind-load-controller kind-load-janitor help
+.PHONY: all build build-controller build-fastlet build-janitor build-fastlet-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-deepcopy manifests verify-generated test test-unit test-race test-network-integration test-e2e test-e2e-controlplane test-e2e-network test-e2e-runtime verify setup-e2e tidy e2e docker-fastlet docker-controller docker-janitor kind-load-fastlet kind-load-controller kind-load-janitor help
 
 all: build
 
@@ -42,6 +43,7 @@ help:
 	@echo "  make test                   - run unit tests (alias of test-unit)"
 	@echo "  make test-unit              - run tests that require no live runtime"
 	@echo "  make test-race              - run unit tests with the race detector"
+	@echo "  make test-network-integration - run privileged Linux netns/veth/NAT validation in Docker"
 	@echo "  make generate               - regenerate protobuf and deepcopy code"
 	@echo "  make manifests              - regenerate CRD manifests"
 	@echo "  make verify-generated       - fail if generated files are stale"
@@ -113,6 +115,16 @@ test-unit:
 test-race:
 	$(GO) test -race $(UNIT_PACKAGES)
 
+test-network-integration: docker-fastlet
+	CGO_ENABLED=0 $(GO) test -c -o bin/network.test ./internal/fastlet/network
+	docker build $(DOCKER_BUILD_FLAGS) \
+		--build-arg FASTLET_IMAGE=$(FASTLET_IMAGE) \
+		-t fast-sandbox/network-test:dev -f build/Dockerfile.network-test .
+	docker run --rm --privileged \
+		-e FAST_SANDBOX_RUN_PRIVILEGED_NETWORK_TEST=1 \
+		fast-sandbox/network-test:dev \
+		-test.run '^TestLinuxNetNSDriverPrivileged$$' -test.v
+
 tools: $(PROTOC) $(TOOLS_BIN)/protoc-gen-go $(TOOLS_BIN)/protoc-gen-go-grpc $(CONTROLLER_GEN)
 
 $(PROTOC):
@@ -161,7 +173,7 @@ tidy:
 e2e: test-e2e
 
 docker-fastlet: build-fastlet-linux
-	docker build -t $(FASTLET_IMAGE) -f build/Dockerfile.fastlet .
+	docker build $(DOCKER_BUILD_FLAGS) -t $(FASTLET_IMAGE) -f build/Dockerfile.fastlet .
 
 docker-controller: build-controller-linux
 	docker build -t $(CONTROLLER_IMAGE) -f build/Dockerfile.controller .

@@ -1,7 +1,7 @@
 # Fast Sandbox 架构重构开发计划
 
 **日期**：2026-07-19  
-**状态**：执行中（阶段 0～6 完成，阶段 7 进行中）
+**状态**：执行中（阶段 0～7 完成，阶段 8 进行中）
 **代码基线**：`master@f92d8e34288365be227d2ee8a6f952687dc7be00`  
 **本地仓库**：`/Users/fengjianhui/WorkSpaceL/fast-sandbox`  
 **远端开发机**：SSH alias `fast`  
@@ -953,6 +953,22 @@ e2e：
 bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_exec.sh \
   'make test-e2e-network'
 ```
+
+### 12.5 实施结果（2026-07-19）
+
+- 新增 runtime-neutral `NetworkDriver/NetworkManager/NetworkSlotPool/IPAM/NetworkStateStore/AccessDescriptor` 边界；Linux reference driver 管理 bridge、独立 netns、veth、唯一私有 IP、DNS、MTU、默认路由、SNAT 和 Sandbox 间默认隔离；
+- slot 状态固定为 `Clean -> Bound -> Destroying -> 删除`。已使用 slot 不回到 clean pool；runtime 删除完成后才销毁，失败保持占用并允许幂等重试，随后异步创建全新 slot；
+- slot owner 使用 Sandbox UID、instanceGeneration 和 assignmentAttempt fencing；状态以 `0600` JSON 原子写入 `/run/fast-sandbox/network/<podUID>`，并持久化 host/container netns path、veth、IP、DNS 和 AccessDescriptor；
+- container/gVisor RuntimeProfile 自动挂载 `/run/fast-sandbox/netns -> /run/netns`（Bidirectional）和 network state hostPath。host containerd 使用宿主可见 netns path，Sandbox `/etc/resolv.conf` 绑定到 slot resolver 文件；
+- ContainerdDriver 在 Create 前 acquire，在失败时销毁；runtime labels 持久化 slot/netns/IP/gateway/DNS identity。Fastlet restart 会用 runtime inventory 与本地 descriptor 双向校验，缺失或不匹配时 fail closed，不开放 readiness；
+- admission 容量与 clean slot 联动：Pool capacity 满时返回 `CapacityRejected`；容量未满但 clean slot 暂缺时返回 retryable `NetworkUnavailable`；
+- Fastlet `/metrics` 暴露 `fastlet_network_slot_acquire_total{result=hit|miss}` 和 `fastlet_network_slots{phase=clean|bound|destroying}`；
+- Fastlet 开发镜像包含 `iproute2/iptables`；`make test-network-integration` 在一次性 privileged 容器内真实验证 netns/veth/bridge/default route/NAT/隔离规则和幂等清理；
+- 远端 unit gate：`make test-unit`，退出状态 `0`；目标 race gate：`go test -race ./internal/fastlet/network ./internal/fastlet/runtime ./internal/fastlet/server ./internal/runtimecatalog ./internal/controller`，退出状态 `0`；
+- 远端 privileged Linux gate：`make DOCKER_BUILD_FLAGS=--network=host test-network-integration`，退出状态 `0`；
+- 远端 Kubernetes focused e2e：同一 Fastlet 上两个 Alpine Sandbox 同时监听 `8080`，DNS/NAT 成功、私有 IP 不同、双向不可直连；删除一个不影响另一个；Fastlet container restart 后 Pod UID、slot ID、IP 和 netns 不变且 HTTP 继续可达，退出状态 `0`；
+- 远端完整网络 gate：`E2E_TEST_TIMEOUT=35m DOCKER_BUILD_FLAGS=--network=host make test-e2e-network`，包含全部 basicvalidation 与私网强用例，退出状态 `0`；
+- Pod 删除后的跨 Pod orphan 网络清理由阶段 10 `LinuxNetworkJanitor` 负责；本阶段状态文件已包含 Janitor 二次确认所需 owner Pod UID、Sandbox UID 和 generation/attempt，不让正常 Create/Delete 依赖 Janitor。
 
 ## 13. 阶段 8：Fastlet Proxy、Sandbox Proxy 和访问解析
 

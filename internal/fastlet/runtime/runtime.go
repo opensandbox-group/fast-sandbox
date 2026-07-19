@@ -7,6 +7,7 @@ import (
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
+	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/runtimecatalog"
 )
 
@@ -46,6 +47,29 @@ type RuntimeLogReader interface {
 type RuntimeArtifactCache interface {
 	ListImages(ctx context.Context) ([]string, error)
 	PullImage(ctx context.Context, image string) error
+}
+
+// RuntimeResourceRecoverer reconciles runtime-owned or Fastlet-owned durable
+// resources before admission readiness is enabled.
+type RuntimeResourceRecoverer interface {
+	RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata) error
+}
+
+// RuntimeResourceAdmission reports whether a new runtime resource can be
+// acquired now. Fixed Pool capacity remains enforced by SandboxManager.
+type RuntimeResourceAdmission interface {
+	RuntimeResourceAvailable() bool
+}
+
+// NetworkConfigurable is implemented by drivers using Fastlet-owned Linux
+// network slots. Runtime-owned networking (for example BoxLite) does not
+// implement this interface.
+type NetworkConfigurable interface {
+	SetNetworkManager(manager *fastletnetwork.Manager)
+}
+
+type AccessDescriptorProvider interface {
+	GetAccessDescriptor(sandboxID string) (fastletnetwork.AccessDescriptor, error)
 }
 
 type RuntimeType = apiv1alpha1.RuntimeName

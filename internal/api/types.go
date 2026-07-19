@@ -35,6 +35,13 @@ type SandboxSpec struct {
 	Args                []string          `json:"args,omitempty"`
 	Env                 map[string]string `json:"env,omitempty"`
 	WorkingDir          string            `json:"workingDir,omitempty"`
+	// Network fields are Fastlet-local runtime material. They are populated
+	// only after admission and are never accepted from the public/RPC API.
+	NetworkSlotID        string `json:"-"`
+	NetworkNamespacePath string `json:"-"`
+	NetworkIP            string `json:"-"`
+	NetworkGateway       string `json:"-"`
+	NetworkDNSPath       string `json:"-"`
 }
 
 // SandboxStatus represents the observed state of a sandbox on a fastlet.

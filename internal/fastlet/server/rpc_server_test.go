@@ -152,6 +152,15 @@ func TestReadinessIsFalseUntilRecoveryCompletes(t *testing.T) {
 	require.Equal(t, http.StatusOK, recorder.Code)
 }
 
+func TestMetricsEndpoint(t *testing.T) {
+	manager := newServerManager(t, newServerRuntime(), false)
+	handler := NewFastletServer(":0", manager).Handler()
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "go_goroutines")
+}
+
 func TestSetDrainingRejectsNewReservations(t *testing.T) {
 	manager := newServerManager(t, newServerRuntime(), false)
 	handler := NewFastletServer(":0", manager).Handler()
