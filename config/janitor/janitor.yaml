@@ -14,7 +14,7 @@ spec:
       labels:
         app: fast-sandbox-janitor
     spec:
-      serviceAccountName: fast-sandbox-manager-role
+      serviceAccountName: fast-sandbox-janitor
       tolerations:
       - operator: Exists
       containers:

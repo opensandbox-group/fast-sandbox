@@ -167,6 +167,7 @@ func createCleanupPool(namespace, name string) *apiv1alpha1.SandboxPool {
 			},
 			MaxSandboxesPerPod: 2,
 			Runtime:            apiv1alpha1.RuntimeContainer,
+			SandboxResources:   suiteenv.SmallSandboxResourceProfile(),
 			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{

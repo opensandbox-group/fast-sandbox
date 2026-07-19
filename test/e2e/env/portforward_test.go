@@ -2,11 +2,11 @@ package env
 
 import "testing"
 
-func TestControllerPortForwardArgsUseControllerDeployment(t *testing.T) {
+func TestControllerPortForwardArgsUseFastPathService(t *testing.T) {
 	args := controllerPortForwardArgs("fast-sandbox-system", 19090)
 	want := []string{
 		"port-forward",
-		"deployment/fast-sandbox-controller",
+		"service/fast-sandbox-fastpath",
 		"19090:9090",
 		"-n",
 		"fast-sandbox-system",

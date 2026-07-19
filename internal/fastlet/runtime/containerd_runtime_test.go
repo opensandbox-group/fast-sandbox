@@ -436,7 +436,7 @@ func TestContainerdRuntime_prepareLabels(t *testing.T) {
 	}
 
 	config := &api.SandboxSpec{
-		SandboxID: "sb-123", ClaimUID: "claim-456", ClaimName: "test-claim", Image: "alpine:latest",
+		SandboxID: "sb-123", ClaimUID: "claim-456", ClaimNamespace: "tenant-a", ClaimName: "test-claim", Image: "alpine:latest",
 		RequestID: "request-1", InstanceGeneration: 2, AssignmentAttempt: 3,
 		CPU: "500m", Memory: "256Mi", PIDs: 128,
 		RuntimeProfileHash: "runtime-hash", ResourceProfileHash: "resource-hash",
@@ -451,6 +451,7 @@ func TestContainerdRuntime_prepareLabels(t *testing.T) {
 		"fast-sandbox.io/namespace":             "default-ns",
 		"fast-sandbox.io/id":                    "sb-123",
 		"fast-sandbox.io/claim-uid":             "claim-456",
+		"fast-sandbox.io/claim-namespace":       "tenant-a",
 		"fast-sandbox.io/sandbox-name":          "test-claim",
 		"fast-sandbox.io/runtime-profile-hash":  "runtime-hash",
 		"fast-sandbox.io/resource-profile-hash": "resource-hash",

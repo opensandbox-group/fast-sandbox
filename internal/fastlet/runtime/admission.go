@@ -22,6 +22,8 @@ func (realClock) Now() time.Time { return time.Now() }
 type reservation struct {
 	requestID           string
 	createSpecHash      string
+	claimNamespace      string
+	claimName           string
 	runtimeProfileHash  string
 	resourceProfileHash string
 	token               string
@@ -33,8 +35,8 @@ func generateReservationToken() (string, error) {
 }
 
 func (m *SandboxManager) ReserveSandbox(req *api.ReserveSandboxRequest) (*api.ReserveSandboxResponse, error) {
-	if req == nil || req.RequestID == "" || req.CreateSpecHash == "" {
-		return reserveFailure(api.ErrorConflict, "requestId and createSpecHash are required", false)
+	if req == nil || req.RequestID == "" || req.CreateSpecHash == "" || req.ClaimNamespace == "" || req.ClaimName == "" {
+		return reserveFailure(api.ErrorConflict, "requestId, createSpecHash, claimNamespace, and claimName are required", false)
 	}
 	if m.fastletPodUID != "" && req.FastletPodUID != m.fastletPodUID {
 		return reserveFailure(api.ErrorStaleAssignment, "request targets a different Fastlet Pod UID", false)
@@ -52,7 +54,8 @@ func (m *SandboxManager) ReserveSandbox(req *api.ReserveSandboxRequest) (*api.Re
 	if m.draining {
 		return reserveFailureWithAdmission(api.ErrorDraining, m.drainReason, true, m.admissionStatusLocked())
 	}
-	if token, ok := m.requestReservations[req.RequestID]; ok {
+	reservationKey := reservationLookupKey(req.ClaimNamespace, req.RequestID)
+	if token, ok := m.requestReservations[reservationKey]; ok {
 		existing := m.reservations[token]
 		if existing != nil && reservationMatches(existing, req) {
 			return &api.ReserveSandboxResponse{ReservationToken: token, FastletPodUID: m.fastletPodUID, ExpiresAt: existing.expiresAt, Admission: m.admissionStatusLocked()}, nil
@@ -69,10 +72,11 @@ func (m *SandboxManager) ReserveSandbox(req *api.ReserveSandboxRequest) (*api.Re
 	expiresAt := m.clock.Now().Add(m.reservationTTL)
 	m.reservations[token] = &reservation{
 		requestID: req.RequestID, createSpecHash: req.CreateSpecHash,
+		claimNamespace: req.ClaimNamespace, claimName: req.ClaimName,
 		runtimeProfileHash: req.RuntimeProfileHash, resourceProfileHash: req.ResourceProfileHash,
 		token: token, expiresAt: expiresAt,
 	}
-	m.requestReservations[req.RequestID] = token
+	m.requestReservations[reservationKey] = token
 	return &api.ReserveSandboxResponse{ReservationToken: token, FastletPodUID: m.fastletPodUID, ExpiresAt: expiresAt, Admission: m.admissionStatusLocked()}, nil
 }
 
@@ -132,11 +136,25 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 		reserved := m.reservations[req.ReservationToken]
 		if reserved == nil || reserved.requestID != req.Identity.RequestID ||
 			reserved.createSpecHash != req.CreateSpecHash ||
+			reserved.claimNamespace != spec.ClaimNamespace || reserved.claimName != spec.ClaimName ||
 			reserved.runtimeProfileHash != spec.RuntimeProfileHash || reserved.resourceProfileHash != spec.ResourceProfileHash {
 			response, err := ensureFailure(fastletError(api.ErrorConflict, "reservation is missing, expired, or does not match Ensure identity/profile", false), m.admissionStatusLocked())
 			m.mu.Unlock()
 			return response, err
 		}
+		m.removeReservationLocked(reserved)
+	} else if token := m.requestReservations[reservationLookupKey(spec.ClaimNamespace, req.Identity.RequestID)]; token != "" {
+		reserved := m.reservations[token]
+		if reserved == nil || reserved.requestID != req.Identity.RequestID ||
+			reserved.createSpecHash != req.CreateSpecHash || reserved.claimNamespace != spec.ClaimNamespace || reserved.claimName != spec.ClaimName ||
+			reserved.runtimeProfileHash != spec.RuntimeProfileHash || reserved.resourceProfileHash != spec.ResourceProfileHash {
+			response, err := ensureFailure(fastletError(api.ErrorConflict, "matching committed claim could not take over reservation", false), m.admissionStatusLocked())
+			m.mu.Unlock()
+			return response, err
+		}
+		// A Controller may win the reconcile race or take over after the
+		// FastPath commits its CRD. The durable claim is allowed to convert the
+		// matching reservation without possessing the ephemeral token.
 		m.removeReservationLocked(reserved)
 	} else if m.usedLocked() >= m.capacity {
 		response, err := ensureFailure(fastletError(api.ErrorCapacityRejected, "Fastlet admission capacity is exhausted", true), m.admissionStatusLocked())
@@ -301,7 +319,8 @@ func (m *SandboxManager) ensureExistingLocked(existing *SandboxMetadata, request
 	if failure := validateIdentityFence(m.fastletPodUID, existing, identity); failure != nil {
 		return ensureFailure(failure, m.admissionStatusLocked())
 	}
-	if existing.ClaimUID != requested.ClaimUID || existing.RuntimeProfileHash != requested.RuntimeProfileHash ||
+	if existing.ClaimUID != requested.ClaimUID || existing.ClaimNamespace != requested.ClaimNamespace || existing.ClaimName != requested.ClaimName ||
+		existing.RuntimeProfileHash != requested.RuntimeProfileHash ||
 		existing.ResourceProfileHash != requested.ResourceProfileHash {
 		return ensureFailure(fastletError(api.ErrorConflict, "Sandbox UID is already bound to a different claim/profile", false), m.admissionStatusLocked())
 	}
@@ -391,8 +410,9 @@ func (m *SandboxManager) cleanupExpiredReservationsLocked() {
 
 func (m *SandboxManager) removeReservationLocked(item *reservation) {
 	delete(m.reservations, item.token)
-	if m.requestReservations[item.requestID] == item.token {
-		delete(m.requestReservations, item.requestID)
+	key := reservationLookupKey(item.claimNamespace, item.requestID)
+	if m.requestReservations[key] == item.token {
+		delete(m.requestReservations, key)
 	}
 }
 
@@ -426,7 +446,12 @@ func sandboxStatus(metadata *SandboxMetadata) api.SandboxStatus {
 
 func reservationMatches(existing *reservation, req *api.ReserveSandboxRequest) bool {
 	return existing.requestID == req.RequestID && existing.createSpecHash == req.CreateSpecHash &&
+		existing.claimNamespace == req.ClaimNamespace && existing.claimName == req.ClaimName &&
 		existing.runtimeProfileHash == req.RuntimeProfileHash && existing.resourceProfileHash == req.ResourceProfileHash
+}
+
+func reservationLookupKey(namespace, requestID string) string {
+	return namespace + "\x00" + requestID
 }
 
 func fastletError(code api.FastletErrorCode, message string, retryable bool) *api.FastletError {

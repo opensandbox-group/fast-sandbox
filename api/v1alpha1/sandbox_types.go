@@ -134,6 +134,9 @@ type SandboxSpec struct {
 type SandboxStatus struct {
 	// Assignment is the authoritative placement for the active instance.
 	Assignment *SandboxAssignment `json:"assignment,omitempty"`
+	// AssignmentAttempt is the monotonic high-water mark retained even while
+	// Assignment is cleared, so a reschedule can never reuse an old fence.
+	AssignmentAttempt int64 `json:"assignmentAttempt,omitempty"`
 
 	// InstanceGeneration fences reset/recreate operations for the same CRD UID.
 	InstanceGeneration int64 `json:"instanceGeneration,omitempty"`

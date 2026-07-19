@@ -47,7 +47,8 @@ func TestGracefulShutdown(t *testing.T) {
 						PoolMax: 2,
 					},
 					MaxSandboxesPerPod: 5,
-			Runtime:            apiv1alpha1.RuntimeContainer,
+					Runtime:            apiv1alpha1.RuntimeContainer,
+					SandboxResources:   suiteenv.SmallSandboxResourceProfile(),
 					FastletTemplate: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
 							Containers: []corev1.Container{{

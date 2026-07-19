@@ -2,17 +2,21 @@ package suiteenv
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	e2eenv "fast-sandbox/test/e2e/env"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -39,6 +43,7 @@ type SuiteEnv struct {
 	cfg                 *envconf.Config
 	controllerNamespace string
 	namespacePrefix     string
+	runID               string
 	cleanups            []CleanupFunc
 	namespaceCounter    uint64
 }
@@ -49,6 +54,7 @@ func New(opts ...Option) *SuiteEnv {
 		cfg:                 cfg,
 		controllerNamespace: DefaultControllerNamespace,
 		namespacePrefix:     defaultNamespacePrefix,
+		runID:               newRunID(),
 	}
 
 	for _, opt := range opts {
@@ -103,22 +109,21 @@ func (e *SuiteEnv) ControllerNamespace() string {
 
 func (e *SuiteEnv) AllocateNamespace(name string) string {
 	suffix := atomic.AddUint64(&e.namespaceCounter, 1)
-	parts := []string{
+	base := strings.Join(filterEmpty([]string{
 		sanitizeDNSLabel(e.namespacePrefix),
 		sanitizeDNSLabel(name),
-		fmt.Sprintf("%d", suffix),
-	}
-	namespace := strings.Join(filterEmpty(parts), "-")
+	}), "-")
+	uniqueSuffix := fmt.Sprintf("-%s-%d", e.runID, suffix)
+	namespace := base + uniqueSuffix
 	if len(namespace) <= maxNamespaceLength {
 		return namespace
 	}
 
-	trimmedSuffix := fmt.Sprintf("-%d", suffix)
-	maxBaseLength := maxNamespaceLength - len(trimmedSuffix)
+	maxBaseLength := maxNamespaceLength - len(uniqueSuffix)
 	if maxBaseLength < 1 {
 		return namespace[len(namespace)-maxNamespaceLength:]
 	}
-	return strings.Trim(namespace[:maxBaseLength], "-") + trimmedSuffix
+	return strings.Trim(base[:maxBaseLength], "-") + uniqueSuffix
 }
 
 func (e *SuiteEnv) RegisterCleanup(fn CleanupFunc) {
@@ -206,6 +211,14 @@ func FastletImage() string {
 	return defaultFastletImage
 }
 
+// SmallSandboxResourceProfile keeps e2e Pool capacity arithmetic realistic
+// while fitting several isolated Fastlet Pods on a single-node kind cluster.
+func SmallSandboxResourceProfile() apiv1alpha1.SandboxResourceProfile {
+	return apiv1alpha1.SandboxResourceProfile{
+		CPU: resource.MustParse("50m"), Memory: resource.MustParse("64Mi"), PIDs: 64,
+	}
+}
+
 func sanitizeDNSLabel(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if value == "" {
@@ -242,4 +255,12 @@ func filterEmpty(values []string) []string {
 		}
 	}
 	return filtered
+}
+
+func newRunID() string {
+	var value [4]byte
+	if _, err := rand.Read(value[:]); err == nil {
+		return hex.EncodeToString(value[:])
+	}
+	return fmt.Sprintf("%x", uint64(time.Now().UnixNano())&0xffffffff)
 }

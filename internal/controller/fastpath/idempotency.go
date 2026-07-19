@@ -13,6 +13,13 @@ import (
 
 const maxRequestIDLength = 128
 
+// requestIDLabelValue returns a compact DNS-label-safe lookup key. The full
+// request ID remains in the annotation and is always compared after listing.
+func requestIDLabelValue(requestID string) string {
+	digest := sha256.Sum256([]byte(requestID))
+	return hex.EncodeToString(digest[:16])
+}
+
 // ValidateRequestID validates the stable idempotency key accepted from an SDK
 // or fastctl. Generation of a missing key belongs to clients; the transitional
 // server may still synthesize one until all clients are migrated.

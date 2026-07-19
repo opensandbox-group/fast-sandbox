@@ -16,13 +16,13 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/features"
 )
 
-func TestPortMutualExclusion(t *testing.T) {
+func TestIdenticalPrivatePortsDoNotAffectScheduling(t *testing.T) {
 	suiteenv.RequireBasic(t)
 
-	feature := features.New("port-mutual-exclusion").
+	feature := features.New("identical-private-ports-do-not-affect-scheduling").
 		WithLabel("suite", "scheduling").
 		WithLabel("tier", "smoke").
-		Assess("same-port sandboxes scheduled to different pods", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+		Assess("same-port sandboxes are both admitted without host-port endpoints", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
 			k8sClient := testSuite.MustKubeClient(t)
 			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
 
@@ -49,8 +49,7 @@ func TestPortMutualExclusion(t *testing.T) {
 			}
 
 			assignedA := waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-port-a")
-			podA := assignedA.Status.AssignedFastlet
-			if podA == "" {
+			if assignedA.Status.AssignedFastlet == "" {
 				t.Fatalf("sandbox A not assigned")
 			}
 
@@ -60,20 +59,12 @@ func TestPortMutualExclusion(t *testing.T) {
 			}
 
 			assignedB := waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-port-b")
-			podB := assignedB.Status.AssignedFastlet
-			if podB == "" {
+			if assignedB.Status.AssignedFastlet == "" {
 				t.Fatalf("sandbox B not assigned")
 			}
 
-			if podA == podB {
-				t.Fatalf("port conflict: both sandboxes on same pod %s", podA)
-			}
-
-			if len(assignedA.Status.Endpoints) > 0 {
-				endpoint := assignedA.Status.Endpoints[0]
-				if endpoint == "" || endpoint[len(endpoint)-5:] != ":8080" {
-					t.Fatalf("unexpected endpoint: %s", endpoint)
-				}
+			if len(assignedA.Status.Endpoints) != 0 || len(assignedB.Status.Endpoints) != 0 {
+				t.Fatalf("deprecated host-port endpoints must stay empty: A=%v B=%v", assignedA.Status.Endpoints, assignedB.Status.Endpoints)
 			}
 
 			return ctx
@@ -215,6 +206,7 @@ func createSchedulingPool(namespace, name string, min, max, maxPerPod int32) *ap
 			},
 			MaxSandboxesPerPod: maxPerPod,
 			Runtime:            apiv1alpha1.RuntimeContainer,
+			SandboxResources:   suiteenv.SmallSandboxResourceProfile(),
 			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{

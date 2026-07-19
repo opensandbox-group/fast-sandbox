@@ -75,6 +75,20 @@ func TestFastletInfoFromPodUsesWatchIdentityAndReadiness(t *testing.T) {
 	require.Equal(t, "resource-hash", info.ResourceProfileHash)
 }
 
+func TestReadyTransitionTriggersImmediateProbeOnlyOnce(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "fastlet-a", UID: types.UID("pod-a"), Labels: map[string]string{"app": "sandbox-fastlet"}},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.1"},
+	}
+	ready := pod.DeepCopy()
+	ready.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	require.True(t, shouldProbeUpdate(pod, ready))
+	require.False(t, shouldProbeUpdate(ready, ready.DeepCopy()))
+	info, ok := probeCandidate(ready)
+	require.True(t, ok)
+	require.Equal(t, "10.0.0.1", info.PodIP)
+}
+
 func TestHeartbeatLoopUsesCacheCursorAndAppliesDelta(t *testing.T) {
 	registry := fastletpool.NewInMemoryRegistry()
 	registry.UpsertPod(fastletpool.FastletInfo{

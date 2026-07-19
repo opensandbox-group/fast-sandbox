@@ -1,7 +1,7 @@
 # Fast Sandbox 架构重构开发计划
 
 **日期**：2026-07-19  
-**状态**：执行中（阶段 0～5 完成，阶段 6 进行中）
+**状态**：执行中（阶段 0～6 完成，阶段 7 进行中）
 **代码基线**：`master@f92d8e34288365be227d2ee8a6f952687dc7be00`  
 **本地仓库**：`/Users/fengjianhui/WorkSpaceL/fast-sandbox`  
 **远端开发机**：SSH alias `fast`  
@@ -773,7 +773,7 @@ bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_
 - Pool `warmImages` 由 Controller 作为平台配置注入；Fastlet recovery/Ready 完成后并发度 2 异步 pull，不阻塞 Ready；PoolWarm、ActiveSandbox、InfraArtifact、HotImage 均进入 runtime-neutral 保护索引；
 - containerd `k8s.io` image store 是节点共享事实，阶段 5 不执行 Fastlet 私有破坏性 GC；实际删除等待 node-scoped coordinator/lease 证明，详见 REF-0011；
 - 删除 runtime 失败时 Fastlet 保留 `delete-failed` entry、capacity 与 active-image 保护，允许幂等重试，避免资源仍存活但 slot/缓存保护提前释放；
-- Pool CRD 对 `warmImages` 增加最多 128 项且去重校验，三份 sample 均符合固定 SandboxResourceProfile 约束；
+- Pool CRD 对 `warmImages` 增加最多 128 项约束，Controller 平台路径线性去重；三份 sample 均符合固定 SandboxResourceProfile 约束（Kubernetes 1.27 的 `uniqueItems` 限制见 REF-0012）；
 - 远端 unit gate：`make test-unit`，退出状态 `0`；
 - 远端 race gate：`go test -race ./internal/controller/fastletpool ./internal/controller/fastletcontrol ./internal/fastlet/cache ./internal/fastlet/runtime ./internal/fastlet/server ./internal/api -count=1`，退出状态 `0`。
 
@@ -865,6 +865,22 @@ bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_
 ```
 
 该阶段完成后形成第一个可独立交付里程碑：多活控制面重构完成，暂时仍可使用兼容网络/数据面适配层。
+
+### 11.6 实施结果（2026-07-19）
+
+- 控制面镜像实现 `fastpath/controller/all` 三角色；生产配置拆为 3 副本无选主 FastPath Deployment 与 2 副本单 Leader Controller Deployment，Service 只选择 FastPath，RBAC、PDB、HPA 分离；
+- FastPath 和 SandboxController 共用 `sandboxorchestrator.Orchestrator`，创建路径统一为 Top-K reservation -> CRD commit -> assignment CAS -> Fastlet Ensure；旧 Fast/Strong 字段不再改变持久化顺序；
+- FastPath 持久化关键路径使用 direct API-server client，避免 informer cache 不具备 read-after-write 一致性；request ID 使用短 SHA-256 label 做可扩展查询，完整 ID 与 create spec hash 仍在 annotation 中做最终校验；
+- assignment attempt 由 CAS helper 根据 API Server 中的 durable high-water mark 单调分配，调用方缓存对象不能选择或复用 attempt；Pod UID、instance generation 和 assignment attempt 全部进入 Fastlet identity fence；
+- Fastlet reservation 原子绑定 request ID、create hash、claim namespace/name、profile hashes 和 Pod UID；CRD 已提交后，Controller 可以凭完全匹配的 durable claim 无 token 接管 reservation，消除 Controller/FastPath 并发 Ensure 导致的 slot 浪费；
+- RPC 无候选/容量拒绝发生在 CRD 前；同 request ID 同 spec 返回同 UID，不同 spec 返回 AlreadyExists/Conflict；CRD commit 后的错误保留同一 Sandbox 供 Controller 或客户端重试；
+- Delete、Reset、expireTime/failurePolicy 只提交声明式期望；Finalizer、generation fencing 和 Controller Reconcile 执行底层生命周期；Pod-bound 丢失模型按 failurePolicy 标记 Lost 或重建；
+- Fastlet Watch 在新 Pod Ready/UID/IP 变化时立即执行一次受并发上限保护的 Heartbeat，不再让新 Pool 等待完整低频周期；
+- e2e Pool fixture 显式使用固定小型 ResourceProfile，保持真实 `单 Sandbox 资源 × maxSandboxesPerPod + overhead` 乘算；namespace 增加每次 test process 的随机 run ID，消除跨运行 Terminating 冲突；
+- 新增专用多活 e2e：验证 3 FastPath/2 Controller/单 Leader、Service endpoint 隔离、PDB/HPA、Leader 删除期间 RPC 可用、直接 CRD 创建、request ID 幂等/冲突，以及 40 并发请求严格受 3-slot Fastlet admission 限制；
+- 远端 unit gate：`make test-unit`，退出状态 `0`；
+- 远端 race gate：`go test -race ./internal/controller/common ./internal/controller/controlplane ./internal/controller/fastletcontrol ./internal/controller/fastletpool ./internal/controller/fastpath ./internal/controller/sandboxorchestrator ./internal/controller ./internal/fastlet/runtime ./internal/fastlet/server ./internal/api -count=1`，退出状态 `0`；
+- 远端 Kubernetes gate：`E2E_TEST_TIMEOUT=35m make test-e2e-controlplane`，多活、basicvalidation、lifecycle、scheduling、cleanupjanitor 全部通过，退出状态 `0`。
 
 ## 12. 阶段 7：Sandbox 私有网络和 AccessHandle
 

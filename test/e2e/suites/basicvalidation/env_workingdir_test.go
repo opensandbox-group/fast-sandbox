@@ -18,6 +18,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
@@ -138,9 +139,9 @@ func TestFastPathEnvAndWorkingDir(t *testing.T) {
 			t.Log("Waiting for fastlet capacity to sync...")
 			time.Sleep(5 * time.Second)
 
-			controllerNamespace := discoverControllerNamespace(ctx, t, k8sClient)
+			controllerNamespace := discoverFastPathNamespace(ctx, t, k8sClient)
 			controllerPort := reserveLocalPort(t)
-			pfCmd := exec.CommandContext(ctx, "kubectl", "port-forward", "deployment/fast-sandbox-controller", fmt.Sprintf("%d:9090", controllerPort), "-n", controllerNamespace)
+			pfCmd := exec.CommandContext(ctx, "kubectl", "port-forward", "service/fast-sandbox-fastpath", fmt.Sprintf("%d:9090", controllerPort), "-n", controllerNamespace)
 			var pfStdout, pfStderr bytes.Buffer
 			pfCmd.Stdout = &pfStdout
 			pfCmd.Stderr = &pfStderr
@@ -243,6 +244,9 @@ func createValidationPool(namespace, name string) *apiv1alpha1.SandboxPool {
 			},
 			MaxSandboxesPerPod: 20, // Increased capacity
 			Runtime:            apiv1alpha1.RuntimeContainer,
+			SandboxResources: apiv1alpha1.SandboxResourceProfile{
+				CPU: resource.MustParse("100m"), Memory: resource.MustParse("64Mi"), PIDs: 64,
+			},
 			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
@@ -329,7 +333,7 @@ func readSandboxLog(ctx context.Context, namespace, fastletPod, sandboxID string
 	return string(output), err
 }
 
-func discoverControllerNamespace(ctx context.Context, t *testing.T, kubeClient ctrlclient.Client) string {
+func discoverFastPathNamespace(ctx context.Context, t *testing.T, kubeClient ctrlclient.Client) string {
 	t.Helper()
 
 	deployments := &appsv1.DeploymentList{}
@@ -337,11 +341,11 @@ func discoverControllerNamespace(ctx context.Context, t *testing.T, kubeClient c
 		t.Fatalf("list deployments: %v", err)
 	}
 	for _, deployment := range deployments.Items {
-		if deployment.Name == "fast-sandbox-controller" {
+		if deployment.Name == "fast-sandbox-fastpath" {
 			return deployment.Namespace
 		}
 	}
-	t.Fatalf("could not find deployment fast-sandbox-controller")
+	t.Fatalf("could not find deployment fast-sandbox-fastpath")
 	return ""
 }
 

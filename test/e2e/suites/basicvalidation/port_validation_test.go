@@ -50,7 +50,8 @@ func TestPortValidation(t *testing.T) {
 						PoolMax: 3, // Increased for multiple valid port tests
 					},
 					MaxSandboxesPerPod: 10,
-			Runtime:            apiv1alpha1.RuntimeContainer,
+					Runtime:            apiv1alpha1.RuntimeContainer,
+					SandboxResources:   suiteenv.SmallSandboxResourceProfile(),
 					FastletTemplate: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
 							Containers: []corev1.Container{{

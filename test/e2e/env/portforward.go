@@ -37,7 +37,7 @@ func StartControllerPortForward(ctx context.Context, namespace string) (string, 
 func controllerPortForwardArgs(namespace string, localPort int) []string {
 	return []string{
 		"port-forward",
-		"deployment/fast-sandbox-controller",
+		"service/fast-sandbox-fastpath",
 		fmt.Sprintf("%d:9090", localPort),
 		"-n",
 		namespace,

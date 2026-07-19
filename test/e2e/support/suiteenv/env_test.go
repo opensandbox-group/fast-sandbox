@@ -44,6 +44,14 @@ func TestAllocateNamespaceUsesPrefixAndSanitizesName(t *testing.T) {
 	}
 }
 
+func TestAllocateNamespaceIsUniqueAcrossSuiteRuns(t *testing.T) {
+	first := New(WithNamespacePrefix("fsb-e2e")).AllocateNamespace("port")
+	second := New(WithNamespacePrefix("fsb-e2e")).AllocateNamespace("port")
+	if first == second {
+		t.Fatalf("separate suite runs reused namespace %q", first)
+	}
+}
+
 func TestRunCleanupsRunsInReverseRegistrationOrder(t *testing.T) {
 	env := New()
 	var order []string
@@ -94,6 +102,13 @@ func TestFastletImagePrefersFastSandboxSpecificEnv(t *testing.T) {
 
 	if got := FastletImage(); got != "preferred:dev" {
 		t.Fatalf("expected FAST_SANDBOX_FASTLET_IMAGE to win, got %q", got)
+	}
+}
+
+func TestSmallSandboxResourceProfileIsComplete(t *testing.T) {
+	profile := SmallSandboxResourceProfile()
+	if profile.CPU.Sign() <= 0 || profile.Memory.Sign() <= 0 || profile.PIDs <= 0 {
+		t.Fatalf("small Sandbox resource profile must be fully positive: %+v", profile)
 	}
 }
 

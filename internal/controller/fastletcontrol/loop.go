@@ -30,6 +30,7 @@ type Loop struct {
 	Interval       time.Duration
 	RequestTimeout time.Duration
 	MaxConcurrent  int
+	probeSemaphore chan struct{}
 }
 
 func NewLoop(cache ctrlcache.Cache, registry *fastletpool.InMemoryRegistry, fastletClient HeartbeatClient) *Loop {
@@ -50,9 +51,26 @@ func (l *Loop) Start(ctx context.Context) {
 		logger.Error(err, "Get Fastlet Pod informer")
 		return
 	}
+	maxConcurrent := l.MaxConcurrent
+	if maxConcurrent <= 0 {
+		maxConcurrent = 8
+	}
+	l.probeSemaphore = make(chan struct{}, maxConcurrent)
 	if _, err := informer.AddEventHandler(clientgocache.ResourceEventHandlerFuncs{
-		AddFunc:    l.onPodAdd,
-		UpdateFunc: l.onPodUpdate,
+		AddFunc: func(object any) {
+			l.onPodAdd(object)
+			if info, ok := probeCandidate(object); ok {
+				l.probeAsync(ctx, info)
+			}
+		},
+		UpdateFunc: func(previous, current any) {
+			l.onPodUpdate(previous, current)
+			if shouldProbeUpdate(previous, current) {
+				if info, ok := probeCandidate(current); ok {
+					l.probeAsync(ctx, info)
+				}
+			}
+		},
 		DeleteFunc: l.onPodDelete,
 	}); err != nil {
 		logger.Error(err, "Register Fastlet Pod informer handler")
@@ -64,7 +82,6 @@ func (l *Loop) Start(ctx context.Context) {
 	}
 
 	l.Registry.SetStaleAfter(3 * l.Interval)
-	l.syncOnce(ctx)
 	for {
 		timer := time.NewTimer(l.nextInterval())
 		select {
@@ -75,6 +92,32 @@ func (l *Loop) Start(ctx context.Context) {
 			l.syncOnce(ctx)
 		}
 	}
+}
+
+func probeCandidate(object any) (fastletpool.FastletInfo, bool) {
+	pod, ok := object.(*corev1.Pod)
+	if !ok || pod.Labels["app"] != "sandbox-fastlet" {
+		return fastletpool.FastletInfo{}, false
+	}
+	info := fastletInfoFromPod(pod)
+	return info, info.PodReady
+}
+
+func shouldProbeUpdate(previous, current any) bool {
+	oldPod, oldOK := previous.(*corev1.Pod)
+	newPod, newOK := current.(*corev1.Pod)
+	if !newOK || newPod.Labels["app"] != "sandbox-fastlet" {
+		return false
+	}
+	newInfo := fastletInfoFromPod(newPod)
+	if !newInfo.PodReady {
+		return false
+	}
+	if !oldOK || oldPod.Labels["app"] != "sandbox-fastlet" {
+		return true
+	}
+	oldInfo := fastletInfoFromPod(oldPod)
+	return !oldInfo.PodReady || oldInfo.PodUID != newInfo.PodUID || oldInfo.PodIP != newInfo.PodIP
 }
 
 func (l *Loop) onPodUpdate(previous, current any) {
@@ -139,7 +182,6 @@ func podConditionTrue(conditions []corev1.PodCondition, conditionType corev1.Pod
 }
 
 func (l *Loop) syncOnce(ctx context.Context) {
-	logger := klog.Background().WithName("fastlet-heartbeat-loop")
 	maxConcurrent := l.MaxConcurrent
 	if maxConcurrent <= 0 {
 		maxConcurrent = 8
@@ -148,7 +190,10 @@ func (l *Loop) syncOnce(ctx context.Context) {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	semaphore := make(chan struct{}, maxConcurrent)
+	semaphore := l.probeSemaphore
+	if semaphore == nil {
+		semaphore = make(chan struct{}, maxConcurrent)
+	}
 	var group sync.WaitGroup
 	for _, info := range l.Registry.GetAllFastlets() {
 		if info.PodIP == "" {
@@ -163,19 +208,40 @@ func (l *Loop) syncOnce(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			}
-			requestContext, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			heartbeat, err := l.FastletClient.Heartbeat(requestContext, info.PodIP, &api.HeartbeatRequest{
-				Cache: api.CacheCursor{Epoch: info.CacheEpoch, Revision: info.CacheRevision},
-			})
-			if err != nil {
-				logger.Error(err, "Fastlet Heartbeat failed", "pod", info.PodName, "podUID", info.PodUID)
-				return
-			}
-			if err := l.Registry.ApplyHeartbeat(info.ID, info.PodUID, heartbeat, time.Now()); err != nil {
-				logger.Error(err, "Reject Fastlet Heartbeat", "pod", info.PodName, "podUID", info.PodUID)
-			}
+			l.probeOne(ctx, info, timeout)
 		}(info)
 	}
 	group.Wait()
+}
+
+func (l *Loop) probeAsync(ctx context.Context, info fastletpool.FastletInfo) {
+	go func() {
+		select {
+		case l.probeSemaphore <- struct{}{}:
+			defer func() { <-l.probeSemaphore }()
+		case <-ctx.Done():
+			return
+		}
+		timeout := l.RequestTimeout
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
+		l.probeOne(ctx, info, timeout)
+	}()
+}
+
+func (l *Loop) probeOne(ctx context.Context, info fastletpool.FastletInfo, timeout time.Duration) {
+	logger := klog.Background().WithName("fastlet-heartbeat-loop")
+	requestContext, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	heartbeat, err := l.FastletClient.Heartbeat(requestContext, info.PodIP, &api.HeartbeatRequest{
+		Cache: api.CacheCursor{Epoch: info.CacheEpoch, Revision: info.CacheRevision},
+	})
+	if err != nil {
+		logger.Error(err, "Fastlet Heartbeat failed", "pod", info.PodName, "podUID", info.PodUID)
+		return
+	}
+	if err := l.Registry.ApplyHeartbeat(info.ID, info.PodUID, heartbeat, time.Now()); err != nil {
+		logger.Error(err, "Reject Fastlet Heartbeat", "pod", info.PodName, "podUID", info.PodUID)
+	}
 }

@@ -2,8 +2,9 @@ package fastpath
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	fastpathv1 "fast-sandbox/api/proto/v1"
@@ -11,504 +12,362 @@ import (
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/controller/common"
 	"fast-sandbox/internal/controller/fastletpool"
+	"fast-sandbox/internal/controller/sandboxorchestrator"
 	"fast-sandbox/internal/runtimecatalog"
 	"fast-sandbox/pkg/util/idgen"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-)
 
-const (
-	maxRetries = 3
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
-
-// envMapToEnvVar converts map[string]string to K8s EnvVar slice
-func envMapToEnvVar(envs map[string]string) []corev1.EnvVar {
-	result := make([]corev1.EnvVar, 0, len(envs))
-	for k, v := range envs {
-		result = append(result, corev1.EnvVar{Name: k, Value: v})
-	}
-	return result
-}
 
 type Server struct {
 	fastpathv1.UnimplementedFastPathServiceServer
-	K8sClient              client.Client
+	K8sClient    client.Client
+	Orchestrator *sandboxorchestrator.Orchestrator
+
+	// Deprecated construction fields retained for source compatibility while
+	// deployments migrate to Orchestrator. Fast/Strong no longer select a path.
 	Registry               fastletpool.FastletRegistry
 	FastletClient          *api.FastletClient
 	DefaultConsistencyMode api.ConsistencyMode
 	Catalog                *runtimecatalog.Catalog
 }
 
-// 强制编译时检查接口实现情况
 var _ fastpathv1.FastPathServiceServer = &Server{}
 
-func (s *Server) CreateSandbox(ctx context.Context, req *fastpathv1.CreateRequest) (*fastpathv1.CreateResponse, error) {
-	start := time.Now()
-	if req.Namespace == "" {
-		req.Namespace = "default"
+func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRequest) (_ *fastpathv1.CreateResponse, resultErr error) {
+	started := time.Now()
+	defer func() {
+		success := "true"
+		if resultErr != nil {
+			success = "false"
+		}
+		createSandboxDuration.WithLabelValues("v2", success).Observe(time.Since(started).Seconds())
+	}()
+
+	if request == nil || request.Image == "" || request.PoolRef == "" {
+		return nil, status.Error(codes.InvalidArgument, "image and pool_ref are required")
 	}
-	if req.RequestId == "" {
+	if request.Namespace == "" {
+		request.Namespace = "default"
+	}
+	if request.RequestId == "" {
 		generated, err := idgen.GenerateRequestID()
 		if err != nil {
-			return nil, err
+			return nil, status.Errorf(codes.Internal, "generate request_id: %v", err)
 		}
-		req.RequestId = generated
+		request.RequestId = generated
 	}
-	if err := ValidateRequestID(req.RequestId); err != nil {
-		return nil, err
+	if err := ValidateRequestID(request.RequestId); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	createSpecHash, err := CreateSpecHash(req)
+	createSpecHash, err := CreateSpecHash(request)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "hash create request: %v", err)
+	}
+	orchestrator, err := s.orchestrator()
+	if err != nil {
+		return nil, status.Error(codes.FailedPrecondition, err.Error())
+	}
+
+	existing, err := s.findSandboxByRequestID(ctx, request.Namespace, request.RequestId)
 	if err != nil {
 		return nil, err
 	}
-	if existing, err := s.findSandboxByRequestID(ctx, req.Namespace, req.RequestId); err != nil {
-		return nil, err
-	} else if existing != nil {
+	if existing != nil {
 		if existing.Annotations[common.AnnotationCreateSpecHash] != createSpecHash {
-			return nil, fmt.Errorf("request_id %q is already bound to a different create spec", req.RequestId)
+			return nil, status.Errorf(codes.AlreadyExists, "request_id %q is bound to a different create spec", request.RequestId)
+		}
+		if err := s.ensureExisting(ctx, orchestrator, existing); err != nil {
+			return nil, err
+		}
+		if err := s.K8sClient.Get(ctx, client.ObjectKeyFromObject(existing), existing); err != nil {
+			return nil, err
 		}
 		return createResponseFromSandbox(existing), nil
 	}
 
-	mode := s.DefaultConsistencyMode
-	if req.ConsistencyMode == fastpathv1.ConsistencyMode_STRONG {
-		mode = api.ConsistencyModeStrong
+	sandbox := sandboxFromCreateRequest(request, createSpecHash)
+	reservation, err := orchestrator.ReserveForCreate(ctx, sandbox, request.RequestId, createSpecHash)
+	if err != nil {
+		if errors.Is(err, sandboxorchestrator.ErrNoCandidate) {
+			return nil, status.Error(codes.ResourceExhausted, err.Error())
+		}
+		return nil, err
+	}
+	ownedReservation := reservation
+	defer func() {
+		cancelContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := orchestrator.CancelReservation(cancelContext, ownedReservation); err != nil {
+			klog.ErrorS(err, "Cancel Fastlet reservation", "requestID", request.RequestId, "fastlet", ownedReservation.Fastlet.ID)
+		}
+	}()
+
+	if err := s.K8sClient.Create(ctx, sandbox); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return nil, err
+		}
+		var collided apiv1alpha1.Sandbox
+		if getErr := s.K8sClient.Get(ctx, client.ObjectKeyFromObject(sandbox), &collided); getErr != nil {
+			return nil, errors.Join(err, getErr)
+		}
+		if collided.Annotations[common.AnnotationRequestID] != request.RequestId || collided.Annotations[common.AnnotationCreateSpecHash] != createSpecHash {
+			return nil, status.Errorf(codes.AlreadyExists, "Sandbox name %q belongs to another request", sandbox.Name)
+		}
+		sandbox = collided.DeepCopy()
 	}
 
-	sandboxName := req.Name
-	if sandboxName == "" {
-		sandboxName = fmt.Sprintf("sb-%d", time.Now().UnixNano())
+	assigned, won, err := orchestrator.EnsureAssignment(ctx, sandbox, reservation.Fastlet)
+	if err != nil {
+		return nil, err
 	}
+	if !won && assigned.Status.Assignment.FastletPodUID != reservation.Fastlet.PodUID {
+		// Another active FastPath replica won the CRD CAS. Its durable assignment
+		// is authoritative; our reservation is canceled by the deferred cleanup.
+		reservation = nil
+	}
+	if err := orchestrator.EnsureRuntime(ctx, assigned, reservation); err != nil {
+		if !errors.Is(err, sandboxorchestrator.ErrRuntimeInProgress) && !errors.Is(err, sandboxorchestrator.ErrUnknownFastletOutcome) {
+			return nil, err
+		}
+		if err := waitForRuntime(ctx, orchestrator, assigned); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.K8sClient.Get(ctx, client.ObjectKeyFromObject(assigned), assigned); err != nil {
+		return nil, err
+	}
+	return createResponseFromSandbox(assigned), nil
+}
 
-	klog.InfoS("FastPath CreateSandbox called", "name", sandboxName, "namespace", req.Namespace)
+func (s *Server) ensureExisting(ctx context.Context, orchestrator *sandboxorchestrator.Orchestrator, sandbox *apiv1alpha1.Sandbox) error {
+	if sandbox.Status.RuntimeState == apiv1alpha1.ObservedStateReady && sandbox.Status.DataPlaneState == apiv1alpha1.ObservedStateReady {
+		return nil
+	}
+	if sandbox.Status.Assignment == nil {
+		assigned, _, err := orchestrator.AssignDeclarative(ctx, sandbox, sandbox.Annotations[common.AnnotationRequestID])
+		if err != nil {
+			if errors.Is(err, sandboxorchestrator.ErrNoCandidate) {
+				return status.Error(codes.ResourceExhausted, err.Error())
+			}
+			return err
+		}
+		sandbox = assigned
+	}
+	if err := orchestrator.EnsureRuntime(ctx, sandbox, nil); err != nil {
+		if !errors.Is(err, sandboxorchestrator.ErrRuntimeInProgress) && !errors.Is(err, sandboxorchestrator.ErrUnknownFastletOutcome) {
+			return err
+		}
+		return waitForRuntime(ctx, orchestrator, sandbox)
+	}
+	return nil
+}
 
-	tempSB := &apiv1alpha1.Sandbox{
+func waitForRuntime(ctx context.Context, orchestrator *sandboxorchestrator.Orchestrator, sandbox *apiv1alpha1.Sandbox) error {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		err := orchestrator.ObserveRuntime(ctx, sandbox)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, sandboxorchestrator.ErrRuntimeInProgress) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func sandboxFromCreateRequest(request *fastpathv1.CreateRequest, createSpecHash string) *apiv1alpha1.Sandbox {
+	name := request.Name
+	if name == "" {
+		digest := sha256.Sum256([]byte(request.RequestId))
+		name = fmt.Sprintf("sb-%x", digest[:12])
+	}
+	environment := make([]corev1.EnvVar, 0, len(request.Envs))
+	for name, value := range request.Envs {
+		environment = append(environment, corev1.EnvVar{Name: name, Value: value})
+	}
+	return &apiv1alpha1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      sandboxName,
-			Namespace: req.Namespace,
+			Name: name, Namespace: request.Namespace,
 			Annotations: map[string]string{
-				common.AnnotationRequestID:      req.RequestId,
-				common.AnnotationCreateSpecHash: createSpecHash,
+				common.AnnotationRequestID: request.RequestId, common.AnnotationCreateSpecHash: createSpecHash,
+			},
+			Labels: map[string]string{
+				common.LabelCreatedBy: "fastpath", common.LabelRequestIDHash: requestIDLabelValue(request.RequestId),
 			},
 		},
 		Spec: apiv1alpha1.SandboxSpec{
-			Image:        req.Image,
-			PoolRef:      req.PoolRef,
-			ExposedPorts: req.ExposedPorts,
-			Command:      req.Command,
-			Args:         req.Args,
-			Envs:         envMapToEnvVar(req.Envs),
-			WorkingDir:   req.WorkingDir,
+			Image: request.Image, PoolRef: request.PoolRef, ExposedPorts: request.ExposedPorts,
+			Command: request.Command, Args: request.Args, Envs: environment, WorkingDir: request.WorkingDir,
 		},
 	}
-
-	fastlet, err := s.Registry.Allocate(tempSB)
-	if err != nil {
-		klog.Error(err, "Failed to allocate fastlet for sandbox", "name", sandboxName, "namespace", req.Namespace)
-		return nil, err
-	}
-
-	klog.InfoS("Fastlet allocated", "fastletID", fastlet.ID, "duration", time.Since(start))
-
-	if mode == api.ConsistencyModeStrong {
-		return s.createStrong(ctx, tempSB, fastlet, req)
-	}
-	return s.createFast(ctx, tempSB, fastlet, req)
 }
 
-func (s *Server) createFast(ctx context.Context, tempSB *apiv1alpha1.Sandbox, fastlet *fastletpool.FastletInfo, req *fastpathv1.CreateRequest) (*fastpathv1.CreateResponse, error) {
-	start := time.Now()
-	var err error
-	defer func() {
-		duration := time.Since(start).Seconds()
-		success := "true"
-		if err != nil {
-			success = "false"
-			klog.ErrorS(err, "Fast mode sandbox creation failed", "name", tempSB.Name, "namespace", tempSB.Namespace, "duration", duration)
-		} else {
-			klog.InfoS("Fast mode sandbox creation completed", "name", tempSB.Name, "namespace", tempSB.Namespace, "duration", duration)
-		}
-		createSandboxDuration.WithLabelValues("fast", success).Observe(duration)
-	}()
-
-	// Generate sandboxID using md5 hash
-	createTimestamp := time.Now().UnixNano()
-	sandboxID := idgen.GenerateHashID(tempSB.Name, tempSB.Namespace, createTimestamp)
-	runtimeParams, err := s.loadRuntimeParameters(ctx, tempSB)
-	if err != nil {
-		s.Registry.Release(fastlet.ID, tempSB)
-		return nil, err
+func (s *Server) orchestrator() (*sandboxorchestrator.Orchestrator, error) {
+	if s.Orchestrator != nil {
+		return s.Orchestrator, nil
 	}
-
-	klog.InfoS("Creating sandbox via fastlet (fast mode)", "name", tempSB.Name, "namespace", tempSB.Namespace, "fastletPodIP", fastlet.PodIP, "fastletPod", fastlet.PodName, "sandboxID", sandboxID)
-
-	_, err = s.FastletClient.CreateSandbox(fastlet.PodIP, &api.CreateSandboxRequest{
-		Sandbox: api.SandboxSpec{
-			SandboxID:           sandboxID,
-			ClaimName:           tempSB.Name,
-			Image:               tempSB.Spec.Image,
-			Command:             tempSB.Spec.Command,
-			Args:                tempSB.Spec.Args,
-			Env:                 req.Envs,
-			WorkingDir:          req.WorkingDir,
-			CPU:                 runtimeParams.CPU,
-			Memory:              runtimeParams.Memory,
-			PIDs:                runtimeParams.PIDs,
-			RuntimeProfileHash:  runtimeParams.RuntimeProfileHash,
-			ResourceProfileHash: runtimeParams.ResourceProfileHash,
-		},
-	})
-	if err != nil {
-		klog.ErrorS(err, "Failed to create sandbox on fastlet", "name", tempSB.Name, "namespace", tempSB.Namespace, "fastletPodIP", fastlet.PodIP)
-		s.Registry.Release(fastlet.ID, tempSB)
-		return nil, err
+	registry, ok := s.Registry.(sandboxorchestrator.Registry)
+	if !ok || s.FastletClient == nil {
+		return nil, errors.New("Sandbox orchestrator is not configured")
 	}
-
-	klog.InfoS("Sandbox created on fastlet, setting label and annotations", "name", tempSB.Name, "namespace", tempSB.Namespace, "fastletPod", fastlet.PodName, "node", fastlet.NodeName, "sandboxID", sandboxID)
-
-	// 设置 label 标识 Fast 模式创建
-	tempSB.SetLabels(map[string]string{
-		common.LabelCreatedBy: common.CreatedByFastPathFast,
-	})
-	// 设置 annotations：allocation 和 createTimestamp（用于重新生成 sandboxID）
-	setAnnotations(tempSB, map[string]string{
-		common.AnnotationAllocation:      common.BuildAllocationJSON(fastlet.PodName, fastlet.NodeName),
-		common.AnnotationCreateTimestamp: strconv.FormatInt(createTimestamp, 10),
-	})
-
-	asyncCtx, _ := context.WithTimeout(context.Background(), 30*time.Second)
-	go s.asyncCreateCRDWithRetry(asyncCtx, tempSB)
-	return &fastpathv1.CreateResponse{SandboxId: sandboxID, SandboxName: tempSB.Name, FastletPod: fastlet.PodName, Endpoints: s.getEndpoints(fastlet.PodIP, tempSB)}, nil
-}
-
-func (s *Server) createStrong(ctx context.Context, tempSB *apiv1alpha1.Sandbox, fastlet *fastletpool.FastletInfo, req *fastpathv1.CreateRequest) (*fastpathv1.CreateResponse, error) {
-	start := time.Now()
-	var err error
-	defer func() {
-		duration := time.Since(start).Seconds()
-		success := "true"
-		if err != nil {
-			success = "false"
-			klog.ErrorS(err, "Strong mode sandbox creation failed", "name", tempSB.Name, "namespace", tempSB.Namespace, "duration", duration)
-		} else {
-			klog.InfoS("Strong mode sandbox creation completed", "name", tempSB.Name, "namespace", tempSB.Namespace, "duration", duration)
-		}
-		createSandboxDuration.WithLabelValues("strong", success).Observe(duration)
-	}()
-
-	klog.InfoS("Creating sandbox CRD first (strong mode)", "name", tempSB.Name, "namespace", tempSB.Namespace, "fastletPod", fastlet.PodName, "node", fastlet.NodeName)
-	runtimeParams, err := s.loadRuntimeParameters(ctx, tempSB)
-	if err != nil {
-		s.Registry.Release(fastlet.ID, tempSB)
-		return nil, err
-	}
-
-	// 设置 allocation annotation，与 CRD 创建同步
-	setAnnotations(tempSB, map[string]string{
-		common.AnnotationAllocation: common.BuildAllocationJSON(fastlet.PodName, fastlet.NodeName),
-	})
-	// Status 留空，由 Controller 从 annotation 同步
-
-	if err = s.K8sClient.Create(ctx, tempSB); err != nil {
-		klog.ErrorS(err, "Failed to create sandbox CRD", "name", tempSB.Name, "namespace", tempSB.Namespace)
-		s.Registry.Release(fastlet.ID, tempSB)
-		return nil, err
-	}
-
-	klog.InfoS("Sandbox CRD created, proceeding to create on fastlet", "name", tempSB.Name, "namespace", tempSB.Namespace, "uid", tempSB.UID)
-
-	// Use UID as sandboxID
-	sandboxID := string(tempSB.UID)
-	tempSB.Status.SandboxID = sandboxID
-
-	_, err = s.FastletClient.CreateSandbox(fastlet.PodIP, &api.CreateSandboxRequest{
-		Sandbox: api.SandboxSpec{
-			SandboxID:           sandboxID, // Changed from tempSB.Name to use UID
-			ClaimUID:            string(tempSB.UID),
-			ClaimName:           tempSB.Name,
-			Image:               tempSB.Spec.Image,
-			Command:             tempSB.Spec.Command,
-			Args:                tempSB.Spec.Args,
-			Env:                 req.Envs,
-			WorkingDir:          req.WorkingDir,
-			CPU:                 runtimeParams.CPU,
-			Memory:              runtimeParams.Memory,
-			PIDs:                runtimeParams.PIDs,
-			RuntimeProfileHash:  runtimeParams.RuntimeProfileHash,
-			ResourceProfileHash: runtimeParams.ResourceProfileHash,
-		},
-	})
-	if err != nil {
-		klog.ErrorS(err, "Failed to create sandbox on fastlet, rolling back CRD", "name", tempSB.Name, "namespace", tempSB.Namespace, "fastletPodIP", fastlet.PodIP)
-		s.K8sClient.Delete(ctx, tempSB)
-		s.Registry.Release(fastlet.ID, tempSB)
-		return nil, err
-	}
-
-	// After Fastlet call succeeds, update CRD status with sandboxID
-	if err := s.K8sClient.Status().Update(ctx, tempSB); err != nil {
-		klog.ErrorS(err, "Failed to update CRD status with sandboxID", "name", tempSB.Name, "sandboxID", sandboxID)
-		// Non-fatal error, continue
-	}
-
-	klog.InfoS("Sandbox created on fastlet, Controller will sync allocation from annotation to status", "name", tempSB.Name, "namespace", tempSB.Namespace, "assignedFastlet", fastlet.PodName, "nodeName", fastlet.NodeName, "sandboxID", sandboxID)
-
-	return &fastpathv1.CreateResponse{SandboxId: sandboxID, SandboxName: tempSB.Name, FastletPod: fastlet.PodName, Endpoints: s.getEndpoints(fastlet.PodIP, tempSB), SandboxUid: string(tempSB.UID)}, nil
+	return &sandboxorchestrator.Orchestrator{
+		Client: s.K8sClient, Registry: registry, FastletClient: s.FastletClient, Catalog: s.Catalog,
+	}, nil
 }
 
 func (s *Server) findSandboxByRequestID(ctx context.Context, namespace, requestID string) (*apiv1alpha1.Sandbox, error) {
 	var list apiv1alpha1.SandboxList
-	if err := s.K8sClient.List(ctx, &list, client.InNamespace(namespace)); err != nil {
+	if err := s.K8sClient.List(ctx, &list, client.InNamespace(namespace), client.MatchingLabels{
+		common.LabelRequestIDHash: requestIDLabelValue(requestID),
+	}); err != nil {
 		return nil, err
 	}
-	for i := range list.Items {
-		if list.Items[i].Annotations[common.AnnotationRequestID] == requestID {
-			return list.Items[i].DeepCopy(), nil
+	matches := make([]apiv1alpha1.Sandbox, 0, len(list.Items))
+	for index := range list.Items {
+		if list.Items[index].Annotations[common.AnnotationRequestID] == requestID {
+			matches = append(matches, list.Items[index])
 		}
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("request_id %q is bound to multiple Sandbox objects", requestID)
+	}
+	if len(matches) == 1 {
+		return matches[0].DeepCopy(), nil
 	}
 	return nil, nil
 }
 
 func createResponseFromSandbox(sandbox *apiv1alpha1.Sandbox) *fastpathv1.CreateResponse {
+	fastletName := sandbox.Status.AssignedFastlet
+	if sandbox.Status.Assignment != nil {
+		fastletName = sandbox.Status.Assignment.FastletName
+	}
 	return &fastpathv1.CreateResponse{
-		SandboxId:   sandbox.Status.SandboxID,
-		SandboxName: sandbox.Name,
-		SandboxUid:  string(sandbox.UID),
-		FastletPod:  sandbox.Status.AssignedFastlet,
-		Endpoints:   append([]string(nil), sandbox.Status.Endpoints...),
+		SandboxId: string(sandbox.UID), SandboxUid: string(sandbox.UID),
+		SandboxName: sandbox.Name, FastletPod: fastletName,
 	}
 }
 
-func setAnnotations(sandbox *apiv1alpha1.Sandbox, values map[string]string) {
-	annotations := sandbox.GetAnnotations()
-	if annotations == nil {
-		annotations = make(map[string]string, len(values))
+func (s *Server) ListSandboxes(ctx context.Context, request *fastpathv1.ListRequest) (*fastpathv1.ListResponse, error) {
+	namespace := request.Namespace
+	if namespace == "" {
+		namespace = "default"
 	}
-	for key, value := range values {
-		annotations[key] = value
-	}
-	sandbox.SetAnnotations(annotations)
-}
-
-type sandboxRuntimeParameters struct {
-	CPU                 string
-	Memory              string
-	PIDs                int64
-	RuntimeProfileHash  string
-	ResourceProfileHash string
-}
-
-func (s *Server) loadRuntimeParameters(ctx context.Context, sandbox *apiv1alpha1.Sandbox) (sandboxRuntimeParameters, error) {
-	var pool apiv1alpha1.SandboxPool
-	if err := s.K8sClient.Get(ctx, client.ObjectKey{Name: sandbox.Spec.PoolRef, Namespace: sandbox.Namespace}, &pool); err != nil {
-		return sandboxRuntimeParameters{}, fmt.Errorf("get SandboxPool %s: %w", sandbox.Spec.PoolRef, err)
-	}
-	runtimeName, err := pool.Spec.EffectiveRuntime()
-	if err != nil {
-		return sandboxRuntimeParameters{}, err
-	}
-	catalog := s.Catalog
-	if catalog == nil {
-		catalog = runtimecatalog.Builtin()
-	}
-	profile, err := catalog.Resolve(runtimeName)
-	if err != nil {
-		return sandboxRuntimeParameters{}, err
-	}
-	sandboxResources, err := pool.Spec.EffectiveSandboxResources()
-	if err != nil {
-		return sandboxRuntimeParameters{}, err
-	}
-	return sandboxRuntimeParameters{
-		CPU:                 sandboxResources.CPU.String(),
-		Memory:              sandboxResources.Memory.String(),
-		PIDs:                sandboxResources.PIDs,
-		RuntimeProfileHash:  profile.ProfileHash,
-		ResourceProfileHash: sandboxResources.Hash(),
-	}, nil
-}
-
-// asyncCreateCRDWithRetry 异步创建 CRD，分配信息已在 annotation 中
-func (s *Server) asyncCreateCRDWithRetry(ctx context.Context, sb *apiv1alpha1.Sandbox) {
-	klog.InfoS("Starting async CRD creation with retry", "name", sb.Name, "namespace", sb.Namespace, "maxRetries", maxRetries)
-
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		err := s.K8sClient.Create(ctx, sb)
-		if err == nil {
-			klog.InfoS("Async CRD creation succeeded", "name", sb.Name, "namespace", sb.Namespace, "attempt", attempt+1)
-			return
-		}
-		klog.InfoS("Async CRD creation failed, retrying", "name", sb.Name, "namespace", sb.Namespace, "attempt", attempt+1, "error", err)
-		time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
-	}
-	klog.ErrorS(nil, "Async CRD creation failed after all retries", "name", sb.Name, "namespace", sb.Namespace, "maxRetries", maxRetries)
-}
-
-func (s *Server) getEndpoints(ip string, sb *apiv1alpha1.Sandbox) []string {
-	var res []string
-	for _, p := range sb.Spec.ExposedPorts {
-		res = append(res, fmt.Sprintf("%s:%d", ip, p))
-	}
-	return res
-}
-
-func (s *Server) ListSandboxes(ctx context.Context, req *fastpathv1.ListRequest) (*fastpathv1.ListResponse, error) {
-	namespace := req.Namespace
-	klog.InfoS("Listing sandboxes", "namespace", namespace)
-
-	var sbList apiv1alpha1.SandboxList
-	if err := s.K8sClient.List(ctx, &sbList, client.InNamespace(namespace)); err != nil {
-		klog.ErrorS(err, "Failed to list sandboxes", "namespace", namespace)
+	var list apiv1alpha1.SandboxList
+	if err := s.K8sClient.List(ctx, &list, client.InNamespace(namespace)); err != nil {
 		return nil, err
 	}
-
-	res := &fastpathv1.ListResponse{}
-	for _, sb := range sbList.Items {
-		res.Items = append(res.Items, &fastpathv1.SandboxInfo{
-			SandboxId:   sb.Status.SandboxID,
-			SandboxName: sb.Name,
-			Phase:       sb.Status.Phase,
-			FastletPod:  sb.Status.AssignedFastlet,
-			Endpoints:   sb.Status.Endpoints,
-			Image:       sb.Spec.Image,
-			PoolRef:     sb.Spec.PoolRef,
-			CreatedAt:   sb.CreationTimestamp.Unix(),
-		})
+	response := &fastpathv1.ListResponse{Items: make([]*fastpathv1.SandboxInfo, 0, len(list.Items))}
+	for index := range list.Items {
+		response.Items = append(response.Items, sandboxInfo(&list.Items[index]))
 	}
-
-	klog.InfoS("Listed sandboxes successfully", "namespace", namespace, "count", len(res.Items))
-	return res, nil
+	return response, nil
 }
 
-func (s *Server) GetSandbox(ctx context.Context, req *fastpathv1.GetRequest) (*fastpathv1.SandboxInfo, error) {
-	namespace := req.Namespace
-	klog.InfoS("Getting sandbox", "name", req.SandboxName, "namespace", namespace)
-
-	var sb apiv1alpha1.Sandbox
-	if err := s.K8sClient.Get(ctx, client.ObjectKey{Name: req.SandboxName, Namespace: namespace}, &sb); err != nil {
-		klog.ErrorS(err, "Failed to get sandbox", "name", req.SandboxName, "namespace", namespace)
+func (s *Server) GetSandbox(ctx context.Context, request *fastpathv1.GetRequest) (*fastpathv1.SandboxInfo, error) {
+	namespace := request.Namespace
+	if namespace == "" {
+		namespace = "default"
+	}
+	var sandbox apiv1alpha1.Sandbox
+	if err := s.K8sClient.Get(ctx, client.ObjectKey{Name: request.SandboxName, Namespace: namespace}, &sandbox); err != nil {
 		return nil, err
 	}
+	return sandboxInfo(&sandbox), nil
+}
 
+func sandboxInfo(sandbox *apiv1alpha1.Sandbox) *fastpathv1.SandboxInfo {
+	fastletName := sandbox.Status.AssignedFastlet
+	if sandbox.Status.Assignment != nil {
+		fastletName = sandbox.Status.Assignment.FastletName
+	}
 	return &fastpathv1.SandboxInfo{
-		SandboxId:   sb.Status.SandboxID,
-		SandboxName: sb.Name,
-		Phase:       sb.Status.Phase,
-		FastletPod:  sb.Status.AssignedFastlet,
-		Endpoints:   sb.Status.Endpoints,
-		Image:       sb.Spec.Image,
-		PoolRef:     sb.Spec.PoolRef,
-		CreatedAt:   sb.CreationTimestamp.Unix(),
-	}, nil
+		SandboxId: string(sandbox.UID), SandboxName: sandbox.Name, Phase: sandbox.Status.Phase,
+		FastletPod: fastletName, Image: sandbox.Spec.Image, PoolRef: sandbox.Spec.PoolRef,
+		CreatedAt: sandbox.CreationTimestamp.Unix(),
+	}
 }
 
-func (s *Server) DeleteSandbox(ctx context.Context, req *fastpathv1.DeleteRequest) (*fastpathv1.DeleteResponse, error) {
-	ns := req.Namespace
-	klog.InfoS("Deleting sandbox", "name", req.SandboxName, "namespace", ns)
-
-	sb := &apiv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: req.SandboxName, Namespace: ns}}
-	if err := s.K8sClient.Delete(ctx, sb); err != nil {
-		klog.ErrorS(err, "Failed to delete sandbox", "name", req.SandboxName, "namespace", ns)
+// Delete only submits desired state. Finalizer reconciliation owns runtime cleanup.
+func (s *Server) DeleteSandbox(ctx context.Context, request *fastpathv1.DeleteRequest) (*fastpathv1.DeleteResponse, error) {
+	namespace := request.Namespace
+	if namespace == "" {
+		namespace = "default"
+	}
+	sandbox := &apiv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: request.SandboxName, Namespace: namespace}}
+	if err := s.K8sClient.Delete(ctx, sandbox); err != nil && !apierrors.IsNotFound(err) {
 		return &fastpathv1.DeleteResponse{Success: false}, err
 	}
-
-	klog.InfoS("Sandbox deleted successfully", "name", req.SandboxName, "namespace", ns)
 	return &fastpathv1.DeleteResponse{Success: true}, nil
 }
 
-func (s *Server) UpdateSandbox(ctx context.Context, req *fastpathv1.UpdateRequest) (*fastpathv1.UpdateResponse, error) {
-	klog.InfoS("Updating sandbox", "name", req.SandboxName, "namespace", req.Namespace)
-
-	var sb apiv1alpha1.Sandbox
-	if err := s.K8sClient.Get(ctx, client.ObjectKey{Name: req.SandboxName, Namespace: req.Namespace}, &sb); err != nil {
-		klog.ErrorS(err, "Failed to get sandbox for update", "name", req.SandboxName, "namespace", req.Namespace)
-		return &fastpathv1.UpdateResponse{
-			Success: false,
-			Message: fmt.Sprintf("failed to get sandbox: %v", err),
-		}, nil
+// Update only commits declarative intent; the Controller observes and reconciles it.
+func (s *Server) UpdateSandbox(ctx context.Context, request *fastpathv1.UpdateRequest) (*fastpathv1.UpdateResponse, error) {
+	namespace := request.Namespace
+	if namespace == "" {
+		namespace = "default"
 	}
-
+	key := client.ObjectKey{Name: request.SandboxName, Namespace: namespace}
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		latest := &apiv1alpha1.Sandbox{}
-		if err := s.K8sClient.Get(ctx, client.ObjectKey{Name: req.SandboxName, Namespace: req.Namespace}, latest); err != nil {
+		var sandbox apiv1alpha1.Sandbox
+		if err := s.K8sClient.Get(ctx, key, &sandbox); err != nil {
 			return err
 		}
-
-		switch v := req.Update.(type) {
+		switch value := request.Update.(type) {
 		case *fastpathv1.UpdateRequest_ExpireTimeSeconds:
-			klog.InfoS("Updating ExpireTime", "name", req.SandboxName, "expireTimeSeconds", v.ExpireTimeSeconds)
-			if v.ExpireTimeSeconds == 0 {
-				latest.Spec.ExpireTime = nil
+			if value.ExpireTimeSeconds == 0 {
+				sandbox.Spec.ExpireTime = nil
 			} else {
-				t := metav1.NewTime(time.Unix(v.ExpireTimeSeconds, 0))
-				latest.Spec.ExpireTime = &t
+				expiresAt := metav1.NewTime(time.Unix(value.ExpireTimeSeconds, 0))
+				sandbox.Spec.ExpireTime = &expiresAt
 			}
 		case *fastpathv1.UpdateRequest_ResetRevision:
-			klog.InfoS("Updating ResetRevision", "name", req.SandboxName, "resetRevision", v.ResetRevision)
-			t, err := time.Parse(time.RFC3339Nano, v.ResetRevision)
+			parsed, err := time.Parse(time.RFC3339Nano, value.ResetRevision)
 			if err != nil {
-				return fmt.Errorf("invalid reset_revision format: %v", err)
+				return fmt.Errorf("invalid reset_revision: %w", err)
 			}
-			latest.Spec.ResetRevision = &metav1.Time{Time: t}
+			sandbox.Spec.ResetRevision = &metav1.Time{Time: parsed}
 		case *fastpathv1.UpdateRequest_FailurePolicy:
-			klog.InfoS("Updating FailurePolicy", "name", req.SandboxName, "failurePolicy", v.FailurePolicy)
-			latest.Spec.FailurePolicy = toFailurePolicy(v.FailurePolicy)
+			sandbox.Spec.FailurePolicy = toFailurePolicy(value.FailurePolicy)
 		case *fastpathv1.UpdateRequest_RecoveryTimeoutSeconds:
-			klog.InfoS("Updating RecoveryTimeoutSeconds", "name", req.SandboxName, "recoveryTimeoutSeconds", v.RecoveryTimeoutSeconds)
-			latest.Spec.RecoveryTimeoutSeconds = v.RecoveryTimeoutSeconds
+			sandbox.Spec.RecoveryTimeoutSeconds = value.RecoveryTimeoutSeconds
 		}
-
-		// 更新标签
-		if len(req.Labels) > 0 {
-			klog.InfoS("Updating labels", "name", req.SandboxName, "labels", req.Labels)
-			if latest.Labels == nil {
-				latest.Labels = make(map[string]string)
-			}
-			for k, v := range req.Labels {
-				latest.Labels[k] = v
-			}
+		if sandbox.Labels == nil {
+			sandbox.Labels = make(map[string]string)
 		}
-
-		return s.K8sClient.Update(ctx, latest)
+		for name, value := range request.Labels {
+			sandbox.Labels[name] = value
+		}
+		return s.K8sClient.Update(ctx, &sandbox)
 	})
-
 	if err != nil {
-		klog.ErrorS(err, "Failed to update sandbox", "name", req.SandboxName, "namespace", req.Namespace)
-		return &fastpathv1.UpdateResponse{
-			Success: false,
-			Message: fmt.Sprintf("failed to update sandbox: %v", err),
-		}, nil
+		return &fastpathv1.UpdateResponse{Success: false, Message: err.Error()}, nil
 	}
-
-	klog.InfoS("Sandbox updated successfully", "name", req.SandboxName, "namespace", req.Namespace)
-
-	s.K8sClient.Get(ctx, client.ObjectKey{Name: req.SandboxName, Namespace: req.Namespace}, &sb)
-
-	return &fastpathv1.UpdateResponse{
-		Success: true,
-		Message: "sandbox updated successfully",
-		Sandbox: &fastpathv1.SandboxInfo{
-			SandboxId:   sb.Status.SandboxID,
-			SandboxName: sb.Name,
-			Phase:       sb.Status.Phase,
-			FastletPod:  sb.Status.AssignedFastlet,
-			Endpoints:   sb.Status.Endpoints,
-			Image:       sb.Spec.Image,
-			PoolRef:     sb.Spec.PoolRef,
-			CreatedAt:   sb.CreationTimestamp.Unix(),
-		},
-	}, nil
+	var updated apiv1alpha1.Sandbox
+	if err := s.K8sClient.Get(ctx, key, &updated); err != nil {
+		return nil, err
+	}
+	return &fastpathv1.UpdateResponse{Success: true, Message: "desired state committed", Sandbox: sandboxInfo(&updated)}, nil
 }
 
-func toFailurePolicy(fp fastpathv1.FailurePolicy) apiv1alpha1.FailurePolicy {
-	switch fp {
-	case fastpathv1.FailurePolicy_AUTO_RECREATE:
+func toFailurePolicy(policy fastpathv1.FailurePolicy) apiv1alpha1.FailurePolicy {
+	if policy == fastpathv1.FailurePolicy_AUTO_RECREATE {
 		return apiv1alpha1.FailurePolicyAutoRecreate
-	default:
-		return apiv1alpha1.FailurePolicyManual
 	}
+	return apiv1alpha1.FailurePolicyManual
 }

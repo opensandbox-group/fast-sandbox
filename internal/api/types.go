@@ -20,6 +20,7 @@ type SandboxSpec struct {
 	SandboxID           string            `json:"sandboxId"`
 	RequestID           string            `json:"requestId,omitempty"`
 	ClaimUID            string            `json:"claimUid"`
+	ClaimNamespace      string            `json:"claimNamespace,omitempty"`
 	ClaimName           string            `json:"claimName"`
 	InstanceGeneration  int64             `json:"instanceGeneration,omitempty"`
 	AssignmentAttempt   int64             `json:"assignmentAttempt,omitempty"`
@@ -144,6 +145,8 @@ type AdmissionStatus struct {
 type ReserveSandboxRequest struct {
 	RequestID           string `json:"requestId"`
 	CreateSpecHash      string `json:"createSpecHash"`
+	ClaimNamespace      string `json:"claimNamespace"`
+	ClaimName           string `json:"claimName"`
 	FastletPodUID       string `json:"fastletPodUid"`
 	RuntimeProfileHash  string `json:"runtimeProfileHash"`
 	ResourceProfileHash string `json:"resourceProfileHash"`

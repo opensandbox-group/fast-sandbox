@@ -62,6 +62,8 @@ func TestManagerEnsureBasicCreatesMissingClusterAndDeploys(t *testing.T) {
 	assertCommand(t, runner.commands, "kubectl", "apply", "-f", "config/crd/")
 	assertCommand(t, runner.commands, "kubectl", "rollout", "restart", "deployment/fast-sandbox-controller")
 	assertCommand(t, runner.commands, "kubectl", "rollout", "status", "deployment/fast-sandbox-controller", "--timeout=120s")
+	assertCommand(t, runner.commands, "kubectl", "rollout", "restart", "deployment/fast-sandbox-fastpath")
+	assertCommand(t, runner.commands, "kubectl", "rollout", "status", "deployment/fast-sandbox-fastpath", "--timeout=120s")
 	assertCommand(t, runner.commands, "kubectl", "rollout", "restart", "ds/fast-sandbox-janitor")
 }
 

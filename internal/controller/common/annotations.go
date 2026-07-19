@@ -8,6 +8,9 @@ import (
 const (
 	// LabelCreatedBy 标识 sandbox 的创建方式
 	LabelCreatedBy = "sandbox.fast.io/created-by"
+	// LabelRequestIDHash supports direct API-server idempotency lookups without
+	// relying on a replica-local informer field index.
+	LabelRequestIDHash = "sandbox.fast.io/request-id-hash"
 	// CreatedByFastPathFast 标识由 FastPath Fast 模式创建
 	CreatedByFastPathFast = "fastpath-fast"
 

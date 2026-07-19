@@ -199,7 +199,7 @@ test-e2e:
 
 test-e2e-controlplane:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test -p 1 ./test/e2e/suites/basicvalidation/... ./test/e2e/suites/lifecycle/... ./test/e2e/suites/scheduling/... ./test/e2e/suites/cleanupjanitor/... -v -count=1 -failfast -timeout $(E2E_TEST_TIMEOUT)
+		$(GO) test -p 1 ./test/e2e/suites/controlplane/... ./test/e2e/suites/basicvalidation/... ./test/e2e/suites/lifecycle/... ./test/e2e/suites/scheduling/... ./test/e2e/suites/cleanupjanitor/... -v -count=1 -failfast -timeout $(E2E_TEST_TIMEOUT)
 
 test-e2e-network:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \

@@ -4,10 +4,10 @@ metadata:
   name: fast-sandbox-controller
   namespace: default
   labels:
-    control-plane: controller-manager
     app: fast-sandbox-controller
+    fast-sandbox.io/control-plane-role: controller
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       control-plane: controller-manager
@@ -17,13 +17,129 @@ spec:
       labels:
         control-plane: controller-manager
         app: fast-sandbox-controller
+        fast-sandbox.io/control-plane-role: controller
     spec:
-      serviceAccountName: fast-sandbox-manager-role
+      serviceAccountName: fast-sandbox-controller
       containers:
       - name: manager
         image: fast-sandbox/controller:dev
         imagePullPolicy: IfNotPresent
-        command:
-        - ./controller
-        - --metrics-bind-address=:0
+        command: ["./controller"]
+        args:
+        - --role=controller
+        - --metrics-bind-address=:9091
         - --health-probe-bind-address=:5758
+        ports:
+        - {name: health, containerPort: 5758}
+        - {name: metrics, containerPort: 9091}
+        readinessProbe:
+          httpGet: {path: /readyz, port: health}
+        livenessProbe:
+          httpGet: {path: /healthz, port: health}
+        resources:
+          requests: {cpu: 100m, memory: 128Mi}
+          limits: {cpu: "1", memory: 512Mi}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fast-sandbox-fastpath
+  namespace: default
+  labels:
+    app: fast-sandbox-fastpath
+    fast-sandbox.io/control-plane-role: fastpath
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: fast-sandbox-fastpath
+      fast-sandbox.io/control-plane-role: fastpath
+  template:
+    metadata:
+      labels:
+        app: fast-sandbox-fastpath
+        fast-sandbox.io/control-plane-role: fastpath
+    spec:
+      serviceAccountName: fast-sandbox-fastpath
+      containers:
+      - name: manager
+        image: fast-sandbox/controller:dev
+        imagePullPolicy: IfNotPresent
+        command: ["./controller"]
+        args:
+        - --role=fastpath
+        - --metrics-bind-address=:9091
+        - --health-probe-bind-address=:5758
+        - --fastpath-bind-address=:9090
+        ports:
+        - {name: grpc, containerPort: 9090}
+        - {name: health, containerPort: 5758}
+        - {name: metrics, containerPort: 9091}
+        readinessProbe:
+          httpGet: {path: /readyz, port: health}
+        livenessProbe:
+          httpGet: {path: /healthz, port: health}
+        resources:
+          requests: {cpu: 100m, memory: 128Mi}
+          limits: {cpu: "1", memory: 512Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fast-sandbox-fastpath
+  namespace: default
+spec:
+  selector:
+    app: fast-sandbox-fastpath
+    fast-sandbox.io/control-plane-role: fastpath
+  ports:
+  - name: grpc
+    port: 9090
+    targetPort: grpc
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fast-sandbox-controller
+  namespace: default
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: fast-sandbox-controller
+      fast-sandbox.io/control-plane-role: controller
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fast-sandbox-fastpath
+  namespace: default
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: fast-sandbox-fastpath
+      fast-sandbox.io/control-plane-role: fastpath
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: fast-sandbox-fastpath
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fast-sandbox-fastpath
+  minReplicas: 3
+  maxReplicas: 10
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 60

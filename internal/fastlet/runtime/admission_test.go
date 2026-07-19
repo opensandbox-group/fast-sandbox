@@ -181,7 +181,14 @@ func ensureRequest(uid string, generation, attempt int64) *api.EnsureSandboxRequ
 			RequestID: "request-" + uid, SandboxUID: uid,
 			InstanceGeneration: generation, AssignmentAttempt: attempt, FastletPodUID: "pod-uid-a",
 		},
-		Sandbox: api.SandboxSpec{ClaimUID: "claim-" + uid, ClaimName: uid, Image: "alpine:latest"},
+		Sandbox: api.SandboxSpec{ClaimUID: "claim-" + uid, ClaimNamespace: "default", ClaimName: uid, Image: "alpine:latest"},
+	}
+}
+
+func reserveRequest(requestID, createSpecHash string) *api.ReserveSandboxRequest {
+	return &api.ReserveSandboxRequest{
+		RequestID: requestID, CreateSpecHash: createSpecHash,
+		ClaimNamespace: "default", ClaimName: "sandbox-" + requestID, FastletPodUID: "pod-uid-a",
 	}
 }
 
@@ -280,18 +287,35 @@ func TestReservationTTLAndCancelReleaseCapacity(t *testing.T) {
 		TokenGenerator: func() (string, error) { return fmt.Sprintf("token-%d", token.Add(1)), nil },
 	})
 	require.NoError(t, err)
-	first, err := manager.ReserveSandbox(&api.ReserveSandboxRequest{RequestID: "request-a", CreateSpecHash: "spec-a", FastletPodUID: "pod-uid-a"})
+	first, err := manager.ReserveSandbox(reserveRequest("request-a", "spec-a"))
 	require.NoError(t, err)
-	_, err = manager.ReserveSandbox(&api.ReserveSandboxRequest{RequestID: "request-b", CreateSpecHash: "spec-b", FastletPodUID: "pod-uid-a"})
+	_, err = manager.ReserveSandbox(reserveRequest("request-b", "spec-b"))
 	requireFastletCode(t, err, api.ErrorCapacityRejected)
 	clock.Advance(6 * time.Second)
-	second, err := manager.ReserveSandbox(&api.ReserveSandboxRequest{RequestID: "request-b", CreateSpecHash: "spec-b", FastletPodUID: "pod-uid-a"})
+	second, err := manager.ReserveSandbox(reserveRequest("request-b", "spec-b"))
 	require.NoError(t, err)
 	require.NotEqual(t, first.ReservationToken, second.ReservationToken)
 	_, err = manager.CancelReservation(&api.CancelReservationRequest{RequestID: "request-b", ReservationToken: second.ReservationToken})
 	require.NoError(t, err)
-	_, err = manager.ReserveSandbox(&api.ReserveSandboxRequest{RequestID: "request-c", CreateSpecHash: "spec-c", FastletPodUID: "pod-uid-a"})
+	_, err = manager.ReserveSandbox(reserveRequest("request-c", "spec-c"))
 	require.NoError(t, err)
+}
+
+func TestCommittedClaimCanTakeOverMatchingReservationWithoutToken(t *testing.T) {
+	manager := newAdmissionManager(t, newAdmissionRuntime(), 1)
+	reservation := reserveRequest("request-a", "spec-a")
+	_, err := manager.ReserveSandbox(reservation)
+	require.NoError(t, err)
+
+	request := ensureRequest("sandbox-a", 1, 1)
+	request.Identity.RequestID = reservation.RequestID
+	request.CreateSpecHash = reservation.CreateSpecHash
+	request.Sandbox.ClaimName = reservation.ClaimName
+	_, err = manager.EnsureSandboxV2(context.Background(), request)
+	require.NoError(t, err)
+	admission, _, _ := manager.State()
+	require.Equal(t, 0, admission.Reservations)
+	require.Equal(t, 1, admission.Running)
 }
 
 func TestIdentityFencingAndClaimConflict(t *testing.T) {

@@ -118,6 +118,12 @@ func TestConstructPodAddsKVMWithoutRuntimeClass(t *testing.T) {
 	require.True(t, hasHostPath(pod, "/opt/kata"))
 }
 
+func TestUniqueWarmImagesPreservesFirstOccurrence(t *testing.T) {
+	require.Equal(t, []string{"alpine:latest", "ubuntu:24.04"}, uniqueWarmImages([]string{
+		"alpine:latest", "", "ubuntu:24.04", "alpine:latest",
+	}))
+}
+
 func envValue(env []corev1.EnvVar, name string) string {
 	for _, item := range env {
 		if item.Name == name {

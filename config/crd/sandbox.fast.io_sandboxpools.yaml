@@ -149,7 +149,6 @@ spec:
                   type: string
                 maxItems: 128
                 type: array
-                uniqueItems: true
             required:
             - capacity
             - fastletTemplate

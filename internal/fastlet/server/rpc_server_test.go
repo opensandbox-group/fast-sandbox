@@ -106,7 +106,7 @@ func TestV2AdmissionProtocolAndHeartbeat(t *testing.T) {
 
 	var reserved api.ReserveSandboxResponse
 	recorder := postJSON(t, handler, "/api/v2/fastlet/reservations", api.ReserveSandboxRequest{
-		RequestID: "request-a", CreateSpecHash: "spec-a", FastletPodUID: "pod-uid-a",
+		RequestID: "request-a", CreateSpecHash: "spec-a", ClaimNamespace: "default", ClaimName: "sandbox-a", FastletPodUID: "pod-uid-a",
 	}, &reserved)
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Equal(t, "reservation-a", reserved.ReservationToken)
@@ -116,7 +116,9 @@ func TestV2AdmissionProtocolAndHeartbeat(t *testing.T) {
 		Identity:         api.SandboxIdentity{RequestID: "request-a", SandboxUID: "sandbox-a", InstanceGeneration: 1, AssignmentAttempt: 1, FastletPodUID: "pod-uid-a"},
 		ReservationToken: reserved.ReservationToken,
 		CreateSpecHash:   "spec-a",
-		Sandbox:          api.SandboxSpec{ClaimUID: "claim-a", Image: "alpine:latest"},
+		Sandbox: api.SandboxSpec{
+			ClaimUID: "claim-a", ClaimNamespace: "default", ClaimName: "sandbox-a", Image: "alpine:latest",
+		},
 	}, &ensured)
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.True(t, ensured.Created)
@@ -132,7 +134,7 @@ func TestV2AdmissionProtocolAndHeartbeat(t *testing.T) {
 
 	var rejected api.ReserveSandboxResponse
 	recorder = postJSON(t, handler, "/api/v2/fastlet/reservations", api.ReserveSandboxRequest{
-		RequestID: "request-b", CreateSpecHash: "spec-b", FastletPodUID: "pod-uid-a",
+		RequestID: "request-b", CreateSpecHash: "spec-b", ClaimNamespace: "default", ClaimName: "sandbox-b", FastletPodUID: "pod-uid-a",
 	}, &rejected)
 	require.Equal(t, http.StatusTooManyRequests, recorder.Code)
 	require.Equal(t, api.ErrorCapacityRejected, rejected.Error.Code)
@@ -158,7 +160,9 @@ func TestSetDrainingRejectsNewReservations(t *testing.T) {
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.True(t, draining.Draining)
 	var rejected api.ReserveSandboxResponse
-	recorder = postJSON(t, handler, "/api/v2/fastlet/reservations", api.ReserveSandboxRequest{RequestID: "request-a", CreateSpecHash: "spec-a", FastletPodUID: "pod-uid-a"}, &rejected)
+	recorder = postJSON(t, handler, "/api/v2/fastlet/reservations", api.ReserveSandboxRequest{
+		RequestID: "request-a", CreateSpecHash: "spec-a", ClaimNamespace: "default", ClaimName: "sandbox-a", FastletPodUID: "pod-uid-a",
+	}, &rejected)
 	require.Equal(t, http.StatusConflict, recorder.Code)
 	require.Equal(t, api.ErrorDraining, rejected.Error.Code)
 }

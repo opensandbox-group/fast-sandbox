@@ -58,7 +58,6 @@ type SandboxPoolSpec struct {
 	// WarmImages are asynchronously pulled and protected from ordinary cache GC.
 	// Fastlet readiness does not wait for this list to finish warming.
 	// +kubebuilder:validation:MaxItems=128
-	// +kubebuilder:validation:UniqueItems=true
 	WarmImages []string `json:"warmImages,omitempty"`
 
 	// InfraProfile selects a platform-controlled Runtime Augmentation profile.

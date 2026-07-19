@@ -1,33 +1,89 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: fast-sandbox-manager-role
+  name: fast-sandbox-controller
+  namespace: default
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fast-sandbox-fastpath
+  namespace: default
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fast-sandbox-janitor
   namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: fast-sandbox-manager-role
+  name: fast-sandbox-controller
 rules:
 - apiGroups: [""]
   resources: ["pods", "nodes"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch", "update"]
 - apiGroups: ["node.k8s.io"]
   resources: ["runtimeclasses"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["sandbox.fast.io"]
   resources: ["sandboxes", "sandboxpools", "sandboxes/status", "sandboxpools/status"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fast-sandbox-fastpath
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["sandbox.fast.io"]
+  resources: ["sandboxpools"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["sandbox.fast.io"]
+  resources: ["sandboxes", "sandboxes/status"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fast-sandbox-janitor
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["sandbox.fast.io"]
+  resources: ["sandboxes"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: fast-sandbox-manager-rolebinding
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: fast-sandbox-manager-role
+  name: fast-sandbox-controller
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: fast-sandbox-controller}
 subjects:
-- kind: ServiceAccount
-  name: fast-sandbox-manager-role
-  namespace: default
+- {kind: ServiceAccount, name: fast-sandbox-controller, namespace: default}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fast-sandbox-fastpath
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: fast-sandbox-fastpath}
+subjects:
+- {kind: ServiceAccount, name: fast-sandbox-fastpath, namespace: default}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fast-sandbox-janitor
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: fast-sandbox-janitor}
+subjects:
+- {kind: ServiceAccount, name: fast-sandbox-janitor, namespace: default}

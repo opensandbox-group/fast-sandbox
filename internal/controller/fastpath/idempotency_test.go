@@ -15,6 +15,13 @@ func TestValidateRequestID(t *testing.T) {
 	require.Error(t, ValidateRequestID(string(make([]byte, maxRequestIDLength+1))))
 }
 
+func TestRequestIDLabelValueIsStableAndLabelSafe(t *testing.T) {
+	value := requestIDLabelValue("request-a")
+	require.Equal(t, value, requestIDLabelValue("request-a"))
+	require.NotEqual(t, value, requestIDLabelValue("request-b"))
+	require.Len(t, value, 32)
+}
+
 func TestCreateSpecHashIsDeterministic(t *testing.T) {
 	a := &fastpathv1.CreateRequest{
 		RequestId: "request-a",

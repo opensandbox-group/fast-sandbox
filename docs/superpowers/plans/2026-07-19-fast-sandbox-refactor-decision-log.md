@@ -36,6 +36,13 @@ Deferred          已明确不属于本轮范围
 | REF-0007 | 3/12 | DecisionPending | 否 | v1alpha1 无法区分“升级前已存在且未写 sandboxResources”的 Pool 与“升级后新建但遗漏字段”的 Pool | 过渡期仅对全字段缺省采用固定兼容 profile；新 sample/fixture 全部显式写入，发布前决定是否通过 v1beta1/转换 webhook 改为必填 |
 | REF-0008 | 3 | Resolved | 否 | SHA-256 RuntimeProfile hash 直接作为 Pod label value 超过 Kubernetes 63 字符限制，导致 Fastlet Pod 无法创建 | label 改为 `version + 12位短 hash`，完整 hash 存 annotation 和 Fastlet env；e2e 继续验证完整 hash 链路 |
 | REF-0009 | 3 | Resolved | 否 | 远端恢复为 master 后，`verify-generated` 会把本地分支已提交但远端 Git 未包含的合法生成物误报为 drift | changed-files 模式下改用远端连续生成前后 hash，并与本地分支 hash 交叉比对；五份生成物完全一致 |
+| REF-0010 | 5 | Resolved | 否 | Heartbeat 发送 containerd 全量镜像清单会随节点缓存无限放大 | 使用 cache epoch/revision/cursor 和受限 normalized inventory；不完整时只关闭镜像亲和 |
+| REF-0011 | 5 | Resolved | 否 | containerd cache 是节点共享状态，单个 Fastlet 无法证明镜像可安全删除 | Fastlet 只生成保护索引/eviction plan，破坏性删除等待 node-scoped coordinator |
+| REF-0012 | 6 | Resolved | 否 | Kubernetes 1.27 拒绝 CRD `uniqueItems` 的二次复杂度校验 | `maxItems=128`，Controller 平台路径 O(n) 去重 |
+| REF-0013 | 6 | Resolved | 否 | 原地升级不能修改存量 Controller Deployment selector | 保留旧 Controller selector，Pod 增加 role label；新 FastPath selector/Service 严格选择 fastpath role |
+| REF-0014 | 6 | Resolved | 否 | informer cache 不保证 FastPath CRD Create/status Patch 后立即读到 UID/assignment | 持久化状态机使用 direct API client；request ID 通过哈希 label 查询并用完整 annotation 复核 |
+| REF-0015 | 6 | Resolved | 否 | Controller 与 FastPath 并发 Ensure 会让无 token Controller 被已有 reservation 拒绝，并触发旧 attempt 重用 | durable claim 可接管完全匹配 reservation；attempt 只由 CAS 内部根据高水位分配 |
+| REF-0016 | 6 | Resolved | 否 | 不同 e2e 进程重置 namespace 计数，会撞到上一轮仍在 Terminating 的同名 namespace | namespace 加每个 test process 的随机 run ID 和进程内计数 |
 
 ## 详细记录
 
@@ -172,3 +179,33 @@ kind load docker-image fast-sandbox/fastlet:dev --name fsb-e2e-basic
 **影响**：如果每个 Fastlet 根据自己的 `warmImages/active/hot/infra` 保护集合独立执行 `ImageService.Delete`，一个 Pool 的 Fastlet 可能删除另一个 Pool 正在预热或使用的 image reference。进程内保护集合只能证明“本 Fastlet 不应删除”，不能证明“节点上无人需要”。
 
 **当前结论**：阶段 5 实现 runtime-neutral ProtectionIndex 和 eviction plan，`PoolWarm/ActiveSandbox/InfraArtifact/HotImage` 全部 fail closed 保护；Fastlet 异步预热仍正常执行，但 ContainerdDriver 暂不执行破坏性的节点共享 image reference 删除。实际 containerd eviction 必须由后续 node-scoped coordinator 汇总同节点所有 Pool 的保护声明，或采用具备等价引用/lease 证明的机制；BoxLite 等私有 artifact store 可以在各自 driver ownership 边界内独立 GC。该限制不影响镜像亲和与创建正确性，但在 coordinator 完成前不宣称 containerd 主动回收能力。
+
+### REF-0012：Kubernetes 1.27 拒绝 CRD `uniqueItems`，warmImages 在平台路径线性去重
+
+**证据**：阶段 6 首次将生成后的 SandboxPool CRD 提交到真实 kind v1.27.3 apiserver 时，服务端拒绝 `spec.warmImages.uniqueItems: true`，错误明确指出该校验运行时复杂度会成为二次方；`kubectl --dry-run=client` 未发现该问题。
+
+**结论**：CRD 继续以 `maxItems: 128` 限制输入规模，不使用 `uniqueItems`。Controller 在合成 Fastlet Pod 前按首次出现顺序 O(n) 去重并忽略空项，Fastlet 侧的保护索引继续做幂等归一化。重复 warm image 不影响 API 语义，也不会造成重复平台配置或缓存保护泄漏。
+
+### REF-0013：角色拆分不能修改存量 Controller Deployment selector
+
+**证据**：阶段 6 在已有集群原地应用双角色 Deployment 时，apiserver 拒绝给 `fast-sandbox-controller.spec.selector` 增加 `fast-sandbox.io/control-plane-role=controller`，因为 Deployment selector 是不可变字段。
+
+**结论**：Controller Deployment 为兼容原地升级继续使用既有 `control-plane=controller-manager,app=fast-sandbox-controller` selector，Pod template 仍明确写入 `role=controller`；新建的 FastPath Deployment selector 和对外 Service selector 都包含 `role=fastpath`。因此旧 Controller 不会进入 FastPath Service，同时升级不需要破坏性重建 Controller Deployment。
+
+### REF-0014：FastPath 持久化路径不能依赖 informer read-after-write
+
+**证据**：真实 FastPath e2e 中，CRD Create 和 status assignment Patch 均已成功，但紧接着从 manager cache 读取到的对象仍缺少最新 assignment，RPC 返回 `persisted Sandbox UID and assignment are required`。fake client 会立即可见，原有单测无法暴露该问题。
+
+**结论**：FastPath 及共享 durable orchestrator 使用 controller-runtime direct API client 完成幂等查询、CRD 写入和 status CAS；Watch cache 只承担 Registry membership/heartbeat 等最终一致视图。自定义 informer field index 不适用于 direct client，因此 Sandbox 增加 `sandbox.fast.io/request-id-hash` label，以 128-bit SHA-256 前缀查询候选，再以完整 request ID annotation 复核，兼顾 API Server 可查询性和碰撞安全。
+
+### REF-0015：Controller 接管 FastPath reservation 与 assignment attempt 高水位
+
+**证据**：3-slot Fastlet 的 40 并发真实 e2e 首次只成功 2 个请求。第三个请求已经 reservation，但 Controller 在 FastPath Ensure 前先 Reconcile；无 token Ensure 因三个 reservation 占满容量而被拒绝，Controller 清理 assignment。随后 FastPath 基于旧对象再次提交 attempt 1，被 durable high-water mark 1 拒绝。
+
+**结论**：reservation 增加 claim namespace/name，并继续绑定 request ID、create hash、profile hash 和目标 Pod UID。CRD commit 后，Controller 发出的 Ensure 如果与 reservation 完全匹配，可以凭 durable claim 原子转换 reservation，无需持有 ephemeral token；不匹配时 fail closed。assignment CAS 不再接收调用方计算的 attempt，而是在每次权威读取后使用 `highWater+1`。修复后同一 40 并发 e2e 稳定得到 3 成功、37 个 ResourceExhausted，且只存在 3 个 CRD。
+
+### REF-0016：e2e namespace 跨进程复用
+
+**证据**：单独运行 `TestPortValidation` 后立即运行完整 gate，两个独立 Go test process 都分配 `fsb-e2e-port-7`；前一次 defer 只提交 namespace 删除，新一次在其 Terminating 期间创建对象被 apiserver Forbidden。
+
+**结论**：SuiteEnv 在每个 test process 初始化 8 位随机 run ID，namespace 结构变为 `prefix-name-runID-counter`，并在 63 字符裁剪时保留唯一后缀。单测覆盖跨 SuiteEnv 实例不复用；完整 control-plane gate 随后通过。

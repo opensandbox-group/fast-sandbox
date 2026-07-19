@@ -106,6 +106,7 @@ func newLifecyclePool(namespace, name string, min, max int32) *apiv1alpha1.Sandb
 			},
 			MaxSandboxesPerPod: 5,
 			Runtime:            apiv1alpha1.RuntimeContainer,
+			SandboxResources:   suiteenv.SmallSandboxResourceProfile(),
 			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{

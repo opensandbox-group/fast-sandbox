@@ -43,7 +43,9 @@ func TestFastletClientV2ReservationAndHeartbeat(t *testing.T) {
 	})
 	client, endpoint, closeServer := v2TestClient(t, handler)
 	defer closeServer()
-	reserved, err := client.ReserveSandbox(context.Background(), endpoint, &ReserveSandboxRequest{RequestID: "request-a", CreateSpecHash: "spec-a", FastletPodUID: "pod-a"})
+	reserved, err := client.ReserveSandbox(context.Background(), endpoint, &ReserveSandboxRequest{
+		RequestID: "request-a", CreateSpecHash: "spec-a", ClaimNamespace: "default", ClaimName: "sandbox-a", FastletPodUID: "pod-a",
+	})
 	require.NoError(t, err)
 	require.Equal(t, "token-a", reserved.ReservationToken)
 	heartbeat, err := client.Heartbeat(context.Background(), endpoint, &HeartbeatRequest{Cache: CacheCursor{Epoch: "boot-a", Revision: 3}})

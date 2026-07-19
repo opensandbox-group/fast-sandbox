@@ -286,6 +286,12 @@ spec:
                 - fastletName
                 - fastletPodUID
                 type: object
+              assignmentAttempt:
+                description: |-
+                  AssignmentAttempt is the monotonic high-water mark retained even while
+                  Assignment is cleared, so a reschedule can never reuse an old fence.
+                format: int64
+                type: integer
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

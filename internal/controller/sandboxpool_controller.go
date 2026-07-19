@@ -164,7 +164,7 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 	}
 	annotations["fast-sandbox.io/runtime-profile-hash"] = profile.ProfileHash
 	annotations["fast-sandbox.io/resource-profile-hash"] = sandboxResources.Hash()
-	warmImagesJSON, err := json.Marshal(pool.Spec.WarmImages)
+	warmImagesJSON, err := json.Marshal(uniqueWarmImages(pool.Spec.WarmImages))
 	if err != nil {
 		return nil, fmt.Errorf("encode warmImages: %w", err)
 	}
@@ -305,6 +305,22 @@ func shortProfileIdentity(profile runtimecatalog.RuntimeProfile) string {
 		hash = hash[:12]
 	}
 	return profile.Version + "-" + hash
+}
+
+func uniqueWarmImages(images []string) []string {
+	seen := make(map[string]struct{}, len(images))
+	result := make([]string, 0, len(images))
+	for _, image := range images {
+		if image == "" {
+			continue
+		}
+		if _, exists := seen[image]; exists {
+			continue
+		}
+		seen[image] = struct{}{}
+		result = append(result, image)
+	}
+	return result
 }
 
 func poolLabels(poolName string) map[string]string {
