@@ -211,6 +211,9 @@ Thumbs.db
 .env.development.local
 .env.test.local
 .env.production.local
+.remote-dev-run.env
+.remote-dev-run.local.env
+.tools/
 
 # API keys and secrets
 secrets/

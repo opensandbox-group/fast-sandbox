@@ -1,5 +1,7 @@
 # Fast Sandbox
 
+> **迁移说明（2026-07-19）**：本文描述当前 `master` 实现。多活控制面、Sandbox 私有网络、透明代理、统一 Runtime 与 Infra Component 的目标架构以[跨模块架构决策](docs/superpowers/specs/2026-07-19-fast-sandbox-cross-cutting-architecture-decisions.md)为准。下文的 Fast/Strong 双模式与 host port 冲突语义已被重构方案替代。
+
 Fast Sandbox 是一个高性能、云原生（Kubernetes-native）的沙箱管理系统，旨在为 AI Agent、Serverless 函数和计算密集型任务提供**毫秒级的容器冷启动**与**受控自愈**能力。
 
 通过预热 "Fastlet Pod" 资源池并直接集成宿主机层面的容器管理能力，Fast Sandbox 绕过了传统 Kubernetes Pod 创建的巨大开销，实现了极速的任务分发与物理隔离。

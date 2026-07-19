@@ -1,5 +1,7 @@
 # FastPath 分配一致性修复设计
 
+> **Superseded（2026-07-19）**：本文的 Fast/Strong 双模式和 annotation 搬运方案仅用于解释旧实现。重构后的权威方案是 reservation-before-CRD、`request_id` 幂等、status assignment CAS，以及 Fastlet 原子 admission。参见[多活 Fast-Path 控制面设计](../superpowers/specs/2026-07-18-multi-active-fastpath-control-plane-design.md)。
+
 ## 问题背景
 
 当前 FastPath Server 创建 Sandbox 时存在竞态条件：

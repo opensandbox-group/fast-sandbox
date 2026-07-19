@@ -1,5 +1,7 @@
 # Fast Sandbox Architecture
 
+> **Superseded target architecture:** This file documents the pre-refactor implementation. Use [the 2026-07-19 cross-cutting architecture decisions](docs/superpowers/specs/2026-07-19-fast-sandbox-cross-cutting-architecture-decisions.md) as the source of truth for new development.
+
 ## 1. Overview
 
 **Fast Sandbox** is a Kubernetes-based high-performance sandbox management system. The core objective is to provide millisecond-scale container startup latency for scenarios sensitive to startup delay, such as serverless functions and code sandbox execution.

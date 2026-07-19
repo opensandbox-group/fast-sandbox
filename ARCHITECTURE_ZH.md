@@ -1,5 +1,7 @@
 # Fast Sandbox 架构设计
 
+> **目标架构已更新**：本文记录重构前实现。新开发以 [2026-07-19 跨模块架构决策](docs/superpowers/specs/2026-07-19-fast-sandbox-cross-cutting-architecture-decisions.md)为准。
+
 ## 1. 概述
 
 **Fast Sandbox** 是一个基于 Kubernetes 的高性能沙箱管理系统。其核心目标是提供毫秒级的容器启动速度，主要用于 serverless 函数、代码沙箱执行等对启动延迟高度敏感的场景。

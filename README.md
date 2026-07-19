@@ -1,5 +1,7 @@
 # Fast Sandbox
 
+> **Migration notice (2026-07-19):** This README describes the current `master` implementation. The target multi-active control plane, private-network, proxy, runtime, and Infra Component architecture is defined by [the architecture decision set](docs/superpowers/specs/2026-07-19-fast-sandbox-cross-cutting-architecture-decisions.md). Fast/Strong dual-mode and host-port conflict semantics below are superseded for the refactor.
+
 Fast Sandbox is a high-performance, cloud-native (Kubernetes-native) sandbox management system designed to provide **millisecond-scale cold container startup** and **controlled self-healing** capabilities for AI Agents, Serverless functions, and compute-intensive tasks.
 
 By pre-warming "Fastlet Pod" resource pools and directly integrating with host-level container management, Fast Sandbox bypasses the significant overhead of traditional Kubernetes Pod creation, achieving ultra-fast task distribution with physical isolation.
