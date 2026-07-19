@@ -58,7 +58,9 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 					Env: []corev1.EnvVar{
 						{Name: "RUNTIME_HANDLER", Value: "attacker-handler"},
 						{Name: "FASTLET_CAPACITY", Value: "999"},
+						{Name: "FASTLET_CONTROL_PORT", Value: ":9999"},
 					},
+					ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"true"}}}},
 				}},
 			}},
 		},
@@ -78,6 +80,10 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	require.Equal(t, "1", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RESOURCE_CPU"))
 	require.Equal(t, "1Gi", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RESOURCE_MEMORY"))
 	require.Equal(t, "opensandbox", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_PROFILE"))
+	require.Equal(t, ":5758", envValue(pod.Spec.Containers[0].Env, "FASTLET_CONTROL_PORT"))
+	require.NotNil(t, pod.Spec.Containers[0].ReadinessProbe)
+	require.Equal(t, "/readyz", pod.Spec.Containers[0].ReadinessProbe.HTTPGet.Path)
+	require.Equal(t, int32(5758), pod.Spec.Containers[0].ReadinessProbe.HTTPGet.Port.IntVal)
 
 	cpu := pod.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU]
 	memory := pod.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory]

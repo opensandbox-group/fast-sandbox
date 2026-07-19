@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,60 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func v2TestClient(t *testing.T, handler http.Handler) (*FastletClient, string, func()) {
+	t.Helper()
+	server := httptest.NewServer(handler)
+	address := server.Listener.Addr().(*net.TCPAddr)
+	return NewFastletClient(address.Port), address.IP.String(), server.Close
+}
+
+func TestFastletClientV2ReservationAndHeartbeat(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/v2/fastlet/reservations":
+			require.Equal(t, http.MethodPost, r.Method)
+			var request ReserveSandboxRequest
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+			require.Equal(t, "request-a", request.RequestID)
+			json.NewEncoder(w).Encode(ReserveSandboxResponse{ReservationToken: "token-a"})
+		case "/api/v2/fastlet/heartbeat":
+			require.Equal(t, http.MethodGet, r.Method)
+			json.NewEncoder(w).Encode(HeartbeatResponse{FastletStatus: FastletStatus{FastletPodUID: "pod-a", RuntimeReady: true}})
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	client, endpoint, closeServer := v2TestClient(t, handler)
+	defer closeServer()
+	reserved, err := client.ReserveSandbox(context.Background(), endpoint, &ReserveSandboxRequest{RequestID: "request-a", CreateSpecHash: "spec-a", FastletPodUID: "pod-a"})
+	require.NoError(t, err)
+	require.Equal(t, "token-a", reserved.ReservationToken)
+	heartbeat, err := client.Heartbeat(context.Background(), endpoint)
+	require.NoError(t, err)
+	require.True(t, heartbeat.RuntimeReady)
+	require.Equal(t, "pod-a", heartbeat.FastletPodUID)
+}
+
+func TestFastletClientV2PreservesStructuredErrors(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		json.NewEncoder(w).Encode(EnsureSandboxResponse{Error: &FastletError{
+			Code: ErrorCapacityRejected, Message: "full", Retryable: true,
+		}})
+	})
+	client, endpoint, closeServer := v2TestClient(t, handler)
+	defer closeServer()
+	response, err := client.EnsureSandbox(context.Background(), endpoint, &EnsureSandboxRequest{})
+	require.Error(t, err)
+	require.NotNil(t, response)
+	var failure *FastletError
+	require.ErrorAs(t, err, &failure)
+	require.Equal(t, ErrorCapacityRejected, failure.Code)
+	require.True(t, failure.Retryable)
+}
 
 // Note: SandboxID can be any string format (md5 hash for Fast mode, UID for Strong mode, or legacy name).
 // Tests use simple strings for readability.

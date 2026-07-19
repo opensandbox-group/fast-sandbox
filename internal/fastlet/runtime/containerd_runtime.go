@@ -478,6 +478,9 @@ func (r *ContainerdRuntime) prepareLabels(config *api.SandboxSpec) map[string]st
 		"fast-sandbox.io/resource-cpu":          config.CPU,
 		"fast-sandbox.io/resource-memory":       config.Memory,
 		"fast-sandbox.io/resource-pids":         strconv.FormatInt(config.PIDs, 10),
+		"fast-sandbox.io/request-id":            config.RequestID,
+		"fast-sandbox.io/instance-generation":   strconv.FormatInt(config.InstanceGeneration, 10),
+		"fast-sandbox.io/assignment-attempt":    strconv.FormatInt(config.AssignmentAttempt, 10),
 	}
 }
 
@@ -586,8 +589,10 @@ func (r *ContainerdRuntime) InspectSandbox(ctx context.Context, sandboxID string
 	metadata := &SandboxMetadata{
 		SandboxSpec: api.SandboxSpec{
 			SandboxID:           sandboxID,
+			RequestID:           info.Labels["fast-sandbox.io/request-id"],
 			ClaimUID:            info.Labels["fast-sandbox.io/claim-uid"],
 			ClaimName:           info.Labels["fast-sandbox.io/sandbox-name"],
+			FastletPodUID:       info.Labels["fast-sandbox.io/fastlet-uid"],
 			Image:               info.Image,
 			CPU:                 info.Labels["fast-sandbox.io/resource-cpu"],
 			Memory:              info.Labels["fast-sandbox.io/resource-memory"],
@@ -599,6 +604,8 @@ func (r *ContainerdRuntime) InspectSandbox(ctx context.Context, sandboxID string
 		Phase:       "stopped",
 	}
 	metadata.PIDs, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/resource-pids"], 10, 64)
+	metadata.InstanceGeneration, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/instance-generation"], 10, 64)
+	metadata.AssignmentAttempt, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/assignment-attempt"], 10, 64)
 	if task, taskErr := container.Task(ctx, nil); taskErr == nil {
 		metadata.PID = int(task.Pid())
 		if status, statusErr := task.Status(ctx); statusErr == nil {

@@ -20,6 +20,11 @@ type SandboxManagerConfig struct {
 	Capacity           int
 	RuntimeProfileHash string
 	ResourceProfile    *apiv1alpha1.SandboxResourceProfile
+	FastletPodUID      string
+	ReservationTTL     time.Duration
+	Clock              Clock
+	TokenGenerator     func() (string, error)
+	RecoverOnStart     bool
 }
 
 type SandboxManager struct {
@@ -29,6 +34,16 @@ type SandboxManager struct {
 	runtimeProfileHash  string
 	resourceProfile     *apiv1alpha1.SandboxResourceProfile
 	resourceProfileHash string
+	fastletPodUID       string
+	reservationTTL      time.Duration
+	clock               Clock
+	tokenGenerator      func() (string, error)
+	recovering          bool
+	runtimeReady        bool
+	draining            bool
+	drainReason         string
+	reservations        map[string]*reservation
+	requestReservations map[string]string
 	// sandboxes  sandboxID -> metadata
 	sandboxes map[string]*SandboxMetadata
 }
@@ -45,6 +60,15 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 	if config.Capacity <= 0 {
 		return nil, fmt.Errorf("%w: capacity must be greater than zero", ErrInvalidConfig)
 	}
+	if config.ReservationTTL <= 0 {
+		config.ReservationTTL = 15 * time.Second
+	}
+	if config.Clock == nil {
+		config.Clock = realClock{}
+	}
+	if config.TokenGenerator == nil {
+		config.TokenGenerator = generateReservationToken
+	}
 	var profile *apiv1alpha1.SandboxResourceProfile
 	resourceHash := ""
 	if config.ResourceProfile != nil {
@@ -59,6 +83,10 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		runtime: runtime, capacity: config.Capacity,
 		runtimeProfileHash: config.RuntimeProfileHash,
 		resourceProfile:    profile, resourceProfileHash: resourceHash,
+		fastletPodUID:  config.FastletPodUID,
+		reservationTTL: config.ReservationTTL, clock: config.Clock, tokenGenerator: config.TokenGenerator,
+		recovering: config.RecoverOnStart, runtimeReady: !config.RecoverOnStart,
+		reservations: make(map[string]*reservation), requestReservations: make(map[string]string),
 		sandboxes: make(map[string]*SandboxMetadata),
 	}, nil
 }
@@ -81,47 +109,36 @@ func capacityFromEnvironment() int {
 }
 
 func (m *SandboxManager) CreateSandbox(ctx context.Context, spec *api.SandboxSpec) (*api.CreateSandboxResponse, error) {
-	if err := m.validateProfiles(spec); err != nil {
-		return &api.CreateSandboxResponse{Success: false, Message: err.Error()}, err
+	identity := api.SandboxIdentity{
+		RequestID: spec.RequestID, SandboxUID: spec.SandboxID,
+		InstanceGeneration: spec.InstanceGeneration, AssignmentAttempt: spec.AssignmentAttempt,
+		FastletPodUID: spec.FastletPodUID,
 	}
-	m.mu.Lock()
-	if _, exists := m.sandboxes[spec.SandboxID]; exists {
-		m.mu.Unlock()
-		klog.InfoS("Sandbox already exists in cache, returning success (idempotent)", "sandbox", spec.SandboxID)
-		return &api.CreateSandboxResponse{
-			Success:   true,
-			SandboxID: spec.SandboxID,
-		}, nil
+	if identity.InstanceGeneration <= 0 {
+		identity.InstanceGeneration = 1
 	}
-	m.sandboxes[spec.SandboxID] = &SandboxMetadata{
-		SandboxSpec: *spec,
-		Phase:       "creating",
+	if identity.AssignmentAttempt <= 0 {
+		identity.AssignmentAttempt = 1
 	}
-	m.mu.Unlock()
-
-	createdAt := time.Now().Unix()
-	metadata, err := m.runtime.EnsureSandbox(ctx, spec)
+	if identity.FastletPodUID == "" {
+		identity.FastletPodUID = m.fastletPodUID
+	}
+	response, err := m.EnsureSandboxV2(ctx, &api.EnsureSandboxRequest{Identity: identity, Sandbox: *spec})
 	if err != nil {
-		// Clean up the "creating" placeholder on failure
-		m.mu.Lock()
-		delete(m.sandboxes, spec.SandboxID)
-		m.mu.Unlock()
-		klog.ErrorS(err, "Failed to create sandbox", "sandbox", spec.SandboxID)
-		return &api.CreateSandboxResponse{
-			Success: false,
-			Message: fmt.Sprintf("create failed: %v", err),
-		}, err
+		message := err.Error()
+		if response != nil && response.Error != nil {
+			message = response.Error.Message
+			if response.Error.Cause != nil {
+				err = response.Error.Cause
+			}
+		}
+		return &api.CreateSandboxResponse{Success: false, Message: message, SandboxID: spec.SandboxID}, err
 	}
-	metadata.Phase = "running"
-	m.mu.Lock()
-	m.sandboxes[spec.SandboxID] = metadata
-	m.mu.Unlock()
-	klog.InfoS("Created sandbox", "sandbox", spec.SandboxID, "image", spec.Image)
-	return &api.CreateSandboxResponse{
-		Success:   true,
-		SandboxID: spec.SandboxID,
-		CreatedAt: createdAt,
-	}, nil
+	createdAt := m.clock.Now().Unix()
+	if response.Sandbox != nil && response.Sandbox.CreatedAt > 0 {
+		createdAt = response.Sandbox.CreatedAt
+	}
+	return &api.CreateSandboxResponse{Success: true, SandboxID: spec.SandboxID, CreatedAt: createdAt}, nil
 }
 
 func (m *SandboxManager) validateProfiles(spec *api.SandboxSpec) error {
@@ -166,16 +183,22 @@ func (m *SandboxManager) DeleteSandbox(sandboxID string) (*api.DeleteSandboxResp
 			Success: true,
 		}, nil
 	}
+	if sandbox.Phase == "creating" {
+		sandbox.Phase = "terminating"
+		m.mu.Unlock()
+		klog.InfoS("DeleteSandbox: creation cancellation recorded", "sandboxID", sandboxID)
+		return &api.DeleteSandboxResponse{Success: true}, nil
+	}
 	sandbox.Phase = "terminating"
 	m.mu.Unlock()
 	klog.InfoS("[DEBUG-FASTLET] DeleteSandbox: marked terminating, starting asyncDelete", "sandboxID", sandboxID)
-	go m.asyncDelete(sandboxID)
+	go m.asyncDelete(sandboxID, sandbox)
 	return &api.DeleteSandboxResponse{
 		Success: true,
 	}, nil
 }
 
-func (m *SandboxManager) asyncDelete(sandboxID string) {
+func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata) {
 	klog.InfoS("[DEBUG-FASTLET] asyncDelete ENTER", "sandboxID", sandboxID)
 	const gracefulTimeout = 10 * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), gracefulTimeout+5*time.Second)
@@ -188,8 +211,11 @@ func (m *SandboxManager) asyncDelete(sandboxID string) {
 		"nextStep", "removing from sandboxes")
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Remove from sandboxes map after deletion completes
-	delete(m.sandboxes, sandboxID)
+	// A delayed delete from an old generation must never erase a newer
+	// manager entry for the same logical Sandbox.
+	if m.sandboxes[sandboxID] == expected {
+		delete(m.sandboxes, sandboxID)
+	}
 	klog.InfoS("[DEBUG-FASTLET] asyncDelete: DONE, sandbox removed from sandboxes",
 		"sandboxID", sandboxID)
 }
@@ -215,26 +241,44 @@ func (m *SandboxManager) GetCapacity() int {
 
 func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []api.SandboxStatus {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	snapshots := make(map[string]SandboxMetadata, len(m.sandboxes))
+	for sandboxID, metadata := range m.sandboxes {
+		snapshots[sandboxID] = *metadata
+	}
+	m.mu.RUnlock()
 
-	result := make([]api.SandboxStatus, 0)
-
-	// Add active sandboxes
-	for sandboxID, meta := range m.sandboxes {
+	result := make([]api.SandboxStatus, 0, len(snapshots))
+	for sandboxID, meta := range snapshots {
 		runtimeStatus := "unknown"
 		if inspected, err := m.runtime.InspectSandbox(ctx, sandboxID); err == nil {
 			runtimeStatus = inspected.Phase
 		}
 		result = append(result, api.SandboxStatus{
-			SandboxID: sandboxID,
-			ClaimUID:  meta.ClaimUID,
-			Phase:     meta.Phase,
-			Message:   runtimeStatus,
-			CreatedAt: meta.CreatedAt,
+			SandboxID:          sandboxID,
+			ClaimUID:           meta.ClaimUID,
+			InstanceGeneration: meta.InstanceGeneration,
+			AssignmentAttempt:  meta.AssignmentAttempt,
+			Phase:              meta.Phase,
+			Message:            runtimeStatus,
+			CreatedAt:          meta.CreatedAt,
 		})
 	}
 
 	return result
+}
+
+func (m *SandboxManager) RuntimeDiagnostics(ctx context.Context) api.RuntimeDiagnostics {
+	report := m.runtime.ProbeCapabilities(ctx)
+	return api.RuntimeDiagnostics{
+		RuntimeProfileHash: m.runtimeProfileHash,
+		State:              string(report.State),
+		Reason:             report.Reason,
+		Message:            report.Message,
+	}
+}
+
+func (m *SandboxManager) FastletPodUID() string {
+	return m.fastletPodUID
 }
 
 func (m *SandboxManager) Close() error {

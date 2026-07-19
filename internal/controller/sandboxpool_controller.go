@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -182,6 +183,7 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 		c.Env = removeRuntimeOwnedEnv(c.Env)
 
 		c.Env = append(c.Env,
+			corev1.EnvVar{Name: "FASTLET_CONTROL_PORT", Value: ":5758"},
 			corev1.EnvVar{
 				Name:      "NODE_NAME",
 				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}},
@@ -236,6 +238,12 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 		)
 		if err := applyFastletResources(c, profile.Deployment.Overhead, sandboxResources, getFastletCapacity(pool)); err != nil {
 			return nil, err
+		}
+		c.ReadinessProbe = &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
+				Path: "/readyz", Port: intstr.FromInt32(5758), Scheme: corev1.URISchemeHTTP,
+			}},
+			InitialDelaySeconds: 0, PeriodSeconds: 2, TimeoutSeconds: 1, FailureThreshold: 1,
 		}
 
 	}
@@ -324,6 +332,7 @@ var runtimeOwnedEnv = map[string]struct{}{
 	"FAST_SANDBOX_RESOURCE_CPU": {}, "FAST_SANDBOX_RESOURCE_MEMORY": {}, "FAST_SANDBOX_RESOURCE_PIDS": {},
 	"FAST_SANDBOX_INFRA_PROFILE": {}, "FASTLET_CAPACITY": {},
 	"RUNTIME_SOCKET": {}, "INFRA_DIR_IN_POD": {},
+	"FASTLET_CONTROL_PORT": {}, "AGENT_PORT": {},
 	"NODE_NAME": {}, "POD_NAME": {}, "POD_IP": {}, "POD_UID": {}, "NAMESPACE": {},
 }
 

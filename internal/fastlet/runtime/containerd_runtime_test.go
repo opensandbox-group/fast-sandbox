@@ -437,6 +437,7 @@ func TestContainerdRuntime_prepareLabels(t *testing.T) {
 
 	config := &api.SandboxSpec{
 		SandboxID: "sb-123", ClaimUID: "claim-456", ClaimName: "test-claim", Image: "alpine:latest",
+		RequestID: "request-1", InstanceGeneration: 2, AssignmentAttempt: 3,
 		CPU: "500m", Memory: "256Mi", PIDs: 128,
 		RuntimeProfileHash: "runtime-hash", ResourceProfileHash: "resource-hash",
 	}
@@ -456,6 +457,9 @@ func TestContainerdRuntime_prepareLabels(t *testing.T) {
 		"fast-sandbox.io/resource-cpu":          "500m",
 		"fast-sandbox.io/resource-memory":       "256Mi",
 		"fast-sandbox.io/resource-pids":         "128",
+		"fast-sandbox.io/request-id":            "request-1",
+		"fast-sandbox.io/instance-generation":   "2",
+		"fast-sandbox.io/assignment-attempt":    "3",
 	}
 
 	assert.Equal(t, expectedLabels, labels)
@@ -483,6 +487,9 @@ func TestContainerdRuntime_prepareLabels_EmptyFastletFields(t *testing.T) {
 	assert.Equal(t, "sb-123", labels["fast-sandbox.io/id"])
 	assert.Equal(t, "claim-456", labels["fast-sandbox.io/claim-uid"])
 	assert.Equal(t, "test-claim", labels["fast-sandbox.io/sandbox-name"])
+	assert.Equal(t, "", labels["fast-sandbox.io/request-id"])
+	assert.Equal(t, "0", labels["fast-sandbox.io/instance-generation"])
+	assert.Equal(t, "0", labels["fast-sandbox.io/assignment-attempt"])
 }
 
 // ============================================================================

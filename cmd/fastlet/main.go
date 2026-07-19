@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"strconv"
+	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/fastlet/runtime"
@@ -20,6 +21,7 @@ func main() {
 	klog.Info("starting sandbox fastlet")
 
 	podName := getEnv("POD_NAME", "")
+	podUID := getEnv("POD_UID", "")
 	podIP := getEnv("POD_IP", "")
 	nodeName := getEnv("NODE_NAME", "")
 	namespace := getEnv("NAMESPACE", "")
@@ -62,12 +64,14 @@ func main() {
 
 	sandboxManager, err := runtime.NewSandboxManagerWithConfig(rt, runtime.SandboxManagerConfig{
 		Capacity: capacityFromEnvironment(), RuntimeProfileHash: runtimeProfile.ProfileHash, ResourceProfile: &resourceProfile,
+		FastletPodUID: podUID, RecoverOnStart: true,
 	})
 	if err != nil {
 		klog.ErrorS(err, "Failed to initialize Sandbox manager")
 		os.Exit(1)
 	}
 	defer sandboxManager.Close()
+	go recoverUntilReady(ctx, sandboxManager)
 
 	fastletServer := server.NewFastletServer(fastletPort, sandboxManager)
 	klog.InfoS("Starting Fastlet HTTP Server", "port", fastletPort)
@@ -75,6 +79,22 @@ func main() {
 	if err := fastletServer.Start(); err != nil {
 		klog.ErrorS(err, "Fastlet server failed")
 		os.Exit(1)
+	}
+}
+
+func recoverUntilReady(ctx context.Context, manager *runtime.SandboxManager) {
+	for {
+		if err := manager.Recover(ctx); err == nil {
+			klog.Info("Fastlet runtime recovery completed")
+			return
+		} else {
+			klog.ErrorS(err, "Fastlet runtime recovery failed; readiness remains false")
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
 	}
 }
 

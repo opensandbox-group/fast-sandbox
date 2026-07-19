@@ -1,5 +1,7 @@
 package api
 
+import "time"
+
 // ConsistencyMode defines the consistency mode for sandbox creation.
 type ConsistencyMode string
 
@@ -16,8 +18,12 @@ const (
 // SandboxSpec describes the desired state of a sandbox on a fastlet.
 type SandboxSpec struct {
 	SandboxID           string            `json:"sandboxId"`
+	RequestID           string            `json:"requestId,omitempty"`
 	ClaimUID            string            `json:"claimUid"`
 	ClaimName           string            `json:"claimName"`
+	InstanceGeneration  int64             `json:"instanceGeneration,omitempty"`
+	AssignmentAttempt   int64             `json:"assignmentAttempt,omitempty"`
+	FastletPodUID       string            `json:"fastletPodUid,omitempty"`
 	Image               string            `json:"image"`
 	CPU                 string            `json:"cpu,omitempty"`
 	Memory              string            `json:"memory,omitempty"`
@@ -32,11 +38,13 @@ type SandboxSpec struct {
 
 // SandboxStatus represents the observed state of a sandbox on a fastlet.
 type SandboxStatus struct {
-	SandboxID string `json:"sandboxId"`
-	ClaimUID  string `json:"claimUid"`
-	Phase     string `json:"phase"`
-	Message   string `json:"message,omitempty"`
-	CreatedAt int64  `json:"createdAt"` // Unix timestamp for orphan cleanup
+	SandboxID          string `json:"sandboxId"`
+	ClaimUID           string `json:"claimUid"`
+	InstanceGeneration int64  `json:"instanceGeneration,omitempty"`
+	AssignmentAttempt  int64  `json:"assignmentAttempt,omitempty"`
+	Phase              string `json:"phase"`
+	Message            string `json:"message,omitempty"`
+	CreatedAt          int64  `json:"createdAt"` // Unix timestamp for orphan cleanup
 }
 
 // CreateSandboxRequest is sent to create a single sandbox on a fastlet.
@@ -71,4 +79,144 @@ type FastletStatus struct {
 	Allocated       int             `json:"allocated"`
 	Images          []string        `json:"images"`
 	SandboxStatuses []SandboxStatus `json:"sandboxStatuses"`
+	Admission       AdmissionStatus `json:"admission"`
+	RuntimeReady    bool            `json:"runtimeReady"`
+	Recovering      bool            `json:"recovering"`
+	Draining        bool            `json:"draining"`
+	FastletPodUID   string          `json:"fastletPodUid,omitempty"`
+}
+
+type FastletErrorCode string
+
+const (
+	ErrorCapacityRejected   FastletErrorCode = "CapacityRejected"
+	ErrorDraining           FastletErrorCode = "Draining"
+	ErrorInProgress         FastletErrorCode = "InProgress"
+	ErrorConflict           FastletErrorCode = "Conflict"
+	ErrorStaleGeneration    FastletErrorCode = "StaleGeneration"
+	ErrorStaleAssignment    FastletErrorCode = "StaleAssignment"
+	ErrorRuntimeUnavailable FastletErrorCode = "RuntimeUnavailable"
+	ErrorNetworkUnavailable FastletErrorCode = "NetworkUnavailable"
+	ErrorInfraUnavailable   FastletErrorCode = "InfraUnavailable"
+	ErrorUnknownOutcome     FastletErrorCode = "UnknownOutcome"
+	ErrorNotFound           FastletErrorCode = "NotFound"
+)
+
+type FastletError struct {
+	Code      FastletErrorCode `json:"code"`
+	Message   string           `json:"message"`
+	Retryable bool             `json:"retryable"`
+	Cause     error            `json:"-"`
+}
+
+func (e *FastletError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func (e *FastletError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return string(e.Code) + ": " + e.Message
+}
+
+type SandboxIdentity struct {
+	RequestID          string `json:"requestId,omitempty"`
+	SandboxUID         string `json:"sandboxUid"`
+	InstanceGeneration int64  `json:"instanceGeneration"`
+	AssignmentAttempt  int64  `json:"assignmentAttempt"`
+	FastletPodUID      string `json:"fastletPodUid"`
+}
+
+type AdmissionStatus struct {
+	Capacity     int `json:"capacity"`
+	Reservations int `json:"reservations"`
+	Creating     int `json:"creating"`
+	Running      int `json:"running"`
+	Deleting     int `json:"deleting"`
+	Used         int `json:"used"`
+}
+
+type ReserveSandboxRequest struct {
+	RequestID           string `json:"requestId"`
+	CreateSpecHash      string `json:"createSpecHash"`
+	FastletPodUID       string `json:"fastletPodUid"`
+	RuntimeProfileHash  string `json:"runtimeProfileHash"`
+	ResourceProfileHash string `json:"resourceProfileHash"`
+}
+
+type ReserveSandboxResponse struct {
+	ReservationToken string          `json:"reservationToken"`
+	FastletPodUID    string          `json:"fastletPodUid"`
+	ExpiresAt        time.Time       `json:"expiresAt"`
+	Admission        AdmissionStatus `json:"admission"`
+	Error            *FastletError   `json:"error,omitempty"`
+}
+
+type CancelReservationRequest struct {
+	RequestID        string `json:"requestId"`
+	ReservationToken string `json:"reservationToken"`
+}
+
+type CancelReservationResponse struct {
+	Canceled bool          `json:"canceled"`
+	Error    *FastletError `json:"error,omitempty"`
+}
+
+type EnsureSandboxRequest struct {
+	Identity         SandboxIdentity `json:"identity"`
+	ReservationToken string          `json:"reservationToken,omitempty"`
+	CreateSpecHash   string          `json:"createSpecHash,omitempty"`
+	Sandbox          SandboxSpec     `json:"sandbox"`
+}
+
+type EnsureSandboxResponse struct {
+	Accepted   bool            `json:"accepted"`
+	Created    bool            `json:"created"`
+	InProgress bool            `json:"inProgress"`
+	Sandbox    *SandboxStatus  `json:"sandbox,omitempty"`
+	Admission  AdmissionStatus `json:"admission"`
+	Error      *FastletError   `json:"error,omitempty"`
+}
+
+type InspectSandboxRequest struct {
+	Identity SandboxIdentity `json:"identity"`
+}
+
+type InspectSandboxResponse struct {
+	Sandbox *SandboxStatus `json:"sandbox,omitempty"`
+	Error   *FastletError  `json:"error,omitempty"`
+}
+
+type DeleteSandboxV2Request struct {
+	Identity SandboxIdentity `json:"identity"`
+}
+
+type DeleteSandboxV2Response struct {
+	Accepted bool          `json:"accepted"`
+	Error    *FastletError `json:"error,omitempty"`
+}
+
+type SetDrainingRequest struct {
+	Draining bool   `json:"draining"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+type SetDrainingResponse struct {
+	Draining bool `json:"draining"`
+}
+
+type RuntimeDiagnostics struct {
+	RuntimeProfileHash string `json:"runtimeProfileHash"`
+	State              string `json:"state"`
+	Reason             string `json:"reason,omitempty"`
+	Message            string `json:"message,omitempty"`
+}
+
+type HeartbeatResponse struct {
+	FastletStatus
+	Diagnostics RuntimeDiagnostics `json:"diagnostics"`
 }

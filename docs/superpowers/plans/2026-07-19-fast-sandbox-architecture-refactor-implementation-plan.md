@@ -1,7 +1,7 @@
 # Fast Sandbox 架构重构开发计划
 
 **日期**：2026-07-19  
-**状态**：执行中（阶段 0～3 完成，阶段 4 准备中）
+**状态**：执行中（阶段 0～4 完成，阶段 5 进行中）
 **代码基线**：`master@f92d8e34288365be227d2ee8a6f952687dc7be00`  
 **本地仓库**：`/Users/fengjianhui/WorkSpaceL/fast-sandbox`  
 **远端开发机**：SSH alias `fast`  
@@ -653,6 +653,21 @@ bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_
 - 恢复完成前 readiness=False。
 
 远端 containerd e2e：创建 Sandbox，重启 Fastlet container 而不改变 Pod UID，确认 Sandbox、capacity 和 route metadata 恢复。
+
+### 9.6 实施结果（2026-07-19）
+
+- Fastlet Control v2 已提供 `ReserveSandbox/CancelReservation/EnsureSandbox/InspectSandbox/DeleteSandbox/Heartbeat/RuntimeDiagnostics/SetDraining`，v1 create/delete/status 作为迁移适配层保留；
+- reservation 原子绑定 request ID、创建参数摘要、完整 runtime/resource profile hash 和目标 Fastlet Pod UID，支持幂等获取、主动取消和 TTL 回收；
+- `reservation + creating + running + deleting` 统一计入本地权威 capacity，Fastlet 在 runtime 调用前原子占位，失败释放，100 并发争夺 5 slot 无超卖；
+- Ensure 使用 Sandbox UID、instanceGeneration、assignmentAttempt、Fastlet Pod UID 做 fencing；重复 Ensure 只创建一次 runtime，旧 generation/Pod UID 和 claim/profile 冲突均返回结构化错误；
+- 删除优先于进行中的创建；延迟删除只允许移除原 manager entry，不能误删同 UID 的后续实例；
+- Fastlet 启动先进入 `Recovering/NotReady`，按本 Pod UID 从 RuntimeDriver 恢复 managed runtime 和 generation/capacity，capability Ready 后才开放 admission；Draining 会关闭 readiness，但不伪装成 runtime 故障；
+- PoolController 强制注入平台控制的 `FASTLET_CONTROL_PORT=:5758` 和 HTTP `/readyz` probe，用户 template 不能覆盖，Kubernetes Pod Ready 因而与 recovery/admission readiness 对齐；
+- containerd managed runtime label 已持久化 request ID、generation、assignment attempt、Pod UID 和完整 profile/resource identity；
+- 远端 unit gate：`make test-unit`，退出状态 `0`；
+- 远端 race gate：`go test -race ./internal/fastlet/runtime ./internal/fastlet/server ./internal/api -count=1`，退出状态 `0`；
+- 远端 containerd e2e：Fastlet Pod UID `00a702f8-d1e7-455b-bfbd-edddc9fd5345` 保持不变，container restart count 从 `0` 变为 `1`；恢复后 `runtimeReady=true`、`recovering=false`、`running=1`、`used=1`，Sandbox CRD 仍为 Running 且 runtime identity 未变化；
+- 当前阶段尚无 NetworkManager/RouteStore，因此 e2e 只验证 runtime/capacity 恢复；route metadata 恢复在阶段 7 实现后纳入同一故障测试。
 
 ## 10. 阶段 5：Local Registry、Heartbeat、Top-K 和镜像缓存
 

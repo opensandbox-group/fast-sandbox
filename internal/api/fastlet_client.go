@@ -20,6 +20,22 @@ type FastletAPIClient interface {
 	GetFastletStatus(ctx context.Context, fastletIP string) (*FastletStatus, error)
 }
 
+// FastletAdmissionClient is the versioned control-plane protocol used by the
+// multi-active Fast-Path and declarative Controller. It deliberately contains
+// lifecycle/admission operations only; Exec/File are data-plane concerns.
+type FastletAdmissionClient interface {
+	ReserveSandbox(ctx context.Context, fastletIP string, req *ReserveSandboxRequest) (*ReserveSandboxResponse, error)
+	CancelReservation(ctx context.Context, fastletIP string, req *CancelReservationRequest) (*CancelReservationResponse, error)
+	EnsureSandbox(ctx context.Context, fastletIP string, req *EnsureSandboxRequest) (*EnsureSandboxResponse, error)
+	InspectSandbox(ctx context.Context, fastletIP string, req *InspectSandboxRequest) (*InspectSandboxResponse, error)
+	DeleteSandboxV2(ctx context.Context, fastletIP string, req *DeleteSandboxV2Request) (*DeleteSandboxV2Response, error)
+	Heartbeat(ctx context.Context, fastletIP string) (*HeartbeatResponse, error)
+	RuntimeDiagnostics(ctx context.Context, fastletIP string) (*RuntimeDiagnostics, error)
+	SetDraining(ctx context.Context, fastletIP string, req *SetDrainingRequest) (*SetDrainingResponse, error)
+}
+
+var _ FastletAdmissionClient = (*FastletClient)(nil)
+
 const (
 	// defaultFastletTimeout is the default timeout for fastlet API calls
 	defaultFastletTimeout = 5 * time.Second
@@ -169,4 +185,108 @@ func (c *FastletClient) GetFastletStatus(ctx context.Context, fastletIP string) 
 	}
 
 	return &status, nil
+}
+
+func (c *FastletClient) ReserveSandbox(ctx context.Context, fastletIP string, req *ReserveSandboxRequest) (*ReserveSandboxResponse, error) {
+	return postFastletJSON[ReserveSandboxRequest, ReserveSandboxResponse](c, ctx, fastletIP, "/api/v2/fastlet/reservations", req)
+}
+
+func (c *FastletClient) CancelReservation(ctx context.Context, fastletIP string, req *CancelReservationRequest) (*CancelReservationResponse, error) {
+	return postFastletJSON[CancelReservationRequest, CancelReservationResponse](c, ctx, fastletIP, "/api/v2/fastlet/reservations/cancel", req)
+}
+
+func (c *FastletClient) EnsureSandbox(ctx context.Context, fastletIP string, req *EnsureSandboxRequest) (*EnsureSandboxResponse, error) {
+	return postFastletJSON[EnsureSandboxRequest, EnsureSandboxResponse](c, ctx, fastletIP, "/api/v2/fastlet/ensure", req)
+}
+
+func (c *FastletClient) InspectSandbox(ctx context.Context, fastletIP string, req *InspectSandboxRequest) (*InspectSandboxResponse, error) {
+	return postFastletJSON[InspectSandboxRequest, InspectSandboxResponse](c, ctx, fastletIP, "/api/v2/fastlet/inspect", req)
+}
+
+func (c *FastletClient) DeleteSandboxV2(ctx context.Context, fastletIP string, req *DeleteSandboxV2Request) (*DeleteSandboxV2Response, error) {
+	return postFastletJSON[DeleteSandboxV2Request, DeleteSandboxV2Response](c, ctx, fastletIP, "/api/v2/fastlet/delete", req)
+}
+
+func (c *FastletClient) Heartbeat(ctx context.Context, fastletIP string) (*HeartbeatResponse, error) {
+	return getFastletJSON[HeartbeatResponse](c, ctx, fastletIP, "/api/v2/fastlet/heartbeat")
+}
+
+func (c *FastletClient) RuntimeDiagnostics(ctx context.Context, fastletIP string) (*RuntimeDiagnostics, error) {
+	return getFastletJSON[RuntimeDiagnostics](c, ctx, fastletIP, "/api/v2/fastlet/runtime-diagnostics")
+}
+
+func (c *FastletClient) SetDraining(ctx context.Context, fastletIP string, req *SetDrainingRequest) (*SetDrainingResponse, error) {
+	return postFastletJSON[SetDrainingRequest, SetDrainingResponse](c, ctx, fastletIP, "/api/v2/fastlet/draining", req)
+}
+
+func postFastletJSON[Request any, Response any](c *FastletClient, ctx context.Context, fastletIP, path string, request *Request) (*Response, error) {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	requestContext, cancel := c.requestContext(ctx)
+	defer cancel()
+	httpRequest, err := http.NewRequestWithContext(requestContext, http.MethodPost, c.endpoint(fastletIP, path), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	return doFastletJSON[Response](c, httpRequest)
+}
+
+func getFastletJSON[Response any](c *FastletClient, ctx context.Context, fastletIP, path string) (*Response, error) {
+	requestContext, cancel := c.requestContext(ctx)
+	defer cancel()
+	httpRequest, err := http.NewRequestWithContext(requestContext, http.MethodGet, c.endpoint(fastletIP, path), nil)
+	if err != nil {
+		return nil, err
+	}
+	return doFastletJSON[Response](c, httpRequest)
+}
+
+func doFastletJSON[Response any](c *FastletClient, request *http.Request) (*Response, error) {
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	var result Response
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	if failure := responseFastletError(any(&result)); failure != nil {
+		return &result, failure
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return &result, fmt.Errorf("Fastlet request failed with status: %d", response.StatusCode)
+	}
+	return &result, nil
+}
+
+func responseFastletError(response any) *FastletError {
+	switch typed := response.(type) {
+	case *ReserveSandboxResponse:
+		return typed.Error
+	case *CancelReservationResponse:
+		return typed.Error
+	case *EnsureSandboxResponse:
+		return typed.Error
+	case *InspectSandboxResponse:
+		return typed.Error
+	case *DeleteSandboxV2Response:
+		return typed.Error
+	default:
+		return nil
+	}
+}
+
+func (c *FastletClient) endpoint(fastletIP, path string) string {
+	return fmt.Sprintf("http://%s:%d%s", fastletIP, c.fastletPort, path)
+}
+
+func (c *FastletClient) requestContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, hasDeadline := ctx.Deadline(); hasDeadline || c.timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, c.timeout)
 }

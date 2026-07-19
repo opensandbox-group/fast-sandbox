@@ -156,3 +156,11 @@ kind load docker-image fast-sandbox/fastlet:dev --name fsb-e2e-basic
 **证据**：用户将远端仓库恢复为 master 后，本地 Phase 2 commit 不存在于远端 Git object/baseline。`make generate && make manifests` 生成内容正确，但 `verify-generated` 内部的 `git diff --exit-code` 必然把 Phase 2 的 protobuf/CRD 变更视为未提交差异。
 
 **结论**：本地分支仍执行正常 Git diff 审核；远端 changed-files 镜像采用“生成前 SHA-256 -> generate/manifests -> 生成后 SHA-256”，并将结果与本地分支交叉比对。阶段 3 的五份生成物前后及本地/远端 hash 均完全一致，随后 `make test-unit` 退出状态为 `0`。如果以后把本地 commit 同步为远端同名分支，可恢复直接使用 `make verify-generated`。
+
+### REF-0010：Heartbeat 不能持续发送 containerd 全量镜像清单
+
+**证据**：阶段 4 真实 containerd 恢复 e2e 中，Fastlet 的首次 v2 Heartbeat 直接返回 node containerd namespace 的全部镜像引用，除用户镜像外还包含 Kubernetes 系统镜像、大量 `import-*` alias 和 `sha256:*` 内容引用。单次响应已经远大于 admission/runtime 状态本身。
+
+**影响**：如果多个 Fast-Path 副本每 10～30 秒持续拉取完整清单，节点镜像数量增长后会放大 Fastlet CPU、序列化、网络和 Registry 内存成本；而大量系统/content alias 对 Sandbox 镜像亲和没有调度价值。
+
+**结论**：阶段 5 Heartbeat 使用 `cacheRevision + changed inventory`：revision 未变化不返回完整 inventory；inventory 只保留可用于 Sandbox 请求匹配的 normalized image reference/digest，排除裸 content digest、kind import alias 和无关系统镜像。首次握手或 revision gap 才发送受大小限制的 full snapshot，超限时 fail closed 为“缓存信息不完整”，不得影响 capacity/admission 正确性。
