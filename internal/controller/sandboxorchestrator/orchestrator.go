@@ -151,7 +151,10 @@ func (o *Orchestrator) ReserveForCreate(ctx context.Context, sandbox *apiv1alpha
 	if err != nil {
 		return nil, err
 	}
-	for _, candidate := range candidates {
+	for index, candidate := range candidates {
+		if index > 0 {
+			recordTopKRetry("attempt")
+		}
 		response, reserveErr := o.FastletClient.ReserveSandbox(ctx, candidate.PodIP, &api.ReserveSandboxRequest{
 			RequestID: requestID, CreateSpecHash: createSpecHash,
 			ClaimNamespace: sandbox.Namespace, ClaimName: sandbox.Name, FastletPodUID: candidate.PodUID,
@@ -159,6 +162,9 @@ func (o *Orchestrator) ReserveForCreate(ctx context.Context, sandbox *apiv1alpha
 			InfraProfileHash: parameters.InfraProfileHash,
 		})
 		if reserveErr == nil && response != nil && response.ReservationToken != "" && response.FastletPodUID == candidate.PodUID {
+			if index > 0 {
+				recordTopKRetry("accepted")
+			}
 			return &Reservation{
 				Fastlet: candidate, RequestID: requestID, CreateSpecHash: createSpecHash,
 				Token: response.ReservationToken, ExpiresAt: response.ExpiresAt, Parameters: parameters,
@@ -168,6 +174,7 @@ func (o *Orchestrator) ReserveForCreate(ctx context.Context, sandbox *apiv1alpha
 			reserveErr = ErrUnknownFastletOutcome
 		}
 		if isCandidateRejection(reserveErr) {
+			recordTopKRetry("candidate_rejected")
 			o.recordFeedback(candidate.ID, reserveErr)
 			continue
 		}

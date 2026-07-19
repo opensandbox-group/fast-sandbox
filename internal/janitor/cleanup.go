@@ -11,20 +11,25 @@ func (j *Janitor) doCleanup(ctx context.Context, task CleanupTask) error {
 	resource := task.Resource
 	decision, err := j.cleanupDecision(ctx, resource)
 	if err != nil {
+		recordJanitorCleanup(resource.Backend, "revalidation_error", "AuthorityCheckFailed")
 		return fmt.Errorf("revalidate %s: %w", resource.String(), err)
 	}
 	if !decision.Eligible {
+		recordJanitorCleanup(resource.Backend, "skipped", decision.Reason)
 		klog.InfoS("Skipping resource after pre-delete revalidation", "backend", resource.Backend, "resource", resource.ResourceID, "reason", decision.Reason)
 		return nil
 	}
 	backend := j.backend(resource.Backend)
 	if backend == nil {
+		recordJanitorCleanup(resource.Backend, "error", "BackendUnavailable")
 		return fmt.Errorf("cleanup backend %q is not configured", resource.Backend)
 	}
 	if err := backend.Cleanup(ctx, resource); err != nil {
+		recordJanitorCleanup(resource.Backend, "error", "BackendCleanupFailed")
 		return fmt.Errorf("cleanup %s: %w", resource.String(), err)
 	}
 	klog.InfoS("Cleaned orphan node resource", "backend", resource.Backend, "resource", resource.ResourceID, "reason", decision.Reason)
+	recordJanitorCleanup(resource.Backend, "cleaned", decision.Reason)
 	return nil
 }
 

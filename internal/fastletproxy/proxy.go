@@ -31,17 +31,23 @@ type Proxy struct {
 }
 
 func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	started := time.Now()
+	metricAccess, metricResult := "", "success"
+	defer func() { observeFastletProxy(metricAccess, metricResult, started) }()
 	sandboxUID, targetPort, suffix, err := ParseRoutePath(request.URL.Path)
 	if err != nil {
+		metricResult = "invalid_route"
 		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if p.Store == nil || p.Verifier == nil {
+		metricResult = "unconfigured"
 		http.Error(writer, "Fastlet Proxy is not configured", http.StatusServiceUnavailable)
 		return
 	}
 	route, err := p.Store.Lookup(sandboxUID)
 	if err != nil {
+		metricResult = "route_unavailable"
 		status := http.StatusNotFound
 		if errors.Is(err, ErrRouteDraining) {
 			status = http.StatusServiceUnavailable
@@ -50,11 +56,13 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if err := validateFenceHeaders(request.Header, route); err != nil {
+		metricResult = "stale_fence"
 		http.Error(writer, err.Error(), http.StatusConflict)
 		return
 	}
 	token, err := bearerToken(request.Header.Get("Authorization"))
 	if err != nil {
+		metricResult = "missing_credential"
 		http.Error(writer, err.Error(), http.StatusUnauthorized)
 		return
 	}
@@ -63,6 +71,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		FastletPodUID: route.FastletPodUID, AssignmentAttempt: route.AssignmentAttempt, RouteGeneration: route.RouteGeneration,
 	})
 	if err != nil {
+		metricResult = "credential_rejected"
 		http.Error(writer, "route credential rejected", http.StatusForbidden)
 		return
 	}
@@ -70,7 +79,9 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	transport := p.Transport
 	switch route.Access.Kind {
 	case fastletnetwork.AccessKindDirectIP:
+		metricAccess = string(fastletnetwork.AccessKindDirectIP)
 		if net.ParseIP(route.Access.Address) == nil {
+			metricResult = "invalid_access"
 			http.Error(writer, "direct IP route address is invalid", http.StatusNotImplemented)
 			return
 		}
@@ -82,8 +93,10 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			}
 		}
 	case fastletnetwork.AccessKindLocalForward:
+		metricAccess = string(fastletnetwork.AccessKindLocalForward)
 		transport, err = newLocalForwardTransport(route.Access, targetPort, p.DialContext)
 		if err != nil {
+			metricResult = "invalid_access"
 			http.Error(writer, "local-forward route is invalid: "+err.Error(), http.StatusNotImplemented)
 			return
 		}
@@ -91,6 +104,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		// runtime-local endpoint after writing the target-port preamble.
 		upstream = "sandbox.local"
 	default:
+		metricResult = "unsupported_access"
 		http.Error(writer, "route access kind is not supported", http.StatusNotImplemented)
 		return
 	}
@@ -110,6 +124,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			}
 		},
 		ErrorHandler: func(response http.ResponseWriter, _ *http.Request, proxyErr error) {
+			metricResult = "upstream_error"
 			http.Error(response, "sandbox upstream unavailable: "+proxyErr.Error(), http.StatusBadGateway)
 		},
 	}

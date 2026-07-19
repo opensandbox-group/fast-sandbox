@@ -37,7 +37,8 @@ func generateReservationToken() (string, error) {
 	return idgen.GenerateRequestID()
 }
 
-func (m *SandboxManager) ReserveSandbox(req *api.ReserveSandboxRequest) (*api.ReserveSandboxResponse, error) {
+func (m *SandboxManager) ReserveSandbox(req *api.ReserveSandboxRequest) (_ *api.ReserveSandboxResponse, resultErr error) {
+	defer func() { recordAdmission("reserve", resultErr) }()
 	if req == nil || req.RequestID == "" || req.CreateSpecHash == "" || req.ClaimNamespace == "" || req.ClaimName == "" {
 		return reserveFailure(api.ErrorConflict, "requestId, createSpecHash, claimNamespace, and claimName are required", false)
 	}
@@ -94,7 +95,8 @@ func (m *SandboxManager) ReserveSandbox(req *api.ReserveSandboxRequest) (*api.Re
 	return &api.ReserveSandboxResponse{ReservationToken: token, FastletPodUID: m.fastletPodUID, ExpiresAt: expiresAt, Admission: m.admissionStatusLocked()}, nil
 }
 
-func (m *SandboxManager) CancelReservation(req *api.CancelReservationRequest) (*api.CancelReservationResponse, error) {
+func (m *SandboxManager) CancelReservation(req *api.CancelReservationRequest) (_ *api.CancelReservationResponse, resultErr error) {
+	defer func() { recordAdmission("cancel", resultErr) }()
 	if req == nil || req.ReservationToken == "" {
 		failure := fastletError(api.ErrorConflict, "reservationToken is required", false)
 		return &api.CancelReservationResponse{Error: failure}, failure
@@ -114,7 +116,12 @@ func (m *SandboxManager) CancelReservation(req *api.CancelReservationRequest) (*
 	return &api.CancelReservationResponse{Canceled: true}, nil
 }
 
-func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSandboxRequest) (*api.EnsureSandboxResponse, error) {
+func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSandboxRequest) (_ *api.EnsureSandboxResponse, resultErr error) {
+	started := time.Now()
+	defer func() {
+		recordAdmission("ensure", resultErr)
+		observeDataPlaneReady(m.runtimeName, m.infraProfile, started, resultErr)
+	}()
 	if failure := m.validateEnsureRequest(req); failure != nil {
 		return ensureFailure(failure, api.AdmissionStatus{})
 	}
@@ -268,7 +275,9 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 	admission := m.admissionStatusLocked()
 	m.mu.Unlock()
 
+	runtimeStarted := time.Now()
 	metadata, err := m.runtime.EnsureSandbox(ctx, &spec)
+	observeRuntimeCreate(m.runtimeName, runtimeStarted, err)
 	if err != nil {
 		m.cacheProtection.ProtectHotUntil(spec.Image, m.clock.Now().Add(time.Hour))
 		m.mu.Lock()
@@ -661,6 +670,7 @@ func (m *SandboxManager) admissionStatusLocked() api.AdmissionStatus {
 		}
 	}
 	status.Used = status.Reservations + status.Creating + status.Running + status.Deleting
+	recordAdmissionStatus(status)
 	return status
 }
 

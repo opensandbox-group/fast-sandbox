@@ -106,7 +106,7 @@ func main() {
 
 	proxyControlClient := fastletproxy.NewControlClient(getEnv("FASTLET_PROXY_CONTROL_SOCKET", fastletproxy.DefaultControlSocket))
 	sandboxManager, err := runtime.NewSandboxManagerWithConfig(rt, runtime.SandboxManagerConfig{
-		Capacity: capacityFromEnvironment(), RuntimeProfileHash: runtimeProfile.ProfileHash, ResourceProfile: &resourceProfile,
+		Capacity: capacityFromEnvironment(), RuntimeName: runtimeProfile.Name, RuntimeProfileHash: runtimeProfile.ProfileHash, ResourceProfile: &resourceProfile,
 		FastletPodUID: podUID, RecoverOnStart: true,
 		WarmImages:     warmImages,
 		RoutePublisher: fastletproxy.NewRoutePublisher(proxyControlClient),

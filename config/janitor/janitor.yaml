@@ -13,6 +13,10 @@ spec:
     metadata:
       labels:
         app: fast-sandbox-janitor
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9092"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: fast-sandbox-janitor
       hostNetwork: true
@@ -25,6 +29,9 @@ spec:
         imagePullPolicy: IfNotPresent
         command: ["/workspace/janitor"]
         args: ["--scan-interval=2m", "--orphan-timeout=30s"]
+        ports:
+        - name: metrics
+          containerPort: 9092
         securityContext:
           privileged: true
         env:

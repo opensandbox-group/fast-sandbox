@@ -41,10 +41,12 @@ func (t *Tracker) Snapshot(ctx context.Context, cursor api.CacheCursor) (api.Cac
 	defer t.mu.Unlock()
 
 	if t.source == nil {
+		cacheSnapshotTotal.WithLabelValues("unavailable").Inc()
 		return api.CacheSnapshot{Epoch: t.epoch, Complete: false}, nil
 	}
 	raw, err := t.source.ListImages(ctx)
 	if err != nil {
+		cacheSnapshotTotal.WithLabelValues("error").Inc()
 		return api.CacheSnapshot{Epoch: t.epoch, Revision: t.revision, Complete: false}, err
 	}
 	normalized := NormalizeInventory(raw)
@@ -65,6 +67,16 @@ func (t *Tracker) Snapshot(ctx context.Context, cursor api.CacheCursor) (api.Cac
 			snapshot.Images = append([]string(nil), t.inventory...)
 		}
 	}
+	cacheRevision.Set(float64(t.revision))
+	cacheInventorySize.Set(float64(len(t.inventory)))
+	result := "unchanged"
+	if snapshot.Full {
+		result = "full"
+	}
+	if !snapshot.Complete {
+		result = "incomplete"
+	}
+	cacheSnapshotTotal.WithLabelValues(result).Inc()
 	return snapshot, nil
 }
 

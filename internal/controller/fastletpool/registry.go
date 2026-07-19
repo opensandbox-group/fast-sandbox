@@ -290,6 +290,7 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 	}
 	request.Image = fastletcache.NormalizeReference(request.Image)
 	candidates := r.GetAllFastlets()
+	recordHeartbeatAges(candidates, request.Now, time.Duration(r.staleAfter.Load()))
 	filtered := candidates[:0]
 	for _, info := range candidates {
 		if !r.hardFilter(info, request) {
@@ -317,6 +318,7 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 	if k > 0 && len(filtered) > k {
 		filtered = filtered[:k]
 	}
+	recordTopK(len(candidates), filtered, request.Image)
 	return filtered
 }
 

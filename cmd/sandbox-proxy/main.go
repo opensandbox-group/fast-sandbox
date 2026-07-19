@@ -14,6 +14,7 @@ import (
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/routeauth"
 	"fast-sandbox/internal/sandboxproxy"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -28,9 +29,11 @@ import (
 
 func main() {
 	var address string
+	var metricsAddress string
 	var publicKeyValue string
 	var fastletPort int
 	flag.StringVar(&address, "bind-address", sandboxproxy.DefaultAddress, "Sandbox Proxy listen address.")
+	flag.StringVar(&metricsAddress, "metrics-bind-address", ":9094", "Prometheus metrics listen address; empty disables the server.")
 	flag.StringVar(&publicKeyValue, "route-verify-public-key", os.Getenv("FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY"), "Comma-separated base64 Ed25519 route credential public keys.")
 	flag.IntVar(&fastletPort, "fastlet-proxy-port", 5780, "Fastlet Proxy data port.")
 	flag.Parse()
@@ -102,11 +105,27 @@ func main() {
 	})
 	mux.Handle("/", dataProxy)
 	server := &http.Server{Addr: address, Handler: mux, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 5 * time.Minute}
+	var metricsServer *http.Server
+	if metricsAddress != "" {
+		metricsMux := http.NewServeMux()
+		metricsMux.Handle("GET /metrics", promhttp.Handler())
+		metricsServer = &http.Server{Addr: metricsAddress, Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			klog.InfoS("Sandbox Proxy metrics server listening", "address", metricsAddress)
+			if serveErr := metricsServer.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				klog.ErrorS(serveErr, "Sandbox Proxy metrics server exited")
+				cancel()
+			}
+		}()
+	}
 	go func() {
 		<-ctx.Done()
 		shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer shutdownCancel()
 		_ = server.Shutdown(shutdownContext)
+		if metricsServer != nil {
+			_ = metricsServer.Shutdown(shutdownContext)
+		}
 	}()
 	klog.InfoS("Sandbox Proxy listening", "address", address)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

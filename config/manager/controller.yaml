@@ -118,19 +118,24 @@ spec:
   template:
     metadata:
       labels: {app: fast-sandbox-proxy}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9094"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: fast-sandbox-proxy
       containers:
       - name: proxy
         image: fast-sandbox/sandbox-proxy:dev
         imagePullPolicy: IfNotPresent
-        args: ["--bind-address=:8080", "--fastlet-proxy-port=5780"]
+        args: ["--bind-address=:8080", "--metrics-bind-address=:9094", "--fastlet-proxy-port=5780"]
         env:
         - name: FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY
           valueFrom:
             secretKeyRef: {name: fast-sandbox-route-keys, key: public-key}
         ports:
         - {name: http, containerPort: 8080}
+        - {name: metrics, containerPort: 9094}
         readinessProbe:
           httpGet: {path: /readyz, port: http}
         livenessProbe:

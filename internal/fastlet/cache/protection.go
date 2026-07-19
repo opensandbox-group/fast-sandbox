@@ -111,7 +111,10 @@ func (p *ProtectionIndex) PlanEviction(candidates []string) []string {
 	result := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
 		if !p.IsProtected(candidate) {
+			cacheGCDecisionTotal.WithLabelValues("eligible").Inc()
 			result = append(result, NormalizeReference(candidate))
+		} else {
+			cacheGCDecisionTotal.WithLabelValues("protected").Inc()
 		}
 	}
 	sort.Strings(result)

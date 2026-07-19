@@ -53,7 +53,9 @@ func (m *Manager) InitializeInstanceWithDialer(ctx context.Context, spec *api.Sa
 	}
 	instance.Diagnostics = nil
 	for _, service := range instance.Services {
+		started := time.Now()
 		serviceErr := m.initializeServiceWithDialer(ctx, spec, dial, service, instance.UpstreamHeaders)
+		m.observeInfraReady(service.Component, started, serviceErr)
 		if serviceErr == nil {
 			instance.Diagnostics = append(instance.Diagnostics, ComponentDiagnostic{
 				Component: service.Component, Service: service.Name, Required: service.Required, State: "Ready",

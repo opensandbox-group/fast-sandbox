@@ -1495,6 +1495,18 @@ bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_
 
 任何 runtime 不能以“skip”作为支持完成的证据。
 
+### 17.5 第一批可观测性实施进度（2026-07-19）
+
+- FastPath 增加 `fast_sandbox_create_accepted_latency_seconds{path,result}` 与 `fast_sandbox_create_data_plane_ready_latency_seconds{result}`；拒绝、reservation accepted、合法幂等命中分开计数，request ID 冲突不会误记为 accepted；
+- Registry/Orchestrator 增加 heartbeat age、watch/eligible candidate count、image affinity outcome 和 Top-K candidate rejection/retry 指标；指标只表达最终有界分类，不把 Fastlet ID、Pod UID、request ID 或 Sandbox UID 放入 label；
+- Fastlet admission 增加 reserve/cancel/ensure outcome、reservation inflight 和 capacity/used/creating/running/deleting gauges；runtime create、Infra service readiness、DataPlaneReady、cache snapshot/revision/GC decision、network clean/in-use slot 均已覆盖；
+- Sandbox Proxy、Fastlet Proxy 分别记录 route/upstream 全请求或流生命周期；指标 server 使用独立 `9094/9093` 管理端口，用户数据端口不暴露 `/metrics`，现有 streaming、WebSocket、SSE、cancel/backpressure 转发实现不包裹 `ResponseWriter`；Sandbox Proxy 与 Janitor manifest 已提供独立 scrape 端口，Fastlet Proxy sidecar 暴露命名的 `proxy-metrics` 端口供 PodMonitor 抓取；
+- NodeJanitor cleanup 指标在删除前二次确认、跳过、backend unavailable、backend error 和 cleaned 各路径采样，backend/reason 都来自代码内枚举集合；
+- `runtime_create_latency{cache_hit}` 当前明确写为 `unknown`，因为进程内 CacheSnapshot 不能证明本次 runtime create 的真实 pull/unpack 命中；在 RuntimeDriver 提供 per-create result 前不做推断；
+- 尚未发射 `user_process_start_latency`：containerd task/Box 启动只证明 supervisor/runtime task 已启动，`StartBeforeUser` 场景下不等于用户进程已经 fork，下一切片必须先定义由 sandbox-init/runtime adapter 回传的可信 started signal；trace context/structured identity log 也留在下一切片，不用 metrics label 代替 tracing；
+- 远端定向 gate：`go test ./internal/controller/fastletpool ./internal/controller/fastpath ./internal/controller/sandboxorchestrator ./internal/fastlet/cache ./internal/fastlet/infra ./internal/fastlet/network ./internal/fastlet/runtime ./internal/fastletproxy ./internal/sandboxproxy ./internal/janitor ./cmd/fastlet ./cmd/fastlet-proxy ./cmd/sandbox-proxy ./cmd/janitor -count=1`，退出状态 `0`；
+- 远端完整 unit gate：`make test-unit`，退出状态 `0`；race gate 拆为 `go test -race -p=1 ./internal/controller/fastletpool ./internal/controller/sandboxorchestrator ./internal/fastlet/cache ./internal/fastlet/infra ./internal/fastlet/runtime -count=1`、`go test -race -p=1 ./internal/controller/fastpath ./internal/sandboxproxy ./internal/fastlet/network ./internal/janitor -count=1` 和 `go test -race -p=1 ./internal/controller ./internal/fastletproxy ./internal/sandboxproxy -count=1`，均退出状态 `0`；代理管理端口调整后再次运行 `make test-unit` 也退出 `0`。首次全并行 race 因远端 `/tmp` 空间耗尽中断；只删除精确的 stale `/tmp/go-build*` 与可再生 Go build cache 后改为 `-p=1`，未删除仓库、镜像、volume 或集群资源。
+
 ## 18. 推荐的代码提交/PR 切分
 
 不要用一个超大提交完成重构。推荐顺序：

@@ -23,6 +23,7 @@ import (
 
 type SandboxManagerConfig struct {
 	Capacity           int
+	RuntimeName        apiv1alpha1.RuntimeName
 	RuntimeProfileHash string
 	ResourceProfile    *apiv1alpha1.SandboxResourceProfile
 	FastletPodUID      string
@@ -41,6 +42,7 @@ type SandboxManagerConfig struct {
 type SandboxManager struct {
 	mu                  sync.RWMutex
 	runtime             Runtime
+	runtimeName         string
 	capacity            int
 	runtimeProfileHash  string
 	resourceProfile     *apiv1alpha1.SandboxResourceProfile
@@ -125,7 +127,7 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		}
 	}
 	return &SandboxManager{
-		runtime: runtime, capacity: config.Capacity,
+		runtime: runtime, runtimeName: string(config.RuntimeName), capacity: config.Capacity,
 		runtimeProfileHash: config.RuntimeProfileHash,
 		resourceProfile:    profile, resourceProfileHash: resourceHash,
 		infraProfile: config.InfraProfile, infraProfileHash: config.InfraProfileHash,

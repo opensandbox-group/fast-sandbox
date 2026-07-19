@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,6 +15,7 @@ import (
 	"fast-sandbox/internal/janitor"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -30,6 +33,7 @@ func main() {
 	var scanInterval time.Duration
 	var networkStateRoot string
 	var boxLiteStateRoot string
+	var metricsAddress string
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Name of the node this janitor is running on")
@@ -38,6 +42,7 @@ func main() {
 	flag.DurationVar(&scanInterval, "scan-interval", 2*time.Minute, "Interval for full container scan")
 	flag.StringVar(&networkStateRoot, "network-state-root", "/run/fast-sandbox/network", "Host-mounted Fastlet Linux network state root")
 	flag.StringVar(&boxLiteStateRoot, "boxlite-state-root", "/var/lib/fast-sandbox/boxlite", "Host-mounted BoxLite state root")
+	flag.StringVar(&metricsAddress, "metrics-address", ":9092", "Prometheus metrics listen address; empty disables the server")
 
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -89,6 +94,22 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	var metricsServer *http.Server
+	if metricsAddress != "" {
+		metricsServer = &http.Server{Addr: metricsAddress, Handler: promhttp.Handler(), ReadHeaderTimeout: 5 * time.Second}
+		go func() {
+			klog.InfoS("Janitor metrics server listening", "address", metricsAddress)
+			if serveErr := metricsServer.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+				klog.ErrorS(serveErr, "Janitor metrics server exited")
+				stop()
+			}
+		}()
+		defer func() {
+			shutdownContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = metricsServer.Shutdown(shutdownContext)
+		}()
+	}
 
 	j := janitor.NewJanitor(clientset, ctrdClient, nodeName)
 	j.AddBackend(janitor.NewLinuxNetworkBackend(networkStateRoot, fastletnetwork.NewLinuxNetNSDriver(fastletnetwork.LinuxDriverConfig{})))
@@ -96,7 +117,7 @@ func main() {
 	j.K8sClient = k8sClient
 	j.OrphanTimeout = orphanTimeout
 	j.ScanInterval = scanInterval
-	klog.InfoS("Starting Janitor", "node", nodeName, "orphan-timeout", orphanTimeout, "scan-interval", scanInterval)
+	klog.InfoS("Starting Janitor", "node", nodeName, "orphan-timeout", orphanTimeout, "scan-interval", scanInterval, "metricsAddress", metricsAddress)
 	if err := j.Run(ctx); err != nil {
 		klog.ErrorS(err, "Janitor exited with error")
 		os.Exit(1)

@@ -168,6 +168,8 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	require.Equal(t, "fastlet-proxy", pod.Spec.Containers[1].Name)
 	require.Equal(t, "fastlet-proxy:test", pod.Spec.Containers[1].Image)
 	require.Equal(t, "test-public-key", envValue(pod.Spec.Containers[1].Env, "FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY"))
+	require.Equal(t, ":9093", envValue(pod.Spec.Containers[1].Env, "FASTLET_PROXY_METRICS_ADDRESS"))
+	require.Equal(t, int32(9093), containerPortForName(t, &pod.Spec.Containers[1], "proxy-metrics"))
 	require.Equal(t, int32(5780), pod.Spec.Containers[1].ReadinessProbe.HTTPGet.Port.IntVal)
 	require.Equal(t, "/run/fast-sandbox/proxy/control.sock", envValue(pod.Spec.Containers[0].Env, "FASTLET_PROXY_CONTROL_SOCKET"))
 	require.NotNil(t, volumeMountForContainer(pod, 0, "proxy-control"))
@@ -493,6 +495,17 @@ func containerForName(t *testing.T, pod *corev1.Pod, name string) *corev1.Contai
 	}
 	t.Fatalf("container %q was not found", name)
 	return nil
+}
+
+func containerPortForName(t *testing.T, container *corev1.Container, name string) int32 {
+	t.Helper()
+	for _, port := range container.Ports {
+		if port.Name == name {
+			return port.ContainerPort
+		}
+	}
+	t.Fatalf("container port %q was not found", name)
+	return 0
 }
 
 func volumeMountForNamedContainer(t *testing.T, pod *corev1.Pod, containerName, volumeName string) *corev1.VolumeMount {

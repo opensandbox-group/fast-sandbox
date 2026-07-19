@@ -23,22 +23,29 @@ type Proxy struct {
 }
 
 func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	started := time.Now()
+	metricResult := "success"
+	defer func() { observeSandboxProxy(metricResult, started) }()
 	sandboxUID, targetPort, _, err := fastletproxy.ParseRoutePath(request.URL.Path)
 	if err != nil {
+		metricResult = "invalid_route"
 		http.Error(writer, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if p.Resolver == nil || p.Verifier == nil {
+		metricResult = "unconfigured"
 		http.Error(writer, "Sandbox Proxy is not configured", http.StatusServiceUnavailable)
 		return
 	}
 	token, err := routeBearerToken(request.Header.Get("Authorization"))
 	if err != nil {
+		metricResult = "missing_credential"
 		http.Error(writer, err.Error(), http.StatusUnauthorized)
 		return
 	}
 	route, err := p.Resolver.Resolve(request.Context(), sandboxUID)
 	if err != nil {
+		metricResult = "resolve_error"
 		writeResolveError(writer, err)
 		return
 	}
@@ -47,10 +54,12 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		// API-server read distinguishes temporary cache lag from a stale token.
 		route, err = p.Resolver.ResolveFresh(request.Context(), sandboxUID)
 		if err != nil {
+			metricResult = "resolve_error"
 			writeResolveError(writer, err)
 			return
 		}
 		if _, err = p.verify(token, targetPort, route); err != nil {
+			metricResult = "credential_rejected"
 			http.Error(writer, "route credential rejected", http.StatusForbidden)
 			return
 		}
@@ -80,6 +89,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			proxyRequest.Out.Header.Set(fastletproxy.HeaderRouteGeneration, strconv.FormatInt(route.RouteGeneration, 10))
 		},
 		ErrorHandler: func(response http.ResponseWriter, _ *http.Request, proxyErr error) {
+			metricResult = "upstream_error"
 			http.Error(response, "assigned Fastlet Proxy unavailable: "+proxyErr.Error(), http.StatusBadGateway)
 		},
 	}

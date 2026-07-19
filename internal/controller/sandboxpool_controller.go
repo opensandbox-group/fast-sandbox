@@ -566,9 +566,13 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 		Env: []corev1.EnvVar{
 			{Name: "FASTLET_PROXY_CONTROL_SOCKET", Value: "/run/fast-sandbox/proxy/control.sock"},
 			{Name: "FASTLET_PROXY_DATA_ADDRESS", Value: ":5780"},
+			{Name: "FASTLET_PROXY_METRICS_ADDRESS", Value: ":9093"},
 			{Name: "FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY", Value: r.RouteVerifyPublicKey},
 		},
-		Ports:        []corev1.ContainerPort{{Name: "data-proxy", ContainerPort: 5780, Protocol: corev1.ProtocolTCP}},
+		Ports: []corev1.ContainerPort{
+			{Name: "data-proxy", ContainerPort: 5780, Protocol: corev1.ProtocolTCP},
+			{Name: "proxy-metrics", ContainerPort: 9093, Protocol: corev1.ProtocolTCP},
+		},
 		VolumeMounts: []corev1.VolumeMount{{Name: "proxy-control", MountPath: "/run/fast-sandbox/proxy"}},
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{

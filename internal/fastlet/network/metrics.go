@@ -14,6 +14,14 @@ var (
 		Name: "fastlet_network_slots",
 		Help: "Current Fastlet network slots by durable phase.",
 	}, []string{"phase"})
+	networkSlotAvailable = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "fast_sandbox_network_slot_available",
+		Help: "Current number of clean Fastlet-owned network slots.",
+	})
+	networkSlotInUse = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "fast_sandbox_network_slot_inuse",
+		Help: "Current number of bound or destroying Fastlet-owned network slots.",
+	})
 )
 
 func recordSlotAcquire(result string) {
@@ -24,4 +32,6 @@ func recordSlotPhases(clean, bound, destroying int) {
 	networkSlots.WithLabelValues("clean").Set(float64(clean))
 	networkSlots.WithLabelValues("bound").Set(float64(bound))
 	networkSlots.WithLabelValues("destroying").Set(float64(destroying))
+	networkSlotAvailable.Set(float64(clean))
+	networkSlotInUse.Set(float64(bound + destroying))
 }

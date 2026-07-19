@@ -143,12 +143,17 @@ const SandboxUIDIndexField = "metadata.uid"
 
 func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRequest) (_ *fastpathv1.CreateResponse, resultErr error) {
 	started := time.Now()
+	acceptedObserved := false
 	defer func() {
 		success := "true"
 		if resultErr != nil {
 			success = "false"
 		}
 		createSandboxDuration.WithLabelValues("v2", success).Observe(time.Since(started).Seconds())
+		createDataPlaneReadyLatency.WithLabelValues(grpcMetricResult(resultErr)).Observe(time.Since(started).Seconds())
+		if !acceptedObserved {
+			observeCreateAccepted("rejected", started, resultErr)
+		}
 	}()
 
 	if request == nil || request.Image == "" || request.PoolRef == "" {
@@ -184,6 +189,8 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRe
 		if existing.Annotations[common.AnnotationCreateSpecHash] != createSpecHash {
 			return nil, status.Errorf(codes.AlreadyExists, "request_id %q is bound to a different create spec", request.RequestId)
 		}
+		observeCreateAccepted("idempotent", started, nil)
+		acceptedObserved = true
 		if err := s.ensureExisting(ctx, orchestrator, existing); err != nil {
 			return nil, err
 		}
@@ -201,6 +208,8 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRe
 		}
 		return nil, err
 	}
+	observeCreateAccepted("reservation", started, nil)
+	acceptedObserved = true
 	ownedReservation := reservation
 	defer func() {
 		cancelContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)

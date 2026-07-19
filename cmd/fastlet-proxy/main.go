@@ -11,6 +11,7 @@ import (
 
 	"fast-sandbox/internal/fastletproxy"
 	"fast-sandbox/internal/routeauth"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/klog/v2"
 )
 
@@ -30,7 +31,7 @@ func main() {
 	defer cancel()
 	store := fastletproxy.NewStore()
 	control := &fastletproxy.ControlServer{Store: store, SocketPath: envOrDefault("FASTLET_PROXY_CONTROL_SOCKET", fastletproxy.DefaultControlSocket)}
-	errorsChannel := make(chan error, 2)
+	errorsChannel := make(chan error, 3)
 	go func() { errorsChannel <- control.Serve(ctx) }()
 
 	dataMux := http.NewServeMux()
@@ -44,6 +45,15 @@ func main() {
 		klog.InfoS("Fastlet Proxy data server listening", "address", dataServer.Addr)
 		errorsChannel <- dataServer.ListenAndServe()
 	}()
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("GET /metrics", promhttp.Handler())
+	metricsServer := &http.Server{
+		Addr: envOrDefault("FASTLET_PROXY_METRICS_ADDRESS", ":9093"), Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second,
+	}
+	go func() {
+		klog.InfoS("Fastlet Proxy metrics server listening", "address", metricsServer.Addr)
+		errorsChannel <- metricsServer.ListenAndServe()
+	}()
 
 	select {
 	case <-ctx.Done():
@@ -56,6 +66,7 @@ func main() {
 	shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = dataServer.Shutdown(shutdownContext)
+	_ = metricsServer.Shutdown(shutdownContext)
 }
 
 func envOrDefault(name, fallback string) string {
