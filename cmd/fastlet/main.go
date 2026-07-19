@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"os"
 	"strconv"
@@ -43,6 +44,11 @@ func main() {
 		klog.ErrorS(err, "Failed to resolve Sandbox resource profile")
 		os.Exit(1)
 	}
+	warmImages, err := warmImagesFromEnvironment()
+	if err != nil {
+		klog.ErrorS(err, "Failed to parse warmImages")
+		os.Exit(1)
+	}
 
 	klog.InfoS("Fastlet Info", "PodName", podName, "PodIP", podIP, "NodeName", nodeName, "Namespace", namespace)
 	klog.InfoS("Runtime", "Type", runtimeTypeStr, "Socket", runtimeSocket)
@@ -65,6 +71,7 @@ func main() {
 	sandboxManager, err := runtime.NewSandboxManagerWithConfig(rt, runtime.SandboxManagerConfig{
 		Capacity: capacityFromEnvironment(), RuntimeProfileHash: runtimeProfile.ProfileHash, ResourceProfile: &resourceProfile,
 		FastletPodUID: podUID, RecoverOnStart: true,
+		WarmImages: warmImages,
 	})
 	if err != nil {
 		klog.ErrorS(err, "Failed to initialize Sandbox manager")
@@ -86,6 +93,11 @@ func recoverUntilReady(ctx context.Context, manager *runtime.SandboxManager) {
 	for {
 		if err := manager.Recover(ctx); err == nil {
 			klog.Info("Fastlet runtime recovery completed")
+			go func() {
+				if err := manager.WarmCache(ctx); err != nil {
+					klog.ErrorS(err, "Asynchronous warmImages preparation failed")
+				}
+			}()
 			return
 		} else {
 			klog.ErrorS(err, "Fastlet runtime recovery failed; readiness remains false")
@@ -96,6 +108,15 @@ func recoverUntilReady(ctx context.Context, manager *runtime.SandboxManager) {
 		case <-time.After(2 * time.Second):
 		}
 	}
+}
+
+func warmImagesFromEnvironment() ([]string, error) {
+	value := getEnv("FAST_SANDBOX_WARM_IMAGES", "[]")
+	var images []string
+	if err := json.Unmarshal([]byte(value), &images); err != nil {
+		return nil, err
+	}
+	return images, nil
 }
 
 func resourceProfileFromEnvironment() (apiv1alpha1.SandboxResourceProfile, error) {

@@ -2,145 +2,180 @@ package fastletcontrol
 
 import (
 	"context"
+	"math/rand"
 	"sync"
 	"time"
 
+	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/controller/fastletpool"
 
 	corev1 "k8s.io/api/core/v1"
+	clientgocache "k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
 )
 
-// Loop periodically syncs desired sandboxes with fastlets and updates claim status.
-type Loop struct {
-	Client        client.Client
-	Registry      fastletpool.FastletRegistry
-	FastletClient *api.FastletClient
-	Interval      time.Duration
+type HeartbeatClient interface {
+	Heartbeat(ctx context.Context, fastletIP string, req *api.HeartbeatRequest) (*api.HeartbeatResponse, error)
 }
 
-// NewLoop creates a new FastletControlLoop with a default interval.
-func NewLoop(c client.Client, reg fastletpool.FastletRegistry, fastletClient *api.FastletClient) *Loop {
+// Loop gets membership from the shared Kubernetes Pod informer and probes only
+// those watched endpoints at a low-frequency, jittered, bounded concurrency.
+// It never lists every Pod on each heartbeat cycle.
+type Loop struct {
+	Cache          ctrlcache.Cache
+	Registry       *fastletpool.InMemoryRegistry
+	FastletClient  HeartbeatClient
+	Interval       time.Duration
+	RequestTimeout time.Duration
+	MaxConcurrent  int
+}
+
+func NewLoop(cache ctrlcache.Cache, registry *fastletpool.InMemoryRegistry, fastletClient HeartbeatClient) *Loop {
 	return &Loop{
-		Client:        c,
-		Registry:      reg,
-		FastletClient: fastletClient,
-		Interval:      2 * time.Second,
+		Cache: cache, Registry: registry, FastletClient: fastletClient,
+		Interval: 20 * time.Second, RequestTimeout: 5 * time.Second, MaxConcurrent: 8,
 	}
 }
 
-// Start runs the loop until the context is cancelled.
 func (l *Loop) Start(ctx context.Context) {
-	logger := klog.Background().WithName("fastlet-control-loop")
-	ticker := time.NewTicker(l.Interval)
-	defer ticker.Stop()
+	logger := klog.Background().WithName("fastlet-heartbeat-loop")
+	if l.Cache == nil {
+		logger.Error(nil, "Pod informer cache is required")
+		return
+	}
+	informer, err := l.Cache.GetInformer(ctx, &corev1.Pod{})
+	if err != nil {
+		logger.Error(err, "Get Fastlet Pod informer")
+		return
+	}
+	if _, err := informer.AddEventHandler(clientgocache.ResourceEventHandlerFuncs{
+		AddFunc:    l.onPodAdd,
+		UpdateFunc: l.onPodUpdate,
+		DeleteFunc: l.onPodDelete,
+	}); err != nil {
+		logger.Error(err, "Register Fastlet Pod informer handler")
+		return
+	}
+	if !l.Cache.WaitForCacheSync(ctx) {
+		logger.Info("Pod informer stopped before cache sync")
+		return
+	}
 
-	syncInProgress := false
-	var syncMu sync.Mutex
-
+	l.Registry.SetStaleAfter(3 * l.Interval)
+	l.syncOnce(ctx)
 	for {
+		timer := time.NewTimer(l.nextInterval())
 		select {
 		case <-ctx.Done():
-			logger.Info("fastlet control loop stopped")
+			timer.Stop()
 			return
-		case <-ticker.C:
-			syncMu.Lock()
-			if syncInProgress {
-				syncMu.Unlock()
-				logger.Info("Previous sync still in progress, skipping this tick")
-				continue
-			}
-			syncInProgress = true
-			syncMu.Unlock()
-
-			go func() {
-				defer func() {
-					syncMu.Lock()
-					syncInProgress = false
-					syncMu.Unlock()
-				}()
-
-				start := time.Now()
-				if err := l.syncOnce(ctx); err != nil {
-					logger.Error(err, "fastlet control loop sync failed")
-				}
-				duration := time.Since(start)
-				if duration > l.Interval {
-					logger.Info("Sync took longer than interval", "duration", duration, "interval", l.Interval)
-				}
-			}()
+		case <-timer.C:
+			l.syncOnce(ctx)
 		}
 	}
 }
 
-const (
-	perFastletTimeout   = 5 * time.Second
-	staleFastletTimeout = 15 * time.Second
-)
-
-func (l *Loop) syncOnce(ctx context.Context) error {
-	logger := klog.Background().WithName("fastlet-control-loop")
-
-	syncCtx, cancel := context.WithTimeout(ctx, l.Interval*2)
-	defer cancel()
-
-	var podList corev1.PodList
-	if err := l.Client.List(syncCtx, &podList, client.MatchingLabels{"app": "sandbox-fastlet"}); err != nil {
-		return err
+func (l *Loop) onPodUpdate(previous, current any) {
+	oldPod, oldOK := previous.(*corev1.Pod)
+	newPod, newOK := current.(*corev1.Pod)
+	if oldOK && oldPod.Labels["app"] == "sandbox-fastlet" &&
+		(!newOK || newPod.Labels["app"] != "sandbox-fastlet" || newPod.Name != oldPod.Name || newPod.UID != oldPod.UID) {
+		l.Registry.RemoveIfPodUID(fastletpool.FastletID(oldPod.Name), string(oldPod.UID))
 	}
+	if newOK {
+		l.onPodAdd(newPod)
+	}
+}
 
-	seenFastlets := make(map[fastletpool.FastletID]bool)
+func (l *Loop) nextInterval() time.Duration {
+	if l.Interval <= 0 {
+		return 20 * time.Second
+	}
+	return time.Duration(float64(l.Interval) * (0.8 + rand.Float64()*0.4))
+}
 
-	for _, pod := range podList.Items {
-		if pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
+func (l *Loop) onPodAdd(object any) {
+	pod, ok := object.(*corev1.Pod)
+	if !ok || pod.Labels["app"] != "sandbox-fastlet" {
+		return
+	}
+	l.Registry.UpsertPod(fastletInfoFromPod(pod))
+}
+
+func (l *Loop) onPodDelete(object any) {
+	pod, ok := object.(*corev1.Pod)
+	if !ok {
+		if tombstone, tombstoneOK := object.(clientgocache.DeletedFinalStateUnknown); tombstoneOK {
+			pod, ok = tombstone.Obj.(*corev1.Pod)
+		}
+	}
+	if ok && pod.Labels["app"] == "sandbox-fastlet" {
+		l.Registry.RemoveIfPodUID(fastletpool.FastletID(pod.Name), string(pod.UID))
+	}
+}
+
+func fastletInfoFromPod(pod *corev1.Pod) fastletpool.FastletInfo {
+	return fastletpool.FastletInfo{
+		ID: fastletpool.FastletID(pod.Name), Namespace: pod.Namespace,
+		PodName: pod.Name, PodUID: string(pod.UID), PodIP: pod.Status.PodIP,
+		NodeName: pod.Spec.NodeName, PoolName: pod.Labels["fast-sandbox.io/pool"],
+		RuntimeName:         apiv1alpha1.RuntimeName(pod.Labels["fast-sandbox.io/runtime"]),
+		RuntimeProfileHash:  pod.Annotations["fast-sandbox.io/runtime-profile-hash"],
+		ResourceProfileHash: pod.Annotations["fast-sandbox.io/resource-profile-hash"],
+		PodReady:            pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" && podConditionTrue(pod.Status.Conditions, corev1.PodReady),
+		PodObservedAt:       time.Now(),
+	}
+}
+
+func podConditionTrue(conditions []corev1.PodCondition, conditionType corev1.PodConditionType) bool {
+	for _, condition := range conditions {
+		if condition.Type == conditionType {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func (l *Loop) syncOnce(ctx context.Context) {
+	logger := klog.Background().WithName("fastlet-heartbeat-loop")
+	maxConcurrent := l.MaxConcurrent
+	if maxConcurrent <= 0 {
+		maxConcurrent = 8
+	}
+	timeout := l.RequestTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	semaphore := make(chan struct{}, maxConcurrent)
+	var group sync.WaitGroup
+	for _, info := range l.Registry.GetAllFastlets() {
+		if info.PodIP == "" {
 			continue
 		}
-
-		fastletID := fastletpool.FastletID(pod.Name)
-		seenFastlets[fastletID] = true
-
-		fastletCtx, fastletCancel := context.WithTimeout(syncCtx, perFastletTimeout)
-		status, err := l.FastletClient.GetFastletStatus(fastletCtx, pod.Status.PodIP)
-		fastletCancel()
-
-		if err != nil {
-			logger.Error(err, "Failed to probe fastlet", "pod", pod.Name, "ip", pod.Status.PodIP)
-			continue
-		}
-
-		sbStatuses := make(map[string]api.SandboxStatus)
-		for _, s := range status.SandboxStatuses {
-			sbStatuses[s.SandboxID] = s
-		}
-
-		info := fastletpool.FastletInfo{
-			ID:              fastletID,
-			Namespace:       pod.Namespace,
-			PodName:         pod.Name,
-			PodIP:           pod.Status.PodIP,
-			NodeName:        pod.Spec.NodeName,
-			PoolName:        pod.Labels["fast-sandbox.io/pool"],
-			Capacity:        status.Capacity,
-			Images:          status.Images,
-			SandboxStatuses: sbStatuses,
-			LastHeartbeat:   time.Now(),
-		}
-		l.Registry.RegisterOrUpdate(info)
+		group.Add(1)
+		go func(info fastletpool.FastletInfo) {
+			defer group.Done()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				return
+			}
+			requestContext, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			heartbeat, err := l.FastletClient.Heartbeat(requestContext, info.PodIP, &api.HeartbeatRequest{
+				Cache: api.CacheCursor{Epoch: info.CacheEpoch, Revision: info.CacheRevision},
+			})
+			if err != nil {
+				logger.Error(err, "Fastlet Heartbeat failed", "pod", info.PodName, "podUID", info.PodUID)
+				return
+			}
+			if err := l.Registry.ApplyHeartbeat(info.ID, info.PodUID, heartbeat, time.Now()); err != nil {
+				logger.Error(err, "Reject Fastlet Heartbeat", "pod", info.PodName, "podUID", info.PodUID)
+			}
+		}(info)
 	}
-
-	allFastlets := l.Registry.GetAllFastlets()
-	for _, a := range allFastlets {
-		if !seenFastlets[a.ID] {
-			logger.Info("Removing stale fastlet from registry (Pod not found)", "fastlet", a.ID, "pool", a.PoolName)
-			l.Registry.Remove(a.ID)
-		}
-	}
-
-	cleaned := l.Registry.CleanupStaleFastlets(staleFastletTimeout)
-	if cleaned > 0 {
-		logger.Info("Cleaned up stale fastlets by heartbeat timeout", "count", cleaned)
-	}
-	return nil
+	group.Wait()
 }

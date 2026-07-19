@@ -13,12 +13,16 @@ spec:
   capacity:
     poolMax: 1
     poolMin: 1
+    bufferMin: 0
+    bufferMax: 0
   maxSandboxesPerPod: 5
   runtime: container
   sandboxResources:
     cpu: 250m
     memory: 256Mi
     pids: 128
+  warmImages:
+  - docker.io/library/alpine:latest
 ---
 # Example: gVisor pool for untrusted code execution
 apiVersion: sandbox.fast.io/v1alpha1
@@ -36,6 +40,8 @@ spec:
   capacity:
     poolMax: 3
     poolMin: 1
+    bufferMin: 0
+    bufferMax: 0
   maxSandboxesPerPod: 5
   runtime: gvisor
   sandboxResources:
@@ -59,6 +65,8 @@ spec:
   capacity:
     poolMax: 2
     poolMin: 1
+    bufferMin: 0
+    bufferMax: 0
   maxSandboxesPerPod: 3
   runtime: kata-qemu
   sandboxResources:

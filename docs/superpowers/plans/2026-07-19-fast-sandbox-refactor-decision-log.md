@@ -164,3 +164,11 @@ kind load docker-image fast-sandbox/fastlet:dev --name fsb-e2e-basic
 **影响**：如果多个 Fast-Path 副本每 10～30 秒持续拉取完整清单，节点镜像数量增长后会放大 Fastlet CPU、序列化、网络和 Registry 内存成本；而大量系统/content alias 对 Sandbox 镜像亲和没有调度价值。
 
 **结论**：阶段 5 Heartbeat 使用 `cacheRevision + changed inventory`：revision 未变化不返回完整 inventory；inventory 只保留可用于 Sandbox 请求匹配的 normalized image reference/digest，排除裸 content digest、kind import alias 和无关系统镜像。首次握手或 revision gap 才发送受大小限制的 full snapshot，超限时 fail closed 为“缓存信息不完整”，不得影响 capacity/admission 正确性。
+
+### REF-0011：containerd cache GC 是节点级共享状态，不能由单个 Fastlet 独立删除
+
+**证据**：当前 ContainerdDriver 连接节点 `/run/containerd/containerd.sock` 的共享 `k8s.io` namespace。同一节点上的多个 Fastlet/Pool 能看到相同 image store；阶段 4 e2e 的 Fastlet Heartbeat 也实际观察到了该节点其他工作负载与平台镜像。
+
+**影响**：如果每个 Fastlet 根据自己的 `warmImages/active/hot/infra` 保护集合独立执行 `ImageService.Delete`，一个 Pool 的 Fastlet 可能删除另一个 Pool 正在预热或使用的 image reference。进程内保护集合只能证明“本 Fastlet 不应删除”，不能证明“节点上无人需要”。
+
+**当前结论**：阶段 5 实现 runtime-neutral ProtectionIndex 和 eviction plan，`PoolWarm/ActiveSandbox/InfraArtifact/HotImage` 全部 fail closed 保护；Fastlet 异步预热仍正常执行，但 ContainerdDriver 暂不执行破坏性的节点共享 image reference 删除。实际 containerd eviction 必须由后续 node-scoped coordinator 汇总同节点所有 Pool 的保护声明，或采用具备等价引用/lease 证明的机制；BoxLite 等私有 artifact store 可以在各自 driver ownership 边界内独立 GC。该限制不影响镜像亲和与创建正确性，但在 coordinator 完成前不宣称 containerd 主动回收能力。

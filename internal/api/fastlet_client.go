@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -29,7 +31,7 @@ type FastletAdmissionClient interface {
 	EnsureSandbox(ctx context.Context, fastletIP string, req *EnsureSandboxRequest) (*EnsureSandboxResponse, error)
 	InspectSandbox(ctx context.Context, fastletIP string, req *InspectSandboxRequest) (*InspectSandboxResponse, error)
 	DeleteSandboxV2(ctx context.Context, fastletIP string, req *DeleteSandboxV2Request) (*DeleteSandboxV2Response, error)
-	Heartbeat(ctx context.Context, fastletIP string) (*HeartbeatResponse, error)
+	Heartbeat(ctx context.Context, fastletIP string, req *HeartbeatRequest) (*HeartbeatResponse, error)
 	RuntimeDiagnostics(ctx context.Context, fastletIP string) (*RuntimeDiagnostics, error)
 	SetDraining(ctx context.Context, fastletIP string, req *SetDrainingRequest) (*SetDrainingResponse, error)
 }
@@ -207,8 +209,16 @@ func (c *FastletClient) DeleteSandboxV2(ctx context.Context, fastletIP string, r
 	return postFastletJSON[DeleteSandboxV2Request, DeleteSandboxV2Response](c, ctx, fastletIP, "/api/v2/fastlet/delete", req)
 }
 
-func (c *FastletClient) Heartbeat(ctx context.Context, fastletIP string) (*HeartbeatResponse, error) {
-	return getFastletJSON[HeartbeatResponse](c, ctx, fastletIP, "/api/v2/fastlet/heartbeat")
+func (c *FastletClient) Heartbeat(ctx context.Context, fastletIP string, req *HeartbeatRequest) (*HeartbeatResponse, error) {
+	path := "/api/v2/fastlet/heartbeat"
+	if req != nil {
+		query := make(url.Values)
+		query.Set("cacheEpoch", req.Cache.Epoch)
+		query.Set("cacheRevision", strconv.FormatUint(req.Cache.Revision, 10))
+		query.Set("fullCache", strconv.FormatBool(req.Cache.ForceFull))
+		path += "?" + query.Encode()
+	}
+	return getFastletJSON[HeartbeatResponse](c, ctx, fastletIP, path)
 }
 
 func (c *FastletClient) RuntimeDiagnostics(ctx context.Context, fastletIP string) (*RuntimeDiagnostics, error) {

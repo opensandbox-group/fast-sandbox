@@ -1,7 +1,7 @@
 # Fast Sandbox 架构重构开发计划
 
 **日期**：2026-07-19  
-**状态**：执行中（阶段 0～4 完成，阶段 5 进行中）
+**状态**：执行中（阶段 0～5 完成，阶段 6 进行中）
 **代码基线**：`master@f92d8e34288365be227d2ee8a6f952687dc7be00`  
 **本地仓库**：`/Users/fengjianhui/WorkSpaceL/fast-sandbox`  
 **远端开发机**：SSH alias `fast`  
@@ -761,6 +761,21 @@ bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_
 - 新 Fastlet 在 warmImages 未完成时仍可 Ready；
 - GC 不删除保护内容；
 - 多个 Registry 最终收敛但不要求瞬时一致。
+
+### 10.6 实施结果（2026-07-19）
+
+- Fastlet Pod 成员关系改由 controller-runtime 共享 Pod informer 驱动；删除事件使用 Pod UID fencing，旧 Pod 的迟到事件不能移除同名新实例；
+- Heartbeat 默认周期 20 秒、带 0.8～1.2 jitter、并发上限 8、单请求超时 5 秒，均可通过控制面参数配置；不再每 2 秒全量 List Pod 并串行探测；
+- 每个 Registry 维护本地、最终一致的 Pod/Heartbeat/cache/feedback 视图；Watch 决定成员身份，过期 Heartbeat 只使候选 fail closed，不删除 Watch 成员；
+- Registry 删除 `UsedPorts`、端口冲突和本地 `Allocated++/--`；兼容 `Allocate` 只选候选，`Release` 不再拥有容量，Fastlet admission 是唯一 slot 裁决者；
+- Top-K 依次执行 Pool/runtime/profile/PodReady/runtimeReady/Draining/stale/capacity hard filter，再按 normalized image hit、负载比例和 request ID/Sandbox UID 稳定扰动排序；Fastlet 明确拒绝会进入短期本地反馈抑制；
+- Heartbeat 增加 Pod UID、sequence、admission、runtime/resource profile、cache epoch/revision/full/complete；同游标且清单不变时不返回 inventory，revision gap 或清单超限时关闭镜像亲和而不影响 capacity 正确性；
+- Pool `warmImages` 由 Controller 作为平台配置注入；Fastlet recovery/Ready 完成后并发度 2 异步 pull，不阻塞 Ready；PoolWarm、ActiveSandbox、InfraArtifact、HotImage 均进入 runtime-neutral 保护索引；
+- containerd `k8s.io` image store 是节点共享事实，阶段 5 不执行 Fastlet 私有破坏性 GC；实际删除等待 node-scoped coordinator/lease 证明，详见 REF-0011；
+- 删除 runtime 失败时 Fastlet 保留 `delete-failed` entry、capacity 与 active-image 保护，允许幂等重试，避免资源仍存活但 slot/缓存保护提前释放；
+- Pool CRD 对 `warmImages` 增加最多 128 项且去重校验，三份 sample 均符合固定 SandboxResourceProfile 约束；
+- 远端 unit gate：`make test-unit`，退出状态 `0`；
+- 远端 race gate：`go test -race ./internal/controller/fastletpool ./internal/controller/fastletcontrol ./internal/fastlet/cache ./internal/fastlet/runtime ./internal/fastlet/server ./internal/api -count=1`，退出状态 `0`。
 
 ## 11. 阶段 6：控制面角色分离和多活 Create 状态机
 

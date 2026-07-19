@@ -2,43 +2,75 @@ package fastletpool
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"hash/fnv"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
+	fastletcache "fast-sandbox/internal/fastlet/cache"
 
-	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// Lock ordering convention:
-// 1. Always acquire registry-level locks (r.mu) before slot-level locks (slot.mu)
-// 2. Never hold r.mu while performing expensive operations or I/O
-// 3. Release r.mu before acquiring slot.mu whenever possible to minimize contention
-// 4. This prevents deadlocks and improves concurrency
-
-// FastletID is a logical identifier for an fastlet instance.
 type FastletID string
 
-// FastletInfo describes a sandbox fastlet pod registered in controller memory.
+var (
+	ErrNoCandidate      = errors.New("no schedulable Fastlet candidate")
+	ErrFastletNotFound  = errors.New("Fastlet is not present in the Pod watch store")
+	ErrStalePodIdentity = errors.New("Fastlet Pod UID does not match the watched Pod")
+	ErrStaleHeartbeat   = errors.New("Fastlet heartbeat sequence is stale")
+	ErrProfileMismatch  = errors.New("Fastlet heartbeat profile does not match the watched Pod")
+)
+
+// FastletInfo is a local, eventually-consistent scheduling view. Capacity and
+// cache fields are hints learned from Heartbeat; Fastlet admission remains the
+// only authority that can consume a slot.
 type FastletInfo struct {
-	ID              FastletID
-	Namespace       string
-	PodName         string
-	PodIP           string
-	NodeName        string
-	PoolName        string
-	Capacity        int
-	Allocated       int
-	UsedPorts       map[int32]bool
+	ID        FastletID
+	Namespace string
+	PodName   string
+	PodUID    string
+	PodIP     string
+	NodeName  string
+	PoolName  string
+
+	RuntimeName         apiv1alpha1.RuntimeName
+	RuntimeProfileHash  string
+	ResourceProfileHash string
+	PodReady            bool
+	RuntimeReady        bool
+	Draining            bool
+
+	Capacity  int
+	Allocated int // compatibility projection of Admission.Used; never mutated by selection.
+	Admission api.AdmissionStatus
+
 	Images          []string
+	CacheEpoch      string
+	CacheRevision   uint64
+	CacheComplete   bool
 	SandboxStatuses map[string]api.SandboxStatus
-	LastHeartbeat   time.Time
+
+	HeartbeatSequence uint64
+	LastHeartbeat     time.Time
+	PodObservedAt     time.Time
+	RejectedUntil     time.Time
 }
 
-// FastletRegistry defines operations to manage fastlets in controller memory.
+func (i FastletInfo) Used() int {
+	if i.Admission.Capacity > 0 || i.Admission.Used > 0 {
+		return i.Admission.Used
+	}
+	return i.Allocated
+}
+
+// FastletRegistry retains Allocate/Release as migration adapters for the old
+// controllers. Allocate performs candidate selection only and Release is a
+// no-op; neither method owns capacity.
 type FastletRegistry interface {
 	RegisterOrUpdate(info FastletInfo)
 	GetAllFastlets() []FastletInfo
@@ -50,110 +82,292 @@ type FastletRegistry interface {
 	CleanupStaleFastlets(timeout time.Duration) int
 }
 
+type CandidateRequest struct {
+	Namespace           string
+	PoolName            string
+	RuntimeName         apiv1alpha1.RuntimeName
+	RuntimeProfileHash  string
+	ResourceProfileHash string
+	Image               string
+	StableKey           string
+	Now                 time.Time
+}
+
+type LocalFeedback struct {
+	Code       api.FastletErrorCode
+	ObservedAt time.Time
+	RetryAfter time.Duration
+}
+
 type fastletSlot struct {
 	mu   sync.RWMutex
 	info FastletInfo
 }
 
 type InMemoryRegistry struct {
-	mu       sync.RWMutex
-	fastlets map[FastletID]*fastletSlot
+	mu         sync.RWMutex
+	fastlets   map[FastletID]*fastletSlot
+	staleAfter atomic.Int64
+	clock      func() time.Time
 }
 
-// NewInMemoryRegistry creates a new in-memory registry.
 func NewInMemoryRegistry() *InMemoryRegistry {
-	return &InMemoryRegistry{
-		fastlets: make(map[FastletID]*fastletSlot),
-	}
+	registry := &InMemoryRegistry{fastlets: make(map[FastletID]*fastletSlot), clock: time.Now}
+	registry.staleAfter.Store(int64(45 * time.Second))
+	return registry
 }
 
-func (r *InMemoryRegistry) RegisterOrUpdate(info FastletInfo) {
-	r.mu.RLock()
-	slot, exists := r.fastlets[info.ID]
-	r.mu.RUnlock()
-	if !exists {
-		r.mu.Lock()
-		slot, exists = r.fastlets[info.ID]
-		if !exists {
-			slot = &fastletSlot{
-				info: FastletInfo{
-					ID:              info.ID,
-					UsedPorts:       make(map[int32]bool),
-					SandboxStatuses: make(map[string]api.SandboxStatus),
-				},
-			}
-			r.fastlets[info.ID] = slot
-		}
-		r.mu.Unlock()
+func (r *InMemoryRegistry) SetStaleAfter(duration time.Duration) { r.staleAfter.Store(int64(duration)) }
+
+// UpsertPod is fed only by the Kubernetes Pod informer. Replacing a Pod UID
+// clears all heartbeat state so a reused endpoint can never inherit readiness,
+// capacity, or cache facts from the previous Pod instance.
+func (r *InMemoryRegistry) UpsertPod(info FastletInfo) {
+	if info.ID == "" {
+		return
 	}
+	r.mu.Lock()
+	slot := r.fastlets[info.ID]
+	if slot == nil {
+		slot = &fastletSlot{}
+		r.fastlets[info.ID] = slot
+	}
+	r.mu.Unlock()
 
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
+	if slot.info.PodUID != "" && slot.info.PodUID == info.PodUID {
+		preserveHeartbeat(&info, slot.info)
+	}
+	if info.SandboxStatuses == nil {
+		info.SandboxStatuses = make(map[string]api.SandboxStatus)
+	}
+	slot.info = cloneInfo(info)
+}
 
-	allocated := slot.info.Allocated
-	usedPorts := slot.info.UsedPorts
-	sandboxStatuses := slot.info.SandboxStatuses
+// RegisterOrUpdate is a compatibility entry point for tests and migration
+// callers that already provide a combined Pod/Heartbeat view.
+func (r *InMemoryRegistry) RegisterOrUpdate(info FastletInfo) {
+	if info.ID == "" {
+		return
+	}
+	if info.PodObservedAt.IsZero() {
+		info.PodObservedAt = r.clock()
+	}
+	r.mu.Lock()
+	slot := r.fastlets[info.ID]
+	if slot == nil {
+		slot = &fastletSlot{}
+		r.fastlets[info.ID] = slot
+	}
+	r.mu.Unlock()
+	slot.mu.Lock()
+	slot.info = cloneInfo(info)
+	slot.mu.Unlock()
+}
 
-	slot.info = info
-	slot.info.Allocated = allocated
+func preserveHeartbeat(target *FastletInfo, previous FastletInfo) {
+	target.RuntimeReady = previous.RuntimeReady
+	target.Draining = previous.Draining
+	target.Capacity = previous.Capacity
+	target.Allocated = previous.Allocated
+	target.Admission = previous.Admission
+	target.Images = append([]string(nil), previous.Images...)
+	target.CacheEpoch = previous.CacheEpoch
+	target.CacheRevision = previous.CacheRevision
+	target.CacheComplete = previous.CacheComplete
+	target.SandboxStatuses = cloneStatuses(previous.SandboxStatuses)
+	target.HeartbeatSequence = previous.HeartbeatSequence
+	target.LastHeartbeat = previous.LastHeartbeat
+	target.RejectedUntil = previous.RejectedUntil
+}
 
-	if usedPorts != nil {
-		slot.info.UsedPorts = usedPorts
-	} else {
-		slot.info.UsedPorts = make(map[int32]bool)
+func (r *InMemoryRegistry) ApplyHeartbeat(id FastletID, expectedPodUID string, heartbeat *api.HeartbeatResponse, observedAt time.Time) error {
+	if heartbeat == nil {
+		return errors.New("heartbeat is nil")
+	}
+	r.mu.RLock()
+	slot := r.fastlets[id]
+	r.mu.RUnlock()
+	if slot == nil {
+		return ErrFastletNotFound
+	}
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	if slot.info.PodUID == "" || slot.info.PodUID != expectedPodUID || heartbeat.FastletPodUID != expectedPodUID {
+		return ErrStalePodIdentity
+	}
+	if heartbeat.Cache.Epoch == slot.info.CacheEpoch && heartbeat.Sequence <= slot.info.HeartbeatSequence {
+		return ErrStaleHeartbeat
+	}
+	if (slot.info.RuntimeProfileHash != "" && heartbeat.Diagnostics.RuntimeProfileHash != slot.info.RuntimeProfileHash) ||
+		(slot.info.ResourceProfileHash != "" && heartbeat.ResourceProfileHash != slot.info.ResourceProfileHash) {
+		slot.info.RuntimeReady = false
+		slot.info.LastHeartbeat = observedAt
+		return ErrProfileMismatch
 	}
 
-	if sandboxStatuses != nil && info.SandboxStatuses == nil {
-		slot.info.SandboxStatuses = sandboxStatuses
-	} else if info.SandboxStatuses == nil {
-		slot.info.SandboxStatuses = make(map[string]api.SandboxStatus)
+	slot.info.RuntimeReady = heartbeat.RuntimeReady
+	slot.info.Draining = heartbeat.Draining
+	slot.info.Capacity = heartbeat.Admission.Capacity
+	if slot.info.Capacity <= 0 {
+		slot.info.Capacity = heartbeat.Capacity
+	}
+	slot.info.Admission = heartbeat.Admission
+	slot.info.Allocated = heartbeat.Admission.Used
+	if slot.info.RuntimeProfileHash == "" {
+		slot.info.RuntimeProfileHash = heartbeat.Diagnostics.RuntimeProfileHash
+	}
+	if slot.info.ResourceProfileHash == "" {
+		slot.info.ResourceProfileHash = heartbeat.ResourceProfileHash
+	}
+	slot.info.SandboxStatuses = make(map[string]api.SandboxStatus, len(heartbeat.SandboxStatuses))
+	for _, status := range heartbeat.SandboxStatuses {
+		slot.info.SandboxStatuses[status.SandboxID] = status
+	}
+	if heartbeat.Cache.Full {
+		slot.info.CacheComplete = heartbeat.Cache.Complete
+		if heartbeat.Cache.Complete {
+			slot.info.Images = fastletcache.NormalizeInventory(heartbeat.Cache.Images)
+		} else {
+			slot.info.Images = nil
+		}
+	} else if heartbeat.Cache.Epoch != slot.info.CacheEpoch || heartbeat.Cache.Revision != slot.info.CacheRevision {
+		// A revision gap without a full snapshot must never be used as an
+		// authoritative cache hit.
+		slot.info.CacheComplete = false
+		slot.info.Images = nil
+	}
+	slot.info.CacheEpoch = heartbeat.Cache.Epoch
+	slot.info.CacheRevision = heartbeat.Cache.Revision
+	slot.info.HeartbeatSequence = heartbeat.Sequence
+	slot.info.LastHeartbeat = observedAt
+	slot.info.RejectedUntil = time.Time{}
+	return nil
+}
+
+func (r *InMemoryRegistry) RecordFeedback(id FastletID, feedback LocalFeedback) {
+	r.mu.RLock()
+	slot := r.fastlets[id]
+	r.mu.RUnlock()
+	if slot == nil {
+		return
+	}
+	if feedback.ObservedAt.IsZero() {
+		feedback.ObservedAt = r.clock()
+	}
+	if feedback.RetryAfter <= 0 {
+		feedback.RetryAfter = 5 * time.Second
+	}
+	switch feedback.Code {
+	case api.ErrorCapacityRejected, api.ErrorDraining, api.ErrorRuntimeUnavailable, api.ErrorNetworkUnavailable, api.ErrorInfraUnavailable:
+		slot.mu.Lock()
+		slot.info.RejectedUntil = feedback.ObservedAt.Add(feedback.RetryAfter)
+		slot.mu.Unlock()
 	}
 }
 
-func (r *InMemoryRegistry) CleanupStaleFastlets(timeout time.Duration) int {
-	now := time.Now()
-
-	// First pass: collect potential stale fastlets under read lock
-	r.mu.RLock()
-	slots := make([]*fastletSlot, 0, len(r.fastlets))
-	ids := make([]FastletID, 0, len(r.fastlets))
-	for id, slot := range r.fastlets {
-		slots = append(slots, slot)
-		ids = append(ids, id)
+func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
+	if request.Now.IsZero() {
+		request.Now = r.clock()
 	}
-	r.mu.RUnlock()
-
-	var staleFastlets []FastletID
-	for i, slot := range slots {
-		slot.mu.RLock()
-		if now.Sub(slot.info.LastHeartbeat) > timeout {
-			staleFastlets = append(staleFastlets, ids[i])
+	request.Image = fastletcache.NormalizeReference(request.Image)
+	candidates := r.GetAllFastlets()
+	filtered := candidates[:0]
+	for _, info := range candidates {
+		if !r.hardFilter(info, request) {
+			continue
 		}
-		slot.mu.RUnlock()
+		filtered = append(filtered, info)
 	}
-
-	// Second pass: verify and delete under write lock
-	// We need to re-check that the fastlet still exists and is still stale
-	if len(staleFastlets) > 0 {
-		r.mu.Lock()
-		for _, id := range staleFastlets {
-			if slot, exists := r.fastlets[id]; exists {
-				// Re-verify the fastlet is still stale before deleting
-				// Note: We don't hold slot.mu here to avoid lock ordering issues.
-				// This is a best-effort cleanup; if the fastlet just updated its heartbeat,
-				// it will be cleaned up in the next cycle.
-				slot.mu.RLock()
-				stale := now.Sub(slot.info.LastHeartbeat) > timeout
-				slot.mu.RUnlock()
-				if stale {
-					delete(r.fastlets, id)
-				}
-			}
+	sort.Slice(filtered, func(i, j int) bool {
+		leftHit := imageHit(filtered[i], request.Image)
+		rightHit := imageHit(filtered[j], request.Image)
+		if leftHit != rightHit {
+			return leftHit
 		}
-		r.mu.Unlock()
+		leftUsed, rightUsed := filtered[i].Used(), filtered[j].Used()
+		if leftUsed*filtered[j].Capacity != rightUsed*filtered[i].Capacity {
+			return leftUsed*filtered[j].Capacity < rightUsed*filtered[i].Capacity
+		}
+		leftHash := stableOrder(request.StableKey, filtered[i].ID)
+		rightHash := stableOrder(request.StableKey, filtered[j].ID)
+		if leftHash != rightHash {
+			return leftHash < rightHash
+		}
+		return filtered[i].ID < filtered[j].ID
+	})
+	if k > 0 && len(filtered) > k {
+		filtered = filtered[:k]
 	}
+	return filtered
+}
 
-	return len(staleFastlets)
+func (r *InMemoryRegistry) hardFilter(info FastletInfo, request CandidateRequest) bool {
+	if info.Namespace != request.Namespace || info.PoolName != request.PoolName {
+		return false
+	}
+	if !info.PodReady || !info.RuntimeReady || info.Draining || info.LastHeartbeat.IsZero() {
+		return false
+	}
+	if request.Now.Sub(info.LastHeartbeat) > time.Duration(r.staleAfter.Load()) || request.Now.Before(info.RejectedUntil) {
+		return false
+	}
+	if info.Capacity <= 0 || info.Used() >= info.Capacity {
+		return false
+	}
+	if request.RuntimeName != "" && info.RuntimeName != request.RuntimeName {
+		return false
+	}
+	if request.RuntimeProfileHash != "" && info.RuntimeProfileHash != request.RuntimeProfileHash {
+		return false
+	}
+	if request.ResourceProfileHash != "" && info.ResourceProfileHash != request.ResourceProfileHash {
+		return false
+	}
+	return true
+}
+
+func imageHit(info FastletInfo, image string) bool {
+	if image == "" || !info.CacheComplete {
+		return false
+	}
+	index := sort.SearchStrings(info.Images, image)
+	return index < len(info.Images) && info.Images[index] == image
+}
+
+func stableOrder(key string, id FastletID) uint64 {
+	hash := fnv.New64a()
+	_, _ = hash.Write([]byte(key))
+	_, _ = hash.Write([]byte{'|'})
+	_, _ = hash.Write([]byte(id))
+	return hash.Sum64()
+}
+
+func (r *InMemoryRegistry) Allocate(sandbox *apiv1alpha1.Sandbox) (*FastletInfo, error) {
+	stableKey := string(sandbox.UID)
+	if stableKey == "" {
+		stableKey = sandbox.Namespace + "/" + sandbox.Name
+	}
+	candidates := r.TopK(CandidateRequest{
+		Namespace: sandbox.Namespace, PoolName: sandbox.Spec.PoolRef, Image: sandbox.Spec.Image, StableKey: stableKey,
+	}, 1)
+	if len(candidates) == 0 {
+		return nil, ErrNoCandidate
+	}
+	result := candidates[0]
+	return &result, nil
+}
+
+func (*InMemoryRegistry) Release(FastletID, *apiv1alpha1.Sandbox) {
+	// Capacity belongs to Fastlet admission and is refreshed by Heartbeat.
+}
+
+func (*InMemoryRegistry) Restore(context.Context, client.Reader) error {
+	// Pod membership is restored by informer replay. Sandbox assignments are
+	// watched by the assignment store introduced with the shared orchestrator;
+	// they must never create phantom Fastlet slots.
+	return nil
 }
 
 func (r *InMemoryRegistry) GetAllFastlets() []FastletInfo {
@@ -163,284 +377,75 @@ func (r *InMemoryRegistry) GetAllFastlets() []FastletInfo {
 		slots = append(slots, slot)
 	}
 	r.mu.RUnlock()
-
-	out := make([]FastletInfo, 0, len(slots))
+	result := make([]FastletInfo, 0, len(slots))
 	for _, slot := range slots {
 		slot.mu.RLock()
-		out = append(out, slot.info)
+		result = append(result, cloneInfo(slot.info))
 		slot.mu.RUnlock()
 	}
-	return out
+	return result
 }
 
 func (r *InMemoryRegistry) GetFastletByID(id FastletID) (FastletInfo, bool) {
 	r.mu.RLock()
-	slot, ok := r.fastlets[id]
+	slot := r.fastlets[id]
 	r.mu.RUnlock()
-
-	if !ok {
+	if slot == nil {
 		return FastletInfo{}, false
 	}
-
 	slot.mu.RLock()
-	info := slot.info
+	result := cloneInfo(slot.info)
 	slot.mu.RUnlock()
-
-	return info, true
-}
-
-func (r *InMemoryRegistry) Allocate(sb *apiv1alpha1.Sandbox) (*FastletInfo, error) {
-	totalStart := time.Now()
-
-	for _, p := range sb.Spec.ExposedPorts {
-		if p < 1 || p > 65535 {
-			return nil, fmt.Errorf("invalid port %d: must be between 1 and 65535", p)
-		}
-	}
-
-	// 1. Find candidates
-	candidateStart := time.Now()
-	r.mu.RLock()
-	candidates := make([]*fastletSlot, 0, len(r.fastlets))
-	for _, slot := range r.fastlets {
-		candidates = append(candidates, slot)
-	}
-	r.mu.RUnlock()
-	candidateDuration := time.Since(candidateStart)
-
-	var bestSlot *fastletSlot
-	var minScore = 1000000
-	var imageHit bool
-
-	// 2. Score fastlets and select best
-	scoreStart := time.Now()
-	for _, slot := range candidates {
-		slot.mu.RLock()
-		info := slot.info
-
-		if info.PoolName != sb.Spec.PoolRef {
-			slot.mu.RUnlock()
-			continue
-		}
-		if info.Namespace != sb.Namespace {
-			slot.mu.RUnlock()
-			continue
-		}
-		if info.Capacity > 0 && info.Allocated >= info.Capacity {
-			slot.mu.RUnlock()
-			continue
-		}
-
-		portConflict := false
-		for _, p := range sb.Spec.ExposedPorts {
-			if info.UsedPorts[p] {
-				portConflict = true
-				break
-			}
-		}
-		if portConflict {
-			slot.mu.RUnlock()
-			continue
-		}
-
-		hasImage := false
-		for _, img := range info.Images {
-			if img == sb.Spec.Image {
-				hasImage = true
-				break
-			}
-		}
-
-		klog.V(4).Info("Checking image affinity", "sandbox", sb.Name, "fastlet", info.ID, "hasImage", hasImage, "image", sb.Spec.Image)
-
-		score := info.Allocated
-		if !hasImage {
-			score += 1000
-		}
-
-		slot.mu.RUnlock()
-
-		if score < minScore {
-			minScore = score
-			bestSlot = slot
-			imageHit = hasImage
-		}
-	}
-	scoreDuration := time.Since(scoreStart)
-
-	if bestSlot == nil {
-		return nil, fmt.Errorf("insufficient capacity or port conflict in pool %s", sb.Spec.PoolRef)
-	}
-
-	// 3. Final allocation
-	selectStart := time.Now()
-	bestSlot.mu.Lock()
-	defer bestSlot.mu.Unlock()
-
-	info := bestSlot.info
-	if info.Capacity > 0 && info.Allocated >= info.Capacity {
-		return nil, fmt.Errorf("fastlet %s capacity full during allocation", info.ID)
-	}
-	for _, p := range sb.Spec.ExposedPorts {
-		if info.UsedPorts[p] {
-			return nil, fmt.Errorf("port %d conflicted during allocation", p)
-		}
-	}
-
-	bestSlot.info.Allocated++
-	if bestSlot.info.UsedPorts == nil {
-		bestSlot.info.UsedPorts = make(map[int32]bool)
-	}
-	for _, p := range sb.Spec.ExposedPorts {
-		bestSlot.info.UsedPorts[p] = true
-	}
-	selectDuration := time.Since(selectStart)
-	totalDuration := time.Since(totalStart)
-
-	klog.InfoS("Registry Allocate timing",
-		"sandbox", sb.Name,
-		"total_ms", totalDuration.Milliseconds(),
-		"candidate_ms", candidateDuration.Milliseconds(),
-		"score_ms", scoreDuration.Milliseconds(),
-		"select_ms", selectDuration.Milliseconds(),
-		"selectedFastlet", info.ID,
-		"imageHit", imageHit,
-		"fastletCount", len(candidates),
-		"bestSlot.info.Allocated", bestSlot.info.Allocated)
-
-	res := bestSlot.info
-	return &res, nil
-}
-
-func (r *InMemoryRegistry) Release(id FastletID, sb *apiv1alpha1.Sandbox) {
-	klog.Info("[DEBUG-REGISTRY] Release ENTER",
-		"fastletID", id,
-		"sandbox", sb.Name,
-		"ports", sb.Spec.ExposedPorts)
-
-	r.mu.RLock()
-	slot, ok := r.fastlets[id]
-	r.mu.RUnlock()
-
-	if !ok {
-		klog.Warning("[DEBUG-REGISTRY] Release: slot not found for fastlet",
-			"fastletID", id,
-			"impact", "Allocated will NOT decrease!")
-		return
-	}
-
-	slot.mu.Lock()
-	defer slot.mu.Unlock()
-
-	klog.Info("[DEBUG-REGISTRY] Release: slot state BEFORE",
-		"allocated", slot.info.Allocated,
-		"sandboxInStatuses", slot.info.SandboxStatuses[sb.Name],
-		"usedPorts", slot.info.UsedPorts)
-
-	// Always release allocated slot - sandbox may have already been removed from
-	// SandboxStatuses due to async deletion or heartbeat sync delay.
-	// The presence or absence of the sandbox in statuses doesn't matter for
-	// allocated count, only whether this specific sandbox was counting against capacity.
-	if _, exists := slot.info.SandboxStatuses[sb.Name]; exists {
-		delete(slot.info.SandboxStatuses, sb.Name)
-		klog.Info("[DEBUG-REGISTRY] Release: removed sandbox from SandboxStatuses")
-	} else {
-		klog.Info("[DEBUG-REGISTRY] Release: sandbox NOT in SandboxStatuses",
-			"this", "is expected if already removed by heartbeat")
-	}
-
-	if slot.info.Allocated > 0 {
-		slot.info.Allocated--
-		klog.Info("[DEBUG-REGISTRY] Release: DECREASED Allocated",
-			"allocatedAfter", slot.info.Allocated)
-	} else {
-		klog.Warning("[DEBUG-REGISTRY] Release: Allocated is already 0!",
-			"this", "indicates double-free or accounting bug")
-	}
-
-	for _, p := range sb.Spec.ExposedPorts {
-		delete(slot.info.UsedPorts, p)
-	}
-
-	klog.Info("[DEBUG-REGISTRY] Release: slot state AFTER",
-		"allocated", slot.info.Allocated,
-		"usedPorts", slot.info.UsedPorts)
-}
-
-func (r *InMemoryRegistry) Restore(ctx context.Context, c client.Reader) error {
-	var sbList apiv1alpha1.SandboxList
-	if err := c.List(ctx, &sbList); err != nil {
-		return err
-	}
-
-	// Lock ordering: Always acquire r.mu before slot.mu to maintain consistency
-	// with other operations in this file. We hold r.mu while creating slots,
-	// then release it before modifying individual slot contents to minimize
-	// lock contention.
-	r.mu.Lock()
-	var slotsToRestore []struct {
-		id     FastletID
-		sb     *apiv1alpha1.Sandbox
-		create bool
-		slot   *fastletSlot
-	}
-
-	for _, sb := range sbList.Items {
-		if sb.Status.AssignedFastlet != "" {
-			id := FastletID(sb.Status.AssignedFastlet)
-			slot, ok := r.fastlets[id]
-			if !ok {
-				// Create new slot but don't modify contents yet
-				slot = &fastletSlot{
-					info: FastletInfo{
-						ID:              id,
-						PodName:         string(id),
-						UsedPorts:       make(map[int32]bool),
-						SandboxStatuses: make(map[string]api.SandboxStatus),
-						LastHeartbeat:   time.Now(),
-					},
-				}
-				r.fastlets[id] = slot
-				slotsToRestore = append(slotsToRestore, struct {
-					id     FastletID
-					sb     *apiv1alpha1.Sandbox
-					create bool
-					slot   *fastletSlot
-				}{id, &sb, true, slot})
-			} else {
-				slotsToRestore = append(slotsToRestore, struct {
-					id     FastletID
-					sb     *apiv1alpha1.Sandbox
-					create bool
-					slot   *fastletSlot
-				}{id, &sb, false, slot})
-			}
-		}
-	}
-	r.mu.Unlock()
-
-	// Now modify each slot's contents without holding r.mu
-	// This prevents lock ordering issues and minimizes critical section time
-	for _, item := range slotsToRestore {
-		item.slot.mu.Lock()
-		if item.slot.info.UsedPorts == nil {
-			item.slot.info.UsedPorts = make(map[int32]bool)
-		}
-		if item.slot.info.SandboxStatuses == nil {
-			item.slot.info.SandboxStatuses = make(map[string]api.SandboxStatus)
-		}
-		item.slot.info.Allocated++
-		for _, p := range item.sb.Spec.ExposedPorts {
-			item.slot.info.UsedPorts[p] = true
-		}
-		item.slot.mu.Unlock()
-	}
-
-	return nil
+	return result, true
 }
 
 func (r *InMemoryRegistry) Remove(id FastletID) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	delete(r.fastlets, id)
+	r.mu.Unlock()
+}
+
+func (r *InMemoryRegistry) RemoveIfPodUID(id FastletID, podUID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	slot := r.fastlets[id]
+	if slot == nil {
+		return
+	}
+	slot.mu.RLock()
+	matches := slot.info.PodUID == podUID
+	slot.mu.RUnlock()
+	if matches {
+		delete(r.fastlets, id)
+	}
+}
+
+// CleanupStaleFastlets reports stale heartbeat views but deliberately does not
+// delete them. Kubernetes Watch owns membership; TopK filters stale entries.
+func (r *InMemoryRegistry) CleanupStaleFastlets(timeout time.Duration) int {
+	now := r.clock()
+	count := 0
+	for _, info := range r.GetAllFastlets() {
+		if info.LastHeartbeat.IsZero() || now.Sub(info.LastHeartbeat) > timeout {
+			count++
+		}
+	}
+	return count
+}
+
+func cloneInfo(info FastletInfo) FastletInfo {
+	info.Images = append([]string(nil), info.Images...)
+	info.SandboxStatuses = cloneStatuses(info.SandboxStatuses)
+	return info
+}
+
+func cloneStatuses(statuses map[string]api.SandboxStatus) map[string]api.SandboxStatus {
+	if statuses == nil {
+		return make(map[string]api.SandboxStatus)
+	}
+	result := make(map[string]api.SandboxStatus, len(statuses))
+	for key, status := range statuses {
+		result[key] = status
+	}
+	return result
 }

@@ -45,11 +45,17 @@ func main() {
 	var fastletPort int
 	var fastpathConsistencyMode string
 	var fastpathOrphanTimeout time.Duration
+	var fastletHeartbeatInterval time.Duration
+	var fastletHeartbeatTimeout time.Duration
+	var fastletHeartbeatConcurrency int
 	flag.IntVar(&fastletPort, "fastlet-port", 5758, "The port the fastlet server binds to.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":9091", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":5758", "The address the probe endpoint binds to.")
 	flag.StringVar(&fastpathConsistencyMode, "fastpath-consistency-mode", "fast", "Fast-Path consistency mode: fast (default) or strong")
 	flag.DurationVar(&fastpathOrphanTimeout, "fastpath-orphan-timeout", 10*time.Second, "Fast-Path orphan cleanup timeout (for Fast mode)")
+	flag.DurationVar(&fastletHeartbeatInterval, "fastlet-heartbeat-interval", 20*time.Second, "Base Fastlet heartbeat interval; actual probes use jitter.")
+	flag.DurationVar(&fastletHeartbeatTimeout, "fastlet-heartbeat-timeout", 5*time.Second, "Timeout for one Fastlet heartbeat request.")
+	flag.IntVar(&fastletHeartbeatConcurrency, "fastlet-heartbeat-concurrency", 8, "Maximum concurrent Fastlet heartbeat requests.")
 
 	flag.Parse()
 
@@ -90,7 +96,14 @@ func main() {
 	}
 
 	ctx := ctrl.SetupSignalHandler()
-	loop := fastletcontrol.NewLoop(mgr.GetClient(), reg, fastletHTTPClient)
+	loop := fastletcontrol.NewLoop(mgr.GetCache(), reg, fastletHTTPClient)
+	if fastletHeartbeatInterval <= 0 || fastletHeartbeatTimeout <= 0 || fastletHeartbeatConcurrency <= 0 {
+		klog.ErrorS(nil, "Fastlet heartbeat interval, timeout, and concurrency must be positive")
+		os.Exit(1)
+	}
+	loop.Interval = fastletHeartbeatInterval
+	loop.RequestTimeout = fastletHeartbeatTimeout
+	loop.MaxConcurrent = fastletHeartbeatConcurrency
 	go loop.Start(ctx)
 
 	lis, err := net.Listen("tcp", ":9090")

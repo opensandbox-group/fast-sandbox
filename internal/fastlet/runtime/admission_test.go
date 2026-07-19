@@ -26,6 +26,10 @@ type admissionRuntime struct {
 	ensureBlock   chan struct{}
 	deleteEntered chan struct{}
 	deleteBlock   chan struct{}
+	pullEntered   chan struct{}
+	pullBlock     chan struct{}
+	pulledImages  []string
+	images        []string
 }
 
 func newAdmissionRuntime() *admissionRuntime {
@@ -113,6 +117,30 @@ func (r *admissionRuntime) ListManagedSandboxes(context.Context) ([]*SandboxMeta
 		result = append(result, &copy)
 	}
 	return result, nil
+}
+
+func (r *admissionRuntime) ListImages(context.Context) ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.images...), nil
+}
+
+func (r *admissionRuntime) PullImage(_ context.Context, image string) error {
+	r.mu.Lock()
+	entered, block := r.pullEntered, r.pullBlock
+	r.pulledImages = append(r.pulledImages, image)
+	r.images = append(r.images, image)
+	r.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if block != nil {
+		<-block
+	}
+	return nil
 }
 
 func (r *admissionRuntime) counts() (int, int) {
@@ -361,4 +389,25 @@ func TestRecoveryBlocksReadinessAndRestoresCapacity(t *testing.T) {
 	require.Equal(t, 1, admission.Running)
 	_, err = manager.EnsureSandboxV2(context.Background(), ensureRequest("sandbox-b", 1, 1))
 	requireFastletCode(t, err, api.ErrorCapacityRejected)
+}
+
+func TestWarmImagesAreAsynchronousAndProtectedFromEviction(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	runtime.pullEntered = make(chan struct{}, 2)
+	runtime.pullBlock = make(chan struct{})
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-uid-a", WarmImages: []string{"alpine:latest", "ubuntu:24.04"},
+	})
+	require.NoError(t, err)
+	require.True(t, manager.Ready(), "warmImages never gate Fastlet readiness")
+	completed := make(chan error, 1)
+	go func() { completed <- manager.WarmCache(context.Background()) }()
+	<-runtime.pullEntered
+	require.True(t, manager.Ready())
+	close(runtime.pullBlock)
+	require.NoError(t, <-completed)
+	runtime.mu.Lock()
+	require.ElementsMatch(t, []string{"alpine:latest", "ubuntu:24.04"}, runtime.pulledImages)
+	runtime.mu.Unlock()
+	require.Equal(t, []string{"cold:1"}, manager.PlanCacheEviction([]string{"ubuntu:24.04", "cold:1", "alpine:latest"}))
 }

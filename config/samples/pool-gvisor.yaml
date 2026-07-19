@@ -12,6 +12,7 @@ spec:
     poolMin: 1
     poolMax: 1
     bufferMin: 0
+    bufferMax: 0
   maxSandboxesPerPod: 5
   fastletTemplate:
     spec:

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"fast-sandbox/internal/api"
+	fastletcache "fast-sandbox/internal/fastlet/cache"
 	"fast-sandbox/internal/runtimecatalog"
 	"fast-sandbox/pkg/util/idgen"
 )
@@ -150,6 +151,7 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 
 	metadata, err := m.runtime.EnsureSandbox(ctx, &spec)
 	if err != nil {
+		m.cacheProtection.ProtectHotUntil(spec.Image, m.clock.Now().Add(time.Hour))
 		m.mu.Lock()
 		if current := m.sandboxes[spec.SandboxID]; current == placeholder {
 			delete(m.sandboxes, spec.SandboxID)
@@ -160,6 +162,7 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 	}
 	metadata.Phase = "running"
 	metadata.SandboxSpec = spec
+	m.cacheProtection.Protect(spec.Image, fastletcache.ProtectActive)
 	m.mu.Lock()
 	if placeholder.Phase == "terminating" {
 		metadata.Phase = "terminating"
@@ -250,6 +253,11 @@ func (m *SandboxManager) Recover(ctx context.Context) error {
 	if len(recovered) > m.capacity {
 		return fmt.Errorf("recovered %d Sandboxes exceeds Fastlet capacity %d", len(recovered), m.capacity)
 	}
+	activeImages := make([]string, 0, len(recovered))
+	for _, metadata := range recovered {
+		activeImages = append(activeImages, metadata.Image)
+	}
+	m.cacheProtection.Replace(fastletcache.ProtectActive, activeImages)
 	m.mu.Lock()
 	m.sandboxes = recovered
 	m.recovering = false
@@ -398,7 +406,7 @@ func (m *SandboxManager) admissionStatusLocked() api.AdmissionStatus {
 		switch metadata.Phase {
 		case "creating":
 			status.Creating++
-		case "terminating", "deleting":
+		case "terminating", "deleting", "delete-failed":
 			status.Deleting++
 		default:
 			status.Running++

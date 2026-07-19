@@ -937,7 +937,19 @@ func TestSandboxManager_AsyncDelete_RuntimeError(t *testing.T) {
 	// Wait for async delete
 	time.Sleep(100 * time.Millisecond)
 
-	// Verify sandbox was completely removed even with runtime error
+	// Failed runtime deletion must retain capacity and identity so a later
+	// retry cannot over-admit while an orphan may still exist.
 	statuses := manager.GetSandboxStatuses(ctx)
-	assert.Empty(t, statuses, "Sandbox should be completely removed even with runtime error")
+	require.Len(t, statuses, 1)
+	assert.Equal(t, "delete-failed", statuses[0].Phase)
+	admission, _, _ := manager.State()
+	assert.Equal(t, 1, admission.Used)
+
+	mockRuntime.SetDeleteError(nil)
+	_, err = manager.DeleteSandbox(spec.SandboxID)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		admission, _, _ := manager.State()
+		return admission.Used == 0
+	}, time.Second, 10*time.Millisecond)
 }

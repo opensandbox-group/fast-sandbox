@@ -48,6 +48,7 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 			Runtime:            apiv1alpha1.RuntimeContainer,
 			MaxSandboxesPerPod: 5,
 			InfraProfile:       "opensandbox",
+			WarmImages:         []string{"alpine:latest", "ubuntu:24.04"},
 			SandboxResources: apiv1alpha1.SandboxResourceProfile{
 				CPU: resource.MustParse("1"), Memory: resource.MustParse("1Gi"), PIDs: 256,
 			},
@@ -73,6 +74,7 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	require.Equal(t, "container", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RUNTIME"))
 	require.Equal(t, profile.ProfileHash, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RUNTIME_PROFILE_HASH"))
 	require.Equal(t, profile.ProfileHash, pod.Annotations["fast-sandbox.io/runtime-profile-hash"])
+	require.Equal(t, pool.Spec.SandboxResources.Hash(), pod.Annotations["fast-sandbox.io/resource-profile-hash"])
 	require.Equal(t, shortProfileIdentity(profile), pod.Labels["fast-sandbox.io/runtime-profile"])
 	require.Empty(t, envValue(pod.Spec.Containers[0].Env, "RUNTIME_HANDLER"))
 	require.Empty(t, envValue(pod.Spec.Containers[0].Env, "RUNTIME_TYPE"))
@@ -81,6 +83,7 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	require.Equal(t, "1Gi", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RESOURCE_MEMORY"))
 	require.Equal(t, "opensandbox", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_PROFILE"))
 	require.Equal(t, ":5758", envValue(pod.Spec.Containers[0].Env, "FASTLET_CONTROL_PORT"))
+	require.JSONEq(t, `["alpine:latest","ubuntu:24.04"]`, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_WARM_IMAGES"))
 	require.NotNil(t, pod.Spec.Containers[0].ReadinessProbe)
 	require.Equal(t, "/readyz", pod.Spec.Containers[0].ReadinessProbe.HTTPGet.Path)
 	require.Equal(t, int32(5758), pod.Spec.Containers[0].ReadinessProbe.HTTPGet.Port.IntVal)

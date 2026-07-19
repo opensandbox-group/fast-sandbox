@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -162,6 +163,11 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 		annotations[k] = v
 	}
 	annotations["fast-sandbox.io/runtime-profile-hash"] = profile.ProfileHash
+	annotations["fast-sandbox.io/resource-profile-hash"] = sandboxResources.Hash()
+	warmImagesJSON, err := json.Marshal(pool.Spec.WarmImages)
+	if err != nil {
+		return nil, fmt.Errorf("encode warmImages: %w", err)
+	}
 
 	podSpec := pool.Spec.FastletTemplate.Spec.DeepCopy()
 	podSpec.HostNetwork = false
@@ -184,6 +190,7 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 
 		c.Env = append(c.Env,
 			corev1.EnvVar{Name: "FASTLET_CONTROL_PORT", Value: ":5758"},
+			corev1.EnvVar{Name: "FAST_SANDBOX_WARM_IMAGES", Value: string(warmImagesJSON)},
 			corev1.EnvVar{
 				Name:      "NODE_NAME",
 				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}},
@@ -333,7 +340,8 @@ var runtimeOwnedEnv = map[string]struct{}{
 	"FAST_SANDBOX_INFRA_PROFILE": {}, "FASTLET_CAPACITY": {},
 	"RUNTIME_SOCKET": {}, "INFRA_DIR_IN_POD": {},
 	"FASTLET_CONTROL_PORT": {}, "AGENT_PORT": {},
-	"NODE_NAME": {}, "POD_NAME": {}, "POD_IP": {}, "POD_UID": {}, "NAMESPACE": {},
+	"FAST_SANDBOX_WARM_IMAGES": {},
+	"NODE_NAME":                {}, "POD_NAME": {}, "POD_IP": {}, "POD_UID": {}, "NAMESPACE": {},
 }
 
 func removeRuntimeOwnedEnv(env []corev1.EnvVar) []corev1.EnvVar {

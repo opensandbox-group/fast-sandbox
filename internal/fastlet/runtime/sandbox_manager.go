@@ -2,15 +2,19 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
+	fastletcache "fast-sandbox/internal/fastlet/cache"
+	"fast-sandbox/pkg/util/idgen"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
@@ -25,6 +29,8 @@ type SandboxManagerConfig struct {
 	Clock              Clock
 	TokenGenerator     func() (string, error)
 	RecoverOnStart     bool
+	CacheEpoch         string
+	WarmImages         []string
 }
 
 type SandboxManager struct {
@@ -44,6 +50,10 @@ type SandboxManager struct {
 	drainReason         string
 	reservations        map[string]*reservation
 	requestReservations map[string]string
+	cacheTracker        *fastletcache.Tracker
+	cacheProtection     *fastletcache.ProtectionIndex
+	warmImages          []string
+	heartbeatSequence   atomic.Uint64
 	// sandboxes  sandboxID -> metadata
 	sandboxes map[string]*SandboxMetadata
 }
@@ -69,6 +79,13 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 	if config.TokenGenerator == nil {
 		config.TokenGenerator = generateReservationToken
 	}
+	if config.CacheEpoch == "" {
+		var err error
+		config.CacheEpoch, err = idgen.GenerateRequestID()
+		if err != nil {
+			return nil, fmt.Errorf("generate cache epoch: %w", err)
+		}
+	}
 	var profile *apiv1alpha1.SandboxResourceProfile
 	resourceHash := ""
 	if config.ResourceProfile != nil {
@@ -79,6 +96,14 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		profile = &effective
 		resourceHash = effective.Hash()
 	}
+	var cacheSource fastletcache.ImageSource
+	if source, ok := runtime.(RuntimeArtifactCache); ok {
+		cacheSource = source
+	}
+	protection := fastletcache.NewProtectionIndex(config.Clock.Now)
+	for _, image := range config.WarmImages {
+		protection.Protect(image, fastletcache.ProtectWarm)
+	}
 	return &SandboxManager{
 		runtime: runtime, capacity: config.Capacity,
 		runtimeProfileHash: config.RuntimeProfileHash,
@@ -87,8 +112,63 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		reservationTTL: config.ReservationTTL, clock: config.Clock, tokenGenerator: config.TokenGenerator,
 		recovering: config.RecoverOnStart, runtimeReady: !config.RecoverOnStart,
 		reservations: make(map[string]*reservation), requestReservations: make(map[string]string),
+		cacheTracker:    fastletcache.NewTracker(cacheSource, config.CacheEpoch, fastletcache.DefaultMaxInventory),
+		cacheProtection: protection, warmImages: append([]string(nil), config.WarmImages...),
 		sandboxes: make(map[string]*SandboxMetadata),
 	}, nil
+}
+
+func (m *SandboxManager) WarmCache(ctx context.Context) error {
+	if len(m.warmImages) == 0 {
+		return nil
+	}
+	cache, ok := m.runtime.(RuntimeArtifactCache)
+	if !ok {
+		return ErrUnsupportedRuntime
+	}
+	semaphore := make(chan struct{}, 2)
+	var group sync.WaitGroup
+	var mu sync.Mutex
+	var result error
+	for _, image := range m.warmImages {
+		image := image
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				mu.Lock()
+				result = errors.Join(result, ctx.Err())
+				mu.Unlock()
+				return
+			}
+			if err := cache.PullImage(ctx, image); err != nil {
+				mu.Lock()
+				result = errors.Join(result, fmt.Errorf("warm image %s: %w", image, err))
+				mu.Unlock()
+			}
+		}()
+	}
+	group.Wait()
+	return result
+}
+
+func (m *SandboxManager) PlanCacheEviction(candidates []string) []string {
+	return m.cacheProtection.PlanEviction(candidates)
+}
+
+func (m *SandboxManager) CacheSnapshot(ctx context.Context, cursor api.CacheCursor) (api.CacheSnapshot, error) {
+	return m.cacheTracker.Snapshot(ctx, cursor)
+}
+
+func (m *SandboxManager) NextHeartbeatSequence() uint64 {
+	return m.heartbeatSequence.Add(1)
+}
+
+func (m *SandboxManager) ResourceProfileHash() string {
+	return m.resourceProfileHash
 }
 
 func capacityFromEnvironment() int {
@@ -207,14 +287,22 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 	err := m.runtime.DeleteSandbox(ctx, sandboxID)
 	klog.InfoS("[DEBUG-FASTLET] asyncDelete: runtime.DeleteSandbox completed",
 		"sandboxID", sandboxID,
-		"err", err,
-		"nextStep", "removing from sandboxes")
+		"err", err)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err != nil {
+		if m.sandboxes[sandboxID] == expected {
+			expected.Phase = "delete-failed"
+		}
+		klog.ErrorS(err, "Runtime deletion failed; retaining admission capacity for retry", "sandboxID", sandboxID)
+		return
+	}
 	// A delayed delete from an old generation must never erase a newer
 	// manager entry for the same logical Sandbox.
 	if m.sandboxes[sandboxID] == expected {
 		delete(m.sandboxes, sandboxID)
+		m.cacheProtection.Unprotect(expected.Image, fastletcache.ProtectActive)
+		m.cacheProtection.ProtectHotUntil(expected.Image, m.clock.Now().Add(time.Hour))
 	}
 	klog.InfoS("[DEBUG-FASTLET] asyncDelete: DONE, sandbox removed from sandboxes",
 		"sandboxID", sandboxID)

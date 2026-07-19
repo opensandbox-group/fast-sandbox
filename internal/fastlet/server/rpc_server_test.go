@@ -19,10 +19,11 @@ import (
 type serverRuntime struct {
 	mu        sync.Mutex
 	sandboxes map[string]*fastletruntime.SandboxMetadata
+	images    []string
 }
 
 func newServerRuntime() *serverRuntime {
-	return &serverRuntime{sandboxes: make(map[string]*fastletruntime.SandboxMetadata)}
+	return &serverRuntime{sandboxes: make(map[string]*fastletruntime.SandboxMetadata), images: []string{"docker.io/library/alpine:latest"}}
 }
 
 func (*serverRuntime) Initialize(context.Context, string) error { return nil }
@@ -64,6 +65,17 @@ func (r *serverRuntime) ListManagedSandboxes(context.Context) ([]*fastletruntime
 		result = append(result, &copy)
 	}
 	return result, nil
+}
+func (r *serverRuntime) ListImages(context.Context) ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.images...), nil
+}
+func (r *serverRuntime) PullImage(_ context.Context, image string) error {
+	r.mu.Lock()
+	r.images = append(r.images, image)
+	r.mu.Unlock()
+	return nil
 }
 
 func newServerManager(t *testing.T, driver fastletruntime.RuntimeDriver, recoverOnStart bool) *fastletruntime.SandboxManager {
@@ -149,4 +161,30 @@ func TestSetDrainingRejectsNewReservations(t *testing.T) {
 	recorder = postJSON(t, handler, "/api/v2/fastlet/reservations", api.ReserveSandboxRequest{RequestID: "request-a", CreateSpecHash: "spec-a", FastletPodUID: "pod-uid-a"}, &rejected)
 	require.Equal(t, http.StatusConflict, recorder.Code)
 	require.Equal(t, api.ErrorDraining, rejected.Error.Code)
+}
+
+func TestHeartbeatUsesCacheCursor(t *testing.T) {
+	manager := newServerManager(t, newServerRuntime(), false)
+	handler := NewFastletServer(":0", manager).Handler()
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v2/fastlet/heartbeat", nil))
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var first api.HeartbeatResponse
+	require.NoError(t, json.NewDecoder(recorder.Body).Decode(&first))
+	require.True(t, first.Cache.Full)
+	require.Equal(t, []string{"alpine:latest"}, first.Cache.Images)
+
+	recorder = httptest.NewRecorder()
+	path := "/api/v2/fastlet/heartbeat?cacheEpoch=" + first.Cache.Epoch + "&cacheRevision=1"
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var unchanged api.HeartbeatResponse
+	require.NoError(t, json.NewDecoder(recorder.Body).Decode(&unchanged))
+	require.False(t, unchanged.Cache.Full)
+	require.Empty(t, unchanged.Cache.Images)
+	require.Greater(t, unchanged.Sequence, first.Sequence)
+
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v2/fastlet/heartbeat?cacheRevision=invalid", nil))
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
 }

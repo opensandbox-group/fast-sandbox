@@ -147,7 +147,9 @@ spec:
                   Fastlet readiness does not wait for this list to finish warming.
                 items:
                   type: string
+                maxItems: 128
                 type: array
+                uniqueItems: true
             required:
             - capacity
             - fastletTemplate

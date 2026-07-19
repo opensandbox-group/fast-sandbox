@@ -73,17 +73,18 @@ type DeleteSandboxResponse struct {
 
 // FastletStatus represents the current status of a fastlet (internal use).
 type FastletStatus struct {
-	FastletID       string          `json:"fastletId"`
-	NodeName        string          `json:"nodeName"`
-	Capacity        int             `json:"capacity"`
-	Allocated       int             `json:"allocated"`
-	Images          []string        `json:"images"`
-	SandboxStatuses []SandboxStatus `json:"sandboxStatuses"`
-	Admission       AdmissionStatus `json:"admission"`
-	RuntimeReady    bool            `json:"runtimeReady"`
-	Recovering      bool            `json:"recovering"`
-	Draining        bool            `json:"draining"`
-	FastletPodUID   string          `json:"fastletPodUid,omitempty"`
+	FastletID           string          `json:"fastletId"`
+	NodeName            string          `json:"nodeName"`
+	Capacity            int             `json:"capacity"`
+	Allocated           int             `json:"allocated"`
+	Images              []string        `json:"images,omitempty"`
+	SandboxStatuses     []SandboxStatus `json:"sandboxStatuses"`
+	Admission           AdmissionStatus `json:"admission"`
+	RuntimeReady        bool            `json:"runtimeReady"`
+	Recovering          bool            `json:"recovering"`
+	Draining            bool            `json:"draining"`
+	FastletPodUID       string          `json:"fastletPodUid,omitempty"`
+	ResourceProfileHash string          `json:"resourceProfileHash,omitempty"`
 }
 
 type FastletErrorCode string
@@ -216,7 +217,28 @@ type RuntimeDiagnostics struct {
 	Message            string `json:"message,omitempty"`
 }
 
+type CacheCursor struct {
+	Epoch     string `json:"epoch,omitempty"`
+	Revision  uint64 `json:"revision,omitempty"`
+	ForceFull bool   `json:"forceFull,omitempty"`
+}
+
+type CacheSnapshot struct {
+	Epoch    string   `json:"epoch"`
+	Revision uint64   `json:"revision"`
+	Full     bool     `json:"full"`
+	Complete bool     `json:"complete"`
+	Images   []string `json:"images,omitempty"`
+}
+
+type HeartbeatRequest struct {
+	Cache CacheCursor `json:"cache"`
+}
+
 type HeartbeatResponse struct {
 	FastletStatus
+	Sequence    uint64             `json:"sequence"`
+	ObservedAt  time.Time          `json:"observedAt"`
+	Cache       CacheSnapshot      `json:"cache"`
 	Diagnostics RuntimeDiagnostics `json:"diagnostics"`
 }

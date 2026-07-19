@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
+	"time"
 
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/fastlet/runtime"
@@ -123,7 +125,25 @@ func (s *FastletServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	writeResponse(w, s.heartbeat(r), nil)
+	cursor := api.CacheCursor{
+		Epoch: r.URL.Query().Get("cacheEpoch"),
+	}
+	var err error
+	if value := r.URL.Query().Get("cacheRevision"); value != "" {
+		cursor.Revision, err = strconv.ParseUint(value, 10, 64)
+		if err != nil {
+			http.Error(w, "cacheRevision must be an unsigned integer", http.StatusBadRequest)
+			return
+		}
+	}
+	if value := r.URL.Query().Get("fullCache"); value != "" {
+		cursor.ForceFull, err = strconv.ParseBool(value)
+		if err != nil {
+			http.Error(w, "fullCache must be a boolean", http.StatusBadRequest)
+			return
+		}
+	}
+	writeResponse(w, s.heartbeat(r, cursor), nil)
 }
 
 func (s *FastletServer) handleRuntimeDiagnostics(w http.ResponseWriter, r *http.Request) {
@@ -279,31 +299,35 @@ func (s *FastletServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	heartbeat := s.heartbeat(r)
+	heartbeat := s.heartbeat(r, api.CacheCursor{ForceFull: true})
+	heartbeat.Images = append([]string(nil), heartbeat.Cache.Images...)
 	writeResponse(w, &heartbeat.FastletStatus, nil)
 }
 
-func (s *FastletServer) heartbeat(r *http.Request) api.HeartbeatResponse {
-	images, err := s.sandboxManager.ListImages(r.Context())
+func (s *FastletServer) heartbeat(r *http.Request, cursor api.CacheCursor) api.HeartbeatResponse {
+	cacheSnapshot, err := s.sandboxManager.CacheSnapshot(r.Context(), cursor)
 	if err != nil {
-		klog.ErrorS(err, "Warning: failed to list images")
-		images = []string{}
+		klog.ErrorS(err, "Warning: failed to refresh cache inventory")
 	}
 	sbStatuses := s.sandboxManager.GetSandboxStatuses(r.Context())
 	nodeName := os.Getenv("NODE_NAME")
 	admission, recovering, draining := s.sandboxManager.State()
 	status := api.FastletStatus{
-		FastletID:       os.Getenv("POD_NAME"), // Use Pod Name as Fastlet ID
-		NodeName:        nodeName,
-		Capacity:        s.sandboxManager.GetCapacity(),
-		Allocated:       len(sbStatuses),
-		Images:          images,
-		SandboxStatuses: sbStatuses,
-		Admission:       admission,
-		RuntimeReady:    s.sandboxManager.RuntimeReady(),
-		Recovering:      recovering,
-		Draining:        draining,
-		FastletPodUID:   s.sandboxManager.FastletPodUID(),
+		FastletID:           os.Getenv("POD_NAME"), // Use Pod Name as Fastlet ID
+		NodeName:            nodeName,
+		Capacity:            s.sandboxManager.GetCapacity(),
+		Allocated:           len(sbStatuses),
+		SandboxStatuses:     sbStatuses,
+		Admission:           admission,
+		RuntimeReady:        s.sandboxManager.RuntimeReady(),
+		Recovering:          recovering,
+		Draining:            draining,
+		FastletPodUID:       s.sandboxManager.FastletPodUID(),
+		ResourceProfileHash: s.sandboxManager.ResourceProfileHash(),
 	}
-	return api.HeartbeatResponse{FastletStatus: status, Diagnostics: s.sandboxManager.RuntimeDiagnostics(r.Context())}
+	return api.HeartbeatResponse{
+		FastletStatus: status,
+		Sequence:      s.sandboxManager.NextHeartbeatSequence(), ObservedAt: time.Now().UTC(),
+		Cache: cacheSnapshot, Diagnostics: s.sandboxManager.RuntimeDiagnostics(r.Context()),
+	}
 }

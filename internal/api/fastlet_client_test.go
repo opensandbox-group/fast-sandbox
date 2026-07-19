@@ -34,6 +34,8 @@ func TestFastletClientV2ReservationAndHeartbeat(t *testing.T) {
 			json.NewEncoder(w).Encode(ReserveSandboxResponse{ReservationToken: "token-a"})
 		case "/api/v2/fastlet/heartbeat":
 			require.Equal(t, http.MethodGet, r.Method)
+			require.Equal(t, "boot-a", r.URL.Query().Get("cacheEpoch"))
+			require.Equal(t, "3", r.URL.Query().Get("cacheRevision"))
 			json.NewEncoder(w).Encode(HeartbeatResponse{FastletStatus: FastletStatus{FastletPodUID: "pod-a", RuntimeReady: true}})
 		default:
 			http.NotFound(w, r)
@@ -44,7 +46,7 @@ func TestFastletClientV2ReservationAndHeartbeat(t *testing.T) {
 	reserved, err := client.ReserveSandbox(context.Background(), endpoint, &ReserveSandboxRequest{RequestID: "request-a", CreateSpecHash: "spec-a", FastletPodUID: "pod-a"})
 	require.NoError(t, err)
 	require.Equal(t, "token-a", reserved.ReservationToken)
-	heartbeat, err := client.Heartbeat(context.Background(), endpoint)
+	heartbeat, err := client.Heartbeat(context.Background(), endpoint, &HeartbeatRequest{Cache: CacheCursor{Epoch: "boot-a", Revision: 3}})
 	require.NoError(t, err)
 	require.True(t, heartbeat.RuntimeReady)
 	require.Equal(t, "pod-a", heartbeat.FastletPodUID)
