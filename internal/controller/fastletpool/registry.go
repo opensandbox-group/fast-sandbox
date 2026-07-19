@@ -47,6 +47,7 @@ type FastletInfo struct {
 	PreparedArtifacts   []string
 	PodReady            bool
 	RuntimeReady        bool
+	DrainRequested      bool
 	Draining            bool
 
 	Capacity  int
@@ -174,7 +175,7 @@ func (r *InMemoryRegistry) RegisterOrUpdate(info FastletInfo) {
 func preserveHeartbeat(target *FastletInfo, previous FastletInfo) {
 	target.RuntimeReady = previous.RuntimeReady
 	target.InfraReady = previous.InfraReady
-	target.Draining = previous.Draining
+	target.Draining = target.DrainRequested || previous.Draining
 	target.Capacity = previous.Capacity
 	target.Allocated = previous.Allocated
 	target.Admission = previous.Admission
@@ -217,7 +218,7 @@ func (r *InMemoryRegistry) ApplyHeartbeat(id FastletID, expectedPodUID string, h
 
 	slot.info.RuntimeReady = heartbeat.RuntimeReady
 	slot.info.InfraReady = heartbeat.InfraReady
-	slot.info.Draining = heartbeat.Draining
+	slot.info.Draining = slot.info.DrainRequested || heartbeat.Draining
 	slot.info.PreparedArtifacts = append([]string(nil), heartbeat.PreparedArtifacts...)
 	slot.info.Capacity = heartbeat.Admission.Capacity
 	if slot.info.Capacity <= 0 {

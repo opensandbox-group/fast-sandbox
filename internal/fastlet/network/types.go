@@ -31,6 +31,8 @@ const (
 // admission. A stale create/delete cannot take over a newer assignment.
 type Owner struct {
 	SandboxUID         string `json:"sandboxUid"`
+	SandboxName        string `json:"sandboxName,omitempty"`
+	SandboxNamespace   string `json:"sandboxNamespace,omitempty"`
 	InstanceGeneration int64  `json:"instanceGeneration"`
 	AssignmentAttempt  int64  `json:"assignmentAttempt"`
 }
@@ -57,6 +59,8 @@ type Slot struct {
 	Version       int              `json:"version"`
 	ID            string           `json:"id"`
 	OwnerPodUID   string           `json:"ownerPodUid"`
+	OwnerPodName  string           `json:"ownerPodName,omitempty"`
+	OwnerNamespace string          `json:"ownerNamespace,omitempty"`
 	Phase         SlotPhase        `json:"phase"`
 	Owner         Owner            `json:"owner,omitempty"`
 	NetNSName     string           `json:"netnsName"`

@@ -138,6 +138,8 @@ func ClearSandboxAssignment(
 				"assignment":         nil,
 				"assignedFastlet":    "",
 				"nodeName":           "",
+				"sandboxID":          "",
+				"endpoints":          []string{},
 				"instanceGeneration": generation,
 				"routeGeneration":    routeGeneration,
 				"runtimeState":       apiv1alpha1.ObservedStatePending,

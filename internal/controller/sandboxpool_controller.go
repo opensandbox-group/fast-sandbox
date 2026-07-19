@@ -5,15 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
+	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/controller/fastletpool"
 	"fast-sandbox/internal/infracatalog"
 	"fast-sandbox/internal/runtimecatalog"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -27,13 +30,26 @@ import (
 // SandboxPoolReconciler reconciles SandboxPool resources.
 type SandboxPoolReconciler struct {
 	client.Client
+	DurableReader        client.Reader
 	Scheme               *runtime.Scheme
 	Registry             fastletpool.FastletRegistry
 	Catalog              *runtimecatalog.Catalog
 	InfraCatalog         *infracatalog.Catalog
+	FastletDrainer       FastletDrainer
 	FastletProxyImage    string
 	RouteVerifyPublicKey string
+	DrainTimeout         time.Duration
+	Now                  func() time.Time
 }
+
+type FastletDrainer interface {
+	SetDraining(context.Context, string, *api.SetDrainingRequest) (*api.SetDrainingResponse, error)
+}
+
+const (
+	defaultDrainTimeout = 5 * time.Minute
+	drainRequeue        = 2 * time.Second
+)
 
 // Reconcile manages the lifecycle of Fastlet Pods based on the demand from Sandboxes.
 func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -87,20 +103,27 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	})
 
 	var childPods corev1.PodList
-	if err := r.List(ctx, &childPods, client.InNamespace(req.Namespace), client.MatchingLabels(poolLabels(pool.Name))); err != nil {
+	if err := r.durableReader().List(ctx, &childPods, client.InNamespace(req.Namespace), client.MatchingLabels(poolLabels(pool.Name))); err != nil {
 		return ctrl.Result{}, err
 	}
 	var allSandboxes apiv1alpha1.SandboxList
-	if err := r.List(ctx, &allSandboxes, client.InNamespace(req.Namespace)); err != nil {
+	if err := r.durableReader().List(ctx, &allSandboxes, client.InNamespace(req.Namespace)); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	var activeCount, pendingCount int32
+	childIdentities := make(map[string]struct{}, len(childPods.Items))
+	for index := range childPods.Items {
+		childIdentities[podIdentity(&childPods.Items[index])] = struct{}{}
+	}
 	for _, sb := range allSandboxes.Items {
-		if sb.Spec.PoolRef == pool.Name {
-			if sb.Status.AssignedFastlet != "" {
-				activeCount++
-			} else {
+		if sb.Spec.PoolRef == pool.Name && sb.DeletionTimestamp == nil {
+			if sb.Status.Assignment != nil {
+				identity := sb.Status.Assignment.FastletName + "/" + sb.Status.Assignment.FastletPodUID
+				if _, exists := childIdentities[identity]; exists {
+					activeCount++
+				}
+			} else if sandboxNeedsPlacement(&sb) {
 				pendingCount++
 			}
 		}
@@ -136,25 +159,207 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				return ctrl.Result{}, err
 			}
 		}
-	} else if currentCount > desiredPods {
-		diff := currentCount - desiredPods
-		logger.Info("Scaling down fastlet pool", "diff", diff)
-		for i := int32(0); i < diff; i++ {
-			pod := childPods.Items[i]
-			if err := r.Delete(ctx, &pod); err != nil {
-				logger.Error(err, "Failed to delete fastlet pod", "pod", pod.Name)
-				return ctrl.Result{}, err
-			}
+	}
+	if pool.Status.CurrentPods != currentCount || pool.Status.TotalFastlets != currentCount {
+		pool.Status.CurrentPods = currentCount
+		pool.Status.TotalFastlets = currentCount
+		if err := r.Status().Update(ctx, &pool); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
-
-	pool.Status.CurrentPods = currentCount
-	pool.Status.TotalFastlets = currentCount
-	if err := r.Status().Update(ctx, &pool); err != nil {
+	if result, handled, err := r.reconcileDraining(ctx, &pool, childPods.Items, allSandboxes.Items, desiredPods); err != nil {
 		return ctrl.Result{}, err
+	} else if handled {
+		return result, nil
 	}
 
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+func (r *SandboxPoolReconciler) reconcileDraining(
+	ctx context.Context,
+	pool *apiv1alpha1.SandboxPool,
+	pods []corev1.Pod,
+	sandboxes []apiv1alpha1.Sandbox,
+	desiredPods int32,
+) (ctrl.Result, bool, error) {
+	target := int(len(pods) - int(desiredPods))
+	if target < 0 {
+		target = 0
+	}
+	draining := make([]*corev1.Pod, 0, len(pods))
+	available := make([]*corev1.Pod, 0, len(pods))
+	for index := range pods {
+		pod := &pods[index]
+		if fastletpool.PodDrainRequested(pod) {
+			draining = append(draining, pod)
+		} else {
+			available = append(available, pod)
+		}
+	}
+
+	// Demand may recover while a previous scale-down is in progress. A Pod is
+	// made schedulable again only after Fastlet has accepted the inverse RPC.
+	if len(draining) > target {
+		sort.Slice(draining, func(i, j int) bool { return drainStartedAt(draining[i]).After(drainStartedAt(draining[j])) })
+		for _, pod := range draining[:len(draining)-target] {
+			if err := r.cancelDrain(ctx, pod); err != nil {
+				return ctrl.Result{RequeueAfter: drainRequeue}, true, err
+			}
+		}
+		return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
+	}
+
+	active := activeAssignmentsByPod(sandboxes, pool.Name)
+	if len(draining) < target {
+		sort.Slice(available, func(i, j int) bool {
+			left := active[podIdentity(available[i])]
+			right := active[podIdentity(available[j])]
+			if left != right {
+				return left < right
+			}
+			return available[i].Name < available[j].Name
+		})
+		count := target - len(draining)
+		if count > len(available) {
+			count = len(available)
+		}
+		for _, pod := range available[:count] {
+			if err := r.startDrain(ctx, pod, "scale-down"); err != nil {
+				return ctrl.Result{RequeueAfter: drainRequeue}, true, err
+			}
+		}
+		return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
+	}
+
+	if target == 0 {
+		return ctrl.Result{}, false, nil
+	}
+
+	now := r.now()
+	timeout := r.DrainTimeout
+	if timeout <= 0 {
+		timeout = defaultDrainTimeout
+	}
+	for _, pod := range draining {
+		acked, err := r.requestDrain(ctx, pod, true, pod.Annotations[fastletpool.AnnotationDrainReason])
+		if err != nil {
+			klog.FromContext(ctx).Error(err, "Retry Fastlet drain request", "pod", pod.Name)
+		}
+		empty := active[podIdentity(pod)] == 0
+		timedOut := !drainStartedAt(pod).IsZero() && now.Sub(drainStartedAt(pod)) >= timeout
+		previouslyAcked := pod.Annotations[fastletpool.AnnotationDrainAckedAt] != ""
+		if (empty && (acked || previouslyAcked)) || timedOut {
+			if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, true, err
+			}
+			klog.FromContext(ctx).Info("Deleted drained Fastlet Pod", "pod", pod.Name, "empty", empty, "timedOut", timedOut)
+		}
+	}
+	return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
+}
+
+func (r *SandboxPoolReconciler) startDrain(ctx context.Context, pod *corev1.Pod, reason string) error {
+	before := pod.DeepCopy()
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	pod.Annotations[fastletpool.AnnotationDraining] = "true"
+	pod.Annotations[fastletpool.AnnotationDrainStartedAt] = r.now().UTC().Format(time.RFC3339Nano)
+	pod.Annotations[fastletpool.AnnotationDrainReason] = reason
+	delete(pod.Annotations, fastletpool.AnnotationDrainAckedAt)
+	if err := r.Patch(ctx, pod, client.MergeFrom(before)); err != nil {
+		return fmt.Errorf("persist drain intent for Fastlet Pod %s: %w", pod.Name, err)
+	}
+	_, err := r.requestDrain(ctx, pod, true, reason)
+	return err
+}
+
+func (r *SandboxPoolReconciler) cancelDrain(ctx context.Context, pod *corev1.Pod) error {
+	if _, err := r.requestDrain(ctx, pod, false, "scale-down-cancelled"); err != nil {
+		return fmt.Errorf("cancel drain for Fastlet Pod %s: %w", pod.Name, err)
+	}
+	before := pod.DeepCopy()
+	delete(pod.Annotations, fastletpool.AnnotationDraining)
+	delete(pod.Annotations, fastletpool.AnnotationDrainStartedAt)
+	delete(pod.Annotations, fastletpool.AnnotationDrainReason)
+	delete(pod.Annotations, fastletpool.AnnotationDrainAckedAt)
+	return r.Patch(ctx, pod, client.MergeFrom(before))
+}
+
+func (r *SandboxPoolReconciler) requestDrain(ctx context.Context, pod *corev1.Pod, draining bool, reason string) (bool, error) {
+	if r.FastletDrainer == nil {
+		return false, errors.New("Fastlet drain client is not configured")
+	}
+	if pod.Status.PodIP == "" {
+		return false, fmt.Errorf("Fastlet Pod %s has no Pod IP", pod.Name)
+	}
+	response, err := r.FastletDrainer.SetDraining(ctx, pod.Status.PodIP, &api.SetDrainingRequest{Draining: draining, Reason: reason})
+	if err != nil {
+		return false, err
+	}
+	if response == nil || response.Draining != draining {
+		return false, fmt.Errorf("Fastlet Pod %s returned an inconsistent drain state", pod.Name)
+	}
+	if draining && pod.Annotations[fastletpool.AnnotationDrainAckedAt] == "" {
+		before := pod.DeepCopy()
+		if pod.Annotations == nil {
+			pod.Annotations = make(map[string]string)
+		}
+		pod.Annotations[fastletpool.AnnotationDrainAckedAt] = r.now().UTC().Format(time.RFC3339Nano)
+		if err := r.Patch(ctx, pod, client.MergeFrom(before)); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func activeAssignmentsByPod(sandboxes []apiv1alpha1.Sandbox, poolName string) map[string]int {
+	result := make(map[string]int)
+	for index := range sandboxes {
+		sandbox := &sandboxes[index]
+		if sandbox.Spec.PoolRef != poolName || sandbox.Status.Assignment == nil {
+			continue
+		}
+		assignment := sandbox.Status.Assignment
+		result[assignment.FastletName+"/"+assignment.FastletPodUID]++
+	}
+	return result
+}
+
+func sandboxNeedsPlacement(sandbox *apiv1alpha1.Sandbox) bool {
+	if sandbox == nil || sandbox.Status.Assignment != nil || sandbox.DeletionTimestamp != nil {
+		return false
+	}
+	switch sandbox.Status.Phase {
+	case string(apiv1alpha1.PhaseExpired), string(apiv1alpha1.PhaseLost), string(apiv1alpha1.PhaseTerminating):
+		return false
+	default:
+		return true
+	}
+}
+
+func podIdentity(pod *corev1.Pod) string {
+	return pod.Name + "/" + string(pod.UID)
+}
+
+func drainStartedAt(pod *corev1.Pod) time.Time {
+	value, _ := time.Parse(time.RFC3339Nano, pod.Annotations[fastletpool.AnnotationDrainStartedAt])
+	return value
+}
+
+func (r *SandboxPoolReconciler) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
+}
+
+func (r *SandboxPoolReconciler) durableReader() client.Reader {
+	if r.DurableReader != nil {
+		return r.DurableReader
+	}
+	return r.Client
 }
 
 // constructPod builds a Fastlet Pod from the template and a platform-owned

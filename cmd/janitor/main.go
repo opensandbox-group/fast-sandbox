@@ -9,9 +9,11 @@ import (
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
+	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/janitor"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -26,12 +28,14 @@ func main() {
 	var ctrdSocket string
 	var orphanTimeout time.Duration
 	var scanInterval time.Duration
+	var networkStateRoot string
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig file")
 	flag.StringVar(&nodeName, "node-name", os.Getenv("NODE_NAME"), "Name of the node this janitor is running on")
 	flag.StringVar(&ctrdSocket, "containerd-socket", "/run/containerd/containerd.sock", "Path to containerd socket")
-	flag.DurationVar(&orphanTimeout, "orphan-timeout", 10*time.Second, "Orphan cleanup timeout for Fast mode (containers older than this without CRD will be cleaned)")
+	flag.DurationVar(&orphanTimeout, "orphan-timeout", 30*time.Second, "Minimum age before an orphan resource can be cleaned")
 	flag.DurationVar(&scanInterval, "scan-interval", 2*time.Minute, "Interval for full container scan")
+	flag.StringVar(&networkStateRoot, "network-state-root", "/run/fast-sandbox/network", "Host-mounted Fastlet Linux network state root")
 
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -60,7 +64,14 @@ func main() {
 	}
 
 	scheme := runtime.NewScheme()
-	apiv1alpha1.AddToScheme(scheme)
+	if err := apiv1alpha1.AddToScheme(scheme); err != nil {
+		klog.ErrorS(err, "Failed to register Sandbox API")
+		os.Exit(1)
+	}
+	if err := corev1.AddToScheme(scheme); err != nil {
+		klog.ErrorS(err, "Failed to register core API")
+		os.Exit(1)
+	}
 	k8sClient, err := client.New(config, client.Options{Scheme: scheme})
 	if err != nil {
 		klog.ErrorS(err, "Failed to create generic k8s client")
@@ -78,6 +89,7 @@ func main() {
 	defer stop()
 
 	j := janitor.NewJanitor(clientset, ctrdClient, nodeName)
+	j.AddBackend(janitor.NewLinuxNetworkBackend(networkStateRoot, fastletnetwork.NewLinuxNetNSDriver(fastletnetwork.LinuxDriverConfig{})))
 	j.K8sClient = k8sClient
 	j.OrphanTimeout = orphanTimeout
 	j.ScanInterval = scanInterval

@@ -130,6 +130,8 @@ func main() {
 
 func newNetworkManager(capacity int, podUID string) (*fastletnetwork.Manager, error) {
 	config := fastletnetwork.DefaultConfig(capacity, podUID)
+	config.PodName = os.Getenv("POD_NAME")
+	config.PodNamespace = os.Getenv("NAMESPACE")
 	config.PrivateCIDR = getEnv("FAST_SANDBOX_NETWORK_CIDR", config.PrivateCIDR)
 	config.Bridge = getEnv("FAST_SANDBOX_NETWORK_BRIDGE", config.Bridge)
 	config.EgressDevice = getEnv("FAST_SANDBOX_NETWORK_EGRESS_DEVICE", "")

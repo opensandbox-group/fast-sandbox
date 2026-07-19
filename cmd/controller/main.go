@@ -51,6 +51,7 @@ func main() {
 	var heartbeatInterval time.Duration
 	var heartbeatTimeout time.Duration
 	var heartbeatConcurrency int
+	var fastletDrainTimeout time.Duration
 	var deprecatedConsistency string
 	var deprecatedOrphanTimeout time.Duration
 	var fastletProxyImage string
@@ -67,6 +68,7 @@ func main() {
 	flag.DurationVar(&heartbeatInterval, "fastlet-heartbeat-interval", 20*time.Second, "Base Fastlet heartbeat interval; actual probes use jitter.")
 	flag.DurationVar(&heartbeatTimeout, "fastlet-heartbeat-timeout", 5*time.Second, "Timeout for one Fastlet heartbeat request.")
 	flag.IntVar(&heartbeatConcurrency, "fastlet-heartbeat-concurrency", 8, "Maximum concurrent Fastlet heartbeat requests.")
+	flag.DurationVar(&fastletDrainTimeout, "fastlet-drain-timeout", 5*time.Minute, "Maximum time to wait for a draining Fastlet Pod to become empty before applying Sandbox failure policies.")
 	flag.StringVar(&deprecatedConsistency, "fastpath-consistency-mode", "", "Deprecated and ignored; Create always uses reservation -> CRD CAS -> Ensure.")
 	flag.DurationVar(&deprecatedOrphanTimeout, "fastpath-orphan-timeout", 0, "Deprecated and ignored; CRD reconciliation owns recovery.")
 	flag.StringVar(&fastletProxyImage, "fastlet-proxy-image", envOrDefault("FASTLET_PROXY_IMAGE", "fast-sandbox/fastlet-proxy:dev"), "Image injected as the platform-owned Fastlet Proxy sidecar.")
@@ -81,8 +83,8 @@ func main() {
 		klog.ErrorS(err, "Invalid control-plane role")
 		os.Exit(1)
 	}
-	if heartbeatInterval <= 0 || heartbeatTimeout <= 0 || heartbeatConcurrency <= 0 {
-		klog.ErrorS(nil, "Heartbeat interval, timeout, and concurrency must be positive")
+	if heartbeatInterval <= 0 || heartbeatTimeout <= 0 || heartbeatConcurrency <= 0 || fastletDrainTimeout <= 0 {
+		klog.ErrorS(nil, "Heartbeat and drain timing values must be positive")
 		os.Exit(1)
 	}
 	if role.RunsControllers() && routeVerifyPublicKey == "" {
@@ -156,7 +158,8 @@ func main() {
 			os.Exit(1)
 		}
 		if err := (&controller.SandboxPoolReconciler{
-			Client: manager.GetClient(), Scheme: manager.GetScheme(), Registry: registry, Catalog: catalog, InfraCatalog: infraCatalog,
+			Client: manager.GetClient(), DurableReader: durableClient, Scheme: manager.GetScheme(), Registry: registry, Catalog: catalog, InfraCatalog: infraCatalog,
+			FastletDrainer: fastletClient, DrainTimeout: fastletDrainTimeout,
 			FastletProxyImage: fastletProxyImage, RouteVerifyPublicKey: routeVerifyPublicKey,
 		}).SetupWithManager(manager); err != nil {
 			klog.ErrorS(err, "Register SandboxPool controller")

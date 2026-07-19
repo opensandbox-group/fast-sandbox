@@ -148,11 +148,6 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 		m.mu.Unlock()
 		return response, err
 	}
-	if m.draining {
-		response, err := ensureFailure(fastletError(api.ErrorDraining, m.drainReason, true), m.admissionStatusLocked())
-		m.mu.Unlock()
-		return response, err
-	}
 	if existing := m.sandboxes[spec.SandboxID]; existing != nil {
 		if existing.Phase == "infra-pending" {
 			identity := api.SandboxIdentity{
@@ -227,6 +222,11 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 			return &api.EnsureSandboxResponse{Accepted: true, Created: false, Sandbox: &status, Admission: admission}, nil
 		}
 		response, err := m.ensureExistingLocked(existing, &spec)
+		m.mu.Unlock()
+		return response, err
+	}
+	if m.draining {
+		response, err := ensureFailure(fastletError(api.ErrorDraining, m.drainReason, true), m.admissionStatusLocked())
 		m.mu.Unlock()
 		return response, err
 	}

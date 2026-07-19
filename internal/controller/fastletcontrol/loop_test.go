@@ -75,10 +75,39 @@ func TestFastletInfoFromPodUsesWatchIdentityAndReadiness(t *testing.T) {
 	require.Equal(t, "resource-hash", info.ResourceProfileHash)
 }
 
+func TestDrainAnnotationImmediatelyExcludesPodAndHeartbeatCannotClearIt(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "fastlet-a", Namespace: "default", UID: types.UID("pod-uid-a"),
+			Labels: map[string]string{"app": "sandbox-fastlet", "fast-sandbox.io/pool": "pool-a"},
+			Annotations: map[string]string{
+				fastletpool.AnnotationDraining: "true",
+			},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning, PodIP: "10.0.0.1",
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+	registry := fastletpool.NewInMemoryRegistry()
+	registry.UpsertPod(fastletInfoFromPod(pod))
+	info, exists := registry.GetFastletByID("fastlet-a")
+	require.True(t, exists)
+	require.True(t, info.DrainRequested)
+	require.True(t, info.Draining)
+
+	heartbeat := heartbeatFor("pod-uid-a", "boot-a", 1, 1, true)
+	heartbeat.Draining = false
+	require.NoError(t, registry.ApplyHeartbeat("fastlet-a", "pod-uid-a", heartbeat, time.Now()))
+	info, exists = registry.GetFastletByID("fastlet-a")
+	require.True(t, exists)
+	require.True(t, info.Draining)
+}
+
 func TestReadyTransitionTriggersImmediateProbeOnlyOnce(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "fastlet-a", UID: types.UID("pod-a"), Labels: map[string]string{"app": "sandbox-fastlet"}},
-		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.1"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.1"},
 	}
 	ready := pod.DeepCopy()
 	ready.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}

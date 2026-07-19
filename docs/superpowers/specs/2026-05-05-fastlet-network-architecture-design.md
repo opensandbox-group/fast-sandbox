@@ -405,6 +405,10 @@ BoxLiteJanitor
 清理 fastlet local bridge 上的残留端口
 ```
 
+实现时统一抽象为 `ResourceIdentity + CleanupBackend`。Containerd 与 Linux network backend 不各自解释 CRD，而是把 Pod UID、Sandbox UID、instance generation、assignment attempt 和创建时间交给 Janitor authority 层；authority 在扫描和删除前各校验一次。API 错误或 fence 不完整时 fail closed。
+
+Linux reference path 的 bridge、host-veth 和 NAT 位于 Fastlet Pod network namespace，Pod 删除时随该 namespace 自动销毁；跨 Pod 持久的是 bind-mounted named netns、其中的 peer、DNS 文件和 JSON state。因此 LinuxNetworkJanitor 负责后者，不删除可能属于其他活跃 Fastlet 的共享宿主规则。BoxLite backend contract 已预留，但只有 BoxLiteDriver 能稳定提供 list/inspect/remove identity 后才能启用实际清理。
+
 BoxLite 不能通过扫描 containerd 判断存活状态。`BoxLiteDriver` 必须提供 runtime-specific list/inspect/remove 能力，janitor 再结合 Sandbox CRD UID、assigned Fastlet UID、BoxLite runtime state 和 shim 进程做二次确认。
 
 建议所有网络资源都带 sandbox id 标记，便于 janitor 判断所有权：

@@ -17,13 +17,16 @@ import (
 )
 
 func NewJanitor(kubeClient kubernetes.Interface, ctrdClient *containerd.Client, nodeName string) *Janitor {
-	return &Janitor{
+	janitor := &Janitor{
 		kubeClient:   kubeClient,
-		ctrdClient:   ctrdClient,
 		nodeName:     nodeName,
 		queue:        workqueue.NewNamedRateLimitingQueue(workqueue.DefaultItemBasedRateLimiter(), "janitor"),
 		ScanInterval: 2 * time.Minute, // 默认值
 	}
+	if ctrdClient != nil {
+		janitor.AddBackend(NewContainerdBackend(ctrdClient, "/run/containerd/fifo"))
+	}
+	return janitor
 }
 
 func (j *Janitor) Run(ctx context.Context) error {
@@ -36,8 +39,6 @@ func (j *Janitor) Run(ctx context.Context) error {
 		}))
 
 	podInformer := factory.Core().V1().Pods()
-	j.podLister = podInformer.Lister()
-
 	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		DeleteFunc: func(obj interface{}) {
 			pod, ok := obj.(*corev1.Pod)
@@ -60,11 +61,15 @@ func (j *Janitor) Run(ctx context.Context) error {
 	if !cache.WaitForCacheSync(ctx.Done(), podInformer.Informer().HasSynced) {
 		return fmt.Errorf("failed to sync informer cache")
 	}
+	defer j.queue.ShutDown()
 
 	// 2. 启动 Worker
 	go wait.UntilWithContext(ctx, j.runWorker, time.Second)
 
 	// 3. 启动定时扫描
+	if j.ScanInterval <= 0 {
+		j.ScanInterval = 2 * time.Minute
+	}
 	ticker := time.NewTicker(j.ScanInterval)
 	defer ticker.Stop()
 	// 初始扫描
@@ -83,8 +88,8 @@ func (j *Janitor) Run(ctx context.Context) error {
 func (j *Janitor) handlePodDeletion(ctx context.Context, pod *corev1.Pod) {
 	// 检查是否是 Fastlet Pod (通过 Label)
 	if pool, ok := pod.Labels["fast-sandbox.io/pool"]; ok {
-		klog.InfoS("Detected fastlet pod deletion, checking for orphans", "pod", pod.Name, "pool", pool)
-		j.enqueueOrphansByUID(ctx, string(pod.UID), pod.Name, pod.Namespace)
+		klog.InfoS("Detected Fastlet Pod deletion, scanning node resources", "pod", pod.Name, "podUID", pod.UID, "pool", pool)
+		go j.Scan(ctx)
 	}
 }
 
@@ -100,7 +105,11 @@ func (j *Janitor) processNextItem(ctx context.Context) bool {
 	}
 	defer j.queue.Done(item)
 
-	task := item.(CleanupTask)
+	task, ok := item.(CleanupTask)
+	if !ok {
+		j.queue.Forget(item)
+		return true
+	}
 	err := j.doCleanup(ctx, task)
 	if err != nil {
 		if j.queue.NumRequeues(item) < 3 {

@@ -19,6 +19,8 @@ const currentSlotVersion = 1
 type Config struct {
 	Capacity         int
 	PodUID           string
+	PodName          string
+	PodNamespace     string
 	PrivateCIDR      string
 	Bridge           string
 	MTU              int
@@ -323,7 +325,9 @@ func (m *Manager) prepareOne(ctx context.Context) error {
 	hostVeth := resourceName("fh", m.config.PodUID, id, 15)
 	peerVeth := resourceName("fp", m.config.PodUID, id, 15)
 	slot := &Slot{
-		Version: currentSlotVersion, ID: id, OwnerPodUID: m.config.PodUID, Phase: SlotPhaseClean,
+		Version: currentSlotVersion, ID: id,
+		OwnerPodUID: m.config.PodUID, OwnerPodName: m.config.PodName, OwnerNamespace: m.config.PodNamespace,
+		Phase: SlotPhaseClean,
 		NetNSName: netnsName, NetNSPath: filepath.Join(m.config.NetNSRoot, netnsName),
 		HostNetNSPath: filepath.Join(m.config.HostNetNSRoot, netnsName),
 		HostVeth:      hostVeth, PeerVeth: peerVeth, Bridge: m.config.Bridge,

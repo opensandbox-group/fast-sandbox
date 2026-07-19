@@ -1,7 +1,7 @@
 # Fast Sandbox 架构重构开发计划
 
 **日期**：2026-07-19  
-**状态**：执行中（阶段 0～9 完成，阶段 10 待执行）
+**状态**：执行中（阶段 0～10 完成，阶段 11 待执行）
 **代码基线**：`master@f92d8e34288365be227d2ee8a6f952687dc7be00`  
 **本地仓库**：`/Users/fengjianhui/WorkSpaceL/fast-sandbox`  
 **远端开发机**：SSH alias `fast`  
@@ -1278,6 +1278,23 @@ Route/State cleanup
 bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_exec.sh \
   'make test-e2e-drain && make test-e2e-faultrecovery && make test-e2e-cleanupjanitor'
 ```
+
+### 15.5 实施结果（2026-07-19）
+
+- Pool 缩容不再按 PodList 顺序直接删除。Controller 通过 direct API reader 根据 CRD 中精确的 `FastletName/FastletPodUID` assignment 计数，避免 Leader 切换后的 cache lag 把 loaded Pod 误判为空，并优先选择真实空 Fastlet；Drain 期望通过 `fast-sandbox.io/draining`、started-at、reason 和 acked-at annotation 持久化，新的 Controller Leader 可只凭 Pod 状态继续；
+- Drain 先持久化 annotation，再调用 Fastlet `SetDraining`。所有 Registry Pod Watch 立即把 annotation 投影成 `DrainRequested/Draining`，Heartbeat 即使暂时报 `Draining=false` 也不能清除平台期望；Fastlet 原子 admission 拒绝新 UID 的 reservation/ensure，但同一 identity 的已有 Sandbox Ensure 仍幂等成功，避免 Controller Reconcile 因 `ErrorDraining` 错误清除 active assignment；
+- 已有 Sandbox 在 Drain 期间继续运行。空且至少成功 ack 过的 Fastlet 才正常删除；有负载的 Fastlet 等待 `--fastlet-drain-timeout`，超时删除后统一进入既有 PodLost `FailurePolicy`。需求恢复时先 RPC 取消 Drain，成功后才移除 annotation；
+- SandboxController 以 Kubernetes Pod Name + UID + deletionTimestamp 判断 PodLost。本地 Registry 暂时缺少 endpoint 只标记 `FastletRegistryPending/Unavailable` 并原地重试，不再触发错误 AutoRecreate；同名 replacement Pod 因 UID 不同必然进入 PodLost；
+- `Manual` 在确切 PodLost 后保持 assignment 并标记 `Lost`；`AutoRecreate` 清除旧 assignment，同时递增 instanceGeneration 和 routeGeneration，下一次 CAS 使用更大的 assignmentAttempt。删除、过期和 reset 路径在 Registry 不可用时也先核对真实 Pod UID，避免提前移除 finalizer；
+- NodeJanitor 重构为统一 `ResourceIdentity + CleanupBackend`。Containerd 与 Linux network backend 都产出 Fastlet Pod UID、Sandbox UID、instance generation、assignment attempt 和创建时间；发现阶段与删除前使用同一 authority decision 做两次校验，任何 Pod/Sandbox API 错误、legacy fence 缺失或资源 identity 前移都 fail closed；
+- Containerd backend 清理 task/container/snapshot/FIFO，并在删除前重新读取 label fence 防止 ID 复用；Linux network backend 扫描 `/run/fast-sandbox/network/<podUID>`，校验 state directory/owner fence，幂等清理持久 named netns、veth peer、DNS 和 JSON state。Pod network namespace 内的 bridge/NAT 随 Fastlet Pod 自动销毁，不作为跨 Pod 共享规则删除；
+- Janitor DaemonSet 增加 host network、network state hostPath 和 Bidirectional named-netns mount，镜像包含 iproute2/iptables。BoxLite 使用同一 backend contract 和保留的 `BackendBoxLite` 类型；实际 Box/shim/state scanner 随阶段 11 BoxLiteDriver 一起实现，不能借 containerd scanner 伪装支持；
+- Expired/clear-assignment 同步清空 deprecated `sandboxID/endpoints` 投影，保持旧 SDK/E2E 兼容，但它们仍不是权威 identity；
+- 新增 Pool Drain unit/e2e：覆盖空 Fastlet 优先、loaded Fastlet 等待 timeout、fresh reconciler 从 annotation 接管、Registry heartbeat 不能清除 Drain、leader election 切换后 Drain 状态保留，以及新 Sandbox 避开 Draining Pod；
+- 远端完整 unit gate：`make test-unit`，退出状态 `0`；Drain/Controller/Janitor 目标 package gate 与 Kubernetes manifest client dry-run 均退出 `0`；
+- 远端 Drain e2e：`E2E_TEST_TIMEOUT=35m DOCKER_BUILD_FLAGS=--network=host make test-e2e-drain`，最终用例包含真实 Controller Leader 删除/重选，退出状态 `0`；最终代码快照总耗时 `79.360s`，核心断言 `28.88s`（首次含全量环境准备运行 `338.399s`）；
+- 远端 fault-recovery：AutoRecreate、Manual Lost、reset、registry create/delete cycle 和 Pod orphan 路径通过；修复兼容投影后定向 `TestAutoExpiry` 通过，退出状态 `0`，耗时 `144.038s`；
+- 远端 cleanup-janitor e2e：`E2E_TEST_TIMEOUT=35m DOCKER_BUILD_FLAGS=--network=host make test-e2e-cleanupjanitor`，退出状态 `0`，耗时 `83.596s`。
 
 ## 16. 阶段 11：gVisor、Kata 和 BoxLite Runtime 全矩阵
 

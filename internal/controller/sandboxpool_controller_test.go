@@ -1,9 +1,14 @@
 package controller
 
 import (
+	"context"
+	"sync"
 	"testing"
+	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
+	"fast-sandbox/internal/api"
+	"fast-sandbox/internal/controller/fastletpool"
 	"fast-sandbox/internal/runtimecatalog"
 
 	"github.com/stretchr/testify/require"
@@ -12,7 +17,22 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+type recordingDrainer struct {
+	mu       sync.Mutex
+	requests []api.SetDrainingRequest
+}
+
+func (d *recordingDrainer) SetDraining(_ context.Context, _ string, request *api.SetDrainingRequest) (*api.SetDrainingResponse, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.requests = append(d.requests, *request)
+	return &api.SetDrainingResponse{Draining: request.Draining}, nil
+}
 
 func TestResolveRuntimeProfileUsesCanonicalAndLegacyFields(t *testing.T) {
 	reconciler := &SandboxPoolReconciler{Catalog: runtimecatalog.Builtin()}
@@ -112,6 +132,122 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	propagation := volumeMount(pod, "fast-sandbox-netns")
 	require.NotNil(t, propagation)
 	require.Equal(t, corev1.MountPropagationBidirectional, *propagation)
+}
+
+func TestScaleDownDrainsEmptyFastletBeforeDeletion(t *testing.T) {
+	reconciler, k8sClient, drainer, pool := newDrainHarness(t, []apiv1alpha1.Sandbox{
+		assignedSandbox("sandbox-a", "fastlet-a", "pod-a"),
+	})
+
+	result, err := reconciler.Reconcile(context.Background(), poolRequest(pool))
+	require.NoError(t, err)
+	require.Equal(t, drainRequeue, result.RequeueAfter)
+	fastletA := getFastletPod(t, k8sClient, "fastlet-a")
+	fastletB := getFastletPod(t, k8sClient, "fastlet-b")
+	require.False(t, fastletpool.PodDrainRequested(fastletA))
+	require.True(t, fastletpool.PodDrainRequested(fastletB), "the empty Fastlet must be selected before a loaded peer")
+	require.NotEmpty(t, fastletB.Annotations[fastletpool.AnnotationDrainAckedAt])
+
+	// A fresh reconciler instance resumes from the durable Pod annotation and
+	// removes the already-empty Fastlet without relying on process memory.
+	replacement := *reconciler
+	_, err = replacement.Reconcile(context.Background(), poolRequest(pool))
+	require.NoError(t, err)
+	var deleted corev1.Pod
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "fastlet-b"}, &deleted)
+	require.True(t, client.IgnoreNotFound(err) == nil && err != nil)
+	require.NotEmpty(t, drainer.requests)
+}
+
+func TestLoadedFastletWaitsUntilDrainTimeout(t *testing.T) {
+	now := time.Date(2026, 7, 19, 8, 0, 0, 0, time.UTC)
+	reconciler, k8sClient, _, pool := newDrainHarness(t, []apiv1alpha1.Sandbox{
+		assignedSandbox("sandbox-a", "fastlet-a", "pod-a"),
+		assignedSandbox("sandbox-b", "fastlet-b", "pod-b"),
+	})
+	reconciler.Now = func() time.Time { return now }
+	reconciler.DrainTimeout = 5 * time.Minute
+	_, err := reconciler.Reconcile(context.Background(), poolRequest(pool))
+	require.NoError(t, err)
+	draining := getFastletPod(t, k8sClient, "fastlet-a")
+	require.True(t, fastletpool.PodDrainRequested(draining))
+
+	_, err = reconciler.Reconcile(context.Background(), poolRequest(pool))
+	require.NoError(t, err)
+	_ = getFastletPod(t, k8sClient, "fastlet-a")
+
+	now = now.Add(6 * time.Minute)
+	_, err = reconciler.Reconcile(context.Background(), poolRequest(pool))
+	require.NoError(t, err)
+	var deleted corev1.Pod
+	err = k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "fastlet-a"}, &deleted)
+	require.True(t, client.IgnoreNotFound(err) == nil && err != nil)
+}
+
+func TestSandboxNeedsPlacementExcludesTerminalAndAssignedStates(t *testing.T) {
+	require.True(t, sandboxNeedsPlacement(&apiv1alpha1.Sandbox{}))
+	for _, phase := range []apiv1alpha1.SandboxPhase{apiv1alpha1.PhaseExpired, apiv1alpha1.PhaseLost, apiv1alpha1.PhaseTerminating} {
+		require.False(t, sandboxNeedsPlacement(&apiv1alpha1.Sandbox{Status: apiv1alpha1.SandboxStatus{Phase: string(phase)}}))
+	}
+	assignment := apiv1alpha1.SandboxAssignment{FastletName: "fastlet-a", FastletPodUID: "pod-a", Attempt: 1}
+	require.False(t, sandboxNeedsPlacement(&apiv1alpha1.Sandbox{Status: apiv1alpha1.SandboxStatus{Assignment: &assignment}}))
+}
+
+func newDrainHarness(t *testing.T, sandboxes []apiv1alpha1.Sandbox) (*SandboxPoolReconciler, client.Client, *recordingDrainer, *apiv1alpha1.SandboxPool) {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	pool := &apiv1alpha1.SandboxPool{
+		TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha1.GroupVersion.String(), Kind: "SandboxPool"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default", UID: types.UID("pool-a-uid")},
+		Spec: apiv1alpha1.SandboxPoolSpec{
+			Runtime: apiv1alpha1.RuntimeContainer, MaxSandboxesPerPod: 5,
+			Capacity: apiv1alpha1.PoolCapacity{PoolMin: 1, PoolMax: 10},
+		},
+	}
+	objects := []client.Object{pool, fastletPod("fastlet-a", "pod-a", "10.0.0.1"), fastletPod("fastlet-b", "pod-b", "10.0.0.2")}
+	for index := range sandboxes {
+		objects = append(objects, &sandboxes[index])
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&apiv1alpha1.SandboxPool{}, &apiv1alpha1.Sandbox{}).
+		WithObjects(objects...).Build()
+	drainer := &recordingDrainer{}
+	reconciler := &SandboxPoolReconciler{
+		Client: k8sClient, Scheme: scheme, Catalog: runtimecatalog.Builtin(), FastletDrainer: drainer,
+	}
+	return reconciler, k8sClient, drainer, pool
+}
+
+func fastletPod(name, uid, ip string) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: "default", UID: types.UID(uid),
+			Labels: map[string]string{"app": "sandbox-fastlet", "fast-sandbox.io/pool": "pool-a"},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: ip},
+	}
+}
+
+func assignedSandbox(name, fastletName, podUID string) apiv1alpha1.Sandbox {
+	assignment := apiv1alpha1.SandboxAssignment{FastletName: fastletName, FastletPodUID: podUID, Attempt: 1}
+	return apiv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: types.UID(name + "-uid")},
+		Spec:       apiv1alpha1.SandboxSpec{Image: "alpine:latest", PoolRef: "pool-a"},
+		Status:     apiv1alpha1.SandboxStatus{Assignment: &assignment, AssignmentAttempt: 1, InstanceGeneration: 1},
+	}
+}
+
+func getFastletPod(t *testing.T, k8sClient client.Client, name string) *corev1.Pod {
+	t.Helper()
+	var pod corev1.Pod
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: name}, &pod))
+	return &pod
+}
+
+func poolRequest(pool *apiv1alpha1.SandboxPool) ctrl.Request {
+	return ctrl.Request{NamespacedName: types.NamespacedName{Namespace: pool.Namespace, Name: pool.Name}}
 }
 
 func TestConstructPodAddsKVMWithoutRuntimeClass(t *testing.T) {

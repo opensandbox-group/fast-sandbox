@@ -428,6 +428,14 @@ Drain 期间：
 
 具体超时值、排序策略和 Pod disruption 配置在实现阶段确定。
 
+实施约束补充：
+
+- Drain intent 必须写入 Fastlet Pod annotation，不能只保存在 Controller 内存或 Local Registry；
+- annotation 是平台期望，Fastlet heartbeat 是观测值，观测值不能把仍有效的 Drain intent 覆盖回 Ready；
+- PodLost 只能由 Kubernetes Pod Name + UID 的权威存在性确认触发，Local Registry miss 只代表本地视图尚未收敛；
+- Janitor 使用与 runtime 相同的 Pod UID、Sandbox UID、instance generation 和 assignment attempt fence，并在实际删除前重新读取权威状态；
+- Manual Lost 保留 assignment 供诊断，但 `Phase=Lost` 是 Janitor 可以清理旧 node-local resource 的明确控制面确认。
+
 ## 8. Local Registry、Watch 和 Heartbeat
 
 ### 8.1 Registry 定位

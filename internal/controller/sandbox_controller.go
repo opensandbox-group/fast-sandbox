@@ -15,6 +15,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -80,7 +81,11 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, request ctrl.Request)
 
 func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *sandboxorchestrator.Orchestrator, sandbox *apiv1alpha1.Sandbox) (ctrl.Result, error) {
 	if sandbox.Status.Assignment != nil {
-		if _, ok := orchestrator.Registry.GetFastletByID(fastletpool.FastletID(sandbox.Status.Assignment.FastletName)); !ok {
+		lost, err := r.assignedPodLost(ctx, sandbox)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if lost {
 			return r.reconcilePodLost(ctx, orchestrator, sandbox)
 		}
 	}
@@ -97,7 +102,10 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *s
 			return ctrl.Result{RequeueAfter: DeletionPollInterval}, nil
 		}
 		if errors.Is(err, sandboxorchestrator.ErrAssignedFastletUnavailable) {
-			return r.reconcilePodLost(ctx, orchestrator, assigned)
+			if statusErr := r.markAssignedFastletUnavailable(ctx, assigned); statusErr != nil {
+				return ctrl.Result{}, statusErr
+			}
+			return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 		}
 		if explicitReschedule(err) {
 			if _, clearErr := orchestrator.ClearAssignment(ctx, assigned, false); clearErr != nil {
@@ -112,6 +120,30 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *s
 		klog.FromContext(ctx).Info("Sandbox assigned and runtime ensured", "sandbox", sandbox.Name, "fastlet", assigned.Status.Assignment.FastletName)
 	}
 	return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
+}
+
+func (r *SandboxReconciler) assignedPodLost(ctx context.Context, sandbox *apiv1alpha1.Sandbox) (bool, error) {
+	if sandbox == nil || sandbox.Status.Assignment == nil {
+		return false, nil
+	}
+	assignment := sandbox.Status.Assignment
+	var pod corev1.Pod
+	err := r.Get(ctx, types.NamespacedName{Namespace: sandbox.Namespace, Name: assignment.FastletName}, &pod)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return string(pod.UID) != assignment.FastletPodUID || pod.DeletionTimestamp != nil, nil
+}
+
+func (r *SandboxReconciler) markAssignedFastletUnavailable(ctx context.Context, sandbox *apiv1alpha1.Sandbox) error {
+	return r.patchStatus(ctx, sandbox, func(status *apiv1alpha1.SandboxStatus) {
+		status.RuntimeState = apiv1alpha1.ObservedStateUnavailable
+		status.DataPlaneState = apiv1alpha1.ObservedStateUnavailable
+		setSandboxCondition(status, sandboxorchestrator.ConditionRuntimeReady, metav1.ConditionFalse, "FastletRegistryPending", "The assigned Fastlet Pod still exists, but its local registry endpoint is temporarily unavailable")
+	})
 }
 
 func (r *SandboxReconciler) reconcilePodLost(ctx context.Context, orchestrator *sandboxorchestrator.Orchestrator, sandbox *apiv1alpha1.Sandbox) (ctrl.Result, error) {
@@ -214,7 +246,17 @@ func (r *SandboxReconciler) ensureRuntimeDeleted(ctx context.Context, orchestrat
 		return true, nil
 	}
 	if inspectErr != nil {
-		if errors.Is(inspectErr, sandboxorchestrator.ErrAssignedFastletUnavailable) || sandboxorchestrator.IsNotFound(inspectErr) {
+		if errors.Is(inspectErr, sandboxorchestrator.ErrAssignedFastletUnavailable) {
+			lost, podErr := r.assignedPodLost(ctx, sandbox)
+			if podErr != nil {
+				return false, podErr
+			}
+			if lost {
+				return true, nil
+			}
+			return false, inspectErr
+		}
+		if sandboxorchestrator.IsNotFound(inspectErr) {
 			// Pod-bound model: once the Fastlet Pod identity is gone, all of its
 			// Sandbox runtimes are considered gone and cannot be taken over.
 			return true, nil

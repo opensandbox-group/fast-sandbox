@@ -664,8 +664,9 @@ func networkOwner(config *api.SandboxSpec) fastletnetwork.Owner {
 		attempt = 1
 	}
 	return fastletnetwork.Owner{
-		SandboxUID: config.SandboxID, InstanceGeneration: generation,
-		AssignmentAttempt: attempt,
+		SandboxUID: config.SandboxID, SandboxName: config.ClaimName, SandboxNamespace: config.ClaimNamespace,
+		InstanceGeneration: generation,
+		AssignmentAttempt:  attempt,
 	}
 }
 

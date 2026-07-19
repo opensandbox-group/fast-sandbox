@@ -68,7 +68,10 @@ func TestClearSandboxAssignmentRetainsAttemptAndOptionallyAdvancesGeneration(t *
 	sandbox := &apiv1alpha1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{Name: "sandbox-a", Namespace: "default"},
 		Spec:       apiv1alpha1.SandboxSpec{Image: "image:v1", PoolRef: "pool-a"},
-		Status:     apiv1alpha1.SandboxStatus{Assignment: &assignment, AssignmentAttempt: 3, InstanceGeneration: 2, RouteGeneration: 4},
+		Status: apiv1alpha1.SandboxStatus{
+			Assignment: &assignment, AssignmentAttempt: 3, InstanceGeneration: 2, RouteGeneration: 4,
+			SandboxID: "sandbox-uid", Endpoints: []string{"http://stale"},
+		},
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(sandbox).WithObjects(sandbox).Build()
 
@@ -78,5 +81,7 @@ func TestClearSandboxAssignmentRetainsAttemptAndOptionallyAdvancesGeneration(t *
 	require.Equal(t, int64(3), cleared.Status.AssignmentAttempt)
 	require.Equal(t, int64(3), cleared.Status.InstanceGeneration)
 	require.Equal(t, int64(5), cleared.Status.RouteGeneration)
+	require.Empty(t, cleared.Status.SandboxID)
+	require.Empty(t, cleared.Status.Endpoints)
 	require.Equal(t, string(apiv1alpha1.PhasePending), cleared.Status.Phase)
 }

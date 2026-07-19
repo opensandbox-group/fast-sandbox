@@ -503,6 +503,27 @@ func TestRoutePublicationGatesCreateAndRetriesWithoutRecreatingRuntime(t *testin
 	publisher.mu.Unlock()
 }
 
+func TestDrainingRejectsNewEnsureButKeepsExistingSandboxIdempotent(t *testing.T) {
+	manager, err := NewSandboxManagerWithConfig(newAdmissionRuntime(), SandboxManagerConfig{
+		Capacity: 2, FastletPodUID: "pod-uid-a",
+	})
+	require.NoError(t, err)
+	existing := ensureRequest("sandbox-a", 1, 1)
+	created, err := manager.EnsureSandboxV2(context.Background(), existing)
+	require.NoError(t, err)
+	require.True(t, created.Accepted)
+
+	manager.SetDraining(true, "pool scale-down")
+	reconciled, err := manager.EnsureSandboxV2(context.Background(), existing)
+	require.NoError(t, err)
+	require.True(t, reconciled.Accepted)
+	require.False(t, reconciled.Created)
+	require.Equal(t, "running", reconciled.Sandbox.Phase)
+
+	_, err = manager.EnsureSandboxV2(context.Background(), ensureRequest("sandbox-b", 1, 1))
+	requireFastletCode(t, err, api.ErrorDraining)
+}
+
 func TestRouteRemovalPrecedesAndGatesRuntimeDeletion(t *testing.T) {
 	runtime := newAdmissionRuntime()
 	publisher := &admissionRoutePublisher{removeError: errors.New("proxy control unavailable")}

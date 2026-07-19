@@ -15,6 +15,8 @@ spec:
         app: fast-sandbox-janitor
     spec:
       serviceAccountName: fast-sandbox-janitor
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       tolerations:
       - operator: Exists
       containers:
@@ -22,7 +24,7 @@ spec:
         image: fast-sandbox/janitor:dev
         imagePullPolicy: IfNotPresent
         command: ["/workspace/janitor"]
-        args: ["--scan-interval=2m"]
+        args: ["--scan-interval=2m", "--orphan-timeout=30s"]
         securityContext:
           privileged: true
         env:
@@ -35,6 +37,11 @@ spec:
           mountPath: /run/containerd/containerd.sock
         - name: fifo
           mountPath: /run/containerd/fifo
+        - name: network-state
+          mountPath: /run/fast-sandbox/network
+        - name: network-namespaces
+          mountPath: /run/netns
+          mountPropagation: Bidirectional
       volumes:
       - name: sock
         hostPath:
@@ -43,4 +50,12 @@ spec:
       - name: fifo
         hostPath:
           path: /run/containerd/fifo
+          type: DirectoryOrCreate
+      - name: network-state
+        hostPath:
+          path: /run/fast-sandbox/network
+          type: DirectoryOrCreate
+      - name: network-namespaces
+        hostPath:
+          path: /run/fast-sandbox/netns
           type: DirectoryOrCreate
