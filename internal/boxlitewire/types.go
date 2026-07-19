@@ -1,6 +1,8 @@
 package boxlitewire
 
 import (
+	"time"
+
 	"fast-sandbox/internal/api"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
@@ -62,6 +64,8 @@ type Box struct {
 	PID                        int                                `json:"pid,omitempty"`
 	Phase                      string                             `json:"phase"`
 	CreatedAt                  int64                              `json:"createdAt"`
+	UserProcessStartedAt       time.Time                          `json:"userProcessStartedAt,omitempty"`
+	UserProcessStartSource     api.UserProcessStartSource         `json:"userProcessStartSource,omitempty"`
 	Access                     fastletnetwork.AccessDescriptor    `json:"access"`
 	InfraServices              []fastletinfra.ServiceEndpoint     `json:"infraServices,omitempty"`
 	InfraUpstreamHeadersByPort map[uint32]map[string]string       `json:"infraUpstreamHeadersByPort,omitempty"`

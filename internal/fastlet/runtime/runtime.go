@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
@@ -18,6 +19,8 @@ type SandboxMetadata struct {
 	PID                        int
 	Phase                      string
 	CreatedAt                  int64
+	UserProcessStartedAt       time.Time
+	UserProcessStartSource     api.UserProcessStartSource
 	InfraServices              []fastletinfra.ServiceEndpoint
 	InfraUpstreamHeadersByPort map[uint32]map[string]string
 	InfraDiagnostics           []fastletinfra.ComponentDiagnostic

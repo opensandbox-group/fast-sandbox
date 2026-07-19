@@ -178,6 +178,7 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 		_ = container.Delete(ctx, containerd.WithSnapshotCleanup)
 		return nil, fmt.Errorf("failed to start task: %w", err)
 	}
+	userProcessStartedAt, userProcessStartSource := userProcessStartAfterTaskStart(infraInstance, time.Now())
 	startDuration := time.Since(startStart)
 
 	totalDuration := time.Since(totalStart)
@@ -190,11 +191,13 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 		"start_ms", startDuration.Milliseconds())
 
 	metadata := &SandboxMetadata{
-		SandboxSpec: *config,
-		ContainerID: containerID,
-		Phase:       "running",
-		CreatedAt:   time.Now().Unix(),
-		PID:         int(task.Pid()),
+		SandboxSpec:            *config,
+		ContainerID:            containerID,
+		Phase:                  "running",
+		CreatedAt:              time.Now().Unix(),
+		PID:                    int(task.Pid()),
+		UserProcessStartedAt:   userProcessStartedAt,
+		UserProcessStartSource: userProcessStartSource,
 	}
 	if infraInstance != nil {
 		metadata.InfraServices = append([]infra.ServiceEndpoint(nil), infraInstance.Services...)
@@ -213,6 +216,7 @@ func (r *ContainerdRuntime) EnsureSandbox(ctx context.Context, config *api.Sandb
 		if err := validateExistingRuntimeProfile(existing, config); err != nil {
 			return nil, err
 		}
+		existing.UserProcessStartSource = api.UserProcessStartExistingRuntime
 		return existing, nil
 	}
 	if !errors.Is(err, ErrSandboxNotFound) {
@@ -238,6 +242,13 @@ func (r *ContainerdRuntime) EnsureSandbox(ctx context.Context, config *api.Sandb
 		return nil, errors.Join(createErr, releaseErr)
 	}
 	return metadata, createErr
+}
+
+func userProcessStartAfterTaskStart(instance *infra.PreparedInstance, observedAt time.Time) (time.Time, api.UserProcessStartSource) {
+	if instance != nil && instance.WrapperRequired {
+		return time.Time{}, api.UserProcessStartSandboxInitUnreported
+	}
+	return observedAt, api.UserProcessStartRuntimeDirect
 }
 
 func validateExistingRuntimeProfile(existing *SandboxMetadata, requested *api.SandboxSpec) error {

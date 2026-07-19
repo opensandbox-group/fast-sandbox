@@ -2,6 +2,15 @@ package api
 
 import "time"
 
+type UserProcessStartSource string
+
+const (
+	UserProcessStartRuntimeDirect         UserProcessStartSource = "runtime_direct"
+	UserProcessStartSandboxInitUnreported UserProcessStartSource = "sandbox_init_unreported"
+	UserProcessStartExistingRuntime       UserProcessStartSource = "existing_runtime"
+	UserProcessStartUnknown               UserProcessStartSource = "unknown"
+)
+
 // ConsistencyMode defines the consistency mode for sandbox creation.
 type ConsistencyMode string
 

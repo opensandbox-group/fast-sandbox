@@ -33,6 +33,15 @@ var (
 		Help:    "Fastlet Ensure latency through runtime, Infra readiness, and route publication.",
 		Buckets: prometheus.ExponentialBuckets(0.005, 2, 14),
 	}, []string{"runtime", "infra_profile", "result"})
+	userProcessStartLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "fast_sandbox_user_process_start_latency_seconds",
+		Help:    "Ensure latency until a runtime adapter can prove the user process started.",
+		Buckets: prometheus.ExponentialBuckets(0.005, 2, 14),
+	}, []string{"runtime", "infra_profile", "source"})
+	userProcessStartObservationTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fast_sandbox_user_process_start_observation_total",
+		Help: "Availability of a trustworthy user-process-start observation.",
+	}, []string{"runtime", "infra_profile", "source", "result"})
 )
 
 func recordAdmission(operation string, err error) {
@@ -80,4 +89,32 @@ func observeDataPlaneReady(runtimeName, infraProfile string, started time.Time, 
 		infraProfile = "minimal"
 	}
 	dataPlaneReadyLatency.WithLabelValues(runtimeName, infraProfile, metricResult(err)).Observe(time.Since(started).Seconds())
+}
+
+func observeUserProcessStart(runtimeName, infraProfile string, ensureStarted time.Time, metadata *SandboxMetadata) {
+	if runtimeName == "" {
+		runtimeName = "unknown"
+	}
+	if infraProfile == "" {
+		infraProfile = "minimal"
+	}
+	source := api.UserProcessStartUnknown
+	if metadata != nil {
+		switch metadata.UserProcessStartSource {
+		case api.UserProcessStartRuntimeDirect, api.UserProcessStartSandboxInitUnreported, api.UserProcessStartExistingRuntime:
+			source = metadata.UserProcessStartSource
+		}
+	}
+	result := "unavailable"
+	if source == api.UserProcessStartExistingRuntime {
+		result = "not_applicable"
+	} else if source == api.UserProcessStartRuntimeDirect && metadata != nil && !metadata.UserProcessStartedAt.IsZero() {
+		result = "observed"
+		latency := metadata.UserProcessStartedAt.Sub(ensureStarted)
+		if latency < 0 {
+			latency = 0
+		}
+		userProcessStartLatency.WithLabelValues(runtimeName, infraProfile, string(source)).Observe(latency.Seconds())
+	}
+	userProcessStartObservationTotal.WithLabelValues(runtimeName, infraProfile, string(source), result).Inc()
 }

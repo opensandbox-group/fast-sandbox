@@ -293,6 +293,8 @@ func (d *BoxLiteDriver) metadataFromBox(box boxLiteBox) (*SandboxMetadata, error
 	}
 	return &SandboxMetadata{
 		SandboxSpec: box.Sandbox, ContainerID: box.BoxID, PID: box.PID, Phase: box.Phase, CreatedAt: box.CreatedAt,
+		UserProcessStartedAt:       box.UserProcessStartedAt,
+		UserProcessStartSource:     box.UserProcessStartSource,
 		InfraServices:              append([]fastletinfra.ServiceEndpoint(nil), box.InfraServices...),
 		InfraUpstreamHeadersByPort: cloneHeadersByPort(box.InfraUpstreamHeadersByPort),
 		InfraDiagnostics:           append([]fastletinfra.ComponentDiagnostic(nil), box.InfraDiagnostics...),

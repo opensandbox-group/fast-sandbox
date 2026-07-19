@@ -278,6 +278,7 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 	runtimeStarted := time.Now()
 	metadata, err := m.runtime.EnsureSandbox(ctx, &spec)
 	observeRuntimeCreate(m.runtimeName, runtimeStarted, err)
+	observeUserProcessStart(m.runtimeName, m.infraProfile, started, metadata)
 	if err != nil {
 		m.cacheProtection.ProtectHotUntil(spec.Image, m.clock.Now().Add(time.Hour))
 		m.mu.Lock()

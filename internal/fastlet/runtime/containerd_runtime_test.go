@@ -6,8 +6,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"fast-sandbox/internal/api"
+	fastletinfra "fast-sandbox/internal/fastlet/infra"
 
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -93,6 +95,17 @@ func TestWithSandboxInitCarriesAdditionalGroupsToUserChild(t *testing.T) {
 func TestWithSandboxInitRejectsImageWithoutEntrypoint(t *testing.T) {
 	spec := &oci.Spec{Process: &specs.Process{}}
 	require.Error(t, withSandboxInit()(context.Background(), nil, nil, spec))
+}
+
+func TestUserProcessStartAfterTaskStartDoesNotTreatSupervisorAsUserProcess(t *testing.T) {
+	observedAt := time.Unix(1700000000, 123)
+	startedAt, source := userProcessStartAfterTaskStart(nil, observedAt)
+	require.Equal(t, observedAt, startedAt)
+	require.Equal(t, api.UserProcessStartRuntimeDirect, source)
+
+	startedAt, source = userProcessStartAfterTaskStart(&fastletinfra.PreparedInstance{WrapperRequired: true}, observedAt)
+	require.True(t, startedAt.IsZero())
+	require.Equal(t, api.UserProcessStartSandboxInitUnreported, source)
 }
 
 func TestRuntimeConfig_OverrideHandler(t *testing.T) {

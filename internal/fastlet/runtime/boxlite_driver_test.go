@@ -21,6 +21,7 @@ import (
 )
 
 func TestBoxLiteDriverSidecarContract(t *testing.T) {
+	userProcessStartedAt := time.Unix(1700000001, 123)
 	credential, err := fastletnetwork.GenerateLocalForwardCredential()
 	require.NoError(t, err)
 	testAccess := fastletnetwork.AccessDescriptor{
@@ -43,7 +44,7 @@ func TestBoxLiteDriverSidecarContract(t *testing.T) {
 			require.NoError(t, json.NewDecoder(request.Body).Decode(&ensured))
 			writeBoxLiteTestJSON(t, writer, boxLiteBox{
 				Sandbox: ensured.Sandbox, BoxID: "box-a", PID: 42, Phase: "running", CreatedAt: 1700000000,
-				Access: testAccess,
+				Access: testAccess, UserProcessStartedAt: userProcessStartedAt, UserProcessStartSource: api.UserProcessStartRuntimeDirect,
 			})
 		case request.Method == http.MethodGet && request.URL.Path == "/v1/boxes/uid-a":
 			writeBoxLiteTestJSON(t, writer, boxLiteBox{
@@ -98,6 +99,8 @@ func TestBoxLiteDriverSidecarContract(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "box-a", metadata.ContainerID)
 	require.Equal(t, 42, metadata.PID)
+	require.True(t, userProcessStartedAt.Equal(metadata.UserProcessStartedAt))
+	require.Equal(t, api.UserProcessStartRuntimeDirect, metadata.UserProcessStartSource)
 	require.Equal(t, uint32(19090), ensured.TunnelGuestPort)
 	require.Equal(t, "tenant-a", ensured.Namespace)
 

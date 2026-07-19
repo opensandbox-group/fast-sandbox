@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/boxlitesidecar"
 	"fast-sandbox/internal/boxlitestate"
 	"fast-sandbox/internal/boxlitewire"
@@ -338,7 +339,7 @@ func (b *nativeBackend) ensureBoxLocked(ctx context.Context, record *nativeRecor
 	if err != nil {
 		return boxlitewire.Box{}, err
 	}
-	box, _, err := b.runtime.GetOrCreate(ctx, record.Request.Sandbox.Image, options...)
+	box, created, err := b.runtime.GetOrCreate(ctx, record.Request.Sandbox.Image, options...)
 	if err != nil {
 		return boxlitewire.Box{}, err
 	}
@@ -352,6 +353,16 @@ func (b *nativeBackend) ensureBoxLocked(ctx context.Context, record *nativeRecor
 	if err := box.Start(ctx); err != nil {
 		return boxlitewire.Box{}, err
 	}
+	userProcessStartedAt := time.Time{}
+	userProcessStartSource := api.UserProcessStartExistingRuntime
+	if created {
+		if hasArtifact(record.Request.Artifacts, fastletinfra.SandboxInitContainerPath) {
+			userProcessStartSource = api.UserProcessStartSandboxInitUnreported
+		} else {
+			userProcessStartedAt = time.Now()
+			userProcessStartSource = api.UserProcessStartRuntimeDirect
+		}
+	}
 	if err := b.ensureTunnelLocked(ctx, record, box); err != nil {
 		return boxlitewire.Box{}, err
 	}
@@ -359,7 +370,10 @@ func (b *nativeBackend) ensureBoxLocked(ctx context.Context, record *nativeRecor
 	if err != nil {
 		return boxlitewire.Box{}, err
 	}
-	return wireBox(record, info), nil
+	result := wireBox(record, info)
+	result.UserProcessStartedAt = userProcessStartedAt
+	result.UserProcessStartSource = userProcessStartSource
+	return result, nil
 }
 
 func boxOptions(record *nativeRecord) ([]boxlite.BoxOption, error) {
