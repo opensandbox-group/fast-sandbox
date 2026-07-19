@@ -14,6 +14,7 @@ import (
 	"fast-sandbox/internal/boxlitestate"
 	"fast-sandbox/internal/boxlitewire"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
+	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,7 +27,7 @@ func TestNativeResourceOptionsAndCapabilityBoundary(t *testing.T) {
 	require.Error(t, err)
 	capabilities := (&nativeBackend{}).Capabilities(context.Background())
 	require.False(t, capabilities.Capabilities[boxlitewire.CapabilityResourceLimit])
-	require.False(t, capabilities.Capabilities[boxlitewire.CapabilityLocalForward])
+	require.True(t, capabilities.Capabilities[boxlitewire.CapabilityLocalForward])
 	require.False(t, capabilities.Ready)
 }
 
@@ -130,9 +131,11 @@ func TestNativeLoadRecordsValidatesOwnerFilenameAndBundleFences(t *testing.T) {
 	}
 	hash, err := ensureHash(request)
 	require.NoError(t, err)
+	credential, err := fastletnetwork.GenerateLocalForwardCredential()
+	require.NoError(t, err)
 	record := nativeRecord{
 		Version: boxlitestate.Version, Namespace: request.Namespace, SpecHash: hash, Request: request,
-		HostPort: 21000, CreatedAt: 1,
+		HostPort: 21000, TunnelCredential: credential, CreatedAt: 1,
 		BundleRoot: filepath.Join(bundleRoot, boxlitestate.SafeSegment(request.Sandbox.SandboxID), hash),
 	}
 	recordPath := filepath.Join(metadataRoot, boxlitestate.RecordFileName(request.Sandbox.SandboxID))

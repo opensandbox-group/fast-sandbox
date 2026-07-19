@@ -24,11 +24,15 @@ type Server struct {
 	DialContext      DialContextFunc
 	HandshakeTimeout time.Duration
 	ReservedPort     uint32
+	Credential       string
 }
 
 func (s *Server) Serve(ctx context.Context) error {
 	if s.Listener == nil {
 		return errors.New("sandbox tunnel listener is required")
+	}
+	if err := fastletnetwork.ValidateLocalForwardCredential(s.Credential); err != nil {
+		return fmt.Errorf("sandbox tunnel credential: %w", err)
 	}
 	dial := s.DialContext
 	if dial == nil {
@@ -75,7 +79,7 @@ func (s *Server) handle(ctx context.Context, downstream net.Conn, dial DialConte
 	if err := downstream.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return err
 	}
-	targetPort, err := fastletnetwork.DecodeLocalForwardPreamble(downstream)
+	targetPort, err := fastletnetwork.DecodeLocalForwardPreamble(downstream, s.Credential)
 	if err != nil {
 		return fmt.Errorf("decode local-forward preamble: %w", err)
 	}

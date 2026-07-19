@@ -393,6 +393,33 @@ func TestConstructPodRejectsPlatformBoxLiteSidecarOverride(t *testing.T) {
 	require.ErrorContains(t, err, "platform-owned sidecar name")
 }
 
+func TestConstructPodRejectsReservedControlMountFromUserSidecarOrInitContainer(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha1.AddToScheme(scheme))
+	reconciler := &SandboxPoolReconciler{Scheme: scheme, Catalog: runtimecatalog.Builtin()}
+	base := &apiv1alpha1.SandboxPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default", UID: types.UID("pool-uid")},
+		Spec: apiv1alpha1.SandboxPoolSpec{
+			Runtime: apiv1alpha1.RuntimeContainer,
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
+				{Name: "fastlet", Image: "fastlet:test"},
+				{Name: "user-sidecar", Image: "user:test", VolumeMounts: []corev1.VolumeMount{{Name: "proxy-control", MountPath: "/user"}}},
+			}}},
+		},
+	}
+	profile, err := reconciler.resolveRuntimeProfile(base)
+	require.NoError(t, err)
+	_, err = reconciler.constructPod(base, profile)
+	require.ErrorContains(t, err, "reserved by the platform")
+
+	base.Spec.FastletTemplate.Spec.Containers = base.Spec.FastletTemplate.Spec.Containers[:1]
+	base.Spec.FastletTemplate.Spec.InitContainers = []corev1.Container{{
+		Name: "user-init", Image: "user:test", VolumeMounts: []corev1.VolumeMount{{Name: "user", MountPath: "/run/fast-sandbox/boxlite"}},
+	}}
+	_, err = reconciler.constructPod(base, profile)
+	require.ErrorContains(t, err, "reserved by the platform")
+}
+
 func TestConstructPodRejectsInfraArtifactStorageOverride(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, apiv1alpha1.AddToScheme(scheme))

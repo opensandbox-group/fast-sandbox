@@ -21,6 +21,11 @@ import (
 )
 
 func TestBoxLiteDriverSidecarContract(t *testing.T) {
+	credential, err := fastletnetwork.GenerateLocalForwardCredential()
+	require.NoError(t, err)
+	testAccess := fastletnetwork.AccessDescriptor{
+		Kind: fastletnetwork.AccessKindLocalForward, Address: "127.0.0.1:21000", Credential: credential,
+	}
 	var mu sync.Mutex
 	var ensured boxLiteEnsureRequest
 	var pulled string
@@ -38,12 +43,12 @@ func TestBoxLiteDriverSidecarContract(t *testing.T) {
 			require.NoError(t, json.NewDecoder(request.Body).Decode(&ensured))
 			writeBoxLiteTestJSON(t, writer, boxLiteBox{
 				Sandbox: ensured.Sandbox, BoxID: "box-a", PID: 42, Phase: "running", CreatedAt: 1700000000,
-				Access: fastletnetwork.AccessDescriptor{Kind: fastletnetwork.AccessKindLocalForward, Address: "127.0.0.1:21000"},
+				Access: testAccess,
 			})
 		case request.Method == http.MethodGet && request.URL.Path == "/v1/boxes/uid-a":
 			writeBoxLiteTestJSON(t, writer, boxLiteBox{
 				Sandbox: ensured.Sandbox, BoxID: "box-a", PID: 42, Phase: "running", CreatedAt: 1700000000,
-				Access: fastletnetwork.AccessDescriptor{Kind: fastletnetwork.AccessKindLocalForward, Address: "127.0.0.1:21000"},
+				Access: testAccess,
 			})
 		case request.Method == http.MethodPost && request.URL.Path == "/v1/boxes/uid-a":
 			mu.Lock()
@@ -51,13 +56,13 @@ func TestBoxLiteDriverSidecarContract(t *testing.T) {
 			mu.Unlock()
 			writeBoxLiteTestJSON(t, writer, boxLiteBox{
 				Sandbox: ensured.Sandbox, BoxID: "box-a", PID: 42, Phase: "running", CreatedAt: 1700000000,
-				Access: fastletnetwork.AccessDescriptor{Kind: fastletnetwork.AccessKindLocalForward, Address: "127.0.0.1:21000"},
+				Access: testAccess,
 			})
 		case request.Method == http.MethodGet && request.URL.Path == "/v1/boxes":
 			require.Equal(t, "tenant-a", request.URL.Query().Get("namespace"))
 			writeBoxLiteTestJSON(t, writer, boxLiteListResponse{Boxes: []boxLiteBox{{
 				Sandbox: ensured.Sandbox, BoxID: "box-a", PID: 42, Phase: "running", CreatedAt: 1700000000,
-				Access: fastletnetwork.AccessDescriptor{Kind: fastletnetwork.AccessKindLocalForward, Address: "127.0.0.1:21000"},
+				Access: testAccess,
 			}}})
 		case request.Method == http.MethodGet && request.URL.Path == "/v1/images":
 			writeBoxLiteTestJSON(t, writer, boxLiteImagesResponse{Images: []string{"alpine:latest"}})

@@ -32,7 +32,7 @@ func (m *SandboxManager) initializeInfraInstance(ctx context.Context, metadata *
 					if dialErr != nil {
 						return nil, dialErr
 					}
-					preamble, encodeErr := fastletnetwork.EncodeLocalForwardPreamble(targetPort)
+					preamble, encodeErr := fastletnetwork.EncodeLocalForwardPreamble(targetPort, access.Credential)
 					if encodeErr == nil {
 						encodeErr = fastletnetwork.WriteLocalForwardPreamble(connection, preamble)
 					}

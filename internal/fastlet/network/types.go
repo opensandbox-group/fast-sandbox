@@ -50,13 +50,14 @@ func (o Owner) Equal(other Owner) bool {
 // AccessDescriptor is durable data from which the separate Fastlet Proxy can
 // construct an in-process dial handle. DirectIP stores an IP address and lets
 // the proxy append the requested target port. LocalForward stores a loopback
-// host:port for a runtime tunnel and sends the requested target port in a
-// connection preamble. It is local Fastlet state and is never written to the
-// Sandbox CRD.
+// host:port plus a per-Sandbox credential for a runtime tunnel, and sends the
+// requested target port and credential in a connection preamble. It is local
+// Fastlet state and is never written to the Sandbox CRD.
 type AccessDescriptor struct {
-	Kind      AccessKind `json:"kind"`
-	Address   string     `json:"address"`
-	NetNSPath string     `json:"netnsPath,omitempty"`
+	Kind       AccessKind `json:"kind"`
+	Address    string     `json:"address"`
+	NetNSPath  string     `json:"netnsPath,omitempty"`
+	Credential string     `json:"credential,omitempty"`
 }
 
 func (a AccessDescriptor) Validate() error {
@@ -64,6 +65,9 @@ func (a AccessDescriptor) Validate() error {
 	case AccessKindDirectIP:
 		if net.ParseIP(a.Address) == nil {
 			return errors.New("DirectIP access descriptor requires an IP address")
+		}
+		if a.Credential != "" {
+			return errors.New("DirectIP access descriptor cannot carry a LocalForward credential")
 		}
 	case AccessKindLocalForward:
 		host, port, err := net.SplitHostPort(a.Address)
@@ -74,6 +78,9 @@ func (a AccessDescriptor) Validate() error {
 		parsedPort, portErr := strconv.ParseUint(port, 10, 16)
 		if ip == nil || !ip.IsLoopback() || portErr != nil || parsedPort == 0 {
 			return errors.New("LocalForward access descriptor requires loopback host:port")
+		}
+		if err := ValidateLocalForwardCredential(a.Credential); err != nil {
+			return err
 		}
 	default:
 		return fmt.Errorf("unsupported access kind %q", a.Kind)

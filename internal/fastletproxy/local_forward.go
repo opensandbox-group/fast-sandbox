@@ -12,24 +12,19 @@ import (
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 )
 
-const (
-	localForwardPreambleSize = fastletnetwork.LocalForwardPreambleSize
-	localForwardVersion      = fastletnetwork.LocalForwardVersion
-	localForwardProtocolTCP  = fastletnetwork.LocalForwardProtocolTCP
-)
-
-var localForwardMagic = [4]byte{'F', 'S', 'B', 'F'}
+const localForwardPreambleSize = fastletnetwork.LocalForwardPreambleSize
 
 type DialContextFunc func(context.Context, string, string) (net.Conn, error)
 
 // EncodeLocalForwardPreamble creates the fixed-size handshake consumed by the
 // guest sandbox-tunnel. The signed route credential has already constrained
 // targetPort before this is called.
-func EncodeLocalForwardPreamble(targetPort uint32) ([]byte, error) {
-	return fastletnetwork.EncodeLocalForwardPreamble(targetPort)
+func EncodeLocalForwardPreamble(targetPort uint32, credential string) ([]byte, error) {
+	return fastletnetwork.EncodeLocalForwardPreamble(targetPort, credential)
 }
 
-func newLocalForwardTransport(endpoint string, targetPort uint32, dial DialContextFunc) (*http.Transport, error) {
+func newLocalForwardTransport(access fastletnetwork.AccessDescriptor, targetPort uint32, dial DialContextFunc) (*http.Transport, error) {
+	endpoint := access.Address
 	host, port, err := net.SplitHostPort(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("invalid local-forward endpoint: %w", err)
@@ -42,7 +37,7 @@ func newLocalForwardTransport(endpoint string, targetPort uint32, dial DialConte
 	if err != nil || parsedPort == 0 {
 		return nil, errors.New("local-forward endpoint port must be between 1 and 65535")
 	}
-	preamble, err := EncodeLocalForwardPreamble(targetPort)
+	preamble, err := EncodeLocalForwardPreamble(targetPort, access.Credential)
 	if err != nil {
 		return nil, err
 	}

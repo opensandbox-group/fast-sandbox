@@ -13,6 +13,7 @@ import (
 )
 
 func TestServerRelaysToSignedTargetPort(t *testing.T) {
+	credential := testCredential(t)
 	backend := listenTCP(t)
 	defer backend.Close()
 	go func() {
@@ -32,7 +33,7 @@ func TestServerRelaysToSignedTargetPort(t *testing.T) {
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	server := &Server{Listener: tunnel, ReservedPort: uint32(tunnelPort)}
+	server := &Server{Listener: tunnel, ReservedPort: uint32(tunnelPort), Credential: credential}
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(ctx) }()
 
@@ -43,7 +44,7 @@ func TestServerRelaysToSignedTargetPort(t *testing.T) {
 	require.NoError(t, err)
 	backendPort, err := strconv.ParseUint(backendPortText, 10, 16)
 	require.NoError(t, err)
-	preamble, err := fastletnetwork.EncodeLocalForwardPreamble(uint32(backendPort))
+	preamble, err := fastletnetwork.EncodeLocalForwardPreamble(uint32(backendPort), credential)
 	require.NoError(t, err)
 	require.NoError(t, fastletnetwork.WriteLocalForwardPreamble(connection, preamble))
 	require.NoError(t, connection.SetDeadline(time.Now().Add(2*time.Second)))
@@ -60,6 +61,7 @@ func TestServerRelaysToSignedTargetPort(t *testing.T) {
 }
 
 func TestServerRejectsReservedTunnelPort(t *testing.T) {
+	credential := testCredential(t)
 	tunnel := listenTCP(t)
 	defer tunnel.Close()
 	_, portText, err := net.SplitHostPort(tunnel.Addr().String())
@@ -67,13 +69,13 @@ func TestServerRejectsReservedTunnelPort(t *testing.T) {
 	port, err := strconv.ParseUint(portText, 10, 16)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
-	server := &Server{Listener: tunnel, ReservedPort: uint32(port)}
+	server := &Server{Listener: tunnel, ReservedPort: uint32(port), Credential: credential}
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(ctx) }()
 
 	connection, err := net.DialTimeout("tcp", tunnel.Addr().String(), time.Second)
 	require.NoError(t, err)
-	preamble, err := fastletnetwork.EncodeLocalForwardPreamble(uint32(port))
+	preamble, err := fastletnetwork.EncodeLocalForwardPreamble(uint32(port), credential)
 	require.NoError(t, err)
 	require.NoError(t, fastletnetwork.WriteLocalForwardPreamble(connection, preamble))
 	require.NoError(t, connection.SetReadDeadline(time.Now().Add(time.Second)))
@@ -86,11 +88,12 @@ func TestServerRejectsReservedTunnelPort(t *testing.T) {
 }
 
 func TestServerHealthHandshakeDoesNotDialGuestPort(t *testing.T) {
+	credential := testCredential(t)
 	tunnel := listenTCP(t)
 	defer tunnel.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	server := &Server{
-		Listener: tunnel,
+		Listener: tunnel, Credential: credential,
 		DialContext: func(context.Context, string, string) (net.Conn, error) {
 			t.Fatal("health handshake must not dial a guest target")
 			return nil, nil
@@ -100,7 +103,38 @@ func TestServerHealthHandshakeDoesNotDialGuestPort(t *testing.T) {
 	go func() { serveDone <- server.Serve(ctx) }()
 	connection, err := net.DialTimeout("tcp", tunnel.Addr().String(), time.Second)
 	require.NoError(t, err)
-	require.NoError(t, fastletnetwork.WriteLocalForwardPreamble(connection, fastletnetwork.EncodeLocalForwardHealthPreamble()))
+	preamble, err := fastletnetwork.EncodeLocalForwardHealthPreamble(credential)
+	require.NoError(t, err)
+	require.NoError(t, fastletnetwork.WriteLocalForwardPreamble(connection, preamble))
+	require.NoError(t, connection.SetReadDeadline(time.Now().Add(time.Second)))
+	buffer := make([]byte, 1)
+	_, err = connection.Read(buffer)
+	require.ErrorIs(t, err, io.EOF)
+	require.NoError(t, connection.Close())
+	cancel()
+	require.NoError(t, <-serveDone)
+}
+
+func TestServerRejectsCredentialFromAnotherBox(t *testing.T) {
+	credential := testCredential(t)
+	otherCredential := testCredential(t)
+	tunnel := listenTCP(t)
+	defer tunnel.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	server := &Server{
+		Listener: tunnel, Credential: credential,
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			t.Fatal("rejected credential must not reach the guest target dialer")
+			return nil, nil
+		},
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(ctx) }()
+	connection, err := net.DialTimeout("tcp", tunnel.Addr().String(), time.Second)
+	require.NoError(t, err)
+	preamble, err := fastletnetwork.EncodeLocalForwardPreamble(8080, otherCredential)
+	require.NoError(t, err)
+	require.NoError(t, fastletnetwork.WriteLocalForwardPreamble(connection, preamble))
 	require.NoError(t, connection.SetReadDeadline(time.Now().Add(time.Second)))
 	buffer := make([]byte, 1)
 	_, err = connection.Read(buffer)
@@ -111,6 +145,7 @@ func TestServerHealthHandshakeDoesNotDialGuestPort(t *testing.T) {
 }
 
 func TestServerCancellationClosesActiveRelay(t *testing.T) {
+	credential := testCredential(t)
 	backend := listenTCP(t)
 	defer backend.Close()
 	backendAccepted := make(chan net.Conn, 1)
@@ -124,7 +159,7 @@ func TestServerCancellationClosesActiveRelay(t *testing.T) {
 	tunnel := listenTCP(t)
 	defer tunnel.Close()
 	ctx, cancel := context.WithCancel(context.Background())
-	server := &Server{Listener: tunnel}
+	server := &Server{Listener: tunnel, Credential: credential}
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(ctx) }()
 
@@ -134,7 +169,7 @@ func TestServerCancellationClosesActiveRelay(t *testing.T) {
 	require.NoError(t, err)
 	backendPort, err := strconv.ParseUint(backendPortText, 10, 16)
 	require.NoError(t, err)
-	preamble, err := fastletnetwork.EncodeLocalForwardPreamble(uint32(backendPort))
+	preamble, err := fastletnetwork.EncodeLocalForwardPreamble(uint32(backendPort), credential)
 	require.NoError(t, err)
 	require.NoError(t, fastletnetwork.WriteLocalForwardPreamble(connection, preamble))
 	backendConnection := <-backendAccepted
@@ -155,4 +190,11 @@ func listenTCP(t *testing.T) net.Listener {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	return listener
+}
+
+func testCredential(t *testing.T) string {
+	t.Helper()
+	credential, err := fastletnetwork.GenerateLocalForwardCredential()
+	require.NoError(t, err)
+	return credential
 }

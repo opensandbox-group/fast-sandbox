@@ -1,52 +1,92 @@
 package network
 
 import (
+	"bytes"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"io"
 )
 
 const (
-	LocalForwardPreambleSize = 8
-	LocalForwardVersion      = byte(1)
-	LocalForwardProtocolTCP  = byte(1)
+	LocalForwardHeaderSize     = 8
+	LocalForwardCredentialSize = 32
+	LocalForwardPreambleSize   = LocalForwardHeaderSize + LocalForwardCredentialSize
+	LocalForwardVersion        = byte(1)
+	LocalForwardProtocolTCP    = byte(1)
 )
 
 var localForwardMagic = [4]byte{'F', 'S', 'B', 'F'}
 
-// EncodeLocalForwardPreamble creates the fixed-size handshake used between
-// Fastlet Proxy and a runtime-specific guest tunnel.
-func EncodeLocalForwardPreamble(targetPort uint32) ([]byte, error) {
+// GenerateLocalForwardCredential returns one unguessable credential for a
+// single runtime tunnel. It remains local Fastlet/Sidecar state and is never
+// persisted in the Sandbox CRD.
+func GenerateLocalForwardCredential() (string, error) {
+	credential := make([]byte, LocalForwardCredentialSize)
+	if _, err := rand.Read(credential); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(credential), nil
+}
+
+func ValidateLocalForwardCredential(encoded string) error {
+	credential, err := decodeLocalForwardCredential(encoded)
+	if err != nil {
+		return err
+	}
+	if len(credential) != LocalForwardCredentialSize {
+		return errors.New("local-forward credential must contain exactly 32 bytes")
+	}
+	return nil
+}
+
+// EncodeLocalForwardPreamble creates the authenticated fixed-size handshake
+// used between Fastlet Proxy and one runtime-specific guest tunnel.
+func EncodeLocalForwardPreamble(targetPort uint32, encodedCredential string) ([]byte, error) {
 	if targetPort == 0 || targetPort > 65535 {
 		return nil, errors.New("local-forward target port must be between 1 and 65535")
 	}
-	return encodeLocalForwardPreamble(targetPort), nil
+	return encodeLocalForwardPreamble(targetPort, encodedCredential)
 }
 
 // EncodeLocalForwardHealthPreamble uses reserved target port zero. It is only
 // used by the runtime Sidecar to prove that the guest tunnel, rather than just
 // the host forwarding socket, accepted the protocol handshake.
-func EncodeLocalForwardHealthPreamble() []byte {
-	return encodeLocalForwardPreamble(0)
+func EncodeLocalForwardHealthPreamble(encodedCredential string) ([]byte, error) {
+	return encodeLocalForwardPreamble(0, encodedCredential)
 }
 
-func encodeLocalForwardPreamble(targetPort uint32) []byte {
+func encodeLocalForwardPreamble(targetPort uint32, encodedCredential string) ([]byte, error) {
+	credential, err := decodeLocalForwardCredential(encodedCredential)
+	if err != nil {
+		return nil, err
+	}
+	if len(credential) != LocalForwardCredentialSize {
+		return nil, errors.New("local-forward credential must contain exactly 32 bytes")
+	}
 	preamble := make([]byte, LocalForwardPreambleSize)
 	copy(preamble[:4], localForwardMagic[:])
 	preamble[4] = LocalForwardVersion
 	preamble[5] = LocalForwardProtocolTCP
 	binary.BigEndian.PutUint16(preamble[6:], uint16(targetPort))
-	return preamble
+	copy(preamble[LocalForwardHeaderSize:], credential)
+	return preamble, nil
 }
 
 // DecodeLocalForwardPreamble validates and decodes one complete tunnel
 // handshake. Only TCP is supported in protocol v1.
-func DecodeLocalForwardPreamble(reader io.Reader) (uint32, error) {
+func DecodeLocalForwardPreamble(reader io.Reader, encodedCredential string) (uint32, error) {
+	expected, err := decodeLocalForwardCredential(encodedCredential)
+	if err != nil || len(expected) != LocalForwardCredentialSize {
+		return 0, errors.New("invalid local-forward server credential")
+	}
 	preamble := make([]byte, LocalForwardPreambleSize)
 	if _, err := io.ReadFull(reader, preamble); err != nil {
 		return 0, err
 	}
-	if string(preamble[:4]) != string(localForwardMagic[:]) {
+	if !bytes.Equal(preamble[:4], localForwardMagic[:]) {
 		return 0, errors.New("invalid local-forward magic")
 	}
 	if preamble[4] != LocalForwardVersion {
@@ -55,8 +95,19 @@ func DecodeLocalForwardPreamble(reader io.Reader) (uint32, error) {
 	if preamble[5] != LocalForwardProtocolTCP {
 		return 0, errors.New("unsupported local-forward protocol")
 	}
+	if subtle.ConstantTimeCompare(preamble[LocalForwardHeaderSize:], expected) != 1 {
+		return 0, errors.New("local-forward credential rejected")
+	}
 	port := binary.BigEndian.Uint16(preamble[6:])
 	return uint32(port), nil
+}
+
+func decodeLocalForwardCredential(encoded string) ([]byte, error) {
+	credential, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, errors.New("local-forward credential is not valid base64url")
+	}
+	return credential, nil
 }
 
 func WriteLocalForwardPreamble(writer io.Writer, preamble []byte) error {

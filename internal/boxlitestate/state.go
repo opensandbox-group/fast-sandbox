@@ -23,14 +23,15 @@ type OwnerRecord struct {
 }
 
 type SandboxRecord struct {
-	Version    int                       `json:"version"`
-	Namespace  string                    `json:"namespace"`
-	SpecHash   string                    `json:"specHash"`
-	Request    boxlitewire.EnsureRequest `json:"request"`
-	BoxID      string                    `json:"boxId,omitempty"`
-	HostPort   uint32                    `json:"hostPort"`
-	CreatedAt  int64                     `json:"createdAt"`
-	BundleRoot string                    `json:"bundleRoot"`
+	Version          int                       `json:"version"`
+	Namespace        string                    `json:"namespace"`
+	SpecHash         string                    `json:"specHash"`
+	Request          boxlitewire.EnsureRequest `json:"request"`
+	BoxID            string                    `json:"boxId,omitempty"`
+	HostPort         uint32                    `json:"hostPort"`
+	TunnelCredential string                    `json:"tunnelCredential"`
+	CreatedAt        int64                     `json:"createdAt"`
+	BundleRoot       string                    `json:"bundleRoot"`
 }
 
 func HomeDirectory(stateRoot, fastletPodUID string) string {

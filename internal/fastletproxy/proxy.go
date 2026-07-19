@@ -82,7 +82,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			}
 		}
 	case fastletnetwork.AccessKindLocalForward:
-		transport, err = newLocalForwardTransport(route.Access.Address, targetPort, p.DialContext)
+		transport, err = newLocalForwardTransport(route.Access, targetPort, p.DialContext)
 		if err != nil {
 			http.Error(writer, "local-forward route is invalid: "+err.Error(), http.StatusNotImplemented)
 			return

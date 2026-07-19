@@ -156,7 +156,7 @@ func (b *nativeBackend) Capabilities(context.Context) boxlitewire.Capabilities {
 	capabilities := map[string]bool{
 		boxlitewire.CapabilityOwnerFence:     true,
 		boxlitewire.CapabilityArtifactVolume: true,
-		boxlitewire.CapabilityLocalForward:   false,
+		boxlitewire.CapabilityLocalForward:   true,
 		boxlitewire.CapabilityResourceLimit:  false,
 		boxlitewire.CapabilityRecovery:       true,
 		boxlitewire.CapabilityImageCache:     true,
@@ -164,7 +164,7 @@ func (b *nativeBackend) Capabilities(context.Context) boxlitewire.Capabilities {
 	return boxlitewire.Capabilities{
 		ProtocolVersion: boxlitewire.ProtocolVersionV1, Ready: false,
 		Reason:       "BoxLiteResourceEnforcementIncomplete",
-		Message:      "native BoxLite lifecycle is available, but resource enforcement and host-forward isolation are incomplete",
+		Message:      "native BoxLite lifecycle and authenticated LocalForward are available, but resource enforcement is incomplete",
 		Capabilities: capabilities,
 	}
 }
@@ -188,9 +188,13 @@ func (b *nativeBackend) Ensure(ctx context.Context, request boxlitewire.EnsureRe
 		if err != nil {
 			return boxlitewire.Box{}, unavailableError(err)
 		}
+		tunnelCredential, err := fastletnetwork.GenerateLocalForwardCredential()
+		if err != nil {
+			return boxlitewire.Box{}, internal(fmt.Errorf("generate LocalForward credential: %w", err))
+		}
 		record = &nativeRecord{
 			Version: boxlitestate.Version, Namespace: request.Namespace, SpecHash: hash, Request: request,
-			HostPort: hostPort, CreatedAt: time.Now().Unix(),
+			HostPort: hostPort, TunnelCredential: tunnelCredential, CreatedAt: time.Now().Unix(),
 			BundleRoot: b.expectedBundleRoot(request.Sandbox.SandboxID, hash),
 		}
 		if err := b.prepareBundle(record); err != nil {
@@ -417,7 +421,10 @@ func (b *nativeBackend) ensureTunnelLocked(ctx context.Context, record *nativeRe
 		return nil
 	}
 	execution, err := box.StartExecution(ctx, fastletinfra.SandboxTunnelContainerPath,
-		[]string{"--listen", ":" + strconv.Itoa(int(record.Request.TunnelGuestPort))}, &boxlite.ExecutionOptions{})
+		[]string{
+			"--listen", ":" + strconv.Itoa(int(record.Request.TunnelGuestPort)),
+			"--credential", record.TunnelCredential,
+		}, &boxlite.ExecutionOptions{})
 	if err != nil {
 		return err
 	}
@@ -434,18 +441,22 @@ func (b *nativeBackend) ensureTunnelLocked(ctx context.Context, record *nativeRe
 		b.mu.Unlock()
 		_ = execution.Close()
 	}()
-	return waitForTunnel(ctx, record.HostPort)
+	return waitForTunnel(ctx, record.HostPort, record.TunnelCredential)
 }
 
-func waitForTunnel(ctx context.Context, port uint32) error {
+func waitForTunnel(ctx context.Context, port uint32, credential string) error {
 	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
+	healthPreamble, err := fastletnetwork.EncodeLocalForwardHealthPreamble(credential)
+	if err != nil {
+		return err
+	}
 	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port)))
 	var lastErr error
 	for {
 		connection, err := (&net.Dialer{}).DialContext(probeCtx, "tcp", address)
 		if connection != nil {
-			preambleErr := fastletnetwork.WriteLocalForwardPreamble(connection, fastletnetwork.EncodeLocalForwardHealthPreamble())
+			preambleErr := fastletnetwork.WriteLocalForwardPreamble(connection, healthPreamble)
 			_ = connection.SetReadDeadline(time.Now().Add(time.Second))
 			buffer := make([]byte, 1)
 			_, readErr := connection.Read(buffer)
@@ -529,7 +540,10 @@ func wireBox(record *nativeRecord, info *boxlite.BoxInfo) boxlitewire.Box {
 	return boxlitewire.Box{
 		Sandbox: record.Request.Sandbox, BoxID: info.ID, PID: info.PID, Phase: string(info.State),
 		CreatedAt: record.CreatedAt,
-		Access:    fastletnetwork.AccessDescriptor{Kind: fastletnetwork.AccessKindLocalForward, Address: net.JoinHostPort("127.0.0.1", strconv.Itoa(int(record.HostPort)))},
+		Access: fastletnetwork.AccessDescriptor{
+			Kind: fastletnetwork.AccessKindLocalForward, Address: net.JoinHostPort("127.0.0.1", strconv.Itoa(int(record.HostPort))),
+			Credential: record.TunnelCredential,
+		},
 	}
 }
 
@@ -554,6 +568,9 @@ func (b *nativeBackend) loadRecords() error {
 		}
 		if record.Version != boxlitestate.Version || record.SpecHash == "" || record.HostPort == 0 || record.HostPort > 65535 {
 			return fmt.Errorf("invalid BoxLite metadata record %s", entry.Name())
+		}
+		if err := fastletnetwork.ValidateLocalForwardCredential(record.TunnelCredential); err != nil {
+			return fmt.Errorf("invalid BoxLite tunnel credential for %s: %w", entry.Name(), err)
 		}
 		if err := validateEnsureRequest(record.Request); err != nil {
 			return fmt.Errorf("invalid BoxLite metadata record %s: %w", entry.Name(), err)

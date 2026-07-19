@@ -3,7 +3,6 @@ package fastletproxy
 import (
 	"bufio"
 	"crypto/ed25519"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -19,15 +18,22 @@ import (
 )
 
 func TestEncodeLocalForwardPreamble(t *testing.T) {
-	preamble, err := EncodeLocalForwardPreamble(18080)
+	credential, err := fastletnetwork.GenerateLocalForwardCredential()
 	require.NoError(t, err)
-	require.Equal(t, []byte{'F', 'S', 'B', 'F', 1, 1, 0x46, 0xa0}, preamble)
-	_, err = EncodeLocalForwardPreamble(0)
+	preamble, err := EncodeLocalForwardPreamble(18080, credential)
+	require.NoError(t, err)
+	require.Len(t, preamble, localForwardPreambleSize)
+	require.Equal(t, []byte{'F', 'S', 'B', 'F', 1, 1, 0x46, 0xa0}, preamble[:8])
+	_, err = EncodeLocalForwardPreamble(0, credential)
 	require.Error(t, err)
 }
 
 func TestLocalForwardTransportRejectsNonLoopbackEndpoint(t *testing.T) {
-	_, err := newLocalForwardTransport("10.0.0.8:19090", 8080, nil)
+	credential, err := fastletnetwork.GenerateLocalForwardCredential()
+	require.NoError(t, err)
+	_, err = newLocalForwardTransport(fastletnetwork.AccessDescriptor{
+		Kind: fastletnetwork.AccessKindLocalForward, Address: "10.0.0.8:19090", Credential: credential,
+	}, 8080, nil)
 	require.EqualError(t, err, "local-forward endpoint must use a loopback IP")
 }
 
@@ -37,6 +43,8 @@ func TestProxyForwardsThroughLocalTunnelWithSignedTargetPort(t *testing.T) {
 	defer listener.Close()
 
 	const targetPort = uint32(32123)
+	credential, err := fastletnetwork.GenerateLocalForwardCredential()
+	require.NoError(t, err)
 	result := make(chan error, 1)
 	go func() {
 		connection, acceptErr := listener.Accept()
@@ -45,14 +53,9 @@ func TestProxyForwardsThroughLocalTunnelWithSignedTargetPort(t *testing.T) {
 			return
 		}
 		defer connection.Close()
-		preamble := make([]byte, localForwardPreambleSize)
-		if _, readErr := io.ReadFull(connection, preamble); readErr != nil {
-			result <- readErr
-			return
-		}
-		if string(preamble[:4]) != string(localForwardMagic[:]) || preamble[4] != localForwardVersion ||
-			preamble[5] != localForwardProtocolTCP || binary.BigEndian.Uint16(preamble[6:]) != uint16(targetPort) {
-			result <- fmt.Errorf("unexpected local-forward preamble %v", preamble)
+		decodedPort, readErr := fastletnetwork.DecodeLocalForwardPreamble(connection, credential)
+		if readErr != nil || decodedPort != targetPort {
+			result <- fmt.Errorf("unexpected local-forward handshake port=%d err=%v", decodedPort, readErr)
 			return
 		}
 		request, readErr := http.ReadRequest(bufio.NewReader(connection))
@@ -76,7 +79,9 @@ func TestProxyForwardsThroughLocalTunnelWithSignedTargetPort(t *testing.T) {
 	require.NoError(t, err)
 	route := Route{
 		Namespace: "default", SandboxUID: "uid-boxlite", FastletPodUID: "pod-a", AssignmentAttempt: 1, RouteGeneration: 1,
-		Access: fastletnetwork.AccessDescriptor{Kind: fastletnetwork.AccessKindLocalForward, Address: listener.Addr().String()}, State: RouteReady,
+		Access: fastletnetwork.AccessDescriptor{
+			Kind: fastletnetwork.AccessKindLocalForward, Address: listener.Addr().String(), Credential: credential,
+		}, State: RouteReady,
 	}
 	store := NewStore()
 	_, err = store.Apply(route)

@@ -51,6 +51,8 @@ Fastlet 与 Sidecar 共享：
 - `/opt/fast-sandbox/infra`：Sidecar 可见的只读 artifact store；
 - 当前 Pod UID 对应的 BoxLite state 目录。
 
+这些平台卷名和挂载路径对 FastletTemplate 中的全部普通容器与 init container 都是保留项；Controller 必须在注入前拒绝用户占用，避免用户 sidecar 获得控制 UDS 或 tunnel credential。
+
 ## 4. 生命周期协议
 
 Sidecar UDS protocol 只暴露以下 runtime primitive：
@@ -81,9 +83,9 @@ ListImages / PullImage
 
 1. 每个 Box 创建时，Sidecar 从 Pod-local port pool 租一个 host port；
 2. 通过 BoxLite `WithPort` 固定映射到 guest `sandbox-tunnel:19090`；
-3. `sandbox-tunnel` 的每条连接先接收目标端口和协议 preamble，再连接 guest loopback 的实际 target port；
+3. Sidecar 为每个 Box 生成独立的 256-bit credential；`sandbox-tunnel` 的每条连接先接收 `FSBF/version/TCP/targetPort/credential` 固定 preamble，常量时间验签后才连接 guest loopback 的实际 target port；
 4. `BoxLiteDriver.GetAccessDescriptor` 返回 `LocalForward(127.0.0.1:<leased-port>)`；
-5. Fastlet Proxy 根据外部请求里的 signed target port 写入 preamble，随后透明转发 HTTP/WebSocket/SSE 字节流。
+5. Fastlet Proxy 先校验外部 route credential，再把 signed target port 与本地 per-Box credential 写入 preamble，随后透明转发 HTTP/WebSocket/SSE 字节流。
 
 因此：
 
@@ -95,7 +97,7 @@ ListImages / PullImage
 LocalForward 建立失败、preamble 被拒绝或 guest tunnel 未 Ready 都必须使 `DataPlaneReady=False`，不能回退成 PodIP 或预声明用户端口。
 Sidecar/guest tunnel 收到终止信号时会关闭 active relay；长期 HTTP、WebSocket 或 SSE 连接不能阻塞 Runtime 回收。
 
-v0.9.7 还有一个必须显式门禁的限制：Go SDK 会拒绝非空 `HostIP`，native port forward 固定绑定所有 host interfaces。因此把 AccessDescriptor 写成 `127.0.0.1:<port>` 并不能阻止其他 Pod 直接访问 Fastlet PodIP 上的同一端口。当前功能 spike 已证明动态转发可行，但 `local-forward-v1=false`；生产实现必须增加每 Box 不可猜测的 tunnel authentication（并防止跨 Box 复用），或在 Pod network namespace 建立经过测试的非 loopback DROP policy，且由 recovery/Janitor 一并管理。该门禁解除前不能开放 Route。
+v0.9.7 还有一个必须显式处理的限制：Go SDK 会拒绝非空 `HostIP`，native port forward 固定绑定所有 host interfaces。因此把 AccessDescriptor 写成 `127.0.0.1:<port>` 本身不能阻止其他 Pod 连接 Fastlet PodIP 上的同一端口。当前实现用每 Box 独立、不可猜测的 256-bit credential 封住该旁路：credential 随 Sidecar record 持久化，经 UDS 进入 Fastlet 本地 AccessDescriptor，只进入对应 guest tunnel 的启动参数，不写入 Sandbox CRD；另一个 Box 的 credential 不能触发 target dial。普通、race 和拒绝跨 Box credential 测试通过后，Sidecar 报告 `local-forward-v1=true`。若部署环境要求连端口探测本身也不可见，可再叠加 Pod network namespace 的 non-loopback DROP policy，不改变协议。
 
 ## 6. Infra Component 注入
 

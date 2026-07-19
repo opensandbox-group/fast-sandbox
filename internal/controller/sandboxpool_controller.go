@@ -681,10 +681,12 @@ func validatePlatformOwnedStorage(podSpec *corev1.PodSpec) error {
 			return fmt.Errorf("%s is a platform-owned volume name", volume.Name)
 		}
 	}
-	for _, mount := range podSpec.Containers[0].VolumeMounts {
-		for name, path := range reservedVolumes {
-			if mount.Name == name || mount.MountPath == path {
-				return fmt.Errorf("volume name %s and mount path %s are reserved by the platform", name, path)
+	for _, container := range append(append([]corev1.Container(nil), podSpec.InitContainers...), podSpec.Containers...) {
+		for _, mount := range container.VolumeMounts {
+			for name, path := range reservedVolumes {
+				if mount.Name == name || mount.MountPath == path {
+					return fmt.Errorf("container %q uses volume name %s or mount path %s reserved by the platform", container.Name, name, path)
+				}
 			}
 		}
 	}

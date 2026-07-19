@@ -10,12 +10,18 @@ import (
 	"strconv"
 	"syscall"
 
+	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/sandboxtunnel"
 )
 
 func main() {
 	listenAddress := flag.String("listen", ":19090", "guest address used by the runtime LocalForward mapping")
+	credential := flag.String("credential", "", "per-Box LocalForward authentication credential")
 	flag.Parse()
+	if err := fastletnetwork.ValidateLocalForwardCredential(*credential); err != nil {
+		fmt.Fprintf(os.Stderr, "sandbox-tunnel: credential: %v\n", err)
+		os.Exit(1)
+	}
 	listener, err := net.Listen("tcp", *listenAddress)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sandbox-tunnel: listen: %v\n", err)
@@ -34,7 +40,7 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-	server := &sandboxtunnel.Server{Listener: listener, ReservedPort: uint32(port)}
+	server := &sandboxtunnel.Server{Listener: listener, ReservedPort: uint32(port), Credential: *credential}
 	if err := server.Serve(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "sandbox-tunnel: %v\n", err)
 		os.Exit(1)

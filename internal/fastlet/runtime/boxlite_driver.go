@@ -245,8 +245,11 @@ func (d *BoxLiteDriver) GetAccessDescriptor(sandboxID string) (fastletnetwork.Ac
 	if !ok {
 		return fastletnetwork.AccessDescriptor{}, fmt.Errorf("%w: BoxLite access descriptor for %q is not recovered", ErrNetworkUnavailable, sandboxID)
 	}
-	if access.Kind != fastletnetwork.AccessKindLocalForward || access.Address == "" {
+	if access.Kind != fastletnetwork.AccessKindLocalForward {
 		return fastletnetwork.AccessDescriptor{}, fmt.Errorf("%w: invalid BoxLite LocalForward descriptor", ErrNetworkUnavailable)
+	}
+	if err := access.Validate(); err != nil {
+		return fastletnetwork.AccessDescriptor{}, fmt.Errorf("%w: %v", ErrNetworkUnavailable, err)
 	}
 	return access, nil
 }
@@ -282,8 +285,11 @@ func (d *BoxLiteDriver) metadataFromBox(box boxLiteBox) (*SandboxMetadata, error
 	if box.Sandbox.SandboxID == "" || box.BoxID == "" {
 		return nil, errors.New("BoxLite sidecar returned incomplete Box identity")
 	}
-	if box.Access.Kind != fastletnetwork.AccessKindLocalForward || box.Access.Address == "" {
+	if box.Access.Kind != fastletnetwork.AccessKindLocalForward {
 		return nil, fmt.Errorf("%w: BoxLite sidecar did not return a LocalForward endpoint", ErrNetworkUnavailable)
+	}
+	if err := box.Access.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: invalid BoxLite LocalForward endpoint: %v", ErrNetworkUnavailable, err)
 	}
 	return &SandboxMetadata{
 		SandboxSpec: box.Sandbox, ContainerID: box.BoxID, PID: box.PID, Phase: box.Phase, CreatedAt: box.CreatedAt,
