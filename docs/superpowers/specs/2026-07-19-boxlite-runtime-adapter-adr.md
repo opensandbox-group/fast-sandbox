@@ -75,7 +75,18 @@ ListImages / PullImage
 4. Fastlet 进程重启后重新连接 Sidecar并通过 `ListBoxes` 恢复；
 5. Fastlet Pod UID 改变时禁止接管旧 Box；旧资源只进入 Janitor；
 6. Sidecar 重启时从自己的唯一 `BOXLITE_HOME` 恢复 Runtime；Fastlet 在发布 Route 前显式调用 `RecoverBox` 重建/确认 guest tunnel；
-7. PIDs 是 Fastlet admission 和 guest policy 的约束。BoxLite v0.9.7 SDK 没有等价 PIDs knob，因此在该约束可验证前 profile 不能宣称资源语义完整。
+7. PIDs 是 Fastlet admission 和 guest policy 的约束。BoxLite v0.9.7 Go/C SDK 没有可配置的 guest PIDs knob，因此在该约束可验证前 profile 不能宣称资源语义完整。
+
+### 4.1 资源边界实验证据
+
+2026-07-19 在 Linux/KVM 环境对 v0.9.7 做了真实 guest cgroup v2 实验，结论不是“guest cgroup 不可用”，而是“当前 API 无法把它做成对 root workload 不可绕过的产品边界”：
+
+- guest 内 `/sys/fs/cgroup` 是可写 cgroup v2，包含 `cpu`、`memory` 和 `pids` controller；创建子 cgroup、写入 `cpu.max=50000 100000`、`memory.max=67108864`、`pids.max=16` 并迁入进程都成功；
+- 同一个 root workload 无权把 cgroup mount remount 为只读，但拥有 BoxLite 默认 OCI capability 集合，可以把 `cpu.max` 改回 `max`，也可以把自身写回父级 `cgroup.procs`；对控制文件做 `chown/chmod` 也不能阻止它利用 capabilities 重新写入；
+- BoxLite Rust jailer 内部确实有 host cgroup `ResourceLimits` 和 `cpu.max/memory.max/pids.max` 实现，但 v0.9.7 Go/C `AdvancedBoxOptions` 只暴露 security enable 开关，没有 resource setters；其 host `pids.max` 约束的是 bwrap/shim/VMM host process tree，也不等价于 guest process 数；
+- `WithCPUs` 仍是整数 vCPU，`WithMemory` 是 VM memory。它们不能补齐 fractional CPU 和 guest PIDs 的统一 Pool ResourceProfile 语义。
+
+因此不采用“由 `sandbox-init` 写 guest cgroup 后继续运行 root 用户进程”的假完成方案，也不通过静默删除 root capabilities 来封锁控制文件；后者会改变用户 OCI 镜像的 root、chown、低端口和系统工具语义。解除门禁至少需要上游提供以下一种可验证机制：创建前的 per-Box host CPU/memory 配置加 guest PIDs policy，或 guest OCI cgroup 的只读/不可逃逸挂载；相应能力必须进入版本化 Go/C API，并由 native E2E 验证 root workload 不能放宽或逃逸限制。
 
 ## 5. 任意端口的 LocalForward
 
@@ -134,6 +145,8 @@ v0.9.7 还有一个必须显式处理的限制：Go SDK 会拒绝非空 `HostIP`
 8. 远端 E2E 覆盖双 Box 同 guest port、任意 target port、Infra readiness、Fastlet 重启、Pod 丢失和 cache heartbeat。
 
 当前 `make test-e2e-runtime-boxlite` 是显式的 fail-closed capability gate，不是 BoxLite 支持完成的证据。它的存在是为了避免 CI skip 或误报 Ready。
+
+资源门禁的负向验收同样是契约的一部分：只要 root workload 仍可修改 `cpu.max`、迁回父 cgroup，或 Go/C API 仍不能在用户进程启动前配置完整限制，`resource-limits-v1` 就必须保持 `false`，Sidecar `Ready` 必须保持 `false`。
 
 ## 9. 上游依赖和后续实现切片
 
