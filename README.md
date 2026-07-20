@@ -159,6 +159,7 @@ Focused Linux/Kubernetes gates include `test-network-integration`, `test-e2e-con
 
 - A Sandbox is bound to a Fastlet Pod. If that Pod disappears, the active Sandbox instance is lost; `AutoRecreate` may create a new instance according to policy.
 - Snapshot, pause/resume, and persistent Sandbox storage are intentionally outside this refactor.
+- Kata Firecracker remains capability-gated as `KataFirecrackerNotValidated`; QEMU and Cloud Hypervisor are the currently verified Kata profiles.
 - BoxLite lifecycle, Infra injection, authenticated local forwarding, and cleanup are integrated. BoxLite v0.9.7 does not provide an unescapable host resource-enforcement contract, so BoxLite Pools fail the resource-capability gate rather than claiming production support.
 - `<50ms` is an observed target only for a warm container profile, not a promise for cold images, Kata, BoxLite, Infra readiness, or the full data-plane route.
 
@@ -170,6 +171,7 @@ Focused Linux/Kubernetes gates include `test-network-integration`, `test-e2e-con
 - [Control/data-plane separation and Infra injection](docs/superpowers/specs/2026-07-19-control-data-plane-separation-design.md)
 - [Runtime abstraction](docs/superpowers/specs/2026-07-19-sandbox-runtime-abstraction-design.md)
 - [Implementation plan and verification log](docs/superpowers/plans/2026-07-19-fast-sandbox-architecture-refactor-implementation-plan.md)
+- [Architecture refactor acceptance report](docs/release-acceptance-report.md)
 
 ## License
 

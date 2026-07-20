@@ -176,6 +176,8 @@ The Orchestrator filters incompatible Pool/runtime/Infra profiles and ranks a bo
 
 Fastlet passes the Pool resource profile to the runtime adapter and fails closed when the selected runtime cannot prove support. The Pool Controller also sizes the resource-owning Fastlet/runtime container from per-Sandbox resources multiplied by capacity plus profile overhead.
 
+The table defines canonical runtime identities, not an unconditional support claim. QEMU and Cloud Hypervisor are the currently validated Kata profiles; `kata-fc` remains fail closed with `KataFirecrackerNotValidated` in the current environment.
+
 The current BoxLite v0.9.7 API cannot prove an unescapable host-side per-Box resource boundary. Consequently BoxLite advertises `resource-limits-v1=false`, and Pool readiness rejects it instead of silently weakening the contract.
 
 ## 7. Private network and proxy path
