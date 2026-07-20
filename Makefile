@@ -13,7 +13,7 @@ KIND_CLUSTER_NAME ?= fast-sandbox
 # E2E test settings
 E2E_PROFILE ?= basic
 E2E_TEST_TIMEOUT ?= 30m
-UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./test/e2e/env/... ./test/e2e/support/...
+UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./test/e2e/env/... ./test/e2e/support/... ./test/performance/...
 
 # Go settings
 GO ?= go

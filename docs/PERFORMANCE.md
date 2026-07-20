@@ -79,6 +79,29 @@ A release report must demonstrate:
 6. losing one Sandbox Proxy replica preserves aggregate route availability;
 7. stale route credentials fail after reset, reassignment, and deletion.
 
+## Create load report
+
+`test/performance/create_load` drives the public FastPath gRPC API and writes one JSON report to stdout. It measures full Create RPC latency; it does not rename that value to CreateAccepted or DataPlaneReady. Use the Prometheus milestone histograms above for server-side phase boundaries.
+
+Example warm container run through a port-forward:
+
+```bash
+go run ./test/performance/create_load \
+  --endpoint 127.0.0.1:19090 \
+  --namespace perf --pool perf-pool \
+  --requests 100 --concurrency 10 --cleanup \
+  --commit "$(git rev-parse HEAD)" \
+  --environment '8c/32GiB, kind vX, containerd vY' \
+  --runtime container --infra-profile minimal \
+  --image-state warm --image-affinity hit --network-slot-state clean \
+  --fastpath-replicas 3 --controller-replicas 2 --sandbox-proxy-replicas 2 \
+  >create-load-warm.json
+```
+
+The default workload sleeps for one hour so a successful runtime remains observable. `--cleanup` submits declarative Delete calls after measurement; cleanup time is reported separately and never included in Create percentiles. The process exits non-zero on any Create failure, duplicate Sandbox UID/name, or requested cleanup failure, while still emitting the JSON report. Use a unique `--request-id-prefix` for each sample; reusing one intentionally measures idempotent replay instead of creation.
+
+The report requires callers to state runtime, InfraProfile, image/cache state, NetworkSlot state, replica counts, commit, and environment. Values default to `unspecified` rather than being inferred from client-visible latency.
+
 The implementation plan records exact remote verification commands and known limitations: [2026-07-19 implementation plan](superpowers/plans/2026-07-19-fast-sandbox-architecture-refactor-implementation-plan.md).
 
 ## Profiling

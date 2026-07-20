@@ -13,6 +13,7 @@ make verify          # regenerate/check protobuf, deepcopy, CRDs; then unit test
 make test-unit       # packages that do not require a live runtime
 make test-race       # unit packages under the race detector
 make test-python-sdk
+go test ./test/performance/... # load-report logic; does not create cluster resources
 ```
 
 If remote disk pressure makes the full race target impractical, split the same package set with `go test -race -p=1 ...` and record every command. A skipped package is not equivalent to a passing race gate.
