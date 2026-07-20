@@ -653,7 +653,7 @@ func (m *Manager) deployFastSandbox(ctx context.Context) error {
 		{name: "kubectl", args: []string{"wait", "--for=condition=Established", "crd/sandboxes.sandbox.fast.io", "--timeout=30s"}},
 		{name: "kubectl", args: []string{"wait", "--for=condition=Established", "crd/sandboxpools.sandbox.fast.io", "--timeout=30s"}},
 		{name: "kubectl", args: []string{"apply", "-f", "config/rbac/base.yaml"}},
-		{name: "kubectl", args: []string{"apply", "-f", "config/manager/dev-route-keys.yaml"}},
+		{name: "kubectl", args: []string{"apply", "-f", "config/dev/route-keys.yaml"}},
 		{name: "kubectl", args: []string{"apply", "-f", "config/manager/controller.yaml"}},
 		{name: "kubectl", args: []string{"rollout", "restart", "deployment/fast-sandbox-controller"}},
 		{name: "kubectl", args: []string{"rollout", "status", "deployment/fast-sandbox-controller", "--timeout=120s"}},

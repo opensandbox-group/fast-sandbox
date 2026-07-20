@@ -5,13 +5,14 @@ package fastpath.v1;
 option go_package = "fast-sandbox/api/proto/v1;fastpathv1";
 
 service FastPathService {
-  // CreateSandbox 极速创建沙箱，绕过 K8s 控制面延迟
+  // CreateSandbox performs the imperative low-latency create path. It reserves
+  // Fastlet capacity, commits a Sandbox CRD, and then ensures the runtime.
   rpc CreateSandbox(CreateRequest) returns (CreateResponse);
 
-  // DeleteSandbox 极速删除沙箱
+  // DeleteSandbox commits declarative deletion; Controller reconciliation owns cleanup.
   rpc DeleteSandbox(DeleteRequest) returns (DeleteResponse);
 
-  // UpdateSandbox 更新沙箱配置（过期时间、重启、策略等）
+  // UpdateSandbox commits declarative expiry, reset, or failure-policy intent.
   rpc UpdateSandbox(UpdateRequest) returns (UpdateResponse);
 
   // ListSandboxes 获取沙箱列表
@@ -27,8 +28,6 @@ service FastPathService {
   rpc IssueRouteCredential(IssueRouteCredentialRequest) returns (IssueRouteCredentialResponse);
 }
 
-// ... (保持现有消息定义不变)
-
 message ListRequest {
   string namespace = 1;
 }
@@ -43,7 +42,7 @@ message GetRequest {
 }
 
 message SandboxInfo {
-  string sandbox_id = 1;    // container ID (md5 hash or UID)
+  string sandbox_id = 1;     // Deprecated alias of the Kubernetes Sandbox UID
   string sandbox_name = 8;   // CRD name (user-provided)
   string phase = 2;
   string fastlet_pod = 3;
@@ -54,14 +53,13 @@ message SandboxInfo {
 }
 
 
-// ConsistencyMode 定义创建 sandbox 的一致性模式
+// ConsistencyMode is retained only for wire compatibility. Create always uses
+// reservation -> CRD commit -> assignment CAS -> runtime Ensure.
 enum ConsistencyMode {
-  // FAST 模式：先创建 Fastlet，后写 CRD（默认）
-  // 最低延迟，但 CRD 写入失败可能导致正在使用的 sandbox 被清理
+  // Deprecated and ignored.
   FAST = 0;
 
-  // STRONG 模式：先写 CRD，后创建 Fastlet
-  // 延迟略高，但保证强一致性
+  // Deprecated and ignored.
   STRONG = 1;
 }
 
@@ -80,7 +78,7 @@ message CreateRequest {
 }
 
 message CreateResponse {
-  string sandbox_id = 1;      // container ID (md5 hash or UID)
+  string sandbox_id = 1;      // Deprecated alias of sandbox_uid
   string sandbox_name = 4;    // CRD name (user-provided)
   string fastlet_pod = 2;
   repeated string endpoints = 3 [deprecated = true];

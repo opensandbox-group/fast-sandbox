@@ -1,290 +1,243 @@
-# Fast Sandbox 架构设计
+# Fast Sandbox 架构
 
-> **目标架构已更新**：本文记录重构前实现。新开发以 [2026-07-19 跨模块架构决策](docs/superpowers/specs/2026-07-19-fast-sandbox-cross-cutting-architecture-decisions.md)为准。
+本文描述当前重构后的架构。设计决策和实施过程保留在 [docs/superpowers](docs/superpowers) 下。
 
-## 1. 概述
+## 1. 系统边界
 
-**Fast Sandbox** 是一个基于 Kubernetes 的高性能沙箱管理系统。其核心目标是提供毫秒级的容器启动速度，主要用于 serverless 函数、代码沙箱执行等对启动延迟高度敏感的场景。
+Fast Sandbox 负责：
 
-系统的核心设计理念是：**Fast-Path 优先** + **资源预热 (Resource Pooling)** + **镜像缓存亲和 (Image Affinity)**。
+- Sandbox 生命周期状态与调度；
+- Pool 容量和固定的单 Sandbox 资源规格；
+- 通过 containerd、Kata/gVisor profile 或 BoxLite adapter 创建 runtime；
+- 每 Sandbox 私有网络和内部 AccessHandle；
+- Infra Component 注入与 readiness 协调；
+- endpoint 解析、短期路由凭证和透明代理；
+- Fastlet Pod 或节点丢失后的残留资源清理。
 
-## 2. 核心架构
+Fast Sandbox 不定义面向用户的 Exec/File/PTY 协议。这些语义由 Execd、Envd 或其他注入组件负责。当前也不承诺 Sandbox 实例跨 Fastlet 存活，不包含 snapshot、pause/resume 和持久化 storage。
 
-系统采用 **Controller-Fastlet** 分离架构，建立在 Kubernetes 之上。
+## 2. 部署拓扑
 
-![ARCHITECTURE](ARCHITECTURE.png)
+```mermaid
+flowchart LR
+  Client["fastctl / Go SDK / Python SDK"]
+  API["Kubernetes API Server"]
+  FP["Fast-Path Server x N<br/>所有副本多活"]
+  Controller["Sandbox + Pool Controller x N<br/>单 Leader"]
+  SP["Sandbox Proxy x N"]
+  FPOD["Fastlet Pod<br/>Fastlet + Fastlet Proxy<br/>+ 可选 runtime sidecar"]
+  SB["Sandbox runtime<br/>私网 + Infra Components"]
+  Janitor["NodeJanitor DaemonSet"]
 
-### 2.1 通信链路
-
-| 链路 | 协议 | 用途 |
-|------|------|------|
-| **CLI → Controller** | gRPC | Fast-Path API，<50ms 延迟 |
-| **Controller → Fastlet** | HTTP | 沙箱创建/删除请求 |
-| **CLI → Fastlet** | HTTP (隧道) | 日志流、未来的 exec |
-| **控制面** | K8s CRD | 持久化存储和最终一致性 |
-
-## 3. 核心组件
-
-### 3.1 Fast-Path Server (gRPC)
-
-**位置**: `internal/controller/fastpath/server.go`
-
-**端口**: `9090`
-
-**服务**:
-- `CreateSandbox` - 快速创建沙箱
-- `DeleteSandbox` - 快速删除沙箱
-- `UpdateSandbox` - 更新沙箱配置（过期时间、重启、策略）
-- `ListSandboxes` - 列出命名空间内的沙箱
-- `GetSandbox` - 获取沙箱详情
-
-**一致性模式**:
-- **FAST** (默认): Fastlet 先创建 → 异步写 CRD。延迟 <50ms
-- **STRONG**: 先写 CRD (Pending) → Watch 触发 → Fastlet 创建。延迟 ~200ms
-
-### 3.2 Registry (内存态)
-
-**位置**: `internal/controller/fastletpool/registry.go`
-
-**职责**:
-- 维护所有 Fastlet 的实时负载和镜像缓存列表
-- 原子分配，使用互斥锁保证并发安全
-- 镜像亲和性评分（优先选择有缓存的 Fastlet）
-
-**分配算法**:
-1. 按池、命名空间、容量、端口冲突过滤候选
-2. 评分: `score = allocated + (无镜像 ? 1000 : 0)`
-3. 选择最低分（有镜像则胜出）
-
-**性能**: 100 Fastlets 时 ~1.3ms，1000 Fastlets 时 ~14ms
-
-### 3.3 SandboxController
-
-**位置**: `internal/controller/sandbox_controller.go`
-
-**职责**:
-- CRD 状态机管理
-- Finalizer 资源回收
-- 与 Registry 同步状态
-- 故障策略处理（Manual/AutoRecreate）
-
-**状态转换**:
-```
-Pending → Creating → Running → Deleting → Gone
-                ↓               ↓
-             Failed         Lost
+  Client -->|"Create / 生命周期 / resolve"| FP
+  Client -->|"声明式 Sandbox/Pool"| API
+  FP -->|"CRD create/status CAS"| API
+  Controller <-->|"Watch / Reconcile"| API
+  FP -->|"Reserve / Ensure"| FPOD
+  Controller -->|"Ensure / Delete / Drain"| FPOD
+  Client -->|"credential + target port"| SP
+  SP -->|"目标 Pod + fences"| FPOD
+  FPOD -->|"AccessHandle"| SB
+  Janitor -->|"孤儿清理"| FPOD
 ```
 
-### 3.4 SandboxPoolController
+### 2.1 控制面角色
 
-**位置**: `internal/controller/sandboxpool_controller.go`
+同一个 `controller` 二进制按不同角色部署：
 
-**职责**:
-- 管理 Fastlet Pod 生命周期（Min/Max 容量）
-- 注入 Containerd 访问所需的特权配置
-- 通过心跳维持 Registry 状态
+| 角色 | 选主 | 对外 Service | 内部子组件 |
+|---|---:|---:|---|
+| `fastpath` | 否 | gRPC `:9090` | FastPath API、本地 Registry、Top-K Orchestrator、路由凭证签发 |
+| `controller` | 是 | 否 | SandboxReconciler、SandboxPoolReconciler、本地 Registry、心跳循环 |
+| `all` | 否 | 可选 | 开发/兼容模式，在单进程组合前两种角色 |
 
-### 3.5 Fastlet (数据面)
+Fast-Path 与 Controller 故意维护各自独立、最终收敛的 Registry。调度结果只有在 Fastlet 原子接纳 reservation 后才成为有效分配。这使多活 Fast-Path 无需分布式 Registry 锁也不会突破单 Pod 容量。
 
-**位置**: `internal/fastlet/`
+### 2.2 Fastlet Pod
 
-**组件**:
-- **Sandbox Manager**: 生命周期管理（创建/删除/状态）
-- **Containerd Runtime**: 直接集成宿主机 containerd socket
-- **HTTP Server**: 端口 `5758` 上的 API 端点
+SandboxPool 创建 Fastlet Pod，其中平台拥有以下子组件：
 
-**HTTP 端点**:
-```
-POST /api/v1/fastlet/create
-POST /api/v1/fastlet/delete
-GET  /api/v1/fastlet/status
-GET  /api/v1/fastlet/logs?follow=true
-```
+- **Fastlet 控制服务（`:5758`）**：reserve/cancel/ensure/delete/status、缓存心跳、runtime 与网络编排；
+- **原子 Admission Store**：串行化 reservation 和 active slot 状态转换，面对并发调用仍严格执行 `maxSandboxesPerPod`；
+- **Runtime Manager**：根据 Pool 的不可变 RuntimeProfile 创建、检查和恢复 runtime；
+- **NetworkManager / SlotPool**：分配、恢复私网 slot，生成 AccessHandle；
+- **Infra Manager**：物化平台 artifact、实例配置、内部凭证和 readiness policy；
+- **Fastlet Proxy（`:5780`）**：校验路由凭证和代际 fence，代理到 runtime-local 地址；metrics 使用独立 `:9093`；
+- **BoxLite runtime sidecar**：仅 `runtime: boxlite` 注入，通过 Pod 内 UDS 和带鉴权 local-forward 工作。
 
-**核心特性**:
-- Host Containerd 集成实现零镜像拉取
-- 日志持久化到宿主机文件系统供流式读取
-- 优雅关闭，完整的 SIGTERM → SIGKILL 流程
+Fastlet Pod 是生命周期边界。即使 Kubernetes 复用了 Pod 名称，只要 Pod UID 改变，旧 assignment 与旧 route 都必须失效。
 
-### 3.6 Node Janitor
+### 2.3 NodeJanitor
 
-**位置**: `internal/janitor/`
+NodeJanitor 以特权 DaemonSet 部署，处理已经丢失的 Fastlet 无法自行清理的资源。Backend 覆盖 containerd、network/netns、Infra 实例 artifact 和 BoxLite 状态。每次删除前都会重新读取 Kubernetes 所有权，并执行最小 orphan age 保护。
 
-**职责**:
-- 扫描孤儿容器（无对应 CRD）
-- Fastlet Pod 消失时清理
-- 删除 FIFO 文件和 containerd 快照
+## 3. 权威状态模型
 
-**孤儿判定标准**:
-1. Fastlet Pod 消失（UID 不在 pod lister 中）
-2. Sandbox CRD 不存在
-3. 容器与 CRD 的 UID 不匹配
+### 3.1 Sandbox CRD
 
-**保护窗口**: 10 秒（可配置），为 Fast-Path 异步 CRD 写入留出时间
+`Sandbox.spec` 表示期望生命周期。当前实例的权威 identity 是：
 
-### 3.7 CLI (fastctl)
-
-**位置**: `cmd/fastctl/`
-
-**功能**:
-- 交互式 YAML 编辑创建沙箱
-- 自动 port-forward 隧道连接 Fastlet Pod
-- 流式日志查看
-- 配置分层: Flags > File > Interactive
-
-## 4. 关键流程
-
-### 4.1 创建沙箱 (Fast Mode)
-
-```
-用户                    控制器                   Fastlet
-  │                         │                         │
-  ├─ run my-sb ────────────>│                         │
-  │                         │                         │
-  │                         ├─ Allocate() ──────────>│
-  │                         │  (Registry 选择)        │
-  │                         │<────────────────────────┤
-  │                         │  (Fastlet 已选择)         │
-  │                         │                         │
-  │                         ├─ HTTP POST /create ───>│
-  │                         │                         │
-  │                         │                         ├─ containerd.Create()
-  │                         │                         │
-  │                         │<────────────────────────┤
-  │                         │  (ContainerID)          │
-  │                         │                         │
-  │<─────────────────────────┤                         │
-  │  (成功, Endpoints)       │                         │
-  │                         │                         │
-  │                         ├─ async: 创建 CRD ──────>│ (K8s)
+```text
+Sandbox CRD UID
++ instanceGeneration
++ assignment.fastletPodUID
++ assignment.attempt
++ routeGeneration
 ```
 
-**延迟分解**:
-- Registry Allocate: ~1.3ms (100 fastlets)
-- Fastlet HTTP RPC: ~10-30ms
-- Containerd create: <10ms (镜像已缓存)
-- **总计**: <50ms
+`status.assignment` 通过 Kubernetes resourceVersion compare-and-swap 写入。runtime、data plane、user process 是三个独立观测状态；旧 `status.phase` 只保留兼容投影，不再作为权威状态机。
 
-### 4.2 创建沙箱 (Strong Mode)
+### 3.2 SandboxPool CRD
 
-```
-用户                    控制器              K8s                 Fastlet
-  │                         │                    │                    │
-  ├─ run my-sb ────────────>│                    │                    │
-  │                         │                    │                    │
-  │                         ├─ 创建 CRD ────────>│                    │
-  │                         │  (Phase: Pending)   │                    │
-  │                         │<────────────────────┤                    │
-  │                         │                    │                    │
-  │                         ├─ Allocate() ──────>│                    │
-  │                         │<────────────────────┤                    │
-  │                         │                    │                    │
-  │                         │                    ├─ Watch 触发 ──────>│
-  │                         │                    │                    │
-  │                         ├─ HTTP POST /create ─────────────────────>│
-  │                         │                    │                    │
-  │                         │<─────────────────────────────────────────┤
-  │                         │                    │                    │
-  │                         ├─ 更新 CRD ────────>│                    │
-  │                         │  (Phase: Running)   │                    │
-  │<─────────────────────────┤                    │                    │
-  │  (成功)                 │                    │                    │
-```
+一个 Pool 固定：
 
-**延迟**: ~200ms (主要消耗在 ETCD + Watch)
+- `runtime`；
+- `sandboxResources`（`cpu`、`memory`、`pids`）；
+- `infraProfile`；
+- `maxSandboxesPerPod`；
+- `warmImages` 与 Fastlet Pod template；
+- Pool 最小、最大和 buffer 容量。
 
-### 4.3 日志流 (Logs)
+Runtime、资源和 Infra profile 不可变，因为修改任一项都会改变已分配 Sandbox 的语义。runtime handler 与二进制路径归内部 RuntimeCatalog 管理，普通用户不能覆盖。
 
-```
-CLI                      控制器                Fastlet
-  │                         │                      │
-  ├─ logs my-sb ───────────>│                      │
-  │                         │                      │
-  │<─ Fastlet Pod IP ──────────┤                      │
-  │                         │                      │
-  ├─ kubectl port-forward ──────────────────────────>│
-  │                         │                      │
-  ├─ GET /api/v1/fastlet/logs?follow=true ────────────>│
-  │<─ 分块日志流 ─────────────────────────────────────┤
-```
+## 4. Create 与 Reconcile
 
-## 5. 配置项
+### 4.1 Fast-Path Create
 
-### 5.1 Controller 参数
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant F as Fast-Path
+  participant R as Local Registry
+  participant L as Fastlet
+  participant K as API Server
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--fastlet-port` | `5758` | Fastlet HTTP 服务器端口 |
-| `--metrics-bind-address` | `:9091` | Prometheus 指标端点 |
-| `--health-probe-bind-address` | `:5758` | 健康检查端点 |
-| `--fastpath-consistency-mode` | `fast` | 一致性模式: fast/strong |
-| `--fastpath-orphan-timeout` | `10s` | Fast 模式孤儿清理超时 |
-
-### 5.2 Fastlet 环境变量
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `FASTLET_CAPACITY` | `5` | 每个 Fastlet 最大沙箱数 |
-| `CONTAINERD_SOCKET` | `/run/containerd/containerd.sock` | Containerd socket 路径 |
-
-### 5.3 Sandbox CRD Spec
-
-```yaml
-spec:
-  image: string              # 容器镜像
-  poolRef: string            # 目标资源池名称
-  exposedPorts: []int32      # 暴露的端口
-  command: []string          # 入口命令
-  args: []string             # 命令参数
-  envs: map[string]string    # 环境变量
-  workingDir: string         # 工作目录
-  consistencyMode: fast|strong  # 一致性模式
-  failurePolicy: manual|autoRecreate  # 故障恢复策略
-  expireTimeSeconds: int64   # 可选的过期时间
+  C->>F: CreateSandbox(request_id, spec)
+  F->>K: 查询已有 request_id
+  alt 相同 request_id 和 spec
+    K-->>F: 已有 Sandbox
+    F-->>C: 幂等返回
+  else 新请求
+    F->>R: 按容量/镜像亲和选 Top-K
+    loop 有界候选集合
+      F->>L: Reserve(request_id, spec hash)
+      alt stale/full/conflict
+        L-->>F: 可重试拒绝
+      else accepted
+        L-->>F: reservation token
+        F->>K: 创建 Sandbox CRD
+        F->>K: assignment status CAS
+        F->>L: Ensure(CRD UID + generations)
+        L-->>F: runtime/data plane 结果
+        F-->>C: Sandbox UID 与 placement
+      end
+    end
+  end
 ```
 
-## 6. 水平扩展考虑
+reservation 接纳前的快速失败不会创建 CRD。持有合法 reservation 后，Fast-Path 必须先提交 CRD，再调用 runtime Ensure。系统不再存在 Fast/Strong 模式分支。稳定 request ID 是必需的；相同 request ID 搭配不同 create spec 会被拒绝。
 
-### 当前限制
+### 4.2 声明式 Create
 
-Fast-Path gRPC 服务运行在 Controller 上，使用内存态 Registry，必须单点运行以避免分配冲突。这限制了水平扩展能力。
+用户直接创建 Sandbox CRD 时，SandboxReconciler 使用同一个 Orchestrator 和 Fastlet admission 协议。因此 Fast-Path 是可选的低延迟入口，不是唯一创建路径。
 
-### 已探索的方案
+### 4.3 Delete、reset、过期和故障策略
 
-我们探索了两种多副本部署的架构方案：
+这些操作全部是声明式的：
 
-1. **Leader-Follower 读写分离**：一个 Leader 处理 CreateSandbox（需要 Registry），Follower 处理读操作并将 CreateSandbox 转发给 Leader。详见 [Leader-Follower 高可用设计](docs/plans/2025-02-09-leader-follower-ha-design.md)。
+- Delete 进入 Kubernetes 删除状态，finalizer 先 drain route，再清理 runtime/network/Infra；
+- Reset 修改 `resetRevision`，Reconcile 先递增 instance/route generation，再创建替代实例；
+- 过期由 `spec.expireTime` 表达，最终进入已清理的 Expired 状态；
+- Fastlet 丢失后，`Manual` 进入 `Lost`；`AutoRecreate` 在 recovery window 后清除旧 assignment 并调度新实例。
 
-2. **Controller 分片 + 客户端路由**：每个 Pool 绑定到特定的 Controller，客户端维护路由表。详见 [Controller 分片设计](docs/plans/2025-02-09-controller-sharding-design.md)。
+Fastlet Pod replacement 不意味着 Sandbox 存活。新 Pod UID 是新的 fence，必须显式 Reconcile 新实例。
 
-### 建议
+## 5. Registry 与调度
 
-对于需要大规模水平扩展的生产环境，我们推荐**应用层分片**（如按团队/环境部署独立的 Controller），而不是实现复杂的集群内分片。这样可以保持架构简洁，同时提供隔离性。
+每个 Fast-Path 和 Controller 副本通过两种信息源维护本地 Registry：
 
----
+1. Kubernetes Pod/Sandbox Watch 提供成员关系、assignment、Pool/runtime 标签和 Pod UID 变化；
+2. 低频、带抖动的 heartbeat 提供精确容量、reservation/runtime phase inventory、镜像缓存快照与 cache revision。
 
-## 7. 日志
+系统不会让每个 Fast-Path 高频全量轮询所有 Fastlet。Watch 立即更新拓扑，heartbeat 用来修复偏差并刷新 runtime/cache 事实。
 
-Fast Sandbox 使用 [klog](https://github.com/kubernetes/klog)，这是 Kubernetes 生态系统的标准日志库。
+Orchestrator 先过滤 Pool/runtime/Infra 不兼容节点，再对有界 Top-K 排序。可用容量是硬条件；镜像缓存亲和是关键启动延迟信号，之后才考虑负载与稳定 tie-break。Fastlet 拒绝 admission 后记录原因并尝试下一个候选；最终 slot authority 始终在 Fastlet。
 
-### 日志级别
+## 6. Runtime 与资源
 
-| 级别 | 用途 |
-|------|------|
-| `klog.InfoS()` | 信息性消息 |
-| `klog.ErrorS()` | 错误消息（始终记录）|
-| `klog.V(2).InfoS()` | 详细信息（通过 `-v=2` 启用）|
-| `klog.V(4).InfoS()` | 调试信息（通过 `-v=4` 启用）|
+| Runtime | Adapter 路径 | 隔离边界 |
+|---|---|---|
+| `container` | containerd task | host kernel namespace/cgroup |
+| `gvisor` | containerd `runsc` handler | user-space kernel |
+| `kata-qemu` | Kata containerd handler | QEMU VM |
+| `kata-clh` | Kata containerd handler | Cloud Hypervisor VM |
+| `kata-fc` | Kata containerd handler | Firecracker VM |
+| `boxlite` | BoxLite sidecar UDS | BoxLite VM/runtime |
 
-### 启用调试日志
+Fastlet 把 Pool 资源规格传给 runtime adapter；如果 runtime 无法证明支持就失败关闭。Pool Controller 同时按照“单 Sandbox 规格 × capacity + profile overhead”设置承担 runtime 资源的 Fastlet/sidecar 容器资源。
 
-```bash
-# Controller
-./bin/controller -v=2
+当前 BoxLite v0.9.7 API 无法证明不可逃逸的 host 侧 per-Box 资源边界。因此 BoxLite 报告 `resource-limits-v1=false`，Pool Ready gate 会拒绝它，不会静默降级资源契约。
 
-# Fastlet
-./bin/fastlet -v=4
+## 7. 私网与代理路径
 
-# CLI
-fastctl -v=4 list
+容器类 runtime 的 network slot 包含独立 netns、veth、私有 IP、bridge attachment 与 NAT egress。所有 Sandbox 可以监听相同内部端口，调度和 Registry 都不维护全局 host port reservation。
+
+用户访问路径为：
+
+```text
+Infra SDK
+  -> ResolveEndpoint(Sandbox UID, target port)
+  -> Sandbox Proxy /v1/sandboxes/{uid}/ports/{port}/...
+  -> 目标 Fastlet Pod 内 Fastlet Proxy
+  -> DirectIP(private IP:target port) 或 LocalForward
+  -> 注入的 Infra Component / 用户服务
 ```
+
+签名凭证包含 namespace、Sandbox UID、target port、Fastlet Pod UID、assignment attempt、route generation 和 expiry。两个代理分别验证适用的 fence。reset、重新调度或删除都会让旧 credential 和缓存 route 失效。代理使用流式 transport，不会整包缓存 SSE、WebSocket 或文件内容。
+
+BoxLite guest network 不属于 Fastlet 管理的 Linux netns，因此通过 Pod-local port forward 接入。每个 Box 使用独立随机 credential，先写入 tunnel preamble，另一个 Box 不能复用该 forward。
+
+## 8. Runtime Augmentation
+
+它的真实抽象是：基于用户 OCI 镜像启动 workload，同时注入平台管理 helper，让最终 Sandbox 同时具备用户程序和选定的管理能力。
+
+InfraProfile 解析为 component artifact 和策略。创建 runtime 前，Fastlet：
+
+1. 把不可变 component 二进制准备到 Pod-local artifact store；
+2. 创建带 generation fence 的实例目录和配置；
+3. 把文件、mount、环境变量注入 OCI 或 BoxLite 请求；
+4. 必要时用 `sandbox-init` 包装原始 entrypoint；
+5. 把 component readiness 与 runtime start 分开等待；
+6. 只有 DataPlane Ready 后才发布 route。
+
+Adapter 复用既有组件协议：
+
+- OpenSandbox `execd`：command/SSE 和 file 操作；
+- E2B `envd`：把解析后的 endpoint 交给原生 client；
+- 自定义组件：增加 catalog profile 与 SDK adapter。
+
+启动额外成本包括 artifact 准备、OCI spec mutation、supervisor 启动、component 进程启动和 readiness probe。artifact 与 warm image 会缓存；Pool warm image、缓存 artifact 和热点镜像受普通 GC 保护。Fastlet Ready 不等待所有 warm image 拉取完成。
+
+## 9. 安全与可用性
+
+- Fast-Path 独占路由签名私钥，其他组件只持有验签公钥；
+- Proxy 数据端口不暴露 Prometheus metrics，metrics 使用独立管理端口；
+- Pool template 不能覆盖平台拥有的 Fastlet 环境变量、sidecar 名称、mount、runtime handler 和安全设置；
+- Controller 通过 Lease 选主；Fast-Path 与 Sandbox Proxy 可独立水平扩缩，清单提供 PDB/HPA；
+- Fastlet 和 Janitor 是特权组件，应调度到可信节点并配套 Kubernetes/host 安全控制；
+- NetworkPolicy 样例默认不启用，因为 Fastlet 可能位于租户 namespace，egress/DNS 需求也依赖部署环境。
+
+## 10. 可观测性
+
+Prometheus metrics 覆盖 Create accepted/data-plane-ready latency、Registry candidate 与 heartbeat age、Top-K retry、Fastlet admission 与 slot、runtime/Infra/network/cache、两跳 proxy 和 Janitor cleanup。
+
+request ID、Sandbox UID、assignment attempt、route generation 等 identity 必须进入结构化日志或 trace，不能作为 metrics label。只有 runtime adapter 能证明用户原始进程已经启动时才记录 `user_process_start_latency`；sandbox-init 路径在可信回调实现前明确标记 unavailable。
+
+## 11. 部署与迁移
+
+- `config/default`：CRD、RBAC、拆分控制面、Sandbox Proxy、PDB/HPA 和 NodeJanitor；route keys 由外部提供；
+- `config/dev`：default 资源加开发专用固定 route key；
+- `config/network-policy`：单 namespace 拓扑的可选策略样例；
+- `config/samples`：canonical Pool/Sandbox 示例。
+
+旧 Pool 字段可使用 `fastctl migrate pool` 转换，兼容规则和 dry-run 步骤见 [docs/migration-guide.md](docs/migration-guide.md)。

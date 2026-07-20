@@ -1,146 +1,92 @@
-# Fast Sandbox Performance Analysis
+# Fast Sandbox performance contract
 
-## Critical Path Latency Breakdown
+Fast Sandbox reports latency by milestone and workload profile. A single end-to-end number hides image pull, VM boot, Infra readiness, and route publication, so results must always identify the measured boundary.
 
-Target: <50ms end-to-end for FastPath mode
+## Milestones
 
-### CLI -> Controller (FastPath gRPC)
-- Expected: 1-5ms
-- Measured: TBD
+| Milestone | Meaning |
+|---|---|
+| Create accepted | An existing idempotent request was found, or a Fastlet atomically accepted a reservation |
+| Runtime created | The selected runtime adapter completed Ensure |
+| User process started | The adapter proved that the original user process started; unavailable for unreported `sandbox-init` paths |
+| Data plane ready | Runtime, Infra Component readiness, and Fastlet route publication completed |
+| Create RPC complete | Fast-Path returned success or a terminal error |
 
-### Registry.Allocate
-- Expected: <1ms
-- Measured: ~1.3ms (from benchmarks)
-- Sub-operations (100 fastlets):
-  - Candidate filtering: <0.5ms
-  - Scoring: <0.5ms
-  - Selection: <0.5ms
-- Large pool (1000 fastlets): ~14ms
+The historical `<50ms` value is an observation target only for a warm `container` Pool with an image cache hit and minimal InfraProfile. It is not a target for cold pulls, gVisor/Kata/BoxLite, or full data-plane readiness.
 
-### Fastlet.CreateSandbox RPC
-- Expected: 5-20ms
-- Measured: TBD
+## Required test dimensions
 
-### containerd Runtime
-- Expected: 10-30ms
-- Measured: TBD
-- Sub-operations:
-  - Image pull (cached): 0ms
-  - Container create: TBD
-  - Container start: TBD
+Every benchmark or load report must record:
 
-## Benchmark Results
+- commit SHA and exact command;
+- node/cluster hardware and Kubernetes/containerd versions;
+- Fast-Path, Controller, Sandbox Proxy, and Fastlet replica counts;
+- concurrent clients and request rate;
+- warm/cold image and image hit/miss;
+- runtime and InfraProfile;
+- NetworkSlot hit/recovery state;
+- Fast-Path or direct-CRD create path;
+- p50, p95, p99, error count, admission rejection count, and retry count.
 
-### Registry Allocation (Baseline)
-
-**Test Environment:**
-- CPU: Apple M4 Pro
-- OS: darwin/arm64
-- Date: 2026-01-26
-
-| Benchmark | ns/op | B/op | allocs/op | Notes |
-|-----------|-------|------|-----------|-------|
-| BenchmarkRegistryAllocate | 1312 | 993 | 4 | Standard allocation (100 fastlets) |
-| BenchmarkRegistryAllocateWithPorts | 1469 | 993 | 4 | With port constraints |
-| BenchmarkRegistryAllocateNoImageMatch | 1349 | 993 | 4 | No pre-image match |
-| BenchmarkRegistryAllocateLargePool | 14613 | 8297 | 4 | Large pool (1000 fastlets) |
-| BenchmarkRegistryRegisterOrUpdate | 127.9 | 91 | 4 | Fastlet registration |
-| BenchmarkRegistryGetAllFastlets | 4810 | 19328 | 2 | Get all fastlets (100) |
-| BenchmarkRegistryGetAllFastletsLargePool | 51290 | 188419 | 2 | Get all fastlets (1000) |
-| BenchmarkRegistryGetFastletByID | 27.06 | 0 | 0 | Map lookup - zero alloc |
-| BenchmarkRegistryRelease | 14.49 | 0 | 0 | Fastlet release - zero alloc |
-| BenchmarkRegistryCleanupStaleFastlets | 38.58 | 0 | 0 | Stale cleanup - zero alloc |
-| BenchmarkParallelAllocate | 1513 | 1016 | 6 | Concurrent allocation |
-
-Run benchmarks with:
-```bash
-go test ./internal/controller/fastletpool/ -bench=. -benchmem
-```
-
-## Profiling
-
-### CPU Profiling
-
-Start controller with profiling:
-```bash
-./scripts/profile.sh
-```
-
-Capture 30-second profile:
-```bash
-go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30 > /tmp/controller_cpu.prof
-```
-
-View profile:
-```bash
-go tool pprof -http=:8080 /tmp/controller_cpu.prof
-```
-
-### Flamegraph
-
-Generate flamegraph from captured profile:
-```bash
-./scripts/flamegraph.sh
-```
+Do not compare profiles while changing more than one of these dimensions.
 
 ## Metrics
 
-Prometheus metrics are available for FastPath operations:
+Important Prometheus series include:
 
-- `fastpath_create_sandbox_duration_seconds` - Histogram of CreateSandbox RPC duration
-  - Labels: `mode` (fast/strong), `success` (true/false)
-  - Buckets: 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s
+- `fast_sandbox_create_accepted_latency_seconds{path,result}`
+- `fast_sandbox_create_data_plane_ready_latency_seconds{result}`
+- `fast_sandbox_runtime_create_latency_seconds{runtime,cache_hit,result}`
+- `fast_sandbox_user_process_start_latency_seconds{runtime,infra_profile,source}`
+- `fast_sandbox_user_process_start_observation_total{runtime,infra_profile,source,result}`
+- `fast_sandbox_data_plane_ready_latency_seconds{runtime,infra_profile,result}`
+- `fast_sandbox_registry_heartbeat_age_seconds{state}`
+- `fast_sandbox_registry_candidate_count{state}`
+- `fast_sandbox_image_affinity_result_total{result}`
+- `fast_sandbox_topk_retry_total{result,reason}`
+- `fast_sandbox_fastlet_admission_total{operation,result,reason}`
+- `fast_sandbox_fastlet_reservation_inflight`
+- `fast_sandbox_fastlet_admission_slots{state}`
+- `fast_sandbox_network_slot_available` / `fast_sandbox_network_slot_inuse`
+- `fast_sandbox_infra_ready_latency_seconds{profile,component,runtime,result}`
+- `fast_sandbox_sandbox_proxy_route_latency_seconds{result}`
+- `fast_sandbox_fastlet_proxy_upstream_latency_seconds{access,result}`
 
-## Timing Logs
+`cache_hit` is currently reported as `unknown` for runtime creation because an inventory snapshot cannot prove whether that specific create pulled or unpacked data. Do not infer a per-create hit until RuntimeDriver returns a trustworthy result.
 
-Enable detailed timing logs with verbosity level 2:
+Metrics use bounded labels. Request ID, Sandbox UID, Pod UID, assignment attempt, and route generation belong in logs/traces and must not become Prometheus labels.
+
+## Microbenchmark
+
+The current scheduler microbenchmark measures Top-K ranking with 1000 watched Fastlets:
 
 ```bash
-# Controller
-./bin/controller -v=2
-
-# Fastlet
-./bin/fastlet -v=2
+go test ./internal/controller/fastletpool -run '^$' \
+  -bench '^BenchmarkRegistryTopK1000$' -benchmem -count=5
 ```
 
-This will show:
-- Registry allocation timing breakdown
-- Fastlet RPC call timing
-- containerd Runtime timing breakdown
+Microbenchmark numbers are not Create latency. They exclude Fastlet admission, Kubernetes persistence, runtime, networking, Infra readiness, and proxy route readiness.
 
-## Optimization Targets
+## Load and failure acceptance
 
-1. [ ] Registry allocation - minimize lock contention (currently ~1.3ms for 100 fastlets)
-2. [ ] Fastlet RPC - consider connection pooling (gRPC connection reuse)
-3. [ ] containerd - ensure image cache hit (zero-pull goal)
-4. [ ] Controller reconcile - optimize periodic sync interval
-5. [ ] FastPath gRPC server - measure actual gRPC call overhead
+A release report must demonstrate:
 
-## Performance Goals
+1. concurrent multi-active Create never exceeds Fastlet capacity and never creates duplicate runtime identity;
+2. image-hit candidates are observably preferred;
+3. heartbeat traffic remains bounded when Fast-Path replicas increase;
+4. proxy SSE/WebSocket/file streams are not fully buffered and cancellation reaches the upstream;
+5. deleting the Controller leader does not remove Fast-Path Service availability;
+6. losing one Sandbox Proxy replica preserves aggregate route availability;
+7. stale route credentials fail after reset, reassignment, and deletion.
 
-| Operation | Target | Current | Status |
-|-----------|--------|---------|--------|
-| FastPath CreateSandbox (e2e) | <50ms | TBD | 🔍 To Measure |
-| Registry.Allocate (100 fastlets) | <2ms | ~1.3ms | ✅ Pass |
-| Registry.Allocate (1000 fastlets) | <20ms | ~14ms | ✅ Pass |
-| Fastlet.CreateSandbox RPC | <20ms | TBD | 🔍 To Measure |
-| containerd container start | <30ms | TBD | 🔍 To Measure |
+The implementation plan records exact remote verification commands and known limitations: [2026-07-19 implementation plan](superpowers/plans/2026-07-19-fast-sandbox-architecture-refactor-implementation-plan.md).
 
-## Debugging Performance Issues
+## Profiling
 
-If performance degrades:
+The Controller exposes pprof on loopback `localhost:6060`:
 
-1. **Run benchmarks** to detect regression:
-   ```bash
-   go test ./internal/controller/fastletpool/ -bench=. -benchmem
-   ```
+```bash
+go tool pprof 'http://localhost:6060/debug/pprof/profile?seconds=30'
+```
 
-2. **Capture CPU profile** to identify hotspots:
-   ```bash
-   go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30 > /tmp/cpu.prof
-   go tool pprof -list Allocate /tmp/cpu.prof
-   ```
-
-3. **Check logs** with `-v=2` to see timing breakdown
-
-4. **Check metrics** at `:9091/metrics` for Prometheus histograms
+Profile production-like Linux runs. Local macOS profiles are suitable for pure Go scheduling analysis only and are not evidence for containerd, network, or secure-runtime performance.

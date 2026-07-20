@@ -21,15 +21,14 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// ConsistencyMode 定义创建 sandbox 的一致性模式
+// ConsistencyMode is retained only for wire compatibility. Create always uses
+// reservation -> CRD commit -> assignment CAS -> runtime Ensure.
 type ConsistencyMode int32
 
 const (
-	// FAST 模式：先创建 Fastlet，后写 CRD（默认）
-	// 最低延迟，但 CRD 写入失败可能导致正在使用的 sandbox 被清理
+	// Deprecated and ignored.
 	ConsistencyMode_FAST ConsistencyMode = 0
-	// STRONG 模式：先写 CRD，后创建 Fastlet
-	// 延迟略高，但保证强一致性
+	// Deprecated and ignored.
 	ConsistencyMode_STRONG ConsistencyMode = 1
 )
 
@@ -261,7 +260,7 @@ func (x *GetRequest) GetNamespace() string {
 
 type SandboxInfo struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`       // container ID (md5 hash or UID)
+	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`       // Deprecated alias of the Kubernetes Sandbox UID
 	SandboxName   string                 `protobuf:"bytes,8,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"` // CRD name (user-provided)
 	Phase         string                 `protobuf:"bytes,2,opt,name=phase,proto3" json:"phase,omitempty"`
 	FastletPod    string                 `protobuf:"bytes,3,opt,name=fastlet_pod,json=fastletPod,proto3" json:"fastlet_pod,omitempty"`
@@ -489,7 +488,7 @@ func (x *CreateRequest) GetRequestId() string {
 
 type CreateResponse struct {
 	state       protoimpl.MessageState `protogen:"open.v1"`
-	SandboxId   string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`       // container ID (md5 hash or UID)
+	SandboxId   string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`       // Deprecated alias of sandbox_uid
 	SandboxName string                 `protobuf:"bytes,4,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"` // CRD name (user-provided)
 	FastletPod  string                 `protobuf:"bytes,2,opt,name=fastlet_pod,json=fastletPod,proto3" json:"fastlet_pod,omitempty"`
 	// Deprecated: Marked as deprecated in api/proto/v1/fastpath.proto.

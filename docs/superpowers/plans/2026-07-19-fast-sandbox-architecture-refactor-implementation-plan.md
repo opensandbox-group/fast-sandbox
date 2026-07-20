@@ -1510,6 +1510,8 @@ bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_
 - 新增本地只读 `fastctl migrate pool`：把 legacy `runtimeType/runtimeClassName/containerdRuntimeHandler` 转为 canonical `runtime`，物化旧对象有效的 `sandboxResources/maxSandboxesPerPod/infraProfile` 默认值，保留未知 metadata/template 字段并支持多 YAML 文档；不一致的 handler/runtimeClass override fail closed。`--check` 可作为配置 CI gate，仓库的 `pool.yaml/pool-gvisor.yaml/pool-kata.yaml` 已全部补齐 `infraProfile: minimal` 并通过检查；迁移步骤和 Create/Sandbox 兼容字段边界记录在 `docs/migration-guide.md`。
 - `fastctl run` 不再发送 deprecated `consistency_mode/exposed_ports`，也不再打印已经废弃的 host-port endpoints；旧 flag/config key 只给出 ignored warning。FastPath 对可检测的旧字段记录 `fast_sandbox_deprecated_create_field_total{field}`，但持久化 Sandbox 时主动丢弃 exposed ports，保证旧客户端不能重新引入端口调度语义。
 - 迁移切片远端运行 `go test -race -p=1 ./cmd/fastctl/cmd ./internal/controller/fastpath -count=1`、三个 canonical sample 的 `go run ./cmd/fastctl migrate pool --file <sample> --check` 以及 `make test-unit`，全部退出状态 `0`。
+- 根 README 与中英文 ARCHITECTURE 已切换为现行架构，不再把 Fast/Strong、host-port reservation 或 PodIP endpoint 当成有效语义；同步更新 FastPath proto 注释、性能契约与测试手册。新增标准 `config/default` kustomize base、带开发测试 key 的 `config/dev` overlay，以及默认不启用的单 namespace NetworkPolicy 样例；e2e 环境改用 overlay 内开发 key。生产 base 仍要求外部 secret manager 提供 `fast-sandbox-route-keys`。
+- 部署/文档切片在远端运行 `kubectl kustomize config/default`、`kubectl kustomize config/dev`、两个 overlay 的 `kubectl apply --dry-run=client --validate=false -k ...`、NetworkPolicy client dry-run、`go test ./api/proto/v1 ./test/e2e/env/... -count=1` 和 `make test-unit`，全部退出状态 `0`；首次直接引用父目录 YAML 被 kustomize load restrictor 拒绝后，已改为每个 base 自带 kustomization 的标准结构并重新通过。
 
 ## 18. 推荐的代码提交/PR 切分
 

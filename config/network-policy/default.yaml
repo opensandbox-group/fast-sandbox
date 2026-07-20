@@ -1,0 +1,99 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fast-sandbox-fastpath-ingress
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: fast-sandbox-fastpath
+      fast-sandbox.io/control-plane-role: fastpath
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          fast-sandbox.io/control-plane-client: "true"
+    ports:
+    - {protocol: TCP, port: 9090}
+  - from:
+    - podSelector:
+        matchLabels:
+          fast-sandbox.io/metrics-client: "true"
+    ports:
+    - {protocol: TCP, port: 9091}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fast-sandbox-proxy-ingress
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: fast-sandbox-proxy
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          fast-sandbox.io/data-plane-client: "true"
+    ports:
+    - {protocol: TCP, port: 8080}
+  - from:
+    - podSelector:
+        matchLabels:
+          fast-sandbox.io/metrics-client: "true"
+    ports:
+    - {protocol: TCP, port: 9094}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fast-sandbox-controller-ingress
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: fast-sandbox-controller
+      fast-sandbox.io/control-plane-role: controller
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          fast-sandbox.io/metrics-client: "true"
+    ports:
+    - {protocol: TCP, port: 9091}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: sandbox-fastlet-ingress
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: sandbox-fastlet
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - podSelector:
+        matchExpressions:
+        - key: fast-sandbox.io/control-plane-role
+          operator: In
+          values: [controller, fastpath]
+    ports:
+    - {protocol: TCP, port: 5758}
+  - from:
+    - podSelector:
+        matchLabels:
+          app: fast-sandbox-proxy
+    ports:
+    - {protocol: TCP, port: 5780}
+  - from:
+    - podSelector:
+        matchLabels:
+          fast-sandbox.io/metrics-client: "true"
+    ports:
+    - {protocol: TCP, port: 9093}

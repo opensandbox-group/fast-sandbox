@@ -32,11 +32,12 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type FastPathServiceClient interface {
-	// CreateSandbox 极速创建沙箱，绕过 K8s 控制面延迟
+	// CreateSandbox performs the imperative low-latency create path. It reserves
+	// Fastlet capacity, commits a Sandbox CRD, and then ensures the runtime.
 	CreateSandbox(ctx context.Context, in *CreateRequest, opts ...grpc.CallOption) (*CreateResponse, error)
-	// DeleteSandbox 极速删除沙箱
+	// DeleteSandbox commits declarative deletion; Controller reconciliation owns cleanup.
 	DeleteSandbox(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
-	// UpdateSandbox 更新沙箱配置（过期时间、重启、策略等）
+	// UpdateSandbox commits declarative expiry, reset, or failure-policy intent.
 	UpdateSandbox(ctx context.Context, in *UpdateRequest, opts ...grpc.CallOption) (*UpdateResponse, error)
 	// ListSandboxes 获取沙箱列表
 	ListSandboxes(ctx context.Context, in *ListRequest, opts ...grpc.CallOption) (*ListResponse, error)
@@ -130,11 +131,12 @@ func (c *fastPathServiceClient) IssueRouteCredential(ctx context.Context, in *Is
 // All implementations must embed UnimplementedFastPathServiceServer
 // for forward compatibility.
 type FastPathServiceServer interface {
-	// CreateSandbox 极速创建沙箱，绕过 K8s 控制面延迟
+	// CreateSandbox performs the imperative low-latency create path. It reserves
+	// Fastlet capacity, commits a Sandbox CRD, and then ensures the runtime.
 	CreateSandbox(context.Context, *CreateRequest) (*CreateResponse, error)
-	// DeleteSandbox 极速删除沙箱
+	// DeleteSandbox commits declarative deletion; Controller reconciliation owns cleanup.
 	DeleteSandbox(context.Context, *DeleteRequest) (*DeleteResponse, error)
-	// UpdateSandbox 更新沙箱配置（过期时间、重启、策略等）
+	// UpdateSandbox commits declarative expiry, reset, or failure-policy intent.
 	UpdateSandbox(context.Context, *UpdateRequest) (*UpdateResponse, error)
 	// ListSandboxes 获取沙箱列表
 	ListSandboxes(context.Context, *ListRequest) (*ListResponse, error)
