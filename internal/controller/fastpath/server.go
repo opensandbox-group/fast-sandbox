@@ -159,6 +159,12 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRe
 	if request == nil || request.Image == "" || request.PoolRef == "" {
 		return nil, status.Error(codes.InvalidArgument, "image and pool_ref are required")
 	}
+	if len(request.ExposedPorts) > 0 {
+		deprecatedCreateFieldTotal.WithLabelValues("exposed_ports").Inc()
+	}
+	if request.ConsistencyMode == fastpathv1.ConsistencyMode_STRONG {
+		deprecatedCreateFieldTotal.WithLabelValues("consistency_mode_strong").Inc()
+	}
 	if request.Namespace == "" {
 		request.Namespace = "default"
 	}
@@ -354,7 +360,7 @@ func sandboxFromCreateRequest(request *fastpathv1.CreateRequest, createSpecHash 
 			},
 		},
 		Spec: apiv1alpha1.SandboxSpec{
-			Image: request.Image, PoolRef: request.PoolRef, ExposedPorts: request.ExposedPorts,
+			Image: request.Image, PoolRef: request.PoolRef,
 			Command: request.Command, Args: request.Args, Envs: environment, WorkingDir: request.WorkingDir,
 		},
 	}

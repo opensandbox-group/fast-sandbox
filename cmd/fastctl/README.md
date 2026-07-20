@@ -1,13 +1,13 @@
 # fastctl (Fast Sandbox Control)
 
-`fastctl` is the official command-line interface for Fast Sandbox. It provides a developer-friendly way to manage sandboxes with millisecond-level latency, bypassing the traditional Kubernetes control plane overhead for rapid iterations.
+`fastctl` is the official command-line interface for Fast Sandbox. Create uses the multi-active FastPath, which reserves Fastlet capacity, commits the Sandbox CRD, and returns only after the data plane is ready.
 
 ## 🚀 Features
 
-*   **Fast-Path Execution**: Create sandboxes in <50ms using the gRPC Fast-Path API.
+*   **Fast-Path Execution**: Low-latency create through the gRPC FastPath API with durable CRD identity.
 *   **Interactive Mode**: Guided configuration for complex sandbox setups without memorizing flags.
 *   **Configuration Management**: Hierarchical config loading (Flags > Local File > Global File).
-*   **Production Ready**: Built-in support for consistency modes (Fast/Strong) and resource management.
+*   **Idempotent Create**: Stable `request_id` prevents duplicate runtimes across retries.
 
 ## 📦 Installation
 
@@ -63,8 +63,9 @@ fastctl run my-sandbox -f sandbox-config.yaml
 **Key Flags:**
 *   `--image`: Container image (required in non-interactive mode).
 *   `--pool`: Target SandboxPool name (default: `default-pool`).
-*   `--mode`: Consistency mode (`fast` for speed, `strong` for consistency).
-*   `--ports`: Exposed ports (e.g., `--ports=8080,9090`).
+*   `--request-id`: Optional idempotency key; generated automatically when omitted.
+
+`--mode` and `--ports` remain accepted only as deprecated, ignored compatibility flags. Ports are selected when resolving an injected Infra Component's data-plane route.
 
 ### 2. List Sandboxes (`list`)
 
@@ -95,9 +96,9 @@ fastctl rm my-sandbox
 
 ## 🛠 Advanced Topics
 
-### Consistency Modes
-*   **Fast (Default)**: Fastlet creates container first, then asynchronously updates K8s. Lowest latency (<50ms). Best for ephemeral tasks.
-*   **Strong**: Writes to K8s ETCD first, then creates container. Guarantees consistency but higher latency (~200ms).
+### Create Semantics
+
+Create always follows reservation -> CRD commit -> assignment CAS -> Fastlet Ensure. Delete, reset, expiry, and failure-policy changes are declarative CRD updates reconciled by the Controller.
 
 ### Interactive Template
 When running interactively, you can define advanced fields like environment variables:
@@ -106,9 +107,17 @@ When running interactively, you can define advanced fields like environment vari
 # fastctl sandbox configuration
 image: python:3.9
 pool_ref: gpu-pool
-consistency_mode: fast
 command: ["python", "app.py"]
 envs:
   API_KEY: secret-value
   DEBUG: "true"
 ```
+
+### Migrate SandboxPool Manifests
+
+```bash
+fastctl migrate pool --file old-pool.yaml --output new-pool.yaml
+fastctl migrate pool --file new-pool.yaml --check
+```
+
+See [the migration guide](../../docs/migration-guide.md) for runtime/resource mapping and compatibility boundaries.

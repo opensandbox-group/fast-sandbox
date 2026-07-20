@@ -62,8 +62,7 @@ Priority: Flags > Config File > Interactive Input
 		klog.V(4).InfoS("CLI run command started", "name", name)
 
 		config := SandboxConfig{
-			PoolRef:         "default-pool",
-			ConsistencyMode: "fast",
+			PoolRef: "default-pool",
 		}
 
 		if configFile != "" {
@@ -110,9 +109,11 @@ Priority: Flags > Config File > Interactive Input
 			defer conn.Close()
 		}
 
-		consistency := fastpathv1.ConsistencyMode_FAST
-		if config.ConsistencyMode == "strong" {
-			consistency = fastpathv1.ConsistencyMode_STRONG
+		if config.ConsistencyMode != "" && !cmd.Flags().Changed("mode") {
+			fmt.Fprintln(cmd.ErrOrStderr(), "Warning: consistency_mode/--mode is deprecated and ignored; Create always commits the CRD before runtime Ensure")
+		}
+		if len(config.ExposedPorts) > 0 && !cmd.Flags().Changed("ports") {
+			fmt.Fprintln(cmd.ErrOrStderr(), "Warning: exposed_ports/--ports is deprecated and ignored; target ports are selected when resolving the data-plane route")
 		}
 
 		start := time.Now()
@@ -125,17 +126,15 @@ Priority: Flags > Config File > Interactive Input
 			}
 		}
 		req := &fastpathv1.CreateRequest{
-			Name:            name,
-			Image:           config.Image,
-			PoolRef:         config.PoolRef,
-			ExposedPorts:    config.ExposedPorts,
-			Namespace:       viper.GetString("namespace"),
-			ConsistencyMode: consistency,
-			Command:         config.Command,
-			Args:            config.Args,
-			Envs:            config.Envs,
-			WorkingDir:      config.WorkingDir,
-			RequestId:       createRequestID,
+			Name:       name,
+			Image:      config.Image,
+			PoolRef:    config.PoolRef,
+			Namespace:  viper.GetString("namespace"),
+			Command:    config.Command,
+			Args:       config.Args,
+			Envs:       config.Envs,
+			WorkingDir: config.WorkingDir,
+			RequestId:  createRequestID,
 		}
 		klog.V(4).InfoS("Sending CreateSandbox request", "name", name, "image", config.Image, "pool", config.PoolRef, "namespace", req.Namespace)
 
@@ -149,8 +148,7 @@ Priority: Flags > Config File > Interactive Input
 		fmt.Printf("🎉 Sandbox created successfully in %v\n", time.Since(start))
 		fmt.Printf("Name:      %s\n", resp.SandboxName)
 		fmt.Printf("ID:        %s\n", resp.SandboxId)
-		fmt.Printf("Fastlet:     %s\n", resp.FastletPod)
-		fmt.Printf("Endpoints: %v\n", resp.Endpoints)
+		fmt.Printf("Fastlet:   %s\n", resp.FastletPod)
 	},
 }
 
@@ -160,8 +158,10 @@ func init() {
 	runCmd.Flags().StringVarP(&configFile, "file", "f", "", "Path to sandbox config file")
 	runCmd.Flags().StringVar(&image, "image", "", "Container image")
 	runCmd.Flags().StringVar(&pool, "pool", "default-pool", "Target SandboxPool")
-	runCmd.Flags().StringVar(&mode, "mode", "fast", "Consistency mode (fast/strong)")
-	runCmd.Flags().Int32SliceVar(&ports, "ports", []int32{}, "Exposed ports")
+	runCmd.Flags().StringVar(&mode, "mode", "", "Deprecated and ignored")
+	runCmd.Flags().Int32SliceVar(&ports, "ports", []int32{}, "Deprecated and ignored")
+	_ = runCmd.Flags().MarkDeprecated("mode", "Create always commits the CRD before runtime Ensure")
+	_ = runCmd.Flags().MarkDeprecated("ports", "ports are selected when resolving the Sandbox data-plane route")
 	runCmd.Flags().StringVar(&requestID, "request-id", "", "Idempotency key (generated automatically when omitted)")
 }
 
@@ -245,19 +245,12 @@ image: docker.io/library/alpine:latest
 # Target SandboxPool (Required)
 pool_ref: default-pool
 
-# Consistency mode: 'fast' (fastlet-first) or 'strong' (crd-first)
-consistency_mode: fast
-
 # Optional: Override entrypoint and arguments
 command: ["/bin/sleep", "3600"]
 args: []
 
 # Optional: Working directory
 # working_dir: /app
-
-# Optional: Expose ports
-# exposed_ports:
-#   - 8080
 
 # Optional: Environment variables
 # envs:

@@ -83,6 +83,9 @@ func TestRunCommand(t *testing.T) {
 	if capturedReq.RequestId == "" {
 		t.Error("expected an automatically generated request_id")
 	}
+	if capturedReq.ConsistencyMode != fastpathv1.ConsistencyMode_FAST || len(capturedReq.ExposedPorts) != 0 {
+		t.Errorf("deprecated create fields must not be sent: mode=%s ports=%v", capturedReq.ConsistencyMode, capturedReq.ExposedPorts)
+	}
 	// ... other assert
 }
 
@@ -120,5 +123,8 @@ consistency_mode: fast
 	}
 	if capturedReq.PoolRef != "override-pool" {
 		t.Errorf("expected pool 'override-pool' (from flag), got '%s'", capturedReq.PoolRef)
+	}
+	if capturedReq.ConsistencyMode != fastpathv1.ConsistencyMode_FAST || len(capturedReq.ExposedPorts) != 0 {
+		t.Errorf("legacy config fields must be ignored: mode=%s ports=%v", capturedReq.ConsistencyMode, capturedReq.ExposedPorts)
 	}
 }

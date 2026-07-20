@@ -17,6 +17,7 @@ spec:
     bufferMax: 0
   maxSandboxesPerPod: 5
   runtime: container
+  infraProfile: minimal
   sandboxResources:
     cpu: 250m
     memory: 256Mi
@@ -44,6 +45,7 @@ spec:
     bufferMax: 0
   maxSandboxesPerPod: 5
   runtime: gvisor
+  infraProfile: minimal
   sandboxResources:
     cpu: 250m
     memory: 256Mi
@@ -69,6 +71,7 @@ spec:
     bufferMax: 0
   maxSandboxesPerPod: 3
   runtime: kata-qemu
+  infraProfile: minimal
   sandboxResources:
     cpu: 500m
     memory: 512Mi

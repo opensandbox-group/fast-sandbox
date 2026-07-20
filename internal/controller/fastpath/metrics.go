@@ -27,6 +27,10 @@ var (
 		Help:    "End-to-end CreateSandbox latency until the data plane is ready or the RPC terminates.",
 		Buckets: prometheus.ExponentialBuckets(.005, 2, 14),
 	}, []string{"result"})
+	deprecatedCreateFieldTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fast_sandbox_deprecated_create_field_total",
+		Help: "Create requests that still carry a detectable deprecated field.",
+	}, []string{"field"})
 )
 
 func grpcMetricResult(err error) string {

@@ -309,3 +309,14 @@ func createRequest(requestID string) *fastpathv1.CreateRequest {
 		Envs: map[string]string{"A": "B"}, WorkingDir: "/workspace",
 	}
 }
+
+func TestSandboxFromCreateRequestDropsDeprecatedPortAndConsistencyFields(t *testing.T) {
+	request := createRequest("request-deprecated-fields")
+	request.ExposedPorts = []int32{80, 8080}
+	request.ConsistencyMode = fastpathv1.ConsistencyMode_STRONG
+
+	sandbox := sandboxFromCreateRequest(request, "create-hash")
+	require.Empty(t, sandbox.Spec.ExposedPorts)
+	require.Equal(t, request.Image, sandbox.Spec.Image)
+	require.Equal(t, request.PoolRef, sandbox.Spec.PoolRef)
+}

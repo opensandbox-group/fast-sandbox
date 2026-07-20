@@ -4,6 +4,7 @@ metadata:
   name: gvisor-pool
 spec:
   runtime: gvisor
+  infraProfile: minimal
   sandboxResources:
     cpu: 250m
     memory: 256Mi
