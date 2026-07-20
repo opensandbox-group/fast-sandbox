@@ -23,6 +23,7 @@ func TestProxyForwardsArbitraryPortAndStripsRouteAuthority(t *testing.T) {
 		require.Empty(t, request.Header.Get("Authorization"))
 		require.Empty(t, request.Header.Get(HeaderRouteGeneration))
 		require.Equal(t, "internal-secret", request.Header.Get("X-Upstream-Auth"))
+		require.Contains(t, request.Header.Get("traceparent"), "4bf92f3577b34da6a3ce929d0e0e4736")
 		writer.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(writer, "data: ready\n\n")
 	}))
@@ -59,6 +60,7 @@ func TestProxyForwardsArbitraryPortAndStripsRouteAuthority(t *testing.T) {
 	request, err := http.NewRequest(http.MethodPost, proxy.URL+RoutePath("uid-a", portNumber)+"/command/run?large=true", strings.NewReader("payload"))
 	require.NoError(t, err)
 	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
 	for name, values := range RouteHeaders(route) {
 		request.Header[name] = values
 	}

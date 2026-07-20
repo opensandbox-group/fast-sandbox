@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"fast-sandbox/internal/observability"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -28,6 +30,7 @@ func TestFastletClientV2ReservationAndHeartbeat(t *testing.T) {
 		switch r.URL.Path {
 		case "/api/v2/fastlet/reservations":
 			require.Equal(t, http.MethodPost, r.Method)
+			require.Contains(t, r.Header.Get("traceparent"), "4bf92f3577b34da6a3ce929d0e0e4736")
 			var request ReserveSandboxRequest
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
 			require.Equal(t, "request-a", request.RequestID)
@@ -43,7 +46,10 @@ func TestFastletClientV2ReservationAndHeartbeat(t *testing.T) {
 	})
 	client, endpoint, closeServer := v2TestClient(t, handler)
 	defer closeServer()
-	reserved, err := client.ReserveSandbox(context.Background(), endpoint, &ReserveSandboxRequest{
+	traceHeaders := make(http.Header)
+	traceHeaders.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+	traceContext := observability.ExtractHTTP(context.Background(), traceHeaders)
+	reserved, err := client.ReserveSandbox(traceContext, endpoint, &ReserveSandboxRequest{
 		RequestID: "request-a", CreateSpecHash: "spec-a", ClaimNamespace: "default", ClaimName: "sandbox-a", FastletPodUID: "pod-a",
 	})
 	require.NoError(t, err)

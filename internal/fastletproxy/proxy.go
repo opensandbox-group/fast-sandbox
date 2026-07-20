@@ -12,7 +12,9 @@ import (
 	"time"
 
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
+	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/routeauth"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 const (
@@ -31,9 +33,17 @@ type Proxy struct {
 }
 
 func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	request, span := observability.StartHTTPServer(request, "fastlet-proxy")
 	started := time.Now()
 	metricAccess, metricResult := "", "success"
-	defer func() { observeFastletProxy(metricAccess, metricResult, started) }()
+	defer func() {
+		span.SetAttributes(
+			attribute.String("fast_sandbox.access_kind", metricAccess),
+			attribute.String("fast_sandbox.proxy_result", metricResult),
+		)
+		observability.End(span, nil)
+		observeFastletProxy(metricAccess, metricResult, started)
+	}()
 	sandboxUID, targetPort, suffix, err := ParseRoutePath(request.URL.Path)
 	if err != nil {
 		metricResult = "invalid_route"
@@ -55,6 +65,10 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		http.Error(writer, err.Error(), status)
 		return
 	}
+	request = request.WithContext(observability.WithIdentity(request.Context(), observability.Identity{
+		Namespace: route.Namespace, SandboxUID: route.SandboxUID, FastletPodUID: route.FastletPodUID,
+		AssignmentAttempt: route.AssignmentAttempt, RouteGeneration: route.RouteGeneration, TargetPort: targetPort,
+	}))
 	if err := validateFenceHeaders(request.Header, route); err != nil {
 		metricResult = "stale_fence"
 		http.Error(writer, err.Error(), http.StatusConflict)
@@ -122,6 +136,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			for name, value := range route.UpstreamHeadersByPort[targetPort] {
 				proxyRequest.Out.Header.Set(name, value)
 			}
+			observability.InjectHTTP(proxyRequest.Out.Context(), proxyRequest.Out.Header)
 		},
 		ErrorHandler: func(response http.ResponseWriter, _ *http.Request, proxyErr error) {
 			metricResult = "upstream_error"

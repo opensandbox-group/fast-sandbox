@@ -16,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"fast-sandbox/internal/observability"
 )
 
 const ExecdPort uint32 = 44772
@@ -380,7 +382,9 @@ func (a *ExecdAdapter) Delete(ctx context.Context, sandbox SandboxRef, path stri
 	return requireSuccess(response)
 }
 
-func (a *ExecdAdapter) do(ctx context.Context, sandbox SandboxRef, method, path string, query url.Values, body io.Reader, contentType string) (*http.Response, error) {
+func (a *ExecdAdapter) do(ctx context.Context, sandbox SandboxRef, method, path string, query url.Values, body io.Reader, contentType string) (_ *http.Response, resultErr error) {
+	ctx, span := observability.StartClient(ctx, "sdk.execd.request_headers")
+	defer func() { observability.End(span, resultErr) }()
 	if a == nil || a.Resolver == nil {
 		return nil, errors.New("Execd adapter route resolver is not configured")
 	}
@@ -392,6 +396,10 @@ func (a *ExecdAdapter) do(ctx context.Context, sandbox SandboxRef, method, path 
 	if err != nil {
 		return nil, err
 	}
+	ctx = observability.WithIdentity(ctx, observability.Identity{
+		Namespace: sandbox.Namespace, SandboxName: sandbox.Name, SandboxUID: route.SandboxUID,
+		RouteGeneration: route.RouteGeneration, TargetPort: route.TargetPort,
+	})
 	requestURL, err := route.RequestURL(path, query)
 	if err != nil {
 		return nil, err
@@ -405,6 +413,7 @@ func (a *ExecdAdapter) do(ctx context.Context, sandbox SandboxRef, method, path 
 	}
 	request.Header.Set("Accept", "application/json, text/event-stream")
 	route.ApplyHeaders(request)
+	observability.InjectHTTP(ctx, request.Header)
 	client := a.HTTPClient
 	if client == nil {
 		client = http.DefaultClient

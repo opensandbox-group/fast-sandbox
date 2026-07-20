@@ -11,19 +11,6 @@ const (
 	UserProcessStartUnknown               UserProcessStartSource = "unknown"
 )
 
-// ConsistencyMode defines the consistency mode for sandbox creation.
-type ConsistencyMode string
-
-const (
-	// ConsistencyModeFast creates sandbox on fastlet first, then writes CRD asynchronously.
-	// Lowest latency, but CRD write failure may cause running sandbox to be cleaned up.
-	ConsistencyModeFast ConsistencyMode = "fast"
-
-	// ConsistencyModeStrong writes CRD first, then creates sandbox on fastlet.
-	// Higher latency, but guarantees strong consistency.
-	ConsistencyModeStrong ConsistencyMode = "strong"
-)
-
 // SandboxSpec describes the desired state of a sandbox on a fastlet.
 type SandboxSpec struct {
 	SandboxID           string            `json:"sandboxId"`

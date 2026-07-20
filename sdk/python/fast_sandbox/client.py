@@ -11,6 +11,7 @@ from .execd import ExecdAdapter
 from .proto import fastpath_pb2, fastpath_pb2_grpc
 from .route import EndpointResolver
 from .sandbox import Sandbox
+from .telemetry import grpc_metadata
 
 
 class Client:
@@ -59,7 +60,8 @@ class Client:
                 envs=dict(envs or {}), working_dir=working_dir,
                 namespace=selected_namespace,
                 request_id=request_id or str(uuid.uuid4()),
-            )
+            ),
+            metadata=grpc_metadata(),
         )
         return Sandbox(
             client=self, name=response.sandbox_name or name,
@@ -70,7 +72,8 @@ class Client:
     def get(self, name: str, namespace: Optional[str] = None) -> Sandbox:
         selected_namespace = namespace or self.namespace
         response = self._stub.GetSandbox(
-            fastpath_pb2.GetRequest(sandbox_name=name, namespace=selected_namespace)
+            fastpath_pb2.GetRequest(sandbox_name=name, namespace=selected_namespace),
+            metadata=grpc_metadata(),
         )
         return Sandbox(
             client=self, name=response.sandbox_name or name,
@@ -79,7 +82,8 @@ class Client:
 
     def delete(self, name: str, namespace: Optional[str] = None) -> bool:
         response = self._stub.DeleteSandbox(
-            fastpath_pb2.DeleteRequest(sandbox_name=name, namespace=namespace or self.namespace)
+            fastpath_pb2.DeleteRequest(sandbox_name=name, namespace=namespace or self.namespace),
+            metadata=grpc_metadata(),
         )
         return response.success
 

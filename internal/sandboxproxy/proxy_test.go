@@ -42,6 +42,7 @@ func (r *fakeResolver) ResolveFresh(context.Context, string) (Route, error) {
 func TestSandboxProxyFallsBackOnStaleWatchAndForwardsToAssignedFastlet(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		require.Equal(t, "/health", request.URL.Path)
+		require.Contains(t, request.Header.Get("traceparent"), "4bf92f3577b34da6a3ce929d0e0e4736")
 		_, _ = io.WriteString(writer, "ready")
 	}))
 	defer backend.Close()
@@ -89,6 +90,7 @@ func TestSandboxProxyFallsBackOnStaleWatchAndForwardsToAssignedFastlet(t *testin
 	request, err := http.NewRequest(http.MethodGet, server.URL+fastletproxy.RoutePath("uid-a", uint32(backendPort))+"/health", nil)
 	require.NoError(t, err)
 	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
 	request.Header.Set(fastletproxy.HeaderFastletPodUID, "attacker-value")
 	response, err := http.DefaultClient.Do(request)
 	require.NoError(t, err)

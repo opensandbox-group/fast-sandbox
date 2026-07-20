@@ -5,6 +5,7 @@ from typing import Mapping
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 from .proto import fastpath_pb2
+from .telemetry import grpc_metadata
 
 
 @dataclass(frozen=True)
@@ -37,7 +38,8 @@ class EndpointResolver:
             raise ValueError("target_port must be between 1 and 65535")
         selected_namespace = namespace or self._namespace
         info = self._stub.GetSandbox(
-            fastpath_pb2.GetRequest(sandbox_name=sandbox_name, namespace=selected_namespace)
+            fastpath_pb2.GetRequest(sandbox_name=sandbox_name, namespace=selected_namespace),
+            metadata=grpc_metadata(),
         )
         if not info.sandbox_id:
             raise RuntimeError(f"Sandbox {selected_namespace}/{sandbox_name} has no CRD UID")
@@ -46,7 +48,8 @@ class EndpointResolver:
                 sandbox_uid=info.sandbox_id,
                 target_port=target_port,
                 protocol="http",
-            )
+            ),
+            metadata=grpc_metadata(),
         )
         if response.sandbox_uid != info.sandbox_id or response.target_port != target_port:
             raise RuntimeError("FastPath returned a route for a different Sandbox or target port")

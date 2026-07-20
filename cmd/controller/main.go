@@ -21,6 +21,7 @@ import (
 	"fast-sandbox/internal/controller/fastpath"
 	"fast-sandbox/internal/controller/sandboxorchestrator"
 	"fast-sandbox/internal/infracatalog"
+	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/routeauth"
 	"fast-sandbox/internal/runtimecatalog"
 
@@ -85,6 +86,12 @@ func main() {
 		klog.ErrorS(err, "Invalid control-plane role")
 		os.Exit(1)
 	}
+	traceShutdown, err := observability.Configure(context.Background(), "fast-sandbox-"+string(role))
+	if err != nil {
+		klog.ErrorS(err, "Configure OpenTelemetry")
+		os.Exit(1)
+	}
+	defer shutdownTracing(traceShutdown)
 	if heartbeatInterval <= 0 || heartbeatTimeout <= 0 || heartbeatConcurrency <= 0 || fastletDrainTimeout <= 0 {
 		klog.ErrorS(nil, "Heartbeat and drain timing values must be positive")
 		os.Exit(1)
@@ -202,7 +209,7 @@ func main() {
 			klog.ErrorS(err, "Listen for FastPath", "address", fastPathAddress)
 			os.Exit(1)
 		}
-		grpcServer := grpc.NewServer()
+		grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(observability.UnaryServerInterceptor("fastpath")))
 		fastpathv1.RegisterFastPathServiceServer(grpcServer, &fastpath.Server{
 			K8sClient: durableClient, RouteCache: manager.GetClient(), Orchestrator: orchestrator,
 			CredentialIssuer: credentialIssuer, SandboxProxyBaseURL: sandboxProxyBaseURL,
@@ -234,4 +241,12 @@ func envOrDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func shutdownTracing(shutdown observability.Shutdown) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := shutdown(ctx); err != nil {
+		klog.ErrorS(err, "Flush OpenTelemetry traces")
+	}
 }

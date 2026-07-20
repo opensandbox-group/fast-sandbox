@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest import mock
 from urllib.parse import parse_qs
 
 import httpx
 
 from fast_sandbox import Client
+from fast_sandbox import telemetry
 from fast_sandbox.proto import fastpath_pb2
 
 
@@ -15,20 +17,25 @@ class FakeFastPathStub:
     def __init__(self):
         self.create_request = None
         self.resolve_requests = []
+        self.metadata = []
 
-    def CreateSandbox(self, request):
+    def CreateSandbox(self, request, metadata=()):
+        self.metadata.append(tuple(metadata))
         self.create_request = request
         return fastpath_pb2.CreateResponse(
             sandbox_id="uid-a", sandbox_uid="uid-a", sandbox_name=request.name
         )
 
-    def GetSandbox(self, request):
+    def GetSandbox(self, request, metadata=()):
+        self.metadata.append(tuple(metadata))
         return fastpath_pb2.SandboxInfo(sandbox_id="uid-a", sandbox_name=request.sandbox_name)
 
-    def DeleteSandbox(self, _request):
+    def DeleteSandbox(self, _request, metadata=()):
+        self.metadata.append(tuple(metadata))
         return fastpath_pb2.DeleteResponse(success=True)
 
-    def ResolveEndpoint(self, request):
+    def ResolveEndpoint(self, request, metadata=()):
+        self.metadata.append(tuple(metadata))
         self.resolve_requests.append(request)
         return fastpath_pb2.ResolveEndpointResponse(
             sandbox_uid=request.sandbox_uid,
@@ -109,6 +116,20 @@ class SDKTest(unittest.TestCase):
             endpoint.base_url,
         )
         self.assertEqual("Bearer route-token", endpoint.headers["Authorization"])
+
+    def test_optional_opentelemetry_context_reaches_grpc_and_http(self):
+        def inject(carrier):
+            carrier["traceparent"] = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+
+        with mock.patch.object(telemetry, "_otel_inject", inject):
+            self.client.create("sandbox-a", "alpine")
+            self.client.get("sandbox-a").files.stat("/tmp/value")
+
+        self.assertTrue(all(("traceparent", mock.ANY) in metadata for metadata in self.stub.metadata))
+        self.assertEqual(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            self.requests[-1].headers["traceparent"],
+        )
 
 
 if __name__ == "__main__":

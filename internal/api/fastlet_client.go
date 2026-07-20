@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"time"
 
+	"fast-sandbox/internal/observability"
+
 	"k8s.io/klog/v2"
 )
 
@@ -190,22 +192,40 @@ func (c *FastletClient) GetFastletStatus(ctx context.Context, fastletIP string) 
 }
 
 func (c *FastletClient) ReserveSandbox(ctx context.Context, fastletIP string, req *ReserveSandboxRequest) (*ReserveSandboxResponse, error) {
+	if req != nil {
+		ctx = observability.WithIdentity(ctx, observability.Identity{
+			RequestID: req.RequestID, Namespace: req.ClaimNamespace, SandboxName: req.ClaimName, FastletPodUID: req.FastletPodUID,
+		})
+	}
 	return postFastletJSON[ReserveSandboxRequest, ReserveSandboxResponse](c, ctx, fastletIP, "/api/v2/fastlet/reservations", req)
 }
 
 func (c *FastletClient) CancelReservation(ctx context.Context, fastletIP string, req *CancelReservationRequest) (*CancelReservationResponse, error) {
+	if req != nil {
+		ctx = observability.WithIdentity(ctx, observability.Identity{RequestID: req.RequestID})
+	}
 	return postFastletJSON[CancelReservationRequest, CancelReservationResponse](c, ctx, fastletIP, "/api/v2/fastlet/reservations/cancel", req)
 }
 
 func (c *FastletClient) EnsureSandbox(ctx context.Context, fastletIP string, req *EnsureSandboxRequest) (*EnsureSandboxResponse, error) {
+	if req != nil {
+		ctx = withFastletIdentity(ctx, req.Identity)
+		ctx = observability.WithIdentity(ctx, observability.Identity{Namespace: req.Sandbox.ClaimNamespace, SandboxName: req.Sandbox.ClaimName})
+	}
 	return postFastletJSON[EnsureSandboxRequest, EnsureSandboxResponse](c, ctx, fastletIP, "/api/v2/fastlet/ensure", req)
 }
 
 func (c *FastletClient) InspectSandbox(ctx context.Context, fastletIP string, req *InspectSandboxRequest) (*InspectSandboxResponse, error) {
+	if req != nil {
+		ctx = withFastletIdentity(ctx, req.Identity)
+	}
 	return postFastletJSON[InspectSandboxRequest, InspectSandboxResponse](c, ctx, fastletIP, "/api/v2/fastlet/inspect", req)
 }
 
 func (c *FastletClient) DeleteSandboxV2(ctx context.Context, fastletIP string, req *DeleteSandboxV2Request) (*DeleteSandboxV2Response, error) {
+	if req != nil {
+		ctx = withFastletIdentity(ctx, req.Identity)
+	}
 	return postFastletJSON[DeleteSandboxV2Request, DeleteSandboxV2Response](c, ctx, fastletIP, "/api/v2/fastlet/delete", req)
 }
 
@@ -229,7 +249,9 @@ func (c *FastletClient) SetDraining(ctx context.Context, fastletIP string, req *
 	return postFastletJSON[SetDrainingRequest, SetDrainingResponse](c, ctx, fastletIP, "/api/v2/fastlet/draining", req)
 }
 
-func postFastletJSON[Request any, Response any](c *FastletClient, ctx context.Context, fastletIP, path string, request *Request) (*Response, error) {
+func postFastletJSON[Request any, Response any](c *FastletClient, ctx context.Context, fastletIP, path string, request *Request) (_ *Response, resultErr error) {
+	ctx, span := observability.StartClient(ctx, "fastlet.client "+path)
+	defer func() { observability.End(span, resultErr) }()
 	body, err := json.Marshal(request)
 	if err != nil {
 		return nil, err
@@ -241,17 +263,28 @@ func postFastletJSON[Request any, Response any](c *FastletClient, ctx context.Co
 		return nil, err
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
+	observability.InjectHTTP(requestContext, httpRequest.Header)
 	return doFastletJSON[Response](c, httpRequest)
 }
 
-func getFastletJSON[Response any](c *FastletClient, ctx context.Context, fastletIP, path string) (*Response, error) {
+func getFastletJSON[Response any](c *FastletClient, ctx context.Context, fastletIP, path string) (_ *Response, resultErr error) {
+	ctx, span := observability.StartClient(ctx, "fastlet.client "+path)
+	defer func() { observability.End(span, resultErr) }()
 	requestContext, cancel := c.requestContext(ctx)
 	defer cancel()
 	httpRequest, err := http.NewRequestWithContext(requestContext, http.MethodGet, c.endpoint(fastletIP, path), nil)
 	if err != nil {
 		return nil, err
 	}
+	observability.InjectHTTP(requestContext, httpRequest.Header)
 	return doFastletJSON[Response](c, httpRequest)
+}
+
+func withFastletIdentity(ctx context.Context, identity SandboxIdentity) context.Context {
+	return observability.WithIdentity(ctx, observability.Identity{
+		RequestID: identity.RequestID, SandboxUID: identity.SandboxUID, FastletPodUID: identity.FastletPodUID,
+		InstanceGeneration: identity.InstanceGeneration, AssignmentAttempt: identity.AssignmentAttempt, RouteGeneration: identity.RouteGeneration,
+	})
 }
 
 func doFastletJSON[Response any](c *FastletClient, request *http.Request) (*Response, error) {

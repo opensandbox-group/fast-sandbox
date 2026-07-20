@@ -102,3 +102,4 @@ Every remote or release validation report should include:
 - resources intentionally created or deleted during the run.
 
 Performance-specific reporting requirements are in [PERFORMANCE.md](PERFORMANCE.md).
+Trace propagation and OTLP validation are documented in [observability.md](observability.md).

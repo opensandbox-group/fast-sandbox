@@ -10,6 +10,8 @@ from typing import BinaryIO, Callable, Iterable, Mapping
 
 import httpx
 
+from .telemetry import inject_headers
+
 from .route import EndpointResolver
 
 EXECD_PORT = 44772
@@ -84,7 +86,7 @@ class ExecdAdapter:
         execution = Execution()
         event_count = 0
         with self._http.stream(
-            "POST", route.url("/command"), headers=route.headers, json=body
+            "POST", route.url("/command"), headers=inject_headers(route.headers), json=body
         ) as response:
             _raise_for_status(response)
             data_lines: list[str] = []
@@ -114,7 +116,7 @@ class ExecdAdapter:
 
     def stat(self, sandbox_name: str, path: str, namespace: str = "") -> FileInfo:
         route = self._resolver.resolve(sandbox_name, self._port, namespace)
-        response = self._http.get(route.url("/files/info", {"path": path}), headers=route.headers)
+        response = self._http.get(route.url("/files/info", {"path": path}), headers=inject_headers(route.headers))
         _raise_for_status(response)
         raw = response.json()
         if path not in raw:
@@ -123,7 +125,7 @@ class ExecdAdapter:
 
     def list(self, sandbox_name: str, path: str, namespace: str = "") -> list[FileInfo]:
         route = self._resolver.resolve(sandbox_name, self._port, namespace)
-        response = self._http.get(route.url("/directories/list", {"path": path}), headers=route.headers)
+        response = self._http.get(route.url("/directories/list", {"path": path}), headers=inject_headers(route.headers))
         _raise_for_status(response)
         return [_file_info(value) for value in response.json()]
 
@@ -138,7 +140,7 @@ class ExecdAdapter:
         route = self._resolver.resolve(sandbox_name, self._port, namespace)
         written = 0
         with self._http.stream(
-            "GET", route.url("/files/download", {"path": path}), headers=route.headers
+            "GET", route.url("/files/download", {"path": path}), headers=inject_headers(route.headers)
         ) as response:
             _raise_for_status(response)
             for chunk in response.iter_bytes():
@@ -160,13 +162,13 @@ class ExecdAdapter:
             ("metadata", ("metadata", metadata, "application/json")),
             ("file", (os.path.basename(path), source, "application/octet-stream")),
         ]
-        response = self._http.post(route.url("/files/upload"), headers=route.headers, files=files)
+        response = self._http.post(route.url("/files/upload"), headers=inject_headers(route.headers), files=files)
         _raise_for_status(response)
 
     def mkdir(self, sandbox_name: str, path: str, namespace: str = "", mode: int = 0o755) -> None:
         route = self._resolver.resolve(sandbox_name, self._port, namespace)
         response = self._http.post(
-            route.url("/directories"), headers=route.headers,
+            route.url("/directories"), headers=inject_headers(route.headers),
             json={path: {"mode": _octal_digits(mode)}},
         )
         _raise_for_status(response)
@@ -174,7 +176,7 @@ class ExecdAdapter:
     def delete(self, sandbox_name: str, path: str, namespace: str = "", directory: bool = False) -> None:
         route = self._resolver.resolve(sandbox_name, self._port, namespace)
         endpoint = "/directories" if directory else "/files"
-        response = self._http.delete(route.url(endpoint, {"path": path}), headers=route.headers)
+        response = self._http.delete(route.url(endpoint, {"path": path}), headers=inject_headers(route.headers))
         _raise_for_status(response)
 
 

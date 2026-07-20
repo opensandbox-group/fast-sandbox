@@ -87,8 +87,9 @@ func (r *ContainerdRuntime) Initialize(ctx context.Context, socketPath string) e
 
 func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.SandboxSpec) (*SandboxMetadata, error) {
 	totalStart := time.Now()
+	logger := klog.FromContext(ctx).WithValues("sandbox_id", config.SandboxID)
 
-	klog.InfoS("Creating sandbox", "sandbox", config.SandboxID, "image", config.Image, "runtime", r.config.Handler, "netns", config.NetworkNamespacePath)
+	logger.Info("Creating sandbox", "image", config.Image, "runtime", r.config.Handler, "netns", config.NetworkNamespacePath)
 	ctx, cancel := context.WithTimeout(ctx, defaultOperationTimeout)
 	defer cancel()
 	ctx = namespaces.WithNamespace(ctx, "k8s.io")
@@ -97,7 +98,7 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 	pullStart := time.Now()
 	image, err := r.prepareImage(ctx, config.Image)
 	if err != nil {
-		klog.ErrorS(err, "Failed to prepare image", "sandbox", config.SandboxID)
+		logger.Error(err, "Failed to prepare image")
 		return nil, err
 	}
 	pullDuration := time.Since(pullStart)
@@ -119,7 +120,7 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 
 	// 2. Create container
 	createStart := time.Now()
-	klog.InfoS("Creating containerd container object", "sandbox", containerID)
+	logger.Info("Creating containerd container object")
 
 	container, err := r.client.NewContainer(
 		ctx,
@@ -131,7 +132,7 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 		containerd.WithContainerLabels(labels),
 	)
 	if err != nil {
-		klog.ErrorS(err, "Failed to create container object", "sandbox", containerID)
+		logger.Error(err, "Failed to create container object")
 		return nil, fmt.Errorf("failed to create container: %w", err)
 	}
 	createDuration := time.Since(createStart)
@@ -149,7 +150,7 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 
 	// 3. Start container
 	startStart := time.Now()
-	klog.InfoS("Creating containerd task", "sandbox", containerID)
+	logger.Info("Creating containerd task")
 
 	// Build CIO options based on runtime configuration
 	var cioOpts []cio.Opt
@@ -165,15 +166,15 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 
 	task, err := container.NewTask(ctx, cio.NewCreator(cioOpts...), taskOpts...)
 	if err != nil {
-		klog.ErrorS(err, "Failed to create containerd task", "sandbox", containerID, "logPath", logPath)
+		logger.Error(err, "Failed to create containerd task", "logPath", logPath)
 		logFile.Close()
 		_ = container.Delete(ctx, containerd.WithSnapshotCleanup)
 		return nil, fmt.Errorf("failed to create task: %w", err)
 	}
 
-	klog.InfoS("Starting containerd task", "sandbox", containerID, "pid", task.Pid())
+	logger.Info("Starting containerd task", "pid", task.Pid())
 	if err = task.Start(ctx); err != nil {
-		klog.ErrorS(err, "Failed to start containerd task", "sandbox", containerID)
+		logger.Error(err, "Failed to start containerd task")
 		_, _ = task.Delete(ctx, containerd.WithProcessKill)
 		_ = container.Delete(ctx, containerd.WithSnapshotCleanup)
 		return nil, fmt.Errorf("failed to start task: %w", err)
@@ -183,8 +184,7 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 
 	totalDuration := time.Since(totalStart)
 
-	klog.InfoS("Runtime CreateSandbox timing",
-		"sandboxID", config.SandboxID,
+	logger.Info("Runtime CreateSandbox timing",
 		"total_ms", totalDuration.Milliseconds(),
 		"pull_ms", pullDuration.Milliseconds(),
 		"create_ms", createDuration.Milliseconds(),
@@ -204,7 +204,7 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 		metadata.InfraUpstreamHeadersByPort = upstreamHeadersByServicePort(infraInstance.Services, infraInstance.UpstreamHeaders)
 	}
 	created = true
-	klog.InfoS("Sandbox created successfully", "sandbox", containerID, "pid", task.Pid())
+	logger.Info("Sandbox created successfully", "pid", task.Pid())
 	return metadata, nil
 }
 

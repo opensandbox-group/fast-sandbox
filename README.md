@@ -143,7 +143,7 @@ fastctl migrate pool --file old-pool.yaml --check
 fastctl migrate pool --file old-pool.yaml --output new-pool.yaml
 ```
 
-See [docs/migration-guide.md](docs/migration-guide.md).
+See [docs/migration-guide.md](docs/migration-guide.md). Metrics, trace propagation, lifecycle identity fields, and OTLP configuration are documented in [docs/observability.md](docs/observability.md).
 
 ## Validation
 

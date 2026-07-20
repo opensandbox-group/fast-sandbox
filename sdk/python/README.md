@@ -28,3 +28,11 @@ with Client(
 
 `Sandbox.exec` and `Sandbox.files` currently select the OpenSandbox Execd
 adapter. No Exec/File RPC is exposed by FastPath or Fastlet Control.
+
+When `opentelemetry-api` is installed (or the `telemetry` extra is selected),
+the SDK injects the current W3C Trace Context into FastPath gRPC metadata and
+Sandbox Proxy HTTP requests. The telemetry hook remains a no-op otherwise:
+
+```bash
+pip install 'fast-sandbox[telemetry]'
+```

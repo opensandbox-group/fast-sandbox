@@ -1,16 +1,19 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/fastlet/runtime"
+	"fast-sandbox/internal/observability"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/klog/v2"
@@ -57,7 +60,19 @@ func (s *FastletServer) Handler() http.Handler {
 	mux.HandleFunc("/api/v2/fastlet/draining", s.handleSetDraining)
 
 	klog.InfoS("Starting fastlet HTTP server", "addr", s.addr)
-	return mux
+	return traceFastletAPI(mux)
+}
+
+func traceFastletAPI(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if !strings.HasPrefix(request.URL.Path, "/api/") {
+			next.ServeHTTP(writer, request)
+			return
+		}
+		request, span := observability.StartHTTPServer(request, "fastlet")
+		defer observability.End(span, nil)
+		next.ServeHTTP(writer, request)
+	})
 }
 
 func (s *FastletServer) handleReady(w http.ResponseWriter, _ *http.Request) {
@@ -73,6 +88,9 @@ func (s *FastletServer) handleReserve(w http.ResponseWriter, r *http.Request) {
 	if !decodePost(w, r, &req) {
 		return
 	}
+	r = r.WithContext(observability.WithIdentity(r.Context(), observability.Identity{
+		RequestID: req.RequestID, Namespace: req.ClaimNamespace, SandboxName: req.ClaimName, FastletPodUID: req.FastletPodUID,
+	}))
 	response, err := s.sandboxManager.ReserveSandbox(&req)
 	writeResponse(w, response, err)
 }
@@ -82,6 +100,7 @@ func (s *FastletServer) handleCancelReservation(w http.ResponseWriter, r *http.R
 	if !decodePost(w, r, &req) {
 		return
 	}
+	r = r.WithContext(observability.WithIdentity(r.Context(), observability.Identity{RequestID: req.RequestID}))
 	response, err := s.sandboxManager.CancelReservation(&req)
 	writeResponse(w, response, err)
 }
@@ -91,6 +110,10 @@ func (s *FastletServer) handleEnsure(w http.ResponseWriter, r *http.Request) {
 	if !decodePost(w, r, &req) {
 		return
 	}
+	r = r.WithContext(withFastletRequestIdentity(r.Context(), req.Identity))
+	r = r.WithContext(observability.WithIdentity(r.Context(), observability.Identity{
+		Namespace: req.Sandbox.ClaimNamespace, SandboxName: req.Sandbox.ClaimName,
+	}))
 	response, err := s.sandboxManager.EnsureSandboxV2(r.Context(), &req)
 	writeResponse(w, response, err)
 }
@@ -100,6 +123,7 @@ func (s *FastletServer) handleInspect(w http.ResponseWriter, r *http.Request) {
 	if !decodePost(w, r, &req) {
 		return
 	}
+	r = r.WithContext(withFastletRequestIdentity(r.Context(), req.Identity))
 	response, err := s.sandboxManager.InspectSandboxV2(&req)
 	writeResponse(w, response, err)
 }
@@ -109,8 +133,16 @@ func (s *FastletServer) handleDeleteV2(w http.ResponseWriter, r *http.Request) {
 	if !decodePost(w, r, &req) {
 		return
 	}
+	r = r.WithContext(withFastletRequestIdentity(r.Context(), req.Identity))
 	response, err := s.sandboxManager.DeleteSandboxV2(&req)
 	writeResponse(w, response, err)
+}
+
+func withFastletRequestIdentity(ctx context.Context, identity api.SandboxIdentity) context.Context {
+	return observability.WithIdentity(ctx, observability.Identity{
+		RequestID: identity.RequestID, SandboxUID: identity.SandboxUID, FastletPodUID: identity.FastletPodUID,
+		InstanceGeneration: identity.InstanceGeneration, AssignmentAttempt: identity.AssignmentAttempt, RouteGeneration: identity.RouteGeneration,
+	})
 }
 
 func (s *FastletServer) handleSetDraining(w http.ResponseWriter, r *http.Request) {

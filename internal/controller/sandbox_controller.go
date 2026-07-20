@@ -9,13 +9,15 @@ import (
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
+	"fast-sandbox/internal/controller/common"
 	"fast-sandbox/internal/controller/fastletpool"
 	"fast-sandbox/internal/controller/sandboxorchestrator"
+	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/runtimecatalog"
 
 	corev1 "k8s.io/api/core/v1"
-	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -44,11 +46,15 @@ type SandboxReconciler struct {
 	Catalog       *runtimecatalog.Catalog
 }
 
-func (r *SandboxReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
+func (r *SandboxReconciler) Reconcile(ctx context.Context, request ctrl.Request) (_ ctrl.Result, resultErr error) {
+	ctx = observability.WithIdentity(ctx, observability.Identity{Namespace: request.Namespace, SandboxName: request.Name})
+	ctx, span := observability.Start(ctx, "controller.reconcile Sandbox")
+	defer func() { observability.End(span, resultErr) }()
 	var sandbox apiv1alpha1.Sandbox
 	if err := r.Get(ctx, request.NamespacedName, &sandbox); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	ctx = observability.WithIdentity(ctx, sandboxObservabilityIdentity(&sandbox))
 	orchestrator, err := r.orchestrator()
 	if err != nil {
 		return ctrl.Result{}, err
@@ -77,6 +83,18 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, request ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 	return r.reconcileEnsure(ctx, orchestrator, &sandbox)
+}
+
+func sandboxObservabilityIdentity(sandbox *apiv1alpha1.Sandbox) observability.Identity {
+	identity := observability.Identity{
+		RequestID: sandbox.Annotations[common.AnnotationRequestID], Namespace: sandbox.Namespace, SandboxName: sandbox.Name,
+		SandboxUID: string(sandbox.UID), InstanceGeneration: sandbox.Status.InstanceGeneration, RouteGeneration: sandbox.Status.RouteGeneration,
+	}
+	if sandbox.Status.Assignment != nil {
+		identity.FastletPodUID = sandbox.Status.Assignment.FastletPodUID
+		identity.AssignmentAttempt = sandbox.Status.Assignment.Attempt
+	}
+	return identity
 }
 
 func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *sandboxorchestrator.Orchestrator, sandbox *apiv1alpha1.Sandbox) (ctrl.Result, error) {

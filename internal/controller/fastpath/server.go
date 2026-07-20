@@ -15,6 +15,7 @@ import (
 	"fast-sandbox/internal/controller/fastletpool"
 	"fast-sandbox/internal/controller/sandboxorchestrator"
 	"fast-sandbox/internal/fastletproxy"
+	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/routeauth"
 	"fast-sandbox/internal/runtimecatalog"
 	"fast-sandbox/pkg/util/idgen"
@@ -38,12 +39,11 @@ type Server struct {
 	CredentialIssuer    *routeauth.Issuer
 	SandboxProxyBaseURL string
 
-	// Deprecated construction fields retained for source compatibility while
-	// deployments migrate to Orchestrator. Fast/Strong no longer select a path.
-	Registry               fastletpool.FastletRegistry
-	FastletClient          *api.FastletClient
-	DefaultConsistencyMode api.ConsistencyMode
-	Catalog                *runtimecatalog.Catalog
+	// Deprecated construction fields retained while in-tree callers migrate to
+	// the shared Orchestrator.
+	Registry      fastletpool.FastletRegistry
+	FastletClient *api.FastletClient
+	Catalog       *runtimecatalog.Catalog
 }
 
 var _ fastpathv1.FastPathServiceServer = &Server{}
@@ -52,6 +52,7 @@ func (s *Server) ResolveEndpoint(ctx context.Context, request *fastpathv1.Resolv
 	if request == nil || request.SandboxUid == "" || request.TargetPort == 0 || request.TargetPort > 65535 {
 		return nil, status.Error(codes.InvalidArgument, "sandbox_uid and target_port between 1 and 65535 are required")
 	}
+	ctx = observability.WithIdentity(ctx, observability.Identity{SandboxUID: request.SandboxUid, TargetPort: request.TargetPort})
 	protocol := strings.ToLower(request.Protocol)
 	if protocol == "" {
 		protocol = "http"
@@ -78,6 +79,7 @@ func (s *Server) IssueRouteCredential(ctx context.Context, request *fastpathv1.I
 	if request == nil || request.SandboxUid == "" || request.TargetPort == 0 || request.TargetPort > 65535 {
 		return nil, status.Error(codes.InvalidArgument, "sandbox_uid and target_port between 1 and 65535 are required")
 	}
+	ctx = observability.WithIdentity(ctx, observability.Identity{SandboxUID: request.SandboxUid, TargetPort: request.TargetPort})
 	credential, claims, err := s.issueRouteCredential(ctx, request.SandboxUid, request.TargetPort)
 	if err != nil {
 		return nil, err
@@ -99,6 +101,7 @@ func (s *Server) issueRouteCredential(ctx context.Context, sandboxUID string, ta
 		sandbox.Status.DataPlaneState != apiv1alpha1.ObservedStateReady {
 		return "", routeauth.Claims{}, status.Error(codes.Unavailable, "Sandbox data plane is not ready")
 	}
+	ctx = observability.WithIdentity(ctx, identityFromSandbox(sandbox, targetPort))
 	routeGeneration := sandbox.Status.RouteGeneration
 	if routeGeneration <= 0 {
 		routeGeneration = 1
@@ -178,6 +181,9 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRe
 	if err := ValidateRequestID(request.RequestId); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	ctx = observability.WithIdentity(ctx, observability.Identity{
+		RequestID: request.RequestId, Namespace: request.Namespace, SandboxName: request.Name,
+	})
 	createSpecHash, err := CreateSpecHash(request)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "hash create request: %v", err)
@@ -192,6 +198,7 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRe
 		return nil, err
 	}
 	if existing != nil {
+		ctx = observability.WithIdentity(ctx, identityFromSandbox(existing, 0))
 		if existing.Annotations[common.AnnotationCreateSpecHash] != createSpecHash {
 			return nil, status.Errorf(codes.AlreadyExists, "request_id %q is bound to a different create spec", request.RequestId)
 		}
@@ -207,6 +214,7 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRe
 	}
 
 	sandbox := sandboxFromCreateRequest(request, createSpecHash)
+	ctx = observability.WithIdentity(ctx, observability.Identity{SandboxName: sandbox.Name})
 	reservation, err := orchestrator.ReserveForCreate(ctx, sandbox, request.RequestId, createSpecHash)
 	if err != nil {
 		if errors.Is(err, sandboxorchestrator.ErrNoCandidate) {
@@ -220,8 +228,11 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRe
 	defer func() {
 		cancelContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
+		cancelContext = observability.WithIdentity(cancelContext, observability.Identity{
+			RequestID: request.RequestId, Namespace: request.Namespace, SandboxName: sandbox.Name, FastletPodUID: ownedReservation.Fastlet.PodUID,
+		})
 		if err := orchestrator.CancelReservation(cancelContext, ownedReservation); err != nil {
-			klog.ErrorS(err, "Cancel Fastlet reservation", "requestID", request.RequestId, "fastlet", ownedReservation.Fastlet.ID)
+			klog.FromContext(cancelContext).Error(err, "Cancel Fastlet reservation", "fastlet", ownedReservation.Fastlet.ID)
 		}
 	}()
 
@@ -243,6 +254,7 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRe
 	if err != nil {
 		return nil, err
 	}
+	ctx = observability.WithIdentity(ctx, identityFromSandbox(assigned, 0))
 	runtimeReservation := reservation
 	if !won && assigned.Status.Assignment.FastletPodUID != reservation.Fastlet.PodUID {
 		// Another active FastPath replica won the CRD CAS. Its durable assignment
@@ -417,6 +429,7 @@ func (s *Server) ListSandboxes(ctx context.Context, request *fastpathv1.ListRequ
 	if namespace == "" {
 		namespace = "default"
 	}
+	ctx = observability.WithIdentity(ctx, observability.Identity{Namespace: namespace})
 	var list apiv1alpha1.SandboxList
 	if err := s.K8sClient.List(ctx, &list, client.InNamespace(namespace)); err != nil {
 		return nil, err
@@ -433,6 +446,7 @@ func (s *Server) GetSandbox(ctx context.Context, request *fastpathv1.GetRequest)
 	if namespace == "" {
 		namespace = "default"
 	}
+	ctx = observability.WithIdentity(ctx, observability.Identity{Namespace: namespace, SandboxName: request.SandboxName})
 	var sandbox apiv1alpha1.Sandbox
 	if err := s.K8sClient.Get(ctx, client.ObjectKey{Name: request.SandboxName, Namespace: namespace}, &sandbox); err != nil {
 		return nil, err
@@ -452,12 +466,29 @@ func sandboxInfo(sandbox *apiv1alpha1.Sandbox) *fastpathv1.SandboxInfo {
 	}
 }
 
+func identityFromSandbox(sandbox *apiv1alpha1.Sandbox, targetPort uint32) observability.Identity {
+	if sandbox == nil {
+		return observability.Identity{TargetPort: targetPort}
+	}
+	identity := observability.Identity{
+		RequestID: sandbox.Annotations[common.AnnotationRequestID], Namespace: sandbox.Namespace, SandboxName: sandbox.Name,
+		SandboxUID: string(sandbox.UID), InstanceGeneration: sandbox.Status.InstanceGeneration,
+		RouteGeneration: sandbox.Status.RouteGeneration, TargetPort: targetPort,
+	}
+	if sandbox.Status.Assignment != nil {
+		identity.FastletPodUID = sandbox.Status.Assignment.FastletPodUID
+		identity.AssignmentAttempt = sandbox.Status.Assignment.Attempt
+	}
+	return identity
+}
+
 // Delete only submits desired state. Finalizer reconciliation owns runtime cleanup.
 func (s *Server) DeleteSandbox(ctx context.Context, request *fastpathv1.DeleteRequest) (*fastpathv1.DeleteResponse, error) {
 	namespace := request.Namespace
 	if namespace == "" {
 		namespace = "default"
 	}
+	ctx = observability.WithIdentity(ctx, observability.Identity{Namespace: namespace, SandboxName: request.SandboxName})
 	sandbox := &apiv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: request.SandboxName, Namespace: namespace}}
 	if err := s.K8sClient.Delete(ctx, sandbox); err != nil && !apierrors.IsNotFound(err) {
 		return &fastpathv1.DeleteResponse{Success: false}, err
@@ -471,6 +502,7 @@ func (s *Server) UpdateSandbox(ctx context.Context, request *fastpathv1.UpdateRe
 	if namespace == "" {
 		namespace = "default"
 	}
+	ctx = observability.WithIdentity(ctx, observability.Identity{Namespace: namespace, SandboxName: request.SandboxName})
 	key := client.ObjectKey{Name: request.SandboxName, Namespace: namespace}
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var sandbox apiv1alpha1.Sandbox

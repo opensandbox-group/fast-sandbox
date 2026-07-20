@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"fast-sandbox/internal/fastletproxy"
+	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/routeauth"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 const DefaultAddress = ":8080"
@@ -23,9 +25,14 @@ type Proxy struct {
 }
 
 func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	request, span := observability.StartHTTPServer(request, "sandbox-proxy")
 	started := time.Now()
 	metricResult := "success"
-	defer func() { observeSandboxProxy(metricResult, started) }()
+	defer func() {
+		span.SetAttributes(attribute.String("fast_sandbox.proxy_result", metricResult))
+		observability.End(span, nil)
+		observeSandboxProxy(metricResult, started)
+	}()
 	sandboxUID, targetPort, _, err := fastletproxy.ParseRoutePath(request.URL.Path)
 	if err != nil {
 		metricResult = "invalid_route"
@@ -49,6 +56,10 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		writeResolveError(writer, err)
 		return
 	}
+	request = request.WithContext(observability.WithIdentity(request.Context(), observability.Identity{
+		Namespace: route.Namespace, SandboxUID: route.SandboxUID, FastletPodUID: route.FastletPodUID,
+		AssignmentAttempt: route.AssignmentAttempt, RouteGeneration: route.RouteGeneration, TargetPort: targetPort,
+	}))
 	if _, err = p.verify(token, targetPort, route); err != nil {
 		// Watch delivery may lag behind a freshly issued credential. One direct
 		// API-server read distinguishes temporary cache lag from a stale token.
@@ -58,6 +69,10 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			writeResolveError(writer, err)
 			return
 		}
+		request = request.WithContext(observability.WithIdentity(request.Context(), observability.Identity{
+			Namespace: route.Namespace, SandboxUID: route.SandboxUID, FastletPodUID: route.FastletPodUID,
+			AssignmentAttempt: route.AssignmentAttempt, RouteGeneration: route.RouteGeneration, TargetPort: targetPort,
+		}))
 		if _, err = p.verify(token, targetPort, route); err != nil {
 			metricResult = "credential_rejected"
 			http.Error(writer, "route credential rejected", http.StatusForbidden)
@@ -87,6 +102,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			proxyRequest.Out.Header.Set(fastletproxy.HeaderFastletPodUID, route.FastletPodUID)
 			proxyRequest.Out.Header.Set(fastletproxy.HeaderAssignmentAttempt, strconv.FormatInt(route.AssignmentAttempt, 10))
 			proxyRequest.Out.Header.Set(fastletproxy.HeaderRouteGeneration, strconv.FormatInt(route.RouteGeneration, 10))
+			observability.InjectHTTP(proxyRequest.Out.Context(), proxyRequest.Out.Header)
 		},
 		ErrorHandler: func(response http.ResponseWriter, _ *http.Request, proxyErr error) {
 			metricResult = "upstream_error"

@@ -143,7 +143,7 @@ fastctl migrate pool --file old-pool.yaml --check
 fastctl migrate pool --file old-pool.yaml --output new-pool.yaml
 ```
 
-详细规则见 [docs/migration-guide.md](docs/migration-guide.md)。
+详细规则见 [docs/migration-guide.md](docs/migration-guide.md)。Metrics、trace 传播、生命周期身份字段和 OTLP 配置见 [docs/observability.md](docs/observability.md)。
 
 ## 验证
 

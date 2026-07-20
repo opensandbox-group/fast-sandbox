@@ -12,6 +12,7 @@ import (
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
+	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/routeauth"
 	"fast-sandbox/internal/sandboxproxy"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -37,6 +38,12 @@ func main() {
 	flag.StringVar(&publicKeyValue, "route-verify-public-key", os.Getenv("FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY"), "Comma-separated base64 Ed25519 route credential public keys.")
 	flag.IntVar(&fastletPort, "fastlet-proxy-port", 5780, "Fastlet Proxy data port.")
 	flag.Parse()
+	traceShutdown, err := observability.Configure(context.Background(), "fast-sandbox-proxy")
+	if err != nil {
+		klog.ErrorS(err, "Configure OpenTelemetry")
+		os.Exit(1)
+	}
+	defer shutdownTracing(traceShutdown)
 
 	publicKeys, err := routeauth.ParsePublicKeySet(publicKeyValue)
 	if err != nil {
@@ -131,6 +138,14 @@ func main() {
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		klog.ErrorS(err, "Sandbox Proxy server exited")
 		os.Exit(1)
+	}
+}
+
+func shutdownTracing(shutdown observability.Shutdown) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := shutdown(ctx); err != nil {
+		klog.ErrorS(err, "Flush OpenTelemetry traces")
 	}
 }
 

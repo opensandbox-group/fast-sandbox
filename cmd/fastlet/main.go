@@ -16,6 +16,7 @@ import (
 	"fast-sandbox/internal/fastlet/server"
 	"fast-sandbox/internal/fastletproxy"
 	"fast-sandbox/internal/infracatalog"
+	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/runtimecatalog"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -25,6 +26,12 @@ import (
 func main() {
 	flag.Parse()
 	klog.Info("starting sandbox fastlet")
+	traceShutdown, err := observability.Configure(context.Background(), "fast-sandbox-fastlet")
+	if err != nil {
+		klog.ErrorS(err, "Configure OpenTelemetry")
+		os.Exit(1)
+	}
+	defer shutdownTracing(traceShutdown)
 
 	podName := getEnv("POD_NAME", "")
 	podUID := getEnv("POD_UID", "")
@@ -267,4 +274,12 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func shutdownTracing(shutdown observability.Shutdown) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := shutdown(ctx); err != nil {
+		klog.ErrorS(err, "Flush OpenTelemetry traces")
+	}
 }

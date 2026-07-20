@@ -9,6 +9,7 @@ import (
 	"fast-sandbox/internal/api"
 	fastletcache "fast-sandbox/internal/fastlet/cache"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
+	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/runtimecatalog"
 	"fast-sandbox/pkg/util/idgen"
 )
@@ -117,8 +118,18 @@ func (m *SandboxManager) CancelReservation(req *api.CancelReservationRequest) (_
 }
 
 func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSandboxRequest) (_ *api.EnsureSandboxResponse, resultErr error) {
+	if req != nil {
+		ctx = observability.WithIdentity(ctx, observability.Identity{
+			RequestID: req.Identity.RequestID, Namespace: req.Sandbox.ClaimNamespace, SandboxName: req.Sandbox.ClaimName,
+			SandboxUID: req.Identity.SandboxUID, FastletPodUID: req.Identity.FastletPodUID,
+			InstanceGeneration: req.Identity.InstanceGeneration, AssignmentAttempt: req.Identity.AssignmentAttempt,
+			RouteGeneration: req.Identity.RouteGeneration,
+		})
+	}
+	ctx, span := observability.Start(ctx, "fastlet.ensure Sandbox")
 	started := time.Now()
 	defer func() {
+		observability.End(span, resultErr)
 		recordAdmission("ensure", resultErr)
 		observeDataPlaneReady(m.runtimeName, m.infraProfile, started, resultErr)
 	}()
