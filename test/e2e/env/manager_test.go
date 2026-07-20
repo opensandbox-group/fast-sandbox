@@ -59,7 +59,7 @@ func TestManagerEnsureBasicCreatesMissingClusterAndDeploys(t *testing.T) {
 	assertCommand(t, runner.commands, "kubectl", "config", "use-context", "kind-fsb-e2e-basic")
 	assertCommand(t, runner.commands, "make", "docker-controller", "docker-fastlet", "docker-fastlet-proxy", "docker-sandbox-proxy", "docker-janitor")
 	assertCommand(t, runner.commands, "kind", "load", "docker-image", "fast-sandbox/controller:dev", "--name", "fsb-e2e-basic")
-	assertCommand(t, runner.commands, "kubectl", "apply", "-f", "config/crd/")
+	assertCommand(t, runner.commands, "kubectl", "apply", "-k", "config/crd")
 	assertCommand(t, runner.commands, "kubectl", "rollout", "restart", "deployment/fast-sandbox-controller")
 	assertCommand(t, runner.commands, "kubectl", "rollout", "status", "deployment/fast-sandbox-controller", "--timeout=120s")
 	assertCommand(t, runner.commands, "kubectl", "rollout", "restart", "deployment/fast-sandbox-fastpath")
@@ -150,7 +150,7 @@ func TestManagerEnsureLoadsAlpineBaseImageBeforeDeploy(t *testing.T) {
 	}
 
 	loadAlpineIndex := commandIndex(runner.commands, "kind", "load", "docker-image", "alpine:latest", "--name", "fsb-e2e-basic")
-	applyIndex := commandIndex(runner.commands, "kubectl", "apply", "-f", "config/crd/")
+	applyIndex := commandIndex(runner.commands, "kubectl", "apply", "-k", "config/crd")
 	if loadAlpineIndex == -1 {
 		t.Fatalf("missing alpine kind load command: %#v", runner.commands)
 	}
@@ -273,7 +273,7 @@ func TestManagerEnsureGVisorConfiguresRuntimeOnKindNodes(t *testing.T) {
 	assertCommand(t, runner.commands, "kubectl", "apply", "-f", "test/e2e/manifests/runtimeclass/gvisor.yaml")
 
 	runtimeClassIndex := commandIndex(runner.commands, "kubectl", "apply", "-f", "test/e2e/manifests/runtimeclass/gvisor.yaml")
-	deployIndex := commandIndex(runner.commands, "kubectl", "apply", "-f", "config/crd/")
+	deployIndex := commandIndex(runner.commands, "kubectl", "apply", "-k", "config/crd")
 	if runtimeClassIndex == -1 || deployIndex == -1 {
 		t.Fatalf("missing expected apply commands: %#v", runner.commands)
 	}

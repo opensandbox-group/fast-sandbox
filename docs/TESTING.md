@@ -56,9 +56,9 @@ A runtime cannot be marked supported because a test skipped. The gate must exerc
 `make test-e2e` runs suites that prepare their own profile. Individual suites include:
 
 - `basicvalidation`: CRDs, namespace isolation, private networking, proxy and Infra augmentation;
-- `controlplane`: multi-active Fast-Path, leader election, Service isolation, request idempotency, concurrent admission;
+- `controlplane`: direct Create against every Fast-Path replica, leader election, Service isolation, request idempotency, and cross-replica concurrent admission;
 - `lifecycle`: create/delete and graceful shutdown;
-- `scheduling`: Pool selection, capacity, image affinity;
+- `scheduling`: Pool selection, private-port independence, capacity, and autoscaling;
 - `cliintegration`: `fastctl` lifecycle and adapters;
 - `secureruntime`: gVisor and Kata capability behavior;
 - `drain`: Pool scale-down and durable drain semantics;
@@ -75,11 +75,14 @@ Run on a host with `kubectl`:
 ```bash
 kubectl kustomize config/default >/tmp/fast-sandbox-default.yaml
 kubectl kustomize config/dev >/tmp/fast-sandbox-dev.yaml
+kubectl apply --dry-run=client --validate=false -k config/crd
 kubectl apply --dry-run=client --validate=false -k config/default
 kubectl apply --dry-run=client --validate=false -f config/network-policy/default.yaml
 ```
 
 The `config/dev` overlay contains a public test key. Production tests must create `fast-sandbox-route-keys` from a secret manager and use `config/default`.
+
+Do not use `kubectl apply -f config/crd/`: that treats `kustomization.yaml` as a Kubernetes object. The e2e environment manager and manual workflows both use `kubectl apply -k config/crd`.
 
 ## Migration checks
 

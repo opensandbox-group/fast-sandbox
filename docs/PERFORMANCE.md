@@ -90,6 +90,13 @@ A release report must demonstrate:
 6. losing one Sandbox Proxy replica preserves aggregate route availability;
 7. stale route credentials fail after reset, reassignment, and deletion.
 
+Current automated evidence is split by boundary:
+
+- `TestMultiActiveControlPlane` opens one direct gRPC connection to each of the three Fast-Path Pods, proves each replica can Create, then distributes 40 simultaneous requests across all replicas against a single Fastlet with capacity 3. Exactly three unique Sandbox identities may reach Ready; rejected RPCs must be `ResourceExhausted`, and failed RPCs must not leave CRDs.
+- `TestSandboxProxyDataPlane` proves every Sandbox Proxy replica can route, deletes one replica, reconnects through the Service while one survivor remains, waits for Deployment recovery, restarts the assigned Fastlet Proxy, and verifies reset/deletion invalidate old credentials.
+- `internal/fastletproxy` streaming tests cover chunked response flushing, cancellation reaching upstream, and transparent WebSocket upgrade without full-response buffering.
+- Registry and heartbeat unit/race tests cover image-hit-first ordering, bounded Top-K metric cost, cache cursor deltas, and per-replica heartbeat concurrency. A production-like multi-node image-affinity/cache-lifecycle report is still required because a single-node kind cluster shares the node image store and cannot represent distinct node caches.
+
 ## Create load report
 
 `test/performance/create_load` drives the public FastPath gRPC API and writes one JSON report to stdout. It measures full Create RPC latency; it does not rename that value to CreateAccepted or DataPlaneReady. Use the Prometheus milestone histograms above for server-side phase boundaries.

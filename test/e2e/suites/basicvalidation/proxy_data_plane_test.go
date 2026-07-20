@@ -17,6 +17,7 @@ import (
 	"fast-sandbox/test/e2e/support/suiteenv"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -71,14 +72,16 @@ func TestSandboxProxyDataPlane(t *testing.T) {
 				t.Fatalf("capacity-one Pool did not place Sandboxes on distinct Fastlet Pods")
 			}
 
+			firstAccess := resolveProxyAccess(ctx, t, fastPath, first.SandboxUid, 8080)
+			secondAccess := resolveProxyAccess(ctx, t, fastPath, second.SandboxUid, 18080)
+			assertEverySandboxProxyReplica(ctx, t, k8sClient, firstAccess, "proxy-a")
+			assertSandboxProxyServiceSurvivesReplicaLoss(ctx, t, k8sClient, firstAccess, "proxy-a")
+
 			proxyBase, proxyForward, err := e2eenv.StartSandboxProxyPortForward(ctx, testSuite.ControllerNamespace())
 			if err != nil {
 				t.Fatalf("start Sandbox Proxy port-forward: %v", err)
 			}
 			defer proxyForward.Cleanup()
-			firstAccess := resolveProxyAccess(ctx, t, fastPath, first.SandboxUid, 8080)
-			secondAccess := resolveProxyAccess(ctx, t, fastPath, second.SandboxUid, 18080)
-			assertEverySandboxProxyReplica(ctx, t, k8sClient, firstAccess, "proxy-a")
 			assertProxyResponse(ctx, t, proxyBase, firstAccess, "proxy-a")
 			assertProxyResponse(ctx, t, proxyBase, secondAccess, "proxy-b")
 			restartFastletProxy(ctx, t, k8sClient, namespace, firstSandbox.Status.Assignment.FastletName)
@@ -259,6 +262,73 @@ func assertEverySandboxProxyReplica(ctx context.Context, t *testing.T, k8sClient
 		assertProxyResponse(ctx, t, base, access, want)
 		if err := forward.Cleanup(); err != nil {
 			t.Errorf("cleanup Sandbox Proxy %s port-forward: %v", pod.Name, err)
+		}
+	}
+}
+
+func assertSandboxProxyServiceSurvivesReplicaLoss(ctx context.Context, t *testing.T, k8sClient client.Client, access *fastpathv1.ResolveEndpointResponse, want string) {
+	t.Helper()
+	var pods corev1.PodList
+	if err := k8sClient.List(ctx, &pods, client.InNamespace(testSuite.ControllerNamespace()), client.MatchingLabels{"app": "fast-sandbox-proxy"}); err != nil {
+		t.Fatalf("list Sandbox Proxy replicas before failure: %v", err)
+	}
+	if len(pods.Items) < 2 {
+		t.Fatalf("need at least two Sandbox Proxy replicas before failure, got %d", len(pods.Items))
+	}
+	victim := pods.Items[0].DeepCopy()
+	zero := int64(0)
+	if err := k8sClient.Delete(ctx, victim, &client.DeleteOptions{GracePeriodSeconds: &zero}); err != nil {
+		t.Fatalf("delete Sandbox Proxy replica %s: %v", victim.Name, err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	for {
+		var current corev1.PodList
+		if err := k8sClient.List(waitCtx, &current, client.InNamespace(testSuite.ControllerNamespace()), client.MatchingLabels{"app": "fast-sandbox-proxy"}); err == nil {
+			readySurvivors := 0
+			victimGone := true
+			for index := range current.Items {
+				if current.Items[index].UID == victim.UID {
+					victimGone = false
+				}
+				for _, condition := range current.Items[index].Status.Conditions {
+					if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+						readySurvivors++
+						break
+					}
+				}
+			}
+			if victimGone && readySurvivors >= 1 {
+				break
+			}
+		}
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf("wait for Sandbox Proxy survivor after deleting %s: %v", victim.Name, waitCtx.Err())
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+
+	proxyBase, forward, err := e2eenv.StartSandboxProxyPortForward(waitCtx, testSuite.ControllerNamespace())
+	if err != nil {
+		t.Fatalf("start Sandbox Proxy Service port-forward after replica loss: %v", err)
+	}
+	assertProxyResponse(waitCtx, t, proxyBase, access, want)
+	if err := forward.Cleanup(); err != nil {
+		t.Errorf("cleanup post-failure Sandbox Proxy port-forward: %v", err)
+	}
+
+	for {
+		var deployment appsv1.Deployment
+		if err := k8sClient.Get(waitCtx, types.NamespacedName{Namespace: testSuite.ControllerNamespace(), Name: "fast-sandbox-proxy"}, &deployment); err == nil &&
+			deployment.Status.ReadyReplicas == 2 && deployment.Status.UpdatedReplicas == 2 {
+			return
+		}
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf("wait for Sandbox Proxy replicas to recover: %v", waitCtx.Err())
+		case <-time.After(250 * time.Millisecond):
 		}
 	}
 }

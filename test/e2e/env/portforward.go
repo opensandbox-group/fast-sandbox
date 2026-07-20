@@ -27,6 +27,16 @@ func StartSandboxProxyPortForward(ctx context.Context, namespace string) (string
 }
 
 func StartPodPortForward(ctx context.Context, namespace, pod string, remotePort int) (string, *portforward.ManagedProcess, error) {
+	endpoint, managed, err := StartPodTCPPortForward(ctx, namespace, pod, remotePort)
+	if err != nil {
+		return "", nil, err
+	}
+	return "http://" + endpoint, managed, nil
+}
+
+// StartPodTCPPortForward returns a raw host:port endpoint for protocols such
+// as gRPC. Callers that need HTTP should use StartPodPortForward.
+func StartPodTCPPortForward(ctx context.Context, namespace, pod string, remotePort int) (string, *portforward.ManagedProcess, error) {
 	localPort, err := reserveLocalPort()
 	if err != nil {
 		return "", nil, err
@@ -43,7 +53,7 @@ func StartPodPortForward(ctx context.Context, namespace, pod string, remotePort 
 		_ = managed.Cleanup()
 		return "", nil, fmt.Errorf("wait for Pod %s port-forward: %w", pod, err)
 	}
-	return "http://" + endpoint, managed, nil
+	return endpoint, managed, nil
 }
 
 func startServicePortForward(ctx context.Context, namespace, service string, remotePort int) (string, *portforward.ManagedProcess, error) {

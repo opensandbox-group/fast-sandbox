@@ -649,7 +649,7 @@ func (m *Manager) deployFastSandbox(ctx context.Context) error {
 		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/fastlet-proxy:dev", "--name", m.settings.ClusterName}},
 		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/sandbox-proxy:dev", "--name", m.settings.ClusterName}},
 		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/janitor:dev", "--name", m.settings.ClusterName}},
-		{name: "kubectl", args: []string{"apply", "-f", "config/crd/"}},
+		{name: "kubectl", args: []string{"apply", "-k", "config/crd"}},
 		{name: "kubectl", args: []string{"wait", "--for=condition=Established", "crd/sandboxes.sandbox.fast.io", "--timeout=30s"}},
 		{name: "kubectl", args: []string{"wait", "--for=condition=Established", "crd/sandboxpools.sandbox.fast.io", "--timeout=30s"}},
 		{name: "kubectl", args: []string{"apply", "-f", "config/rbac/base.yaml"}},

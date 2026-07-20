@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -66,6 +67,8 @@ func TestMultiActiveControlPlane(t *testing.T) {
 	}
 	defer conn.Close()
 	fastPath := fastpathv1.NewFastPathServiceClient(conn)
+	replicas, closeReplicas := dialFastPathReplicas(ctx, t, k8sClient)
+	defer closeReplicas()
 
 	t.Run("direct CRD creation is reconciled independently of FastPath", func(t *testing.T) {
 		sandbox := &apiv1alpha1.Sandbox{
@@ -104,6 +107,20 @@ func TestMultiActiveControlPlane(t *testing.T) {
 		conflict.Image = "docker.io/library/busybox:latest"
 		if _, err := fastPath.CreateSandbox(ctx, conflict); status.Code(err) != codes.AlreadyExists {
 			t.Fatalf("same request ID with different spec: code=%s err=%v", status.Code(err), err)
+		}
+	})
+
+	t.Run("every FastPath replica independently serves Create", func(t *testing.T) {
+		seenUIDs := make(map[string]string, len(replicas))
+		seenNames := make(map[string]string, len(replicas))
+		for index, replica := range replicas {
+			requestCtx, requestCancel := context.WithTimeout(ctx, 30*time.Second)
+			response, createErr := replica.client.CreateSandbox(requestCtx, createRequest(namespace, pool.Name, fmt.Sprintf("%s-replica-%d", namespace, index)))
+			requestCancel()
+			if createErr != nil {
+				t.Fatalf("FastPath replica %s CreateSandbox: %v", replica.name, createErr)
+			}
+			assertUniqueCreateIdentity(t, seenUIDs, seenNames, replica.name, response)
 		}
 	})
 
@@ -149,6 +166,7 @@ func TestMultiActiveControlPlane(t *testing.T) {
 		var group sync.WaitGroup
 		var lock sync.Mutex
 		successes := 0
+		successfulResponses := make([]*fastpathv1.CreateResponse, 0, capacityPool.Spec.MaxSandboxesPerPod)
 		failures := make([]error, 0, requests)
 		for index := 0; index < requests; index++ {
 			group.Add(1)
@@ -156,11 +174,12 @@ func TestMultiActiveControlPlane(t *testing.T) {
 				defer group.Done()
 				requestCtx, requestCancel := context.WithTimeout(ctx, 30*time.Second)
 				defer requestCancel()
-				_, createErr := fastPath.CreateSandbox(requestCtx, createRequest(namespace, capacityPool.Name, fmt.Sprintf("%s-capacity-%d", namespace, index)))
+				response, createErr := replicas[index%len(replicas)].client.CreateSandbox(requestCtx, createRequest(namespace, capacityPool.Name, fmt.Sprintf("%s-capacity-%d", namespace, index)))
 				lock.Lock()
 				defer lock.Unlock()
 				if createErr == nil {
 					successes++
+					successfulResponses = append(successfulResponses, response)
 					return
 				}
 				failures = append(failures, createErr)
@@ -175,6 +194,11 @@ func TestMultiActiveControlPlane(t *testing.T) {
 				t.Fatalf("capacity failure code=%s, want ResourceExhausted: %v", status.Code(failure), failure)
 			}
 		}
+		seenUIDs := make(map[string]string, len(successfulResponses))
+		seenNames := make(map[string]string, len(successfulResponses))
+		for index, response := range successfulResponses {
+			assertUniqueCreateIdentity(t, seenUIDs, seenNames, fmt.Sprintf("response-%d", index), response)
+		}
 		waitUntil(ctx, t, "only admitted capacity CRDs", func() (bool, error) {
 			var list apiv1alpha1.SandboxList
 			if err := k8sClient.List(ctx, &list, client.InNamespace(namespace)); err != nil {
@@ -183,12 +207,97 @@ func TestMultiActiveControlPlane(t *testing.T) {
 			count := 0
 			for index := range list.Items {
 				if list.Items[index].Spec.PoolRef == capacityPool.Name {
+					if list.Items[index].Status.RuntimeState != apiv1alpha1.ObservedStateReady ||
+						list.Items[index].Status.SandboxID != string(list.Items[index].UID) {
+						return false, nil
+					}
+					if owner, exists := seenUIDs[string(list.Items[index].UID)]; !exists || owner == "" {
+						return false, fmt.Errorf("ready Sandbox %s/%s has unreported RPC identity %q", list.Items[index].Namespace, list.Items[index].Name, list.Items[index].UID)
+					}
 					count++
 				}
 			}
 			return count == successes, nil
 		})
 	})
+}
+
+type fastPathReplica struct {
+	name       string
+	client     fastpathv1.FastPathServiceClient
+	connection *grpc.ClientConn
+	forward    interface{ Cleanup() error }
+}
+
+func dialFastPathReplicas(ctx context.Context, t *testing.T, k8sClient client.Client) ([]fastPathReplica, func()) {
+	t.Helper()
+	var pods corev1.PodList
+	if err := k8sClient.List(ctx, &pods, client.InNamespace(controlPlaneNamespace), client.MatchingLabels{"app": "fast-sandbox-fastpath"}); err != nil {
+		t.Fatalf("list FastPath replicas: %v", err)
+	}
+	sort.Slice(pods.Items, func(i, j int) bool { return pods.Items[i].Name < pods.Items[j].Name })
+	if len(pods.Items) != 3 {
+		t.Fatalf("FastPath replica count=%d, want 3", len(pods.Items))
+	}
+	replicas := make([]fastPathReplica, 0, len(pods.Items))
+	cleanup := func() {
+		for index := len(replicas) - 1; index >= 0; index-- {
+			if err := replicas[index].connection.Close(); err != nil {
+				t.Errorf("close FastPath replica %s connection: %v", replicas[index].name, err)
+			}
+			if err := replicas[index].forward.Cleanup(); err != nil {
+				t.Errorf("cleanup FastPath replica %s port-forward: %v", replicas[index].name, err)
+			}
+		}
+	}
+	for index := range pods.Items {
+		pod := &pods.Items[index]
+		if !podReady(pod) {
+			cleanup()
+			t.Fatalf("FastPath replica %s is not Ready", pod.Name)
+		}
+		endpoint, forward, err := e2eenv.StartPodTCPPortForward(ctx, pod.Namespace, pod.Name, 9090)
+		if err != nil {
+			cleanup()
+			t.Fatalf("start FastPath replica %s port-forward: %v", pod.Name, err)
+		}
+		dialCtx, dialCancel := context.WithTimeout(ctx, 20*time.Second)
+		connection, err := grpc.DialContext(dialCtx, endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+		dialCancel()
+		if err != nil {
+			_ = forward.Cleanup()
+			cleanup()
+			t.Fatalf("dial FastPath replica %s: %v", pod.Name, err)
+		}
+		replicas = append(replicas, fastPathReplica{
+			name: pod.Name, client: fastpathv1.NewFastPathServiceClient(connection), connection: connection, forward: forward,
+		})
+	}
+	return replicas, cleanup
+}
+
+func podReady(pod *corev1.Pod) bool {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func assertUniqueCreateIdentity(t *testing.T, seenUIDs, seenNames map[string]string, owner string, response *fastpathv1.CreateResponse) {
+	t.Helper()
+	if response == nil || response.SandboxUid == "" || response.SandboxName == "" {
+		t.Fatalf("%s returned incomplete Create identity: %+v", owner, response)
+	}
+	if previous, exists := seenUIDs[response.SandboxUid]; exists {
+		t.Fatalf("duplicate Sandbox UID %q returned by %s and %s", response.SandboxUid, previous, owner)
+	}
+	if previous, exists := seenNames[response.SandboxName]; exists {
+		t.Fatalf("duplicate Sandbox name %q returned by %s and %s", response.SandboxName, previous, owner)
+	}
+	seenUIDs[response.SandboxUid] = owner
+	seenNames[response.SandboxName] = owner
 }
 
 func assertProductionTopology(ctx context.Context, t *testing.T, k8sClient client.Client) {
