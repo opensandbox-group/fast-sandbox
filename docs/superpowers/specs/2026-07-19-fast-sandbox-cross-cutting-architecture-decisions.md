@@ -432,6 +432,9 @@ Drain 期间：
 
 - Drain intent 必须写入 Fastlet Pod annotation，不能只保存在 Controller 内存或 Local Registry；
 - annotation 是平台期望，Fastlet heartbeat 是观测值，观测值不能把仍有效的 Drain intent 覆盖回 Ready；
+- PoolController 必须把期望 Fastlet Pod 的有效 template（平台 labels/annotations、PodSpec、runtime/resource/Infra/warmImages 配置）计算为稳定 hash，并写入新 Pod；
+- template 变化采用单 Pod surge 的滚动升级：先创建一个新 template Pod，只有 Kubernetes Ready 且精确 Pod UID 的 heartbeat 同时证明 RuntimeReady、InfraReady、非 stale、非 Draining 后，才允许对一个旧 template Pod发起 Drain；
+- 计划升级的 Drain intent 使用持久化 reason `planned-upgrade`，并继续复用同一套 ack、负载等待、timeout 和 Leader 接管语义；旧 Pod 删除后才为下一个旧 Pod创建 replacement，第一阶段不并行驱逐多个有状态 Fastlet；
 - PodLost 只能由 Kubernetes Pod Name + UID 的权威存在性确认触发，Local Registry miss 只代表本地视图尚未收敛；
 - Janitor 使用与 runtime 相同的 Pod UID、Sandbox UID、instance generation 和 assignment attempt fence，并在实际删除前重新读取权威状态；
 - Manual Lost 保留 assignment 供诊断，但 `Phase=Lost` 是 Janitor 可以清理旧 node-local resource 的明确控制面确认。

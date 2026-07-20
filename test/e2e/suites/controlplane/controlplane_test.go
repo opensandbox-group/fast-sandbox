@@ -52,6 +52,75 @@ func TestMultiActiveControlPlane(t *testing.T) {
 	}
 	waitForReadyFastlets(ctx, t, k8sClient, namespace, pool.Name, 1)
 
+	t.Run("Controller-only deployment reconciles direct CRD creation", func(t *testing.T) {
+		restoreFastPath := scaleFastPath(ctx, t, k8sClient, 0)
+		defer restoreFastPath()
+		waitForFastPathPodCount(ctx, t, k8sClient, 0)
+
+		sandbox := &apiv1alpha1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{Name: "declarative", Namespace: namespace},
+			Spec: apiv1alpha1.SandboxSpec{
+				Image: "docker.io/library/alpine:latest", PoolRef: pool.Name,
+				Command: []string{"/bin/sh", "-c", "sleep 3600"},
+			},
+		}
+		if err := k8sClient.Create(ctx, sandbox); err != nil {
+			t.Fatalf("create declarative Sandbox without FastPath: %v", err)
+		}
+		ready := waitForSandbox(ctx, t, k8sClient, types.NamespacedName{Namespace: namespace, Name: sandbox.Name}, func(item *apiv1alpha1.Sandbox) bool {
+			return item.Status.Assignment != nil && item.Status.RuntimeState == apiv1alpha1.ObservedStateReady
+		})
+		if ready.Status.SandboxID != string(ready.UID) {
+			t.Fatalf("Sandbox ID must be durable UID: id=%q uid=%q", ready.Status.SandboxID, ready.UID)
+		}
+
+		restoreFastPath()
+		waitForDeploymentReady(ctx, t, k8sClient, "fast-sandbox-fastpath", 3)
+	})
+
+	t.Run("role all preserves the single-process compatibility topology", func(t *testing.T) {
+		enableAllInOneTopology(ctx, t, k8sClient)
+
+		endpoint, portForward, err := e2eenv.StartControllerPortForward(ctx, controlPlaneNamespace)
+		if err != nil {
+			t.Fatalf("start all-in-one FastPath port-forward: %v", err)
+		}
+		defer func() {
+			if err := portForward.Cleanup(); err != nil {
+				t.Errorf("cleanup all-in-one FastPath port-forward: %v", err)
+			}
+		}()
+		connection, err := grpc.DialContext(ctx, endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+		if err != nil {
+			t.Fatalf("dial all-in-one FastPath: %v", err)
+		}
+		defer connection.Close()
+		allInOne := fastpathv1.NewFastPathServiceClient(connection)
+
+		var response *fastpathv1.CreateResponse
+		waitUntil(ctx, t, "all-in-one Registry heartbeat and Create", func() (bool, error) {
+			requestCtx, requestCancel := context.WithTimeout(ctx, 10*time.Second)
+			defer requestCancel()
+			created, createErr := allInOne.CreateSandbox(requestCtx, createRequest(namespace, pool.Name, namespace+"-all-in-one"))
+			if createErr == nil {
+				response = created
+				return true, nil
+			}
+			switch status.Code(createErr) {
+			case codes.ResourceExhausted, codes.Unavailable:
+				return false, nil
+			default:
+				return false, createErr
+			}
+		})
+		ready := waitForSandbox(ctx, t, k8sClient, types.NamespacedName{Namespace: namespace, Name: response.SandboxName}, func(item *apiv1alpha1.Sandbox) bool {
+			return item.Status.RuntimeState == apiv1alpha1.ObservedStateReady && item.Status.SandboxID == string(item.UID)
+		})
+		if response.SandboxUid != string(ready.UID) {
+			t.Fatalf("all-in-one returned UID %q, want CRD UID %q", response.SandboxUid, ready.UID)
+		}
+	})
+
 	endpoint, portForward, err := e2eenv.StartControllerPortForward(ctx, controlPlaneNamespace)
 	if err != nil {
 		t.Fatalf("start FastPath port-forward: %v", err)
@@ -69,25 +138,6 @@ func TestMultiActiveControlPlane(t *testing.T) {
 	fastPath := fastpathv1.NewFastPathServiceClient(conn)
 	replicas, closeReplicas := dialFastPathReplicas(ctx, t, k8sClient)
 	defer closeReplicas()
-
-	t.Run("direct CRD creation is reconciled independently of FastPath", func(t *testing.T) {
-		sandbox := &apiv1alpha1.Sandbox{
-			ObjectMeta: metav1.ObjectMeta{Name: "declarative", Namespace: namespace},
-			Spec: apiv1alpha1.SandboxSpec{
-				Image: "docker.io/library/alpine:latest", PoolRef: pool.Name,
-				Command: []string{"/bin/sh", "-c", "sleep 3600"},
-			},
-		}
-		if err := k8sClient.Create(ctx, sandbox); err != nil {
-			t.Fatalf("create declarative Sandbox: %v", err)
-		}
-		ready := waitForSandbox(ctx, t, k8sClient, types.NamespacedName{Namespace: namespace, Name: sandbox.Name}, func(item *apiv1alpha1.Sandbox) bool {
-			return item.Status.Assignment != nil && item.Status.RuntimeState == apiv1alpha1.ObservedStateReady
-		})
-		if ready.Status.SandboxID != string(ready.UID) {
-			t.Fatalf("Sandbox ID must be durable UID: id=%q uid=%q", ready.Status.SandboxID, ready.UID)
-		}
-	})
 
 	t.Run("request ID is idempotent and spec-bound", func(t *testing.T) {
 		requestID := namespace + "-idempotent"
@@ -438,6 +488,227 @@ func waitForDeploymentReady(ctx context.Context, t *testing.T, k8sClient client.
 		}
 		return deployment.Status.ReadyReplicas == replicas && deployment.Status.UpdatedReplicas == replicas, nil
 	})
+}
+
+func scaleFastPath(ctx context.Context, t *testing.T, k8sClient client.Client, replicas int32) func() {
+	t.Helper()
+	key := types.NamespacedName{Namespace: controlPlaneNamespace, Name: "fast-sandbox-fastpath"}
+	var deployment appsv1.Deployment
+	if err := k8sClient.Get(ctx, key, &deployment); err != nil {
+		t.Fatalf("get FastPath Deployment before scale: %v", err)
+	}
+	original := int32(1)
+	if deployment.Spec.Replicas != nil {
+		original = *deployment.Spec.Replicas
+	}
+	restored := false
+	restore := func() {
+		if restored {
+			return
+		}
+		restoreCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		var current appsv1.Deployment
+		if err := k8sClient.Get(restoreCtx, key, &current); err != nil {
+			t.Errorf("get FastPath Deployment for restore: %v", err)
+			return
+		}
+		current.Spec.Replicas = &original
+		if err := k8sClient.Update(restoreCtx, &current); err != nil {
+			t.Errorf("restore FastPath replicas to %d: %v", original, err)
+			return
+		}
+		restored = true
+	}
+	deployment.Spec.Replicas = &replicas
+	if err := k8sClient.Update(ctx, &deployment); err != nil {
+		t.Fatalf("scale FastPath to %d: %v", replicas, err)
+	}
+	return restore
+}
+
+func waitForFastPathPodCount(ctx context.Context, t *testing.T, k8sClient client.Client, want int) {
+	t.Helper()
+	waitUntil(ctx, t, fmt.Sprintf("FastPath Pod count %d", want), func() (bool, error) {
+		var pods corev1.PodList
+		if err := k8sClient.List(ctx, &pods, client.InNamespace(controlPlaneNamespace), client.MatchingLabels{"app": "fast-sandbox-fastpath"}); err != nil {
+			return false, err
+		}
+		return len(pods.Items) == want, nil
+	})
+}
+
+func enableAllInOneTopology(ctx context.Context, t *testing.T, k8sClient client.Client) {
+	t.Helper()
+	controllerKey := types.NamespacedName{Namespace: controlPlaneNamespace, Name: "fast-sandbox-controller"}
+	fastPathKey := types.NamespacedName{Namespace: controlPlaneNamespace, Name: "fast-sandbox-fastpath"}
+
+	var originalController appsv1.Deployment
+	if err := k8sClient.Get(ctx, controllerKey, &originalController); err != nil {
+		t.Fatalf("get Controller Deployment before all-in-one transition: %v", err)
+	}
+	var originalFastPath appsv1.Deployment
+	if err := k8sClient.Get(ctx, fastPathKey, &originalFastPath); err != nil {
+		t.Fatalf("get FastPath Deployment before all-in-one transition: %v", err)
+	}
+	var originalService corev1.Service
+	if err := k8sClient.Get(ctx, fastPathKey, &originalService); err != nil {
+		t.Fatalf("get FastPath Service before all-in-one transition: %v", err)
+	}
+	var originalHPA autoscalingv2.HorizontalPodAutoscaler
+	if err := k8sClient.Get(ctx, fastPathKey, &originalHPA); err != nil {
+		t.Fatalf("get FastPath HPA before all-in-one transition: %v", err)
+	}
+	hpaDeleted := false
+
+	t.Cleanup(func() {
+		restoreCtx, restoreCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer restoreCancel()
+
+		var currentFastPath appsv1.Deployment
+		if err := k8sClient.Get(restoreCtx, fastPathKey, &currentFastPath); err != nil {
+			t.Errorf("get FastPath Deployment for all-in-one restore: %v", err)
+		} else {
+			currentFastPath.Spec = originalFastPath.Spec
+			currentFastPath.Labels = originalFastPath.Labels
+			if err := k8sClient.Update(restoreCtx, &currentFastPath); err != nil {
+				t.Errorf("restore FastPath Deployment after all-in-one test: %v", err)
+			} else {
+				waitForDeploymentReady(restoreCtx, t, k8sClient, originalFastPath.Name, *originalFastPath.Spec.Replicas)
+			}
+		}
+		if hpaDeleted {
+			restoredHPA := &autoscalingv2.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: originalHPA.Name, Namespace: originalHPA.Namespace,
+					Labels: originalHPA.Labels, Annotations: originalHPA.Annotations,
+				},
+				Spec: originalHPA.Spec,
+			}
+			if err := k8sClient.Create(restoreCtx, restoredHPA); err != nil {
+				t.Errorf("restore FastPath HPA after all-in-one test: %v", err)
+			}
+		}
+
+		var currentService corev1.Service
+		if err := k8sClient.Get(restoreCtx, fastPathKey, &currentService); err != nil {
+			t.Errorf("get FastPath Service for all-in-one restore: %v", err)
+		} else {
+			currentService.Spec.Selector = originalService.Spec.Selector
+			if err := k8sClient.Update(restoreCtx, &currentService); err != nil {
+				t.Errorf("restore FastPath Service after all-in-one test: %v", err)
+			}
+		}
+
+		var currentController appsv1.Deployment
+		if err := k8sClient.Get(restoreCtx, controllerKey, &currentController); err != nil {
+			t.Errorf("get Controller Deployment for all-in-one restore: %v", err)
+		} else {
+			currentController.Spec = originalController.Spec
+			currentController.Labels = originalController.Labels
+			if err := k8sClient.Update(restoreCtx, &currentController); err != nil {
+				t.Errorf("restore Controller Deployment after all-in-one test: %v", err)
+			} else {
+				waitForDeploymentReady(restoreCtx, t, k8sClient, originalController.Name, *originalController.Spec.Replicas)
+			}
+		}
+	})
+
+	controller := originalController.DeepCopy()
+	one := int32(1)
+	controller.Spec.Replicas = &one
+	controller.Labels["fast-sandbox.io/control-plane-role"] = "all"
+	controller.Spec.Template.Labels["fast-sandbox.io/control-plane-role"] = "all"
+	manager := &controller.Spec.Template.Spec.Containers[0]
+	manager.Args = replaceArgument(manager.Args, "--role=", "--role=all")
+	if !hasArgumentPrefix(manager.Args, "--fastpath-bind-address=") {
+		manager.Args = append(manager.Args, "--fastpath-bind-address=:9090")
+	}
+	if !hasEnv(manager.Env, "FAST_SANDBOX_ROUTE_SIGNING_PRIVATE_KEY") {
+		manager.Env = append(manager.Env, corev1.EnvVar{
+			Name: "FAST_SANDBOX_ROUTE_SIGNING_PRIVATE_KEY",
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "fast-sandbox-route-keys"}, Key: "private-key",
+			}},
+		})
+	}
+	if !hasContainerPort(manager.Ports, "grpc") {
+		manager.Ports = append(manager.Ports, corev1.ContainerPort{Name: "grpc", ContainerPort: 9090})
+	}
+	if err := k8sClient.Update(ctx, controller); err != nil {
+		t.Fatalf("transition Controller Deployment to role=all: %v", err)
+	}
+	waitForDeploymentReady(ctx, t, k8sClient, controller.Name, 1)
+
+	service := originalService.DeepCopy()
+	service.Spec.Selector = map[string]string{
+		"app": "fast-sandbox-controller", "fast-sandbox.io/control-plane-role": "all",
+	}
+	if err := k8sClient.Update(ctx, service); err != nil {
+		t.Fatalf("route FastPath Service to role=all Pod: %v", err)
+	}
+
+	if err := k8sClient.Delete(ctx, &originalHPA); err != nil {
+		t.Fatalf("temporarily remove FastPath HPA for all-in-one test: %v", err)
+	}
+	hpaDeleted = true
+	fastPath := originalFastPath.DeepCopy()
+	zero := int32(0)
+	fastPath.Spec.Replicas = &zero
+	if err := k8sClient.Update(ctx, fastPath); err != nil {
+		t.Fatalf("scale separate FastPath Deployment to zero for all-in-one test: %v", err)
+	}
+	waitForFastPathPodCount(ctx, t, k8sClient, 0)
+	waitUntil(ctx, t, "FastPath Service selecting one role=all Pod", func() (bool, error) {
+		var endpoints corev1.Endpoints
+		if err := k8sClient.Get(ctx, fastPathKey, &endpoints); err != nil {
+			return false, err
+		}
+		addresses := make([]corev1.EndpointAddress, 0, 1)
+		for _, subset := range endpoints.Subsets {
+			addresses = append(addresses, subset.Addresses...)
+		}
+		return len(addresses) == 1 && addresses[0].TargetRef != nil &&
+			strings.HasPrefix(addresses[0].TargetRef.Name, "fast-sandbox-controller-"), nil
+	})
+}
+
+func replaceArgument(arguments []string, prefix, value string) []string {
+	result := append([]string(nil), arguments...)
+	for index := range result {
+		if strings.HasPrefix(result[index], prefix) {
+			result[index] = value
+			return result
+		}
+	}
+	return append(result, value)
+}
+
+func hasArgumentPrefix(arguments []string, prefix string) bool {
+	for _, argument := range arguments {
+		if strings.HasPrefix(argument, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasEnv(environment []corev1.EnvVar, name string) bool {
+	for _, variable := range environment {
+		if variable.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func hasContainerPort(ports []corev1.ContainerPort, name string) bool {
+	for _, port := range ports {
+		if port.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func waitUntil(ctx context.Context, t *testing.T, description string, predicate func() (bool, error)) {

@@ -42,6 +42,10 @@ var (
 		Name: "fast_sandbox_user_process_start_observation_total",
 		Help: "Availability of a trustworthy user-process-start observation.",
 	}, []string{"runtime", "infra_profile", "source", "result"})
+	warmImagePullTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fast_sandbox_warm_image_pull_total",
+		Help: "Pool warm image preparation attempts by bounded result; image references are intentionally not labels.",
+	}, []string{"result"})
 )
 
 func recordAdmission(operation string, err error) {
@@ -70,6 +74,10 @@ func metricResult(err error) string {
 		return "success"
 	}
 	return "error"
+}
+
+func recordWarmImagePull(err error) {
+	warmImagePullTotal.WithLabelValues(metricResult(err)).Inc()
 }
 
 func observeRuntimeCreate(runtimeName string, started time.Time, err error) {

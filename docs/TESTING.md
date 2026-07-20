@@ -40,6 +40,19 @@ make test-e2e-sdk
 make test-e2e-drain
 ```
 
+三项跨架构边界的定向 Gate 可用于快速回归；它们仍然必须在最终完整 suite 之外执行或被完整 suite 覆盖：
+
+```bash
+# 真实 Controller-only：测试会把 FastPath Deployment 缩容为 0，再直接创建 CRD。
+go test ./test/e2e/suites/controlplane/... -run '^TestMultiActiveControlPlane$' -v -count=1
+
+# warmImages：断言实际 runtime cache inventory 和有界 success metric。
+go test ./test/e2e/suites/basicvalidation/... -run '^TestPoolWarmImagesReachRuntimeCacheInventory$' -v -count=1
+
+# 计划升级：replacement 完成 K8s/Runtime/Infra readiness 后才 Drain 旧 Fastlet。
+go test ./test/e2e/suites/drain/... -run '^TestPoolPlannedUpgradeUsesReadySurgeAndDurableDrain$' -v -count=1
+```
+
 Runtime capability gates are explicit:
 
 ```bash
@@ -61,7 +74,7 @@ A runtime cannot be marked supported because a test skipped. The gate must exerc
 - `scheduling`: Pool selection, private-port independence, capacity, and autoscaling;
 - `cliintegration`: `fastctl` lifecycle and adapters;
 - `secureruntime`: gVisor and Kata capability behavior;
-- `drain`: Pool scale-down and durable drain semantics;
+- `drain`: Pool scale-down、基于 template hash 的 ready-surge 滚动升级和持久化 drain semantics；
 - `faultrecovery`: Pod loss and generation fencing;
 - `cleanupjanitor`: orphan cleanup backends;
 - `advancedfeatures`: additional lifecycle behavior.
@@ -75,12 +88,15 @@ Run on a host with `kubectl`:
 ```bash
 kubectl kustomize config/default >/tmp/fast-sandbox-default.yaml
 kubectl kustomize config/dev >/tmp/fast-sandbox-dev.yaml
+kubectl kustomize config/all-in-one >/tmp/fast-sandbox-all-in-one.yaml
 kubectl apply --dry-run=client --validate=false -k config/crd
 kubectl apply --dry-run=client --validate=false -k config/default
 kubectl apply --dry-run=client --validate=false -f config/network-policy/default.yaml
 ```
 
 The `config/dev` overlay contains a public test key. Production tests must create `fast-sandbox-route-keys` from a secret manager and use `config/default`.
+
+`config/all-in-one` is a development/compatibility overlay built on `config/dev`: it renders one `--role=all` Controller Pod, routes the FastPath Service to it, and removes the separate FastPath Deployment/HPA/PDB. It is not a production HA topology.
 
 Do not use `kubectl apply -f config/crd/`: that treats `kustomization.yaml` as a Kubernetes object. The e2e environment manager and manual workflows both use `kubectl apply -k config/crd`.
 

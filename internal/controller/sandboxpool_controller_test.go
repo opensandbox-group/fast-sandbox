@@ -158,6 +158,7 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	require.Equal(t, "test-infra", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_PROFILE"))
 	require.NotEmpty(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_PROFILE_HASH"))
 	require.Equal(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_PROFILE_HASH"), pod.Annotations["fast-sandbox.io/infra-profile-hash"])
+	require.NotEmpty(t, pod.Annotations[fastletpool.AnnotationPodTemplateHash])
 	require.Equal(t, "test-infra", pod.Labels["fast-sandbox.io/infra-profile"])
 	require.Equal(t, ":5758", envValue(pod.Spec.Containers[0].Env, "FASTLET_CONTROL_PORT"))
 	require.JSONEq(t, `["alpine:latest","ubuntu:24.04"]`, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_WARM_IMAGES"))
@@ -185,6 +186,14 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	propagation := volumeMount(pod, "fast-sandbox-netns")
 	require.NotNil(t, propagation)
 	require.Equal(t, corev1.MountPropagationBidirectional, *propagation)
+
+	samePod, err := reconciler.constructPod(pool, profile)
+	require.NoError(t, err)
+	require.Equal(t, pod.Annotations[fastletpool.AnnotationPodTemplateHash], samePod.Annotations[fastletpool.AnnotationPodTemplateHash])
+	pool.Spec.WarmImages = append(pool.Spec.WarmImages, "busybox:latest")
+	changedPod, err := reconciler.constructPod(pool, profile)
+	require.NoError(t, err)
+	require.NotEqual(t, pod.Annotations[fastletpool.AnnotationPodTemplateHash], changedPod.Annotations[fastletpool.AnnotationPodTemplateHash])
 }
 
 func TestScaleDownDrainsEmptyFastletBeforeDeletion(t *testing.T) {
@@ -237,6 +246,51 @@ func TestLoadedFastletWaitsUntilDrainTimeout(t *testing.T) {
 	require.True(t, client.IgnoreNotFound(err) == nil && err != nil)
 }
 
+func TestPlannedUpgradeWaitsForReadySurgeThenDrainsOldTemplate(t *testing.T) {
+	reconciler, k8sClient, _, pool := newDrainHarness(t, []apiv1alpha1.Sandbox{
+		assignedSandbox("sandbox-a", "fastlet-a", "pod-a"),
+	})
+	const desiredHash = "desired-template"
+
+	oldPod := getFastletPod(t, k8sClient, "fastlet-a")
+	oldPod.Annotations = map[string]string{fastletpool.AnnotationPodTemplateHash: "old-template"}
+	require.NoError(t, k8sClient.Update(context.Background(), oldPod))
+	newPod := getFastletPod(t, k8sClient, "fastlet-b")
+	newPod.Annotations = map[string]string{fastletpool.AnnotationPodTemplateHash: desiredHash}
+	newPod.Status.Phase = corev1.PodRunning
+	require.NoError(t, k8sClient.Update(context.Background(), newPod))
+	registry := fastletpool.NewInMemoryRegistry()
+	reconciler.Registry = registry
+
+	oldPod = getFastletPod(t, k8sClient, "fastlet-a")
+	newPod = getFastletPod(t, k8sClient, "fastlet-b")
+	result, handled, err := reconciler.reconcileDraining(context.Background(), pool, []corev1.Pod{*oldPod, *newPod}, []apiv1alpha1.Sandbox{
+		assignedSandbox("sandbox-a", "fastlet-a", "pod-a"),
+	}, 1, desiredHash)
+	require.NoError(t, err)
+	require.True(t, handled)
+	require.Equal(t, drainRequeue, result.RequeueAfter)
+	require.False(t, fastletpool.PodDrainRequested(getFastletPod(t, k8sClient, "fastlet-a")), "old Pod must remain schedulable until the surge Pod is Ready")
+
+	newPod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	registry.RegisterOrUpdate(fastletpool.FastletInfo{
+		ID: fastletpool.FastletID(newPod.Name), Namespace: newPod.Namespace, PodName: newPod.Name, PodUID: string(newPod.UID),
+		PodReady: true, RuntimeReady: true, InfraReady: true, LastHeartbeat: time.Now(),
+	})
+	_, handled, err = reconciler.reconcileDraining(context.Background(), pool, []corev1.Pod{*oldPod, *newPod}, []apiv1alpha1.Sandbox{
+		assignedSandbox("sandbox-a", "fastlet-a", "pod-a"),
+	}, 1, desiredHash)
+	require.NoError(t, err)
+	require.True(t, handled)
+	draining := getFastletPod(t, k8sClient, "fastlet-a")
+	require.True(t, fastletpool.PodDrainRequested(draining))
+	require.Equal(t, fastletpool.DrainReasonPlannedUpgrade, draining.Annotations[fastletpool.AnnotationDrainReason])
+	require.NotEmpty(t, draining.Annotations[fastletpool.AnnotationDrainAckedAt])
+
+	require.True(t, needsPlannedUpgradeSurge([]corev1.Pod{*oldPod}, 1, desiredHash))
+	require.False(t, needsPlannedUpgradeSurge([]corev1.Pod{*oldPod, *newPod}, 1, desiredHash))
+}
+
 func TestSandboxNeedsPlacementExcludesTerminalAndAssignedStates(t *testing.T) {
 	require.True(t, sandboxNeedsPlacement(&apiv1alpha1.Sandbox{}))
 	for _, phase := range []apiv1alpha1.SandboxPhase{apiv1alpha1.PhaseExpired, apiv1alpha1.PhaseLost, apiv1alpha1.PhaseTerminating} {
@@ -256,7 +310,8 @@ func newDrainHarness(t *testing.T, sandboxes []apiv1alpha1.Sandbox) (*SandboxPoo
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default", UID: types.UID("pool-a-uid")},
 		Spec: apiv1alpha1.SandboxPoolSpec{
 			Runtime: apiv1alpha1.RuntimeContainer, MaxSandboxesPerPod: 5,
-			Capacity: apiv1alpha1.PoolCapacity{PoolMin: 1, PoolMax: 10},
+			Capacity:        apiv1alpha1.PoolCapacity{PoolMin: 1, PoolMax: 10},
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}}}},
 		},
 	}
 	objects := []client.Object{pool, fastletPod("fastlet-a", "pod-a", "10.0.0.1"), fastletPod("fastlet-b", "pod-b", "10.0.0.2")}

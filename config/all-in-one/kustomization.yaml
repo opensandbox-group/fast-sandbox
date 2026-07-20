@@ -1,0 +1,45 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Development/compatibility topology only: one process runs both the FastPath
+# API and reconcilers without leader election. Production uses config/default.
+resources:
+- ../dev
+
+patches:
+- path: controller-all-in-one.yaml
+- path: service-all-in-one.yaml
+- path: controller-pdb-all-in-one.yaml
+- target:
+    group: apps
+    version: v1
+    kind: Deployment
+    name: fast-sandbox-fastpath
+  patch: |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: fast-sandbox-fastpath
+    $patch: delete
+- target:
+    group: policy
+    version: v1
+    kind: PodDisruptionBudget
+    name: fast-sandbox-fastpath
+  patch: |-
+    apiVersion: policy/v1
+    kind: PodDisruptionBudget
+    metadata:
+      name: fast-sandbox-fastpath
+    $patch: delete
+- target:
+    group: autoscaling
+    version: v2
+    kind: HorizontalPodAutoscaler
+    name: fast-sandbox-fastpath
+  patch: |-
+    apiVersion: autoscaling/v2
+    kind: HorizontalPodAutoscaler
+    metadata:
+      name: fast-sandbox-fastpath
+    $patch: delete

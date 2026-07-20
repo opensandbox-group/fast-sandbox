@@ -771,11 +771,13 @@ bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_
 - Top-K 依次执行 Pool/runtime/profile/PodReady/runtimeReady/Draining/stale/capacity hard filter，再按 normalized image hit、负载比例和 request ID/Sandbox UID 稳定扰动排序；Fastlet 明确拒绝会进入短期本地反馈抑制；
 - Heartbeat 增加 Pod UID、sequence、admission、runtime/resource profile、cache epoch/revision/full/complete；同游标且清单不变时不返回 inventory，revision gap 或清单超限时关闭镜像亲和而不影响 capacity 正确性；
 - Pool `warmImages` 由 Controller 作为平台配置注入；Fastlet recovery/Ready 完成后并发度 2 异步 pull，不阻塞 Ready；PoolWarm、ActiveSandbox、InfraArtifact、HotImage 均进入 runtime-neutral 保护索引；
+- warmImages 增加有界 Prometheus counter `fast_sandbox_warm_image_pull_total{result}`；真实远端 Gate 使用 kind 节点已加载的 `alpine:latest`，同时断言 Fastlet heartbeat 完整 cache inventory 与 success counter，证明调用了实际 RuntimeArtifactCache，而不依赖外部 registry 网络；
 - containerd `k8s.io` image store 是节点共享事实，阶段 5 不执行 Fastlet 私有破坏性 GC；实际删除等待 node-scoped coordinator/lease 证明，详见 REF-0011；
 - 删除 runtime 失败时 Fastlet 保留 `delete-failed` entry、capacity 与 active-image 保护，允许幂等重试，避免资源仍存活但 slot/缓存保护提前释放；
 - Pool CRD 对 `warmImages` 增加最多 128 项约束，Controller 平台路径线性去重；三份 sample 均符合固定 SandboxResourceProfile 约束（Kubernetes 1.27 的 `uniqueItems` 限制见 REF-0012）；
 - 远端 unit gate：`make test-unit`，退出状态 `0`；
 - 远端 race gate：`go test -race ./internal/controller/fastletpool ./internal/controller/fastletcontrol ./internal/fastlet/cache ./internal/fastlet/runtime ./internal/fastlet/server ./internal/api -count=1`，退出状态 `0`。
+- 2026-07-20 最终快照定向远端 Gate：`E2E_TEST_TIMEOUT=35m DOCKER_BUILD_FLAGS=--network=host go test ./test/e2e/suites/basicvalidation/... -run "^TestPoolWarmImagesReachRuntimeCacheInventory$" -v -count=1 -timeout 12m`，退出状态 `0`，耗时 `35.477s`；外部 Docker Hub 不可达曾使 `busybox:1.36.1` pull 超时，改用测试环境已明确加载的 alpine 后消除了环境耦合，产品逻辑不因此降级。
 
 ## 11. 阶段 6：控制面角色分离和多活 Create 状态机
 
@@ -878,6 +880,8 @@ bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_
 - Fastlet Watch 在新 Pod Ready/UID/IP 变化时立即执行一次受并发上限保护的 Heartbeat，不再让新 Pool 等待完整低频周期；
 - e2e Pool fixture 显式使用固定小型 ResourceProfile，保持真实 `单 Sandbox 资源 × maxSandboxesPerPod + overhead` 乘算；namespace 增加每次 test process 的随机 run ID，消除跨运行 Terminating 冲突；
 - 新增专用多活 e2e：验证 3 FastPath/2 Controller/单 Leader、Service endpoint 隔离、PDB/HPA、Leader 删除期间 RPC 可用、直接 CRD 创建、request ID 幂等/冲突，以及 40 并发请求严格受 3-slot Fastlet admission 限制；
+- 增加 `config/all-in-one` 开发兼容 overlay：一个 `--role=all` Controller Pod 同时运行 FastPath 和 Reconciler，FastPath Service 只选择该 Pod，独立 FastPath Deployment/HPA/PDB 不进入渲染结果，Controller PDB 改选 `role=all`；生产 `config/default` 保持 split topology；
+- controlplane e2e 会把 FastPath Deployment 实际缩为 0 验证 Controller-only；还会临时切换为单 Pod `role=all`、删除 HPA、确认 Service 唯一 endpoint 与 RPC Create/CRD UID，再完整恢复生产 split topology。2026-07-20 最终快照命令退出 `0`，总耗时 `454.960s`；Controller-only `3.03s`，role=all `22.68s`；
 - 远端 unit gate：`make test-unit`，退出状态 `0`；
 - 远端 race gate：`go test -race ./internal/controller/common ./internal/controller/controlplane ./internal/controller/fastletcontrol ./internal/controller/fastletpool ./internal/controller/fastpath ./internal/controller/sandboxorchestrator ./internal/controller ./internal/fastlet/runtime ./internal/fastlet/server ./internal/api -count=1`，退出状态 `0`；
 - 远端 Kubernetes gate：`E2E_TEST_TIMEOUT=35m make test-e2e-controlplane`，多活、basicvalidation、lifecycle、scheduling、cleanupjanitor 全部通过，退出状态 `0`。
@@ -1291,10 +1295,13 @@ bash /Users/fengjianhui/.codex/superpowers/skills/remote-dev-run/scripts/remote_
 - Janitor DaemonSet 增加 host network、network state hostPath 和 Bidirectional named-netns mount，镜像包含 iproute2/iptables。BoxLite 使用同一 backend contract 和保留的 `BackendBoxLite` 类型；实际 Box/shim/state scanner 随阶段 11 BoxLiteDriver 一起实现，不能借 containerd scanner 伪装支持；
 - Expired/clear-assignment 同步清空 deprecated `sandboxID/endpoints` 投影，保持旧 SDK/E2E 兼容，但它们仍不是权威 identity；
 - 新增 Pool Drain unit/e2e：覆盖空 Fastlet 优先、loaded Fastlet 等待 timeout、fresh reconciler 从 annotation 接管、Registry heartbeat 不能清除 Drain、leader election 切换后 Drain 状态保留，以及新 Sandbox 避开 Draining Pod；
+- PoolController 为期望 Fastlet template 计算稳定 SHA-256 并写入 Pod annotation；template 变化时只创建一个 surge，必须等待新 Pod Kubernetes Ready 和精确 Pod UID heartbeat 的 RuntimeReady/InfraReady 后，才对一个旧 template Pod 持久化 `planned-upgrade` Drain。旧 Pod 沿用原有 ack、负载等待和 timeout 语义，删除后再滚动下一个；
+- 新增 planned-upgrade unit/e2e：验证 replacement heartbeat 未就绪时旧 Pod 不 Drain、replacement 就绪后旧 Pod 收到持久化 reason、已有 Sandbox 退出后旧 Pod 才删除；远端命令 `GOFLAGS= E2E_TEST_TIMEOUT=35m DOCKER_BUILD_FLAGS=--network=host go test ./test/e2e/suites/drain/... -run "^TestPoolPlannedUpgradeUsesReadySurgeAndDurableDrain$" -v -count=1 -timeout 12m`，退出状态 `0`，耗时 `165.748s`，核心断言 `16.21s`；
 - 远端完整 unit gate：`make test-unit`，退出状态 `0`；Drain/Controller/Janitor 目标 package gate 与 Kubernetes manifest client dry-run 均退出 `0`；
 - 远端 Drain e2e：`E2E_TEST_TIMEOUT=35m DOCKER_BUILD_FLAGS=--network=host make test-e2e-drain`，最终用例包含真实 Controller Leader 删除/重选，退出状态 `0`；最终代码快照总耗时 `79.360s`，核心断言 `28.88s`（首次含全量环境准备运行 `338.399s`）；
 - 远端 fault-recovery：AutoRecreate、Manual Lost、reset、registry create/delete cycle 和 Pod orphan 路径通过；修复兼容投影后定向 `TestAutoExpiry` 通过，退出状态 `0`，耗时 `144.038s`；
 - 远端 cleanup-janitor e2e：`E2E_TEST_TIMEOUT=35m DOCKER_BUILD_FLAGS=--network=host make test-e2e-cleanupjanitor`，退出状态 `0`，耗时 `83.596s`。
+- Controller-only e2e 不再只绕过 FastPath client：测试会把 FastPath Deployment 实际缩容为 0，等待无 FastPath Pod，直接创建 Sandbox CRD并等待 assignment/runtime Ready，再恢复三个 FastPath 副本；远端定向 controlplane Gate 退出状态 `0`，总耗时 `119.943s`、Controller-only 核心断言 `3.03s`。
 
 ## 16. 阶段 11：gVisor、Kata 和 BoxLite Runtime 全矩阵
 

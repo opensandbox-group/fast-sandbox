@@ -1,5 +1,7 @@
 # Secure Runtime Support Implementation Plan
 
+> **历史计划，已完成替代性重构。** 本计划依赖的旧 runtime 多字段模型不再执行；当前实施计划见 [2026-07-19 架构重构实施计划](2026-07-19-fast-sandbox-architecture-refactor-implementation-plan.md)，规范设计见 [Runtime/Profile 设计](../specs/2026-07-19-sandbox-runtime-abstraction-design.md)。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add gVisor and Kata Containers support to Fast Sandbox with Pool-level configuration and RuntimeClass validation.

@@ -171,9 +171,12 @@ func (m *SandboxManager) WarmCache(ctx context.Context) error {
 				return
 			}
 			if err := cache.PullImage(ctx, image); err != nil {
+				recordWarmImagePull(err)
 				mu.Lock()
 				result = errors.Join(result, fmt.Errorf("warm image %s: %w", image, err))
 				mu.Unlock()
+			} else {
+				recordWarmImagePull(nil)
 			}
 		}()
 	}

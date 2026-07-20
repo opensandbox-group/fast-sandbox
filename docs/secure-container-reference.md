@@ -1,5 +1,7 @@
 # Secure Container Runtime Guide
 
+> **历史文档，非规范性。** 本文保留用于说明旧 secure-runtime 探索，包含已废弃的 `runtimeType/runtimeClassName/containerdRuntimeHandler` 模型和未经当前 Gate 证明的性能/支持描述。当前规范以 [Runtime/Profile 设计](superpowers/specs/2026-07-19-sandbox-runtime-abstraction-design.md)、[迁移指南](migration-guide.md)和[验收报告](release-acceptance-report.md)为准。
+
 This guide explains how to use secure container runtimes with OpenSandbox to provide hardware-level isolation for executing untrusted AI-generated code.
 
 ## Table of Contents

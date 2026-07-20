@@ -41,6 +41,8 @@ Controller Reconcile 由 Kubernetes Watch 异步触发，因此创建新的 root
 
 这些字段都是高基数或潜在高基数字段，只能进入 trace/log，禁止增加为 Prometheus label。Prometheus 只保留 `runtime`、`profile`、`result`、`reason`、`state` 等代码内有界分类；完整指标清单和延迟边界见 [PERFORMANCE.md](PERFORMANCE.md)。
 
+与缓存预热直接相关的指标是 `fast_sandbox_warm_image_pull_total{result="success|error"}`。它按实际 RuntimeArtifactCache pull 结果计数，不携带 image、Pool、Pod 或 Sandbox label；具体镜像命中通过 heartbeat cache inventory 和结构化日志排查，避免 Prometheus 高基数。
+
 ## OTLP 配置
 
 二进制仅在显式设置 OTLP endpoint 时安装 OTLP/gRPC exporter；未配置时 provider 保持 no-op，但上下文仍会透明传播。常用环境变量：

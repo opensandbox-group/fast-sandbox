@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: fast-sandbox-fastpath
+  namespace: default
+spec:
+  selector:
+    app: fast-sandbox-controller
+    fast-sandbox.io/control-plane-role: all

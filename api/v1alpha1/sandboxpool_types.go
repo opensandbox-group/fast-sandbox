@@ -70,14 +70,15 @@ type SandboxPoolSpec struct {
 	// +deprecated
 	RuntimeType RuntimeName `json:"runtimeType,omitempty"`
 
-	// RuntimeClassName specifies the Kubernetes RuntimeClass to use for validation.
-	// If not set, defaults to the string representation of RuntimeType.
-	// Ignored when RuntimeType is "container".
+	// RuntimeClassName is a deprecated compatibility input for old manifests.
+	// It must match the canonical profile selected by RuntimeType during migration;
+	// it is never copied to the Fastlet Pod or used as an independent runtime choice.
 	// +deprecated
 	RuntimeClassName string `json:"runtimeClassName,omitempty"`
 
-	// ContainerdRuntimeHandler overrides the containerd runtime handler.
-	// If not set, defaults based on RuntimeType.
+	// ContainerdRuntimeHandler is a deprecated compatibility input for old
+	// manifests. It must match the canonical RuntimeType profile during migration
+	// and cannot override the platform-owned runtime handler.
 	// +deprecated
 	ContainerdRuntimeHandler string `json:"containerdRuntimeHandler,omitempty"`
 

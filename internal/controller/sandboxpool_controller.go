@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -160,20 +161,29 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	currentCount := int32(len(childPods.Items))
+	desiredPod, err := r.constructPod(&pool, profile)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	desiredPodHash := desiredPod.Annotations[fastletpool.AnnotationPodTemplateHash]
 
 	if currentCount < desiredPods {
 		diff := desiredPods - currentCount
 		logger.Info("Scaling up fastlet pool", "diff", diff)
 		for i := int32(0); i < diff; i++ {
-			pod, err := r.constructPod(&pool, profile)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
+			pod := desiredPod.DeepCopy()
 			if err := r.Create(ctx, pod); err != nil {
 				logger.Error(err, "Failed to create fastlet pod")
 				return ctrl.Result{}, err
 			}
 		}
+	}
+	if needsPlannedUpgradeSurge(childPods.Items, desiredPods, desiredPodHash) {
+		logger.Info("Creating Fastlet surge Pod before planned upgrade drain", "desiredPods", desiredPods, "templateHash", desiredPodHash)
+		if err := r.Create(ctx, desiredPod.DeepCopy()); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: drainRequeue}, nil
 	}
 	if pool.Status.CurrentPods != currentCount || pool.Status.TotalFastlets != currentCount || pool.Status.ReadyPods != readyPods {
 		pool.Status.CurrentPods = currentCount
@@ -183,7 +193,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return ctrl.Result{}, err
 		}
 	}
-	if result, handled, err := r.reconcileDraining(ctx, &pool, childPods.Items, allSandboxes.Items, desiredPods); err != nil {
+	if result, handled, err := r.reconcileDraining(ctx, &pool, childPods.Items, allSandboxes.Items, desiredPods, desiredPodHash); err != nil {
 		return ctrl.Result{}, err
 	} else if handled {
 		return result, nil
@@ -241,6 +251,7 @@ func (r *SandboxPoolReconciler) reconcileDraining(
 	pods []corev1.Pod,
 	sandboxes []apiv1alpha1.Sandbox,
 	desiredPods int32,
+	desiredPodHash string,
 ) (ctrl.Result, bool, error) {
 	target := int(len(pods) - int(desiredPods))
 	if target < 0 {
@@ -272,6 +283,11 @@ func (r *SandboxPoolReconciler) reconcileDraining(
 	active := activeAssignmentsByPod(sandboxes, pool.Name)
 	if len(draining) < target {
 		sort.Slice(available, func(i, j int) bool {
+			leftCurrent := fastletPodTemplateCurrent(available[i], desiredPodHash)
+			rightCurrent := fastletPodTemplateCurrent(available[j], desiredPodHash)
+			if leftCurrent != rightCurrent {
+				return !leftCurrent
+			}
 			left := active[podIdentity(available[i])]
 			right := active[podIdentity(available[j])]
 			if left != right {
@@ -283,8 +299,16 @@ func (r *SandboxPoolReconciler) reconcileDraining(
 		if count > len(available) {
 			count = len(available)
 		}
+		currentTemplateReady := currentTemplatePodsReady(pods, desiredPodHash, r.Registry)
 		for _, pod := range available[:count] {
-			if err := r.startDrain(ctx, pod, "scale-down"); err != nil {
+			reason := fastletpool.DrainReasonScaleDown
+			if !fastletPodTemplateCurrent(pod, desiredPodHash) && currentTemplateReady {
+				reason = fastletpool.DrainReasonPlannedUpgrade
+			}
+			if !fastletPodTemplateCurrent(pod, desiredPodHash) && hasCurrentTemplatePod(pods, desiredPodHash) && !currentTemplateReady {
+				return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
+			}
+			if err := r.startDrain(ctx, pod, reason); err != nil {
 				return ctrl.Result{RequeueAfter: drainRequeue}, true, err
 			}
 		}
@@ -632,11 +656,99 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 		},
 		Spec: *podSpec,
 	}
+	if err := stampFastletPodTemplateHash(pod); err != nil {
+		return nil, err
+	}
 
 	if err := ctrl.SetControllerReference(pool, pod, r.Scheme); err != nil {
 		return nil, err
 	}
 	return pod, nil
+}
+
+func stampFastletPodTemplateHash(pod *corev1.Pod) error {
+	annotations := make(map[string]string, len(pod.Annotations))
+	for key, value := range pod.Annotations {
+		if key != fastletpool.AnnotationPodTemplateHash {
+			annotations[key] = value
+		}
+	}
+	payload := struct {
+		Labels      map[string]string `json:"labels"`
+		Annotations map[string]string `json:"annotations"`
+		Spec        corev1.PodSpec    `json:"spec"`
+	}{Labels: pod.Labels, Annotations: annotations, Spec: pod.Spec}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode Fastlet Pod template identity: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
+	}
+	pod.Annotations[fastletpool.AnnotationPodTemplateHash] = fmt.Sprintf("%x", digest)
+	return nil
+}
+
+func needsPlannedUpgradeSurge(pods []corev1.Pod, desiredPods int32, desiredPodHash string) bool {
+	if desiredPods <= 0 || len(pods) != int(desiredPods) {
+		return false
+	}
+	for index := range pods {
+		if !fastletPodTemplateCurrent(&pods[index], desiredPodHash) {
+			return true
+		}
+	}
+	return false
+}
+
+func fastletPodTemplateCurrent(pod *corev1.Pod, desiredPodHash string) bool {
+	return pod != nil && desiredPodHash != "" && pod.Annotations[fastletpool.AnnotationPodTemplateHash] == desiredPodHash
+}
+
+func hasCurrentTemplatePod(pods []corev1.Pod, desiredPodHash string) bool {
+	for index := range pods {
+		if fastletPodTemplateCurrent(&pods[index], desiredPodHash) {
+			return true
+		}
+	}
+	return false
+}
+
+func currentTemplatePodsReady(pods []corev1.Pod, desiredPodHash string, registry fastletpool.FastletRegistry) bool {
+	heartbeats := make(map[string]fastletpool.FastletInfo)
+	if registry != nil {
+		for _, info := range registry.GetAllFastlets() {
+			heartbeats[info.Namespace+"/"+info.PodName+"/"+info.PodUID] = info
+		}
+	}
+	found := false
+	for index := range pods {
+		pod := &pods[index]
+		if !fastletPodTemplateCurrent(pod, desiredPodHash) {
+			continue
+		}
+		found = true
+		if pod.Status.Phase != corev1.PodRunning || !podConditionTrue(pod.Status.Conditions, corev1.PodReady) {
+			return false
+		}
+		if registry != nil {
+			info, exists := heartbeats[pod.Namespace+"/"+pod.Name+"/"+string(pod.UID)]
+			if !exists || !info.PodReady || !info.RuntimeReady || !info.InfraReady || info.LastHeartbeat.IsZero() || info.Draining {
+				return false
+			}
+		}
+	}
+	return found
+}
+
+func podConditionTrue(conditions []corev1.PodCondition, conditionType corev1.PodConditionType) bool {
+	for _, condition := range conditions {
+		if condition.Type == conditionType {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 func (r *SandboxPoolReconciler) boxLiteRuntimeContainer(config runtimecatalog.BoxLiteConfig) corev1.Container {

@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fast-sandbox-controller
+  namespace: default
+  labels:
+    fast-sandbox.io/control-plane-role: all
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        fast-sandbox.io/control-plane-role: all
+    spec:
+      containers:
+      - name: manager
+        args:
+        - --role=all
+        - --metrics-bind-address=:9091
+        - --health-probe-bind-address=:5758
+        - --fastpath-bind-address=:9090
+        env:
+        - name: FAST_SANDBOX_ROUTE_SIGNING_PRIVATE_KEY
+          valueFrom:
+            secretKeyRef: {name: fast-sandbox-route-keys, key: private-key}
+        ports:
+        - {name: grpc, containerPort: 9090}

@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fast-sandbox-controller
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: fast-sandbox-controller
+      fast-sandbox.io/control-plane-role: all

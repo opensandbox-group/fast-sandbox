@@ -11,8 +11,9 @@ import (
 	"fast-sandbox/test/e2e/support/fixtures"
 	"fast-sandbox/test/e2e/support/suiteenv"
 
-	corev1 "k8s.io/api/core/v1"
 	coordinationv1 "k8s.io/api/coordination/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -106,9 +107,109 @@ func TestPoolScaleDownUsesDurableDrain(t *testing.T) {
 	testSuite.Env().Test(t, feature)
 }
 
+func TestPoolPlannedUpgradeUsesReadySurgeAndDurableDrain(t *testing.T) {
+	suiteenv.RequireBasic(t)
+	feature := features.New("planned-upgrade-drain").
+		WithLabel("suite", "drain").
+		WithLabel("tier", "smoke").
+		Assess("replacement is Ready before an outdated loaded Fastlet is drained", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+			k8sClient := testSuite.MustKubeClient(t)
+			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
+			namespace := testSuite.AllocateNamespace("upgrade")
+			requireNoError(t, k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}), "create namespace")
+			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
+
+			pool := drainPool(namespace)
+			pool.Name = "upgrade-pool"
+			pool.Spec.Capacity = apiv1alpha1.PoolCapacity{PoolMin: 1, PoolMax: 1}
+			_, err := fixture.CreateSandboxPool(ctx, namespace, pool)
+			requireNoError(t, err, "create upgrade Pool")
+			waitCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+			defer cancel()
+			_, err = fixture.WaitForReadyFastletPods(waitCtx, client.ObjectKeyFromObject(pool), 1)
+			requireNoError(t, err, "wait for initial Fastlet")
+			var initialPods corev1.PodList
+			requireNoError(t, k8sClient.List(ctx, &initialPods, client.InNamespace(namespace), client.MatchingLabels{"fast-sandbox.io/pool": pool.Name}), "list initial Fastlet")
+			if len(initialPods.Items) != 1 {
+				t.Fatalf("initial Fastlet count=%d, want 1", len(initialPods.Items))
+			}
+			oldPod := initialPods.Items[0]
+			oldHash := oldPod.Annotations[fastletpool.AnnotationPodTemplateHash]
+			if oldHash == "" {
+				t.Fatal("initial Fastlet has no desired Pod template hash")
+			}
+
+			sandbox := drainSandbox(namespace, "upgrade-sandbox", pool.Name, "docker.io/library/alpine:latest")
+			requireNoError(t, k8sClient.Create(ctx, sandbox), "create loaded Sandbox")
+			sandbox = waitAssigned(ctx, t, fixture, sandbox)
+			if sandbox.Status.Assignment.FastletPodUID != string(oldPod.UID) {
+				t.Fatalf("Sandbox assigned to %s, want initial Fastlet %s", sandbox.Status.Assignment.FastletPodUID, oldPod.UID)
+			}
+
+			requireNoError(t, retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				var current apiv1alpha1.SandboxPool
+				if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), &current); err != nil {
+					return err
+				}
+				current.Spec.WarmImages = append(current.Spec.WarmImages, "docker.io/library/busybox:latest")
+				return k8sClient.Update(ctx, &current)
+			}), "change desired Fastlet Pod configuration")
+
+			_, err = fixture.WaitForReadyFastletPods(waitCtx, client.ObjectKeyFromObject(pool), 2)
+			requireNoError(t, err, "wait for Ready surge Fastlet")
+			var drainingOld corev1.Pod
+			var replacement corev1.Pod
+			deadline := time.Now().Add(90 * time.Second)
+			for time.Now().Before(deadline) {
+				var pods corev1.PodList
+				requireNoError(t, k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{"fast-sandbox.io/pool": pool.Name}), "list upgrade Fastlets")
+				for index := range pods.Items {
+					pod := pods.Items[index]
+					if pod.UID == oldPod.UID {
+						if fastletpool.PodDrainRequested(&pod) {
+							drainingOld = pod
+						}
+						continue
+					}
+					if pod.Annotations[fastletpool.AnnotationPodTemplateHash] != oldHash && podReady(&pod) {
+						replacement = pod
+					}
+				}
+				if drainingOld.Name != "" && replacement.Name != "" {
+					break
+				}
+				time.Sleep(250 * time.Millisecond)
+			}
+			if replacement.Name == "" {
+				t.Fatal("no Ready replacement Fastlet with the new template hash")
+			}
+			if drainingOld.Name == "" {
+				t.Fatal("outdated loaded Fastlet was not durably drained after replacement became Ready")
+			}
+			if drainingOld.Annotations[fastletpool.AnnotationDrainReason] != fastletpool.DrainReasonPlannedUpgrade || drainingOld.Annotations[fastletpool.AnnotationDrainAckedAt] == "" {
+				t.Fatalf("planned upgrade drain metadata is incomplete: %#v", drainingOld.Annotations)
+			}
+
+			requireNoError(t, k8sClient.Delete(ctx, sandbox), "delete loaded Sandbox")
+			deadline = time.Now().Add(90 * time.Second)
+			for time.Now().Before(deadline) {
+				var current corev1.Pod
+				err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: oldPod.Name}, &current)
+				if apierrors.IsNotFound(err) {
+					return ctx
+				}
+				requireNoError(t, err, "wait for drained old Fastlet deletion")
+				time.Sleep(250 * time.Millisecond)
+			}
+			t.Fatal("old Fastlet was not deleted after its Sandbox completed declarative deletion")
+			return ctx
+		}).Feature()
+	testSuite.Env().Test(t, feature)
+}
+
 func drainPool(namespace string) *apiv1alpha1.SandboxPool {
 	return &apiv1alpha1.SandboxPool{
-		TypeMeta: metav1.TypeMeta{APIVersion: apiv1alpha1.GroupVersion.String(), Kind: "SandboxPool"},
+		TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha1.GroupVersion.String(), Kind: "SandboxPool"},
 		ObjectMeta: metav1.ObjectMeta{Name: "drain-pool", Namespace: namespace},
 		Spec: apiv1alpha1.SandboxPoolSpec{
 			Capacity: apiv1alpha1.PoolCapacity{PoolMin: 2, PoolMax: 2}, MaxSandboxesPerPod: 5,
@@ -120,9 +221,9 @@ func drainPool(namespace string) *apiv1alpha1.SandboxPool {
 
 func drainSandbox(namespace, name, pool, image string) *apiv1alpha1.Sandbox {
 	return &apiv1alpha1.Sandbox{
-		TypeMeta: metav1.TypeMeta{APIVersion: apiv1alpha1.GroupVersion.String(), Kind: "Sandbox"},
+		TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha1.GroupVersion.String(), Kind: "Sandbox"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
-		Spec: apiv1alpha1.SandboxSpec{Image: image, Command: []string{"/bin/sleep", "3600"}, PoolRef: pool},
+		Spec:       apiv1alpha1.SandboxSpec{Image: image, Command: []string{"/bin/sleep", "3600"}, PoolRef: pool},
 	}
 }
 
@@ -135,6 +236,18 @@ func waitAssigned(ctx context.Context, t *testing.T, fixture *fixtures.FixtureCl
 	})
 	requireNoError(t, err, "wait for Sandbox assignment")
 	return result
+}
+
+func podReady(pod *corev1.Pod) bool {
+	if pod == nil || pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 func requireNoError(t *testing.T, err error, action string) {
