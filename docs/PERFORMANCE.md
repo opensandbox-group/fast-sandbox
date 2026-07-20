@@ -52,6 +52,8 @@ Important Prometheus series include:
 - `fast_sandbox_sandbox_proxy_route_latency_seconds{result}`
 - `fast_sandbox_fastlet_proxy_upstream_latency_seconds{access,result}`
 
+`fast_sandbox_registry_heartbeat_age_seconds` emits at most one observation for each present `fresh`, `stale`, or `missing` state per Top-K evaluation. The value is the maximum age in that state, so metric write volume is bounded by scheduling calls rather than watched Fastlet count. `registry_candidate_count{state="eligible"}` is measured after hard filtering and before the K limit.
+
 `cache_hit` is currently reported as `unknown` for runtime creation because an inventory snapshot cannot prove whether that specific create pulled or unpacked data. Do not infer a per-create hit until RuntimeDriver returns a trustworthy result.
 
 Metrics use bounded labels. Request ID, Sandbox UID, Pod UID, assignment attempt, and route generation belong in logs/traces and must not become Prometheus labels.
@@ -66,6 +68,15 @@ go test ./internal/controller/fastletpool -run '^$' \
 ```
 
 Microbenchmark numbers are not Create latency. They exclude Fastlet admission, Kubernetes persistence, runtime, networking, Infra readiness, and proxy route readiness.
+
+On the Linux validation VM (`Intel Xeon Platinum 8269CY`, 1000 watched Fastlets, K=3), the Registry snapshot/ranking optimization produced the following median over five runs:
+
+| Implementation | Time/op | Bytes/op | Allocs/op |
+|---|---:|---:|---:|
+| Full deep-copy plus per-Fastlet heartbeat observation | 2.156 ms | 515,080 B | 2,005 |
+| Bounded ranking projection plus per-state heartbeat summary | 0.431 ms | 67,272 B | 12 |
+
+This is approximately 80% lower CPU time, 87% fewer allocated bytes, and 99% fewer allocations for this microbenchmark. Candidate behavior is unchanged: hard filters, normalized image affinity, load ratio, stable perturbation, and Fastlet-authoritative admission remain in force.
 
 ## Load and failure acceptance
 

@@ -110,6 +110,15 @@ type fastletSlot struct {
 	info FastletInfo
 }
 
+type rankedFastlet struct {
+	slot        *fastletSlot
+	id          FastletID
+	capacity    int
+	imageHit    bool
+	used        int
+	stableOrder uint64
+}
+
 type InMemoryRegistry struct {
 	mu         sync.RWMutex
 	fastlets   map[FastletID]*fastletSlot
@@ -289,47 +298,74 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 		request.Now = r.clock()
 	}
 	request.Image = fastletcache.NormalizeReference(request.Image)
-	candidates := r.GetAllFastlets()
-	recordHeartbeatAges(candidates, request.Now, time.Duration(r.staleAfter.Load()))
-	filtered := candidates[:0]
-	for _, info := range candidates {
-		if !r.hardFilter(info, request) {
+	staleAfter := time.Duration(r.staleAfter.Load())
+	r.mu.RLock()
+	slots := make([]*fastletSlot, 0, len(r.fastlets))
+	for _, slot := range r.fastlets {
+		slots = append(slots, slot)
+	}
+	r.mu.RUnlock()
+
+	heartbeats := heartbeatAgeSummary{}
+	ranked := make([]rankedFastlet, 0, len(slots))
+	for _, slot := range slots {
+		slot.mu.RLock()
+		info := slot.info
+		heartbeats.observe(info.LastHeartbeat, request.Now, staleAfter)
+		if !hardFilter(info, request, staleAfter) {
+			slot.mu.RUnlock()
 			continue
 		}
-		filtered = append(filtered, info)
+		ranked = append(ranked, rankedFastlet{
+			slot:        slot,
+			id:          info.ID,
+			capacity:    info.Capacity,
+			imageHit:    imageHit(info, request.Image),
+			used:        info.Used(),
+			stableOrder: stableOrder(request.StableKey, info.ID),
+		})
+		slot.mu.RUnlock()
 	}
-	sort.Slice(filtered, func(i, j int) bool {
-		leftHit := imageHit(filtered[i], request.Image)
-		rightHit := imageHit(filtered[j], request.Image)
-		if leftHit != rightHit {
-			return leftHit
+	recordHeartbeatAgeSummary(heartbeats)
+	sort.Slice(ranked, func(i, j int) bool {
+		left, right := ranked[i], ranked[j]
+		if left.imageHit != right.imageHit {
+			return left.imageHit
 		}
-		leftUsed, rightUsed := filtered[i].Used(), filtered[j].Used()
-		if leftUsed*filtered[j].Capacity != rightUsed*filtered[i].Capacity {
-			return leftUsed*filtered[j].Capacity < rightUsed*filtered[i].Capacity
+		if left.used*right.capacity != right.used*left.capacity {
+			return left.used*right.capacity < right.used*left.capacity
 		}
-		leftHash := stableOrder(request.StableKey, filtered[i].ID)
-		rightHash := stableOrder(request.StableKey, filtered[j].ID)
-		if leftHash != rightHash {
-			return leftHash < rightHash
+		if left.stableOrder != right.stableOrder {
+			return left.stableOrder < right.stableOrder
 		}
-		return filtered[i].ID < filtered[j].ID
+		return left.id < right.id
 	})
-	if k > 0 && len(filtered) > k {
-		filtered = filtered[:k]
+	eligibleCount := len(ranked)
+	selectedImageHit := eligibleCount > 0 && ranked[0].imageHit
+	if k > 0 && len(ranked) > k {
+		ranked = ranked[:k]
 	}
-	recordTopK(len(candidates), filtered, request.Image)
-	return filtered
+	selected := make([]FastletInfo, len(ranked))
+	for index := range ranked {
+		// Ranking is advisory; re-read and deep-clone only the bounded result.
+		// A concurrent heartbeat may make this view newer than the rank, while
+		// Fastlet admission remains authoritative for the actual reservation.
+		ranked[index].slot.mu.RLock()
+		selected[index] = cloneInfo(ranked[index].slot.info)
+		ranked[index].slot.mu.RUnlock()
+	}
+	recordTopK(len(slots), eligibleCount, request.Image, selectedImageHit)
+	return selected
 }
 
-func (r *InMemoryRegistry) hardFilter(info FastletInfo, request CandidateRequest) bool {
+func hardFilter(info FastletInfo, request CandidateRequest, staleAfter time.Duration) bool {
 	if info.Namespace != request.Namespace || info.PoolName != request.PoolName {
 		return false
 	}
 	if !info.PodReady || !info.RuntimeReady || info.Draining || info.LastHeartbeat.IsZero() {
 		return false
 	}
-	if request.Now.Sub(info.LastHeartbeat) > time.Duration(r.staleAfter.Load()) || request.Now.Before(info.RejectedUntil) {
+	if request.Now.Sub(info.LastHeartbeat) > staleAfter || request.Now.Before(info.RejectedUntil) {
 		return false
 	}
 	if info.Capacity <= 0 || info.Used() >= info.Capacity {
@@ -468,6 +504,7 @@ func cloneStatuses(statuses map[string]api.SandboxStatus) map[string]api.Sandbox
 	}
 	result := make(map[string]api.SandboxStatus, len(statuses))
 	for key, status := range statuses {
+		status.InfraDiagnostics = append([]api.InfraComponentDiagnostic(nil), status.InfraDiagnostics...)
 		result[key] = status
 	}
 	return result

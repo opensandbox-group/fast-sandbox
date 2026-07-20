@@ -3,6 +3,7 @@ package fastletpool
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -248,6 +249,67 @@ func TestGetReturnsDeepCopy(t *testing.T) {
 	stored, _ := registry.GetFastletByID("fastlet-a")
 	require.Equal(t, []string{"alpine:latest"}, stored.Images)
 	require.Empty(t, stored.SandboxStatuses)
+}
+
+func TestTopKReturnsDeepCopy(t *testing.T) {
+	registry := NewInMemoryRegistry()
+	info := readyFastlet("fastlet-a", 0, 5, "alpine:latest")
+	info.PreparedArtifacts = []string{"infra-profile-a"}
+	info.SandboxStatuses["sandbox-a"] = api.SandboxStatus{
+		SandboxID: "sandbox-a",
+		InfraDiagnostics: []api.InfraComponentDiagnostic{{
+			Component: "execd",
+			State:     "ready",
+		}},
+	}
+	registry.RegisterOrUpdate(info)
+
+	selected := registry.TopK(candidate("alpine:latest", "request-a"), 1)
+	require.Len(t, selected, 1)
+	selected[0].Images[0] = "mutated"
+	selected[0].PreparedArtifacts[0] = "mutated"
+	selectedStatus := selected[0].SandboxStatuses["sandbox-a"]
+	selectedStatus.SandboxID = "mutated"
+	selectedStatus.InfraDiagnostics[0].State = "mutated"
+	selected[0].SandboxStatuses["sandbox-a"] = selectedStatus
+
+	stored, ok := registry.GetFastletByID("fastlet-a")
+	require.True(t, ok)
+	require.Equal(t, []string{"alpine:latest"}, stored.Images)
+	require.Equal(t, []string{"infra-profile-a"}, stored.PreparedArtifacts)
+	require.Equal(t, "sandbox-a", stored.SandboxStatuses["sandbox-a"].SandboxID)
+	require.Equal(t, "ready", stored.SandboxStatuses["sandbox-a"].InfraDiagnostics[0].State)
+}
+
+func TestTopKIsSafeDuringConcurrentRegistryUpdates(t *testing.T) {
+	registry := NewInMemoryRegistry()
+	registry.RegisterOrUpdate(readyFastlet("fastlet-a", 0, 5, "alpine:latest"))
+
+	start := make(chan struct{})
+	var updates sync.WaitGroup
+	updates.Add(1)
+	go func() {
+		defer updates.Done()
+		<-start
+		for index := 0; index < 200; index++ {
+			image := "alpine:latest"
+			if index%2 == 0 {
+				image = "ubuntu:24.04"
+			}
+			registry.RegisterOrUpdate(readyFastlet("fastlet-a", index%4, 5, image))
+		}
+	}()
+
+	close(start)
+	for index := 0; index < 200; index++ {
+		selected := registry.TopK(candidate("alpine:latest", "request-a"), 1)
+		require.Len(t, selected, 1)
+		selected[0].Images[0] = "caller-mutated"
+	}
+	updates.Wait()
+	stored, ok := registry.GetFastletByID("fastlet-a")
+	require.True(t, ok)
+	require.NotEqual(t, "caller-mutated", stored.Images[0])
 }
 
 func TestStaleRegistryHintsCannotExceedFastletCapacity(t *testing.T) {
