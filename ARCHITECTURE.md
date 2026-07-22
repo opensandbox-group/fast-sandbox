@@ -49,7 +49,7 @@ One `controller` binary is deployed in separate roles:
 |---|---:|---:|---|
 | `fastpath` | No | gRPC `:9090` | FastPath API, local Registry, Top-K orchestrator, route credential issuer |
 | `controller` | Yes | No | SandboxReconciler, SandboxPoolReconciler, local Registry, heartbeat loop |
-| `all` | No | Optional | Development/compatibility combination of both roles |
+| `all` | No | Optional | Single-process development combination of both roles |
 
 Fast-Path and Controller deliberately maintain independent, eventually convergent Registries. A scheduling decision is only a hint until Fastlet accepts a reservation atomically. This is what makes multi-active Fast-Path safe without a distributed Registry lock.
 
@@ -85,7 +85,7 @@ Sandbox CRD UID
 + routeGeneration
 ```
 
-`status.assignment` is written using Kubernetes resourceVersion compare-and-swap. Runtime, data-plane, and user-process states are independent observations; the old monolithic `status.phase` remains only as a compatibility projection.
+`status.assignment` is written using Kubernetes resourceVersion compare-and-swap. Runtime, data-plane, and user-process states are independent observations represented by canonical status fields and Conditions.
 
 ### 3.2 SandboxPool CRD
 
@@ -235,11 +235,11 @@ Prometheus metrics cover Create accepted/data-plane-ready latency, Registry cand
 
 Identity values such as request ID, Sandbox UID, assignment attempt, and route generation must remain in structured logs/traces, not metric labels. `user_process_start_latency` is emitted only when the runtime adapter can prove the original user process started; sandbox-init paths are marked unavailable until a trustworthy callback exists.
 
-## 11. Deployment and migration
+## 11. Deployment
 
 - `config/default`: CRDs, RBAC, split control-plane deployments, Sandbox Proxy, PDB/HPA, and NodeJanitor. Supply route keys separately.
 - `config/dev`: default resources plus a development-only fixed route key.
 - `config/network-policy`: opt-in policy examples for a single namespace topology.
 - `config/samples`: canonical Pool and Sandbox examples.
 
-Legacy Pool fields can be converted with `fastctl migrate pool`. See [docs/migration-guide.md](docs/migration-guide.md) for compatibility and dry-run instructions.
+`config/all-in-one` combines the two control-plane roles in one process for local development. It is not a production HA topology.

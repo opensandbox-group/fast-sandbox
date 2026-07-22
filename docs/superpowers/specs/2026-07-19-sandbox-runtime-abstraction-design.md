@@ -2,7 +2,7 @@
 
 ## 状态
 
-本文记录 2026-07-19 已确认的 Sandbox Runtime 总体方案。当前阶段固定公共 API、内部抽象和迁移边界，不进入 CRD、RuntimeDriver 和部署模板的代码实现。
+本文记录 2026-07-19 已确认并已实现的 Sandbox Runtime 总体方案。项目尚未生产部署，因此公共 API 采用直接切换，不保留重构前字段或迁移适配层。
 
 相关方案：
 
@@ -515,45 +515,18 @@ create new SandboxPool with target runtime
 
 这些不属于第一阶段范围。
 
-## 9. API 迁移
+## 9. API 切换
 
-### 9.1 旧字段映射
+项目尚未生产部署，Runtime API 直接收敛到唯一 canonical contract：
 
-```text
-runtimeType: container -> runtime: container
-runtimeType: gvisor    -> runtime: gvisor
-runtimeType: kata-qemu -> runtime: kata-qemu
-runtimeType: kata-clh  -> runtime: kata-clh
-runtimeType: kata-fc   -> runtime: kata-fc
-```
+- SandboxPool 必须显式写 `spec.runtime`；
+- `runtimeType`、`runtimeClassName`、`containerdRuntimeHandler` 不存在于 CRD schema、Go API、CLI 或 SDK 中；
+- API Server 对未知字段按结构化 CRD schema 拒绝，不做默认映射、双写、优先级或转换；
+- `runtime` 缺失、值未知或更新不可变字段时直接拒绝；
+- `kata-fc` 是唯一 Firecracker RuntimeName，不提供别名；
+- 用户不能通过 Pool 覆盖 handler、runtime path 或 config path，这些实现参数只属于平台 RuntimeCatalog。
 
-`kata-fc` 保持原值，不引入重命名迁移。
-
-### 9.2 新旧字段共存规则
-
-迁移阶段建议：
-
-- 新对象只生成 `spec.runtime`；
-- 旧字段标记 deprecated，并提供有限兼容读取窗口；
-- `spec.runtime` 与任何旧 runtime 字段同时出现时拒绝，避免优先级歧义；
-- 旧对象只有 `runtimeType` 时按上述表映射；
-- 旧 `runtimeClassName` 为空或等于 `runtimeType` 默认名称时，视为冗余配置，可以一起迁移；
-- 旧 `containerdRuntimeHandler` 为空或等于内置 RuntimeCatalog 的默认 handler 时，视为冗余配置，可以一起迁移；
-- 空 `runtimeType` 映射为 `container`；
-- 映射结果写入 status/metrics 时始终使用 canonical RuntimeName。
-
-### 9.3 旧 override 的处理
-
-以下偏离内置 RuntimeCatalog 的旧配置不能自动、无损地转换成 RuntimeName：
-
-```yaml
-runtimeClassName: custom-runtime
-containerdRuntimeHandler: custom-handler
-```
-
-迁移工具或 admission 应比较旧 override 与内置 profile 的有效配置：相同则折叠为 canonical RuntimeName；不同则明确报告无法直接迁移。不能静默忽略 custom override，也不能把任意 handler 复制到新的 Pool API。
-
-如果实际集群存在这种定制，需要先将其注册为平台受控 RuntimeProfile；外部 RuntimeProfile 的资源形态另行设计。
+如果未来需要外部 RuntimeProfile，应设计新的平台受控资源和版本化契约，不能重新引入任意 handler override。
 
 ## 10. 状态和可观测性
 
@@ -598,8 +571,8 @@ unit/e2e tests
 
 主要代码变化：
 
-1. 增加 `spec.runtime`，默认 `container`，实现不可变校验；
-2. 删除或迁移 `runtimeType/runtimeClassName/containerdRuntimeHandler`；
+1. 增加必填 `spec.runtime`，实现枚举和不可变校验；
+2. 删除 `runtimeType/runtimeClassName/containerdRuntimeHandler` 及所有适配代码；
 3. 建立 Controller/Fastlet 共享 RuntimeCatalog；
 4. Controller 从 RuntimeProfile 生成 Fastlet Deployment Plan；
 5. Fastlet 只读取 `FAST_SANDBOX_RUNTIME`；
@@ -612,13 +585,12 @@ unit/e2e tests
 
 ### 12.1 单元测试
 
-- canonical RuntimeName 解析和默认值；
+- canonical RuntimeName 解析；
 - 未知 runtime 拒绝；
 - RuntimeCatalog 每个内置 profile 的 DriverKind 和私有配置；
 - `kata-fc` 保持 canonical，不接受未声明别名；
 - Pool runtime 不可变；
-- 新旧字段冲突拒绝；
-- 旧 `runtimeType` 兼容映射；
+- 缺失 runtime 和未知字段由 CRD schema 拒绝；
 - DeploymentRequirements merge 和冲突校验；
 - RuntimeDriverFactory 选择；
 - capability probe 错误分类。

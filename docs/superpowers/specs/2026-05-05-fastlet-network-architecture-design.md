@@ -544,13 +544,13 @@ BoxLite 官方架构和接口参考：
 
 ### SandboxSpec
 
-计划移除或废弃：
+公共 schema 不包含：
 
 ```text
 spec.exposedPorts
 ```
 
-新增或调整：
+当前网络策略保留在 Fastlet 内部，不暴露尚未稳定的公共 CRD；未来如需开放，应使用独立、版本化的 policy contract，例如：
 
 ```yaml
 spec:
@@ -564,33 +564,23 @@ spec:
       - 169.254.169.254/32
 ```
 
-第一阶段可以只保留内部 Go 类型，不急于把完整 policy 暴露到 CRD。
+当前实现只保留内部 Go 类型。
 
 ### SandboxStatus
 
-旧模型：
+当前权威模型：
 
 ```yaml
 status:
-  endpoints:
-    - 10.244.1.23:8080
+  assignment:
+    fastletName: fastlet-abc
+    fastletPodUID: 01234567-89ab-cdef-0123-456789abcdef
+    attempt: 1
+  routeGeneration: 1
+  dataPlaneState: Ready
 ```
 
-新模型：
-
-```yaml
-status:
-  assignedFastlet: fastlet-abc
-  fastletPodIP: 10.244.1.23
-  sandboxID: sb_xxx
-  network:
-    mode: sandbox-proxy
-    runtimeNetworkMode: linux-netns # linux-netns | kata | boxlite-gvproxy
-```
-
-`guestIP`、`gatewayIP` 和 host-side forward 端口属于 runtime 内部状态，不应成为稳定的跨 runtime API。需要诊断时可以通过 runtime-specific status 或 metrics 暴露。
-
-`assignedPod` 可以作为兼容字段短期保留，但对外语义应迁移到 `assignedFastlet`。
+`guestIP`、`gatewayIP`、AccessHandle 和 host-side forward 信息属于 runtime/Fastlet Proxy 内部状态，不是稳定的跨 runtime CRD API。诊断通过 runtime-specific diagnostics 或 metrics 暴露，不添加投影字段。
 
 ### FastPath API
 
@@ -740,10 +730,10 @@ AGENT_* env -> FASTLET_* env
 
 目标：
 
-- 废弃 `exposedPorts` 调度冲突。
+- 从公共 schema 和调度状态中删除 `exposedPorts`。
 - 不再生成 `agentPodIP:port` endpoints。
 - status/API 返回 Sandbox Proxy endpoint、service descriptor 和 required headers。
-- 保留旧字段兼容或做一次性迁移，具体在实现计划中决定。
+- 不保留旧字段、endpoint 投影或迁移 adapter。
 
 ### Phase 3: Sandbox Proxy 和 Fastlet Proxy
 
@@ -798,18 +788,14 @@ AGENT_* env -> FASTLET_* env
 - 长连接断开语义明确。
 - janitor 可清理异常中断后的残留网络资源。
 
-## 未决问题
+## 后续问题
 
-1. `assignedPod` 是否直接改为 `assignedFastlet`，还是先保留兼容字段。
-2. Sandbox Proxy 最终采用 URI、Host 还是 Header routing。
-3. ResolveEndpoint descriptor 和 required headers 的具体返回格式。
-4. `AccessHandle` 的 Dialer 接口和 route 持久化格式。
-5. kata-qemu/kata-clh/kata-fc 是否都能使用同一套 netns/network driver。
-6. 第一阶段是否需要在 CRD 暴露 network policy，还是仅内部预留。
-7. BoxLite 使用 Go SDK 内嵌还是 `boxlite serve` sidecar。
-8. BoxLite 是否支持运行中动态增加/删除 port forwarding；不支持时如何满足任意目标端口访问。
-9. `BOXLITE_HOME` 使用 hostPath 还是 PVC，以及 Fastlet Pod 重建和迁移语义。
-10. BoxLite persistent/detached Box 与 Sandbox delete/reset/expireTime 的声明式语义映射。
+当前已确定 URI route、ResolveEndpoint descriptor、两跳代理、内部 AccessHandle、network policy 暂不进入 CRD，以及 BoxLite sidecar 形态。后续仍需分别验证：
+
+1. kata-qemu/kata-clh/kata-fc 的 network driver 能力差异；
+2. BoxLite 动态 port forwarding 对任意 target port 的覆盖范围；
+3. `BOXLITE_HOME` 的持久化形态；
+4. BoxLite persistent/detached Box 与 delete/reset/expireTime 的声明式语义。
 
 ## 总结
 

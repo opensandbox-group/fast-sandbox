@@ -49,7 +49,7 @@ flowchart LR
 |---|---:|---:|---|
 | `fastpath` | 否 | gRPC `:9090` | FastPath API、本地 Registry、Top-K Orchestrator、路由凭证签发 |
 | `controller` | 是 | 否 | SandboxReconciler、SandboxPoolReconciler、本地 Registry、心跳循环 |
-| `all` | 否 | 可选 | 开发/兼容模式，在单进程组合前两种角色 |
+| `all` | 否 | 可选 | 开发模式，在单进程组合前两种角色 |
 
 Fast-Path 与 Controller 故意维护各自独立、最终收敛的 Registry。调度结果只有在 Fastlet 原子接纳 reservation 后才成为有效分配。这使多活 Fast-Path 无需分布式 Registry 锁也不会突破单 Pod 容量。
 
@@ -85,7 +85,7 @@ Sandbox CRD UID
 + routeGeneration
 ```
 
-`status.assignment` 通过 Kubernetes resourceVersion compare-and-swap 写入。runtime、data plane、user process 是三个独立观测状态；旧 `status.phase` 只保留兼容投影，不再作为权威状态机。
+`status.assignment` 通过 Kubernetes resourceVersion compare-and-swap 写入。runtime、data plane、user process 是三个独立观测状态，由 canonical status 字段和 Conditions 表达。
 
 ### 3.2 SandboxPool CRD
 
@@ -235,11 +235,11 @@ Prometheus metrics 覆盖 Create accepted/data-plane-ready latency、Registry ca
 
 request ID、Sandbox UID、assignment attempt、route generation 等 identity 必须进入结构化日志或 trace，不能作为 metrics label。只有 runtime adapter 能证明用户原始进程已经启动时才记录 `user_process_start_latency`；sandbox-init 路径在可信回调实现前明确标记 unavailable。
 
-## 11. 部署与迁移
+## 11. 部署
 
 - `config/default`：CRD、RBAC、拆分控制面、Sandbox Proxy、PDB/HPA 和 NodeJanitor；route keys 由外部提供；
 - `config/dev`：default 资源加开发专用固定 route key；
 - `config/network-policy`：单 namespace 拓扑的可选策略样例；
 - `config/samples`：canonical Pool/Sandbox 示例。
 
-旧 Pool 字段可使用 `fastctl migrate pool` 转换，兼容规则和 dry-run 步骤见 [docs/migration-guide.md](docs/migration-guide.md)。
+`config/all-in-one` 只用于本地开发，把两种控制面角色组合进一个进程，不是生产 HA 拓扑。

@@ -65,8 +65,6 @@ fastctl run my-sandbox -f sandbox-config.yaml
 *   `--pool`: Target SandboxPool name (default: `default-pool`).
 *   `--request-id`: Optional idempotency key; generated automatically when omitted.
 
-`--mode` and `--ports` remain accepted only as deprecated, ignored compatibility flags. Ports are selected when resolving an injected Infra Component's data-plane route.
-
 ### 2. List Sandboxes (`list`)
 
 View all active sandboxes, including those pending CRD synchronization.
@@ -113,11 +111,4 @@ envs:
   DEBUG: "true"
 ```
 
-### Migrate SandboxPool Manifests
-
-```bash
-fastctl migrate pool --file old-pool.yaml --output new-pool.yaml
-fastctl migrate pool --file new-pool.yaml --check
-```
-
-See [the migration guide](../../docs/migration-guide.md) for runtime/resource mapping and compatibility boundaries.
+SandboxPool manifests must use the canonical `runtime`, `sandboxResources`, and `maxSandboxesPerPod` fields.

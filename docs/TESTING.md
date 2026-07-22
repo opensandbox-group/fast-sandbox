@@ -96,19 +96,19 @@ kubectl apply --dry-run=client --validate=false -f config/network-policy/default
 
 The `config/dev` overlay contains a public test key. Production tests must create `fast-sandbox-route-keys` from a secret manager and use `config/default`.
 
-`config/all-in-one` is a development/compatibility overlay built on `config/dev`: it renders one `--role=all` Controller Pod, routes the FastPath Service to it, and removes the separate FastPath Deployment/HPA/PDB. It is not a production HA topology.
+`config/all-in-one` is a development overlay built on `config/dev`: it renders one `--role=all` Controller Pod, routes the FastPath Service to it, and removes the separate FastPath Deployment/HPA/PDB. It is not a production HA topology.
 
 Do not use `kubectl apply -f config/crd/`: that treats `kustomization.yaml` as a Kubernetes object. The e2e environment manager and manual workflows both use `kubectl apply -k config/crd`.
 
-## Migration checks
+## Canonical manifest checks
 
 ```bash
-go run ./cmd/fastctl migrate pool --file config/samples/pool.yaml --check
-go run ./cmd/fastctl migrate pool --file config/samples/pool-gvisor.yaml --check
-go run ./cmd/fastctl migrate pool --file config/samples/pool-kata.yaml --check
+kubectl apply --server-side --dry-run=server -f config/samples/pool.yaml
+kubectl apply --server-side --dry-run=server -f config/samples/pool-gvisor.yaml
+kubectl apply --server-side --dry-run=server -f config/samples/pool-kata.yaml
 ```
 
-For migrated user manifests, also run `kubectl apply --server-side --dry-run=server` against the target cluster.
+The samples and user manifests must use only the canonical CRD fields; no client-side migration command is provided.
 
 ## Reporting results
 

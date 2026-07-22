@@ -1,6 +1,6 @@
 # Secure Runtime Support Design
 
-> **历史设计，已被取代。** 本文描述的 `runtimeType + runtimeClassName + containerdRuntimeHandler` 多字段抽象不再是当前架构。当前唯一规范字段是 Pool `spec.runtime`；请参阅 [Runtime/Profile 设计](superpowers/specs/2026-07-19-sandbox-runtime-abstraction-design.md)和[迁移指南](migration-guide.md)。
+> **历史设计，已被取代。** 本文描述的 `runtimeType + runtimeClassName + containerdRuntimeHandler` 多字段抽象从未进入生产契约，当前代码不接受这些字段。唯一规范字段是 Pool `spec.runtime`；请参阅 [Runtime/Profile 设计](superpowers/specs/2026-07-19-sandbox-runtime-abstraction-design.md)。
 
 Date: 2026-03-22
 Status: Superseded

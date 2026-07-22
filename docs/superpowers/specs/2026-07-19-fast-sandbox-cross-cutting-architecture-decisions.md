@@ -86,7 +86,7 @@ flowchart LR
 | NodeJanitor | 每节点 DaemonSet | orphan runtime/network 资源兜底清理 |
 | Infra Component | 每个 Sandbox 内注入 | execd、envd 等具体数据面能力 |
 
-同一套控制面代码可以支持 `fastpath`、`controller` 和兼容迁移期的 `all` 角色，但生产部署的 Service、Leader Election、RBAC 和扩缩容必须按角色分离。
+同一套控制面代码支持 `fastpath`、`controller` 和仅用于开发的 `all` 角色，但生产部署的 Service、Leader Election、RBAC 和扩缩容必须按角色分离。
 
 ## 3. Fastlet Pod 绑定故障模型
 
@@ -584,6 +584,50 @@ CacheInventory
 ```
 
 E2B Orchestrator 暴露 `ListCachedBuilds`，说明 Template/Build 驻留信息和 CPU/Memory 一样是节点选择的重要输入。Fast Sandbox 的 image affinity 与其 cached build affinity 属于同类调度问题。
+
+### 8.6.1 Node-scoped GC 的决策和执行边界
+
+containerd-backed Runtime 的 image store 是 Node scope，同一节点上可能同时存在多个 Pool、多个 Fastlet Pod 和不同控制面副本。任何单个 Fastlet 的 ProtectionIndex 都只看到自己的局部状态，因此 Fastlet 只能生成本地保护信息，不能直接删除 node-scoped image。
+
+采用“调度层决策、NodeJanitor 执行、节点本地最终否决”的模型：
+
+```text
+Fastlet heartbeat/cache inventory + active Sandbox image
+Pool warmImages + Infra artifact + scheduling/hotness state
+                         |
+                         v
+Control-plane cache coordinator (global decision)
+                         |
+             NodeCachePlan(revision, nodeUID, TTL)
+                         |
+                         v
+NodeJanitor (local validation + execution)
+                         |
+                         v
+containerd / runtime-specific cache deletion
+```
+
+控制面的 cache coordinator 属于调度层能力，可以与 Top-K scheduler 共用 node/cache inventory，但只由单活的声明式角色发布同一节点的 GC plan。它负责计算所有本地保护集合的并集：
+
+- 节点上运行中或创建中的 Sandbox 实际使用镜像；
+- 可能在该节点运行的 Pool `warmImages`；
+- Pool 所需 Infra Component artifact；
+- 热点镜像保护窗口；
+- runtime/platform 保留镜像和正在进行的 pull/unpack lease。
+
+`NodeCachePlan` 必须带 node UID、单调 revision、生成时间、TTL、触发水位、最大释放预算和候选对象的本地不可变身份。用户 Create 请求不需要同步解析 digest；Fastlet/runtime inventory 已经取得 digest 时，GC plan 应使用它避免 tag 漂移。
+
+NodeJanitor 不重新做跨 Pool 的价值排序，只执行最新 plan，并保留最终安全否决权：
+
+- plan 过期、revision 回退、node UID 不匹配或 inventory 不完整时不执行；
+- 删除前重新检查本地 active snapshot、container lease、pull/unpack 和 Fastlet protection feed；
+- 任一保护来源不确定时 fail closed；
+- 每个删除结果回报实际释放量和新的 cache revision，供控制面重新调度；
+- 同一节点同一时刻只有一个持有 execution lease 的 GC executor。
+
+这样调度层可以利用全局视角，NodeJanitor 则利用最接近 containerd 的实时状态防止过期计划误删。NodeJanitor 不应独立决定“哪个 Pool 的 warm image 可以牺牲”，Fastlet 也不应绕过 NodeJanitor 执行破坏性 GC。
+
+第一阶段尚未实现 `NodeCachePlan` 前，现有 ProtectionIndex 和 `PlanCacheEviction` 只作为观测/规划 API；node-scoped destructive GC 保持关闭。
 
 ### 8.7 Top-K 评分顺序
 

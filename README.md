@@ -21,7 +21,7 @@ The `controller` binary supports three roles:
 
 - `--role=fastpath`: serves gRPC without leader election; every replica is active.
 - `--role=controller`: runs Sandbox and SandboxPool reconcilers with leader election.
-- `--role=all`: single-process compatibility/development mode.
+- `--role=all`: single-process development mode.
 
 Only Create is an imperative fast-path operation. Delete, reset, expiry, and failure-policy updates change the Sandbox CRD and are completed by reconciliation. Creating a Sandbox CRD directly therefore remains fully supported when Fast-Path is not deployed.
 
@@ -29,7 +29,7 @@ Only Create is an imperative fast-path operation. Delete, reset, expiry, and fai
 
 - **Bounded multi-active Create**: a stable `request_id` plus Kubernetes persistence makes retries idempotent; Fastlet performs the final atomic `maxSandboxesPerPod` admission.
 - **Watch + heartbeat scheduling**: every control-plane replica builds a local Registry from Kubernetes watches and low-frequency jittered Fastlet heartbeats. Top-K selection considers available slots and image-cache affinity; stale candidates fail fast and retry within a bounded list.
-- **Private Sandbox networks**: container-based runtimes receive an independent network namespace, veth, private address, and NAT egress. Internal ports are not globally reserved and `exposedPorts` is deprecated.
+- **Private Sandbox networks**: container-based runtimes receive an independent network namespace, veth, private address, and NAT egress. Every Sandbox can use the full private port space without global port reservation.
 - **Authenticated two-hop proxy**: Sandbox Proxy resolves `Sandbox UID -> Fastlet Pod`; Fastlet Proxy resolves the runtime-local AccessHandle. Credentials are fenced by Fastlet Pod UID, assignment attempt, and route generation.
 - **Runtime profiles**: a Pool selects one immutable `runtime`: `container`, `gvisor`, `kata-qemu`, `kata-clh`, `kata-fc`, or `boxlite`.
 - **Runtime Augmentation**: platform-owned `sandbox-init`, binaries, configuration, tokens, and readiness rules are injected without rebuilding the user's OCI image. Built-in adapters include OpenSandbox Execd and E2B Envd integration points.
@@ -125,7 +125,7 @@ fastctl --proxy-endpoint http://fast-sandbox-proxy.default.svc:8080 \
   --adapter execd exec my-sandbox -- /bin/sh -lc 'echo hello'
 ```
 
-Fast Sandbox intentionally does not define a new Exec/File wire protocol. Runtime diagnostics remain available through `fastctl logs`; user-process logs and files belong to the injected component's protocol.
+Fast Sandbox intentionally does not define a new Exec/File wire protocol. User-process execution, logs, and files belong to the injected component's protocol.
 
 ## API contracts
 
@@ -134,16 +134,7 @@ The FastPath gRPC service exposes:
 - `CreateSandbox`, `DeleteSandbox`, `UpdateSandbox`, `ListSandboxes`, `GetSandbox`
 - `ResolveEndpoint`, `IssueRouteCredential`
 
-New clients must send a stable Create `request_id`. Deprecated `consistency_mode`, `exposed_ports`, and endpoint arrays are read only for v1alpha1 compatibility and do not change scheduling, persistence order, or routing.
-
-Pool manifests using `runtimeType`, `runtimeClassName`, or `containerdRuntimeHandler` can be checked and converted locally:
-
-```bash
-fastctl migrate pool --file old-pool.yaml --check
-fastctl migrate pool --file old-pool.yaml --output new-pool.yaml
-```
-
-See [docs/migration-guide.md](docs/migration-guide.md). Metrics, trace propagation, lifecycle identity fields, and OTLP configuration are documented in [docs/observability.md](docs/observability.md).
+Create callers must send a stable `request_id`. The API accepts only the canonical contracts documented above; pre-refactor field names are not part of the schema. Metrics, trace propagation, lifecycle identity fields, and OTLP configuration are documented in [docs/observability.md](docs/observability.md).
 
 ## Validation
 
