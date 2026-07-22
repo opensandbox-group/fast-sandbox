@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"fast-sandbox/internal/api"
@@ -24,7 +23,6 @@ import (
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
-	"github.com/containerd/errdefs"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
@@ -494,68 +492,13 @@ func (r *ContainerdRuntime) DeleteSandbox(ctx context.Context, sandboxID string)
 
 func (r *ContainerdRuntime) deleteContainerdSandbox(ctx context.Context, sandboxID string) error {
 	ctx = namespaces.WithNamespace(ctx, "k8s.io")
-	snapshotName := snapShotName(sandboxID)
-
-	container, err := r.client.LoadContainer(ctx, sandboxID)
-	if err != nil {
-		klog.ErrorS(err, "Failed to load container", "sandbox", sandboxID)
-		// Container load failed, try to clean up orphaned snapshot
-		snapErr := r.client.SnapshotService("").Remove(ctx, snapshotName)
-		if snapErr != nil {
-			klog.InfoS("Snapshot cleanup", "sandbox", sandboxID, "err", snapErr)
-		}
-		if errdefs.IsNotFound(err) {
-			return snapErr
-		}
-		return JoinErrors(err, snapErr)
-	}
-
-	task, err := container.Task(ctx, nil)
-	if err != nil {
-		// Task doesn't exist, delete container and clean up snapshot
-		delErr := container.Delete(ctx)
-		snapErr := r.forceCleanupSnapshot(ctx, snapshotName)
-		return JoinErrors(err, delErr, snapErr)
-	}
-
-	// Task exists, try graceful shutdown first
-	if taskKillErr := task.Kill(ctx, syscall.SIGTERM); taskKillErr != nil {
-		exitS, taskDelErr := task.Delete(ctx, containerd.WithProcessKill)
-		containerDelErr := container.Delete(ctx)
-		snapErr := r.forceCleanupSnapshot(ctx, snapshotName)
-		klog.InfoS("Failed to kill task, force delete", "sandbox", sandboxID, "taskKillErr", taskKillErr, "taskDelErr", taskDelErr, "containerDelErr", containerDelErr, "snapErr", snapErr, "exitStatus", exitS)
-		return JoinErrors(taskKillErr, taskDelErr, containerDelErr, snapErr)
-	}
-
-	waitCh, err := task.Wait(ctx)
-	if err != nil {
-		klog.InfoS("Failed to wait for task", "sandbox", sandboxID, "err", err)
-	}
-
-	var taskKillErr error
-	select {
-	case <-waitCh:
-	case <-time.After(waitStopTimeout):
-		klog.InfoS("Sandbox did not exit after timeout, sending SIGKILL", "sandbox", sandboxID, "timeout", waitStopTimeout)
-		taskKillErr = task.Kill(ctx, syscall.SIGKILL)
-		<-waitCh
-	}
-
-	exitS, taskDelErr := task.Delete(ctx, containerd.WithProcessKill)
-	containerDelErr := container.Delete(ctx)
-	snapErr := r.forceCleanupSnapshot(ctx, snapshotName)
-	klog.InfoS("Task delete completed", "sandbox", sandboxID, "taskKillErr", taskKillErr, "taskDelErr", taskDelErr, "containerDelErr", containerDelErr, "snapErr", snapErr, "exitStatus", exitS)
-	return JoinErrors(taskDelErr, containerDelErr, snapErr)
-}
-
-// forceCleanupSnapshot explicitly removes the snapshot, ignoring "not found" errors
-func (r *ContainerdRuntime) forceCleanupSnapshot(ctx context.Context, snapshotName string) error {
-	snapErr := r.client.SnapshotService("").Remove(ctx, snapshotName)
-	// Ignore "not found" errors - snapshot may have already been cleaned up
-	if snapErr != nil && !strings.Contains(snapErr.Error(), "not found") && !strings.Contains(snapErr.Error(), "no such") {
-		return snapErr
-	}
-	return nil
+	return ensureContainerdSandboxAbsent(
+		ctx,
+		containerdDeleteClient{client: r.client},
+		sandboxID,
+		snapShotName(sandboxID),
+		waitStopTimeout,
+	)
 }
 
 func (r *ContainerdRuntime) GetSandboxStatus(ctx context.Context, sandboxID string) (string, error) {
