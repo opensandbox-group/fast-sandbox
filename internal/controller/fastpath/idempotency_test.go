@@ -30,13 +30,11 @@ func TestCreateSpecHashIsDeterministic(t *testing.T) {
 		Envs:      map[string]string{"B": "2", "A": "1"},
 	}
 	b := &fastpathv1.CreateRequest{
-		RequestId:       "request-b",
-		Image:           "example/image:v1",
-		PoolRef:         "default",
-		Namespace:       "default",
-		Envs:            map[string]string{"A": "1", "B": "2"},
-		ConsistencyMode: fastpathv1.ConsistencyMode_STRONG,
-		ExposedPorts:    []int32{8080},
+		RequestId: "request-b",
+		Image:     "example/image:v1",
+		PoolRef:   "default",
+		Namespace: "default",
+		Envs:      map[string]string{"A": "1", "B": "2"},
 	}
 
 	hashA, err := CreateSpecHash(a)

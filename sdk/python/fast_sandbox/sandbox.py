@@ -18,10 +18,10 @@ class ExecResult:
 
 
 class Sandbox:
-    def __init__(self, client: "Client", name: str, sandbox_id: str = "", namespace: str = "default"):
+    def __init__(self, client: "Client", name: str, sandbox_uid: str = "", namespace: str = "default"):
         self._client = client
         self.name = name
-        self.sandbox_id = sandbox_id
+        self.sandbox_uid = sandbox_uid
         self.namespace = namespace
         from .files import FilesClient
 

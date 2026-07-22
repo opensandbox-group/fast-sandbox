@@ -13,6 +13,7 @@ import (
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/controller/fastletpool"
+	"fast-sandbox/internal/controller/sandboxorchestrator"
 	"fast-sandbox/internal/infracatalog"
 	"fast-sandbox/internal/runtimecatalog"
 
@@ -92,7 +93,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		})
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
-	if _, err := pool.Spec.EffectiveSandboxResources(); err != nil {
+	if err := apiv1alpha1.ValidateSandboxResourceProfile(pool.Spec.SandboxResources); err != nil {
 		_ = r.updatePoolCondition(ctx, &pool, metav1.Condition{
 			Type:    apiv1alpha1.PoolConditionRuntimeReady,
 			Status:  metav1.ConditionFalse,
@@ -414,12 +415,12 @@ func sandboxNeedsPlacement(sandbox *apiv1alpha1.Sandbox) bool {
 	if sandbox == nil || sandbox.Status.Assignment != nil || sandbox.DeletionTimestamp != nil {
 		return false
 	}
-	switch sandbox.Status.Phase {
-	case string(apiv1alpha1.PhaseExpired), string(apiv1alpha1.PhaseLost), string(apiv1alpha1.PhaseTerminating):
+	if sandbox.Status.HasCondition(sandboxorchestrator.ConditionRuntimeReady, metav1.ConditionFalse, sandboxorchestrator.ReasonExpired) ||
+		sandbox.Status.HasCondition(sandboxorchestrator.ConditionRuntimeReady, metav1.ConditionFalse, sandboxorchestrator.ReasonFastletPodLost) ||
+		sandbox.Status.RuntimeState == apiv1alpha1.ObservedStateDraining {
 		return false
-	default:
-		return true
 	}
+	return true
 }
 
 func podIdentity(pod *corev1.Pod) string {
@@ -449,8 +450,8 @@ func (r *SandboxPoolReconciler) durableReader() client.Reader {
 // RuntimeProfile. RuntimeClass and backend handler overrides are never copied
 // from the Pool into the Pod.
 func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, profile runtimecatalog.RuntimeProfile) (*corev1.Pod, error) {
-	sandboxResources, err := pool.Spec.EffectiveSandboxResources()
-	if err != nil {
+	sandboxResources := pool.Spec.SandboxResources
+	if err := apiv1alpha1.ValidateSandboxResourceProfile(sandboxResources); err != nil {
 		return nil, err
 	}
 	infraPlan, err := r.resolveInfraPlan(pool, profile)
@@ -841,22 +842,18 @@ func poolLabels(poolName string) map[string]string {
 }
 
 func getFastletCapacity(pool *apiv1alpha1.SandboxPool) int32 {
-	if pool.Spec.MaxSandboxesPerPod > 0 {
-		return pool.Spec.MaxSandboxesPerPod
-	}
-	return 5
+	return pool.Spec.MaxSandboxesPerPod
 }
 
 func (r *SandboxPoolReconciler) resolveRuntimeProfile(pool *apiv1alpha1.SandboxPool) (runtimecatalog.RuntimeProfile, error) {
-	name, err := pool.Spec.EffectiveRuntime()
-	if err != nil {
+	if err := pool.Spec.ValidateRuntime(); err != nil {
 		return runtimecatalog.RuntimeProfile{}, err
 	}
 	catalog := r.Catalog
 	if catalog == nil {
 		catalog = runtimecatalog.Builtin()
 	}
-	return catalog.Resolve(name)
+	return catalog.Resolve(pool.Spec.Runtime)
 }
 
 func (r *SandboxPoolReconciler) resolveInfraPlan(pool *apiv1alpha1.SandboxPool, runtimeProfile runtimecatalog.RuntimeProfile) (infracatalog.Plan, error) {
@@ -868,12 +865,11 @@ func (r *SandboxPoolReconciler) resolveInfraPlan(pool *apiv1alpha1.SandboxPool, 
 }
 
 var runtimeOwnedEnv = map[string]struct{}{
-	"RUNTIME_TYPE": {}, "RUNTIME_HANDLER": {},
 	"FAST_SANDBOX_RUNTIME": {}, "FAST_SANDBOX_RUNTIME_PROFILE_HASH": {},
 	"FAST_SANDBOX_RESOURCE_CPU": {}, "FAST_SANDBOX_RESOURCE_MEMORY": {}, "FAST_SANDBOX_RESOURCE_PIDS": {},
 	"FAST_SANDBOX_INFRA_PROFILE": {}, "FAST_SANDBOX_INFRA_PROFILE_HASH": {}, "FASTLET_CAPACITY": {},
 	"RUNTIME_SOCKET": {}, "INFRA_DIR_IN_POD": {},
-	"FASTLET_CONTROL_PORT": {}, "AGENT_PORT": {},
+	"FASTLET_CONTROL_PORT":         {},
 	"FASTLET_PROXY_CONTROL_SOCKET": {},
 	"FAST_SANDBOX_WARM_IMAGES":     {},
 	"NODE_NAME":                    {}, "POD_NAME": {}, "POD_IP": {}, "POD_UID": {}, "NAMESPACE": {},

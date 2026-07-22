@@ -419,10 +419,7 @@ func (m *SandboxManager) DeleteSandboxV2(req *api.DeleteSandboxV2Request) (*api.
 		}
 	}
 	m.mu.RUnlock()
-	if _, err := m.DeleteSandbox(req.Identity.SandboxUID); err != nil {
-		failure := fastletError(api.ErrorRuntimeUnavailable, err.Error(), true)
-		return &api.DeleteSandboxV2Response{Error: failure}, failure
-	}
+	m.beginDelete(req.Identity.SandboxUID)
 	return &api.DeleteSandboxV2Response{Accepted: true}, nil
 }
 

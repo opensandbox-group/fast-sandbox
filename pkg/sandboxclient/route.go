@@ -67,16 +67,16 @@ func (r *EndpointResolver) Resolve(ctx context.Context, sandbox SandboxRef, targ
 	if err != nil {
 		return Route{}, fmt.Errorf("get Sandbox %s/%s: %w", namespace, sandbox.Name, err)
 	}
-	if info.GetSandboxId() == "" {
+	if info.GetSandboxUid() == "" {
 		return Route{}, fmt.Errorf("Sandbox %s/%s has no CRD UID", namespace, sandbox.Name)
 	}
 	resolved, err := r.Control.ResolveEndpoint(ctx, &fastpathv1.ResolveEndpointRequest{
-		SandboxUid: info.GetSandboxId(), TargetPort: targetPort, Protocol: "http",
+		SandboxUid: info.GetSandboxUid(), TargetPort: targetPort, Protocol: "http",
 	})
 	if err != nil {
 		return Route{}, fmt.Errorf("resolve Sandbox %s/%s port %d: %w", namespace, sandbox.Name, targetPort, err)
 	}
-	if resolved.GetSandboxUid() != info.GetSandboxId() || resolved.GetTargetPort() != targetPort {
+	if resolved.GetSandboxUid() != info.GetSandboxUid() || resolved.GetTargetPort() != targetPort {
 		return Route{}, errors.New("FastPath returned a route for a different Sandbox or target port")
 	}
 	endpoint, err := url.Parse(resolved.GetProxyEndpoint())

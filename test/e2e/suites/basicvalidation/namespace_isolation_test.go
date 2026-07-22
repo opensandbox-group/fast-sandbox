@@ -88,8 +88,7 @@ func TestNamespaceIsolation(t *testing.T) {
 				t.Fatalf("create same-namespace sandbox: %v", err)
 			}
 			if _, err := fixture.WaitForSandbox(ctx, types.NamespacedName{Name: sameNamespaceSandbox.Name, Namespace: namespaceA}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedFastlet != "" &&
-					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
+				return sb.Status.Assignment != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 			}); err != nil {
 				t.Fatalf("wait for same-namespace sandbox assignment: %v", err)
 			}

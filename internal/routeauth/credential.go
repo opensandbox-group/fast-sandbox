@@ -207,8 +207,8 @@ func ParsePublicKey(encoded string) (ed25519.PublicKey, error) {
 	return ed25519.PublicKey(data), nil
 }
 
-// ParsePublicKeySet parses a comma-separated list of base64 Ed25519 public
-// keys. A single key remains fully backward compatible with existing config.
+// ParsePublicKeySet parses one or more comma-separated base64 Ed25519 public
+// keys. A single key is a valid key set.
 func ParsePublicKeySet(encoded string) ([]ed25519.PublicKey, error) {
 	parts := strings.Split(encoded, ",")
 	keys := make([]ed25519.PublicKey, 0, len(parts))

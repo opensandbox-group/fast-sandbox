@@ -116,7 +116,6 @@ func TestSandboxCRDValidation(t *testing.T) {
 				Spec: apiv1alpha1.SandboxSpec{
 					Image:                  "nginx:alpine",
 					PoolRef:                "test-pool",
-					ExposedPorts:           []int32{8080},
 					FailurePolicy:          apiv1alpha1.FailurePolicyManual,
 					RecoveryTimeoutSeconds: 60,
 				},

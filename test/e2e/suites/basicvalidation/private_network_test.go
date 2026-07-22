@@ -63,13 +63,13 @@ func TestSandboxPrivateNetwork(t *testing.T) {
 			}
 			first = waitForAssignedSandbox(ctx, t, fixture, namespace, first.Name)
 			second = waitForAssignedSandbox(ctx, t, fixture, namespace, second.Name)
-			if first.Status.AssignedFastlet != second.Status.AssignedFastlet {
-				t.Fatalf("sandboxes were not placed on the same Fastlet: %s != %s", first.Status.AssignedFastlet, second.Status.AssignedFastlet)
-			}
-			fastletPod := first.Status.AssignedFastlet
 			if first.Status.Assignment == nil || second.Status.Assignment == nil {
 				t.Fatalf("sandboxes have no authoritative assignment")
 			}
+			if first.Status.Assignment.FastletName != second.Status.Assignment.FastletName {
+				t.Fatalf("sandboxes were not placed on the same Fastlet: %s != %s", first.Status.Assignment.FastletName, second.Status.Assignment.FastletName)
+			}
+			fastletPod := first.Status.Assignment.FastletName
 			fastletPodUID := first.Status.Assignment.FastletPodUID
 			if fastletPodUID == "" || second.Status.Assignment.FastletPodUID != fastletPodUID {
 				t.Fatalf("sandboxes do not share a fenced Fastlet Pod UID")

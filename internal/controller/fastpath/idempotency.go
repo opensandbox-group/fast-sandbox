@@ -21,8 +21,7 @@ func requestIDLabelValue(requestID string) string {
 }
 
 // ValidateRequestID validates the stable idempotency key accepted from an SDK
-// or fastctl. Generation of a missing key belongs to clients; the transitional
-// server may still synthesize one until all clients are migrated.
+// or fastctl. Clients must generate the key before sending the request.
 func ValidateRequestID(requestID string) error {
 	requestID = strings.TrimSpace(requestID)
 	if requestID == "" {
@@ -40,16 +39,13 @@ func ValidateRequestID(requestID string) error {
 }
 
 // CreateSpecHash returns a deterministic digest of the immutable Create
-// intent. Transport-only request_id and deprecated Fast/Strong/host-port fields
-// are deliberately excluded from the identity.
+// intent. The transport-only request_id is excluded from the identity.
 func CreateSpecHash(req *fastpathv1.CreateRequest) (string, error) {
 	if req == nil {
 		return "", errors.New("create request is required")
 	}
 	normalized := proto.Clone(req).(*fastpathv1.CreateRequest)
 	normalized.RequestId = ""
-	normalized.ConsistencyMode = fastpathv1.ConsistencyMode_FAST
-	normalized.ExposedPorts = nil
 	if normalized.Namespace == "" {
 		normalized.Namespace = "default"
 	}

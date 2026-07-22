@@ -12,8 +12,8 @@ import (
 	"fast-sandbox/test/e2e/support/fixtures"
 	"fast-sandbox/test/e2e/support/suiteenv"
 
-	corev1 "k8s.io/api/core/v1"
 	"github.com/opencontainers/runtime-spec/specs-go"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -214,11 +214,10 @@ EOF
 chmod +x /serve.sh
 exec nc -lk -p 18080 -e /serve.sh`
 	return e2eenv.FastctlConfig{
-		Image:           "docker.io/library/alpine:latest",
-		PoolRef:         poolName,
-		ConsistencyMode: "strong",
-		Command:         []string{"/bin/sh"},
-		Args:            []string{"-c", script},
+		Image:   "docker.io/library/alpine:latest",
+		PoolRef: poolName,
+		Command: []string{"/bin/sh"},
+		Args:    []string{"-c", script},
 	}
 }
 

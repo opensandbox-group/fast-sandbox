@@ -2,15 +2,11 @@ package runtime
 
 import (
 	"context"
-	"fmt"
-	"io"
 	"time"
 
-	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
-	"fast-sandbox/internal/runtimecatalog"
 )
 
 type SandboxMetadata struct {
@@ -37,16 +33,6 @@ type RuntimeDriver interface {
 	DeleteSandbox(ctx context.Context, sandboxID string) error
 	ListManagedSandboxes(ctx context.Context) ([]*SandboxMetadata, error)
 	Close() error
-}
-
-// Runtime is retained as a source-compatible alias while callers migrate to
-// the explicit RuntimeDriver name.
-type Runtime = RuntimeDriver
-
-// RuntimeLogReader is a temporary internal diagnostic capability. It is not a
-// Fast Sandbox public data-plane contract and will move behind Fastlet Proxy.
-type RuntimeLogReader interface {
-	GetSandboxLogs(ctx context.Context, sandboxID string, follow bool, stdout io.Writer) error
 }
 
 // RuntimeArtifactCache is an optional cache capability implemented by drivers
@@ -104,17 +90,6 @@ type RoutePublisher interface {
 	ReconcileRoutes(context.Context, []RoutePublication) error
 }
 
-type RuntimeType = apiv1alpha1.RuntimeName
-
-const (
-	RuntimeTypeContainer RuntimeType = "container"
-	RuntimeTypeGVisor    RuntimeType = "gvisor"
-	RuntimeTypeKataQemu  RuntimeType = "kata-qemu"
-	RuntimeTypeKataFc    RuntimeType = "kata-fc"
-	RuntimeTypeKataClh   RuntimeType = "kata-clh"
-	RuntimeTypeBoxLite   RuntimeType = "boxlite"
-)
-
 // RuntimeConfig defines the configuration for each runtime type.
 type RuntimeConfig struct {
 	Handler     string // containerd runtime handler name
@@ -122,76 +97,4 @@ type RuntimeConfig struct {
 	ConfigPath  string // configuration file path (optional)
 	NeedsTTY    bool   // whether TTY is required for this runtime
 	OptionsType string // TypeUrl for runtime options (optional, e.g., gVisor)
-}
-
-var sharedRuntimeCatalog = runtimecatalog.Builtin()
-
-// GetRuntimeHandler returns the containerd runtime handler for the given type.
-func GetRuntimeHandler(rt RuntimeType) string {
-	if cfg, err := ResolveRuntimeConfig(rt, ""); err == nil {
-		return cfg.Handler
-	}
-	return ""
-}
-
-// GetRuntimeConfig returns the full RuntimeConfig for the given type.
-func GetRuntimeConfig(rt RuntimeType) RuntimeConfig {
-	cfg, err := ResolveRuntimeConfig(rt, "")
-	if err != nil {
-		cfg, _ = ResolveRuntimeConfig(RuntimeTypeContainer, "")
-	}
-	return cfg
-}
-
-func ResolveRuntimeConfig(rt RuntimeType, handlerOverride string) (RuntimeConfig, error) {
-	profile, err := sharedRuntimeCatalog.Resolve(rt)
-	if err != nil || profile.Driver != runtimecatalog.DriverKindContainerd || profile.Containerd == nil {
-		return RuntimeConfig{}, ErrUnsupportedRuntime
-	}
-	cfg := RuntimeConfig{
-		Handler:     profile.Containerd.Handler,
-		RuntimePath: profile.Containerd.RuntimePath,
-		ConfigPath:  profile.Containerd.ConfigPath,
-		NeedsTTY:    profile.Containerd.NeedsTTY,
-		OptionsType: profile.Containerd.OptionsType,
-	}
-	// Legacy-only compatibility hook. Production Fastlets no longer read a
-	// handler override from Pod environment; the RuntimeCatalog is authoritative.
-	if handlerOverride != "" {
-		cfg.Handler = handlerOverride
-	}
-	return cfg, nil
-}
-
-func NewRuntime(ctx context.Context, runtimeType RuntimeType, socketPath string) (Runtime, error) {
-	driver, _, err := NewDriverFactory(sharedRuntimeCatalog, NewHostCapabilityProber()).Create(ctx, runtimeType, socketPath)
-	return driver, err
-}
-
-func NewRuntimeWithHandler(ctx context.Context, runtimeType RuntimeType, socketPath, handlerOverride string) (Runtime, error) {
-	if handlerOverride == "" {
-		return NewRuntime(ctx, runtimeType, socketPath)
-	}
-	cfg, err := ResolveRuntimeConfig(runtimeType, handlerOverride)
-	if err != nil {
-		return nil, err
-	}
-
-	var rt Runtime
-	switch runtimeType {
-	case RuntimeTypeContainer, RuntimeTypeGVisor,
-		RuntimeTypeKataQemu, RuntimeTypeKataFc, RuntimeTypeKataClh:
-		rt = newContainerdRuntimeWithConfig(runtimeType, cfg)
-	default:
-		return nil, ErrUnsupportedRuntime
-	}
-
-	if err := rt.Initialize(ctx, socketPath); err != nil {
-		return nil, err
-	}
-	if report := rt.ProbeCapabilities(ctx); report.State != runtimecatalog.CapabilityReady {
-		_ = rt.Close()
-		return nil, fmt.Errorf("runtime driver did not become ready: %s: %s", report.Reason, report.Message)
-	}
-	return rt, nil
 }

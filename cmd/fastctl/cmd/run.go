@@ -19,21 +19,17 @@ import (
 
 // SandboxConfig for yaml
 type SandboxConfig struct {
-	Image           string            `yaml:"image"`
-	PoolRef         string            `yaml:"pool_ref"`
-	ConsistencyMode string            `yaml:"consistency_mode"` // "fast" or "strong"
-	Command         []string          `yaml:"command,omitempty"`
-	Args            []string          `yaml:"args,omitempty"`
-	ExposedPorts    []int32           `yaml:"exposed_ports,omitempty"`
-	Envs            map[string]string `yaml:"envs,omitempty"`
-	WorkingDir      string            `yaml:"working_dir,omitempty"`
+	Image      string            `yaml:"image"`
+	PoolRef    string            `yaml:"pool_ref"`
+	Command    []string          `yaml:"command,omitempty"`
+	Args       []string          `yaml:"args,omitempty"`
+	Envs       map[string]string `yaml:"envs,omitempty"`
+	WorkingDir string            `yaml:"working_dir,omitempty"`
 }
 
 var (
 	configFile string
 	pool       string
-	mode       string
-	ports      []int32
 	image      string
 	requestID  string
 )
@@ -90,12 +86,6 @@ Priority: Flags > Config File > Interactive Input
 		if pool != "" && cmd.Flags().Changed("pool") {
 			config.PoolRef = pool
 		}
-		if mode != "" && cmd.Flags().Changed("mode") {
-			config.ConsistencyMode = mode
-		}
-		if len(ports) > 0 {
-			config.ExposedPorts = ports
-		}
 		if len(args) > 1 {
 			config.Command = args[1:]
 		}
@@ -107,13 +97,6 @@ Priority: Flags > Config File > Interactive Input
 		client, conn := getClient()
 		if conn != nil {
 			defer conn.Close()
-		}
-
-		if config.ConsistencyMode != "" && !cmd.Flags().Changed("mode") {
-			fmt.Fprintln(cmd.ErrOrStderr(), "Warning: consistency_mode/--mode is deprecated and ignored; Create always commits the CRD before runtime Ensure")
-		}
-		if len(config.ExposedPorts) > 0 && !cmd.Flags().Changed("ports") {
-			fmt.Fprintln(cmd.ErrOrStderr(), "Warning: exposed_ports/--ports is deprecated and ignored; target ports are selected when resolving the data-plane route")
 		}
 
 		start := time.Now()
@@ -144,10 +127,10 @@ Priority: Flags > Config File > Interactive Input
 			log.Fatalf("Error: %v", err)
 		}
 
-		klog.V(4).InfoS("Sandbox created successfully", "name", name, "sandboxId", resp.SandboxId, "sandboxName", resp.SandboxName, "fastlet", resp.FastletPod, "duration", time.Since(start))
+		klog.V(4).InfoS("Sandbox created successfully", "name", name, "sandboxUid", resp.SandboxUid, "sandboxName", resp.SandboxName, "fastlet", resp.FastletPod, "duration", time.Since(start))
 		fmt.Printf("🎉 Sandbox created successfully in %v\n", time.Since(start))
 		fmt.Printf("Name:      %s\n", resp.SandboxName)
-		fmt.Printf("ID:        %s\n", resp.SandboxId)
+		fmt.Printf("UID:       %s\n", resp.SandboxUid)
 		fmt.Printf("Fastlet:   %s\n", resp.FastletPod)
 	},
 }
@@ -158,10 +141,6 @@ func init() {
 	runCmd.Flags().StringVarP(&configFile, "file", "f", "", "Path to sandbox config file")
 	runCmd.Flags().StringVar(&image, "image", "", "Container image")
 	runCmd.Flags().StringVar(&pool, "pool", "default-pool", "Target SandboxPool")
-	runCmd.Flags().StringVar(&mode, "mode", "", "Deprecated and ignored")
-	runCmd.Flags().Int32SliceVar(&ports, "ports", []int32{}, "Deprecated and ignored")
-	_ = runCmd.Flags().MarkDeprecated("mode", "Create always commits the CRD before runtime Ensure")
-	_ = runCmd.Flags().MarkDeprecated("ports", "ports are selected when resolving the Sandbox data-plane route")
 	runCmd.Flags().StringVar(&requestID, "request-id", "", "Idempotency key (generated automatically when omitted)")
 }
 

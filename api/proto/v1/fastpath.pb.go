@@ -21,56 +21,6 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// ConsistencyMode is retained only for wire compatibility. Create always uses
-// reservation -> CRD commit -> assignment CAS -> runtime Ensure.
-type ConsistencyMode int32
-
-const (
-	// Deprecated and ignored.
-	ConsistencyMode_FAST ConsistencyMode = 0
-	// Deprecated and ignored.
-	ConsistencyMode_STRONG ConsistencyMode = 1
-)
-
-// Enum value maps for ConsistencyMode.
-var (
-	ConsistencyMode_name = map[int32]string{
-		0: "FAST",
-		1: "STRONG",
-	}
-	ConsistencyMode_value = map[string]int32{
-		"FAST":   0,
-		"STRONG": 1,
-	}
-)
-
-func (x ConsistencyMode) Enum() *ConsistencyMode {
-	p := new(ConsistencyMode)
-	*p = x
-	return p
-}
-
-func (x ConsistencyMode) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (ConsistencyMode) Descriptor() protoreflect.EnumDescriptor {
-	return file_api_proto_v1_fastpath_proto_enumTypes[0].Descriptor()
-}
-
-func (ConsistencyMode) Type() protoreflect.EnumType {
-	return &file_api_proto_v1_fastpath_proto_enumTypes[0]
-}
-
-func (x ConsistencyMode) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use ConsistencyMode.Descriptor instead.
-func (ConsistencyMode) EnumDescriptor() ([]byte, []int) {
-	return file_api_proto_v1_fastpath_proto_rawDescGZIP(), []int{0}
-}
-
 // FailurePolicy 定义故障恢复策略
 type FailurePolicy int32
 
@@ -102,11 +52,11 @@ func (x FailurePolicy) String() string {
 }
 
 func (FailurePolicy) Descriptor() protoreflect.EnumDescriptor {
-	return file_api_proto_v1_fastpath_proto_enumTypes[1].Descriptor()
+	return file_api_proto_v1_fastpath_proto_enumTypes[0].Descriptor()
 }
 
 func (FailurePolicy) Type() protoreflect.EnumType {
-	return &file_api_proto_v1_fastpath_proto_enumTypes[1]
+	return &file_api_proto_v1_fastpath_proto_enumTypes[0]
 }
 
 func (x FailurePolicy) Number() protoreflect.EnumNumber {
@@ -115,7 +65,7 @@ func (x FailurePolicy) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use FailurePolicy.Descriptor instead.
 func (FailurePolicy) EnumDescriptor() ([]byte, []int) {
-	return file_api_proto_v1_fastpath_proto_rawDescGZIP(), []int{1}
+	return file_api_proto_v1_fastpath_proto_rawDescGZIP(), []int{0}
 }
 
 type ListRequest struct {
@@ -259,17 +209,18 @@ func (x *GetRequest) GetNamespace() string {
 }
 
 type SandboxInfo struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`       // Deprecated alias of the Kubernetes Sandbox UID
-	SandboxName   string                 `protobuf:"bytes,8,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"` // CRD name (user-provided)
-	Phase         string                 `protobuf:"bytes,2,opt,name=phase,proto3" json:"phase,omitempty"`
-	FastletPod    string                 `protobuf:"bytes,3,opt,name=fastlet_pod,json=fastletPod,proto3" json:"fastlet_pod,omitempty"`
-	Endpoints     []string               `protobuf:"bytes,4,rep,name=endpoints,proto3" json:"endpoints,omitempty"`
-	CreatedAt     int64                  `protobuf:"varint,5,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	Image         string                 `protobuf:"bytes,6,opt,name=image,proto3" json:"image,omitempty"`
-	PoolRef       string                 `protobuf:"bytes,7,opt,name=pool_ref,json=poolRef,proto3" json:"pool_ref,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	SandboxUid       string                 `protobuf:"bytes,1,opt,name=sandbox_uid,json=sandboxUid,proto3" json:"sandbox_uid,omitempty"`    // Kubernetes Sandbox CRD UID
+	SandboxName      string                 `protobuf:"bytes,2,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"` // CRD name (user-provided)
+	RuntimeState     string                 `protobuf:"bytes,3,opt,name=runtime_state,json=runtimeState,proto3" json:"runtime_state,omitempty"`
+	DataPlaneState   string                 `protobuf:"bytes,4,opt,name=data_plane_state,json=dataPlaneState,proto3" json:"data_plane_state,omitempty"`
+	UserProcessState string                 `protobuf:"bytes,5,opt,name=user_process_state,json=userProcessState,proto3" json:"user_process_state,omitempty"`
+	FastletPod       string                 `protobuf:"bytes,6,opt,name=fastlet_pod,json=fastletPod,proto3" json:"fastlet_pod,omitempty"`
+	CreatedAt        int64                  `protobuf:"varint,7,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	Image            string                 `protobuf:"bytes,8,opt,name=image,proto3" json:"image,omitempty"`
+	PoolRef          string                 `protobuf:"bytes,9,opt,name=pool_ref,json=poolRef,proto3" json:"pool_ref,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *SandboxInfo) Reset() {
@@ -302,9 +253,9 @@ func (*SandboxInfo) Descriptor() ([]byte, []int) {
 	return file_api_proto_v1_fastpath_proto_rawDescGZIP(), []int{3}
 }
 
-func (x *SandboxInfo) GetSandboxId() string {
+func (x *SandboxInfo) GetSandboxUid() string {
 	if x != nil {
-		return x.SandboxId
+		return x.SandboxUid
 	}
 	return ""
 }
@@ -316,9 +267,23 @@ func (x *SandboxInfo) GetSandboxName() string {
 	return ""
 }
 
-func (x *SandboxInfo) GetPhase() string {
+func (x *SandboxInfo) GetRuntimeState() string {
 	if x != nil {
-		return x.Phase
+		return x.RuntimeState
+	}
+	return ""
+}
+
+func (x *SandboxInfo) GetDataPlaneState() string {
+	if x != nil {
+		return x.DataPlaneState
+	}
+	return ""
+}
+
+func (x *SandboxInfo) GetUserProcessState() string {
+	if x != nil {
+		return x.UserProcessState
 	}
 	return ""
 }
@@ -328,13 +293,6 @@ func (x *SandboxInfo) GetFastletPod() string {
 		return x.FastletPod
 	}
 	return ""
-}
-
-func (x *SandboxInfo) GetEndpoints() []string {
-	if x != nil {
-		return x.Endpoints
-	}
-	return nil
 }
 
 func (x *SandboxInfo) GetCreatedAt() int64 {
@@ -359,22 +317,18 @@ func (x *SandboxInfo) GetPoolRef() string {
 }
 
 type CreateRequest struct {
-	state   protoimpl.MessageState `protogen:"open.v1"`
-	Image   string                 `protobuf:"bytes,1,opt,name=image,proto3" json:"image,omitempty"`
-	PoolRef string                 `protobuf:"bytes,2,opt,name=pool_ref,json=poolRef,proto3" json:"pool_ref,omitempty"`
-	// Deprecated: Marked as deprecated in api/proto/v1/fastpath.proto.
-	ExposedPorts []int32  `protobuf:"varint,3,rep,packed,name=exposed_ports,json=exposedPorts,proto3" json:"exposed_ports,omitempty"`
-	Command      []string `protobuf:"bytes,4,rep,name=command,proto3" json:"command,omitempty"`
-	Args         []string `protobuf:"bytes,5,rep,name=args,proto3" json:"args,omitempty"`
-	Namespace    string   `protobuf:"bytes,6,opt,name=namespace,proto3" json:"namespace,omitempty"` // 可选，默认为 "default"
-	// Deprecated: Marked as deprecated in api/proto/v1/fastpath.proto.
-	ConsistencyMode ConsistencyMode   `protobuf:"varint,7,opt,name=consistency_mode,json=consistencyMode,proto3,enum=fastpath.v1.ConsistencyMode" json:"consistency_mode,omitempty"`
-	Name            string            `protobuf:"bytes,8,opt,name=name,proto3" json:"name,omitempty"`                                                                           // 可选，指定沙箱名称（用于测试故障注入）
-	Envs            map[string]string `protobuf:"bytes,9,rep,name=envs,proto3" json:"envs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // 环境变量
-	WorkingDir      string            `protobuf:"bytes,10,opt,name=working_dir,json=workingDir,proto3" json:"working_dir,omitempty"`                                            // 工作目录
-	RequestId       string            `protobuf:"bytes,11,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`                                               // stable idempotency key, generated by SDK/fastctl when omitted
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Image         string                 `protobuf:"bytes,1,opt,name=image,proto3" json:"image,omitempty"`
+	PoolRef       string                 `protobuf:"bytes,2,opt,name=pool_ref,json=poolRef,proto3" json:"pool_ref,omitempty"`
+	Command       []string               `protobuf:"bytes,3,rep,name=command,proto3" json:"command,omitempty"`
+	Args          []string               `protobuf:"bytes,4,rep,name=args,proto3" json:"args,omitempty"`
+	Namespace     string                 `protobuf:"bytes,5,opt,name=namespace,proto3" json:"namespace,omitempty"`                                                                 // 可选，默认为 "default"
+	Name          string                 `protobuf:"bytes,6,opt,name=name,proto3" json:"name,omitempty"`                                                                           // 可选，指定沙箱名称（用于测试故障注入）
+	Envs          map[string]string      `protobuf:"bytes,7,rep,name=envs,proto3" json:"envs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"` // 环境变量
+	WorkingDir    string                 `protobuf:"bytes,8,opt,name=working_dir,json=workingDir,proto3" json:"working_dir,omitempty"`                                             // 工作目录
+	RequestId     string                 `protobuf:"bytes,9,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`                                                // required stable idempotency key generated by SDK/fastctl
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CreateRequest) Reset() {
@@ -421,14 +375,6 @@ func (x *CreateRequest) GetPoolRef() string {
 	return ""
 }
 
-// Deprecated: Marked as deprecated in api/proto/v1/fastpath.proto.
-func (x *CreateRequest) GetExposedPorts() []int32 {
-	if x != nil {
-		return x.ExposedPorts
-	}
-	return nil
-}
-
 func (x *CreateRequest) GetCommand() []string {
 	if x != nil {
 		return x.Command
@@ -448,14 +394,6 @@ func (x *CreateRequest) GetNamespace() string {
 		return x.Namespace
 	}
 	return ""
-}
-
-// Deprecated: Marked as deprecated in api/proto/v1/fastpath.proto.
-func (x *CreateRequest) GetConsistencyMode() ConsistencyMode {
-	if x != nil {
-		return x.ConsistencyMode
-	}
-	return ConsistencyMode_FAST
 }
 
 func (x *CreateRequest) GetName() string {
@@ -487,13 +425,10 @@ func (x *CreateRequest) GetRequestId() string {
 }
 
 type CreateResponse struct {
-	state       protoimpl.MessageState `protogen:"open.v1"`
-	SandboxId   string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`       // Deprecated alias of sandbox_uid
-	SandboxName string                 `protobuf:"bytes,4,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"` // CRD name (user-provided)
-	FastletPod  string                 `protobuf:"bytes,2,opt,name=fastlet_pod,json=fastletPod,proto3" json:"fastlet_pod,omitempty"`
-	// Deprecated: Marked as deprecated in api/proto/v1/fastpath.proto.
-	Endpoints     []string `protobuf:"bytes,3,rep,name=endpoints,proto3" json:"endpoints,omitempty"`
-	SandboxUid    string   `protobuf:"bytes,5,opt,name=sandbox_uid,json=sandboxUid,proto3" json:"sandbox_uid,omitempty"` // Kubernetes Sandbox CRD UID
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SandboxUid    string                 `protobuf:"bytes,1,opt,name=sandbox_uid,json=sandboxUid,proto3" json:"sandbox_uid,omitempty"`    // Kubernetes Sandbox CRD UID
+	SandboxName   string                 `protobuf:"bytes,2,opt,name=sandbox_name,json=sandboxName,proto3" json:"sandbox_name,omitempty"` // CRD name (user-provided)
+	FastletPod    string                 `protobuf:"bytes,3,opt,name=fastlet_pod,json=fastletPod,proto3" json:"fastlet_pod,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -528,9 +463,9 @@ func (*CreateResponse) Descriptor() ([]byte, []int) {
 	return file_api_proto_v1_fastpath_proto_rawDescGZIP(), []int{5}
 }
 
-func (x *CreateResponse) GetSandboxId() string {
+func (x *CreateResponse) GetSandboxUid() string {
 	if x != nil {
-		return x.SandboxId
+		return x.SandboxUid
 	}
 	return ""
 }
@@ -545,21 +480,6 @@ func (x *CreateResponse) GetSandboxName() string {
 func (x *CreateResponse) GetFastletPod() string {
 	if x != nil {
 		return x.FastletPod
-	}
-	return ""
-}
-
-// Deprecated: Marked as deprecated in api/proto/v1/fastpath.proto.
-func (x *CreateResponse) GetEndpoints() []string {
-	if x != nil {
-		return x.Endpoints
-	}
-	return nil
-}
-
-func (x *CreateResponse) GetSandboxUid() string {
-	if x != nil {
-		return x.SandboxUid
 	}
 	return ""
 }
@@ -1129,46 +1049,41 @@ const file_api_proto_v1_fastpath_proto_rawDesc = "" +
 	"\n" +
 	"GetRequest\x12!\n" +
 	"\fsandbox_name\x18\x01 \x01(\tR\vsandboxName\x12\x1c\n" +
-	"\tnamespace\x18\x02 \x01(\tR\tnamespace\"\xf4\x01\n" +
-	"\vSandboxInfo\x12\x1d\n" +
+	"\tnamespace\x18\x02 \x01(\tR\tnamespace\"\xbf\x02\n" +
+	"\vSandboxInfo\x12\x1f\n" +
+	"\vsandbox_uid\x18\x01 \x01(\tR\n" +
+	"sandboxUid\x12!\n" +
+	"\fsandbox_name\x18\x02 \x01(\tR\vsandboxName\x12#\n" +
+	"\rruntime_state\x18\x03 \x01(\tR\fruntimeState\x12(\n" +
+	"\x10data_plane_state\x18\x04 \x01(\tR\x0edataPlaneState\x12,\n" +
+	"\x12user_process_state\x18\x05 \x01(\tR\x10userProcessState\x12\x1f\n" +
+	"\vfastlet_pod\x18\x06 \x01(\tR\n" +
+	"fastletPod\x12\x1d\n" +
 	"\n" +
-	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +
-	"\fsandbox_name\x18\b \x01(\tR\vsandboxName\x12\x14\n" +
-	"\x05phase\x18\x02 \x01(\tR\x05phase\x12\x1f\n" +
-	"\vfastlet_pod\x18\x03 \x01(\tR\n" +
-	"fastletPod\x12\x1c\n" +
-	"\tendpoints\x18\x04 \x03(\tR\tendpoints\x12\x1d\n" +
-	"\n" +
-	"created_at\x18\x05 \x01(\x03R\tcreatedAt\x12\x14\n" +
-	"\x05image\x18\x06 \x01(\tR\x05image\x12\x19\n" +
-	"\bpool_ref\x18\a \x01(\tR\apoolRef\"\xc9\x03\n" +
+	"created_at\x18\a \x01(\x03R\tcreatedAt\x12\x14\n" +
+	"\x05image\x18\b \x01(\tR\x05image\x12\x19\n" +
+	"\bpool_ref\x18\t \x01(\tR\apoolRef\"\xd3\x02\n" +
 	"\rCreateRequest\x12\x14\n" +
 	"\x05image\x18\x01 \x01(\tR\x05image\x12\x19\n" +
-	"\bpool_ref\x18\x02 \x01(\tR\apoolRef\x12'\n" +
-	"\rexposed_ports\x18\x03 \x03(\x05B\x02\x18\x01R\fexposedPorts\x12\x18\n" +
-	"\acommand\x18\x04 \x03(\tR\acommand\x12\x12\n" +
-	"\x04args\x18\x05 \x03(\tR\x04args\x12\x1c\n" +
-	"\tnamespace\x18\x06 \x01(\tR\tnamespace\x12K\n" +
-	"\x10consistency_mode\x18\a \x01(\x0e2\x1c.fastpath.v1.ConsistencyModeB\x02\x18\x01R\x0fconsistencyMode\x12\x12\n" +
-	"\x04name\x18\b \x01(\tR\x04name\x128\n" +
-	"\x04envs\x18\t \x03(\v2$.fastpath.v1.CreateRequest.EnvsEntryR\x04envs\x12\x1f\n" +
-	"\vworking_dir\x18\n" +
-	" \x01(\tR\n" +
+	"\bpool_ref\x18\x02 \x01(\tR\apoolRef\x12\x18\n" +
+	"\acommand\x18\x03 \x03(\tR\acommand\x12\x12\n" +
+	"\x04args\x18\x04 \x03(\tR\x04args\x12\x1c\n" +
+	"\tnamespace\x18\x05 \x01(\tR\tnamespace\x12\x12\n" +
+	"\x04name\x18\x06 \x01(\tR\x04name\x128\n" +
+	"\x04envs\x18\a \x03(\v2$.fastpath.v1.CreateRequest.EnvsEntryR\x04envs\x12\x1f\n" +
+	"\vworking_dir\x18\b \x01(\tR\n" +
 	"workingDir\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\v \x01(\tR\trequestId\x1a7\n" +
+	"request_id\x18\t \x01(\tR\trequestId\x1a7\n" +
 	"\tEnvsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb6\x01\n" +
-	"\x0eCreateResponse\x12\x1d\n" +
-	"\n" +
-	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +
-	"\fsandbox_name\x18\x04 \x01(\tR\vsandboxName\x12\x1f\n" +
-	"\vfastlet_pod\x18\x02 \x01(\tR\n" +
-	"fastletPod\x12 \n" +
-	"\tendpoints\x18\x03 \x03(\tB\x02\x18\x01R\tendpoints\x12\x1f\n" +
-	"\vsandbox_uid\x18\x05 \x01(\tR\n" +
-	"sandboxUid\"v\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"u\n" +
+	"\x0eCreateResponse\x12\x1f\n" +
+	"\vsandbox_uid\x18\x01 \x01(\tR\n" +
+	"sandboxUid\x12!\n" +
+	"\fsandbox_name\x18\x02 \x01(\tR\vsandboxName\x12\x1f\n" +
+	"\vfastlet_pod\x18\x03 \x01(\tR\n" +
+	"fastletPod\"v\n" +
 	"\x16ResolveEndpointRequest\x12\x1f\n" +
 	"\vsandbox_uid\x18\x01 \x01(\tR\n" +
 	"sandboxUid\x12\x1f\n" +
@@ -1218,11 +1133,7 @@ const file_api_proto_v1_fastpath_proto_rawDesc = "" +
 	"\x0eUpdateResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x122\n" +
-	"\asandbox\x18\x03 \x01(\v2\x18.fastpath.v1.SandboxInfoR\asandbox*'\n" +
-	"\x0fConsistencyMode\x12\b\n" +
-	"\x04FAST\x10\x00\x12\n" +
-	"\n" +
-	"\x06STRONG\x10\x01*.\n" +
+	"\asandbox\x18\x03 \x01(\v2\x18.fastpath.v1.SandboxInfoR\asandbox*.\n" +
 	"\rFailurePolicy\x12\n" +
 	"\n" +
 	"\x06MANUAL\x10\x00\x12\x11\n" +
@@ -1249,56 +1160,54 @@ func file_api_proto_v1_fastpath_proto_rawDescGZIP() []byte {
 	return file_api_proto_v1_fastpath_proto_rawDescData
 }
 
-var file_api_proto_v1_fastpath_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_api_proto_v1_fastpath_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
 var file_api_proto_v1_fastpath_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_api_proto_v1_fastpath_proto_goTypes = []any{
-	(ConsistencyMode)(0),                 // 0: fastpath.v1.ConsistencyMode
-	(FailurePolicy)(0),                   // 1: fastpath.v1.FailurePolicy
-	(*ListRequest)(nil),                  // 2: fastpath.v1.ListRequest
-	(*ListResponse)(nil),                 // 3: fastpath.v1.ListResponse
-	(*GetRequest)(nil),                   // 4: fastpath.v1.GetRequest
-	(*SandboxInfo)(nil),                  // 5: fastpath.v1.SandboxInfo
-	(*CreateRequest)(nil),                // 6: fastpath.v1.CreateRequest
-	(*CreateResponse)(nil),               // 7: fastpath.v1.CreateResponse
-	(*ResolveEndpointRequest)(nil),       // 8: fastpath.v1.ResolveEndpointRequest
-	(*ResolveEndpointResponse)(nil),      // 9: fastpath.v1.ResolveEndpointResponse
-	(*IssueRouteCredentialRequest)(nil),  // 10: fastpath.v1.IssueRouteCredentialRequest
-	(*IssueRouteCredentialResponse)(nil), // 11: fastpath.v1.IssueRouteCredentialResponse
-	(*DeleteRequest)(nil),                // 12: fastpath.v1.DeleteRequest
-	(*DeleteResponse)(nil),               // 13: fastpath.v1.DeleteResponse
-	(*UpdateRequest)(nil),                // 14: fastpath.v1.UpdateRequest
-	(*UpdateResponse)(nil),               // 15: fastpath.v1.UpdateResponse
-	nil,                                  // 16: fastpath.v1.CreateRequest.EnvsEntry
-	nil,                                  // 17: fastpath.v1.ResolveEndpointResponse.RequiredHeadersEntry
-	nil,                                  // 18: fastpath.v1.UpdateRequest.LabelsEntry
+	(FailurePolicy)(0),                   // 0: fastpath.v1.FailurePolicy
+	(*ListRequest)(nil),                  // 1: fastpath.v1.ListRequest
+	(*ListResponse)(nil),                 // 2: fastpath.v1.ListResponse
+	(*GetRequest)(nil),                   // 3: fastpath.v1.GetRequest
+	(*SandboxInfo)(nil),                  // 4: fastpath.v1.SandboxInfo
+	(*CreateRequest)(nil),                // 5: fastpath.v1.CreateRequest
+	(*CreateResponse)(nil),               // 6: fastpath.v1.CreateResponse
+	(*ResolveEndpointRequest)(nil),       // 7: fastpath.v1.ResolveEndpointRequest
+	(*ResolveEndpointResponse)(nil),      // 8: fastpath.v1.ResolveEndpointResponse
+	(*IssueRouteCredentialRequest)(nil),  // 9: fastpath.v1.IssueRouteCredentialRequest
+	(*IssueRouteCredentialResponse)(nil), // 10: fastpath.v1.IssueRouteCredentialResponse
+	(*DeleteRequest)(nil),                // 11: fastpath.v1.DeleteRequest
+	(*DeleteResponse)(nil),               // 12: fastpath.v1.DeleteResponse
+	(*UpdateRequest)(nil),                // 13: fastpath.v1.UpdateRequest
+	(*UpdateResponse)(nil),               // 14: fastpath.v1.UpdateResponse
+	nil,                                  // 15: fastpath.v1.CreateRequest.EnvsEntry
+	nil,                                  // 16: fastpath.v1.ResolveEndpointResponse.RequiredHeadersEntry
+	nil,                                  // 17: fastpath.v1.UpdateRequest.LabelsEntry
 }
 var file_api_proto_v1_fastpath_proto_depIdxs = []int32{
-	5,  // 0: fastpath.v1.ListResponse.items:type_name -> fastpath.v1.SandboxInfo
-	0,  // 1: fastpath.v1.CreateRequest.consistency_mode:type_name -> fastpath.v1.ConsistencyMode
-	16, // 2: fastpath.v1.CreateRequest.envs:type_name -> fastpath.v1.CreateRequest.EnvsEntry
-	17, // 3: fastpath.v1.ResolveEndpointResponse.required_headers:type_name -> fastpath.v1.ResolveEndpointResponse.RequiredHeadersEntry
-	1,  // 4: fastpath.v1.UpdateRequest.failure_policy:type_name -> fastpath.v1.FailurePolicy
-	18, // 5: fastpath.v1.UpdateRequest.labels:type_name -> fastpath.v1.UpdateRequest.LabelsEntry
-	5,  // 6: fastpath.v1.UpdateResponse.sandbox:type_name -> fastpath.v1.SandboxInfo
-	6,  // 7: fastpath.v1.FastPathService.CreateSandbox:input_type -> fastpath.v1.CreateRequest
-	12, // 8: fastpath.v1.FastPathService.DeleteSandbox:input_type -> fastpath.v1.DeleteRequest
-	14, // 9: fastpath.v1.FastPathService.UpdateSandbox:input_type -> fastpath.v1.UpdateRequest
-	2,  // 10: fastpath.v1.FastPathService.ListSandboxes:input_type -> fastpath.v1.ListRequest
-	4,  // 11: fastpath.v1.FastPathService.GetSandbox:input_type -> fastpath.v1.GetRequest
-	8,  // 12: fastpath.v1.FastPathService.ResolveEndpoint:input_type -> fastpath.v1.ResolveEndpointRequest
-	10, // 13: fastpath.v1.FastPathService.IssueRouteCredential:input_type -> fastpath.v1.IssueRouteCredentialRequest
-	7,  // 14: fastpath.v1.FastPathService.CreateSandbox:output_type -> fastpath.v1.CreateResponse
-	13, // 15: fastpath.v1.FastPathService.DeleteSandbox:output_type -> fastpath.v1.DeleteResponse
-	15, // 16: fastpath.v1.FastPathService.UpdateSandbox:output_type -> fastpath.v1.UpdateResponse
-	3,  // 17: fastpath.v1.FastPathService.ListSandboxes:output_type -> fastpath.v1.ListResponse
-	5,  // 18: fastpath.v1.FastPathService.GetSandbox:output_type -> fastpath.v1.SandboxInfo
-	9,  // 19: fastpath.v1.FastPathService.ResolveEndpoint:output_type -> fastpath.v1.ResolveEndpointResponse
-	11, // 20: fastpath.v1.FastPathService.IssueRouteCredential:output_type -> fastpath.v1.IssueRouteCredentialResponse
-	14, // [14:21] is the sub-list for method output_type
-	7,  // [7:14] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	4,  // 0: fastpath.v1.ListResponse.items:type_name -> fastpath.v1.SandboxInfo
+	15, // 1: fastpath.v1.CreateRequest.envs:type_name -> fastpath.v1.CreateRequest.EnvsEntry
+	16, // 2: fastpath.v1.ResolveEndpointResponse.required_headers:type_name -> fastpath.v1.ResolveEndpointResponse.RequiredHeadersEntry
+	0,  // 3: fastpath.v1.UpdateRequest.failure_policy:type_name -> fastpath.v1.FailurePolicy
+	17, // 4: fastpath.v1.UpdateRequest.labels:type_name -> fastpath.v1.UpdateRequest.LabelsEntry
+	4,  // 5: fastpath.v1.UpdateResponse.sandbox:type_name -> fastpath.v1.SandboxInfo
+	5,  // 6: fastpath.v1.FastPathService.CreateSandbox:input_type -> fastpath.v1.CreateRequest
+	11, // 7: fastpath.v1.FastPathService.DeleteSandbox:input_type -> fastpath.v1.DeleteRequest
+	13, // 8: fastpath.v1.FastPathService.UpdateSandbox:input_type -> fastpath.v1.UpdateRequest
+	1,  // 9: fastpath.v1.FastPathService.ListSandboxes:input_type -> fastpath.v1.ListRequest
+	3,  // 10: fastpath.v1.FastPathService.GetSandbox:input_type -> fastpath.v1.GetRequest
+	7,  // 11: fastpath.v1.FastPathService.ResolveEndpoint:input_type -> fastpath.v1.ResolveEndpointRequest
+	9,  // 12: fastpath.v1.FastPathService.IssueRouteCredential:input_type -> fastpath.v1.IssueRouteCredentialRequest
+	6,  // 13: fastpath.v1.FastPathService.CreateSandbox:output_type -> fastpath.v1.CreateResponse
+	12, // 14: fastpath.v1.FastPathService.DeleteSandbox:output_type -> fastpath.v1.DeleteResponse
+	14, // 15: fastpath.v1.FastPathService.UpdateSandbox:output_type -> fastpath.v1.UpdateResponse
+	2,  // 16: fastpath.v1.FastPathService.ListSandboxes:output_type -> fastpath.v1.ListResponse
+	4,  // 17: fastpath.v1.FastPathService.GetSandbox:output_type -> fastpath.v1.SandboxInfo
+	8,  // 18: fastpath.v1.FastPathService.ResolveEndpoint:output_type -> fastpath.v1.ResolveEndpointResponse
+	10, // 19: fastpath.v1.FastPathService.IssueRouteCredential:output_type -> fastpath.v1.IssueRouteCredentialResponse
+	13, // [13:20] is the sub-list for method output_type
+	6,  // [6:13] is the sub-list for method input_type
+	6,  // [6:6] is the sub-list for extension type_name
+	6,  // [6:6] is the sub-list for extension extendee
+	0,  // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_v1_fastpath_proto_init() }
@@ -1317,7 +1226,7 @@ func file_api_proto_v1_fastpath_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_v1_fastpath_proto_rawDesc), len(file_api_proto_v1_fastpath_proto_rawDesc)),
-			NumEnums:      2,
+			NumEnums:      1,
 			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   1,

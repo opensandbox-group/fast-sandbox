@@ -122,7 +122,8 @@ Examples:
 		klog.V(4).InfoS("UpdateSandbox request succeeded", "sandboxName", sandboxName)
 		fmt.Printf("✓ Sandbox %s updated successfully\n", sandboxName)
 		if resp.Sandbox != nil {
-			fmt.Printf("  Phase: %s\n", resp.Sandbox.Phase)
+			fmt.Printf("  Runtime: %s\n", resp.Sandbox.RuntimeState)
+			fmt.Printf("  Data plane: %s\n", resp.Sandbox.DataPlaneState)
 			fmt.Printf("  Fastlet: %s\n", resp.Sandbox.FastletPod)
 		}
 	},

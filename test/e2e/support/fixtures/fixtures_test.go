@@ -54,7 +54,7 @@ func TestCreateSandboxSetsNamespace(t *testing.T) {
 	}
 }
 
-func TestWaitForSandboxPhaseReturnsUpdatedSandbox(t *testing.T) {
+func TestWaitForSandboxRuntimeStateReturnsUpdatedSandbox(t *testing.T) {
 	fixture := newFixtureHarness(t)
 	sb := &apiv1alpha1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{Name: "sb-running", Namespace: "tenant-a"},
@@ -63,7 +63,7 @@ func TestWaitForSandboxPhaseReturnsUpdatedSandbox(t *testing.T) {
 			PoolRef: "pool-a",
 		},
 		Status: apiv1alpha1.SandboxStatus{
-			Phase: string(apiv1alpha1.PhasePending),
+			RuntimeState: apiv1alpha1.ObservedStatePending,
 		},
 	}
 	if err := fixture.client.Create(context.Background(), sb); err != nil {
@@ -76,19 +76,19 @@ func TestWaitForSandboxPhaseReturnsUpdatedSandbox(t *testing.T) {
 		if err := fixture.client.Get(context.Background(), types.NamespacedName{Name: "sb-running", Namespace: "tenant-a"}, current); err != nil {
 			return
 		}
-		current.Status.Phase = string(apiv1alpha1.PhaseRunning)
+		current.Status.RuntimeState = apiv1alpha1.ObservedStateReady
 		_ = fixture.client.Update(context.Background(), current)
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	got, err := fixture.WaitForSandboxPhase(ctx, types.NamespacedName{Name: "sb-running", Namespace: "tenant-a"}, apiv1alpha1.PhaseRunning)
+	got, err := fixture.WaitForSandboxRuntimeState(ctx, types.NamespacedName{Name: "sb-running", Namespace: "tenant-a"}, apiv1alpha1.ObservedStateReady)
 	if err != nil {
 		t.Fatalf("expected wait to succeed, got error: %v", err)
 	}
-	if got.Status.Phase != string(apiv1alpha1.PhaseRunning) {
-		t.Fatalf("expected running phase, got %q", got.Status.Phase)
+	if got.Status.RuntimeState != apiv1alpha1.ObservedStateReady {
+		t.Fatalf("expected ready runtime state, got %q", got.Status.RuntimeState)
 	}
 }
 
@@ -101,7 +101,7 @@ func TestWaitForSandboxUsesPredicate(t *testing.T) {
 			PoolRef: "pool-a",
 		},
 		Status: apiv1alpha1.SandboxStatus{
-			Phase: string(apiv1alpha1.PhasePending),
+			RuntimeState: apiv1alpha1.ObservedStatePending,
 		},
 	}
 	if err := fixture.client.Create(context.Background(), sb); err != nil {
@@ -114,8 +114,8 @@ func TestWaitForSandboxUsesPredicate(t *testing.T) {
 		if err := fixture.client.Get(context.Background(), types.NamespacedName{Name: "sb-predicate", Namespace: "tenant-a"}, current); err != nil {
 			return
 		}
-		current.Status.Phase = string(apiv1alpha1.PhaseRunning)
-		current.Status.AssignedFastlet = "fastlet-a"
+		current.Status.RuntimeState = apiv1alpha1.ObservedStateReady
+		current.Status.Assignment = &apiv1alpha1.SandboxAssignment{FastletName: "fastlet-a", FastletPodUID: "pod-a", Attempt: 1}
 		_ = fixture.client.Update(context.Background(), current)
 	}()
 
@@ -123,13 +123,13 @@ func TestWaitForSandboxUsesPredicate(t *testing.T) {
 	defer cancel()
 
 	got, err := fixture.WaitForSandbox(ctx, types.NamespacedName{Name: "sb-predicate", Namespace: "tenant-a"}, func(sb *apiv1alpha1.Sandbox) bool {
-		return sb.Status.AssignedFastlet != "" && sb.Status.Phase == string(apiv1alpha1.PhaseRunning)
+		return sb.Status.Assignment != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 	})
 	if err != nil {
 		t.Fatalf("expected predicate wait to succeed, got error: %v", err)
 	}
-	if got.Status.AssignedFastlet != "fastlet-a" {
-		t.Fatalf("expected assigned pod to be observed, got %q", got.Status.AssignedFastlet)
+	if got.Status.Assignment.FastletName != "fastlet-a" {
+		t.Fatalf("expected assigned pod to be observed, got %q", got.Status.Assignment.FastletName)
 	}
 }
 
@@ -152,8 +152,7 @@ func TestEnsureSandboxRemainsUnassignedFailsOnAssignment(t *testing.T) {
 		if err := fixture.client.Get(context.Background(), types.NamespacedName{Name: "sb-assigned", Namespace: "tenant-a"}, current); err != nil {
 			return
 		}
-		current.Status.AssignedFastlet = "fastlet-a"
-		current.Status.SandboxID = "sandbox-a"
+		current.Status.Assignment = &apiv1alpha1.SandboxAssignment{FastletName: "fastlet-a", FastletPodUID: "pod-a", Attempt: 1}
 		_ = fixture.client.Update(context.Background(), current)
 	}()
 

@@ -23,12 +23,12 @@ class FakeFastPathStub:
         self.metadata.append(tuple(metadata))
         self.create_request = request
         return fastpath_pb2.CreateResponse(
-            sandbox_id="uid-a", sandbox_uid="uid-a", sandbox_name=request.name
+            sandbox_uid="uid-a", sandbox_name=request.name
         )
 
     def GetSandbox(self, request, metadata=()):
         self.metadata.append(tuple(metadata))
-        return fastpath_pb2.SandboxInfo(sandbox_id="uid-a", sandbox_name=request.sandbox_name)
+        return fastpath_pb2.SandboxInfo(sandbox_uid="uid-a", sandbox_name=request.sandbox_name)
 
     def DeleteSandbox(self, _request, metadata=()):
         self.metadata.append(tuple(metadata))

@@ -3,14 +3,15 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 output="$repo_root/sdk/python/fast_sandbox/proto"
+python_bin="${PYTHON:-python3}"
 
-python3 -m grpc_tools.protoc \
+"$python_bin" -m grpc_tools.protoc \
   -I "$repo_root/api/proto/v1" \
   --python_out="$output" \
   --grpc_python_out="$output" \
   "$repo_root/api/proto/v1/fastpath.proto"
 
-python3 - "$output/fastpath_pb2_grpc.py" <<'PY'
+"$python_bin" - "$output/fastpath_pb2_grpc.py" <<'PY'
 from pathlib import Path
 import sys
 

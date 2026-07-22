@@ -43,13 +43,13 @@ func TestNamespaceAware(t *testing.T) {
 				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
-			sandbox := createCleanupSandbox(namespace, "sb-ns-test", pool.Name, []int32{8080})
+			sandbox := createCleanupSandbox(namespace, "sb-ns-test", pool.Name)
 			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox); err != nil {
 				t.Fatalf("create sandbox: %v", err)
 			}
 
 			assigned := waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-ns-test")
-			if assigned.Status.AssignedFastlet == "" {
+			if assigned.Status.Assignment == nil {
 				t.Fatalf("sandbox not assigned")
 			}
 
@@ -100,7 +100,7 @@ func TestJanitorRecovery(t *testing.T) {
 				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
-			sandbox := createCleanupSandbox(namespace, "sb-orphan", pool.Name, nil)
+			sandbox := createCleanupSandbox(namespace, "sb-orphan", pool.Name)
 			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox); err != nil {
 				t.Fatalf("create sandbox: %v", err)
 			}
@@ -180,7 +180,7 @@ func createCleanupPool(namespace, name string) *apiv1alpha1.SandboxPool {
 	}
 }
 
-func createCleanupSandbox(namespace, name, pool string, ports []int32) *apiv1alpha1.Sandbox {
+func createCleanupSandbox(namespace, name, pool string) *apiv1alpha1.Sandbox {
 	return &apiv1alpha1.Sandbox{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: apiv1alpha1.GroupVersion.String(),
@@ -191,10 +191,9 @@ func createCleanupSandbox(namespace, name, pool string, ports []int32) *apiv1alp
 			Namespace: namespace,
 		},
 		Spec: apiv1alpha1.SandboxSpec{
-			Image:        "docker.io/library/alpine:latest",
-			Command:      []string{"/bin/sleep", "3600"},
-			PoolRef:      pool,
-			ExposedPorts: ports,
+			Image:   "docker.io/library/alpine:latest",
+			Command: []string{"/bin/sleep", "3600"},
+			PoolRef: pool,
 		},
 	}
 }
@@ -205,8 +204,7 @@ func waitForAssignedSandbox(ctx context.Context, t *testing.T, fixture *fixtures
 	defer cancel()
 
 	sandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-		return sb.Status.AssignedFastlet != "" &&
-			(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
+		return sb.Status.Assignment != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 	})
 	if err != nil {
 		t.Fatalf("wait for assigned sandbox %s/%s: %v", namespace, name, err)

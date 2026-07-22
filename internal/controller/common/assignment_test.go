@@ -32,7 +32,6 @@ func TestEnsureSandboxAssignmentIsIdempotentAndConflicts(t *testing.T) {
 	require.True(t, assignmentTargetEqual(desired, *assigned.Status.Assignment))
 	require.Equal(t, int64(1), assigned.Status.InstanceGeneration)
 	require.Equal(t, int64(1), assigned.Status.AssignmentAttempt)
-	require.Equal(t, desired.FastletName, assigned.Status.AssignedFastlet)
 
 	again, err := EnsureSandboxAssignment(context.Background(), k8sClient, key, desired)
 	require.NoError(t, err)
@@ -70,7 +69,7 @@ func TestClearSandboxAssignmentRetainsAttemptAndOptionallyAdvancesGeneration(t *
 		Spec:       apiv1alpha1.SandboxSpec{Image: "image:v1", PoolRef: "pool-a"},
 		Status: apiv1alpha1.SandboxStatus{
 			Assignment: &assignment, AssignmentAttempt: 3, InstanceGeneration: 2, RouteGeneration: 4,
-			SandboxID: "sandbox-uid", Endpoints: []string{"http://stale"},
+			RuntimeState: apiv1alpha1.ObservedStateReady, DataPlaneState: apiv1alpha1.ObservedStateReady,
 		},
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(sandbox).WithObjects(sandbox).Build()
@@ -81,7 +80,6 @@ func TestClearSandboxAssignmentRetainsAttemptAndOptionallyAdvancesGeneration(t *
 	require.Equal(t, int64(3), cleared.Status.AssignmentAttempt)
 	require.Equal(t, int64(3), cleared.Status.InstanceGeneration)
 	require.Equal(t, int64(5), cleared.Status.RouteGeneration)
-	require.Empty(t, cleared.Status.SandboxID)
-	require.Empty(t, cleared.Status.Endpoints)
-	require.Equal(t, string(apiv1alpha1.PhasePending), cleared.Status.Phase)
+	require.Equal(t, apiv1alpha1.ObservedStatePending, cleared.Status.RuntimeState)
+	require.Equal(t, apiv1alpha1.ObservedStatePending, cleared.Status.DataPlaneState)
 }

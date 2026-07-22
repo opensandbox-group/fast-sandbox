@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -123,8 +124,6 @@ func TestEnsureAssignmentAndRuntimeUseDurableUIDAndFences(t *testing.T) {
 	require.NoError(t, orchestrator.Client.Get(context.Background(), client.ObjectKeyFromObject(persisted), &ready))
 	require.Equal(t, apiv1alpha1.ObservedStateReady, ready.Status.RuntimeState)
 	require.Equal(t, apiv1alpha1.ObservedStateReady, ready.Status.DataPlaneState)
-	require.Equal(t, string(apiv1alpha1.PhaseRunning), ready.Status.Phase)
-	require.Empty(t, ready.Status.Endpoints)
 }
 
 func TestLostEnsureResponseInspectsSameAssignment(t *testing.T) {
@@ -154,8 +153,11 @@ func newHarness(t *testing.T) (*Orchestrator, *fakeRegistry, *fakeFastletClient,
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
 		Spec: apiv1alpha1.SandboxPoolSpec{
 			Runtime: apiv1alpha1.RuntimeContainer, Capacity: apiv1alpha1.PoolCapacity{PoolMin: 1, PoolMax: 1},
-			SandboxResources: apiv1alpha1.SandboxResourceProfile{},
-			FastletTemplate:  corev1.PodTemplateSpec{},
+			MaxSandboxesPerPod: 8,
+			SandboxResources: apiv1alpha1.SandboxResourceProfile{
+				CPU: resource.MustParse("1"), Memory: resource.MustParse("512Mi"), PIDs: 256,
+			},
+			FastletTemplate: corev1.PodTemplateSpec{},
 		},
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&apiv1alpha1.Sandbox{}).WithObjects(pool).Build()

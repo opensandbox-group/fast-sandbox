@@ -10,10 +10,6 @@ import (
 // +kubebuilder:validation:Enum=container;gvisor;kata-qemu;kata-clh;kata-fc;boxlite
 type RuntimeName string
 
-// RuntimeType is retained as a source-compatible alias during the v1alpha1
-// migration. New code should use RuntimeName and SandboxPoolSpec.Runtime.
-type RuntimeType = RuntimeName
-
 const (
 	// RuntimeContainer is the default runc runtime (process-level isolation).
 	RuntimeContainer RuntimeName = "container"
@@ -32,28 +28,27 @@ const (
 // SandboxResourceProfile defines the fixed resource limit for every Sandbox in
 // a Pool. Fastlet is the component that enforces these values at runtime.
 type SandboxResourceProfile struct {
-	CPU    resource.Quantity `json:"cpu,omitempty"`
-	Memory resource.Quantity `json:"memory,omitempty"`
-	// +kubebuilder:validation:Minimum=0
-	PIDs int64 `json:"pids,omitempty"`
+	CPU    resource.Quantity `json:"cpu"`
+	Memory resource.Quantity `json:"memory"`
+	// +kubebuilder:validation:Minimum=1
+	PIDs int64 `json:"pids"`
 }
 
 // SandboxPoolSpec defines the desired state of SandboxPool.
-// +kubebuilder:validation:XValidation:rule="!(has(self.runtime) && (has(self.runtimeType) || has(self.runtimeClassName) || has(self.containerdRuntimeHandler)))",message="spec.runtime cannot be combined with deprecated runtime fields"
 type SandboxPoolSpec struct {
 	Capacity PoolCapacity `json:"capacity"`
 
 	// +kubebuilder:validation:Minimum=1
-	MaxSandboxesPerPod int32 `json:"maxSandboxesPerPod,omitempty"`
+	MaxSandboxesPerPod int32 `json:"maxSandboxesPerPod"`
 
 	// Runtime selects one immutable, platform-owned runtime profile.
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="runtime is immutable"
-	Runtime RuntimeName `json:"runtime,omitempty"`
+	Runtime RuntimeName `json:"runtime"`
 
 	// SandboxResources is the immutable resource profile applied to each
 	// Sandbox created from this Pool.
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="sandboxResources is immutable"
-	SandboxResources SandboxResourceProfile `json:"sandboxResources,omitempty"`
+	SandboxResources SandboxResourceProfile `json:"sandboxResources"`
 
 	// WarmImages are asynchronously pulled and protected from ordinary cache GC.
 	// Fastlet readiness does not wait for this list to finish warming.
@@ -64,23 +59,6 @@ type SandboxPoolSpec struct {
 	// +kubebuilder:default=minimal
 	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="infraProfile is immutable"
 	InfraProfile string `json:"infraProfile,omitempty"`
-
-	// RuntimeType is the deprecated runtime field accepted only for old objects.
-	// New objects must write Runtime. Runtime and RuntimeType may not coexist.
-	// +deprecated
-	RuntimeType RuntimeName `json:"runtimeType,omitempty"`
-
-	// RuntimeClassName is a deprecated compatibility input for old manifests.
-	// It must match the canonical profile selected by RuntimeType during migration;
-	// it is never copied to the Fastlet Pod or used as an independent runtime choice.
-	// +deprecated
-	RuntimeClassName string `json:"runtimeClassName,omitempty"`
-
-	// ContainerdRuntimeHandler is a deprecated compatibility input for old
-	// manifests. It must match the canonical RuntimeType profile during migration
-	// and cannot override the platform-owned runtime handler.
-	// +deprecated
-	ContainerdRuntimeHandler string `json:"containerdRuntimeHandler,omitempty"`
 
 	// FastletTemplate is intentionally preserved as a Kubernetes-native pod
 	// template. Fast Sandbox validates the platform-owned fields separately.

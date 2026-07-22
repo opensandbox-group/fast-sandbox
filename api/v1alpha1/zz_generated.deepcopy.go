@@ -244,11 +244,6 @@ func (in *SandboxSpec) DeepCopyInto(out *SandboxSpec) {
 		in, out := &in.ExpireTime, &out.ExpireTime
 		*out = (*in).DeepCopy()
 	}
-	if in.ExposedPorts != nil {
-		in, out := &in.ExposedPorts, &out.ExposedPorts
-		*out = make([]int32, len(*in))
-		copy(*out, *in)
-	}
 	if in.ResetRevision != nil {
 		in, out := &in.ResetRevision, &out.ResetRevision
 		*out = (*in).DeepCopy()
@@ -272,11 +267,6 @@ func (in *SandboxStatus) DeepCopyInto(out *SandboxStatus) {
 		in, out := &in.Assignment, &out.Assignment
 		*out = new(SandboxAssignment)
 		**out = **in
-	}
-	if in.Endpoints != nil {
-		in, out := &in.Endpoints, &out.Endpoints
-		*out = make([]string, len(*in))
-		copy(*out, *in)
 	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions

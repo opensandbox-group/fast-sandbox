@@ -52,18 +52,14 @@ func TestBasicLifecycleRecreateSameName(t *testing.T) {
 
 				runCtx, cancelRunWait := context.WithTimeout(ctx, 60*time.Second)
 				assignedSandbox, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-					return sb.Status.AssignedFastlet != "" &&
-						(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
+					return sb.Status.Assignment != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 				})
 				cancelRunWait()
 				if err != nil {
 					t.Fatalf("wait for running sandbox on attempt %d: %v", attempt, err)
 				}
 
-				currentSandboxID := assignedSandbox.Status.SandboxID
-				if currentSandboxID == "" {
-					currentSandboxID = string(assignedSandbox.UID)
-				}
+				currentSandboxID := string(assignedSandbox.UID)
 				if previousSandboxID != "" && currentSandboxID == previousSandboxID {
 					t.Fatalf("sandbox recreation attempt %d reused sandbox ID %q", attempt, currentSandboxID)
 				}

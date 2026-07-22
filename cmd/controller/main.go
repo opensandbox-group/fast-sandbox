@@ -53,8 +53,6 @@ func main() {
 	var heartbeatTimeout time.Duration
 	var heartbeatConcurrency int
 	var fastletDrainTimeout time.Duration
-	var deprecatedConsistency string
-	var deprecatedOrphanTimeout time.Duration
 	var fastletProxyImage string
 	var boxLiteRuntimeImage string
 	var routeVerifyPublicKey string
@@ -71,8 +69,6 @@ func main() {
 	flag.DurationVar(&heartbeatTimeout, "fastlet-heartbeat-timeout", 5*time.Second, "Timeout for one Fastlet heartbeat request.")
 	flag.IntVar(&heartbeatConcurrency, "fastlet-heartbeat-concurrency", 8, "Maximum concurrent Fastlet heartbeat requests.")
 	flag.DurationVar(&fastletDrainTimeout, "fastlet-drain-timeout", 5*time.Minute, "Maximum time to wait for a draining Fastlet Pod to become empty before applying Sandbox failure policies.")
-	flag.StringVar(&deprecatedConsistency, "fastpath-consistency-mode", "", "Deprecated and ignored; Create always uses reservation -> CRD CAS -> Ensure.")
-	flag.DurationVar(&deprecatedOrphanTimeout, "fastpath-orphan-timeout", 0, "Deprecated and ignored; CRD reconciliation owns recovery.")
 	flag.StringVar(&fastletProxyImage, "fastlet-proxy-image", envOrDefault("FASTLET_PROXY_IMAGE", "fast-sandbox/fastlet-proxy:dev"), "Image injected as the platform-owned Fastlet Proxy sidecar.")
 	flag.StringVar(&boxLiteRuntimeImage, "boxlite-runtime-image", envOrDefault("BOXLITE_RUNTIME_IMAGE", "fast-sandbox/boxlite-runtime:dev"), "Image injected as the platform-owned BoxLite runtime sidecar.")
 	flag.StringVar(&routeVerifyPublicKey, "route-verify-public-key", os.Getenv("FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY"), "Comma-separated base64 Ed25519 public keys injected into data-plane proxies.")
@@ -118,9 +114,6 @@ func main() {
 			klog.ErrorS(err, "Configure route credential issuer")
 			os.Exit(1)
 		}
-	}
-	if deprecatedConsistency != "" || deprecatedOrphanTimeout != 0 {
-		klog.InfoS("Deprecated Fast/Strong flags are ignored", "consistency", deprecatedConsistency, "orphanTimeout", deprecatedOrphanTimeout)
 	}
 	ctrl.SetLogger(klog.NewKlogr())
 

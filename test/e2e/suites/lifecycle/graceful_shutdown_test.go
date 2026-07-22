@@ -98,13 +98,12 @@ done
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 60*time.Second)
 			defer cancelRunWait()
 			assignedSandbox, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedFastlet != "" &&
-					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
+				return sb.Status.Assignment != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 			})
 			if err != nil {
 				t.Fatalf("wait for running sandbox: %v", err)
 			}
-			if assignedSandbox.Status.AssignedFastlet == "" {
+			if assignedSandbox.Status.Assignment == nil {
 				t.Fatalf("sandbox assigned pod is empty")
 			}
 
@@ -120,21 +119,25 @@ done
 			termCtx, cancelTermWait := context.WithTimeout(ctx, 90*time.Second) // Increased from 45s
 			defer cancelTermWait()
 			terminatingSandbox, err := fixture.WaitForSandbox(termCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.DeletionTimestamp != nil && sb.Status.Phase == string(apiv1alpha1.PhaseTerminating)
+				return sb.DeletionTimestamp != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateDraining
 			})
 			if err != nil {
 				// Log current state for debugging
 				currentSandbox := &apiv1alpha1.Sandbox{}
 				if getErr := k8sClient.Get(ctx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, currentSandbox); getErr == nil {
-					t.Logf("Sandbox state at timeout: phase=%s, deletionTimestamp=%v, assignedFastlet=%s",
-						currentSandbox.Status.Phase, currentSandbox.DeletionTimestamp, currentSandbox.Status.AssignedFastlet)
+					assignedFastlet := ""
+					if currentSandbox.Status.Assignment != nil {
+						assignedFastlet = currentSandbox.Status.Assignment.FastletName
+					}
+					t.Logf("Sandbox state at timeout: runtimeState=%s, deletionTimestamp=%v, fastlet=%s",
+						currentSandbox.Status.RuntimeState, currentSandbox.DeletionTimestamp, assignedFastlet)
 				}
 				t.Fatalf("wait for sandbox terminating: %v", err)
 			}
 			if terminatingSandbox.DeletionTimestamp == nil {
 				t.Fatalf("sandbox deletion timestamp is nil after delete")
 			}
-			if terminatingSandbox.Status.AssignedFastlet == "" {
+			if terminatingSandbox.Status.Assignment == nil {
 				t.Fatalf("sandbox assigned pod cleared too early")
 			}
 

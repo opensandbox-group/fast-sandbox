@@ -74,8 +74,7 @@ func TestGVisorSandbox(t *testing.T) {
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 60*time.Second)
 			defer cancelRunWait()
 			_, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedFastlet != "" &&
-					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
+				return sb.Status.Assignment != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 			})
 			if err != nil {
 				t.Fatalf("wait for running sandbox: %v", err)
@@ -158,7 +157,7 @@ func TestGVisorIsolation(t *testing.T) {
 
 			// Get the fastlet pod where the sandbox runs
 			fastletPod := &corev1.Pod{}
-			if err := k8sClient.Get(ctx, types.NamespacedName{Name: createdSandbox.Status.AssignedFastlet, Namespace: namespace}, fastletPod); err != nil {
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: createdSandbox.Status.Assignment.FastletName, Namespace: namespace}, fastletPod); err != nil {
 				t.Fatalf("get fastlet pod: %v", err)
 			}
 
@@ -222,9 +221,6 @@ type secureRuntimeNetworkState struct {
 }
 
 func secureRuntimeSandboxIdentifier(sandbox *apiv1alpha1.Sandbox) string {
-	if sandbox.Status.SandboxID != "" {
-		return sandbox.Status.SandboxID
-	}
 	return string(sandbox.UID)
 }
 
@@ -466,8 +462,7 @@ func TestGVisorMultipleSandboxes(t *testing.T) {
 			defer cancelRunWait()
 			for _, name := range sandboxNames {
 				_, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-					return sb.Status.AssignedFastlet != "" &&
-						(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
+					return sb.Status.Assignment != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 				})
 				if err != nil {
 					t.Fatalf("wait for running sandbox %s: %v", name, err)

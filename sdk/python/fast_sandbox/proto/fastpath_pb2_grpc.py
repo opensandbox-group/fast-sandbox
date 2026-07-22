@@ -75,21 +75,22 @@ class FastPathServiceServicer(object):
     """Missing associated documentation comment in .proto file."""
 
     def CreateSandbox(self, request, context):
-        """CreateSandbox 极速创建沙箱，绕过 K8s 控制面延迟
+        """CreateSandbox performs the imperative low-latency create path. It reserves
+        Fastlet capacity, commits a Sandbox CRD, and then ensures the runtime.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def DeleteSandbox(self, request, context):
-        """DeleteSandbox 极速删除沙箱
+        """DeleteSandbox commits declarative deletion; Controller reconciliation owns cleanup.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def UpdateSandbox(self, request, context):
-        """UpdateSandbox 更新沙箱配置（过期时间、重启、策略等）
+        """UpdateSandbox commits declarative expiry, reset, or failure-policy intent.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

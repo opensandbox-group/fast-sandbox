@@ -41,7 +41,7 @@ var getCmd = &cobra.Command{
 			log.Fatalf("Error: %v", err)
 		}
 
-		klog.V(4).InfoS("GetSandbox request succeeded", "sandboxId", resp.SandboxId, "sandboxName", resp.SandboxName, "phase", resp.Phase, "outputFormat", outputFormat)
+		klog.V(4).InfoS("GetSandbox request succeeded", "sandboxUid", resp.SandboxUid, "sandboxName", resp.SandboxName, "runtimeState", resp.RuntimeState, "dataPlaneState", resp.DataPlaneState, "outputFormat", outputFormat)
 		if outputFormat == "json" {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")

@@ -13,25 +13,24 @@ import (
 )
 
 type FastctlConfig struct {
-	Image           string            `yaml:"image"`
-	PoolRef         string            `yaml:"pool_ref"`
-	ConsistencyMode string            `yaml:"consistency_mode"`
-	Command         []string          `yaml:"command,omitempty"`
-	Args            []string          `yaml:"args,omitempty"`
-	ExposedPorts    []int32           `yaml:"exposed_ports,omitempty"`
-	Envs            map[string]string `yaml:"envs,omitempty"`
-	WorkingDir      string            `yaml:"working_dir,omitempty"`
+	Image      string            `yaml:"image"`
+	PoolRef    string            `yaml:"pool_ref"`
+	Command    []string          `yaml:"command,omitempty"`
+	Args       []string          `yaml:"args,omitempty"`
+	Envs       map[string]string `yaml:"envs,omitempty"`
+	WorkingDir string            `yaml:"working_dir,omitempty"`
 }
 
 type SandboxInfo struct {
-	SandboxID   string   `json:"sandbox_id"`
-	SandboxName string   `json:"sandbox_name"`
-	Phase       string   `json:"phase"`
-	FastletPod  string   `json:"fastlet_pod"`
-	Endpoints   []string `json:"endpoints"`
-	Image       string   `json:"image"`
-	PoolRef     string   `json:"pool_ref"`
-	CreatedAt   int64    `json:"created_at"`
+	SandboxUID       string `json:"sandbox_uid"`
+	SandboxName      string `json:"sandbox_name"`
+	RuntimeState     string `json:"runtime_state"`
+	DataPlaneState   string `json:"data_plane_state"`
+	UserProcessState string `json:"user_process_state"`
+	FastletPod       string `json:"fastlet_pod"`
+	Image            string `json:"image"`
+	PoolRef          string `json:"pool_ref"`
+	CreatedAt        int64  `json:"created_at"`
 }
 
 type FastctlOption func(*Fastctl)
@@ -110,9 +109,6 @@ func WithFastctlConfigDir(configDir string) FastctlOption {
 }
 
 func (c *Fastctl) Run(ctx context.Context, name string, config FastctlConfig) ([]byte, error) {
-	if config.ConsistencyMode == "" {
-		config.ConsistencyMode = "strong"
-	}
 	if err := os.MkdirAll(c.configDir, 0755); err != nil {
 		return nil, fmt.Errorf("create fastctl config dir: %w", err)
 	}
@@ -152,14 +148,6 @@ func (c *Fastctl) GetJSON(ctx context.Context, name string) (*SandboxInfo, error
 	return &info, nil
 }
 
-func (c *Fastctl) Logs(ctx context.Context, name string) (string, error) {
-	output, err := c.run(ctx, "logs", name)
-	if err != nil {
-		return "", err
-	}
-	return string(output), nil
-}
-
 func (c *Fastctl) UpdateLabels(ctx context.Context, name string, labels ...string) ([]byte, error) {
 	return c.run(ctx, "update", name, "--labels", strings.Join(labels, ","))
 }
@@ -179,7 +167,7 @@ func (c *Fastctl) WaitRunning(ctx context.Context, name string) (*SandboxInfo, e
 
 	for {
 		info, err := c.GetJSON(ctx, name)
-		if err == nil && (info.Phase == "Running" || info.Phase == "Bound") && info.SandboxID != "" && info.FastletPod != "" {
+		if err == nil && info.RuntimeState == "Ready" && info.DataPlaneState == "Ready" && info.SandboxUID != "" && info.FastletPod != "" {
 			return info, nil
 		}
 		select {

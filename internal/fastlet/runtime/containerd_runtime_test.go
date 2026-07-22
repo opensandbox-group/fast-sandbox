@@ -8,8 +8,10 @@ import (
 	"testing"
 	"time"
 
+	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
+	"fast-sandbox/internal/runtimecatalog"
 
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/opencontainers/runtime-spec/specs-go"
@@ -21,46 +23,55 @@ import (
 // 1. TestNewContainerdRuntime
 // ============================================================================
 
-func TestNewContainerdRuntime_GVisor(t *testing.T) {
-	// N-02: Constructor creates gVisor runtime with correct handler
-	runtime := newContainerdRuntime("gvisor")
+func newTestContainerdRuntime() *ContainerdRuntime {
+	return newContainerdRuntimeWithConfig(
+		apiv1alpha1.RuntimeContainer,
+		"test-profile-hash",
+		RuntimeConfig{Handler: "io.containerd.runc.v2"},
+	).(*ContainerdRuntime)
+}
 
-	require.NotNil(t, runtime, "Runtime should not be nil")
-
-	cr, ok := runtime.(*ContainerdRuntime)
-	require.True(t, ok, "Runtime should be *ContainerdRuntime type")
-
-	assert.Equal(t, "io.containerd.runsc.v1", cr.config.Handler, "Runtime handler should be runsc for gVisor")
+func TestBuildContainerdRuntimeUsesCanonicalProfile(t *testing.T) {
+	profile, err := runtimecatalog.Builtin().Resolve(apiv1alpha1.RuntimeGVisor)
+	require.NoError(t, err)
+	driver, err := buildRuntimeDriver(profile)
+	require.NoError(t, err)
+	cr := driver.(*ContainerdRuntime)
+	require.Equal(t, apiv1alpha1.RuntimeGVisor, cr.runtimeName)
+	require.Equal(t, profile.ProfileHash, cr.runtimeProfileHash)
+	require.Equal(t, "io.containerd.runsc.v1", cr.config.Handler)
 }
 
 func TestRuntimeConfig_KataVariantsUseKataV2Runtime(t *testing.T) {
 	tests := []struct {
 		name       string
-		runtime    RuntimeType
+		runtime    apiv1alpha1.RuntimeName
 		configPath string
 	}{
 		{
 			name:       "kata qemu",
-			runtime:    RuntimeTypeKataQemu,
+			runtime:    apiv1alpha1.RuntimeKataQemu,
 			configPath: "/opt/kata/share/defaults/kata-containers/configuration-qemu.toml",
 		},
 		{
 			name:       "kata firecracker",
-			runtime:    RuntimeTypeKataFc,
+			runtime:    apiv1alpha1.RuntimeKataFc,
 			configPath: "/opt/kata/share/defaults/kata-containers/configuration-fc.toml",
 		},
 		{
 			name:       "kata cloud hypervisor",
-			runtime:    RuntimeTypeKataClh,
+			runtime:    apiv1alpha1.RuntimeKataClh,
 			configPath: "/opt/kata/share/defaults/kata-containers/configuration-clh.toml",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := GetRuntimeConfig(tt.runtime)
-			assert.Equal(t, "io.containerd.kata.v2", cfg.Handler)
-			assert.Equal(t, tt.configPath, cfg.ConfigPath)
+			profile, err := runtimecatalog.Builtin().Resolve(tt.runtime)
+			require.NoError(t, err)
+			require.NotNil(t, profile.Containerd)
+			assert.Equal(t, "io.containerd.kata.v2", profile.Containerd.Handler)
+			assert.Equal(t, tt.configPath, profile.Containerd.ConfigPath)
 		})
 	}
 }
@@ -108,15 +119,6 @@ func TestUserProcessStartAfterTaskStartDoesNotTreatSupervisorAsUserProcess(t *te
 	require.Equal(t, api.UserProcessStartSandboxInitUnreported, source)
 }
 
-func TestRuntimeConfig_OverrideHandler(t *testing.T) {
-	cfg, err := ResolveRuntimeConfig(RuntimeTypeGVisor, "custom.handler.v2")
-
-	require.NoError(t, err)
-	assert.Equal(t, "custom.handler.v2", cfg.Handler)
-	assert.Equal(t, "/etc/containerd/runsc.toml", cfg.ConfigPath)
-	assert.True(t, cfg.NeedsTTY)
-}
-
 func TestSandboxResourceSpecOptsEnforceCPUAndMemory(t *testing.T) {
 	opts, err := sandboxResourceSpecOpts(&api.SandboxSpec{CPU: "500m", Memory: "256Mi", PIDs: 128})
 	require.NoError(t, err)
@@ -147,6 +149,28 @@ func TestValidateExistingRuntimeProfile(t *testing.T) {
 	require.NoError(t, validateExistingRuntimeProfile(existing, &requested))
 	requested.CPU = "1"
 	require.ErrorIs(t, validateExistingRuntimeProfile(existing, &requested), ErrSandboxProfileMismatch)
+}
+
+func TestSameRuntimeIdentityIncludesPodAndGenerationFences(t *testing.T) {
+	requested := api.SandboxSpec{
+		SandboxID: "sandbox-a", RequestID: "request-a", ClaimUID: "sandbox-a",
+		ClaimNamespace: "default", ClaimName: "sandbox-a", FastletPodUID: "pod-a",
+		InstanceGeneration: 2, AssignmentAttempt: 3,
+	}
+	existing := &SandboxMetadata{SandboxSpec: requested}
+	require.True(t, sameRuntimeIdentity(existing, &requested))
+
+	for name, mutate := range map[string]func(*api.SandboxSpec){
+		"Fastlet Pod":         func(spec *api.SandboxSpec) { spec.FastletPodUID = "pod-b" },
+		"instance generation": func(spec *api.SandboxSpec) { spec.InstanceGeneration++ },
+		"assignment attempt":  func(spec *api.SandboxSpec) { spec.AssignmentAttempt++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := requested
+			mutate(&changed)
+			require.False(t, sameRuntimeIdentity(existing, &changed))
+		})
+	}
 }
 
 // ============================================================================
@@ -300,7 +324,7 @@ func TestContainerdRuntime_Initialize_ShortMode(t *testing.T) {
 
 	// This test would require an actual containerd socket
 	// In CI/short mode, we skip it
-	cr := newContainerdRuntime("io.containerd.runc.v2").(*ContainerdRuntime)
+	cr := newTestContainerdRuntime()
 
 	ctx := context.Background()
 	err := cr.Initialize(ctx, "/run/containerd/containerd.sock")
@@ -320,7 +344,7 @@ func TestContainerdRuntime_Initialize_DefaultSocketPath(t *testing.T) {
 		t.Skip("Skipping containerd initialization test in short mode")
 	}
 
-	cr := newContainerdRuntime("io.containerd.runc.v2").(*ContainerdRuntime)
+	cr := newTestContainerdRuntime()
 
 	ctx := context.Background()
 
@@ -352,7 +376,7 @@ func TestContainerdRuntime_Initialize_EnvVars(t *testing.T) {
 		t.Skip("Skipping containerd initialization test in short mode")
 	}
 
-	cr := newContainerdRuntime("io.containerd.runc.v2").(*ContainerdRuntime)
+	cr := newTestContainerdRuntime()
 
 	ctx := context.Background()
 	_ = cr.Initialize(ctx, "") // Connection may fail, but env vars should be read
@@ -662,7 +686,7 @@ func TestContainerdRuntime_Close(t *testing.T) {
 
 func TestContainerdRuntime_Close_NotInitialized(t *testing.T) {
 	// CL-02: Close on newly created runtime is safe
-	cr := newContainerdRuntime("io.containerd.runc.v2").(*ContainerdRuntime)
+	cr := newTestContainerdRuntime()
 
 	err := cr.Close()
 	assert.NoError(t, err, "Close should not error on uninitialized runtime")

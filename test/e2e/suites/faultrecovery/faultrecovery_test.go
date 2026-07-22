@@ -74,13 +74,12 @@ func TestAutoExpiry(t *testing.T) {
 			waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 			assignedSandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: "sb-expiry-test", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedFastlet != "" &&
-					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
+				return sb.Status.Assignment != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 			})
 			if err != nil {
 				t.Fatalf("wait for sandbox to be assigned: %v", err)
 			}
-			t.Logf("Sandbox is assigned and running, phase=%s", assignedSandbox.Status.Phase)
+			t.Logf("Sandbox is assigned and ready, runtimeState=%s", assignedSandbox.Status.RuntimeState)
 
 			// Wait for expiry (with buffer)
 			// Expiry time was set to 90 seconds, so we need to wait for that plus some buffer
@@ -89,30 +88,27 @@ func TestAutoExpiry(t *testing.T) {
 			defer cancel()
 
 			expiredSandbox, err := fixture.WaitForSandbox(expireWaitCtx, types.NamespacedName{Name: "sb-expiry-test", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.Phase == string(apiv1alpha1.PhaseExpired)
+				return sb.Status.HasCondition(apiv1alpha1.SandboxConditionRuntimeReady, metav1.ConditionFalse, "Expired")
 			})
 			if err != nil {
 				// Log current state for debugging
 				currentSandbox := &apiv1alpha1.Sandbox{}
 				if getErr := k8sClient.Get(ctx, types.NamespacedName{Name: "sb-expiry-test", Namespace: namespace}, currentSandbox); getErr == nil {
-					t.Logf("Sandbox state at timeout: phase=%s, assignedFastlet=%s, sandboxID=%s",
-						currentSandbox.Status.Phase, currentSandbox.Status.AssignedFastlet, currentSandbox.Status.SandboxID)
+					t.Logf("Sandbox state at timeout: runtimeState=%s, assignment=%+v, uid=%s",
+						currentSandbox.Status.RuntimeState, currentSandbox.Status.Assignment, currentSandbox.UID)
 				}
 				t.Fatalf("wait for sandbox expiry: %v", err)
 			}
 
 			// Verify CRD is preserved
-			if expiredSandbox.Status.Phase != string(apiv1alpha1.PhaseExpired) {
-				t.Fatalf("expected phase Expired, got %s", expiredSandbox.Status.Phase)
+			if !expiredSandbox.Status.HasCondition(apiv1alpha1.SandboxConditionRuntimeReady, metav1.ConditionFalse, "Expired") {
+				t.Fatalf("expected Expired RuntimeReady condition, got %+v", expiredSandbox.Status.Conditions)
 			}
 			t.Log("✓ Sandbox expired, CRD preserved")
 
 			// Verify status fields are cleared
-			if expiredSandbox.Status.AssignedFastlet != "" {
-				t.Fatalf("expected assignedFastlet to be empty after expiry, got %s", expiredSandbox.Status.AssignedFastlet)
-			}
-			if expiredSandbox.Status.SandboxID != "" {
-				t.Fatalf("expected sandboxID to be empty after expiry, got %s", expiredSandbox.Status.SandboxID)
+			if expiredSandbox.Status.Assignment != nil {
+				t.Fatalf("expected assignment to be empty after expiry, got %+v", expiredSandbox.Status.Assignment)
 			}
 			t.Log("✓ Status fields correctly cleared after expiry")
 
@@ -187,7 +183,7 @@ func TestMemoryLeak(t *testing.T) {
 			waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 			if _, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: "sb-mem-new", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedFastlet != ""
+				return sb.Status.Assignment != nil
 			}); err != nil {
 				t.Fatalf("new sandbox not assigned, registry may have issues: %v", err)
 			}
@@ -249,14 +245,13 @@ func TestControlledRecovery(t *testing.T) {
 			waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 			runningSandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: "sb-recovery", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedFastlet != "" &&
-					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
+				return sb.Status.Assignment != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 			})
 			if err != nil {
 				t.Fatalf("wait for sandbox to be running: %v", err)
 			}
 
-			oldPod := runningSandbox.Status.AssignedFastlet
+			oldPod := runningSandbox.Status.Assignment.FastletName
 			t.Logf("Sandbox running on pod: %s", oldPod)
 
 			// Test 1: Manual reset via ResetRevision
@@ -289,8 +284,8 @@ func TestControlledRecovery(t *testing.T) {
 				// Log current state for debugging
 				currentSandbox := &apiv1alpha1.Sandbox{}
 				if getErr := k8sClient.Get(ctx, types.NamespacedName{Name: "sb-recovery", Namespace: namespace}, currentSandbox); getErr == nil {
-					t.Logf("Sandbox state at timeout: phase=%s, acceptedResetRevision=%v",
-						currentSandbox.Status.Phase, currentSandbox.Status.AcceptedResetRevision)
+					t.Logf("Sandbox state at timeout: runtimeState=%s, acceptedResetRevision=%v",
+						currentSandbox.Status.RuntimeState, currentSandbox.Status.AcceptedResetRevision)
 				}
 				t.Fatalf("wait for reset to be accepted: %v", err)
 			}
@@ -321,7 +316,10 @@ func TestControlledRecovery(t *testing.T) {
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "sb-recovery", Namespace: namespace}, currentSandbox); err != nil {
 				t.Fatalf("get sandbox: %v", err)
 			}
-			currentPod := currentSandbox.Status.AssignedFastlet
+			if currentSandbox.Status.Assignment == nil {
+				t.Fatal("sandbox lost its assignment before AutoRecreate test")
+			}
+			currentPod := currentSandbox.Status.Assignment.FastletName
 
 			// Delete the fastlet pod to trigger disconnect
 			t.Logf("Deleting fastlet pod %s to trigger AutoRecreate...", currentPod)
@@ -336,13 +334,12 @@ func TestControlledRecovery(t *testing.T) {
 			defer cancel()
 
 			_, err = fixture.WaitForSandbox(recreateWaitCtx, types.NamespacedName{Name: "sb-recovery", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedFastlet != "" && sb.Status.AssignedFastlet != oldPod
+				return sb.Status.Assignment != nil && sb.Status.Assignment.FastletName != oldPod && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 			})
 			if err != nil {
-				t.Logf("Warning: AutoRecreate may not have completed in time: %v", err)
-			} else {
-				t.Log("✓ AutoRecreate triggered, sandbox rescheduled to new pod")
+				t.Fatalf("wait for AutoRecreate to reschedule the Sandbox: %v", err)
 			}
+			t.Log("✓ AutoRecreate triggered, sandbox rescheduled to new pod")
 
 			return ctx
 		}).
@@ -379,7 +376,7 @@ func TestPodExistence(t *testing.T) {
 				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
-			// Create sandbox with exposed ports
+			// Create sandbox
 			sandbox := &apiv1alpha1.Sandbox{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: apiv1alpha1.GroupVersion.String(),
@@ -390,10 +387,9 @@ func TestPodExistence(t *testing.T) {
 					Namespace: namespace,
 				},
 				Spec: apiv1alpha1.SandboxSpec{
-					Image:        "docker.io/library/alpine:latest",
-					Command:      []string{"/bin/sleep", "3600"},
-					PoolRef:      pool.Name,
-					ExposedPorts: []int32{8080},
+					Image:   "docker.io/library/alpine:latest",
+					Command: []string{"/bin/sleep", "3600"},
+					PoolRef: pool.Name,
 				},
 			}
 			if err := k8sClient.Create(ctx, sandbox); err != nil {
@@ -404,15 +400,14 @@ func TestPodExistence(t *testing.T) {
 			waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 			runningSandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: "sb-existence", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedFastlet != "" &&
-					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
+				return sb.Status.Assignment != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 			})
 			if err != nil {
 				t.Fatalf("wait for sandbox to be running: %v", err)
 			}
 			t.Log("Sandbox created successfully")
 
-			fastletPod := runningSandbox.Status.AssignedFastlet
+			fastletPod := runningSandbox.Status.Assignment.FastletName
 			t.Logf("Fastlet Pod: %s", fastletPod)
 
 			// Delete fastlet pod to simulate orphan scenario
@@ -438,19 +433,22 @@ func TestPodExistence(t *testing.T) {
 			}
 
 			// Sandbox exists, check its state
-			phase := existingSandbox.Status.Phase
-			switch phase {
-			case string(apiv1alpha1.PhaseFailed), "Unknown":
-				t.Logf("✓ Sandbox in %s state, orphan was identified", phase)
-			case string(apiv1alpha1.PhaseRunning), string(apiv1alpha1.PhaseBound):
-				newPod := existingSandbox.Status.AssignedFastlet
+			state := existingSandbox.Status.RuntimeState
+			switch state {
+			case apiv1alpha1.ObservedStateFailed, apiv1alpha1.ObservedStateUnavailable, apiv1alpha1.ObservedStateUnknown:
+				t.Logf("✓ Sandbox in %s state, orphan was identified", state)
+			case apiv1alpha1.ObservedStateReady:
+				newPod := ""
+				if existingSandbox.Status.Assignment != nil {
+					newPod = existingSandbox.Status.Assignment.FastletName
+				}
 				if newPod != "" && newPod != fastletPod {
 					t.Logf("✓ Sandbox was rescheduled to new pod: %s", newPod)
 				} else {
 					t.Log("✓ Sandbox still running (may be expected state)")
 				}
 			default:
-				t.Logf("Sandbox phase: %s", phase)
+				t.Logf("Sandbox runtime state: %s", state)
 			}
 
 			return ctx
@@ -477,6 +475,7 @@ func createFaultPool(namespace, name string) *apiv1alpha1.SandboxPool {
 			},
 			MaxSandboxesPerPod: 5,
 			Runtime:            apiv1alpha1.RuntimeContainer,
+			SandboxResources:   suiteenv.SmallSandboxResourceProfile(),
 			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{

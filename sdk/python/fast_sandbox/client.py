@@ -65,7 +65,7 @@ class Client:
         )
         return Sandbox(
             client=self, name=response.sandbox_name or name,
-            sandbox_id=response.sandbox_uid or response.sandbox_id,
+            sandbox_uid=response.sandbox_uid,
             namespace=selected_namespace,
         )
 
@@ -77,7 +77,7 @@ class Client:
         )
         return Sandbox(
             client=self, name=response.sandbox_name or name,
-            sandbox_id=response.sandbox_id, namespace=selected_namespace,
+            sandbox_uid=response.sandbox_uid, namespace=selected_namespace,
         )
 
     def delete(self, name: str, namespace: Optional[str] = None) -> bool:

@@ -31,8 +31,10 @@ var (
 )
 
 const (
-	ConditionRuntimeReady   = "RuntimeReady"
-	ConditionDataPlaneReady = "DataPlaneReady"
+	ConditionRuntimeReady   = apiv1alpha1.SandboxConditionRuntimeReady
+	ConditionDataPlaneReady = apiv1alpha1.SandboxConditionDataPlaneReady
+	ReasonFastletPodLost    = "FastletPodLost"
+	ReasonExpired           = "Expired"
 )
 
 type FastletClient interface {
@@ -87,10 +89,10 @@ func (o *Orchestrator) ResolveRuntime(ctx context.Context, sandbox *apiv1alpha1.
 	if err := o.Client.Get(ctx, types.NamespacedName{Namespace: sandbox.Namespace, Name: sandbox.Spec.PoolRef}, &pool); err != nil {
 		return RuntimeParameters{}, fmt.Errorf("get SandboxPool %s: %w", sandbox.Spec.PoolRef, err)
 	}
-	runtimeName, err := pool.Spec.EffectiveRuntime()
-	if err != nil {
+	if err := pool.Spec.ValidateRuntime(); err != nil {
 		return RuntimeParameters{}, fmt.Errorf("resolve Pool runtime: %w", err)
 	}
+	runtimeName := pool.Spec.Runtime
 	catalog := o.Catalog
 	if catalog == nil {
 		catalog = runtimecatalog.Builtin()
@@ -99,8 +101,8 @@ func (o *Orchestrator) ResolveRuntime(ctx context.Context, sandbox *apiv1alpha1.
 	if err != nil {
 		return RuntimeParameters{}, fmt.Errorf("resolve runtime profile: %w", err)
 	}
-	resources, err := pool.Spec.EffectiveSandboxResources()
-	if err != nil {
+	resources := pool.Spec.SandboxResources
+	if err := apiv1alpha1.ValidateSandboxResourceProfile(resources); err != nil {
 		return RuntimeParameters{}, fmt.Errorf("resolve Sandbox resources: %w", err)
 	}
 	infraCatalog := o.InfraCatalog
@@ -346,7 +348,6 @@ func (o *Orchestrator) ClearAssignment(ctx context.Context, sandbox *apiv1alpha1
 
 func (o *Orchestrator) MarkPending(ctx context.Context, sandbox *apiv1alpha1.Sandbox, reason, message string) error {
 	return o.patchStatus(ctx, sandbox, func(status *apiv1alpha1.SandboxStatus) {
-		status.Phase = string(apiv1alpha1.PhasePending)
 		status.RuntimeState = apiv1alpha1.ObservedStatePending
 		status.DataPlaneState = apiv1alpha1.ObservedStatePending
 		setCondition(status, ConditionRuntimeReady, metav1.ConditionFalse, reason, message)
@@ -356,7 +357,6 @@ func (o *Orchestrator) MarkPending(ctx context.Context, sandbox *apiv1alpha1.San
 
 func (o *Orchestrator) MarkCreating(ctx context.Context, sandbox *apiv1alpha1.Sandbox, message string) error {
 	return o.patchStatus(ctx, sandbox, func(status *apiv1alpha1.SandboxStatus) {
-		status.Phase = string(apiv1alpha1.PhaseBound)
 		status.RuntimeState = apiv1alpha1.ObservedStateCreating
 		status.DataPlaneState = apiv1alpha1.ObservedStatePending
 		setCondition(status, ConditionRuntimeReady, metav1.ConditionFalse, "Creating", message)
@@ -365,8 +365,6 @@ func (o *Orchestrator) MarkCreating(ctx context.Context, sandbox *apiv1alpha1.Sa
 
 func (o *Orchestrator) MarkReady(ctx context.Context, sandbox *apiv1alpha1.Sandbox) error {
 	return o.patchStatus(ctx, sandbox, func(status *apiv1alpha1.SandboxStatus) {
-		status.Phase = string(apiv1alpha1.PhaseRunning)
-		status.SandboxID = string(sandbox.UID)
 		status.RuntimeState = apiv1alpha1.ObservedStateReady
 		status.DataPlaneState = apiv1alpha1.ObservedStateReady
 		setCondition(status, ConditionRuntimeReady, metav1.ConditionTrue, "RuntimeRunning", "Fastlet reports the runtime running")

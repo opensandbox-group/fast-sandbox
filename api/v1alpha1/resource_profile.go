@@ -6,33 +6,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-
-	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 var ErrInvalidSandboxResourceProfile = errors.New("invalid sandbox resource profile")
 
-func DefaultSandboxResourceProfile() SandboxResourceProfile {
-	return SandboxResourceProfile{
-		CPU: resource.MustParse("1"), Memory: resource.MustParse("512Mi"), PIDs: 256,
-	}
-}
-
-// EffectiveSandboxResources gives legacy Pools that omitted the entire field a
-// deterministic fixed profile. Partially specified or non-positive profiles
-// fail closed so a Sandbox can never silently lose only one hard limit.
-func (s SandboxPoolSpec) EffectiveSandboxResources() (SandboxResourceProfile, error) {
-	p := s.SandboxResources
-	if p.CPU.IsZero() && p.Memory.IsZero() && p.PIDs == 0 {
-		return DefaultSandboxResourceProfile(), nil
-	}
+// ValidateSandboxResourceProfile verifies the fixed, Fastlet-enforced resource
+// profile required by every SandboxPool.
+func ValidateSandboxResourceProfile(p SandboxResourceProfile) error {
 	if p.CPU.Sign() <= 0 || p.Memory.Sign() <= 0 || p.PIDs <= 0 {
-		return SandboxResourceProfile{}, fmt.Errorf("%w: cpu, memory, and pids must all be greater than zero", ErrInvalidSandboxResourceProfile)
+		return fmt.Errorf("%w: cpu, memory, and pids must all be greater than zero", ErrInvalidSandboxResourceProfile)
 	}
 	if p.CPU.MilliValue() < 10 {
-		return SandboxResourceProfile{}, fmt.Errorf("%w: cpu must be at least 10m for Linux CFS enforcement", ErrInvalidSandboxResourceProfile)
+		return fmt.Errorf("%w: cpu must be at least 10m for Linux CFS enforcement", ErrInvalidSandboxResourceProfile)
 	}
-	return p, nil
+	return nil
 }
 
 // Hash returns the canonical identity carried from SandboxPool through the

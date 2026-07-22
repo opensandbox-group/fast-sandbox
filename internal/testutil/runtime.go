@@ -2,7 +2,6 @@ package testutil
 
 import (
 	"context"
-	"io"
 	"sync"
 
 	"fast-sandbox/internal/api"
@@ -10,7 +9,7 @@ import (
 	"fast-sandbox/internal/runtimecatalog"
 )
 
-var _ fastletruntime.Runtime = (*FakeRuntime)(nil)
+var _ fastletruntime.RuntimeDriver = (*FakeRuntime)(nil)
 
 // FakeRuntime provides deterministic hooks for Fastlet lifecycle tests. It is
 // intentionally kept behind the current Runtime interface and will evolve with
@@ -18,13 +17,13 @@ var _ fastletruntime.Runtime = (*FakeRuntime)(nil)
 type FakeRuntime struct {
 	mu sync.Mutex
 
-	CreateFunc func(context.Context, *api.SandboxSpec) (*fastletruntime.SandboxMetadata, error)
+	EnsureFunc func(context.Context, *api.SandboxSpec) (*fastletruntime.SandboxMetadata, error)
 	DeleteFunc func(context.Context, string) error
 	StatusFunc func(context.Context, string) (string, error)
 	ImagesFunc func(context.Context) ([]string, error)
 
 	Namespace   string
-	CreateCalls []api.SandboxSpec
+	EnsureCalls []api.SandboxSpec
 	DeleteCalls []string
 }
 
@@ -40,18 +39,14 @@ func (f *FakeRuntime) SetNamespace(namespace string) {
 	f.Namespace = namespace
 }
 
-func (f *FakeRuntime) CreateSandbox(ctx context.Context, spec *api.SandboxSpec) (*fastletruntime.SandboxMetadata, error) {
+func (f *FakeRuntime) EnsureSandbox(ctx context.Context, spec *api.SandboxSpec) (*fastletruntime.SandboxMetadata, error) {
 	f.mu.Lock()
-	f.CreateCalls = append(f.CreateCalls, *spec)
+	f.EnsureCalls = append(f.EnsureCalls, *spec)
 	f.mu.Unlock()
-	if f.CreateFunc != nil {
-		return f.CreateFunc(ctx, spec)
+	if f.EnsureFunc != nil {
+		return f.EnsureFunc(ctx, spec)
 	}
 	return &fastletruntime.SandboxMetadata{SandboxSpec: *spec, ContainerID: spec.SandboxID, Phase: "running"}, nil
-}
-
-func (f *FakeRuntime) EnsureSandbox(ctx context.Context, spec *api.SandboxSpec) (*fastletruntime.SandboxMetadata, error) {
-	return f.CreateSandbox(ctx, spec)
 }
 
 func (f *FakeRuntime) DeleteSandbox(ctx context.Context, sandboxID string) error {
@@ -63,8 +58,6 @@ func (f *FakeRuntime) DeleteSandbox(ctx context.Context, sandboxID string) error
 	}
 	return nil
 }
-
-func (f *FakeRuntime) GetSandboxLogs(context.Context, string, bool, io.Writer) error { return nil }
 
 func (f *FakeRuntime) ListImages(ctx context.Context) ([]string, error) {
 	if f.ImagesFunc != nil {

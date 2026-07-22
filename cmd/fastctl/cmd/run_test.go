@@ -52,8 +52,9 @@ func TestRunCommand(t *testing.T) {
 	mockClient.CreateFunc = func(ctx context.Context, req *fastpathv1.CreateRequest) (*fastpathv1.CreateResponse, error) {
 		capturedReq = req
 		return &fastpathv1.CreateResponse{
-			SandboxId:  "test-sb-id",
-			FastletPod: "test-fastlet",
+			SandboxUid:  "test-sb-id",
+			SandboxName: "my-sandbox",
+			FastletPod:  "test-fastlet",
 		}, nil
 	}
 
@@ -61,11 +62,10 @@ func TestRunCommand(t *testing.T) {
 	viper.Set("namespace", "test-ns")
 
 	pool = ""
-	mode = ""
 	image = ""
-	ports = nil
+	requestID = ""
 
-	rootCmd.SetArgs([]string{"run", "my-sandbox", "--image=alpine", "--pool=test-pool", "--mode=strong"})
+	rootCmd.SetArgs([]string{"run", "my-sandbox", "--image=alpine", "--pool=test-pool"})
 
 	if err := rootCmd.Execute(); err != nil {
 		t.Fatalf("Execute failed: %v", err)
@@ -82,9 +82,6 @@ func TestRunCommand(t *testing.T) {
 	}
 	if capturedReq.RequestId == "" {
 		t.Error("expected an automatically generated request_id")
-	}
-	if capturedReq.ConsistencyMode != fastpathv1.ConsistencyMode_FAST || len(capturedReq.ExposedPorts) != 0 {
-		t.Errorf("deprecated create fields must not be sent: mode=%s ports=%v", capturedReq.ConsistencyMode, capturedReq.ExposedPorts)
 	}
 	// ... other assert
 }
@@ -105,12 +102,13 @@ func TestRunCommandWithFile(t *testing.T) {
 	tmpFile.WriteString(`
 image: nginx
 pool_ref: file-pool
-consistency_mode: fast
+working_dir: /workspace
 `)
 	tmpFile.Close()
 
 	pool = ""
 	image = ""
+	requestID = ""
 
 	// exec: run my-sandbox -f config.yaml --pool=override-pool
 	rootCmd.SetArgs([]string{"run", "my-sandbox", "-f", tmpFile.Name(), "--pool=override-pool"})
@@ -124,7 +122,7 @@ consistency_mode: fast
 	if capturedReq.PoolRef != "override-pool" {
 		t.Errorf("expected pool 'override-pool' (from flag), got '%s'", capturedReq.PoolRef)
 	}
-	if capturedReq.ConsistencyMode != fastpathv1.ConsistencyMode_FAST || len(capturedReq.ExposedPorts) != 0 {
-		t.Errorf("legacy config fields must be ignored: mode=%s ports=%v", capturedReq.ConsistencyMode, capturedReq.ExposedPorts)
+	if capturedReq.WorkingDir != "/workspace" {
+		t.Errorf("expected working dir '/workspace', got '%s'", capturedReq.WorkingDir)
 	}
 }

@@ -38,7 +38,7 @@ func (r *sequenceRunner) Run(_ context.Context, dir, name string, args ...string
 		args: append([]string(nil), args...),
 	})
 	if len(r.outputs) == 0 {
-		return []byte(`{"phase":"Running","sandbox_id":"sb-id","fastlet_pod":"fastlet-pod"}`), nil
+		return []byte(`{"runtime_state":"Ready","data_plane_state":"Ready","sandbox_uid":"sb-id","fastlet_pod":"fastlet-pod"}`), nil
 	}
 	output := r.outputs[0]
 	r.outputs = r.outputs[1:]
@@ -57,11 +57,10 @@ func TestFastctlRunWritesConfigAndInvokesCLI(t *testing.T) {
 	)
 
 	_, err := client.Run(context.Background(), "sb-cli", FastctlConfig{
-		Image:           "docker.io/library/alpine:latest",
-		PoolRef:         "pool-a",
-		ConsistencyMode: "strong",
-		Command:         []string{"/bin/sh"},
-		Args:            []string{"-c", "echo FSB_OK && sleep 60"},
+		Image:   "docker.io/library/alpine:latest",
+		PoolRef: "pool-a",
+		Command: []string{"/bin/sh"},
+		Args:    []string{"-c", "echo FSB_OK && sleep 60"},
 		Envs: map[string]string{
 			"TEST_VAR": "hello",
 		},
@@ -80,7 +79,6 @@ func TestFastctlRunWritesConfigAndInvokesCLI(t *testing.T) {
 	for _, want := range []string{
 		"image: docker.io/library/alpine:latest",
 		"pool_ref: pool-a",
-		"consistency_mode: strong",
 		"command:",
 		"- /bin/sh",
 		"args:",
@@ -95,11 +93,10 @@ func TestFastctlRunWritesConfigAndInvokesCLI(t *testing.T) {
 	}
 }
 
-func TestFastctlGetLogsAndDeleteInvokeCLI(t *testing.T) {
+func TestFastctlGetAndDeleteInvokeCLI(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string]string{
-			commandKey("/repo/bin/fastctl", "--endpoint", "127.0.0.1:19090", "--namespace", "tenant-a", "get", "sb-cli", "-o", "json"): `{"phase":"Running"}`,
-			commandKey("/repo/bin/fastctl", "--endpoint", "127.0.0.1:19090", "--namespace", "tenant-a", "logs", "sb-cli"):              "FSB_OK\n",
+			commandKey("/repo/bin/fastctl", "--endpoint", "127.0.0.1:19090", "--namespace", "tenant-a", "get", "sb-cli", "-o", "json"): `{"runtime_state":"Ready"}`,
 			commandKey("/repo/bin/fastctl", "--endpoint", "127.0.0.1:19090", "--namespace", "tenant-a", "delete", "sb-cli"):            "deleted\n",
 		},
 		errs: map[string]error{},
@@ -115,26 +112,18 @@ func TestFastctlGetLogsAndDeleteInvokeCLI(t *testing.T) {
 	if _, err := client.GetJSON(context.Background(), "sb-cli"); err != nil {
 		t.Fatalf("GetJSON returned error: %v", err)
 	}
-	logs, err := client.Logs(context.Background(), "sb-cli")
-	if err != nil {
-		t.Fatalf("Logs returned error: %v", err)
-	}
-	if logs != "FSB_OK\n" {
-		t.Fatalf("Logs = %q, want FSB_OK", logs)
-	}
 	if err := client.Delete(context.Background(), "sb-cli"); err != nil {
 		t.Fatalf("Delete returned error: %v", err)
 	}
 
 	assertCommand(t, runner.commands, "/repo/bin/fastctl", "--endpoint", "127.0.0.1:19090", "--namespace", "tenant-a", "get", "sb-cli", "-o", "json")
-	assertCommand(t, runner.commands, "/repo/bin/fastctl", "--endpoint", "127.0.0.1:19090", "--namespace", "tenant-a", "logs", "sb-cli")
 	assertCommand(t, runner.commands, "/repo/bin/fastctl", "--endpoint", "127.0.0.1:19090", "--namespace", "tenant-a", "delete", "sb-cli")
 }
 
 func TestFastctlGetJSONIgnoresCLIConfigPreamble(t *testing.T) {
 	runner := &fakeRunner{
 		outputs: map[string]string{
-			commandKey("/repo/bin/fastctl", "--endpoint", "127.0.0.1:19090", "--namespace", "tenant-a", "get", "sb-cli", "-o", "json"): "Using config file: /repo/.fastctl/config.json\n{\"sandbox_name\":\"sb-cli\",\"phase\":\"Running\"}\n",
+			commandKey("/repo/bin/fastctl", "--endpoint", "127.0.0.1:19090", "--namespace", "tenant-a", "get", "sb-cli", "-o", "json"): "Using config file: /repo/.fastctl/config.json\n{\"sandbox_name\":\"sb-cli\",\"runtime_state\":\"Ready\"}\n",
 		},
 		errs: map[string]error{},
 	}
@@ -150,16 +139,16 @@ func TestFastctlGetJSONIgnoresCLIConfigPreamble(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetJSON returned error: %v", err)
 	}
-	if info.SandboxName != "sb-cli" || info.Phase != "Running" {
-		t.Fatalf("info = %+v, want sandbox_name sb-cli phase Running", info)
+	if info.SandboxName != "sb-cli" || info.RuntimeState != "Ready" {
+		t.Fatalf("info = %+v, want sandbox_name sb-cli runtime Ready", info)
 	}
 }
 
-func TestFastctlWaitRunningRequiresSandboxIDAndFastletPod(t *testing.T) {
+func TestFastctlWaitRunningRequiresReadyStatesUIDAndFastletPod(t *testing.T) {
 	runner := &sequenceRunner{
 		outputs: [][]byte{
-			[]byte(`{"phase":"Running"}`),
-			[]byte(`{"phase":"Running","sandbox_id":"sb-id","fastlet_pod":"fastlet-pod"}`),
+			[]byte(`{"runtime_state":"Ready","data_plane_state":"Ready"}`),
+			[]byte(`{"runtime_state":"Ready","data_plane_state":"Ready","sandbox_uid":"sb-id","fastlet_pod":"fastlet-pod"}`),
 		},
 	}
 	client := NewFastctl(
@@ -176,7 +165,7 @@ func TestFastctlWaitRunningRequiresSandboxIDAndFastletPod(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WaitRunning returned error: %v", err)
 	}
-	if info.SandboxID != "sb-id" || info.FastletPod != "fastlet-pod" {
+	if info.SandboxUID != "sb-id" || info.FastletPod != "fastlet-pod" {
 		t.Fatalf("info = %+v, want sandbox ID and fastlet pod", info)
 	}
 	if len(runner.commands) < 2 {

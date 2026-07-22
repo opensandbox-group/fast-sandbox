@@ -15,6 +15,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -116,8 +117,6 @@ func (c *assigningUIDClient) Create(ctx context.Context, object client.Object, o
 		sandbox.Status.AssignmentAttempt = c.assignmentOnCreate.Attempt
 		sandbox.Status.InstanceGeneration = 1
 		sandbox.Status.RouteGeneration = 1
-		sandbox.Status.AssignedFastlet = c.assignmentOnCreate.FastletName
-		sandbox.Status.NodeName = c.assignmentOnCreate.NodeName
 		return c.Client.Status().Update(ctx, sandbox)
 	}
 	return nil
@@ -133,16 +132,14 @@ func TestCreateFastFailureDoesNotPersistCRD(t *testing.T) {
 	require.Empty(t, list.Items)
 }
 
-func TestCreateIsIdempotentAndDeprecatedConsistencyDoesNotChangeOrdering(t *testing.T) {
+func TestCreateIsIdempotent(t *testing.T) {
 	server, k8sClient, _, fastlet := newV2Server(t)
 	request := createRequest("request-a")
-	request.ConsistencyMode = fastpathv1.ConsistencyMode_STRONG
 	first, err := server.CreateSandbox(context.Background(), request)
 	require.NoError(t, err)
 	require.NotEmpty(t, first.SandboxUid)
 
 	retryRequest := createRequest("request-a")
-	retryRequest.ConsistencyMode = fastpathv1.ConsistencyMode_FAST
 	second, err := server.CreateSandbox(context.Background(), retryRequest)
 	require.NoError(t, err)
 	require.Equal(t, first.SandboxUid, second.SandboxUid)
@@ -163,6 +160,15 @@ func TestCreateIsIdempotentAndDeprecatedConsistencyDoesNotChangeOrdering(t *test
 	conflict.Image = "ubuntu:24.04"
 	_, err = server.CreateSandbox(context.Background(), conflict)
 	require.Equal(t, codes.AlreadyExists, status.Code(err))
+}
+
+func TestCreateRequiresRequestID(t *testing.T) {
+	server, k8sClient, _, _ := newV2Server(t)
+	_, err := server.CreateSandbox(context.Background(), createRequest(""))
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	var list apiv1alpha1.SandboxList
+	require.NoError(t, k8sClient.List(context.Background(), &list))
+	require.Empty(t, list.Items)
 }
 
 func TestCreateCommitSurvivesFastPathFailureAndRetryContinuesSameCRD(t *testing.T) {
@@ -284,8 +290,12 @@ func newV2Server(t *testing.T) (*Server, client.Client, *fastpathRegistry, *fast
 	pool := &apiv1alpha1.SandboxPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
 		Spec: apiv1alpha1.SandboxPoolSpec{
-			Runtime:         apiv1alpha1.RuntimeContainer,
-			Capacity:        apiv1alpha1.PoolCapacity{PoolMin: 1, PoolMax: 1},
+			Runtime:            apiv1alpha1.RuntimeContainer,
+			Capacity:           apiv1alpha1.PoolCapacity{PoolMin: 1, PoolMax: 1},
+			MaxSandboxesPerPod: 8,
+			SandboxResources: apiv1alpha1.SandboxResourceProfile{
+				CPU: resource.MustParse("1"), Memory: resource.MustParse("512Mi"), PIDs: 256,
+			},
 			FastletTemplate: corev1.PodTemplateSpec{},
 		},
 	}
@@ -310,13 +320,13 @@ func createRequest(requestID string) *fastpathv1.CreateRequest {
 	}
 }
 
-func TestSandboxFromCreateRequestDropsDeprecatedPortAndConsistencyFields(t *testing.T) {
-	request := createRequest("request-deprecated-fields")
-	request.ExposedPorts = []int32{80, 8080}
-	request.ConsistencyMode = fastpathv1.ConsistencyMode_STRONG
-
+func TestSandboxFromCreateRequestUsesCanonicalFields(t *testing.T) {
+	request := createRequest("request-a")
 	sandbox := sandboxFromCreateRequest(request, "create-hash")
-	require.Empty(t, sandbox.Spec.ExposedPorts)
 	require.Equal(t, request.Image, sandbox.Spec.Image)
 	require.Equal(t, request.PoolRef, sandbox.Spec.PoolRef)
+	require.Equal(t, request.Command, sandbox.Spec.Command)
+	require.Equal(t, request.Args, sandbox.Spec.Args)
+	require.Equal(t, []corev1.EnvVar{{Name: "A", Value: "B"}}, sandbox.Spec.Envs)
+	require.Equal(t, request.WorkingDir, sandbox.Spec.WorkingDir)
 }

@@ -16,64 +16,6 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/features"
 )
 
-func TestIdenticalPrivatePortsDoNotAffectScheduling(t *testing.T) {
-	suiteenv.RequireBasic(t)
-
-	feature := features.New("identical-private-ports-do-not-affect-scheduling").
-		WithLabel("suite", "scheduling").
-		WithLabel("tier", "smoke").
-		Assess("same-port sandboxes are both admitted without host-port endpoints", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
-			k8sClient := testSuite.MustKubeClient(t)
-			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
-
-			namespace := testSuite.AllocateNamespace("portmutex")
-			if err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
-				t.Fatalf("create namespace: %v", err)
-			}
-			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
-
-			pool := createSchedulingPool(namespace, "port-mutex-pool", 2, 2, 5)
-			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
-				t.Fatalf("create sandbox pool: %v", err)
-			}
-
-			poolWaitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
-			defer cancel()
-			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 2); err != nil {
-				t.Fatalf("wait for ready fastlet pods: %v", err)
-			}
-
-			sandboxA := createSandboxWithPorts(namespace, "sb-port-a", pool.Name, []int32{8080})
-			if _, err := fixture.CreateSandbox(ctx, namespace, sandboxA); err != nil {
-				t.Fatalf("create sandbox A: %v", err)
-			}
-
-			assignedA := waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-port-a")
-			if assignedA.Status.AssignedFastlet == "" {
-				t.Fatalf("sandbox A not assigned")
-			}
-
-			sandboxB := createSandboxWithPorts(namespace, "sb-port-b", pool.Name, []int32{8080})
-			if _, err := fixture.CreateSandbox(ctx, namespace, sandboxB); err != nil {
-				t.Fatalf("create sandbox B: %v", err)
-			}
-
-			assignedB := waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-port-b")
-			if assignedB.Status.AssignedFastlet == "" {
-				t.Fatalf("sandbox B not assigned")
-			}
-
-			if len(assignedA.Status.Endpoints) != 0 || len(assignedB.Status.Endpoints) != 0 {
-				t.Fatalf("deprecated host-port endpoints must stay empty: A=%v B=%v", assignedA.Status.Endpoints, assignedB.Status.Endpoints)
-			}
-
-			return ctx
-		}).
-		Feature()
-
-	testSuite.Env().Test(t, feature)
-}
-
 func TestResourceSlotCapacity(t *testing.T) {
 	suiteenv.RequireBasic(t)
 
@@ -101,19 +43,19 @@ func TestResourceSlotCapacity(t *testing.T) {
 				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
-			sandbox1 := createSandboxWithPorts(namespace, "sb-slot-1", pool.Name, nil)
+			sandbox1 := createSchedulingSandbox(namespace, "sb-slot-1", pool.Name)
 			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox1); err != nil {
 				t.Fatalf("create sandbox 1: %v", err)
 			}
 			waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-slot-1")
 
-			sandbox2 := createSandboxWithPorts(namespace, "sb-slot-2", pool.Name, nil)
+			sandbox2 := createSchedulingSandbox(namespace, "sb-slot-2", pool.Name)
 			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox2); err != nil {
 				t.Fatalf("create sandbox 2: %v", err)
 			}
 			waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-slot-2")
 
-			sandbox3 := createSandboxWithPorts(namespace, "sb-slot-3", pool.Name, nil)
+			sandbox3 := createSchedulingSandbox(namespace, "sb-slot-3", pool.Name)
 			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox3); err != nil {
 				t.Fatalf("create sandbox 3: %v", err)
 			}
@@ -159,12 +101,12 @@ func TestAutoScaling(t *testing.T) {
 				t.Fatalf("wait for initial fastlet pod: %v", err)
 			}
 
-			sandbox1 := createSandboxWithPorts(namespace, "sb-scale-1", pool.Name, nil)
+			sandbox1 := createSchedulingSandbox(namespace, "sb-scale-1", pool.Name)
 			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox1); err != nil {
 				t.Fatalf("create sandbox 1: %v", err)
 			}
 
-			sandbox2 := createSandboxWithPorts(namespace, "sb-scale-2", pool.Name, nil)
+			sandbox2 := createSchedulingSandbox(namespace, "sb-scale-2", pool.Name)
 			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox2); err != nil {
 				t.Fatalf("create sandbox 2: %v", err)
 			}
@@ -178,8 +120,8 @@ func TestAutoScaling(t *testing.T) {
 			assigned1 := waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-scale-1")
 			assigned2 := waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-scale-2")
 
-			if assigned1.Status.AssignedFastlet == assigned2.Status.AssignedFastlet {
-				t.Fatalf("both sandboxes on same pod %s, expected different pods", assigned1.Status.AssignedFastlet)
+			if assigned1.Status.Assignment.FastletName == assigned2.Status.Assignment.FastletName {
+				t.Fatalf("both sandboxes on same pod %s, expected different pods", assigned1.Status.Assignment.FastletName)
 			}
 
 			return ctx
@@ -219,7 +161,7 @@ func createSchedulingPool(namespace, name string, min, max, maxPerPod int32) *ap
 	}
 }
 
-func createSandboxWithPorts(namespace, name, pool string, ports []int32) *apiv1alpha1.Sandbox {
+func createSchedulingSandbox(namespace, name, pool string) *apiv1alpha1.Sandbox {
 	return &apiv1alpha1.Sandbox{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: apiv1alpha1.GroupVersion.String(),
@@ -230,10 +172,9 @@ func createSandboxWithPorts(namespace, name, pool string, ports []int32) *apiv1a
 			Namespace: namespace,
 		},
 		Spec: apiv1alpha1.SandboxSpec{
-			Image:        "docker.io/library/alpine:latest",
-			Command:      []string{"/bin/sleep", "3600"},
-			PoolRef:      pool,
-			ExposedPorts: ports,
+			Image:   "docker.io/library/alpine:latest",
+			Command: []string{"/bin/sleep", "3600"},
+			PoolRef: pool,
 		},
 	}
 }
@@ -244,8 +185,7 @@ func waitForAssignedSandbox(ctx context.Context, t *testing.T, fixture *fixtures
 	defer cancel()
 
 	sandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-		return sb.Status.AssignedFastlet != "" &&
-			(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
+		return sb.Status.Assignment != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 	})
 	if err != nil {
 		t.Fatalf("wait for assigned sandbox %s/%s: %v", namespace, name, err)

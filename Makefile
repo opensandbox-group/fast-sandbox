@@ -17,6 +17,7 @@ UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./test/e2e/env/...
 
 # Go settings
 GO ?= go
+PYTHON ?= python3
 GOFLAGS ?= -gcflags="all=-N -l"
 DOCKER_BUILD_FLAGS ?=
 
@@ -151,7 +152,7 @@ test-unit:
 	$(GO) test $(GOFLAGS) $(UNIT_PACKAGES)
 
 test-python-sdk:
-	PYTHONPATH=sdk/python python3 -m unittest discover -s sdk/python/tests -v
+	PYTHONPATH=sdk/python:$(PYTHONPATH) $(PYTHON) -m unittest discover -s sdk/python/tests -v
 
 test-race:
 	$(GO) test -race $(UNIT_PACKAGES)
@@ -195,7 +196,7 @@ $(CONTROLLER_GEN):
 generate: generate-proto generate-deepcopy
 
 generate-python-proto:
-	bash sdk/python/generate_proto.sh
+	PYTHON=$(PYTHON) bash sdk/python/generate_proto.sh
 
 generate-proto: tools
 	@PATH=$(TOOLS_BIN):$$PATH $(PROTOC) -I . --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative api/proto/v1/fastpath.proto

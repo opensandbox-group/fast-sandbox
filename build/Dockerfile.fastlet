@@ -19,7 +19,7 @@ COPY bin/sandbox-tunnel /opt/fast-sandbox/bin/sandbox-tunnel
 
 # Default envs; can be overridden by Pod spec
 ENV FASTLET_CONTROL_PORT=":5758"
-ENV RUNTIME_TYPE="container"
+ENV FAST_SANDBOX_RUNTIME="container"
 ENV RUNTIME_SOCKET="/run/containerd/containerd.sock"
 
 EXPOSE 5758

@@ -12,13 +12,10 @@ import (
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/controller/common"
-	"fast-sandbox/internal/controller/fastletpool"
 	"fast-sandbox/internal/controller/sandboxorchestrator"
 	"fast-sandbox/internal/fastletproxy"
 	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/routeauth"
-	"fast-sandbox/internal/runtimecatalog"
-	"fast-sandbox/pkg/util/idgen"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -38,12 +35,6 @@ type Server struct {
 	Orchestrator        *sandboxorchestrator.Orchestrator
 	CredentialIssuer    *routeauth.Issuer
 	SandboxProxyBaseURL string
-
-	// Deprecated construction fields retained while in-tree callers migrate to
-	// the shared Orchestrator.
-	Registry      fastletpool.FastletRegistry
-	FastletClient *api.FastletClient
-	Catalog       *runtimecatalog.Catalog
 }
 
 var _ fastpathv1.FastPathServiceServer = &Server{}
@@ -162,21 +153,11 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRe
 	if request == nil || request.Image == "" || request.PoolRef == "" {
 		return nil, status.Error(codes.InvalidArgument, "image and pool_ref are required")
 	}
-	if len(request.ExposedPorts) > 0 {
-		deprecatedCreateFieldTotal.WithLabelValues("exposed_ports").Inc()
-	}
-	if request.ConsistencyMode == fastpathv1.ConsistencyMode_STRONG {
-		deprecatedCreateFieldTotal.WithLabelValues("consistency_mode_strong").Inc()
-	}
 	if request.Namespace == "" {
 		request.Namespace = "default"
 	}
 	if request.RequestId == "" {
-		generated, err := idgen.GenerateRequestID()
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "generate request_id: %v", err)
-		}
-		request.RequestId = generated
+		return nil, status.Error(codes.InvalidArgument, "request_id is required")
 	}
 	if err := ValidateRequestID(request.RequestId); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -379,16 +360,10 @@ func sandboxFromCreateRequest(request *fastpathv1.CreateRequest, createSpecHash 
 }
 
 func (s *Server) orchestrator() (*sandboxorchestrator.Orchestrator, error) {
-	if s.Orchestrator != nil {
-		return s.Orchestrator, nil
-	}
-	registry, ok := s.Registry.(sandboxorchestrator.Registry)
-	if !ok || s.FastletClient == nil {
+	if s.Orchestrator == nil {
 		return nil, errors.New("Sandbox orchestrator is not configured")
 	}
-	return &sandboxorchestrator.Orchestrator{
-		Client: s.K8sClient, Registry: registry, FastletClient: s.FastletClient, Catalog: s.Catalog,
-	}, nil
+	return s.Orchestrator, nil
 }
 
 func (s *Server) findSandboxByRequestID(ctx context.Context, namespace, requestID string) (*apiv1alpha1.Sandbox, error) {
@@ -414,13 +389,12 @@ func (s *Server) findSandboxByRequestID(ctx context.Context, namespace, requestI
 }
 
 func createResponseFromSandbox(sandbox *apiv1alpha1.Sandbox) *fastpathv1.CreateResponse {
-	fastletName := sandbox.Status.AssignedFastlet
+	fastletName := ""
 	if sandbox.Status.Assignment != nil {
 		fastletName = sandbox.Status.Assignment.FastletName
 	}
 	return &fastpathv1.CreateResponse{
-		SandboxId: string(sandbox.UID), SandboxUid: string(sandbox.UID),
-		SandboxName: sandbox.Name, FastletPod: fastletName,
+		SandboxUid: string(sandbox.UID), SandboxName: sandbox.Name, FastletPod: fastletName,
 	}
 }
 
@@ -455,13 +429,15 @@ func (s *Server) GetSandbox(ctx context.Context, request *fastpathv1.GetRequest)
 }
 
 func sandboxInfo(sandbox *apiv1alpha1.Sandbox) *fastpathv1.SandboxInfo {
-	fastletName := sandbox.Status.AssignedFastlet
+	fastletName := ""
 	if sandbox.Status.Assignment != nil {
 		fastletName = sandbox.Status.Assignment.FastletName
 	}
 	return &fastpathv1.SandboxInfo{
-		SandboxId: string(sandbox.UID), SandboxName: sandbox.Name, Phase: sandbox.Status.Phase,
-		FastletPod: fastletName, Image: sandbox.Spec.Image, PoolRef: sandbox.Spec.PoolRef,
+		SandboxUid: string(sandbox.UID), SandboxName: sandbox.Name,
+		RuntimeState: string(sandbox.Status.RuntimeState), DataPlaneState: string(sandbox.Status.DataPlaneState),
+		UserProcessState: string(sandbox.Status.UserProcessState), FastletPod: fastletName,
+		Image: sandbox.Spec.Image, PoolRef: sandbox.Spec.PoolRef,
 		CreatedAt: sandbox.CreationTimestamp.Unix(),
 	}
 }

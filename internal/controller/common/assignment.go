@@ -19,9 +19,8 @@ var ErrAssignmentConflict = errors.New("sandbox already has a different assignme
 var ErrAssignmentChanged = errors.New("sandbox assignment changed before it could be cleared")
 
 // EnsureSandboxAssignment establishes the authoritative assignment with a
-// resourceVersion precondition. Its merge patch only owns assignment and the
-// deprecated compatibility projection, so independent status writers do not
-// overwrite runtime/data-plane Conditions.
+// resourceVersion precondition. Its merge patch only owns assignment, so
+// independent status writers do not overwrite runtime/data-plane Conditions.
 func EnsureSandboxAssignment(
 	ctx context.Context,
 	k8sClient client.Client,
@@ -65,8 +64,6 @@ func EnsureSandboxAssignment(
 				"assignmentAttempt":  nextAssignment.Attempt,
 				"instanceGeneration": generation,
 				"routeGeneration":    routeGeneration,
-				"assignedFastlet":    desired.FastletName,
-				"nodeName":           desired.NodeName,
 			},
 		})
 		if err != nil {
@@ -136,15 +133,10 @@ func ClearSandboxAssignment(
 			"metadata": map[string]any{"resourceVersion": current.ResourceVersion},
 			"status": map[string]any{
 				"assignment":         nil,
-				"assignedFastlet":    "",
-				"nodeName":           "",
-				"sandboxID":          "",
-				"endpoints":          []string{},
 				"instanceGeneration": generation,
 				"routeGeneration":    routeGeneration,
 				"runtimeState":       apiv1alpha1.ObservedStatePending,
 				"dataPlaneState":     apiv1alpha1.ObservedStatePending,
-				"phase":              string(apiv1alpha1.PhasePending),
 			},
 		})
 		if err != nil {

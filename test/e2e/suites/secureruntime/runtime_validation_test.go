@@ -54,6 +54,7 @@ func TestRuntimeValidationUnsupportedBoxLite(t *testing.T) {
 					},
 					MaxSandboxesPerPod: 5,
 					Runtime:            apiv1alpha1.RuntimeBoxLite,
+					SandboxResources:   suiteenv.SmallSandboxResourceProfile(),
 					FastletTemplate: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
 							Tolerations: []corev1.Toleration{
@@ -188,16 +189,12 @@ func TestRuntimeValidationContainerDefault(t *testing.T) {
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 60*time.Second)
 			defer cancelRunWait()
 			running, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedFastlet != "" &&
-					(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
+				return sb.Status.Assignment != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 			})
 			if err != nil {
 				t.Fatalf("wait for running sandbox: %v", err)
 			}
-			sandboxID := running.Status.SandboxID
-			if sandboxID == "" {
-				sandboxID = string(running.UID)
-			}
+			sandboxID := string(running.UID)
 			assertSandboxCgroupLimits(ctx, t, fastlet.Spec.NodeName, sandboxID)
 
 			return ctx

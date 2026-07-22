@@ -29,7 +29,10 @@ func TestCleanupDecisionRequiresPodAndAssignmentFences(t *testing.T) {
 	assignment := apiv1alpha1.SandboxAssignment{FastletName: "fastlet-a", FastletPodUID: "pod-a", Attempt: 1}
 	running := &apiv1alpha1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{Name: "sandbox-a", Namespace: "default", UID: types.UID("sandbox-a-uid")},
-		Status:     apiv1alpha1.SandboxStatus{Assignment: &assignment, InstanceGeneration: 1, AssignmentAttempt: 1, Phase: string(apiv1alpha1.PhaseRunning)},
+		Status: apiv1alpha1.SandboxStatus{
+			Assignment: &assignment, InstanceGeneration: 1, AssignmentAttempt: 1,
+			RuntimeState: apiv1alpha1.ObservedStateReady,
+		},
 	}
 	exactPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "fastlet-a", Namespace: "default", UID: types.UID("pod-a")}}
 
@@ -51,7 +54,10 @@ func TestCleanupDecisionRequiresPodAndAssignmentFences(t *testing.T) {
 
 	t.Run("Manual policy Sandbox is durably Lost", func(t *testing.T) {
 		lost := running.DeepCopy()
-		lost.Status.Phase = string(apiv1alpha1.PhaseLost)
+		lost.Status.RuntimeState = apiv1alpha1.ObservedStateUnavailable
+		lost.Status.Conditions = []metav1.Condition{{
+			Type: apiv1alpha1.SandboxConditionRuntimeReady, Status: metav1.ConditionFalse, Reason: "FastletPodLost",
+		}}
 		janitor := newAuthorityJanitor(t, now, nil, []*apiv1alpha1.Sandbox{lost})
 		decision, err := janitor.cleanupDecision(context.Background(), resource)
 		require.NoError(t, err)

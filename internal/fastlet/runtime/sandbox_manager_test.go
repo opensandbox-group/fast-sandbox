@@ -3,7 +3,6 @@ package runtime
 import (
 	"context"
 	"errors"
-	"io"
 	"os"
 	"sync"
 	"testing"
@@ -56,7 +55,7 @@ func (m *MockRuntime) ProbeCapabilities(context.Context) CapabilityReport {
 
 func (m *MockRuntime) SetNamespace(ns string) {}
 
-func (m *MockRuntime) CreateSandbox(ctx context.Context, spec *api.SandboxSpec) (*SandboxMetadata, error) {
+func (m *MockRuntime) EnsureSandbox(ctx context.Context, spec *api.SandboxSpec) (*SandboxMetadata, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.createCalled = true
@@ -76,10 +75,6 @@ func (m *MockRuntime) CreateSandbox(ctx context.Context, spec *api.SandboxSpec) 
 	m.containers[spec.SandboxID] = metadata.ContainerID
 
 	return metadata, nil
-}
-
-func (m *MockRuntime) EnsureSandbox(ctx context.Context, spec *api.SandboxSpec) (*SandboxMetadata, error) {
-	return m.CreateSandbox(ctx, spec)
 }
 
 func (m *MockRuntime) DeleteSandbox(ctx context.Context, sandboxID string) error {
@@ -138,10 +133,6 @@ func (m *MockRuntime) PullImage(ctx context.Context, image string) error {
 	return nil
 }
 
-func (m *MockRuntime) GetSandboxLogs(ctx context.Context, sandboxID string, follow bool, stdout io.Writer) error {
-	return nil
-}
-
 func (m *MockRuntime) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -150,6 +141,22 @@ func (m *MockRuntime) Close() error {
 }
 
 // Helper methods for testing
+
+func ensureSandboxForTest(ctx context.Context, manager *SandboxManager, spec *api.SandboxSpec) (*api.EnsureSandboxResponse, error) {
+	return manager.EnsureSandboxV2(ctx, &api.EnsureSandboxRequest{
+		Identity: api.SandboxIdentity{
+			RequestID: "test-" + spec.SandboxID, SandboxUID: spec.SandboxID,
+			InstanceGeneration: 1, AssignmentAttempt: 1, FastletPodUID: manager.fastletPodUID,
+		},
+		Sandbox: *spec,
+	})
+}
+
+func deleteSandboxForTest(manager *SandboxManager, sandboxID string) (*api.DeleteSandboxV2Response, error) {
+	return manager.DeleteSandboxV2(&api.DeleteSandboxV2Request{Identity: api.SandboxIdentity{
+		SandboxUID: sandboxID, InstanceGeneration: 1, AssignmentAttempt: 1, FastletPodUID: manager.fastletPodUID,
+	}})
+}
 
 func (m *MockRuntime) SetCreateError(err error) {
 	m.mu.Lock()
@@ -374,12 +381,13 @@ func TestSandboxManager_CreateSandbox_Success(t *testing.T) {
 		Command:   []string{"/bin/sh"},
 	}
 
-	resp, err := manager.CreateSandbox(ctx, spec)
+	resp, err := ensureSandboxForTest(ctx, manager, spec)
 
 	require.NoError(t, err, "CreateSandbox should succeed")
-	assert.True(t, resp.Success, "Response should indicate success")
-	assert.Equal(t, spec.SandboxID, resp.SandboxID, "SandboxID should match")
-	assert.Greater(t, resp.CreatedAt, int64(0), "CreatedAt should be set")
+	assert.True(t, resp.Accepted, "Response should indicate acceptance")
+	require.NotNil(t, resp.Sandbox)
+	assert.Equal(t, spec.SandboxID, resp.Sandbox.SandboxID, "SandboxID should match")
+	assert.Greater(t, resp.Sandbox.CreatedAt, int64(0), "CreatedAt should be set")
 
 	// Verify sandbox is in manager's cache
 	statuses := manager.GetSandboxStatuses(ctx)
@@ -403,18 +411,19 @@ func TestSandboxManager_CreateSandbox_Idempotent(t *testing.T) {
 	}
 
 	// First creation
-	resp1, err1 := manager.CreateSandbox(ctx, spec)
+	resp1, err1 := ensureSandboxForTest(ctx, manager, spec)
 	require.NoError(t, err1, "First creation should succeed")
-	assert.True(t, resp1.Success)
+	assert.True(t, resp1.Accepted)
 
 	// Reset mock to track if CreateSandbox is called again
 	mockRuntime.Reset()
 
 	// Second creation of same sandbox
-	resp2, err2 := manager.CreateSandbox(ctx, spec)
+	resp2, err2 := ensureSandboxForTest(ctx, manager, spec)
 	require.NoError(t, err2, "Second creation should succeed (idempotent)")
-	assert.True(t, resp2.Success, "Second creation should return success")
-	assert.Equal(t, spec.SandboxID, resp2.SandboxID)
+	assert.True(t, resp2.Accepted, "Second creation should be accepted")
+	require.NotNil(t, resp2.Sandbox)
+	assert.Equal(t, spec.SandboxID, resp2.Sandbox.SandboxID)
 
 	// Verify runtime CreateSandbox was NOT called again (cached)
 	assert.False(t, mockRuntime.GetCreateCalled(), "Runtime CreateSandbox should not be called for existing sandbox")
@@ -437,12 +446,13 @@ func TestSandboxManager_CreateSandbox_RuntimeFailure(t *testing.T) {
 	expectedErr := errors.New("runtime create failed")
 	mockRuntime.SetCreateError(expectedErr)
 
-	resp, err := manager.CreateSandbox(ctx, spec)
+	resp, err := ensureSandboxForTest(ctx, manager, spec)
 
 	require.Error(t, err, "CreateSandbox should return error")
-	assert.False(t, resp.Success, "Response should indicate failure")
-	assert.Contains(t, resp.Message, "create failed", "Error message should contain details")
-	assert.Equal(t, expectedErr, err, "Returned error should match runtime error")
+	assert.False(t, resp.Accepted, "Response should indicate failure")
+	require.NotNil(t, resp.Error)
+	assert.Contains(t, resp.Error.Message, "create failed", "Error message should contain details")
+	require.ErrorIs(t, err, expectedErr, "Structured Fastlet error should preserve the runtime cause")
 
 	// Wait for any potential async cleanup
 	time.Sleep(100 * time.Millisecond)
@@ -484,9 +494,9 @@ func TestSandboxManager_CreateSandbox_MultipleSandboxes(t *testing.T) {
 	}
 
 	for _, spec := range sandboxes {
-		resp, err := manager.CreateSandbox(ctx, &spec)
+		resp, err := ensureSandboxForTest(ctx, manager, &spec)
 		require.NoError(t, err, "CreateSandbox for %s should succeed", spec.SandboxID)
-		assert.True(t, resp.Success)
+		assert.True(t, resp.Accepted)
 	}
 
 	// Verify all sandboxes are in status
@@ -525,14 +535,14 @@ func TestSandboxManager_DeleteSandbox_Success(t *testing.T) {
 	}
 
 	// Create sandbox first
-	_, err := manager.CreateSandbox(ctx, spec)
+	_, err := ensureSandboxForTest(ctx, manager, spec)
 	require.NoError(t, err)
 
 	// Delete sandbox
-	resp, err := manager.DeleteSandbox(spec.SandboxID)
+	resp, err := deleteSandboxForTest(manager, spec.SandboxID)
 
 	require.NoError(t, err, "DeleteSandbox should succeed")
-	assert.True(t, resp.Success, "Response should indicate success")
+	assert.True(t, resp.Accepted, "Response should indicate acceptance")
 
 	// Sandbox should be in terminating phase
 	statuses := manager.GetSandboxStatuses(ctx)
@@ -562,21 +572,21 @@ func TestSandboxManager_DeleteSandbox_Idempotent(t *testing.T) {
 	}
 
 	// Create sandbox first
-	_, err := manager.CreateSandbox(ctx, spec)
+	_, err := ensureSandboxForTest(ctx, manager, spec)
 	require.NoError(t, err)
 
 	// First delete
-	resp1, err1 := manager.DeleteSandbox(spec.SandboxID)
+	resp1, err1 := deleteSandboxForTest(manager, spec.SandboxID)
 	require.NoError(t, err1, "First delete should succeed")
-	assert.True(t, resp1.Success)
+	assert.True(t, resp1.Accepted)
 
 	// Reset mock to track if DeleteSandbox is called again
 	mockRuntime.Reset()
 
 	// Second delete (should be idempotent)
-	resp2, err2 := manager.DeleteSandbox(spec.SandboxID)
+	resp2, err2 := deleteSandboxForTest(manager, spec.SandboxID)
 	require.NoError(t, err2, "Second delete should succeed (idempotent)")
-	assert.True(t, resp2.Success, "Second delete should return success")
+	assert.True(t, resp2.Accepted, "Second delete should be accepted")
 
 	// The runtime DeleteSandbox might be called again by asyncDelete goroutine
 	// but the manager's DeleteSandbox should return immediately without queuing another delete
@@ -589,9 +599,9 @@ func TestSandboxManager_DeleteSandbox_NonExistent(t *testing.T) {
 	manager := NewSandboxManager(mockRuntime)
 
 	// Deleting a non-existent sandbox should succeed (idempotent behavior)
-	resp, err := manager.DeleteSandbox("non-existent-sandbox")
+	resp, err := deleteSandboxForTest(manager, "non-existent-sandbox")
 	assert.NoError(t, err)
-	assert.True(t, resp.Success)
+	assert.True(t, resp.Accepted)
 }
 
 func TestSandboxManager_DeleteSandbox_MultipleDeletes(t *testing.T) {
@@ -608,19 +618,19 @@ func TestSandboxManager_DeleteSandbox_MultipleDeletes(t *testing.T) {
 	}
 
 	// Create sandbox first
-	_, err := manager.CreateSandbox(ctx, spec)
+	_, err := ensureSandboxForTest(ctx, manager, spec)
 	require.NoError(t, err)
 
 	// First delete
-	resp1, err1 := manager.DeleteSandbox(spec.SandboxID)
+	resp1, err1 := deleteSandboxForTest(manager, spec.SandboxID)
 	require.NoError(t, err1)
-	assert.True(t, resp1.Success)
+	assert.True(t, resp1.Accepted)
 
 	// Second delete while in "terminating" phase (before async completes)
 	// This should be idempotent and return success
-	resp2, err2 := manager.DeleteSandbox(spec.SandboxID)
+	resp2, err2 := deleteSandboxForTest(manager, spec.SandboxID)
 	require.NoError(t, err2)
-	assert.True(t, resp2.Success, "Second delete during terminating phase should succeed")
+	assert.True(t, resp2.Accepted, "Second delete during terminating phase should be accepted")
 
 	// Wait for async delete to complete
 	time.Sleep(100 * time.Millisecond)
@@ -655,13 +665,13 @@ func TestSandboxManager_GetSandboxStatuses(t *testing.T) {
 		Image:     "nginx:latest",
 	}
 
-	_, err := manager.CreateSandbox(ctx, spec1)
+	_, err := ensureSandboxForTest(ctx, manager, spec1)
 	require.NoError(t, err)
-	_, err = manager.CreateSandbox(ctx, spec2)
+	_, err = ensureSandboxForTest(ctx, manager, spec2)
 	require.NoError(t, err)
 
 	// Delete one sandbox
-	_, err = manager.DeleteSandbox(spec1.SandboxID)
+	_, err = deleteSandboxForTest(manager, spec1.SandboxID)
 	require.NoError(t, err)
 
 	// Wait for async delete to complete
@@ -705,7 +715,7 @@ func TestSandboxManager_GetSandboxStatuses_RuntimeStatus(t *testing.T) {
 		Image:     "alpine:latest",
 	}
 
-	_, err := manager.CreateSandbox(ctx, spec)
+	_, err := ensureSandboxForTest(ctx, manager, spec)
 	require.NoError(t, err)
 
 	statuses := manager.GetSandboxStatuses(ctx)
@@ -734,12 +744,12 @@ func TestSandboxManager_GetSandboxStatuses_MultiplePhases(t *testing.T) {
 	}
 
 	for _, spec := range specs {
-		_, err := manager.CreateSandbox(ctx, spec)
+		_, err := ensureSandboxForTest(ctx, manager, spec)
 		require.NoError(t, err)
 	}
 
 	// Mark one for deletion
-	_, err := manager.DeleteSandbox(specs[0].SandboxID)
+	_, err := deleteSandboxForTest(manager, specs[0].SandboxID)
 	require.NoError(t, err)
 
 	// Wait for async delete to start
@@ -830,21 +840,6 @@ func TestSandboxManager_Close_MultipleCalls(t *testing.T) {
 }
 
 // ============================================================================
-// 7. TestSandboxManager_GetLogs
-// ============================================================================
-
-func TestSandboxManager_GetLogs(t *testing.T) {
-	// GL-01: GetLogs propagates to runtime
-	mockRuntime := NewMockRuntime()
-	manager := NewSandboxManager(mockRuntime)
-
-	ctx := context.Background()
-	err := manager.GetLogs(ctx, "test-sandbox", false, nil)
-
-	assert.NoError(t, err, "GetLogs should succeed")
-}
-
-// ============================================================================
 // 8. TestSandboxManager_ListImages
 // ============================================================================
 
@@ -893,13 +888,13 @@ func TestSandboxManager_AsyncDelete_Timeout(t *testing.T) {
 	}
 
 	// Create sandbox first
-	_, err := manager.CreateSandbox(ctx, spec)
+	_, err := ensureSandboxForTest(ctx, manager, spec)
 	require.NoError(t, err)
 
 	// Delete sandbox (async)
-	resp, err := manager.DeleteSandbox(spec.SandboxID)
+	resp, err := deleteSandboxForTest(manager, spec.SandboxID)
 	require.NoError(t, err)
-	assert.True(t, resp.Success)
+	assert.True(t, resp.Accepted)
 
 	// Wait for async delete to complete (should complete within timeout)
 	time.Sleep(200 * time.Millisecond)
@@ -923,16 +918,16 @@ func TestSandboxManager_AsyncDelete_RuntimeError(t *testing.T) {
 	}
 
 	// Create sandbox first
-	_, err := manager.CreateSandbox(ctx, spec)
+	_, err := ensureSandboxForTest(ctx, manager, spec)
 	require.NoError(t, err)
 
 	// Set delete error
 	mockRuntime.SetDeleteError(errors.New("delete failed"))
 
 	// Delete sandbox (async)
-	resp, err := manager.DeleteSandbox(spec.SandboxID)
+	resp, err := deleteSandboxForTest(manager, spec.SandboxID)
 	require.NoError(t, err)
-	assert.True(t, resp.Success)
+	assert.True(t, resp.Accepted)
 
 	// Wait for async delete
 	time.Sleep(100 * time.Millisecond)
@@ -946,7 +941,7 @@ func TestSandboxManager_AsyncDelete_RuntimeError(t *testing.T) {
 	assert.Equal(t, 1, admission.Used)
 
 	mockRuntime.SetDeleteError(nil)
-	_, err = manager.DeleteSandbox(spec.SandboxID)
+	_, err = deleteSandboxForTest(manager, spec.SandboxID)
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		admission, _, _ := manager.State()

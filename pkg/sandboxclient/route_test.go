@@ -17,7 +17,7 @@ type fakeEndpointControl struct {
 
 func (c *fakeEndpointControl) GetSandbox(_ context.Context, request *fastpathv1.GetRequest, _ ...grpc.CallOption) (*fastpathv1.SandboxInfo, error) {
 	c.getRequest = request
-	return &fastpathv1.SandboxInfo{SandboxId: "uid-a", SandboxName: request.SandboxName}, nil
+	return &fastpathv1.SandboxInfo{SandboxUid: "uid-a", SandboxName: request.SandboxName}, nil
 }
 
 func (c *fakeEndpointControl) ResolveEndpoint(_ context.Context, request *fastpathv1.ResolveEndpointRequest, _ ...grpc.CallOption) (*fastpathv1.ResolveEndpointResponse, error) {

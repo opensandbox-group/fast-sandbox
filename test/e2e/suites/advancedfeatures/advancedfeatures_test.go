@@ -17,13 +17,13 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/features"
 )
 
-func TestInfraInjection(t *testing.T) {
+func TestInfraProfileWiring(t *testing.T) {
 	suiteenv.RequireBasic(t)
 
-	feature := features.New("infra-injection").
+	feature := features.New("infra-profile-wiring").
 		WithLabel("suite", "advancedfeatures").
 		WithLabel("tier", "smoke").
-		Assess("initContainer infra-init is injected into fastlet pod", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+		Assess("platform-owned InfraProfile is wired into the fastlet pod", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
 			k8sClient := testSuite.MustKubeClient(t)
 			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
 
@@ -48,7 +48,9 @@ func TestInfraInjection(t *testing.T) {
 						PoolMax: 1,
 					},
 					MaxSandboxesPerPod: 5,
-			Runtime:            apiv1alpha1.RuntimeContainer,
+					Runtime:            apiv1alpha1.RuntimeContainer,
+					SandboxResources:   suiteenv.SmallSandboxResourceProfile(),
+					InfraProfile:       "test-infra",
 					FastletTemplate: corev1.PodTemplateSpec{
 						Spec: corev1.PodSpec{
 							Containers: []corev1.Container{{
@@ -87,17 +89,35 @@ func TestInfraInjection(t *testing.T) {
 				t.Fatalf("fastlet pod not found")
 			}
 
-			// Check for infra-init initContainer
-			found := false
-			for _, ic := range fastletPod.Spec.InitContainers {
-				if ic.Name == "infra-init" {
-					found = true
-					break
+			if got := fastletPod.Labels["fast-sandbox.io/infra-profile"]; got != "test-infra" {
+				t.Fatalf("infra profile label = %q, want test-infra", got)
+			}
+			if fastletPod.Annotations["fast-sandbox.io/infra-profile-hash"] == "" {
+				t.Fatalf("infra profile hash annotation is empty")
+			}
+			var foundProfileEnv, foundInfraMount, foundInfraVolume bool
+			for _, container := range fastletPod.Spec.Containers {
+				if container.Name != "fastlet" {
+					continue
+				}
+				for _, env := range container.Env {
+					if env.Name == "FAST_SANDBOX_INFRA_PROFILE" && env.Value == "test-infra" {
+						foundProfileEnv = true
+					}
+				}
+				for _, mount := range container.VolumeMounts {
+					if mount.Name == "infra-tools" && mount.MountPath == "/opt/fast-sandbox/infra" {
+						foundInfraMount = true
+					}
 				}
 			}
-
-			if !found {
-				t.Fatalf("infra-init initContainer not found in fastlet pod")
+			for _, volume := range fastletPod.Spec.Volumes {
+				if volume.Name == "infra-tools" && volume.EmptyDir != nil {
+					foundInfraVolume = true
+				}
+			}
+			if !foundProfileEnv || !foundInfraMount || !foundInfraVolume {
+				t.Fatalf("InfraProfile wiring incomplete: env=%t mount=%t volume=%t", foundProfileEnv, foundInfraMount, foundInfraVolume)
 			}
 
 			return ctx

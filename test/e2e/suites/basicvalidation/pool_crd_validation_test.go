@@ -25,7 +25,7 @@ func TestSandboxPoolCRDValidation(t *testing.T) {
 	feature := features.New("sandbox-pool-crd-validation").
 		WithLabel("suite", "basicvalidation").
 		WithLabel("tier", "smoke").
-		Assess("enforce canonical runtime compatibility and immutability", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+		Assess("enforce canonical runtime schema and immutability", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
 			k8sClient := testSuite.MustKubeClient(t)
 			namespace := testSuite.AllocateNamespace("pool-validation")
 			if err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
@@ -33,20 +33,22 @@ func TestSandboxPoolCRDValidation(t *testing.T) {
 			}
 			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
 
-			conflict := sandboxPoolObject(namespace, "runtime-field-conflict", map[string]any{
-				"runtime":         "container",
-				"runtimeType":     "container",
-				"capacity":        zeroPoolCapacity(),
-				"fastletTemplate": map[string]any{},
+			missingRuntime := sandboxPoolObject(namespace, "missing-runtime", map[string]any{
+				"maxSandboxesPerPod": int64(1),
+				"sandboxResources":   requiredPoolResources(),
+				"capacity":           zeroPoolCapacity(),
+				"fastletTemplate":    map[string]any{},
 			})
-			if err := k8sClient.Create(ctx, conflict); err == nil || !apierrors.IsInvalid(err) {
-				t.Fatalf("create Pool with new and legacy runtime fields error = %v, want Invalid", err)
+			if err := k8sClient.Create(ctx, missingRuntime); err == nil || !apierrors.IsInvalid(err) {
+				t.Fatalf("create Pool without runtime error = %v, want Invalid", err)
 			}
 
 			invalidRuntime := sandboxPoolObject(namespace, "invalid-runtime", map[string]any{
-				"runtime":         "not-a-runtime",
-				"capacity":        zeroPoolCapacity(),
-				"fastletTemplate": map[string]any{},
+				"runtime":            "not-a-runtime",
+				"maxSandboxesPerPod": int64(1),
+				"sandboxResources":   requiredPoolResources(),
+				"capacity":           zeroPoolCapacity(),
+				"fastletTemplate":    map[string]any{},
 			})
 			if err := k8sClient.Create(ctx, invalidRuntime); err == nil || !apierrors.IsInvalid(err) {
 				t.Fatalf("create Pool with invalid runtime error = %v, want Invalid", err)
@@ -55,7 +57,8 @@ func TestSandboxPoolCRDValidation(t *testing.T) {
 			pool := &apiv1alpha1.SandboxPool{
 				ObjectMeta: metav1.ObjectMeta{Name: "valid-runtime-pool", Namespace: namespace},
 				Spec: apiv1alpha1.SandboxPoolSpec{
-					Runtime: apiv1alpha1.RuntimeContainer,
+					Runtime:            apiv1alpha1.RuntimeContainer,
+					MaxSandboxesPerPod: 1,
 					SandboxResources: apiv1alpha1.SandboxResourceProfile{
 						CPU: resource.MustParse("1"), Memory: resource.MustParse("1Gi"), PIDs: 256,
 					},
@@ -106,6 +109,10 @@ func sandboxPoolObject(namespace, name string, spec map[string]any) *unstructure
 
 func zeroPoolCapacity() map[string]any {
 	return map[string]any{"poolMin": int64(0), "poolMax": int64(0), "bufferMin": int64(0), "bufferMax": int64(0)}
+}
+
+func requiredPoolResources() map[string]any {
+	return map[string]any{"cpu": "1", "memory": "1Gi", "pids": int64(256)}
 }
 
 func clientObjectKey(object metav1.Object) client.ObjectKey {

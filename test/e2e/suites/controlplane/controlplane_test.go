@@ -70,15 +70,15 @@ func TestMultiActiveControlPlane(t *testing.T) {
 		ready := waitForSandbox(ctx, t, k8sClient, types.NamespacedName{Namespace: namespace, Name: sandbox.Name}, func(item *apiv1alpha1.Sandbox) bool {
 			return item.Status.Assignment != nil && item.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 		})
-		if ready.Status.SandboxID != string(ready.UID) {
-			t.Fatalf("Sandbox ID must be durable UID: id=%q uid=%q", ready.Status.SandboxID, ready.UID)
+		if ready.UID == "" {
+			t.Fatal("declarative Sandbox has no durable Kubernetes UID")
 		}
 
 		restoreFastPath()
 		waitForDeploymentReady(ctx, t, k8sClient, "fast-sandbox-fastpath", 3)
 	})
 
-	t.Run("role all preserves the single-process compatibility topology", func(t *testing.T) {
+	t.Run("role all supports the single-process topology", func(t *testing.T) {
 		enableAllInOneTopology(ctx, t, k8sClient)
 
 		endpoint, portForward, err := e2eenv.StartControllerPortForward(ctx, controlPlaneNamespace)
@@ -114,7 +114,7 @@ func TestMultiActiveControlPlane(t *testing.T) {
 			}
 		})
 		ready := waitForSandbox(ctx, t, k8sClient, types.NamespacedName{Namespace: namespace, Name: response.SandboxName}, func(item *apiv1alpha1.Sandbox) bool {
-			return item.Status.RuntimeState == apiv1alpha1.ObservedStateReady && item.Status.SandboxID == string(item.UID)
+			return item.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 		})
 		if response.SandboxUid != string(ready.UID) {
 			t.Fatalf("all-in-one returned UID %q, want CRD UID %q", response.SandboxUid, ready.UID)
@@ -257,8 +257,7 @@ func TestMultiActiveControlPlane(t *testing.T) {
 			count := 0
 			for index := range list.Items {
 				if list.Items[index].Spec.PoolRef == capacityPool.Name {
-					if list.Items[index].Status.RuntimeState != apiv1alpha1.ObservedStateReady ||
-						list.Items[index].Status.SandboxID != string(list.Items[index].UID) {
+					if list.Items[index].Status.RuntimeState != apiv1alpha1.ObservedStateReady {
 						return false, nil
 					}
 					if owner, exists := seenUIDs[string(list.Items[index].UID)]; !exists || owner == "" {

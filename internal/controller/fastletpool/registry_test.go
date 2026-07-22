@@ -13,8 +13,6 @@ import (
 	"fast-sandbox/internal/testutil"
 
 	"github.com/stretchr/testify/require"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 var registryNow = time.Unix(1000, 0)
@@ -24,11 +22,56 @@ func readyFastlet(id string, used, capacity int, images ...string) FastletInfo {
 		ID: FastletID(id), Namespace: "default", PodName: id, PodUID: "uid-" + id,
 		PodIP: "10.0.0.1", NodeName: "node-a", PoolName: "pool-a",
 		RuntimeName: apiv1alpha1.RuntimeContainer, RuntimeProfileHash: "runtime-hash", ResourceProfileHash: "resource-hash",
-		PodReady: true, RuntimeReady: true, Capacity: capacity, Allocated: used,
+		PodReady: true, RuntimeReady: true, Capacity: capacity,
 		Admission: api.AdmissionStatus{Capacity: capacity, Used: used, Running: used},
 		Images:    append([]string(nil), images...), CacheEpoch: "boot-a", CacheRevision: 1, CacheComplete: true,
 		SandboxStatuses: make(map[string]api.SandboxStatus), HeartbeatSequence: 1, LastHeartbeat: registryNow, PodObservedAt: registryNow,
 	}
+}
+
+func seedFastlet(tb testing.TB, registry *InMemoryRegistry, info FastletInfo) {
+	tb.Helper()
+	pod := FastletInfo{
+		ID: info.ID, Namespace: info.Namespace, PodName: info.PodName, PodUID: info.PodUID,
+		PodIP: info.PodIP, NodeName: info.NodeName, PoolName: info.PoolName,
+		RuntimeName: info.RuntimeName, RuntimeProfileHash: info.RuntimeProfileHash,
+		ResourceProfileHash: info.ResourceProfileHash, InfraProfile: info.InfraProfile,
+		InfraProfileHash: info.InfraProfileHash, PodReady: info.PodReady, PodObservedAt: info.PodObservedAt,
+	}
+	registry.UpsertPod(pod)
+	sequence := info.HeartbeatSequence
+	if sequence == 0 {
+		sequence = 1
+	}
+	if previous, exists := registry.GetFastletByID(info.ID); exists && previous.PodUID == info.PodUID && sequence <= previous.HeartbeatSequence {
+		sequence = previous.HeartbeatSequence + 1
+	}
+	statuses := make([]api.SandboxStatus, 0, len(info.SandboxStatuses))
+	for _, status := range info.SandboxStatuses {
+		statuses = append(statuses, status)
+	}
+	epoch := info.CacheEpoch
+	if epoch == "" {
+		epoch = "boot-a"
+	}
+	heartbeat := &api.HeartbeatResponse{
+		FastletStatus: api.FastletStatus{
+			FastletPodUID: info.PodUID, RuntimeReady: info.RuntimeReady, Draining: info.Draining,
+			Capacity: info.Capacity, Admission: info.Admission, ResourceProfileHash: info.ResourceProfileHash,
+			InfraProfile: info.InfraProfile, InfraProfileHash: info.InfraProfileHash, InfraReady: info.InfraReady,
+			PreparedArtifacts: info.PreparedArtifacts, SandboxStatuses: statuses,
+		},
+		Sequence: sequence,
+		Cache: api.CacheSnapshot{
+			Epoch: epoch, Revision: info.CacheRevision, Full: true, Complete: info.CacheComplete, Images: info.Images,
+		},
+		Diagnostics: api.RuntimeDiagnostics{RuntimeProfileHash: info.RuntimeProfileHash},
+	}
+	observedAt := info.LastHeartbeat
+	if observedAt.IsZero() {
+		observedAt = registryNow
+	}
+	require.NoError(tb, registry.ApplyHeartbeat(info.ID, info.PodUID, heartbeat, observedAt))
 }
 
 func candidate(image, stableKey string) CandidateRequest {
@@ -41,8 +84,8 @@ func candidate(image, stableKey string) CandidateRequest {
 
 func TestTopKPrefersImageThenLoadAndDoesNotAllocate(t *testing.T) {
 	registry := NewInMemoryRegistry()
-	registry.RegisterOrUpdate(readyFastlet("cache-hit", 4, 5, "alpine:latest"))
-	registry.RegisterOrUpdate(readyFastlet("cache-miss", 0, 5, "ubuntu:24.04"))
+	seedFastlet(t, registry, readyFastlet("cache-hit", 4, 5, "alpine:latest"))
+	seedFastlet(t, registry, readyFastlet("cache-miss", 0, 5, "ubuntu:24.04"))
 
 	selected := registry.TopK(candidate("docker.io/library/alpine:latest", "request-a"), 2)
 	require.Len(t, selected, 2)
@@ -52,22 +95,16 @@ func TestTopKPrefersImageThenLoadAndDoesNotAllocate(t *testing.T) {
 	require.Equal(t, 4, stored.Used(), "selection must not consume Registry capacity")
 }
 
-func TestTopKAllowsDuplicateSandboxPorts(t *testing.T) {
+func TestTopKDoesNotMutateAdmission(t *testing.T) {
 	registry := NewInMemoryRegistry()
 	registry.clock = func() time.Time { return registryNow }
-	registry.RegisterOrUpdate(readyFastlet("fastlet-a", 0, 5))
-	first := &apiv1alpha1.Sandbox{
-		ObjectMeta: metav1.ObjectMeta{Name: "sandbox-a", Namespace: "default", UID: types.UID("uid-a")},
-		Spec:       apiv1alpha1.SandboxSpec{PoolRef: "pool-a", Image: "alpine:latest", ExposedPorts: []int32{8080}},
-	}
-	second := first.DeepCopy()
-	second.Name, second.UID = "sandbox-b", types.UID("uid-b")
-	firstChoice, err := registry.Allocate(first)
-	require.NoError(t, err)
-	secondChoice, err := registry.Allocate(second)
-	require.NoError(t, err)
-	require.Equal(t, firstChoice.ID, secondChoice.ID)
-	stored, _ := registry.GetFastletByID(firstChoice.ID)
+	seedFastlet(t, registry, readyFastlet("fastlet-a", 0, 5))
+	firstChoice := registry.TopK(candidate("alpine:latest", "request-a"), 1)
+	secondChoice := registry.TopK(candidate("alpine:latest", "request-b"), 1)
+	require.Len(t, firstChoice, 1)
+	require.Len(t, secondChoice, 1)
+	require.Equal(t, firstChoice[0].ID, secondChoice[0].ID)
+	stored, _ := registry.GetFastletByID(firstChoice[0].ID)
 	require.Equal(t, 0, stored.Used())
 }
 
@@ -82,7 +119,7 @@ func TestTopKHardFiltersStaleDrainingProfilesAndCapacity(t *testing.T) {
 	full := readyFastlet("full", 5, 5)
 	ready := readyFastlet("ready", 1, 5)
 	for _, info := range []FastletInfo{stale, draining, wrongProfile, full, ready} {
-		registry.RegisterOrUpdate(info)
+		seedFastlet(t, registry, info)
 	}
 	selected := registry.TopK(candidate("alpine:latest", "request-a"), 10)
 	require.Len(t, selected, 1)
@@ -92,7 +129,7 @@ func TestTopKHardFiltersStaleDrainingProfilesAndCapacity(t *testing.T) {
 func TestStablePerturbationIsDeterministic(t *testing.T) {
 	registry := NewInMemoryRegistry()
 	for _, id := range []string{"fastlet-a", "fastlet-b", "fastlet-c"} {
-		registry.RegisterOrUpdate(readyFastlet(id, 0, 5))
+		seedFastlet(t, registry, readyFastlet(id, 0, 5))
 	}
 	first := registry.TopK(candidate("alpine:latest", "request-a"), 3)
 	second := registry.TopK(candidate("alpine:latest", "request-a"), 3)
@@ -104,7 +141,7 @@ func TestStablePerturbationIsDeterministic(t *testing.T) {
 func TestPodReplacementClearsOldHeartbeatState(t *testing.T) {
 	registry := NewInMemoryRegistry()
 	old := readyFastlet("fastlet-a", 1, 5, "alpine:latest")
-	registry.RegisterOrUpdate(old)
+	seedFastlet(t, registry, old)
 	registry.UpsertPod(FastletInfo{
 		ID: old.ID, Namespace: old.Namespace, PodName: old.PodName, PodUID: "replacement-uid",
 		PodIP: "10.0.0.2", PoolName: old.PoolName, PodReady: true, PodObservedAt: registryNow,
@@ -120,7 +157,7 @@ func TestPodReplacementClearsOldHeartbeatState(t *testing.T) {
 func TestSamePodWatchUpdatePreservesHeartbeatButRefreshesExpectedProfiles(t *testing.T) {
 	registry := NewInMemoryRegistry()
 	existing := readyFastlet("fastlet-a", 1, 5, "alpine:latest")
-	registry.RegisterOrUpdate(existing)
+	seedFastlet(t, registry, existing)
 
 	registry.UpsertPod(FastletInfo{
 		ID: existing.ID, Namespace: existing.Namespace, PodName: existing.PodName, PodUID: existing.PodUID,
@@ -201,7 +238,7 @@ func heartbeatWithProfilesForRegistry(runtimeHash, resourceHash string) *api.Hea
 
 func TestLocalCapacityFeedbackSuppressesCandidateUntilHeartbeat(t *testing.T) {
 	registry := NewInMemoryRegistry()
-	registry.RegisterOrUpdate(readyFastlet("fastlet-a", 0, 5))
+	seedFastlet(t, registry, readyFastlet("fastlet-a", 0, 5))
 	registry.RecordFeedback("fastlet-a", LocalFeedback{
 		Code: api.ErrorCapacityRejected, ObservedAt: registryNow, RetryAfter: 10 * time.Second,
 	})
@@ -211,28 +248,15 @@ func TestLocalCapacityFeedbackSuppressesCandidateUntilHeartbeat(t *testing.T) {
 	require.Len(t, registry.TopK(request, 1), 1)
 }
 
-func TestStaleCleanupNeverDeletesPodWatchMembership(t *testing.T) {
-	registry := NewInMemoryRegistry()
-	stale := readyFastlet("fastlet-a", 0, 5)
-	stale.LastHeartbeat = registryNow.Add(-time.Minute)
-	registry.RegisterOrUpdate(stale)
-	registry.clock = func() time.Time { return registryNow }
-	require.Equal(t, 1, registry.CleanupStaleFastlets(30*time.Second))
-	_, exists := registry.GetFastletByID("fastlet-a")
-	require.True(t, exists)
-}
-
 func TestRegistryViewsConvergeWithoutSharedAllocationState(t *testing.T) {
 	left, right := NewInMemoryRegistry(), NewInMemoryRegistry()
 	left.clock = func() time.Time { return registryNow }
 	right.clock = func() time.Time { return registryNow }
 	for _, registry := range []*InMemoryRegistry{left, right} {
-		registry.RegisterOrUpdate(readyFastlet("fastlet-a", 1, 5, "alpine:latest"))
-		registry.RegisterOrUpdate(readyFastlet("fastlet-b", 0, 5, "ubuntu:24.04"))
+		seedFastlet(t, registry, readyFastlet("fastlet-a", 1, 5, "alpine:latest"))
+		seedFastlet(t, registry, readyFastlet("fastlet-b", 0, 5, "ubuntu:24.04"))
 	}
 	require.Equal(t, left.TopK(candidate("alpine:latest", "request-a"), 2), right.TopK(candidate("alpine:latest", "request-a"), 2))
-	_, err := left.Allocate(&apiv1alpha1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: "sandbox", Namespace: "default"}, Spec: apiv1alpha1.SandboxSpec{PoolRef: "pool-a"}})
-	require.NoError(t, err)
 	for _, id := range []FastletID{"fastlet-a", "fastlet-b"} {
 		leftInfo, _ := left.GetFastletByID(id)
 		rightInfo, _ := right.GetFastletByID(id)
@@ -242,7 +266,7 @@ func TestRegistryViewsConvergeWithoutSharedAllocationState(t *testing.T) {
 
 func TestGetReturnsDeepCopy(t *testing.T) {
 	registry := NewInMemoryRegistry()
-	registry.RegisterOrUpdate(readyFastlet("fastlet-a", 0, 5, "alpine:latest"))
+	seedFastlet(t, registry, readyFastlet("fastlet-a", 0, 5, "alpine:latest"))
 	copy, _ := registry.GetFastletByID("fastlet-a")
 	copy.Images[0] = "mutated"
 	copy.SandboxStatuses["x"] = api.SandboxStatus{SandboxID: "x"}
@@ -262,7 +286,7 @@ func TestTopKReturnsDeepCopy(t *testing.T) {
 			State:     "ready",
 		}},
 	}
-	registry.RegisterOrUpdate(info)
+	seedFastlet(t, registry, info)
 
 	selected := registry.TopK(candidate("alpine:latest", "request-a"), 1)
 	require.Len(t, selected, 1)
@@ -283,7 +307,7 @@ func TestTopKReturnsDeepCopy(t *testing.T) {
 
 func TestTopKIsSafeDuringConcurrentRegistryUpdates(t *testing.T) {
 	registry := NewInMemoryRegistry()
-	registry.RegisterOrUpdate(readyFastlet("fastlet-a", 0, 5, "alpine:latest"))
+	seedFastlet(t, registry, readyFastlet("fastlet-a", 0, 5, "alpine:latest"))
 
 	start := make(chan struct{})
 	var updates sync.WaitGroup
@@ -296,7 +320,7 @@ func TestTopKIsSafeDuringConcurrentRegistryUpdates(t *testing.T) {
 			if index%2 == 0 {
 				image = "ubuntu:24.04"
 			}
-			registry.RegisterOrUpdate(readyFastlet("fastlet-a", index%4, 5, image))
+			seedFastlet(t, registry, readyFastlet("fastlet-a", index%4, 5, image))
 		}
 	}()
 
@@ -317,7 +341,7 @@ func TestStaleRegistryHintsCannotExceedFastletCapacity(t *testing.T) {
 	registry.clock = func() time.Time { return registryNow }
 	// Deliberately stale/optimistic local view: it never observes any of the
 	// successful admissions below and continues returning the same candidate.
-	registry.RegisterOrUpdate(readyFastlet("fastlet-a", 0, 100))
+	seedFastlet(t, registry, readyFastlet("fastlet-a", 0, 100))
 	manager, err := fastletruntime.NewSandboxManagerWithConfig(&testutil.FakeRuntime{}, fastletruntime.SandboxManagerConfig{
 		Capacity: 5, FastletPodUID: "uid-fastlet-a",
 	})
@@ -325,11 +349,7 @@ func TestStaleRegistryHintsCannotExceedFastletCapacity(t *testing.T) {
 	successes := 0
 	for index := 0; index < 100; index++ {
 		sandboxUID := fmt.Sprintf("sandbox-%03d", index)
-		_, err := registry.Allocate(&apiv1alpha1.Sandbox{
-			ObjectMeta: metav1.ObjectMeta{Name: sandboxUID, Namespace: "default", UID: types.UID(sandboxUID)},
-			Spec:       apiv1alpha1.SandboxSpec{PoolRef: "pool-a", Image: "alpine:latest"},
-		})
-		require.NoError(t, err)
+		require.Len(t, registry.TopK(candidate("alpine:latest", sandboxUID), 1), 1)
 		_, err = manager.EnsureSandboxV2(context.Background(), &api.EnsureSandboxRequest{
 			Identity: api.SandboxIdentity{SandboxUID: sandboxUID, InstanceGeneration: 1, AssignmentAttempt: 1, FastletPodUID: "uid-fastlet-a"},
 			Sandbox:  api.SandboxSpec{ClaimUID: "claim-" + sandboxUID, Image: "alpine:latest"},

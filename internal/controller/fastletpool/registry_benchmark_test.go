@@ -12,7 +12,7 @@ func BenchmarkRegistryTopK1000(b *testing.B) {
 		if index%10 == 0 {
 			images = []string{"alpine:latest"}
 		}
-		registry.RegisterOrUpdate(readyFastlet(fmt.Sprintf("fastlet-%04d", index), index%5, 10, images...))
+		seedFastlet(b, registry, readyFastlet(fmt.Sprintf("fastlet-%04d", index), index%5, 10, images...))
 	}
 	request := candidate("alpine:latest", "request-a")
 	b.ResetTimer()

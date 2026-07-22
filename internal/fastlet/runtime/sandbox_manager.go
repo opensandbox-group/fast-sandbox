@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"sync"
@@ -41,7 +40,7 @@ type SandboxManagerConfig struct {
 
 type SandboxManager struct {
 	mu                  sync.RWMutex
-	runtime             Runtime
+	runtime             RuntimeDriver
 	runtimeName         string
 	capacity            int
 	runtimeProfileHash  string
@@ -72,7 +71,7 @@ type SandboxManager struct {
 	sandboxes map[string]*SandboxMetadata
 }
 
-func NewSandboxManager(runtime Runtime) *SandboxManager {
+func NewSandboxManager(runtime RuntimeDriver) *SandboxManager {
 	manager, _ := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{Capacity: capacityFromEnvironment()})
 	return manager
 }
@@ -103,12 +102,12 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 	var profile *apiv1alpha1.SandboxResourceProfile
 	resourceHash := ""
 	if config.ResourceProfile != nil {
-		effective, err := (apiv1alpha1.SandboxPoolSpec{SandboxResources: *config.ResourceProfile}).EffectiveSandboxResources()
-		if err != nil {
+		if err := apiv1alpha1.ValidateSandboxResourceProfile(*config.ResourceProfile); err != nil {
 			return nil, err
 		}
-		profile = &effective
-		resourceHash = effective.Hash()
+		copy := *config.ResourceProfile
+		profile = &copy
+		resourceHash = copy.Hash()
 	}
 	var cacheSource fastletcache.ImageSource
 	if source, ok := runtime.(RuntimeArtifactCache); ok {
@@ -254,56 +253,12 @@ func (m *SandboxManager) ResourceProfileHash() string {
 
 func capacityFromEnvironment() int {
 	capVal := 5
-	if capStr := os.Getenv("FASTLET_CAPACITY"); capStr == "" {
-		capStr = os.Getenv("AGENT_CAPACITY")
-		if capStr != "" {
-			if v, err := strconv.Atoi(capStr); err == nil && v > 0 {
-				capVal = v
-			}
-		}
-	} else {
+	if capStr := os.Getenv("FASTLET_CAPACITY"); capStr != "" {
 		if v, err := strconv.Atoi(capStr); err == nil && v > 0 {
 			capVal = v
 		}
 	}
 	return capVal
-}
-
-func (m *SandboxManager) CreateSandbox(ctx context.Context, spec *api.SandboxSpec) (*api.CreateSandboxResponse, error) {
-	identity := api.SandboxIdentity{
-		RequestID: spec.RequestID, SandboxUID: spec.SandboxID,
-		InstanceGeneration: spec.InstanceGeneration, AssignmentAttempt: spec.AssignmentAttempt,
-		RouteGeneration: spec.RouteGeneration,
-		FastletPodUID:   spec.FastletPodUID,
-	}
-	if identity.InstanceGeneration <= 0 {
-		identity.InstanceGeneration = 1
-	}
-	if identity.AssignmentAttempt <= 0 {
-		identity.AssignmentAttempt = 1
-	}
-	if identity.RouteGeneration <= 0 {
-		identity.RouteGeneration = 1
-	}
-	if identity.FastletPodUID == "" {
-		identity.FastletPodUID = m.fastletPodUID
-	}
-	response, err := m.EnsureSandboxV2(ctx, &api.EnsureSandboxRequest{Identity: identity, Sandbox: *spec})
-	if err != nil {
-		message := err.Error()
-		if response != nil && response.Error != nil {
-			message = response.Error.Message
-			if response.Error.Cause != nil {
-				err = response.Error.Cause
-			}
-		}
-		return &api.CreateSandboxResponse{Success: false, Message: message, SandboxID: spec.SandboxID}, err
-	}
-	createdAt := m.clock.Now().Unix()
-	if response.Sandbox != nil && response.Sandbox.CreatedAt > 0 {
-		createdAt = response.Sandbox.CreatedAt
-	}
-	return &api.CreateSandboxResponse{Success: true, SandboxID: spec.SandboxID, CreatedAt: createdAt}, nil
 }
 
 func (m *SandboxManager) validateProfiles(spec *api.SandboxSpec) error {
@@ -340,41 +295,30 @@ func (m *SandboxManager) validateInfraProfile(spec *api.SandboxSpec) error {
 	return nil
 }
 
-func (m *SandboxManager) DeleteSandbox(sandboxID string) (*api.DeleteSandboxResponse, error) {
-	klog.InfoS("[DEBUG-FASTLET] DeleteSandbox ENTER", "sandboxID", sandboxID)
+func (m *SandboxManager) beginDelete(sandboxID string) {
 	m.mu.Lock()
 	sandbox, ok := m.sandboxes[sandboxID]
 	if !ok {
 		m.mu.Unlock()
-		klog.InfoS("[DEBUG-FASTLET] DeleteSandbox: sandbox not found, idempotent success", "sandboxID", sandboxID)
-		return &api.DeleteSandboxResponse{
-			Success: true,
-		}, nil
+		return
 	}
 	if sandbox.Phase == "terminating" {
 		m.mu.Unlock()
-		klog.InfoS("[DEBUG-FASTLET] DeleteSandbox: already terminating, idempotent", "sandboxID", sandboxID)
-		return &api.DeleteSandboxResponse{
-			Success: true,
-		}, nil
+		return
 	}
 	if sandbox.Phase == "creating" {
 		sandbox.Phase = "terminating"
 		m.mu.Unlock()
 		klog.InfoS("DeleteSandbox: creation cancellation recorded", "sandboxID", sandboxID)
-		return &api.DeleteSandboxResponse{Success: true}, nil
+		return
 	}
 	sandbox.Phase = "terminating"
 	m.mu.Unlock()
-	klog.InfoS("[DEBUG-FASTLET] DeleteSandbox: marked terminating, starting asyncDelete", "sandboxID", sandboxID)
+	klog.InfoS("Sandbox deletion started", "sandboxID", sandboxID)
 	go m.asyncDelete(sandboxID, sandbox)
-	return &api.DeleteSandboxResponse{
-		Success: true,
-	}, nil
 }
 
 func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata) {
-	klog.InfoS("[DEBUG-FASTLET] asyncDelete ENTER", "sandboxID", sandboxID)
 	const gracefulTimeout = 10 * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), gracefulTimeout+5*time.Second)
 	defer cancel()
@@ -387,11 +331,7 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 		klog.ErrorS(err, "Fastlet Proxy route removal failed; runtime retained", "sandboxID", sandboxID)
 		return
 	}
-	klog.InfoS("[DEBUG-FASTLET] asyncDelete: calling runtime.DeleteSandbox", "sandboxID", sandboxID)
 	err := m.runtime.DeleteSandbox(ctx, sandboxID)
-	klog.InfoS("[DEBUG-FASTLET] asyncDelete: runtime.DeleteSandbox completed",
-		"sandboxID", sandboxID,
-		"err", err)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err != nil {
@@ -407,18 +347,10 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 		delete(m.sandboxes, sandboxID)
 		m.cacheProtection.Unprotect(expected.Image, fastletcache.ProtectActive)
 		m.cacheProtection.ProtectHotUntil(expected.Image, m.clock.Now().Add(time.Hour))
+		klog.InfoS("Sandbox deletion completed", "sandboxID", sandboxID)
 	}
-	klog.InfoS("[DEBUG-FASTLET] asyncDelete: DONE, sandbox removed from sandboxes",
-		"sandboxID", sandboxID)
 }
 
-func (m *SandboxManager) GetLogs(ctx context.Context, sandboxID string, follow bool, w io.Writer) error {
-	reader, ok := m.runtime.(RuntimeLogReader)
-	if !ok {
-		return ErrUnsupportedRuntime
-	}
-	return reader.GetSandboxLogs(ctx, sandboxID, follow, w)
-}
 func (m *SandboxManager) ListImages(ctx context.Context) ([]string, error) {
 	cache, ok := m.runtime.(RuntimeArtifactCache)
 	if !ok {

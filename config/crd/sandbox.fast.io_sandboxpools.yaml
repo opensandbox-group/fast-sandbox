@@ -65,12 +65,6 @@ spec:
                 - poolMax
                 - poolMin
                 type: object
-              containerdRuntimeHandler:
-                description: |-
-                  ContainerdRuntimeHandler is a deprecated compatibility input for old
-                  manifests. It must match the canonical RuntimeType profile during migration
-                  and cannot override the platform-owned runtime handler.
-                type: string
               fastletTemplate:
                 description: |-
                   FastletTemplate is intentionally preserved as a Kubernetes-native pod
@@ -102,24 +96,6 @@ spec:
                 x-kubernetes-validations:
                 - message: runtime is immutable
                   rule: self == oldSelf
-              runtimeClassName:
-                description: |-
-                  RuntimeClassName is a deprecated compatibility input for old manifests.
-                  It must match the canonical profile selected by RuntimeType during migration;
-                  it is never copied to the Fastlet Pod or used as an independent runtime choice.
-                type: string
-              runtimeType:
-                description: |-
-                  RuntimeType is the deprecated runtime field accepted only for old objects.
-                  New objects must write Runtime. Runtime and RuntimeType may not coexist.
-                enum:
-                - container
-                - gvisor
-                - kata-qemu
-                - kata-clh
-                - kata-fc
-                - boxlite
-                type: string
               sandboxResources:
                 description: |-
                   SandboxResources is the immutable resource profile applied to each
@@ -139,8 +115,12 @@ spec:
                     x-kubernetes-int-or-string: true
                   pids:
                     format: int64
-                    minimum: 0
+                    minimum: 1
                     type: integer
+                required:
+                - cpu
+                - memory
+                - pids
                 type: object
                 x-kubernetes-validations:
                 - message: sandboxResources is immutable
@@ -156,11 +136,10 @@ spec:
             required:
             - capacity
             - fastletTemplate
+            - maxSandboxesPerPod
+            - runtime
+            - sandboxResources
             type: object
-            x-kubernetes-validations:
-            - message: spec.runtime cannot be combined with deprecated runtime fields
-              rule: '!(has(self.runtime) && (has(self.runtimeType) || has(self.runtimeClassName)
-                || has(self.containerdRuntimeHandler)))'
           status:
             description: SandboxPoolStatus defines the observed state of SandboxPool.
             properties:

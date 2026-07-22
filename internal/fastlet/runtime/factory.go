@@ -66,7 +66,7 @@ func buildRuntimeDriver(profile runtimecatalog.RuntimeProfile) (RuntimeDriver, e
 			ConfigPath: profile.Containerd.ConfigPath, NeedsTTY: profile.Containerd.NeedsTTY,
 			OptionsType: profile.Containerd.OptionsType,
 		}
-		return newContainerdRuntimeWithConfig(profile.Name, cfg), nil
+		return newContainerdRuntimeWithConfig(profile.Name, profile.ProfileHash, cfg), nil
 	case runtimecatalog.DriverKindBoxLite:
 		if profile.BoxLite == nil {
 			return nil, fmt.Errorf("BoxLite runtime profile %q has no private configuration", profile.Name)

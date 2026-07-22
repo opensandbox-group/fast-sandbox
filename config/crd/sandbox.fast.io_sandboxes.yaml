@@ -209,17 +209,6 @@ spec:
                   If not set, the sandbox will not expire automatically.
                 format: date-time
                 type: string
-              exposedPorts:
-                description: |-
-                  ExposedPorts specifies the ports that the sandbox application will listen on.
-                  Deprecated: private Sandbox networks allow identical internal ports and
-                  routing is resolved by Sandbox UID plus target port.
-                items:
-                  format: int32
-                  maximum: 65535
-                  minimum: 1
-                  type: integer
-                type: array
               failurePolicy:
                 default: Manual
                 description: |-
@@ -264,9 +253,6 @@ spec:
                 description: AcceptedResetRevision reflects the latest reset revision
                   that was processed by the controller.
                 format: date-time
-                type: string
-              assignedFastlet:
-                description: 'Deprecated: use Assignment.FastletName.'
                 type: string
               assignment:
                 description: Assignment is the authoritative placement for the active
@@ -349,10 +335,8 @@ spec:
                   type: object
                 type: array
               dataPlaneState:
-                description: |-
-                  ObservedState is the independently observed state of a Sandbox subsystem.
-                  Phase remains available as a compatibility projection and is not the source
-                  of truth for the v2 state machine.
+                description: ObservedState is the independently observed state of
+                  a Sandbox subsystem.
                 enum:
                 - Unknown
                 - Pending
@@ -363,35 +347,19 @@ spec:
                 - Failed
                 - Unavailable
                 type: string
-              endpoints:
-                description: 'Deprecated: use ResolveEndpoint with Sandbox UID and
-                  target port.'
-                items:
-                  type: string
-                type: array
               instanceGeneration:
                 description: InstanceGeneration fences reset/recreate operations for
                   the same CRD UID.
                 format: int64
                 type: integer
-              nodeName:
-                description: 'Deprecated: use Assignment.NodeName.'
-                type: string
-              phase:
-                description: |-
-                  Deprecated compatibility projection. New reconcilers derive this from the
-                  independent observed states and Conditions.
-                type: string
               routeGeneration:
                 description: RouteGeneration fences stale local and cluster proxy
                   routes.
                 format: int64
                 type: integer
               runtimeState:
-                description: |-
-                  ObservedState is the independently observed state of a Sandbox subsystem.
-                  Phase remains available as a compatibility projection and is not the source
-                  of truth for the v2 state machine.
+                description: ObservedState is the independently observed state of
+                  a Sandbox subsystem.
                 enum:
                 - Unknown
                 - Pending
@@ -402,15 +370,9 @@ spec:
                 - Failed
                 - Unavailable
                 type: string
-              sandboxID:
-                description: 'Deprecated: runtime identity is the Sandbox CRD UID
-                  plus generation.'
-                type: string
               userProcessState:
-                description: |-
-                  ObservedState is the independently observed state of a Sandbox subsystem.
-                  Phase remains available as a compatibility projection and is not the source
-                  of truth for the v2 state machine.
+                description: ObservedState is the independently observed state of
+                  a Sandbox subsystem.
                 enum:
                 - Unknown
                 - Pending

@@ -64,36 +64,11 @@ type InfraComponentDiagnostic struct {
 	Message   string `json:"message,omitempty"`
 }
 
-// CreateSandboxRequest is sent to create a single sandbox on a fastlet.
-type CreateSandboxRequest struct {
-	Sandbox SandboxSpec `json:"sandbox"`
-}
-
-// CreateSandboxResponse is returned after creating a sandbox.
-type CreateSandboxResponse struct {
-	Success   bool   `json:"success"`
-	Message   string `json:"message,omitempty"`
-	SandboxID string `json:"sandboxId"`
-	CreatedAt int64  `json:"createdAt"` // Unix timestamp when sandbox was created
-}
-
-// DeleteSandboxRequest is sent to delete a single sandbox from a fastlet.
-type DeleteSandboxRequest struct {
-	SandboxID string `json:"sandboxId"`
-}
-
-// DeleteSandboxResponse is returned after deleting a sandbox.
-type DeleteSandboxResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message,omitempty"`
-}
-
 // FastletStatus represents the current status of a fastlet (internal use).
 type FastletStatus struct {
 	FastletID           string          `json:"fastletId"`
 	NodeName            string          `json:"nodeName"`
 	Capacity            int             `json:"capacity"`
-	Allocated           int             `json:"allocated"`
 	Images              []string        `json:"images,omitempty"`
 	SandboxStatuses     []SandboxStatus `json:"sandboxStatuses"`
 	Admission           AdmissionStatus `json:"admission"`

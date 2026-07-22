@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -38,18 +37,13 @@ func (s *FastletServer) Start() error {
 	return http.ListenAndServe(s.addr, s.Handler())
 }
 
-// Handler exposes the versioned Fastlet control protocol and legacy v1
-// adapters. It is separated from Start so protocol behavior can be tested
-// without opening a real listener.
+// Handler exposes the Fastlet control protocol. It is separated from Start so
+// protocol behavior can be tested without opening a real listener.
 func (s *FastletServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("/readyz", s.handleReady)
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/api/v1/fastlet/create", s.handleCreate)
-	mux.HandleFunc("/api/v1/fastlet/delete", s.handleDelete)
-	mux.HandleFunc("/api/v1/fastlet/status", s.handleStatus)
-	mux.HandleFunc("/api/v1/fastlet/logs", s.handleLogs)
 	mux.HandleFunc("/api/v2/fastlet/reservations", s.handleReserve)
 	mux.HandleFunc("/api/v2/fastlet/reservations/cancel", s.handleCancelReservation)
 	mux.HandleFunc("/api/v2/fastlet/ensure", s.handleEnsure)
@@ -229,115 +223,6 @@ func statusForFastletError(err error) int {
 	}
 }
 
-// handleLogs streams sandbox logs.
-func (s *FastletServer) handleLogs(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	sandboxID := r.URL.Query().Get("sandboxId")
-	if sandboxID == "" {
-		http.Error(w, "sandboxId is required", http.StatusBadRequest)
-		return
-	}
-	follow := r.URL.Query().Get("follow") == "true"
-
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-
-	w.Header().Set("Content-Type", "text/plain")
-	w.Header().Set("Transfer-Encoding", "chunked")
-
-	fw := &flushWriter{w: w}
-	if f, ok := w.(http.Flusher); ok {
-		fw.f = f
-	}
-
-	if err := s.sandboxManager.GetLogs(r.Context(), sandboxID, follow, fw); err != nil {
-		klog.ErrorS(err, "GetLogs failed", "sandbox", sandboxID)
-		return
-	}
-}
-
-type flushWriter struct {
-	w io.Writer
-	f http.Flusher
-}
-
-func (fw *flushWriter) Write(p []byte) (n int, err error) {
-	n, err = fw.w.Write(p)
-	if fw.f != nil {
-		fw.f.Flush()
-	}
-	return
-}
-
-// handleCreate handles create sandbox requests.
-func (s *FastletServer) handleCreate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req api.CreateSandboxRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	resp, err := s.sandboxManager.CreateSandbox(r.Context(), &req.Sandbox)
-	if err != nil {
-		klog.ErrorS(err, "Create sandbox failed", "sandbox", req.Sandbox.SandboxID)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(resp)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-// handleDelete handles delete sandbox requests.
-func (s *FastletServer) handleDelete(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req api.DeleteSandboxRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	resp, err := s.sandboxManager.DeleteSandbox(req.SandboxID)
-	if err != nil {
-		klog.ErrorS(err, "Delete sandbox failed", "sandbox", req.SandboxID)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(resp)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-// handleStatus handles status queries.
-func (s *FastletServer) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	heartbeat := s.heartbeat(r, api.CacheCursor{ForceFull: true})
-	heartbeat.Images = append([]string(nil), heartbeat.Cache.Images...)
-	writeResponse(w, &heartbeat.FastletStatus, nil)
-}
-
 func (s *FastletServer) heartbeat(r *http.Request, cursor api.CacheCursor) api.HeartbeatResponse {
 	cacheSnapshot, err := s.sandboxManager.CacheSnapshot(r.Context(), cursor)
 	if err != nil {
@@ -351,7 +236,6 @@ func (s *FastletServer) heartbeat(r *http.Request, cursor api.CacheCursor) api.H
 		FastletID:           os.Getenv("POD_NAME"), // Use Pod Name as Fastlet ID
 		NodeName:            nodeName,
 		Capacity:            s.sandboxManager.GetCapacity(),
-		Allocated:           len(sbStatuses),
 		SandboxStatuses:     sbStatuses,
 		Admission:           admission,
 		RuntimeReady:        s.sandboxManager.RuntimeReady(),

@@ -38,10 +38,10 @@ func main() {
 	podIP := getEnv("POD_IP", "")
 	nodeName := getEnv("NODE_NAME", "")
 	namespace := getEnv("NAMESPACE", "")
-	fastletPort := getEnv("FASTLET_CONTROL_PORT", getEnv("AGENT_PORT", ":5758"))
-	runtimeTypeStr := getEnv("FAST_SANDBOX_RUNTIME", "container")
+	fastletPort := getEnv("FASTLET_CONTROL_PORT", ":5758")
+	runtimeName := getEnv("FAST_SANDBOX_RUNTIME", "container")
 	runtimeSocket := getEnv("RUNTIME_SOCKET", "")
-	runtimeProfile, err := runtimecatalog.Builtin().Resolve(apiv1alpha1.RuntimeName(runtimeTypeStr))
+	runtimeProfile, err := runtimecatalog.Builtin().Resolve(apiv1alpha1.RuntimeName(runtimeName))
 	if err != nil {
 		klog.ErrorS(err, "Failed to resolve runtime profile")
 		os.Exit(1)
@@ -63,12 +63,12 @@ func main() {
 	}
 
 	klog.InfoS("Fastlet Info", "PodName", podName, "PodIP", podIP, "NodeName", nodeName, "Namespace", namespace)
-	klog.InfoS("Runtime", "Type", runtimeTypeStr, "Socket", runtimeSocket)
+	klog.InfoS("Runtime", "Name", runtimeName, "Socket", runtimeSocket)
 
 	ctx := context.Background()
 	var rt runtime.RuntimeDriver
 
-	rt, err = runtime.NewRuntime(ctx, runtime.RuntimeType(runtimeTypeStr), runtimeSocket)
+	rt, _, err = runtime.NewDriverFactory(runtimecatalog.Builtin(), runtime.NewHostCapabilityProber()).Create(ctx, runtimeProfile.Name, runtimeSocket)
 
 	if err != nil {
 		klog.ErrorS(err, "Failed to initialize runtime")
@@ -109,7 +109,7 @@ func main() {
 	}
 	infraConfigurable.SetInfraManager(infraManager)
 
-	klog.InfoS("Runtime initialized successfully", "type", runtimeTypeStr)
+	klog.InfoS("Runtime initialized successfully", "name", runtimeName)
 
 	proxyControlClient := fastletproxy.NewControlClient(getEnv("FASTLET_PROXY_CONTROL_SOCKET", fastletproxy.DefaultControlSocket))
 	sandboxManager, err := runtime.NewSandboxManagerWithConfig(rt, runtime.SandboxManagerConfig{
@@ -256,13 +256,15 @@ func resourceProfileFromEnvironment() (apiv1alpha1.SandboxResourceProfile, error
 	if err != nil {
 		return apiv1alpha1.SandboxResourceProfile{}, err
 	}
-	return (apiv1alpha1.SandboxPoolSpec{SandboxResources: apiv1alpha1.SandboxResourceProfile{
-		CPU: cpu, Memory: memory, PIDs: pids,
-	}}).EffectiveSandboxResources()
+	profile := apiv1alpha1.SandboxResourceProfile{CPU: cpu, Memory: memory, PIDs: pids}
+	if err := apiv1alpha1.ValidateSandboxResourceProfile(profile); err != nil {
+		return apiv1alpha1.SandboxResourceProfile{}, err
+	}
+	return profile, nil
 }
 
 func capacityFromEnvironment() int {
-	value, err := strconv.Atoi(getEnv("FASTLET_CAPACITY", getEnv("AGENT_CAPACITY", "5")))
+	value, err := strconv.Atoi(getEnv("FASTLET_CAPACITY", "5"))
 	if err != nil || value <= 0 {
 		return 0
 	}

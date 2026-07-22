@@ -39,10 +39,10 @@ var listCmd = &cobra.Command{
 
 		klog.V(4).InfoS("ListSandboxes request succeeded", "namespace", namespace, "count", len(resp.Items))
 		w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-		fmt.Fprintln(w, "NAME\tID\tPHASE\tIMAGE\tFASTLET\tAGE")
+		fmt.Fprintln(w, "NAME\tUID\tRUNTIME\tDATA-PLANE\tIMAGE\tFASTLET\tAGE")
 		for _, item := range resp.Items {
 			age := time.Since(time.Unix(item.CreatedAt, 0)).Truncate(time.Second)
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", item.SandboxName, item.SandboxId, item.Phase, item.Image, item.FastletPod, age)
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", item.SandboxName, item.SandboxUid, item.RuntimeState, item.DataPlaneState, item.Image, item.FastletPod, age)
 		}
 		w.Flush()
 	},

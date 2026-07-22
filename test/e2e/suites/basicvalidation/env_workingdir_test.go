@@ -73,7 +73,7 @@ func TestSandboxEnvAndWorkingDir(t *testing.T) {
 			}
 
 			assignedEnvSandbox := waitForAssignedSandbox(ctx, t, fixture, namespace, envSandbox.Name)
-			envLog := waitForSandboxLog(ctx, t, namespace, assignedEnvSandbox.Status.AssignedFastlet, sandboxIdentifier(assignedEnvSandbox),
+			envLog := waitForSandboxLog(ctx, t, namespace, assignedEnvSandbox.Status.Assignment.FastletName, sandboxIdentifier(assignedEnvSandbox),
 				"TEST_VAR=test_value_123",
 				"ANOTHER_VAR=another_value_456",
 			)
@@ -102,7 +102,7 @@ func TestSandboxEnvAndWorkingDir(t *testing.T) {
 			}
 
 			assignedWorkdirSandbox := waitForAssignedSandbox(ctx, t, fixture, namespace, workdirSandbox.Name)
-			workdirLog := waitForSandboxLog(ctx, t, namespace, assignedWorkdirSandbox.Status.AssignedFastlet, sandboxIdentifier(assignedWorkdirSandbox), "PWD=/tmp")
+			workdirLog := waitForSandboxLog(ctx, t, namespace, assignedWorkdirSandbox.Status.Assignment.FastletName, sandboxIdentifier(assignedWorkdirSandbox), "PWD=/tmp")
 			if !strings.Contains(workdirLog, "PWD=/tmp") {
 				t.Fatalf("unexpected working-dir sandbox log: %q", workdirLog)
 			}
@@ -176,13 +176,13 @@ func TestFastPathEnvAndWorkingDir(t *testing.T) {
 			createCtx, cancelCreate := context.WithTimeout(ctx, 30*time.Second)
 			defer cancelCreate()
 			resp, err := client.CreateSandbox(createCtx, &fastpathv1.CreateRequest{
-				Name:            "sb-fastpath-env",
-				Image:           "docker.io/library/alpine:latest",
-				PoolRef:         pool.Name,
-				Namespace:       namespace,
-				ConsistencyMode: fastpathv1.ConsistencyMode_FAST,
-				Command:         []string{"/bin/sh", "-c", `echo "FASTPATH_VAR=$FASTPATH_VAR"; echo "PWD=$(pwd)"; sleep 3600`},
-				WorkingDir:      "/app",
+				Name:       "sb-fastpath-env",
+				Image:      "docker.io/library/alpine:latest",
+				PoolRef:    pool.Name,
+				Namespace:  namespace,
+				RequestId:  namespace + "-fastpath-env",
+				Command:    []string{"/bin/sh", "-c", `echo "FASTPATH_VAR=$FASTPATH_VAR"; echo "PWD=$(pwd)"; sleep 3600`},
+				WorkingDir: "/app",
 				Envs: map[string]string{
 					"FASTPATH_VAR": "hello_from_fastpath",
 				},
@@ -193,19 +193,19 @@ func TestFastPathEnvAndWorkingDir(t *testing.T) {
 			if resp.FastletPod == "" {
 				t.Fatalf("create fast-path sandbox returned empty fastlet pod")
 			}
-			if resp.SandboxId == "" {
-				t.Fatalf("create fast-path sandbox returned empty sandbox ID")
+			if resp.SandboxUid == "" {
+				t.Fatalf("create fast-path sandbox returned empty sandbox UID")
 			}
 
 			waitCtx, cancelWait := context.WithTimeout(ctx, 30*time.Second)
 			defer cancelWait()
 			if _, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: resp.SandboxName, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-				return sb.Status.AssignedFastlet != "" || string(sb.UID) != ""
+				return sb.Status.Assignment != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 			}); err != nil {
 				t.Fatalf("wait for fast-path sandbox CRD: %v", err)
 			}
 
-			fastpathLog := waitForSandboxLog(ctx, t, namespace, resp.FastletPod, resp.SandboxId,
+			fastpathLog := waitForSandboxLog(ctx, t, namespace, resp.FastletPod, resp.SandboxUid,
 				"FASTPATH_VAR=hello_from_fastpath",
 				"PWD=/app",
 			)
@@ -275,8 +275,7 @@ func waitForAssignedSandbox(ctx context.Context, t *testing.T, fixture *fixtures
 	defer cancel()
 
 	sandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: name, Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
-		return sb.Status.AssignedFastlet != "" &&
-			(sb.Status.Phase == string(apiv1alpha1.PhaseBound) || sb.Status.Phase == string(apiv1alpha1.PhaseRunning))
+		return sb.Status.Assignment != nil && sb.Status.RuntimeState == apiv1alpha1.ObservedStateReady
 	})
 	if err != nil {
 		t.Fatalf("wait for assigned sandbox %s/%s: %v", namespace, name, err)
@@ -287,9 +286,6 @@ func waitForAssignedSandbox(ctx context.Context, t *testing.T, fixture *fixtures
 func sandboxIdentifier(sandbox *apiv1alpha1.Sandbox) string {
 	if sandbox == nil {
 		return ""
-	}
-	if sandbox.Status.SandboxID != "" {
-		return sandbox.Status.SandboxID
 	}
 	return string(sandbox.UID)
 }

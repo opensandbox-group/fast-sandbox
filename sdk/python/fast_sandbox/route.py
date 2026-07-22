@@ -41,17 +41,17 @@ class EndpointResolver:
             fastpath_pb2.GetRequest(sandbox_name=sandbox_name, namespace=selected_namespace),
             metadata=grpc_metadata(),
         )
-        if not info.sandbox_id:
+        if not info.sandbox_uid:
             raise RuntimeError(f"Sandbox {selected_namespace}/{sandbox_name} has no CRD UID")
         response = self._stub.ResolveEndpoint(
             fastpath_pb2.ResolveEndpointRequest(
-                sandbox_uid=info.sandbox_id,
+                sandbox_uid=info.sandbox_uid,
                 target_port=target_port,
                 protocol="http",
             ),
             metadata=grpc_metadata(),
         )
-        if response.sandbox_uid != info.sandbox_id or response.target_port != target_port:
+        if response.sandbox_uid != info.sandbox_uid or response.target_port != target_port:
             raise RuntimeError("FastPath returned a route for a different Sandbox or target port")
         endpoint = _replace_authority(response.proxy_endpoint, self._proxy_endpoint)
         return ResolvedRoute(

@@ -1,7 +1,6 @@
 package fastletpool
 
 import (
-	"context"
 	"errors"
 	"hash/fnv"
 	"sort"
@@ -12,14 +11,11 @@ import (
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
 	fastletcache "fast-sandbox/internal/fastlet/cache"
-
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type FastletID string
 
 var (
-	ErrNoCandidate      = errors.New("no schedulable Fastlet candidate")
 	ErrFastletNotFound  = errors.New("Fastlet is not present in the Pod watch store")
 	ErrStalePodIdentity = errors.New("Fastlet Pod UID does not match the watched Pod")
 	ErrStaleHeartbeat   = errors.New("Fastlet heartbeat sequence is stale")
@@ -51,7 +47,6 @@ type FastletInfo struct {
 	Draining            bool
 
 	Capacity  int
-	Allocated int // compatibility projection of Admission.Used; never mutated by selection.
 	Admission api.AdmissionStatus
 
 	Images          []string
@@ -67,24 +62,13 @@ type FastletInfo struct {
 }
 
 func (i FastletInfo) Used() int {
-	if i.Admission.Capacity > 0 || i.Admission.Used > 0 {
-		return i.Admission.Used
-	}
-	return i.Allocated
+	return i.Admission.Used
 }
 
-// FastletRegistry retains Allocate/Release as migration adapters for the old
-// controllers. Allocate performs candidate selection only and Release is a
-// no-op; neither method owns capacity.
+// FastletRegistry is the scheduling view consumed by the Pool controller.
 type FastletRegistry interface {
-	RegisterOrUpdate(info FastletInfo)
 	GetAllFastlets() []FastletInfo
 	GetFastletByID(id FastletID) (FastletInfo, bool)
-	Allocate(sb *apiv1alpha1.Sandbox) (*FastletInfo, error)
-	Release(id FastletID, sb *apiv1alpha1.Sandbox)
-	Restore(ctx context.Context, c client.Reader) error
-	Remove(id FastletID)
-	CleanupStaleFastlets(timeout time.Duration) int
 }
 
 type CandidateRequest struct {
@@ -160,33 +144,11 @@ func (r *InMemoryRegistry) UpsertPod(info FastletInfo) {
 	slot.info = cloneInfo(info)
 }
 
-// RegisterOrUpdate is a compatibility entry point for tests and migration
-// callers that already provide a combined Pod/Heartbeat view.
-func (r *InMemoryRegistry) RegisterOrUpdate(info FastletInfo) {
-	if info.ID == "" {
-		return
-	}
-	if info.PodObservedAt.IsZero() {
-		info.PodObservedAt = r.clock()
-	}
-	r.mu.Lock()
-	slot := r.fastlets[info.ID]
-	if slot == nil {
-		slot = &fastletSlot{}
-		r.fastlets[info.ID] = slot
-	}
-	r.mu.Unlock()
-	slot.mu.Lock()
-	slot.info = cloneInfo(info)
-	slot.mu.Unlock()
-}
-
 func preserveHeartbeat(target *FastletInfo, previous FastletInfo) {
 	target.RuntimeReady = previous.RuntimeReady
 	target.InfraReady = previous.InfraReady
 	target.Draining = target.DrainRequested || previous.Draining
 	target.Capacity = previous.Capacity
-	target.Allocated = previous.Allocated
 	target.Admission = previous.Admission
 	target.Images = append([]string(nil), previous.Images...)
 	target.PreparedArtifacts = append([]string(nil), previous.PreparedArtifacts...)
@@ -234,7 +196,6 @@ func (r *InMemoryRegistry) ApplyHeartbeat(id FastletID, expectedPodUID string, h
 		slot.info.Capacity = heartbeat.Capacity
 	}
 	slot.info.Admission = heartbeat.Admission
-	slot.info.Allocated = heartbeat.Admission.Used
 	if slot.info.RuntimeProfileHash == "" {
 		slot.info.RuntimeProfileHash = heartbeat.Diagnostics.RuntimeProfileHash
 	}
@@ -402,32 +363,6 @@ func stableOrder(key string, id FastletID) uint64 {
 	return hash.Sum64()
 }
 
-func (r *InMemoryRegistry) Allocate(sandbox *apiv1alpha1.Sandbox) (*FastletInfo, error) {
-	stableKey := string(sandbox.UID)
-	if stableKey == "" {
-		stableKey = sandbox.Namespace + "/" + sandbox.Name
-	}
-	candidates := r.TopK(CandidateRequest{
-		Namespace: sandbox.Namespace, PoolName: sandbox.Spec.PoolRef, Image: sandbox.Spec.Image, StableKey: stableKey,
-	}, 1)
-	if len(candidates) == 0 {
-		return nil, ErrNoCandidate
-	}
-	result := candidates[0]
-	return &result, nil
-}
-
-func (*InMemoryRegistry) Release(FastletID, *apiv1alpha1.Sandbox) {
-	// Capacity belongs to Fastlet admission and is refreshed by Heartbeat.
-}
-
-func (*InMemoryRegistry) Restore(context.Context, client.Reader) error {
-	// Pod membership is restored by informer replay. Sandbox assignments are
-	// watched by the assignment store introduced with the shared orchestrator;
-	// they must never create phantom Fastlet slots.
-	return nil
-}
-
 func (r *InMemoryRegistry) GetAllFastlets() []FastletInfo {
 	r.mu.RLock()
 	slots := make([]*fastletSlot, 0, len(r.fastlets))
@@ -457,12 +392,6 @@ func (r *InMemoryRegistry) GetFastletByID(id FastletID) (FastletInfo, bool) {
 	return result, true
 }
 
-func (r *InMemoryRegistry) Remove(id FastletID) {
-	r.mu.Lock()
-	delete(r.fastlets, id)
-	r.mu.Unlock()
-}
-
 func (r *InMemoryRegistry) RemoveIfPodUID(id FastletID, podUID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -476,19 +405,6 @@ func (r *InMemoryRegistry) RemoveIfPodUID(id FastletID, podUID string) {
 	if matches {
 		delete(r.fastlets, id)
 	}
-}
-
-// CleanupStaleFastlets reports stale heartbeat views but deliberately does not
-// delete them. Kubernetes Watch owns membership; TopK filters stale entries.
-func (r *InMemoryRegistry) CleanupStaleFastlets(timeout time.Duration) int {
-	now := r.clock()
-	count := 0
-	for _, info := range r.GetAllFastlets() {
-		if info.LastHeartbeat.IsZero() || now.Sub(info.LastHeartbeat) > timeout {
-			count++
-		}
-	}
-	return count
 }
 
 func cloneInfo(info FastletInfo) FastletInfo {

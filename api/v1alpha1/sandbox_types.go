@@ -24,27 +24,6 @@ const (
 	FailurePolicyAutoRecreate FailurePolicy = "AutoRecreate"
 )
 
-// SandboxPhase defines the lifecycle phase of a Sandbox in the Controller.
-// +kubebuilder:validation:Enum=Pending;Bound;Running;Terminating;Expired;Failed;Lost
-type SandboxPhase string
-
-const (
-	// PhasePending - Sandbox has been scheduled to a Fastlet but container not yet created.
-	PhasePending SandboxPhase = "Pending"
-	// PhaseBound - Container creation request sent to Fastlet, waiting for confirmation.
-	PhaseBound SandboxPhase = "Bound"
-	// PhaseRunning - Container is running on the Fastlet (synced from Fastlet status).
-	PhaseRunning SandboxPhase = "Running"
-	// PhaseTerminating - Sandbox is being deleted, waiting for Fastlet to confirm cleanup.
-	PhaseTerminating SandboxPhase = "Terminating"
-	// PhaseExpired - Sandbox has expired, runtime resources cleaned but CRD preserved.
-	PhaseExpired SandboxPhase = "Expired"
-	// PhaseFailed - Sandbox creation or operation failed.
-	PhaseFailed SandboxPhase = "Failed"
-	// PhaseLost - Fastlet Pod was lost under Manual failure policy, waiting for user intervention.
-	PhaseLost SandboxPhase = "Lost"
-)
-
 // FastletSandboxPhase defines the lifecycle phase reported by the Fastlet.
 type FastletSandboxPhase string
 
@@ -62,8 +41,6 @@ const (
 )
 
 // ObservedState is the independently observed state of a Sandbox subsystem.
-// Phase remains available as a compatibility projection and is not the source
-// of truth for the v2 state machine.
 // +kubebuilder:validation:Enum=Unknown;Pending;Creating;Ready;Draining;Stopped;Failed;Unavailable
 type ObservedState string
 
@@ -76,6 +53,13 @@ const (
 	ObservedStateStopped     ObservedState = "Stopped"
 	ObservedStateFailed      ObservedState = "Failed"
 	ObservedStateUnavailable ObservedState = "Unavailable"
+)
+
+// Sandbox condition types form the durable lifecycle contract shared by the
+// imperative create path, declarative controllers, Janitor, and clients.
+const (
+	SandboxConditionRuntimeReady   = "RuntimeReady"
+	SandboxConditionDataPlaneReady = "DataPlaneReady"
 )
 
 // SandboxAssignment is the authoritative placement selected through a status
@@ -100,14 +84,6 @@ type SandboxSpec struct {
 	// ExpireTime specifies when this sandbox should expire and be garbage collected.
 	// If not set, the sandbox will not expire automatically.
 	ExpireTime *metav1.Time `json:"expireTime,omitempty"`
-
-	// ExposedPorts specifies the ports that the sandbox application will listen on.
-	// Deprecated: private Sandbox networks allow identical internal ports and
-	// routing is resolved by Sandbox UID plus target port.
-	// +deprecated
-	// +kubebuilder:validation:items:Minimum=1
-	// +kubebuilder:validation:items:Maximum=65535
-	ExposedPorts []int32 `json:"exposedPorts,omitempty"`
 
 	// FailurePolicy defines the recovery strategy when the fastlet is lost.
 	// Defaults to "Manual".
@@ -148,21 +124,25 @@ type SandboxStatus struct {
 	DataPlaneState   ObservedState `json:"dataPlaneState,omitempty"`
 	UserProcessState ObservedState `json:"userProcessState,omitempty"`
 
-	// Deprecated compatibility projection. New reconcilers derive this from the
-	// independent observed states and Conditions.
-	Phase string `json:"phase,omitempty"`
-	// Deprecated: use Assignment.FastletName.
-	AssignedFastlet string `json:"assignedFastlet,omitempty"`
-	// Deprecated: use Assignment.NodeName.
-	NodeName string `json:"nodeName,omitempty"`
-	// Deprecated: runtime identity is the Sandbox CRD UID plus generation.
-	SandboxID string `json:"sandboxID,omitempty"`
-	// Deprecated: use ResolveEndpoint with Sandbox UID and target port.
-	Endpoints  []string           `json:"endpoints,omitempty"`
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
 	// AcceptedResetRevision reflects the latest reset revision that was processed by the controller.
 	AcceptedResetRevision *metav1.Time `json:"acceptedResetRevision,omitempty"`
+}
+
+// HasCondition reports whether a canonical condition currently has the given
+// status and reason.
+func (s *SandboxStatus) HasCondition(conditionType string, conditionStatus metav1.ConditionStatus, reason string) bool {
+	if s == nil {
+		return false
+	}
+	for index := range s.Conditions {
+		condition := &s.Conditions[index]
+		if condition.Type == conditionType && condition.Status == conditionStatus && condition.Reason == reason {
+			return true
+		}
+	}
+	return false
 }
 
 // +kubebuilder:object:root=true

@@ -72,7 +72,7 @@ func (j *Janitor) cleanupDecision(ctx context.Context, resource ResourceIdentity
 		return CleanupDecision{Eligible: true, Reason: "AssignmentMoved"}, nil
 	}
 	if resource.InstanceGeneration <= 0 || resource.AssignmentAttempt <= 0 {
-		return CleanupDecision{Reason: "LegacyFenceAmbiguous"}, nil
+		return CleanupDecision{Reason: "InvalidResourceFence"}, nil
 	}
 	currentGeneration := sandbox.Status.InstanceGeneration
 	if currentGeneration < apiv1alpha1.InitialInstanceGeneration {
@@ -84,7 +84,7 @@ func (j *Janitor) cleanupDecision(ctx context.Context, resource ResourceIdentity
 	if currentGeneration < resource.InstanceGeneration || assignment.Attempt < resource.AssignmentAttempt {
 		return CleanupDecision{Reason: "ResourceFenceAheadOfControlPlane"}, nil
 	}
-	if sandbox.Status.Phase == string(apiv1alpha1.PhaseLost) {
+	if sandbox.Status.HasCondition("RuntimeReady", metav1.ConditionFalse, "FastletPodLost") {
 		return CleanupDecision{Eligible: true, Reason: "SandboxMarkedLost"}, nil
 	}
 	return CleanupDecision{Reason: "AssignmentStillAuthoritative"}, nil

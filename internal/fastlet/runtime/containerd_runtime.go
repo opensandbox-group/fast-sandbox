@@ -1,17 +1,16 @@
 package runtime
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
@@ -29,15 +28,16 @@ import (
 )
 
 type ContainerdRuntime struct {
-	socketPath       string
-	client           *containerd.Client
-	fastletPodName   string
-	fastletPodUID    string
-	fastletNamespace string
-	infraMgr         *infra.Manager
-	runtimeType      RuntimeType   // runtime type identifier
-	config           RuntimeConfig // cached runtime configuration
-	networkManager   *fastletnetwork.Manager
+	socketPath         string
+	client             *containerd.Client
+	fastletPodName     string
+	fastletPodUID      string
+	fastletNamespace   string
+	infraMgr           *infra.Manager
+	runtimeName        apiv1alpha1.RuntimeName // runtime profile identifier
+	runtimeProfileHash string
+	config             RuntimeConfig // cached runtime configuration
+	networkManager     *fastletnetwork.Manager
 }
 
 const (
@@ -49,14 +49,11 @@ const (
 	waitStopTimeout         = 10 * time.Second
 )
 
-func newContainerdRuntime(rt RuntimeType) Runtime {
-	return newContainerdRuntimeWithConfig(rt, GetRuntimeConfig(rt))
-}
-
-func newContainerdRuntimeWithConfig(rt RuntimeType, cfg RuntimeConfig) Runtime {
+func newContainerdRuntimeWithConfig(rt apiv1alpha1.RuntimeName, profileHash string, cfg RuntimeConfig) RuntimeDriver {
 	return &ContainerdRuntime{
-		runtimeType: rt,
-		config:      cfg,
+		runtimeName:        rt,
+		runtimeProfileHash: profileHash,
+		config:             cfg,
 	}
 }
 
@@ -211,11 +208,23 @@ func (r *ContainerdRuntime) CreateSandbox(ctx context.Context, config *api.Sandb
 func (r *ContainerdRuntime) EnsureSandbox(ctx context.Context, config *api.SandboxSpec) (*SandboxMetadata, error) {
 	existing, err := r.InspectSandbox(ctx, config.SandboxID)
 	if err == nil {
-		if err := validateExistingRuntimeProfile(existing, config); err != nil {
-			return nil, err
+		if sameRuntimeIdentity(existing, config) {
+			if err := validateExistingRuntimeProfile(existing, config); err != nil {
+				return nil, err
+			}
+			existing.UserProcessStartSource = api.UserProcessStartExistingRuntime
+			return existing, nil
 		}
-		existing.UserProcessStartSource = api.UserProcessStartExistingRuntime
-		return existing, nil
+		klog.InfoS("Replacing stale runtime owned by a previous Sandbox instance",
+			"sandbox", config.SandboxID,
+			"existingFastletPodUID", existing.FastletPodUID,
+			"requestedFastletPodUID", config.FastletPodUID,
+			"existingInstanceGeneration", existing.InstanceGeneration,
+			"requestedInstanceGeneration", config.InstanceGeneration)
+		if err := r.DeleteSandbox(ctx, config.SandboxID); err != nil {
+			return nil, fmt.Errorf("replace stale Sandbox runtime: %w", err)
+		}
+		err = ErrSandboxNotFound
 	}
 	if !errors.Is(err, ErrSandboxNotFound) {
 		return nil, err
@@ -257,6 +266,19 @@ func validateExistingRuntimeProfile(existing *SandboxMetadata, requested *api.Sa
 		return fmt.Errorf("%w: existing runtime identity %q has different runtime/resource profile", ErrSandboxProfileMismatch, requested.SandboxID)
 	}
 	return nil
+}
+
+func sameRuntimeIdentity(existing *SandboxMetadata, requested *api.SandboxSpec) bool {
+	if existing == nil || requested == nil {
+		return false
+	}
+	return existing.SandboxID == requested.SandboxID &&
+		existing.ClaimUID == requested.ClaimUID &&
+		existing.ClaimNamespace == requested.ClaimNamespace &&
+		existing.ClaimName == requested.ClaimName &&
+		existing.FastletPodUID == requested.FastletPodUID &&
+		existing.InstanceGeneration == requested.InstanceGeneration &&
+		existing.AssignmentAttempt == requested.AssignmentAttempt
 }
 
 func (r *ContainerdRuntime) prepareImage(ctx context.Context, imageName string) (containerd.Image, error) {
@@ -652,10 +674,7 @@ func (r *ContainerdRuntime) ListManagedSandboxes(ctx context.Context) ([]*Sandbo
 }
 
 func (r *ContainerdRuntime) ProbeCapabilities(ctx context.Context) CapabilityReport {
-	report := CapabilityReport{Runtime: r.runtimeType, State: runtimecatalog.CapabilityDegraded}
-	if profile, err := sharedRuntimeCatalog.Resolve(r.runtimeType); err == nil {
-		report.ProfileHash = profile.ProfileHash
-	}
+	report := CapabilityReport{Runtime: r.runtimeName, ProfileHash: r.runtimeProfileHash, State: runtimecatalog.CapabilityDegraded}
 	if r.client == nil {
 		report.Reason = "RuntimeDriverNotInitialized"
 		report.Message = "containerd client is not initialized"
@@ -700,72 +719,6 @@ func (r *ContainerdRuntime) Close() error {
 		return r.client.Close()
 	}
 	return nil
-}
-
-func (r *ContainerdRuntime) GetSandboxLogs(ctx context.Context, sandboxID string, follow bool, stdout io.Writer) error {
-	logPath := filepath.Join("/var/log/fast-sandbox", fmt.Sprintf("%s.log", sandboxID))
-	file, err := os.Open(logPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("log file not found")
-		}
-		return err
-	}
-	defer file.Close()
-	reader := bufio.NewReader(file)
-	// 读取现有内容
-	for {
-		line, err := reader.ReadString('\n')
-		if line != "" {
-			if _, wErr := stdout.Write([]byte(line)); wErr != nil {
-
-				return wErr
-
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-
-				break
-
-			}
-			return err
-		}
-	}
-	if !follow {
-
-		return nil
-
-	}
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			for {
-				line, err := reader.ReadString('\n')
-				if line != "" {
-					if _, wErr := stdout.Write([]byte(line)); wErr != nil {
-
-						return wErr
-
-					}
-				}
-				if err == io.EOF {
-
-					break
-
-				}
-				if err != nil {
-
-					return err
-
-				}
-			}
-		}
-	}
 }
 
 func envMapToSlice(env map[string]string) []string {

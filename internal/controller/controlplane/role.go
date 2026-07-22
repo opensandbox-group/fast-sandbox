@@ -24,7 +24,7 @@ func (r Role) RunsFastPath() bool { return r == RoleFastPath || r == RoleAll }
 
 func (r Role) RunsControllers() bool { return r == RoleController || r == RoleAll }
 
-// All is intentionally a single-process development/compatibility mode.
+// All is intentionally a single-process development mode.
 // Production controller replicas use leader election; production FastPath
 // replicas never do.
 func (r Role) LeaderElection() bool { return r == RoleController }
