@@ -128,8 +128,10 @@ make quickstart-kata-clh
 
 - `container` 准备 `fsb-e2e-basic` 和带真实 Execd 的 `quickstart-execd-pool`。
 - `minimal` 准备不含 Execd、只验证生命周期的 `quickstart-pool`。
-- `gVisor` 准备 `fsb-e2e-gvisor`、安装并校验 runsc，并创建 `gvisor-pool`。
-- `kata-qemu` 和 `kata-clh` 准备 `fsb-e2e-kata`，要求宿主机支持嵌套 KVM，分别创建 `kata-qemu-pool` 和 `kata-clh-pool`。
+- `gVisor` 准备 `fsb-e2e-gvisor`、安装并校验 runsc，并创建 `gvisor-execd-pool`。
+- `kata-qemu` 和 `kata-clh` 准备 `fsb-e2e-kata`，要求宿主机支持嵌套 KVM，分别创建 `kata-qemu-execd-pool` 和 `kata-clh-execd-pool`。
+
+Container、gVisor、Kata QEMU 和 Kata CLH Quick Start 现在都会注入固定版本的 OpenSandbox Execd，并打印相同的 `exec`、上传、读取和下载示例。Kata 通过 runtime 的 OCI shared bind-mount 路径把只读 Infra bundle 带入 guest。
 
 Kata Firecracker 和 BoxLite 当前尚未达到可运行能力，因此没有 Quick Start 入口；对应的 fail-closed 行为仍由 `test-e2e-runtime-kata` 和 `test-e2e-runtime-boxlite` 验证。所有 Quick Start 目标都会保留可复用的 kind 集群和 Pool，首次运行需要构建镜像和准备 runtime，耗时会明显高于后续运行。
 

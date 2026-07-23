@@ -138,17 +138,18 @@ task -> sandbox-init -> execd/bootstrap Ready -> user entrypoint
 
 ### 6.1 可运行的开发绑定
 
-`make quickstart` 使用独立的 `opensandbox-execd-quickstart` profile：
+Container、gVisor、Kata QEMU 和 Kata CLH 的 `make quickstart-*` 使用同一个独立的 `opensandbox-execd-quickstart` profile：
 
 - Fastlet 镜像从 OpenSandbox Execd v1.0.21 的不可变 amd64 image digest 提取 `/execd`；
 - profile 同时固定 `/execd` 的文件级 SHA-256，Fastlet 准备 artifact 时再次校验；
 - artifact 位于 Fastlet 镜像只读路径 `/opt/fast-sandbox/components`，再进入 Fastlet 的 content-addressed store；
+- container/gVisor 直接使用 OCI bind mount；Kata QEMU/CLH 通过 Kata shared filesystem 承载同一个只读 OCI bind mount；
 - `sandbox-init` 并行启动 Execd 和用户 entrypoint；
 - 每个 Sandbox generation 的随机 token 通过 `EXECD_ACCESS_TOKEN` 传给 Execd；
 - Fastlet Proxy 仅在 Execd 上游 hop 注入 `X-EXECD-ACCESS-TOKEN`；
 - `GET /ping` Ready 后才发布 `:44772` route。
 
-该 profile 只允许 `runtime=container`，只用于 kind/开发验收。它没有签名验证、多架构 artifact 选择、私有镜像源和 release compatibility matrix，因此不能作为生产 profile 使用。
+该 profile 只允许 `container`、`gvisor`、`kata-qemu` 和 `kata-clh`，只用于 kind/开发验收。Kata Firecracker 和 BoxLite 继续 fail closed。该 profile 没有签名验证、多架构 artifact 选择、私有镜像源和 release compatibility matrix，因此不能作为生产 profile 使用。
 
 自动化门禁是：
 
@@ -196,7 +197,7 @@ OpenSandbox SDK 仍负责构造 execd 业务请求；调用方不需要知道 Fa
 |---|---|---|---|
 | container | BindMount bundle | sandbox-init/bootstrap | 最低启动成本 |
 | gVisor | BindMount bundle | sandbox-init/bootstrap | 与 container 保持相同逻辑 profile |
-| kata-qemu/clh | TemplateBake/GuestCopy | guest service 或 sandbox-init | 需要 guest channel/模板能力 |
+| kata-qemu/clh | Quick Start: OCI shared BindMount；生产推荐 TemplateBake/Preinstalled | sandbox-init/bootstrap | Quick Start 复用 Kata shared filesystem，生产避免逐实例 artifact delivery |
 | kata-fc | 暂不承诺 | 暂不承诺 | Firecracker 支持门禁尚未解除 |
 | boxlite | ArtifactVolume/TemplateBake | sandbox-init/bootstrap | 生产资源和 native tunnel 门禁尚未解除 |
 

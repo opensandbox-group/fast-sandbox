@@ -25,12 +25,32 @@ func TestBuiltinCompileAndFailClosedProfiles(t *testing.T) {
 	require.Len(t, testInfra.Components, 1)
 	require.Equal(t, runtimecatalog.InfraDeliveryBindMount, testInfra.Components[0].DeliveryMode)
 
-	quickStartExecd, err := catalog.Compile("opensandbox-execd-quickstart", container)
-	require.NoError(t, err)
-	require.Len(t, quickStartExecd.Components, 1)
-	require.Equal(t, OpenSandboxExecdQuickStartDigest, quickStartExecd.Components[0].Component.Artifact.Digest)
-	require.Equal(t, "EXECD_ACCESS_TOKEN", quickStartExecd.Components[0].Component.InstanceInit.Credential.EnvironmentVariable)
-	require.Equal(t, "X-EXECD-ACCESS-TOKEN", quickStartExecd.Components[0].Component.InstanceInit.Credential.UpstreamHeader)
+	for _, runtimeName := range []apiv1alpha1.RuntimeName{
+		apiv1alpha1.RuntimeContainer,
+		apiv1alpha1.RuntimeGVisor,
+		apiv1alpha1.RuntimeKataQemu,
+		apiv1alpha1.RuntimeKataClh,
+	} {
+		runtimeProfile, resolveErr := runtimecatalog.Builtin().Resolve(runtimeName)
+		require.NoError(t, resolveErr)
+		quickStartExecd, compileErr := catalog.Compile("opensandbox-execd-quickstart", runtimeProfile)
+		require.NoError(t, compileErr, "runtime %s", runtimeName)
+		require.Len(t, quickStartExecd.Components, 1)
+		require.Equal(t, runtimecatalog.InfraDeliveryBindMount, quickStartExecd.Components[0].DeliveryMode)
+		require.Equal(t, OpenSandboxExecdQuickStartDigest, quickStartExecd.Components[0].Component.Artifact.Digest)
+		require.Equal(t, "EXECD_ACCESS_TOKEN", quickStartExecd.Components[0].Component.InstanceInit.Credential.EnvironmentVariable)
+		require.Equal(t, "X-EXECD-ACCESS-TOKEN", quickStartExecd.Components[0].Component.InstanceInit.Credential.UpstreamHeader)
+	}
+
+	for _, runtimeName := range []apiv1alpha1.RuntimeName{
+		apiv1alpha1.RuntimeKataFc,
+		apiv1alpha1.RuntimeBoxLite,
+	} {
+		runtimeProfile, resolveErr := runtimecatalog.Builtin().Resolve(runtimeName)
+		require.NoError(t, resolveErr)
+		_, compileErr := catalog.Compile("opensandbox-execd-quickstart", runtimeProfile)
+		require.ErrorIs(t, compileErr, ErrRuntimeUnsupported, "runtime %s", runtimeName)
+	}
 
 	_, err = catalog.Compile("opensandbox-execd", container)
 	require.ErrorIs(t, err, ErrProfileUnconfigured)

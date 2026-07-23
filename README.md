@@ -128,8 +128,10 @@ make quickstart-kata-clh
 
 - `container` prepares `fsb-e2e-basic` and the real-Execd `quickstart-execd-pool`.
 - `minimal` prepares the lifecycle-only `quickstart-pool` without Execd.
-- `gVisor` prepares `fsb-e2e-gvisor`, installs and verifies runsc, and creates `gvisor-pool`.
-- `kata-qemu` and `kata-clh` prepare `fsb-e2e-kata`, require nested KVM on the host, and create `kata-qemu-pool` and `kata-clh-pool`, respectively.
+- `gVisor` prepares `fsb-e2e-gvisor`, installs and verifies runsc, and creates `gvisor-execd-pool`.
+- `kata-qemu` and `kata-clh` prepare `fsb-e2e-kata`, require nested KVM on the host, and create `kata-qemu-execd-pool` and `kata-clh-execd-pool`, respectively.
+
+Container, gVisor, Kata QEMU, and Kata CLH Quick Starts all inject the pinned OpenSandbox Execd component and print the same `exec`, upload, read, and download examples. Kata carries the read-only Infra bundle into its guest through the runtime's OCI shared bind-mount path.
 
 Kata Firecracker and BoxLite do not have Quick Start entry points because they are not currently runnable capabilities. Their fail-closed behavior remains covered by `test-e2e-runtime-kata` and `test-e2e-runtime-boxlite`. All Quick Start targets retain reusable kind clusters and Pools. The first run builds images and prepares runtimes, so it takes substantially longer than later runs.
 

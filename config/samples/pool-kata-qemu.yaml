@@ -1,11 +1,11 @@
 apiVersion: sandbox.fast.io/v1alpha1
 kind: SandboxPool
 metadata:
-  name: kata-qemu-pool
+  name: kata-qemu-execd-pool
   namespace: default
 spec:
   runtime: kata-qemu
-  infraProfile: minimal
+  infraProfile: opensandbox-execd-quickstart
   sandboxResources:
     cpu: 250m
     memory: 256Mi

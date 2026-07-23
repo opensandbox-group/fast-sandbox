@@ -124,7 +124,12 @@ func builtinProfiles() map[string]Profile {
 		},
 		"opensandbox-execd-quickstart": {
 			Name: "opensandbox-execd-quickstart", Version: builtinVersion, Configured: true,
-			AllowedRuntimes: []apiv1alpha1.RuntimeName{apiv1alpha1.RuntimeContainer},
+			AllowedRuntimes: []apiv1alpha1.RuntimeName{
+				apiv1alpha1.RuntimeContainer,
+				apiv1alpha1.RuntimeGVisor,
+				apiv1alpha1.RuntimeKataQemu,
+				apiv1alpha1.RuntimeKataClh,
+			},
 			Components: []Component{{
 				Name: "execd",
 				Artifact: Artifact{

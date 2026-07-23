@@ -82,11 +82,20 @@ func unavailableKataProfile(name apiv1alpha1.RuntimeName, configPath string, pat
 func kataProfile(name apiv1alpha1.RuntimeName, configPath string, paths []HostPathRequirement) RuntimeProfile {
 	return RuntimeProfile{
 		Name: name, Version: builtinProfileVersion, Driver: DriverKindContainerd,
-		Containerd:         &ContainerdConfig{Handler: "io.containerd.kata.v2", RuntimePath: "/opt/kata/bin/containerd-shim-kata-v2", ConfigPath: configPath},
-		Deployment:         DeploymentRequirements{Privileged: true, RequiresKVM: true, HostPaths: paths, Overhead: overhead("250m", "256Mi")},
-		Capabilities:       Capabilities{DefaultState: CapabilityConfigured, SupportsNetwork: true, SupportsCache: true, SupportsRecovery: true},
-		NetworkMode:        NetworkModeKata,
-		InfraDeliveryModes: []InfraDeliveryMode{InfraDeliveryTemplateBake, InfraDeliveryPreinstalled, InfraDeliveryGuestCopy},
+		Containerd:   &ContainerdConfig{Handler: "io.containerd.kata.v2", RuntimePath: "/opt/kata/bin/containerd-shim-kata-v2", ConfigPath: configPath},
+		Deployment:   DeploymentRequirements{Privileged: true, RequiresKVM: true, HostPaths: paths, Overhead: overhead("250m", "256Mi")},
+		Capabilities: Capabilities{DefaultState: CapabilityConfigured, SupportsNetwork: true, SupportsCache: true, SupportsRecovery: true},
+		NetworkMode:  NetworkModeKata,
+		InfraDeliveryModes: []InfraDeliveryMode{
+			// Kata/containerd carries OCI bind mounts into the guest through
+			// its shared filesystem. Quick Start uses this path for immutable
+			// Infra bundles; production images can still bake or preinstall
+			// the same logical component.
+			InfraDeliveryBindMount,
+			InfraDeliveryTemplateBake,
+			InfraDeliveryPreinstalled,
+			InfraDeliveryGuestCopy,
+		},
 	}
 }
 

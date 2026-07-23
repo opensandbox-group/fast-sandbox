@@ -50,6 +50,11 @@ func TestBuiltinCatalogProfiles(t *testing.T) {
 	require.Contains(t, kata.Containerd.ConfigPath, "configuration-fc.toml")
 	require.Equal(t, CapabilityDegraded, kata.Capabilities.DefaultState)
 	require.Equal(t, "KataFirecrackerNotValidated", kata.Capabilities.Reason)
+	for _, name := range []apiv1alpha1.RuntimeName{apiv1alpha1.RuntimeKataQemu, apiv1alpha1.RuntimeKataClh} {
+		kataProfile, resolveErr := catalog.Resolve(name)
+		require.NoError(t, resolveErr)
+		require.Contains(t, kataProfile.InfraDeliveryModes, InfraDeliveryBindMount)
+	}
 
 	gvisor, err := catalog.Resolve(apiv1alpha1.RuntimeGVisor)
 	require.NoError(t, err)

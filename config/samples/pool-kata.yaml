@@ -1,11 +1,11 @@
 apiVersion: sandbox.fast.io/v1alpha1
 kind: SandboxPool
 metadata:
-  name: kata-clh-pool
+  name: kata-clh-execd-pool
   namespace: default
 spec:
   runtime: kata-clh
-  infraProfile: minimal
+  infraProfile: opensandbox-execd-quickstart
   sandboxResources:
     cpu: 250m
     memory: 256Mi

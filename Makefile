@@ -70,9 +70,9 @@ help:
 	@echo "  make quickstart-container   - same as quickstart"
 	@echo "  make quickstart-minimal     - prepare lifecycle-only container environment"
 	@echo "  make quickstart-forward     - expose Fast-Path and Sandbox Proxy until Ctrl-C"
-	@echo "  make quickstart-gvisor      - prepare an interactive gVisor environment"
-	@echo "  make quickstart-kata-qemu   - prepare an interactive Kata QEMU environment"
-	@echo "  make quickstart-kata-clh    - prepare an interactive Kata Cloud Hypervisor environment"
+	@echo "  make quickstart-gvisor      - prepare gVisor + real OpenSandbox Execd"
+	@echo "  make quickstart-kata-qemu   - prepare Kata QEMU + real OpenSandbox Execd"
+	@echo "  make quickstart-kata-clh    - prepare Kata Cloud Hypervisor + real OpenSandbox Execd"
 	@echo "  make setup-kind KIND_PROFILE=<profile> - prepare only the kind control plane"
 	@echo ""
 	@echo "E2E targets:"
@@ -352,22 +352,25 @@ quickstart-gvisor:
 	@$(MAKE) quickstart-profile \
 		KIND_PROFILE=gvisor \
 		QUICKSTART_POOL_FILE=config/samples/pool-gvisor.yaml \
-		QUICKSTART_POOL_NAME=gvisor-pool \
-		QUICKSTART_SANDBOX_NAME=quickstart-gvisor-sandbox
+		QUICKSTART_POOL_NAME=gvisor-execd-pool \
+		QUICKSTART_SANDBOX_NAME=quickstart-gvisor-execd-sandbox \
+		QUICKSTART_DATA_PLANE=execd
 
 quickstart-kata-qemu:
 	@$(MAKE) quickstart-profile \
 		KIND_PROFILE=kata-qemu \
 		QUICKSTART_POOL_FILE=config/samples/pool-kata-qemu.yaml \
-		QUICKSTART_POOL_NAME=kata-qemu-pool \
-		QUICKSTART_SANDBOX_NAME=quickstart-kata-qemu-sandbox
+		QUICKSTART_POOL_NAME=kata-qemu-execd-pool \
+		QUICKSTART_SANDBOX_NAME=quickstart-kata-qemu-execd-sandbox \
+		QUICKSTART_DATA_PLANE=execd
 
 quickstart-kata-clh:
 	@$(MAKE) quickstart-profile \
 		KIND_PROFILE=kata-clh \
 		QUICKSTART_POOL_FILE=config/samples/pool-kata.yaml \
-		QUICKSTART_POOL_NAME=kata-clh-pool \
-		QUICKSTART_SANDBOX_NAME=quickstart-kata-clh-sandbox
+		QUICKSTART_POOL_NAME=kata-clh-execd-pool \
+		QUICKSTART_SANDBOX_NAME=quickstart-kata-clh-execd-sandbox \
+		QUICKSTART_DATA_PLANE=execd
 
 quickstart-profile:
 	@$(MAKE) setup-kind KIND_PROFILE=$(KIND_PROFILE)
