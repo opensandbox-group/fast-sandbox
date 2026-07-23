@@ -22,7 +22,6 @@ const (
 	SandboxInitContainerPath   = "/.fast/bin/sandbox-init"
 	SandboxTunnelContainerPath = "/.fast/bin/sandbox-tunnel"
 	InstanceConfigPath         = "/.fast/run/infra.json"
-	UpstreamTokenHeader        = "X-Fast-Sandbox-Infra-Token"
 )
 
 type Mount struct {
@@ -102,7 +101,6 @@ func (m *Manager) PrepareInstance(ctx context.Context, spec *api.SandboxSpec) (P
 		return PreparedInstance{}, fmt.Errorf("generate Infra instance token: %w", err)
 	}
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
-	result.UpstreamHeaders = map[string]string{UpstreamTokenHeader: token}
 	initConfig := sandboxinit.Config{Version: sandboxinit.ConfigVersion, SandboxUID: spec.SandboxID}
 	if plan.Supervisor != nil {
 		result.WrapperRequired = true
@@ -113,6 +111,20 @@ func (m *Manager) PrepareInstance(ctx context.Context, spec *api.SandboxSpec) (P
 	}
 	for _, preparedComponent := range plan.Components {
 		component := preparedComponent.Plan.Component
+		componentEnv := map[string]string{
+			"FAST_SANDBOX_UID": spec.SandboxID, "FAST_SANDBOX_INSTANCE_GENERATION": strconv.FormatInt(spec.InstanceGeneration, 10),
+			"FAST_SANDBOX_ASSIGNMENT_ATTEMPT": strconv.FormatInt(spec.AssignmentAttempt, 10),
+		}
+		if credential := component.InstanceInit.Credential; credential != nil {
+			componentEnv[credential.EnvironmentVariable] = token
+			if result.UpstreamHeaders == nil {
+				result.UpstreamHeaders = make(map[string]string)
+			}
+			if existing, found := result.UpstreamHeaders[credential.UpstreamHeader]; found && existing != token {
+				return PreparedInstance{}, fmt.Errorf("Infra credential header %s has conflicting bindings", credential.UpstreamHeader)
+			}
+			result.UpstreamHeaders[credential.UpstreamHeader] = token
+		}
 		if preparedComponent.Artifact != nil {
 			result.Mounts = append(result.Mounts, Mount{
 				Source: preparedComponent.Artifact.HostPath, GuestSource: preparedComponent.Artifact.PodPath, Destination: component.ContainerPath,
@@ -130,10 +142,7 @@ func (m *Manager) PrepareInstance(ctx context.Context, spec *api.SandboxSpec) (P
 			}
 			initConfig.Components = append(initConfig.Components, sandboxinit.Component{
 				Name: component.Name, Command: component.Activation.Command, Args: append([]string(nil), component.Activation.Args...),
-				Env: map[string]string{
-					"FAST_SANDBOX_UID": spec.SandboxID, "FAST_SANDBOX_INSTANCE_GENERATION": strconv.FormatInt(spec.InstanceGeneration, 10),
-					"FAST_SANDBOX_ASSIGNMENT_ATTEMPT": strconv.FormatInt(spec.AssignmentAttempt, 10), "FAST_SANDBOX_INTERNAL_TOKEN": token,
-				},
+				Env:             componentEnv,
 				StartBeforeUser: component.Activation.StartBeforeUser, RestartPolicy: component.Activation.RestartPolicy, Readiness: readiness,
 				Required: component.Required, DependsOn: append([]string(nil), component.DependsOn...),
 			})
@@ -150,17 +159,17 @@ func (m *Manager) PrepareInstance(ctx context.Context, spec *api.SandboxSpec) (P
 		Identity: instanceIdentity{SandboxUID: spec.SandboxID, InstanceGeneration: spec.InstanceGeneration, AssignmentAttempt: spec.AssignmentAttempt},
 		Init:     initConfig, Prepared: result,
 	}
-	podPath, hostPath, err := m.writeInstance(ctx, persisted)
-	if err != nil {
-		return PreparedInstance{}, err
-	}
+	podPath, hostPath := m.instancePaths(spec.SandboxID, spec.InstanceGeneration, spec.AssignmentAttempt)
 	result.ConfigPodPath = podPath
 	result.ConfigHostPath = hostPath
 	result.Mounts = append(result.Mounts, Mount{
 		Source: hostPath, GuestSource: podPath, Destination: InstanceConfigPath,
 		Options: []string{"ro", "rbind", "nosuid", "nodev", "noexec"},
 	})
-	// Persist final paths and mounts as the recovery source.
+	// Paths are deterministic, so compile the final recovery state before the
+	// first write. infra.json and state.json remain separate trust domains, but
+	// each is now fsynced exactly once instead of rewriting both files after the
+	// config mount is discovered.
 	persisted.Prepared = result
 	if _, _, err := m.writeInstance(ctx, persisted); err != nil {
 		return PreparedInstance{}, err

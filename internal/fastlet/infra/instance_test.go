@@ -2,6 +2,7 @@ package infra
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/infracatalog"
 	"fast-sandbox/internal/runtimecatalog"
+	"fast-sandbox/internal/sandboxinit"
 
 	"github.com/stretchr/testify/require"
 )
@@ -38,8 +40,16 @@ func TestPrepareAndRecoverInstanceUsesFencedPrivateConfig(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, instance.WrapperRequired)
 	require.Len(t, instance.Services, 1)
-	require.NotEmpty(t, instance.UpstreamHeaders[UpstreamTokenHeader])
+	const testTokenHeader = "X-Fast-Sandbox-Infra-Token"
+	require.NotEmpty(t, instance.UpstreamHeaders[testTokenHeader])
 	require.FileExists(t, instance.ConfigPodPath)
+	configFile, err := os.Open(instance.ConfigPodPath)
+	require.NoError(t, err)
+	var initConfig sandboxinit.Config
+	require.NoError(t, json.NewDecoder(configFile).Decode(&initConfig))
+	require.NoError(t, configFile.Close())
+	require.Len(t, initConfig.Components, 1)
+	require.Equal(t, instance.UpstreamHeaders[testTokenHeader], initConfig.Components[0].Env["FAST_SANDBOX_INTERNAL_TOKEN"])
 	info, err := os.Stat(instance.ConfigPodPath)
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(0400), info.Mode().Perm())
@@ -56,5 +66,5 @@ func TestPrepareAndRecoverInstanceUsesFencedPrivateConfig(t *testing.T) {
 	next.InstanceGeneration++
 	nextInstance, err := manager.PrepareInstance(context.Background(), &next)
 	require.NoError(t, err)
-	require.NotEqual(t, instance.UpstreamHeaders[UpstreamTokenHeader], nextInstance.UpstreamHeaders[UpstreamTokenHeader], "reset generation must fence the old Infra credential")
+	require.NotEqual(t, instance.UpstreamHeaders[testTokenHeader], nextInstance.UpstreamHeaders[testTokenHeader], "reset generation must fence the old Infra credential")
 }

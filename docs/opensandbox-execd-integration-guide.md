@@ -1,7 +1,7 @@
 # OpenSandbox execd 接入 Fast Sandbox 指南
 
-**状态**：接入边界已确认；生产 artifact 尚未绑定
-**更新时间**：2026-07-21
+**状态**：开发 Quick Start 已绑定真实 artifact；生产 artifact 尚未绑定
+**更新时间**：2026-07-23
 **上游参考**：[OpenSandbox architecture](https://github.com/alibaba/OpenSandbox/blob/main/docs/architecture.md)、[execd OpenAPI](https://github.com/alibaba/OpenSandbox/blob/main/specs/execd-api.yaml)
 
 ## 1. 核心结论
@@ -131,10 +131,34 @@ task -> sandbox-init -> execd/bootstrap Ready -> user entrypoint
 - container/gVisor 使用只读 bundle mount，避免逐 Sandbox 复制；
 - VM/BoxLite 优先 TemplateBake/Preinstalled；
 - execd 与用户 entrypoint 在语义允许时并行；
-- `CreateSandbox` 的 RuntimeReady 和 DataPlaneReady 分开观测；
+- `CreateSandbox` 在 RuntimeReady 后返回，execd readiness 和 route publication 异步推进到 DataPlaneReady；
 - 不把 sandbox-init 启动时间冒充用户原始进程启动时间。
 
-## 6. 生产 artifact 绑定
+## 6. 开发 Quick Start 与生产 artifact 绑定
+
+### 6.1 可运行的开发绑定
+
+`make quickstart` 使用独立的 `opensandbox-execd-quickstart` profile：
+
+- Fastlet 镜像从 OpenSandbox Execd v1.0.21 的不可变 amd64 image digest 提取 `/execd`；
+- profile 同时固定 `/execd` 的文件级 SHA-256，Fastlet 准备 artifact 时再次校验；
+- artifact 位于 Fastlet 镜像只读路径 `/opt/fast-sandbox/components`，再进入 Fastlet 的 content-addressed store；
+- `sandbox-init` 并行启动 Execd 和用户 entrypoint；
+- 每个 Sandbox generation 的随机 token 通过 `EXECD_ACCESS_TOKEN` 传给 Execd；
+- Fastlet Proxy 仅在 Execd 上游 hop 注入 `X-EXECD-ACCESS-TOKEN`；
+- `GET /ping` Ready 后才发布 `:44772` route。
+
+该 profile 只允许 `runtime=container`，只用于 kind/开发验收。它没有签名验证、多架构 artifact 选择、私有镜像源和 release compatibility matrix，因此不能作为生产 profile 使用。
+
+自动化门禁是：
+
+```bash
+make test-e2e-quickstart
+```
+
+它通过真实 `fastctl` 和官方 OpenSandbox Go SDK 验证 create、get、diagnostics、exec、file upload/stat/read/download 与声明式 delete；不会使用返回固定结果的 `test-infra`。
+
+### 6.2 生产绑定
 
 当前内置 profile 有意 `Configured=false`。发布系统需要提供：
 

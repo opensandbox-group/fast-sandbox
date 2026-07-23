@@ -40,6 +40,7 @@ type Fastctl struct {
 	rootDir    string
 	binaryPath string
 	endpoint   string
+	proxyURL   string
 	namespace  string
 	configDir  string
 }
@@ -88,6 +89,14 @@ func WithFastctlEndpoint(endpoint string) FastctlOption {
 	return func(client *Fastctl) {
 		if endpoint != "" {
 			client.endpoint = endpoint
+		}
+	}
+}
+
+func WithFastctlProxyEndpoint(proxyURL string) FastctlOption {
+	return func(client *Fastctl) {
+		if proxyURL != "" {
+			client.proxyURL = proxyURL
 		}
 	}
 }
@@ -161,6 +170,12 @@ func (c *Fastctl) Delete(ctx context.Context, name string) error {
 	return err
 }
 
+// Command runs a raw fastctl subcommand with this client's configured
+// Fast-Path, Sandbox Proxy, and namespace endpoints.
+func (c *Fastctl) Command(ctx context.Context, args ...string) ([]byte, error) {
+	return c.run(ctx, args...)
+}
+
 func (c *Fastctl) WaitRunning(ctx context.Context, name string) (*SandboxInfo, error) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -185,6 +200,9 @@ func (c *Fastctl) run(ctx context.Context, args ...string) ([]byte, error) {
 	commandArgs := []string{
 		"--endpoint", c.endpoint,
 		"--namespace", c.namespace,
+	}
+	if c.proxyURL != "" {
+		commandArgs = append(commandArgs, "--proxy-endpoint", c.proxyURL)
 	}
 	commandArgs = append(commandArgs, args...)
 	output, err := c.runner.Run(ctx, c.rootDir, c.binaryPath, commandArgs...)

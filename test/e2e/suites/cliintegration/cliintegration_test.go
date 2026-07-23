@@ -2,6 +2,8 @@ package cliintegration
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -12,11 +14,139 @@ import (
 	"fast-sandbox/test/e2e/support/suiteenv"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
 )
+
+func TestQuickStartOpenSandboxExecd(t *testing.T) {
+	manager := e2eenv.Require(t, e2eenv.ProfileBasic)
+	cliBinaryPath := buildFastctl(t, manager)
+
+	feature := features.New("quickstart-opensandbox-execd").
+		WithLabel("suite", "cliintegration").
+		WithLabel("tier", "smoke").
+		Assess("runs the printed lifecycle, diagnostics, exec, and file commands against real Execd", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+			k8sClient := testSuite.MustKubeClient(t)
+			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
+			namespace := testSuite.AllocateNamespace("quickstart")
+			if err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
+				t.Fatalf("create namespace: %v", err)
+			}
+			defer suiteenv.DeleteNamespace(context.Background(), t, k8sClient, namespace)
+
+			pool := createCLIPool(namespace, "quickstart-execd-pool")
+			pool.Spec.InfraProfile = "opensandbox-execd-quickstart"
+			pool.Spec.Capacity = apiv1alpha1.PoolCapacity{PoolMin: 1, PoolMax: 1}
+			pool.Spec.MaxSandboxesPerPod = 1
+			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
+				t.Fatalf("create quickstart Pool: %v", err)
+			}
+			poolWaitCtx, poolCancel := context.WithTimeout(ctx, 2*time.Minute)
+			defer poolCancel()
+			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for Execd-ready Fastlet Pod: %v", err)
+			}
+
+			controlEndpoint, controlForward, err := e2eenv.StartControllerPortForward(ctx, testSuite.ControllerNamespace())
+			if err != nil {
+				t.Fatalf("start Fast-Path port-forward: %v", err)
+			}
+			defer controlForward.Cleanup()
+			proxyEndpoint, proxyForward, err := e2eenv.StartSandboxProxyPortForward(ctx, testSuite.ControllerNamespace())
+			if err != nil {
+				t.Fatalf("start Sandbox Proxy port-forward: %v", err)
+			}
+			defer proxyForward.Cleanup()
+
+			ctl := e2eenv.NewFastctl(
+				e2eenv.WithFastctlBinary(cliBinaryPath),
+				e2eenv.WithFastctlEndpoint(controlEndpoint),
+				e2eenv.WithFastctlProxyEndpoint(proxyEndpoint),
+				e2eenv.WithFastctlNamespace(namespace),
+			)
+			const sandboxName = "quickstart-execd-sandbox"
+			if output, err := ctl.Run(ctx, sandboxName, e2eenv.FastctlConfig{
+				Image: "docker.io/library/alpine:latest", PoolRef: pool.Name,
+				Command: []string{"/bin/sleep"}, Args: []string{"3600"},
+			}); err != nil {
+				t.Fatalf("fastctl run failed: %v\n%s", err, output)
+			}
+			defer ctl.Delete(context.Background(), sandboxName)
+
+			readyCtx, readyCancel := context.WithTimeout(ctx, 90*time.Second)
+			defer readyCancel()
+			if _, err := ctl.WaitRunning(readyCtx, sandboxName); err != nil {
+				t.Fatalf("wait for quickstart Sandbox: %v", err)
+			}
+			if output, err := ctl.Command(ctx, "diagnostics", "sandbox", sandboxName); err != nil {
+				t.Fatalf("fastctl diagnostics failed: %v\n%s", err, output)
+			} else if !strings.Contains(string(output), "Fastlet diagnostics: reachable") {
+				t.Fatalf("unexpected diagnostics output: %s", output)
+			}
+
+			output, err := ctl.Command(ctx, "opensandbox", "exec", sandboxName, "--", "sh", "-lc", "printf 'hello from execd\\n' > /tmp/execd.txt && cat /tmp/execd.txt")
+			if err != nil {
+				t.Fatalf("fastctl opensandbox exec failed: %v\n%s", err, output)
+			}
+			if !strings.Contains(string(output), "hello from execd") {
+				t.Fatalf("unexpected exec output: %s", output)
+			}
+
+			localRoot := t.TempDir()
+			uploadPath := filepath.Join(localRoot, "from-host.txt")
+			if err := os.WriteFile(uploadPath, []byte("hello from host\n"), 0600); err != nil {
+				t.Fatalf("write upload fixture: %v", err)
+			}
+			if output, err = ctl.Command(ctx, "opensandbox", "cp", uploadPath, sandboxName+":/tmp/from-host.txt"); err != nil {
+				t.Fatalf("fastctl opensandbox cp upload failed: %v\n%s", err, output)
+			}
+			if output, err = ctl.Command(ctx, "opensandbox", "files", "stat", sandboxName, "/tmp/from-host.txt"); err != nil {
+				t.Fatalf("fastctl opensandbox files stat failed: %v\n%s", err, output)
+			} else if !strings.Contains(string(output), "/tmp/from-host.txt") {
+				t.Fatalf("unexpected stat output: %s", output)
+			}
+			if output, err = ctl.Command(ctx, "opensandbox", "files", "read", sandboxName, "/tmp/from-host.txt"); err != nil {
+				t.Fatalf("fastctl opensandbox files read failed: %v\n%s", err, output)
+			} else if !strings.Contains(string(output), "hello from host") {
+				t.Fatalf("unexpected file output: %s", output)
+			}
+			downloadPath := filepath.Join(localRoot, "downloaded.txt")
+			if output, err = ctl.Command(ctx, "opensandbox", "cp", sandboxName+":/tmp/execd.txt", downloadPath); err != nil {
+				t.Fatalf("fastctl opensandbox cp download failed: %v\n%s", err, output)
+			}
+			if downloaded, err := os.ReadFile(downloadPath); err != nil {
+				t.Fatalf("read downloaded fixture: %v", err)
+			} else if string(downloaded) != "hello from execd\n" {
+				t.Fatalf("downloaded content = %q", downloaded)
+			}
+
+			if err := ctl.Delete(ctx, sandboxName); err != nil {
+				t.Fatalf("fastctl delete failed: %v", err)
+			}
+			deleteDeadline := time.Now().Add(60 * time.Second)
+			for {
+				var sandbox apiv1alpha1.Sandbox
+				err := k8sClient.Get(ctx, types.NamespacedName{Name: sandboxName, Namespace: namespace}, &sandbox)
+				if apierrors.IsNotFound(err) {
+					break
+				}
+				if err != nil {
+					t.Fatalf("get deleting Sandbox: %v", err)
+				}
+				if time.Now().After(deleteDeadline) {
+					t.Fatalf("Sandbox %s was not deleted", sandboxName)
+				}
+				time.Sleep(250 * time.Millisecond)
+			}
+			return ctx
+		}).
+		Feature()
+
+	testSuite.Env().Test(t, feature)
+}
 
 func TestUpdateReset(t *testing.T) {
 	manager := e2eenv.Require(t, e2eenv.ProfileBasic)

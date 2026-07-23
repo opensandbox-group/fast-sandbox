@@ -25,11 +25,28 @@ func TestBuiltinCompileAndFailClosedProfiles(t *testing.T) {
 	require.Len(t, testInfra.Components, 1)
 	require.Equal(t, runtimecatalog.InfraDeliveryBindMount, testInfra.Components[0].DeliveryMode)
 
+	quickStartExecd, err := catalog.Compile("opensandbox-execd-quickstart", container)
+	require.NoError(t, err)
+	require.Len(t, quickStartExecd.Components, 1)
+	require.Equal(t, OpenSandboxExecdQuickStartDigest, quickStartExecd.Components[0].Component.Artifact.Digest)
+	require.Equal(t, "EXECD_ACCESS_TOKEN", quickStartExecd.Components[0].Component.InstanceInit.Credential.EnvironmentVariable)
+	require.Equal(t, "X-EXECD-ACCESS-TOKEN", quickStartExecd.Components[0].Component.InstanceInit.Credential.UpstreamHeader)
+
 	_, err = catalog.Compile("opensandbox-execd", container)
 	require.ErrorIs(t, err, ErrProfileUnconfigured)
 
 	_, err = catalog.Compile("e2b-envd", container)
 	require.ErrorIs(t, err, ErrProfileNotFound)
+}
+
+func TestProfileValidationRejectsPartialCredentialBinding(t *testing.T) {
+	profile := Profile{Name: "bad-credential", Version: "v1", Configured: true, Components: []Component{
+		componentForTest("a", "", "svc", 8080),
+	}}
+	profile.Components[0].InstanceInit.Credential = &CredentialBinding{EnvironmentVariable: "TOKEN"}
+	err := Validate(profile)
+	require.ErrorIs(t, err, ErrProfileInvalid)
+	require.ErrorContains(t, err, "credential requires environment variable and upstream header")
 }
 
 func TestProfileValidationRejectsServiceConflictsAndCycles(t *testing.T) {

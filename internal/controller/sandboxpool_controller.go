@@ -563,6 +563,9 @@ func (r *SandboxPoolReconciler) constructPod(pool *apiv1alpha1.SandboxPool, prof
 			corev1.EnvVar{Name: "RUNTIME_SOCKET", Value: "/run/containerd/containerd.sock"},
 			corev1.EnvVar{Name: "INFRA_DIR_IN_POD", Value: "/opt/fast-sandbox/infra"},
 		)
+		if infraPlanUsesStaticArtifacts(infraPlan) {
+			c.Env = append(c.Env, corev1.EnvVar{Name: "FAST_SANDBOX_INFRA_STATIC_ROOTS", Value: "/opt/fast-sandbox/components"})
+		}
 
 		c.VolumeMounts = append(c.VolumeMounts,
 			corev1.VolumeMount{Name: "tmp", MountPath: "/tmp"},
@@ -864,11 +867,21 @@ func (r *SandboxPoolReconciler) resolveInfraPlan(pool *apiv1alpha1.SandboxPool, 
 	return catalog.Compile(pool.Spec.InfraProfile, runtimeProfile)
 }
 
+func infraPlanUsesStaticArtifacts(plan infracatalog.Plan) bool {
+	for _, component := range plan.Components {
+		if component.Component.Artifact.SourceType == infracatalog.SourceStatic {
+			return true
+		}
+	}
+	return false
+}
+
 var runtimeOwnedEnv = map[string]struct{}{
 	"FAST_SANDBOX_RUNTIME": {}, "FAST_SANDBOX_RUNTIME_PROFILE_HASH": {},
 	"FAST_SANDBOX_RESOURCE_CPU": {}, "FAST_SANDBOX_RESOURCE_MEMORY": {}, "FAST_SANDBOX_RESOURCE_PIDS": {},
 	"FAST_SANDBOX_INFRA_PROFILE": {}, "FAST_SANDBOX_INFRA_PROFILE_HASH": {}, "FASTLET_CAPACITY": {},
-	"RUNTIME_SOCKET": {}, "INFRA_DIR_IN_POD": {},
+	"FAST_SANDBOX_INFRA_STATIC_ROOTS": {},
+	"RUNTIME_SOCKET":                  {}, "INFRA_DIR_IN_POD": {},
 	"FASTLET_CONTROL_PORT":         {},
 	"FASTLET_PROXY_CONTROL_SOCKET": {},
 	"FAST_SANDBOX_WARM_IMAGES":     {},

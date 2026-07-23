@@ -11,6 +11,11 @@ import (
 
 const (
 	builtinVersion = "v1"
+	// OpenSandboxExecdQuickStartDigest is the sha256 of /execd from the
+	// OpenSandbox Execd v1.0.21 amd64 release image pinned in
+	// build/Dockerfile.fastlet.
+	OpenSandboxExecdQuickStartDigest = "sha256:d81ddb9774caee284b85760f0ac0e5306530dca82ca4d74b1c6442f1c7d424cc"
+	OpenSandboxExecdQuickStartPath   = "/opt/fast-sandbox/components/opensandbox-execd"
 	// TestInfraScript is an e2e-only component artifact. It intentionally
 	// relies on BusyBox nc and is never selected by production profiles. The
 	// service requires the per-instance credential, proving that Fastlet Proxy
@@ -103,10 +108,45 @@ func builtinProfiles() map[string]Profile {
 				ContainerPath: "/.fast/infra/test-infra",
 				DeliveryModes: []runtimecatalog.InfraDeliveryMode{runtimecatalog.InfraDeliveryBindMount},
 				Activation:    Activation{Mode: ActivationEntrypointSupervisor, Command: "/.fast/infra/test-infra", RestartPolicy: RestartOnFailure},
-				InstanceInit:  InstanceInit{Mode: InitNone},
+				InstanceInit: InstanceInit{
+					Mode: InitNone,
+					Credential: &CredentialBinding{
+						EnvironmentVariable: "FAST_SANDBOX_INTERNAL_TOKEN",
+						UpstreamHeader:      "X-Fast-Sandbox-Infra-Token",
+					},
+				},
 				Services: []Service{{
 					Name: "test-infra", Transport: "http", Port: 18080,
-					Readiness: ReadinessProbe{Type: ProbeHTTP, Path: "/health", Timeout: 5 * time.Second, Interval: 50 * time.Millisecond},
+					Readiness: ReadinessProbe{Type: ProbeHTTP, Path: "/health", Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
+				}},
+				Required: true,
+			}},
+		},
+		"opensandbox-execd-quickstart": {
+			Name: "opensandbox-execd-quickstart", Version: builtinVersion, Configured: true,
+			AllowedRuntimes: []apiv1alpha1.RuntimeName{apiv1alpha1.RuntimeContainer},
+			Components: []Component{{
+				Name: "execd",
+				Artifact: Artifact{
+					SourceType: SourceStatic, Reference: "file://" + OpenSandboxExecdQuickStartPath,
+					Digest: OpenSandboxExecdQuickStartDigest, Executable: true,
+				},
+				ContainerPath: "/.fast/infra/opensandbox-execd",
+				DeliveryModes: []runtimecatalog.InfraDeliveryMode{runtimecatalog.InfraDeliveryBindMount},
+				Activation: Activation{
+					Mode: ActivationEntrypointSupervisor, Command: "/.fast/infra/opensandbox-execd",
+					RestartPolicy: RestartOnFailure,
+				},
+				InstanceInit: InstanceInit{
+					Mode: InitEnvironment,
+					Credential: &CredentialBinding{
+						EnvironmentVariable: "EXECD_ACCESS_TOKEN",
+						UpstreamHeader:      "X-EXECD-ACCESS-TOKEN",
+					},
+				},
+				Services: []Service{{
+					Name: "execd", Transport: "http", Port: 44772,
+					Readiness: ReadinessProbe{Type: ProbeHTTP, Path: "/ping", Timeout: 10 * time.Second, Interval: 10 * time.Millisecond},
 				}},
 				Required: true,
 			}},
@@ -127,7 +167,7 @@ func builtinProfiles() map[string]Profile {
 				InstanceInit:  InstanceInit{Mode: InitEnvironment},
 				Services: []Service{{
 					Name: "execd", Transport: "http", Port: 44772,
-					Readiness: ReadinessProbe{Type: ProbeHTTP, Path: "/ping", Timeout: 10 * time.Second, Interval: 100 * time.Millisecond},
+					Readiness: ReadinessProbe{Type: ProbeHTTP, Path: "/ping", Timeout: 10 * time.Second, Interval: 10 * time.Millisecond},
 				}},
 				Required: true,
 			}},

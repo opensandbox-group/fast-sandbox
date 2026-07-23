@@ -75,15 +75,26 @@ type Activation struct {
 }
 
 type InstanceInit struct {
-	Mode   InitMode `json:"mode"`
-	Method string   `json:"method,omitempty"`
-	Path   string   `json:"path,omitempty"`
+	Mode       InitMode           `json:"mode"`
+	Method     string             `json:"method,omitempty"`
+	Path       string             `json:"path,omitempty"`
+	Credential *CredentialBinding `json:"credential,omitempty"`
+}
+
+// CredentialBinding maps the Fastlet-generated, per-Sandbox credential into
+// an Infra Component's native contract. Fastlet Proxy adds UpstreamHeader
+// only on the component-facing hop; callers never receive this credential.
+type CredentialBinding struct {
+	EnvironmentVariable string `json:"environmentVariable"`
+	UpstreamHeader      string `json:"upstreamHeader"`
 }
 
 type ReadinessProbe struct {
-	Type     ProbeType     `json:"type"`
-	Path     string        `json:"path,omitempty"`
-	Timeout  time.Duration `json:"timeout,omitempty"`
+	Type    ProbeType     `json:"type"`
+	Path    string        `json:"path,omitempty"`
+	Timeout time.Duration `json:"timeout,omitempty"`
+	// Interval is the retry ceiling. Probes start immediately and back off from
+	// 1ms; Fastlet and sandbox-init enforce a platform maximum of 10ms.
 	Interval time.Duration `json:"interval,omitempty"`
 }
 
@@ -232,6 +243,11 @@ func Validate(profile Profile) error {
 		if component.Artifact.SourceType != SourcePreinstalled {
 			if component.Artifact.Reference == "" || !validDigest(component.Artifact.Digest) || component.ContainerPath == "" {
 				return fmt.Errorf("%w: component %s requires immutable artifact reference, sha256 digest, and container path", ErrProfileInvalid, component.Name)
+			}
+		}
+		if credential := component.InstanceInit.Credential; credential != nil {
+			if strings.TrimSpace(credential.EnvironmentVariable) == "" || strings.TrimSpace(credential.UpstreamHeader) == "" {
+				return fmt.Errorf("%w: component %s credential requires environment variable and upstream header", ErrProfileInvalid, component.Name)
 			}
 		}
 		for _, service := range component.Services {

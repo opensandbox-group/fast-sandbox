@@ -35,7 +35,7 @@ PROTOC_GEN_GO_GRPC_VERSION := v1.6.0
 CONTROLLER_GEN_VERSION := v0.20.1
 CONTROLLER_GEN := $(TOOLS_BIN)/controller-gen
 
-.PHONY: all build build-controller build-fastlet build-sandbox-init build-sandbox-tunnel build-fastlet-proxy build-sandbox-proxy build-janitor build-fastlet-linux build-sandbox-init-linux build-sandbox-tunnel-linux build-fastlet-proxy-linux build-sandbox-proxy-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-python-proto generate-deepcopy manifests verify-generated test test-unit test-python-sdk test-race test-network-integration test-e2e test-e2e-controlplane test-e2e-network test-e2e-proxy test-e2e-infra test-e2e-sdk test-e2e-runtime test-e2e-runtime-container test-e2e-runtime-gvisor test-e2e-runtime-kata test-e2e-runtime-boxlite test-e2e-drain quickstart quickstart-container quickstart-gvisor quickstart-kata-qemu quickstart-kata-clh quickstart-profile setup-kind verify setup-e2e tidy e2e docker-fastlet docker-fastlet-proxy docker-sandbox-proxy docker-controller docker-janitor docker-boxlite-runtime kind-load-fastlet kind-load-fastlet-proxy kind-load-sandbox-proxy kind-load-controller kind-load-janitor help
+.PHONY: all build build-controller build-fastlet build-sandbox-init build-sandbox-tunnel build-fastlet-proxy build-sandbox-proxy build-janitor build-fastlet-linux build-sandbox-init-linux build-sandbox-tunnel-linux build-fastlet-proxy-linux build-sandbox-proxy-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-python-proto generate-deepcopy manifests verify-generated test test-unit test-python-sdk test-race test-network-integration test-e2e test-e2e-controlplane test-e2e-network test-e2e-proxy test-e2e-infra test-e2e-sdk test-e2e-quickstart test-e2e-runtime test-e2e-runtime-container test-e2e-runtime-gvisor test-e2e-runtime-kata test-e2e-runtime-boxlite test-e2e-drain quickstart quickstart-container quickstart-minimal quickstart-gvisor quickstart-kata-qemu quickstart-kata-clh quickstart-profile quickstart-forward setup-kind verify setup-e2e tidy e2e docker-fastlet docker-fastlet-proxy docker-sandbox-proxy docker-controller docker-janitor docker-boxlite-runtime kind-load-fastlet kind-load-fastlet-proxy kind-load-sandbox-proxy kind-load-controller kind-load-janitor help
 
 all: build
 
@@ -52,6 +52,7 @@ help:
 	@echo "  make test-e2e-proxy         - run the focused Sandbox/Fastlet Proxy data-plane e2e"
 	@echo "  make test-e2e-infra         - run the focused Infra runtime-augmentation e2e"
 	@echo "  make test-e2e-sdk           - run the focused SDK Adapter data-plane e2e"
+	@echo "  make test-e2e-quickstart    - run real Execd CLI quick-start smoke"
 	@echo "  make test-e2e-runtime-*     - run container, gVisor, Kata, or BoxLite capability gates"
 	@echo "  make test-e2e-drain         - run the focused durable Pool Drain e2e"
 	@echo "  make test-python-sdk        - run Python SDK unit tests in the active Python environment"
@@ -65,8 +66,10 @@ help:
 	@echo "  make docker-boxlite-runtime - build native BoxLite runtime Sidecar image"
 	@echo ""
 	@echo "Kind quick starts:"
-	@echo "  make quickstart             - prepare an interactive container kind environment"
-	@echo "  make quickstart-container   - prepare an interactive container environment"
+	@echo "  make quickstart             - prepare container + real OpenSandbox Execd"
+	@echo "  make quickstart-container   - same as quickstart"
+	@echo "  make quickstart-minimal     - prepare lifecycle-only container environment"
+	@echo "  make quickstart-forward     - expose Fast-Path and Sandbox Proxy until Ctrl-C"
 	@echo "  make quickstart-gvisor      - prepare an interactive gVisor environment"
 	@echo "  make quickstart-kata-qemu   - prepare an interactive Kata QEMU environment"
 	@echo "  make quickstart-kata-clh    - prepare an interactive Kata Cloud Hypervisor environment"
@@ -301,6 +304,10 @@ test-e2e-sdk:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
 		$(GO) test ./test/e2e/suites/basicvalidation/... -run '^TestSDKAdapterDataPlane$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
 
+test-e2e-quickstart:
+	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
+		$(GO) test ./test/e2e/suites/cliintegration/... -run '^TestQuickStartOpenSandboxExecd$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
+
 test-e2e-runtime:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
 		$(GO) test -p 1 ./test/e2e/suites/secureruntime/... -v -count=1 -failfast -timeout $(E2E_TEST_TIMEOUT)
@@ -329,26 +336,38 @@ quickstart: quickstart-container
 quickstart-container:
 	@$(MAKE) quickstart-profile \
 		KIND_PROFILE=basic \
+		QUICKSTART_POOL_FILE=config/samples/pool-container-execd.yaml \
+		QUICKSTART_POOL_NAME=quickstart-execd-pool \
+		QUICKSTART_SANDBOX_NAME=quickstart-execd-sandbox \
+		QUICKSTART_DATA_PLANE=execd
+
+quickstart-minimal:
+	@$(MAKE) quickstart-profile \
+		KIND_PROFILE=basic \
 		QUICKSTART_POOL_FILE=config/samples/pool-container.yaml \
-		QUICKSTART_POOL_NAME=quickstart-pool
+		QUICKSTART_POOL_NAME=quickstart-pool \
+		QUICKSTART_SANDBOX_NAME=quickstart-minimal-sandbox
 
 quickstart-gvisor:
 	@$(MAKE) quickstart-profile \
 		KIND_PROFILE=gvisor \
 		QUICKSTART_POOL_FILE=config/samples/pool-gvisor.yaml \
-		QUICKSTART_POOL_NAME=gvisor-pool
+		QUICKSTART_POOL_NAME=gvisor-pool \
+		QUICKSTART_SANDBOX_NAME=quickstart-gvisor-sandbox
 
 quickstart-kata-qemu:
 	@$(MAKE) quickstart-profile \
 		KIND_PROFILE=kata-qemu \
 		QUICKSTART_POOL_FILE=config/samples/pool-kata-qemu.yaml \
-		QUICKSTART_POOL_NAME=kata-qemu-pool
+		QUICKSTART_POOL_NAME=kata-qemu-pool \
+		QUICKSTART_SANDBOX_NAME=quickstart-kata-qemu-sandbox
 
 quickstart-kata-clh:
 	@$(MAKE) quickstart-profile \
 		KIND_PROFILE=kata-clh \
 		QUICKSTART_POOL_FILE=config/samples/pool-kata.yaml \
-		QUICKSTART_POOL_NAME=kata-clh-pool
+		QUICKSTART_POOL_NAME=kata-clh-pool \
+		QUICKSTART_SANDBOX_NAME=quickstart-kata-clh-sandbox
 
 quickstart-profile:
 	@$(MAKE) setup-kind KIND_PROFILE=$(KIND_PROFILE)
@@ -362,13 +381,11 @@ quickstart-profile:
 	@kubectl config current-context
 	@echo "Pool:    $(QUICKSTART_POOL_NAME)"
 	@echo ""
-	@echo "Terminal 1:"
-	@echo "  kubectl port-forward service/fast-sandbox-fastpath 9090:9090"
-	@echo ""
-	@echo "Terminal 2:"
-	@echo "  bin/fastctl --endpoint localhost:9090 run quickstart-sandbox \\"
-	@echo "    --image docker.io/library/alpine:latest \\"
-	@echo "    --pool $(QUICKSTART_POOL_NAME) -- /bin/sleep 3600"
+	@bash test/e2e/hack/quickstart-print.sh \
+		"$(QUICKSTART_POOL_NAME)" "$(QUICKSTART_SANDBOX_NAME)" "$(QUICKSTART_DATA_PLANE)"
+
+quickstart-forward:
+	@bash test/e2e/hack/quickstart-forward.sh
 
 test-e2e-drain:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \

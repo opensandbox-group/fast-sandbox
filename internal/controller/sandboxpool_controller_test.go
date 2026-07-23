@@ -161,6 +161,7 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	require.Equal(t, "1Gi", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RESOURCE_MEMORY"))
 	require.Equal(t, "test-infra", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_PROFILE"))
 	require.NotEmpty(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_PROFILE_HASH"))
+	require.Empty(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_STATIC_ROOTS"))
 	require.Equal(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_PROFILE_HASH"), pod.Annotations["fast-sandbox.io/infra-profile-hash"])
 	require.NotEmpty(t, pod.Annotations[fastletpool.AnnotationPodTemplateHash])
 	require.Equal(t, "test-infra", pod.Labels["fast-sandbox.io/infra-profile"])
@@ -179,6 +180,12 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	require.Equal(t, "/run/fast-sandbox/proxy/control.sock", envValue(pod.Spec.Containers[0].Env, "FASTLET_PROXY_CONTROL_SOCKET"))
 	require.NotNil(t, volumeMountForContainer(pod, 0, "proxy-control"))
 	require.NotNil(t, volumeMountForContainer(pod, 1, "proxy-control"))
+
+	execdPool := pool.DeepCopy()
+	execdPool.Spec.InfraProfile = "opensandbox-execd-quickstart"
+	execdPod, err := reconciler.constructPod(execdPool, profile)
+	require.NoError(t, err)
+	require.Equal(t, "/opt/fast-sandbox/components", envValue(execdPod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_STATIC_ROOTS"))
 
 	cpu := pod.Spec.Containers[0].Resources.Requests[corev1.ResourceCPU]
 	memory := pod.Spec.Containers[0].Resources.Requests[corev1.ResourceMemory]

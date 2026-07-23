@@ -1,3 +1,7 @@
+ARG OPENSANDBOX_EXECD_IMAGE=sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd@sha256:1dc98c7de10b9a73450ac75aa0f200ad7972f2c40f5225f6a8998e166b45d6dd
+
+FROM ${OPENSANDBOX_EXECD_IMAGE} AS opensandbox-execd
+
 # Build stage
 FROM golang:1.25-alpine AS builder
 WORKDIR /workspace
@@ -16,6 +20,7 @@ RUN apk add --no-cache iproute2 iptables
 COPY --from=builder /workspace/fastlet .
 COPY bin/sandbox-init /opt/fast-sandbox/bin/sandbox-init
 COPY bin/sandbox-tunnel /opt/fast-sandbox/bin/sandbox-tunnel
+COPY --from=opensandbox-execd /execd /opt/fast-sandbox/components/opensandbox-execd
 
 # Default envs; can be overridden by Pod spec
 ENV FASTLET_CONTROL_PORT=":5758"
