@@ -33,7 +33,7 @@ func TestEndpointResolverPreservesRoutePathWhenAuthorityIsOverridden(t *testing.
 	control := &fakeEndpointControl{}
 	resolver := &EndpointResolver{Control: control, DefaultNamespace: "tenant-a", ProxyBaseURL: "http://127.0.0.1:18080/proxy"}
 
-	route, err := resolver.Resolve(context.Background(), SandboxRef{Name: "sandbox-a"}, ExecdPort)
+	route, err := resolver.Resolve(context.Background(), SandboxRef{Name: "sandbox-a"}, OpenSandboxExecdPort)
 	require.NoError(t, err)
 	require.Equal(t, "tenant-a", control.getRequest.Namespace)
 	require.Equal(t, "uid-a", control.resolveRequest.SandboxUid)
@@ -48,7 +48,7 @@ func TestEndpointResolverPreservesRoutePathWhenAuthorityIsOverridden(t *testing.
 func TestEndpointResolverRejectsMismatchedRouteIdentity(t *testing.T) {
 	control := &fakeEndpointControl{}
 	resolver := &EndpointResolver{Control: mismatchedEndpointControl{control}}
-	_, err := resolver.Resolve(context.Background(), SandboxRef{Name: "sandbox-a"}, ExecdPort)
+	_, err := resolver.Resolve(context.Background(), SandboxRef{Name: "sandbox-a"}, OpenSandboxExecdPort)
 	require.ErrorContains(t, err, "different Sandbox")
 }
 

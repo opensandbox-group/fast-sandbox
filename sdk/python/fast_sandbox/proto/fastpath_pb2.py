@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0e\x66\x61stpath.proto\x12\x0b\x66\x61stpath.v1\" \n\x0bListRequest\x12\x11\n\tnamespace\x18\x01 \x01(\t\"7\n\x0cListResponse\x12\'\n\x05items\x18\x01 \x03(\x0b\x32\x18.fastpath.v1.SandboxInfo\"5\n\nGetRequest\x12\x14\n\x0csandbox_name\x18\x01 \x01(\t\x12\x11\n\tnamespace\x18\x02 \x01(\t\"\xcf\x01\n\x0bSandboxInfo\x12\x13\n\x0bsandbox_uid\x18\x01 \x01(\t\x12\x14\n\x0csandbox_name\x18\x02 \x01(\t\x12\x15\n\rruntime_state\x18\x03 \x01(\t\x12\x18\n\x10\x64\x61ta_plane_state\x18\x04 \x01(\t\x12\x1a\n\x12user_process_state\x18\x05 \x01(\t\x12\x13\n\x0b\x66\x61stlet_pod\x18\x06 \x01(\t\x12\x12\n\ncreated_at\x18\x07 \x01(\x03\x12\r\n\x05image\x18\x08 \x01(\t\x12\x10\n\x08pool_ref\x18\t \x01(\t\"\xfa\x01\n\rCreateRequest\x12\r\n\x05image\x18\x01 \x01(\t\x12\x10\n\x08pool_ref\x18\x02 \x01(\t\x12\x0f\n\x07\x63ommand\x18\x03 \x03(\t\x12\x0c\n\x04\x61rgs\x18\x04 \x03(\t\x12\x11\n\tnamespace\x18\x05 \x01(\t\x12\x0c\n\x04name\x18\x06 \x01(\t\x12\x32\n\x04\x65nvs\x18\x07 \x03(\x0b\x32$.fastpath.v1.CreateRequest.EnvsEntry\x12\x13\n\x0bworking_dir\x18\x08 \x01(\t\x12\x12\n\nrequest_id\x18\t \x01(\t\x1a+\n\tEnvsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"P\n\x0e\x43reateResponse\x12\x13\n\x0bsandbox_uid\x18\x01 \x01(\t\x12\x14\n\x0csandbox_name\x18\x02 \x01(\t\x12\x13\n\x0b\x66\x61stlet_pod\x18\x03 \x01(\t\"T\n\x16ResolveEndpointRequest\x12\x13\n\x0bsandbox_uid\x18\x01 \x01(\t\x12\x13\n\x0btarget_port\x18\x02 \x01(\r\x12\x10\n\x08protocol\x18\x03 \x01(\t\"\xa3\x02\n\x17ResolveEndpointResponse\x12\x13\n\x0bsandbox_uid\x18\x01 \x01(\t\x12\x13\n\x0btarget_port\x18\x02 \x01(\r\x12\x16\n\x0eproxy_endpoint\x18\x03 \x01(\t\x12S\n\x10required_headers\x18\x04 \x03(\x0b\x32\x39.fastpath.v1.ResolveEndpointResponse.RequiredHeadersEntry\x12\x18\n\x10route_generation\x18\x05 \x01(\x03\x12\x1f\n\x17\x65xpires_at_unix_seconds\x18\x06 \x01(\x03\x1a\x36\n\x14RequiredHeadersEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"G\n\x1bIssueRouteCredentialRequest\x12\x13\n\x0bsandbox_uid\x18\x01 \x01(\t\x12\x13\n\x0btarget_port\x18\x02 \x01(\r\"m\n\x1cIssueRouteCredentialResponse\x12\x12\n\ncredential\x18\x01 \x01(\t\x12\x1f\n\x17\x65xpires_at_unix_seconds\x18\x02 \x01(\x03\x12\x18\n\x10route_generation\x18\x03 \x01(\x03\"8\n\rDeleteRequest\x12\x14\n\x0csandbox_name\x18\x01 \x01(\t\x12\x11\n\tnamespace\x18\x02 \x01(\t\"!\n\x0e\x44\x65leteResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"\xbc\x02\n\rUpdateRequest\x12\x14\n\x0csandbox_name\x18\x01 \x01(\t\x12\x11\n\tnamespace\x18\x02 \x01(\t\x12\x1d\n\x13\x65xpire_time_seconds\x18\x03 \x01(\x03H\x00\x12\x18\n\x0ereset_revision\x18\x04 \x01(\tH\x00\x12\x34\n\x0e\x66\x61ilure_policy\x18\x05 \x01(\x0e\x32\x1a.fastpath.v1.FailurePolicyH\x00\x12\"\n\x18recovery_timeout_seconds\x18\x06 \x01(\x05H\x00\x12\x36\n\x06labels\x18\x07 \x03(\x0b\x32&.fastpath.v1.UpdateRequest.LabelsEntry\x1a-\n\x0bLabelsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x42\x08\n\x06update\"]\n\x0eUpdateResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\x12)\n\x07sandbox\x18\x03 \x01(\x0b\x32\x18.fastpath.v1.SandboxInfo*.\n\rFailurePolicy\x12\n\n\x06MANUAL\x10\x00\x12\x11\n\rAUTO_RECREATE\x10\x01\x32\xc1\x04\n\x0f\x46\x61stPathService\x12H\n\rCreateSandbox\x12\x1a.fastpath.v1.CreateRequest\x1a\x1b.fastpath.v1.CreateResponse\x12H\n\rDeleteSandbox\x12\x1a.fastpath.v1.DeleteRequest\x1a\x1b.fastpath.v1.DeleteResponse\x12H\n\rUpdateSandbox\x12\x1a.fastpath.v1.UpdateRequest\x1a\x1b.fastpath.v1.UpdateResponse\x12\x44\n\rListSandboxes\x12\x18.fastpath.v1.ListRequest\x1a\x19.fastpath.v1.ListResponse\x12?\n\nGetSandbox\x12\x17.fastpath.v1.GetRequest\x1a\x18.fastpath.v1.SandboxInfo\x12\\\n\x0fResolveEndpoint\x12#.fastpath.v1.ResolveEndpointRequest\x1a$.fastpath.v1.ResolveEndpointResponse\x12k\n\x14IssueRouteCredential\x12(.fastpath.v1.IssueRouteCredentialRequest\x1a).fastpath.v1.IssueRouteCredentialResponseB&Z$fast-sandbox/api/proto/v1;fastpathv1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0e\x66\x61stpath.proto\x12\x0b\x66\x61stpath.v1\" \n\x0bListRequest\x12\x11\n\tnamespace\x18\x01 \x01(\t\"7\n\x0cListResponse\x12\'\n\x05items\x18\x01 \x03(\x0b\x32\x18.fastpath.v1.SandboxInfo\"5\n\nGetRequest\x12\x14\n\x0csandbox_name\x18\x01 \x01(\t\x12\x11\n\tnamespace\x18\x02 \x01(\t\"\xcf\x01\n\x0bSandboxInfo\x12\x13\n\x0bsandbox_uid\x18\x01 \x01(\t\x12\x14\n\x0csandbox_name\x18\x02 \x01(\t\x12\x15\n\rruntime_state\x18\x03 \x01(\t\x12\x18\n\x10\x64\x61ta_plane_state\x18\x04 \x01(\t\x12\x1a\n\x12user_process_state\x18\x05 \x01(\t\x12\x13\n\x0b\x66\x61stlet_pod\x18\x06 \x01(\t\x12\x12\n\ncreated_at\x18\x07 \x01(\x03\x12\r\n\x05image\x18\x08 \x01(\t\x12\x10\n\x08pool_ref\x18\t \x01(\t\"\xfa\x01\n\rCreateRequest\x12\r\n\x05image\x18\x01 \x01(\t\x12\x10\n\x08pool_ref\x18\x02 \x01(\t\x12\x0f\n\x07\x63ommand\x18\x03 \x03(\t\x12\x0c\n\x04\x61rgs\x18\x04 \x03(\t\x12\x11\n\tnamespace\x18\x05 \x01(\t\x12\x0c\n\x04name\x18\x06 \x01(\t\x12\x32\n\x04\x65nvs\x18\x07 \x03(\x0b\x32$.fastpath.v1.CreateRequest.EnvsEntry\x12\x13\n\x0bworking_dir\x18\x08 \x01(\t\x12\x12\n\nrequest_id\x18\t \x01(\t\x1a+\n\tEnvsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"P\n\x0e\x43reateResponse\x12\x13\n\x0bsandbox_uid\x18\x01 \x01(\t\x12\x14\n\x0csandbox_name\x18\x02 \x01(\t\x12\x13\n\x0b\x66\x61stlet_pod\x18\x03 \x01(\t\"S\n\x19SandboxDiagnosticsRequest\x12\x14\n\x0csandbox_name\x18\x01 \x01(\t\x12\x11\n\tnamespace\x18\x02 \x01(\t\x12\r\n\x05limit\x18\x03 \x01(\x05\"t\n\x16SandboxDiagnosticEvent\x12\x1b\n\x13timestamp_unix_nano\x18\x01 \x01(\x03\x12\r\n\x05level\x18\x02 \x01(\t\x12\x0e\n\x06source\x18\x03 \x01(\t\x12\r\n\x05phase\x18\x04 \x01(\t\x12\x0f\n\x07message\x18\x05 \x01(\t\"\x81\x02\n\x1aSandboxDiagnosticsResponse\x12)\n\x07sandbox\x18\x01 \x01(\x0b\x32\x18.fastpath.v1.SandboxInfo\x12\x18\n\x10\x61ssignment_state\x18\x02 \x01(\t\x12\x1b\n\x13runtime_instance_id\x18\x03 \x01(\t\x12\x1a\n\x12\x61ssignment_attempt\x18\x04 \x01(\x03\x12\x19\n\x11\x66\x61stlet_reachable\x18\x05 \x01(\x08\x12\x15\n\rfastlet_error\x18\x06 \x01(\t\x12\x33\n\x06\x65vents\x18\x07 \x03(\x0b\x32#.fastpath.v1.SandboxDiagnosticEvent\"T\n\x16ResolveEndpointRequest\x12\x13\n\x0bsandbox_uid\x18\x01 \x01(\t\x12\x13\n\x0btarget_port\x18\x02 \x01(\r\x12\x10\n\x08protocol\x18\x03 \x01(\t\"\xa3\x02\n\x17ResolveEndpointResponse\x12\x13\n\x0bsandbox_uid\x18\x01 \x01(\t\x12\x13\n\x0btarget_port\x18\x02 \x01(\r\x12\x16\n\x0eproxy_endpoint\x18\x03 \x01(\t\x12S\n\x10required_headers\x18\x04 \x03(\x0b\x32\x39.fastpath.v1.ResolveEndpointResponse.RequiredHeadersEntry\x12\x18\n\x10route_generation\x18\x05 \x01(\x03\x12\x1f\n\x17\x65xpires_at_unix_seconds\x18\x06 \x01(\x03\x1a\x36\n\x14RequiredHeadersEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"G\n\x1bIssueRouteCredentialRequest\x12\x13\n\x0bsandbox_uid\x18\x01 \x01(\t\x12\x13\n\x0btarget_port\x18\x02 \x01(\r\"m\n\x1cIssueRouteCredentialResponse\x12\x12\n\ncredential\x18\x01 \x01(\t\x12\x1f\n\x17\x65xpires_at_unix_seconds\x18\x02 \x01(\x03\x12\x18\n\x10route_generation\x18\x03 \x01(\x03\"8\n\rDeleteRequest\x12\x14\n\x0csandbox_name\x18\x01 \x01(\t\x12\x11\n\tnamespace\x18\x02 \x01(\t\"!\n\x0e\x44\x65leteResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"\xbc\x02\n\rUpdateRequest\x12\x14\n\x0csandbox_name\x18\x01 \x01(\t\x12\x11\n\tnamespace\x18\x02 \x01(\t\x12\x1d\n\x13\x65xpire_time_seconds\x18\x03 \x01(\x03H\x00\x12\x18\n\x0ereset_revision\x18\x04 \x01(\tH\x00\x12\x34\n\x0e\x66\x61ilure_policy\x18\x05 \x01(\x0e\x32\x1a.fastpath.v1.FailurePolicyH\x00\x12\"\n\x18recovery_timeout_seconds\x18\x06 \x01(\x05H\x00\x12\x36\n\x06labels\x18\x07 \x03(\x0b\x32&.fastpath.v1.UpdateRequest.LabelsEntry\x1a-\n\x0bLabelsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x42\x08\n\x06update\"]\n\x0eUpdateResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\x12)\n\x07sandbox\x18\x03 \x01(\x0b\x32\x18.fastpath.v1.SandboxInfo*.\n\rFailurePolicy\x12\n\n\x06MANUAL\x10\x00\x12\x11\n\rAUTO_RECREATE\x10\x01\x32\xab\x05\n\x0f\x46\x61stPathService\x12H\n\rCreateSandbox\x12\x1a.fastpath.v1.CreateRequest\x1a\x1b.fastpath.v1.CreateResponse\x12H\n\rDeleteSandbox\x12\x1a.fastpath.v1.DeleteRequest\x1a\x1b.fastpath.v1.DeleteResponse\x12H\n\rUpdateSandbox\x12\x1a.fastpath.v1.UpdateRequest\x1a\x1b.fastpath.v1.UpdateResponse\x12\x44\n\rListSandboxes\x12\x18.fastpath.v1.ListRequest\x1a\x19.fastpath.v1.ListResponse\x12?\n\nGetSandbox\x12\x17.fastpath.v1.GetRequest\x1a\x18.fastpath.v1.SandboxInfo\x12h\n\x15GetSandboxDiagnostics\x12&.fastpath.v1.SandboxDiagnosticsRequest\x1a\'.fastpath.v1.SandboxDiagnosticsResponse\x12\\\n\x0fResolveEndpoint\x12#.fastpath.v1.ResolveEndpointRequest\x1a$.fastpath.v1.ResolveEndpointResponse\x12k\n\x14IssueRouteCredential\x12(.fastpath.v1.IssueRouteCredentialRequest\x1a).fastpath.v1.IssueRouteCredentialResponseB&Z$fast-sandbox/api/proto/v1;fastpathv1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -38,8 +38,8 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_RESOLVEENDPOINTRESPONSE_REQUIREDHEADERSENTRY']._serialized_options = b'8\001'
   _globals['_UPDATEREQUEST_LABELSENTRY']._loaded_options = None
   _globals['_UPDATEREQUEST_LABELSENTRY']._serialized_options = b'8\001'
-  _globals['_FAILUREPOLICY']._serialized_start=1793
-  _globals['_FAILUREPOLICY']._serialized_end=1839
+  _globals['_FAILUREPOLICY']._serialized_start=2256
+  _globals['_FAILUREPOLICY']._serialized_end=2302
   _globals['_LISTREQUEST']._serialized_start=31
   _globals['_LISTREQUEST']._serialized_end=63
   _globals['_LISTRESPONSE']._serialized_start=65
@@ -54,26 +54,32 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_CREATEREQUEST_ENVSENTRY']._serialized_end=638
   _globals['_CREATERESPONSE']._serialized_start=640
   _globals['_CREATERESPONSE']._serialized_end=720
-  _globals['_RESOLVEENDPOINTREQUEST']._serialized_start=722
-  _globals['_RESOLVEENDPOINTREQUEST']._serialized_end=806
-  _globals['_RESOLVEENDPOINTRESPONSE']._serialized_start=809
-  _globals['_RESOLVEENDPOINTRESPONSE']._serialized_end=1100
-  _globals['_RESOLVEENDPOINTRESPONSE_REQUIREDHEADERSENTRY']._serialized_start=1046
-  _globals['_RESOLVEENDPOINTRESPONSE_REQUIREDHEADERSENTRY']._serialized_end=1100
-  _globals['_ISSUEROUTECREDENTIALREQUEST']._serialized_start=1102
-  _globals['_ISSUEROUTECREDENTIALREQUEST']._serialized_end=1173
-  _globals['_ISSUEROUTECREDENTIALRESPONSE']._serialized_start=1175
-  _globals['_ISSUEROUTECREDENTIALRESPONSE']._serialized_end=1284
-  _globals['_DELETEREQUEST']._serialized_start=1286
-  _globals['_DELETEREQUEST']._serialized_end=1342
-  _globals['_DELETERESPONSE']._serialized_start=1344
-  _globals['_DELETERESPONSE']._serialized_end=1377
-  _globals['_UPDATEREQUEST']._serialized_start=1380
-  _globals['_UPDATEREQUEST']._serialized_end=1696
-  _globals['_UPDATEREQUEST_LABELSENTRY']._serialized_start=1641
-  _globals['_UPDATEREQUEST_LABELSENTRY']._serialized_end=1686
-  _globals['_UPDATERESPONSE']._serialized_start=1698
-  _globals['_UPDATERESPONSE']._serialized_end=1791
-  _globals['_FASTPATHSERVICE']._serialized_start=1842
-  _globals['_FASTPATHSERVICE']._serialized_end=2419
+  _globals['_SANDBOXDIAGNOSTICSREQUEST']._serialized_start=722
+  _globals['_SANDBOXDIAGNOSTICSREQUEST']._serialized_end=805
+  _globals['_SANDBOXDIAGNOSTICEVENT']._serialized_start=807
+  _globals['_SANDBOXDIAGNOSTICEVENT']._serialized_end=923
+  _globals['_SANDBOXDIAGNOSTICSRESPONSE']._serialized_start=926
+  _globals['_SANDBOXDIAGNOSTICSRESPONSE']._serialized_end=1183
+  _globals['_RESOLVEENDPOINTREQUEST']._serialized_start=1185
+  _globals['_RESOLVEENDPOINTREQUEST']._serialized_end=1269
+  _globals['_RESOLVEENDPOINTRESPONSE']._serialized_start=1272
+  _globals['_RESOLVEENDPOINTRESPONSE']._serialized_end=1563
+  _globals['_RESOLVEENDPOINTRESPONSE_REQUIREDHEADERSENTRY']._serialized_start=1509
+  _globals['_RESOLVEENDPOINTRESPONSE_REQUIREDHEADERSENTRY']._serialized_end=1563
+  _globals['_ISSUEROUTECREDENTIALREQUEST']._serialized_start=1565
+  _globals['_ISSUEROUTECREDENTIALREQUEST']._serialized_end=1636
+  _globals['_ISSUEROUTECREDENTIALRESPONSE']._serialized_start=1638
+  _globals['_ISSUEROUTECREDENTIALRESPONSE']._serialized_end=1747
+  _globals['_DELETEREQUEST']._serialized_start=1749
+  _globals['_DELETEREQUEST']._serialized_end=1805
+  _globals['_DELETERESPONSE']._serialized_start=1807
+  _globals['_DELETERESPONSE']._serialized_end=1840
+  _globals['_UPDATEREQUEST']._serialized_start=1843
+  _globals['_UPDATEREQUEST']._serialized_end=2159
+  _globals['_UPDATEREQUEST_LABELSENTRY']._serialized_start=2104
+  _globals['_UPDATEREQUEST_LABELSENTRY']._serialized_end=2149
+  _globals['_UPDATERESPONSE']._serialized_start=2161
+  _globals['_UPDATERESPONSE']._serialized_end=2254
+  _globals['_FASTPATHSERVICE']._serialized_start=2305
+  _globals['_FASTPATHSERVICE']._serialized_end=2988
 # @@protoc_insertion_point(module_scope)

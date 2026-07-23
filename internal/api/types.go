@@ -19,6 +19,7 @@ type SandboxSpec struct {
 	ClaimNamespace      string            `json:"claimNamespace,omitempty"`
 	ClaimName           string            `json:"claimName"`
 	InstanceGeneration  int64             `json:"instanceGeneration,omitempty"`
+	RuntimeInstanceID   string            `json:"runtimeInstanceId,omitempty"`
 	AssignmentAttempt   int64             `json:"assignmentAttempt,omitempty"`
 	RouteGeneration     int64             `json:"routeGeneration,omitempty"`
 	FastletPodUID       string            `json:"fastletPodUid,omitempty"`
@@ -48,6 +49,7 @@ type SandboxStatus struct {
 	SandboxID          string                     `json:"sandboxId"`
 	ClaimUID           string                     `json:"claimUid"`
 	InstanceGeneration int64                      `json:"instanceGeneration,omitempty"`
+	RuntimeInstanceID  string                     `json:"runtimeInstanceId,omitempty"`
 	AssignmentAttempt  int64                      `json:"assignmentAttempt,omitempty"`
 	RouteGeneration    int64                      `json:"routeGeneration,omitempty"`
 	Phase              string                     `json:"phase"`
@@ -97,12 +99,26 @@ const (
 	ErrorInfraUnavailable   FastletErrorCode = "InfraUnavailable"
 	ErrorUnknownOutcome     FastletErrorCode = "UnknownOutcome"
 	ErrorNotFound           FastletErrorCode = "NotFound"
+	ErrorGenerationFenced   FastletErrorCode = "GenerationFenced"
+	ErrorProfileMismatch    FastletErrorCode = "ProfileMismatch"
+)
+
+type FastletOutcome string
+
+const (
+	OutcomeRejectedBeforeSideEffects FastletOutcome = "RejectedBeforeSideEffects"
+	OutcomeInProgress                FastletOutcome = "InProgress"
+	OutcomeCreated                   FastletOutcome = "Created"
+	OutcomeFailedNeedsCleanup        FastletOutcome = "FailedNeedsCleanup"
+	OutcomeUnknown                   FastletOutcome = "Unknown"
+	OutcomeGenerationFenced          FastletOutcome = "GenerationFenced"
 )
 
 type FastletError struct {
 	Code      FastletErrorCode `json:"code"`
 	Message   string           `json:"message"`
 	Retryable bool             `json:"retryable"`
+	Outcome   FastletOutcome   `json:"outcome"`
 	Cause     error            `json:"-"`
 }
 
@@ -124,57 +140,26 @@ type SandboxIdentity struct {
 	RequestID          string `json:"requestId,omitempty"`
 	SandboxUID         string `json:"sandboxUid"`
 	InstanceGeneration int64  `json:"instanceGeneration"`
+	RuntimeInstanceID  string `json:"runtimeInstanceId"`
 	AssignmentAttempt  int64  `json:"assignmentAttempt"`
 	RouteGeneration    int64  `json:"routeGeneration,omitempty"`
 	FastletPodUID      string `json:"fastletPodUid"`
 }
 
 type AdmissionStatus struct {
-	Capacity     int `json:"capacity"`
-	Reservations int `json:"reservations"`
-	Creating     int `json:"creating"`
-	Running      int `json:"running"`
-	Deleting     int `json:"deleting"`
-	Used         int `json:"used"`
+	Capacity int `json:"capacity"`
+	Creating int `json:"creating"`
+	Running  int `json:"running"`
+	Deleting int `json:"deleting"`
+	Used     int `json:"used"`
 }
 
-type ReserveSandboxRequest struct {
-	RequestID           string `json:"requestId"`
-	CreateSpecHash      string `json:"createSpecHash"`
-	ClaimNamespace      string `json:"claimNamespace"`
-	ClaimName           string `json:"claimName"`
-	FastletPodUID       string `json:"fastletPodUid"`
-	RuntimeProfileHash  string `json:"runtimeProfileHash"`
-	ResourceProfileHash string `json:"resourceProfileHash"`
-	InfraProfileHash    string `json:"infraProfileHash"`
+type CreateSandboxRequest struct {
+	Identity SandboxIdentity `json:"identity"`
+	Sandbox  SandboxSpec     `json:"sandbox"`
 }
 
-type ReserveSandboxResponse struct {
-	ReservationToken string          `json:"reservationToken"`
-	FastletPodUID    string          `json:"fastletPodUid"`
-	ExpiresAt        time.Time       `json:"expiresAt"`
-	Admission        AdmissionStatus `json:"admission"`
-	Error            *FastletError   `json:"error,omitempty"`
-}
-
-type CancelReservationRequest struct {
-	RequestID        string `json:"requestId"`
-	ReservationToken string `json:"reservationToken"`
-}
-
-type CancelReservationResponse struct {
-	Canceled bool          `json:"canceled"`
-	Error    *FastletError `json:"error,omitempty"`
-}
-
-type EnsureSandboxRequest struct {
-	Identity         SandboxIdentity `json:"identity"`
-	ReservationToken string          `json:"reservationToken,omitempty"`
-	CreateSpecHash   string          `json:"createSpecHash,omitempty"`
-	Sandbox          SandboxSpec     `json:"sandbox"`
-}
-
-type EnsureSandboxResponse struct {
+type CreateSandboxResponse struct {
 	Accepted   bool            `json:"accepted"`
 	Created    bool            `json:"created"`
 	InProgress bool            `json:"inProgress"`
@@ -219,6 +204,27 @@ type RuntimeDiagnostics struct {
 	State              string `json:"state"`
 	Reason             string `json:"reason,omitempty"`
 	Message            string `json:"message,omitempty"`
+}
+
+// SandboxDiagnosticEvent is a bounded Fastlet-side lifecycle record. It is
+// platform diagnostics, not stdout/stderr from a process inside the Sandbox.
+type SandboxDiagnosticEvent struct {
+	Timestamp time.Time `json:"timestamp"`
+	Level     string    `json:"level"`
+	Source    string    `json:"source"`
+	Phase     string    `json:"phase,omitempty"`
+	Message   string    `json:"message"`
+}
+
+type SandboxDiagnosticsRequest struct {
+	Identity SandboxIdentity `json:"identity"`
+	Limit    int             `json:"limit,omitempty"`
+}
+
+type SandboxDiagnosticsResponse struct {
+	Sandbox *SandboxStatus           `json:"sandbox,omitempty"`
+	Events  []SandboxDiagnosticEvent `json:"events,omitempty"`
+	Error   *FastletError            `json:"error,omitempty"`
 }
 
 type CacheCursor struct {

@@ -29,7 +29,7 @@ func TestBuiltinCompileAndFailClosedProfiles(t *testing.T) {
 	require.ErrorIs(t, err, ErrProfileUnconfigured)
 
 	_, err = catalog.Compile("e2b-envd", container)
-	require.ErrorIs(t, err, ErrRuntimeUnsupported)
+	require.ErrorIs(t, err, ErrProfileNotFound)
 }
 
 func TestProfileValidationRejectsServiceConflictsAndCycles(t *testing.T) {

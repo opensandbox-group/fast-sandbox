@@ -24,24 +24,26 @@ func testFastletClient(t *testing.T, handler http.Handler) (*FastletClient, stri
 
 func TestFastletClientAdmissionEndpoints(t *testing.T) {
 	paths := make(chan string, 8)
+	identity := SandboxIdentity{RequestID: "request-a", SandboxUID: "sandbox-a", RuntimeInstanceID: "runtime-a", FastletPodUID: "pod-a", InstanceGeneration: 1, AssignmentAttempt: 1}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths <- r.URL.Path
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/api/v2/fastlet/reservations":
-			var request ReserveSandboxRequest
+		case "/api/v2/fastlet/create":
+			var request CreateSandboxRequest
 			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
-			require.Equal(t, "request-a", request.RequestID)
+			require.Equal(t, "request-a", request.Identity.RequestID)
 			require.NotEmpty(t, r.Header.Get("traceparent"))
-			require.NoError(t, json.NewEncoder(w).Encode(ReserveSandboxResponse{ReservationToken: "token-a"}))
-		case "/api/v2/fastlet/reservations/cancel":
-			require.NoError(t, json.NewEncoder(w).Encode(CancelReservationResponse{Canceled: true}))
-		case "/api/v2/fastlet/ensure":
-			require.NoError(t, json.NewEncoder(w).Encode(EnsureSandboxResponse{Accepted: true}))
+			require.NoError(t, json.NewEncoder(w).Encode(CreateSandboxResponse{Accepted: true}))
 		case "/api/v2/fastlet/inspect":
 			require.NoError(t, json.NewEncoder(w).Encode(InspectSandboxResponse{Sandbox: &SandboxStatus{Phase: "running"}}))
 		case "/api/v2/fastlet/delete":
 			require.NoError(t, json.NewEncoder(w).Encode(DeleteSandboxV2Response{Accepted: true}))
+		case "/api/v2/fastlet/diagnostics/sandbox":
+			var request SandboxDiagnosticsRequest
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+			require.Equal(t, identity.RuntimeInstanceID, request.Identity.RuntimeInstanceID)
+			require.NoError(t, json.NewEncoder(w).Encode(SandboxDiagnosticsResponse{Events: []SandboxDiagnosticEvent{{Source: "runtime", Message: "ready"}}}))
 		case "/api/v2/fastlet/draining":
 			require.NoError(t, json.NewEncoder(w).Encode(SetDrainingResponse{Draining: true}))
 		default:
@@ -52,27 +54,23 @@ func TestFastletClientAdmissionEndpoints(t *testing.T) {
 	traceHeaders := make(http.Header)
 	traceHeaders.Set("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
 	ctx := observability.ExtractHTTP(context.Background(), traceHeaders)
-	identity := SandboxIdentity{RequestID: "request-a", SandboxUID: "sandbox-a", FastletPodUID: "pod-a", InstanceGeneration: 1, AssignmentAttempt: 1}
-
-	reserved, err := client.ReserveSandbox(ctx, endpoint, &ReserveSandboxRequest{RequestID: "request-a"})
-	require.NoError(t, err)
-	require.Equal(t, "token-a", reserved.ReservationToken)
-	_, err = client.CancelReservation(ctx, endpoint, &CancelReservationRequest{RequestID: "request-a"})
-	require.NoError(t, err)
-	_, err = client.EnsureSandbox(ctx, endpoint, &EnsureSandboxRequest{Identity: identity})
+	_, err := client.CreateSandbox(ctx, endpoint, &CreateSandboxRequest{Identity: identity})
 	require.NoError(t, err)
 	inspected, err := client.InspectSandbox(ctx, endpoint, &InspectSandboxRequest{Identity: identity})
 	require.NoError(t, err)
 	require.Equal(t, "running", inspected.Sandbox.Phase)
 	_, err = client.DeleteSandboxV2(ctx, endpoint, &DeleteSandboxV2Request{Identity: identity})
 	require.NoError(t, err)
+	diagnostics, err := client.SandboxDiagnostics(ctx, endpoint, &SandboxDiagnosticsRequest{Identity: identity, Limit: 10})
+	require.NoError(t, err)
+	require.Equal(t, "ready", diagnostics.Events[0].Message)
 	draining, err := client.SetDraining(ctx, endpoint, &SetDrainingRequest{Draining: true})
 	require.NoError(t, err)
 	require.True(t, draining.Draining)
 
 	for _, want := range []string{
-		"/api/v2/fastlet/reservations", "/api/v2/fastlet/reservations/cancel", "/api/v2/fastlet/ensure",
-		"/api/v2/fastlet/inspect", "/api/v2/fastlet/delete", "/api/v2/fastlet/draining",
+		"/api/v2/fastlet/create",
+		"/api/v2/fastlet/inspect", "/api/v2/fastlet/delete", "/api/v2/fastlet/diagnostics/sandbox", "/api/v2/fastlet/draining",
 	} {
 		require.Equal(t, want, <-paths)
 	}
@@ -106,14 +104,14 @@ func TestFastletClientPreservesStructuredErrorsAndTimeout(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusTooManyRequests)
-		require.NoError(t, json.NewEncoder(w).Encode(EnsureSandboxResponse{Error: &FastletError{
+		require.NoError(t, json.NewEncoder(w).Encode(CreateSandboxResponse{Error: &FastletError{
 			Code: ErrorCapacityRejected, Message: "full", Retryable: true,
 		}}))
 	})
 	client, endpoint := testFastletClient(t, handler)
 	client.SetTimeout(2 * time.Second)
 	require.Equal(t, 2*time.Second, client.timeout)
-	response, err := client.EnsureSandbox(context.Background(), endpoint, &EnsureSandboxRequest{})
+	response, err := client.CreateSandbox(context.Background(), endpoint, &CreateSandboxRequest{})
 	require.Error(t, err)
 	require.NotNil(t, response)
 	var failure *FastletError

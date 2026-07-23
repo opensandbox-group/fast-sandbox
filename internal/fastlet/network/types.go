@@ -38,12 +38,14 @@ type Owner struct {
 	SandboxName        string `json:"sandboxName,omitempty"`
 	SandboxNamespace   string `json:"sandboxNamespace,omitempty"`
 	InstanceGeneration int64  `json:"instanceGeneration"`
+	RuntimeInstanceID  string `json:"runtimeInstanceId,omitempty"`
 	AssignmentAttempt  int64  `json:"assignmentAttempt"`
 }
 
 func (o Owner) Equal(other Owner) bool {
 	return o.SandboxUID == other.SandboxUID &&
 		o.InstanceGeneration == other.InstanceGeneration &&
+		o.RuntimeInstanceID == other.RuntimeInstanceID &&
 		o.AssignmentAttempt == other.AssignmentAttempt
 }
 

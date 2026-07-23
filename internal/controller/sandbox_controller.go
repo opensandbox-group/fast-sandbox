@@ -106,9 +106,15 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *s
 			_ = orchestrator.MarkPending(ctx, sandbox, "NoCandidate", "No Ready Fastlet currently accepts this Pool/profile")
 			return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 		}
+		if errors.Is(err, sandboxorchestrator.ErrAssignedFastletUnavailable) {
+			if statusErr := r.markAssignedFastletUnavailable(ctx, sandbox); statusErr != nil {
+				return ctrl.Result{}, statusErr
+			}
+			return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
+		}
 		return ctrl.Result{}, err
 	}
-	if err := orchestrator.EnsureRuntime(ctx, assigned, nil); err != nil {
+	if err := orchestrator.ReconcileRuntime(ctx, assigned); err != nil {
 		if errors.Is(err, sandboxorchestrator.ErrRuntimeInProgress) || errors.Is(err, sandboxorchestrator.ErrUnknownFastletOutcome) {
 			return ctrl.Result{RequeueAfter: DeletionPollInterval}, nil
 		}
@@ -119,8 +125,19 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *s
 			return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 		}
 		if explicitReschedule(err) {
-			if _, clearErr := orchestrator.ClearAssignment(ctx, assigned, false); clearErr != nil {
-				return ctrl.Result{}, clearErr
+			// A CRD-first assignment is a durable creation fact. Move directly
+			// from the rejected identity to another eligible candidate with one
+			// CAS; if none exists, preserve the current identity until capacity
+			// or a new Fastlet becomes visible.
+			_, moved, reassignErr := orchestrator.ReassignDeclarativeAfterRejection(ctx, assigned, string(assigned.UID))
+			if reassignErr != nil {
+				return ctrl.Result{}, reassignErr
+			}
+			if moved {
+				// Status still projects the previous annotation here. Requeue
+				// immediately so the normal annotation-to-status projection runs
+				// before the new identity is sent to Fastlet.
+				return ctrl.Result{Requeue: true}, nil
 			}
 			_ = orchestrator.MarkPending(ctx, assigned, "FastletRejected", err.Error())
 			return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
@@ -289,7 +306,7 @@ func resetPending(sandbox *apiv1alpha1.Sandbox) bool {
 
 func explicitReschedule(err error) bool {
 	var failure *api.FastletError
-	if !errors.As(err, &failure) {
+	if !errors.As(err, &failure) || failure.Outcome != api.OutcomeRejectedBeforeSideEffects {
 		return false
 	}
 	switch failure.Code {

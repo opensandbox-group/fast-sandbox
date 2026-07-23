@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -39,25 +40,18 @@ func (r *fakeRegistry) RecordFeedback(id fastletpool.FastletID, _ fastletpool.Lo
 }
 
 type fakeFastletClient struct {
-	reserve func(string, *api.ReserveSandboxRequest) (*api.ReserveSandboxResponse, error)
-	ensure  func(string, *api.EnsureSandboxRequest) (*api.EnsureSandboxResponse, error)
-	inspect func(string, *api.InspectSandboxRequest) (*api.InspectSandboxResponse, error)
-	deleted bool
+	create       func(string, *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error)
+	inspect      func(string, *api.InspectSandboxRequest) (*api.InspectSandboxResponse, error)
+	inspectCalls int
+	deleted      bool
 }
 
-func (f *fakeFastletClient) ReserveSandbox(_ context.Context, ip string, request *api.ReserveSandboxRequest) (*api.ReserveSandboxResponse, error) {
-	return f.reserve(ip, request)
-}
-
-func (*fakeFastletClient) CancelReservation(context.Context, string, *api.CancelReservationRequest) (*api.CancelReservationResponse, error) {
-	return &api.CancelReservationResponse{Canceled: true}, nil
-}
-
-func (f *fakeFastletClient) EnsureSandbox(_ context.Context, ip string, request *api.EnsureSandboxRequest) (*api.EnsureSandboxResponse, error) {
-	return f.ensure(ip, request)
+func (f *fakeFastletClient) CreateSandbox(_ context.Context, ip string, request *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
+	return f.create(ip, request)
 }
 
 func (f *fakeFastletClient) InspectSandbox(_ context.Context, ip string, request *api.InspectSandboxRequest) (*api.InspectSandboxResponse, error) {
+	f.inspectCalls++
 	return f.inspect(ip, request)
 }
 
@@ -66,83 +60,168 @@ func (f *fakeFastletClient) DeleteSandboxV2(context.Context, string, *api.Delete
 	return &api.DeleteSandboxV2Response{Accepted: true}, nil
 }
 
-func TestReserveForCreateTriesTopKWithoutWritingSandbox(t *testing.T) {
-	orchestrator, registry, fastletClient, sandbox := newHarness(t)
-	registry.candidates = []fastletpool.FastletInfo{
-		{ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", PodIP: "10.0.0.1"},
-		{ID: "fastlet-b", PodName: "fastlet-b", PodUID: "pod-b", PodIP: "10.0.0.2"},
-	}
-	fastletClient.reserve = func(ip string, request *api.ReserveSandboxRequest) (*api.ReserveSandboxResponse, error) {
-		if ip == "10.0.0.1" {
-			failure := &api.FastletError{Code: api.ErrorCapacityRejected, Message: "full", Retryable: true}
-			return &api.ReserveSandboxResponse{Error: failure}, failure
-		}
-		return &api.ReserveSandboxResponse{ReservationToken: "token-b", FastletPodUID: request.FastletPodUID}, nil
-	}
+func TestFastPathCandidatesIsRegistryOnly(t *testing.T) {
+	orchestrator, registry, _, sandbox := newHarness(t)
+	candidate := fastletpool.FastletInfo{ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", PodIP: "10.0.0.1"}
+	registry.candidates = []fastletpool.FastletInfo{candidate}
 
-	reservation, err := orchestrator.ReserveForCreate(context.Background(), sandbox, "request-a", "spec-a")
+	candidates, err := orchestrator.FastPathCandidates(sandbox, "request-a")
 	require.NoError(t, err)
-	require.Equal(t, "token-b", reservation.Token)
-	require.Equal(t, fastletpool.FastletID("fastlet-b"), reservation.Fastlet.ID)
-	require.Equal(t, []fastletpool.FastletID{"fastlet-a"}, registry.feedback)
-
-	var list apiv1alpha1.SandboxList
-	require.NoError(t, orchestrator.Client.List(context.Background(), &list))
-	require.Empty(t, list.Items, "reservation gate must not create a CRD")
+	require.Equal(t, candidate.ID, candidates[0].ID)
 }
 
-func TestEnsureAssignmentAndRuntimeUseDurableUIDAndFences(t *testing.T) {
+func TestAssignDeclarativeProjectsAnnotationAndReconcilesRuntime(t *testing.T) {
 	orchestrator, registry, fastletClient, sandbox := newHarness(t)
 	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
 	require.NoError(t, err)
-	candidate := fastletpool.FastletInfo{
-		ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", PodIP: "10.0.0.1", NodeName: "node-a",
-		RuntimeProfileHash: parameters.RuntimeProfileHash, ResourceProfileHash: parameters.ResourceProfileHash,
-	}
+	candidate := candidateFor(parameters)
+	registry.candidates = []fastletpool.FastletInfo{candidate}
 	registry.fastlets[candidate.ID] = candidate
 
-	persisted := sandbox.DeepCopy()
-	persisted.UID = "sandbox-uid-a"
-	require.NoError(t, orchestrator.Client.Create(context.Background(), persisted))
-	persisted, won, err := orchestrator.EnsureAssignment(context.Background(), persisted, candidate)
+	sandbox.UID = types.UID("sandbox-uid-a")
+	require.NoError(t, orchestrator.Client.Create(context.Background(), sandbox))
+	assigned, won, err := orchestrator.AssignDeclarative(context.Background(), sandbox, "sandbox-uid-a")
 	require.NoError(t, err)
 	require.True(t, won)
-	require.Equal(t, int64(1), persisted.Status.Assignment.Attempt)
+	require.NotNil(t, assigned.Status.Assignment)
+	envelope, err := common.EffectiveAssignment(assigned)
+	require.NoError(t, err)
+	require.NotEmpty(t, envelope.RuntimeInstanceID)
 
-	fastletClient.ensure = func(ip string, request *api.EnsureSandboxRequest) (*api.EnsureSandboxResponse, error) {
+	fastletClient.create = func(ip string, request *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
 		require.Equal(t, candidate.PodIP, ip)
 		require.Equal(t, "sandbox-uid-a", request.Identity.SandboxUID)
-		require.Equal(t, int64(1), request.Identity.InstanceGeneration)
-		require.Equal(t, int64(1), request.Identity.AssignmentAttempt)
-		require.Equal(t, "pod-a", request.Identity.FastletPodUID)
-		require.Equal(t, "sandbox-uid-a", request.Sandbox.ClaimUID)
-		return &api.EnsureSandboxResponse{Accepted: true, Sandbox: &api.SandboxStatus{SandboxID: "sandbox-uid-a", Phase: "running"}}, nil
+		require.Equal(t, envelope.RuntimeInstanceID, request.Identity.RuntimeInstanceID)
+		require.Empty(t, request.Sandbox.CPU, "Fastlet injects its fixed resource profile")
+		return &api.CreateSandboxResponse{Accepted: true, Sandbox: &api.SandboxStatus{SandboxID: "sandbox-uid-a", Phase: "running"}}, nil
 	}
-	require.NoError(t, orchestrator.EnsureRuntime(context.Background(), persisted, nil))
+	require.NoError(t, orchestrator.ReconcileRuntime(context.Background(), assigned))
 
 	var ready apiv1alpha1.Sandbox
-	require.NoError(t, orchestrator.Client.Get(context.Background(), client.ObjectKeyFromObject(persisted), &ready))
+	require.NoError(t, orchestrator.Client.Get(context.Background(), client.ObjectKeyFromObject(assigned), &ready))
 	require.Equal(t, apiv1alpha1.ObservedStateReady, ready.Status.RuntimeState)
 	require.Equal(t, apiv1alpha1.ObservedStateReady, ready.Status.DataPlaneState)
 }
 
-func TestLostEnsureResponseInspectsSameAssignment(t *testing.T) {
+func TestLostCreateResponseDoesNotInspectOrChangeIdentity(t *testing.T) {
 	orchestrator, registry, fastletClient, sandbox := newHarness(t)
-	sandbox.UID = "sandbox-uid-a"
-	assignment := apiv1alpha1.SandboxAssignment{FastletName: "fastlet-a", FastletPodUID: "pod-a", Attempt: 2}
-	sandbox.Status = apiv1alpha1.SandboxStatus{Assignment: &assignment, AssignmentAttempt: 2, InstanceGeneration: 1}
+	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+	candidate := candidateFor(parameters)
+	registry.fastlets[candidate.ID] = candidate
+	sandbox.UID = types.UID("sandbox-uid-a")
+	envelope, err := AssignmentForCandidate(candidate, 2, 1, 3, "runtime-a")
+	require.NoError(t, err)
+	require.NoError(t, common.SetAssignmentAnnotation(sandbox, envelope))
+	assignment := envelope.StatusAssignment()
+	sandbox.Status = apiv1alpha1.SandboxStatus{
+		Assignment: &assignment, AssignmentAttempt: 2, InstanceGeneration: 1, RouteGeneration: 3,
+	}
 	require.NoError(t, orchestrator.Client.Create(context.Background(), sandbox))
-	registry.fastlets["fastlet-a"] = fastletpool.FastletInfo{ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", PodIP: "10.0.0.1"}
-	fastletClient.ensure = func(string, *api.EnsureSandboxRequest) (*api.EnsureSandboxResponse, error) {
+	fastletClient.create = func(string, *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
 		return nil, errors.New("response lost")
 	}
-	fastletClient.inspect = func(_ string, request *api.InspectSandboxRequest) (*api.InspectSandboxResponse, error) {
-		require.Equal(t, int64(2), request.Identity.AssignmentAttempt)
-		return &api.InspectSandboxResponse{Sandbox: &api.SandboxStatus{SandboxID: "sandbox-uid-a", Phase: "running"}}, nil
-	}
 
-	require.NoError(t, orchestrator.EnsureRuntime(context.Background(), sandbox, nil))
-	require.Empty(t, registry.feedback)
+	err = orchestrator.ReconcileRuntime(context.Background(), sandbox)
+	require.ErrorIs(t, err, ErrUnknownFastletOutcome)
+	require.Zero(t, fastletClient.inspectCalls)
+	current, parseErr := common.AssignmentFromAnnotation(sandbox)
+	require.NoError(t, parseErr)
+	require.Equal(t, envelope, *current)
+}
+
+func TestReassignDeclarativeAfterRejectionCASesDirectlyToAlternative(t *testing.T) {
+	orchestrator, registry, _, sandbox := newHarness(t)
+	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+	first := candidateFor(parameters)
+	second := first
+	second.ID, second.PodName, second.PodUID, second.PodIP, second.NodeName = "fastlet-b", "fastlet-b", "pod-b", "10.0.0.2", "node-b"
+	registry.candidates = []fastletpool.FastletInfo{first, second}
+	registry.fastlets[first.ID] = first
+	registry.fastlets[second.ID] = second
+
+	sandbox.UID = types.UID("sandbox-uid-a")
+	envelope, err := AssignmentForCandidate(first, 3, 2, 5, "runtime-a")
+	require.NoError(t, err)
+	require.NoError(t, common.SetAssignmentAnnotation(sandbox, envelope))
+	assignment := envelope.StatusAssignment()
+	sandbox.Status = apiv1alpha1.SandboxStatus{
+		Assignment: &assignment, AssignmentAttempt: 3, InstanceGeneration: 2, RouteGeneration: 5,
+	}
+	require.NoError(t, orchestrator.Client.Create(context.Background(), sandbox))
+
+	updated, moved, err := orchestrator.ReassignDeclarativeAfterRejection(context.Background(), sandbox, string(sandbox.UID))
+	require.NoError(t, err)
+	require.True(t, moved)
+	next, err := common.AssignmentFromAnnotation(updated)
+	require.NoError(t, err)
+	require.Equal(t, second.PodName, next.FastletName)
+	require.Equal(t, second.PodUID, next.FastletPodUID)
+	require.Equal(t, int64(4), next.Attempt)
+	require.Equal(t, int64(2), next.InstanceGeneration)
+	require.Equal(t, int64(6), next.RouteGeneration)
+	require.NotEqual(t, envelope.RuntimeInstanceID, next.RuntimeInstanceID)
+	// Status remains an asynchronous projection; the annotation CAS never
+	// passes through an unassigned value.
+	require.Equal(t, first.PodName, updated.Status.Assignment.FastletName)
+}
+
+func TestReassignDeclarativeAfterRejectionPreservesAssignmentWithoutAlternative(t *testing.T) {
+	orchestrator, registry, _, sandbox := newHarness(t)
+	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+	first := candidateFor(parameters)
+	registry.candidates = []fastletpool.FastletInfo{first}
+	registry.fastlets[first.ID] = first
+
+	sandbox.UID = types.UID("sandbox-uid-a")
+	envelope, err := AssignmentForCandidate(first, 1, 1, 1, "runtime-a")
+	require.NoError(t, err)
+	require.NoError(t, common.SetAssignmentAnnotation(sandbox, envelope))
+	require.NoError(t, orchestrator.Client.Create(context.Background(), sandbox))
+
+	updated, moved, err := orchestrator.ReassignDeclarativeAfterRejection(context.Background(), sandbox, string(sandbox.UID))
+	require.NoError(t, err)
+	require.False(t, moved)
+	current, err := common.AssignmentFromAnnotation(updated)
+	require.NoError(t, err)
+	require.Equal(t, envelope, *current)
+}
+
+func TestClearAssignmentRemovesAnnotationAndAdvancesFences(t *testing.T) {
+	orchestrator, registry, _, sandbox := newHarness(t)
+	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+	candidate := candidateFor(parameters)
+	registry.fastlets[candidate.ID] = candidate
+	sandbox.UID = types.UID("sandbox-uid-a")
+	envelope, err := AssignmentForCandidate(candidate, 4, 2, 5, "runtime-a")
+	require.NoError(t, err)
+	require.NoError(t, common.SetAssignmentAnnotation(sandbox, envelope))
+	assignment := envelope.StatusAssignment()
+	sandbox.Status = apiv1alpha1.SandboxStatus{
+		Assignment: &assignment, AssignmentAttempt: 4, InstanceGeneration: 2, RouteGeneration: 5,
+	}
+	require.NoError(t, orchestrator.Client.Create(context.Background(), sandbox))
+
+	cleared, err := orchestrator.ClearAssignment(context.Background(), sandbox, true)
+	require.NoError(t, err)
+	require.Nil(t, cleared.Status.Assignment)
+	require.Equal(t, int64(3), cleared.Status.InstanceGeneration)
+	require.Equal(t, int64(6), cleared.Status.RouteGeneration)
+	current, err := common.AssignmentFromAnnotation(cleared)
+	require.NoError(t, err)
+	require.Nil(t, current)
+}
+
+func candidateFor(parameters RuntimeParameters) fastletpool.FastletInfo {
+	return fastletpool.FastletInfo{
+		ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", PodIP: "10.0.0.1", NodeName: "node-a",
+		RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
+		ResourceProfileHash: parameters.ResourceProfileHash,
+		InfraProfile:        parameters.InfraProfile, InfraProfileHash: parameters.InfraProfileHash, InfraReady: true,
+	}
 }
 
 func newHarness(t *testing.T) (*Orchestrator, *fakeRegistry, *fakeFastletClient, *apiv1alpha1.Sandbox) {
@@ -163,11 +242,8 @@ func newHarness(t *testing.T) (*Orchestrator, *fakeRegistry, *fakeFastletClient,
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&apiv1alpha1.Sandbox{}).WithObjects(pool).Build()
 	registry := &fakeRegistry{fastlets: make(map[fastletpool.FastletID]fastletpool.FastletInfo)}
 	fastletClient := &fakeFastletClient{
-		reserve: func(string, *api.ReserveSandboxRequest) (*api.ReserveSandboxResponse, error) {
-			return nil, errors.New("unexpected reserve")
-		},
-		ensure: func(string, *api.EnsureSandboxRequest) (*api.EnsureSandboxResponse, error) {
-			return nil, errors.New("unexpected ensure")
+		create: func(string, *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
+			return nil, errors.New("unexpected create")
 		},
 		inspect: func(string, *api.InspectSandboxRequest) (*api.InspectSandboxResponse, error) {
 			return nil, errors.New("unexpected inspect")

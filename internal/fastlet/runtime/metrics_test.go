@@ -33,10 +33,9 @@ func TestAdmissionMetricsUseBoundedOutcomeLabels(t *testing.T) {
 
 func TestAdmissionStatusMetricsReflectLatestSnapshot(t *testing.T) {
 	recordAdmissionStatus(api.AdmissionStatus{
-		Capacity: 8, Reservations: 2, Used: 7, Creating: 1, Running: 3, Deleting: 1,
+		Capacity: 8, Used: 7, Creating: 1, Running: 3, Deleting: 1,
 	})
 
-	require.Equal(t, float64(2), gatheredMetricValue(t, "fast_sandbox_fastlet_reservation_inflight", nil))
 	require.Equal(t, float64(8), gatheredMetricValue(t, "fast_sandbox_fastlet_admission_slots", map[string]string{"state": "capacity"}))
 	require.Equal(t, float64(7), gatheredMetricValue(t, "fast_sandbox_fastlet_admission_slots", map[string]string{"state": "used"}))
 	require.Equal(t, float64(1), gatheredMetricValue(t, "fast_sandbox_fastlet_admission_slots", map[string]string{"state": "creating"}))

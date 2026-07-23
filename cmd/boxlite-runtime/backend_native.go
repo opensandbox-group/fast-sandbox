@@ -171,7 +171,7 @@ func (b *nativeBackend) Capabilities(context.Context) boxlitewire.Capabilities {
 }
 
 func (b *nativeBackend) Ensure(ctx context.Context, request boxlitewire.EnsureRequest) (boxlitewire.Box, error) {
-	if err := validateEnsureRequest(request); err != nil {
+	if err := validateCreateRequest(request); err != nil {
 		return boxlitewire.Box{}, invalid(err)
 	}
 	hash, err := ensureHash(request)
@@ -586,7 +586,7 @@ func (b *nativeBackend) loadRecords() error {
 		if err := fastletnetwork.ValidateLocalForwardCredential(record.TunnelCredential); err != nil {
 			return fmt.Errorf("invalid BoxLite tunnel credential for %s: %w", entry.Name(), err)
 		}
-		if err := validateEnsureRequest(record.Request); err != nil {
+		if err := validateCreateRequest(record.Request); err != nil {
 			return fmt.Errorf("invalid BoxLite metadata record %s: %w", entry.Name(), err)
 		}
 		sandboxUID := record.Request.Sandbox.SandboxID
@@ -660,9 +660,9 @@ func ensureHash(request boxlitewire.EnsureRequest) (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
-func validateEnsureRequest(request boxlitewire.EnsureRequest) error {
+func validateCreateRequest(request boxlitewire.EnsureRequest) error {
 	spec := request.Sandbox
-	if request.Namespace == "" || spec.SandboxID == "" || spec.FastletPodUID == "" || spec.InstanceGeneration <= 0 || spec.AssignmentAttempt <= 0 {
+	if request.Namespace == "" || spec.SandboxID == "" || spec.FastletPodUID == "" || spec.InstanceGeneration <= 0 || spec.RuntimeInstanceID == "" || spec.AssignmentAttempt <= 0 {
 		return errors.New("complete namespace and Sandbox owner fence are required")
 	}
 	if spec.Image == "" || spec.CPU == "" || spec.Memory == "" || request.TunnelGuestPort == 0 || request.TunnelGuestPort > 65535 {

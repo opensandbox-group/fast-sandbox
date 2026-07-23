@@ -7,9 +7,9 @@ import (
 
 var topKRetryTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "fast_sandbox_topk_retry_total",
-	Help: "Top-K reservation retries after a candidate rejects admission.",
+	Help: "Top-K atomic Create retries after a candidate rejects admission before side effects.",
 }, []string{"result"})
 
-func recordTopKRetry(result string) {
+func RecordTopKRetry(result string) {
 	topKRetryTotal.WithLabelValues(result).Inc()
 }

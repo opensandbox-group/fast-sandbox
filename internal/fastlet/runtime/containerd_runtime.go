@@ -278,6 +278,7 @@ func sameRuntimeIdentity(existing *SandboxMetadata, requested *api.SandboxSpec) 
 		existing.ClaimName == requested.ClaimName &&
 		existing.FastletPodUID == requested.FastletPodUID &&
 		existing.InstanceGeneration == requested.InstanceGeneration &&
+		existing.RuntimeInstanceID == requested.RuntimeInstanceID &&
 		existing.AssignmentAttempt == requested.AssignmentAttempt
 }
 
@@ -465,6 +466,7 @@ func (r *ContainerdRuntime) prepareLabels(config *api.SandboxSpec) map[string]st
 		"fast-sandbox.io/resource-pids":         strconv.FormatInt(config.PIDs, 10),
 		"fast-sandbox.io/request-id":            config.RequestID,
 		"fast-sandbox.io/instance-generation":   strconv.FormatInt(config.InstanceGeneration, 10),
+		"fast-sandbox.io/runtime-instance-id":   config.RuntimeInstanceID,
 		"fast-sandbox.io/assignment-attempt":    strconv.FormatInt(config.AssignmentAttempt, 10),
 		"fast-sandbox.io/route-generation":      strconv.FormatInt(routeGeneration, 10),
 		"fast-sandbox.io/network-slot-id":       config.NetworkSlotID,
@@ -566,6 +568,7 @@ func (r *ContainerdRuntime) InspectSandbox(ctx context.Context, sandboxID string
 			ClaimNamespace:       info.Labels["fast-sandbox.io/claim-namespace"],
 			ClaimName:            info.Labels["fast-sandbox.io/sandbox-name"],
 			FastletPodUID:        info.Labels["fast-sandbox.io/fastlet-uid"],
+			RuntimeInstanceID:    info.Labels["fast-sandbox.io/runtime-instance-id"],
 			Image:                info.Image,
 			CPU:                  info.Labels["fast-sandbox.io/resource-cpu"],
 			Memory:               info.Labels["fast-sandbox.io/resource-memory"],
@@ -641,8 +644,8 @@ func networkOwner(config *api.SandboxSpec) fastletnetwork.Owner {
 	}
 	return fastletnetwork.Owner{
 		SandboxUID: config.SandboxID, SandboxName: config.ClaimName, SandboxNamespace: config.ClaimNamespace,
-		InstanceGeneration: generation,
-		AssignmentAttempt:  attempt,
+		InstanceGeneration: generation, RuntimeInstanceID: config.RuntimeInstanceID,
+		AssignmentAttempt: attempt,
 	}
 }
 

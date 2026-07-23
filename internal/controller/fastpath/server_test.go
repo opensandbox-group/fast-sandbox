@@ -2,9 +2,9 @@ package fastpath
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
-	"time"
 
 	fastpathv1 "fast-sandbox/api/proto/v1"
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
@@ -14,8 +14,6 @@ import (
 	"fast-sandbox/internal/controller/sandboxorchestrator"
 
 	"github.com/stretchr/testify/require"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -53,40 +51,30 @@ func (r *fastpathRegistry) RecordFeedback(id fastletpool.FastletID, _ fastletpoo
 }
 
 type fastpathFastlet struct {
-	mu              sync.Mutex
-	rejectReserve   bool
-	ensureFailure   error
-	ensureFailures  map[string]error
-	ensureRequests  []*api.EnsureSandboxRequest
-	reserveRequests []*api.ReserveSandboxRequest
+	mu             sync.Mutex
+	createFailure  error
+	createFailures map[string]error
+	createRequests []*api.CreateSandboxRequest
+	createIPs      []string
+	diagnostics    *api.SandboxDiagnosticsResponse
+	diagnosticsErr error
 }
 
-func (f *fastpathFastlet) ReserveSandbox(_ context.Context, _ string, request *api.ReserveSandboxRequest) (*api.ReserveSandboxResponse, error) {
+func (f *fastpathFastlet) CreateSandbox(_ context.Context, fastletIP string, request *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.reserveRequests = append(f.reserveRequests, request)
-	if f.rejectReserve {
-		failure := &api.FastletError{Code: api.ErrorCapacityRejected, Message: "full", Retryable: true}
-		return &api.ReserveSandboxResponse{Error: failure}, failure
+	f.createRequests = append(f.createRequests, request)
+	f.createIPs = append(f.createIPs, fastletIP)
+	if f.createFailure != nil {
+		return &api.CreateSandboxResponse{}, f.createFailure
 	}
-	return &api.ReserveSandboxResponse{ReservationToken: "reservation-" + request.RequestID, FastletPodUID: request.FastletPodUID, ExpiresAt: time.Now().Add(time.Minute)}, nil
-}
-
-func (*fastpathFastlet) CancelReservation(context.Context, string, *api.CancelReservationRequest) (*api.CancelReservationResponse, error) {
-	return &api.CancelReservationResponse{Canceled: true}, nil
-}
-
-func (f *fastpathFastlet) EnsureSandbox(_ context.Context, fastletIP string, request *api.EnsureSandboxRequest) (*api.EnsureSandboxResponse, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.ensureRequests = append(f.ensureRequests, request)
-	if f.ensureFailure != nil {
-		return &api.EnsureSandboxResponse{}, f.ensureFailure
+	if failure := f.createFailures[fastletIP]; failure != nil {
+		return &api.CreateSandboxResponse{}, failure
 	}
-	if failure := f.ensureFailures[fastletIP]; failure != nil {
-		return &api.EnsureSandboxResponse{}, failure
-	}
-	return &api.EnsureSandboxResponse{Accepted: true, Created: true, Sandbox: &api.SandboxStatus{SandboxID: request.Identity.SandboxUID, Phase: "running"}}, nil
+	return &api.CreateSandboxResponse{
+		Accepted: true, Created: true,
+		Sandbox: &api.SandboxStatus{SandboxID: request.Identity.SandboxUID, RuntimeInstanceID: request.Identity.RuntimeInstanceID, Phase: "running"},
+	}, nil
 }
 
 func (*fastpathFastlet) InspectSandbox(_ context.Context, _ string, request *api.InspectSandboxRequest) (*api.InspectSandboxResponse, error) {
@@ -97,140 +85,182 @@ func (*fastpathFastlet) DeleteSandboxV2(context.Context, string, *api.DeleteSand
 	return &api.DeleteSandboxV2Response{Accepted: true}, nil
 }
 
-type assigningUIDClient struct {
-	client.Client
-	mu                 sync.Mutex
-	assignmentOnCreate *apiv1alpha1.SandboxAssignment
+func (f *fastpathFastlet) SandboxDiagnostics(context.Context, string, *api.SandboxDiagnosticsRequest) (*api.SandboxDiagnosticsResponse, error) {
+	if f.diagnostics != nil || f.diagnosticsErr != nil {
+		return f.diagnostics, f.diagnosticsErr
+	}
+	return &api.SandboxDiagnosticsResponse{}, nil
 }
 
-func (c *assigningUIDClient) Create(ctx context.Context, object client.Object, options ...client.CreateOption) error {
+type countingUIDClient struct {
+	client.Client
+	mu      sync.Mutex
+	creates int
+	gets    int
+	lists   int
+	patches int
+}
+
+func (c *countingUIDClient) Create(ctx context.Context, object client.Object, options ...client.CreateOption) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.creates++
 	if sandbox, ok := object.(*apiv1alpha1.Sandbox); ok && sandbox.UID == "" {
 		sandbox.UID = types.UID("uid-" + sandbox.Name)
 	}
-	if err := c.Client.Create(ctx, object, options...); err != nil {
-		return err
-	}
-	if sandbox, ok := object.(*apiv1alpha1.Sandbox); ok && c.assignmentOnCreate != nil {
-		sandbox.Status.Assignment = c.assignmentOnCreate.DeepCopy()
-		sandbox.Status.AssignmentAttempt = c.assignmentOnCreate.Attempt
-		sandbox.Status.InstanceGeneration = 1
-		sandbox.Status.RouteGeneration = 1
-		return c.Client.Status().Update(ctx, sandbox)
-	}
-	return nil
+	c.mu.Unlock()
+	return c.Client.Create(ctx, object, options...)
 }
 
-func TestCreateFastFailureDoesNotPersistCRD(t *testing.T) {
+func (c *countingUIDClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	c.mu.Lock()
+	c.gets++
+	c.mu.Unlock()
+	return c.Client.Get(ctx, key, object, options...)
+}
+
+func (c *countingUIDClient) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
+	c.mu.Lock()
+	c.lists++
+	c.mu.Unlock()
+	return c.Client.List(ctx, list, options...)
+}
+
+func (c *countingUIDClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
+	c.mu.Lock()
+	c.patches++
+	c.mu.Unlock()
+	return c.Client.Patch(ctx, object, patch, options...)
+}
+
+func (c *countingUIDClient) counts() (int, int, int, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.creates, c.gets, c.lists, c.patches
+}
+
+func TestCreateHappyPathUsesExactlyTwoDownstreamIO(t *testing.T) {
 	server, k8sClient, _, fastlet := newV2Server(t)
-	fastlet.rejectReserve = true
+	response, err := server.CreateSandbox(context.Background(), createRequest("request-a"))
+	require.NoError(t, err)
+	require.Equal(t, "request-a", response.SandboxName)
+	require.Equal(t, "fastlet-a", response.FastletPod)
+
+	creates, gets, lists, patches := k8sClient.counts()
+	require.Equal(t, 1, creates)
+	require.Zero(t, gets)
+	require.Zero(t, lists)
+	require.Zero(t, patches)
+	fastlet.mu.Lock()
+	require.Len(t, fastlet.createRequests, 1)
+	require.Equal(t, response.SandboxUid, fastlet.createRequests[0].Identity.SandboxUID)
+	require.NotEmpty(t, fastlet.createRequests[0].Identity.RuntimeInstanceID)
+	fastlet.mu.Unlock()
+
+	var persisted apiv1alpha1.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "request-a"}, &persisted))
+	require.Nil(t, persisted.Status.Assignment, "Controller projection is asynchronous")
+	envelope, err := common.AssignmentFromAnnotation(&persisted)
+	require.NoError(t, err)
+	require.Equal(t, "fastlet-a", envelope.FastletName)
+}
+
+func TestNoCandidateFailsBeforeCRDCreate(t *testing.T) {
+	server, k8sClient, registry, fastlet := newV2Server(t)
+	registry.candidates = nil
 	_, err := server.CreateSandbox(context.Background(), createRequest("request-a"))
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
-	var list apiv1alpha1.SandboxList
-	require.NoError(t, k8sClient.List(context.Background(), &list))
-	require.Empty(t, list.Items)
+	creates, _, _, _ := k8sClient.counts()
+	require.Zero(t, creates)
+	fastlet.mu.Lock()
+	require.Empty(t, fastlet.createRequests)
+	fastlet.mu.Unlock()
 }
 
-func TestCreateIsIdempotent(t *testing.T) {
+func TestFastletRejectionKeepsPersistedIntent(t *testing.T) {
 	server, k8sClient, _, fastlet := newV2Server(t)
-	request := createRequest("request-a")
-	first, err := server.CreateSandbox(context.Background(), request)
-	require.NoError(t, err)
-	require.NotEmpty(t, first.SandboxUid)
+	fastlet.createFailure = &api.FastletError{
+		Code: api.ErrorCapacityRejected, Message: "full", Retryable: true, Outcome: api.OutcomeRejectedBeforeSideEffects,
+	}
+	_, err := server.CreateSandbox(context.Background(), createRequest("request-a"))
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	var persisted apiv1alpha1.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "request-a"}, &persisted))
+	require.NotEmpty(t, persisted.Annotations[common.AnnotationAssignment])
+}
 
-	retryRequest := createRequest("request-a")
-	second, err := server.CreateSandbox(context.Background(), retryRequest)
+func TestCreateRetryUsesSameCRDAndRuntimeIdentity(t *testing.T) {
+	server, k8sClient, _, fastlet := newV2Server(t)
+	first, err := server.CreateSandbox(context.Background(), createRequest("request-a"))
+	require.NoError(t, err)
+	second, err := server.CreateSandbox(context.Background(), createRequest("request-a"))
 	require.NoError(t, err)
 	require.Equal(t, first.SandboxUid, second.SandboxUid)
 	require.Equal(t, first.SandboxName, second.SandboxName)
-
-	var list apiv1alpha1.SandboxList
-	require.NoError(t, k8sClient.List(context.Background(), &list))
-	require.Len(t, list.Items, 1)
-	require.Equal(t, int64(1), list.Items[0].Status.AssignmentAttempt)
-	require.Equal(t, apiv1alpha1.ObservedStateReady, list.Items[0].Status.RuntimeState)
-	require.Equal(t, requestIDLabelValue("request-a"), list.Items[0].Labels[common.LabelRequestIDHash])
 	fastlet.mu.Lock()
-	require.Len(t, fastlet.ensureRequests, 1)
-	require.Equal(t, first.SandboxUid, fastlet.ensureRequests[0].Identity.SandboxUID)
+	require.Len(t, fastlet.createRequests, 2)
+	require.Equal(t, fastlet.createRequests[0].Identity.RuntimeInstanceID, fastlet.createRequests[1].Identity.RuntimeInstanceID)
 	fastlet.mu.Unlock()
 
 	conflict := createRequest("request-a")
 	conflict.Image = "ubuntu:24.04"
 	_, err = server.CreateSandbox(context.Background(), conflict)
 	require.Equal(t, codes.AlreadyExists, status.Code(err))
+	creates, gets, lists, _ := k8sClient.counts()
+	require.Equal(t, 3, creates)
+	require.Equal(t, 2, gets)
+	require.Zero(t, lists)
 }
 
-func TestCreateRequiresRequestID(t *testing.T) {
-	server, k8sClient, _, _ := newV2Server(t)
-	_, err := server.CreateSandbox(context.Background(), createRequest(""))
-	require.Equal(t, codes.InvalidArgument, status.Code(err))
-	var list apiv1alpha1.SandboxList
-	require.NoError(t, k8sClient.List(context.Background(), &list))
-	require.Empty(t, list.Items)
-}
+func TestExplicitRejectionCASesToSecondCandidate(t *testing.T) {
+	server, k8sClient, registry, fastlet := newV2Server(t)
+	second := testCandidate("fastlet-b", "pod-b", "10.0.0.2")
+	registry.candidates = append(registry.candidates, second)
+	registry.fastlets[second.ID] = second
+	fastlet.createFailures = map[string]error{
+		"10.0.0.1": &api.FastletError{Code: api.ErrorCapacityRejected, Message: "full", Retryable: true, Outcome: api.OutcomeRejectedBeforeSideEffects},
+	}
 
-func TestCreateCommitSurvivesFastPathFailureAndRetryContinuesSameCRD(t *testing.T) {
-	server, k8sClient, _, fastlet := newV2Server(t)
-	failure := &api.FastletError{Code: api.ErrorRuntimeUnavailable, Message: "temporary", Retryable: true}
-	fastlet.ensureFailure = failure
-	_, err := server.CreateSandbox(context.Background(), createRequest("request-a"))
-	require.Error(t, err)
-
-	var list apiv1alpha1.SandboxList
-	require.NoError(t, k8sClient.List(context.Background(), &list))
-	require.Len(t, list.Items, 1)
-	committedUID := string(list.Items[0].UID)
-	require.NotNil(t, list.Items[0].Status.Assignment)
-
-	fastlet.mu.Lock()
-	fastlet.ensureFailure = nil
-	fastlet.mu.Unlock()
 	response, err := server.CreateSandbox(context.Background(), createRequest("request-a"))
 	require.NoError(t, err)
-	require.Equal(t, committedUID, response.SandboxUid)
-
-	require.NoError(t, k8sClient.List(context.Background(), &list))
-	require.Len(t, list.Items, 1)
-}
-
-func TestCreateConsumesReservationAfterControllerWinsWithRejectedAssignment(t *testing.T) {
-	server, k8sClient, registry, fastlet := newV2Server(t)
-	controllerWinner := fastletpool.FastletInfo{ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", PodIP: "10.0.0.1", NodeName: "node-a"}
-	reserved := fastletpool.FastletInfo{ID: "fastlet-b", PodName: "fastlet-b", PodUID: "pod-b", PodIP: "10.0.0.2", NodeName: "node-b"}
-	registry.candidates = []fastletpool.FastletInfo{reserved}
-	registry.fastlets[reserved.ID] = reserved
-	k8sClient.(*assigningUIDClient).assignmentOnCreate = &apiv1alpha1.SandboxAssignment{
-		FastletName: controllerWinner.PodName, FastletPodUID: controllerWinner.PodUID, NodeName: controllerWinner.NodeName, Attempt: 1,
-	}
-	fastlet.ensureFailures = map[string]error{
-		controllerWinner.PodIP: &api.FastletError{Code: api.ErrorCapacityRejected, Message: "full", Retryable: true},
-	}
-
-	response, err := server.CreateSandbox(context.Background(), createRequest("controller-race"))
+	require.Equal(t, "fastlet-b", response.FastletPod)
+	var persisted apiv1alpha1.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "request-a"}, &persisted))
+	envelope, err := common.AssignmentFromAnnotation(&persisted)
 	require.NoError(t, err)
-	require.NotEmpty(t, response.SandboxUid)
-	var sandbox apiv1alpha1.Sandbox
-	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: response.SandboxName}, &sandbox))
-	require.NotNil(t, sandbox.Status.Assignment)
-	require.Equal(t, "pod-b", sandbox.Status.Assignment.FastletPodUID)
-	require.Equal(t, int64(2), sandbox.Status.Assignment.Attempt)
-	require.Equal(t, int64(2), sandbox.Status.RouteGeneration)
+	require.Equal(t, "fastlet-b", envelope.FastletName)
+	require.Equal(t, int64(2), envelope.Attempt)
+	require.Equal(t, int64(2), envelope.RouteGeneration)
 	fastlet.mu.Lock()
-	require.Len(t, fastlet.ensureRequests, 2)
-	require.Empty(t, fastlet.ensureRequests[0].ReservationToken)
-	require.NotEmpty(t, fastlet.ensureRequests[1].ReservationToken)
+	require.Equal(t, []string{"10.0.0.1", "10.0.0.2"}, fastlet.createIPs)
 	fastlet.mu.Unlock()
 }
 
-func TestConcurrentSameRequestConvergesToOneCRDAndUID(t *testing.T) {
-	server, k8sClient, _, _ := newV2Server(t)
+func TestAmbiguousFailureNeverReassigns(t *testing.T) {
+	server, k8sClient, registry, fastlet := newV2Server(t)
+	second := testCandidate("fastlet-b", "pod-b", "10.0.0.2")
+	registry.candidates = append(registry.candidates, second)
+	registry.fastlets[second.ID] = second
+	fastlet.createFailure = errors.New("transport response lost")
+
+	_, err := server.CreateSandbox(context.Background(), createRequest("request-a"))
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	var persisted apiv1alpha1.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "request-a"}, &persisted))
+	envelope, parseErr := common.AssignmentFromAnnotation(&persisted)
+	require.NoError(t, parseErr)
+	require.Equal(t, "fastlet-a", envelope.FastletName)
+	fastlet.mu.Lock()
+	require.Len(t, fastlet.createRequests, 1)
+	fastlet.mu.Unlock()
+}
+
+func TestConcurrentSameRequestConvergesToOneCRDAndIdentity(t *testing.T) {
+	server, k8sClient, _, fastlet := newV2Server(t)
 	const workers = 20
 	responses := make(chan *fastpathv1.CreateResponse, workers)
 	errorsFound := make(chan error, workers)
 	var group sync.WaitGroup
-	for index := 0; index < workers; index++ {
+	for range workers {
 		group.Add(1)
 		go func() {
 			defer group.Done()
@@ -256,8 +286,27 @@ func TestConcurrentSameRequestConvergesToOneCRDAndUID(t *testing.T) {
 		require.Equal(t, uid, response.SandboxUid)
 	}
 	var list apiv1alpha1.SandboxList
-	require.NoError(t, k8sClient.List(context.Background(), &list))
+	require.NoError(t, k8sClient.Client.List(context.Background(), &list))
 	require.Len(t, list.Items, 1)
+	fastlet.mu.Lock()
+	var runtimeID string
+	for _, request := range fastlet.createRequests {
+		if runtimeID == "" {
+			runtimeID = request.Identity.RuntimeInstanceID
+		}
+		require.Equal(t, runtimeID, request.Identity.RuntimeInstanceID)
+	}
+	fastlet.mu.Unlock()
+}
+
+func TestCreateRejectsSplitNameAndRequestID(t *testing.T) {
+	server, k8sClient, _, _ := newV2Server(t)
+	request := createRequest("request-a")
+	request.Name = "different"
+	_, err := server.CreateSandbox(context.Background(), request)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	creates, _, _, _ := k8sClient.counts()
+	require.Zero(t, creates)
 }
 
 func TestDeleteAndUpdateOnlyCommitDesiredState(t *testing.T) {
@@ -266,51 +315,66 @@ func TestDeleteAndUpdateOnlyCommitDesiredState(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "sandbox-a", Namespace: "default", Finalizers: []string{"sandbox.fast.io/cleanup"}},
 		Spec:       apiv1alpha1.SandboxSpec{Image: "alpine:latest", PoolRef: "pool-a"},
 	}
-	require.NoError(t, k8sClient.Create(context.Background(), sandbox))
+	require.NoError(t, k8sClient.Client.Create(context.Background(), sandbox))
 	update, err := server.UpdateSandbox(context.Background(), &fastpathv1.UpdateRequest{
 		SandboxName: "sandbox-a", Namespace: "default",
 		Update: &fastpathv1.UpdateRequest_ExpireTimeSeconds{ExpireTimeSeconds: 1234},
 	})
 	require.NoError(t, err)
 	require.True(t, update.Success)
-	require.Equal(t, "desired state committed", update.Message)
-
 	deleted, err := server.DeleteSandbox(context.Background(), &fastpathv1.DeleteRequest{SandboxName: "sandbox-a", Namespace: "default"})
 	require.NoError(t, err)
 	require.True(t, deleted.Success)
 	var terminating apiv1alpha1.Sandbox
-	require.NoError(t, k8sClient.Get(context.Background(), client.ObjectKeyFromObject(sandbox), &terminating))
+	require.NoError(t, k8sClient.Client.Get(context.Background(), client.ObjectKeyFromObject(sandbox), &terminating))
 	require.NotNil(t, terminating.DeletionTimestamp)
 }
 
-func newV2Server(t *testing.T) (*Server, client.Client, *fastpathRegistry, *fastpathFastlet) {
+func newV2Server(t *testing.T) (*Server, *countingUIDClient, *fastpathRegistry, *fastpathFastlet) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	require.NoError(t, apiv1alpha1.AddToScheme(scheme))
-	pool := &apiv1alpha1.SandboxPool{
-		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default"},
-		Spec: apiv1alpha1.SandboxPoolSpec{
-			Runtime:            apiv1alpha1.RuntimeContainer,
-			Capacity:           apiv1alpha1.PoolCapacity{PoolMin: 1, PoolMax: 1},
-			MaxSandboxesPerPod: 8,
-			SandboxResources: apiv1alpha1.SandboxResourceProfile{
-				CPU: resource.MustParse("1"), Memory: resource.MustParse("512Mi"), PIDs: 256,
-			},
-			FastletTemplate: corev1.PodTemplateSpec{},
-		},
-	}
-	baseClient := fake.NewClientBuilder().WithScheme(scheme).
-		WithStatusSubresource(&apiv1alpha1.Sandbox{}).
-		WithObjects(pool).Build()
-	k8sClient := &assigningUIDClient{Client: baseClient}
-	candidate := fastletpool.FastletInfo{ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", PodIP: "10.0.0.1", NodeName: "node-a"}
+	baseClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&apiv1alpha1.Sandbox{}).Build()
+	k8sClient := &countingUIDClient{Client: baseClient}
+	candidate := testCandidate("fastlet-a", "pod-a", "10.0.0.1")
 	registry := &fastpathRegistry{
 		candidates: []fastletpool.FastletInfo{candidate},
-		fastlets:   map[fastletpool.FastletID]fastletpool.FastletInfo{"fastlet-a": candidate},
+		fastlets:   map[fastletpool.FastletID]fastletpool.FastletInfo{candidate.ID: candidate},
 	}
 	fastlet := &fastpathFastlet{}
 	orchestrator := &sandboxorchestrator.Orchestrator{Client: k8sClient, Registry: registry, FastletClient: fastlet}
-	return &Server{K8sClient: k8sClient, Orchestrator: orchestrator}, k8sClient, registry, fastlet
+	return &Server{K8sClient: k8sClient, Orchestrator: orchestrator, DiagnosticsClient: fastlet}, k8sClient, registry, fastlet
+}
+
+func TestGetSandboxDiagnosticsUsesAnnotationAndDegradesWhenFastletFails(t *testing.T) {
+	server, _, _, fastlet := newV2Server(t)
+	created, err := server.CreateSandbox(context.Background(), createRequest("sandbox-a"))
+	require.NoError(t, err)
+	fastlet.diagnostics = &api.SandboxDiagnosticsResponse{Events: []api.SandboxDiagnosticEvent{{
+		Timestamp: metav1.Now().Time, Level: "info", Source: "runtime", Phase: "running", Message: "ready",
+	}}}
+
+	diagnostics, err := server.GetSandboxDiagnostics(context.Background(), &fastpathv1.SandboxDiagnosticsRequest{SandboxName: created.SandboxName, Namespace: "default"})
+	require.NoError(t, err)
+	require.True(t, diagnostics.FastletReachable)
+	require.Equal(t, "status-projection-pending", diagnostics.AssignmentState)
+	require.Equal(t, "ready", diagnostics.Events[0].Message)
+	require.NotEmpty(t, diagnostics.RuntimeInstanceId)
+
+	fastlet.diagnostics = nil
+	fastlet.diagnosticsErr = errors.New("connection refused")
+	diagnostics, err = server.GetSandboxDiagnostics(context.Background(), &fastpathv1.SandboxDiagnosticsRequest{SandboxName: created.SandboxName, Namespace: "default"})
+	require.NoError(t, err)
+	require.False(t, diagnostics.FastletReachable)
+	require.Contains(t, diagnostics.FastletError, "connection refused")
+}
+
+func testCandidate(name, uid, ip string) fastletpool.FastletInfo {
+	return fastletpool.FastletInfo{
+		ID: fastletpool.FastletID(name), PodName: name, PodUID: uid, PodIP: ip, NodeName: "node-a",
+		RuntimeName: apiv1alpha1.RuntimeContainer, RuntimeProfileHash: "runtime-hash",
+		ResourceProfileHash: "resource-hash", InfraProfile: "minimal", InfraProfileHash: "infra-hash", InfraReady: true,
+	}
 }
 
 func createRequest(requestID string) *fastpathv1.CreateRequest {
@@ -323,10 +387,8 @@ func createRequest(requestID string) *fastpathv1.CreateRequest {
 func TestSandboxFromCreateRequestUsesCanonicalFields(t *testing.T) {
 	request := createRequest("request-a")
 	sandbox := sandboxFromCreateRequest(request, "create-hash")
+	require.Equal(t, request.RequestId, sandbox.Name)
 	require.Equal(t, request.Image, sandbox.Spec.Image)
 	require.Equal(t, request.PoolRef, sandbox.Spec.PoolRef)
-	require.Equal(t, request.Command, sandbox.Spec.Command)
-	require.Equal(t, request.Args, sandbox.Spec.Args)
-	require.Equal(t, []corev1.EnvVar{{Name: "A", Value: "B"}}, sandbox.Spec.Envs)
-	require.Equal(t, request.WorkingDir, sandbox.Spec.WorkingDir)
+	require.Equal(t, []metav1.Condition(nil), sandbox.Status.Conditions)
 }

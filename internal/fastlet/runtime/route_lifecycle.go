@@ -17,7 +17,7 @@ func (m *SandboxManager) ReconcileProxyRoutes(ctx context.Context) error {
 	pendingInfra := false
 	for _, sandbox := range m.sandboxes {
 		switch sandbox.Phase {
-		case "terminating", "deleting", "delete-failed", "infra-pending", "initializing-infra":
+		case "terminating", "deleting", "delete-failed", "create-cleanup", "create-cleanup-failed", "infra-pending", "initializing-infra":
 			if sandbox.Phase == "infra-pending" || sandbox.Phase == "initializing-infra" {
 				pendingInfra = true
 			}

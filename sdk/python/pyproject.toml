@@ -9,7 +9,6 @@ description = "Fast Sandbox lifecycle SDK with injected Infra Component adapters
 requires-python = ">=3.10"
 dependencies = [
   "grpcio>=1.76.0,<2",
-  "httpx>=0.27,<1",
   "protobuf>=6.33.5,<7",
 ]
 

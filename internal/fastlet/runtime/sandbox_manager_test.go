@@ -142,11 +142,12 @@ func (m *MockRuntime) Close() error {
 
 // Helper methods for testing
 
-func ensureSandboxForTest(ctx context.Context, manager *SandboxManager, spec *api.SandboxSpec) (*api.EnsureSandboxResponse, error) {
-	return manager.EnsureSandboxV2(ctx, &api.EnsureSandboxRequest{
+func ensureSandboxForTest(ctx context.Context, manager *SandboxManager, spec *api.SandboxSpec) (*api.CreateSandboxResponse, error) {
+	return manager.CreateSandbox(ctx, &api.CreateSandboxRequest{
 		Identity: api.SandboxIdentity{
 			RequestID: "test-" + spec.SandboxID, SandboxUID: spec.SandboxID,
-			InstanceGeneration: 1, AssignmentAttempt: 1, FastletPodUID: manager.fastletPodUID,
+			InstanceGeneration: 1, RuntimeInstanceID: "runtime-" + spec.SandboxID,
+			AssignmentAttempt: 1, FastletPodUID: manager.fastletPodUID,
 		},
 		Sandbox: *spec,
 	})
@@ -154,7 +155,8 @@ func ensureSandboxForTest(ctx context.Context, manager *SandboxManager, spec *ap
 
 func deleteSandboxForTest(manager *SandboxManager, sandboxID string) (*api.DeleteSandboxV2Response, error) {
 	return manager.DeleteSandboxV2(&api.DeleteSandboxV2Request{Identity: api.SandboxIdentity{
-		SandboxUID: sandboxID, InstanceGeneration: 1, AssignmentAttempt: 1, FastletPodUID: manager.fastletPodUID,
+		SandboxUID: sandboxID, InstanceGeneration: 1, RuntimeInstanceID: "runtime-" + sandboxID,
+		AssignmentAttempt: 1, FastletPodUID: manager.fastletPodUID,
 	}})
 }
 

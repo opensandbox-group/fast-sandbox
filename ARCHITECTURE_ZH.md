@@ -14,7 +14,7 @@ Fast Sandbox 负责：
 - endpoint 解析、短期路由凭证和透明代理；
 - Fastlet Pod 或节点丢失后的残留资源清理。
 
-Fast Sandbox 不定义面向用户的 Exec/File/PTY 协议。这些语义由 Execd、Envd 或其他注入组件负责。当前也不承诺 Sandbox 实例跨 Fastlet 存活，不包含 snapshot、pause/resume 和持久化 storage。
+Fast Sandbox 不定义面向用户的 Exec/File/PTY 协议。这些语义由 OpenSandbox Execd 或其他注入组件及其上游 SDK 负责。当前也不承诺 Sandbox 实例跨 Fastlet 存活，不包含 snapshot、pause/resume 和持久化 storage。
 
 ## 2. 部署拓扑
 
@@ -31,10 +31,10 @@ flowchart LR
 
   Client -->|"Create / 生命周期 / resolve"| FP
   Client -->|"声明式 Sandbox/Pool"| API
-  FP -->|"CRD create/status CAS"| API
+  FP -->|"携带 assignment annotation 创建 CRD"| API
   Controller <-->|"Watch / Reconcile"| API
-  FP -->|"Reserve / Ensure"| FPOD
-  Controller -->|"Ensure / Delete / Drain"| FPOD
+  FP -->|"原子 Create"| FPOD
+  Controller -->|"Create / Inspect / Delete / Drain"| FPOD
   Client -->|"credential + target port"| SP
   SP -->|"目标 Pod + fences"| FPOD
   FPOD -->|"AccessHandle"| SB
@@ -51,21 +51,21 @@ flowchart LR
 | `controller` | 是 | 否 | SandboxReconciler、SandboxPoolReconciler、本地 Registry、心跳循环 |
 | `all` | 否 | 可选 | 开发模式，在单进程组合前两种角色 |
 
-Fast-Path 与 Controller 故意维护各自独立、最终收敛的 Registry。调度结果只有在 Fastlet 原子接纳 reservation 后才成为有效分配。这使多活 Fast-Path 无需分布式 Registry 锁也不会突破单 Pod 容量。
+Fast-Path 与 Controller 故意维护各自独立、最终收敛的 Registry。调度结果只是 hint，最终由 Fastlet 原子接纳并创建 runtime。这使多活 Fast-Path 无需分布式 Registry 锁也不会突破单 Pod 容量。
 
 ### 2.2 Fastlet Pod
 
 SandboxPool 创建 Fastlet Pod，其中平台拥有以下子组件：
 
-- **Fastlet 控制服务（`:5758`）**：reserve/cancel/ensure/delete/status、缓存心跳、runtime 与网络编排；
-- **原子 Admission Store**：串行化 reservation 和 active slot 状态转换，面对并发调用仍严格执行 `maxSandboxesPerPod`；
+- **Fastlet 控制服务（`:5758`）**：原子 create、inspect、delete、Sandbox diagnostics、缓存心跳、runtime 与网络编排；
+- **原子 Admission Store**：串行化 create 和 active slot 状态转换，面对并发调用仍严格执行 `maxSandboxesPerPod`；
 - **Runtime Manager**：根据 Pool 的不可变 RuntimeProfile 创建、检查和恢复 runtime；
 - **NetworkManager / SlotPool**：分配、恢复私网 slot，生成 AccessHandle；
 - **Infra Manager**：物化平台 artifact、实例配置、内部凭证和 readiness policy；
 - **Fastlet Proxy（`:5780`）**：校验路由凭证和代际 fence，代理到 runtime-local 地址；metrics 使用独立 `:9093`；
 - **BoxLite runtime sidecar**：仅 `runtime: boxlite` 注入，通过 Pod 内 UDS 和带鉴权 local-forward 工作。
 
-Fastlet Pod 是生命周期边界。即使 Kubernetes 复用了 Pod 名称，只要 Pod UID 改变，旧 assignment 与旧 route 都必须失效。
+Fastlet Pod 是生命周期边界。即使 Kubernetes 复用了 Pod 名称，只要 Pod UID 改变，旧 assignment 与旧 route 都必须失效。替代 Fastlet 看到带旧 Pod UID 的 containerd runtime 时，先把旧 task/container/snapshot 收敛到不存在，再创建新 fence identity。失败 Create 的 cleanup 只能由相同 identity 续做；用户 Delete 失败后不能被 Create 复活。
 
 ### 2.3 NodeJanitor
 
@@ -75,17 +75,18 @@ NodeJanitor 以特权 DaemonSet 部署，处理已经丢失的 Fastlet 无法自
 
 ### 3.1 Sandbox CRD
 
-`Sandbox.spec` 表示期望生命周期。当前实例的权威 identity 是：
+`Sandbox.spec` 表示期望生命周期。assignment annotation 是权威状态，`status.assignment` 和 generation 字段只是异步投影。当前实例 identity 是：
 
 ```text
 Sandbox CRD UID
 + instanceGeneration
 + assignment.fastletPodUID
 + assignment.attempt
++ runtimeInstanceID
 + routeGeneration
 ```
 
-`status.assignment` 通过 Kubernetes resourceVersion compare-and-swap 写入。runtime、data plane、user process 是三个独立观测状态，由 canonical status 字段和 Conditions 表达。
+Fast-Path 在创建 CRD 的同一次写入中带上初始 assignment annotation；重新分配只对该 annotation 做 compare-and-swap。投影冲突必须 fail closed。runtime、data plane、user process 仍是三个独立观测状态，由 canonical status 字段和 Conditions 表达。
 
 ### 3.2 SandboxPool CRD
 
@@ -109,33 +110,30 @@ sequenceDiagram
   participant C as Client
   participant F as Fast-Path
   participant R as Local Registry
-  participant L as Fastlet
   participant K as API Server
+  participant L as Fastlet
 
   C->>F: CreateSandbox(request_id, spec)
-  F->>K: 查询已有 request_id
-  alt 相同 request_id 和 spec
-    K-->>F: 已有 Sandbox
-    F-->>C: 幂等返回
-  else 新请求
-    F->>R: 按容量/镜像亲和选 Top-K
-    loop 有界候选集合
-      F->>L: Reserve(request_id, spec hash)
-      alt stale/full/conflict
-        L-->>F: 可重试拒绝
-      else accepted
-        L-->>F: reservation token
-        F->>K: 创建 Sandbox CRD
-        F->>K: assignment status CAS
-        F->>L: Ensure(CRD UID + generations)
-        L-->>F: runtime/data plane 结果
-        F-->>C: Sandbox UID 与 placement
-      end
-    end
+  F->>R: 按资格/镜像亲和选择有界 Top-K
+  F->>K: IO 1：创建 CRD + assignment annotation
+  alt 名称已存在
+    F->>K: Get canonical name
+    K-->>F: 校验 request_id/spec hash 并复用 identity
+  end
+  F->>L: IO 2：原子 Create(CRD UID + runtime identity)
+  alt 新建成功或已幂等存在
+    L-->>F: runtime/data plane Ready
+    F-->>C: Sandbox UID 与 placement
+  else 明确在副作用前拒绝
+    F->>K: CAS assignment annotation 到下一 Top-K candidate
+    F->>L: 用新 assignment attempt 原子 Create
+  else 模糊失败/进行中/需要清理
+    F-->>C: 可重试错误；CRD 保持持久化
+    Note over F,L: Controller 使用同一 runtime identity 接管重试
   end
 ```
 
-reservation 接纳前的快速失败不会创建 CRD。持有合法 reservation 后，Fast-Path 必须先提交 CRD，再调用 runtime Ensure。系统不再存在 Fast/Strong 模式分支。稳定 request ID 是必需的；相同 request ID 搭配不同 create spec 会被拒绝。
+本地 Top-K 找不到候选时不会创建 CRD。正常路径严格是一次 Kubernetes Create 加一次 Fastlet Create；Fast-Path 不做前置 Get/List，也不写 status。稳定 request ID 是必需的，并且等于 CRD 名称；相同 request ID 搭配不同 create spec 会被拒绝。只有 `RejectedBeforeSideEffects` 允许换节点，传输层模糊失败绝不重新分配。改派必须从旧 annotation 直接 CAS 到新 annotation；没有替代候选时保留当前 durable assignment，让 Sandbox 维持 Pending/Creating，Pool 后续扩容出现新 Fastlet 后再 CAS，禁止形成 assignment 为空的窗口。
 
 ### 4.2 声明式 Create
 
@@ -157,7 +155,7 @@ Fastlet Pod replacement 不意味着 Sandbox 存活。新 Pod UID 是新的 fenc
 每个 Fast-Path 和 Controller 副本通过两种信息源维护本地 Registry：
 
 1. Kubernetes Pod/Sandbox Watch 提供成员关系、assignment、Pool/runtime 标签和 Pod UID 变化；
-2. 低频、带抖动的 heartbeat 提供精确容量、reservation/runtime phase inventory、镜像缓存快照与 cache revision。
+2. 低频、带抖动的 heartbeat 提供 admission/runtime phase inventory、镜像缓存快照与 cache revision。
 
 系统不会让每个 Fast-Path 高频全量轮询所有 Fastlet。Watch 立即更新拓扑，heartbeat 用来修复偏差并刷新 runtime/cache 事实。
 
@@ -212,11 +210,11 @@ InfraProfile 解析为 component artifact 和策略。创建 runtime 前，Fastl
 5. 把 component readiness 与 runtime start 分开等待；
 6. 只有 DataPlane Ready 后才发布 route。
 
-Adapter 复用既有组件协议：
+协议接入使用上游官方 SDK，不在仓库内复制协议：
 
-- OpenSandbox `execd`：command/SSE 和 file 操作；
-- E2B `envd`：把解析后的 endpoint 交给原生 client；
-- 自定义组件：增加 catalog profile 与 SDK adapter。
+- OpenSandbox `execd`：`fastctl opensandbox` 使用官方 OpenSandbox Go SDK；
+- Python 生命周期 SDK 只提供通用 endpoint/header hand-off；
+- 自定义组件使用 catalog profile 和各自上游 SDK。
 
 启动额外成本包括 artifact 准备、OCI spec mutation、supervisor 启动、component 进程启动和 readiness probe。artifact 与 warm image 会缓存；Pool warm image、缓存 artifact 和热点镜像受普通 GC 保护。Fastlet Ready 不等待所有 warm image 拉取完成。
 
@@ -232,6 +230,8 @@ Adapter 复用既有组件协议：
 ## 10. 可观测性
 
 Prometheus metrics 覆盖 Create accepted/data-plane-ready latency、Registry candidate 与 heartbeat age、Top-K retry、Fastlet admission 与 slot、runtime/Infra/network/cache、两跳 proxy 和 Janitor cleanup。
+
+`fastctl diagnostics sandbox` 读取 CRD 状态和 Fastlet 侧有界生命周期事件环。该平台诊断链路独立于 Execd，因此注入组件缺失或异常时仍然可用。
 
 request ID、Sandbox UID、assignment attempt、route generation 等 identity 必须进入结构化日志或 trace，不能作为 metrics label。只有 runtime adapter 能证明用户原始进程已经启动时才记录 `user_process_start_latency`；sandbox-init 路径在可信回调实现前明确标记 unavailable。
 

@@ -24,6 +24,7 @@ type admissionRuntime struct {
 	ensureCalls   int
 	deleteCalls   int
 	ensureError   error
+	deleteError   error
 	ensureEntered chan struct{}
 	ensureBlock   chan struct{}
 	deleteEntered chan struct{}
@@ -100,6 +101,7 @@ func (r *admissionRuntime) DeleteSandbox(_ context.Context, sandboxID string) er
 	r.mu.Lock()
 	r.deleteCalls++
 	entered, block := r.deleteEntered, r.deleteBlock
+	err := r.deleteError
 	r.mu.Unlock()
 	if entered != nil {
 		select {
@@ -109,6 +111,9 @@ func (r *admissionRuntime) DeleteSandbox(_ context.Context, sandboxID string) er
 	}
 	if block != nil {
 		<-block
+	}
+	if err != nil {
+		return err
 	}
 	r.mu.Lock()
 	delete(r.sandboxes, sandboxID)
@@ -165,23 +170,6 @@ func (r *admissionRuntime) counts() (int, int) {
 	return r.ensureCalls, r.deleteCalls
 }
 
-type admissionClock struct {
-	mu  sync.Mutex
-	now time.Time
-}
-
-func (c *admissionClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *admissionClock) Advance(duration time.Duration) {
-	c.mu.Lock()
-	c.now = c.now.Add(duration)
-	c.mu.Unlock()
-}
-
 func newAdmissionManager(t *testing.T, runtime RuntimeDriver, capacity int) *SandboxManager {
 	t.Helper()
 	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
@@ -191,11 +179,12 @@ func newAdmissionManager(t *testing.T, runtime RuntimeDriver, capacity int) *San
 	return manager
 }
 
-func ensureRequest(uid string, generation, attempt int64) *api.EnsureSandboxRequest {
-	return &api.EnsureSandboxRequest{
+func ensureRequest(uid string, generation, attempt int64) *api.CreateSandboxRequest {
+	return &api.CreateSandboxRequest{
 		Identity: api.SandboxIdentity{
 			RequestID: "request-" + uid, SandboxUID: uid,
-			InstanceGeneration: generation, AssignmentAttempt: attempt, RouteGeneration: 1, FastletPodUID: "pod-uid-a",
+			InstanceGeneration: generation, RuntimeInstanceID: fmt.Sprintf("runtime-%s-%d-%d", uid, generation, attempt),
+			AssignmentAttempt: attempt, RouteGeneration: 1, FastletPodUID: "pod-uid-a",
 		},
 		Sandbox: api.SandboxSpec{ClaimUID: "claim-" + uid, ClaimNamespace: "default", ClaimName: uid, Image: "alpine:latest"},
 	}
@@ -232,18 +221,32 @@ func (p *admissionRoutePublisher) ReconcileRoutes(_ context.Context, routes []Ro
 	return p.reconcileError
 }
 
-func reserveRequest(requestID, createSpecHash string) *api.ReserveSandboxRequest {
-	return &api.ReserveSandboxRequest{
-		RequestID: requestID, CreateSpecHash: createSpecHash,
-		ClaimNamespace: "default", ClaimName: "sandbox-" + requestID, FastletPodUID: "pod-uid-a",
-	}
-}
-
 func requireFastletCode(t *testing.T, err error, code api.FastletErrorCode) {
 	t.Helper()
 	var failure *api.FastletError
 	require.ErrorAs(t, err, &failure)
 	require.Equal(t, code, failure.Code)
+}
+
+func TestSandboxDiagnosticsAreBoundedAndIdentityFenced(t *testing.T) {
+	manager := newAdmissionManager(t, newAdmissionRuntime(), 2)
+	request := ensureRequest("sandbox-a", 1, 1)
+	created, err := manager.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
+	require.True(t, created.Accepted)
+
+	diagnostics, err := manager.SandboxDiagnostics(&api.SandboxDiagnosticsRequest{Identity: request.Identity, Limit: 2})
+	require.NoError(t, err)
+	require.NotNil(t, diagnostics.Sandbox)
+	require.Equal(t, "running", diagnostics.Sandbox.Phase)
+	require.Len(t, diagnostics.Events, 2)
+	require.Equal(t, "fastlet", diagnostics.Events[1].Source)
+	require.Equal(t, "running", diagnostics.Events[1].Phase)
+
+	stale := request.Identity
+	stale.RuntimeInstanceID = "different-runtime"
+	_, err = manager.SandboxDiagnostics(&api.SandboxDiagnosticsRequest{Identity: stale})
+	requireFastletCode(t, err, api.ErrorConflict)
 }
 
 func TestAdmissionNeverExceedsCapacityUnderConcurrency(t *testing.T) {
@@ -258,7 +261,7 @@ func TestAdmissionNeverExceedsCapacityUnderConcurrency(t *testing.T) {
 		go func(index int) {
 			defer group.Done()
 			<-start
-			_, err := manager.EnsureSandboxV2(context.Background(), ensureRequest(fmt.Sprintf("sandbox-%03d", index), 1, 1))
+			_, err := manager.CreateSandbox(context.Background(), ensureRequest(fmt.Sprintf("sandbox-%03d", index), 1, 1))
 			if err == nil {
 				successes.Add(1)
 				return
@@ -294,7 +297,7 @@ func TestDuplicateEnsureCreatesRuntimeOnce(t *testing.T) {
 		go func() {
 			defer group.Done()
 			<-start
-			_, err := manager.EnsureSandboxV2(context.Background(), request)
+			_, err := manager.CreateSandbox(context.Background(), request)
 			if err != nil {
 				var failure *api.FastletError
 				require.True(t, errors.As(err, &failure))
@@ -315,73 +318,100 @@ func TestEnsureFailureReleasesCapacity(t *testing.T) {
 	runtime := newAdmissionRuntime()
 	runtime.ensureError = errors.New("create failed")
 	manager := newAdmissionManager(t, runtime, 1)
-	_, err := manager.EnsureSandboxV2(context.Background(), ensureRequest("sandbox-a", 1, 1))
+	_, err := manager.CreateSandbox(context.Background(), ensureRequest("sandbox-a", 1, 1))
 	requireFastletCode(t, err, api.ErrorRuntimeUnavailable)
 	runtime.mu.Lock()
 	runtime.ensureError = nil
 	runtime.mu.Unlock()
-	_, err = manager.EnsureSandboxV2(context.Background(), ensureRequest("sandbox-b", 1, 1))
+	_, err = manager.CreateSandbox(context.Background(), ensureRequest("sandbox-b", 1, 1))
 	require.NoError(t, err)
 	admission, _, _ := manager.State()
 	require.Equal(t, 1, admission.Running)
 }
 
-func TestReservationTTLAndCancelReleaseCapacity(t *testing.T) {
-	clock := &admissionClock{now: time.Unix(100, 0)}
-	var token atomic.Int64
-	manager, err := NewSandboxManagerWithConfig(newAdmissionRuntime(), SandboxManagerConfig{
-		Capacity: 1, FastletPodUID: "pod-uid-a", Clock: clock, ReservationTTL: 5 * time.Second,
-		TokenGenerator: func() (string, error) { return fmt.Sprintf("token-%d", token.Add(1)), nil },
-	})
+func TestFailedCreateCleanupIsRetriedBySameIdentity(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	runtime.ensureError = errors.New("create failed")
+	runtime.deleteError = errors.New("containerd task still exiting")
+	manager := newAdmissionManager(t, runtime, 1)
+	request := ensureRequest("sandbox-a", 1, 1)
+
+	response, err := manager.CreateSandbox(context.Background(), request)
+	requireFastletCode(t, err, api.ErrorRuntimeUnavailable)
+	require.Equal(t, api.OutcomeFailedNeedsCleanup, response.Error.Outcome)
+	statuses := manager.GetSandboxStatuses(context.Background())
+	require.Len(t, statuses, 1)
+	require.Equal(t, "create-cleanup-failed", statuses[0].Phase)
+
+	runtime.mu.Lock()
+	runtime.ensureError = nil
+	runtime.deleteError = nil
+	runtime.mu.Unlock()
+	response, err = manager.CreateSandbox(context.Background(), request)
 	require.NoError(t, err)
-	first, err := manager.ReserveSandbox(reserveRequest("request-a", "spec-a"))
-	require.NoError(t, err)
-	_, err = manager.ReserveSandbox(reserveRequest("request-b", "spec-b"))
-	requireFastletCode(t, err, api.ErrorCapacityRejected)
-	clock.Advance(6 * time.Second)
-	second, err := manager.ReserveSandbox(reserveRequest("request-b", "spec-b"))
-	require.NoError(t, err)
-	require.NotEqual(t, first.ReservationToken, second.ReservationToken)
-	_, err = manager.CancelReservation(&api.CancelReservationRequest{RequestID: "request-b", ReservationToken: second.ReservationToken})
-	require.NoError(t, err)
-	_, err = manager.ReserveSandbox(reserveRequest("request-c", "spec-c"))
-	require.NoError(t, err)
+	require.True(t, response.Accepted)
+	require.Equal(t, "running", response.Sandbox.Phase)
+	ensureCalls, deleteCalls := runtime.counts()
+	require.Equal(t, 2, ensureCalls)
+	require.Equal(t, 2, deleteCalls)
 }
 
-func TestReservationRejectsUnavailableNetworkResource(t *testing.T) {
+func TestUserDeleteFailureCannotBeResurrectedByCreateRetry(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	manager := newAdmissionManager(t, runtime, 1)
+	request := ensureRequest("sandbox-a", 1, 1)
+	_, err := manager.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
+
+	runtime.mu.Lock()
+	runtime.deleteError = errors.New("delete failed")
+	runtime.mu.Unlock()
+	_, err = manager.DeleteSandboxV2(&api.DeleteSandboxV2Request{Identity: request.Identity})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		statuses := manager.GetSandboxStatuses(context.Background())
+		return len(statuses) == 1 && statuses[0].Phase == "delete-failed"
+	}, time.Second, 10*time.Millisecond)
+	_, err = manager.CreateSandbox(context.Background(), request)
+	requireFastletCode(t, err, api.ErrorRuntimeUnavailable)
+}
+
+func TestAtomicCreateRejectsUnavailableNetworkResource(t *testing.T) {
 	available := false
 	runtime := newAdmissionRuntime()
 	runtime.resourceReady = &available
 	manager := newAdmissionManager(t, runtime, 1)
-	_, err := manager.ReserveSandbox(reserveRequest("request-a", "spec-a"))
+	_, err := manager.CreateSandbox(context.Background(), ensureRequest("sandbox-a", 1, 1))
 	requireFastletCode(t, err, api.ErrorNetworkUnavailable)
 
 	available = true
-	_, err = manager.ReserveSandbox(reserveRequest("request-a", "spec-a"))
+	_, err = manager.CreateSandbox(context.Background(), ensureRequest("sandbox-a", 1, 1))
 	require.NoError(t, err)
 }
 
-func TestCommittedClaimCanTakeOverMatchingReservationWithoutToken(t *testing.T) {
+func TestDeletedIdentityCannotBeResurrectedByDelayedCreate(t *testing.T) {
 	manager := newAdmissionManager(t, newAdmissionRuntime(), 1)
-	reservation := reserveRequest("request-a", "spec-a")
-	_, err := manager.ReserveSandbox(reservation)
-	require.NoError(t, err)
-
 	request := ensureRequest("sandbox-a", 1, 1)
-	request.Identity.RequestID = reservation.RequestID
-	request.CreateSpecHash = reservation.CreateSpecHash
-	request.Sandbox.ClaimName = reservation.ClaimName
-	_, err = manager.EnsureSandboxV2(context.Background(), request)
+	_, err := manager.CreateSandbox(context.Background(), request)
 	require.NoError(t, err)
-	admission, _, _ := manager.State()
-	require.Equal(t, 0, admission.Reservations)
-	require.Equal(t, 1, admission.Running)
+	_, err = manager.DeleteSandboxV2(&api.DeleteSandboxV2Request{Identity: request.Identity})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		admission, _, _ := manager.State()
+		return admission.Used == 0
+	}, time.Second, 10*time.Millisecond)
+	_, err = manager.CreateSandbox(context.Background(), request)
+	requireFastletCode(t, err, api.ErrorGenerationFenced)
+
+	next := ensureRequest("sandbox-a", 1, 2)
+	_, err = manager.CreateSandbox(context.Background(), next)
+	require.NoError(t, err, "a higher assignment attempt is a new fenced runtime identity")
 }
 
 func TestIdentityFencingAndClaimConflict(t *testing.T) {
 	manager := newAdmissionManager(t, newAdmissionRuntime(), 2)
 	request := ensureRequest("sandbox-a", 2, 3)
-	_, err := manager.EnsureSandboxV2(context.Background(), request)
+	_, err := manager.CreateSandbox(context.Background(), request)
 	require.NoError(t, err)
 
 	stale := request.Identity
@@ -397,7 +427,7 @@ func TestIdentityFencingAndClaimConflict(t *testing.T) {
 	conflict := *request
 	conflict.Sandbox = request.Sandbox
 	conflict.Sandbox.ClaimUID = "another-claim"
-	_, err = manager.EnsureSandboxV2(context.Background(), &conflict)
+	_, err = manager.CreateSandbox(context.Background(), &conflict)
 	requireFastletCode(t, err, api.ErrorConflict)
 }
 
@@ -407,7 +437,7 @@ func TestDeleteIsIdempotentAndFenced(t *testing.T) {
 	runtime.deleteBlock = make(chan struct{})
 	manager := newAdmissionManager(t, runtime, 1)
 	request := ensureRequest("sandbox-a", 1, 2)
-	_, err := manager.EnsureSandboxV2(context.Background(), request)
+	_, err := manager.CreateSandbox(context.Background(), request)
 	require.NoError(t, err)
 
 	stale := request.Identity
@@ -437,7 +467,7 @@ func TestDeleteDuringCreateWinsWithoutOrphan(t *testing.T) {
 	request := ensureRequest("sandbox-a", 1, 1)
 	result := make(chan error, 1)
 	go func() {
-		_, err := manager.EnsureSandboxV2(context.Background(), request)
+		_, err := manager.CreateSandbox(context.Background(), request)
 		result <- err
 	}()
 	<-runtime.ensureEntered
@@ -464,14 +494,14 @@ func TestRecoveryBlocksReadinessAndRestoresCapacity(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.False(t, manager.Ready())
-	_, err = manager.EnsureSandboxV2(context.Background(), ensureRequest("sandbox-b", 1, 1))
+	_, err = manager.CreateSandbox(context.Background(), ensureRequest("sandbox-b", 1, 1))
 	requireFastletCode(t, err, api.ErrorRuntimeUnavailable)
 	require.NoError(t, manager.Recover(context.Background()))
 	require.True(t, manager.Ready())
 	admission, recovering, _ := manager.State()
 	require.False(t, recovering)
 	require.Equal(t, 1, admission.Running)
-	_, err = manager.EnsureSandboxV2(context.Background(), ensureRequest("sandbox-b", 1, 1))
+	_, err = manager.CreateSandbox(context.Background(), ensureRequest("sandbox-b", 1, 1))
 	requireFastletCode(t, err, api.ErrorCapacityRejected)
 }
 
@@ -484,7 +514,7 @@ func TestRoutePublicationGatesCreateAndRetriesWithoutRecreatingRuntime(t *testin
 	require.NoError(t, err)
 	request := ensureRequest("sandbox-a", 1, 2)
 
-	_, err = manager.EnsureSandboxV2(context.Background(), request)
+	_, err = manager.CreateSandbox(context.Background(), request)
 	requireFastletCode(t, err, api.ErrorInProgress)
 	ensures, _ := runtime.counts()
 	require.Equal(t, 1, ensures)
@@ -492,7 +522,7 @@ func TestRoutePublicationGatesCreateAndRetriesWithoutRecreatingRuntime(t *testin
 	publisher.mu.Lock()
 	publisher.applyError = nil
 	publisher.mu.Unlock()
-	response, err := manager.EnsureSandboxV2(context.Background(), request)
+	response, err := manager.CreateSandbox(context.Background(), request)
 	require.NoError(t, err)
 	require.Equal(t, "running", response.Sandbox.Phase)
 	ensures, _ = runtime.counts()
@@ -510,18 +540,18 @@ func TestDrainingRejectsNewEnsureButKeepsExistingSandboxIdempotent(t *testing.T)
 	})
 	require.NoError(t, err)
 	existing := ensureRequest("sandbox-a", 1, 1)
-	created, err := manager.EnsureSandboxV2(context.Background(), existing)
+	created, err := manager.CreateSandbox(context.Background(), existing)
 	require.NoError(t, err)
 	require.True(t, created.Accepted)
 
 	manager.SetDraining(true, "pool scale-down")
-	reconciled, err := manager.EnsureSandboxV2(context.Background(), existing)
+	reconciled, err := manager.CreateSandbox(context.Background(), existing)
 	require.NoError(t, err)
 	require.True(t, reconciled.Accepted)
 	require.False(t, reconciled.Created)
 	require.Equal(t, "running", reconciled.Sandbox.Phase)
 
-	_, err = manager.EnsureSandboxV2(context.Background(), ensureRequest("sandbox-b", 1, 1))
+	_, err = manager.CreateSandbox(context.Background(), ensureRequest("sandbox-b", 1, 1))
 	requireFastletCode(t, err, api.ErrorDraining)
 }
 
@@ -533,7 +563,7 @@ func TestRouteRemovalPrecedesAndGatesRuntimeDeletion(t *testing.T) {
 	})
 	require.NoError(t, err)
 	request := ensureRequest("sandbox-a", 1, 1)
-	_, err = manager.EnsureSandboxV2(context.Background(), request)
+	_, err = manager.CreateSandbox(context.Background(), request)
 	require.NoError(t, err)
 	_, err = manager.DeleteSandboxV2(&api.DeleteSandboxV2Request{Identity: request.Identity})
 	require.NoError(t, err)
@@ -622,7 +652,7 @@ func TestProxyControlReconnectRevokesAndRestoresReadiness(t *testing.T) {
 		Capacity: 1, FastletPodUID: "pod-uid-a", RoutePublisher: publisher,
 	})
 	require.NoError(t, err)
-	_, err = manager.EnsureSandboxV2(context.Background(), ensureRequest("sandbox-a", 1, 1))
+	_, err = manager.CreateSandbox(context.Background(), ensureRequest("sandbox-a", 1, 1))
 	require.NoError(t, err)
 	require.True(t, manager.Ready())
 

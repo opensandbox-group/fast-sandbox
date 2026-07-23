@@ -2,6 +2,7 @@ package scheduling
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
 )
@@ -60,11 +62,22 @@ func TestResourceSlotCapacity(t *testing.T) {
 				t.Fatalf("create sandbox 3: %v", err)
 			}
 
-			// Verify sandbox 3 remains unassigned due to capacity limit
+			// CRD-first persists a durable assignment before Fastlet admission.
+			// Capacity rejection therefore leaves the third declarative intent
+			// assigned but Pending; it must never become a third runtime while
+			// the first two slots remain occupied.
+			pendingCtx, cancelPending := context.WithTimeout(ctx, 30*time.Second)
+			defer cancelPending()
+			if _, err := fixture.WaitForSandbox(pendingCtx, types.NamespacedName{Name: "sb-slot-3", Namespace: namespace}, func(sb *apiv1alpha1.Sandbox) bool {
+				return sb.Status.Assignment != nil &&
+					sb.Annotations["sandbox.fast.io/assignment"] != ""
+			}); err != nil {
+				t.Fatalf("wait for capacity-rejected Sandbox to retain its durable assignment: %v", err)
+			}
 			ensureCtx, cancelEnsure := context.WithTimeout(ctx, 30*time.Second)
 			defer cancelEnsure()
-			if err := fixture.EnsureSandboxRemainsUnassigned(ensureCtx, types.NamespacedName{Name: "sb-slot-3", Namespace: namespace}, 10*time.Second); err != nil {
-				t.Fatalf("sandbox 3 should remain unassigned due to capacity limit: %v", err)
+			if err := ensureSandboxRemainsCapacityBlocked(ensureCtx, k8sClient, types.NamespacedName{Name: "sb-slot-3", Namespace: namespace}, 10*time.Second); err != nil {
+				t.Fatalf("sandbox 3 should remain Pending without consuming a third runtime slot: %v", err)
 			}
 
 			return ctx
@@ -72,6 +85,28 @@ func TestResourceSlotCapacity(t *testing.T) {
 		Feature()
 
 	testSuite.Env().Test(t, feature)
+}
+
+func ensureSandboxRemainsCapacityBlocked(ctx context.Context, k8sClient client.Client, name types.NamespacedName, duration time.Duration) error {
+	deadline := time.Now().Add(duration)
+	for time.Now().Before(deadline) {
+		var sandbox apiv1alpha1.Sandbox
+		if err := k8sClient.Get(ctx, name, &sandbox); err != nil {
+			return err
+		}
+		if sandbox.Status.Assignment == nil || sandbox.Annotations["sandbox.fast.io/assignment"] == "" {
+			return fmt.Errorf("durable assignment disappeared")
+		}
+		if sandbox.Status.RuntimeState == apiv1alpha1.ObservedStateReady {
+			return fmt.Errorf("runtime became Ready despite exhausted capacity")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+	return nil
 }
 
 func TestAutoScaling(t *testing.T) {

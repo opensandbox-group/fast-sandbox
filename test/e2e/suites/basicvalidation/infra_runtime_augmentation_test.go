@@ -3,6 +3,7 @@ package basicvalidation
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"fast-sandbox/test/e2e/support/fixtures"
 	"fast-sandbox/test/e2e/support/suiteenv"
 
+	opensandbox "github.com/alibaba/OpenSandbox/sdks/sandbox/go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	corev1 "k8s.io/api/core/v1"
@@ -70,20 +72,47 @@ func TestSDKAdapterDataPlane(t *testing.T) {
 				t.Fatalf("start Sandbox Proxy port-forward: %v", err)
 			}
 			defer proxyForward.Cleanup()
-			adapter := &sandboxclient.ExecdAdapter{
+			adapter := &sandboxclient.OpenSandboxExecd{
 				Resolver: &sandboxclient.EndpointResolver{Control: fastPath, DefaultNamespace: namespace, ProxyBaseURL: proxyBase},
 				Port:     18080,
 			}
-			execution, err := adapter.RunCommand(ctx, sandboxclient.SandboxRef{Name: created.SandboxName, Namespace: namespace}, sandboxclient.RunCommandRequest{Command: "printf sdk-exec"}, nil)
+			execd, _, err := adapter.Client(ctx, sandboxclient.SandboxRef{Name: created.SandboxName, Namespace: namespace})
 			if err != nil {
-				t.Fatalf("ExecdAdapter command: %v", err)
+				t.Fatalf("resolve OpenSandbox Execd client: %v", err)
 			}
-			if len(execution.Stdout) != 1 || execution.Stdout[0].Text != "sdk-exec\n" || execution.ExitCode == nil || *execution.ExitCode != 0 {
-				t.Fatalf("unexpected ExecdAdapter execution: %+v", execution)
+			var stdout strings.Builder
+			var exitCode *int
+			err = execd.RunCommand(ctx, opensandbox.RunCommandRequest{Command: "printf sdk-exec"}, func(event opensandbox.StreamEvent) error {
+				var payload struct {
+					Type     string `json:"type"`
+					Text     string `json:"text"`
+					ExitCode *int   `json:"exit_code"`
+				}
+				if err := json.Unmarshal([]byte(event.Data), &payload); err != nil {
+					return err
+				}
+				if payload.Type == "stdout" {
+					stdout.WriteString(payload.Text)
+				}
+				if payload.Type == "execution_complete" {
+					exitCode = payload.ExitCode
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatalf("OpenSandbox SDK command: %v", err)
+			}
+			if stdout.String() != "sdk-exec\n" || exitCode == nil || *exitCode != 0 {
+				t.Fatalf("unexpected OpenSandbox SDK execution: stdout=%q exit=%v", stdout.String(), exitCode)
 			}
 			var downloaded bytes.Buffer
-			if _, err := adapter.Download(ctx, sandboxclient.SandboxRef{Name: created.SandboxName, Namespace: namespace}, "/tmp/value", &downloaded); err != nil {
-				t.Fatalf("ExecdAdapter download: %v", err)
+			reader, err := execd.DownloadFile(ctx, "/tmp/value", "")
+			if err != nil {
+				t.Fatalf("OpenSandbox SDK download: %v", err)
+			}
+			defer reader.Close()
+			if _, err := io.Copy(&downloaded, reader); err != nil {
+				t.Fatalf("copy OpenSandbox SDK download: %v", err)
 			}
 			if downloaded.String() != "sdk-file" {
 				t.Fatalf("download = %q, want sdk-file", downloaded.String())
@@ -178,9 +207,10 @@ printf 'HTTP/1.1 200 OK\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s' "$
 EOF
 chmod 0700 /tmp/user-serve
 exec nc -lk -p 18081 -e /tmp/user-serve`
+	requestID := namespace + "-infra-sandbox"
 	request := &fastpathv1.CreateRequest{
-		Namespace: namespace, PoolRef: pool, Name: "infra-sandbox", Image: "docker.io/library/alpine:latest",
-		Command: []string{"/bin/sh", "-c", command}, RequestId: namespace + "-infra-sandbox",
+		Namespace: namespace, PoolRef: pool, Name: requestID, Image: "docker.io/library/alpine:latest",
+		Command: []string{"/bin/sh", "-c", command}, RequestId: requestID,
 	}
 	deadline := time.Now().Add(90 * time.Second)
 	var lastErr error

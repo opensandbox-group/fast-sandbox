@@ -44,13 +44,12 @@ func (s *FastletServer) Handler() http.Handler {
 	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("/readyz", s.handleReady)
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/api/v2/fastlet/reservations", s.handleReserve)
-	mux.HandleFunc("/api/v2/fastlet/reservations/cancel", s.handleCancelReservation)
-	mux.HandleFunc("/api/v2/fastlet/ensure", s.handleEnsure)
+	mux.HandleFunc("/api/v2/fastlet/create", s.handleCreate)
 	mux.HandleFunc("/api/v2/fastlet/inspect", s.handleInspect)
 	mux.HandleFunc("/api/v2/fastlet/delete", s.handleDeleteV2)
 	mux.HandleFunc("/api/v2/fastlet/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("/api/v2/fastlet/runtime-diagnostics", s.handleRuntimeDiagnostics)
+	mux.HandleFunc("/api/v2/fastlet/diagnostics/sandbox", s.handleSandboxDiagnostics)
 	mux.HandleFunc("/api/v2/fastlet/draining", s.handleSetDraining)
 
 	klog.InfoS("Starting fastlet HTTP server", "addr", s.addr)
@@ -77,30 +76,8 @@ func (s *FastletServer) handleReady(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func (s *FastletServer) handleReserve(w http.ResponseWriter, r *http.Request) {
-	var req api.ReserveSandboxRequest
-	if !decodePost(w, r, &req) {
-		return
-	}
-	r = r.WithContext(observability.WithIdentity(r.Context(), observability.Identity{
-		RequestID: req.RequestID, Namespace: req.ClaimNamespace, SandboxName: req.ClaimName, FastletPodUID: req.FastletPodUID,
-	}))
-	response, err := s.sandboxManager.ReserveSandbox(&req)
-	writeResponse(w, response, err)
-}
-
-func (s *FastletServer) handleCancelReservation(w http.ResponseWriter, r *http.Request) {
-	var req api.CancelReservationRequest
-	if !decodePost(w, r, &req) {
-		return
-	}
-	r = r.WithContext(observability.WithIdentity(r.Context(), observability.Identity{RequestID: req.RequestID}))
-	response, err := s.sandboxManager.CancelReservation(&req)
-	writeResponse(w, response, err)
-}
-
-func (s *FastletServer) handleEnsure(w http.ResponseWriter, r *http.Request) {
-	var req api.EnsureSandboxRequest
+func (s *FastletServer) handleCreate(w http.ResponseWriter, r *http.Request) {
+	var req api.CreateSandboxRequest
 	if !decodePost(w, r, &req) {
 		return
 	}
@@ -108,7 +85,7 @@ func (s *FastletServer) handleEnsure(w http.ResponseWriter, r *http.Request) {
 	r = r.WithContext(observability.WithIdentity(r.Context(), observability.Identity{
 		Namespace: req.Sandbox.ClaimNamespace, SandboxName: req.Sandbox.ClaimName,
 	}))
-	response, err := s.sandboxManager.EnsureSandboxV2(r.Context(), &req)
+	response, err := s.sandboxManager.CreateSandbox(r.Context(), &req)
 	writeResponse(w, response, err)
 }
 
@@ -180,6 +157,16 @@ func (s *FastletServer) handleRuntimeDiagnostics(w http.ResponseWriter, r *http.
 		return
 	}
 	writeResponse(w, s.sandboxManager.RuntimeDiagnostics(r.Context()), nil)
+}
+
+func (s *FastletServer) handleSandboxDiagnostics(w http.ResponseWriter, r *http.Request) {
+	var req api.SandboxDiagnosticsRequest
+	if !decodePost(w, r, &req) {
+		return
+	}
+	r = r.WithContext(withFastletRequestIdentity(r.Context(), req.Identity))
+	response, err := s.sandboxManager.SandboxDiagnostics(&req)
+	writeResponse(w, response, err)
 }
 
 func decodePost(w http.ResponseWriter, r *http.Request, target any) bool {

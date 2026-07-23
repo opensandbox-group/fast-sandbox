@@ -13,7 +13,8 @@ import (
 
 type MockClient struct {
 	fastpathv1.UnimplementedFastPathServiceServer
-	CreateFunc func(ctx context.Context, req *fastpathv1.CreateRequest) (*fastpathv1.CreateResponse, error)
+	CreateFunc      func(ctx context.Context, req *fastpathv1.CreateRequest) (*fastpathv1.CreateResponse, error)
+	DiagnosticsFunc func(ctx context.Context, req *fastpathv1.SandboxDiagnosticsRequest) (*fastpathv1.SandboxDiagnosticsResponse, error)
 }
 
 func (m *MockClient) CreateSandbox(ctx context.Context, in *fastpathv1.CreateRequest, opts ...grpc.CallOption) (*fastpathv1.CreateResponse, error) {
@@ -31,6 +32,12 @@ func (m *MockClient) ListSandboxes(ctx context.Context, in *fastpathv1.ListReque
 }
 func (m *MockClient) GetSandbox(ctx context.Context, in *fastpathv1.GetRequest, opts ...grpc.CallOption) (*fastpathv1.SandboxInfo, error) {
 	return &fastpathv1.SandboxInfo{}, nil
+}
+func (m *MockClient) GetSandboxDiagnostics(ctx context.Context, in *fastpathv1.SandboxDiagnosticsRequest, opts ...grpc.CallOption) (*fastpathv1.SandboxDiagnosticsResponse, error) {
+	if m.DiagnosticsFunc != nil {
+		return m.DiagnosticsFunc(ctx, in)
+	}
+	return &fastpathv1.SandboxDiagnosticsResponse{}, nil
 }
 func (m *MockClient) UpdateSandbox(ctx context.Context, in *fastpathv1.UpdateRequest, opts ...grpc.CallOption) (*fastpathv1.UpdateResponse, error) {
 	return &fastpathv1.UpdateResponse{}, nil
@@ -80,8 +87,8 @@ func TestRunCommand(t *testing.T) {
 	if capturedReq.Image != "alpine" {
 		t.Errorf("expected image 'alpine', got '%s'", capturedReq.Image)
 	}
-	if capturedReq.RequestId == "" {
-		t.Error("expected an automatically generated request_id")
+	if capturedReq.RequestId != "my-sandbox" {
+		t.Errorf("expected request_id to equal Sandbox name, got %q", capturedReq.RequestId)
 	}
 	// ... other assert
 }

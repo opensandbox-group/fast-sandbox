@@ -3,10 +3,13 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
+	opensandbox "github.com/alibaba/OpenSandbox/sdks/sandbox/go"
 	"github.com/spf13/cobra"
 )
 
@@ -23,16 +26,25 @@ var cpCmd = &cobra.Command{
 		if sourceOK == destinationOK {
 			log.Fatal("Error: exactly one side of cp must be sandbox:path")
 		}
-		adapter, closeClient := commandExecdAdapter()
+		adapter, closeClient := commandOpenSandboxExecd()
 		defer closeClient()
 		ctx := context.Background()
 		if sourceOK {
+			client, _, err := adapter.Client(ctx, sandboxReference(sourceRemote.Sandbox))
+			if err != nil {
+				log.Fatalf("Error: %v", err)
+			}
 			output, err := os.Create(args[1])
 			if err != nil {
 				log.Fatalf("Error: %v", err)
 			}
 			defer output.Close()
-			if _, err := adapter.Download(ctx, sandboxReference(sourceRemote.Sandbox), sourceRemote.Path, output); err != nil {
+			download, err := client.DownloadFile(ctx, sourceRemote.Path, "")
+			if err != nil {
+				log.Fatalf("Error: %v", err)
+			}
+			defer download.Close()
+			if _, err := io.Copy(output, download); err != nil {
 				log.Fatalf("Error: %v", err)
 			}
 			return
@@ -42,7 +54,14 @@ var cpCmd = &cobra.Command{
 			log.Fatalf("Error: %v", err)
 		}
 		defer input.Close()
-		if err := adapter.Upload(ctx, sandboxReference(destinationRemote.Sandbox), destinationRemote.Path, input, 0o644); err != nil {
+		client, _, err := adapter.Client(ctx, sandboxReference(destinationRemote.Sandbox))
+		if err != nil {
+			log.Fatalf("Error: %v", err)
+		}
+		if err := client.UploadFile(ctx, input, opensandbox.UploadFileOptions{
+			FileName: filepath.Base(destinationRemote.Path),
+			Metadata: opensandbox.FileMetadata{Path: destinationRemote.Path, Mode: opensandbox.OctalMode(0o644)},
+		}); err != nil {
 			log.Fatalf("Error: %v", err)
 		}
 	},
@@ -63,4 +82,4 @@ func parseSandboxPath(value string) (sandboxPath, bool) {
 	return sandboxPath{Sandbox: sandbox, Path: path}, true
 }
 
-func init() { rootCmd.AddCommand(cpCmd) }
+func init() { openSandboxCmd.AddCommand(cpCmd) }

@@ -15,10 +15,6 @@ var (
 		Name: "fast_sandbox_fastlet_admission_total",
 		Help: "Fastlet admission operations partitioned by bounded result and reason enums.",
 	}, []string{"operation", "result", "reason"})
-	fastletReservationInflight = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "fast_sandbox_fastlet_reservation_inflight",
-		Help: "Current number of uncommitted Fastlet reservations.",
-	})
 	fastletAdmissionSlots = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "fast_sandbox_fastlet_admission_slots",
 		Help: "Current Fastlet slot accounting by state.",
@@ -61,7 +57,6 @@ func recordAdmission(operation string, err error) {
 }
 
 func recordAdmissionStatus(status api.AdmissionStatus) {
-	fastletReservationInflight.Set(float64(status.Reservations))
 	fastletAdmissionSlots.WithLabelValues("capacity").Set(float64(status.Capacity))
 	fastletAdmissionSlots.WithLabelValues("used").Set(float64(status.Used))
 	fastletAdmissionSlots.WithLabelValues("creating").Set(float64(status.Creating))

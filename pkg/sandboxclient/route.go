@@ -29,6 +29,10 @@ type SandboxRef struct {
 	Namespace string
 }
 
+type RouteResolver interface {
+	Resolve(context.Context, SandboxRef, uint32) (Route, error)
+}
+
 type Route struct {
 	SandboxUID       string
 	TargetPort       uint32

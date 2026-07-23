@@ -77,9 +77,15 @@ func TestEnsureContainerdSandboxAbsentRunningTaskStopsGracefully(t *testing.T) {
 }
 
 func TestEnsureContainerdSandboxAbsentRunningTaskIsForceKilledAfterTimeout(t *testing.T) {
+	exitCh := make(chan containerd.ExitStatus, 1)
 	task := &fakeContainerdDeleteTask{
 		status: containerd.Status{Status: containerd.Running},
-		waitCh: make(chan containerd.ExitStatus),
+		waitCh: exitCh, pendingExit: exitCh, requireExitWaitBeforeDelete: true,
+		onKill: func(signal syscall.Signal) {
+			if signal == syscall.SIGKILL {
+				exitCh <- containerd.ExitStatus{}
+			}
+		},
 	}
 	backend := newFakeContainerdDeleteBackend(true, true, task)
 
@@ -87,6 +93,7 @@ func TestEnsureContainerdSandboxAbsentRunningTaskIsForceKilledAfterTimeout(t *te
 
 	require.NoError(t, err)
 	require.Equal(t, []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL}, task.signals)
+	require.False(t, task.deleteBeforeExitWait, "SIGKILL exit must be consumed before Task.Delete")
 	require.True(t, task.deleteCalled)
 }
 
@@ -278,15 +285,18 @@ func (c *fakeContainerdDeleteContainer) Delete(context.Context) error {
 }
 
 type fakeContainerdDeleteTask struct {
-	status       containerd.Status
-	statusErr    error
-	waitCh       <-chan containerd.ExitStatus
-	waitErr      error
-	killErr      map[syscall.Signal]error
-	deleteErr    error
-	signals      []syscall.Signal
-	deleteCalled bool
-	onKill       func(syscall.Signal)
+	status                      containerd.Status
+	statusErr                   error
+	waitCh                      <-chan containerd.ExitStatus
+	waitErr                     error
+	killErr                     map[syscall.Signal]error
+	deleteErr                   error
+	signals                     []syscall.Signal
+	deleteCalled                bool
+	onKill                      func(syscall.Signal)
+	pendingExit                 chan containerd.ExitStatus
+	requireExitWaitBeforeDelete bool
+	deleteBeforeExitWait        bool
 }
 
 func (t *fakeContainerdDeleteTask) Status(context.Context) (containerd.Status, error) {
@@ -307,5 +317,8 @@ func (t *fakeContainerdDeleteTask) Kill(_ context.Context, signal syscall.Signal
 
 func (t *fakeContainerdDeleteTask) Delete(context.Context) error {
 	t.deleteCalled = true
+	if t.requireExitWaitBeforeDelete && len(t.pendingExit) > 0 {
+		t.deleteBeforeExitWait = true
+	}
 	return t.deleteErr
 }

@@ -160,6 +160,12 @@ func deleteContainerdTask(
 		if waitErr == nil && !waitForContainerdTask(ctx, waitCh, gracePeriod) {
 			if killErr := task.Kill(ctx, syscall.SIGKILL); killErr != nil && !errdefs.IsNotFound(killErr) {
 				cleanupErrs = append(cleanupErrs, fmt.Errorf("force signal task for container %q: %w", sandboxID, killErr))
+			} else {
+				// containerd may reject Task.Delete while the SIGKILL exit event
+				// is still being committed. Wait on the original channel again so
+				// stale-runtime takeover does not turn a transient race into a
+				// permanent delete-failed manager state.
+				_ = waitForContainerdTask(ctx, waitCh, gracePeriod)
 			}
 		}
 	}

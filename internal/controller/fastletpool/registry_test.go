@@ -22,7 +22,7 @@ func readyFastlet(id string, used, capacity int, images ...string) FastletInfo {
 		ID: FastletID(id), Namespace: "default", PodName: id, PodUID: "uid-" + id,
 		PodIP: "10.0.0.1", NodeName: "node-a", PoolName: "pool-a",
 		RuntimeName: apiv1alpha1.RuntimeContainer, RuntimeProfileHash: "runtime-hash", ResourceProfileHash: "resource-hash",
-		PodReady: true, RuntimeReady: true, Capacity: capacity,
+		PodReady: true, RuntimeReady: true, InfraReady: true, Capacity: capacity,
 		Admission: api.AdmissionStatus{Capacity: capacity, Used: used, Running: used},
 		Images:    append([]string(nil), images...), CacheEpoch: "boot-a", CacheRevision: 1, CacheComplete: true,
 		SandboxStatuses: make(map[string]api.SandboxStatus), HeartbeatSequence: 1, LastHeartbeat: registryNow, PodObservedAt: registryNow,
@@ -350,8 +350,8 @@ func TestStaleRegistryHintsCannotExceedFastletCapacity(t *testing.T) {
 	for index := 0; index < 100; index++ {
 		sandboxUID := fmt.Sprintf("sandbox-%03d", index)
 		require.Len(t, registry.TopK(candidate("alpine:latest", sandboxUID), 1), 1)
-		_, err = manager.EnsureSandboxV2(context.Background(), &api.EnsureSandboxRequest{
-			Identity: api.SandboxIdentity{SandboxUID: sandboxUID, InstanceGeneration: 1, AssignmentAttempt: 1, FastletPodUID: "uid-fastlet-a"},
+		_, err = manager.CreateSandbox(context.Background(), &api.CreateSandboxRequest{
+			Identity: api.SandboxIdentity{SandboxUID: sandboxUID, InstanceGeneration: 1, RuntimeInstanceID: "runtime-" + sandboxUID, AssignmentAttempt: 1, FastletPodUID: "uid-fastlet-a"},
 			Sandbox:  api.SandboxSpec{ClaimUID: "claim-" + sandboxUID, Image: "alpine:latest"},
 		})
 		if err == nil {

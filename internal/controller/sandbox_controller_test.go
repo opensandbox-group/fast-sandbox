@@ -49,23 +49,15 @@ type controllerFastlet struct {
 	deleteCall int
 }
 
-func (*controllerFastlet) ReserveSandbox(context.Context, string, *api.ReserveSandboxRequest) (*api.ReserveSandboxResponse, error) {
-	return nil, errors.New("declarative reconciliation must not reserve")
-}
-
-func (*controllerFastlet) CancelReservation(context.Context, string, *api.CancelReservationRequest) (*api.CancelReservationResponse, error) {
-	return nil, errors.New("unexpected cancel")
-}
-
-func (f *controllerFastlet) EnsureSandbox(_ context.Context, _ string, request *api.EnsureSandboxRequest) (*api.EnsureSandboxResponse, error) {
+func (f *controllerFastlet) CreateSandbox(_ context.Context, _ string, request *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ensureCall++
 	if f.ensureErr != nil {
-		return &api.EnsureSandboxResponse{}, f.ensureErr
+		return &api.CreateSandboxResponse{}, f.ensureErr
 	}
 	f.runtimes[request.Identity.SandboxUID] = "running"
-	return &api.EnsureSandboxResponse{Accepted: true, Sandbox: &api.SandboxStatus{SandboxID: request.Identity.SandboxUID, Phase: "running"}}, nil
+	return &api.CreateSandboxResponse{Accepted: true, Sandbox: &api.SandboxStatus{SandboxID: request.Identity.SandboxUID, Phase: "running"}}, nil
 }
 
 func (f *controllerFastlet) InspectSandbox(_ context.Context, _ string, request *api.InspectSandboxRequest) (*api.InspectSandboxResponse, error) {
@@ -113,13 +105,15 @@ func TestDeclarativeCreateUsesSharedV2Orchestrator(t *testing.T) {
 	fastlet.mu.Unlock()
 }
 
-func TestExplicitCapacityRejectionClearsAssignmentButKeepsAttemptFence(t *testing.T) {
+func TestExplicitCapacityRejectionPreservesDurableAssignmentAndAttemptFence(t *testing.T) {
 	reconciler, _, fastlet, sandbox := newControllerHarness(t)
-	failure := &api.FastletError{Code: api.ErrorCapacityRejected, Message: "full", Retryable: true}
+	failure := &api.FastletError{Code: api.ErrorCapacityRejected, Message: "full", Retryable: true, Outcome: api.OutcomeRejectedBeforeSideEffects}
 	fastlet.ensureErr = failure
 	reconcileTwice(t, reconciler, sandbox.Name)
 	current := getControllerSandbox(t, reconciler, sandbox.Name)
-	require.Nil(t, current.Status.Assignment)
+	require.NotNil(t, current.Status.Assignment)
+	require.Equal(t, "fastlet-a", current.Status.Assignment.FastletName)
+	require.NotEmpty(t, current.Annotations["sandbox.fast.io/assignment"])
 	require.Equal(t, int64(1), current.Status.AssignmentAttempt)
 	require.Equal(t, apiv1alpha1.ObservedStatePending, current.Status.RuntimeState)
 }
@@ -288,7 +282,11 @@ func newControllerHarness(t *testing.T) (*SandboxReconciler, *controllerRegistry
 		Name: "fastlet-a", Namespace: "default", UID: types.UID("pod-a"), Labels: map[string]string{"app": "sandbox-fastlet"},
 	}}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&apiv1alpha1.Sandbox{}).WithObjects(pool, sandbox, fastletPod).Build()
-	candidate := fastletpool.FastletInfo{ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", PodIP: "10.0.0.1", NodeName: "node-a"}
+	candidate := fastletpool.FastletInfo{
+		ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", PodIP: "10.0.0.1", NodeName: "node-a",
+		RuntimeName: apiv1alpha1.RuntimeContainer, RuntimeProfileHash: "container-runtime-profile-v1",
+		ResourceProfileHash: pool.Spec.SandboxResources.Hash(), InfraProfile: "minimal", InfraProfileHash: "infra-minimal-v1", InfraReady: true,
+	}
 	registry := &controllerRegistry{
 		candidates: []fastletpool.FastletInfo{candidate},
 		fastlets:   map[fastletpool.FastletID]fastletpool.FastletInfo{"fastlet-a": candidate},

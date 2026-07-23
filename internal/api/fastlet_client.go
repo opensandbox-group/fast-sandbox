@@ -17,13 +17,12 @@ import (
 // multi-active Fast-Path and declarative Controller. It deliberately contains
 // lifecycle/admission operations only; Exec/File are data-plane concerns.
 type FastletAdmissionClient interface {
-	ReserveSandbox(ctx context.Context, fastletIP string, req *ReserveSandboxRequest) (*ReserveSandboxResponse, error)
-	CancelReservation(ctx context.Context, fastletIP string, req *CancelReservationRequest) (*CancelReservationResponse, error)
-	EnsureSandbox(ctx context.Context, fastletIP string, req *EnsureSandboxRequest) (*EnsureSandboxResponse, error)
+	CreateSandbox(ctx context.Context, fastletIP string, req *CreateSandboxRequest) (*CreateSandboxResponse, error)
 	InspectSandbox(ctx context.Context, fastletIP string, req *InspectSandboxRequest) (*InspectSandboxResponse, error)
 	DeleteSandboxV2(ctx context.Context, fastletIP string, req *DeleteSandboxV2Request) (*DeleteSandboxV2Response, error)
 	Heartbeat(ctx context.Context, fastletIP string, req *HeartbeatRequest) (*HeartbeatResponse, error)
 	RuntimeDiagnostics(ctx context.Context, fastletIP string) (*RuntimeDiagnostics, error)
+	SandboxDiagnostics(ctx context.Context, fastletIP string, req *SandboxDiagnosticsRequest) (*SandboxDiagnosticsResponse, error)
 	SetDraining(ctx context.Context, fastletIP string, req *SetDrainingRequest) (*SetDrainingResponse, error)
 }
 
@@ -58,28 +57,12 @@ func (c *FastletClient) SetTimeout(timeout time.Duration) {
 	c.httpClient.Timeout = timeout
 }
 
-func (c *FastletClient) ReserveSandbox(ctx context.Context, fastletIP string, req *ReserveSandboxRequest) (*ReserveSandboxResponse, error) {
-	if req != nil {
-		ctx = observability.WithIdentity(ctx, observability.Identity{
-			RequestID: req.RequestID, Namespace: req.ClaimNamespace, SandboxName: req.ClaimName, FastletPodUID: req.FastletPodUID,
-		})
-	}
-	return postFastletJSON[ReserveSandboxRequest, ReserveSandboxResponse](c, ctx, fastletIP, "/api/v2/fastlet/reservations", req)
-}
-
-func (c *FastletClient) CancelReservation(ctx context.Context, fastletIP string, req *CancelReservationRequest) (*CancelReservationResponse, error) {
-	if req != nil {
-		ctx = observability.WithIdentity(ctx, observability.Identity{RequestID: req.RequestID})
-	}
-	return postFastletJSON[CancelReservationRequest, CancelReservationResponse](c, ctx, fastletIP, "/api/v2/fastlet/reservations/cancel", req)
-}
-
-func (c *FastletClient) EnsureSandbox(ctx context.Context, fastletIP string, req *EnsureSandboxRequest) (*EnsureSandboxResponse, error) {
+func (c *FastletClient) CreateSandbox(ctx context.Context, fastletIP string, req *CreateSandboxRequest) (*CreateSandboxResponse, error) {
 	if req != nil {
 		ctx = withFastletIdentity(ctx, req.Identity)
 		ctx = observability.WithIdentity(ctx, observability.Identity{Namespace: req.Sandbox.ClaimNamespace, SandboxName: req.Sandbox.ClaimName})
 	}
-	return postFastletJSON[EnsureSandboxRequest, EnsureSandboxResponse](c, ctx, fastletIP, "/api/v2/fastlet/ensure", req)
+	return postFastletJSON[CreateSandboxRequest, CreateSandboxResponse](c, ctx, fastletIP, "/api/v2/fastlet/create", req)
 }
 
 func (c *FastletClient) InspectSandbox(ctx context.Context, fastletIP string, req *InspectSandboxRequest) (*InspectSandboxResponse, error) {
@@ -110,6 +93,13 @@ func (c *FastletClient) Heartbeat(ctx context.Context, fastletIP string, req *He
 
 func (c *FastletClient) RuntimeDiagnostics(ctx context.Context, fastletIP string) (*RuntimeDiagnostics, error) {
 	return getFastletJSON[RuntimeDiagnostics](c, ctx, fastletIP, "/api/v2/fastlet/runtime-diagnostics")
+}
+
+func (c *FastletClient) SandboxDiagnostics(ctx context.Context, fastletIP string, req *SandboxDiagnosticsRequest) (*SandboxDiagnosticsResponse, error) {
+	if req != nil {
+		ctx = withFastletIdentity(ctx, req.Identity)
+	}
+	return postFastletJSON[SandboxDiagnosticsRequest, SandboxDiagnosticsResponse](c, ctx, fastletIP, "/api/v2/fastlet/diagnostics/sandbox", req)
 }
 
 func (c *FastletClient) SetDraining(ctx context.Context, fastletIP string, req *SetDrainingRequest) (*SetDrainingResponse, error) {
@@ -175,15 +165,13 @@ func doFastletJSON[Response any](c *FastletClient, request *http.Request) (*Resp
 
 func responseFastletError(response any) *FastletError {
 	switch typed := response.(type) {
-	case *ReserveSandboxResponse:
-		return typed.Error
-	case *CancelReservationResponse:
-		return typed.Error
-	case *EnsureSandboxResponse:
+	case *CreateSandboxResponse:
 		return typed.Error
 	case *InspectSandboxResponse:
 		return typed.Error
 	case *DeleteSandboxV2Response:
+		return typed.Error
+	case *SandboxDiagnosticsResponse:
 		return typed.Error
 	default:
 		return nil

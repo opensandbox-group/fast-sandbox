@@ -26,9 +26,7 @@ type SandboxManagerConfig struct {
 	RuntimeProfileHash string
 	ResourceProfile    *apiv1alpha1.SandboxResourceProfile
 	FastletPodUID      string
-	ReservationTTL     time.Duration
 	Clock              Clock
-	TokenGenerator     func() (string, error)
 	RecoverOnStart     bool
 	CacheEpoch         string
 	WarmImages         []string
@@ -52,16 +50,15 @@ type SandboxManager struct {
 	infraReady          bool
 	infraMessage        string
 	fastletPodUID       string
-	reservationTTL      time.Duration
 	clock               Clock
-	tokenGenerator      func() (string, error)
 	recovering          bool
 	runtimeReady        bool
 	routeReady          bool
 	draining            bool
 	drainReason         string
-	reservations        map[string]*reservation
-	requestReservations map[string]string
+	tombstones          map[string]api.SandboxIdentity
+	diagnostics         map[string][]api.SandboxDiagnosticEvent
+	diagnosticOrder     []string
 	cacheTracker        *fastletcache.Tracker
 	cacheProtection     *fastletcache.ProtectionIndex
 	warmImages          []string
@@ -83,14 +80,8 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 	if config.Capacity <= 0 {
 		return nil, fmt.Errorf("%w: capacity must be greater than zero", ErrInvalidConfig)
 	}
-	if config.ReservationTTL <= 0 {
-		config.ReservationTTL = 15 * time.Second
-	}
 	if config.Clock == nil {
 		config.Clock = realClock{}
-	}
-	if config.TokenGenerator == nil {
-		config.TokenGenerator = generateReservationToken
 	}
 	if config.CacheEpoch == "" {
 		var err error
@@ -131,11 +122,12 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		resourceProfile:    profile, resourceProfileHash: resourceHash,
 		infraProfile: config.InfraProfile, infraProfileHash: config.InfraProfileHash,
 		infraManager: config.InfraManager, infraReady: config.InfraManager == nil,
-		fastletPodUID:  config.FastletPodUID,
-		reservationTTL: config.ReservationTTL, clock: config.Clock, tokenGenerator: config.TokenGenerator,
-		recovering: config.RecoverOnStart, runtimeReady: !config.RecoverOnStart,
-		routeReady:   config.RoutePublisher == nil || !config.RecoverOnStart,
-		reservations: make(map[string]*reservation), requestReservations: make(map[string]string),
+		fastletPodUID: config.FastletPodUID,
+		clock:         config.Clock,
+		recovering:    config.RecoverOnStart, runtimeReady: !config.RecoverOnStart,
+		routeReady:      config.RoutePublisher == nil || !config.RecoverOnStart,
+		tombstones:      make(map[string]api.SandboxIdentity),
+		diagnostics:     make(map[string][]api.SandboxDiagnosticEvent),
 		cacheTracker:    fastletcache.NewTracker(cacheSource, config.CacheEpoch, fastletcache.DefaultMaxInventory),
 		cacheProtection: protection, warmImages: append([]string(nil), config.WarmImages...),
 		routePublisher: config.RoutePublisher,
@@ -271,17 +263,26 @@ func (m *SandboxManager) validateProfiles(spec *api.SandboxSpec) error {
 	if spec.ResourceProfileHash != m.resourceProfileHash {
 		return fmt.Errorf("%w: resource profile hash %q does not match Fastlet profile %q", ErrSandboxProfileMismatch, spec.ResourceProfileHash, m.resourceProfileHash)
 	}
-	cpu, err := resource.ParseQuantity(spec.CPU)
-	if err != nil || cpu.Cmp(m.resourceProfile.CPU) != 0 {
-		return fmt.Errorf("%w: cpu %q does not match %s", ErrSandboxProfileMismatch, spec.CPU, m.resourceProfile.CPU.String())
+	if spec.CPU != "" {
+		cpu, err := resource.ParseQuantity(spec.CPU)
+		if err != nil || cpu.Cmp(m.resourceProfile.CPU) != 0 {
+			return fmt.Errorf("%w: cpu %q does not match %s", ErrSandboxProfileMismatch, spec.CPU, m.resourceProfile.CPU.String())
+		}
 	}
-	memory, err := resource.ParseQuantity(spec.Memory)
-	if err != nil || memory.Cmp(m.resourceProfile.Memory) != 0 {
-		return fmt.Errorf("%w: memory %q does not match %s", ErrSandboxProfileMismatch, spec.Memory, m.resourceProfile.Memory.String())
+	if spec.Memory != "" {
+		memory, err := resource.ParseQuantity(spec.Memory)
+		if err != nil || memory.Cmp(m.resourceProfile.Memory) != 0 {
+			return fmt.Errorf("%w: memory %q does not match %s", ErrSandboxProfileMismatch, spec.Memory, m.resourceProfile.Memory.String())
+		}
 	}
-	if spec.PIDs != m.resourceProfile.PIDs {
+	if spec.PIDs != 0 && spec.PIDs != m.resourceProfile.PIDs {
 		return fmt.Errorf("%w: pids %d does not match %d", ErrSandboxProfileMismatch, spec.PIDs, m.resourceProfile.PIDs)
 	}
+	// The Fastlet profile is authoritative. The control plane sends only the
+	// profile identity; runtime-enforced values are injected atomically here.
+	spec.CPU = m.resourceProfile.CPU.String()
+	spec.Memory = m.resourceProfile.Memory.String()
+	spec.PIDs = m.resourceProfile.PIDs
 	return m.validateInfraProfile(spec)
 }
 
@@ -308,11 +309,13 @@ func (m *SandboxManager) beginDelete(sandboxID string) {
 	}
 	if sandbox.Phase == "creating" {
 		sandbox.Phase = "terminating"
+		m.recordDiagnosticLocked(sandboxID, "info", "fastlet", "terminating", "creation cancellation recorded")
 		m.mu.Unlock()
 		klog.InfoS("DeleteSandbox: creation cancellation recorded", "sandboxID", sandboxID)
 		return
 	}
 	sandbox.Phase = "terminating"
+	m.recordDiagnosticLocked(sandboxID, "info", "fastlet", "terminating", "runtime deletion started")
 	m.mu.Unlock()
 	klog.InfoS("Sandbox deletion started", "sandboxID", sandboxID)
 	go m.asyncDelete(sandboxID, sandbox)
@@ -326,6 +329,7 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 		m.mu.Lock()
 		if m.sandboxes[sandboxID] == expected {
 			expected.Phase = "delete-failed"
+			m.recordDiagnosticLocked(sandboxID, "error", "route", "delete-failed", err.Error())
 		}
 		m.mu.Unlock()
 		klog.ErrorS(err, "Fastlet Proxy route removal failed; runtime retained", "sandboxID", sandboxID)
@@ -337,6 +341,7 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 	if err != nil {
 		if m.sandboxes[sandboxID] == expected {
 			expected.Phase = "delete-failed"
+			m.recordDiagnosticLocked(sandboxID, "error", "runtime", "delete-failed", err.Error())
 		}
 		klog.ErrorS(err, "Runtime deletion failed; retaining admission capacity for retry", "sandboxID", sandboxID)
 		return
@@ -344,9 +349,15 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 	// A delayed delete from an old generation must never erase a newer
 	// manager entry for the same logical Sandbox.
 	if m.sandboxes[sandboxID] == expected {
+		m.recordTombstoneLocked(api.SandboxIdentity{
+			SandboxUID: sandboxID, InstanceGeneration: expected.InstanceGeneration,
+			RuntimeInstanceID: expected.RuntimeInstanceID, AssignmentAttempt: expected.AssignmentAttempt,
+			FastletPodUID: expected.FastletPodUID,
+		})
 		delete(m.sandboxes, sandboxID)
 		m.cacheProtection.Unprotect(expected.Image, fastletcache.ProtectActive)
 		m.cacheProtection.ProtectHotUntil(expected.Image, m.clock.Now().Add(time.Hour))
+		m.recordDiagnosticLocked(sandboxID, "info", "fastlet", "deleted", "proxy route and runtime resources were deleted")
 		klog.InfoS("Sandbox deletion completed", "sandboxID", sandboxID)
 	}
 }
@@ -381,6 +392,7 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []api.SandboxSt
 			SandboxID:          sandboxID,
 			ClaimUID:           meta.ClaimUID,
 			InstanceGeneration: meta.InstanceGeneration,
+			RuntimeInstanceID:  meta.RuntimeInstanceID,
 			AssignmentAttempt:  meta.AssignmentAttempt,
 			Phase:              meta.Phase,
 			Message:            runtimeStatus,

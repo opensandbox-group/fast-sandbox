@@ -14,7 +14,7 @@ Fast Sandbox owns:
 - endpoint resolution, short-lived route credentials, and transparent proxying;
 - cleanup of resources left by lost Fastlet Pods or nodes.
 
-Fast Sandbox does not define a user-facing Exec/File/PTY protocol. Execd, Envd, or another injected component owns those semantics. Fast Sandbox also does not currently promise cross-Fastlet instance survival, snapshots, pause/resume, or persistent storage.
+Fast Sandbox does not define a user-facing Exec/File/PTY protocol. OpenSandbox Execd or another injected component and its upstream SDK own those semantics. Fast Sandbox also does not currently promise cross-Fastlet instance survival, snapshots, pause/resume, or persistent storage.
 
 ## 2. Deployment topology
 
@@ -31,10 +31,10 @@ flowchart LR
 
   Client -->|"Create / lifecycle / resolve"| FP
   Client -->|"declarative Sandbox/Pool"| API
-  FP -->|"CRD create/status CAS"| API
+  FP -->|"CRD Create with assignment annotation"| API
   Controller <-->|"Watch / Reconcile"| API
-  FP -->|"Reserve / Ensure"| FPOD
-  Controller -->|"Ensure / Delete / Drain"| FPOD
+  FP -->|"atomic Create"| FPOD
+  Controller -->|"Create / Inspect / Delete / Drain"| FPOD
   Client -->|"credential + target port"| SP
   SP -->|"assigned Pod + fences"| FPOD
   FPOD -->|"AccessHandle"| SB
@@ -51,21 +51,21 @@ One `controller` binary is deployed in separate roles:
 | `controller` | Yes | No | SandboxReconciler, SandboxPoolReconciler, local Registry, heartbeat loop |
 | `all` | No | Optional | Single-process development combination of both roles |
 
-Fast-Path and Controller deliberately maintain independent, eventually convergent Registries. A scheduling decision is only a hint until Fastlet accepts a reservation atomically. This is what makes multi-active Fast-Path safe without a distributed Registry lock.
+Fast-Path and Controller deliberately maintain independent, eventually convergent Registries. A scheduling decision is only a hint until Fastlet atomically accepts and creates the runtime. This is what makes multi-active Fast-Path safe without a distributed Registry lock.
 
 ### 2.2 Fastlet Pod
 
 A Pool creates Fastlet Pods. The platform owns these subcomponents:
 
-- **Fastlet control server (`:5758`)**: reserve/cancel/ensure/delete/status, cache heartbeat, runtime and network orchestration.
-- **Atomic admission store**: serializes reservation and active-slot transitions; enforces `maxSandboxesPerPod` against concurrent callers.
+- **Fastlet control server (`:5758`)**: atomic create, inspect, delete, Sandbox diagnostics, cache heartbeat, runtime and network orchestration.
+- **Atomic admission store**: serializes create and active-slot transitions; enforces `maxSandboxesPerPod` against concurrent callers.
 - **Runtime Manager**: selects the immutable Pool RuntimeProfile and reconciles runtime identity.
 - **NetworkManager / SlotPool**: allocates and recovers private network slots and produces an AccessHandle.
 - **Infra Manager**: materializes platform artifacts, instance config, internal credentials, and readiness policy.
 - **Fastlet Proxy (`:5780`)**: validates route credentials/fences and forwards to the runtime-local access address. Metrics use the separate `:9093` port.
 - **BoxLite runtime sidecar**: present only for `runtime: boxlite`; exposes a Pod-local UDS control protocol and authenticated local-forward tunnel.
 
-The Fastlet Pod is the lifetime boundary. When the Pod UID changes, old assignment and route fences are invalid even if Kubernetes reuses the Pod name.
+The Fastlet Pod is the lifetime boundary. When the Pod UID changes, old assignment and route fences are invalid even if Kubernetes reuses the Pod name. A replacement Fastlet treats a containerd runtime carrying the old Pod UID as stale: it first drives the old task/container/snapshot to absence, then creates the new fenced identity. Failed Create cleanup is resumable only by the same identity; a failed user Delete cannot be resurrected by Create.
 
 ### 2.3 NodeJanitor
 
@@ -75,17 +75,18 @@ NodeJanitor runs as a privileged DaemonSet and handles resources that a lost Fas
 
 ### 3.1 Sandbox CRD
 
-`Sandbox.spec` is desired lifecycle state. The authoritative active identity is:
+`Sandbox.spec` is desired lifecycle state. The durable assignment annotation is authoritative; `status.assignment` and generation fields are asynchronous projections. The active identity is:
 
 ```text
 Sandbox CRD UID
 + instanceGeneration
 + assignment.fastletPodUID
 + assignment.attempt
++ runtimeInstanceID
 + routeGeneration
 ```
 
-`status.assignment` is written using Kubernetes resourceVersion compare-and-swap. Runtime, data-plane, and user-process states are independent observations represented by canonical status fields and Conditions.
+Fast-Path includes the initial assignment annotation in the same CRD Create. Reassignment uses compare-and-swap on that annotation. A projection mismatch fails closed; runtime, data-plane, and user-process states remain independent observations represented by canonical status fields and Conditions.
 
 ### 3.2 SandboxPool CRD
 
@@ -109,33 +110,30 @@ sequenceDiagram
   participant C as Client
   participant F as Fast-Path
   participant R as Local Registry
-  participant L as Fastlet
   participant K as API Server
+  participant L as Fastlet
 
   C->>F: CreateSandbox(request_id, spec)
-  F->>K: find existing request_id
-  alt same request_id and spec
-    K-->>F: existing Sandbox
-    F-->>C: idempotent result
-  else new request
-    F->>R: rank Top-K by eligibility/image affinity
-    loop bounded candidates
-      F->>L: Reserve(request_id, spec hash)
-      alt stale/full/conflict
-        L-->>F: retryable rejection
-      else accepted
-        L-->>F: reservation token
-        F->>K: create Sandbox CRD
-        F->>K: assignment status CAS
-        F->>L: Ensure(CRD UID + generations)
-        L-->>F: runtime/data plane result
-        F-->>C: Sandbox UID and placement
-      end
-    end
+  F->>R: rank bounded Top-K by eligibility/image affinity
+  F->>K: IO 1: Create CRD + assignment annotation
+  alt name already exists
+    F->>K: Get canonical name
+    K-->>F: verify request_id/spec hash and reuse identity
+  end
+  F->>L: IO 2: atomic Create(CRD UID + runtime identity)
+  alt created or idempotently present
+    L-->>F: runtime/data plane Ready
+    F-->>C: Sandbox UID and placement
+  else explicit rejection before side effects
+    F->>K: CAS assignment annotation to next Top-K candidate
+    F->>L: atomic Create with new assignment attempt
+  else ambiguous/in-progress/cleanup required
+    F-->>C: retryable error; CRD remains durable
+    Note over F,L: Controller retries the same runtime identity
   end
 ```
 
-Fast failure before a reservation is accepted creates no CRD. Once a valid reservation is owned, the CRD is committed before runtime Ensure. There is no Fast/Strong mode switch. A stable request ID is required; a retry with the same request ID and a different create spec is rejected.
+Failure before a local Top-K candidate is selected creates no CRD. The normal path is exactly one Kubernetes Create plus one Fastlet Create; Fast-Path does not preflight Get/List or write status. A stable request ID is required and equals the CRD name. A retry with a different create spec is rejected. Only `RejectedBeforeSideEffects` permits reassignment; transport ambiguity never does. Reassignment CASes directly from the old annotation to the new one. If no alternative exists, the current durable assignment remains while the Sandbox stays Pending/Creating; a later Pool scale-up can then CAS it to the new Fastlet without an unassigned window.
 
 ### 4.2 Declarative Create
 
@@ -157,7 +155,7 @@ Fastlet Pod replacement never implies Sandbox survival. The new instance has a d
 Every Fast-Path and Controller replica maintains a local Registry from two channels:
 
 1. Kubernetes Pod/Sandbox watches provide membership, assignments, Pool/runtime labels, and Pod UID changes.
-2. Low-frequency jittered heartbeats provide exact Fastlet capacity, reservation/phase inventory, image-cache snapshot, and cache revision.
+2. Low-frequency jittered heartbeats provide Fastlet admission/phase inventory, image-cache snapshot, and cache revision.
 
 There is no high-frequency full polling per Fast-Path replica. Watch events update topology immediately; heartbeats repair drift and refresh runtime/cache facts.
 
@@ -212,11 +210,11 @@ An InfraProfile resolves to component artifacts and policy. Before runtime creat
 5. waits for component readiness separately from runtime start;
 6. publishes a route only after the data-plane state is ready.
 
-Adapters translate existing component protocols:
+Protocol integration uses upstream SDKs rather than local protocol copies:
 
-- OpenSandbox `execd`: command/SSE and file operations;
-- E2B `envd`: native client endpoint hand-off;
-- custom components: catalog profile plus an SDK adapter.
+- OpenSandbox `execd`: `fastctl opensandbox` uses the official OpenSandbox Go SDK;
+- the Python lifecycle SDK provides generic endpoint/header hand-off only;
+- custom components use a catalog profile and their upstream SDK.
 
 Startup cost consists of artifact preparation, OCI-spec mutation, supervisor start, component process start, and readiness probing. Artifacts and warm images are cached; cached artifacts, Pool warm images, and hot images are protected from ordinary cache GC. Fastlet readiness does not wait for all warm images to finish pulling.
 
@@ -232,6 +230,8 @@ Startup cost consists of artifact preparation, OCI-spec mutation, supervisor sta
 ## 10. Observability
 
 Prometheus metrics cover Create accepted/data-plane-ready latency, Registry candidates and heartbeat age, Top-K retry outcomes, Fastlet admission and active slots, runtime/Infra/network/cache latency and state, both proxy hops, and Janitor cleanup.
+
+`fastctl diagnostics sandbox` reads CRD state plus a bounded Fastlet lifecycle event ring. This platform diagnostic path is independent of Execd and remains useful when an injected component is absent or unhealthy.
 
 Identity values such as request ID, Sandbox UID, assignment attempt, and route generation must remain in structured logs/traces, not metric labels. `user_process_start_latency` is emitted only when the runtime adapter can prove the original user process started; sandbox-init paths are marked unavailable until a trustworthy callback exists.
 

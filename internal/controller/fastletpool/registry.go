@@ -310,7 +310,7 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 	for index := range ranked {
 		// Ranking is advisory; re-read and deep-clone only the bounded result.
 		// A concurrent heartbeat may make this view newer than the rank, while
-		// Fastlet admission remains authoritative for the actual reservation.
+		// Fastlet atomic Create remains authoritative for actual admission.
 		ranked[index].slot.mu.RLock()
 		selected[index] = cloneInfo(ranked[index].slot.info)
 		ranked[index].slot.mu.RUnlock()
@@ -323,7 +323,7 @@ func hardFilter(info FastletInfo, request CandidateRequest, staleAfter time.Dura
 	if info.Namespace != request.Namespace || info.PoolName != request.PoolName {
 		return false
 	}
-	if !info.PodReady || !info.RuntimeReady || info.Draining || info.LastHeartbeat.IsZero() {
+	if !info.PodReady || !info.RuntimeReady || !info.InfraReady || info.Draining || info.LastHeartbeat.IsZero() {
 		return false
 	}
 	if request.Now.Sub(info.LastHeartbeat) > staleAfter || request.Now.Before(info.RejectedUntil) {
@@ -341,7 +341,7 @@ func hardFilter(info FastletInfo, request CandidateRequest, staleAfter time.Dura
 	if request.ResourceProfileHash != "" && info.ResourceProfileHash != request.ResourceProfileHash {
 		return false
 	}
-	if request.InfraProfileHash != "" && (!info.InfraReady || info.InfraProfileHash != request.InfraProfileHash) {
+	if request.InfraProfileHash != "" && info.InfraProfileHash != request.InfraProfileHash {
 		return false
 	}
 	return true

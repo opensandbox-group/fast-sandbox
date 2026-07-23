@@ -205,7 +205,8 @@ func main() {
 		grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(observability.UnaryServerInterceptor("fastpath")))
 		fastpathv1.RegisterFastPathServiceServer(grpcServer, &fastpath.Server{
 			K8sClient: durableClient, RouteCache: manager.GetClient(), Orchestrator: orchestrator,
-			CredentialIssuer: credentialIssuer, SandboxProxyBaseURL: sandboxProxyBaseURL,
+			DiagnosticsClient: fastletClient,
+			CredentialIssuer:  credentialIssuer, SandboxProxyBaseURL: sandboxProxyBaseURL,
 		})
 		go func() {
 			<-runContext.Done()

@@ -189,7 +189,7 @@ Container、gVisor 和 Kata 路径中的 fastlet 是 privileged，并挂载 cont
 | KATA-001 | P1 | CapabilityGate | `kata-fc` 节点基线缺少 Firecracker MMIO kernel 和 block snapshotter | 根因与修复路径已固化到 [Kata Firecracker 调查](./kata-firecracker-investigation.md)；完成 pinned artifact + devmapper + 真实 E2E 前继续 fail closed |
 | CACHE-001 | P1 | CapabilityGate | containerd image store 是 node-scoped 共享状态，单 Fastlet 无权执行破坏性 GC | 已确定“调度层生成带 fence/TTL 的 NodeCachePlan，NodeJanitor 本地复核并执行”；该协议实现前只生成 protection/eviction plan |
 | INFRA-001 | P1 | CapabilityGate | 生产 opensandbox-execd artifact reference、digest、签名和 OCI opener 尚未绑定；当前 profile 有意 `Configured=false` | execd 是重点接入 case，边界与后续步骤见 [OpenSandbox execd 接入指南](./opensandbox-execd-integration-guide.md)；artifact 绑定后续实施 |
-| INFRA-002 | P2 | Deferred | E2B envd 的 template/preinstalled capability 没有真实绑定 | envd 不再作为重点方向；后续可删除内置 profile，或仅保留为 fail-closed 示例 |
+| INFRA-002 | P2 | Closed | E2B envd 的 template/preinstalled capability 没有真实绑定 | 已删除内置 profile、专属 Adapter 和 SDK 入口；未来有明确消费者时重新按 capability gate 接入 |
 | API-001 | P1 | Verified | 当前工作区删除旧兼容字段/CLI 后需要最终源码快照 Gate | protobuf/DeepCopy/CRD/Python proto、完整 unit/race、CLI/SDK 和远端声明式/快速路径均已通过 |
 | PERF-001 | P2 | Deferred | 当前 Create 数据只有单节点 kind smoke，不是生产 SLO | 后续在目标硬件形成独立性能报告，不阻塞本轮架构关闭 |
 | PERF-002 | P2 | Deferred | 单节点 kind 不能证明多节点 cache affinity 和低频 heartbeat 的规模行为 | 后续规模测试，不阻塞本轮架构关闭 |

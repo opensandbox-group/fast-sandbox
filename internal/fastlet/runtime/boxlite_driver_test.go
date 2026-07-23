@@ -91,7 +91,7 @@ func TestBoxLiteDriverSidecarContract(t *testing.T) {
 
 	spec := &api.SandboxSpec{
 		SandboxID: "uid-a", ClaimUID: "uid-a", ClaimNamespace: "tenant-a", ClaimName: "sandbox-a", FastletPodUID: "pod-a",
-		InstanceGeneration: 1, AssignmentAttempt: 2, RouteGeneration: 3, Image: "alpine:latest",
+		InstanceGeneration: 1, RuntimeInstanceID: "runtime-a", AssignmentAttempt: 2, RouteGeneration: 3, Image: "alpine:latest",
 		CPU: "1", Memory: "256Mi", PIDs: 128, RuntimeProfileHash: "runtime-hash", ResourceProfileHash: "resource-hash",
 		InfraProfile: "minimal", InfraProfileHash: "infra-hash",
 	}
@@ -156,7 +156,7 @@ func TestBoxLiteDriverCapabilityAndIdentityFailClosed(t *testing.T) {
 	require.Contains(t, report.Missing, "local-forward-v1")
 
 	_, err := driver.EnsureSandbox(context.Background(), &api.SandboxSpec{
-		SandboxID: "uid-conflict", FastletPodUID: "pod-a", InstanceGeneration: 1, AssignmentAttempt: 1,
+		SandboxID: "uid-conflict", FastletPodUID: "pod-a", InstanceGeneration: 1, RuntimeInstanceID: "runtime-conflict", AssignmentAttempt: 1,
 	})
 	require.ErrorIs(t, err, ErrSandboxProfileMismatch)
 }

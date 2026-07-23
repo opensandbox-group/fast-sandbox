@@ -5,6 +5,7 @@ go 1.25.0
 toolchain go1.25.5
 
 require (
+	github.com/alibaba/OpenSandbox/sdks/sandbox/go v1.0.1
 	github.com/boxlite-ai/boxlite/sdks/go v0.9.7
 	github.com/containerd/containerd/api v1.10.0
 	github.com/containerd/containerd/v2 v2.2.1

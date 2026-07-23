@@ -2,7 +2,6 @@ package fastpath
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,16 +11,17 @@ import (
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
 	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/controller/common"
+	"fast-sandbox/internal/controller/fastletpool"
 	"fast-sandbox/internal/controller/sandboxorchestrator"
 	"fast-sandbox/internal/fastletproxy"
 	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/routeauth"
+	"fast-sandbox/pkg/util/idgen"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
-	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"google.golang.org/grpc/codes"
@@ -30,9 +30,12 @@ import (
 
 type Server struct {
 	fastpathv1.UnimplementedFastPathServiceServer
-	K8sClient           client.Client
-	RouteCache          client.Client
-	Orchestrator        *sandboxorchestrator.Orchestrator
+	K8sClient         client.Client
+	RouteCache        client.Client
+	Orchestrator      *sandboxorchestrator.Orchestrator
+	DiagnosticsClient interface {
+		SandboxDiagnostics(context.Context, string, *api.SandboxDiagnosticsRequest) (*api.SandboxDiagnosticsResponse, error)
+	}
 	CredentialIssuer    *routeauth.Issuer
 	SandboxProxyBaseURL string
 }
@@ -162,6 +165,10 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRe
 	if err := ValidateRequestID(request.RequestId); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
+	if request.Name != "" && request.Name != request.RequestId {
+		return nil, status.Error(codes.InvalidArgument, "name and request_id must be identical")
+	}
+	request.Name = request.RequestId
 	ctx = observability.WithIdentity(ctx, observability.Identity{
 		RequestID: request.RequestId, Namespace: request.Namespace, SandboxName: request.Name,
 	})
@@ -174,183 +181,113 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRe
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
 
-	existing, err := s.findSandboxByRequestID(ctx, request.Namespace, request.RequestId)
-	if err != nil {
-		return nil, err
-	}
-	if existing != nil {
-		ctx = observability.WithIdentity(ctx, identityFromSandbox(existing, 0))
-		if existing.Annotations[common.AnnotationCreateSpecHash] != createSpecHash {
-			return nil, status.Errorf(codes.AlreadyExists, "request_id %q is bound to a different create spec", request.RequestId)
-		}
-		observeCreateAccepted("idempotent", started, nil)
-		acceptedObserved = true
-		if err := s.ensureExisting(ctx, orchestrator, existing); err != nil {
-			return nil, err
-		}
-		if err := s.K8sClient.Get(ctx, client.ObjectKeyFromObject(existing), existing); err != nil {
-			return nil, err
-		}
-		return createResponseFromSandbox(existing), nil
-	}
-
 	sandbox := sandboxFromCreateRequest(request, createSpecHash)
 	ctx = observability.WithIdentity(ctx, observability.Identity{SandboxName: sandbox.Name})
-	reservation, err := orchestrator.ReserveForCreate(ctx, sandbox, request.RequestId, createSpecHash)
+	candidates, err := orchestrator.FastPathCandidates(sandbox, request.RequestId)
 	if err != nil {
 		if errors.Is(err, sandboxorchestrator.ErrNoCandidate) {
 			return nil, status.Error(codes.ResourceExhausted, err.Error())
 		}
 		return nil, err
 	}
-	observeCreateAccepted("reservation", started, nil)
-	acceptedObserved = true
-	ownedReservation := reservation
-	defer func() {
-		cancelContext, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		cancelContext = observability.WithIdentity(cancelContext, observability.Identity{
-			RequestID: request.RequestId, Namespace: request.Namespace, SandboxName: sandbox.Name, FastletPodUID: ownedReservation.Fastlet.PodUID,
-		})
-		if err := orchestrator.CancelReservation(cancelContext, ownedReservation); err != nil {
-			klog.FromContext(cancelContext).Error(err, "Cancel Fastlet reservation", "fastlet", ownedReservation.Fastlet.ID)
-		}
-	}()
-
-	if err := s.K8sClient.Create(ctx, sandbox); err != nil {
-		if !apierrors.IsAlreadyExists(err) {
-			return nil, err
-		}
-		var collided apiv1alpha1.Sandbox
-		if getErr := s.K8sClient.Get(ctx, client.ObjectKeyFromObject(sandbox), &collided); getErr != nil {
-			return nil, errors.Join(err, getErr)
-		}
-		if collided.Annotations[common.AnnotationRequestID] != request.RequestId || collided.Annotations[common.AnnotationCreateSpecHash] != createSpecHash {
-			return nil, status.Errorf(codes.AlreadyExists, "Sandbox name %q belongs to another request", sandbox.Name)
-		}
-		sandbox = collided.DeepCopy()
-	}
-
-	assigned, won, err := orchestrator.EnsureAssignment(ctx, sandbox, reservation.Fastlet)
+	runtimeInstanceID, err := idgen.GenerateRequestID()
 	if err != nil {
-		return nil, err
+		return nil, status.Errorf(codes.Internal, "generate runtime instance ID: %v", err)
 	}
-	ctx = observability.WithIdentity(ctx, identityFromSandbox(assigned, 0))
-	runtimeReservation := reservation
-	if !won && assigned.Status.Assignment.FastletPodUID != reservation.Fastlet.PodUID {
-		// Another active FastPath replica won the CRD CAS. Its durable assignment
-		// is authoritative for the first attempt. Keep our reservation alive until
-		// that winner either succeeds or explicitly rejects admission.
-		runtimeReservation = nil
+	envelope, err := sandboxorchestrator.AssignmentForCandidate(candidates[0], 1, apiv1alpha1.InitialInstanceGeneration, 1, runtimeInstanceID)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "invalid Fastlet candidate: %v", err)
 	}
-	ensureErr := orchestrator.EnsureRuntime(ctx, assigned, runtimeReservation)
-	if ensureErr != nil && runtimeReservation == nil && isAdmissionReschedule(ensureErr) {
-		// Controller can race the FastPath between CRD Create and assignment CAS.
-		// If it picked a stale/full Fastlet while this request already owns a valid
-		// reservation elsewhere, move only the rejected assignment and consume the
-		// reservation instead of leaking a retryable capacity error to the caller.
-		cleared, clearErr := orchestrator.ClearAssignment(ctx, assigned, false)
-		if clearErr != nil {
-			return nil, errors.Join(ensureErr, clearErr)
-		}
-		assigned, _, clearErr = orchestrator.EnsureAssignment(ctx, cleared, ownedReservation.Fastlet)
-		if clearErr != nil {
-			return nil, errors.Join(ensureErr, clearErr)
-		}
-		if assigned.Status.Assignment != nil && assigned.Status.Assignment.FastletPodUID == ownedReservation.Fastlet.PodUID {
-			runtimeReservation = ownedReservation
-		}
-		ensureErr = orchestrator.EnsureRuntime(ctx, assigned, runtimeReservation)
+	if err := common.SetAssignmentAnnotation(sandbox, envelope); err != nil {
+		return nil, status.Errorf(codes.Internal, "encode assignment: %v", err)
 	}
-	if ensureErr != nil {
-		err := ensureErr
-		if !errors.Is(err, sandboxorchestrator.ErrRuntimeInProgress) && !errors.Is(err, sandboxorchestrator.ErrUnknownFastletOutcome) {
-			return nil, err
-		}
-		if err := waitForRuntime(ctx, orchestrator, assigned); err != nil {
-			return nil, err
-		}
-	}
-	if err := s.K8sClient.Get(ctx, client.ObjectKeyFromObject(assigned), assigned); err != nil {
-		return nil, err
-	}
-	return createResponseFromSandbox(assigned), nil
-}
 
-func isAdmissionReschedule(err error) bool {
-	var failure *api.FastletError
-	if !errors.As(err, &failure) {
-		return false
-	}
-	switch failure.Code {
-	case api.ErrorCapacityRejected, api.ErrorDraining, api.ErrorRuntimeUnavailable, api.ErrorNetworkUnavailable, api.ErrorInfraUnavailable:
-		return true
-	default:
-		return false
-	}
-}
-
-func (s *Server) ensureExisting(ctx context.Context, orchestrator *sandboxorchestrator.Orchestrator, sandbox *apiv1alpha1.Sandbox) error {
-	if sandbox.Status.RuntimeState == apiv1alpha1.ObservedStateReady && sandbox.Status.DataPlaneState == apiv1alpha1.ObservedStateReady {
-		return nil
-	}
-	if sandbox.Status.Assignment == nil {
-		assigned, _, err := orchestrator.AssignDeclarative(ctx, sandbox, sandbox.Annotations[common.AnnotationRequestID])
-		if err != nil {
-			if errors.Is(err, sandboxorchestrator.ErrNoCandidate) {
-				return status.Error(codes.ResourceExhausted, err.Error())
+	// IO 1: CRD Create. The happy path does not preflight with a Get/List.
+	if createErr := s.K8sClient.Create(ctx, sandbox); createErr != nil {
+		var existing apiv1alpha1.Sandbox
+		getErr := s.K8sClient.Get(ctx, client.ObjectKeyFromObject(sandbox), &existing)
+		if getErr != nil {
+			if apierrors.IsNotFound(getErr) && !apierrors.IsAlreadyExists(createErr) {
+				return nil, createErr
 			}
-			return err
+			return nil, errors.Join(createErr, getErr)
 		}
-		sandbox = assigned
-	}
-	if err := orchestrator.EnsureRuntime(ctx, sandbox, nil); err != nil {
-		if !errors.Is(err, sandboxorchestrator.ErrRuntimeInProgress) && !errors.Is(err, sandboxorchestrator.ErrUnknownFastletOutcome) {
-			return err
+		if existing.Annotations[common.AnnotationRequestID] != request.RequestId || existing.Annotations[common.AnnotationCreateSpecHash] != createSpecHash {
+			return nil, status.Errorf(codes.AlreadyExists, "Sandbox name %q belongs to another create intent", sandbox.Name)
 		}
-		return waitForRuntime(ctx, orchestrator, sandbox)
+		sandbox = existing.DeepCopy()
+		existingEnvelope, envelopeErr := common.AssignmentFromAnnotation(sandbox)
+		if envelopeErr != nil || existingEnvelope == nil {
+			return nil, status.Errorf(codes.Unavailable, "existing Sandbox assignment is not ready: %v", envelopeErr)
+		}
+		envelope = *existingEnvelope
+		selected, ok := orchestrator.Registry.GetFastletByID(fastletpool.FastletID(envelope.FastletName))
+		if !ok {
+			return nil, status.Error(codes.Unavailable, sandboxorchestrator.ErrAssignedFastletUnavailable.Error())
+		}
+		candidates = []fastletpool.FastletInfo{selected}
+		observeCreateAccepted("idempotent", started, nil)
+	} else {
+		observeCreateAccepted("crd", started, nil)
 	}
-	return nil
-}
+	acceptedObserved = true
+	ctx = observability.WithIdentity(ctx, observability.Identity{
+		RequestID: request.RequestId, Namespace: sandbox.Namespace, SandboxName: sandbox.Name, SandboxUID: string(sandbox.UID),
+		FastletPodUID: envelope.FastletPodUID, InstanceGeneration: envelope.InstanceGeneration,
+		AssignmentAttempt: envelope.Attempt, RouteGeneration: envelope.RouteGeneration,
+	})
 
-func waitForRuntime(ctx context.Context, orchestrator *sandboxorchestrator.Orchestrator, sandbox *apiv1alpha1.Sandbox) error {
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		err := orchestrator.ObserveRuntime(ctx, sandbox)
-		if err == nil {
-			return nil
+	for index, candidate := range candidates {
+		if index > 0 {
+			sandboxorchestrator.RecordTopKRetry("attempt")
+			runtimeInstanceID, err = idgen.GenerateRequestID()
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "generate runtime instance ID: %v", err)
+			}
+			next, nextErr := sandboxorchestrator.AssignmentForCandidate(candidate, envelope.Attempt+1, envelope.InstanceGeneration, envelope.RouteGeneration+1, runtimeInstanceID)
+			if nextErr != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "invalid Fastlet candidate: %v", nextErr)
+			}
+			sandbox, err = common.CASAssignmentAnnotation(ctx, s.K8sClient, client.ObjectKeyFromObject(sandbox), envelope, next)
+			if err != nil {
+				return nil, status.Errorf(codes.Aborted, "assignment changed concurrently: %v", err)
+			}
+			envelope = next
 		}
-		if !errors.Is(err, sandboxorchestrator.ErrRuntimeInProgress) {
-			return err
+
+		// IO 2 on the happy path: one atomic Fastlet admission/create call.
+		_, createErr := orchestrator.CreateRuntimeOnCandidate(ctx, sandbox, candidate, envelope)
+		if createErr == nil {
+			if index > 0 {
+				sandboxorchestrator.RecordTopKRetry("accepted")
+			}
+			return createResponseFromSandbox(sandbox, &envelope), nil
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
+		if sandboxorchestrator.IsCandidateRejection(createErr) && index+1 < len(candidates) {
+			sandboxorchestrator.RecordTopKRetry("candidate_rejected")
+			orchestrator.RecordCandidateFeedback(candidate.ID, createErr)
+			continue
 		}
+		if sandboxorchestrator.IsCandidateRejection(createErr) {
+			return nil, status.Errorf(codes.ResourceExhausted, "all Fastlet candidates rejected admission: %v", createErr)
+		}
+		return nil, status.Errorf(codes.Unavailable, "Sandbox intent is persisted and Controller will retry the same runtime identity: %v", createErr)
 	}
+	return nil, status.Error(codes.ResourceExhausted, sandboxorchestrator.ErrNoCandidate.Error())
 }
 
 func sandboxFromCreateRequest(request *fastpathv1.CreateRequest, createSpecHash string) *apiv1alpha1.Sandbox {
-	name := request.Name
-	if name == "" {
-		digest := sha256.Sum256([]byte(request.RequestId))
-		name = fmt.Sprintf("sb-%x", digest[:12])
-	}
 	environment := make([]corev1.EnvVar, 0, len(request.Envs))
 	for name, value := range request.Envs {
 		environment = append(environment, corev1.EnvVar{Name: name, Value: value})
 	}
 	return &apiv1alpha1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name, Namespace: request.Namespace,
+			Name: request.RequestId, Namespace: request.Namespace,
 			Annotations: map[string]string{
 				common.AnnotationRequestID: request.RequestId, common.AnnotationCreateSpecHash: createSpecHash,
 			},
-			Labels: map[string]string{
-				common.LabelCreatedBy: "fastpath", common.LabelRequestIDHash: requestIDLabelValue(request.RequestId),
-			},
+			Labels: map[string]string{common.LabelCreatedBy: "fastpath"},
 		},
 		Spec: apiv1alpha1.SandboxSpec{
 			Image: request.Image, PoolRef: request.PoolRef,
@@ -366,31 +303,11 @@ func (s *Server) orchestrator() (*sandboxorchestrator.Orchestrator, error) {
 	return s.Orchestrator, nil
 }
 
-func (s *Server) findSandboxByRequestID(ctx context.Context, namespace, requestID string) (*apiv1alpha1.Sandbox, error) {
-	var list apiv1alpha1.SandboxList
-	if err := s.K8sClient.List(ctx, &list, client.InNamespace(namespace), client.MatchingLabels{
-		common.LabelRequestIDHash: requestIDLabelValue(requestID),
-	}); err != nil {
-		return nil, err
-	}
-	matches := make([]apiv1alpha1.Sandbox, 0, len(list.Items))
-	for index := range list.Items {
-		if list.Items[index].Annotations[common.AnnotationRequestID] == requestID {
-			matches = append(matches, list.Items[index])
-		}
-	}
-	if len(matches) > 1 {
-		return nil, fmt.Errorf("request_id %q is bound to multiple Sandbox objects", requestID)
-	}
-	if len(matches) == 1 {
-		return matches[0].DeepCopy(), nil
-	}
-	return nil, nil
-}
-
-func createResponseFromSandbox(sandbox *apiv1alpha1.Sandbox) *fastpathv1.CreateResponse {
+func createResponseFromSandbox(sandbox *apiv1alpha1.Sandbox, envelope *common.AssignmentEnvelope) *fastpathv1.CreateResponse {
 	fastletName := ""
-	if sandbox.Status.Assignment != nil {
+	if envelope != nil {
+		fastletName = envelope.FastletName
+	} else if sandbox.Status.Assignment != nil {
 		fastletName = sandbox.Status.Assignment.FastletName
 	}
 	return &fastpathv1.CreateResponse{
@@ -426,6 +343,88 @@ func (s *Server) GetSandbox(ctx context.Context, request *fastpathv1.GetRequest)
 		return nil, err
 	}
 	return sandboxInfo(&sandbox), nil
+}
+
+func (s *Server) GetSandboxDiagnostics(ctx context.Context, request *fastpathv1.SandboxDiagnosticsRequest) (*fastpathv1.SandboxDiagnosticsResponse, error) {
+	if request == nil || request.SandboxName == "" {
+		return nil, status.Error(codes.InvalidArgument, "sandbox_name is required")
+	}
+	if request.Limit < 0 || request.Limit > 128 {
+		return nil, status.Error(codes.InvalidArgument, "limit must be between 0 and 128")
+	}
+	namespace := request.Namespace
+	if namespace == "" {
+		namespace = "default"
+	}
+	ctx = observability.WithIdentity(ctx, observability.Identity{Namespace: namespace, SandboxName: request.SandboxName})
+	var sandbox apiv1alpha1.Sandbox
+	if err := s.K8sClient.Get(ctx, client.ObjectKey{Name: request.SandboxName, Namespace: namespace}, &sandbox); err != nil {
+		return nil, err
+	}
+	response := &fastpathv1.SandboxDiagnosticsResponse{Sandbox: sandboxInfo(&sandbox)}
+	envelope, annotationErr := common.AssignmentFromAnnotation(&sandbox)
+	if annotationErr != nil {
+		response.AssignmentState = "invalid-annotation"
+		response.FastletError = annotationErr.Error()
+		return response, nil
+	}
+	if envelope == nil {
+		response.AssignmentState = "unassigned"
+		response.FastletError = "Sandbox has no durable assignment annotation"
+		return response, nil
+	}
+	response.AssignmentState = "annotation-authoritative"
+	if _, projectionErr := common.EffectiveAssignment(&sandbox); projectionErr != nil {
+		response.AssignmentState = "status-projection-conflict"
+		response.FastletError = projectionErr.Error()
+	} else if sandbox.Status.Assignment == nil {
+		response.AssignmentState = "status-projection-pending"
+	} else {
+		response.AssignmentState = "synchronized"
+	}
+	response.RuntimeInstanceId = envelope.RuntimeInstanceID
+	response.AssignmentAttempt = envelope.Attempt
+
+	if s.Orchestrator == nil || s.Orchestrator.Registry == nil || s.DiagnosticsClient == nil {
+		response.FastletError = appendDiagnosticError(response.FastletError, "Fastlet diagnostics client is not configured")
+		return response, nil
+	}
+	fastlet, found := s.Orchestrator.Registry.GetFastletByID(fastletpool.FastletID(envelope.FastletName))
+	if !found {
+		response.FastletError = appendDiagnosticError(response.FastletError, "assigned Fastlet is absent from the local registry")
+		return response, nil
+	}
+	if fastlet.PodUID != envelope.FastletPodUID {
+		response.FastletError = appendDiagnosticError(response.FastletError, "assigned Fastlet Pod UID was replaced")
+		return response, nil
+	}
+	identity := api.SandboxIdentity{
+		RequestID: sandbox.Annotations[common.AnnotationRequestID], SandboxUID: string(sandbox.UID),
+		FastletPodUID: envelope.FastletPodUID, InstanceGeneration: envelope.InstanceGeneration,
+		RuntimeInstanceID: envelope.RuntimeInstanceID, AssignmentAttempt: envelope.Attempt, RouteGeneration: envelope.RouteGeneration,
+	}
+	fastletResponse, err := s.DiagnosticsClient.SandboxDiagnostics(ctx, fastlet.PodIP, &api.SandboxDiagnosticsRequest{
+		Identity: identity, Limit: int(request.Limit),
+	})
+	if err != nil {
+		response.FastletError = appendDiagnosticError(response.FastletError, err.Error())
+		return response, nil
+	}
+	response.FastletReachable = true
+	for _, event := range fastletResponse.Events {
+		response.Events = append(response.Events, &fastpathv1.SandboxDiagnosticEvent{
+			TimestampUnixNano: event.Timestamp.UnixNano(), Level: event.Level,
+			Source: event.Source, Phase: event.Phase, Message: event.Message,
+		})
+	}
+	return response, nil
+}
+
+func appendDiagnosticError(existing, next string) string {
+	if existing == "" {
+		return next
+	}
+	return existing + "; " + next
 }
 
 func sandboxInfo(sandbox *apiv1alpha1.Sandbox) *fastpathv1.SandboxInfo {

@@ -175,12 +175,13 @@ func TestFastPathEnvAndWorkingDir(t *testing.T) {
 			client := fastpathv1.NewFastPathServiceClient(conn)
 			createCtx, cancelCreate := context.WithTimeout(ctx, 30*time.Second)
 			defer cancelCreate()
+			requestID := namespace + "-fastpath-env"
 			resp, err := client.CreateSandbox(createCtx, &fastpathv1.CreateRequest{
-				Name:       "sb-fastpath-env",
+				Name:       requestID,
 				Image:      "docker.io/library/alpine:latest",
 				PoolRef:    pool.Name,
 				Namespace:  namespace,
-				RequestId:  namespace + "-fastpath-env",
+				RequestId:  requestID,
 				Command:    []string{"/bin/sh", "-c", `echo "FASTPATH_VAR=$FASTPATH_VAR"; echo "PWD=$(pwd)"; sleep 3600`},
 				WorkingDir: "/app",
 				Envs: map[string]string{

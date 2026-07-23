@@ -132,23 +132,5 @@ func builtinProfiles() map[string]Profile {
 				Required: true,
 			}},
 		},
-		"e2b-envd": {
-			Name: "e2b-envd", Version: builtinVersion, Configured: true,
-			AllowedRuntimes: []apiv1alpha1.RuntimeName{
-				apiv1alpha1.RuntimeKataQemu, apiv1alpha1.RuntimeKataClh, apiv1alpha1.RuntimeKataFc, apiv1alpha1.RuntimeBoxLite,
-			},
-			Components: []Component{{
-				Name:          "envd",
-				Artifact:      Artifact{SourceType: SourcePreinstalled, Reference: "preinstalled://e2b-envd"},
-				DeliveryModes: []runtimecatalog.InfraDeliveryMode{runtimecatalog.InfraDeliveryTemplateBake, runtimecatalog.InfraDeliveryPreinstalled},
-				Activation:    Activation{Mode: ActivationSystemService, Command: "/usr/bin/envd", RestartPolicy: RestartAlways},
-				InstanceInit:  InstanceInit{Mode: InitHTTP, Method: "POST", Path: "/init"},
-				Services: []Service{{
-					Name: "envd", Transport: "http", Port: 49983,
-					Readiness: ReadinessProbe{Type: ProbeHTTP, Path: "/health", Timeout: 10 * time.Second, Interval: 100 * time.Millisecond},
-				}},
-				Required: true,
-			}},
-		},
 	}
 }

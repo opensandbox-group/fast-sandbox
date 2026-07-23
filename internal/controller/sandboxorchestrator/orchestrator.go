@@ -13,6 +13,7 @@ import (
 	"fast-sandbox/internal/controller/fastletpool"
 	"fast-sandbox/internal/infracatalog"
 	"fast-sandbox/internal/runtimecatalog"
+	"fast-sandbox/pkg/util/idgen"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -24,7 +25,7 @@ import (
 )
 
 var (
-	ErrNoCandidate                = errors.New("no Fastlet accepted the Sandbox request")
+	ErrNoCandidate                = errors.New("no eligible Fastlet for the Sandbox request")
 	ErrRuntimeInProgress          = errors.New("Sandbox runtime creation is in progress")
 	ErrAssignedFastletUnavailable = errors.New("assigned Fastlet is unavailable or was replaced")
 	ErrUnknownFastletOutcome      = errors.New("Fastlet operation outcome is unknown")
@@ -38,9 +39,7 @@ const (
 )
 
 type FastletClient interface {
-	ReserveSandbox(context.Context, string, *api.ReserveSandboxRequest) (*api.ReserveSandboxResponse, error)
-	CancelReservation(context.Context, string, *api.CancelReservationRequest) (*api.CancelReservationResponse, error)
-	EnsureSandbox(context.Context, string, *api.EnsureSandboxRequest) (*api.EnsureSandboxResponse, error)
+	CreateSandbox(context.Context, string, *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error)
 	InspectSandbox(context.Context, string, *api.InspectSandboxRequest) (*api.InspectSandboxResponse, error)
 	DeleteSandboxV2(context.Context, string, *api.DeleteSandboxV2Request) (*api.DeleteSandboxV2Response, error)
 }
@@ -61,24 +60,15 @@ type Orchestrator struct {
 	Now           func() time.Time
 }
 
+// RuntimeParameters are used only by the declarative Controller to validate a
+// Pool against the watched Fastlet profile. Fastlet remains authoritative for
+// the concrete CPU/memory/PID values it injects into the runtime request.
 type RuntimeParameters struct {
 	RuntimeName         apiv1alpha1.RuntimeName
 	RuntimeProfileHash  string
 	ResourceProfileHash string
 	InfraProfile        string
 	InfraProfileHash    string
-	CPU                 string
-	Memory              string
-	PIDs                int64
-}
-
-type Reservation struct {
-	Fastlet        fastletpool.FastletInfo
-	RequestID      string
-	CreateSpecHash string
-	Token          string
-	ExpiresAt      time.Time
-	Parameters     RuntimeParameters
 }
 
 func (o *Orchestrator) ResolveRuntime(ctx context.Context, sandbox *apiv1alpha1.Sandbox) (RuntimeParameters, error) {
@@ -92,17 +82,15 @@ func (o *Orchestrator) ResolveRuntime(ctx context.Context, sandbox *apiv1alpha1.
 	if err := pool.Spec.ValidateRuntime(); err != nil {
 		return RuntimeParameters{}, fmt.Errorf("resolve Pool runtime: %w", err)
 	}
-	runtimeName := pool.Spec.Runtime
 	catalog := o.Catalog
 	if catalog == nil {
 		catalog = runtimecatalog.Builtin()
 	}
-	profile, err := catalog.Resolve(runtimeName)
+	profile, err := catalog.Resolve(pool.Spec.Runtime)
 	if err != nil {
 		return RuntimeParameters{}, fmt.Errorf("resolve runtime profile: %w", err)
 	}
-	resources := pool.Spec.SandboxResources
-	if err := apiv1alpha1.ValidateSandboxResourceProfile(resources); err != nil {
+	if err := apiv1alpha1.ValidateSandboxResourceProfile(pool.Spec.SandboxResources); err != nil {
 		return RuntimeParameters{}, fmt.Errorf("resolve Sandbox resources: %w", err)
 	}
 	infraCatalog := o.InfraCatalog
@@ -114,10 +102,9 @@ func (o *Orchestrator) ResolveRuntime(ctx context.Context, sandbox *apiv1alpha1.
 		return RuntimeParameters{}, fmt.Errorf("resolve InfraProfile: %w", err)
 	}
 	return RuntimeParameters{
-		RuntimeName: runtimeName, RuntimeProfileHash: profile.ProfileHash,
-		ResourceProfileHash: resources.Hash(), CPU: resources.CPU.String(),
-		Memory: resources.Memory.String(), PIDs: resources.PIDs,
-		InfraProfile: infraPlan.ProfileName, InfraProfileHash: infraPlan.ProfileHash,
+		RuntimeName: pool.Spec.Runtime, RuntimeProfileHash: profile.ProfileHash,
+		ResourceProfileHash: pool.Spec.SandboxResources.Hash(),
+		InfraProfile:        infraPlan.ProfileName, InfraProfileHash: infraPlan.ProfileHash,
 	}, nil
 }
 
@@ -126,173 +113,246 @@ func (o *Orchestrator) Candidates(ctx context.Context, sandbox *apiv1alpha1.Sand
 	if err != nil {
 		return nil, RuntimeParameters{}, err
 	}
-	k := o.TopK
-	if k <= 0 {
-		k = 3
-	}
-	now := time.Now()
-	if o.Now != nil {
-		now = o.Now()
-	}
-	candidates := o.Registry.TopK(fastletpool.CandidateRequest{
+	candidates := o.topK(fastletpool.CandidateRequest{
 		Namespace: sandbox.Namespace, PoolName: sandbox.Spec.PoolRef,
 		RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
-		ResourceProfileHash: parameters.ResourceProfileHash, Image: sandbox.Spec.Image,
-		InfraProfileHash: parameters.InfraProfileHash,
-		StableKey:        stableKey, Now: now,
-	}, k)
+		ResourceProfileHash: parameters.ResourceProfileHash, InfraProfileHash: parameters.InfraProfileHash,
+		Image: sandbox.Spec.Image, StableKey: stableKey,
+	})
 	if len(candidates) == 0 {
 		return nil, parameters, ErrNoCandidate
 	}
 	return candidates, parameters, nil
 }
 
-// ReserveForCreate is the RPC-only admission gate. It never writes a CRD.
-func (o *Orchestrator) ReserveForCreate(ctx context.Context, sandbox *apiv1alpha1.Sandbox, requestID, createSpecHash string) (*Reservation, error) {
-	candidates, parameters, err := o.Candidates(ctx, sandbox, requestID)
-	if err != nil {
-		return nil, err
+// FastPathCandidates is intentionally registry-only. Calling it cannot issue
+// a Kubernetes API request, which keeps the first-create happy path at two IOs.
+func (o *Orchestrator) FastPathCandidates(sandbox *apiv1alpha1.Sandbox, stableKey string) ([]fastletpool.FastletInfo, error) {
+	if sandbox == nil {
+		return nil, errors.New("Sandbox is required")
 	}
-	for index, candidate := range candidates {
-		if index > 0 {
-			recordTopKRetry("attempt")
-		}
-		response, reserveErr := o.FastletClient.ReserveSandbox(ctx, candidate.PodIP, &api.ReserveSandboxRequest{
-			RequestID: requestID, CreateSpecHash: createSpecHash,
-			ClaimNamespace: sandbox.Namespace, ClaimName: sandbox.Name, FastletPodUID: candidate.PodUID,
-			RuntimeProfileHash: parameters.RuntimeProfileHash, ResourceProfileHash: parameters.ResourceProfileHash,
-			InfraProfileHash: parameters.InfraProfileHash,
-		})
-		if reserveErr == nil && response != nil && response.ReservationToken != "" && response.FastletPodUID == candidate.PodUID {
-			if index > 0 {
-				recordTopKRetry("accepted")
-			}
-			return &Reservation{
-				Fastlet: candidate, RequestID: requestID, CreateSpecHash: createSpecHash,
-				Token: response.ReservationToken, ExpiresAt: response.ExpiresAt, Parameters: parameters,
-			}, nil
-		}
-		if reserveErr == nil {
-			reserveErr = ErrUnknownFastletOutcome
-		}
-		if isCandidateRejection(reserveErr) {
-			recordTopKRetry("candidate_rejected")
-			o.recordFeedback(candidate.ID, reserveErr)
-			continue
-		}
-		return nil, fmt.Errorf("reserve Fastlet %s: %w", candidate.ID, reserveErr)
+	candidates := o.topK(fastletpool.CandidateRequest{
+		Namespace: sandbox.Namespace, PoolName: sandbox.Spec.PoolRef,
+		Image: sandbox.Spec.Image, StableKey: stableKey,
+	})
+	if len(candidates) == 0 {
+		return nil, ErrNoCandidate
 	}
-	return nil, ErrNoCandidate
+	return candidates, nil
 }
 
-func (o *Orchestrator) CancelReservation(ctx context.Context, reservation *Reservation) error {
-	if reservation == nil || reservation.Token == "" {
+func (o *Orchestrator) topK(request fastletpool.CandidateRequest) []fastletpool.FastletInfo {
+	if o.Registry == nil {
 		return nil
 	}
-	_, err := o.FastletClient.CancelReservation(ctx, reservation.Fastlet.PodIP, &api.CancelReservationRequest{
-		RequestID: reservation.RequestID, ReservationToken: reservation.Token,
-	})
-	return err
+	if request.Now.IsZero() {
+		request.Now = time.Now()
+		if o.Now != nil {
+			request.Now = o.Now()
+		}
+	}
+	k := o.TopK
+	if k <= 0 {
+		k = 3
+	}
+	return o.Registry.TopK(request, k)
 }
 
-// EnsureAssignment uses status CAS. If another active replica wins with a
-// different candidate, that durable winner is returned and must be used.
-func (o *Orchestrator) EnsureAssignment(ctx context.Context, sandbox *apiv1alpha1.Sandbox, candidate fastletpool.FastletInfo) (*apiv1alpha1.Sandbox, bool, error) {
-	if sandbox.Status.Assignment != nil {
-		return sandbox.DeepCopy(), false, nil
-	}
-	desired := apiv1alpha1.SandboxAssignment{
+func AssignmentForCandidate(candidate fastletpool.FastletInfo, attempt, instanceGeneration, routeGeneration int64, runtimeInstanceID string) (common.AssignmentEnvelope, error) {
+	envelope := common.AssignmentEnvelope{
+		Version:     common.AssignmentEnvelopeVersion,
 		FastletName: candidate.PodName, FastletPodUID: candidate.PodUID, NodeName: candidate.NodeName,
+		Attempt: attempt, InstanceGeneration: instanceGeneration, RouteGeneration: routeGeneration,
+		RuntimeInstanceID:  runtimeInstanceID,
+		RuntimeProfileHash: candidate.RuntimeProfileHash, ResourceProfileHash: candidate.ResourceProfileHash,
+		InfraProfileHash: candidate.InfraProfileHash,
 	}
-	assigned, err := common.EnsureSandboxAssignment(ctx, o.Client, client.ObjectKeyFromObject(sandbox), desired)
-	if err == nil {
-		return assigned, true, nil
+	if err := envelope.Validate(); err != nil {
+		return common.AssignmentEnvelope{}, err
 	}
-	if !errors.Is(err, common.ErrAssignmentConflict) {
-		return nil, false, err
+	if candidate.PodIP == "" || candidate.InfraProfile == "" {
+		return common.AssignmentEnvelope{}, errors.New("candidate endpoint and InfraProfile are required")
 	}
-	var winner apiv1alpha1.Sandbox
-	if getErr := o.Client.Get(ctx, client.ObjectKeyFromObject(sandbox), &winner); getErr != nil {
-		return nil, false, errors.Join(err, getErr)
-	}
-	if winner.Status.Assignment == nil {
-		return nil, false, err
-	}
-	return winner.DeepCopy(), false, nil
+	return envelope, nil
 }
 
+// AssignDeclarative preserves the standalone Controller deployment mode. It
+// first honors any FastPath-written annotation, then performs Pool validation
+// and registry selection only when no durable assignment exists.
 func (o *Orchestrator) AssignDeclarative(ctx context.Context, sandbox *apiv1alpha1.Sandbox, stableKey string) (*apiv1alpha1.Sandbox, bool, error) {
-	if sandbox.Status.Assignment != nil {
-		return sandbox.DeepCopy(), false, nil
+	if sandbox == nil || sandbox.UID == "" {
+		return nil, false, errors.New("persisted Sandbox UID is required")
 	}
+	envelope, err := common.AssignmentFromAnnotation(sandbox)
+	if err != nil {
+		return nil, false, err
+	}
+	if envelope != nil {
+		projected, err := common.ProjectAssignmentToStatus(ctx, o.Client, client.ObjectKeyFromObject(sandbox))
+		return projected, false, err
+	}
+
+	// Upgrade bridge for objects created by the previous status-only model.
+	if sandbox.Status.Assignment != nil {
+		candidate, ok := o.Registry.GetFastletByID(fastletpool.FastletID(sandbox.Status.Assignment.FastletName))
+		if !ok || candidate.PodUID != sandbox.Status.Assignment.FastletPodUID {
+			return nil, false, ErrAssignedFastletUnavailable
+		}
+		generation := max(sandbox.Status.InstanceGeneration, apiv1alpha1.InitialInstanceGeneration)
+		routeGeneration := max(sandbox.Status.RouteGeneration, int64(1))
+		legacyEnvelope, err := AssignmentForCandidate(candidate, sandbox.Status.Assignment.Attempt, generation, routeGeneration, "legacy-"+string(sandbox.UID))
+		if err != nil {
+			return nil, false, err
+		}
+		if _, _, err := common.InitializeAssignmentAnnotation(ctx, o.Client, client.ObjectKeyFromObject(sandbox), legacyEnvelope); err != nil {
+			return nil, false, err
+		}
+		projected, err := common.ProjectAssignmentToStatus(ctx, o.Client, client.ObjectKeyFromObject(sandbox))
+		return projected, false, err
+	}
+
 	candidates, _, err := o.Candidates(ctx, sandbox, stableKey)
 	if err != nil {
 		return nil, false, err
 	}
-	return o.EnsureAssignment(ctx, sandbox, candidates[0])
+	runtimeInstanceID, err := idgen.GenerateRequestID()
+	if err != nil {
+		return nil, false, fmt.Errorf("generate runtime instance ID: %w", err)
+	}
+	attempt := sandbox.Status.AssignmentAttempt + 1
+	generation := max(sandbox.Status.InstanceGeneration, apiv1alpha1.InitialInstanceGeneration)
+	routeGeneration := max(sandbox.Status.RouteGeneration, int64(1))
+	desired, err := AssignmentForCandidate(candidates[0], attempt, generation, routeGeneration, runtimeInstanceID)
+	if err != nil {
+		return nil, false, err
+	}
+	_, won, err := common.InitializeAssignmentAnnotation(ctx, o.Client, client.ObjectKeyFromObject(sandbox), desired)
+	if err != nil {
+		return nil, false, err
+	}
+	projected, err := common.ProjectAssignmentToStatus(ctx, o.Client, client.ObjectKeyFromObject(sandbox))
+	return projected, won, err
 }
 
-func (o *Orchestrator) EnsureRuntime(ctx context.Context, sandbox *apiv1alpha1.Sandbox, reservation *Reservation) error {
-	if sandbox == nil || sandbox.Status.Assignment == nil || sandbox.UID == "" {
-		return errors.New("persisted Sandbox UID and assignment are required")
+// ReassignDeclarativeAfterRejection atomically moves a durable assignment to
+// a different eligible Fastlet. When no alternative exists it deliberately
+// preserves the current annotation, so CRD-first never exposes an unassigned
+// window between rejection and a later Pool scale-up or heartbeat refresh.
+func (o *Orchestrator) ReassignDeclarativeAfterRejection(ctx context.Context, sandbox *apiv1alpha1.Sandbox, stableKey string) (*apiv1alpha1.Sandbox, bool, error) {
+	if sandbox == nil || sandbox.UID == "" {
+		return nil, false, errors.New("persisted Sandbox UID is required")
 	}
-	assignment := *sandbox.Status.Assignment
-	fastlet, ok := o.Registry.GetFastletByID(fastletpool.FastletID(assignment.FastletName))
-	if !ok || fastlet.PodUID != assignment.FastletPodUID || fastlet.PodIP == "" {
-		return ErrAssignedFastletUnavailable
-	}
-	parameters, err := o.ResolveRuntime(ctx, sandbox)
+	current, err := common.AssignmentFromAnnotation(sandbox)
 	if err != nil {
-		return err
+		return nil, false, err
 	}
-	requestID := sandbox.Annotations[common.AnnotationRequestID]
-	createSpecHash := sandbox.Annotations[common.AnnotationCreateSpecHash]
-	identity := identityFor(sandbox)
-	request := &api.EnsureSandboxRequest{
-		Identity: identity, CreateSpecHash: createSpecHash,
+	if current == nil {
+		return sandbox.DeepCopy(), false, nil
+	}
+	candidates, _, err := o.Candidates(ctx, sandbox, stableKey)
+	if errors.Is(err, ErrNoCandidate) {
+		return sandbox.DeepCopy(), false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	for _, candidate := range candidates {
+		if candidate.PodName == current.FastletName && candidate.PodUID == current.FastletPodUID {
+			continue
+		}
+		runtimeInstanceID, err := idgen.GenerateRequestID()
+		if err != nil {
+			return nil, false, fmt.Errorf("generate runtime instance ID: %w", err)
+		}
+		next, err := AssignmentForCandidate(candidate, current.Attempt+1, current.InstanceGeneration, current.RouteGeneration+1, runtimeInstanceID)
+		if err != nil {
+			return nil, false, err
+		}
+		updated, err := common.CASAssignmentAnnotation(ctx, o.Client, client.ObjectKeyFromObject(sandbox), *current, next)
+		if err != nil {
+			return nil, false, err
+		}
+		return updated, true, nil
+	}
+	return sandbox.DeepCopy(), false, nil
+}
+
+// CreateRuntime performs exactly one Fastlet call. It never reads a Pool and
+// never writes Kubernetes status, so FastPath can use it as IO 2.
+func (o *Orchestrator) CreateRuntime(ctx context.Context, sandbox *apiv1alpha1.Sandbox) (*api.CreateSandboxResponse, error) {
+	fastlet, envelope, identity, err := o.assignedTarget(sandbox)
+	if err != nil {
+		return nil, err
+	}
+	return o.createRuntimeOnTarget(ctx, sandbox, fastlet, envelope, identity)
+}
+
+// CreateRuntimeOnCandidate is used immediately after FastPath wins an
+// annotation Create/CAS. The annotation is revalidated, while a concurrently
+// stale status projection is deliberately ignored.
+func (o *Orchestrator) CreateRuntimeOnCandidate(ctx context.Context, sandbox *apiv1alpha1.Sandbox, fastlet fastletpool.FastletInfo, envelope common.AssignmentEnvelope) (*api.CreateSandboxResponse, error) {
+	current, err := common.AssignmentFromAnnotation(sandbox)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil || *current != envelope {
+		return nil, common.ErrAssignmentAnnotationChanged
+	}
+	if fastlet.PodName != envelope.FastletName || fastlet.PodUID != envelope.FastletPodUID || fastlet.PodIP == "" ||
+		fastlet.RuntimeProfileHash != envelope.RuntimeProfileHash || fastlet.ResourceProfileHash != envelope.ResourceProfileHash ||
+		fastlet.InfraProfileHash != envelope.InfraProfileHash {
+		return nil, ErrAssignedFastletUnavailable
+	}
+	identity := api.SandboxIdentity{
+		RequestID: sandbox.Annotations[common.AnnotationRequestID], SandboxUID: string(sandbox.UID),
+		InstanceGeneration: envelope.InstanceGeneration, RuntimeInstanceID: envelope.RuntimeInstanceID,
+		AssignmentAttempt: envelope.Attempt, RouteGeneration: envelope.RouteGeneration, FastletPodUID: envelope.FastletPodUID,
+	}
+	return o.createRuntimeOnTarget(ctx, sandbox, fastlet, envelope, identity)
+}
+
+func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1alpha1.Sandbox, fastlet fastletpool.FastletInfo, envelope common.AssignmentEnvelope, identity api.SandboxIdentity) (*api.CreateSandboxResponse, error) {
+	request := &api.CreateSandboxRequest{
+		Identity: identity,
 		Sandbox: api.SandboxSpec{
-			SandboxID: string(sandbox.UID), RequestID: requestID, ClaimUID: string(sandbox.UID),
-			ClaimNamespace: sandbox.Namespace, ClaimName: sandbox.Name,
-			RouteGeneration: identity.RouteGeneration,
-			Image:           sandbox.Spec.Image, CPU: parameters.CPU, Memory: parameters.Memory, PIDs: parameters.PIDs,
-			RuntimeProfileHash: parameters.RuntimeProfileHash, ResourceProfileHash: parameters.ResourceProfileHash,
-			InfraProfile: parameters.InfraProfile, InfraProfileHash: parameters.InfraProfileHash,
+			SandboxID: string(sandbox.UID), RequestID: sandbox.Annotations[common.AnnotationRequestID], ClaimUID: string(sandbox.UID),
+			ClaimNamespace: sandbox.Namespace, ClaimName: sandbox.Name, Image: sandbox.Spec.Image,
+			RuntimeProfileHash: envelope.RuntimeProfileHash, ResourceProfileHash: envelope.ResourceProfileHash,
+			InfraProfile: fastlet.InfraProfile, InfraProfileHash: envelope.InfraProfileHash,
 			Command: sandbox.Spec.Command, Args: sandbox.Spec.Args, Env: envMap(sandbox.Spec.Envs), WorkingDir: sandbox.Spec.WorkingDir,
 		},
 	}
-	if reservation != nil {
-		if reservation.Fastlet.PodUID != assignment.FastletPodUID {
-			return errors.New("reservation does not match durable assignment")
-		}
-		request.ReservationToken = reservation.Token
-		request.CreateSpecHash = reservation.CreateSpecHash
+	response, createErr := o.FastletClient.CreateSandbox(ctx, fastlet.PodIP, request)
+	if createErr == nil && response != nil && response.Accepted && response.Sandbox != nil && response.Sandbox.Phase == "running" {
+		return response, nil
 	}
-	response, ensureErr := o.FastletClient.EnsureSandbox(ctx, fastlet.PodIP, request)
-	if ensureErr == nil && response != nil && response.Accepted && response.Sandbox != nil && response.Sandbox.Phase == "running" {
+	if createErr == nil {
+		createErr = ErrUnknownFastletOutcome
+	}
+	o.recordFeedback(fastlet.ID, createErr)
+	return response, createErr
+}
+
+// ReconcileRuntime is the declarative wrapper around CreateRuntime. Status
+// convergence is intentionally outside the FastPath request.
+func (o *Orchestrator) ReconcileRuntime(ctx context.Context, sandbox *apiv1alpha1.Sandbox) error {
+	_, err := o.CreateRuntime(ctx, sandbox)
+	if err == nil {
 		return o.MarkReady(ctx, sandbox)
 	}
-	if ensureErr == nil {
-		ensureErr = ErrUnknownFastletOutcome
+	var failure *api.FastletError
+	if errors.As(err, &failure) && failure.Code == api.ErrorInProgress {
+		_ = o.MarkCreating(ctx, sandbox, failure.Message)
+		return ErrRuntimeInProgress
 	}
-	var fastletErr *api.FastletError
-	if errors.As(ensureErr, &fastletErr) {
-		o.recordFeedback(fastlet.ID, ensureErr)
-		if fastletErr.Code == api.ErrorInProgress {
-			_ = o.MarkCreating(ctx, sandbox, fastletErr.Message)
-			return ErrRuntimeInProgress
-		}
-		return ensureErr
+	if errors.As(err, &failure) {
+		return err
 	}
-	// A lost response is never a reason to choose a second Fastlet. Inspect the
-	// durable assignment once and let the caller retry the same identity.
-	if observeErr := o.ObserveRuntime(ctx, sandbox); observeErr == nil {
-		return nil
-	}
-	return fmt.Errorf("%w: %v", ErrUnknownFastletOutcome, ensureErr)
+	return fmt.Errorf("%w: %v", ErrUnknownFastletOutcome, err)
 }
 
 func (o *Orchestrator) ObserveRuntime(ctx context.Context, sandbox *apiv1alpha1.Sandbox) error {
-	fastlet, identity, err := o.assignedTarget(sandbox)
+	fastlet, _, identity, err := o.assignedTarget(sandbox)
 	if err != nil {
 		return err
 	}
@@ -315,7 +375,7 @@ func (o *Orchestrator) ObserveRuntime(ctx context.Context, sandbox *apiv1alpha1.
 }
 
 func (o *Orchestrator) DeleteRuntime(ctx context.Context, sandbox *apiv1alpha1.Sandbox) error {
-	fastlet, identity, err := o.assignedTarget(sandbox)
+	fastlet, _, identity, err := o.assignedTarget(sandbox)
 	if err != nil {
 		return err
 	}
@@ -324,14 +384,14 @@ func (o *Orchestrator) DeleteRuntime(ctx context.Context, sandbox *apiv1alpha1.S
 }
 
 func (o *Orchestrator) RuntimeGone(ctx context.Context, sandbox *apiv1alpha1.Sandbox) (bool, error) {
-	fastlet, identity, err := o.assignedTarget(sandbox)
+	fastlet, _, identity, err := o.assignedTarget(sandbox)
 	if err != nil {
 		return errors.Is(err, ErrAssignedFastletUnavailable), err
 	}
 	response, err := o.FastletClient.InspectSandbox(ctx, fastlet.PodIP, &api.InspectSandboxRequest{Identity: identity})
 	if err != nil {
-		var fastletErr *api.FastletError
-		if errors.As(err, &fastletErr) && fastletErr.Code == api.ErrorNotFound {
+		var failure *api.FastletError
+		if errors.As(err, &failure) && failure.Code == api.ErrorNotFound {
 			return true, nil
 		}
 		return false, err
@@ -340,10 +400,67 @@ func (o *Orchestrator) RuntimeGone(ctx context.Context, sandbox *apiv1alpha1.San
 }
 
 func (o *Orchestrator) ClearAssignment(ctx context.Context, sandbox *apiv1alpha1.Sandbox, advanceInstance bool) (*apiv1alpha1.Sandbox, error) {
-	if sandbox.Status.Assignment == nil {
-		return sandbox.DeepCopy(), nil
+	if sandbox == nil {
+		return nil, errors.New("Sandbox is required")
 	}
-	return common.ClearSandboxAssignment(ctx, o.Client, client.ObjectKeyFromObject(sandbox), *sandbox.Status.Assignment, advanceInstance)
+	envelope, err := common.AssignmentFromAnnotation(sandbox)
+	if err != nil {
+		return nil, err
+	}
+	if envelope == nil {
+		if sandbox.Status.Assignment == nil {
+			return sandbox.DeepCopy(), nil
+		}
+		return o.clearAssignmentProjection(ctx, sandbox, nil, advanceInstance)
+	}
+	updated, _, err := common.RemoveAssignmentAnnotation(ctx, o.Client, client.ObjectKeyFromObject(sandbox), *envelope)
+	if err != nil {
+		return nil, err
+	}
+	return o.clearAssignmentProjection(ctx, updated, envelope, advanceInstance)
+}
+
+func (o *Orchestrator) clearAssignmentProjection(ctx context.Context, sandbox *apiv1alpha1.Sandbox, envelope *common.AssignmentEnvelope, advanceInstance bool) (*apiv1alpha1.Sandbox, error) {
+	key := client.ObjectKeyFromObject(sandbox)
+	var result *apiv1alpha1.Sandbox
+	err := retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		var current apiv1alpha1.Sandbox
+		if err := o.Client.Get(ctx, key, &current); err != nil {
+			return err
+		}
+		active, err := common.AssignmentFromAnnotation(&current)
+		if err != nil {
+			return err
+		}
+		if active != nil {
+			return common.ErrAssignmentAnnotationChanged
+		}
+		if current.Status.Assignment == nil {
+			result = current.DeepCopy()
+			return nil
+		}
+		generation := max(current.Status.InstanceGeneration, apiv1alpha1.InitialInstanceGeneration)
+		routeGeneration := max(current.Status.RouteGeneration, int64(1)) + 1
+		if envelope != nil {
+			generation = max(generation, envelope.InstanceGeneration)
+			routeGeneration = max(routeGeneration, envelope.RouteGeneration+1)
+		}
+		if advanceInstance {
+			generation = apiv1alpha1.NextInstanceGeneration(generation)
+		}
+		before := current.DeepCopy()
+		current.Status.Assignment = nil
+		current.Status.InstanceGeneration = generation
+		current.Status.RouteGeneration = routeGeneration
+		current.Status.RuntimeState = apiv1alpha1.ObservedStatePending
+		current.Status.DataPlaneState = apiv1alpha1.ObservedStatePending
+		if err := o.Client.Status().Patch(ctx, &current, client.MergeFrom(before)); err != nil {
+			return err
+		}
+		result = current.DeepCopy()
+		return nil
+	})
+	return result, err
 }
 
 func (o *Orchestrator) MarkPending(ctx context.Context, sandbox *apiv1alpha1.Sandbox, reason, message string) error {
@@ -379,6 +496,9 @@ func (o *Orchestrator) patchStatus(ctx context.Context, sandbox *apiv1alpha1.San
 		if err := o.Client.Get(ctx, key, &current); err != nil {
 			return err
 		}
+		if _, err := common.EffectiveAssignment(&current); err != nil {
+			return err
+		}
 		before := current.DeepCopy().Status
 		mutate(&current.Status)
 		if reflect.DeepEqual(before, current.Status) {
@@ -388,36 +508,51 @@ func (o *Orchestrator) patchStatus(ctx context.Context, sandbox *apiv1alpha1.San
 	})
 }
 
-func (o *Orchestrator) assignedTarget(sandbox *apiv1alpha1.Sandbox) (fastletpool.FastletInfo, api.SandboxIdentity, error) {
-	if sandbox == nil || sandbox.Status.Assignment == nil || sandbox.UID == "" {
-		return fastletpool.FastletInfo{}, api.SandboxIdentity{}, ErrAssignedFastletUnavailable
+func (o *Orchestrator) assignedTarget(sandbox *apiv1alpha1.Sandbox) (fastletpool.FastletInfo, common.AssignmentEnvelope, api.SandboxIdentity, error) {
+	if sandbox == nil || sandbox.UID == "" {
+		return fastletpool.FastletInfo{}, common.AssignmentEnvelope{}, api.SandboxIdentity{}, ErrAssignedFastletUnavailable
 	}
-	assignment := sandbox.Status.Assignment
-	fastlet, ok := o.Registry.GetFastletByID(fastletpool.FastletID(assignment.FastletName))
-	if !ok || fastlet.PodUID != assignment.FastletPodUID || fastlet.PodIP == "" {
-		return fastletpool.FastletInfo{}, api.SandboxIdentity{}, ErrAssignedFastletUnavailable
+	envelope, err := common.EffectiveAssignment(sandbox)
+	if err != nil {
+		if !errors.Is(err, common.ErrAssignmentAnnotationMissing) || sandbox.Status.Assignment == nil {
+			return fastletpool.FastletInfo{}, common.AssignmentEnvelope{}, api.SandboxIdentity{}, err
+		}
+		// Status-only objects are an upgrade bridge. Existing runtimes recover the
+		// same deterministic legacy identity; active reconcile persists it later.
+		legacyFastlet, ok := o.Registry.GetFastletByID(fastletpool.FastletID(sandbox.Status.Assignment.FastletName))
+		if !ok || legacyFastlet.PodUID != sandbox.Status.Assignment.FastletPodUID || legacyFastlet.PodIP == "" {
+			return fastletpool.FastletInfo{}, common.AssignmentEnvelope{}, api.SandboxIdentity{}, ErrAssignedFastletUnavailable
+		}
+		legacy, legacyErr := AssignmentForCandidate(
+			legacyFastlet, sandbox.Status.Assignment.Attempt,
+			max(sandbox.Status.InstanceGeneration, apiv1alpha1.InitialInstanceGeneration),
+			max(sandbox.Status.RouteGeneration, int64(1)), "legacy-"+string(sandbox.UID),
+		)
+		if legacyErr != nil {
+			return fastletpool.FastletInfo{}, common.AssignmentEnvelope{}, api.SandboxIdentity{}, legacyErr
+		}
+		identity := api.SandboxIdentity{
+			RequestID: sandbox.Annotations[common.AnnotationRequestID], SandboxUID: string(sandbox.UID),
+			InstanceGeneration: legacy.InstanceGeneration, RuntimeInstanceID: legacy.RuntimeInstanceID,
+			AssignmentAttempt: legacy.Attempt, RouteGeneration: legacy.RouteGeneration, FastletPodUID: legacy.FastletPodUID,
+		}
+		return legacyFastlet, legacy, identity, nil
 	}
-	return fastlet, identityFor(sandbox), nil
-}
-
-func identityFor(sandbox *apiv1alpha1.Sandbox) api.SandboxIdentity {
-	generation := sandbox.Status.InstanceGeneration
-	if generation < apiv1alpha1.InitialInstanceGeneration {
-		generation = apiv1alpha1.InitialInstanceGeneration
+	if envelope == nil {
+		return fastletpool.FastletInfo{}, common.AssignmentEnvelope{}, api.SandboxIdentity{}, ErrAssignedFastletUnavailable
 	}
-	return api.SandboxIdentity{
+	fastlet, ok := o.Registry.GetFastletByID(fastletpool.FastletID(envelope.FastletName))
+	if !ok || fastlet.PodUID != envelope.FastletPodUID || fastlet.PodIP == "" ||
+		fastlet.RuntimeProfileHash != envelope.RuntimeProfileHash || fastlet.ResourceProfileHash != envelope.ResourceProfileHash ||
+		fastlet.InfraProfileHash != envelope.InfraProfileHash {
+		return fastletpool.FastletInfo{}, common.AssignmentEnvelope{}, api.SandboxIdentity{}, ErrAssignedFastletUnavailable
+	}
+	identity := api.SandboxIdentity{
 		RequestID: sandbox.Annotations[common.AnnotationRequestID], SandboxUID: string(sandbox.UID),
-		InstanceGeneration: generation, AssignmentAttempt: sandbox.Status.Assignment.Attempt,
-		RouteGeneration: routeGenerationFor(sandbox),
-		FastletPodUID:   sandbox.Status.Assignment.FastletPodUID,
+		InstanceGeneration: envelope.InstanceGeneration, RuntimeInstanceID: envelope.RuntimeInstanceID,
+		AssignmentAttempt: envelope.Attempt, RouteGeneration: envelope.RouteGeneration, FastletPodUID: envelope.FastletPodUID,
 	}
-}
-
-func routeGenerationFor(sandbox *apiv1alpha1.Sandbox) int64 {
-	if sandbox.Status.RouteGeneration > 0 {
-		return sandbox.Status.RouteGeneration
-	}
-	return 1
+	return fastlet, *envelope, identity, nil
 }
 
 func envMap(values []corev1.EnvVar) map[string]string {
@@ -428,17 +563,21 @@ func envMap(values []corev1.EnvVar) map[string]string {
 	return result
 }
 
-func isCandidateRejection(err error) bool {
+func IsCandidateRejection(err error) bool {
 	var failure *api.FastletError
-	if !errors.As(err, &failure) {
+	if !errors.As(err, &failure) || failure.Outcome != api.OutcomeRejectedBeforeSideEffects {
 		return false
 	}
 	switch failure.Code {
-	case api.ErrorCapacityRejected, api.ErrorDraining, api.ErrorRuntimeUnavailable, api.ErrorNetworkUnavailable, api.ErrorInfraUnavailable:
+	case api.ErrorCapacityRejected, api.ErrorDraining, api.ErrorRuntimeUnavailable, api.ErrorNetworkUnavailable, api.ErrorInfraUnavailable, api.ErrorProfileMismatch:
 		return true
 	default:
 		return false
 	}
+}
+
+func (o *Orchestrator) RecordCandidateFeedback(id fastletpool.FastletID, err error) {
+	o.recordFeedback(id, err)
 }
 
 func (o *Orchestrator) recordFeedback(id fastletpool.FastletID, err error) {

@@ -153,6 +153,18 @@ func TestMultiActiveControlPlane(t *testing.T) {
 		if first.SandboxUid == "" || first.SandboxUid != second.SandboxUid || first.SandboxName != second.SandboxName {
 			t.Fatalf("idempotent response mismatch: first=%+v second=%+v", first, second)
 		}
+		waitUntil(ctx, t, "Fastlet platform diagnostics", func() (bool, error) {
+			diagnostics, diagnosticsErr := fastPath.GetSandboxDiagnostics(ctx, &fastpathv1.SandboxDiagnosticsRequest{
+				SandboxName: first.SandboxName, Namespace: namespace, Limit: 10,
+			})
+			if diagnosticsErr != nil {
+				return false, nil
+			}
+			if !diagnostics.FastletReachable || diagnostics.RuntimeInstanceId == "" || len(diagnostics.Events) == 0 {
+				return false, nil
+			}
+			return true, nil
+		})
 		conflict := createRequest(namespace, pool.Name, requestID)
 		conflict.Image = "docker.io/library/busybox:latest"
 		if _, err := fastPath.CreateSandbox(ctx, conflict); status.Code(err) != codes.AlreadyExists {
@@ -249,24 +261,31 @@ func TestMultiActiveControlPlane(t *testing.T) {
 		for index, response := range successfulResponses {
 			assertUniqueCreateIdentity(t, seenUIDs, seenNames, fmt.Sprintf("response-%d", index), response)
 		}
-		waitUntil(ctx, t, "only admitted capacity CRDs", func() (bool, error) {
+		waitUntil(ctx, t, "capacity-bounded ready runtimes and durable CRD-first intents", func() (bool, error) {
 			var list apiv1alpha1.SandboxList
 			if err := k8sClient.List(ctx, &list, client.InNamespace(namespace)); err != nil {
 				return false, err
 			}
-			count := 0
+			readyCount := 0
+			intentCount := 0
 			for index := range list.Items {
 				if list.Items[index].Spec.PoolRef == capacityPool.Name {
-					if list.Items[index].Status.RuntimeState != apiv1alpha1.ObservedStateReady {
-						return false, nil
+					intentCount++
+					if list.Items[index].Annotations["sandbox.fast.io/assignment"] == "" {
+						return false, fmt.Errorf("CRD-first Sandbox %s/%s has no durable assignment annotation", list.Items[index].Namespace, list.Items[index].Name)
 					}
-					if owner, exists := seenUIDs[string(list.Items[index].UID)]; !exists || owner == "" {
-						return false, fmt.Errorf("ready Sandbox %s/%s has unreported RPC identity %q", list.Items[index].Namespace, list.Items[index].Name, list.Items[index].UID)
+					if list.Items[index].Status.RuntimeState == apiv1alpha1.ObservedStateReady {
+						if owner, exists := seenUIDs[string(list.Items[index].UID)]; !exists || owner == "" {
+							return false, fmt.Errorf("ready Sandbox %s/%s has unreported RPC identity %q", list.Items[index].Namespace, list.Items[index].Name, list.Items[index].UID)
+						}
+						readyCount++
 					}
-					count++
 				}
 			}
-			return count == successes, nil
+			if readyCount > successes {
+				return false, fmt.Errorf("ready runtimes=%d exceeds successful admissions=%d", readyCount, successes)
+			}
+			return readyCount == successes && intentCount >= successes && intentCount <= requests, nil
 		})
 	})
 }

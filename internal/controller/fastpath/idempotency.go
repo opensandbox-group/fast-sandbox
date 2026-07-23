@@ -4,36 +4,21 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"strings"
 
 	fastpathv1 "fast-sandbox/api/proto/v1"
 
 	"google.golang.org/protobuf/proto"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
-const maxRequestIDLength = 128
-
-// requestIDLabelValue returns a compact DNS-label-safe lookup key. The full
-// request ID remains in the annotation and is always compared after listing.
-func requestIDLabelValue(requestID string) string {
-	digest := sha256.Sum256([]byte(requestID))
-	return hex.EncodeToString(digest[:16])
-}
-
-// ValidateRequestID validates the stable idempotency key accepted from an SDK
-// or fastctl. Clients must generate the key before sending the request.
+// ValidateRequestID validates the single create identity. request_id is also
+// metadata.name, so idempotency is a direct namespace/name lookup.
 func ValidateRequestID(requestID string) error {
-	requestID = strings.TrimSpace(requestID)
 	if requestID == "" {
 		return errors.New("request_id is required")
 	}
-	if len(requestID) > maxRequestIDLength {
-		return errors.New("request_id exceeds 128 bytes")
-	}
-	for _, r := range requestID {
-		if r <= 0x20 || r == 0x7f {
-			return errors.New("request_id contains whitespace or control characters")
-		}
+	if problems := validation.IsDNS1123Subdomain(requestID); len(problems) > 0 {
+		return errors.New("request_id must be a valid Kubernetes DNS subdomain: " + problems[0])
 	}
 	return nil
 }

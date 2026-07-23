@@ -129,7 +129,7 @@ func (d *BoxLiteDriver) ProbeCapabilities(ctx context.Context) CapabilityReport 
 }
 
 func (d *BoxLiteDriver) EnsureSandbox(ctx context.Context, config *api.SandboxSpec) (*SandboxMetadata, error) {
-	if config == nil || config.SandboxID == "" || config.FastletPodUID == "" || config.InstanceGeneration <= 0 || config.AssignmentAttempt <= 0 {
+	if config == nil || config.SandboxID == "" || config.FastletPodUID == "" || config.InstanceGeneration <= 0 || config.RuntimeInstanceID == "" || config.AssignmentAttempt <= 0 {
 		return nil, fmt.Errorf("%w: complete BoxLite Sandbox identity is required", ErrInvalidConfig)
 	}
 	d.mu.RLock()

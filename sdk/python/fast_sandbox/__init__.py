@@ -1,5 +1,5 @@
 from .client import Client
-from .envd import EnvdEndpoint
-from .sandbox import ExecResult, Sandbox
+from .route import ResolvedRoute
+from .sandbox import Sandbox
 
-__all__ = ["Client", "Sandbox", "ExecResult", "EnvdEndpoint"]
+__all__ = ["Client", "Sandbox", "ResolvedRoute"]

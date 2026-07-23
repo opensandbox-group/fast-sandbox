@@ -127,11 +127,12 @@ func proxyPool(namespace, name string) *apiv1alpha1.SandboxPool {
 func createProxySandbox(ctx context.Context, t *testing.T, fastPath fastpathv1.FastPathServiceClient, namespace, pool, name string, port int) *fastpathv1.CreateResponse {
 	t.Helper()
 	command := fmt.Sprintf(`printf '%%s\n' '#!/bin/sh' 'printf "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n%s\n"' > /serve.sh; chmod +x /serve.sh; exec nc -lk -p %d -e /serve.sh`, name, port)
+	requestID := namespace + "-" + name
 	requestContext, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	response, err := fastPath.CreateSandbox(requestContext, &fastpathv1.CreateRequest{
-		Namespace: namespace, PoolRef: pool, Name: name, Image: "docker.io/library/alpine:latest",
-		Command: []string{"/bin/sh", "-c", command}, RequestId: namespace + "-" + name,
+		Namespace: namespace, PoolRef: pool, Name: requestID, Image: "docker.io/library/alpine:latest",
+		Command: []string{"/bin/sh", "-c", command}, RequestId: requestID,
 	})
 	if err != nil {
 		t.Fatalf("CreateSandbox %s: %v", name, err)

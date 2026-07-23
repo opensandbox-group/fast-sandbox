@@ -11,7 +11,6 @@ import (
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/runtimecatalog"
-	"fast-sandbox/pkg/util/idgen"
 )
 
 type Clock interface {
@@ -22,102 +21,7 @@ type realClock struct{}
 
 func (realClock) Now() time.Time { return time.Now() }
 
-type reservation struct {
-	requestID           string
-	createSpecHash      string
-	claimNamespace      string
-	claimName           string
-	runtimeProfileHash  string
-	resourceProfileHash string
-	infraProfileHash    string
-	token               string
-	expiresAt           time.Time
-}
-
-func generateReservationToken() (string, error) {
-	return idgen.GenerateRequestID()
-}
-
-func (m *SandboxManager) ReserveSandbox(req *api.ReserveSandboxRequest) (_ *api.ReserveSandboxResponse, resultErr error) {
-	defer func() { recordAdmission("reserve", resultErr) }()
-	if req == nil || req.RequestID == "" || req.CreateSpecHash == "" || req.ClaimNamespace == "" || req.ClaimName == "" {
-		return reserveFailure(api.ErrorConflict, "requestId, createSpecHash, claimNamespace, and claimName are required", false)
-	}
-	if m.fastletPodUID != "" && req.FastletPodUID != m.fastletPodUID {
-		return reserveFailure(api.ErrorStaleAssignment, "request targets a different Fastlet Pod UID", false)
-	}
-	if err := m.validateReservationProfiles(req); err != nil {
-		return reserveFailure(api.ErrorConflict, err.Error(), false)
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.cleanupExpiredReservationsLocked()
-	if m.recovering || !m.runtimeReady {
-		return reserveFailureWithAdmission(api.ErrorRuntimeUnavailable, "Fastlet runtime recovery/capability probe is incomplete", true, m.admissionStatusLocked())
-	}
-	if !m.infraReady {
-		message := m.infraMessage
-		if message == "" {
-			message = "required InfraProfile artifacts are still preparing"
-		}
-		return reserveFailureWithAdmission(api.ErrorInfraUnavailable, message, true, m.admissionStatusLocked())
-	}
-	if m.draining {
-		return reserveFailureWithAdmission(api.ErrorDraining, m.drainReason, true, m.admissionStatusLocked())
-	}
-	reservationKey := reservationLookupKey(req.ClaimNamespace, req.RequestID)
-	if token, ok := m.requestReservations[reservationKey]; ok {
-		existing := m.reservations[token]
-		if existing != nil && reservationMatches(existing, req) {
-			return &api.ReserveSandboxResponse{ReservationToken: token, FastletPodUID: m.fastletPodUID, ExpiresAt: existing.expiresAt, Admission: m.admissionStatusLocked()}, nil
-		}
-		return reserveFailureWithAdmission(api.ErrorConflict, "requestId is already reserved with a different create spec/profile", false, m.admissionStatusLocked())
-	}
-	if m.usedLocked() >= m.capacity {
-		return reserveFailureWithAdmission(api.ErrorCapacityRejected, "Fastlet admission capacity is exhausted", true, m.admissionStatusLocked())
-	}
-	if !m.runtimeResourceAvailable() {
-		return reserveFailureWithAdmission(api.ErrorNetworkUnavailable, "Fastlet has no clean network slot available", true, m.admissionStatusLocked())
-	}
-	token, err := m.tokenGenerator()
-	if err != nil {
-		return reserveFailureWithAdmission(api.ErrorUnknownOutcome, fmt.Sprintf("generate reservation token: %v", err), true, m.admissionStatusLocked())
-	}
-	expiresAt := m.clock.Now().Add(m.reservationTTL)
-	m.reservations[token] = &reservation{
-		requestID: req.RequestID, createSpecHash: req.CreateSpecHash,
-		claimNamespace: req.ClaimNamespace, claimName: req.ClaimName,
-		runtimeProfileHash: req.RuntimeProfileHash, resourceProfileHash: req.ResourceProfileHash,
-		infraProfileHash: req.InfraProfileHash,
-		token:            token, expiresAt: expiresAt,
-	}
-	m.requestReservations[reservationKey] = token
-	return &api.ReserveSandboxResponse{ReservationToken: token, FastletPodUID: m.fastletPodUID, ExpiresAt: expiresAt, Admission: m.admissionStatusLocked()}, nil
-}
-
-func (m *SandboxManager) CancelReservation(req *api.CancelReservationRequest) (_ *api.CancelReservationResponse, resultErr error) {
-	defer func() { recordAdmission("cancel", resultErr) }()
-	if req == nil || req.ReservationToken == "" {
-		failure := fastletError(api.ErrorConflict, "reservationToken is required", false)
-		return &api.CancelReservationResponse{Error: failure}, failure
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.cleanupExpiredReservationsLocked()
-	reservation := m.reservations[req.ReservationToken]
-	if reservation == nil {
-		return &api.CancelReservationResponse{Canceled: true}, nil
-	}
-	if req.RequestID != "" && reservation.requestID != req.RequestID {
-		failure := fastletError(api.ErrorConflict, "reservation token belongs to another requestId", false)
-		return &api.CancelReservationResponse{Error: failure}, failure
-	}
-	m.removeReservationLocked(reservation)
-	return &api.CancelReservationResponse{Canceled: true}, nil
-}
-
-func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSandboxRequest) (_ *api.EnsureSandboxResponse, resultErr error) {
+func (m *SandboxManager) CreateSandbox(ctx context.Context, req *api.CreateSandboxRequest) (_ *api.CreateSandboxResponse, resultErr error) {
 	if req != nil {
 		ctx = observability.WithIdentity(ctx, observability.Identity{
 			RequestID: req.Identity.RequestID, Namespace: req.Sandbox.ClaimNamespace, SandboxName: req.Sandbox.ClaimName,
@@ -126,20 +30,21 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 			RouteGeneration: req.Identity.RouteGeneration,
 		})
 	}
-	ctx, span := observability.Start(ctx, "fastlet.ensure Sandbox")
+	ctx, span := observability.Start(ctx, "fastlet.create Sandbox")
 	started := time.Now()
 	defer func() {
 		observability.End(span, resultErr)
-		recordAdmission("ensure", resultErr)
+		recordAdmission("create", resultErr)
 		observeDataPlaneReady(m.runtimeName, m.infraProfile, started, resultErr)
 	}()
-	if failure := m.validateEnsureRequest(req); failure != nil {
-		return ensureFailure(failure, api.AdmissionStatus{})
+	if failure := m.validateCreateRequest(req); failure != nil {
+		return createFailure(failure, api.AdmissionStatus{})
 	}
 	spec := req.Sandbox
 	spec.SandboxID = req.Identity.SandboxUID
 	spec.RequestID = req.Identity.RequestID
 	spec.InstanceGeneration = req.Identity.InstanceGeneration
+	spec.RuntimeInstanceID = req.Identity.RuntimeInstanceID
 	spec.AssignmentAttempt = req.Identity.AssignmentAttempt
 	spec.RouteGeneration = req.Identity.RouteGeneration
 	if spec.RouteGeneration <= 0 {
@@ -147,13 +52,12 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 	}
 	spec.FastletPodUID = req.Identity.FastletPodUID
 	if err := m.validateProfiles(&spec); err != nil {
-		return ensureFailure(fastletError(api.ErrorConflict, err.Error(), false), api.AdmissionStatus{})
+		return createFailure(fastletErrorWithOutcome(api.ErrorProfileMismatch, err.Error(), false, api.OutcomeRejectedBeforeSideEffects), api.AdmissionStatus{})
 	}
 
 	m.mu.Lock()
-	m.cleanupExpiredReservationsLocked()
 	if m.recovering || !m.runtimeReady {
-		response, err := ensureFailure(fastletError(api.ErrorRuntimeUnavailable, "Fastlet runtime recovery/capability probe is incomplete", true), m.admissionStatusLocked())
+		response, err := createFailure(fastletErrorWithOutcome(api.ErrorRuntimeUnavailable, "Fastlet runtime recovery/capability probe is incomplete", true, api.OutcomeRejectedBeforeSideEffects), m.admissionStatusLocked())
 		m.mu.Unlock()
 		return response, err
 	}
@@ -162,24 +66,27 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 		if message == "" {
 			message = "required InfraProfile artifacts are still preparing"
 		}
-		response, err := ensureFailure(fastletError(api.ErrorInfraUnavailable, message, true), m.admissionStatusLocked())
+		response, err := createFailure(fastletErrorWithOutcome(api.ErrorInfraUnavailable, message, true, api.OutcomeRejectedBeforeSideEffects), m.admissionStatusLocked())
 		m.mu.Unlock()
 		return response, err
 	}
 	if existing := m.sandboxes[spec.SandboxID]; existing != nil {
+		if existing.Phase == "create-cleanup-failed" {
+			return m.retryFailedCreateCleanup(ctx, req, &spec, existing)
+		}
 		if existing.Phase == "infra-pending" {
 			identity := api.SandboxIdentity{
 				RequestID: spec.RequestID, SandboxUID: spec.SandboxID,
-				InstanceGeneration: spec.InstanceGeneration, AssignmentAttempt: spec.AssignmentAttempt,
+				InstanceGeneration: spec.InstanceGeneration, RuntimeInstanceID: spec.RuntimeInstanceID, AssignmentAttempt: spec.AssignmentAttempt,
 				RouteGeneration: spec.RouteGeneration, FastletPodUID: spec.FastletPodUID,
 			}
 			if failure := validateIdentityFence(m.fastletPodUID, existing, identity); failure != nil {
-				response, err := ensureFailure(failure, m.admissionStatusLocked())
+				response, err := createFailure(failure, m.admissionStatusLocked())
 				m.mu.Unlock()
 				return response, err
 			}
 			if !sameSandboxClaim(existing, &spec) {
-				response, err := ensureFailure(fastletError(api.ErrorConflict, "Sandbox UID is already bound to a different claim/profile", false), m.admissionStatusLocked())
+				response, err := createFailure(fastletError(api.ErrorConflict, "Sandbox UID is already bound to a different claim/profile", false), m.admissionStatusLocked())
 				m.mu.Unlock()
 				return response, err
 			}
@@ -190,13 +97,13 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 			if m.sandboxes[spec.SandboxID] != existing || existing.Phase != "initializing-infra" {
 				admission := m.admissionStatusLocked()
 				m.mu.Unlock()
-				return ensureFailure(fastletError(api.ErrorConflict, "Sandbox changed while Infra Components were initializing", true), admission)
+				return createFailure(fastletError(api.ErrorConflict, "Sandbox changed while Infra Components were initializing", true), admission)
 			}
 			if infraErr != nil {
 				existing.Phase = "infra-pending"
 				admission := m.admissionStatusLocked()
 				m.mu.Unlock()
-				return ensureFailure(fastletErrorWithCause(api.ErrorInProgress, infraErr.Error(), true, infraErr), admission)
+				return createFailure(fastletErrorWithCause(api.ErrorInProgress, infraErr.Error(), true, infraErr), admission)
 			}
 			existing.Phase = "route-pending"
 			m.mu.Unlock()
@@ -205,16 +112,16 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 		if existing.Phase == "route-pending" {
 			identity := api.SandboxIdentity{
 				RequestID: spec.RequestID, SandboxUID: spec.SandboxID,
-				InstanceGeneration: spec.InstanceGeneration, AssignmentAttempt: spec.AssignmentAttempt,
+				InstanceGeneration: spec.InstanceGeneration, RuntimeInstanceID: spec.RuntimeInstanceID, AssignmentAttempt: spec.AssignmentAttempt,
 				RouteGeneration: spec.RouteGeneration, FastletPodUID: spec.FastletPodUID,
 			}
 			if failure := validateIdentityFence(m.fastletPodUID, existing, identity); failure != nil {
-				response, err := ensureFailure(failure, m.admissionStatusLocked())
+				response, err := createFailure(failure, m.admissionStatusLocked())
 				m.mu.Unlock()
 				return response, err
 			}
 			if !sameSandboxClaim(existing, &spec) {
-				response, err := ensureFailure(fastletError(api.ErrorConflict, "Sandbox UID is already bound to a different claim/profile", false), m.admissionStatusLocked())
+				response, err := createFailure(fastletError(api.ErrorConflict, "Sandbox UID is already bound to a different claim/profile", false), m.admissionStatusLocked())
 				m.mu.Unlock()
 				return response, err
 			}
@@ -225,58 +132,41 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 			if m.sandboxes[spec.SandboxID] != existing || existing.Phase != "publishing-route" {
 				admission := m.admissionStatusLocked()
 				m.mu.Unlock()
-				return ensureFailure(fastletError(api.ErrorConflict, "Sandbox changed while its route was being published", true), admission)
+				return createFailure(fastletError(api.ErrorConflict, "Sandbox changed while its route was being published", true), admission)
 			}
 			if publishErr != nil {
 				existing.Phase = "route-pending"
 				admission := m.admissionStatusLocked()
 				m.mu.Unlock()
-				return ensureFailure(fastletErrorWithCause(api.ErrorInProgress, publishErr.Error(), true, publishErr), admission)
+				return createFailure(fastletErrorWithCause(api.ErrorInProgress, publishErr.Error(), true, publishErr), admission)
 			}
 			existing.Phase = "running"
 			status := sandboxStatus(existing)
 			admission := m.admissionStatusLocked()
 			m.mu.Unlock()
-			return &api.EnsureSandboxResponse{Accepted: true, Created: false, Sandbox: &status, Admission: admission}, nil
+			return &api.CreateSandboxResponse{Accepted: true, Created: false, Sandbox: &status, Admission: admission}, nil
 		}
-		response, err := m.ensureExistingLocked(existing, &spec)
+		response, err := m.createExistingLocked(existing, &spec)
+		m.mu.Unlock()
+		return response, err
+	}
+	if tombstone, found := m.tombstones[spec.SandboxID]; found && identityAtOrBefore(spec.InstanceGeneration, spec.AssignmentAttempt, tombstone) {
+		response, err := createFailure(fastletErrorWithOutcome(api.ErrorGenerationFenced, "Sandbox generation was already deleted", false, api.OutcomeGenerationFenced), m.admissionStatusLocked())
 		m.mu.Unlock()
 		return response, err
 	}
 	if m.draining {
-		response, err := ensureFailure(fastletError(api.ErrorDraining, m.drainReason, true), m.admissionStatusLocked())
+		response, err := createFailure(fastletErrorWithOutcome(api.ErrorDraining, m.drainReason, true, api.OutcomeRejectedBeforeSideEffects), m.admissionStatusLocked())
 		m.mu.Unlock()
 		return response, err
 	}
-
-	if req.ReservationToken != "" {
-		reserved := m.reservations[req.ReservationToken]
-		if reserved == nil || reserved.requestID != req.Identity.RequestID ||
-			reserved.createSpecHash != req.CreateSpecHash ||
-			reserved.claimNamespace != spec.ClaimNamespace || reserved.claimName != spec.ClaimName ||
-			reserved.runtimeProfileHash != spec.RuntimeProfileHash || reserved.resourceProfileHash != spec.ResourceProfileHash ||
-			reserved.infraProfileHash != spec.InfraProfileHash {
-			response, err := ensureFailure(fastletError(api.ErrorConflict, "reservation is missing, expired, or does not match Ensure identity/profile", false), m.admissionStatusLocked())
-			m.mu.Unlock()
-			return response, err
-		}
-		m.removeReservationLocked(reserved)
-	} else if token := m.requestReservations[reservationLookupKey(spec.ClaimNamespace, req.Identity.RequestID)]; token != "" {
-		reserved := m.reservations[token]
-		if reserved == nil || reserved.requestID != req.Identity.RequestID ||
-			reserved.createSpecHash != req.CreateSpecHash || reserved.claimNamespace != spec.ClaimNamespace || reserved.claimName != spec.ClaimName ||
-			reserved.runtimeProfileHash != spec.RuntimeProfileHash || reserved.resourceProfileHash != spec.ResourceProfileHash ||
-			reserved.infraProfileHash != spec.InfraProfileHash {
-			response, err := ensureFailure(fastletError(api.ErrorConflict, "matching committed claim could not take over reservation", false), m.admissionStatusLocked())
-			m.mu.Unlock()
-			return response, err
-		}
-		// A Controller may win the reconcile race or take over after the
-		// FastPath commits its CRD. The durable claim is allowed to convert the
-		// matching reservation without possessing the ephemeral token.
-		m.removeReservationLocked(reserved)
-	} else if m.usedLocked() >= m.capacity {
-		response, err := ensureFailure(fastletError(api.ErrorCapacityRejected, "Fastlet admission capacity is exhausted", true), m.admissionStatusLocked())
+	if len(m.sandboxes) >= m.capacity {
+		response, err := createFailure(fastletErrorWithOutcome(api.ErrorCapacityRejected, "Fastlet admission capacity is exhausted", true, api.OutcomeRejectedBeforeSideEffects), m.admissionStatusLocked())
+		m.mu.Unlock()
+		return response, err
+	}
+	if !m.runtimeResourceAvailable() {
+		response, err := createFailure(fastletErrorWithOutcome(api.ErrorNetworkUnavailable, "Fastlet has no clean runtime/network resource available", true, api.OutcomeRejectedBeforeSideEffects), m.admissionStatusLocked())
 		m.mu.Unlock()
 		return response, err
 	}
@@ -285,6 +175,7 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 	m.sandboxes[spec.SandboxID] = placeholder
 	admission := m.admissionStatusLocked()
 	m.mu.Unlock()
+	m.recordDiagnostic(spec.SandboxID, "info", "admission", "creating", "Fastlet admission accepted; atomic runtime creation started")
 
 	runtimeStarted := time.Now()
 	metadata, err := m.runtime.EnsureSandbox(ctx, &spec)
@@ -292,9 +183,14 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 	observeUserProcessStart(m.runtimeName, m.infraProfile, started, metadata)
 	if err != nil {
 		m.cacheProtection.ProtectHotUntil(spec.Image, m.clock.Now().Add(time.Hour))
+		cleanupErr := m.runtime.DeleteSandbox(ctx, spec.SandboxID)
 		m.mu.Lock()
-		if current := m.sandboxes[spec.SandboxID]; current == placeholder {
+		outcome := api.OutcomeRejectedBeforeSideEffects
+		if cleanupErr == nil && m.sandboxes[spec.SandboxID] == placeholder {
 			delete(m.sandboxes, spec.SandboxID)
+		} else if m.sandboxes[spec.SandboxID] == placeholder {
+			placeholder.Phase = "create-cleanup-failed"
+			outcome = api.OutcomeFailedNeedsCleanup
 		}
 		admission = m.admissionStatusLocked()
 		m.mu.Unlock()
@@ -304,7 +200,12 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 		} else if errors.Is(err, ErrInfraUnavailable) {
 			code = api.ErrorInfraUnavailable
 		}
-		return ensureFailure(fastletErrorWithCause(code, err.Error(), true, err), admission)
+		failureMessage := err.Error()
+		if cleanupErr != nil {
+			failureMessage = fmt.Sprintf("%s; cleanup failed: %v", failureMessage, cleanupErr)
+		}
+		m.recordDiagnostic(spec.SandboxID, "error", "runtime", string(outcome), failureMessage)
+		return createFailure(fastletErrorWithCauseAndOutcome(code, failureMessage, true, errors.Join(err, cleanupErr), outcome), admission)
 	}
 	runtimeSpec := metadata.SandboxSpec
 	metadata.Phase = "infra-pending"
@@ -322,22 +223,25 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 		admission = m.admissionStatusLocked()
 		m.mu.Unlock()
 		go m.asyncDelete(spec.SandboxID, metadata)
-		return ensureFailure(fastletError(api.ErrorConflict, "Sandbox was deleted while creation was in progress", false), admission)
+		return createFailure(fastletError(api.ErrorConflict, "Sandbox was deleted while creation was in progress", false), admission)
 	}
 	m.sandboxes[spec.SandboxID] = metadata
 	m.mu.Unlock()
+	m.recordDiagnostic(spec.SandboxID, "info", "runtime", "infra-pending", "runtime and private network are ready; Infra Component initialization started")
 	if err := m.initializeInfraInstance(ctx, metadata); err != nil {
 		m.mu.Lock()
 		admission = m.admissionStatusLocked()
 		m.mu.Unlock()
-		return ensureFailure(fastletErrorWithCause(api.ErrorInProgress, err.Error(), true, err), admission)
+		m.recordDiagnostic(spec.SandboxID, "error", "infra", "infra-pending", err.Error())
+		return createFailure(fastletErrorWithCause(api.ErrorInProgress, err.Error(), true, err), admission)
 	}
+	m.recordDiagnostic(spec.SandboxID, "info", "infra", "route-pending", "required Infra Components are ready; proxy route publication started")
 
 	m.mu.Lock()
 	if m.sandboxes[spec.SandboxID] != metadata || metadata.Phase != "infra-pending" {
 		admission = m.admissionStatusLocked()
 		m.mu.Unlock()
-		return ensureFailure(fastletError(api.ErrorConflict, "Sandbox changed while Infra Components were initializing", true), admission)
+		return createFailure(fastletError(api.ErrorConflict, "Sandbox changed while Infra Components were initializing", true), admission)
 	}
 	metadata.Phase = "route-pending"
 	m.mu.Unlock()
@@ -348,20 +252,68 @@ func (m *SandboxManager) EnsureSandboxV2(ctx context.Context, req *api.EnsureSan
 			admission = m.admissionStatusLocked()
 		}
 		m.mu.Unlock()
-		return ensureFailure(fastletErrorWithCause(api.ErrorInProgress, err.Error(), true, err), admission)
+		m.recordDiagnostic(spec.SandboxID, "error", "route", "route-pending", err.Error())
+		return createFailure(fastletErrorWithCause(api.ErrorInProgress, err.Error(), true, err), admission)
 	}
 
 	m.mu.Lock()
 	if m.sandboxes[spec.SandboxID] != metadata || metadata.Phase != "route-pending" {
 		admission = m.admissionStatusLocked()
 		m.mu.Unlock()
-		return ensureFailure(fastletError(api.ErrorConflict, "Sandbox changed while its route was being published", true), admission)
+		return createFailure(fastletError(api.ErrorConflict, "Sandbox changed while its route was being published", true), admission)
 	}
 	metadata.Phase = "running"
 	status := sandboxStatus(metadata)
 	admission = m.admissionStatusLocked()
+	m.recordDiagnosticLocked(spec.SandboxID, "info", "fastlet", "running", "runtime, private network, Infra Components, and proxy route are ready")
 	m.mu.Unlock()
-	return &api.EnsureSandboxResponse{Accepted: true, Created: true, Sandbox: &status, Admission: admission}, nil
+	return &api.CreateSandboxResponse{Accepted: true, Created: true, Sandbox: &status, Admission: admission}, nil
+}
+
+// retryFailedCreateCleanup resumes only cleanup that belongs to a failed
+// Create attempt. A user-requested delete uses the distinct delete-failed
+// phase and can never be resurrected by a delayed Create retry.
+//
+// m.mu must be held on entry. This method releases it before returning.
+func (m *SandboxManager) retryFailedCreateCleanup(ctx context.Context, req *api.CreateSandboxRequest, requested *api.SandboxSpec, existing *SandboxMetadata) (*api.CreateSandboxResponse, error) {
+	identity := api.SandboxIdentity{
+		RequestID: requested.RequestID, SandboxUID: requested.SandboxID,
+		InstanceGeneration: requested.InstanceGeneration, RuntimeInstanceID: requested.RuntimeInstanceID,
+		AssignmentAttempt: requested.AssignmentAttempt, RouteGeneration: requested.RouteGeneration,
+		FastletPodUID: requested.FastletPodUID,
+	}
+	if failure := validateIdentityFence(m.fastletPodUID, existing, identity); failure != nil {
+		response, err := createFailure(failure, m.admissionStatusLocked())
+		m.mu.Unlock()
+		return response, err
+	}
+	if !sameSandboxClaim(existing, requested) {
+		response, err := createFailure(fastletError(api.ErrorConflict, "Sandbox UID is already bound to a different claim/profile", false), m.admissionStatusLocked())
+		m.mu.Unlock()
+		return response, err
+	}
+	existing.Phase = "create-cleanup"
+	m.mu.Unlock()
+
+	cleanupErr := m.runtime.DeleteSandbox(ctx, requested.SandboxID)
+	m.mu.Lock()
+	if m.sandboxes[requested.SandboxID] != existing {
+		admission := m.admissionStatusLocked()
+		m.mu.Unlock()
+		return createFailure(fastletError(api.ErrorConflict, "Sandbox changed while failed Create cleanup was retried", true), admission)
+	}
+	if cleanupErr != nil {
+		existing.Phase = "create-cleanup-failed"
+		admission := m.admissionStatusLocked()
+		m.mu.Unlock()
+		message := fmt.Sprintf("retry failed Create cleanup: %v", cleanupErr)
+		m.recordDiagnostic(requested.SandboxID, "error", "runtime", string(api.OutcomeFailedNeedsCleanup), message)
+		return createFailure(fastletErrorWithCauseAndOutcome(api.ErrorRuntimeUnavailable, message, true, cleanupErr, api.OutcomeFailedNeedsCleanup), admission)
+	}
+	delete(m.sandboxes, requested.SandboxID)
+	m.mu.Unlock()
+	m.recordDiagnostic(requested.SandboxID, "info", "runtime", "cleanup-recovered", "failed Create cleanup converged; retrying the same runtime identity")
+	return m.CreateSandbox(ctx, req)
 }
 
 func (m *SandboxManager) InspectSandboxV2(req *api.InspectSandboxRequest) (*api.InspectSandboxResponse, error) {
@@ -382,12 +334,12 @@ func (m *SandboxManager) InspectSandboxV2(req *api.InspectSandboxRequest) (*api.
 	return &api.InspectSandboxResponse{Sandbox: &status}, nil
 }
 
-func (m *SandboxManager) retryRoutePublication(ctx context.Context, metadata *SandboxMetadata) (*api.EnsureSandboxResponse, error) {
+func (m *SandboxManager) retryRoutePublication(ctx context.Context, metadata *SandboxMetadata) (*api.CreateSandboxResponse, error) {
 	m.mu.Lock()
 	if m.sandboxes[metadata.SandboxID] != metadata || metadata.Phase != "route-pending" {
 		admission := m.admissionStatusLocked()
 		m.mu.Unlock()
-		return ensureFailure(fastletError(api.ErrorConflict, "Sandbox changed before its route could be published", true), admission)
+		return createFailure(fastletError(api.ErrorConflict, "Sandbox changed before its route could be published", true), admission)
 	}
 	metadata.Phase = "publishing-route"
 	m.mu.Unlock()
@@ -395,30 +347,32 @@ func (m *SandboxManager) retryRoutePublication(ctx context.Context, metadata *Sa
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.sandboxes[metadata.SandboxID] != metadata || metadata.Phase != "publishing-route" {
-		return ensureFailure(fastletError(api.ErrorConflict, "Sandbox changed while its route was being published", true), m.admissionStatusLocked())
+		return createFailure(fastletError(api.ErrorConflict, "Sandbox changed while its route was being published", true), m.admissionStatusLocked())
 	}
 	if publishErr != nil {
 		metadata.Phase = "route-pending"
-		return ensureFailure(fastletErrorWithCause(api.ErrorInProgress, publishErr.Error(), true, publishErr), m.admissionStatusLocked())
+		return createFailure(fastletErrorWithCause(api.ErrorInProgress, publishErr.Error(), true, publishErr), m.admissionStatusLocked())
 	}
 	metadata.Phase = "running"
 	status := sandboxStatus(metadata)
-	return &api.EnsureSandboxResponse{Accepted: true, Created: false, Sandbox: &status, Admission: m.admissionStatusLocked()}, nil
+	return &api.CreateSandboxResponse{Accepted: true, Created: false, Sandbox: &status, Admission: m.admissionStatusLocked()}, nil
 }
 
 func (m *SandboxManager) DeleteSandboxV2(req *api.DeleteSandboxV2Request) (*api.DeleteSandboxV2Response, error) {
 	if failure := m.validateIdentityTarget(deleteIdentity(req)); failure != nil {
 		return &api.DeleteSandboxV2Response{Error: failure}, failure
 	}
-	m.mu.RLock()
+	m.mu.Lock()
 	metadata := m.sandboxes[req.Identity.SandboxUID]
 	if metadata != nil {
 		if failure := validateIdentityFence(m.fastletPodUID, metadata, req.Identity); failure != nil {
-			m.mu.RUnlock()
+			m.mu.Unlock()
 			return &api.DeleteSandboxV2Response{Error: failure}, failure
 		}
 	}
-	m.mu.RUnlock()
+	m.recordTombstoneLocked(req.Identity)
+	m.recordDiagnosticLocked(req.Identity.SandboxUID, "info", "admission", "terminating", "declarative deletion accepted")
+	m.mu.Unlock()
 	m.beginDelete(req.Identity.SandboxUID)
 	return &api.DeleteSandboxV2Response{Accepted: true}, nil
 }
@@ -453,6 +407,9 @@ func (m *SandboxManager) Recover(ctx context.Context) error {
 		}
 		if metadata.InstanceGeneration <= 0 {
 			metadata.InstanceGeneration = 1
+		}
+		if metadata.RuntimeInstanceID == "" {
+			metadata.RuntimeInstanceID = "legacy-" + metadata.SandboxID
 		}
 		if metadata.AssignmentAttempt <= 0 {
 			metadata.AssignmentAttempt = 1
@@ -535,39 +492,38 @@ func (m *SandboxManager) RuntimeReady() bool {
 func (m *SandboxManager) State() (api.AdmissionStatus, bool, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.cleanupExpiredReservationsLocked()
 	return m.admissionStatusLocked(), m.recovering, m.draining
 }
 
-func (m *SandboxManager) ensureExistingLocked(existing *SandboxMetadata, requested *api.SandboxSpec) (*api.EnsureSandboxResponse, error) {
+func (m *SandboxManager) createExistingLocked(existing *SandboxMetadata, requested *api.SandboxSpec) (*api.CreateSandboxResponse, error) {
 	identity := api.SandboxIdentity{
 		RequestID: requested.RequestID, SandboxUID: requested.SandboxID,
-		InstanceGeneration: requested.InstanceGeneration, AssignmentAttempt: requested.AssignmentAttempt,
+		InstanceGeneration: requested.InstanceGeneration, RuntimeInstanceID: requested.RuntimeInstanceID, AssignmentAttempt: requested.AssignmentAttempt,
 		RouteGeneration: requested.RouteGeneration, FastletPodUID: requested.FastletPodUID,
 	}
 	if failure := validateIdentityFence(m.fastletPodUID, existing, identity); failure != nil {
-		return ensureFailure(failure, m.admissionStatusLocked())
+		return createFailure(failure, m.admissionStatusLocked())
 	}
 	if !sameSandboxClaim(existing, requested) {
-		return ensureFailure(fastletError(api.ErrorConflict, "Sandbox UID is already bound to a different claim/profile", false), m.admissionStatusLocked())
+		return createFailure(fastletError(api.ErrorConflict, "Sandbox UID is already bound to a different claim/profile", false), m.admissionStatusLocked())
 	}
 	status := sandboxStatus(existing)
 	if existing.Phase == "creating" || existing.Phase == "initializing-infra" || existing.Phase == "publishing-route" {
 		failure := fastletError(api.ErrorInProgress, "Sandbox creation is already in progress", true)
-		return &api.EnsureSandboxResponse{Accepted: true, InProgress: true, Sandbox: &status, Admission: m.admissionStatusLocked(), Error: failure}, failure
+		return &api.CreateSandboxResponse{Accepted: true, InProgress: true, Sandbox: &status, Admission: m.admissionStatusLocked(), Error: failure}, failure
 	}
 	if existing.Phase == "terminating" || existing.Phase == "deleting" {
-		return ensureFailure(fastletError(api.ErrorConflict, "Sandbox deletion is already in progress", true), m.admissionStatusLocked())
+		return createFailure(fastletError(api.ErrorConflict, "Sandbox deletion is already in progress", true), m.admissionStatusLocked())
 	}
 	if existing.Phase != "running" {
-		return ensureFailure(fastletError(api.ErrorRuntimeUnavailable, fmt.Sprintf("managed Sandbox runtime is %s, not running", existing.Phase), true), m.admissionStatusLocked())
+		return createFailure(fastletError(api.ErrorRuntimeUnavailable, fmt.Sprintf("managed Sandbox runtime is %s, not running", existing.Phase), true), m.admissionStatusLocked())
 	}
-	return &api.EnsureSandboxResponse{Accepted: true, Created: false, Sandbox: &status, Admission: m.admissionStatusLocked()}, nil
+	return &api.CreateSandboxResponse{Accepted: true, Created: false, Sandbox: &status, Admission: m.admissionStatusLocked()}, nil
 }
 
 func (m *SandboxManager) validateIdentityTarget(identity *api.SandboxIdentity) *api.FastletError {
-	if identity == nil || identity.SandboxUID == "" || identity.InstanceGeneration <= 0 || identity.AssignmentAttempt <= 0 {
-		return fastletError(api.ErrorConflict, "sandboxUid, positive instanceGeneration, and positive assignmentAttempt are required", false)
+	if identity == nil || identity.SandboxUID == "" || identity.InstanceGeneration <= 0 || identity.RuntimeInstanceID == "" || identity.AssignmentAttempt <= 0 {
+		return fastletError(api.ErrorConflict, "sandboxUid, runtimeInstanceId, positive instanceGeneration, and positive assignmentAttempt are required", false)
 	}
 	if m.fastletPodUID != "" && identity.FastletPodUID != m.fastletPodUID {
 		return fastletError(api.ErrorStaleAssignment, "request targets a different Fastlet Pod UID", false)
@@ -600,6 +556,9 @@ func validateIdentityFence(expectedPodUID string, existing *SandboxMetadata, req
 	if requested.InstanceGeneration > existing.InstanceGeneration || requested.AssignmentAttempt > existing.AssignmentAttempt {
 		return fastletError(api.ErrorConflict, "newer generation/assignment requires the old runtime to be deleted first", true)
 	}
+	if requested.RuntimeInstanceID != existing.RuntimeInstanceID {
+		return fastletError(api.ErrorConflict, "runtimeInstanceId conflicts with the managed Sandbox", false)
+	}
 	requestedRouteGeneration := requested.RouteGeneration
 	if requestedRouteGeneration <= 0 {
 		requestedRouteGeneration = existing.RouteGeneration
@@ -619,9 +578,22 @@ func sameSandboxClaim(existing *SandboxMetadata, requested *api.SandboxSpec) boo
 		existing.InfraProfile == requested.InfraProfile && existing.InfraProfileHash == requested.InfraProfileHash
 }
 
-func (m *SandboxManager) validateEnsureRequest(req *api.EnsureSandboxRequest) *api.FastletError {
-	if req == nil || req.Identity.SandboxUID == "" || req.Identity.InstanceGeneration <= 0 || req.Identity.AssignmentAttempt <= 0 {
-		return fastletError(api.ErrorConflict, "sandboxUid, positive instanceGeneration, and positive assignmentAttempt are required", false)
+func identityAtOrBefore(generation, attempt int64, highWater api.SandboxIdentity) bool {
+	return generation < highWater.InstanceGeneration ||
+		(generation == highWater.InstanceGeneration && attempt <= highWater.AssignmentAttempt)
+}
+
+func (m *SandboxManager) recordTombstoneLocked(identity api.SandboxIdentity) {
+	current, found := m.tombstones[identity.SandboxUID]
+	if !found || current.InstanceGeneration < identity.InstanceGeneration ||
+		(current.InstanceGeneration == identity.InstanceGeneration && current.AssignmentAttempt < identity.AssignmentAttempt) {
+		m.tombstones[identity.SandboxUID] = identity
+	}
+}
+
+func (m *SandboxManager) validateCreateRequest(req *api.CreateSandboxRequest) *api.FastletError {
+	if req == nil || req.Identity.SandboxUID == "" || req.Identity.InstanceGeneration <= 0 || req.Identity.RuntimeInstanceID == "" || req.Identity.AssignmentAttempt <= 0 {
+		return fastletError(api.ErrorConflict, "sandboxUid, runtimeInstanceId, positive instanceGeneration, and positive assignmentAttempt are required", false)
 	}
 	if m.fastletPodUID != "" && req.Identity.FastletPodUID != m.fastletPodUID {
 		return fastletError(api.ErrorStaleAssignment, "request targets a different Fastlet Pod UID", false)
@@ -632,53 +604,19 @@ func (m *SandboxManager) validateEnsureRequest(req *api.EnsureSandboxRequest) *a
 	return nil
 }
 
-func (m *SandboxManager) validateReservationProfiles(req *api.ReserveSandboxRequest) error {
-	if m.runtimeProfileHash != "" && req.RuntimeProfileHash != m.runtimeProfileHash {
-		return fmt.Errorf("runtime profile hash does not match Fastlet")
-	}
-	if m.resourceProfileHash != "" && req.ResourceProfileHash != m.resourceProfileHash {
-		return fmt.Errorf("resource profile hash does not match Fastlet")
-	}
-	if m.infraProfileHash != "" && req.InfraProfileHash != m.infraProfileHash {
-		return fmt.Errorf("InfraProfile hash does not match Fastlet")
-	}
-	return nil
-}
-
-func (m *SandboxManager) cleanupExpiredReservationsLocked() {
-	now := m.clock.Now()
-	for _, item := range m.reservations {
-		if !now.Before(item.expiresAt) {
-			m.removeReservationLocked(item)
-		}
-	}
-}
-
-func (m *SandboxManager) removeReservationLocked(item *reservation) {
-	delete(m.reservations, item.token)
-	key := reservationLookupKey(item.claimNamespace, item.requestID)
-	if m.requestReservations[key] == item.token {
-		delete(m.requestReservations, key)
-	}
-}
-
-func (m *SandboxManager) usedLocked() int {
-	return len(m.reservations) + len(m.sandboxes)
-}
-
 func (m *SandboxManager) admissionStatusLocked() api.AdmissionStatus {
-	status := api.AdmissionStatus{Capacity: m.capacity, Reservations: len(m.reservations)}
+	status := api.AdmissionStatus{Capacity: m.capacity}
 	for _, metadata := range m.sandboxes {
 		switch metadata.Phase {
 		case "creating", "infra-pending", "initializing-infra", "route-pending", "publishing-route":
 			status.Creating++
-		case "terminating", "deleting", "delete-failed":
+		case "terminating", "deleting", "delete-failed", "create-cleanup", "create-cleanup-failed":
 			status.Deleting++
 		default:
 			status.Running++
 		}
 	}
-	status.Used = status.Reservations + status.Creating + status.Running + status.Deleting
+	status.Used = status.Creating + status.Running + status.Deleting
 	recordAdmissionStatus(status)
 	return status
 }
@@ -686,7 +624,7 @@ func (m *SandboxManager) admissionStatusLocked() api.AdmissionStatus {
 func sandboxStatus(metadata *SandboxMetadata) api.SandboxStatus {
 	return api.SandboxStatus{
 		SandboxID: metadata.SandboxID, ClaimUID: metadata.ClaimUID,
-		InstanceGeneration: metadata.InstanceGeneration, AssignmentAttempt: metadata.AssignmentAttempt,
+		InstanceGeneration: metadata.InstanceGeneration, RuntimeInstanceID: metadata.RuntimeInstanceID, AssignmentAttempt: metadata.AssignmentAttempt,
 		RouteGeneration: metadata.RouteGeneration,
 		Phase:           metadata.Phase, CreatedAt: metadata.CreatedAt, InfraDiagnostics: apiInfraDiagnostics(metadata.InfraDiagnostics),
 	}
@@ -703,34 +641,35 @@ func apiInfraDiagnostics(diagnostics []fastletinfra.ComponentDiagnostic) []api.I
 	return result
 }
 
-func reservationMatches(existing *reservation, req *api.ReserveSandboxRequest) bool {
-	return existing.requestID == req.RequestID && existing.createSpecHash == req.CreateSpecHash &&
-		existing.claimNamespace == req.ClaimNamespace && existing.claimName == req.ClaimName &&
-		existing.runtimeProfileHash == req.RuntimeProfileHash && existing.resourceProfileHash == req.ResourceProfileHash &&
-		existing.infraProfileHash == req.InfraProfileHash
-}
-
-func reservationLookupKey(namespace, requestID string) string {
-	return namespace + "\x00" + requestID
-}
-
 func fastletError(code api.FastletErrorCode, message string, retryable bool) *api.FastletError {
-	return &api.FastletError{Code: code, Message: message, Retryable: retryable}
+	return fastletErrorWithOutcome(code, message, retryable, defaultOutcome(code))
 }
 
 func fastletErrorWithCause(code api.FastletErrorCode, message string, retryable bool, cause error) *api.FastletError {
-	return &api.FastletError{Code: code, Message: message, Retryable: retryable, Cause: cause}
+	return fastletErrorWithCauseAndOutcome(code, message, retryable, cause, defaultOutcome(code))
 }
 
-func reserveFailure(code api.FastletErrorCode, message string, retryable bool) (*api.ReserveSandboxResponse, error) {
-	return reserveFailureWithAdmission(code, message, retryable, api.AdmissionStatus{})
+func fastletErrorWithOutcome(code api.FastletErrorCode, message string, retryable bool, outcome api.FastletOutcome) *api.FastletError {
+	return &api.FastletError{Code: code, Message: message, Retryable: retryable, Outcome: outcome}
 }
 
-func reserveFailureWithAdmission(code api.FastletErrorCode, message string, retryable bool, admission api.AdmissionStatus) (*api.ReserveSandboxResponse, error) {
-	failure := fastletError(code, message, retryable)
-	return &api.ReserveSandboxResponse{Admission: admission, Error: failure}, failure
+func fastletErrorWithCauseAndOutcome(code api.FastletErrorCode, message string, retryable bool, cause error, outcome api.FastletOutcome) *api.FastletError {
+	return &api.FastletError{Code: code, Message: message, Retryable: retryable, Outcome: outcome, Cause: cause}
 }
 
-func ensureFailure(failure *api.FastletError, admission api.AdmissionStatus) (*api.EnsureSandboxResponse, error) {
-	return &api.EnsureSandboxResponse{Admission: admission, Error: failure}, failure
+func defaultOutcome(code api.FastletErrorCode) api.FastletOutcome {
+	switch code {
+	case api.ErrorCapacityRejected, api.ErrorDraining, api.ErrorProfileMismatch:
+		return api.OutcomeRejectedBeforeSideEffects
+	case api.ErrorInProgress:
+		return api.OutcomeInProgress
+	case api.ErrorGenerationFenced, api.ErrorStaleGeneration:
+		return api.OutcomeGenerationFenced
+	default:
+		return api.OutcomeUnknown
+	}
+}
+
+func createFailure(failure *api.FastletError, admission api.AdmissionStatus) (*api.CreateSandboxResponse, error) {
+	return &api.CreateSandboxResponse{Admission: admission, Error: failure}, failure
 }

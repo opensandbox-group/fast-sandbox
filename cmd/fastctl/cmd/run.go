@@ -9,7 +9,6 @@ import (
 	"time"
 
 	fastpathv1 "fast-sandbox/api/proto/v1"
-	"fast-sandbox/pkg/util/idgen"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -102,11 +101,10 @@ Priority: Flags > Config File > Interactive Input
 		start := time.Now()
 		createRequestID := requestID
 		if createRequestID == "" {
-			var err error
-			createRequestID, err = idgen.GenerateRequestID()
-			if err != nil {
-				log.Fatalf("Error: %v", err)
-			}
+			createRequestID = name
+		}
+		if createRequestID != name {
+			log.Fatal("Error: --request-id must equal the Sandbox name")
 		}
 		req := &fastpathv1.CreateRequest{
 			Name:       name,
@@ -141,7 +139,7 @@ func init() {
 	runCmd.Flags().StringVarP(&configFile, "file", "f", "", "Path to sandbox config file")
 	runCmd.Flags().StringVar(&image, "image", "", "Container image")
 	runCmd.Flags().StringVar(&pool, "pool", "default-pool", "Target SandboxPool")
-	runCmd.Flags().StringVar(&requestID, "request-id", "", "Idempotency key (generated automatically when omitted)")
+	runCmd.Flags().StringVar(&requestID, "request-id", "", "Idempotency key; must equal the Sandbox name")
 }
 
 func runInteractive(name string, config *SandboxConfig) error {

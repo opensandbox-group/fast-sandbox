@@ -155,7 +155,7 @@ func TestSameRuntimeIdentityIncludesPodAndGenerationFences(t *testing.T) {
 	requested := api.SandboxSpec{
 		SandboxID: "sandbox-a", RequestID: "request-a", ClaimUID: "sandbox-a",
 		ClaimNamespace: "default", ClaimName: "sandbox-a", FastletPodUID: "pod-a",
-		InstanceGeneration: 2, AssignmentAttempt: 3,
+		InstanceGeneration: 2, RuntimeInstanceID: "runtime-a", AssignmentAttempt: 3,
 	}
 	existing := &SandboxMetadata{SandboxSpec: requested}
 	require.True(t, sameRuntimeIdentity(existing, &requested))
@@ -163,6 +163,7 @@ func TestSameRuntimeIdentityIncludesPodAndGenerationFences(t *testing.T) {
 	for name, mutate := range map[string]func(*api.SandboxSpec){
 		"Fastlet Pod":         func(spec *api.SandboxSpec) { spec.FastletPodUID = "pod-b" },
 		"instance generation": func(spec *api.SandboxSpec) { spec.InstanceGeneration++ },
+		"runtime instance":    func(spec *api.SandboxSpec) { spec.RuntimeInstanceID = "runtime-b" },
 		"assignment attempt":  func(spec *api.SandboxSpec) { spec.AssignmentAttempt++ },
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -498,7 +499,7 @@ func TestContainerdRuntime_prepareLabels(t *testing.T) {
 
 	config := &api.SandboxSpec{
 		SandboxID: "sb-123", ClaimUID: "claim-456", ClaimNamespace: "tenant-a", ClaimName: "test-claim", Image: "alpine:latest",
-		RequestID: "request-1", InstanceGeneration: 2, AssignmentAttempt: 3,
+		RequestID: "request-1", InstanceGeneration: 2, RuntimeInstanceID: "runtime-1", AssignmentAttempt: 3,
 		CPU: "500m", Memory: "256Mi", PIDs: 128,
 		RuntimeProfileHash: "runtime-hash", ResourceProfileHash: "resource-hash",
 		InfraProfile: "test-infra", InfraProfileHash: "infra-hash",
@@ -526,6 +527,7 @@ func TestContainerdRuntime_prepareLabels(t *testing.T) {
 		"fast-sandbox.io/resource-pids":         "128",
 		"fast-sandbox.io/request-id":            "request-1",
 		"fast-sandbox.io/instance-generation":   "2",
+		"fast-sandbox.io/runtime-instance-id":   "runtime-1",
 		"fast-sandbox.io/assignment-attempt":    "3",
 		"fast-sandbox.io/route-generation":      "1",
 		"fast-sandbox.io/network-slot-id":       "slot-1",

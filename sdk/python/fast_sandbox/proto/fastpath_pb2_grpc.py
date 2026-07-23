@@ -59,6 +59,11 @@ class FastPathServiceStub(object):
                 request_serializer=fastpath__pb2.GetRequest.SerializeToString,
                 response_deserializer=fastpath__pb2.SandboxInfo.FromString,
                 _registered_method=True)
+        self.GetSandboxDiagnostics = channel.unary_unary(
+                '/fastpath.v1.FastPathService/GetSandboxDiagnostics',
+                request_serializer=fastpath__pb2.SandboxDiagnosticsRequest.SerializeToString,
+                response_deserializer=fastpath__pb2.SandboxDiagnosticsResponse.FromString,
+                _registered_method=True)
         self.ResolveEndpoint = channel.unary_unary(
                 '/fastpath.v1.FastPathService/ResolveEndpoint',
                 request_serializer=fastpath__pb2.ResolveEndpointRequest.SerializeToString,
@@ -75,8 +80,8 @@ class FastPathServiceServicer(object):
     """Missing associated documentation comment in .proto file."""
 
     def CreateSandbox(self, request, context):
-        """CreateSandbox performs the imperative low-latency create path. It reserves
-        Fastlet capacity, commits a Sandbox CRD, and then ensures the runtime.
+        """CreateSandbox performs the imperative CRD-first low-latency path: one CRD
+        Create followed by one atomic Fastlet Create on the happy path.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -105,6 +110,14 @@ class FastPathServiceServicer(object):
 
     def GetSandbox(self, request, context):
         """GetSandbox 获取沙箱详情
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetSandboxDiagnostics(self, request, context):
+        """GetSandboxDiagnostics returns platform lifecycle diagnostics. It never
+        depends on an injected user-space Infra Component such as execd.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -151,6 +164,11 @@ def add_FastPathServiceServicer_to_server(servicer, server):
                     servicer.GetSandbox,
                     request_deserializer=fastpath__pb2.GetRequest.FromString,
                     response_serializer=fastpath__pb2.SandboxInfo.SerializeToString,
+            ),
+            'GetSandboxDiagnostics': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetSandboxDiagnostics,
+                    request_deserializer=fastpath__pb2.SandboxDiagnosticsRequest.FromString,
+                    response_serializer=fastpath__pb2.SandboxDiagnosticsResponse.SerializeToString,
             ),
             'ResolveEndpoint': grpc.unary_unary_rpc_method_handler(
                     servicer.ResolveEndpoint,
@@ -298,6 +316,33 @@ class FastPathService(object):
             '/fastpath.v1.FastPathService/GetSandbox',
             fastpath__pb2.GetRequest.SerializeToString,
             fastpath__pb2.SandboxInfo.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetSandboxDiagnostics(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/fastpath.v1.FastPathService/GetSandboxDiagnostics',
+            fastpath__pb2.SandboxDiagnosticsRequest.SerializeToString,
+            fastpath__pb2.SandboxDiagnosticsResponse.FromString,
             options,
             channel_credentials,
             insecure,

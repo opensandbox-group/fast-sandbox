@@ -2,7 +2,7 @@
 
 Fast Sandbox is a Kubernetes-native runtime plane for low-latency, isolated sandboxes. It keeps Fastlet Pods warm, creates multiple Sandbox runtimes inside each Fastlet, and preserves declarative lifecycle state in Kubernetes CRDs.
 
-The current architecture separates the multi-active request path from leader-elected reconciliation. It also separates lifecycle control from user data protocols: Fast Sandbox resolves and authenticates a route to an injected Infra Component, while Execd/Envd-compatible SDKs own exec and file semantics.
+The current architecture separates the multi-active request path from leader-elected reconciliation. It also separates lifecycle control from user data protocols: Fast Sandbox resolves and authenticates a route to an injected Infra Component, while the component's upstream SDK owns exec and file semantics.
 
 Chinese documentation: [README_ZH.md](README_ZH.md). Detailed component and workflow documentation: [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -10,8 +10,8 @@ Chinese documentation: [README_ZH.md](README_ZH.md). Detailed component and work
 
 | Deployment unit | Availability model | Responsibility |
 |---|---|---|
-| `fastctl` / Go / Python SDK | Client | Lifecycle calls, endpoint resolution, Infra protocol adapters |
-| Fast-Path Server | Multi-active Deployment | Imperative `CreateSandbox`, idempotency, Top-K reservation, CRD commit, route credentials |
+| `fastctl` / Go / Python SDK | Client | Lifecycle calls, diagnostics, endpoint resolution, upstream SDK hand-off |
+| Fast-Path Server | Multi-active Deployment | CRD-first imperative `CreateSandbox`, idempotency, Top-K placement, route credentials |
 | Sandbox/Pool Controller | Leader-elected Deployment | Declarative reconciliation, Pool scaling, delete/reset/expiry, failure policy |
 | Sandbox Proxy | Multi-active Deployment | Authenticated, transparent HTTP/streaming proxy to the assigned Fastlet |
 | Fastlet Pod | Pool-managed Pod | Atomic admission, runtime creation, private networking, Infra injection, local proxy |
@@ -32,7 +32,7 @@ Only Create is an imperative fast-path operation. Delete, reset, expiry, and fai
 - **Private Sandbox networks**: container-based runtimes receive an independent network namespace, veth, private address, and NAT egress. Every Sandbox can use the full private port space without global port reservation.
 - **Authenticated two-hop proxy**: Sandbox Proxy resolves `Sandbox UID -> Fastlet Pod`; Fastlet Proxy resolves the runtime-local AccessHandle. Credentials are fenced by Fastlet Pod UID, assignment attempt, and route generation.
 - **Runtime profiles**: a Pool selects one immutable `runtime`: `container`, `gvisor`, `kata-qemu`, `kata-clh`, `kata-fc`, or `boxlite`.
-- **Runtime Augmentation**: platform-owned `sandbox-init`, binaries, configuration, tokens, and readiness rules are injected without rebuilding the user's OCI image. Built-in adapters include OpenSandbox Execd and E2B Envd integration points.
+- **Runtime Augmentation**: platform-owned `sandbox-init`, binaries, configuration, tokens, and readiness rules are injected without rebuilding the user's OCI image. OpenSandbox Execd is the primary integration case; production artifact binding remains fail closed until supplied by the release.
 - **Fixed Pool resources**: every Sandbox in a Pool uses the same immutable CPU, memory, and PID profile; Fastlet/runtime adapters are the enforcement boundary.
 - **Fenced recovery**: CRD UID, instance generation, assignment attempt, Fastlet Pod UID, and route generation prevent stale runtime and proxy operations.
 
@@ -122,7 +122,7 @@ The SDK resolves `(Sandbox UID, target port)` through Fast-Path and sends the re
 
 ```bash
 fastctl --proxy-endpoint http://fast-sandbox-proxy.default.svc:8080 \
-  --adapter execd exec my-sandbox -- /bin/sh -lc 'echo hello'
+  opensandbox exec my-sandbox -- /bin/sh -lc 'echo hello'
 ```
 
 Fast Sandbox intentionally does not define a new Exec/File wire protocol. User-process execution, logs, and files belong to the injected component's protocol.
@@ -131,10 +131,10 @@ Fast Sandbox intentionally does not define a new Exec/File wire protocol. User-p
 
 The FastPath gRPC service exposes:
 
-- `CreateSandbox`, `DeleteSandbox`, `UpdateSandbox`, `ListSandboxes`, `GetSandbox`
+- `CreateSandbox`, `DeleteSandbox`, `UpdateSandbox`, `ListSandboxes`, `GetSandbox`, `GetSandboxDiagnostics`
 - `ResolveEndpoint`, `IssueRouteCredential`
 
-Create callers must send a stable `request_id`. The API accepts only the canonical contracts documented above; pre-refactor field names are not part of the schema. Metrics, trace propagation, lifecycle identity fields, and OTLP configuration are documented in [docs/observability.md](docs/observability.md).
+Create callers must send a stable `request_id`; it is also the canonical Sandbox CRD name. `fastctl diagnostics sandbox NAME` reports CRD state and bounded Fastlet lifecycle events independently of Execd. The API accepts only the canonical contracts documented above; pre-refactor field names are not part of the schema. Metrics, trace propagation, lifecycle identity fields, and OTLP configuration are documented in [docs/observability.md](docs/observability.md).
 
 ## Validation
 
