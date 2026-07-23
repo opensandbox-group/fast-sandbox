@@ -13,6 +13,7 @@ KIND_CLUSTER_NAME ?= fast-sandbox
 # E2E test settings
 E2E_PROFILE ?= basic
 E2E_TEST_TIMEOUT ?= 30m
+KIND_PROFILE ?= basic
 UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./test/e2e/env/... ./test/e2e/support/... ./test/performance/...
 
 # Go settings
@@ -34,7 +35,7 @@ PROTOC_GEN_GO_GRPC_VERSION := v1.6.0
 CONTROLLER_GEN_VERSION := v0.20.1
 CONTROLLER_GEN := $(TOOLS_BIN)/controller-gen
 
-.PHONY: all build build-controller build-fastlet build-sandbox-init build-sandbox-tunnel build-fastlet-proxy build-sandbox-proxy build-janitor build-fastlet-linux build-sandbox-init-linux build-sandbox-tunnel-linux build-fastlet-proxy-linux build-sandbox-proxy-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-python-proto generate-deepcopy manifests verify-generated test test-unit test-python-sdk test-race test-network-integration test-e2e test-e2e-controlplane test-e2e-network test-e2e-proxy test-e2e-infra test-e2e-sdk test-e2e-runtime test-e2e-runtime-container test-e2e-runtime-gvisor test-e2e-runtime-kata test-e2e-runtime-boxlite test-e2e-drain verify setup-e2e tidy e2e docker-fastlet docker-fastlet-proxy docker-sandbox-proxy docker-controller docker-janitor docker-boxlite-runtime kind-load-fastlet kind-load-fastlet-proxy kind-load-sandbox-proxy kind-load-controller kind-load-janitor help
+.PHONY: all build build-controller build-fastlet build-sandbox-init build-sandbox-tunnel build-fastlet-proxy build-sandbox-proxy build-janitor build-fastlet-linux build-sandbox-init-linux build-sandbox-tunnel-linux build-fastlet-proxy-linux build-sandbox-proxy-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-python-proto generate-deepcopy manifests verify-generated test test-unit test-python-sdk test-race test-network-integration test-e2e test-e2e-controlplane test-e2e-network test-e2e-proxy test-e2e-infra test-e2e-sdk test-e2e-runtime test-e2e-runtime-container test-e2e-runtime-gvisor test-e2e-runtime-kata test-e2e-runtime-boxlite test-e2e-drain quickstart quickstart-container quickstart-gvisor quickstart-kata-qemu quickstart-kata-clh quickstart-profile setup-kind verify setup-e2e tidy e2e docker-fastlet docker-fastlet-proxy docker-sandbox-proxy docker-controller docker-janitor docker-boxlite-runtime kind-load-fastlet kind-load-fastlet-proxy kind-load-sandbox-proxy kind-load-controller kind-load-janitor help
 
 all: build
 
@@ -62,6 +63,14 @@ help:
 	@echo "  make docker-controller      - build controller image"
 	@echo "  make docker-janitor         - build janitor image"
 	@echo "  make docker-boxlite-runtime - build native BoxLite runtime Sidecar image"
+	@echo ""
+	@echo "Kind quick starts:"
+	@echo "  make quickstart             - prepare an interactive container kind environment"
+	@echo "  make quickstart-container   - prepare an interactive container environment"
+	@echo "  make quickstart-gvisor      - prepare an interactive gVisor environment"
+	@echo "  make quickstart-kata-qemu   - prepare an interactive Kata QEMU environment"
+	@echo "  make quickstart-kata-clh    - prepare an interactive Kata Cloud Hypervisor environment"
+	@echo "  make setup-kind KIND_PROFILE=<profile> - prepare only the kind control plane"
 	@echo ""
 	@echo "E2E targets:"
 	@echo "  make setup-e2e              - prepare one e2e profile, default E2E_PROFILE=basic"
@@ -254,11 +263,14 @@ kind-load-janitor: docker-janitor
 setup-e2e:
 	@echo "=== Preparing E2E environment ==="
 	@echo "Profile: $(E2E_PROFILE)"
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) run ./test/e2e/env/cmd/setup -profile $(E2E_PROFILE) -timeout $(E2E_TEST_TIMEOUT)
+	@$(MAKE) setup-kind KIND_PROFILE=$(E2E_PROFILE)
 	@echo ""
 	@echo "=== E2E environment ready ==="
 	@echo "Run tests with: make test-e2e-<suite> or go test ./test/e2e/suites/<suite>"
+
+setup-kind:
+	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
+		$(GO) run ./test/e2e/env/cmd/setup -profile $(KIND_PROFILE) -timeout $(E2E_TEST_TIMEOUT)
 
 # E2E test - full test. Each test prepares the profile it needs.
 test-e2e:
@@ -311,6 +323,52 @@ test-e2e-runtime-kata:
 test-e2e-runtime-boxlite:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
 		$(GO) test ./test/e2e/suites/secureruntime/... -run '^TestRuntimeValidationUnsupportedBoxLite$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
+
+quickstart: quickstart-container
+
+quickstart-container:
+	@$(MAKE) quickstart-profile \
+		KIND_PROFILE=basic \
+		QUICKSTART_POOL_FILE=config/samples/pool-container.yaml \
+		QUICKSTART_POOL_NAME=quickstart-pool
+
+quickstart-gvisor:
+	@$(MAKE) quickstart-profile \
+		KIND_PROFILE=gvisor \
+		QUICKSTART_POOL_FILE=config/samples/pool-gvisor.yaml \
+		QUICKSTART_POOL_NAME=gvisor-pool
+
+quickstart-kata-qemu:
+	@$(MAKE) quickstart-profile \
+		KIND_PROFILE=kata-qemu \
+		QUICKSTART_POOL_FILE=config/samples/pool-kata-qemu.yaml \
+		QUICKSTART_POOL_NAME=kata-qemu-pool
+
+quickstart-kata-clh:
+	@$(MAKE) quickstart-profile \
+		KIND_PROFILE=kata-clh \
+		QUICKSTART_POOL_FILE=config/samples/pool-kata.yaml \
+		QUICKSTART_POOL_NAME=kata-clh-pool
+
+quickstart-profile:
+	@$(MAKE) setup-kind KIND_PROFILE=$(KIND_PROFILE)
+	@kubectl apply -f $(QUICKSTART_POOL_FILE)
+	@kubectl wait --for=jsonpath='{.status.readyPods}'=1 \
+		sandboxpool/$(QUICKSTART_POOL_NAME) --timeout=180s
+	@$(MAKE) build-fastctl
+	@echo ""
+	@echo "Quick Start environment is ready."
+	@printf "Context: "
+	@kubectl config current-context
+	@echo "Pool:    $(QUICKSTART_POOL_NAME)"
+	@echo ""
+	@echo "Terminal 1:"
+	@echo "  kubectl port-forward service/fast-sandbox-fastpath 9090:9090"
+	@echo ""
+	@echo "Terminal 2:"
+	@echo "  bin/fastctl --endpoint localhost:9090 run quickstart-sandbox \\"
+	@echo "    --image docker.io/library/alpine:latest \\"
+	@echo "    --pool $(QUICKSTART_POOL_NAME) -- /bin/sleep 3600"
 
 test-e2e-drain:
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \

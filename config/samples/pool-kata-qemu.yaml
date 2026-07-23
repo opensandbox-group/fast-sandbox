@@ -1,10 +1,10 @@
 apiVersion: sandbox.fast.io/v1alpha1
 kind: SandboxPool
 metadata:
-  name: gvisor-pool
+  name: kata-qemu-pool
   namespace: default
 spec:
-  runtime: gvisor
+  runtime: kata-qemu
   infraProfile: minimal
   sandboxResources:
     cpu: 250m
@@ -19,12 +19,6 @@ spec:
   fastletTemplate:
     spec:
       containers:
-        - name: fastlet
-          image: fast-sandbox/fastlet:dev
-          resources:
-            requests:
-              cpu: "500m"
-              memory: "512Mi"
-            limits:
-              cpu: "2"
-              memory: "2Gi"
+      - name: fastlet
+        image: fast-sandbox/fastlet:dev
+        imagePullPolicy: IfNotPresent

@@ -1,10 +1,10 @@
 apiVersion: sandbox.fast.io/v1alpha1
 kind: SandboxPool
 metadata:
-  name: gvisor-pool
+  name: quickstart-pool
   namespace: default
 spec:
-  runtime: gvisor
+  runtime: container
   infraProfile: minimal
   sandboxResources:
     cpu: 250m
@@ -16,15 +16,11 @@ spec:
     bufferMin: 0
     bufferMax: 0
   maxSandboxesPerPod: 5
+  warmImages:
+  - docker.io/library/alpine:latest
   fastletTemplate:
     spec:
       containers:
-        - name: fastlet
-          image: fast-sandbox/fastlet:dev
-          resources:
-            requests:
-              cpu: "500m"
-              memory: "512Mi"
-            limits:
-              cpu: "2"
-              memory: "2Gi"
+      - name: fastlet
+        image: fast-sandbox/fastlet:dev
+        imagePullPolicy: IfNotPresent

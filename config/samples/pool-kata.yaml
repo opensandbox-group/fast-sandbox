@@ -2,6 +2,7 @@ apiVersion: sandbox.fast.io/v1alpha1
 kind: SandboxPool
 metadata:
   name: kata-clh-pool
+  namespace: default
 spec:
   runtime: kata-clh
   infraProfile: minimal
@@ -19,29 +20,5 @@ spec:
     spec:
       containers:
       - name: fastlet
-        image: fast-sandbox-fastlet:latest
+        image: fast-sandbox/fastlet:dev
         imagePullPolicy: IfNotPresent
-        command: ["/fastlet"]
-        resources:
-          requests:
-            cpu: "500m"
-            memory: "512Mi"
-          limits:
-            cpu: "2"
-            memory: "2Gi"
-        securityContext:
-          privileged: true
-        volumeMounts:
-        - name: containerd-run
-          mountPath: /run/containerd
-        - name: containerd-root
-          mountPath: /var/lib/containerd
-      volumes:
-      - name: containerd-run
-        hostPath:
-          path: /run/containerd
-          type: Directory
-      - name: containerd-root
-        hostPath:
-          path: /var/lib/containerd
-          type: Directory

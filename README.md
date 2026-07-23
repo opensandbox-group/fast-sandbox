@@ -36,77 +36,91 @@ Only Create is an imperative fast-path operation. Delete, reset, expiry, and fai
 - **Fixed Pool resources**: every Sandbox in a Pool uses the same immutable CPU, memory, and PID profile; Fastlet/runtime adapters are the enforcement boundary.
 - **Fenced recovery**: CRD UID, instance generation, assignment attempt, Fastlet Pod UID, and route generation prevent stale runtime and proxy operations.
 
-## Quick start
+## Quick start (kind)
 
-### Build
+Quick Start is a reproducible kind acceptance path and must run on a Linux host. Install Go, Docker, kind, kubectl, and make first. Container, network, and secure-runtime behavior must not be validated locally on macOS; see [docs/TESTING.md](docs/TESTING.md).
 
-```bash
-make build
-export PATH="$PWD/bin:$PATH"
-```
-
-Linux container, network, Kubernetes, and secure-runtime flows must be validated on a Linux development host. See [docs/TESTING.md](docs/TESTING.md).
-
-### Install development manifests
-
-The development overlay contains a public test signing key and must not be used in production:
+### Prepare a container environment
 
 ```bash
-kubectl apply -k config/dev
+make quickstart
 ```
 
-For production, create `fast-sandbox-route-keys` from a secret manager first, then apply `config/default`. The private key is mounted only into Fast-Path; controllers, Sandbox Proxy, and Fastlet Proxy receive only the public key.
+This is an alias for `make quickstart-container`. It only prepares and retains an interactive environment:
 
-### Create a Pool
+- create or reuse the `fsb-e2e-basic` kind cluster;
+- build and load the Controller, Fastlet, Proxy, and Janitor images from the current source tree;
+- deploy the development control plane;
+- create `quickstart-pool` and wait for a Ready Fastlet;
+- build `bin/fastctl`;
+- print the port-forward and Sandbox creation commands.
 
-```yaml
-apiVersion: sandbox.fast.io/v1alpha1
-kind: SandboxPool
-metadata:
-  name: default-pool
-spec:
-  capacity:
-    poolMin: 1
-    poolMax: 10
-    bufferMin: 1
-    bufferMax: 2
-  maxSandboxesPerPod: 5
-  runtime: container
-  sandboxResources:
-    cpu: "1"
-    memory: 512Mi
-    pids: 256
-  warmImages:
-  - docker.io/library/alpine:latest
-  infraProfile: minimal
-  fastletTemplate:
-    spec:
-      containers:
-      - name: fastlet
-        image: fast-sandbox/fastlet:dev
-```
+`make quickstart` does not run `go test`, create a Sandbox automatically, or clean up the Pool or kind cluster when it exits. The development manifests contain a public test signing key and must not be used in production.
 
-See [config/samples](config/samples) for container, gVisor, and Kata examples.
+### Use Fast-Path interactively
 
-### Create a Sandbox
-
-Fast-Path:
+After the environment is ready, expose the in-cluster Fast-Path to the host in one terminal:
 
 ```bash
-fastctl --endpoint fast-sandbox-fastpath.default.svc:9090 \
-  run my-sandbox --image docker.io/library/alpine:latest --pool default-pool
+kubectl port-forward service/fast-sandbox-fastpath 9090:9090
 ```
 
-Declarative API:
+Create and inspect a Sandbox from another terminal:
+
+```bash
+fastctl --endpoint localhost:9090 run my-sandbox \
+  --image docker.io/library/alpine:latest \
+  --pool quickstart-pool -- /bin/sleep 3600
+
+kubectl wait --for=jsonpath='{.status.runtimeState}'=Ready \
+  sandbox/my-sandbox --timeout=60s
+fastctl --endpoint localhost:9090 get my-sandbox
+fastctl --endpoint localhost:9090 diagnostics sandbox my-sandbox
+fastctl --endpoint localhost:9090 delete my-sandbox
+```
+
+`fast-sandbox-fastpath.default.svc` is an in-cluster DNS name and cannot be resolved by a host-side `fastctl`. Host access requires a port-forward, Ingress, LoadBalancer, or another explicit exposure mechanism.
+
+Fast-Path Create returns after the runtime is created, while the Controller projects CRD `status` asynchronously. An immediate Get may therefore briefly show `Creating/Pending`; the `kubectl wait` above waits for the declarative view to catch up.
+
+### Prepare other runtimes
+
+These entry points reuse the kind profile provisioner but do not execute E2E cases:
+
+```bash
+make quickstart-container
+make quickstart-gvisor
+make quickstart-kata-qemu
+make quickstart-kata-clh
+```
+
+- `container` prepares `fsb-e2e-basic` and `quickstart-pool`.
+- `gVisor` prepares `fsb-e2e-gvisor`, installs and verifies runsc, and creates `gvisor-pool`.
+- `kata-qemu` and `kata-clh` prepare `fsb-e2e-kata`, require nested KVM on the host, and create `kata-qemu-pool` and `kata-clh-pool`, respectively.
+
+Kata Firecracker and BoxLite do not have Quick Start entry points because they are not currently runnable capabilities. Their fail-closed behavior remains covered by `test-e2e-runtime-kata` and `test-e2e-runtime-boxlite`. All Quick Start targets retain reusable kind clusters and Pools. The first run builds images and prepares runtimes, so it takes substantially longer than later runs.
+
+Automated acceptance remains separate from Quick Start:
+
+```bash
+make test-e2e-runtime-container
+make test-e2e-runtime-gvisor
+make test-e2e-runtime-kata
+make test-e2e-runtime-boxlite
+```
+
+### Declarative API
+
+The Controller-only path does not depend on Fast-Path Create:
 
 ```yaml
 apiVersion: sandbox.fast.io/v1alpha1
 kind: Sandbox
 metadata:
-  name: my-sandbox
+  name: my-declarative-sandbox
 spec:
   image: docker.io/library/alpine:latest
-  poolRef: default-pool
+  poolRef: quickstart-pool
   command: ["/bin/sleep"]
   args: ["3600"]
   failurePolicy: Manual
@@ -114,16 +128,12 @@ spec:
 
 ```bash
 kubectl apply -f sandbox.yaml
+kubectl get sandbox my-declarative-sandbox -w
 ```
 
-### Access an injected service
+### OpenSandbox Execd
 
-The SDK resolves `(Sandbox UID, target port)` through Fast-Path and sends the returned bearer credential to Sandbox Proxy. Fast Sandbox transparently forwards HTTP, SSE, and WebSocket traffic; the selected Infra adapter defines endpoint paths and payloads.
-
-```bash
-fastctl --proxy-endpoint http://fast-sandbox-proxy.default.svc:8080 \
-  opensandbox exec my-sandbox -- /bin/sh -lc 'echo hello'
-```
+The basic Quick Start uses `infraProfile: minimal` and does not pretend that OpenSandbox Execd is injected. See the [OpenSandbox Execd integration guide](docs/opensandbox-execd-integration-guide.md) for production artifact/profile binding, Sandbox Proxy forwarding, and `fastctl opensandbox exec/cp/files`.
 
 Fast Sandbox intentionally does not define a new Exec/File wire protocol. User-process execution, logs, and files belong to the injected component's protocol.
 
