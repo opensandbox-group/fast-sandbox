@@ -103,6 +103,45 @@ func TestAssignDeclarativeProjectsAnnotationAndReconcilesRuntime(t *testing.T) {
 	require.Equal(t, apiv1alpha1.ObservedStateReady, ready.Status.DataPlaneState)
 }
 
+func TestReconcileRuntimeProjectsRuntimeAndDataPlaneIndependently(t *testing.T) {
+	orchestrator, registry, fastletClient, sandbox := newHarness(t)
+	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+	candidate := candidateFor(parameters)
+	registry.candidates = []fastletpool.FastletInfo{candidate}
+	registry.fastlets[candidate.ID] = candidate
+
+	sandbox.UID = types.UID("sandbox-uid-a")
+	require.NoError(t, orchestrator.Client.Create(context.Background(), sandbox))
+	assigned, _, err := orchestrator.AssignDeclarative(context.Background(), sandbox, "sandbox-uid-a")
+	require.NoError(t, err)
+
+	phase := "infra-pending"
+	fastletClient.create = func(string, *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
+		return &api.CreateSandboxResponse{Accepted: true, Sandbox: &api.SandboxStatus{SandboxID: "sandbox-uid-a", Phase: phase}}, nil
+	}
+	err = orchestrator.ReconcileRuntime(context.Background(), assigned)
+	require.ErrorIs(t, err, ErrDataPlaneInProgress)
+
+	var current apiv1alpha1.Sandbox
+	require.NoError(t, orchestrator.Client.Get(context.Background(), client.ObjectKeyFromObject(assigned), &current))
+	require.Equal(t, apiv1alpha1.ObservedStateReady, current.Status.RuntimeState)
+	require.Equal(t, apiv1alpha1.ObservedStateCreating, current.Status.DataPlaneState)
+
+	phase = "infra-unavailable"
+	err = orchestrator.ReconcileRuntime(context.Background(), &current)
+	require.ErrorIs(t, err, ErrDataPlaneUnavailable)
+	require.NoError(t, orchestrator.Client.Get(context.Background(), client.ObjectKeyFromObject(assigned), &current))
+	require.Equal(t, apiv1alpha1.ObservedStateReady, current.Status.RuntimeState)
+	require.Equal(t, apiv1alpha1.ObservedStateUnavailable, current.Status.DataPlaneState)
+
+	phase = "running"
+	require.NoError(t, orchestrator.ReconcileRuntime(context.Background(), &current))
+	require.NoError(t, orchestrator.Client.Get(context.Background(), client.ObjectKeyFromObject(assigned), &current))
+	require.Equal(t, apiv1alpha1.ObservedStateReady, current.Status.RuntimeState)
+	require.Equal(t, apiv1alpha1.ObservedStateReady, current.Status.DataPlaneState)
+}
+
 func TestLostCreateResponseDoesNotInspectOrChangeIdentity(t *testing.T) {
 	orchestrator, registry, fastletClient, sandbox := newHarness(t)
 	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)

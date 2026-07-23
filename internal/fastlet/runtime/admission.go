@@ -35,7 +35,6 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, req *api.CreateSandb
 	defer func() {
 		observability.End(span, resultErr)
 		recordAdmission("create", resultErr)
-		observeDataPlaneReady(m.runtimeName, m.infraProfile, started, resultErr)
 	}()
 	if failure := m.validateCreateRequest(req); failure != nil {
 		return createFailure(failure, api.AdmissionStatus{})
@@ -73,78 +72,6 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, req *api.CreateSandb
 	if existing := m.sandboxes[spec.SandboxID]; existing != nil {
 		if existing.Phase == "create-cleanup-failed" {
 			return m.retryFailedCreateCleanup(ctx, req, &spec, existing)
-		}
-		if existing.Phase == "infra-pending" {
-			identity := api.SandboxIdentity{
-				RequestID: spec.RequestID, SandboxUID: spec.SandboxID,
-				InstanceGeneration: spec.InstanceGeneration, RuntimeInstanceID: spec.RuntimeInstanceID, AssignmentAttempt: spec.AssignmentAttempt,
-				RouteGeneration: spec.RouteGeneration, FastletPodUID: spec.FastletPodUID,
-			}
-			if failure := validateIdentityFence(m.fastletPodUID, existing, identity); failure != nil {
-				response, err := createFailure(failure, m.admissionStatusLocked())
-				m.mu.Unlock()
-				return response, err
-			}
-			if !sameSandboxClaim(existing, &spec) {
-				response, err := createFailure(fastletError(api.ErrorConflict, "Sandbox UID is already bound to a different claim/profile", false), m.admissionStatusLocked())
-				m.mu.Unlock()
-				return response, err
-			}
-			existing.Phase = "initializing-infra"
-			m.mu.Unlock()
-			infraErr := m.initializeInfraInstance(ctx, existing)
-			m.mu.Lock()
-			if m.sandboxes[spec.SandboxID] != existing || existing.Phase != "initializing-infra" {
-				admission := m.admissionStatusLocked()
-				m.mu.Unlock()
-				return createFailure(fastletError(api.ErrorConflict, "Sandbox changed while Infra Components were initializing", true), admission)
-			}
-			if infraErr != nil {
-				existing.Phase = "infra-pending"
-				admission := m.admissionStatusLocked()
-				m.mu.Unlock()
-				return createFailure(fastletErrorWithCause(api.ErrorInProgress, infraErr.Error(), true, infraErr), admission)
-			}
-			existing.Phase = "route-pending"
-			m.mu.Unlock()
-			return m.retryRoutePublication(ctx, existing)
-		}
-		if existing.Phase == "route-pending" {
-			identity := api.SandboxIdentity{
-				RequestID: spec.RequestID, SandboxUID: spec.SandboxID,
-				InstanceGeneration: spec.InstanceGeneration, RuntimeInstanceID: spec.RuntimeInstanceID, AssignmentAttempt: spec.AssignmentAttempt,
-				RouteGeneration: spec.RouteGeneration, FastletPodUID: spec.FastletPodUID,
-			}
-			if failure := validateIdentityFence(m.fastletPodUID, existing, identity); failure != nil {
-				response, err := createFailure(failure, m.admissionStatusLocked())
-				m.mu.Unlock()
-				return response, err
-			}
-			if !sameSandboxClaim(existing, &spec) {
-				response, err := createFailure(fastletError(api.ErrorConflict, "Sandbox UID is already bound to a different claim/profile", false), m.admissionStatusLocked())
-				m.mu.Unlock()
-				return response, err
-			}
-			existing.Phase = "publishing-route"
-			m.mu.Unlock()
-			publishErr := m.publishRoute(ctx, existing)
-			m.mu.Lock()
-			if m.sandboxes[spec.SandboxID] != existing || existing.Phase != "publishing-route" {
-				admission := m.admissionStatusLocked()
-				m.mu.Unlock()
-				return createFailure(fastletError(api.ErrorConflict, "Sandbox changed while its route was being published", true), admission)
-			}
-			if publishErr != nil {
-				existing.Phase = "route-pending"
-				admission := m.admissionStatusLocked()
-				m.mu.Unlock()
-				return createFailure(fastletErrorWithCause(api.ErrorInProgress, publishErr.Error(), true, publishErr), admission)
-			}
-			existing.Phase = "running"
-			status := sandboxStatus(existing)
-			admission := m.admissionStatusLocked()
-			m.mu.Unlock()
-			return &api.CreateSandboxResponse{Accepted: true, Created: false, Sandbox: &status, Admission: admission}, nil
 		}
 		response, err := m.createExistingLocked(existing, &spec)
 		m.mu.Unlock()
@@ -226,47 +153,20 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, req *api.CreateSandb
 		return createFailure(fastletError(api.ErrorConflict, "Sandbox was deleted while creation was in progress", false), admission)
 	}
 	m.sandboxes[spec.SandboxID] = metadata
-	m.mu.Unlock()
-	m.recordDiagnostic(spec.SandboxID, "info", "runtime", "infra-pending", "runtime and private network are ready; Infra Component initialization started")
-	if err := m.initializeInfraInstance(ctx, metadata); err != nil {
-		m.mu.Lock()
-		admission = m.admissionStatusLocked()
-		m.mu.Unlock()
-		m.recordDiagnostic(spec.SandboxID, "error", "infra", "infra-pending", err.Error())
-		return createFailure(fastletErrorWithCause(api.ErrorInProgress, err.Error(), true, err), admission)
+	if m.infraManager == nil && m.routePublisher == nil {
+		metadata.Phase = "running"
+		m.recordDiagnosticLocked(spec.SandboxID, "info", "fastlet", "running", "runtime is ready; no asynchronous data-plane initialization is required")
 	}
-	m.recordDiagnostic(spec.SandboxID, "info", "infra", "route-pending", "required Infra Components are ready; proxy route publication started")
-
-	m.mu.Lock()
-	if m.sandboxes[spec.SandboxID] != metadata || metadata.Phase != "infra-pending" {
-		admission = m.admissionStatusLocked()
-		m.mu.Unlock()
-		return createFailure(fastletError(api.ErrorConflict, "Sandbox changed while Infra Components were initializing", true), admission)
-	}
-	metadata.Phase = "route-pending"
-	m.mu.Unlock()
-
-	if err := m.publishRoute(ctx, metadata); err != nil {
-		m.mu.Lock()
-		if m.sandboxes[spec.SandboxID] == metadata && metadata.Phase == "route-pending" {
-			admission = m.admissionStatusLocked()
-		}
-		m.mu.Unlock()
-		m.recordDiagnostic(spec.SandboxID, "error", "route", "route-pending", err.Error())
-		return createFailure(fastletErrorWithCause(api.ErrorInProgress, err.Error(), true, err), admission)
-	}
-
-	m.mu.Lock()
-	if m.sandboxes[spec.SandboxID] != metadata || metadata.Phase != "route-pending" {
-		admission = m.admissionStatusLocked()
-		m.mu.Unlock()
-		return createFailure(fastletError(api.ErrorConflict, "Sandbox changed while its route was being published", true), admission)
-	}
-	metadata.Phase = "running"
 	status := sandboxStatus(metadata)
 	admission = m.admissionStatusLocked()
-	m.recordDiagnosticLocked(spec.SandboxID, "info", "fastlet", "running", "runtime, private network, Infra Components, and proxy route are ready")
+	dataPlaneReady := metadata.Phase == "running"
 	m.mu.Unlock()
+	if dataPlaneReady {
+		observeDataPlaneReady(m.runtimeName, m.infraProfile, started, nil)
+	} else {
+		m.recordDiagnostic(spec.SandboxID, "info", "runtime", "infra-pending", "runtime and private network are ready; Infra Component initialization continues asynchronously")
+		m.startDataPlaneReconcile(metadata, started)
+	}
 	return &api.CreateSandboxResponse{Accepted: true, Created: true, Sandbox: &status, Admission: admission}, nil
 }
 
@@ -332,30 +232,6 @@ func (m *SandboxManager) InspectSandboxV2(req *api.InspectSandboxRequest) (*api.
 	}
 	status := sandboxStatus(metadata)
 	return &api.InspectSandboxResponse{Sandbox: &status}, nil
-}
-
-func (m *SandboxManager) retryRoutePublication(ctx context.Context, metadata *SandboxMetadata) (*api.CreateSandboxResponse, error) {
-	m.mu.Lock()
-	if m.sandboxes[metadata.SandboxID] != metadata || metadata.Phase != "route-pending" {
-		admission := m.admissionStatusLocked()
-		m.mu.Unlock()
-		return createFailure(fastletError(api.ErrorConflict, "Sandbox changed before its route could be published", true), admission)
-	}
-	metadata.Phase = "publishing-route"
-	m.mu.Unlock()
-	publishErr := m.publishRoute(ctx, metadata)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.sandboxes[metadata.SandboxID] != metadata || metadata.Phase != "publishing-route" {
-		return createFailure(fastletError(api.ErrorConflict, "Sandbox changed while its route was being published", true), m.admissionStatusLocked())
-	}
-	if publishErr != nil {
-		metadata.Phase = "route-pending"
-		return createFailure(fastletErrorWithCause(api.ErrorInProgress, publishErr.Error(), true, publishErr), m.admissionStatusLocked())
-	}
-	metadata.Phase = "running"
-	status := sandboxStatus(metadata)
-	return &api.CreateSandboxResponse{Accepted: true, Created: false, Sandbox: &status, Admission: m.admissionStatusLocked()}, nil
 }
 
 func (m *SandboxManager) DeleteSandboxV2(req *api.DeleteSandboxV2Request) (*api.DeleteSandboxV2Response, error) {
@@ -508,12 +384,16 @@ func (m *SandboxManager) createExistingLocked(existing *SandboxMetadata, request
 		return createFailure(fastletError(api.ErrorConflict, "Sandbox UID is already bound to a different claim/profile", false), m.admissionStatusLocked())
 	}
 	status := sandboxStatus(existing)
-	if existing.Phase == "creating" || existing.Phase == "initializing-infra" || existing.Phase == "publishing-route" {
+	if existing.Phase == "creating" {
 		failure := fastletError(api.ErrorInProgress, "Sandbox creation is already in progress", true)
 		return &api.CreateSandboxResponse{Accepted: true, InProgress: true, Sandbox: &status, Admission: m.admissionStatusLocked(), Error: failure}, failure
 	}
 	if existing.Phase == "terminating" || existing.Phase == "deleting" {
 		return createFailure(fastletError(api.ErrorConflict, "Sandbox deletion is already in progress", true), m.admissionStatusLocked())
+	}
+	switch existing.Phase {
+	case "infra-pending", "initializing-infra", "infra-unavailable", "route-pending", "publishing-route", "route-unavailable":
+		return &api.CreateSandboxResponse{Accepted: true, Created: false, Sandbox: &status, Admission: m.admissionStatusLocked()}, nil
 	}
 	if existing.Phase != "running" {
 		return createFailure(fastletError(api.ErrorRuntimeUnavailable, fmt.Sprintf("managed Sandbox runtime is %s, not running", existing.Phase), true), m.admissionStatusLocked())
@@ -608,7 +488,7 @@ func (m *SandboxManager) admissionStatusLocked() api.AdmissionStatus {
 	status := api.AdmissionStatus{Capacity: m.capacity}
 	for _, metadata := range m.sandboxes {
 		switch metadata.Phase {
-		case "creating", "infra-pending", "initializing-infra", "route-pending", "publishing-route":
+		case "creating", "infra-pending", "initializing-infra", "infra-unavailable", "route-pending", "publishing-route", "route-unavailable":
 			status.Creating++
 		case "terminating", "deleting", "delete-failed", "create-cleanup", "create-cleanup-failed":
 			status.Deleting++

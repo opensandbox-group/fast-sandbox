@@ -56,6 +56,7 @@ type fastpathFastlet struct {
 	createFailures map[string]error
 	createRequests []*api.CreateSandboxRequest
 	createIPs      []string
+	createPhase    string
 	diagnostics    *api.SandboxDiagnosticsResponse
 	diagnosticsErr error
 }
@@ -71,9 +72,13 @@ func (f *fastpathFastlet) CreateSandbox(_ context.Context, fastletIP string, req
 	if failure := f.createFailures[fastletIP]; failure != nil {
 		return &api.CreateSandboxResponse{}, failure
 	}
+	phase := f.createPhase
+	if phase == "" {
+		phase = "running"
+	}
 	return &api.CreateSandboxResponse{
 		Accepted: true, Created: true,
-		Sandbox: &api.SandboxStatus{SandboxID: request.Identity.SandboxUID, RuntimeInstanceID: request.Identity.RuntimeInstanceID, Phase: "running"},
+		Sandbox: &api.SandboxStatus{SandboxID: request.Identity.SandboxUID, RuntimeInstanceID: request.Identity.RuntimeInstanceID, Phase: phase},
 	}, nil
 }
 
@@ -162,6 +167,22 @@ func TestCreateHappyPathUsesExactlyTwoDownstreamIO(t *testing.T) {
 	envelope, err := common.AssignmentFromAnnotation(&persisted)
 	require.NoError(t, err)
 	require.Equal(t, "fastlet-a", envelope.FastletName)
+}
+
+func TestCreateReturnsWhenRuntimeIsReadyAndDataPlaneIsPending(t *testing.T) {
+	server, k8sClient, _, fastlet := newV2Server(t)
+	fastlet.createPhase = "infra-pending"
+
+	response, err := server.CreateSandbox(context.Background(), createRequest("request-runtime-ready"))
+	require.NoError(t, err)
+	require.Equal(t, "request-runtime-ready", response.SandboxName)
+
+	creates, gets, lists, patches := k8sClient.counts()
+	require.Equal(t, 1, creates)
+	require.Zero(t, gets)
+	require.Zero(t, lists)
+	require.Zero(t, patches)
+	require.Len(t, fastlet.createRequests, 1)
 }
 
 func TestNoCandidateFailsBeforeCRDCreate(t *testing.T) {

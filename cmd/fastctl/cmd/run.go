@@ -125,11 +125,12 @@ Priority: Flags > Config File > Interactive Input
 			log.Fatalf("Error: %v", err)
 		}
 
-		klog.V(4).InfoS("Sandbox created successfully", "name", name, "sandboxUid", resp.SandboxUid, "sandboxName", resp.SandboxName, "fastlet", resp.FastletPod, "duration", time.Since(start))
-		fmt.Printf("🎉 Sandbox created successfully in %v\n", time.Since(start))
+		klog.V(4).InfoS("Sandbox runtime created successfully", "name", name, "sandboxUid", resp.SandboxUid, "sandboxName", resp.SandboxName, "fastlet", resp.FastletPod, "duration", time.Since(start))
+		fmt.Printf("🎉 Sandbox runtime created successfully in %v\n", time.Since(start))
 		fmt.Printf("Name:      %s\n", resp.SandboxName)
 		fmt.Printf("UID:       %s\n", resp.SandboxUid)
 		fmt.Printf("Fastlet:   %s\n", resp.FastletPod)
+		fmt.Println("Data plane: Initializing asynchronously")
 	},
 }
 

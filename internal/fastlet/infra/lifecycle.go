@@ -25,6 +25,11 @@ type initPayload struct {
 
 type TargetDialer func(context.Context, uint32) (net.Conn, error)
 
+const (
+	initialReadinessRetry = time.Millisecond
+	maxReadinessRetry     = 10 * time.Millisecond
+)
+
 // InitializeInstance executes per-instance initialization and local probes.
 // It dials the Sandbox private IP directly and never traverses Sandbox Proxy.
 func (m *Manager) InitializeInstance(ctx context.Context, spec *api.SandboxSpec, privateIP string) (PreparedInstance, error) {
@@ -144,10 +149,11 @@ func probeServiceWithDialer(ctx context.Context, port uint32, probe infracatalog
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	interval := probe.Interval
-	if interval <= 0 {
-		interval = 100 * time.Millisecond
+	retryCeiling := probe.Interval
+	if retryCeiling <= 0 || retryCeiling > maxReadinessRetry {
+		retryCeiling = maxReadinessRetry
 	}
+	retryDelay := min(initialReadinessRetry, retryCeiling)
 	probeContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var lastErr error
@@ -181,13 +187,14 @@ func probeServiceWithDialer(ctx context.Context, port uint32, probe infracatalog
 		default:
 			return fmt.Errorf("unsupported readiness probe %s", probe.Type)
 		}
-		timer := time.NewTimer(interval)
+		timer := time.NewTimer(retryDelay)
 		select {
 		case <-probeContext.Done():
 			timer.Stop()
 			return errors.Join(probeContext.Err(), lastErr)
 		case <-timer.C:
 		}
+		retryDelay = min(retryDelay*2, retryCeiling)
 	}
 }
 

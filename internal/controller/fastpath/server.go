@@ -91,9 +91,16 @@ func (s *Server) issueRouteCredential(ctx context.Context, sandboxUID string, ta
 	if err != nil {
 		return "", routeauth.Claims{}, err
 	}
-	if sandbox.Status.Assignment == nil || sandbox.Status.RuntimeState != apiv1alpha1.ObservedStateReady ||
-		sandbox.Status.DataPlaneState != apiv1alpha1.ObservedStateReady {
-		return "", routeauth.Claims{}, status.Error(codes.Unavailable, "Sandbox data plane is not ready")
+	if sandbox.Status.Assignment == nil || sandbox.Status.RuntimeState != apiv1alpha1.ObservedStateReady {
+		return "", routeauth.Claims{}, status.Error(codes.Unavailable, "Sandbox runtime is not ready")
+	}
+	if sandbox.Status.DataPlaneState != apiv1alpha1.ObservedStateReady {
+		message := "Sandbox runtime is ready, but the data plane is still initializing"
+		if sandbox.Status.DataPlaneState == apiv1alpha1.ObservedStateUnavailable ||
+			sandbox.Status.DataPlaneState == apiv1alpha1.ObservedStateFailed {
+			message = "Sandbox runtime is ready, but the data plane is unavailable"
+		}
+		return "", routeauth.Claims{}, status.Error(codes.Unavailable, message)
 	}
 	ctx = observability.WithIdentity(ctx, identityFromSandbox(sandbox, targetPort))
 	routeGeneration := sandbox.Status.RouteGeneration
@@ -147,7 +154,7 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv1.CreateRe
 			success = "false"
 		}
 		createSandboxDuration.WithLabelValues("v2", success).Observe(time.Since(started).Seconds())
-		createDataPlaneReadyLatency.WithLabelValues(grpcMetricResult(resultErr)).Observe(time.Since(started).Seconds())
+		createRuntimeReadyLatency.WithLabelValues(grpcMetricResult(resultErr)).Observe(time.Since(started).Seconds())
 		if !acceptedObserved {
 			observeCreateAccepted("rejected", started, resultErr)
 		}

@@ -268,10 +268,11 @@ func waitReady(ctx context.Context, readiness Readiness) error {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
-	interval := readiness.Interval
-	if interval <= 0 {
-		interval = 100 * time.Millisecond
+	retryCeiling := readiness.Interval
+	if retryCeiling <= 0 || retryCeiling > 10*time.Millisecond {
+		retryCeiling = 10 * time.Millisecond
 	}
+	retryDelay := min(time.Millisecond, retryCeiling)
 	probeContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	for {
@@ -302,13 +303,14 @@ func waitReady(ctx context.Context, readiness Readiness) error {
 		if err == nil {
 			return nil
 		}
-		timer := time.NewTimer(interval)
+		timer := time.NewTimer(retryDelay)
 		select {
 		case <-probeContext.Done():
 			timer.Stop()
 			return errors.Join(probeContext.Err(), err)
 		case <-timer.C:
 		}
+		retryDelay = min(retryDelay*2, retryCeiling)
 	}
 }
 

@@ -4,6 +4,8 @@
 **状态**：已确认并实现
 **范围**：Fast-Path Server 多活、Controller 单活、Local Registry、Fastlet Admission、Sandbox 创建一致性
 
+> 2026-07-23 更新：多活、幂等身份和接管机制不变；Create 返回点已修订为 RuntimeReady，详见 [CreateSandbox RuntimeReady 快速返回语义](./2026-07-23-runtime-ready-create-semantics.md)。
+
 ## 1. 背景
 
 当前 Fast Sandbox 将以下能力运行在同一个 Controller 进程中：
@@ -62,7 +64,7 @@ Fast-Path Server 收到创建请求后：
 3. 如果所有候选明确拒绝，直接快速失败，不创建 Sandbox CRD；
 4. Reservation 成功后创建 Sandbox CRD，并通过 status CAS 持久化唯一 assignment；
 5. 使用 CRD UID、assignment attempt 和 generation 请求对应 Fastlet 幂等 Ensure；
-6. required Infra 和本地 route Ready 后返回结果。
+6. Runtime 和私有网络 Ready 后返回结果；required Infra 和本地 route 异步收敛。
 
 Fast-Path 的价值是同步推进创建流程，不需要等待 Controller Watch、workqueue 和 Reconcile 调度。
 
@@ -331,7 +333,7 @@ sequenceDiagram
 
     FP->>API: Ensure Status Running
     Controller->>API: Ensure Status Running
-    FP-->>Client: CreateSandbox Response (DataPlaneReady)
+    FP-->>Client: CreateSandbox Response (RuntimeReady)
 ```
 
 该流程允许 Fast-Path 和 Controller 并发工作，不需要显式 owner lease，也不需要 Controller 等待 Fast-Path 故障后再接管。

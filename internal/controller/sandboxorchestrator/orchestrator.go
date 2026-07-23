@@ -27,6 +27,8 @@ import (
 var (
 	ErrNoCandidate                = errors.New("no eligible Fastlet for the Sandbox request")
 	ErrRuntimeInProgress          = errors.New("Sandbox runtime creation is in progress")
+	ErrDataPlaneInProgress        = errors.New("Sandbox data plane initialization is in progress")
+	ErrDataPlaneUnavailable       = errors.New("Sandbox data plane is unavailable and retrying")
 	ErrAssignedFastletUnavailable = errors.New("assigned Fastlet is unavailable or was replaced")
 	ErrUnknownFastletOutcome      = errors.New("Fastlet operation outcome is unknown")
 )
@@ -323,8 +325,11 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 		},
 	}
 	response, createErr := o.FastletClient.CreateSandbox(ctx, fastlet.PodIP, request)
-	if createErr == nil && response != nil && response.Accepted && response.Sandbox != nil && response.Sandbox.Phase == "running" {
-		return response, nil
+	if createErr == nil && response != nil && response.Accepted && response.Sandbox != nil {
+		switch response.Sandbox.Phase {
+		case "running", "infra-pending", "initializing-infra", "infra-unavailable", "route-pending", "publishing-route", "route-unavailable":
+			return response, nil
+		}
 	}
 	if createErr == nil {
 		createErr = ErrUnknownFastletOutcome
@@ -333,12 +338,13 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 	return response, createErr
 }
 
-// ReconcileRuntime is the declarative wrapper around CreateRuntime. Status
-// convergence is intentionally outside the FastPath request.
+// ReconcileRuntime is the declarative wrapper around CreateRuntime. A
+// successful Create proves the runtime is ready; Infra readiness and route
+// publication are projected independently as the data plane converges.
 func (o *Orchestrator) ReconcileRuntime(ctx context.Context, sandbox *apiv1alpha1.Sandbox) error {
-	_, err := o.CreateRuntime(ctx, sandbox)
+	response, err := o.CreateRuntime(ctx, sandbox)
 	if err == nil {
-		return o.MarkReady(ctx, sandbox)
+		return o.projectObservedPhase(ctx, sandbox, response.Sandbox.Phase)
 	}
 	var failure *api.FastletError
 	if errors.As(err, &failure) && failure.Code == api.ErrorInProgress {
@@ -366,11 +372,30 @@ func (o *Orchestrator) ObserveRuntime(ctx context.Context, sandbox *apiv1alpha1.
 	switch response.Sandbox.Phase {
 	case "running":
 		return o.MarkReady(ctx, sandbox)
-	case "creating", "infra-pending", "initializing-infra", "route-pending", "publishing-route":
+	case "creating":
 		_ = o.MarkCreating(ctx, sandbox, "Fastlet is still creating the runtime")
 		return ErrRuntimeInProgress
 	default:
-		return fmt.Errorf("runtime is %s", response.Sandbox.Phase)
+		return o.projectObservedPhase(ctx, sandbox, response.Sandbox.Phase)
+	}
+}
+
+func (o *Orchestrator) projectObservedPhase(ctx context.Context, sandbox *apiv1alpha1.Sandbox, phase string) error {
+	switch phase {
+	case "running":
+		return o.MarkReady(ctx, sandbox)
+	case "infra-pending", "initializing-infra", "route-pending", "publishing-route":
+		if err := o.MarkRuntimeReadyDataPlaneCreating(ctx, sandbox, phase); err != nil {
+			return err
+		}
+		return ErrDataPlaneInProgress
+	case "infra-unavailable", "route-unavailable":
+		if err := o.MarkRuntimeReadyDataPlaneUnavailable(ctx, sandbox, phase); err != nil {
+			return err
+		}
+		return ErrDataPlaneUnavailable
+	default:
+		return fmt.Errorf("runtime is %s", phase)
 	}
 }
 
@@ -477,6 +502,24 @@ func (o *Orchestrator) MarkCreating(ctx context.Context, sandbox *apiv1alpha1.Sa
 		status.RuntimeState = apiv1alpha1.ObservedStateCreating
 		status.DataPlaneState = apiv1alpha1.ObservedStatePending
 		setCondition(status, ConditionRuntimeReady, metav1.ConditionFalse, "Creating", message)
+	})
+}
+
+func (o *Orchestrator) MarkRuntimeReadyDataPlaneCreating(ctx context.Context, sandbox *apiv1alpha1.Sandbox, phase string) error {
+	return o.patchStatus(ctx, sandbox, func(status *apiv1alpha1.SandboxStatus) {
+		status.RuntimeState = apiv1alpha1.ObservedStateReady
+		status.DataPlaneState = apiv1alpha1.ObservedStateCreating
+		setCondition(status, ConditionRuntimeReady, metav1.ConditionTrue, "RuntimeRunning", "Fastlet reports the runtime and private network ready")
+		setCondition(status, ConditionDataPlaneReady, metav1.ConditionFalse, "DataPlaneInitializing", "Fastlet data plane is "+phase)
+	})
+}
+
+func (o *Orchestrator) MarkRuntimeReadyDataPlaneUnavailable(ctx context.Context, sandbox *apiv1alpha1.Sandbox, phase string) error {
+	return o.patchStatus(ctx, sandbox, func(status *apiv1alpha1.SandboxStatus) {
+		status.RuntimeState = apiv1alpha1.ObservedStateReady
+		status.DataPlaneState = apiv1alpha1.ObservedStateUnavailable
+		setCondition(status, ConditionRuntimeReady, metav1.ConditionTrue, "RuntimeRunning", "Fastlet reports the runtime and private network ready")
+		setCondition(status, ConditionDataPlaneReady, metav1.ConditionFalse, "DataPlaneUnavailable", "Fastlet data plane is "+phase+" and will be retried")
 	})
 }
 

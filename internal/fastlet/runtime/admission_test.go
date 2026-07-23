@@ -196,15 +196,27 @@ type admissionRoutePublisher struct {
 	removed        []RoutePublication
 	reconciled     [][]RoutePublication
 	applyError     error
+	applyEntered   chan struct{}
+	applyBlock     chan struct{}
 	removeError    error
 	reconcileError error
 }
 
 func (p *admissionRoutePublisher) ApplyRoute(_ context.Context, route RoutePublication) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.applied = append(p.applied, route)
-	return p.applyError
+	err, entered, block := p.applyError, p.applyEntered, p.applyBlock
+	p.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+	}
+	if block != nil {
+		<-block
+	}
+	return err
 }
 
 func (p *admissionRoutePublisher) RemoveRoute(_ context.Context, route RoutePublication) error {
@@ -505,7 +517,7 @@ func TestRecoveryBlocksReadinessAndRestoresCapacity(t *testing.T) {
 	requireFastletCode(t, err, api.ErrorCapacityRejected)
 }
 
-func TestRoutePublicationGatesCreateAndRetriesWithoutRecreatingRuntime(t *testing.T) {
+func TestRoutePublicationContinuesAfterRuntimeReadyWithoutRecreatingRuntime(t *testing.T) {
 	runtime := newAdmissionRuntime()
 	publisher := &admissionRoutePublisher{applyError: errors.New("proxy control unavailable")}
 	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
@@ -514,24 +526,67 @@ func TestRoutePublicationGatesCreateAndRetriesWithoutRecreatingRuntime(t *testin
 	require.NoError(t, err)
 	request := ensureRequest("sandbox-a", 1, 2)
 
-	_, err = manager.CreateSandbox(context.Background(), request)
-	requireFastletCode(t, err, api.ErrorInProgress)
+	response, err := manager.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
+	require.True(t, response.Accepted)
+	require.Equal(t, "infra-pending", response.Sandbox.Phase)
 	ensures, _ := runtime.counts()
 	require.Equal(t, 1, ensures)
+	require.Eventually(t, func() bool {
+		inspected, inspectErr := manager.InspectSandboxV2(&api.InspectSandboxRequest{Identity: request.Identity})
+		return inspectErr == nil && inspected.Sandbox.Phase == "route-unavailable"
+	}, time.Second, 10*time.Millisecond)
+
+	idempotent, err := manager.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
+	require.True(t, idempotent.Accepted)
+	require.False(t, idempotent.Created)
+	ensures, _ = runtime.counts()
+	require.Equal(t, 1, ensures, "a duplicate Create must not wait for or recreate the data plane")
 
 	publisher.mu.Lock()
 	publisher.applyError = nil
 	publisher.mu.Unlock()
+	require.Eventually(t, func() bool {
+		inspected, inspectErr := manager.InspectSandboxV2(&api.InspectSandboxRequest{Identity: request.Identity})
+		return inspectErr == nil && inspected.Sandbox.Phase == "running"
+	}, 3*time.Second, 10*time.Millisecond)
+	ensures, _ = runtime.counts()
+	require.Equal(t, 1, ensures, "asynchronous route retry must not create a second runtime")
+	publisher.mu.Lock()
+	require.GreaterOrEqual(t, len(publisher.applied), 2)
+	last := publisher.applied[len(publisher.applied)-1]
+	require.Equal(t, int64(1), last.RouteGeneration)
+	require.Equal(t, int64(2), last.AssignmentAttempt)
+	publisher.mu.Unlock()
+}
+
+func TestDeleteFencesAsynchronousRoutePublication(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	publisher := &admissionRoutePublisher{applyEntered: make(chan struct{}, 1), applyBlock: make(chan struct{})}
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-uid-a", RoutePublisher: publisher,
+	})
+	require.NoError(t, err)
+	request := ensureRequest("sandbox-a", 1, 1)
+
 	response, err := manager.CreateSandbox(context.Background(), request)
 	require.NoError(t, err)
-	require.Equal(t, "running", response.Sandbox.Phase)
-	ensures, _ = runtime.counts()
-	require.Equal(t, 1, ensures, "route retry must not create a second runtime")
-	publisher.mu.Lock()
-	require.Len(t, publisher.applied, 2)
-	require.Equal(t, int64(1), publisher.applied[1].RouteGeneration)
-	require.Equal(t, int64(2), publisher.applied[1].AssignmentAttempt)
-	publisher.mu.Unlock()
+	require.Equal(t, "infra-pending", response.Sandbox.Phase)
+	<-publisher.applyEntered
+
+	_, err = manager.DeleteSandboxV2(&api.DeleteSandboxV2Request{Identity: request.Identity})
+	require.NoError(t, err)
+	close(publisher.applyBlock)
+	require.Eventually(t, func() bool {
+		admission, _, _ := manager.State()
+		return admission.Used == 0
+	}, time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		publisher.mu.Lock()
+		defer publisher.mu.Unlock()
+		return len(publisher.removed) >= 1
+	}, time.Second, 10*time.Millisecond)
 }
 
 func TestDrainingRejectsNewEnsureButKeepsExistingSandboxIdempotent(t *testing.T) {
@@ -654,6 +709,11 @@ func TestProxyControlReconnectRevokesAndRestoresReadiness(t *testing.T) {
 	require.NoError(t, err)
 	_, err = manager.CreateSandbox(context.Background(), ensureRequest("sandbox-a", 1, 1))
 	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		manager.mu.RLock()
+		defer manager.mu.RUnlock()
+		return manager.sandboxes["sandbox-a"].Phase == "running"
+	}, time.Second, 10*time.Millisecond)
 	require.True(t, manager.Ready())
 
 	manager.MarkProxyRouteUnavailable()

@@ -26,7 +26,7 @@ var (
 	}, []string{"runtime", "cache_hit", "result"})
 	dataPlaneReadyLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "fast_sandbox_data_plane_ready_latency_seconds",
-		Help:    "Fastlet Ensure latency through runtime, Infra readiness, and route publication.",
+		Help:    "Latency from runtime creation start until asynchronous Infra readiness and route publication complete.",
 		Buckets: prometheus.ExponentialBuckets(0.005, 2, 14),
 	}, []string{"runtime", "infra_profile", "result"})
 	userProcessStartLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{

@@ -10,7 +10,7 @@ Fast Sandbox reports latency by milestone and workload profile. A single end-to-
 | Runtime created | The selected runtime adapter completed Ensure |
 | User process started | The adapter proved that the original user process started; unavailable for unreported `sandbox-init` paths |
 | Data plane ready | Runtime, Infra Component readiness, and Fastlet route publication completed |
-| Create RPC complete | Fast-Path returned success or a terminal error |
+| Create RPC complete | Fast-Path returned after RuntimeReady or a terminal error; DataPlaneReady may follow asynchronously |
 
 The historical `<50ms` value is an observation target only for a warm `container` Pool with an image cache hit and minimal InfraProfile. It is not a target for cold pulls, gVisor/Kata/BoxLite, or full data-plane readiness.
 
@@ -35,7 +35,7 @@ Do not compare profiles while changing more than one of these dimensions.
 Important Prometheus series include:
 
 - `fast_sandbox_create_accepted_latency_seconds{path,result}`
-- `fast_sandbox_create_data_plane_ready_latency_seconds{result}`
+- `fast_sandbox_create_runtime_ready_latency_seconds{result}`
 - `fast_sandbox_runtime_create_latency_seconds{runtime,cache_hit,result}`
 - `fast_sandbox_user_process_start_latency_seconds{runtime,infra_profile,source}`
 - `fast_sandbox_user_process_start_observation_total{runtime,infra_profile,source,result}`

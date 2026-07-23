@@ -41,12 +41,13 @@ func (r *controllerRegistry) GetFastletByID(id fastletpool.FastletID) (fastletpo
 func (*controllerRegistry) RecordFeedback(fastletpool.FastletID, fastletpool.LocalFeedback) {}
 
 type controllerFastlet struct {
-	mu         sync.Mutex
-	ensureErr  error
-	inspectErr error
-	runtimes   map[string]string
-	ensureCall int
-	deleteCall int
+	mu          sync.Mutex
+	ensureErr   error
+	inspectErr  error
+	ensurePhase string
+	runtimes    map[string]string
+	ensureCall  int
+	deleteCall  int
 }
 
 func (f *controllerFastlet) CreateSandbox(_ context.Context, _ string, request *api.CreateSandboxRequest) (*api.CreateSandboxResponse, error) {
@@ -56,8 +57,12 @@ func (f *controllerFastlet) CreateSandbox(_ context.Context, _ string, request *
 	if f.ensureErr != nil {
 		return &api.CreateSandboxResponse{}, f.ensureErr
 	}
-	f.runtimes[request.Identity.SandboxUID] = "running"
-	return &api.CreateSandboxResponse{Accepted: true, Sandbox: &api.SandboxStatus{SandboxID: request.Identity.SandboxUID, Phase: "running"}}, nil
+	phase := f.ensurePhase
+	if phase == "" {
+		phase = "running"
+	}
+	f.runtimes[request.Identity.SandboxUID] = phase
+	return &api.CreateSandboxResponse{Accepted: true, Sandbox: &api.SandboxStatus{SandboxID: request.Identity.SandboxUID, Phase: phase}}, nil
 }
 
 func (f *controllerFastlet) InspectSandbox(_ context.Context, _ string, request *api.InspectSandboxRequest) (*api.InspectSandboxResponse, error) {
@@ -103,6 +108,27 @@ func TestDeclarativeCreateUsesSharedV2Orchestrator(t *testing.T) {
 	fastlet.mu.Lock()
 	require.Equal(t, 1, fastlet.ensureCall)
 	fastlet.mu.Unlock()
+}
+
+func TestDeclarativeCreatePollsDataPlaneWithoutBlockingRuntimeReady(t *testing.T) {
+	reconciler, _, fastlet, sandbox := newControllerHarness(t)
+	fastlet.ensurePhase = "infra-pending"
+
+	_, err := reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+	require.NoError(t, err)
+	result, err := reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+	require.NoError(t, err)
+	require.Equal(t, DataPlanePollInterval, result.RequeueAfter)
+	current := getControllerSandbox(t, reconciler, sandbox.Name)
+	require.Equal(t, apiv1alpha1.ObservedStateReady, current.Status.RuntimeState)
+	require.Equal(t, apiv1alpha1.ObservedStateCreating, current.Status.DataPlaneState)
+
+	fastlet.ensurePhase = "running"
+	result, err = reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+	require.NoError(t, err)
+	require.Equal(t, DefaultRequeueInterval, result.RequeueAfter)
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	require.Equal(t, apiv1alpha1.ObservedStateReady, current.Status.DataPlaneState)
 }
 
 func TestExplicitCapacityRejectionPreservesDurableAssignmentAndAttemptFence(t *testing.T) {

@@ -3,6 +3,7 @@ package infra
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -46,6 +47,21 @@ func TestProbeServiceHTTPAndTimeout(t *testing.T) {
 		Type: infracatalog.ProbeTCP, Timeout: 30 * time.Millisecond, Interval: 5 * time.Millisecond,
 	}, nil)
 	require.Error(t, err)
+}
+
+func TestReadinessProbeUsesFastExponentialBackoff(t *testing.T) {
+	attempts := 0
+	dial := func(context.Context, uint32) (net.Conn, error) {
+		attempts++
+		return nil, errors.New("not ready")
+	}
+	started := time.Now()
+	err := probeServiceWithDialer(context.Background(), 44772, infracatalog.ReadinessProbe{
+		Type: infracatalog.ProbeTCP, Timeout: 25 * time.Millisecond, Interval: 100 * time.Millisecond,
+	}, nil, dial, nil)
+	require.Error(t, err)
+	require.GreaterOrEqual(t, attempts, 4, "a configured 100ms interval must be capped instead of imposing a fixed 100ms sleep")
+	require.Less(t, time.Since(started), 100*time.Millisecond)
 }
 
 func TestOptionalServiceFailureIsReturnedAsDiagnostic(t *testing.T) {
@@ -108,7 +124,7 @@ func TestOptionalServiceFailureIsReturnedAsDiagnostic(t *testing.T) {
 func TestInitializeServiceUsesInternalCredentialForReadiness(t *testing.T) {
 	const token = "instance-secret"
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Header.Get(UpstreamTokenHeader) != token {
+		if request.Header.Get("X-Fast-Sandbox-Infra-Token") != token {
 			http.Error(writer, "missing internal credential", http.StatusUnauthorized)
 			return
 		}
@@ -126,5 +142,5 @@ func TestInitializeServiceUsesInternalCredentialForReadiness(t *testing.T) {
 	require.NoError(t, manager.initializeService(context.Background(), &api.SandboxSpec{SandboxID: "uid-a"}, host, ServiceEndpoint{
 		Component: "component", Name: "service", Port: uint32(port), Required: true,
 		Readiness: infracatalog.ReadinessProbe{Type: infracatalog.ProbeHTTP, Path: "/", Timeout: time.Second},
-	}, map[string]string{UpstreamTokenHeader: token}))
+	}, map[string]string{"X-Fast-Sandbox-Infra-Token": token}))
 }

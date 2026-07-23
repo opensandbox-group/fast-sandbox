@@ -161,7 +161,7 @@ func TestInfraRuntimeAugmentation(t *testing.T) {
 			created := createInfraSandbox(ctx, t, fastPath, namespace, pool.Name)
 			ready := waitForProxyReady(ctx, t, fixture, namespace, created.SandboxName)
 			if ready.Status.DataPlaneState != apiv1alpha1.ObservedStateReady {
-				t.Fatalf("Create returned before DataPlaneReady: %s", ready.Status.DataPlaneState)
+				t.Fatalf("DataPlane did not converge after RuntimeReady Create: %s", ready.Status.DataPlaneState)
 			}
 
 			proxyBase, proxyForward, err := e2eenv.StartSandboxProxyPortForward(ctx, testSuite.ControllerNamespace())

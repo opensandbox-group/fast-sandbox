@@ -31,6 +31,7 @@ const (
 	FinalizerName          = "sandbox.fast.io/cleanup"
 	DefaultRequeueInterval = 5 * time.Second
 	DeletionPollInterval   = time.Second
+	DataPlanePollInterval  = 100 * time.Millisecond
 )
 
 type SandboxReconciler struct {
@@ -115,6 +116,12 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *s
 		return ctrl.Result{}, err
 	}
 	if err := orchestrator.ReconcileRuntime(ctx, assigned); err != nil {
+		if errors.Is(err, sandboxorchestrator.ErrDataPlaneInProgress) {
+			return ctrl.Result{RequeueAfter: DataPlanePollInterval}, nil
+		}
+		if errors.Is(err, sandboxorchestrator.ErrDataPlaneUnavailable) {
+			return ctrl.Result{RequeueAfter: DeletionPollInterval}, nil
+		}
 		if errors.Is(err, sandboxorchestrator.ErrRuntimeInProgress) || errors.Is(err, sandboxorchestrator.ErrUnknownFastletOutcome) {
 			return ctrl.Result{RequeueAfter: DeletionPollInterval}, nil
 		}

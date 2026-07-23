@@ -9,6 +9,8 @@
 
 > **2026-07-21 收口说明：** 项目尚未生产部署，计划早期记录的 deprecated 字段、兼容 adapter、迁移 CLI 和投影状态均已被直接切换决策取代并从代码删除。本文保留阶段性执行记录；当前契约以五份设计文档、`ARCHITECTURE.md` 和现行 CRD/protobuf 为准。
 
+> **2026-07-23 Create 语义修订：** 本文中“Create 等待 required Infra/DataPlaneReady”的历史执行记录已由 [CreateSandbox RuntimeReady 快速返回语义](../specs/2026-07-23-runtime-ready-create-semantics.md) 替代。
+
 ## 1. 目标
 
 本计划把以下五份已确认设计落实为可部署、可测试的代码：

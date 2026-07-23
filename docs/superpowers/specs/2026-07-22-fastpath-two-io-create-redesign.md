@@ -6,6 +6,8 @@
 
 **范围**：仅重设计 `CreateSandbox` FastPath；声明式 Controller 路径不要求满足两次 IO
 
+> 2026-07-23 更新：本文的两次 IO 与 CRD-first 决策保持不变；第 10 节原有“同步等待 DataPlaneReady”已由 [CreateSandbox RuntimeReady 快速返回语义](./2026-07-23-runtime-ready-create-semantics.md) 替代。
+
 ## 1. 结论
 
 当前 `CreateSandbox` 名义上是 FastPath，实际 happy path 却包含约 13 次下游网络往返：
@@ -556,16 +558,17 @@ CRD-first 的崩溃窗口是 CRD 已创建、Fastlet 尚未创建。该状态不
 
 1. Sandbox CRD 已经持久化并包含 assignment annotation；
 2. Fastlet 已经创建 runtime 和私有网络；
-3. Pool 声明的必需 Infra Component 已通过 readiness；
-4. Fastlet local route 已发布，因此所需 DataPlane 已 Ready。
+3. container/task 已启动，Fastlet 已按 UID 和 generation 登记 runtime identity。
 
 FastPath 不再同步等待：
 
+- Pool 声明的必需 Infra Component readiness；
+- Fastlet local route publication 和 DataPlaneReady；
 - Controller 把 assignment 写入 status；
 - Controller Conditions 收敛；
 - status 的 read-after-write 投影。
 
-Fastlet `CreateSandbox` 是第二次 IO，调用时已经持有 CRD UID，因此 route publication 不需要等待 Controller。任何必需 Infra 或 route 未 Ready 都不能返回成功；CRD 保持 Pending/Creating，由 FastPath 重试或 Controller 收敛。Controller status 投影仍然是异步的，不进入成功路径 IO 预算。
+Fastlet `CreateSandbox` 是第二次 IO，调用时已经持有 CRD UID。RuntimeReady 后返回成功；required Infra 和 route 由 Fastlet 本地异步推进。Controller 独立投影 `RuntimeState=Ready` 与 `DataPlaneState=Creating/Unavailable/Ready`，状态写入不进入成功路径 IO 预算。
 
 ## 11. 接口变化
 

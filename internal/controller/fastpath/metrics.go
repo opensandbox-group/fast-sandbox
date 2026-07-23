@@ -22,9 +22,9 @@ var (
 		Help:    "FastPath latency until an idempotent existing request or a Fastlet reservation is accepted.",
 		Buckets: []float64{.001, .0025, .005, .01, .025, .05, .1, .25, .5, 1},
 	}, []string{"path", "result"})
-	createDataPlaneReadyLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "fast_sandbox_create_data_plane_ready_latency_seconds",
-		Help:    "End-to-end CreateSandbox latency until the data plane is ready or the RPC terminates.",
+	createRuntimeReadyLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "fast_sandbox_create_runtime_ready_latency_seconds",
+		Help:    "End-to-end CreateSandbox latency until the runtime is ready or the RPC terminates.",
 		Buckets: prometheus.ExponentialBuckets(.005, 2, 14),
 	}, []string{"result"})
 )

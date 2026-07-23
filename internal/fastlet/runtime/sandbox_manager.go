@@ -63,6 +63,7 @@ type SandboxManager struct {
 	cacheProtection     *fastletcache.ProtectionIndex
 	warmImages          []string
 	routePublisher      RoutePublisher
+	dataPlaneWorkers    map[string]dataPlaneWorker
 	heartbeatSequence   atomic.Uint64
 	// sandboxes  sandboxID -> metadata
 	sandboxes map[string]*SandboxMetadata
@@ -130,8 +131,9 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		diagnostics:     make(map[string][]api.SandboxDiagnosticEvent),
 		cacheTracker:    fastletcache.NewTracker(cacheSource, config.CacheEpoch, fastletcache.DefaultMaxInventory),
 		cacheProtection: protection, warmImages: append([]string(nil), config.WarmImages...),
-		routePublisher: config.RoutePublisher,
-		sandboxes:      make(map[string]*SandboxMetadata),
+		routePublisher:   config.RoutePublisher,
+		dataPlaneWorkers: make(map[string]dataPlaneWorker),
+		sandboxes:        make(map[string]*SandboxMetadata),
 	}, nil
 }
 
@@ -314,6 +316,7 @@ func (m *SandboxManager) beginDelete(sandboxID string) {
 		klog.InfoS("DeleteSandbox: creation cancellation recorded", "sandboxID", sandboxID)
 		return
 	}
+	m.cancelDataPlaneReconcileLocked(sandbox)
 	sandbox.Phase = "terminating"
 	m.recordDiagnosticLocked(sandboxID, "info", "fastlet", "terminating", "runtime deletion started")
 	m.mu.Unlock()
