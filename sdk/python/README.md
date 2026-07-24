@@ -1,7 +1,22 @@
 # Fast Sandbox Python SDK
 
-The SDK owns Fast Sandbox lifecycle calls and generic route discovery. It does
-not implement Execd, Envd, or another Infra Component's wire protocol.
+The Python package owns Fast Sandbox lifecycle calls and generic Infra
+Component route discovery. It does not implement Execd, Envd, or another
+component's wire protocol.
+
+## Install for development
+
+```bash
+python -m pip install -e 'sdk/python[dev]'
+```
+
+Run the package tests from the repository root:
+
+```bash
+make test SCOPE=python
+```
+
+## Lifecycle and route discovery
 
 ```python
 from fast_sandbox import Client
@@ -22,9 +37,16 @@ with Client(
     print(route.endpoint, route.headers)
 ```
 
-For OpenSandbox command and file operations, use `fastctl opensandbox` or an
-official OpenSandbox SDK with the resolved endpoint and required headers. No
-Exec/File RPC is exposed by FastPath or Fastlet Control.
+For OpenSandbox command and file operations, use `fastctl opensandbox` or the
+official OpenSandbox SDK with the resolved endpoint and required headers.
+FastPath and Fastlet Control expose no Exec/File RPC.
+
+See:
+
+- [Quick Start](../../docs/getting-started/quickstart.md)
+- [API reference](../../docs/reference/api.md)
+- [Data plane](../../docs/concepts/data-plane.md)
+- [OpenSandbox Execd](../../docs/guides/opensandbox-execd.md)
 
 When `opentelemetry-api` is installed (or the `telemetry` extra is selected),
 the SDK injects the current W3C Trace Context into FastPath gRPC metadata. The

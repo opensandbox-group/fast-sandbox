@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="760" viewBox="0 0 1440 760" role="img" aria-labelledby="title description">
+  <title id="title">Fast Sandbox system overview</title>
+  <desc id="description">Fast Sandbox control plane and data plane with pluggable Infra Components on a Kubernetes foundation.</desc>
+
+  <defs>
+    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M 24 0 L 0 0 0 24" fill="none" stroke="#e7e7e4" stroke-width="1"/>
+    </pattern>
+    <marker id="arrow-blue" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8" fill="none" stroke="#2563eb" stroke-width="1.5"/>
+    </marker>
+    <marker id="arrow-violet" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8" fill="none" stroke="#7c3aed" stroke-width="1.5"/>
+    </marker>
+    <style>
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      }
+      .sans {
+        font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      .product {
+        fill: #18181b;
+        font-size: 22px;
+        font-weight: 600;
+      }
+      .breadcrumb {
+        fill: #71717a;
+        font-size: 17px;
+        font-weight: 400;
+      }
+      .section {
+        fill: #71717a;
+        font-size: 14px;
+        font-weight: 500;
+        letter-spacing: 0.04em;
+      }
+      .node-title {
+        fill: #18181b;
+        font-size: 20px;
+        font-weight: 500;
+      }
+      .node-note {
+        fill: #71717a;
+        font-size: 13px;
+        font-weight: 400;
+      }
+      .runtime {
+        fill: #52525b;
+        font-size: 12px;
+        font-weight: 400;
+      }
+      .foundation-title {
+        fill: #172554;
+        font-size: 28px;
+        font-weight: 500;
+      }
+      .foundation-note {
+        fill: #475569;
+        font-size: 14px;
+        font-weight: 400;
+      }
+      .foundation-token {
+        fill: #1e3a8a;
+        font-size: 12px;
+        font-weight: 500;
+      }
+    </style>
+  </defs>
+
+  <rect width="1440" height="760" fill="#fbfbfa"/>
+  <rect width="1440" height="760" fill="url(#grid)" opacity="0.48"/>
+  <rect x="24" y="24" width="1392" height="712" rx="10" fill="none" stroke="#d4d4d0"/>
+
+  <circle cx="62" cy="57" r="5" fill="#22c55e"/>
+  <text x="78" y="64" class="mono product">fast-sandbox</text>
+  <text x="244" y="64" class="mono breadcrumb">/ system overview</text>
+  <text x="1378" y="63" text-anchor="end" class="mono breadcrumb">kubernetes-native runtime plane</text>
+  <line x1="48" y1="88" x2="1392" y2="88" stroke="#d4d4d0"/>
+
+  <text x="64" y="125" class="mono section">01 / control plane</text>
+  <line x1="64" y1="142" x2="1376" y2="142" stroke="#d4d4d0" stroke-dasharray="3 6"/>
+
+  <rect x="64" y="168" width="276" height="104" rx="7" fill="#fbfbfa" stroke="#a1a1aa"/>
+  <text x="86" y="213" class="mono node-title">fastctl / SDK</text>
+  <text x="86" y="241" class="mono node-note">imperative API client</text>
+
+  <line x1="340" y1="220" x2="462" y2="220" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+
+  <rect x="472" y="168" width="382" height="104" rx="7" fill="#fbfbfa" stroke="#a1a1aa"/>
+  <text x="494" y="213" class="mono node-title">fast-path / reconciler</text>
+  <text x="494" y="241" class="mono node-note">create fast / converge state</text>
+
+  <line x1="854" y1="220" x2="976" y2="220" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
+
+  <rect x="986" y="168" width="390" height="104" rx="7" fill="#fbfbfa" stroke="#a1a1aa"/>
+  <text x="1008" y="207" class="mono node-title">Fastlet Pod</text>
+  <text x="1008" y="235" class="mono node-note">pod-side runtime control</text>
+  <text x="1008" y="257" class="mono runtime">[ runc ]  [ gVisor ]  [ Kata ]  [ BoxLite ]</text>
+
+  <text x="64" y="329" class="mono section">02 / data plane</text>
+  <line x1="64" y1="346" x2="1376" y2="346" stroke="#d4d4d0" stroke-dasharray="3 6"/>
+
+  <rect x="64" y="386" width="282" height="96" rx="7" fill="#fbfbfa" stroke="#a1a1aa"/>
+  <text x="86" y="426" class="mono node-title">fastctl</text>
+  <text x="86" y="454" class="mono node-note">component-aware client</text>
+
+  <line x1="346" y1="434" x2="400" y2="434" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arrow-violet)"/>
+
+  <rect x="410" y="386" width="250" height="96" rx="7" fill="#fbfbfa" stroke="#a1a1aa"/>
+  <text x="432" y="426" class="mono node-title">Sandbox Proxy</text>
+  <text x="432" y="454" class="mono node-note">cluster entry</text>
+
+  <rect x="700" y="360" width="676" height="144" rx="8" fill="#faf8ff" fill-opacity="0.45" stroke="#c4b5fd" stroke-dasharray="4 5"/>
+  <text x="718" y="379" class="mono section" fill="#7c3aed">Fastlet Pod</text>
+
+  <line x1="660" y1="434" x2="714" y2="434" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arrow-violet)"/>
+
+  <rect x="724" y="386" width="250" height="96" rx="7" fill="#fbfbfa" stroke="#a1a1aa"/>
+  <text x="746" y="426" class="mono node-title">Fastlet Proxy</text>
+  <text x="746" y="454" class="mono node-note">pod-local routing</text>
+
+  <line x1="974" y1="434" x2="1028" y2="434" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arrow-violet)"/>
+
+  <rect x="1038" y="386" width="338" height="96" rx="7" fill="#fbfbfa" stroke="#a1a1aa"/>
+  <text x="1060" y="426" class="mono node-title">Infra Component</text>
+  <text x="1060" y="454" class="mono node-note">[ execd ]  [ custom ]  [ ... ]</text>
+
+  <text x="1376" y="526" text-anchor="end" class="mono node-note">transparent proxy / no protocol translation</text>
+
+  <rect x="64" y="548" width="1312" height="142" rx="8" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text x="88" y="582" class="mono section" fill="#3b82f6">03 / foundation</text>
+  <text x="88" y="632" class="mono foundation-title">built on Kubernetes</text>
+  <text x="88" y="663" class="mono foundation-note">portable control, durable state, native operations</text>
+
+  <rect x="680" y="570" width="200" height="40" rx="5" fill="#f8fbff" stroke="#bfdbfe"/>
+  <text x="780" y="595" text-anchor="middle" class="mono foundation-token">[ Sandbox CRD ]</text>
+  <rect x="896" y="570" width="200" height="40" rx="5" fill="#f8fbff" stroke="#bfdbfe"/>
+  <text x="996" y="595" text-anchor="middle" class="mono foundation-token">[ SandboxPool CRD ]</text>
+  <rect x="1112" y="570" width="200" height="40" rx="5" fill="#f8fbff" stroke="#bfdbfe"/>
+  <text x="1212" y="595" text-anchor="middle" class="mono foundation-token">[ Runtime · Kata / gVisor ]</text>
+
+  <rect x="788" y="624" width="200" height="40" rx="5" fill="#f8fbff" stroke="#bfdbfe"/>
+  <text x="888" y="649" text-anchor="middle" class="mono foundation-token">[ Fastlet Pods ]</text>
+  <rect x="1004" y="624" width="200" height="40" rx="5" fill="#f8fbff" stroke="#bfdbfe"/>
+  <text x="1104" y="649" text-anchor="middle" class="mono foundation-token">[ NodeJanitor DaemonSet ]</text>
+</svg>
