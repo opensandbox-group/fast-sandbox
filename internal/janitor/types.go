@@ -60,9 +60,9 @@ type Janitor struct {
 	K8sClient  client.Client
 	nodeName   string
 
-	queue     workqueue.RateLimitingInterface
-	scanMu    sync.Mutex
-	backends  []CleanupBackend
+	queue    workqueue.RateLimitingInterface
+	scanMu   sync.Mutex
+	backends []CleanupBackend
 
 	ScanInterval  time.Duration
 	OrphanTimeout time.Duration

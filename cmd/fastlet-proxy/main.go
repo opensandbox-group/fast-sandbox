@@ -9,9 +9,10 @@ import (
 	"syscall"
 	"time"
 
-	"fast-sandbox/internal/fastletproxy"
+	routeauth "fast-sandbox/internal/dataplane/auth"
+	"fast-sandbox/internal/dataplane/fastletproxy"
 	"fast-sandbox/internal/observability"
-	"fast-sandbox/internal/routeauth"
+
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/klog/v2"
 )

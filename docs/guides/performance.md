@@ -75,7 +75,7 @@ The process reports cleanup separately and exits non-zero on Create failure, dup
 ## Scheduler microbenchmark
 
 ```bash
-go test ./internal/controller/fastletpool -run '^$' \
+go test ./internal/controlplane/placement -run '^$' \
   -bench '^BenchmarkRegistryTopK1000$' -benchmem -count=5
 ```
 

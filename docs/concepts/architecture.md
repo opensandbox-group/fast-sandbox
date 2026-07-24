@@ -115,6 +115,33 @@ A Fastlet Pod contains:
 
 The Fastlet Pod UID is a physical ownership fence. Reusing a Pod name never makes an old runtime or route valid.
 
+## Source layout
+
+Deployable binaries are composition roots under `cmd`. Internal packages are
+organized by architectural ownership rather than by executable name:
+
+```text
+internal/
+  controlplane/          Fast-Path, reconcilers, assignment, placement
+  dataplane/             shared contract, route auth, both proxies
+  fastlet/               admission, lifecycle, network, Infra, cache, server
+  runtime/               neutral contract, factory, containerd, BoxLite
+  sandbox/               in-Sandbox supervisor and tunnel
+  catalog/               platform-owned Runtime and Infra profiles
+  protocol/fastlet/      Controller-to-Fastlet control protocol
+  janitor/               node cleanup
+  observability/         tracing and identity propagation
+```
+
+The dependency direction is intentional:
+
+```text
+cmd -> control/lifecycle orchestration -> neutral contracts <- adapters
+```
+
+Data-plane protocols do not depend on Fastlet implementation packages, and
+runtime adapters do not own Fastlet admission.
+
 ## NodeJanitor
 
 NodeJanitor runs on trusted nodes and cleans orphan containerd resources, network namespaces and rules, Infra instance state, and BoxLite state. It performs a fresh Kubernetes ownership check and an orphan-age check before deletion.

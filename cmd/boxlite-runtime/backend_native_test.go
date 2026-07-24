@@ -5,16 +5,17 @@ package main
 import (
 	"context"
 	"encoding/json"
+	dataplane "fast-sandbox/internal/dataplane/contract"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"fast-sandbox/internal/api"
-	"fast-sandbox/internal/boxlitesidecar"
-	"fast-sandbox/internal/boxlitestate"
-	"fast-sandbox/internal/boxlitewire"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
-	fastletnetwork "fast-sandbox/internal/fastlet/network"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	boxliteprotocol "fast-sandbox/internal/runtime/boxlite/protocol"
+	boxliteserver "fast-sandbox/internal/runtime/boxlite/server"
+	boxlitestate "fast-sandbox/internal/runtime/boxlite/state"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -26,8 +27,8 @@ func TestNativeResourceOptionsAndCapabilityBoundary(t *testing.T) {
 	_, _, err = resourceOptions("0", "256Mi")
 	require.Error(t, err)
 	capabilities := (&nativeBackend{}).Capabilities(context.Background())
-	require.False(t, capabilities.Capabilities[boxlitewire.CapabilityResourceLimit])
-	require.True(t, capabilities.Capabilities[boxlitewire.CapabilityLocalForward])
+	require.False(t, capabilities.Capabilities[boxliteprotocol.CapabilityResourceLimit])
+	require.True(t, capabilities.Capabilities[boxliteprotocol.CapabilityLocalForward])
 	require.False(t, capabilities.Ready)
 }
 
@@ -65,7 +66,7 @@ func TestNativeBundleCopiesOnlySharedInfraArtifacts(t *testing.T) {
 	backend := &nativeBackend{artifactRoot: artifactRoot}
 	record := &nativeRecord{
 		BundleRoot: bundleRoot,
-		Request: boxlitewire.EnsureRequest{Artifacts: []boxlitewire.Artifact{{
+		Request: boxliteprotocol.EnsureRequest{Artifacts: []boxliteprotocol.Artifact{{
 			Source: source, Destination: fastletinfra.SandboxTunnelContainerPath,
 		}}},
 	}
@@ -80,9 +81,9 @@ func TestNativeBundleCopiesOnlySharedInfraArtifacts(t *testing.T) {
 }
 
 func TestNativeEnsureHashFencesImmutableSpec(t *testing.T) {
-	request := boxlitewire.EnsureRequest{
+	request := boxliteprotocol.EnsureRequest{
 		Namespace: "ns", TunnelGuestPort: 19090,
-		Sandbox: api.SandboxSpec{SandboxID: "uid-a", Image: "alpine:latest", FastletPodUID: "pod-a", InstanceGeneration: 1, AssignmentAttempt: 1},
+		Sandbox: fastletapi.SandboxSpec{SandboxID: "uid-a", Image: "alpine:latest", FastletPodUID: "pod-a", InstanceGeneration: 1, AssignmentAttempt: 1},
 	}
 	first, err := ensureHash(request)
 	require.NoError(t, err)
@@ -93,13 +94,13 @@ func TestNativeEnsureHashFencesImmutableSpec(t *testing.T) {
 }
 
 func TestNativeEnsureReturnsTypedImmutableSpecConflict(t *testing.T) {
-	request := boxlitewire.EnsureRequest{
+	request := boxliteprotocol.EnsureRequest{
 		Namespace: "default", TunnelGuestPort: 19090,
-		Sandbox: api.SandboxSpec{
+		Sandbox: fastletapi.SandboxSpec{
 			SandboxID: "sandbox-a", Image: "alpine:latest", CPU: "1", Memory: "256Mi",
 			FastletPodUID: "pod-a", InstanceGeneration: 1, AssignmentAttempt: 1,
 		},
-		Artifacts: []boxlitewire.Artifact{{Destination: fastletinfra.SandboxTunnelContainerPath}},
+		Artifacts: []boxliteprotocol.Artifact{{Destination: fastletinfra.SandboxTunnelContainerPath}},
 	}
 	hash, err := ensureHash(request)
 	require.NoError(t, err)
@@ -108,9 +109,9 @@ func TestNativeEnsureReturnsTypedImmutableSpecConflict(t *testing.T) {
 	}}
 	request.Sandbox.Image = "busybox:latest"
 	_, err = backend.Ensure(context.Background(), request)
-	var typed *boxlitesidecar.Error
+	var typed *boxliteserver.Error
 	require.ErrorAs(t, err, &typed)
-	require.Equal(t, boxlitewire.ErrorImmutableSpecConflict, typed.Code)
+	require.Equal(t, boxliteprotocol.ErrorImmutableSpecConflict, typed.Code)
 }
 
 func TestNativeLoadRecordsValidatesOwnerFilenameAndBundleFences(t *testing.T) {
@@ -119,19 +120,19 @@ func TestNativeLoadRecordsValidatesOwnerFilenameAndBundleFences(t *testing.T) {
 	bundleRoot := filepath.Join(root, boxlitestate.BundleDirectoryName)
 	require.NoError(t, os.MkdirAll(metadataRoot, 0700))
 	require.NoError(t, os.MkdirAll(bundleRoot, 0700))
-	request := boxlitewire.EnsureRequest{
+	request := boxliteprotocol.EnsureRequest{
 		Namespace: "default", TunnelGuestPort: 19090,
-		Sandbox: api.SandboxSpec{
+		Sandbox: fastletapi.SandboxSpec{
 			SandboxID: "sandbox-a", Image: "alpine:latest", CPU: "250m", Memory: "256Mi",
 			FastletPodUID: "pod-a", InstanceGeneration: 1, AssignmentAttempt: 1,
 		},
-		Artifacts: []boxlitewire.Artifact{{
+		Artifacts: []boxliteprotocol.Artifact{{
 			Source: "/opt/fast-sandbox/infra/tunnel", Destination: fastletinfra.SandboxTunnelContainerPath,
 		}},
 	}
 	hash, err := ensureHash(request)
 	require.NoError(t, err)
-	credential, err := fastletnetwork.GenerateLocalForwardCredential()
+	credential, err := dataplane.GenerateLocalForwardCredential()
 	require.NoError(t, err)
 	record := nativeRecord{
 		Version: boxlitestate.Version, Namespace: request.Namespace, SpecHash: hash, Request: request,

@@ -9,43 +9,44 @@ import (
 	"sync"
 	"testing"
 
-	"fast-sandbox/internal/api"
-	fastletruntime "fast-sandbox/internal/fastlet/runtime"
-	"fast-sandbox/internal/runtimecatalog"
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	fastletsandbox "fast-sandbox/internal/fastlet/sandbox"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	runtimecontract "fast-sandbox/internal/runtime/contract"
 
 	"github.com/stretchr/testify/require"
 )
 
 type serverRuntime struct {
 	mu        sync.Mutex
-	sandboxes map[string]*fastletruntime.SandboxMetadata
+	sandboxes map[string]*runtimecontract.Metadata
 	images    []string
 }
 
 func newServerRuntime() *serverRuntime {
-	return &serverRuntime{sandboxes: make(map[string]*fastletruntime.SandboxMetadata), images: []string{"docker.io/library/alpine:latest"}}
+	return &serverRuntime{sandboxes: make(map[string]*runtimecontract.Metadata), images: []string{"docker.io/library/alpine:latest"}}
 }
 
 func (*serverRuntime) Initialize(context.Context, string) error { return nil }
 func (*serverRuntime) SetNamespace(string)                      {}
 func (*serverRuntime) Close() error                             { return nil }
-func (*serverRuntime) ProbeCapabilities(context.Context) fastletruntime.CapabilityReport {
-	return fastletruntime.CapabilityReport{State: runtimecatalog.CapabilityReady, Reason: "TestRuntimeReady"}
+func (*serverRuntime) ProbeCapabilities(context.Context) runtimecontract.CapabilityReport {
+	return runtimecontract.CapabilityReport{State: runtimecatalog.CapabilityReady, Reason: "TestRuntimeReady"}
 }
-func (r *serverRuntime) EnsureSandbox(_ context.Context, spec *api.SandboxSpec) (*fastletruntime.SandboxMetadata, error) {
+func (r *serverRuntime) EnsureSandbox(_ context.Context, spec *fastletapi.SandboxSpec) (*runtimecontract.Metadata, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	metadata := &fastletruntime.SandboxMetadata{SandboxSpec: *spec, Phase: "running"}
+	metadata := &runtimecontract.Metadata{SandboxSpec: *spec, Phase: "running"}
 	r.sandboxes[spec.SandboxID] = metadata
 	copy := *metadata
 	return &copy, nil
 }
-func (r *serverRuntime) InspectSandbox(_ context.Context, id string) (*fastletruntime.SandboxMetadata, error) {
+func (r *serverRuntime) InspectSandbox(_ context.Context, id string) (*runtimecontract.Metadata, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	metadata := r.sandboxes[id]
 	if metadata == nil {
-		return nil, fastletruntime.ErrSandboxNotFound
+		return nil, runtimecontract.ErrSandboxNotFound
 	}
 	copy := *metadata
 	return &copy, nil
@@ -56,10 +57,10 @@ func (r *serverRuntime) DeleteSandbox(_ context.Context, id string) error {
 	r.mu.Unlock()
 	return nil
 }
-func (r *serverRuntime) ListManagedSandboxes(context.Context) ([]*fastletruntime.SandboxMetadata, error) {
+func (r *serverRuntime) ListManagedSandboxes(context.Context) ([]*runtimecontract.Metadata, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	result := make([]*fastletruntime.SandboxMetadata, 0, len(r.sandboxes))
+	result := make([]*runtimecontract.Metadata, 0, len(r.sandboxes))
 	for _, metadata := range r.sandboxes {
 		copy := *metadata
 		result = append(result, &copy)
@@ -78,9 +79,9 @@ func (r *serverRuntime) PullImage(_ context.Context, image string) error {
 	return nil
 }
 
-func newServerManager(t *testing.T, driver fastletruntime.RuntimeDriver, recoverOnStart bool) *fastletruntime.SandboxManager {
+func newServerManager(t *testing.T, driver runtimecontract.Driver, recoverOnStart bool) *fastletsandbox.SandboxManager {
 	t.Helper()
-	manager, err := fastletruntime.NewSandboxManagerWithConfig(driver, fastletruntime.SandboxManagerConfig{
+	manager, err := fastletsandbox.NewSandboxManagerWithConfig(driver, fastletsandbox.SandboxManagerConfig{
 		Capacity: 1, FastletPodUID: "pod-uid-a", RecoverOnStart: recoverOnStart,
 	})
 	require.NoError(t, err)
@@ -102,19 +103,19 @@ func postJSON(t *testing.T, handler http.Handler, path string, request, response
 func TestV2AdmissionProtocolAndHeartbeat(t *testing.T) {
 	manager := newServerManager(t, newServerRuntime(), false)
 	handler := NewFastletServer(":0", manager).Handler()
-	identity := api.SandboxIdentity{RequestID: "request-a", SandboxUID: "sandbox-a", InstanceGeneration: 1, RuntimeInstanceID: "runtime-a", AssignmentAttempt: 1, FastletPodUID: "pod-uid-a"}
+	identity := fastletapi.SandboxIdentity{RequestID: "request-a", SandboxUID: "sandbox-a", InstanceGeneration: 1, RuntimeInstanceID: "runtime-a", AssignmentAttempt: 1, FastletPodUID: "pod-uid-a"}
 
-	var created api.CreateSandboxResponse
-	recorder := postJSON(t, handler, "/api/v2/fastlet/create", api.CreateSandboxRequest{
+	var created fastletapi.CreateSandboxResponse
+	recorder := postJSON(t, handler, "/api/v2/fastlet/create", fastletapi.CreateSandboxRequest{
 		Identity: identity,
-		Sandbox: api.SandboxSpec{
+		Sandbox: fastletapi.SandboxSpec{
 			ClaimUID: "claim-a", ClaimNamespace: "default", ClaimName: "sandbox-a", Image: "alpine:latest",
 		},
 	}, &created)
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.True(t, created.Created)
-	var diagnostics api.SandboxDiagnosticsResponse
-	recorder = postJSON(t, handler, "/api/v2/fastlet/diagnostics/sandbox", api.SandboxDiagnosticsRequest{Identity: identity, Limit: 2}, &diagnostics)
+	var diagnostics fastletapi.SandboxDiagnosticsResponse
+	recorder = postJSON(t, handler, "/api/v2/fastlet/diagnostics/sandbox", fastletapi.SandboxDiagnosticsRequest{Identity: identity, Limit: 2}, &diagnostics)
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.NotNil(t, diagnostics.Sandbox)
 	require.Equal(t, "running", diagnostics.Sandbox.Phase)
@@ -123,19 +124,19 @@ func TestV2AdmissionProtocolAndHeartbeat(t *testing.T) {
 	recorder = httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v2/fastlet/heartbeat", nil))
 	require.Equal(t, http.StatusOK, recorder.Code)
-	var heartbeat api.HeartbeatResponse
+	var heartbeat fastletapi.HeartbeatResponse
 	require.NoError(t, json.NewDecoder(recorder.Body).Decode(&heartbeat))
 	require.Equal(t, 1, heartbeat.Admission.Running)
 	require.True(t, heartbeat.RuntimeReady)
 	require.Equal(t, "pod-uid-a", heartbeat.FastletPodUID)
 
-	var rejected api.CreateSandboxResponse
-	recorder = postJSON(t, handler, "/api/v2/fastlet/create", api.CreateSandboxRequest{
-		Identity: api.SandboxIdentity{RequestID: "request-b", SandboxUID: "sandbox-b", InstanceGeneration: 1, RuntimeInstanceID: "runtime-b", AssignmentAttempt: 1, FastletPodUID: "pod-uid-a"},
-		Sandbox:  api.SandboxSpec{ClaimUID: "claim-b", ClaimNamespace: "default", ClaimName: "sandbox-b", Image: "alpine:latest"},
+	var rejected fastletapi.CreateSandboxResponse
+	recorder = postJSON(t, handler, "/api/v2/fastlet/create", fastletapi.CreateSandboxRequest{
+		Identity: fastletapi.SandboxIdentity{RequestID: "request-b", SandboxUID: "sandbox-b", InstanceGeneration: 1, RuntimeInstanceID: "runtime-b", AssignmentAttempt: 1, FastletPodUID: "pod-uid-a"},
+		Sandbox:  fastletapi.SandboxSpec{ClaimUID: "claim-b", ClaimNamespace: "default", ClaimName: "sandbox-b", Image: "alpine:latest"},
 	}, &rejected)
 	require.Equal(t, http.StatusTooManyRequests, recorder.Code)
-	require.Equal(t, api.ErrorCapacityRejected, rejected.Error.Code)
+	require.Equal(t, fastletapi.ErrorCapacityRejected, rejected.Error.Code)
 }
 
 func TestReadinessIsFalseUntilRecoveryCompletes(t *testing.T) {
@@ -162,17 +163,17 @@ func TestMetricsEndpoint(t *testing.T) {
 func TestSetDrainingRejectsNewCreates(t *testing.T) {
 	manager := newServerManager(t, newServerRuntime(), false)
 	handler := NewFastletServer(":0", manager).Handler()
-	var draining api.SetDrainingResponse
-	recorder := postJSON(t, handler, "/api/v2/fastlet/draining", api.SetDrainingRequest{Draining: true, Reason: "upgrade"}, &draining)
+	var draining fastletapi.SetDrainingResponse
+	recorder := postJSON(t, handler, "/api/v2/fastlet/draining", fastletapi.SetDrainingRequest{Draining: true, Reason: "upgrade"}, &draining)
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.True(t, draining.Draining)
-	var rejected api.CreateSandboxResponse
-	recorder = postJSON(t, handler, "/api/v2/fastlet/create", api.CreateSandboxRequest{
-		Identity: api.SandboxIdentity{RequestID: "request-a", SandboxUID: "sandbox-a", InstanceGeneration: 1, RuntimeInstanceID: "runtime-a", AssignmentAttempt: 1, FastletPodUID: "pod-uid-a"},
-		Sandbox:  api.SandboxSpec{ClaimUID: "claim-a", ClaimNamespace: "default", ClaimName: "sandbox-a", Image: "alpine:latest"},
+	var rejected fastletapi.CreateSandboxResponse
+	recorder = postJSON(t, handler, "/api/v2/fastlet/create", fastletapi.CreateSandboxRequest{
+		Identity: fastletapi.SandboxIdentity{RequestID: "request-a", SandboxUID: "sandbox-a", InstanceGeneration: 1, RuntimeInstanceID: "runtime-a", AssignmentAttempt: 1, FastletPodUID: "pod-uid-a"},
+		Sandbox:  fastletapi.SandboxSpec{ClaimUID: "claim-a", ClaimNamespace: "default", ClaimName: "sandbox-a", Image: "alpine:latest"},
 	}, &rejected)
 	require.Equal(t, http.StatusConflict, recorder.Code)
-	require.Equal(t, api.ErrorDraining, rejected.Error.Code)
+	require.Equal(t, fastletapi.ErrorDraining, rejected.Error.Code)
 }
 
 func TestHeartbeatUsesCacheCursor(t *testing.T) {
@@ -181,7 +182,7 @@ func TestHeartbeatUsesCacheCursor(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v2/fastlet/heartbeat", nil))
 	require.Equal(t, http.StatusOK, recorder.Code)
-	var first api.HeartbeatResponse
+	var first fastletapi.HeartbeatResponse
 	require.NoError(t, json.NewDecoder(recorder.Body).Decode(&first))
 	require.True(t, first.Cache.Full)
 	require.Equal(t, []string{"alpine:latest"}, first.Cache.Images)
@@ -190,7 +191,7 @@ func TestHeartbeatUsesCacheCursor(t *testing.T) {
 	path := "/api/v2/fastlet/heartbeat?cacheEpoch=" + first.Cache.Epoch + "&cacheRevision=1"
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
 	require.Equal(t, http.StatusOK, recorder.Code)
-	var unchanged api.HeartbeatResponse
+	var unchanged fastletapi.HeartbeatResponse
 	require.NoError(t, json.NewDecoder(recorder.Body).Decode(&unchanged))
 	require.False(t, unchanged.Cache.Full)
 	require.Empty(t, unchanged.Cache.Images)

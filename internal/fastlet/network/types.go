@@ -3,10 +3,9 @@ package network
 import (
 	"context"
 	"errors"
-	"fmt"
-	"net"
-	"strconv"
 	"time"
+
+	dataplane "fast-sandbox/internal/dataplane/contract"
 )
 
 var (
@@ -24,11 +23,11 @@ const (
 	SlotPhaseDestroying SlotPhase = "Destroying"
 )
 
-type AccessKind string
+type AccessKind = dataplane.AccessKind
 
 const (
-	AccessKindDirectIP     AccessKind = "DirectIP"
-	AccessKindLocalForward AccessKind = "LocalForward"
+	AccessKindDirectIP     = dataplane.AccessKindDirectIP
+	AccessKindLocalForward = dataplane.AccessKindLocalForward
 )
 
 // Owner fences a network binding with the same identity used by Fastlet
@@ -49,46 +48,7 @@ func (o Owner) Equal(other Owner) bool {
 		o.AssignmentAttempt == other.AssignmentAttempt
 }
 
-// AccessDescriptor is durable data from which the separate Fastlet Proxy can
-// construct an in-process dial handle. DirectIP stores an IP address and lets
-// the proxy append the requested target port. LocalForward stores a loopback
-// host:port plus a per-Sandbox credential for a runtime tunnel, and sends the
-// requested target port and credential in a connection preamble. It is local
-// Fastlet state and is never written to the Sandbox CRD.
-type AccessDescriptor struct {
-	Kind       AccessKind `json:"kind"`
-	Address    string     `json:"address"`
-	NetNSPath  string     `json:"netnsPath,omitempty"`
-	Credential string     `json:"credential,omitempty"`
-}
-
-func (a AccessDescriptor) Validate() error {
-	switch a.Kind {
-	case AccessKindDirectIP:
-		if net.ParseIP(a.Address) == nil {
-			return errors.New("DirectIP access descriptor requires an IP address")
-		}
-		if a.Credential != "" {
-			return errors.New("DirectIP access descriptor cannot carry a LocalForward credential")
-		}
-	case AccessKindLocalForward:
-		host, port, err := net.SplitHostPort(a.Address)
-		if err != nil {
-			return fmt.Errorf("LocalForward access descriptor requires loopback host:port: %w", err)
-		}
-		ip := net.ParseIP(host)
-		parsedPort, portErr := strconv.ParseUint(port, 10, 16)
-		if ip == nil || !ip.IsLoopback() || portErr != nil || parsedPort == 0 {
-			return errors.New("LocalForward access descriptor requires loopback host:port")
-		}
-		if err := ValidateLocalForwardCredential(a.Credential); err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("unsupported access kind %q", a.Kind)
-	}
-	return nil
-}
+type AccessDescriptor = dataplane.AccessDescriptor
 
 // Slot is the durable description of one prepared Linux network namespace.
 // HostNetNSPath is consumed by host containerd; NetNSPath is the path visible

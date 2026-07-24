@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	dataplane "fast-sandbox/internal/dataplane/contract"
 	"fmt"
 	"io"
 	"net"
@@ -19,12 +20,11 @@ import (
 	"sync"
 	"time"
 
-	"fast-sandbox/internal/api"
-	"fast-sandbox/internal/boxlitesidecar"
-	"fast-sandbox/internal/boxlitestate"
-	"fast-sandbox/internal/boxlitewire"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
-	fastletnetwork "fast-sandbox/internal/fastlet/network"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	boxliteprotocol "fast-sandbox/internal/runtime/boxlite/protocol"
+	boxliteserver "fast-sandbox/internal/runtime/boxlite/server"
+	boxlitestate "fast-sandbox/internal/runtime/boxlite/state"
 
 	boxlite "github.com/boxlite-ai/boxlite/sdks/go"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -44,7 +44,7 @@ type nativeBackend struct {
 	tunnels      map[string]*boxlite.Execution
 }
 
-func newBackend(stateRoot string) (boxlitesidecar.Backend, error) {
+func newBackend(stateRoot string) (boxliteserver.Backend, error) {
 	podUID := strings.TrimSpace(os.Getenv("POD_UID"))
 	if podUID == "" {
 		return nil, errors.New("POD_UID is required")
@@ -153,45 +153,45 @@ func optionalBoolEnv(name string) (bool, error) {
 	return parsed, nil
 }
 
-func (b *nativeBackend) Capabilities(context.Context) boxlitewire.Capabilities {
+func (b *nativeBackend) Capabilities(context.Context) boxliteprotocol.Capabilities {
 	capabilities := map[string]bool{
-		boxlitewire.CapabilityOwnerFence:     true,
-		boxlitewire.CapabilityArtifactVolume: true,
-		boxlitewire.CapabilityLocalForward:   true,
-		boxlitewire.CapabilityResourceLimit:  false,
-		boxlitewire.CapabilityRecovery:       true,
-		boxlitewire.CapabilityImageCache:     true,
+		boxliteprotocol.CapabilityOwnerFence:     true,
+		boxliteprotocol.CapabilityArtifactVolume: true,
+		boxliteprotocol.CapabilityLocalForward:   true,
+		boxliteprotocol.CapabilityResourceLimit:  false,
+		boxliteprotocol.CapabilityRecovery:       true,
+		boxliteprotocol.CapabilityImageCache:     true,
 	}
-	return boxlitewire.Capabilities{
-		ProtocolVersion: boxlitewire.ProtocolVersionV1, Ready: false,
+	return boxliteprotocol.Capabilities{
+		ProtocolVersion: boxliteprotocol.ProtocolVersionV1, Ready: false,
 		Reason:       "BoxLiteResourceEnforcementIncomplete",
 		Message:      "native BoxLite lifecycle and authenticated LocalForward are available, but resource enforcement is incomplete",
 		Capabilities: capabilities,
 	}
 }
 
-func (b *nativeBackend) Ensure(ctx context.Context, request boxlitewire.EnsureRequest) (boxlitewire.Box, error) {
+func (b *nativeBackend) Ensure(ctx context.Context, request boxliteprotocol.EnsureRequest) (boxliteprotocol.Box, error) {
 	if err := validateCreateRequest(request); err != nil {
-		return boxlitewire.Box{}, invalid(err)
+		return boxliteprotocol.Box{}, invalid(err)
 	}
 	hash, err := ensureHash(request)
 	if err != nil {
-		return boxlitewire.Box{}, internal(err)
+		return boxliteprotocol.Box{}, internal(err)
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	record := b.records[request.Sandbox.SandboxID]
 	if record != nil && record.SpecHash != hash {
-		return boxlitewire.Box{}, immutableSpecConflict("Sandbox UID is already bound to a different immutable BoxLite create spec")
+		return boxliteprotocol.Box{}, immutableSpecConflict("Sandbox UID is already bound to a different immutable BoxLite create spec")
 	}
 	if record == nil {
 		hostPort, err := allocateHostPort()
 		if err != nil {
-			return boxlitewire.Box{}, unavailableError(err)
+			return boxliteprotocol.Box{}, unavailableError(err)
 		}
-		tunnelCredential, err := fastletnetwork.GenerateLocalForwardCredential()
+		tunnelCredential, err := dataplane.GenerateLocalForwardCredential()
 		if err != nil {
-			return boxlitewire.Box{}, internal(fmt.Errorf("generate LocalForward credential: %w", err))
+			return boxliteprotocol.Box{}, internal(fmt.Errorf("generate LocalForward credential: %w", err))
 		}
 		record = &nativeRecord{
 			Version: boxlitestate.Version, Namespace: request.Namespace, SpecHash: hash, Request: request,
@@ -199,44 +199,44 @@ func (b *nativeBackend) Ensure(ctx context.Context, request boxlitewire.EnsureRe
 			BundleRoot: b.expectedBundleRoot(request.Sandbox.SandboxID, hash),
 		}
 		if err := b.prepareBundle(record); err != nil {
-			return boxlitewire.Box{}, invalid(err)
+			return boxliteprotocol.Box{}, invalid(err)
 		}
 		if err := b.persistRecord(record); err != nil {
-			return boxlitewire.Box{}, internal(err)
+			return boxliteprotocol.Box{}, internal(err)
 		}
 		b.records[request.Sandbox.SandboxID] = record
 	}
 	box, err := b.ensureBoxLocked(ctx, record)
 	if err != nil {
-		return boxlitewire.Box{}, mapNativeError(err)
+		return boxliteprotocol.Box{}, mapNativeError(err)
 	}
 	return box, nil
 }
 
-func (b *nativeBackend) Inspect(ctx context.Context, sandboxUID string) (boxlitewire.Box, error) {
+func (b *nativeBackend) Inspect(ctx context.Context, sandboxUID string) (boxliteprotocol.Box, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	record := b.records[sandboxUID]
 	if record == nil {
-		return boxlitewire.Box{}, notFound("BoxLite Sandbox metadata was not found")
+		return boxliteprotocol.Box{}, notFound("BoxLite Sandbox metadata was not found")
 	}
 	info, err := b.runtime.GetInfo(ctx, recordIdentity(record))
 	if err != nil {
-		return boxlitewire.Box{}, mapNativeError(err)
+		return boxliteprotocol.Box{}, mapNativeError(err)
 	}
 	return wireBox(record, info), nil
 }
 
-func (b *nativeBackend) Recover(ctx context.Context, sandboxUID string) (boxlitewire.Box, error) {
+func (b *nativeBackend) Recover(ctx context.Context, sandboxUID string) (boxliteprotocol.Box, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	record := b.records[sandboxUID]
 	if record == nil {
-		return boxlitewire.Box{}, notFound("BoxLite Sandbox metadata was not found")
+		return boxliteprotocol.Box{}, notFound("BoxLite Sandbox metadata was not found")
 	}
 	box, err := b.ensureBoxLocked(ctx, record)
 	if err != nil {
-		return boxlitewire.Box{}, mapNativeError(err)
+		return boxliteprotocol.Box{}, mapNativeError(err)
 	}
 	return box, nil
 }
@@ -262,7 +262,7 @@ func (b *nativeBackend) Delete(ctx context.Context, sandboxUID string) error {
 	return nil
 }
 
-func (b *nativeBackend) List(ctx context.Context, namespace string) ([]boxlitewire.Box, error) {
+func (b *nativeBackend) List(ctx context.Context, namespace string) ([]boxliteprotocol.Box, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	infos, err := b.runtime.ListInfo(ctx)
@@ -275,7 +275,7 @@ func (b *nativeBackend) List(ctx context.Context, namespace string) ([]boxlitewi
 		byIdentity[info.ID] = info
 		byIdentity[info.Name] = info
 	}
-	boxes := make([]boxlitewire.Box, 0, len(b.records))
+	boxes := make([]boxliteprotocol.Box, 0, len(b.records))
 	for _, record := range b.records {
 		if namespace != "" && record.Namespace != namespace {
 			continue
@@ -334,41 +334,41 @@ func (b *nativeBackend) Close() error {
 	return nil
 }
 
-func (b *nativeBackend) ensureBoxLocked(ctx context.Context, record *nativeRecord) (boxlitewire.Box, error) {
+func (b *nativeBackend) ensureBoxLocked(ctx context.Context, record *nativeRecord) (boxliteprotocol.Box, error) {
 	options, err := boxOptions(record)
 	if err != nil {
-		return boxlitewire.Box{}, err
+		return boxliteprotocol.Box{}, err
 	}
 	box, created, err := b.runtime.GetOrCreate(ctx, record.Request.Sandbox.Image, options...)
 	if err != nil {
-		return boxlitewire.Box{}, err
+		return boxliteprotocol.Box{}, err
 	}
 	defer box.Close()
 	if record.BoxID != box.ID() {
 		record.BoxID = box.ID()
 		if err := b.persistRecord(record); err != nil {
-			return boxlitewire.Box{}, err
+			return boxliteprotocol.Box{}, err
 		}
 	}
 	if err := box.Start(ctx); err != nil {
-		return boxlitewire.Box{}, err
+		return boxliteprotocol.Box{}, err
 	}
 	userProcessStartedAt := time.Time{}
-	userProcessStartSource := api.UserProcessStartExistingRuntime
+	userProcessStartSource := fastletapi.UserProcessStartExistingRuntime
 	if created {
 		if hasArtifact(record.Request.Artifacts, fastletinfra.SandboxInitContainerPath) {
-			userProcessStartSource = api.UserProcessStartSandboxInitUnreported
+			userProcessStartSource = fastletapi.UserProcessStartSandboxInitUnreported
 		} else {
 			userProcessStartedAt = time.Now()
-			userProcessStartSource = api.UserProcessStartRuntimeDirect
+			userProcessStartSource = fastletapi.UserProcessStartRuntimeDirect
 		}
 	}
 	if err := b.ensureTunnelLocked(ctx, record, box); err != nil {
-		return boxlitewire.Box{}, err
+		return boxliteprotocol.Box{}, err
 	}
 	info, err := box.Info(ctx)
 	if err != nil {
-		return boxlitewire.Box{}, err
+		return boxliteprotocol.Box{}, err
 	}
 	result := wireBox(record, info)
 	result.UserProcessStartedAt = userProcessStartedAt
@@ -461,7 +461,7 @@ func (b *nativeBackend) ensureTunnelLocked(ctx context.Context, record *nativeRe
 func waitForTunnel(ctx context.Context, port uint32, credential string) error {
 	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	healthPreamble, err := fastletnetwork.EncodeLocalForwardHealthPreamble(credential)
+	healthPreamble, err := dataplane.EncodeLocalForwardHealthPreamble(credential)
 	if err != nil {
 		return err
 	}
@@ -470,7 +470,7 @@ func waitForTunnel(ctx context.Context, port uint32, credential string) error {
 	for {
 		connection, err := (&net.Dialer{}).DialContext(probeCtx, "tcp", address)
 		if connection != nil {
-			preambleErr := fastletnetwork.WriteLocalForwardPreamble(connection, healthPreamble)
+			preambleErr := dataplane.WriteLocalForwardPreamble(connection, healthPreamble)
 			_ = connection.SetReadDeadline(time.Now().Add(time.Second))
 			buffer := make([]byte, 1)
 			_, readErr := connection.Read(buffer)
@@ -550,12 +550,12 @@ func copyArtifact(source, destination string) error {
 	return errors.Join(copyErr, closeErr)
 }
 
-func wireBox(record *nativeRecord, info *boxlite.BoxInfo) boxlitewire.Box {
-	return boxlitewire.Box{
+func wireBox(record *nativeRecord, info *boxlite.BoxInfo) boxliteprotocol.Box {
+	return boxliteprotocol.Box{
 		Sandbox: record.Request.Sandbox, BoxID: info.ID, PID: info.PID, Phase: string(info.State),
 		CreatedAt: record.CreatedAt,
-		Access: fastletnetwork.AccessDescriptor{
-			Kind: fastletnetwork.AccessKindLocalForward, Address: net.JoinHostPort("127.0.0.1", strconv.Itoa(int(record.HostPort))),
+		Access: dataplane.AccessDescriptor{
+			Kind: dataplane.AccessKindLocalForward, Address: net.JoinHostPort("127.0.0.1", strconv.Itoa(int(record.HostPort))),
 			Credential: record.TunnelCredential,
 		},
 	}
@@ -583,7 +583,7 @@ func (b *nativeBackend) loadRecords() error {
 		if record.Version != boxlitestate.Version || record.SpecHash == "" || record.HostPort == 0 || record.HostPort > 65535 {
 			return fmt.Errorf("invalid BoxLite metadata record %s", entry.Name())
 		}
-		if err := fastletnetwork.ValidateLocalForwardCredential(record.TunnelCredential); err != nil {
+		if err := dataplane.ValidateLocalForwardCredential(record.TunnelCredential); err != nil {
 			return fmt.Errorf("invalid BoxLite tunnel credential for %s: %w", entry.Name(), err)
 		}
 		if err := validateCreateRequest(record.Request); err != nil {
@@ -651,7 +651,7 @@ func (b *nativeBackend) closeTunnelLocked(sandboxUID string) {
 	}
 }
 
-func ensureHash(request boxlitewire.EnsureRequest) (string, error) {
+func ensureHash(request boxliteprotocol.EnsureRequest) (string, error) {
 	payload, err := json.Marshal(request)
 	if err != nil {
 		return "", err
@@ -660,7 +660,7 @@ func ensureHash(request boxlitewire.EnsureRequest) (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
-func validateCreateRequest(request boxlitewire.EnsureRequest) error {
+func validateCreateRequest(request boxliteprotocol.EnsureRequest) error {
 	spec := request.Sandbox
 	if request.Namespace == "" || spec.SandboxID == "" || spec.FastletPodUID == "" || spec.InstanceGeneration <= 0 || spec.RuntimeInstanceID == "" || spec.AssignmentAttempt <= 0 {
 		return errors.New("complete namespace and Sandbox owner fence are required")
@@ -674,7 +674,7 @@ func validateCreateRequest(request boxlitewire.EnsureRequest) error {
 	return nil
 }
 
-func hasArtifact(artifacts []boxlitewire.Artifact, destination string) bool {
+func hasArtifact(artifacts []boxliteprotocol.Artifact, destination string) bool {
 	for _, artifact := range artifacts {
 		if filepath.Clean(artifact.Destination) == destination {
 			return true
@@ -726,20 +726,20 @@ func mapNativeError(err error) error {
 }
 
 func invalid(err error) error {
-	return &boxlitesidecar.Error{Code: boxlitewire.ErrorInvalid, Message: err.Error(), Cause: err}
+	return &boxliteserver.Error{Code: boxliteprotocol.ErrorInvalid, Message: err.Error(), Cause: err}
 }
 func notFound(message string) error {
-	return &boxlitesidecar.Error{Code: boxlitewire.ErrorNotFound, Message: message}
+	return &boxliteserver.Error{Code: boxliteprotocol.ErrorNotFound, Message: message}
 }
 func conflict(message string) error {
-	return &boxlitesidecar.Error{Code: boxlitewire.ErrorConflict, Message: message}
+	return &boxliteserver.Error{Code: boxliteprotocol.ErrorConflict, Message: message}
 }
 func immutableSpecConflict(message string) error {
-	return &boxlitesidecar.Error{Code: boxlitewire.ErrorImmutableSpecConflict, Message: message}
+	return &boxliteserver.Error{Code: boxliteprotocol.ErrorImmutableSpecConflict, Message: message}
 }
 func unavailableError(err error) error {
-	return &boxlitesidecar.Error{Code: boxlitewire.ErrorUnavailable, Message: err.Error(), Cause: err}
+	return &boxliteserver.Error{Code: boxliteprotocol.ErrorUnavailable, Message: err.Error(), Cause: err}
 }
 func internal(err error) error {
-	return &boxlitesidecar.Error{Code: boxlitewire.ErrorInternal, Message: err.Error(), Cause: err}
+	return &boxliteserver.Error{Code: boxliteprotocol.ErrorInternal, Message: err.Error(), Cause: err}
 }

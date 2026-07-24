@@ -10,7 +10,7 @@ import (
 	"strings"
 	"syscall"
 
-	"fast-sandbox/internal/sandboxinit"
+	"fast-sandbox/internal/sandbox/supervisor"
 )
 
 func main() {
@@ -23,7 +23,7 @@ func main() {
 	flag.UintVar(&userGID, "user-gid", 0, "Original OCI user GID.")
 	flag.StringVar(&additionalGIDs, "user-additional-gids", "", "Comma-separated original OCI supplementary groups.")
 	flag.Parse()
-	config, err := sandboxinit.Load(configPath)
+	config, err := supervisor.Load(configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "sandbox-init: load config: %v\n", err)
 		os.Exit(1)
@@ -33,14 +33,14 @@ func main() {
 		fmt.Fprintf(os.Stderr, "sandbox-init: parse user groups: %v\n", err)
 		os.Exit(1)
 	}
-	config.UserCredential = &sandboxinit.UserCredential{UID: uint32(userUID), GID: uint32(userGID), AdditionalGIDs: groups}
+	config.UserCredential = &supervisor.UserCredential{UID: uint32(userUID), GID: uint32(userGID), AdditionalGIDs: groups}
 	userArgs := flag.Args()
 	if len(userArgs) > 0 && userArgs[0] == "--" {
 		userArgs = userArgs[1:]
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	supervisor := sandboxinit.NewSupervisor(os.Stdout, os.Stderr)
+	supervisor := supervisor.NewSupervisor(os.Stdout, os.Stderr)
 	signals := make(chan os.Signal, 4)
 	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)
 	defer signal.Stop(signals)

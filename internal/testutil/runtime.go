@@ -4,12 +4,12 @@ import (
 	"context"
 	"sync"
 
-	"fast-sandbox/internal/api"
-	fastletruntime "fast-sandbox/internal/fastlet/runtime"
-	"fast-sandbox/internal/runtimecatalog"
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
 
-var _ fastletruntime.RuntimeDriver = (*FakeRuntime)(nil)
+var _ runtimecontract.Driver = (*FakeRuntime)(nil)
 
 // FakeRuntime provides deterministic hooks for Fastlet lifecycle tests. It is
 // intentionally kept behind the current Runtime interface and will evolve with
@@ -17,20 +17,20 @@ var _ fastletruntime.RuntimeDriver = (*FakeRuntime)(nil)
 type FakeRuntime struct {
 	mu sync.Mutex
 
-	EnsureFunc func(context.Context, *api.SandboxSpec) (*fastletruntime.SandboxMetadata, error)
+	EnsureFunc func(context.Context, *fastletapi.SandboxSpec) (*runtimecontract.Metadata, error)
 	DeleteFunc func(context.Context, string) error
 	StatusFunc func(context.Context, string) (string, error)
 	ImagesFunc func(context.Context) ([]string, error)
 
 	Namespace   string
-	EnsureCalls []api.SandboxSpec
+	EnsureCalls []fastletapi.SandboxSpec
 	DeleteCalls []string
 }
 
 func (f *FakeRuntime) Initialize(context.Context, string) error { return nil }
 
-func (f *FakeRuntime) ProbeCapabilities(context.Context) fastletruntime.CapabilityReport {
-	return fastletruntime.CapabilityReport{State: runtimecatalog.CapabilityReady}
+func (f *FakeRuntime) ProbeCapabilities(context.Context) runtimecontract.CapabilityReport {
+	return runtimecontract.CapabilityReport{State: runtimecatalog.CapabilityReady}
 }
 
 func (f *FakeRuntime) SetNamespace(namespace string) {
@@ -39,14 +39,14 @@ func (f *FakeRuntime) SetNamespace(namespace string) {
 	f.Namespace = namespace
 }
 
-func (f *FakeRuntime) EnsureSandbox(ctx context.Context, spec *api.SandboxSpec) (*fastletruntime.SandboxMetadata, error) {
+func (f *FakeRuntime) EnsureSandbox(ctx context.Context, spec *fastletapi.SandboxSpec) (*runtimecontract.Metadata, error) {
 	f.mu.Lock()
 	f.EnsureCalls = append(f.EnsureCalls, *spec)
 	f.mu.Unlock()
 	if f.EnsureFunc != nil {
 		return f.EnsureFunc(ctx, spec)
 	}
-	return &fastletruntime.SandboxMetadata{SandboxSpec: *spec, ContainerID: spec.SandboxID, Phase: "running"}, nil
+	return &runtimecontract.Metadata{SandboxSpec: *spec, ContainerID: spec.SandboxID, Phase: "running"}, nil
 }
 
 func (f *FakeRuntime) DeleteSandbox(ctx context.Context, sandboxID string) error {
@@ -75,15 +75,15 @@ func (f *FakeRuntime) GetSandboxStatus(ctx context.Context, sandboxID string) (s
 	return "running", nil
 }
 
-func (f *FakeRuntime) InspectSandbox(ctx context.Context, sandboxID string) (*fastletruntime.SandboxMetadata, error) {
+func (f *FakeRuntime) InspectSandbox(ctx context.Context, sandboxID string) (*runtimecontract.Metadata, error) {
 	status, err := f.GetSandboxStatus(ctx, sandboxID)
 	if err != nil {
 		return nil, err
 	}
-	return &fastletruntime.SandboxMetadata{SandboxSpec: api.SandboxSpec{SandboxID: sandboxID}, Phase: status}, nil
+	return &runtimecontract.Metadata{SandboxSpec: fastletapi.SandboxSpec{SandboxID: sandboxID}, Phase: status}, nil
 }
 
-func (f *FakeRuntime) ListManagedSandboxes(context.Context) ([]*fastletruntime.SandboxMetadata, error) {
+func (f *FakeRuntime) ListManagedSandboxes(context.Context) ([]*runtimecontract.Metadata, error) {
 	return nil, nil
 }
 

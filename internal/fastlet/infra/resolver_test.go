@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"fast-sandbox/internal/infracatalog"
+	infracatalog "fast-sandbox/internal/catalog/infra"
 
 	"github.com/stretchr/testify/require"
 )

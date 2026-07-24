@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"fast-sandbox/internal/boxlitesidecar"
-	"fast-sandbox/internal/boxlitewire"
+	boxliteprotocol "fast-sandbox/internal/runtime/boxlite/protocol"
+	boxliteserver "fast-sandbox/internal/runtime/boxlite/server"
 )
 
 const probeResponseLimit = 1 << 20
@@ -50,7 +50,7 @@ func main() {
 	}
 	defer listener.Close()
 	server := &http.Server{
-		Handler:           &boxlitesidecar.Server{Backend: backend},
+		Handler:           &boxliteserver.Server{Backend: backend},
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       90 * time.Second,
 	}
@@ -96,15 +96,15 @@ func probeCapabilities(ctx context.Context, socketPath string) error {
 		body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
 		return fmt.Errorf("capability endpoint returned %s: %s", response.Status, string(body))
 	}
-	var capabilities boxlitewire.Capabilities
+	var capabilities boxliteprotocol.Capabilities
 	decoder := json.NewDecoder(io.LimitReader(response.Body, probeResponseLimit))
 	if err := decoder.Decode(&capabilities); err != nil {
 		return fmt.Errorf("decode capabilities: %w", err)
 	}
-	if capabilities.ProtocolVersion != boxlitewire.ProtocolVersionV1 {
+	if capabilities.ProtocolVersion != boxliteprotocol.ProtocolVersionV1 {
 		return fmt.Errorf("protocol version %q is not supported", capabilities.ProtocolVersion)
 	}
-	for _, capability := range boxlitewire.RequiredCapabilities {
+	for _, capability := range boxliteprotocol.RequiredCapabilities {
 		if !capabilities.Capabilities[capability] {
 			return fmt.Errorf("required capability %q is unavailable", capability)
 		}

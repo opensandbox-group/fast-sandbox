@@ -48,7 +48,8 @@ The profile hash lets Controllers and Fastlets detect incompatible configuration
 
 ## RuntimeDriver
 
-The RuntimeDriver interface contains lifecycle operations:
+The runtime contract is defined in `internal/runtime/contract`. Its `Driver`
+interface contains lifecycle operations:
 
 ```text
 Initialize
@@ -60,7 +61,10 @@ ListManagedSandboxes
 Close
 ```
 
-Optional interfaces add image cache, recovery, resource admission, network injection, Infra injection, access descriptors, and route publication.
+Optional interfaces add image cache, recovery, resource admission, and access
+descriptors. Fastlet assembles network and Infra dependencies around the
+selected concrete driver; route publication belongs to the separate data-plane
+contract.
 
 Exec, file transfer, PTY, and user protocol operations are deliberately absent. They belong to Infra Components and their upstream SDKs.
 
@@ -84,6 +88,10 @@ Kata supports Infra delivery through OCI bind mounts, image/template baking, pre
 ## BoxLite
 
 BoxLite does not use a containerd runtime handler. Fastlet talks to a `boxlite-runtime` sidecar over a versioned Pod-local Unix socket. The sidecar contains native/CGO integration and owns BoxLite state.
+
+The implementation is grouped under `internal/runtime/boxlite`: `protocol`
+owns the versioned DTOs, `driver` is the pure-Go Fastlet adapter, `server`
+serves the Pod-local API, and `state` owns durable recovery records.
 
 BoxLite networking produces a local-forward access descriptor rather than a Fastlet-managed netns. The current profile remains fail closed because the upstream API cannot yet prove the required host-enforced per-Box resource contract.
 

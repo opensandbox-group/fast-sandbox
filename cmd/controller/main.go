@@ -13,17 +13,17 @@ import (
 
 	fastpathv1 "fast-sandbox/api/proto/v1"
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
-	"fast-sandbox/internal/api"
-	"fast-sandbox/internal/controller"
-	"fast-sandbox/internal/controller/controlplane"
-	"fast-sandbox/internal/controller/fastletcontrol"
-	"fast-sandbox/internal/controller/fastletpool"
-	"fast-sandbox/internal/controller/fastpath"
-	"fast-sandbox/internal/controller/sandboxorchestrator"
-	"fast-sandbox/internal/infracatalog"
+	infracatalog "fast-sandbox/internal/catalog/infra"
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/controlplane"
+	"fast-sandbox/internal/controlplane/fastletcontrol"
+	"fast-sandbox/internal/controlplane/fastpath"
+	orchestration "fast-sandbox/internal/controlplane/orchestrator"
+	"fast-sandbox/internal/controlplane/placement"
+	"fast-sandbox/internal/controlplane/reconciler"
+	routeauth "fast-sandbox/internal/dataplane/auth"
 	"fast-sandbox/internal/observability"
-	"fast-sandbox/internal/routeauth"
-	"fast-sandbox/internal/runtimecatalog"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
 
 	"google.golang.org/grpc"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -122,7 +122,7 @@ func main() {
 		Metrics:                       metricsserver.Options{BindAddress: metricsAddress},
 		HealthProbeBindAddress:        probeAddress,
 		LeaderElection:                role.LeaderElection(),
-		LeaderElectionID:              "fast-sandbox-controller.sandbox.fast.io",
+		LeaderElectionID:              "fast-sandbox-reconciler.sandbox.fast.io",
 		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
@@ -144,22 +144,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	registry := fastletpool.NewInMemoryRegistry()
+	registry := placement.NewInMemoryRegistry()
 	catalog := runtimecatalog.Builtin()
 	infraCatalog := infracatalog.Builtin()
-	fastletClient := api.NewFastletClient(fastletPort)
-	orchestrator := &sandboxorchestrator.Orchestrator{
+	fastletClient := fastletapi.NewFastletClient(fastletPort)
+	orchestrator := &orchestration.Orchestrator{
 		Client: durableClient, Registry: registry, FastletClient: fastletClient, Catalog: catalog, InfraCatalog: infraCatalog,
 	}
 
 	if role.RunsControllers() {
-		if err := (&controller.SandboxReconciler{
+		if err := (&reconciler.SandboxReconciler{
 			Client: manager.GetClient(), Scheme: manager.GetScheme(), Orchestrator: orchestrator,
 		}).SetupWithManager(manager); err != nil {
 			klog.ErrorS(err, "Register Sandbox controller")
 			os.Exit(1)
 		}
-		if err := (&controller.SandboxPoolReconciler{
+		if err := (&reconciler.SandboxPoolReconciler{
 			Client: manager.GetClient(), DurableReader: durableClient, Scheme: manager.GetScheme(), Registry: registry, Catalog: catalog, InfraCatalog: infraCatalog,
 			FastletDrainer: fastletClient, DrainTimeout: fastletDrainTimeout,
 			FastletProxyImage: fastletProxyImage, BoxLiteRuntimeImage: boxLiteRuntimeImage, RouteVerifyPublicKey: routeVerifyPublicKey,

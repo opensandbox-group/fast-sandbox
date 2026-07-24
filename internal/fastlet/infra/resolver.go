@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"fast-sandbox/internal/infracatalog"
+	infracatalog "fast-sandbox/internal/catalog/infra"
 )
 
 var ErrArtifactSourceUnsupported = errors.New("Infra artifact source is unsupported")

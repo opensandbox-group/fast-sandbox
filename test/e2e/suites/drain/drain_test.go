@@ -7,7 +7,7 @@ import (
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
-	"fast-sandbox/internal/controller/fastletpool"
+	"fast-sandbox/internal/controlplane/placement"
 	"fast-sandbox/test/e2e/support/fixtures"
 	"fast-sandbox/test/e2e/support/suiteenv"
 
@@ -70,7 +70,7 @@ func TestPoolScaleDownUsesDurableDrain(t *testing.T) {
 				var pods corev1.PodList
 				requireNoError(t, k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{"fast-sandbox.io/pool": pool.Name}), "list Fastlets")
 				for index := range pods.Items {
-					if fastletpool.PodDrainRequested(&pods.Items[index]) {
+					if placement.PodDrainRequested(&pods.Items[index]) {
 						drainingPod = pods.Items[index]
 						break
 					}
@@ -86,13 +86,13 @@ func TestPoolScaleDownUsesDurableDrain(t *testing.T) {
 			if drainingPod.Name == "" {
 				t.Fatal("no Fastlet received the durable drain annotation")
 			}
-			if drainingPod.Annotations[fastletpool.AnnotationDrainStartedAt] == "" || drainingPod.Annotations[fastletpool.AnnotationDrainAckedAt] == "" {
+			if drainingPod.Annotations[placement.AnnotationDrainStartedAt] == "" || drainingPod.Annotations[placement.AnnotationDrainAckedAt] == "" {
 				t.Fatalf("drain intent was not durably started and acknowledged: %#v", drainingPod.Annotations)
 			}
 			restartControllerLeader(ctx, t, k8sClient)
 			var persisted corev1.Pod
 			requireNoError(t, k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: drainingPod.Name}, &persisted), "get draining Pod after leader change")
-			if persisted.UID != drainingPod.UID || !fastletpool.PodDrainRequested(&persisted) {
+			if persisted.UID != drainingPod.UID || !placement.PodDrainRequested(&persisted) {
 				t.Fatalf("leader change lost durable drain state: before=%s/%s after=%s/%s", drainingPod.Name, drainingPod.UID, persisted.Name, persisted.UID)
 			}
 
@@ -134,7 +134,7 @@ func TestPoolPlannedUpgradeUsesReadySurgeAndDurableDrain(t *testing.T) {
 				t.Fatalf("initial Fastlet count=%d, want 1", len(initialPods.Items))
 			}
 			oldPod := initialPods.Items[0]
-			oldHash := oldPod.Annotations[fastletpool.AnnotationPodTemplateHash]
+			oldHash := oldPod.Annotations[placement.AnnotationPodTemplateHash]
 			if oldHash == "" {
 				t.Fatal("initial Fastlet has no desired Pod template hash")
 			}
@@ -166,12 +166,12 @@ func TestPoolPlannedUpgradeUsesReadySurgeAndDurableDrain(t *testing.T) {
 				for index := range pods.Items {
 					pod := pods.Items[index]
 					if pod.UID == oldPod.UID {
-						if fastletpool.PodDrainRequested(&pod) {
+						if placement.PodDrainRequested(&pod) {
 							drainingOld = pod
 						}
 						continue
 					}
-					if pod.Annotations[fastletpool.AnnotationPodTemplateHash] != oldHash && podReady(&pod) {
+					if pod.Annotations[placement.AnnotationPodTemplateHash] != oldHash && podReady(&pod) {
 						replacement = pod
 					}
 				}
@@ -186,7 +186,7 @@ func TestPoolPlannedUpgradeUsesReadySurgeAndDurableDrain(t *testing.T) {
 			if drainingOld.Name == "" {
 				t.Fatal("outdated loaded Fastlet was not durably drained after replacement became Ready")
 			}
-			if drainingOld.Annotations[fastletpool.AnnotationDrainReason] != fastletpool.DrainReasonPlannedUpgrade || drainingOld.Annotations[fastletpool.AnnotationDrainAckedAt] == "" {
+			if drainingOld.Annotations[placement.AnnotationDrainReason] != placement.DrainReasonPlannedUpgrade || drainingOld.Annotations[placement.AnnotationDrainAckedAt] == "" {
 				t.Fatalf("planned upgrade drain metadata is incomplete: %#v", drainingOld.Annotations)
 			}
 

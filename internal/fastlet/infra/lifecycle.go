@@ -12,8 +12,8 @@ import (
 	"strconv"
 	"time"
 
-	"fast-sandbox/internal/api"
-	"fast-sandbox/internal/infracatalog"
+	infracatalog "fast-sandbox/internal/catalog/infra"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
 
 type initPayload struct {
@@ -32,7 +32,7 @@ const (
 
 // InitializeInstance executes per-instance initialization and local probes.
 // It dials the Sandbox private IP directly and never traverses Sandbox Proxy.
-func (m *Manager) InitializeInstance(ctx context.Context, spec *api.SandboxSpec, privateIP string) (PreparedInstance, error) {
+func (m *Manager) InitializeInstance(ctx context.Context, spec *fastletapi.SandboxSpec, privateIP string) (PreparedInstance, error) {
 	if spec == nil || privateIP == "" {
 		return PreparedInstance{}, errors.New("Sandbox spec and private IP are required for Infra initialization")
 	}
@@ -43,7 +43,7 @@ func (m *Manager) InitializeInstance(ctx context.Context, spec *api.SandboxSpec,
 
 // InitializeInstanceWithDialer supports runtimes such as BoxLite whose guest
 // loopback is reached through a runtime-specific LocalForward transport.
-func (m *Manager) InitializeInstanceWithDialer(ctx context.Context, spec *api.SandboxSpec, dial TargetDialer) (PreparedInstance, error) {
+func (m *Manager) InitializeInstanceWithDialer(ctx context.Context, spec *fastletapi.SandboxSpec, dial TargetDialer) (PreparedInstance, error) {
 	if spec == nil || dial == nil {
 		return PreparedInstance{}, errors.New("Sandbox spec and target dialer are required for Infra initialization")
 	}
@@ -80,13 +80,13 @@ func (m *Manager) InitializeInstanceWithDialer(ctx context.Context, spec *api.Sa
 	return instance, nil
 }
 
-func (m *Manager) initializeService(ctx context.Context, spec *api.SandboxSpec, privateIP string, service ServiceEndpoint, headers map[string]string) error {
+func (m *Manager) initializeService(ctx context.Context, spec *fastletapi.SandboxSpec, privateIP string, service ServiceEndpoint, headers map[string]string) error {
 	return m.initializeServiceWithDialer(ctx, spec, func(ctx context.Context, port uint32) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(privateIP, strconv.Itoa(int(port))))
 	}, service, headers)
 }
 
-func (m *Manager) initializeServiceWithDialer(ctx context.Context, spec *api.SandboxSpec, dial TargetDialer, service ServiceEndpoint, headers map[string]string) error {
+func (m *Manager) initializeServiceWithDialer(ctx context.Context, spec *fastletapi.SandboxSpec, dial TargetDialer, service ServiceEndpoint, headers map[string]string) error {
 	client, transport := serviceHTTPClient(dial, service.Port)
 	defer transport.CloseIdleConnections()
 	address := net.JoinHostPort("sandbox.local", strconv.Itoa(int(service.Port)))

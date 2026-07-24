@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"fast-sandbox/internal/api"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
 
 	"github.com/stretchr/testify/require"
 )
@@ -21,20 +21,20 @@ func TestTrackerUsesEpochRevisionAndUnchangedCursor(t *testing.T) {
 		"import-2026-07-19@sha256:abc", "registry.k8s.io/pause:3.9", "docker.io/fast-sandbox/fastlet:dev",
 	}}
 	tracker := NewTracker(source, "boot-a", 100)
-	first, err := tracker.Snapshot(context.Background(), api.CacheCursor{})
+	first, err := tracker.Snapshot(context.Background(), fastletapi.CacheCursor{})
 	require.NoError(t, err)
 	require.True(t, first.Full)
 	require.True(t, first.Complete)
 	require.Equal(t, uint64(1), first.Revision)
 	require.Equal(t, []string{"alpine:latest"}, first.Images)
 
-	unchanged, err := tracker.Snapshot(context.Background(), api.CacheCursor{Epoch: first.Epoch, Revision: first.Revision})
+	unchanged, err := tracker.Snapshot(context.Background(), fastletapi.CacheCursor{Epoch: first.Epoch, Revision: first.Revision})
 	require.NoError(t, err)
 	require.False(t, unchanged.Full)
 	require.Empty(t, unchanged.Images)
 
 	source.images = append(source.images, "docker.io/library/ubuntu:24.04")
-	changed, err := tracker.Snapshot(context.Background(), api.CacheCursor{Epoch: first.Epoch, Revision: first.Revision})
+	changed, err := tracker.Snapshot(context.Background(), fastletapi.CacheCursor{Epoch: first.Epoch, Revision: first.Revision})
 	require.NoError(t, err)
 	require.True(t, changed.Full)
 	require.Equal(t, uint64(2), changed.Revision)
@@ -43,7 +43,7 @@ func TestTrackerUsesEpochRevisionAndUnchangedCursor(t *testing.T) {
 
 func TestTrackerFailsCacheAffinityClosedWhenInventoryExceedsLimit(t *testing.T) {
 	tracker := NewTracker(&imageSource{images: []string{"a:1", "b:1"}}, "boot-a", 1)
-	snapshot, err := tracker.Snapshot(context.Background(), api.CacheCursor{})
+	snapshot, err := tracker.Snapshot(context.Background(), fastletapi.CacheCursor{})
 	require.NoError(t, err)
 	require.True(t, snapshot.Full)
 	require.False(t, snapshot.Complete)

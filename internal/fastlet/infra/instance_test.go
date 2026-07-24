@@ -8,10 +8,10 @@ import (
 	"testing"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
-	"fast-sandbox/internal/api"
-	"fast-sandbox/internal/infracatalog"
-	"fast-sandbox/internal/runtimecatalog"
-	"fast-sandbox/internal/sandboxinit"
+	infracatalog "fast-sandbox/internal/catalog/infra"
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	"fast-sandbox/internal/sandbox/supervisor"
 
 	"github.com/stretchr/testify/require"
 )
@@ -32,7 +32,7 @@ func TestPrepareAndRecoverInstanceUsesFencedPrivateConfig(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, manager.Prepare(context.Background()))
-	spec := &api.SandboxSpec{
+	spec := &fastletapi.SandboxSpec{
 		SandboxID: "uid-a", InstanceGeneration: 2, AssignmentAttempt: 3,
 		InfraProfile: profile.Name, InfraProfileHash: profile.ProfileHash,
 	}
@@ -45,7 +45,7 @@ func TestPrepareAndRecoverInstanceUsesFencedPrivateConfig(t *testing.T) {
 	require.FileExists(t, instance.ConfigPodPath)
 	configFile, err := os.Open(instance.ConfigPodPath)
 	require.NoError(t, err)
-	var initConfig sandboxinit.Config
+	var initConfig supervisor.Config
 	require.NoError(t, json.NewDecoder(configFile).Decode(&initConfig))
 	require.NoError(t, configFile.Close())
 	require.Len(t, initConfig.Components, 1)

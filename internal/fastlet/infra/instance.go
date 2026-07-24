@@ -13,9 +13,10 @@ import (
 	"strconv"
 	"strings"
 
-	"fast-sandbox/internal/api"
-	"fast-sandbox/internal/infracatalog"
-	"fast-sandbox/internal/sandboxinit"
+	infracatalog "fast-sandbox/internal/catalog/infra"
+	infracontract "fast-sandbox/internal/infra/contract"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	"fast-sandbox/internal/sandbox/supervisor"
 )
 
 const (
@@ -31,14 +32,7 @@ type Mount struct {
 	Options     []string `json:"options"`
 }
 
-type ServiceEndpoint struct {
-	Component string                      `json:"component"`
-	Name      string                      `json:"name"`
-	Port      uint32                      `json:"port"`
-	Readiness infracatalog.ReadinessProbe `json:"readiness"`
-	Required  bool                        `json:"required"`
-	Init      infracatalog.InstanceInit   `json:"init"`
-}
+type ServiceEndpoint = infracontract.ServiceEndpoint
 
 type PreparedInstance struct {
 	SandboxUID      string                `json:"sandboxUid"`
@@ -51,19 +45,13 @@ type PreparedInstance struct {
 	Diagnostics     []ComponentDiagnostic `json:"diagnostics,omitempty"`
 }
 
-type ComponentDiagnostic struct {
-	Component string `json:"component"`
-	Service   string `json:"service"`
-	Required  bool   `json:"required"`
-	State     string `json:"state"`
-	Message   string `json:"message,omitempty"`
-}
+type ComponentDiagnostic = infracontract.ComponentDiagnostic
 
 type persistedInstance struct {
-	Version  int                `json:"version"`
-	Identity instanceIdentity   `json:"identity"`
-	Init     sandboxinit.Config `json:"sandboxInit"`
-	Prepared PreparedInstance   `json:"prepared"`
+	Version  int               `json:"version"`
+	Identity instanceIdentity  `json:"identity"`
+	Init     supervisor.Config `json:"sandboxInit"`
+	Prepared PreparedInstance  `json:"prepared"`
 }
 
 type instanceIdentity struct {
@@ -72,7 +60,7 @@ type instanceIdentity struct {
 	AssignmentAttempt  int64  `json:"assignmentAttempt"`
 }
 
-func (m *Manager) PrepareInstance(ctx context.Context, spec *api.SandboxSpec) (PreparedInstance, error) {
+func (m *Manager) PrepareInstance(ctx context.Context, spec *fastletapi.SandboxSpec) (PreparedInstance, error) {
 	if spec == nil || spec.SandboxID == "" || spec.InstanceGeneration <= 0 || spec.AssignmentAttempt <= 0 {
 		return PreparedInstance{}, errors.New("Sandbox UID, instance generation, and assignment attempt are required for Infra init")
 	}
@@ -101,7 +89,7 @@ func (m *Manager) PrepareInstance(ctx context.Context, spec *api.SandboxSpec) (P
 		return PreparedInstance{}, fmt.Errorf("generate Infra instance token: %w", err)
 	}
 	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
-	initConfig := sandboxinit.Config{Version: sandboxinit.ConfigVersion, SandboxUID: spec.SandboxID}
+	initConfig := supervisor.Config{Version: supervisor.ConfigVersion, SandboxUID: spec.SandboxID}
 	if plan.Supervisor != nil {
 		result.WrapperRequired = true
 		result.Mounts = append(result.Mounts, Mount{
@@ -132,15 +120,15 @@ func (m *Manager) PrepareInstance(ctx context.Context, spec *api.SandboxSpec) (P
 			})
 		}
 		if component.Activation.Mode != infracatalog.ActivationSystemService {
-			readiness := sandboxinit.Readiness{Type: infracatalog.ProbeNone}
+			readiness := supervisor.Readiness{Type: infracatalog.ProbeNone}
 			if len(component.Services) > 0 {
 				service := component.Services[0]
-				readiness = sandboxinit.Readiness{
+				readiness = supervisor.Readiness{
 					Type: service.Readiness.Type, Address: "127.0.0.1:" + strconv.Itoa(int(service.Port)),
 					Path: service.Readiness.Path, Timeout: service.Readiness.Timeout, Interval: service.Readiness.Interval,
 				}
 			}
-			initConfig.Components = append(initConfig.Components, sandboxinit.Component{
+			initConfig.Components = append(initConfig.Components, supervisor.Component{
 				Name: component.Name, Command: component.Activation.Command, Args: append([]string(nil), component.Activation.Args...),
 				Env:             componentEnv,
 				StartBeforeUser: component.Activation.StartBeforeUser, RestartPolicy: component.Activation.RestartPolicy, Readiness: readiness,
@@ -177,7 +165,7 @@ func (m *Manager) PrepareInstance(ctx context.Context, spec *api.SandboxSpec) (P
 	return result, nil
 }
 
-func (m *Manager) RecoverInstance(ctx context.Context, spec *api.SandboxSpec) (PreparedInstance, error) {
+func (m *Manager) RecoverInstance(ctx context.Context, spec *fastletapi.SandboxSpec) (PreparedInstance, error) {
 	if spec == nil {
 		return PreparedInstance{}, errors.New("Sandbox spec is required")
 	}
@@ -202,7 +190,7 @@ func (m *Manager) RecoverInstance(ctx context.Context, spec *api.SandboxSpec) (P
 	return persisted.Prepared, nil
 }
 
-func (m *Manager) RemoveInstance(spec *api.SandboxSpec) error {
+func (m *Manager) RemoveInstance(spec *fastletapi.SandboxSpec) error {
 	if spec == nil {
 		return nil
 	}

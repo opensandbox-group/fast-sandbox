@@ -12,8 +12,8 @@ import (
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
-	"fast-sandbox/internal/api"
 	"fast-sandbox/internal/fastlet/cache"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	e2eenv "fast-sandbox/test/e2e/env"
 	"fast-sandbox/test/e2e/support/fixtures"
 	"fast-sandbox/test/e2e/support/suiteenv"
@@ -122,7 +122,7 @@ func warmImagePrepared(ctx context.Context, baseURL, target string) (bool, error
 	if heartbeatResponse.StatusCode != http.StatusOK {
 		return false, fmt.Errorf("heartbeat status=%d", heartbeatResponse.StatusCode)
 	}
-	var heartbeat api.HeartbeatResponse
+	var heartbeat fastletapi.HeartbeatResponse
 	if err := json.NewDecoder(heartbeatResponse.Body).Decode(&heartbeat); err != nil {
 		return false, err
 	}

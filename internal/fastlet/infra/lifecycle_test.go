@@ -16,9 +16,9 @@ import (
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
-	"fast-sandbox/internal/api"
-	"fast-sandbox/internal/infracatalog"
-	"fast-sandbox/internal/runtimecatalog"
+	infracatalog "fast-sandbox/internal/catalog/infra"
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
 
 	"github.com/stretchr/testify/require"
 )
@@ -108,7 +108,7 @@ func TestOptionalServiceFailureIsReturnedAsDiagnostic(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NoError(t, manager.Prepare(context.Background()))
-	spec := &api.SandboxSpec{
+	spec := &fastletapi.SandboxSpec{
 		SandboxID: "uid-optional", InstanceGeneration: 1, AssignmentAttempt: 1,
 		InfraProfile: profile.Name, InfraProfileHash: resolvedProfile.ProfileHash,
 	}
@@ -139,7 +139,7 @@ func TestInitializeServiceUsesInternalCredentialForReadiness(t *testing.T) {
 	require.NoError(t, err)
 
 	manager := &Manager{}
-	require.NoError(t, manager.initializeService(context.Background(), &api.SandboxSpec{SandboxID: "uid-a"}, host, ServiceEndpoint{
+	require.NoError(t, manager.initializeService(context.Background(), &fastletapi.SandboxSpec{SandboxID: "uid-a"}, host, ServiceEndpoint{
 		Component: "component", Name: "service", Port: uint32(port), Required: true,
 		Readiness: infracatalog.ReadinessProbe{Type: infracatalog.ProbeHTTP, Path: "/", Timeout: time.Second},
 	}, map[string]string{"X-Fast-Sandbox-Infra-Token": token}))

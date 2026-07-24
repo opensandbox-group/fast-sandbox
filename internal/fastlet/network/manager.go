@@ -327,7 +327,7 @@ func (m *Manager) prepareOne(ctx context.Context) error {
 	slot := &Slot{
 		Version: currentSlotVersion, ID: id,
 		OwnerPodUID: m.config.PodUID, OwnerPodName: m.config.PodName, OwnerNamespace: m.config.PodNamespace,
-		Phase: SlotPhaseClean,
+		Phase:     SlotPhaseClean,
 		NetNSName: netnsName, NetNSPath: filepath.Join(m.config.NetNSRoot, netnsName),
 		HostNetNSPath: filepath.Join(m.config.HostNetNSRoot, netnsName),
 		HostVeth:      hostVeth, PeerVeth: peerVeth, Bridge: m.config.Bridge,

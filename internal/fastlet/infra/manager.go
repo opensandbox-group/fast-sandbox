@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"sync"
 
-	"fast-sandbox/internal/infracatalog"
-	"fast-sandbox/internal/runtimecatalog"
+	infracatalog "fast-sandbox/internal/catalog/infra"
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 )
 
 type PreparedComponent struct {

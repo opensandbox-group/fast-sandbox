@@ -9,8 +9,8 @@ import (
 	"testing"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
-	"fast-sandbox/internal/infracatalog"
-	"fast-sandbox/internal/runtimecatalog"
+	infracatalog "fast-sandbox/internal/catalog/infra"
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 
 	"github.com/stretchr/testify/require"
 )

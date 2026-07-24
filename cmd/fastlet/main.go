@@ -10,14 +10,16 @@ import (
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
+	infracatalog "fast-sandbox/internal/catalog/infra"
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/dataplane/fastletproxy"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
-	"fast-sandbox/internal/fastlet/runtime"
+	fastletsandbox "fast-sandbox/internal/fastlet/sandbox"
 	"fast-sandbox/internal/fastlet/server"
-	"fast-sandbox/internal/fastletproxy"
-	"fast-sandbox/internal/infracatalog"
 	"fast-sandbox/internal/observability"
-	"fast-sandbox/internal/runtimecatalog"
+	runtimecontract "fast-sandbox/internal/runtime/contract"
+	runtimefactory "fast-sandbox/internal/runtime/factory"
 
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
@@ -48,7 +50,7 @@ func main() {
 	}
 	injectedRuntimeHash := getEnv("FAST_SANDBOX_RUNTIME_PROFILE_HASH", runtimeProfile.ProfileHash)
 	if injectedRuntimeHash != runtimeProfile.ProfileHash {
-		klog.ErrorS(runtime.ErrSandboxProfileMismatch, "Injected runtime profile hash does not match built-in catalog", "injected", injectedRuntimeHash, "expected", runtimeProfile.ProfileHash)
+		klog.ErrorS(runtimecontract.ErrSandboxProfileMismatch, "Injected runtime profile hash does not match built-in catalog", "injected", injectedRuntimeHash, "expected", runtimeProfile.ProfileHash)
 		os.Exit(1)
 	}
 	resourceProfile, err := resourceProfileFromEnvironment()
@@ -66,9 +68,9 @@ func main() {
 	klog.InfoS("Runtime", "Name", runtimeName, "Socket", runtimeSocket)
 
 	ctx := context.Background()
-	var rt runtime.RuntimeDriver
+	var rt runtimecontract.Driver
 
-	rt, _, err = runtime.NewDriverFactory(runtimecatalog.Builtin(), runtime.NewHostCapabilityProber()).Create(ctx, runtimeProfile.Name, runtimeSocket)
+	rt, _, err = runtimefactory.New(runtimecatalog.Builtin(), runtimefactory.NewHostCapabilityProber()).Create(ctx, runtimeProfile.Name, runtimeSocket)
 
 	if err != nil {
 		klog.ErrorS(err, "Failed to initialize runtime")
@@ -87,9 +89,9 @@ func main() {
 			klog.ErrorS(err, "Failed to initialize Fastlet-owned network")
 			os.Exit(1)
 		}
-		configurable, ok := rt.(runtime.NetworkConfigurable)
+		configurable, ok := rt.(networkConfigurable)
 		if !ok {
-			klog.ErrorS(runtime.ErrUnsupportedRuntime, "Runtime profile requires Linux netns but driver is not network configurable")
+			klog.ErrorS(runtimecontract.ErrUnsupportedRuntime, "Runtime profile requires Linux netns but driver is not network configurable")
 			os.Exit(1)
 		}
 		configurable.SetNetworkManager(networkManager)
@@ -102,9 +104,9 @@ func main() {
 		klog.ErrorS(err, "Failed to configure InfraProfile")
 		os.Exit(1)
 	}
-	infraConfigurable, ok := rt.(runtime.InfraConfigurable)
+	infraConfigurable, ok := rt.(infraConfigurable)
 	if !ok {
-		klog.ErrorS(runtime.ErrUnsupportedRuntime, "Runtime driver cannot accept an InfraProfile augmentation plan")
+		klog.ErrorS(runtimecontract.ErrUnsupportedRuntime, "Runtime driver cannot accept an InfraProfile augmentation plan")
 		os.Exit(1)
 	}
 	infraConfigurable.SetInfraManager(infraManager)
@@ -112,7 +114,7 @@ func main() {
 	klog.InfoS("Runtime initialized successfully", "name", runtimeName)
 
 	proxyControlClient := fastletproxy.NewControlClient(getEnv("FASTLET_PROXY_CONTROL_SOCKET", fastletproxy.DefaultControlSocket))
-	sandboxManager, err := runtime.NewSandboxManagerWithConfig(rt, runtime.SandboxManagerConfig{
+	sandboxManager, err := fastletsandbox.NewSandboxManagerWithConfig(rt, fastletsandbox.SandboxManagerConfig{
 		Capacity: capacityFromEnvironment(), RuntimeName: runtimeProfile.Name, RuntimeProfileHash: runtimeProfile.ProfileHash, ResourceProfile: &resourceProfile,
 		FastletPodUID: podUID, RecoverOnStart: true,
 		WarmImages:     warmImages,
@@ -147,14 +149,22 @@ func newNetworkManager(capacity int, podUID string) (*fastletnetwork.Manager, er
 	config.HostNetNSRoot = getEnv("FAST_SANDBOX_NETWORK_HOST_NETNS_ROOT", config.HostNetNSRoot)
 	mtu, err := strconv.Atoi(getEnv("FAST_SANDBOX_NETWORK_MTU", strconv.Itoa(config.MTU)))
 	if err != nil || mtu <= 0 {
-		return nil, runtime.ErrInvalidConfig
+		return nil, runtimecontract.ErrInvalidConfig
 	}
 	config.MTU = mtu
 	store := fastletnetwork.NewFileStateStore(filepath.Join(config.StateRoot, podUID))
 	return fastletnetwork.NewManager(config, fastletnetwork.NewLinuxNetNSDriver(fastletnetwork.LinuxDriverConfig{}), store)
 }
 
-func recoverUntilReady(ctx context.Context, manager *runtime.SandboxManager, proxyClient *fastletproxy.ControlClient) {
+type networkConfigurable interface {
+	SetNetworkManager(*fastletnetwork.Manager)
+}
+
+type infraConfigurable interface {
+	SetInfraManager(*fastletinfra.Manager)
+}
+
+func recoverUntilReady(ctx context.Context, manager *fastletsandbox.SandboxManager, proxyClient *fastletproxy.ControlClient) {
 	for {
 		if err := manager.Recover(ctx); err == nil {
 			klog.Info("Fastlet runtime recovery completed")
@@ -177,7 +187,7 @@ func recoverUntilReady(ctx context.Context, manager *runtime.SandboxManager, pro
 	}
 }
 
-func prepareInfraUntilReady(ctx context.Context, manager *runtime.SandboxManager) {
+func prepareInfraUntilReady(ctx context.Context, manager *fastletsandbox.SandboxManager) {
 	for ctx.Err() == nil {
 		if err := manager.PrepareInfra(ctx); err == nil {
 			klog.Info("Fastlet InfraProfile preparation completed")
@@ -216,7 +226,7 @@ func newInfraManager(podUID string, runtimeProfile runtimecatalog.RuntimeProfile
 	})
 }
 
-func watchProxyRoutes(ctx context.Context, manager *runtime.SandboxManager, proxyClient *fastletproxy.ControlClient) {
+func watchProxyRoutes(ctx context.Context, manager *fastletsandbox.SandboxManager, proxyClient *fastletproxy.ControlClient) {
 	for ctx.Err() == nil {
 		if err := manager.ReconcileProxyRoutes(ctx); err != nil {
 			klog.ErrorS(err, "Reconcile Fastlet Proxy routes after control reconnect")

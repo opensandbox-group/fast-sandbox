@@ -7,7 +7,7 @@ BoxLite is a strategic RuntimeDriver integration, but the built-in `boxlite` pro
 ```text
 Fast Sandbox control plane
   -> RuntimeProfile(runtime=boxlite)
-  -> Fastlet BoxLiteDriver
+  -> runtime/boxlite/driver
   -> versioned Pod-local Unix socket
   -> boxlite-runtime sidecar
   -> BoxLite native SDK and runtime
@@ -20,8 +20,8 @@ Fastlet stays pure Go. Native libraries, CGO, KVM, gvproxy, and persistent BoxLi
 
 The repository contains:
 
-- a pure-Go BoxLiteDriver client;
-- a versioned sidecar wire protocol;
+- a pure-Go BoxLite runtime driver;
+- a versioned Pod-local runtime protocol;
 - Sandbox and Fastlet identity fencing;
 - artifact-volume Infra delivery;
 - a credential-protected guest tunnel and LocalForward descriptor;

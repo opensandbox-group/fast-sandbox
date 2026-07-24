@@ -95,7 +95,7 @@ func networkResource(slot *fastletnetwork.Slot) ResourceIdentity {
 	return ResourceIdentity{
 		Backend: BackendLinuxNetwork, ResourceID: slot.OwnerPodUID + "/" + slot.ID,
 		FastletPodUID: slot.OwnerPodUID, FastletPodName: slot.OwnerPodName, FastletPodNamespace: slot.OwnerNamespace,
-		SandboxUID:    slot.Owner.SandboxUID, SandboxName: slot.Owner.SandboxName, SandboxNamespace: slot.Owner.SandboxNamespace,
+		SandboxUID: slot.Owner.SandboxUID, SandboxName: slot.Owner.SandboxName, SandboxNamespace: slot.Owner.SandboxNamespace,
 		InstanceGeneration: slot.Owner.InstanceGeneration, AssignmentAttempt: slot.Owner.AssignmentAttempt,
 		CreatedAt: slot.CreatedAt, NetworkSlotID: slot.ID, NetworkStatePodUID: slot.OwnerPodUID,
 	}

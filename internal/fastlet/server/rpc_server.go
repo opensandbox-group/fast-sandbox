@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"fast-sandbox/internal/api"
-	"fast-sandbox/internal/fastlet/runtime"
+	fastletsandbox "fast-sandbox/internal/fastlet/sandbox"
 	"fast-sandbox/internal/observability"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/klog/v2"
@@ -21,11 +21,11 @@ import (
 // FastletServer handles HTTP requests from controller.
 type FastletServer struct {
 	addr           string
-	sandboxManager *runtime.SandboxManager
+	sandboxManager *fastletsandbox.SandboxManager
 }
 
 // NewFastletServer creates a new fastlet HTTP server.
-func NewFastletServer(addr string, sandboxManager *runtime.SandboxManager) *FastletServer {
+func NewFastletServer(addr string, sandboxManager *fastletsandbox.SandboxManager) *FastletServer {
 	return &FastletServer{
 		addr:           addr,
 		sandboxManager: sandboxManager,
@@ -77,7 +77,7 @@ func (s *FastletServer) handleReady(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *FastletServer) handleCreate(w http.ResponseWriter, r *http.Request) {
-	var req api.CreateSandboxRequest
+	var req fastletapi.CreateSandboxRequest
 	if !decodePost(w, r, &req) {
 		return
 	}
@@ -90,7 +90,7 @@ func (s *FastletServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *FastletServer) handleInspect(w http.ResponseWriter, r *http.Request) {
-	var req api.InspectSandboxRequest
+	var req fastletapi.InspectSandboxRequest
 	if !decodePost(w, r, &req) {
 		return
 	}
@@ -100,7 +100,7 @@ func (s *FastletServer) handleInspect(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *FastletServer) handleDeleteV2(w http.ResponseWriter, r *http.Request) {
-	var req api.DeleteSandboxV2Request
+	var req fastletapi.DeleteSandboxV2Request
 	if !decodePost(w, r, &req) {
 		return
 	}
@@ -109,7 +109,7 @@ func (s *FastletServer) handleDeleteV2(w http.ResponseWriter, r *http.Request) {
 	writeResponse(w, response, err)
 }
 
-func withFastletRequestIdentity(ctx context.Context, identity api.SandboxIdentity) context.Context {
+func withFastletRequestIdentity(ctx context.Context, identity fastletapi.SandboxIdentity) context.Context {
 	return observability.WithIdentity(ctx, observability.Identity{
 		RequestID: identity.RequestID, SandboxUID: identity.SandboxUID, FastletPodUID: identity.FastletPodUID,
 		InstanceGeneration: identity.InstanceGeneration, AssignmentAttempt: identity.AssignmentAttempt, RouteGeneration: identity.RouteGeneration,
@@ -117,12 +117,12 @@ func withFastletRequestIdentity(ctx context.Context, identity api.SandboxIdentit
 }
 
 func (s *FastletServer) handleSetDraining(w http.ResponseWriter, r *http.Request) {
-	var req api.SetDrainingRequest
+	var req fastletapi.SetDrainingRequest
 	if !decodePost(w, r, &req) {
 		return
 	}
 	s.sandboxManager.SetDraining(req.Draining, req.Reason)
-	writeResponse(w, &api.SetDrainingResponse{Draining: req.Draining}, nil)
+	writeResponse(w, &fastletapi.SetDrainingResponse{Draining: req.Draining}, nil)
 }
 
 func (s *FastletServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -130,7 +130,7 @@ func (s *FastletServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	cursor := api.CacheCursor{
+	cursor := fastletapi.CacheCursor{
 		Epoch: r.URL.Query().Get("cacheEpoch"),
 	}
 	var err error
@@ -160,7 +160,7 @@ func (s *FastletServer) handleRuntimeDiagnostics(w http.ResponseWriter, r *http.
 }
 
 func (s *FastletServer) handleSandboxDiagnostics(w http.ResponseWriter, r *http.Request) {
-	var req api.SandboxDiagnosticsRequest
+	var req fastletapi.SandboxDiagnosticsRequest
 	if !decodePost(w, r, &req) {
 		return
 	}
@@ -192,25 +192,25 @@ func writeResponse(w http.ResponseWriter, response any, err error) {
 }
 
 func statusForFastletError(err error) int {
-	var failure *api.FastletError
+	var failure *fastletapi.FastletError
 	if !errors.As(err, &failure) {
 		return http.StatusInternalServerError
 	}
 	switch failure.Code {
-	case api.ErrorCapacityRejected:
+	case fastletapi.ErrorCapacityRejected:
 		return http.StatusTooManyRequests
-	case api.ErrorInProgress:
+	case fastletapi.ErrorInProgress:
 		return http.StatusAccepted
-	case api.ErrorRuntimeUnavailable, api.ErrorNetworkUnavailable, api.ErrorInfraUnavailable, api.ErrorUnknownOutcome:
+	case fastletapi.ErrorRuntimeUnavailable, fastletapi.ErrorNetworkUnavailable, fastletapi.ErrorInfraUnavailable, fastletapi.ErrorUnknownOutcome:
 		return http.StatusServiceUnavailable
-	case api.ErrorNotFound:
+	case fastletapi.ErrorNotFound:
 		return http.StatusNotFound
 	default:
 		return http.StatusConflict
 	}
 }
 
-func (s *FastletServer) heartbeat(r *http.Request, cursor api.CacheCursor) api.HeartbeatResponse {
+func (s *FastletServer) heartbeat(r *http.Request, cursor fastletapi.CacheCursor) fastletapi.HeartbeatResponse {
 	cacheSnapshot, err := s.sandboxManager.CacheSnapshot(r.Context(), cursor)
 	if err != nil {
 		klog.ErrorS(err, "Warning: failed to refresh cache inventory")
@@ -219,7 +219,7 @@ func (s *FastletServer) heartbeat(r *http.Request, cursor api.CacheCursor) api.H
 	nodeName := os.Getenv("NODE_NAME")
 	admission, recovering, draining := s.sandboxManager.State()
 	infraProfile, infraProfileHash, infraReady, preparedArtifacts, _ := s.sandboxManager.InfraStatus()
-	status := api.FastletStatus{
+	status := fastletapi.FastletStatus{
 		FastletID:           os.Getenv("POD_NAME"), // Use Pod Name as Fastlet ID
 		NodeName:            nodeName,
 		Capacity:            s.sandboxManager.GetCapacity(),
@@ -233,7 +233,7 @@ func (s *FastletServer) heartbeat(r *http.Request, cursor api.CacheCursor) api.H
 		InfraProfile:        infraProfile, InfraProfileHash: infraProfileHash,
 		InfraReady: infraReady, PreparedArtifacts: preparedArtifacts,
 	}
-	return api.HeartbeatResponse{
+	return fastletapi.HeartbeatResponse{
 		FastletStatus: status,
 		Sequence:      s.sandboxManager.NextHeartbeatSequence(), ObservedAt: time.Now().UTC(),
 		Cache: cacheSnapshot, Diagnostics: s.sandboxManager.RuntimeDiagnostics(r.Context()),

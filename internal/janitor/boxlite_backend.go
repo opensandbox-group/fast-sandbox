@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"fast-sandbox/internal/boxlitestate"
+	boxlitestate "fast-sandbox/internal/runtime/boxlite/state"
 
 	"golang.org/x/sys/unix"
 )

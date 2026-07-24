@@ -12,9 +12,10 @@ import (
 	"time"
 
 	apiv1alpha1 "fast-sandbox/api/v1alpha1"
+	routeauth "fast-sandbox/internal/dataplane/auth"
+	"fast-sandbox/internal/dataplane/sandboxproxy"
 	"fast-sandbox/internal/observability"
-	"fast-sandbox/internal/routeauth"
-	"fast-sandbox/internal/sandboxproxy"
+
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"

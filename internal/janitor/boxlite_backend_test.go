@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"fast-sandbox/internal/api"
-	"fast-sandbox/internal/boxlitestate"
-	"fast-sandbox/internal/boxlitewire"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	boxliteprotocol "fast-sandbox/internal/runtime/boxlite/protocol"
+	boxlitestate "fast-sandbox/internal/runtime/boxlite/state"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -94,7 +94,7 @@ func writeBoxLiteState(t *testing.T, root, podUID, sandboxUID string) (string, s
 	record := boxlitestate.SandboxRecord{
 		Version: boxlitestate.Version, Namespace: "default", SpecHash: "spec-hash", HostPort: 21000,
 		CreatedAt: createdAt, BundleRoot: bundleRoot,
-		Request: boxlitewire.EnsureRequest{Namespace: "default", TunnelGuestPort: 19090, Sandbox: api.SandboxSpec{
+		Request: boxliteprotocol.EnsureRequest{Namespace: "default", TunnelGuestPort: 19090, Sandbox: fastletapi.SandboxSpec{
 			SandboxID: sandboxUID, ClaimUID: sandboxUID, ClaimName: "sandbox-a", ClaimNamespace: "default",
 			FastletPodUID: podUID, InstanceGeneration: 2, AssignmentAttempt: 3, RouteGeneration: 4,
 		}},

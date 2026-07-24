@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	"fast-sandbox/internal/api"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
 
 const DefaultMaxInventory = 4096
@@ -36,18 +36,18 @@ func NewTracker(source ImageSource, epoch string, maxInventory int) *Tracker {
 	return &Tracker{source: source, epoch: epoch, maxInventory: maxInventory}
 }
 
-func (t *Tracker) Snapshot(ctx context.Context, cursor api.CacheCursor) (api.CacheSnapshot, error) {
+func (t *Tracker) Snapshot(ctx context.Context, cursor fastletapi.CacheCursor) (fastletapi.CacheSnapshot, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if t.source == nil {
 		cacheSnapshotTotal.WithLabelValues("unavailable").Inc()
-		return api.CacheSnapshot{Epoch: t.epoch, Complete: false}, nil
+		return fastletapi.CacheSnapshot{Epoch: t.epoch, Complete: false}, nil
 	}
 	raw, err := t.source.ListImages(ctx)
 	if err != nil {
 		cacheSnapshotTotal.WithLabelValues("error").Inc()
-		return api.CacheSnapshot{Epoch: t.epoch, Revision: t.revision, Complete: false}, err
+		return fastletapi.CacheSnapshot{Epoch: t.epoch, Revision: t.revision, Complete: false}, err
 	}
 	normalized := NormalizeInventory(raw)
 	complete := len(normalized) <= t.maxInventory
@@ -60,7 +60,7 @@ func (t *Tracker) Snapshot(ctx context.Context, cursor api.CacheCursor) (api.Cac
 		t.initialized = true
 	}
 
-	snapshot := api.CacheSnapshot{Epoch: t.epoch, Revision: t.revision, Complete: complete}
+	snapshot := fastletapi.CacheSnapshot{Epoch: t.epoch, Revision: t.revision, Complete: complete}
 	if cursor.ForceFull || cursor.Epoch != t.epoch || cursor.Revision != t.revision {
 		snapshot.Full = true
 		if complete {
