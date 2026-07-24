@@ -256,6 +256,7 @@ out/
 .classpath
 .settings/
 bin/
+.build/
 
 # NetBeans specific
 nbproject/
@@ -267,6 +268,4 @@ nbdist/
 generated/
 **/generated/**
 
-# Archive directory for old documentation (local only)
-docs/archive/
 .sisyphus

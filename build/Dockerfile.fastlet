@@ -2,12 +2,6 @@ ARG OPENSANDBOX_EXECD_IMAGE=sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/open
 
 FROM ${OPENSANDBOX_EXECD_IMAGE} AS opensandbox-execd
 
-# Build stage
-FROM golang:1.25-alpine AS builder
-WORKDIR /workspace
-COPY bin/fastlet .
-
-# Final stage
 # Keep the Go toolchain in the development image for the existing debugging
 # workflow, while using Alpine's small network tooling layer.
 FROM golang:1.25-alpine
@@ -17,9 +11,9 @@ FROM golang:1.25-alpine
 
 WORKDIR /workspace
 RUN apk add --no-cache iproute2 iptables
-COPY --from=builder /workspace/fastlet .
-COPY bin/sandbox-init /opt/fast-sandbox/bin/sandbox-init
-COPY bin/sandbox-tunnel /opt/fast-sandbox/bin/sandbox-tunnel
+COPY .build/linux-amd64/fastlet .
+COPY .build/linux-amd64/sandbox-init /opt/fast-sandbox/bin/sandbox-init
+COPY .build/linux-amd64/sandbox-tunnel /opt/fast-sandbox/bin/sandbox-tunnel
 COPY --from=opensandbox-execd /execd /opt/fast-sandbox/components/opensandbox-execd
 
 # Default envs; can be overridden by Pod spec

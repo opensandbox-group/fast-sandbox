@@ -1,13 +1,6 @@
-# Build stage
-FROM golang:1.25-alpine AS builder
-WORKDIR /workspace
-COPY bin/controller .
-
-# Final stage
 FROM alpine:3.19
 WORKDIR /workspace
-COPY --from=builder /workspace/controller .
+COPY .build/linux-amd64/controller .
 
 EXPOSE 9090 8080
 ENTRYPOINT ["./controller"]
-

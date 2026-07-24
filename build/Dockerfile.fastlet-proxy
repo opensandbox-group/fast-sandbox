@@ -1,5 +1,5 @@
 FROM alpine:3.22
 WORKDIR /workspace
-COPY bin/fastlet-proxy .
+COPY .build/linux-amd64/fastlet-proxy .
 EXPOSE 5780
 ENTRYPOINT ["./fastlet-proxy"]

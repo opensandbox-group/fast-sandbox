@@ -1,5 +1,5 @@
 FROM alpine:3.22
 WORKDIR /workspace
-COPY bin/sandbox-proxy .
+COPY .build/linux-amd64/sandbox-proxy .
 EXPOSE 8080
 ENTRYPOINT ["./sandbox-proxy"]

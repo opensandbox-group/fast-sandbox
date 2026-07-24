@@ -1,4 +1,5 @@
-# Default registry and images
+.DEFAULT_GOAL := help
+
 REGISTRY ?= fast-sandbox
 FASTLET_IMAGE ?= $(REGISTRY)/fastlet:dev
 FASTLET_PROXY_IMAGE ?= $(REGISTRY)/fastlet-proxy:dev
@@ -7,23 +8,37 @@ CONTROLLER_IMAGE ?= $(REGISTRY)/controller:dev
 JANITOR_IMAGE ?= $(REGISTRY)/janitor:dev
 BOXLITE_RUNTIME_IMAGE ?= $(REGISTRY)/boxlite-runtime:dev
 
-# Kind cluster name
-KIND_CLUSTER_NAME ?= fast-sandbox
-
-# E2E test settings
-E2E_PROFILE ?= basic
-E2E_TEST_TIMEOUT ?= 30m
-KIND_PROFILE ?= basic
-UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./test/e2e/env/... ./test/e2e/support/... ./test/performance/...
-
-# Go settings
 GO ?= go
 PYTHON ?= python3
-GOFLAGS ?= -gcflags="all=-N -l"
+GOPROXY ?= $(shell $(GO) env GOPROXY)
 DOCKER_BUILD_FLAGS ?=
+DEBUG ?= 0
+COMPONENT ?= all
+SCOPE ?= unit
+SUITE ?= all
+RUNTIME ?= container
+INFRA ?= execd
+PROFILE ?= basic
+E2E_TEST_TIMEOUT ?= 30m
 
-# Pinned code-generation tools. They are installed under the repository-local
-# .tools directory so generation does not depend on developer machine state.
+BIN_DIR := $(CURDIR)/bin
+LINUX_BIN_DIR := $(CURDIR)/.build/linux-amd64
+ALL_BINARIES := controller fastlet sandbox-init sandbox-tunnel fastlet-proxy sandbox-proxy janitor fastctl boxlite-runtime
+CORE_IMAGES := controller fastlet fastlet-proxy sandbox-proxy janitor
+ALL_IMAGES := $(CORE_IMAGES) boxlite-runtime
+UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./test/e2e/env/... ./test/e2e/support/... ./test/performance/...
+
+ifeq ($(DEBUG),1)
+GO_BUILD_FLAGS := -gcflags="all=-N -l"
+else ifeq ($(DEBUG),0)
+GO_BUILD_FLAGS :=
+else
+$(error DEBUG must be 0 or 1)
+endif
+
+# Pinned generators live inside the repository so output does not depend on
+# globally installed Go tools. Protoc installation currently targets the Linux
+# development and CI environment used by this project.
 TOOLS_DIR := $(CURDIR)/.tools
 TOOLS_BIN := $(TOOLS_DIR)/bin
 PROTOC_VERSION := 29.3
@@ -35,151 +50,88 @@ PROTOC_GEN_GO_GRPC_VERSION := v1.6.0
 CONTROLLER_GEN_VERSION := v0.20.1
 CONTROLLER_GEN := $(TOOLS_BIN)/controller-gen
 
-.PHONY: all build build-controller build-fastlet build-sandbox-init build-sandbox-tunnel build-fastlet-proxy build-sandbox-proxy build-janitor build-fastlet-linux build-sandbox-init-linux build-sandbox-tunnel-linux build-fastlet-proxy-linux build-sandbox-proxy-linux build-controller-linux build-janitor-linux build-fastctl build-fastctl-linux tools generate generate-proto generate-python-proto generate-deepcopy manifests verify-generated test test-unit test-python-sdk test-race test-network-integration test-e2e test-e2e-controlplane test-e2e-network test-e2e-proxy test-e2e-infra test-e2e-sdk test-e2e-quickstart test-e2e-runtime test-e2e-runtime-container test-e2e-runtime-gvisor test-e2e-runtime-kata test-e2e-runtime-boxlite test-e2e-drain quickstart quickstart-container quickstart-minimal quickstart-gvisor quickstart-kata-qemu quickstart-kata-clh quickstart-profile quickstart-forward setup-kind verify setup-e2e tidy e2e docker-fastlet docker-fastlet-proxy docker-sandbox-proxy docker-controller docker-janitor docker-boxlite-runtime kind-load-fastlet kind-load-fastlet-proxy kind-load-sandbox-proxy kind-load-controller kind-load-janitor help
-
-all: build
+.PHONY: help build images generate verify test e2e env quickstart quickstart-forward tidy
+.PHONY: _network-test
 
 help:
-	@echo "Common targets:"
-	@echo "  make build                  - build all binaries"
-	@echo "  make build-fastlet-linux    - build fastlet binary for linux/amd64"
-	@echo "  make build-controller-linux - build controller binary for linux/amd64"
-	@echo "  make build-janitor-linux    - build janitor binary for linux/amd64"
-	@echo "  make test                   - run unit tests (alias of test-unit)"
-	@echo "  make test-unit              - run tests that require no live runtime"
-	@echo "  make test-race              - run unit tests with the race detector"
-	@echo "  make test-network-integration - run privileged Linux netns/veth/NAT validation in Docker"
-	@echo "  make test-e2e-proxy         - run the focused Sandbox/Fastlet Proxy data-plane e2e"
-	@echo "  make test-e2e-infra         - run the focused Infra runtime-augmentation e2e"
-	@echo "  make test-e2e-sdk           - run the focused SDK Adapter data-plane e2e"
-	@echo "  make test-e2e-quickstart    - run real Execd CLI quick-start smoke"
-	@echo "  make test-e2e-runtime-*     - run container, gVisor, Kata, or BoxLite capability gates"
-	@echo "  make test-e2e-drain         - run the focused durable Pool Drain e2e"
-	@echo "  make test-python-sdk        - run Python SDK unit tests in the active Python environment"
-	@echo "  make generate               - regenerate protobuf and deepcopy code"
-	@echo "  make manifests              - regenerate CRD manifests"
-	@echo "  make verify-generated       - fail if generated files are stale"
-	@echo "  make verify                 - run generated-file and unit-test gates"
-	@echo "  make docker-fastlet         - build fastlet image"
-	@echo "  make docker-controller      - build controller image"
-	@echo "  make docker-janitor         - build janitor image"
-	@echo "  make docker-boxlite-runtime - build native BoxLite runtime Sidecar image"
+	@echo "Fast Sandbox developer interface"
 	@echo ""
-	@echo "Kind quick starts:"
-	@echo "  make quickstart             - prepare container + real OpenSandbox Execd"
-	@echo "  make quickstart-container   - same as quickstart"
-	@echo "  make quickstart-minimal     - prepare lifecycle-only container environment"
-	@echo "  make quickstart-forward     - expose Fast-Path and Sandbox Proxy until Ctrl-C"
-	@echo "  make quickstart-gvisor      - prepare gVisor + real OpenSandbox Execd"
-	@echo "  make quickstart-kata-qemu   - prepare Kata QEMU + real OpenSandbox Execd"
-	@echo "  make quickstart-kata-clh    - prepare Kata Cloud Hypervisor + real OpenSandbox Execd"
-	@echo "  make setup-kind KIND_PROFILE=<profile> - prepare only the kind control plane"
+	@echo "  make build [COMPONENT=all] [DEBUG=0|1]"
+	@echo "      Build host binaries. COMPONENT may be any cmd/ directory name."
 	@echo ""
-	@echo "E2E targets:"
-	@echo "  make setup-e2e              - prepare one e2e profile, default E2E_PROFILE=basic"
-	@echo "  make test-e2e               - run all e2e suites; tests prepare their own profiles"
-	@echo "  make test-e2e-<suite>       - run a specific suite"
+	@echo "  make images [COMPONENT=all|core|<image>]"
+	@echo "      Build Linux binaries and development container images."
 	@echo ""
-	@echo "E2E settings:"
-	@echo "  E2E_PROFILE=basic|gvisor|kata-qemu|kata-clh|kata-fc"
-	@echo "  E2E_TEST_TIMEOUT=30m"
+	@echo "  make generate"
+	@echo "      Regenerate Go/Python protobuf, deepcopy, and CRD output."
 	@echo ""
-	@echo "E2E test suites:"
-	@echo "  basicvalidation, lifecycle, scheduling, cleanupjanitor"
-	@echo "  advancedfeatures, cliintegration, faultrecovery, secureruntime"
+	@echo "  make verify"
+	@echo "      Verify generated output and run unit tests."
 	@echo ""
-	@echo "E2E examples:"
-	@echo "  # Full verification"
-	@echo "  make test-e2e"
+	@echo "  make test [SCOPE=unit|python|race|network]"
+	@echo "      Run one local or Linux integration test scope."
 	@echo ""
-	@echo "  # Prepare one profile explicitly"
-	@echo "  E2E_PROFILE=kata-qemu make setup-e2e"
+	@echo "  make env PROFILE=basic|gvisor|kata-qemu|kata-clh|kata-fc"
+	@echo "      Prepare a reusable kind environment without running tests."
 	@echo ""
-	@echo "  # Quick iteration"
-	@echo "  make test-e2e-basicvalidation"
-	@echo "  make test-e2e-lifecycle"
+	@echo "  make e2e [SUITE=all|controlplane|network|proxy|infra|sdk|quickstart|runtime|drain|<suite>]"
+	@echo "           [RUNTIME=container|gvisor|kata|boxlite]"
+	@echo "      Run E2E tests; each suite prepares the runtime profile it needs."
+	@echo ""
+	@echo "  make quickstart [RUNTIME=container|gvisor|kata-qemu|kata-clh] [INFRA=execd|minimal]"
+	@echo "      Prepare an interactive environment and print copy/paste examples."
+	@echo ""
+	@echo "  make quickstart-forward"
+	@echo "      Forward Fast-Path and Sandbox Proxy until Ctrl-C."
+	@echo ""
+	@echo "  make tidy"
+	@echo "      Run go mod tidy."
 
-build: build-controller build-fastlet build-sandbox-init build-sandbox-tunnel build-fastlet-proxy build-sandbox-proxy build-janitor build-fastctl
+build:
+	@case " $(ALL_BINARIES) " in \
+		*" $(COMPONENT) "*) components="$(COMPONENT)" ;; \
+		*) if [ "$(COMPONENT)" = "all" ]; then components="$(ALL_BINARIES)"; \
+		   else echo "unknown build COMPONENT=$(COMPONENT)" >&2; exit 2; fi ;; \
+	esac; \
+	mkdir -p "$(BIN_DIR)"; \
+	for component in $$components; do \
+		echo "==> build $$component"; \
+		$(GO) build $(GO_BUILD_FLAGS) -o "$(BIN_DIR)/$$component" "./cmd/$$component" || exit $$?; \
+	done
 
-build-controller:
-	$(GO) build $(GOFLAGS) -o bin/controller ./cmd/controller
-
-build-fastlet:
-	$(GO) build $(GOFLAGS) -o bin/fastlet ./cmd/fastlet
-
-build-sandbox-init:
-	$(GO) build $(GOFLAGS) -o bin/sandbox-init ./cmd/sandbox-init
-
-build-sandbox-tunnel:
-	$(GO) build $(GOFLAGS) -o bin/sandbox-tunnel ./cmd/sandbox-tunnel
-
-build-fastlet-proxy:
-	$(GO) build $(GOFLAGS) -o bin/fastlet-proxy ./cmd/fastlet-proxy
-
-build-sandbox-proxy:
-	$(GO) build $(GOFLAGS) -o bin/sandbox-proxy ./cmd/sandbox-proxy
-
-build-janitor:
-	$(GO) build $(GOFLAGS) -o bin/janitor ./cmd/janitor
-
-build-fastctl:
-	$(GO) build $(GOFLAGS) -o bin/fastctl ./cmd/fastctl
-
-# Cross-compile for linux/amd64 (for docker images)
-build-fastlet-linux:
-	@mkdir -p bin
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/fastlet ./cmd/fastlet
-
-build-sandbox-init-linux:
-	@mkdir -p bin
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/sandbox-init ./cmd/sandbox-init
-
-build-sandbox-tunnel-linux:
-	@mkdir -p bin
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/sandbox-tunnel ./cmd/sandbox-tunnel
-
-build-fastlet-proxy-linux:
-	@mkdir -p bin
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/fastlet-proxy ./cmd/fastlet-proxy
-
-build-sandbox-proxy-linux:
-	@mkdir -p bin
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/sandbox-proxy ./cmd/sandbox-proxy
-
-build-controller-linux:
-	@mkdir -p bin
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/controller ./cmd/controller
-
-build-janitor-linux:
-	@mkdir -p bin
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/janitor ./cmd/janitor
-
-build-fastctl-linux:
-	@mkdir -p bin
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/fastctl ./cmd/fastctl
-
-test: test-unit
-
-test-unit:
-	$(GO) test $(GOFLAGS) $(UNIT_PACKAGES)
-
-test-python-sdk:
-	PYTHONPATH=sdk/python:$(PYTHONPATH) $(PYTHON) -m unittest discover -s sdk/python/tests -v
-
-test-race:
-	$(GO) test -race $(UNIT_PACKAGES)
-
-test-network-integration: docker-fastlet
-	CGO_ENABLED=0 $(GO) test -c -o bin/network.test ./internal/fastlet/network
-	docker build $(DOCKER_BUILD_FLAGS) \
-		--build-arg FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		-t fast-sandbox/network-test:dev -f build/Dockerfile.network-test .
-	docker run --rm --privileged \
-		-e FAST_SANDBOX_RUN_PRIVILEGED_NETWORK_TEST=1 \
-		fast-sandbox/network-test:dev \
-		-test.run '^TestLinuxNetNSDriverPrivileged$$' -test.v
-
-tools: $(PROTOC) $(TOOLS_BIN)/protoc-gen-go $(TOOLS_BIN)/protoc-gen-go-grpc $(CONTROLLER_GEN)
+images:
+	@case " $(ALL_IMAGES) " in \
+		*" $(COMPONENT) "*) components="$(COMPONENT)" ;; \
+		*) case "$(COMPONENT)" in \
+			all) components="$(ALL_IMAGES)" ;; \
+			core) components="$(CORE_IMAGES)" ;; \
+			*) echo "unknown image COMPONENT=$(COMPONENT)" >&2; exit 2 ;; \
+		   esac ;; \
+	esac; \
+	mkdir -p "$(LINUX_BIN_DIR)"; \
+	for component in $$components; do \
+		case "$$component" in \
+			fastlet) binaries="fastlet sandbox-init sandbox-tunnel" ;; \
+			boxlite-runtime) binaries="" ;; \
+			*) binaries="$$component" ;; \
+		esac; \
+		for binary in $$binaries; do \
+			echo "==> build linux/amd64 $$binary"; \
+			CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GO_BUILD_FLAGS) \
+				-o "$(LINUX_BIN_DIR)/$$binary" "./cmd/$$binary" || exit $$?; \
+		done; \
+		echo "==> image $$component"; \
+		case "$$component" in \
+			controller) docker build $(DOCKER_BUILD_FLAGS) -t "$(CONTROLLER_IMAGE)" -f build/Dockerfile.controller . ;; \
+			fastlet) docker build $(DOCKER_BUILD_FLAGS) -t "$(FASTLET_IMAGE)" -f build/Dockerfile.fastlet . ;; \
+			fastlet-proxy) docker build $(DOCKER_BUILD_FLAGS) -t "$(FASTLET_PROXY_IMAGE)" -f build/Dockerfile.fastlet-proxy . ;; \
+			sandbox-proxy) docker build $(DOCKER_BUILD_FLAGS) -t "$(SANDBOX_PROXY_IMAGE)" -f build/Dockerfile.sandbox-proxy . ;; \
+			janitor) docker build $(DOCKER_BUILD_FLAGS) -t "$(JANITOR_IMAGE)" -f build/Dockerfile.janitor . ;; \
+			boxlite-runtime) docker build $(DOCKER_BUILD_FLAGS) \
+				--build-arg GOPROXY="$(GOPROXY)" \
+				-t "$(BOXLITE_RUNTIME_IMAGE)" -f build/Dockerfile.boxlite-runtime . ;; \
+		esac || exit $$?; \
+	done
 
 $(PROTOC):
 	@mkdir -p $(TOOLS_DIR) $(PROTOC_ROOT)
@@ -190,7 +142,7 @@ $(PROTOC):
 	elif command -v busybox >/dev/null 2>&1; then \
 		busybox unzip -q -o $(TOOLS_DIR)/protoc-$(PROTOC_VERSION)-linux-x86_64.zip -d $(PROTOC_ROOT); \
 	else \
-		python3 -m zipfile -e $(TOOLS_DIR)/protoc-$(PROTOC_VERSION)-linux-x86_64.zip $(PROTOC_ROOT); \
+		$(PYTHON) -m zipfile -e $(TOOLS_DIR)/protoc-$(PROTOC_VERSION)-linux-x86_64.zip $(PROTOC_ROOT); \
 	fi
 
 $(TOOLS_BIN)/protoc-gen-go:
@@ -205,197 +157,134 @@ $(CONTROLLER_GEN):
 	@mkdir -p $(TOOLS_BIN)
 	@GOBIN=$(TOOLS_BIN) $(GO) install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION)
 
-generate: generate-proto generate-deepcopy
-
-generate-python-proto:
-	PYTHON=$(PYTHON) bash sdk/python/generate_proto.sh
-
-generate-proto: tools
-	@PATH=$(TOOLS_BIN):$$PATH $(PROTOC) -I . --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative api/proto/v1/fastpath.proto
-
-generate-deepcopy: tools
+generate: $(PROTOC) $(TOOLS_BIN)/protoc-gen-go $(TOOLS_BIN)/protoc-gen-go-grpc $(CONTROLLER_GEN)
+	@PATH=$(TOOLS_BIN):$$PATH $(PROTOC) -I . \
+		--go_out=. --go_opt=paths=source_relative \
+		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
+		api/proto/v1/fastpath.proto
+	@PYTHON=$(PYTHON) bash sdk/python/generate_proto.sh
 	@$(CONTROLLER_GEN) object paths=./api/v1alpha1/...
-
-manifests: tools
 	@$(CONTROLLER_GEN) crd paths=./api/v1alpha1/... output:crd:artifacts:config=config/crd
 
-verify-generated: generate manifests
-	@git diff --exit-code -- api/proto/v1 api/v1alpha1/zz_generated.deepcopy.go config/crd
+verify: generate
+	@git diff --exit-code -- \
+		api/proto/v1 \
+		api/v1alpha1/zz_generated.deepcopy.go \
+		config/crd \
+		sdk/python/fast_sandbox/proto
+	@$(GO) test $(UNIT_PACKAGES)
 
-verify: verify-generated test-unit
+test:
+	@case "$(SCOPE)" in \
+		unit) $(GO) test $(UNIT_PACKAGES) ;; \
+		python) PYTHONPATH=sdk/python:$${PYTHONPATH:-} $(PYTHON) -m unittest discover -s sdk/python/tests -v ;; \
+		race) $(GO) test -race $(UNIT_PACKAGES) ;; \
+		network) $(MAKE) --no-print-directory _network-test ;; \
+		*) echo "unknown test SCOPE=$(SCOPE); expected unit, python, race, or network" >&2; exit 2 ;; \
+	esac
 
-tidy:
-	$(GO) mod tidy
+_network-test:
+	@$(MAKE) --no-print-directory images COMPONENT=fastlet
+	@mkdir -p "$(LINUX_BIN_DIR)"
+	@CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) test -c \
+		-o "$(LINUX_BIN_DIR)/network.test" ./internal/fastlet/network
+	@docker build $(DOCKER_BUILD_FLAGS) \
+		--build-arg FASTLET_IMAGE=$(FASTLET_IMAGE) \
+		-t fast-sandbox/network-test:dev -f build/Dockerfile.network-test .
+	@docker run --rm --privileged \
+		-e FAST_SANDBOX_RUN_PRIVILEGED_NETWORK_TEST=1 \
+		fast-sandbox/network-test:dev \
+		-test.run '^TestLinuxNetNSDriverPrivileged$$' -test.v
 
-e2e: test-e2e
-
-docker-fastlet: build-fastlet-linux build-sandbox-init-linux build-sandbox-tunnel-linux
-	docker build $(DOCKER_BUILD_FLAGS) -t $(FASTLET_IMAGE) -f build/Dockerfile.fastlet .
-
-docker-fastlet-proxy: build-fastlet-proxy-linux
-	docker build $(DOCKER_BUILD_FLAGS) -t $(FASTLET_PROXY_IMAGE) -f build/Dockerfile.fastlet-proxy .
-
-docker-sandbox-proxy: build-sandbox-proxy-linux
-	docker build $(DOCKER_BUILD_FLAGS) -t $(SANDBOX_PROXY_IMAGE) -f build/Dockerfile.sandbox-proxy .
-
-docker-controller: build-controller-linux
-	docker build -t $(CONTROLLER_IMAGE) -f build/Dockerfile.controller .
-
-docker-janitor: build-janitor-linux
-	docker build -t $(JANITOR_IMAGE) -f build/Dockerfile.janitor .
-
-docker-boxlite-runtime:
-	docker build $(DOCKER_BUILD_FLAGS) -t $(BOXLITE_RUNTIME_IMAGE) -f build/Dockerfile.boxlite-runtime .
-
-kind-load-fastlet: docker-fastlet
-	kind load docker-image $(FASTLET_IMAGE) --name fast-sandbox
-
-kind-load-fastlet-proxy: docker-fastlet-proxy
-	kind load docker-image $(FASTLET_PROXY_IMAGE) --name fast-sandbox
-
-kind-load-sandbox-proxy: docker-sandbox-proxy
-	kind load docker-image $(SANDBOX_PROXY_IMAGE) --name fast-sandbox
-
-kind-load-controller: docker-controller
-	kind load docker-image $(CONTROLLER_IMAGE) --name fast-sandbox
-
-kind-load-janitor: docker-janitor
-	kind load docker-image $(JANITOR_IMAGE) --name fast-sandbox
-
-# E2E test - prepare one environment profile
-setup-e2e:
-	@echo "=== Preparing E2E environment ==="
-	@echo "Profile: $(E2E_PROFILE)"
-	@$(MAKE) setup-kind KIND_PROFILE=$(E2E_PROFILE)
-	@echo ""
-	@echo "=== E2E environment ready ==="
-	@echo "Run tests with: make test-e2e-<suite> or go test ./test/e2e/suites/<suite>"
-
-setup-kind:
+env:
+	@case "$(PROFILE)" in \
+		basic|gvisor|kata-qemu|kata-clh|kata-fc) ;; \
+		*) echo "unknown PROFILE=$(PROFILE)" >&2; exit 2 ;; \
+	esac
 	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) run ./test/e2e/env/cmd/setup -profile $(KIND_PROFILE) -timeout $(E2E_TEST_TIMEOUT)
+		$(GO) run ./test/e2e/env/cmd/setup \
+		-profile "$(PROFILE)" -timeout "$(E2E_TEST_TIMEOUT)"
 
-# E2E test - full test. Each test prepares the profile it needs.
-test-e2e:
-	@echo ""
-	@echo "=== Running all E2E tests ==="
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test -p 1 ./test/e2e/suites/... -v -count=1 -failfast -timeout $(E2E_TEST_TIMEOUT)
-	@echo ""
-	@echo "All E2E tests passed"
+e2e:
+	@case "$(SUITE)" in \
+		all) packages="./test/e2e/suites/..."; flags="-p 1 -failfast" ;; \
+		controlplane) packages="./test/e2e/suites/controlplane/... ./test/e2e/suites/basicvalidation/... ./test/e2e/suites/lifecycle/... ./test/e2e/suites/scheduling/... ./test/e2e/suites/cleanupjanitor/..."; flags="-p 1 -failfast" ;; \
+		network) packages="./test/e2e/suites/basicvalidation/..."; flags="" ;; \
+		proxy) packages="./test/e2e/suites/basicvalidation/..."; flags="-run ^TestSandboxProxyDataPlane$$" ;; \
+		infra) packages="./test/e2e/suites/basicvalidation/..."; flags="-run ^TestInfraRuntimeAugmentation$$" ;; \
+		sdk) packages="./test/e2e/suites/basicvalidation/..."; flags="-run ^TestSDKAdapterDataPlane$$" ;; \
+		quickstart) packages="./test/e2e/suites/cliintegration/..."; flags="-run ^TestQuickStartOpenSandboxExecd$$" ;; \
+		drain) packages="./test/e2e/suites/drain/..."; flags="" ;; \
+		runtime) \
+			packages="./test/e2e/suites/secureruntime/..."; \
+			case "$(RUNTIME)" in \
+				container) flags="-run ^TestRuntimeValidationContainerDefault$$" ;; \
+				gvisor) flags="-run ^TestGVisor" ;; \
+				kata) flags="-p 1 -failfast -run ^TestKata\\(QemuSandbox\\|ClhSandbox\\|FcSandbox\\)$$" ;; \
+				boxlite) flags="-run ^TestRuntimeValidationUnsupportedBoxLite$$" ;; \
+				*) echo "unknown runtime gate RUNTIME=$(RUNTIME)" >&2; exit 2 ;; \
+			esac ;; \
+		*) \
+			if [ -d "test/e2e/suites/$(SUITE)" ]; then \
+				packages="./test/e2e/suites/$(SUITE)/..."; flags=""; \
+			else \
+				echo "unknown E2E SUITE=$(SUITE)" >&2; exit 2; \
+			fi ;; \
+	esac; \
+	FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
+		$(GO) test $$flags $$packages -v -count=1 -timeout "$(E2E_TEST_TIMEOUT)"
 
-test-e2e-controlplane:
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test -p 1 ./test/e2e/suites/controlplane/... ./test/e2e/suites/basicvalidation/... ./test/e2e/suites/lifecycle/... ./test/e2e/suites/scheduling/... ./test/e2e/suites/cleanupjanitor/... -v -count=1 -failfast -timeout $(E2E_TEST_TIMEOUT)
-
-test-e2e-network:
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test -p 1 ./test/e2e/suites/basicvalidation/... -v -count=1 -failfast -timeout $(E2E_TEST_TIMEOUT)
-
-test-e2e-proxy:
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test ./test/e2e/suites/basicvalidation/... -run '^TestSandboxProxyDataPlane$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
-
-test-e2e-infra:
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test ./test/e2e/suites/basicvalidation/... -run '^TestInfraRuntimeAugmentation$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
-
-test-e2e-sdk:
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test ./test/e2e/suites/basicvalidation/... -run '^TestSDKAdapterDataPlane$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
-
-test-e2e-quickstart:
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test ./test/e2e/suites/cliintegration/... -run '^TestQuickStartOpenSandboxExecd$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
-
-test-e2e-runtime:
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test -p 1 ./test/e2e/suites/secureruntime/... -v -count=1 -failfast -timeout $(E2E_TEST_TIMEOUT)
-
-test-e2e-runtime-container:
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test ./test/e2e/suites/secureruntime/... -run '^TestRuntimeValidationContainerDefault$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
-
-test-e2e-runtime-gvisor:
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test ./test/e2e/suites/secureruntime/... -run '^TestGVisor' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
-
-test-e2e-runtime-kata:
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test -p 1 ./test/e2e/suites/secureruntime/... -run '^TestKata(QemuSandbox|ClhSandbox|FcSandbox)$$' -v -count=1 -failfast -timeout $(E2E_TEST_TIMEOUT)
-
-# BoxLite is a first-class capability gate. Until all required resource limits
-# can be enforced, this target proves fail-closed behavior rather than silently
-# skipping or claiming the packaged Sidecar/tunnel is production-ready.
-test-e2e-runtime-boxlite:
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test ./test/e2e/suites/secureruntime/... -run '^TestRuntimeValidationUnsupportedBoxLite$$' -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
-
-quickstart: quickstart-container
-
-quickstart-container:
-	@$(MAKE) quickstart-profile \
-		KIND_PROFILE=basic \
-		QUICKSTART_POOL_FILE=config/samples/pool-container-execd.yaml \
-		QUICKSTART_POOL_NAME=quickstart-execd-pool \
-		QUICKSTART_SANDBOX_NAME=quickstart-execd-sandbox \
-		QUICKSTART_DATA_PLANE=execd
-
-quickstart-minimal:
-	@$(MAKE) quickstart-profile \
-		KIND_PROFILE=basic \
-		QUICKSTART_POOL_FILE=config/samples/pool-container.yaml \
-		QUICKSTART_POOL_NAME=quickstart-pool \
-		QUICKSTART_SANDBOX_NAME=quickstart-minimal-sandbox
-
-quickstart-gvisor:
-	@$(MAKE) quickstart-profile \
-		KIND_PROFILE=gvisor \
-		QUICKSTART_POOL_FILE=config/samples/pool-gvisor.yaml \
-		QUICKSTART_POOL_NAME=gvisor-execd-pool \
-		QUICKSTART_SANDBOX_NAME=quickstart-gvisor-execd-sandbox \
-		QUICKSTART_DATA_PLANE=execd
-
-quickstart-kata-qemu:
-	@$(MAKE) quickstart-profile \
-		KIND_PROFILE=kata-qemu \
-		QUICKSTART_POOL_FILE=config/samples/pool-kata-qemu.yaml \
-		QUICKSTART_POOL_NAME=kata-qemu-execd-pool \
-		QUICKSTART_SANDBOX_NAME=quickstart-kata-qemu-execd-sandbox \
-		QUICKSTART_DATA_PLANE=execd
-
-quickstart-kata-clh:
-	@$(MAKE) quickstart-profile \
-		KIND_PROFILE=kata-clh \
-		QUICKSTART_POOL_FILE=config/samples/pool-kata.yaml \
-		QUICKSTART_POOL_NAME=kata-clh-execd-pool \
-		QUICKSTART_SANDBOX_NAME=quickstart-kata-clh-execd-sandbox \
-		QUICKSTART_DATA_PLANE=execd
-
-quickstart-profile:
-	@$(MAKE) setup-kind KIND_PROFILE=$(KIND_PROFILE)
-	@kubectl apply -f $(QUICKSTART_POOL_FILE)
-	@kubectl wait --for=jsonpath='{.status.readyPods}'=1 \
-		sandboxpool/$(QUICKSTART_POOL_NAME) --timeout=180s
-	@$(MAKE) build-fastctl
-	@echo ""
-	@echo "Quick Start environment is ready."
-	@printf "Context: "
-	@kubectl config current-context
-	@echo "Pool:    $(QUICKSTART_POOL_NAME)"
-	@echo ""
-	@bash test/e2e/hack/quickstart-print.sh \
-		"$(QUICKSTART_POOL_NAME)" "$(QUICKSTART_SANDBOX_NAME)" "$(QUICKSTART_DATA_PLANE)"
+quickstart:
+	@case "$(RUNTIME):$(INFRA)" in \
+		container:execd) \
+			profile=basic; pool_file=config/samples/pool-container-execd.yaml; \
+			pool=quickstart-execd-pool; sandbox=quickstart-execd-sandbox; data_plane=execd ;; \
+		container:minimal) \
+			profile=basic; pool_file=config/samples/pool-container.yaml; \
+			pool=quickstart-pool; sandbox=quickstart-minimal-sandbox; data_plane= ;; \
+		gvisor:execd) \
+			profile=gvisor; pool_file=config/samples/pool-gvisor.yaml; \
+			pool=gvisor-execd-pool; sandbox=quickstart-gvisor-execd-sandbox; data_plane=execd ;; \
+		kata-qemu:execd) \
+			profile=kata-qemu; pool_file=config/samples/pool-kata-qemu.yaml; \
+			pool=kata-qemu-execd-pool; sandbox=quickstart-kata-qemu-execd-sandbox; data_plane=execd ;; \
+		kata-clh:execd) \
+			profile=kata-clh; pool_file=config/samples/pool-kata.yaml; \
+			pool=kata-clh-execd-pool; sandbox=quickstart-kata-clh-execd-sandbox; data_plane=execd ;; \
+		*) echo "unsupported Quick Start RUNTIME=$(RUNTIME) INFRA=$(INFRA)" >&2; exit 2 ;; \
+	esac; \
+	$(MAKE) --no-print-directory env PROFILE=$$profile || exit $$?; \
+	kubectl apply -f "$$pool_file" || exit $$?; \
+	image_id=$$(docker image inspect --format='{{.Id}}' "$(FASTLET_IMAGE)") || exit $$?; \
+	patch=$$(printf '{"spec":{"fastletTemplate":{"metadata":{"annotations":{"fast-sandbox.io/quickstart-image-id":"%s"}}}}}' "$$image_id"); \
+	kubectl patch "sandboxpool/$$pool" --type=merge -p "$$patch" >/dev/null || exit $$?; \
+	echo "Waiting for a ready Fastlet built from $$image_id"; \
+	ready=false; \
+	for i in $$(seq 1 90); do \
+		for pod in $$(kubectl get pods -l "fast-sandbox.io/pool=$$pool" -o name); do \
+			pod_image_id=$$(kubectl get "$$pod" -o jsonpath='{.metadata.annotations.fast-sandbox\.io/quickstart-image-id}'); \
+			pod_ready=$$(kubectl get "$$pod" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'); \
+			if [ "$$pod_image_id" = "$$image_id" ] && [ "$$pod_ready" = "True" ]; then \
+				ready=true; break 2; \
+			fi; \
+		done; \
+		sleep 2; \
+	done; \
+	if [ "$$ready" != true ]; then \
+		echo "timed out waiting for the current Fastlet image in Pool $$pool" >&2; \
+		kubectl get pods -l "fast-sandbox.io/pool=$$pool" -o wide; \
+		exit 1; \
+	fi; \
+	$(MAKE) --no-print-directory build COMPONENT=fastctl || exit $$?; \
+	echo ""; \
+	echo "Quick Start environment is ready."; \
+	printf "Context: "; kubectl config current-context; \
+	echo "Pool:    $$pool"; \
+	echo ""; \
+	bash test/e2e/hack/quickstart-print.sh "$$pool" "$$sandbox" "$$data_plane"
 
 quickstart-forward:
 	@bash test/e2e/hack/quickstart-forward.sh
 
-test-e2e-drain:
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test ./test/e2e/suites/drain/... -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
-
-# E2E test - run specific suite
-test-e2e-basicvalidation test-e2e-lifecycle test-e2e-scheduling test-e2e-cleanupjanitor test-e2e-advancedfeatures test-e2e-cliintegration test-e2e-faultrecovery test-e2e-secureruntime:
-	@echo "=== Running E2E test: $@ ==="
-	@FAST_SANDBOX_FASTLET_IMAGE=$(FASTLET_IMAGE) \
-		$(GO) test ./test/e2e/suites/$(subst test-e2e-,,$@)/... -v -count=1 -timeout $(E2E_TEST_TIMEOUT)
+tidy:
+	@$(GO) mod tidy

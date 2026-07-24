@@ -57,7 +57,7 @@ func TestManagerEnsureBasicCreatesMissingClusterAndDeploys(t *testing.T) {
 
 	assertCommand(t, runner.commands, "kind", "create", "cluster", "--name", "fsb-e2e-basic", "--image", "kindest/node:v1.27.3")
 	assertCommand(t, runner.commands, "kubectl", "config", "use-context", "kind-fsb-e2e-basic")
-	assertCommand(t, runner.commands, "make", "docker-controller", "docker-fastlet", "docker-fastlet-proxy", "docker-sandbox-proxy", "docker-janitor")
+	assertCommand(t, runner.commands, "make", "images", "COMPONENT=core")
 	assertCommand(t, runner.commands, "kind", "load", "docker-image", "fast-sandbox/controller:dev", "--name", "fsb-e2e-basic")
 	assertCommand(t, runner.commands, "kubectl", "apply", "-k", "config/crd")
 	assertCommand(t, runner.commands, "kubectl", "rollout", "restart", "deployment/fast-sandbox-controller")
@@ -116,7 +116,7 @@ func TestManagerEnsureWaitsForKubeSystemBeforeDeploy(t *testing.T) {
 	}
 
 	kubeProxyIndex := commandIndex(runner.commands, "kubectl", "rollout", "status", "ds/kube-proxy", "-n", "kube-system", "--timeout=120s")
-	buildIndex := commandIndex(runner.commands, "make", "docker-controller", "docker-fastlet", "docker-fastlet-proxy", "docker-sandbox-proxy", "docker-janitor")
+	buildIndex := commandIndex(runner.commands, "make", "images", "COMPONENT=core")
 	if kubeProxyIndex == -1 {
 		t.Fatalf("missing kube-proxy rollout wait: %#v", runner.commands)
 	}

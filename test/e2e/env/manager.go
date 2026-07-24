@@ -643,7 +643,7 @@ func (m *Manager) deployFastSandbox(ctx context.Context) error {
 		name string
 		args []string
 	}{
-		{name: "make", args: []string{"docker-controller", "docker-fastlet", "docker-fastlet-proxy", "docker-sandbox-proxy", "docker-janitor"}},
+		{name: "make", args: []string{"images", "COMPONENT=core"}},
 		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/controller:dev", "--name", m.settings.ClusterName}},
 		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/fastlet:dev", "--name", m.settings.ClusterName}},
 		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/fastlet-proxy:dev", "--name", m.settings.ClusterName}},

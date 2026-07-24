@@ -1,12 +1,6 @@
-# Build stage
-FROM golang:1.25-alpine AS builder
-WORKDIR /workspace
-COPY bin/janitor .
-
-# Final stage
 FROM alpine:3.19
 WORKDIR /workspace
 RUN apk add --no-cache iproute2 iptables
-COPY --from=builder /workspace/janitor .
+COPY .build/linux-amd64/janitor .
 
 ENTRYPOINT ["./janitor"]
