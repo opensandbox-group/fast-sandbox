@@ -1,8 +1,10 @@
 package env
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 const minInotifyInstances = 256
@@ -27,6 +30,7 @@ type Manager struct {
 	tempDir  string
 	runner   Runner
 	hostOS   string
+	progress io.Writer
 }
 
 func NewManager(profile Profile, opts ...Option) (*Manager, error) {
@@ -86,6 +90,15 @@ func WithHostOS(hostOS string) Option {
 	}
 }
 
+// WithProgressWriter enables human-readable environment progress. Long-running
+// subprocess output is streamed to the same writer when the active Runner
+// supports streaming.
+func WithProgressWriter(writer io.Writer) Option {
+	return func(manager *Manager) {
+		manager.progress = writer
+	}
+}
+
 func Require(t testing.TB, profile Profile) *Manager {
 	t.Helper()
 
@@ -103,24 +116,27 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	if m.hostOS != "linux" {
 		return fmt.Errorf("e2e profile %q requires a Linux host; run it on the remote development VM or through remote-dev-run", m.profile)
 	}
-	if err := m.preflight(ctx); err != nil {
-		return err
+
+	steps := []struct {
+		label string
+		run   func(context.Context) error
+	}{
+		{label: "Checking host prerequisites", run: m.preflight},
+		{label: fmt.Sprintf("Preparing kind cluster %s", m.settings.ClusterName), run: m.ensureKindCluster},
+		{label: "Waiting for Kubernetes system components", run: m.ensureKubeSystemReady},
+		{label: fmt.Sprintf("Preparing runtime %s", m.settings.Runtime), run: m.ensureRuntime},
+		{label: "Loading the base Sandbox image", run: m.ensureBaseImages},
+		{label: "Building and deploying Fast Sandbox", run: m.deployFastSandbox},
 	}
-	if err := m.ensureKindCluster(ctx); err != nil {
-		return err
+	for index, step := range steps {
+		startedAt := time.Now()
+		m.progressf("[environment %d/%d] %s...\n", index+1, len(steps), step.label)
+		if err := step.run(ctx); err != nil {
+			return err
+		}
+		m.progressf("  done in %s\n", progressDuration(time.Since(startedAt)))
 	}
-	if err := m.ensureKubeSystemReady(ctx); err != nil {
-		return err
-	}
-	if err := m.ensureRuntime(ctx); err != nil {
-		return err
-	}
-	if err := m.ensureBaseImages(ctx); err != nil {
-		return err
-	}
-	if err := m.deployFastSandbox(ctx); err != nil {
-		return err
-	}
+	m.progressf("Environment ready: context=kind-%s\n", m.settings.ClusterName)
 	return nil
 }
 
@@ -177,10 +193,10 @@ func (m *Manager) ensureGVisorHostBinaries(ctx context.Context) error {
 	for _, name := range []string{"runsc", "containerd-shim-runsc-v1"} {
 		binary := filepath.Join(cacheDir, name)
 		checksum := binary + ".sha512"
-		if _, err := m.run(ctx, "wget", "-q", "--show-progress", gvisorReleaseURL()+"/"+name, "-O", binary); err != nil {
+		if _, err := m.runLive(ctx, "wget", "-q", "--show-progress", gvisorReleaseURL()+"/"+name, "-O", binary); err != nil {
 			return err
 		}
-		if _, err := m.run(ctx, "wget", "-q", "--show-progress", gvisorReleaseURL()+"/"+name+".sha512", "-O", checksum); err != nil {
+		if _, err := m.runLive(ctx, "wget", "-q", "--show-progress", gvisorReleaseURL()+"/"+name+".sha512", "-O", checksum); err != nil {
 			return err
 		}
 	}
@@ -250,7 +266,7 @@ func (m *Manager) ensureKindCluster(ctx context.Context) error {
 		if configPath != "" {
 			args = append(args, "--config", configPath)
 		}
-		if _, err := m.run(ctx, "kind", args...); err != nil {
+		if _, err := m.runLive(ctx, "kind", args...); err != nil {
 			return err
 		}
 	}
@@ -261,11 +277,11 @@ func (m *Manager) ensureKindCluster(ctx context.Context) error {
 
 func (m *Manager) ensureBaseImages(ctx context.Context) error {
 	if _, err := m.run(ctx, "docker", "image", "inspect", "alpine:latest"); err != nil {
-		if _, err := m.run(ctx, "docker", "pull", "alpine:latest"); err != nil {
+		if _, err := m.runLive(ctx, "docker", "pull", "alpine:latest"); err != nil {
 			return err
 		}
 	}
-	_, err := m.run(ctx, "kind", "load", "docker-image", "alpine:latest", "--name", m.settings.ClusterName)
+	_, err := m.runLive(ctx, "kind", "load", "docker-image", "alpine:latest", "--name", m.settings.ClusterName)
 	return err
 }
 
@@ -316,7 +332,7 @@ func (m *Manager) ensureKubeSystemReady(ctx context.Context) error {
 		{"rollout", "status", "deployment/coredns", "-n", "kube-system", "--timeout=120s"},
 	}
 	for _, args := range steps {
-		if _, err := m.run(ctx, "kubectl", args...); err != nil {
+		if _, err := m.runLive(ctx, "kubectl", args...); err != nil {
 			return fmt.Errorf("kube-system is not healthy: %w\n%s", err, m.kubeSystemDiagnostics(ctx))
 		}
 	}
@@ -424,7 +440,7 @@ func (m *Manager) ensureKataInstalled(ctx context.Context, node string) error {
 	if _, err := m.run(ctx, "docker", "cp", kataDataFile(), node+":/root/kata.tar.zst"); err != nil {
 		return err
 	}
-	_, err := m.run(ctx, "docker", "exec", node, "bash", "-c", kataInstallScript())
+	_, err := m.runLive(ctx, "docker", "exec", node, "bash", "-c", kataInstallScript())
 	return err
 }
 
@@ -433,7 +449,7 @@ func (m *Manager) ensureKataTarball(ctx context.Context) error {
 		return err
 	}
 	if _, err := m.run(ctx, "sh", "-c", "test -f "+shellQuote(kataCacheFile())); err != nil {
-		if _, err := m.run(ctx, "wget", "-q", "--show-progress", kataURL(), "-O", kataCacheFile()); err != nil {
+		if _, err := m.runLive(ctx, "wget", "-q", "--show-progress", kataURL(), "-O", kataCacheFile()); err != nil {
 			return err
 		}
 	}
@@ -640,34 +656,36 @@ func (m *Manager) kubeSystemDiagnostics(ctx context.Context) string {
 
 func (m *Manager) deployFastSandbox(ctx context.Context) error {
 	steps := []struct {
-		name string
-		args []string
+		label string
+		name  string
+		args  []string
 	}{
-		{name: "make", args: []string{"images", "COMPONENT=core"}},
-		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/controller:dev", "--name", m.settings.ClusterName}},
-		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/fastlet:dev", "--name", m.settings.ClusterName}},
-		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/fastlet-proxy:dev", "--name", m.settings.ClusterName}},
-		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/sandbox-proxy:dev", "--name", m.settings.ClusterName}},
-		{name: "kind", args: []string{"load", "docker-image", "fast-sandbox/janitor:dev", "--name", m.settings.ClusterName}},
-		{name: "kubectl", args: []string{"apply", "-k", "config/crd"}},
-		{name: "kubectl", args: []string{"wait", "--for=condition=Established", "crd/sandboxes.sandbox.fast.io", "--timeout=30s"}},
-		{name: "kubectl", args: []string{"wait", "--for=condition=Established", "crd/sandboxpools.sandbox.fast.io", "--timeout=30s"}},
-		{name: "kubectl", args: []string{"apply", "-f", "config/rbac/base.yaml"}},
-		{name: "kubectl", args: []string{"apply", "-f", "config/dev/route-keys.yaml"}},
-		{name: "kubectl", args: []string{"apply", "-f", "config/manager/controller.yaml"}},
-		{name: "kubectl", args: []string{"rollout", "restart", "deployment/fast-sandbox-controller"}},
-		{name: "kubectl", args: []string{"rollout", "status", "deployment/fast-sandbox-controller", "--timeout=120s"}},
-		{name: "kubectl", args: []string{"rollout", "restart", "deployment/fast-sandbox-fastpath"}},
-		{name: "kubectl", args: []string{"rollout", "status", "deployment/fast-sandbox-fastpath", "--timeout=120s"}},
-		{name: "kubectl", args: []string{"rollout", "restart", "deployment/fast-sandbox-proxy"}},
-		{name: "kubectl", args: []string{"rollout", "status", "deployment/fast-sandbox-proxy", "--timeout=120s"}},
-		{name: "kubectl", args: []string{"apply", "-f", "config/janitor/janitor.yaml"}},
-		{name: "kubectl", args: []string{"rollout", "restart", "ds/fast-sandbox-janitor"}},
-		{name: "kubectl", args: []string{"rollout", "status", "ds/fast-sandbox-janitor", "--timeout=60s"}},
+		{label: "Building core development images", name: "make", args: []string{"images", "COMPONENT=core"}},
+		{label: "Loading controller image into kind", name: "kind", args: []string{"load", "docker-image", "fast-sandbox/controller:dev", "--name", m.settings.ClusterName}},
+		{label: "Loading Fastlet image into kind", name: "kind", args: []string{"load", "docker-image", "fast-sandbox/fastlet:dev", "--name", m.settings.ClusterName}},
+		{label: "Loading Fastlet Proxy image into kind", name: "kind", args: []string{"load", "docker-image", "fast-sandbox/fastlet-proxy:dev", "--name", m.settings.ClusterName}},
+		{label: "Loading Sandbox Proxy image into kind", name: "kind", args: []string{"load", "docker-image", "fast-sandbox/sandbox-proxy:dev", "--name", m.settings.ClusterName}},
+		{label: "Loading NodeJanitor image into kind", name: "kind", args: []string{"load", "docker-image", "fast-sandbox/janitor:dev", "--name", m.settings.ClusterName}},
+		{label: "Applying CRDs", name: "kubectl", args: []string{"apply", "-k", "config/crd"}},
+		{label: "Waiting for Sandbox CRD", name: "kubectl", args: []string{"wait", "--for=condition=Established", "crd/sandboxes.sandbox.fast.io", "--timeout=30s"}},
+		{label: "Waiting for SandboxPool CRD", name: "kubectl", args: []string{"wait", "--for=condition=Established", "crd/sandboxpools.sandbox.fast.io", "--timeout=30s"}},
+		{label: "Applying RBAC", name: "kubectl", args: []string{"apply", "-f", "config/rbac/base.yaml"}},
+		{label: "Applying development route keys", name: "kubectl", args: []string{"apply", "-f", "config/dev/route-keys.yaml"}},
+		{label: "Applying control-plane workloads", name: "kubectl", args: []string{"apply", "-f", "config/manager/controller.yaml"}},
+		{label: "Restarting Reconcilers", name: "kubectl", args: []string{"rollout", "restart", "deployment/fast-sandbox-controller"}},
+		{label: "Waiting for Reconcilers", name: "kubectl", args: []string{"rollout", "status", "deployment/fast-sandbox-controller", "--timeout=120s"}},
+		{label: "Restarting Fast-Path servers", name: "kubectl", args: []string{"rollout", "restart", "deployment/fast-sandbox-fastpath"}},
+		{label: "Waiting for Fast-Path servers", name: "kubectl", args: []string{"rollout", "status", "deployment/fast-sandbox-fastpath", "--timeout=120s"}},
+		{label: "Restarting Sandbox Proxy", name: "kubectl", args: []string{"rollout", "restart", "deployment/fast-sandbox-proxy"}},
+		{label: "Waiting for Sandbox Proxy", name: "kubectl", args: []string{"rollout", "status", "deployment/fast-sandbox-proxy", "--timeout=120s"}},
+		{label: "Applying NodeJanitor", name: "kubectl", args: []string{"apply", "-f", "config/janitor/janitor.yaml"}},
+		{label: "Restarting NodeJanitor", name: "kubectl", args: []string{"rollout", "restart", "ds/fast-sandbox-janitor"}},
+		{label: "Waiting for NodeJanitor", name: "kubectl", args: []string{"rollout", "status", "ds/fast-sandbox-janitor", "--timeout=60s"}},
 	}
 
-	for _, step := range steps {
-		if _, err := m.run(ctx, step.name, step.args...); err != nil {
+	for index, step := range steps {
+		m.progressf("  [%d/%d] %s\n", index+1, len(steps), step.label)
+		if _, err := m.runLive(ctx, step.name, step.args...); err != nil {
 			return err
 		}
 	}
@@ -675,11 +693,52 @@ func (m *Manager) deployFastSandbox(ctx context.Context) error {
 }
 
 func (m *Manager) run(ctx context.Context, name string, args ...string) ([]byte, error) {
-	output, err := m.runner.Run(ctx, m.rootDir, name, args...)
+	return m.runCommand(ctx, false, name, args...)
+}
+
+func (m *Manager) runLive(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return m.runCommand(ctx, true, name, args...)
+}
+
+func (m *Manager) runCommand(ctx context.Context, live bool, name string, args ...string) ([]byte, error) {
+	var (
+		output []byte
+		err    error
+	)
+	if live && m.progress != nil {
+		if runner, ok := m.runner.(streamingRunner); ok {
+			output, err = runner.RunStreaming(ctx, m.rootDir, m.progress, name, args...)
+		} else {
+			output, err = m.runner.Run(ctx, m.rootDir, name, args...)
+		}
+	} else {
+		output, err = m.runner.Run(ctx, m.rootDir, name, args...)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("%s failed: %w\n%s", commandString(name, args...), err, strings.TrimSpace(string(output)))
 	}
 	return output, nil
+}
+
+func (m *Manager) progressf(format string, args ...any) {
+	if m.progress == nil {
+		return
+	}
+	fmt.Fprintf(m.progress, format, args...)
+}
+
+func progressDuration(elapsed time.Duration) string {
+	if elapsed < 10*time.Millisecond {
+		return "<10ms"
+	}
+	if elapsed < time.Second {
+		return elapsed.Round(10 * time.Millisecond).String()
+	}
+	return elapsed.Round(100 * time.Millisecond).String()
+}
+
+type streamingRunner interface {
+	RunStreaming(ctx context.Context, dir string, output io.Writer, name string, args ...string) ([]byte, error)
 }
 
 type execRunner struct{}
@@ -688,6 +747,18 @@ func (execRunner) Run(ctx context.Context, dir, name string, args ...string) ([]
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	return cmd.CombinedOutput()
+}
+
+func (execRunner) RunStreaming(ctx context.Context, dir string, output io.Writer, name string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Dir = dir
+
+	var captured bytes.Buffer
+	stream := io.MultiWriter(output, &captured)
+	cmd.Stdout = stream
+	cmd.Stderr = stream
+	err := cmd.Run()
+	return captured.Bytes(), err
 }
 
 func findRootDir() (string, error) {

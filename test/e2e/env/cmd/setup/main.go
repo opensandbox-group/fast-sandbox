@@ -18,7 +18,10 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	manager, err := e2eenv.NewManager(e2eenv.Profile(*profile))
+	manager, err := e2eenv.NewManager(
+		e2eenv.Profile(*profile),
+		e2eenv.WithProgressWriter(os.Stdout),
+	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create e2e environment manager: %v\n", err)
 		os.Exit(1)

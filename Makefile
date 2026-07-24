@@ -253,21 +253,36 @@ quickstart:
 			pool=kata-clh-execd-pool; sandbox=quickstart-kata-clh-execd-sandbox; data_plane=execd ;; \
 		*) echo "unsupported Quick Start RUNTIME=$(RUNTIME) INFRA=$(INFRA)" >&2; exit 2 ;; \
 	esac; \
+	echo ""; \
+	echo "Fast Sandbox Quick Start"; \
+	echo "Runtime:  $(RUNTIME)"; \
+	echo "Infra:    $(INFRA)"; \
+	echo "Profile:  $$profile"; \
+	echo ""; \
+	echo "The first run builds images and can take several minutes."; \
+	echo "Existing clusters and cached runtime artifacts are reused."; \
+	echo ""; \
+	echo "[quickstart 1/4] Preparing the reusable kind environment..."; \
 	$(MAKE) --no-print-directory env PROFILE=$$profile || exit $$?; \
+	echo "[quickstart 2/4] Applying SandboxPool $$pool..."; \
 	kubectl apply -f "$$pool_file" || exit $$?; \
 	image_id=$$(docker image inspect --format='{{.Id}}' "$(FASTLET_IMAGE)") || exit $$?; \
 	patch=$$(printf '{"spec":{"fastletTemplate":{"metadata":{"annotations":{"fast-sandbox.io/quickstart-image-id":"%s"}}}}}' "$$image_id"); \
 	kubectl patch "sandboxpool/$$pool" --type=merge -p "$$patch" >/dev/null || exit $$?; \
-	echo "Waiting for a ready Fastlet built from $$image_id"; \
+	echo "[quickstart 3/4] Waiting for a ready Fastlet built from $$image_id..."; \
 	ready=false; \
 	for i in $$(seq 1 90); do \
 		for pod in $$(kubectl get pods -l "fast-sandbox.io/pool=$$pool" -o name); do \
 			pod_image_id=$$(kubectl get "$$pod" -o jsonpath='{.metadata.annotations.fast-sandbox\.io/quickstart-image-id}'); \
 			pod_ready=$$(kubectl get "$$pod" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'); \
 			if [ "$$pod_image_id" = "$$image_id" ] && [ "$$pod_ready" = "True" ]; then \
-				ready=true; break 2; \
+				ready=true; ready_pod=$$pod; ready_after=$$((($$i - 1) * 2)); break 2; \
 			fi; \
 		done; \
+		if [ $$(( $$i % 5 )) -eq 0 ]; then \
+			echo "  still waiting ($$(( $$i * 2 ))s elapsed):"; \
+			kubectl get pods -l "fast-sandbox.io/pool=$$pool" --no-headers 2>/dev/null | sed 's/^/    /'; \
+		fi; \
 		sleep 2; \
 	done; \
 	if [ "$$ready" != true ]; then \
@@ -275,6 +290,8 @@ quickstart:
 		kubectl get pods -l "fast-sandbox.io/pool=$$pool" -o wide; \
 		exit 1; \
 	fi; \
+	echo "  ready after $${ready_after}s: $$ready_pod"; \
+	echo "[quickstart 4/4] Building fastctl and preparing examples..."; \
 	$(MAKE) --no-print-directory build COMPONENT=fastctl || exit $$?; \
 	echo ""; \
 	echo "Quick Start environment is ready."; \

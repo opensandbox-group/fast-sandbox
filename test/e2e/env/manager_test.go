@@ -1,6 +1,7 @@
 package env
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -93,6 +94,63 @@ func TestManagerEnsureBasicReusesExistingCluster(t *testing.T) {
 		t.Fatalf("expected existing cluster to be reused, commands: %#v", runner.commands)
 	}
 	assertCommand(t, runner.commands, "kubectl", "config", "use-context", "kind-fsb-e2e-basic")
+}
+
+func TestManagerEnsureReportsProgress(t *testing.T) {
+	runner := &fakeRunner{
+		outputs: map[string]string{
+			commandKey("kind", "get", "clusters"): "fsb-e2e-basic\n",
+		},
+		errs: map[string]error{},
+	}
+	var progress bytes.Buffer
+	manager, err := NewManager(ProfileBasic,
+		WithRunner(runner),
+		WithRootDir("/repo"),
+		WithHostOS("linux"),
+		WithProgressWriter(&progress),
+	)
+	if err != nil {
+		t.Fatalf("NewManager returned error: %v", err)
+	}
+
+	if err := manager.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure returned error: %v", err)
+	}
+
+	output := progress.String()
+	for _, want := range []string{
+		"[environment 1/6] Checking host prerequisites...",
+		"[environment 2/6] Preparing kind cluster fsb-e2e-basic...",
+		"[environment 4/6] Preparing runtime container...",
+		"[environment 6/6] Building and deploying Fast Sandbox...",
+		"[1/21] Building core development images",
+		"[21/21] Waiting for NodeJanitor",
+		"Environment ready: context=kind-fsb-e2e-basic",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("progress output missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestExecRunnerStreamsAndCapturesOutput(t *testing.T) {
+	var streamed bytes.Buffer
+	output, err := (execRunner{}).RunStreaming(
+		context.Background(),
+		t.TempDir(),
+		&streamed,
+		"sh", "-c", "printf 'live output'",
+	)
+	if err != nil {
+		t.Fatalf("RunStreaming returned error: %v", err)
+	}
+	if got, want := string(output), "live output"; got != want {
+		t.Fatalf("captured output = %q, want %q", got, want)
+	}
+	if got, want := streamed.String(), "live output"; got != want {
+		t.Fatalf("streamed output = %q, want %q", got, want)
+	}
 }
 
 func TestManagerEnsureWaitsForKubeSystemBeforeDeploy(t *testing.T) {
