@@ -52,11 +52,13 @@ const builderImageEnv = "SANDBOX_TEMPLATE_SPEC"
 // sandboxTemplateGenerationLabel carries the template generation the Pod
 // was created for so a mid-build spec change is never adopted.
 const (
-	sandboxTemplateBuildLabel        = "sandbox.fast.io/sandboxtemplate"
-	sandboxTemplateNamespaceLabel    = "sandbox.fast.io/template-namespace"
-	sandboxTemplateGenerationLabel   = "sandbox.fast.io/generation"
-	sandboxTemplateManifestRefAnnot  = "sandbox.fast.io/manifest-ref"
-	sandboxTemplateArtifactDigestAnn = "sandbox.fast.io/artifact-digest"
+	sandboxTemplateBuildLabel           = "sandbox.fast.io/sandboxtemplate"
+	sandboxTemplateNamespaceLabel       = "sandbox.fast.io/template-namespace"
+	sandboxTemplateGenerationLabel      = "sandbox.fast.io/generation"
+	sandboxTemplateManifestRefAnnot     = "sandbox.fast.io/manifest-ref"
+	sandboxTemplateArtifactDigestAnn    = "sandbox.fast.io/artifact-digest"
+	sandboxTemplateRootfsImageRefAnnot  = "sandbox.fast.io/rootfs-image-ref"
+	sandboxTemplateMemoryImageRefAnnot  = "sandbox.fast.io/memory-image-ref"
 	// sandboxTemplateKVMNodeLabel selects nodes that expose /dev/kvm and
 	// /dev/net/tun; the build Pod is pinned to them via nodeSelector.
 	sandboxTemplateKVMNodeLabel = "sandbox.fast.io/kvm"
@@ -169,6 +171,8 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.
 		logger.Info("sandbox template build pod succeeded", "template", template.Name, "pod", pod.Name)
 		template.Status.ManifestRef = pod.Annotations[sandboxTemplateManifestRefAnnot]
 		template.Status.ArtifactDigest = pod.Annotations[sandboxTemplateArtifactDigestAnn]
+		template.Status.RootfsImageRef = pod.Annotations[sandboxTemplateRootfsImageRefAnnot]
+		template.Status.MemoryImageRef = pod.Annotations[sandboxTemplateMemoryImageRefAnnot]
 		template.Status.Phase = apiv1alpha2.SandboxTemplatePhaseSucceeded
 		now := metav1.Now()
 		template.Status.LastBuildTime = &now
@@ -454,6 +458,11 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 	if ref := template.Spec.Output.PublishSecretRef; ref != nil {
 		env = append(env, publishCredentialEnvRefs(ref)...)
 	}
+	// OCI image publishing (format=overlaybd with an output registry): the
+	// registry credentials ride in as a docker config JSON secret.
+	if ref := template.Spec.Output.RegistrySecretRef; ref != nil {
+		env = append(env, registryCredentialEnvRefs(ref)...)
+	}
 
 	// The build Pod runs the sandbox template builder: privileged for the
 	// loop mount, with the host's KVM/tun devices passed through via hostPath
@@ -522,30 +531,41 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 						corev1.ResourceEphemeralStorage: storageLimit,
 					},
 				},
-				VolumeMounts: []corev1.VolumeMount{
-					{Name: "workspace", MountPath: sandboxTemplateBuildDir},
-					{Name: "kvm", MountPath: "/dev/kvm"},
-					{Name: "net-tun", MountPath: "/dev/net/tun"},
-				},
-			}},
-			Volumes: []corev1.Volume{
-				{
-					Name:         "workspace",
-					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-				},
-				{
-					Name: "kvm",
-					VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
-						Path: "/dev/kvm", Type: ptr(corev1.HostPathCharDev),
-					}},
-				},
-				{
-					Name: "net-tun",
-					VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
-						Path: "/dev/net/tun", Type: ptr(corev1.HostPathCharDev),
-					}},
-				},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "workspace", MountPath: sandboxTemplateBuildDir},
+				{Name: "kvm", MountPath: "/dev/kvm"},
+				{Name: "net-tun", MountPath: "/dev/net/tun"},
+				// OCI image publishing creates ublk devices through the
+				// host's /dev/ublk-control; the resulting block nodes (and
+				// the loop fallback devices) only exist in the host devtmpfs,
+				// so the whole /dev is passed through like the KVM device.
+				{Name: "host-dev", MountPath: "/dev"},
 			},
+		}},
+		Volumes: []corev1.Volume{
+			{
+				Name:         "workspace",
+				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			},
+			{
+				Name: "kvm",
+				VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+					Path: "/dev/kvm", Type: ptr(corev1.HostPathCharDev),
+				}},
+			},
+			{
+				Name: "net-tun",
+				VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+					Path: "/dev/net/tun", Type: ptr(corev1.HostPathCharDev),
+				}},
+			},
+			{
+				Name: "host-dev",
+				VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+					Path: "/dev", Type: ptr(corev1.HostPathDirectory),
+				}},
+			},
+		},
 		},
 	}
 	// The Pod is owned by the template, so deleting the template cascades
@@ -670,6 +690,27 @@ func publishCredentialEnvRefs(ref *corev1.LocalObjectReference) []corev1.EnvVar 
 		key(publishSecretKeyPoint, "AWS_ENDPOINT_URL"),
 		key(publishSecretKeyRegion, "AWS_REGION"),
 	}
+}
+
+// registrySecretKeyConfig is the single key the registry secret is expected
+// to carry: a docker config JSON document ({"auths":{registry:{...}}}) that
+// the builder forwards to strmvold as secret.type=dockerAuth.
+const registrySecretKeyConfig = "config.json"
+
+// registryCredentialEnvRefs maps the registry secret (key config.json) onto
+// the SANDBOX_TEMPLATE_REGISTRY_AUTH env var the builder consumes for OCI
+// image publishing. Same SecretKeyRef pattern as the publish secret: the
+// controller never reads the secret contents.
+func registryCredentialEnvRefs(ref *corev1.LocalObjectReference) []corev1.EnvVar {
+	return []corev1.EnvVar{{
+		Name: "SANDBOX_TEMPLATE_REGISTRY_AUTH",
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: *ref,
+				Key:                  registrySecretKeyConfig,
+			},
+		},
+	}}
 }
 
 // updatePhase persists the phase and its transition condition.

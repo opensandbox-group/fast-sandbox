@@ -47,7 +47,11 @@ RUN cd /src/overlaybd \
         -DBUILD_TESTING=0 \
         -DBUILD_STREAM_CONVERTOR=0 \
         -DORIGIN_EXT2FS=1 \
-    && cmake --build build --target overlaybd-import-raw --parallel "$(nproc)"
+    # overlaybd-commit is required by the strmvold commit path (OCI image
+    # publishing); overlaybd-tcmu is the block-device handler for the tcmu
+    # fallback (kernels without ublk, < 5.19); overlaybd-import-raw serves
+    # the legacy S3 packaging path.
+    && cmake --build build --target overlaybd-import-raw overlaybd-commit overlaybd-tcmu --parallel "$(nproc)"
 
 # --- sandboxtemplate-builder binary ----------------------------------------
 FROM golang:1.25 AS builder-build
@@ -83,6 +87,16 @@ ARG OCI2ROOTFS_REV
 ARG KERNEL_NAME=vmlinux.bin
 ARG KERNEL_URL=https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260722-38359b8055fc-0/x86_64/vmlinux-6.1.176
 
+# OCI image publishing (spec.output.registry) drives an embedded strmvold
+# session, which additionally needs the streamingvolume runtime (strmvold
+# binary + overlaybd api server + ublk helpers) and /dev/ublk-control from
+# the host. The streamingvolume release RPM is internal-only: point
+# STREAMINGVOLUME_RPM_URL at the t-storage-strmvold rpm to bake it in;
+# leave it empty to build an image without the OCI publish path (the
+# builder then fails with a clear message when a registry output is
+# requested).
+ARG STREAMINGVOLUME_RPM_URL=
+
 ENV OCI2ROOTFS_REV=${OCI2ROOTFS_REV}
 
 RUN apt-get update \
@@ -110,7 +124,25 @@ RUN set -eux; \
 
 COPY --from=oci2rootfs-build /src/oci2rootfs/target/release/oci2rootfs /usr/local/bin/oci2rootfs
 COPY --from=overlaybd-build /src/overlaybd/build/output/overlaybd-import-raw /usr/local/bin/overlaybd-import-raw
+# strmvold resolves overlaybd-commit at /opt/overlaybd/bin/overlaybd-commit,
+# and the tcmu driver launches the handler from the same dir.
+COPY --from=overlaybd-build /src/overlaybd/build/output/overlaybd-commit /opt/overlaybd/bin/overlaybd-commit
+COPY --from=overlaybd-build /src/overlaybd/build/output/overlaybd-tcmu /opt/overlaybd/bin/overlaybd-tcmu
+RUN ln -sf /opt/overlaybd/bin/overlaybd-tcmu /opt/overlaybd/bin/overlaybd
 COPY --from=builder-build /out/sandboxtemplate-builder /usr/local/bin/sandboxtemplate-builder
+
+# streamingvolume runtime (strmvold, overlaybd api server, ublk helpers) from
+# the internal release RPM. Extracted with rpm2cpio so no package manager
+# database is needed in the image.
+RUN set -eux; \
+    if [ -n "${STREAMINGVOLUME_RPM_URL}" ]; then \
+        apt-get update \
+        && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends rpm2cpio cpio \
+        && rm -rf /var/lib/apt/lists/*; \
+        curl -fsSL --retry 5 "${STREAMINGVOLUME_RPM_URL}" -o /tmp/strmvold.rpm; \
+        cd / && rpm2cpio /tmp/strmvold.rpm | cpio -idmv --no-absolute-filenames; \
+        rm -f /tmp/strmvold.rpm; \
+    fi
 
 # Guest kernel, embedded in the builder image so builds do not download a
 # kernel at build time. Override KERNEL_URL to pin a specific build.

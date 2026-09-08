@@ -134,6 +134,23 @@ type OutputSpec struct {
 	// +optional
 	PublishSecretRef *corev1.LocalObjectReference `json:"publishSecretRef,omitempty"`
 
+	// Registry is the OCI registry base reference for the OverlayBD image
+	// artifacts produced when format=overlaybd (e.g.
+	// registry.example.com/fs-templates/my-template). The builder derives
+	// <Registry>-rootfs:<tag> and <Registry>-mem:<tag> from it. When set,
+	// rootfs.ext4 and memory.snap are published as single-layer OverlayBD
+	// OCI images instead of S3 objects; vmstate.snap and manifest.json keep
+	// going to the S3 publish target. When unset, the legacy S3 layout is
+	// used. Ignored for format=native.
+	// +optional
+	Registry string `json:"registry,omitempty"`
+
+	// RegistrySecretRef references the secret holding the registry
+	// credentials (docker config JSON, consumed as streamingvolume
+	// secret.type=dockerAuth). Same namespace rules as publishSecretRef.
+	// +optional
+	RegistrySecretRef *corev1.LocalObjectReference `json:"registrySecretRef,omitempty"`
+
 	// Prime optionally selects seed nodes (by label selector) whose agent
 	// warms the local cache after a successful build.
 	// Not yet implemented: reserved — the controller currently ignores it.
@@ -197,6 +214,14 @@ type SandboxTemplateStatus struct {
 	// ArtifactDigest is the sha256 of the manifest document itself.
 	// +optional
 	ArtifactDigest string `json:"artifactDigest,omitempty"`
+	// RootfsImageRef is the digest-pinned OCI reference of the published
+	// rootfs OverlayBD image (format=overlaybd with an output registry only).
+	// +optional
+	RootfsImageRef string `json:"rootfsImageRef,omitempty"`
+	// MemoryImageRef is the digest-pinned OCI reference of the published
+	// memory OverlayBD image (format=overlaybd with an output registry only).
+	// +optional
+	MemoryImageRef string `json:"memoryImageRef,omitempty"`
 	// LastBuildTime is when the last build completed.
 	// +optional
 	LastBuildTime *metav1.Time `json:"lastBuildTime,omitempty"`

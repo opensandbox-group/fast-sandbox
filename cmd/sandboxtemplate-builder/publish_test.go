@@ -25,14 +25,19 @@ func TestImageIndexKeyMatchesConsumerCacheKey(t *testing.T) {
 }
 
 // TestImageIndexPayload verifies the index document shape: manifestRef,
-// artifactDigest, and an RFC3339 updatedAt timestamp.
+// artifactDigest, the optional OCI image refs, and an RFC3339 updatedAt
+// timestamp.
 func TestImageIndexPayload(t *testing.T) {
 	const (
 		image          = "registry.example.com/sandbox:v1.0.21"
 		manifestURI    = "s3://bucket/sandbox-images/0123456789abcdef/manifest.json"
 		artifactDigest = "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567"
 	)
-	payload, err := imageIndexPayload(image, manifestURI, artifactDigest)
+	refs := ociImageRefs{
+		Rootfs: "registry.example.com/fs-templates/t1-rootfs:abc@sha256:aaaa",
+		Memory: "registry.example.com/fs-templates/t1-mem:abc@sha256:bbbb",
+	}
+	payload, err := imageIndexPayload(image, manifestURI, artifactDigest, refs)
 	if err != nil {
 		t.Fatalf("imageIndexPayload: %v", err)
 	}
@@ -40,6 +45,8 @@ func TestImageIndexPayload(t *testing.T) {
 		Image          string `json:"image"`
 		ManifestRef    string `json:"manifestRef"`
 		ArtifactDigest string `json:"artifactDigest"`
+		RootfsImageRef string `json:"rootfsImageRef"`
+		MemoryImageRef string `json:"memoryImageRef"`
 		UpdatedAt      string `json:"updatedAt"`
 	}
 	if err := json.Unmarshal(payload, &document); err != nil {
@@ -54,6 +61,12 @@ func TestImageIndexPayload(t *testing.T) {
 	if document.ArtifactDigest != artifactDigest {
 		t.Fatalf("artifactDigest = %q, want %q", document.ArtifactDigest, artifactDigest)
 	}
+	if document.RootfsImageRef != refs.Rootfs {
+		t.Fatalf("rootfsImageRef = %q, want %q", document.RootfsImageRef, refs.Rootfs)
+	}
+	if document.MemoryImageRef != refs.Memory {
+		t.Fatalf("memoryImageRef = %q, want %q", document.MemoryImageRef, refs.Memory)
+	}
 	if _, err := time.Parse(time.RFC3339, document.UpdatedAt); err != nil {
 		t.Fatalf("updatedAt %q is not RFC3339: %v", document.UpdatedAt, err)
 	}
@@ -66,7 +79,7 @@ func TestPublishImageIndexRejectsEmptyImage(t *testing.T) {
 	for _, image := range []string{"", "   ", "\t\n"} {
 		err := publishImageIndex(context.Background(), "aws", []string{"s3", "cp"}, image,
 			"s3://bucket/sandbox-images/0123456789abcdef/manifest.json",
-			"deadbeef", "s3://bucket/sandbox-images")
+			"deadbeef", "s3://bucket/sandbox-images", ociImageRefs{})
 		if err == nil {
 			t.Fatalf("expected an error for empty image reference %q", image)
 		}

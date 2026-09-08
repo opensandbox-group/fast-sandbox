@@ -298,6 +298,34 @@ spec:
                         type: string
                     type: object
                     x-kubernetes-map-type: atomic
+                  registry:
+                    description: |-
+                      Registry is the OCI registry base reference for the OverlayBD image
+                      artifacts produced when format=overlaybd (e.g.
+                      registry.example.com/fs-templates/my-template). The builder derives
+                      <Registry>-rootfs:<tag> and <Registry>-mem:<tag> from it. When set,
+                      rootfs.ext4 and memory.snap are published as single-layer OverlayBD
+                      OCI images instead of S3 objects; vmstate.snap and manifest.json keep
+                      going to the S3 publish target. When unset, the legacy S3 layout is
+                      used. Ignored for format=native.
+                    type: string
+                  registrySecretRef:
+                    description: |-
+                      RegistrySecretRef references the secret holding the registry
+                      credentials (docker config JSON, consumed as streamingvolume
+                      secret.type=dockerAuth). Same namespace rules as publishSecretRef.
+                    properties:
+                      name:
+                        default: ""
+                        description: |-
+                          Name of the referent.
+                          This field is effectively required, but due to backwards compatibility is
+                          allowed to be empty. Instances of this type with an empty value here are
+                          almost certainly wrong.
+                          More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
                   rootfsSize:
                     default: 30Gi
                     description: |-
@@ -385,6 +413,11 @@ spec:
                 description: ManifestRef points at the published manifest in the object
                   store.
                 type: string
+              memoryImageRef:
+                description: |-
+                  MemoryImageRef is the digest-pinned OCI reference of the published
+                  memory OverlayBD image (format=overlaybd with an output registry only).
+                type: string
               observedGeneration:
                 description: ObservedGeneration is the generation of the last applied
                   build.
@@ -397,6 +430,11 @@ spec:
                 - Building
                 - Succeeded
                 - Failed
+                type: string
+              rootfsImageRef:
+                description: |-
+                  RootfsImageRef is the digest-pinned OCI reference of the published
+                  rootfs OverlayBD image (format=overlaybd with an output registry only).
                 type: string
             type: object
         type: object

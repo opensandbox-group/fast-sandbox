@@ -20,43 +20,51 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 )
 
-// publish uploads the artifacts under a digest namespace and returns the
-// manifest URI. Upload order guarantees consumers never observe a
-// half-published artifact set: artifacts and SHA256SUMS first, then the
+// publish uploads the S3-side artifacts under a digest namespace and
+// returns the manifest URI. Upload order guarantees consumers never observe
+// a half-published artifact set: artifacts and SHA256SUMS first, then the
 // manifest, and finally the image index that points at this build.
-// OverlayBD layers keep their relative paths
-// (overlaybd/rootfs/layer.lsmt, overlaybd/memory/layer.lsmt) — a flat
-// basename would collide on the same S3 key.
-func publish(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir string, manifestBytes []byte) (string, error) {
+// On the OCI image path (imageRefs set) rootfs.ext4, memory.snap and the
+// overlaybd/ layers live in the registry; only vmstate.snap and SHA256SUMS
+// are uploaded. The legacy path keeps uploading the full artifact set with
+// OverlayBD layers at their relative paths (overlaybd/rootfs/layer.lsmt,
+// overlaybd/memory/layer.lsmt) — a flat basename would collide on the same
+// S3 key.
+func publish(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir string, manifestBytes []byte, imageRefs ociImageRefs) (string, error) {
 	aws, err := exec.LookPath(awsBin)
 	if err != nil {
 		return "", fmt.Errorf("aws CLI not found: %w", err)
 	}
 	base := strings.TrimRight(spec.Output.Publish, "/") + "/" + sha256Of(manifestBytes)[:16]
-	entries := []struct{ local, key string }{
-		{filepath.Join(workdir, "rootfs.ext4"), "rootfs.ext4"},
-		{filepath.Join(workdir, "vmstate.snap"), "vmstate.snap"},
-		{filepath.Join(workdir, "memory.snap"), "memory.snap"},
-		// SHA256SUMS covers only the published artifact set; it belongs to
-		// the immutable build directory and goes up with the artifacts.
-		{filepath.Join(workdir, "SHA256SUMS"), "SHA256SUMS"},
-	}
-	if layers, err := filepath.Glob(filepath.Join(workdir, "overlaybd", "*", "layer.lsmt")); err == nil {
-		for _, layer := range layers {
-			relative, err := filepath.Rel(workdir, layer)
-			if err != nil {
-				return "", err
+	s3Files := []struct{ local, key string }{}
+	if imageRefs.Rootfs == "" {
+		s3Files = append(s3Files,
+			struct{ local, key string }{filepath.Join(workdir, "rootfs.ext4"), "rootfs.ext4"},
+			struct{ local, key string }{filepath.Join(workdir, "memory.snap"), "memory.snap"},
+		)
+		if layers, globErr := filepath.Glob(filepath.Join(workdir, "overlaybd", "*", "layer.lsmt")); globErr == nil {
+			for _, layer := range layers {
+				relative, relErr := filepath.Rel(workdir, layer)
+				if relErr != nil {
+					return "", relErr
+				}
+				s3Files = append(s3Files, struct{ local, key string }{layer, relative})
 			}
-			entries = append(entries, struct{ local, key string }{layer, relative})
 		}
 	}
+	s3Files = append(s3Files,
+		struct{ local, key string }{filepath.Join(workdir, "vmstate.snap"), "vmstate.snap"},
+		// SHA256SUMS covers only the published artifact set; it belongs to
+		// the immutable build directory and goes up with the artifacts.
+		struct{ local, key string }{filepath.Join(workdir, "SHA256SUMS"), "SHA256SUMS"},
+	)
 	// --endpoint-url pins the S3-compatible target even with awscli v1
 	// (AWS_ENDPOINT_URL is only honored by botocore >=1.29.16 / CLI v2).
 	args := []string{"s3", "cp"}
 	if endpoint := os.Getenv("AWS_ENDPOINT_URL"); endpoint != "" {
 		args = append(args, "--endpoint-url", endpoint)
 	}
-	for _, entry := range entries {
+	for _, entry := range s3Files {
 		if err := uploadWithRetry(ctx, aws, args, entry.local, base+"/"+entry.key, entry.key); err != nil {
 			return "", err
 		}
@@ -68,7 +76,7 @@ func publish(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir 
 	// The image index is uploaded last: a consumer that can resolve the
 	// index is guaranteed a complete artifact set (artifacts, checksums,
 	// and manifest are all already in place).
-	if err := publishImageIndex(ctx, aws, args, spec.Image, manifestURI, sha256Of(manifestBytes), spec.Output.Publish); err != nil {
+	if err := publishImageIndex(ctx, aws, args, spec.Image, manifestURI, sha256Of(manifestBytes), spec.Output.Publish, imageRefs); err != nil {
 		return "", err
 	}
 	return manifestURI, nil
@@ -85,17 +93,22 @@ func imageIndexKey(image string) string {
 // imageIndexPayload builds the image index document pointing at the latest
 // published manifest. The manifest reference is content-addressed, so an
 // older build of the same image reference stays intact and only the index
-// pointer moves.
-func imageIndexPayload(image, manifestURI, artifactDigest string) ([]byte, error) {
+// pointer moves. The optional OCI image refs ride along so warm pools can
+// discover the registry channel without parsing the manifest.
+func imageIndexPayload(image, manifestURI, artifactDigest string, imageRefs ociImageRefs) ([]byte, error) {
 	document := struct {
 		Image          string `json:"image"`
 		ManifestRef    string `json:"manifestRef"`
 		ArtifactDigest string `json:"artifactDigest"`
+		RootfsImageRef string `json:"rootfsImageRef,omitempty"`
+		MemoryImageRef string `json:"memoryImageRef,omitempty"`
 		UpdatedAt      string `json:"updatedAt"`
 	}{
 		Image:          image,
 		ManifestRef:    manifestURI,
 		ArtifactDigest: artifactDigest,
+		RootfsImageRef: imageRefs.Rootfs,
+		MemoryImageRef: imageRefs.Memory,
 		UpdatedAt:      time.Now().UTC().Format(time.RFC3339),
 	}
 	return json.MarshalIndent(document, "", "  ")
@@ -115,11 +128,11 @@ func imageIndexPayload(image, manifestURI, artifactDigest string) ([]byte, error
 // root are last-writer-wins: every build is complete before its index is
 // written, so no half-published state is ever observable, but the winner
 // is not deterministic (publishers should serialize per image).
-func publishImageIndex(ctx context.Context, aws string, args []string, image, manifestURI, artifactDigest, storeRoot string) error {
+func publishImageIndex(ctx context.Context, aws string, args []string, image, manifestURI, artifactDigest, storeRoot string, imageRefs ociImageRefs) error {
 	if strings.TrimSpace(image) == "" {
 		return fmt.Errorf("publish image index: image reference is required (empty image would collide on the empty-hash index key)")
 	}
-	payload, err := imageIndexPayload(image, manifestURI, artifactDigest)
+	payload, err := imageIndexPayload(image, manifestURI, artifactDigest, imageRefs)
 	if err != nil {
 		return err
 	}
@@ -175,9 +188,10 @@ func uploadWithRetry(ctx context.Context, aws string, args []string, local, targ
 
 // patchPodAnnotations records the build outcome on the builder Pod so the
 // controller can surface it on the template status. It uses a merge Patch
-// touching only the two annotations to avoid racing kubelet's own status
-// updates. Standalone runs (E2E, local debugging) simply skip the report.
-func patchPodAnnotations(ctx context.Context, manifestRef, digest string) error {
+// touching only the builder's own annotations to avoid racing kubelet's own
+// status updates. Standalone runs (E2E, local debugging) simply skip the
+// report. The OCI image refs are only included when the OCI path ran.
+func patchPodAnnotations(ctx context.Context, manifestRef, digest string, imageRefs ociImageRefs) error {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		klog.V(2).InfoS("skipping pod annotation update (not running in a cluster)", "err", err)
@@ -203,8 +217,27 @@ func patchPodAnnotations(ctx context.Context, manifestRef, digest string) error 
 	if err != nil {
 		return err
 	}
-	patch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":%s,"%s":%s}}}`,
-		manifestRefAnnotation, refJSON, digestAnnotation, digestJSON)
+	annotations := map[string]json.RawMessage{
+		manifestRefAnnotation: refJSON,
+		digestAnnotation:      digestJSON,
+	}
+	if imageRefs.Rootfs != "" {
+		rootfsJSON, err := json.Marshal(imageRefs.Rootfs)
+		if err != nil {
+			return err
+		}
+		memoryJSON, err := json.Marshal(imageRefs.Memory)
+		if err != nil {
+			return err
+		}
+		annotations[rootfsImageRefAnnotation] = rootfsJSON
+		annotations[memoryImageRefAnnotation] = memoryJSON
+	}
+	annotationBytes, err := json.Marshal(annotations)
+	if err != nil {
+		return err
+	}
+	patch := fmt.Sprintf(`{"metadata":{"annotations":%s}}`, annotationBytes)
 	_, err = clientSet.CoreV1().Pods(namespace).Patch(ctx, name, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
 	return err
 }
