@@ -10,7 +10,7 @@
 >   `internal/fastlet/action/manager.go`（HTTPCaller / buildRequest）+ 投递语义；
 > - OpenSandbox 侧：`Pangjiping/OpenSandbox @ feat/egress-actions-handler`
 >   pin `460b1cb`，`components/egress/pkg/actionhandler/actionhandler.go` +
->   `components/egress/fleet_actions.go`（lifecycle 语义）+ `fleet_server.go`
+>   `components/egress/fastsandbox_actions.go`（lifecycle 语义）+ `fastsandbox_server.go`
 >   （status 端点）。
 >
 > 方法：两侧独立实现同一协议（`sandbox.fast.io/actions/v1`），逐字段字节级
@@ -67,7 +67,7 @@ fastlet 请求构造核对：`buildRequest`（`manager.go:914`）总是填充
 | REMOVE_BINDING fence 不匹配 | **200 忽略**（永不卸载当前 subject） | 删除幂等 | ✅ |
 | REMOVE_BINDING 未注册 subject | 200（清理缓存） | 删除幂等 | ✅ |
 
-幂等/重放核对（egress 侧 `fleet_actions.go` vs fast-sandbox `manager.go`）：
+幂等/重放核对（egress 侧 `fastsandbox_actions.go` vs fast-sandbox `manager.go`）：
 
 - SET_BINDING 重放：`RegisterAndEnforce` 幂等；input 更新对 active subject 原地应用、**不重放 Hooks** —— 与 fastlet `replayHooks` 逻辑一致；
 - egress 重启：新 `instanceId`（status 端点）→ fastlet 检测变化 → 置 Pending 并重放最新 SET_BINDING + 已到达 Hooks（`manager.go:318`）——与 egress 侧注释契约一致；
@@ -106,5 +106,5 @@ fast-sandbox `HTTPCaller.Status`（`manager.go:46`）：非 200 / apiVersion 不
 
 - fast-sandbox 协议：`internal/protocol/action/types.go`、`internal/fastlet/action/manager.go`
 - egress 协议：`Pangjiping/OpenSandbox @ 460b1cb` `components/egress/pkg/actionhandler/actionhandler.go`、
-  `components/egress/fleet_actions.go`、`components/egress/fleet_server.go`
+  `components/egress/fastsandbox_actions.go`、`components/egress/fastsandbox_server.go`
 - 方案：`docs/design/egress-integration-plan.md`；任务清单：`docs/design/egress-integration-plan-tasks.md`
