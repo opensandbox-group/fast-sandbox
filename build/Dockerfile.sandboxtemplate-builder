@@ -61,7 +61,10 @@ ENV GOPROXY=${GOPROXY}
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
+# internal/artifacts: the artifact-set conventions shared with the live
+# snapshot producer (checksums, manifest encoding, index layout).
 COPY api ./api
+COPY internal/artifacts ./internal/artifacts
 COPY cmd/sandboxtemplate-builder ./cmd/sandboxtemplate-builder
 RUN CGO_ENABLED=0 go build -o /out/sandboxtemplate-builder ./cmd/sandboxtemplate-builder
 

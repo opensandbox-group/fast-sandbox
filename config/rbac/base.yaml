@@ -51,7 +51,7 @@ rules:
   resources: ["runtimeclasses"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["sandbox.fast.io"]
-  resources: ["sandboxes", "sandboxpools", "sandboxtemplates", "sandboxes/status", "sandboxpools/status", "sandboxtemplates/status"]
+  resources: ["sandboxes", "sandboxpools", "sandboxtemplates", "sandboxsnapshots", "sandboxes/status", "sandboxpools/status", "sandboxtemplates/status", "sandboxsnapshots/status"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: ["coordination.k8s.io"]
   resources: ["leases"]
@@ -70,6 +70,9 @@ rules:
   verbs: ["get", "list", "watch"]
 - apiGroups: ["sandbox.fast.io"]
   resources: ["sandboxes", "sandboxes/status"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["sandbox.fast.io"]
+  resources: ["sandboxsnapshots", "sandboxsnapshots/status"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

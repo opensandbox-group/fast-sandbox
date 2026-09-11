@@ -1,4 +1,4 @@
-package main
+package artifacts
 
 import (
 	"crypto/sha256"
@@ -46,9 +46,9 @@ func TestSha256FileSparse(t *testing.T) {
 	_ = handle.Close()
 	want := hex.EncodeToString(reference.Sum(nil))
 
-	got, err := sha256File(path)
+	got, err := SHA256File(path)
 	if err != nil {
-		t.Fatalf("sha256File: %v", err)
+		t.Fatalf("SHA256File: %v", err)
 	}
 	if got != want {
 		t.Fatalf("sparse hash mismatch: got %s want %s", got, want)

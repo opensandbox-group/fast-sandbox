@@ -76,6 +76,62 @@ registries:
 	require.Equal(t, previous, projected.Data[registryconfig.SecretKey], "an invalid update must retain the last compiled Secret")
 }
 
+func TestRegistryWriteCredentialCompilesFromWriteSecretRef(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	pool := &apiv1alpha2.SandboxPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "tenant-a", UID: types.UID("pool-a-uid")},
+	}
+	source := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: registryconfig.ConfigMapName, Namespace: "tenant-a"},
+		Data: map[string]string{registryconfig.ConfigMapKey: `
+registries:
+  - host: registry.example.com
+    secretRef:
+      name: registry-team-a
+    writeSecretRef:
+      name: artifact-store-rw
+`},
+	}
+	credential := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "registry-team-a", Namespace: "tenant-a"},
+		Type:       corev1.SecretTypeDockerConfigJson,
+		Data: map[string][]byte{corev1.DockerConfigJsonKey: []byte(
+			`{"auths":{"registry.example.com":{"username":"alice","password":"secret"}}}`,
+		)},
+	}
+	writeSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "artifact-store-rw", Namespace: "tenant-a"},
+		Data: map[string][]byte{
+			"accessKeyId": []byte(" writer-key "), "secretAccessKey": []byte("writer-secret"),
+		},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool, source, credential, writeSecret).Build()
+	reconciler := &SandboxPoolReconciler{Client: k8sClient, Scheme: scheme}
+
+	compiled, err := reconciler.ensureRegistrySecret(context.Background(), pool)
+	require.NoError(t, err)
+	selected, found := compiled.Match("registry.example.com/app:v1")
+	require.True(t, found)
+	require.Equal(t, "writer-key", selected.WriteUsername, "the write pair is trimmed and compiled in")
+	require.Equal(t, "writer-secret", selected.WritePassword)
+
+	// A missing write secret is rejected (the last compiled revision is
+	// retained by the existing invalid-update path).
+	require.NoError(t, k8sClient.Delete(context.Background(), writeSecret))
+	_, err = reconciler.ensureRegistrySecret(context.Background(), pool)
+	require.ErrorContains(t, err, "artifact-store-rw")
+}
+
+func TestRegistryWriteSecretRefRequiresName(t *testing.T) {
+	_, err := registryconfig.NormalizeAndValidate(registryconfig.Config{Registries: []registryconfig.RegistryRule{{
+		Host: "registry.example.com", SecretRef: registryconfig.SecretRef{Name: "ro"},
+		WriteSecretRef: &registryconfig.SecretRef{},
+	}}})
+	require.ErrorContains(t, err, "writeSecretRef")
+}
+
 type recordingDrainer struct {
 	mu       sync.Mutex
 	requests []fastletapi.SetDrainingRequest

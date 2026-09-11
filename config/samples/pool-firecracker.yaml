@@ -40,14 +40,31 @@ spec:
         env:
         - name: FAST_SANDBOX_RUNTIME_AGENT_SOCKET
           value: /run/fast-sandbox/firecracker/runtime.sock
+        # Live-snapshot dumps land on this fast spill area while the VM is
+        # paused, then move to the StateRoot after the resume: the
+        # business-visible pause window pays the spill area's bandwidth
+        # instead of the (network-backed) StateRoot. sizeLimit must cover
+        # the largest sandbox memory plus overhead (rule of thumb:
+        # 2 × memory + 1Gi). This Memory-backed emptyDir suits test
+        # clusters; production should prefer a local-NVMe hostPath — the
+        # RAM-backed variant spends node memory equal to the dump. See
+        # docs/guides/sandbox-snapshots.md.
+        - name: FAST_SANDBOX_SNAPSHOT_SPILL_DIR
+          value: /spill
         volumeMounts:
         - name: agent-socket
           mountPath: /run/fast-sandbox/firecracker
+        - name: snapshot-spill
+          mountPath: /spill
       volumes:
       - name: agent-socket
         hostPath:
           path: /run/fast-sandbox/firecracker
           type: DirectoryOrCreate
+      - name: snapshot-spill
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
       nodeSelector:
         fast-sandbox.io/firecracker-node: "true"
       # P2P is the standard topology: the pool keeps ONE fastlet per node

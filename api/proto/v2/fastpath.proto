@@ -14,6 +14,13 @@ service FastPathService {
   rpc ResolveEndpoint(ResolveEndpointRequest) returns (ResolveEndpointResponse);
   rpc GetPool(GetPoolRequest) returns (PoolInfo);
   rpc ListPools(ListPoolsRequest) returns (ListPoolsResponse);
+  // CreateSandboxSnapshot snapshots a running Sandbox and publishes the
+  // artifact set to the artifact store under the snapshot's template name.
+  // It returns after the intent is persisted and the snapshot is triggered;
+  // completion is observed via GetSandboxSnapshot.
+  rpc CreateSandboxSnapshot(CreateSandboxSnapshotRequest) returns (CreateSandboxSnapshotResponse);
+  rpc GetSandboxSnapshot(GetSandboxSnapshotRequest) returns (GetSandboxSnapshotResponse);
+  rpc DeleteSandboxSnapshot(DeleteSandboxSnapshotRequest) returns (DeleteSandboxSnapshotResponse);
 }
 
 message NamespacedName {
@@ -304,3 +311,84 @@ message ListPoolsRequest {
 message ListPoolsResponse {
   repeated PoolInfo items = 1;
 }
+
+// SnapshotPhase is the lifecycle of one SandboxSnapshot. Pending means the
+// intent is persisted but not yet accepted by a fastlet; Creating covers the
+// pause/dump/resume window on the node; Publishing uploads the artifact set
+// to the artifact store; Succeeded and Failed are terminal.
+enum SnapshotPhase {
+  SNAPSHOT_PHASE_UNSPECIFIED = 0;
+  SNAPSHOT_PHASE_PENDING = 1;
+  SNAPSHOT_PHASE_CREATING = 2;
+  SNAPSHOT_PHASE_PUBLISHING = 3;
+  SNAPSHOT_PHASE_SUCCEEDED = 4;
+  SNAPSHOT_PHASE_FAILED = 5;
+}
+
+// CreateSandboxSnapshotRequest snapshots the referenced running Sandbox. The
+// request is rejected while any non-terminal SandboxSnapshot exists for the
+// same Sandbox or the same template_name (no reentrancy): retry after the
+// previous snapshot reaches a terminal phase.
+message CreateSandboxSnapshotRequest {
+  // request_id becomes the SandboxSnapshot name and is the idempotency key:
+  // replaying a request with the same request_id and identical fields
+  // returns the current snapshot state.
+  string request_id = 1;
+  // sandbox is the snapshot target; expected_uid fences against a Sandbox
+  // recreated under the same name.
+  SandboxReference sandbox = 2;
+  // template_name is the artifact-store index key the artifact set is
+  // published under; afterwards CreateSandbox(image=template_name) boots
+  // from the snapshot. Immutable per request_id.
+  string template_name = 3;
+  // metadata is projected as sandbox.fast.io/<k> labels, mirroring
+  // CreateSandboxRequest.metadata.
+  map<string, string> metadata = 4;
+}
+
+// SandboxSnapshotInfo is the observed state of one SandboxSnapshot.
+message SandboxSnapshotInfo {
+  // identity identifies the SandboxSnapshot object itself.
+  SandboxIdentity identity = 1;
+  string sandbox_name = 2;
+  string sandbox_uid = 3;
+  string template_name = 4;
+  SnapshotPhase phase = 5;
+  // message carries the latest progress or failure reason.
+  string message = 6;
+  // fastlet_name is the fastlet the snapshot was triggered on (resolved
+  // from the target Sandbox's assignment at trigger time).
+  string fastlet_name = 7;
+  // manifest_ref is the s3:// URI of the published manifest.json (terminal
+  // success only).
+  string manifest_ref = 8;
+  // artifact_digest is the sha256 of the manifest document.
+  string artifact_digest = 9;
+  // size_bytes is the total logical size of the published artifact set.
+  int64 size_bytes = 10;
+  int64 created_unix_seconds = 11;
+  int64 completed_unix_seconds = 12;
+}
+
+message CreateSandboxSnapshotResponse {
+  SandboxSnapshotInfo snapshot = 1;
+}
+
+message GetSandboxSnapshotRequest {
+  NamespacedName snapshot = 1;
+  // expected_uid, when set, must match the SandboxSnapshot UID.
+  string expected_uid = 2;
+}
+
+message GetSandboxSnapshotResponse {
+  SandboxSnapshotInfo snapshot = 1;
+}
+
+message DeleteSandboxSnapshotRequest {
+  // snapshot references the SandboxSnapshot to delete; expected_uid, when
+  // set, must match the SandboxSnapshot UID. Deleting a snapshot does not
+  // unpublish its artifacts.
+  SandboxReference snapshot = 1;
+}
+
+message DeleteSandboxSnapshotResponse {}

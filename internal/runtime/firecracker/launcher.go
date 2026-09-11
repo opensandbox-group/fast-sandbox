@@ -222,6 +222,10 @@ func prepareJailRoot(jailRoot, cachedRootfs, vmstatePath, memoryPath string) err
 	if jailRoot == "" || filepath.Base(jailRoot) != jailerChrootRootDir {
 		return fmt.Errorf("%w: invalid jail root %q", ErrInvalidConfig, jailRoot)
 	}
+	// A stale jail root may hold a surviving spill bind: unmount it first,
+	// or the RemoveAll below would descend into the SHARED spill root and
+	// delete other sandboxes' dumps.
+	_ = unmountPath(filepath.Join(jailRoot, jailerSpillDirName))
 	_ = os.RemoveAll(filepath.Dir(jailRoot))
 	if err := os.MkdirAll(filepath.Join(jailRoot, jailerChrootSnapshotsDir), 0o750); err != nil {
 		return fmt.Errorf("create jail root: %w", err)

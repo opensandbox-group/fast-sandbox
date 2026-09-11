@@ -28,6 +28,9 @@ const (
 	FastPathService_ResolveEndpoint_FullMethodName       = "/fastpath.v2.FastPathService/ResolveEndpoint"
 	FastPathService_GetPool_FullMethodName               = "/fastpath.v2.FastPathService/GetPool"
 	FastPathService_ListPools_FullMethodName             = "/fastpath.v2.FastPathService/ListPools"
+	FastPathService_CreateSandboxSnapshot_FullMethodName = "/fastpath.v2.FastPathService/CreateSandboxSnapshot"
+	FastPathService_GetSandboxSnapshot_FullMethodName    = "/fastpath.v2.FastPathService/GetSandboxSnapshot"
+	FastPathService_DeleteSandboxSnapshot_FullMethodName = "/fastpath.v2.FastPathService/DeleteSandboxSnapshot"
 )
 
 // FastPathServiceClient is the client API for FastPathService service.
@@ -43,6 +46,13 @@ type FastPathServiceClient interface {
 	ResolveEndpoint(ctx context.Context, in *ResolveEndpointRequest, opts ...grpc.CallOption) (*ResolveEndpointResponse, error)
 	GetPool(ctx context.Context, in *GetPoolRequest, opts ...grpc.CallOption) (*PoolInfo, error)
 	ListPools(ctx context.Context, in *ListPoolsRequest, opts ...grpc.CallOption) (*ListPoolsResponse, error)
+	// CreateSandboxSnapshot snapshots a running Sandbox and publishes the
+	// artifact set to the artifact store under the snapshot's template name.
+	// It returns after the intent is persisted and the snapshot is triggered;
+	// completion is observed via GetSandboxSnapshot.
+	CreateSandboxSnapshot(ctx context.Context, in *CreateSandboxSnapshotRequest, opts ...grpc.CallOption) (*CreateSandboxSnapshotResponse, error)
+	GetSandboxSnapshot(ctx context.Context, in *GetSandboxSnapshotRequest, opts ...grpc.CallOption) (*GetSandboxSnapshotResponse, error)
+	DeleteSandboxSnapshot(ctx context.Context, in *DeleteSandboxSnapshotRequest, opts ...grpc.CallOption) (*DeleteSandboxSnapshotResponse, error)
 }
 
 type fastPathServiceClient struct {
@@ -143,6 +153,36 @@ func (c *fastPathServiceClient) ListPools(ctx context.Context, in *ListPoolsRequ
 	return out, nil
 }
 
+func (c *fastPathServiceClient) CreateSandboxSnapshot(ctx context.Context, in *CreateSandboxSnapshotRequest, opts ...grpc.CallOption) (*CreateSandboxSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateSandboxSnapshotResponse)
+	err := c.cc.Invoke(ctx, FastPathService_CreateSandboxSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *fastPathServiceClient) GetSandboxSnapshot(ctx context.Context, in *GetSandboxSnapshotRequest, opts ...grpc.CallOption) (*GetSandboxSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSandboxSnapshotResponse)
+	err := c.cc.Invoke(ctx, FastPathService_GetSandboxSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *fastPathServiceClient) DeleteSandboxSnapshot(ctx context.Context, in *DeleteSandboxSnapshotRequest, opts ...grpc.CallOption) (*DeleteSandboxSnapshotResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteSandboxSnapshotResponse)
+	err := c.cc.Invoke(ctx, FastPathService_DeleteSandboxSnapshot_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // FastPathServiceServer is the server API for FastPathService service.
 // All implementations must embed UnimplementedFastPathServiceServer
 // for forward compatibility.
@@ -156,6 +196,13 @@ type FastPathServiceServer interface {
 	ResolveEndpoint(context.Context, *ResolveEndpointRequest) (*ResolveEndpointResponse, error)
 	GetPool(context.Context, *GetPoolRequest) (*PoolInfo, error)
 	ListPools(context.Context, *ListPoolsRequest) (*ListPoolsResponse, error)
+	// CreateSandboxSnapshot snapshots a running Sandbox and publishes the
+	// artifact set to the artifact store under the snapshot's template name.
+	// It returns after the intent is persisted and the snapshot is triggered;
+	// completion is observed via GetSandboxSnapshot.
+	CreateSandboxSnapshot(context.Context, *CreateSandboxSnapshotRequest) (*CreateSandboxSnapshotResponse, error)
+	GetSandboxSnapshot(context.Context, *GetSandboxSnapshotRequest) (*GetSandboxSnapshotResponse, error)
+	DeleteSandboxSnapshot(context.Context, *DeleteSandboxSnapshotRequest) (*DeleteSandboxSnapshotResponse, error)
 	mustEmbedUnimplementedFastPathServiceServer()
 }
 
@@ -192,6 +239,15 @@ func (UnimplementedFastPathServiceServer) GetPool(context.Context, *GetPoolReque
 }
 func (UnimplementedFastPathServiceServer) ListPools(context.Context, *ListPoolsRequest) (*ListPoolsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListPools not implemented")
+}
+func (UnimplementedFastPathServiceServer) CreateSandboxSnapshot(context.Context, *CreateSandboxSnapshotRequest) (*CreateSandboxSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateSandboxSnapshot not implemented")
+}
+func (UnimplementedFastPathServiceServer) GetSandboxSnapshot(context.Context, *GetSandboxSnapshotRequest) (*GetSandboxSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSandboxSnapshot not implemented")
+}
+func (UnimplementedFastPathServiceServer) DeleteSandboxSnapshot(context.Context, *DeleteSandboxSnapshotRequest) (*DeleteSandboxSnapshotResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteSandboxSnapshot not implemented")
 }
 func (UnimplementedFastPathServiceServer) mustEmbedUnimplementedFastPathServiceServer() {}
 func (UnimplementedFastPathServiceServer) testEmbeddedByValue()                         {}
@@ -376,6 +432,60 @@ func _FastPathService_ListPools_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _FastPathService_CreateSandboxSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateSandboxSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FastPathServiceServer).CreateSandboxSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FastPathService_CreateSandboxSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FastPathServiceServer).CreateSandboxSnapshot(ctx, req.(*CreateSandboxSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FastPathService_GetSandboxSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSandboxSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FastPathServiceServer).GetSandboxSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FastPathService_GetSandboxSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FastPathServiceServer).GetSandboxSnapshot(ctx, req.(*GetSandboxSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FastPathService_DeleteSandboxSnapshot_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteSandboxSnapshotRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FastPathServiceServer).DeleteSandboxSnapshot(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FastPathService_DeleteSandboxSnapshot_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FastPathServiceServer).DeleteSandboxSnapshot(ctx, req.(*DeleteSandboxSnapshotRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // FastPathService_ServiceDesc is the grpc.ServiceDesc for FastPathService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -418,6 +528,18 @@ var FastPathService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListPools",
 			Handler:    _FastPathService_ListPools_Handler,
+		},
+		{
+			MethodName: "CreateSandboxSnapshot",
+			Handler:    _FastPathService_CreateSandboxSnapshot_Handler,
+		},
+		{
+			MethodName: "GetSandboxSnapshot",
+			Handler:    _FastPathService_GetSandboxSnapshot_Handler,
+		},
+		{
+			MethodName: "DeleteSandboxSnapshot",
+			Handler:    _FastPathService_DeleteSandboxSnapshot_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

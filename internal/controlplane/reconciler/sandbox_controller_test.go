@@ -42,13 +42,18 @@ func (r *controllerRegistry) GetFastletByID(id placement.FastletID) (placement.F
 func (*controllerRegistry) RecordFeedback(placement.FastletID, placement.LocalFeedback) {}
 
 type controllerFastlet struct {
-	mu          sync.Mutex
-	ensureErr   error
-	inspectErr  error
-	ensurePhase string
-	runtimes    map[string]string
-	ensureCall  int
-	deleteCall  int
+	mu                   sync.Mutex
+	ensureErr            error
+	inspectErr           error
+	ensurePhase          string
+	runtimes             map[string]string
+	ensureCall           int
+	deleteCall           int
+	snapshotCreateErr    error
+	snapshotInspectErr   error
+	snapshotInspectPhase fastletapi.SnapshotPhase
+	snapshotDeleteCall   int
+	lastSnapshotInspect  *fastletapi.SnapshotIdentity
 }
 
 func (f *controllerFastlet) CreateSandbox(_ context.Context, _ string, request *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error) {
@@ -104,6 +109,45 @@ func (f *controllerFastlet) ReconcileBindings(_ context.Context, _ string, reque
 		DataPlane:          controllerObservation(request.Identity.SandboxUID, phase).DataPlane,
 		AcceptedGeneration: request.SpecGeneration, AppliedGeneration: request.SpecGeneration,
 	}}, nil
+}
+
+func (f *controllerFastlet) CreateSnapshot(_ context.Context, _ string, request *fastletapi.CreateSnapshotRequest) (*fastletapi.CreateSnapshotResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.snapshotCreateErr != nil {
+		return &fastletapi.CreateSnapshotResponse{}, f.snapshotCreateErr
+	}
+	f.runtimes[request.Identity.Sandbox.SandboxUID] = "running"
+	return &fastletapi.CreateSnapshotResponse{
+		Disposition: fastletapi.CreateDispositionCreated,
+		Snapshot: &fastletapi.SnapshotStatus{
+			SnapshotID: "snap-" + request.Identity.SnapshotUID, Phase: fastletapi.SnapshotPhaseCreating,
+		},
+	}, nil
+}
+
+func (f *controllerFastlet) InspectSnapshot(_ context.Context, _ string, request *fastletapi.InspectSnapshotRequest) (*fastletapi.InspectSnapshotResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lastSnapshotInspect = &request.Identity
+	if f.snapshotInspectErr != nil {
+		return &fastletapi.InspectSnapshotResponse{}, f.snapshotInspectErr
+	}
+	phase := f.snapshotInspectPhase
+	if phase == "" {
+		phase = fastletapi.SnapshotPhaseSucceeded
+	}
+	return &fastletapi.InspectSnapshotResponse{Snapshot: &fastletapi.SnapshotStatus{
+		SnapshotID: "snap-" + request.Identity.SnapshotUID, Phase: phase,
+		ManifestRef: "s3://bucket/publish/abc123/manifest.json", ArtifactDigest: "deadbeef", SizeBytes: 42,
+	}}, nil
+}
+
+func (f *controllerFastlet) DeleteSnapshot(_ context.Context, _ string, _ *fastletapi.DeleteSnapshotRequest) (*fastletapi.DeleteSnapshotResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.snapshotDeleteCall++
+	return &fastletapi.DeleteSnapshotResponse{}, nil
 }
 
 func controllerObservation(sandboxID, phase string) *fastletapi.SandboxStatus {

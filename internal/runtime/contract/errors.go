@@ -17,4 +17,12 @@ var (
 	// firecracker runtime-agent pull layer so both can fail a create with
 	// the same sentinel.
 	ErrImageNotReady = errors.New("rootfs image is not ready in the local cache")
+	// ErrSnapshotUnsupported reports that the runtime driver does not
+	// implement the optional Snapshotter extension.
+	ErrSnapshotUnsupported = errors.New("runtime does not support sandbox snapshots")
+	// ErrInsufficientStorage reports that the node-local staging space
+	// cannot hold the snapshot artifact set (checked before the VM is
+	// paused, after a best-effort cache GC). It is retryable: the caller
+	// parks the task instead of failing it, and retries when space frees.
+	ErrInsufficientStorage = errors.New("insufficient local storage for the snapshot artifact set")
 )

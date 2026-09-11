@@ -18,6 +18,7 @@ type Backend interface {
 	ListLeases(context.Context, agentprotocol.Identity) ([]agentprotocol.Lease, error)
 	Compatibility(context.Context) (string, error)
 	Health(context.Context) (agentprotocol.HealthResponse, error)
+	PublishImage(context.Context, agentprotocol.PublishImageRequest) (agentprotocol.PublishImageResponse, error)
 }
 
 // Error is a wire-classified backend error; plain errors map to Internal.
@@ -49,4 +50,10 @@ func invalidRequest(format string, args ...any) *Error {
 // unauthorized builds a 403 backend error.
 func unauthorized(format string, args ...any) *Error {
 	return &Error{Code: agentprotocol.ErrorUnauthorized, Message: fmt.Sprintf(format, args...)}
+}
+
+// forbidden builds a 403 backend error for a store-level refusal (no write
+// credential) as opposed to a caller-identity rejection.
+func forbidden(format string, args ...any) *Error {
+	return &Error{Code: agentprotocol.ErrorForbidden, Message: fmt.Sprintf(format, args...)}
 }

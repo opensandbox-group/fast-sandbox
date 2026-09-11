@@ -22,6 +22,9 @@ type FastletAdmissionClient interface {
 	InspectSandbox(ctx context.Context, fastletIP string, req *InspectSandboxRequest) (*InspectSandboxResponse, error)
 	DeleteSandbox(ctx context.Context, fastletIP string, req *DeleteSandboxRequest) (*DeleteSandboxResponse, error)
 	ReconcileBindings(ctx context.Context, fastletIP string, req *ReconcileBindingsRequest) (*ReconcileBindingsResponse, error)
+	CreateSnapshot(ctx context.Context, fastletIP string, req *CreateSnapshotRequest) (*CreateSnapshotResponse, error)
+	InspectSnapshot(ctx context.Context, fastletIP string, req *InspectSnapshotRequest) (*InspectSnapshotResponse, error)
+	DeleteSnapshot(ctx context.Context, fastletIP string, req *DeleteSnapshotRequest) (*DeleteSnapshotResponse, error)
 	Heartbeat(ctx context.Context, fastletIP string, req *HeartbeatRequest) (*HeartbeatResponse, error)
 	RuntimeDiagnostics(ctx context.Context, fastletIP string) (*RuntimeDiagnostics, error)
 	SandboxDiagnostics(ctx context.Context, fastletIP string, req *SandboxDiagnosticsRequest) (*SandboxDiagnosticsResponse, error)
@@ -103,6 +106,35 @@ func (c *FastletClient) ReconcileBindings(ctx context.Context, fastletIP string,
 		ctx = withFastletIdentity(ctx, req.Identity)
 	}
 	return postFastletJSON[ReconcileBindingsRequest, ReconcileBindingsResponse](c, ctx, fastletIP, "/api/v2/fastlet/bindings/reconcile", req)
+}
+
+func (c *FastletClient) CreateSnapshot(ctx context.Context, fastletIP string, req *CreateSnapshotRequest) (*CreateSnapshotResponse, error) {
+	if req != nil {
+		ctx = withFastletIdentity(ctx, req.Identity.Sandbox)
+	}
+	response, err := postFastletJSON[CreateSnapshotRequest, CreateSnapshotResponse](c, ctx, fastletIP, "/api/v2/fastlet/snapshots/create", req)
+	if err == nil || response == nil {
+		return response, err
+	}
+	var failure *FastletError
+	if errors.As(err, &failure) {
+		return response, &CreateCallError{Disposition: response.Disposition, Failure: failure}
+	}
+	return response, err
+}
+
+func (c *FastletClient) InspectSnapshot(ctx context.Context, fastletIP string, req *InspectSnapshotRequest) (*InspectSnapshotResponse, error) {
+	if req != nil {
+		ctx = withFastletIdentity(ctx, req.Identity.Sandbox)
+	}
+	return postFastletJSON[InspectSnapshotRequest, InspectSnapshotResponse](c, ctx, fastletIP, "/api/v2/fastlet/snapshots/inspect", req)
+}
+
+func (c *FastletClient) DeleteSnapshot(ctx context.Context, fastletIP string, req *DeleteSnapshotRequest) (*DeleteSnapshotResponse, error) {
+	if req != nil {
+		ctx = withFastletIdentity(ctx, req.Identity.Sandbox)
+	}
+	return postFastletJSON[DeleteSnapshotRequest, DeleteSnapshotResponse](c, ctx, fastletIP, "/api/v2/fastlet/snapshots/delete", req)
 }
 
 func (c *FastletClient) Heartbeat(ctx context.Context, fastletIP string, req *HeartbeatRequest) (*HeartbeatResponse, error) {
@@ -204,6 +236,12 @@ func responseFastletError(response any) *FastletError {
 	case *ReconcileBindingsResponse:
 		return typed.Error
 	case *SandboxDiagnosticsResponse:
+		return typed.Error
+	case *CreateSnapshotResponse:
+		return typed.Error
+	case *InspectSnapshotResponse:
+		return typed.Error
+	case *DeleteSnapshotResponse:
 		return typed.Error
 	default:
 		return nil

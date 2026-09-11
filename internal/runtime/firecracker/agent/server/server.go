@@ -196,6 +196,23 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		s.handleRead(writer, request, func(ctx context.Context, identity agentprotocol.Identity) (any, error) {
 			return s.Backend.Health(ctx)
 		})
+	case agentprotocol.RoutePublishImage:
+		s.handleMutating(writer, request, func(ctx context.Context, payload json.RawMessage) (any, error) {
+			var req agentprotocol.PublishImageRequest
+			if err := decodeRequest(payload, &req); err != nil {
+				return nil, err
+			}
+			if err := validateIdentity(req.Identity, true); err != nil {
+				return nil, err
+			}
+			if strings.TrimSpace(req.Key) == "" {
+				return nil, invalidRequest("publish key is required")
+			}
+			if strings.TrimSpace(req.Dir) == "" {
+				return nil, invalidRequest("staging directory is required")
+			}
+			return s.Backend.PublishImage(ctx, req)
+		})
 	default:
 		http.NotFound(writer, request)
 	}
@@ -334,6 +351,8 @@ func writeError(writer http.ResponseWriter, err error) {
 		status = http.StatusConflict
 	case agentprotocol.ErrorNotFound:
 		status = http.StatusNotFound
+	case agentprotocol.ErrorForbidden:
+		status = http.StatusForbidden
 	}
 	writeJSON(writer, status, agentprotocol.ErrorResponse{Code: classified.Code, Message: classified.Message})
 }

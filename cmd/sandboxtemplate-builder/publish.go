@@ -18,6 +18,7 @@ import (
 	"k8s.io/klog/v2"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 )
 
 // publish uploads the artifacts under a digest namespace and returns the
@@ -74,31 +75,12 @@ func publish(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir 
 	return manifestURI, nil
 }
 
-// imageIndexKey derives the content-addressed index key of an image
-// reference. It matches the consumer-side cache key, so a consumer can
-// resolve the latest published manifest for an image reference without any
-// control-plane coordination.
-func imageIndexKey(image string) string {
-	return sha256Of([]byte(image))
-}
-
 // imageIndexPayload builds the image index document pointing at the latest
 // published manifest. The manifest reference is content-addressed, so an
 // older build of the same image reference stays intact and only the index
-// pointer moves.
+// pointer moves. The format lives in internal/artifacts.
 func imageIndexPayload(image, manifestURI, artifactDigest string) ([]byte, error) {
-	document := struct {
-		Image          string `json:"image"`
-		ManifestRef    string `json:"manifestRef"`
-		ArtifactDigest string `json:"artifactDigest"`
-		UpdatedAt      string `json:"updatedAt"`
-	}{
-		Image:          image,
-		ManifestRef:    manifestURI,
-		ArtifactDigest: artifactDigest,
-		UpdatedAt:      time.Now().UTC().Format(time.RFC3339),
-	}
-	return json.MarshalIndent(document, "", "  ")
+	return artifacts.ImageIndexPayload(image, manifestURI, artifactDigest, time.Now())
 }
 
 // publishImageIndex uploads the image index object(s) under the store root
@@ -161,7 +143,7 @@ func publishOneImageIndex(ctx context.Context, aws string, args []string, key, m
 	if err := local.Close(); err != nil {
 		return err
 	}
-	objectKey := "index/" + imageIndexKey(key) + ".json"
+	objectKey := "index/" + artifacts.ImageIndexKey(key) + ".json"
 	target := strings.TrimRight(storeRoot, "/") + "/" + objectKey
 	return uploadWithRetry(ctx, aws, args, local.Name(), target, objectKey)
 }

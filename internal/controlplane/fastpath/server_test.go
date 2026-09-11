@@ -2,6 +2,7 @@ package fastpath
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -65,6 +66,7 @@ type fastpathFastlet struct {
 	inspectError   error
 	diagnostics    *fastletapi.SandboxDiagnosticsResponse
 	diagnosticsErr error
+	snapshotErr    error
 }
 
 func (f *fastpathFastlet) CreateSandbox(_ context.Context, fastletIP string, request *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error) {
@@ -109,6 +111,31 @@ func (f *fastpathFastlet) InspectSandbox(_ context.Context, _ string, request *f
 
 func (*fastpathFastlet) DeleteSandbox(context.Context, string, *fastletapi.DeleteSandboxRequest) (*fastletapi.DeleteSandboxResponse, error) {
 	return &fastletapi.DeleteSandboxResponse{}, nil
+}
+
+func (f *fastpathFastlet) CreateSnapshot(_ context.Context, _ string, request *fastletapi.CreateSnapshotRequest) (*fastletapi.CreateSnapshotResponse, error) {
+	f.mu.Lock()
+	snapshotErr := f.snapshotErr
+	f.mu.Unlock()
+	if snapshotErr != nil {
+		return &fastletapi.CreateSnapshotResponse{Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects}, snapshotErr
+	}
+	return &fastletapi.CreateSnapshotResponse{
+		Disposition: fastletapi.CreateDispositionCreated,
+		Snapshot: &fastletapi.SnapshotStatus{
+			SnapshotID: "snap-" + request.Identity.SnapshotUID, Phase: fastletapi.SnapshotPhaseCreating,
+		},
+	}, nil
+}
+
+func (*fastpathFastlet) InspectSnapshot(_ context.Context, _ string, request *fastletapi.InspectSnapshotRequest) (*fastletapi.InspectSnapshotResponse, error) {
+	return &fastletapi.InspectSnapshotResponse{Snapshot: &fastletapi.SnapshotStatus{
+		SnapshotID: "snap-" + request.Identity.SnapshotUID, Phase: fastletapi.SnapshotPhaseCreating,
+	}}, nil
+}
+
+func (*fastpathFastlet) DeleteSnapshot(context.Context, string, *fastletapi.DeleteSnapshotRequest) (*fastletapi.DeleteSnapshotResponse, error) {
+	return &fastletapi.DeleteSnapshotResponse{}, nil
 }
 
 func (f *fastpathFastlet) ReconcileBindings(_ context.Context, _ string, request *fastletapi.ReconcileBindingsRequest) (*fastletapi.ReconcileBindingsResponse, error) {
@@ -164,6 +191,9 @@ func (c *countingUIDClient) Create(ctx context.Context, object client.Object, op
 		if sandbox.Generation == 0 {
 			sandbox.Generation = 1
 		}
+	}
+	if snapshot, ok := object.(*apiv1alpha2.SandboxSnapshot); ok && snapshot.UID == "" {
+		snapshot.UID = types.UID("snapshot-uid-" + snapshot.Name)
 	}
 	c.mu.Unlock()
 	return c.Client.Create(ctx, object, options...)
@@ -225,6 +255,57 @@ func TestCreateHappyPathUsesOneRemoteWriteAndOneFastletCall(t *testing.T) {
 	envelope, err := assignment.AssignmentFromAnnotation(&persisted)
 	require.NoError(t, err)
 	require.Equal(t, "fastlet-a", envelope.FastletName)
+}
+
+func TestCreateSandboxAppliesSnapshotRecordedBindings(t *testing.T) {
+	server, k8sClient, _, _ := newV2Server(t)
+	// A Succeeded snapshot whose templateName matches the create image,
+	// carrying the source sandbox's policy provenance.
+	snapshot := &apiv1alpha2.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "snap-a", Namespace: "default", UID: types.UID("snap-uid-a"),
+			CreationTimestamp: metav1.Now()},
+		Spec: apiv1alpha2.SandboxSnapshotSpec{
+			SandboxRef:   apiv1alpha2.SandboxRef{Name: "sandbox-old", Namespace: "default"},
+			TemplateName: "app-snap-v1",
+		},
+		Status: apiv1alpha2.SandboxSnapshotStatus{Phase: apiv1alpha2.SandboxSnapshotPhaseSucceeded},
+	}
+	provenance, err := json.Marshal([]apiv1alpha2.ActionBinding{
+		{Handler: "audit", Input: `{"a":1}`},
+		{Handler: "missing-in-pool", Input: `{}`},
+	})
+	require.NoError(t, err)
+	snapshot.Annotations = map[string]string{assignment.AnnotationSourceActionBindings: string(provenance)}
+	require.NoError(t, k8sClient.Client.Create(context.Background(), snapshot))
+
+	request := createRequest("restored-1")
+	request.Image = "app-snap-v1"
+	request.ActionBindings = []*fastpathv2.ActionBinding{{Handler: "audit", Input: `{"explicit":true}`}}
+	response, err := server.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
+
+	var persisted apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "restored-1"}, &persisted))
+	require.Equal(t, response.Sandbox.GetIdentity().GetUid(), string(persisted.UID))
+	// Explicit wins per handler; undeclared handlers are dropped.
+	require.Equal(t, []apiv1alpha2.ActionBinding{{Handler: "audit", Input: `{"explicit":true}`}}, persisted.Spec.ActionBindings)
+
+	// Without explicit bindings the recorded policy applies verbatim.
+	request2 := createRequest("restored-2")
+	request2.Image = "app-snap-v1"
+	_, err = server.CreateSandbox(context.Background(), request2)
+	require.NoError(t, err)
+	var second apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "restored-2"}, &second))
+	require.Equal(t, []apiv1alpha2.ActionBinding{{Handler: "audit", Input: `{"a":1}`}}, second.Spec.ActionBindings)
+
+	// An image with no snapshot provenance is untouched.
+	request3 := createRequest("plain-1")
+	_, err = server.CreateSandbox(context.Background(), request3)
+	require.NoError(t, err)
+	var plain apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "plain-1"}, &plain))
+	require.Empty(t, plain.Spec.ActionBindings)
 }
 
 func TestGetAndListCacheHitsAvoidDurableKubernetesReads(t *testing.T) {

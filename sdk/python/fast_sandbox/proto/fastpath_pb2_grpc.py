@@ -79,6 +79,21 @@ class FastPathServiceStub(object):
                 request_serializer=fastpath__pb2.ListPoolsRequest.SerializeToString,
                 response_deserializer=fastpath__pb2.ListPoolsResponse.FromString,
                 _registered_method=True)
+        self.CreateSandboxSnapshot = channel.unary_unary(
+                '/fastpath.v2.FastPathService/CreateSandboxSnapshot',
+                request_serializer=fastpath__pb2.CreateSandboxSnapshotRequest.SerializeToString,
+                response_deserializer=fastpath__pb2.CreateSandboxSnapshotResponse.FromString,
+                _registered_method=True)
+        self.GetSandboxSnapshot = channel.unary_unary(
+                '/fastpath.v2.FastPathService/GetSandboxSnapshot',
+                request_serializer=fastpath__pb2.GetSandboxSnapshotRequest.SerializeToString,
+                response_deserializer=fastpath__pb2.GetSandboxSnapshotResponse.FromString,
+                _registered_method=True)
+        self.DeleteSandboxSnapshot = channel.unary_unary(
+                '/fastpath.v2.FastPathService/DeleteSandboxSnapshot',
+                request_serializer=fastpath__pb2.DeleteSandboxSnapshotRequest.SerializeToString,
+                response_deserializer=fastpath__pb2.DeleteSandboxSnapshotResponse.FromString,
+                _registered_method=True)
 
 
 class FastPathServiceServicer(object):
@@ -138,6 +153,28 @@ class FastPathServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def CreateSandboxSnapshot(self, request, context):
+        """CreateSandboxSnapshot snapshots a running Sandbox and publishes the
+        artifact set to the artifact store under the snapshot's template name.
+        It returns after the intent is persisted and the snapshot is triggered;
+        completion is observed via GetSandboxSnapshot.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetSandboxSnapshot(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteSandboxSnapshot(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_FastPathServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -185,6 +222,21 @@ def add_FastPathServiceServicer_to_server(servicer, server):
                     servicer.ListPools,
                     request_deserializer=fastpath__pb2.ListPoolsRequest.FromString,
                     response_serializer=fastpath__pb2.ListPoolsResponse.SerializeToString,
+            ),
+            'CreateSandboxSnapshot': grpc.unary_unary_rpc_method_handler(
+                    servicer.CreateSandboxSnapshot,
+                    request_deserializer=fastpath__pb2.CreateSandboxSnapshotRequest.FromString,
+                    response_serializer=fastpath__pb2.CreateSandboxSnapshotResponse.SerializeToString,
+            ),
+            'GetSandboxSnapshot': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetSandboxSnapshot,
+                    request_deserializer=fastpath__pb2.GetSandboxSnapshotRequest.FromString,
+                    response_serializer=fastpath__pb2.GetSandboxSnapshotResponse.SerializeToString,
+            ),
+            'DeleteSandboxSnapshot': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteSandboxSnapshot,
+                    request_deserializer=fastpath__pb2.DeleteSandboxSnapshotRequest.FromString,
+                    response_serializer=fastpath__pb2.DeleteSandboxSnapshotResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -430,6 +482,87 @@ class FastPathService(object):
             '/fastpath.v2.FastPathService/ListPools',
             fastpath__pb2.ListPoolsRequest.SerializeToString,
             fastpath__pb2.ListPoolsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def CreateSandboxSnapshot(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/fastpath.v2.FastPathService/CreateSandboxSnapshot',
+            fastpath__pb2.CreateSandboxSnapshotRequest.SerializeToString,
+            fastpath__pb2.CreateSandboxSnapshotResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetSandboxSnapshot(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/fastpath.v2.FastPathService/GetSandboxSnapshot',
+            fastpath__pb2.GetSandboxSnapshotRequest.SerializeToString,
+            fastpath__pb2.GetSandboxSnapshotResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteSandboxSnapshot(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/fastpath.v2.FastPathService/DeleteSandboxSnapshot',
+            fastpath__pb2.DeleteSandboxSnapshotRequest.SerializeToString,
+            fastpath__pb2.DeleteSandboxSnapshotResponse.FromString,
             options,
             channel_credentials,
             insecure,

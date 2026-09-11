@@ -84,6 +84,10 @@ type Driver struct {
 	// DeleteSandbox (set by fastlet when the profile requires it; nil in
 	// local/host mode).
 	nodeCleanup nodecleanup.RuntimeProcessCleaner
+	// snapshotCapacityWait overrides the GC self-heal window of the
+	// snapshot staging capacity gate (tests shorten it; 0 selects the
+	// default).
+	snapshotCapacityWait time.Duration
 }
 
 // defaultImageGCInterval bounds the image cache by usage without coupling GC
@@ -781,9 +785,45 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 			d.killAndForget(state.Config.Identity.SandboxUID, state.PID)
 			d.removeJailRoot(state.Config.Identity.SandboxUID)
 			_ = removeSandboxDir(directory)
+			continue
 		}
+		// A Fastlet crash during a snapshot dump leaves the VM paused (the
+		// Snapshotter contract only covers in-process failure paths). The
+		// surviving VMM is resumed here so recovery never strands a guest.
+		d.resumePausedVM(ctx, state)
 	}
 	return nil
+}
+
+// resumePausedVM resumes a live but paused microVM (snapshot-dump crash
+// recovery). The VM state is polled first: resuming a Running VM is a
+// Firecracker API error, so only a confirmed Paused state is resumed.
+func (d *Driver) resumePausedVM(ctx context.Context, state *SandboxState) {
+	if state == nil || state.APIAddress == "" {
+		return
+	}
+	client := d.newClient(state.APIAddress)
+	defer client.Close()
+	vmState, err := client.VMState(ctx)
+	if err != nil || vmState != "Paused" {
+		return
+	}
+	if _, err := resumeVM(ctx, client, d.bootTimeoutOrDefault()); err != nil {
+		klog.ErrorS(err, "Resume paused microVM after crash recovery failed; Sandbox remains paused",
+			"sandboxId", state.Config.Identity.SandboxUID)
+		return
+	}
+	klog.InfoS("Resumed paused microVM after crash recovery", "sandboxId", state.Config.Identity.SandboxUID)
+}
+
+// bootTimeoutOrDefault returns the configured boot (resume) poll timeout.
+func (d *Driver) bootTimeoutOrDefault() int32 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.config.BootTimeoutSeconds > 0 {
+		return d.config.BootTimeoutSeconds
+	}
+	return 60
 }
 
 // GetAccessDescriptor returns the pod-side DirectIP descriptor of the Sandbox.
@@ -963,6 +1003,23 @@ func (d *Driver) prepareInstance(stateRoot, sandboxID, image, stateDir, vmstateP
 		if prepareErr := prepareJailRoot(jailRoot, cached, vmstatePath, memoryPath); prepareErr != nil {
 			return "", "", "", prepareErr
 		}
+		// Bind the snapshot spill root into the jail BEFORE the VMM starts:
+		// the jailer clones its mount namespace at process start, so a dump
+		// window bind would be invisible to the running VMM. A failed bind
+		// only disables spilling for this sandbox (the dump falls back to
+		// the staging directory).
+		if spillRoot := d.snapshotSpillRoot(); spillRoot != "" {
+			spillMount := filepath.Join(jailRoot, jailerSpillDirName)
+			// The bind target must exist before MS_BIND (the jail root only
+			// carries snapshots/ from prepareJailRoot).
+			if err := os.MkdirAll(spillRoot, 0o750); err != nil {
+				klog.InfoS("prepare snapshot spill root failed; spilling disabled", "spillRoot", spillRoot, "err", err)
+			} else if err := os.MkdirAll(spillMount, 0o750); err != nil {
+				klog.InfoS("create the jail spill mount point failed; spilling disabled", "err", err)
+			} else if err := bindMount(spillRoot, spillMount); err != nil {
+				klog.InfoS("bind the snapshot spill root into the jail root failed; spilling disabled", "err", err)
+			}
+		}
 		return instanceRootfs, jailRoot, apiAddress, nil
 	}
 	instanceRootfs, err = prepareInstanceRootfs(stateRoot, image, stateDir)
@@ -979,6 +1036,10 @@ func (d *Driver) removeJailRoot(sandboxID string) {
 		return
 	}
 	root := jailerRoot(filepath.Join(d.config.StateRoot, jailerChrootBaseDir), filepath.Base(d.config.BinaryPath), truncatedSandboxID(sandboxID))
+	// Release the spill bind before the recursive removal: RemoveAll would
+	// otherwise descend into the SHARED spill root and delete other
+	// sandboxes' dumps.
+	_ = unmountPath(filepath.Join(root, jailerSpillDirName))
 	if err := os.RemoveAll(filepath.Dir(root)); err != nil {
 		klog.V(2).InfoS("remove firecracker jail root failed", "sandboxId", sandboxID, "err", err)
 	}

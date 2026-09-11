@@ -47,6 +47,9 @@ func (s *FastletServer) Handler() http.Handler {
 	mux.HandleFunc("/api/v2/fastlet/inspect", s.handleInspect)
 	mux.HandleFunc("/api/v2/fastlet/delete", s.handleDelete)
 	mux.HandleFunc("/api/v2/fastlet/bindings/reconcile", s.handleReconcileBindings)
+	mux.HandleFunc("/api/v2/fastlet/snapshots/create", s.handleSnapshotCreate)
+	mux.HandleFunc("/api/v2/fastlet/snapshots/inspect", s.handleSnapshotInspect)
+	mux.HandleFunc("/api/v2/fastlet/snapshots/delete", s.handleSnapshotDelete)
 	mux.HandleFunc("/api/v2/fastlet/heartbeat", s.handleHeartbeat)
 	mux.HandleFunc("/api/v2/fastlet/runtime-diagnostics", s.handleRuntimeDiagnostics)
 	mux.HandleFunc("/api/v2/fastlet/diagnostics/sandbox", s.handleSandboxDiagnostics)
@@ -116,6 +119,36 @@ func (s *FastletServer) handleReconcileBindings(w http.ResponseWriter, r *http.R
 	}
 	r = r.WithContext(withFastletRequestIdentity(r.Context(), req.Identity))
 	response, err := s.sandboxManager.ReconcileBindings(r.Context(), &req)
+	writeResponse(w, response, err)
+}
+
+func (s *FastletServer) handleSnapshotCreate(w http.ResponseWriter, r *http.Request) {
+	var req fastletapi.CreateSnapshotRequest
+	if !decodePost(w, r, &req) {
+		return
+	}
+	r = r.WithContext(withFastletRequestIdentity(r.Context(), req.Identity.Sandbox))
+	response, err := s.sandboxManager.CreateSnapshot(r.Context(), &req)
+	writeResponse(w, response, err)
+}
+
+func (s *FastletServer) handleSnapshotInspect(w http.ResponseWriter, r *http.Request) {
+	var req fastletapi.InspectSnapshotRequest
+	if !decodePost(w, r, &req) {
+		return
+	}
+	r = r.WithContext(withFastletRequestIdentity(r.Context(), req.Identity.Sandbox))
+	response, err := s.sandboxManager.InspectSnapshot(&req)
+	writeResponse(w, response, err)
+}
+
+func (s *FastletServer) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
+	var req fastletapi.DeleteSnapshotRequest
+	if !decodePost(w, r, &req) {
+		return
+	}
+	r = r.WithContext(withFastletRequestIdentity(r.Context(), req.Identity.Sandbox))
+	response, err := s.sandboxManager.DeleteSnapshot(r.Context(), &req)
 	writeResponse(w, response, err)
 }
 
@@ -215,6 +248,10 @@ func statusForFastletError(err error) int {
 		return http.StatusServiceUnavailable
 	case fastletapi.ErrorNotFound:
 		return http.StatusNotFound
+	case fastletapi.ErrorSnapshotUnsupported:
+		return http.StatusNotImplemented
+	case fastletapi.ErrorSnapshotInProgress:
+		return http.StatusConflict
 	default:
 		return http.StatusConflict
 	}

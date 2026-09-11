@@ -1,9 +1,9 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"strings"
+
+	"fast-sandbox/internal/artifacts"
 )
 
 // shellQuote single-quotes an argument for /bin/sh, escaping embedded
@@ -14,6 +14,5 @@ func shellQuote(argument string) string {
 
 // sha256Of returns the hex digest of a byte slice.
 func sha256Of(payload []byte) string {
-	digest := sha256.Sum256(payload)
-	return hex.EncodeToString(digest[:])
+	return artifacts.SHA256Of(payload)
 }

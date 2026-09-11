@@ -32,12 +32,22 @@ One-liners:
 ```bash
 ./scripts/integration-env.sh up        # two-node env + DART (tasks 1-8)
 ./scripts/integration-env.sh verify    # 2 + 5 sandboxes; verify 4 = P2P evidence
+./scripts/integration-env.sh verify-snapshot  # live snapshot E2E (see below)
 ./scripts/integration-env.sh status    # component health + dart block_source counters
 ./scripts/integration-env.sh down      # host left clean
 ```
 
 `KIND_SINGLE=1` falls back to one node (cache-only, no peer traffic);
 `WARM_IMAGES=1` restores the preheat for fast delivery baselines.
+
+`verify-snapshot` drives the full live-checkpoint chain (fastpath gRPC →
+SandboxSnapshot CR → fastlet → Firecracker pause/dump/resume → runtime-agent
+publish → restore from `image=<templateName>` → `/ping`), measures the pause
+window and the `/ping` gap, exercises the reentrancy fencing (rejected
+inside the pause window, admitted during `Publishing`), and validates the
+published artifact set. See the
+[Sandbox Snapshots guide](sandbox-snapshots.md); evidence lands in
+`logs/snapshot-e2e-<ts>/`.
 
 `up` and the plain `verify` only prove execd `/ping` delivery. For execd
 **protocol** usability in the guest (OpenSandbox issue #1695: `POST

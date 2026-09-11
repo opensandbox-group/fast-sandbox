@@ -12,14 +12,17 @@ import (
 
 // fakeAgentClient is a scriptable AgentClient for wiring tests.
 type fakeAgentClient struct {
-	mu        sync.Mutex
-	pins      []string
-	pinReqs   []string
-	unpins    []string
-	unpinReqs []string
-	releases  []string
-	healthErr error
-	digest    string
+	mu         sync.Mutex
+	pins       []string
+	pinReqs    []string
+	unpins     []string
+	unpinReqs  []string
+	releases   []string
+	healthErr  error
+	digest     string
+	publishes  []string
+	publishOut PublishOutcome
+	publishErr error
 }
 
 func (f *fakeAgentClient) PinImage(_ context.Context, requestID, image string) (string, error) {
@@ -39,6 +42,16 @@ func (f *fakeAgentClient) UnpinImage(_ context.Context, requestID, image string)
 	f.unpins = append(f.unpins, image)
 	f.unpinReqs = append(f.unpinReqs, requestID)
 	return nil
+}
+
+func (f *fakeAgentClient) PublishImage(_ context.Context, _, key, _ string) (PublishOutcome, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.publishes = append(f.publishes, key)
+	if f.publishErr != nil {
+		return PublishOutcome{}, f.publishErr
+	}
+	return f.publishOut, nil
 }
 
 func (f *fakeAgentClient) LeaseDevices(context.Context, string, *fastletapi.RuntimeSandboxConfig) (Lease, error) {

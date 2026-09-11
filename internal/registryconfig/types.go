@@ -27,6 +27,11 @@ type RegistryRule struct {
 	Host             string    `json:"host" yaml:"host"`
 	RepositoryPrefix string    `json:"repositoryPrefix,omitempty" yaml:"repositoryPrefix,omitempty"`
 	SecretRef        SecretRef `json:"secretRef" yaml:"secretRef"`
+	// WriteSecretRef optionally references an Opaque secret holding the
+	// publish (write) access key pair of an S3-compatible artifact store:
+	// keys accessKeyId and secretAccessKey (the SandboxTemplate
+	// PublishSecretRef convention). Empty keeps the store read-only.
+	WriteSecretRef *SecretRef `json:"writeSecretRef,omitempty" yaml:"writeSecretRef,omitempty"`
 }
 
 type SecretRef struct {
@@ -39,6 +44,14 @@ type Credential struct {
 	Username         string `json:"username,omitempty"`
 	Password         string `json:"password,omitempty"`
 	IdentityToken    string `json:"identityToken,omitempty"`
+	// WriteUsername/WritePassword carry the optional publish (write) access
+	// key pair of an S3-compatible artifact store. Empty keeps the store
+	// read-only: pulls work, the runtime-agent refuses to publish. The
+	// fields are compiled from a RegistryRule's writeSecretRef (plain
+	// accessKeyId/secretAccessKey keys, mirroring the SandboxTemplate
+	// PublishSecretRef convention).
+	WriteUsername string `json:"writeUsername,omitempty"`
+	WritePassword string `json:"writePassword,omitempty"`
 	// Endpoint is the connection address of an S3-compatible artifact store
 	// (firecracker runtime-agent), e.g. "http://127.0.0.1:9000". Host keeps
 	// its matching-key meaning (registry host, or the artifact store host
@@ -65,6 +78,12 @@ func NormalizeAndValidate(config Config) (Config, error) {
 		rule.Host = NormalizeHost(rule.Host)
 		rule.RepositoryPrefix = strings.Trim(strings.TrimSpace(rule.RepositoryPrefix), "/")
 		rule.SecretRef.Name = strings.TrimSpace(rule.SecretRef.Name)
+		if rule.WriteSecretRef != nil {
+			rule.WriteSecretRef.Name = strings.TrimSpace(rule.WriteSecretRef.Name)
+			if rule.WriteSecretRef.Name == "" {
+				return Config{}, fmt.Errorf("registry %s has an empty writeSecretRef.name", rule.Host)
+			}
+		}
 		if rule.Host == "" {
 			return Config{}, errors.New("registry host is required")
 		}

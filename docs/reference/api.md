@@ -230,6 +230,53 @@ template cascades to its Pods via the garbage collector), pinned to
 See the [SandboxTemplate guide](../guides/sandboxtemplate-golden-images.md)
 for the end-to-end workflow, artifact layout, and consumption contract.
 
+## SandboxSnapshot
+
+SandboxSnapshot is a one-shot live checkpoint of a running Sandbox: the
+Firecracker driver pauses the VM, dumps the artifact set, resumes, and
+publishes it to the artifact store in the SandboxTemplate layout, addressable
+under `spec.templateName`. The spec is immutable (CEL-enforced).
+
+```yaml
+apiVersion: sandbox.fast.io/v1alpha2
+kind: SandboxSnapshot
+metadata:
+  name: checkpoint-1            # == the create request_id (idempotency key)
+spec:
+  sandboxRef:
+    name: my-sandbox
+    namespace: default
+    uid: ""                     # fastpath fills the live UID; mismatches fence
+  templateName: my-app-v2
+```
+
+### Spec
+
+| Field | Required | Meaning |
+| --- | ---: | --- |
+| `sandboxRef.name`/`namespace` | Yes | Target running Sandbox |
+| `sandboxRef.uid` | No | Filled by fastpath from the validated object; a recreated same-name Sandbox fails the snapshot |
+| `templateName` | Yes | Artifact-store index key the set is published under; global across namespaces, same pattern as SandboxTemplate `indexKey`. Only this one index key is written — never a default `sha256(image)` |
+
+### Status
+
+| Field | Meaning |
+| --- | --- |
+| `phase` | `Pending` → `Creating` (pause window) → `Publishing` (upload only, VM resumed) → `Succeeded`/`Failed` |
+| `triggered` | Placement + identity fence pinned at trigger time; observations resolve it across later reassignments |
+| `fastletName`/`fastletPodUID`, `snapshotID`, `sandboxUID` | Placement projection and node-local task identity |
+| `manifestRef`, `artifactDigest`, `sizeBytes` | Published artifact facts (Succeeded only) |
+| `conditions` | `Completed` (True on Succeeded; False + reason on Failed) |
+
+Fences are split by resource: the **Sandbox** fence covers only
+`Pending`/`Creating` (the pause window) — a snapshot in `Publishing` no
+longer blocks the next snapshot of the same Sandbox. The **template-name**
+fence holds to terminal. `Failed` never moved the store index, so nothing it
+produced is addressable.
+
+See the [Sandbox Snapshots guide](../guides/sandbox-snapshots.md) for the
+pause window, spill area, artifact layout, and write credentials.
+
 ## FastPath v2
 
 The protobuf contract is
@@ -244,6 +291,9 @@ The protobuf contract is
 | `DeleteSandbox` | Submit declarative deletion |
 | `GetSandboxDiagnostics` | Lifecycle and Fastlet diagnostics, not process stdout |
 | `ResolveEndpoint` | Non-blocking resolution of a named component or raw user port in central/direct mode; requires live aggregate Ready |
+| `CreateSandboxSnapshot` | One-shot live checkpoint of a Ready Sandbox; `request_id` is the idempotency key, sandbox fence until `Publishing`, template-name fence until terminal |
+| `GetSandboxSnapshot` | CR-backed phase/artifact/placement observation |
+| `DeleteSandboxSnapshot` | Deletes the object (`expected_uid` fenced); never unpublishes stored artifacts |
 | `GetPool`, `ListPools` | Runtime, fixed resources, components, capacity, and warm-image discovery |
 
 ### Atomic Create

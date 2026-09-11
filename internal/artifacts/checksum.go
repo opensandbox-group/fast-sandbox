@@ -1,4 +1,10 @@
-package main
+// Package artifacts holds the artifact-set conventions shared by every
+// producer and consumer of SandboxTemplate-style snapshot artifacts: the
+// golden-image builder (cmd/sandboxtemplate-builder), the live-snapshot
+// firecracker driver, and the node runtime-agent. Anything here is a wire
+// format or a byte-exact layout invariant — changing it desynchronizes
+// already-published artifact sets.
+package artifacts
 
 import (
 	"crypto/sha256"
@@ -8,10 +14,10 @@ import (
 	"syscall"
 )
 
-// sha256File hashes a file, skipping sparse holes by feeding zero bytes for
+// SHA256File hashes a file, skipping sparse holes by feeding zero bytes for
 // them (holes are semantically zero), so multi-GiB sparse roots are not read
 // in full. Dense files fall back to a plain full read.
-func sha256File(path string) (string, error) {
+func SHA256File(path string) (string, error) {
 	handle, err := os.Open(path)
 	if err != nil {
 		return "", err

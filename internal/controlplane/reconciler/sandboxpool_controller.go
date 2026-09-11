@@ -1255,10 +1255,40 @@ func (r *SandboxPoolReconciler) registryCredentialFromSecret(
 	if auth.Username == "" && auth.Password == "" && auth.IdentityToken == "" {
 		return registryconfig.Credential{}, fmt.Errorf("Registry Secret %s has empty credentials for host %s", secret.Name, rule.Host)
 	}
-	return registryconfig.Credential{
+	credential := registryconfig.Credential{
 		Host: rule.Host, RepositoryPrefix: rule.RepositoryPrefix,
 		Username: auth.Username, Password: auth.Password, IdentityToken: auth.IdentityToken,
-	}, nil
+	}
+	if rule.WriteSecretRef != nil {
+		writeUsername, writePassword, err := r.registryWriteCredential(ctx, namespace, rule.Host, *rule.WriteSecretRef)
+		if err != nil {
+			return registryconfig.Credential{}, err
+		}
+		credential.WriteUsername, credential.WritePassword = writeUsername, writePassword
+	}
+	return credential, nil
+}
+
+// registryWriteCredentialFromSecret keys of the write (publish) secret; they
+// mirror the SandboxTemplate PublishSecretRef convention.
+const (
+	writeSecretAccessKeyID = "accessKeyId"
+	writeSecretAccessKey   = "secretAccessKey"
+)
+
+// registryWriteCredential reads the Opaque write secret of an artifact-store
+// rule (accessKeyId/secretAccessKey keys) and validates the pair is complete.
+func (r *SandboxPoolReconciler) registryWriteCredential(ctx context.Context, namespace, host string, ref registryconfig.SecretRef) (string, string, error) {
+	var secret corev1.Secret
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: ref.Name}, &secret); err != nil {
+		return "", "", fmt.Errorf("read write Secret %s for host %s: %w", ref.Name, host, err)
+	}
+	username := strings.TrimSpace(string(secret.Data[writeSecretAccessKeyID]))
+	password := strings.TrimSpace(string(secret.Data[writeSecretAccessKey]))
+	if username == "" || password == "" {
+		return "", "", fmt.Errorf("write Secret %s for host %s must contain non-empty %s and %s", secret.Name, host, writeSecretAccessKeyID, writeSecretAccessKey)
+	}
+	return username, password, nil
 }
 
 func (r *SandboxPoolReconciler) persistRegistrySecret(

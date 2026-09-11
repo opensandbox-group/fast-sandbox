@@ -3,4 +3,5 @@ kind: Kustomization
 resources:
 - sandbox.fast.io_sandboxpools.yaml
 - sandbox.fast.io_sandboxes.yaml
+- sandbox.fast.io_sandboxsnapshots.yaml
 - sandbox.fast.io_sandboxtemplates.yaml

@@ -8,6 +8,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,6 +26,13 @@ type imagePuller interface {
 	PullImage(ctx context.Context, stateRoot, image string) error
 }
 
+// artifactPublisher publishes a node-local artifact set to the store. The
+// pull client satisfies it too; the service only wires it when the injected
+// puller also publishes (tests inject a bare fake puller).
+type artifactPublisher interface {
+	PublishImage(ctx context.Context, key, dir string) (agentpull.PublishResult, error)
+}
+
 // compatibilityPlaceholder is the stage-1 compatibility class. The full
 // class (CPU/kernel/Firecracker digests, design doc §8) arrives with the
 // snapshot stages.
@@ -33,6 +41,7 @@ const compatibilityPlaceholder = "native-stage-1"
 // Service is the concrete agent backend.
 type Service struct {
 	pull      imagePuller
+	publisher artifactPublisher
 	state     *agentstate.State
 	stateRoot string
 	now       func() time.Time
@@ -41,9 +50,13 @@ type Service struct {
 	dartUp func() bool
 }
 
-// NewService assembles the stage-1 backend.
+// NewService assembles the stage-1 backend. When the pull client also
+// implements artifactPublisher it is wired as the publish path.
 func NewService(pull imagePuller, state *agentstate.State, stateRoot string, options ...ServiceOption) *Service {
 	service := &Service{pull: pull, state: state, stateRoot: stateRoot, now: time.Now}
+	if publisher, ok := pull.(artifactPublisher); ok {
+		service.publisher = publisher
+	}
 	for _, option := range options {
 		option(service)
 	}
@@ -156,6 +169,27 @@ func (s *Service) Health(_ context.Context) (agentprotocol.HealthResponse, error
 		response.DartUp = s.dartUp()
 	}
 	return response, nil
+}
+
+// PublishImage publishes a node-local snapshot artifact set under the
+// requested index key. A store without a write credential is refused with
+// ErrorForbidden (pulls keep working); the staging directory must hold a
+// complete native set including the manifest.
+func (s *Service) PublishImage(ctx context.Context, request agentprotocol.PublishImageRequest) (agentprotocol.PublishImageResponse, error) {
+	if s.publisher == nil {
+		return agentprotocol.PublishImageResponse{}, forbidden("artifact publishing is not configured on this agent")
+	}
+	result, err := s.publisher.PublishImage(ctx, request.Key, request.Dir)
+	if err != nil {
+		if errors.Is(err, agentpull.ErrNotWritable) {
+			return agentprotocol.PublishImageResponse{}, forbidden("%v", err)
+		}
+		if os.IsNotExist(err) {
+			return agentprotocol.PublishImageResponse{}, invalidRequest("staged artifact set is incomplete: %v", err)
+		}
+		return agentprotocol.PublishImageResponse{}, err
+	}
+	return agentprotocol.PublishImageResponse{ManifestRef: result.ManifestRef, ArtifactDigest: result.ArtifactDigest}, nil
 }
 
 // manifestDigestFor re-reads the committed manifest digest of an image.

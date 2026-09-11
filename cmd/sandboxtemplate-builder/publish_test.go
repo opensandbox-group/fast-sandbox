@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fast-sandbox/internal/artifacts"
+
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,11 +18,11 @@ import (
 func TestImageIndexKeyMatchesConsumerCacheKey(t *testing.T) {
 	const image = "registry.example.com/sandbox:v1.0.21"
 	digest := sha256.Sum256([]byte(image))
-	if got, want := imageIndexKey(image), hex.EncodeToString(digest[:]); got != want {
-		t.Fatalf("imageIndexKey(%q) = %s, want %s", image, got, want)
+	if got, want := artifacts.ImageIndexKey(image), hex.EncodeToString(digest[:]); got != want {
+		t.Fatalf("ImageIndexKey(%q) = %s, want %s", image, got, want)
 	}
-	if got := imageIndexKey(image); len(got) != sha256.Size*2 {
-		t.Fatalf("imageIndexKey length = %d, want %d", len(got), sha256.Size*2)
+	if got := artifacts.ImageIndexKey(image); len(got) != sha256.Size*2 {
+		t.Fatalf("ImageIndexKey length = %d, want %d", len(got), sha256.Size*2)
 	}
 }
 

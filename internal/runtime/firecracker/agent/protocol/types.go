@@ -21,6 +21,7 @@ const (
 	RouteListLeases     = "/v1/list-leases"
 	RouteCompatibility  = "/v1/compatibility"
 	RouteHealth         = "/v1/health"
+	RoutePublishImage   = "/v1/publish-image"
 )
 
 // Identity is the caller identity carried by every request. The server
@@ -41,6 +42,7 @@ const (
 	ErrorUnauthorized   ErrorCode = "Unauthorized"   // 403 (identity missing or empty)
 	ErrorConflict       ErrorCode = "Conflict"       // 409 (idempotency key or ownership mismatch)
 	ErrorNotFound       ErrorCode = "NotFound"       // 404 (image not published)
+	ErrorForbidden      ErrorCode = "Forbidden"      // 403 (store not writable: no write credential)
 	ErrorInternal       ErrorCode = "Internal"       // 500
 )
 
@@ -111,6 +113,27 @@ type Lease struct {
 // ListLeasesResponse returns every lease on the node (recovery/audit).
 type ListLeasesResponse struct {
 	Leases []Lease `json:"leases"`
+}
+
+// PublishImageRequest publishes a node-local artifact set (a live Sandbox
+// snapshot staged by the firecracker driver) to the artifact store in the
+// SandboxTemplate layout. Key is the index key the set becomes addressable
+// under (the snapshot's template name); Dir is the staging directory holding
+// rootfs.ext4, vmstate.snap, memory.snap, manifest.json, and SHA256SUMS.
+// The upload order is artifacts first, manifest last within the digest
+// namespace, and the index object last overall, so consumers never observe a
+// half-published set. Idempotent: re-publishing identical bytes overwrites
+// the same keys harmlessly.
+type PublishImageRequest struct {
+	Identity
+	Key string `json:"key"`
+	Dir string `json:"dir"`
+}
+
+// PublishImageResponse reports the published manifest reference and digest.
+type PublishImageResponse struct {
+	ManifestRef    string `json:"manifestRef"`
+	ArtifactDigest string `json:"artifactDigest"`
 }
 
 // CompatibilityResponse returns the node compatibility class (stage 3

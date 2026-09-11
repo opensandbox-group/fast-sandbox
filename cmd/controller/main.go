@@ -174,6 +174,12 @@ func main() {
 			klog.ErrorS(err, "Register SandboxTemplate controller")
 			os.Exit(1)
 		}
+		if err := (&reconciler.SandboxSnapshotReconciler{
+			Client: manager.GetClient(), Scheme: manager.GetScheme(), Orchestrator: orchestrator,
+		}).SetupWithManager(manager); err != nil {
+			klog.ErrorS(err, "Register SandboxSnapshot controller")
+			os.Exit(1)
+		}
 	}
 
 	runContext := ctrl.SetupSignalHandler()

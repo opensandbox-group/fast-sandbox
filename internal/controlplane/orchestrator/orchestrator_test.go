@@ -73,6 +73,18 @@ func (f *fakeFastletClient) DeleteSandbox(context.Context, string, *fastletapi.D
 	return &fastletapi.DeleteSandboxResponse{}, nil
 }
 
+func (f *fakeFastletClient) CreateSnapshot(context.Context, string, *fastletapi.CreateSnapshotRequest) (*fastletapi.CreateSnapshotResponse, error) {
+	return nil, errors.New("snapshot create is not configured in this fake")
+}
+
+func (f *fakeFastletClient) InspectSnapshot(context.Context, string, *fastletapi.InspectSnapshotRequest) (*fastletapi.InspectSnapshotResponse, error) {
+	return nil, errors.New("snapshot inspect is not configured in this fake")
+}
+
+func (f *fakeFastletClient) DeleteSnapshot(context.Context, string, *fastletapi.DeleteSnapshotRequest) (*fastletapi.DeleteSnapshotResponse, error) {
+	return nil, errors.New("snapshot delete is not configured in this fake")
+}
+
 func TestFastPathCandidatesIsRegistryOnly(t *testing.T) {
 	orchestrator, registry, _, sandbox := newHarness(t)
 	candidate := placement.FastletInfo{

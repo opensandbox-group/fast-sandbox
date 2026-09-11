@@ -54,6 +54,15 @@ func (m *MockClient) GetPool(ctx context.Context, in *fastpathv2.GetPoolRequest,
 func (m *MockClient) ListPools(ctx context.Context, in *fastpathv2.ListPoolsRequest, opts ...grpc.CallOption) (*fastpathv2.ListPoolsResponse, error) {
 	return &fastpathv2.ListPoolsResponse{}, nil
 }
+func (m *MockClient) CreateSandboxSnapshot(ctx context.Context, in *fastpathv2.CreateSandboxSnapshotRequest, opts ...grpc.CallOption) (*fastpathv2.CreateSandboxSnapshotResponse, error) {
+	return &fastpathv2.CreateSandboxSnapshotResponse{Snapshot: &fastpathv2.SandboxSnapshotInfo{}}, nil
+}
+func (m *MockClient) GetSandboxSnapshot(ctx context.Context, in *fastpathv2.GetSandboxSnapshotRequest, opts ...grpc.CallOption) (*fastpathv2.GetSandboxSnapshotResponse, error) {
+	return &fastpathv2.GetSandboxSnapshotResponse{Snapshot: &fastpathv2.SandboxSnapshotInfo{}}, nil
+}
+func (m *MockClient) DeleteSandboxSnapshot(ctx context.Context, in *fastpathv2.DeleteSandboxSnapshotRequest, opts ...grpc.CallOption) (*fastpathv2.DeleteSandboxSnapshotResponse, error) {
+	return &fastpathv2.DeleteSandboxSnapshotResponse{}, nil
+}
 
 func TestRunCommand(t *testing.T) {
 	mockClient := &MockClient{}

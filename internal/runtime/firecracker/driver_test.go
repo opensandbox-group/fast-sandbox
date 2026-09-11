@@ -128,6 +128,8 @@ type statefulFakeServer struct {
 	mu            sync.Mutex
 	calls         []string
 	snapshotLoads []SnapshotLoadRequest
+	snapshotDumps []SnapshotCreateRequest
+	failSnapshot  bool
 	running       bool
 	socket        string
 }
@@ -147,6 +149,13 @@ func (s *statefulFakeServer) handle(w http.ResponseWriter, r *http.Request) {
 			s.snapshotLoads = append(s.snapshotLoads, request)
 		}
 	}
+	if r.URL.Path == "/snapshot/create" {
+		var request SnapshotCreateRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err == nil {
+			s.snapshotDumps = append(s.snapshotDumps, request)
+		}
+	}
+	failSnapshot := s.failSnapshot
 	s.mu.Unlock()
 	switch r.URL.Path {
 	case "/version":
@@ -163,10 +172,27 @@ func (s *statefulFakeServer) handle(w http.ResponseWriter, r *http.Request) {
 		var payload map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&payload)
 		s.mu.Lock()
-		if payload["state"] == "Resumed" {
+		switch payload["state"] {
+		case "Paused":
+			s.running = false
+		case "Resumed":
 			s.running = true
 		}
 		s.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	case "/snapshot/create":
+		if failSnapshot {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"dump failed"}`))
+			return
+		}
+		s.mu.Lock()
+		request := s.snapshotDumps[len(s.snapshotDumps)-1]
+		s.mu.Unlock()
+		// Emulate the VMM: write the two snapshot files where the request
+		// points so the driver's staging assembly finds them.
+		_ = os.WriteFile(request.SnapshotPath, []byte("vmstate-dump-data"), 0o640)
+		_ = os.WriteFile(request.MemFilePath, []byte("memory-dump-data"), 0o640)
 		w.WriteHeader(http.StatusNoContent)
 	case "/":
 		s.mu.Lock()

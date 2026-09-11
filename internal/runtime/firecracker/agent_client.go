@@ -42,6 +42,9 @@ type AgentClient interface {
 	PinImage(ctx context.Context, requestID, image string) (string, error)
 	// UnpinImage drops one pin reference of an image.
 	UnpinImage(ctx context.Context, requestID, image string) error
+	// PublishImage uploads a node-local artifact set to the store under the
+	// given index key and reports the manifest reference and digest.
+	PublishImage(ctx context.Context, requestID, key, dir string) (PublishOutcome, error)
 	// LeaseDevices creates a device lease for a Sandbox. The native stage
 	// returns the shared cache file paths.
 	LeaseDevices(ctx context.Context, requestID string, config *fastletapi.RuntimeSandboxConfig) (Lease, error)
@@ -53,6 +56,12 @@ type AgentClient interface {
 	Compatibility(ctx context.Context) (string, error)
 	// Health verifies the agent is serving.
 	Health(ctx context.Context) error
+}
+
+// PublishOutcome reports one agent-side artifact publication.
+type PublishOutcome struct {
+	ManifestRef    string
+	ArtifactDigest string
 }
 
 // agentHTTPClient implements AgentClient over the UDS socket.
@@ -97,6 +106,16 @@ func (c *agentHTTPClient) UnpinImage(ctx context.Context, requestID, image strin
 	return c.doJSON(ctx, agentprotocol.RouteUnpinImage, agentprotocol.UnpinImageRequest{
 		Identity: c.identity(requestID), Image: image,
 	}, nil)
+}
+
+func (c *agentHTTPClient) PublishImage(ctx context.Context, requestID, key, dir string) (PublishOutcome, error) {
+	var response agentprotocol.PublishImageResponse
+	if err := c.doJSON(ctx, agentprotocol.RoutePublishImage, agentprotocol.PublishImageRequest{
+		Identity: c.identity(requestID), Key: key, Dir: dir,
+	}, &response); err != nil {
+		return PublishOutcome{}, err
+	}
+	return PublishOutcome{ManifestRef: response.ManifestRef, ArtifactDigest: response.ArtifactDigest}, nil
 }
 
 func (c *agentHTTPClient) LeaseDevices(ctx context.Context, requestID string, config *fastletapi.RuntimeSandboxConfig) (Lease, error) {

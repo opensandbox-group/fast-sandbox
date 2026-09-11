@@ -123,8 +123,7 @@ spec:
                     artifact and are deployed by fastletTemplate in the Pod network namespace.
                   properties:
                     artifact:
-                      description: InfraArtifact defines immutable delivery for one
-                        component.
+                      description: Artifact is required unless delivery selects host-process.
                       properties:
                         mappings:
                           items:
@@ -270,9 +269,6 @@ spec:
                   - name
                   - process
                   type: object
-                  x-kubernetes-validations:
-                  - message: artifact is required unless delivery is host-process
-                    rule: has(self.delivery) || has(self.artifact)
                 maxItems: 16
                 type: array
                 x-kubernetes-list-map-keys:

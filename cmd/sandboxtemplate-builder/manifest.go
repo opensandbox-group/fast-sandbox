@@ -1,19 +1,19 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 )
 
 // stageManifest assembles manifest.json (content-addressed, design schema)
 // and SHA256SUMS in the workdir. Checksums are computed once and shared
-// between the two outputs via the cache.
+// between the two outputs via the cache. The serialization and checksum
+// conventions live in internal/artifacts so every producer (builder, live
+// snapshot driver, runtime-agent) emits byte-identical layouts.
 func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, workdir string) ([]byte, error) {
 	cache := map[string]string{}
 	rootfsGiB, err := sizeGiB(spec.Output.RootfsSize)
@@ -24,11 +24,10 @@ func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 	if err != nil {
 		return nil, err
 	}
-	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	manifestBytes, err := artifacts.MarshalManifest(manifest)
 	if err != nil {
 		return nil, err
 	}
-	manifestBytes = append(manifestBytes, '\n')
 	if err := os.WriteFile(filepath.Join(workdir, "manifest.json"), manifestBytes, 0o644); err != nil {
 		return nil, err
 	}
@@ -44,27 +43,27 @@ func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 // declared minimum with the real artifact size.
 func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, cache map[string]string, rootfsGiB int) (map[string]any, error) {
 	files := map[string]any{}
-	artifacts := []struct{ name, path string }{
+	staged := []struct{ name, path string }{
 		{"rootfs.ext4", rootfs},
 		{"vmstate.snap", vmstate},
 		{"memory.snap", memory},
 	}
 	if len(layers) > 0 {
-		artifacts = append(artifacts,
+		staged = append(staged,
 			struct{ name, path string }{"overlaybd/rootfs/layer.lsmt", layers[0]})
 		if len(layers) > 1 {
-			artifacts = append(artifacts,
+			staged = append(staged,
 				struct{ name, path string }{"overlaybd/memory/layer.lsmt", layers[1]})
 		}
 	}
-	for _, artifact := range artifacts {
-		entry, err := fileEntry(artifact.path, cache)
+	for _, artifact := range staged {
+		entry, err := artifacts.FileEntry(artifact.path, cache)
 		if err != nil {
 			return nil, fmt.Errorf("checksum %s: %w", artifact.name, err)
 		}
 		files[artifact.name] = entry
 	}
-	kernelDigest, err := sha256FileCached(kernel, cache)
+	kernelDigest, err := artifacts.SHA256FileCached(kernel, cache)
 	if err != nil {
 		return nil, fmt.Errorf("checksum kernel: %w", err)
 	}
@@ -81,9 +80,9 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 		// Snapshot compatibility tuple (design): consumers match these
 		// against node labels before restoring a snapshot.
 		"compatibility": map[string]any{
-			"firecrackerVersion": firecrackerVersion(),
-			"hostKernel":         hostKernelRelease(),
-			"cpuModel":           hostCPUModel(),
+			"firecrackerVersion": artifacts.FirecrackerVersion(firecrackerBin),
+			"hostKernel":         artifacts.HostKernelRelease(),
+			"cpuModel":           artifacts.HostCPUModel(),
 		},
 		"machine": map[string]any{
 			"vcpu":   spec.Machine.VCPU,
@@ -118,28 +117,12 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 	}, nil
 }
 
-// fileEntry describes one artifact: sha256 (sparse-aware) and logical size.
-func fileEntry(path string, cache map[string]string) (map[string]any, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return nil, err
-	}
-	sum, err := sha256FileCached(path, cache)
-	if err != nil {
-		return nil, err
-	}
-	return map[string]any{
-		"sha256":    sum,
-		"sizeBytes": info.Size(),
-	}, nil
-}
-
 // writeChecksums writes SHA256SUMS covering only the published artifact set
 // (rootfs/vmstate/memory/layers), reusing the checksums already computed for
 // the manifest. Intermediate build files (OCI layout, console logs, etc.) are
 // deliberately excluded.
 func writeChecksums(workdir string, cache map[string]string) error {
-	artifacts := []string{"rootfs.ext4", "vmstate.snap", "memory.snap"}
+	files := []string{"rootfs.ext4", "vmstate.snap", "memory.snap"}
 	layers, err := filepath.Glob(filepath.Join(workdir, "overlaybd", "*", "layer.lsmt"))
 	if err != nil {
 		return fmt.Errorf("glob overlaybd layers: %w", err)
@@ -149,71 +132,7 @@ func writeChecksums(workdir string, cache map[string]string) error {
 		if err != nil {
 			return err
 		}
-		artifacts = append(artifacts, relative)
+		files = append(files, relative)
 	}
-	var lines []string
-	for _, relative := range artifacts {
-		path := filepath.Join(workdir, relative)
-		sum, err := sha256FileCached(path, cache)
-		if err != nil {
-			return err
-		}
-		lines = append(lines, sum+"  "+relative)
-	}
-	return os.WriteFile(filepath.Join(workdir, "SHA256SUMS"), []byte(strings.Join(lines, "\n")+"\n"), 0o644)
-}
-
-// sha256FileCached returns the checksum of path, memoized in cache.
-func sha256FileCached(path string, cache map[string]string) (string, error) {
-	if sum, ok := cache[path]; ok {
-		return sum, nil
-	}
-	sum, err := sha256File(path)
-	if err != nil {
-		return "", err
-	}
-	cache[path] = sum
-	return sum, nil
-}
-
-// firecrackerVersion reads the embedded Firecracker binary's version
-// (e.g. "1.16.1"), falling back to "unknown".
-func firecrackerVersion() string {
-	output, err := exec.Command(firecrackerBin, "--version").CombinedOutput()
-	if err != nil {
-		return "unknown"
-	}
-	fields := strings.Fields(string(output))
-	for index, field := range fields {
-		if field == "v" && index+1 < len(fields) {
-			return strings.TrimPrefix(fields[index+1], "v")
-		}
-	}
-	return "unknown"
-}
-
-// hostKernelRelease returns the builder host's kernel release (uname -r).
-func hostKernelRelease() string {
-	output, err := os.ReadFile("/proc/sys/kernel/osrelease")
-	if err != nil {
-		return "unknown"
-	}
-	return strings.TrimSpace(string(output))
-}
-
-// hostCPUModel returns the first CPU model name from /proc/cpuinfo.
-func hostCPUModel() string {
-	payload, err := os.ReadFile("/proc/cpuinfo")
-	if err != nil {
-		return "unknown"
-	}
-	for _, line := range strings.Split(string(payload), "\n") {
-		if strings.HasPrefix(line, "model name") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				return strings.TrimSpace(parts[1])
-			}
-		}
-	}
-	return "unknown"
+	return artifacts.WriteSHA256SUMS(workdir, files, cache)
 }

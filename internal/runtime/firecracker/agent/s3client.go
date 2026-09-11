@@ -48,10 +48,10 @@ const (
 	s3RetryAttempts = 3
 )
 
-// s3Client implements path-style, SigV4-signed GETs against an
+// s3Client implements path-style, SigV4-signed GETs and PUTs against an
 // S3-compatible store (AWS S3, Aliyun OSS, MinIO) with a read-only access
-// key pair. Only the GET verb needed by the pull layer is implemented;
-// range GETs arrive with the overlaybd stage.
+// key pair plus an optional write key pair (live-snapshot publishing). Range
+// GETs arrive with the overlaybd stage.
 type s3Client struct {
 	endpoint  string // scheme://host[:port], e.g. https://oss-cn-hangzhou.aliyuncs.com
 	region    string
@@ -59,11 +59,20 @@ type s3Client struct {
 	prefix    string // store key prefix under the bucket, "" when the root is the bucket
 	accessKey string
 	secretKey string
-	http      *http.Client
+	// writeAccessKey/writeSecretKey carry the publish (write) credential.
+	// Empty means read-only: PUTs fail with ErrNotWritable.
+	writeAccessKey string
+	writeSecretKey string
+	http           *http.Client
+	putHTTP        *http.Client
 	// retryDelay is the base of the exponential backoff for transient
 	// failures; it is a field (not a constant) so tests can shorten it.
 	retryDelay time.Duration
 }
+
+// ErrNotWritable reports that the store has no write credential configured,
+// so publishing is refused while pulls keep working.
+var ErrNotWritable = errors.New("artifact store is not writable (no write credential configured)")
 
 // newS3Client parses the store root (s3://bucket/prefix) and the read-only
 // credential into a GET client. The credential Host names the store endpoint
@@ -100,11 +109,106 @@ func newS3Client(storeRoot string, credential registryconfig.Credential, httpCli
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: defaultS3RequestTimeout}
 	}
-	return &s3Client{
+	// PUTs stream multi-GiB artifacts: the client-wide GET timeout would cut
+	// legitimate uploads mid-body. The publish client shares the transport
+	// but has no Timeout; the caller's context bounds the upload.
+	client := &s3Client{
 		endpoint: endpoint, region: region, bucket: bucket, prefix: strings.Trim(prefix, "/"),
 		accessKey: credential.Username, secretKey: credential.Password,
-		http: httpClient, retryDelay: 2 * time.Second,
-	}, nil
+		writeAccessKey: credential.WriteUsername, writeSecretKey: credential.WritePassword,
+		http: httpClient, putHTTP: &http.Client{Transport: httpClient.Transport},
+		retryDelay: 2 * time.Second,
+	}
+	return client, nil
+}
+
+// writable reports whether a write credential is configured.
+func (c *s3Client) writable() bool {
+	return c.writeAccessKey != "" && c.writeSecretKey != ""
+}
+
+// storeRootURI returns the configured store root as an s3:// URI, the base
+// of every manifest reference this store hands out.
+func (c *s3Client) storeRootURI() string {
+	root := "s3://" + c.bucket
+	if c.prefix != "" {
+		root += "/" + c.prefix
+	}
+	return root
+}
+
+// put streams one object into the store under a store-relative key with the
+// write credential. Transport errors and 5xx responses are retried with
+// exponential backoff; 4xx responses (including auth failures) are not.
+// The body is provided by an opener callback because net/http takes
+// ownership of a request body and closes it after the attempt: a retry
+// must open a fresh reader (seeking a closed *os.File was the field bug).
+func (c *s3Client) put(ctx context.Context, storeKey string, size int64, open func() (io.ReadCloser, error)) error {
+	if !c.writable() {
+		return ErrNotWritable
+	}
+	key := storeKey
+	if c.prefix != "" {
+		key = c.prefix + "/" + storeKey
+	}
+	urlString, err := c.objectURL(key)
+	if err != nil {
+		return err
+	}
+	backoff := c.retryDelay
+	var lastErr error
+	for attempt := 0; attempt <= s3RetryAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			backoff *= 2
+		}
+		body, openErr := open()
+		if openErr != nil {
+			return openErr
+		}
+		err := c.putOnce(ctx, urlString, key, body, size)
+		_ = body.Close()
+		if err == nil {
+			return nil
+		}
+		var status *httpError
+		if errors.As(err, &status) && status.StatusCode < http.StatusInternalServerError {
+			return err
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("PUT %s: %w", key, lastErr)
+}
+
+// putOnce performs a single signed PUT. The payload is signed as
+// UNSIGNED-PAYLOAD so multi-GiB artifacts stream from disk without a second
+// read for the content hash; Content-Length still carries the exact size.
+func (c *s3Client) putOnce(ctx context.Context, urlString, key string, body io.Reader, size int64) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPut, urlString, body)
+	if err != nil {
+		return err
+	}
+	request.ContentLength = size
+	c.signWrite(request)
+	response, err := c.putHTTP.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		payload, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+		if response.StatusCode == http.StatusNotFound {
+			return fmt.Errorf("%w: %s", ErrObjectNotFound, key)
+		}
+		return &httpError{StatusCode: response.StatusCode, Body: string(payload)}
+	}
+	// Drain the (small) success body so the connection can be reused.
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	return nil
 }
 
 // parseStoreRoot splits "s3://bucket/prefix" into its bucket and key prefix.
@@ -346,6 +450,43 @@ func deriveSigningKey(secretKey, date, region string) []byte {
 	key = hmacSHA256(key, region)
 	key = hmacSHA256(key, "s3")
 	return hmacSHA256(key, "aws4_request")
+}
+
+// signWrite applies AWS Signature Version 4 to a PUT with the write
+// credential. The payload hash is UNSIGNED-PAYLOAD: streamed bodies cannot
+// promise a content hash header without a second full read.
+func (c *s3Client) signWrite(request *http.Request) {
+	now := time.Now().UTC()
+	amzDate := now.Format("20060102T150405Z")
+	date := now.Format("20060102")
+
+	request.Header.Set("x-amz-date", amzDate)
+	request.Header.Set("x-amz-content-sha256", unsignedPayload)
+
+	canonicalURI := request.URL.EscapedPath()
+	if canonicalURI == "" {
+		canonicalURI = "/"
+	}
+	canonicalHeaders := "host:" + request.URL.Host + "\n" +
+		"x-amz-content-sha256:" + unsignedPayload + "\n" +
+		"x-amz-date:" + amzDate + "\n"
+	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
+	canonicalRequest := strings.Join([]string{
+		http.MethodPut,
+		canonicalURI,
+		request.URL.RawQuery,
+		canonicalHeaders,
+		signedHeaders,
+		unsignedPayload,
+	}, "\n")
+	scope := date + "/" + c.region + "/s3/aws4_request"
+	stringToSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + sha256Hex([]byte(canonicalRequest))
+
+	signingKey := deriveSigningKey(c.writeSecretKey, date, c.region)
+	signature := hmacHex(signingKey, stringToSign)
+	request.Header.Set("Authorization",
+		"AWS4-HMAC-SHA256 Credential="+c.writeAccessKey+"/"+scope+
+			", SignedHeaders="+signedHeaders+", Signature="+signature)
 }
 
 func hmacSHA256(key []byte, value string) []byte {

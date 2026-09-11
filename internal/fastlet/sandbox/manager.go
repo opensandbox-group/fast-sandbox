@@ -82,6 +82,9 @@ type SandboxManager struct {
 	heartbeatSequence atomic.Uint64
 	// sandboxes  sandboxID -> metadata
 	sandboxes map[string]*SandboxMetadata
+	// snapshots tracks in-memory snapshot tasks keyed by the SandboxSnapshot
+	// UID (snapshot.go). Tasks are ephemeral and never survive a restart.
+	snapshots map[string]*snapshotTask
 }
 
 func NewSandboxManager(runtime RuntimeDriver) *SandboxManager {
@@ -154,6 +157,7 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		imageBootWorkers: make(map[string]imageBootWorker),
 		runtimeMessages:  make(map[string]string),
 		sandboxes:        make(map[string]*SandboxMetadata),
+		snapshots:        make(map[string]*snapshotTask),
 	}
 	if manager.actionManager != nil {
 		manager.actionManager.SetChangeNotifier(manager.actionStateChanged)

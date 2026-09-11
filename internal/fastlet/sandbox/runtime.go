@@ -16,6 +16,9 @@ type RoutePublication = dataplane.RoutePublication
 type RoutePublisher = dataplane.RoutePublisher
 type ImageDelivery = runtimecontract.ImageDelivery
 type ImageDeliveryStatus = runtimecontract.ImageDeliveryStatus
+type RuntimeSnapshotter = runtimecontract.Snapshotter
+type SnapshotResult = runtimecontract.SnapshotResult
+type RuntimeSnapshotInput = runtimecontract.SnapshotInput
 
 const (
 	ImageDelivering = runtimecontract.ImageDelivering
@@ -31,4 +34,6 @@ var (
 	ErrSandboxProfileMismatch = runtimecontract.ErrSandboxProfileMismatch
 	ErrInvalidConfig          = runtimecontract.ErrInvalidConfig
 	ErrImageNotReady          = runtimecontract.ErrImageNotReady
+	ErrSnapshotUnsupported    = runtimecontract.ErrSnapshotUnsupported
+	ErrInsufficientStorage    = runtimecontract.ErrInsufficientStorage
 )

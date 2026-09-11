@@ -76,6 +76,66 @@ type ImageDelivery interface {
 	DeliverImage(ctx context.Context, image string) (ImageDeliveryStatus, error)
 }
 
+// SnapshotResult reports the artifact set produced by one snapshot.
+type SnapshotResult struct {
+	// SnapshotID is the node-local identity of the snapshot; it scopes the
+	// on-disk staging directory and any cleanup.
+	SnapshotID string
+	// ManifestRef locates the published manifest in the artifact store
+	// (SandboxTemplate layout), e.g. s3://bucket/prefix/<digest>/manifest.json.
+	ManifestRef string
+	// ArtifactDigest is the sha256 of the published manifest document.
+	ArtifactDigest string
+	// SizeBytes is the total logical size of the artifact set.
+	SizeBytes int64
+}
+
+// SnapshotActionBinding is one source-Sandbox action binding recorded in
+// the published manifest: the durable policy record that outlives the
+// SandboxSnapshot CR (the CR is only the in-cluster auto-apply path).
+type SnapshotActionBinding struct {
+	Handler string `json:"handler"`
+	Input   string `json:"input"`
+}
+
+// SnapshotInput carries one snapshot request to the runtime driver.
+type SnapshotInput struct {
+	// SandboxID identifies the running Sandbox to snapshot.
+	SandboxID string
+	// SnapshotID is the node-local identity of the snapshot; it scopes the
+	// staging directory and any cleanup.
+	SnapshotID string
+	// TemplateName is the artifact-store index key the artifact set is
+	// published under.
+	TemplateName string
+	// OnPublishing is invoked once the pause window has closed and the
+	// local artifact set is complete — right before the store upload
+	// begins. The caller uses it to surface the Publishing phase, which no
+	// longer touches the VM and therefore does not block the next snapshot
+	// of the same Sandbox. Optional; drivers must tolerate nil.
+	OnPublishing func()
+	// ActionBindings are the source Sandbox's bindings, recorded verbatim
+	// in the published manifest so the artifact set is self-contained.
+	ActionBindings []SnapshotActionBinding
+}
+
+// Snapshotter is the optional runtime extension for snapshotting a running
+// Sandbox in place. Runtimes that cannot snapshot (containerd, kata, boxlite)
+// simply do not implement it; Fastlet then rejects the request with
+// ErrSnapshotUnsupported instead of attempting a partial fallback.
+//
+// CreateSnapshot is one-shot per (SandboxID, SnapshotID) pair and blocking;
+// it must resume the Sandbox on every in-process failure path. A host or
+// Fastlet crash mid-dump can still leave the runtime paused — implementers
+// that also implement ResourceRecoverer must resume such runtimes during
+// RecoverRuntimeResources so recovery never strands a paused guest.
+// DeleteSnapshot discards node-local artifacts of a previous snapshot; it
+// never unpublishes stored objects.
+type Snapshotter interface {
+	CreateSnapshot(ctx context.Context, input *SnapshotInput) (*SnapshotResult, error)
+	DeleteSnapshot(ctx context.Context, snapshotID string) error
+}
+
 type ResourceRecoverer interface {
 	RecoverRuntimeResources(ctx context.Context, managed []*Metadata) error
 }

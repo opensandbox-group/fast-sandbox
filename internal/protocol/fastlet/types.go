@@ -182,6 +182,12 @@ const (
 	ErrorNotFound           FastletErrorCode = "NotFound"
 	ErrorGenerationFenced   FastletErrorCode = "GenerationFenced"
 	ErrorProfileMismatch    FastletErrorCode = "ProfileMismatch"
+	// ErrorSnapshotInProgress reports the deterministic non-reentrancy
+	// rejection: another non-terminal snapshot holds the target Sandbox.
+	ErrorSnapshotInProgress FastletErrorCode = "SnapshotInProgress"
+	// ErrorSnapshotUnsupported reports that the Fastlet's runtime driver
+	// does not implement snapshots.
+	ErrorSnapshotUnsupported FastletErrorCode = "SnapshotUnsupported"
 )
 
 type FastletError struct {
@@ -386,4 +392,93 @@ type HeartbeatResponse struct {
 	FastletStatus
 	Sequence uint64        `json:"sequence"`
 	Cache    CacheSnapshot `json:"cache"`
+}
+
+// SnapshotPhase is the Fastlet-side lifecycle of one snapshot task. It
+// mirrors the SandboxSnapshot CRD phase; Pending means accepted but the
+// worker has not started the dump yet.
+type SnapshotPhase string
+
+const (
+	SnapshotPhasePending    SnapshotPhase = "Pending"
+	SnapshotPhaseCreating   SnapshotPhase = "Creating"
+	SnapshotPhasePublishing SnapshotPhase = "Publishing"
+	SnapshotPhaseSucceeded  SnapshotPhase = "Succeeded"
+	SnapshotPhaseFailed     SnapshotPhase = "Failed"
+)
+
+// SnapshotPhaseTerminal reports whether the phase is final.
+func SnapshotPhaseTerminal(phase SnapshotPhase) bool {
+	return phase == SnapshotPhaseSucceeded || phase == SnapshotPhaseFailed
+}
+
+// SnapshotIdentity fences one snapshot task. SnapshotUID/Name/Namespace
+// identify the SandboxSnapshot object; Sandbox carries the full target
+// Sandbox identity fence (validated like every other Sandbox request).
+type SnapshotIdentity struct {
+	SnapshotUID string          `json:"snapshotUid"`
+	Namespace   string          `json:"namespace"`
+	Name        string          `json:"name"`
+	Sandbox     SandboxIdentity `json:"sandbox"`
+}
+
+// SnapshotSpec is the desired snapshot configuration.
+type SnapshotSpec struct {
+	// TemplateName is the artifact-store index key the artifact set is
+	// published under.
+	TemplateName string `json:"templateName"`
+}
+
+// SnapshotStatus is the Fastlet observation of one snapshot task. Reason
+// is a stable classification of a Failed task (e.g. InsufficientStorage);
+// empty for in-flight and unclassified failures.
+type SnapshotStatus struct {
+	SnapshotID     string        `json:"snapshotId,omitempty"`
+	Phase          SnapshotPhase `json:"phase"`
+	Reason         string        `json:"reason,omitempty"`
+	Message        string        `json:"message,omitempty"`
+	ManifestRef    string        `json:"manifestRef,omitempty"`
+	ArtifactDigest string        `json:"artifactDigest,omitempty"`
+	SizeBytes      int64         `json:"sizeBytes,omitempty"`
+	StartedAt      time.Time     `json:"startedAt,omitempty"`
+	CompletedAt    time.Time     `json:"completedAt,omitempty"`
+}
+
+// CreateSnapshotRequest registers one snapshot task. The response returns
+// after admission (EXISTING replays report the current task state); the
+// dump/publish runs in a Fastlet worker and is observed via
+// InspectSnapshotRequest.
+type CreateSnapshotRequest struct {
+	RequestID string           `json:"requestId,omitempty"`
+	Identity  SnapshotIdentity `json:"identity"`
+	Snapshot  SnapshotSpec     `json:"snapshot"`
+	// ActionBindings are the source Sandbox's bindings, recorded in the
+	// published manifest (durable policy provenance).
+	ActionBindings []ActionBindingInput `json:"actionBindings,omitempty"`
+}
+
+type CreateSnapshotResponse struct {
+	Disposition CreateDisposition `json:"disposition"`
+	Snapshot    *SnapshotStatus   `json:"snapshot,omitempty"`
+	Error       *FastletError     `json:"error,omitempty"`
+}
+
+type InspectSnapshotRequest struct {
+	Identity SnapshotIdentity `json:"identity"`
+}
+
+type InspectSnapshotResponse struct {
+	Snapshot *SnapshotStatus `json:"snapshot,omitempty"`
+	Error    *FastletError   `json:"error,omitempty"`
+}
+
+// DeleteSnapshotRequest discards the node-local artifacts of a terminal
+// snapshot task. A non-terminal task is rejected with ErrorInProgress: the
+// Fastlet never aborts a running dump.
+type DeleteSnapshotRequest struct {
+	Identity SnapshotIdentity `json:"identity"`
+}
+
+type DeleteSnapshotResponse struct {
+	Error *FastletError `json:"error,omitempty"`
 }
