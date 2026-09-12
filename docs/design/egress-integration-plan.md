@@ -123,13 +123,19 @@ OSEP-0022 原方案：egress 通过**观察 fastlet slot-store 文件**（
 
 ### B. egress 构建与集成（直接集成，非 mock）
 
-**直接用 PR #1678 head 分支构建真实 egress**（已确认可构建）：
+**历史构建基准：PR #1678 的固定提交**（当时已确认可构建）：
 
 ```text
 repo:    Pangjiping/OpenSandbox @ feat/egress-actions-handler（pin commit 460b1cb）
-路径:    components/egress/（fastsandbox.go / fastsandbox_actions.go / pkg/actionhandler / pkg/fastsandboxnft）
+路径:    components/egress/（fleet.go / fleet_actions.go / pkg/actionhandler / pkg/fleetnft）
 产物:    egress 镜像（集成环境 `kind load docker-image`）
 ```
+
+以上保留 `460b1cb` 构建基准中的历史路径。后续
+[OpenSandbox PR #1811](https://github.com/opensandbox-group/OpenSandbox/pull/1811)
+将 `fleet*.go` / `pkg/fleetnft` 重命名为 `fastsandbox*.go` / `pkg/fastsandboxnft`。
+当前样例使用 `fast-sandbox` profile，需构建并加载包含该重命名的 Egress 镜像；
+上述历史提交的镜像不适用于当前样例。
 
 - **pin commit 缓解 PR 未合入的演进风险**：PR 合并后切官方 tag/镜像；
 - **交叉验证（mock 无法替代的核心价值）**：fast-sandbox
