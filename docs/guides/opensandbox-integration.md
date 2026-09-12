@@ -1,6 +1,6 @@
 # OpenSandbox integration
 
-OpenSandbox can use Fast Sandbox as a fleets backend while keeping its public
+OpenSandbox can use Fast Sandbox as a runtime backend while keeping its public
 SDK and Execd protocol unchanged. Fast Sandbox supplies low-latency lifecycle
 operations, Pool placement, runtime creation, Infra Component injection, and a
 transparent route to the selected Sandbox service.
@@ -76,7 +76,7 @@ OpenSandbox should use one stable Sandbox ID as Fast Sandbox `request_id`.
 | Sandbox ID | `request_id` |
 | Resource namespace | `namespace` |
 | Image URI | `image` |
-| Fleet/Pool selection | `pool_ref` |
+| SandboxPool selection | `pool_ref` |
 | Entrypoint | `command` and `args` |
 | Environment | `envs` |
 | Working directory | `working_dir` |
@@ -272,7 +272,7 @@ See [Private Registries](private-registries.md).
 
 ## Unsupported semantics
 
-The Fast Sandbox fleets model does not provide:
+The Fast Sandbox runtime model does not provide:
 
 - per-Sandbox Kubernetes volumes;
 - snapshot, pause, or resume;

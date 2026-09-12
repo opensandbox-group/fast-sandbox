@@ -13,6 +13,11 @@
 >   `components/egress/fleet_actions.go`（lifecycle 语义）+ `fleet_server.go`
 >   （status 端点）。
 >
+> 命名说明：本文保留上述固定提交中的历史文件名。后续
+> [OpenSandbox PR #1811](https://github.com/opensandbox-group/OpenSandbox/pull/1811)
+> 将 `fleet_actions.go` / `fleet_server.go` 重命名为
+> `fastsandbox_actions.go` / `fastsandbox_server.go`；本核对表的验证基准不变。
+>
 > 方法：两侧独立实现同一协议（`sandbox.fast.io/actions/v1`），逐字段字节级
 > 核对 + egress 侧 `go build ./components/egress/...` 编译验证（已通过，
 > 见 §验证）。

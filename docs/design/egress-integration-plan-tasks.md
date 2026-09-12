@@ -111,7 +111,7 @@
 
 **位置**：`internal/dataplane/fastletproxy/proxy.go`（`parseTarget`）
 
-- [ ] `parseTarget` 增加 `/v1/sandboxfleets/{sandboxId}/egress/*` 分支：
+- [ ] `parseTarget` 增加 `/v1/sandboxes/{sandboxId}/egress/*` 分支：
   - 解析 sandbox 路由（sandboxId 定位）
   - 校验 route credential（与现有分支一致）
   - 目标 = egress listener（127.0.0.1:18080，host 转发语义见任务 3）

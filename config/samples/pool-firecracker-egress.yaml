@@ -44,15 +44,15 @@ spec:
         # IfNotPresent: the integration environment kind-loads the image
         # into the nodes; Always would force a docker.io pull per restart.
         imagePullPolicy: IfNotPresent
-        # Fleet profile is required: it serves the Sandbox Actions Handler
+        # Fast Sandbox profile is required: it serves the Sandbox Actions Handler
         # endpoints (/_fastlet/v1/actions[/status]) that the Fastlet uses.
         # Without it egress runs the sidecar profile (policy-file driven)
         # and exposes no actions surface.
         env:
         - name: OPENSANDBOX_EGRESS_PROFILE
-          value: "fleet"
+          value: "fast-sandbox"
         # dns+nft: DNS-based domain policy plus the per-subject nft rules
-        # (table opensandbox-fleet, subj_ chains). dns-only would neither
+        # (table opensandbox-fast-sandbox, subj_ chains). dns-only would neither
         # block IP-direct traffic nor create the subj_ chains the
         # integration test asserts on unload.
         - name: OPENSANDBOX_EGRESS_MODE

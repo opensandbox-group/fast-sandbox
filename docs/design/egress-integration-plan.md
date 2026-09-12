@@ -4,7 +4,7 @@
 >
 > 日期：2026-08-29
 >
-> 依赖：OpenSandbox PR #1678（egress fleet profile 改造，待合并）；
+> 依赖：OpenSandbox PR #1678（egress fast-sandbox profile 改造，待合并）；
 > fast-sandbox #30（Sandbox Actions 协议与 CRD，已合入 master）。
 >
 > 关联：OSEP-0022（多沙箱 egress 控制面）、opensandbox-group/OpenSandbox#1582、
@@ -74,8 +74,8 @@ OSEP-0022 原方案：egress 通过**观察 fastlet slot-store 文件**（
 | **host-process 交付模式** | `InfraDeliveryMode` 新增 `host-process`：Pool revision 携带、但不进 in-sandbox 的 sandbox-init supervisor 配置；egress daemon 由 FastletTemplate 部署；readiness 探测 Pod-netns listener | fast-sandbox（本期） |
 | **fastlet-proxy host upstream** | egress route 转发到 Pod-netns listener（`127.0.0.1:18080`）而非 sandbox Access 地址 | fast-sandbox（延后，credential 通道） |
 | **UID 传播** | proxy 注入 `X-Fast-Sandbox-Uid`（subject 标识） | fast-sandbox（延后，credential 通道） |
-| **egress route parsing** | `parseTarget` 增加 `/v1/sandboxfleets/{sandboxId}/egress/*` 分支（凭据校验 + 目标 egress） | fast-sandbox（延后，credential 通道） |
-| **egress 实现/部署** | OpenSandbox fleet egress（PR #1678）+ 集成环境部署（host 域组件，共享 slot-store 不需要了——actions 驱动） | OpenSandbox |
+| **egress route parsing** | `parseTarget` 增加 `/v1/sandboxes/{sandboxId}/egress/*` 分支（凭据校验 + 目标 egress） | fast-sandbox（延后，credential 通道） |
+| **egress 实现/部署** | OpenSandbox fast-sandbox egress（PR #1678）+ 集成环境部署（host 域组件，共享 slot-store 不需要了——actions 驱动） | OpenSandbox |
 | **firecracker 衔接验证** | data-plane-ready 时机（restore + 网络就绪）；clone 网络下 egress 流量 src=slot.IP（#28 已保证唯一性） | 集成测试 |
 
 ## 集成架构
@@ -123,13 +123,19 @@ OSEP-0022 原方案：egress 通过**观察 fastlet slot-store 文件**（
 
 ### B. egress 构建与集成（直接集成，非 mock）
 
-**直接用 PR #1678 head 分支构建真实 egress**（已确认可构建）：
+**历史构建基准：PR #1678 的固定提交**（当时已确认可构建）：
 
 ```text
 repo:    Pangjiping/OpenSandbox @ feat/egress-actions-handler（pin commit 460b1cb）
 路径:    components/egress/（fleet.go / fleet_actions.go / pkg/actionhandler / pkg/fleetnft）
 产物:    egress 镜像（集成环境 `kind load docker-image`）
 ```
+
+以上保留 `460b1cb` 构建基准中的历史路径。后续
+[OpenSandbox PR #1811](https://github.com/opensandbox-group/OpenSandbox/pull/1811)
+将 `fleet*.go` / `pkg/fleetnft` 重命名为 `fastsandbox*.go` / `pkg/fastsandboxnft`。
+当前样例使用 `fast-sandbox` profile，需构建并加载包含该重命名的 Egress 镜像；
+上述历史提交的镜像不适用于当前样例。
 
 - **pin commit 缓解 PR 未合入的演进风险**：PR 合并后切官方 tag/镜像；
 - **交叉验证（mock 无法替代的核心价值）**：fast-sandbox

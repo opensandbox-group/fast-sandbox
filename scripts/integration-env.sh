@@ -2503,7 +2503,7 @@ egress_dyn_v4_has() { # sandbox ip
 	uid="$(kubectl -n "$NS" get sandbox "$1" -o jsonpath='{.metadata.uid}' 2>/dev/null)"
 	[[ -n "$uid" ]] || return 1
 	set="subj_s_${uid//-/_}_dyn_v4"
-	kubectl -n "$NS" exec "pod/$pod" -c egress -- nft list set inet opensandbox-fleet "$set" 2>/dev/null | grep -q "$2"
+	kubectl -n "$NS" exec "pod/$pod" -c egress -- nft list set inet opensandbox-fast-sandbox "$set" 2>/dev/null | grep -q "$2"
 }
 
 # EGRESS_IP is a well-known, reliably reachable public address used for
@@ -2521,7 +2521,7 @@ egress_binding_ready() { # sandbox
 
 # egress_nft_subjects_clean asserts the per-subject chains are really gone
 # from the host data plane on every pool pod. The egress image implements
-# enforcement with nft (table opensandbox-fleet, per-subject chain
+# enforcement with nft (table opensandbox-fast-sandbox, per-subject chain
 # subj_<id>), so the CLI must be present; a missing CLI fails the stage
 # instead of skipping the assertion.
 egress_nft_subjects_clean() {
@@ -2745,7 +2745,7 @@ egress_subject_present() { # sandbox pod
 	uid="$(kubectl -n "$NS" get sandbox "$1" -o jsonpath='{.metadata.uid}' 2>/dev/null)"
 	[[ -n "$uid" ]] || return 1
 	kubectl -n "$NS" exec "pod/$2" -c egress -- \
-		nft list chain inet opensandbox-fleet "subj_s_${uid//-/_}" 2>/dev/null | grep -q "chain subj_s_"
+		nft list chain inet opensandbox-fast-sandbox "subj_s_${uid//-/_}" 2>/dev/null | grep -q "chain subj_s_"
 }
 
 egress_subject_absent() { # sandbox pod
@@ -2753,7 +2753,7 @@ egress_subject_absent() { # sandbox pod
 	uid="$(kubectl -n "$NS" get sandbox "$1" -o jsonpath='{.metadata.uid}' 2>/dev/null)"
 	[[ -n "$uid" ]] || return 0
 	! kubectl -n "$NS" exec "pod/$2" -c egress -- \
-		nft list chain inet opensandbox-fleet "subj_s_${uid//-/_}" 2>/dev/null | grep -q "chain subj_s_"
+		nft list chain inet opensandbox-fast-sandbox "subj_s_${uid//-/_}" 2>/dev/null | grep -q "chain subj_s_"
 }
 
 egress_count_gt() { # count
