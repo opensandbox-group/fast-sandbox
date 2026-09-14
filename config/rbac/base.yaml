@@ -74,6 +74,11 @@ rules:
 - apiGroups: ["sandbox.fast.io"]
   resources: ["sandboxsnapshots", "sandboxsnapshots/status"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Snapshot-recorded policy resolution reads the pool's compiled registry
+# secret (read-only store credential).
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole

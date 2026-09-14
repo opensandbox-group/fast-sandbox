@@ -23,5 +23,10 @@ spec:
         - name: FAST_SANDBOX_ROUTE_SIGNING_PRIVATE_KEY
           valueFrom:
             secretKeyRef: {name: fast-sandbox-route-keys, key: private-key}
+        # Artifact store root (same as the node agents): lets FastPath
+        # resolve snapshot-recorded action bindings (e.g. egress network
+        # policy) from the published manifest at sandbox create time.
+        - name: FAST_SANDBOX_ARTIFACT_STORE
+          value: s3://sandbox-images/publish
         ports:
         - {name: grpc, containerPort: 9090}
