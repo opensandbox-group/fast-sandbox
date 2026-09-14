@@ -3098,10 +3098,12 @@ snapshot_env_up() {
 		kubectl -n "$NS" rollout status daemonset/firecracker-runtime-agent --timeout=10s
 	wait_for "fastlet pod ready (recreated)" 180 fastlet_pod_ready
 	# Egress plane for the policy checks: image, single-fastlet pool (one
-	# deterministic plane), warm image cached (creates before the fastlet
-	# heartbeat would race into ResourceExhausted).
+	# deterministic plane; the sample pins poolMin=poolMax=1), warm image
+	# cached (creates before the fastlet heartbeat would race into
+	# ResourceExhausted). The pool is applied IN PLACE: deleting it would
+	# stop every egress container, letting the kubelet image GC evict the
+	# image (a minutes-long reload) and dropping the warm cache.
 	egress_image_ready
-	kubectl -n "$NS" delete sandboxpool "$EGRESS_POOL" --ignore-not-found >/dev/null
 	snapshot_policy_render_pool
 	kubectl -n "$NS" apply -f "$WORK/pool-firecracker-egress-snapshot.yaml" >/dev/null
 	wait_for "exactly one egress fastlet pod" 180 egress_single_pod
