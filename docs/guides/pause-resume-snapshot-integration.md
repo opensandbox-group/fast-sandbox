@@ -350,5 +350,7 @@ artifact validation:
   machine, identity model, non-goals
 - [Sandbox Snapshots](sandbox-snapshots.md) — snapshot internals: spill
   area, fences, artifact layout, recorded network policy
+- [Artifact manifest reference (Chinese)](artifact-manifest-reference.zh-CN.md) —
+  every field of the published manifest.json and how producers/consumers use it
 - [OpenSandbox integration](opensandbox-integration.md) — create, endpoint
   resolution, and route contract around these operations
