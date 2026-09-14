@@ -3517,10 +3517,15 @@ snapshot_report_manifest() { # snapshot-cr-name
 	[[ -n "$ref" && "$ref" == s3://* ]] || fail "snapshot $1 has no s3 manifestRef"
 	path="${ref#s3://}"
 	dir="$(dirname "${path#*/}")"
-	highlight "  snapshot manifest: $ref"
+	highlight "  snapshot manifest (store): $ref"
 	highlight "  artifact directory: s3://$MINIO_BUCKET/$dir/   (mc: chain/$MINIO_BUCKET/$dir/)"
 	log "  artifactDigest: $digest"
 	mc stat "chain/$path" >/dev/null 2>&1 || fail "manifest object missing: $path"
+	# Local, directly readable copies for inspection.
+	mc cat "chain/$path" > "$SNAP_E2E_DIR/manifest-$1.json" 2>/dev/null \
+		|| log "  warning: could not copy the manifest into the evidence directory"
+	highlight "  manifest locally: $SNAP_E2E_DIR/manifest-$1.json"
+	highlight "  store data on host: $MINIO_DATA/$MINIO_BUCKET/$dir/  (MinIO internal format; read via mc above)"
 	mc ls "chain/$MINIO_BUCKET/$dir/" 2>/dev/null | tee -a "$WORK/run.log" >&2 || true
 }
 
@@ -3632,6 +3637,9 @@ snapshot_restore() {
 		|| fail "restored sandbox image is not $SNAPSHOT_TEMPLATE"
 	show_restore_timings "$SNAPSHOT_RESTORE"
 	pass "restored sandbox Ready + /ping (image=$SNAPSHOT_TEMPLATE pulled through the snapshot index)"
+	local cache_key
+	cache_key="$(printf '%s' "$SNAPSHOT_TEMPLATE" | sha256sum | awk '{print $1}')"
+	highlight "  restored manifest on the host (node cache): /var/lib/fast-sandbox/firecracker/images/$cache_key/manifest.json"
 
 	# The snapshot-recorded policy must have been auto-applied (fastpath
 	# resolves the manifest from the store at create time) and it must be
