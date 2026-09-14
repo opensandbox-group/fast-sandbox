@@ -17,6 +17,10 @@ The protobuf contract is
 [`api/proto/v2/fastpath.proto`](../../api/proto/v2/fastpath.proto). Nothing
 below requires `fastctl`; the CLI is a thin client over the same gRPC API.
 
+A Chinese field-level companion reference (request fields, CRD spec/status,
+and state machines) is available at
+[pause-resume-snapshot-integration.zh-CN.md](pause-resume-snapshot-integration.zh-CN.md).
+
 ## Choose the primitive
 
 | | Pause / Resume | Snapshot |
