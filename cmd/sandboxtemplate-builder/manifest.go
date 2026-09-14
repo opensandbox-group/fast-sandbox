@@ -40,7 +40,9 @@ func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 // buildManifest assembles the content-addressed manifest (design schema).
 // rootfsGiB is the actual size passed to oci2rootfs (the declared
 // rootfsSize rounded up to SI GiB), recorded so consumers can reconcile the
-// declared minimum with the real artifact size.
+// declared minimum with the real artifact size. The lineage object records
+// where the set came from and what was baked in at build time; snapshot
+// and checkpoint producers carry it forward verbatim across generations.
 func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, cache map[string]string, rootfsGiB int) (map[string]any, error) {
 	files := map[string]any{}
 	staged := []struct{ name, path string }{
@@ -68,14 +70,22 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 		return nil, fmt.Errorf("checksum kernel: %w", err)
 	}
 	return map[string]any{
-		"schemaVersion":     1,
-		"runtime":           "firecracker",
-		"sourceImage":       spec.Image,
-		"sourceImageDigest": sourceDigest,
-		"execd":             spec.Execd,
-		"kernel": map[string]any{
-			"name":   filepath.Base(kernel),
-			"digest": kernelDigest,
+		"schemaVersion": 1,
+		"runtime":       "firecracker",
+		"lineage": map[string]any{
+			"image":       spec.Image,
+			"imageDigest": sourceDigest,
+			"execd":       spec.Execd,
+			"kernel": map[string]any{
+				"name":   filepath.Base(kernel),
+				"digest": kernelDigest,
+			},
+			"entrypoint": spec.Entrypoint,
+			"init":       spec.Init,
+			// Note: envs are published verbatim into the manifest — do not
+			// place secrets here; use the publishSecretRef secret for
+			// credentials.
+			"envs": spec.Envs,
 		},
 		// Snapshot compatibility tuple (design): consumers match these
 		// against node labels before restoring a snapshot.
@@ -100,11 +110,6 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 			"netmask": bakedGuestNetmask,
 			"mtu":     bakedGuestMTU,
 		},
-		"entrypoint": spec.Entrypoint,
-		"init":       spec.Init,
-		// Note: envs are published verbatim into the manifest — do not place
-		// secrets here; use the publishSecretRef secret for credentials.
-		"envs": spec.Envs,
 		// The actual rootfs size (rounded up from the declared minimum to SI
 		// GiB), matching files['rootfs.ext4'].sizeBytes.
 		"rootfsSize": fmt.Sprintf("%dG", rootfsGiB),

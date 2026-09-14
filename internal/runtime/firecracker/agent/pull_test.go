@@ -115,7 +115,7 @@ func testManifest(artifacts map[string][]byte) []byte {
 	document := map[string]any{
 		"schemaVersion": 1,
 		"runtime":       "firecracker",
-		"sourceImage":   testImage,
+		"lineage":       map[string]any{"image": testImage},
 		"files":         files,
 	}
 	payload, err := json.MarshalIndent(document, "", "  ")

@@ -187,7 +187,7 @@ credentials) see the sections below.
   last). The manifest copies `machine`/`guestNetwork`/`kernel`/`envs`
   verbatim from the source image (they describe the vmstate lineage that
   restore validates). Only the template-name index is written — never a
-  default `sha256(sourceImage)` key, which would pollute the golden image.
+  default `sha256(image)` key, which would pollute the golden image.
 - **Follow-ups**: [#56](https://github.com/opensandbox-group/fast-sandbox/issues/56)
   diff snapshots (pause window proportional to dirty pages),
   [#57](https://github.com/opensandbox-group/fast-sandbox/issues/57)

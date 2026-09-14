@@ -209,8 +209,9 @@ s3://sandbox-images/publish/
   `network_overrides`;
 - `files` — publish filename → `{sha256, sizeBytes}` for digest-verified pull;
 - `compatibility` — firecracker version / host kernel / CPU model;
-- `kernel` / `sourceImage` / `sourceImageDigest` / `validation` — build
-  provenance and gates.
+- `lineage` — build provenance carried by every derived snapshot: `image`,
+  `imageDigest`, `execd`, `kernel`, `entrypoint`, `init`, `envs`;
+- `validation` — build gates.
 
 The consumer-side cache layout is
 `<StateRoot>/images/<sha256(image)>/{rootfs.img, vmstate.snap, memory.snap,

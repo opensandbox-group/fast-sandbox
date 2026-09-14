@@ -198,7 +198,8 @@ func TestCreateSnapshotDumpsPublishesAndResumes(t *testing.T) {
 	// The published manifest copies the source facts verbatim and describes
 	// this dump.
 	require.Equal(t, "app-v2", agent.key)
-	require.Equal(t, fixture.sandboxSpec.Spec.Image, agent.manifest["sourceImage"])
+	require.Equal(t, fixture.sandboxSpec.Spec.Image,
+		agent.manifest["lineage"].(map[string]any)["image"])
 	require.Equal(t, map[string]any{
 		"vcpu": "2", "memory": "1Gi",
 	}, agent.manifest["machine"])
@@ -372,7 +373,8 @@ func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
 	require.NoError(t, json.Unmarshal(payload, &document))
 	require.Equal(t, "10.0.0.2", document["guestNetwork"].(map[string]any)["ip"],
 		"the checkpoint lineage facts ride forward into the new checkpoint")
-	require.Equal(t, fixture.sandboxSpec.Spec.Image, document["sourceImage"])
+	require.Equal(t, fixture.sandboxSpec.Spec.Image,
+		document["lineage"].(map[string]any)["image"])
 }
 
 func TestCreateSnapshotPublishesWithTemplateKind(t *testing.T) {

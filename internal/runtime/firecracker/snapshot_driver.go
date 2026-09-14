@@ -624,11 +624,11 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 }
 
 // assembleSnapshotManifest builds the restore-compatible manifest of the
-// dumped set: the machine/guestNetwork/kernel/envs facts baked into the
-// SOURCE image manifest are copied verbatim (they describe the vmstate
-// lineage and are what restore validation checks), while the compatibility
-// tuple, files, rootfsSize, format, and validation describe this dump. It
-// returns the total logical size of the artifact set.
+// dumped set: the lineage object and the machine/guestNetwork facts baked
+// into the SOURCE image manifest are carried forward verbatim (they describe
+// the vmstate lineage and are what restore validation checks), while the
+// compatibility tuple, files, rootfsSize, format, and validation describe
+// this dump. It returns the total logical size of the artifact set.
 func assembleSnapshotManifest(stateRoot, staging, sandboxDir, firecrackerBinary string, actionBindings []runtimecontract.SnapshotActionBinding) (int64, error) {
 	state, err := loadState(sandboxDir)
 	if err != nil {
@@ -669,7 +669,15 @@ func assembleSnapshotManifest(stateRoot, staging, sandboxDir, firecrackerBinary 
 
 	document["schemaVersion"] = 1
 	document["runtime"] = "firecracker"
-	document["sourceImage"] = state.Config.Spec.Image
+	// The lineage object rides forward from the source manifest; only the
+	// image reference is rewritten to the one this Sandbox booted from (the
+	// imageDigest stays the original build's anchor).
+	lineage, ok := document["lineage"].(map[string]any)
+	if !ok {
+		lineage = map[string]any{}
+		document["lineage"] = lineage
+	}
+	lineage["image"] = state.Config.Spec.Image
 	document["compatibility"] = map[string]any{
 		"firecrackerVersion": artifacts.FirecrackerVersion(firecrackerBinary),
 		"hostKernel":         artifacts.HostKernelRelease(),

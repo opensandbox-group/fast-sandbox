@@ -7,7 +7,7 @@ package agent
 // SHA-256, artifacts and SHA256SUMS upload first, the manifest last within
 // the namespace, and the image index object last overall. Unlike a
 // SandboxTemplate build, a snapshot publishes ONLY the index key given by
-// the caller (the template name) — never a default sha256(sourceImage) key,
+// the caller (the template name) — never a default sha256(image) key,
 // which would alias and pollute the source golden image (last-writer-wins).
 
 import (
