@@ -9,6 +9,9 @@ import (
 	"fmt"
 	"reflect"
 	"regexp"
+	"strings"
+	"sync"
+	"time"
 
 	fastpathv2 "fast-sandbox/api/proto/v2"
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
@@ -16,7 +19,10 @@ import (
 	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 	"fast-sandbox/internal/observability"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	"fast-sandbox/internal/registryconfig"
+	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -68,18 +74,10 @@ func snapshotFromCreateRequest(request *fastpathv2.CreateSandboxSnapshotRequest,
 	for name, value := range request.Metadata {
 		labels[metadataLabelKey(name)] = value
 	}
-	annotations := map[string]string{assignment.AnnotationRequestID: request.RequestId, assignment.AnnotationCreateSpecHash: specHash}
-	// Provenance: the source Sandbox's action bindings ride along verbatim
-	// so a restore (CreateSandbox with image=<templateName>) can re-apply
-	// the same runtime policy (egress rules, hooks). Opaque, best-effort:
-	// oversized payloads are skipped rather than rejected.
-	if encoded, err := encodeSourceActionBindings(sandbox.Spec.ActionBindings); err == nil && encoded != "" {
-		annotations[assignment.AnnotationSourceActionBindings] = encoded
-	}
 	return &apiv1alpha2.SandboxSnapshot{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: request.RequestId, Namespace: sandbox.Namespace, Labels: labels,
-			Annotations: annotations,
+			Annotations: map[string]string{assignment.AnnotationRequestID: request.RequestId, assignment.AnnotationCreateSpecHash: specHash},
 		},
 		Spec: apiv1alpha2.SandboxSnapshotSpec{
 			SandboxRef: apiv1alpha2.SandboxRef{
@@ -191,36 +189,165 @@ func snapshotSelfKey(namespace, name string) string { return namespace + "/" + n
 // acceptSnapshotIntent persists the snapshot intent idempotently: an
 // AlreadyExists with the same request-id and spec hash replays the persisted
 // object, anything else is a conflict.
-// maxSourceActionBindingsAnnotation bounds the provenance annotation so a
-// pathological binding set cannot exceed the object annotation budget.
-const maxSourceActionBindingsAnnotation = 128 << 10
-
-// encodeSourceActionBindings serializes the bindings verbatim; empty input
-// and oversized payloads encode to "" (record nothing).
-func encodeSourceActionBindings(bindings []apiv1alpha2.ActionBinding) (string, error) {
-	if len(bindings) == 0 {
-		return "", nil
-	}
-	payload, err := json.Marshal(bindings)
-	if err != nil {
-		return "", err
-	}
-	if len(payload) > maxSourceActionBindingsAnnotation {
-		return "", nil
-	}
-	return string(payload), nil
+// ManifestPolicySource resolves snapshot-recorded action bindings for an
+// image from the artifact store. The manifest is the ONLY policy record:
+// it outlives the SandboxSnapshot CR (deleting the CR keeps the
+// artifacts), so checkpoint and restore treat the artifact set as
+// self-contained.
+type ManifestPolicySource interface {
+	ActionBindings(ctx context.Context, pool *apiv1alpha2.SandboxPool, image string) ([]apiv1alpha2.ActionBinding, error)
 }
 
-// decodeSourceActionBindings parses a provenance annotation.
-func decodeSourceActionBindings(encoded string) ([]apiv1alpha2.ActionBinding, error) {
-	if encoded == "" {
-		return nil, nil
+// policyCacheTTL bounds index freshness: a republished template name moves
+// the index to a new digest namespace; entries re-resolve after the TTL.
+const policyCacheTTL = time.Minute
+
+type policyCacheEntry struct {
+	bindings  []apiv1alpha2.ActionBinding
+	fetchedAt time.Time
+}
+
+// storePolicySource is the default ManifestPolicySource: per-pool artifact
+// read clients built from the pool's compiled registry secret (read-only
+// pair) with a short-TTL resolution cache. Resolution is two tiny GETs
+// (index + manifest, both small); the immutable manifest needs no
+// long-lived state.
+type storePolicySource struct {
+	Client    client.Client
+	StoreRoot string
+
+	mu      sync.Mutex
+	clients map[string]*agentpull.Client
+	cache   map[string]policyCacheEntry
+}
+
+// NewStorePolicySource builds the default policy source over the pool
+// registry secrets and the configured artifact store root (the same store
+// the node agents pull from).
+func NewStorePolicySource(reader client.Client, storeRoot string) ManifestPolicySource {
+	return &storePolicySource{
+		Client:    reader,
+		StoreRoot: storeRoot,
+		clients:   map[string]*agentpull.Client{},
+		cache:     map[string]policyCacheEntry{},
 	}
-	var bindings []apiv1alpha2.ActionBinding
-	if err := json.Unmarshal([]byte(encoded), &bindings); err != nil {
+}
+
+// poolRegistryClient builds (once) the artifact-store read client for a
+// pool from its compiled registry secret.
+func (s *storePolicySource) poolRegistryClient(ctx context.Context, pool *apiv1alpha2.SandboxPool) (*agentpull.Client, error) {
+	key := pool.Namespace + "/" + pool.Name
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cached, ok := s.clients[key]; ok {
+		return cached, nil
+	}
+	var secret corev1.Secret
+	if err := s.Client.Get(ctx, client.ObjectKey{Namespace: pool.Namespace, Name: poolRegistrySecretName(pool.Name)}, &secret); err != nil {
 		return nil, err
 	}
+	compiled, parseErr := registryconfig.ParseCompiled(secret.Data[registryconfig.SecretKey])
+	if parseErr != nil {
+		return nil, parseErr
+	}
+	if len(compiled.Credentials) == 0 {
+		return nil, fmt.Errorf("pool %s registry secret carries no credentials", pool.Name)
+	}
+	pull, clientErr := agentpull.NewClient(s.StoreRoot, compiled.Credentials[0])
+	if clientErr != nil {
+		return nil, clientErr
+	}
+	s.clients[key] = pull
+	return pull, nil
+}
+
+// poolRegistrySecretName mirrors the reconciler's compiled-secret naming
+// (pool name + "-registry", truncated to a valid secret name).
+func poolRegistrySecretName(poolName string) string {
+	const suffix = "-registry"
+	if len(poolName) > 253-len(suffix) {
+		poolName = strings.TrimRight(poolName[:253-len(suffix)], "-.")
+	}
+	return poolName + suffix
+}
+
+func (s *storePolicySource) ActionBindings(ctx context.Context, pool *apiv1alpha2.SandboxPool, image string) ([]apiv1alpha2.ActionBinding, error) {
+	key := image + "@" + pool.Namespace + "/" + pool.Name
+	s.mu.Lock()
+	entry, ok := s.cache[key]
+	s.mu.Unlock()
+	if ok && time.Since(entry.fetchedAt) < policyCacheTTL {
+		return entry.bindings, nil
+	}
+	pull, err := s.poolRegistryClient(ctx, pool)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := pull.ReadImageManifest(ctx, image)
+	if err != nil {
+		return nil, err
+	}
+	bindings := decodeManifestActionBindings(payload)
+	s.mu.Lock()
+	s.cache[key] = policyCacheEntry{bindings: bindings, fetchedAt: time.Now()}
+	s.mu.Unlock()
 	return bindings, nil
+}
+
+// decodeManifestActionBindings reads the optional actionBindings field;
+// manifests without it (every golden-image build) resolve to nil.
+func decodeManifestActionBindings(manifest []byte) []apiv1alpha2.ActionBinding {
+	var document struct {
+		ActionBindings []apiv1alpha2.ActionBinding `json:"actionBindings"`
+	}
+	if err := json.Unmarshal(manifest, &document); err != nil {
+		return nil
+	}
+	return document.ActionBindings
+}
+
+// applyManifestRecordedBindings merges the snapshot-recorded bindings of
+// the create's image into the initial set: explicit request bindings win
+// per handler, and recorded handlers the target Pool does not declare are
+// dropped (they could not take effect there). The spec hash stays over the
+// caller's own request, so a policy change between retries never conflicts
+// an idempotent replay. Store resolution is best-effort: an unreachable
+// store or an image unknown to it proceeds without recorded policy.
+func (s *Server) applyManifestRecordedBindings(ctx context.Context, request *fastpathv2.CreateSandboxRequest, explicit []apiv1alpha2.ActionBinding, pool *apiv1alpha2.SandboxPool) ([]apiv1alpha2.ActionBinding, error) {
+	if s.ManifestPolicy == nil || request.Image == "" || len(pool.Spec.ActionHandlers) == 0 {
+		return explicit, nil
+	}
+	bindings, err := s.ManifestPolicy.ActionBindings(ctx, pool, request.Image)
+	if err != nil {
+		klog.FromContext(ctx).V(2).Info("Snapshot-recorded policy unavailable; proceeding without it", "image", request.Image, "err", err)
+		return explicit, nil
+	}
+	if len(bindings) == 0 {
+		return explicit, nil
+	}
+	handlers := make(map[string]struct{}, len(pool.Spec.ActionHandlers))
+	for _, handler := range pool.Spec.ActionHandlers {
+		handlers[handler.Name] = struct{}{}
+	}
+	overrides := make(map[string]struct{}, len(explicit))
+	for _, binding := range explicit {
+		overrides[binding.Handler] = struct{}{}
+	}
+	merged := explicit
+	for _, binding := range bindings {
+		if _, done := overrides[binding.Handler]; done {
+			continue
+		}
+		if _, declared := handlers[binding.Handler]; !declared {
+			continue
+		}
+		merged = append(merged, binding)
+	}
+	if len(merged) != len(explicit) {
+		klog.FromContext(ctx).Info("Re-applying snapshot-recorded action bindings",
+			"image", request.Image, "recorded", len(bindings), "applied", len(merged)-len(explicit))
+	}
+	return merged, nil
 }
 
 func (s *Server) acceptSnapshotIntent(ctx context.Context, snapshot *apiv1alpha2.SandboxSnapshot) (*apiv1alpha2.SandboxSnapshot, error) {

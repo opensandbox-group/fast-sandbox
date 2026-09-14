@@ -42,6 +42,9 @@ type Server struct {
 	CredentialIssuer    *routeauth.Issuer
 	SandboxProxyBaseURL string
 	DefaultNamespace    string
+	// ManifestPolicy resolves snapshot-recorded action bindings from the
+	// artifact store at create time (nil disables the re-application).
+	ManifestPolicy ManifestPolicySource
 }
 
 var _ fastpathv2.FastPathServiceServer = &Server{}
@@ -99,11 +102,11 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	if err != nil {
 		return nil, err
 	}
-	// A create whose image resolves to a snapshot re-applies the source
-	// Sandbox's recorded runtime policy (network policy via the egress
+	// A create whose image resolves to a snapshot re-applies the
+	// manifest-recorded runtime policy (network policy via the egress
 	// handler, lifecycle hooks): explicit bindings win per handler, and
 	// only handlers the target Pool declares are filled in.
-	bindings, err = s.applySnapshotRecordedBindings(ctx, request, bindings, pool)
+	bindings, err = s.applyManifestRecordedBindings(ctx, request, bindings, pool)
 	if err != nil {
 		return nil, err
 	}
@@ -164,71 +167,6 @@ func (s *Server) validateCreateRequest(request *fastpathv2.CreateSandboxRequest)
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	return nil
-}
-
-// applySnapshotRecordedBindings merges the action bindings recorded on the
-// newest SandboxSnapshot whose templateName equals the create's image:
-// checkpoint and restore thereby preserve the source's runtime policy.
-// Explicit request bindings override recorded ones per handler; recorded
-// handlers the target Pool does not declare are dropped (they could not
-// take effect there anyway). The spec hash stays over the caller's own
-// request, so a policy change between retries never conflicts a replay.
-func (s *Server) applySnapshotRecordedBindings(ctx context.Context, request *fastpathv2.CreateSandboxRequest, explicit []apiv1alpha2.ActionBinding, pool *apiv1alpha2.SandboxPool) ([]apiv1alpha2.ActionBinding, error) {
-	if request.Image == "" || len(pool.Spec.ActionHandlers) == 0 {
-		return explicit, nil
-	}
-	var list apiv1alpha2.SandboxSnapshotList
-	reader := s.K8sClient
-	if s.RouteCache != nil {
-		reader = s.RouteCache
-	}
-	if err := reader.List(ctx, &list, client.InNamespace(request.Namespace)); err != nil {
-		// Best-effort: an unreachable cache falls back to the durable client.
-		if reader == s.K8sClient || s.K8sClient.List(ctx, &list, client.InNamespace(request.Namespace)) != nil {
-			return explicit, grpcKubernetesError(err)
-		}
-	}
-	var newest *apiv1alpha2.SandboxSnapshot
-	for index := range list.Items {
-		item := &list.Items[index]
-		if item.Spec.TemplateName != request.Image || item.Annotations[assignment.AnnotationSourceActionBindings] == "" {
-			continue
-		}
-		if newest == nil || item.CreationTimestamp.After(newest.CreationTimestamp.Time) {
-			newest = item
-		}
-	}
-	if newest == nil {
-		return explicit, nil
-	}
-	bindings, err := decodeSourceActionBindings(newest.Annotations[assignment.AnnotationSourceActionBindings])
-	if err != nil {
-		klog.FromContext(ctx).Error(err, "Decode snapshot source action bindings", "snapshot", newest.Name)
-		return explicit, nil
-	}
-	handlers := make(map[string]struct{}, len(pool.Spec.ActionHandlers))
-	for _, handler := range pool.Spec.ActionHandlers {
-		handlers[handler.Name] = struct{}{}
-	}
-	overrides := make(map[string]struct{}, len(explicit))
-	for _, binding := range explicit {
-		overrides[binding.Handler] = struct{}{}
-	}
-	merged := explicit
-	for _, binding := range bindings {
-		if _, done := overrides[binding.Handler]; done {
-			continue
-		}
-		if _, declared := handlers[binding.Handler]; !declared {
-			continue
-		}
-		merged = append(merged, binding)
-	}
-	if len(merged) != len(explicit) {
-		klog.FromContext(ctx).Info("Re-applying snapshot-recorded action bindings",
-			"image", request.Image, "snapshot", newest.Name, "recorded", len(bindings), "applied", len(merged)-len(explicit))
-	}
-	return merged, nil
 }
 
 func buildActionBindings(request *fastpathv2.CreateSandboxRequest, pool *apiv1alpha2.SandboxPool) ([]apiv1alpha2.ActionBinding, error) {

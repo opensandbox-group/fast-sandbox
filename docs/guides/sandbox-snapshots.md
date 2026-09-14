@@ -96,10 +96,18 @@ path); later creates on that node restore in milliseconds.
 
 ## Network policy on restore
 
-The snapshot CR records the source Sandbox's **action bindings** verbatim
-(`sandbox.fast.io/source-action-bindings` annotation) — including egress
-network policy applied through the egress handler. Creating a Sandbox whose
-`image` equals a snapshot's `templateName` re-applies them automatically:
+A snapshot records the source Sandbox's **action bindings** verbatim in the
+published manifest (`actionBindings`, an optional field every existing
+consumer ignores) — including egress network policy applied through the
+egress handler. The artifact set is therefore self-contained and outlives
+the SandboxSnapshot CR: deleting the CR keeps the artifacts, and the
+policy survives with them.
+
+Creating a Sandbox whose `image` equals a snapshot's `templateName`
+re-applies the recorded policy automatically: fastpath resolves the image
+through the artifact store at create time (two small GETs — index then
+manifest — served through the target Pool's compiled registry credential,
+with a short-TTL cache), then merges:
 
 - bindings you pass **explicitly** on the create win per handler (override
   one policy, keep the rest);
@@ -108,14 +116,12 @@ network policy applied through the egress handler. Creating a Sandbox whose
 - in-guest network state (routes, connections, in-guest firewall) comes
   along in the memory image itself.
 
-The bindings are also recorded **in the published manifest**
-(`actionBindings`, an optional field existing consumers ignore): the
-artifact set outlives the SandboxSnapshot CR — deleting the CR keeps the
-artifacts — so the manifest is the durable record. A restore after the CR
-is gone (or in another cluster) reads the policy from the store and
-constructs the create with those bindings; the fastpath auto-apply only
-consults the CR because the control plane cannot read the object store at
-binding time (the image has not been placed on a node yet).
+Resolution is best-effort: an unreachable store or an image unknown to it
+(the local-only case) proceeds without recorded policy, so sandbox create
+availability never hinges on the object store. Enable it on the
+controller with `--artifact-store-root` / `FAST_SANDBOX_ARTIFACT_STORE`
+(empty disables the feature). The policy still passes the target Pool's
+handler validation and drives the normal binding lifecycle.
 
 ## Rules of thumb
 

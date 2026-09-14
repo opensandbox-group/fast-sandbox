@@ -2,7 +2,6 @@ package fastpath
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"testing"
 
@@ -94,33 +93,6 @@ func TestCreateSandboxSnapshotPersistsTriggersAndProjects(t *testing.T) {
 	require.Equal(t, apiv1alpha2.SandboxSnapshotPhaseCreating, persisted.Status.Phase)
 	require.Equal(t, "fastlet-a", persisted.Status.FastletName)
 	require.NotEmpty(t, persisted.Status.SnapshotID)
-}
-
-func TestCreateSandboxSnapshotRecordsSourceActionBindings(t *testing.T) {
-	server, k8sClient, _ := newSnapshotServer(t)
-	var sandbox apiv1alpha2.Sandbox
-	require.NoError(t, server.K8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "sandbox-a"}, &sandbox))
-	sandbox.Spec.ActionBindings = []apiv1alpha2.ActionBinding{
-		{Handler: "egress", Input: `{"egressPolicy":"deny-all"}`},
-	}
-	require.NoError(t, server.K8sClient.Update(context.Background(), &sandbox))
-
-	_, err := server.CreateSandboxSnapshot(context.Background(), snapshotCreateRequest("snap-a", "app-v2"))
-	require.NoError(t, err)
-	var persisted apiv1alpha2.SandboxSnapshot
-	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "snap-a"}, &persisted))
-	var recorded []apiv1alpha2.ActionBinding
-	require.NoError(t, json.Unmarshal([]byte(persisted.Annotations[assignment.AnnotationSourceActionBindings]), &recorded))
-	require.Equal(t, []apiv1alpha2.ActionBinding{{Handler: "egress", Input: `{"egressPolicy":"deny-all"}`}}, recorded)
-}
-
-func TestCreateSandboxSnapshotOmitsProvenanceWithoutBindings(t *testing.T) {
-	server, k8sClient, _ := newSnapshotServer(t)
-	_, err := server.CreateSandboxSnapshot(context.Background(), snapshotCreateRequest("snap-a", "app-v2"))
-	require.NoError(t, err)
-	var persisted apiv1alpha2.SandboxSnapshot
-	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "snap-a"}, &persisted))
-	require.NotContains(t, persisted.Annotations, assignment.AnnotationSourceActionBindings)
 }
 
 func TestCreateSandboxSnapshotReplaysIdempotently(t *testing.T) {
