@@ -2202,10 +2202,12 @@ verify_p2p() {
 
 	# The presigned URL must name the MinIO container IP on the kind network
 	# (the node containers' view of the store), not the host loopback the
-	# dev alias signs for.
+	# dev alias signs for. A fresh shell has no MINIO_ENDPOINT (up derived
+	# it in its own process), so resolve it here like verify-snapshot does.
 	local endpoint_host
+	[[ -n "$MINIO_ENDPOINT" ]] || resolve_minio_endpoint
 	endpoint_host="${MINIO_ENDPOINT#http://}"
-	[[ -n "$endpoint_host" ]] || die "MINIO_ENDPOINT is empty (up must run first)"
+	[[ -n "$endpoint_host" ]] || die "MINIO_ENDPOINT could not be resolved (is the MinIO container up?)"
 	mc alias set chain-net "$MINIO_ENDPOINT" "$MINIO_AK" "$MINIO_SK" >/dev/null 2>&1 || true
 	presigned="$(mc presign --expiry 1h "chain-net/$MINIO_BUCKET/$probe_key")" \
 		|| die "mc presign failed for $probe_key"
