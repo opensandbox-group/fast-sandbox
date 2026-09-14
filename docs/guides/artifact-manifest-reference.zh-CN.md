@@ -19,7 +19,7 @@
     "init": "/usr/local/sbin/sandbox-init",
     "envs": [{ "name": "FOO", "value": "bar" }]
   },
-  "machine": { "vcpu": "2", "memory": "2Gi", "rootfs": "30G" },
+  "machine": { "vcpu": "2", "memory": "2Gi", "rootfs": "30Gi" },
   "compatibility": {
     "firecrackerVersion": "1.16.1",
     "hostKernel": "5.10.134-18.al8.x86_64",
@@ -33,7 +33,6 @@
     "netmask": "255.255.255.0",
     "mtu": 1500
   },
-  "rootfsSize": "30G",
   "format": "overlaybd",
   "files": {
     "rootfs.ext4":  { "sha256": "a1b2…", "sizeBytes": 32212254720 },
@@ -60,7 +59,7 @@
 | `lineage.entrypoint` | 模板声明的业务命令 argv。构建期已写进 rootfs 启动链，这里逐字发布作谱系/审计 |
 | `lineage.init` | 注入的 guest PID 1 路径（默认 `/usr/local/sbin/sandbox-init`；空表示不注入，由镜像自己的 init 负责）。构建期事实的记录 |
 | `lineage.envs` | 模板 envs 逐字发布（不做 OCI `Config.Env` 合并，不支持 `valueFrom`），构建期写入 guest 的 `/etc/sandbox-init.env`。注意不要放机密——任何能读到 manifest 的人都能看到这些值，凭据应走 `publishSecretRef` |
-| `machine` | 快照的机器规格三元组：`vcpu`、`memory` 为 resource quantity（如 `"2"`、`"2Gi"`），`rootfs` 为实际 rootfs 容量（声明值向上取整到 SI GiB，形如 `"30G"`，与 `files["rootfs.ext4"].sizeBytes` 一致）。`vcpu`/`memory` 是恢复的权威配置——Firecracker 拒绝以不同于 vmstate 创建时的内存恢复，因此创建请求的 cpu/mem 只做校验：请求内存低于快照内存会被显式拒绝。快照逐字继承源镜像的 `vcpu`/`memory`，`rootfs` 由每次拍摄按实际制品重写 |
+| `machine` | 快照的机器规格三元组：`vcpu`、`memory` 为 resource quantity（如 `"2"`、`"2Gi"`），`rootfs` 为实际 rootfs 容量（声明值向上取整到 GiB，形如 `"30Gi"`，与 `files["rootfs.ext4"].sizeBytes` 一致）。`vcpu`/`memory` 是恢复的权威配置——Firecracker 拒绝以不同于 vmstate 创建时的内存恢复，因此创建请求的 cpu/mem 只做校验：请求内存低于快照内存会被显式拒绝。快照逐字继承源镜像的 `vcpu`/`memory`，`rootfs` 由每次拍摄按实际制品重写 |
 | `compatibility` | 拍摄环境三元组：`firecrackerVersion`（Firecracker 二进制版本）、`hostKernel`（宿主机内核 `uname -r`）、`cpuModel`（宿主机 CPU 型号）。用于排障，以及设计上"快照能在哪些节点恢复"的匹配依据；当前恢复路径不强制校验，属信息性字段。每次拍摄重新写入，不继承 |
 | `guestNetwork` | 烘焙进快照的客户机静态网络（克隆网络模型）：`iface`/`mac`/`ip`/`gateway`/`netmask`/`mtu`。恢复时客户机侧不变（都在内存镜像里），节点侧只替换 host tap；消费端读取 `ip`/`gateway`/`netmask`/`mtu`——`mtu` 为 0 表示老格式清单，回退内核默认。同样逐字继承 |
 | `format` | `native` 或 `overlaybd`，两种格式都包含完整快照集，区别是有无额外的 LSMT 层（用于按需加载）。快照/checkpoint 恒为 `native` |

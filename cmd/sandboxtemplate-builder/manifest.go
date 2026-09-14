@@ -39,7 +39,7 @@ func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 
 // buildManifest assembles the content-addressed manifest (design schema).
 // rootfsGiB is the actual size passed to oci2rootfs (the declared
-// rootfsSize rounded up to SI GiB), recorded so consumers can reconcile the
+// rootfsSize rounded up to whole GiB), recorded so consumers can reconcile the
 // declared minimum with the real artifact size. The lineage object records
 // where the set came from and what was baked in at build time; snapshot
 // and checkpoint producers carry it forward verbatim across generations.
@@ -98,8 +98,8 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 			"vcpu":   spec.Machine.VCPU,
 			"memory": spec.Machine.Memory,
 			// The actual rootfs size (rounded up from the declared minimum
-			// to SI GiB), matching files['rootfs.ext4'].sizeBytes.
-			"rootfs": fmt.Sprintf("%dG", rootfsGiB),
+			// to whole GiB), matching files['rootfs.ext4'].sizeBytes.
+			"rootfs": fmt.Sprintf("%dGi", rootfsGiB),
 		},
 		// The guest network baked into the snapshot (clone networking
 		// model): the restored guest owns a static eth0 address/MAC; the

@@ -688,7 +688,7 @@ func assembleSnapshotManifest(stateRoot, staging, sandboxDir, firecrackerBinary 
 	// machine.rootfs reflects this dump's actual rootfs size; vcpu/memory
 	// ride forward from the source manifest untouched.
 	if machine, ok := document["machine"].(map[string]any); ok {
-		machine["rootfs"] = fmt.Sprintf("%dG", artifacts.SizeGiB(rootfsSize))
+		machine["rootfs"] = fmt.Sprintf("%dGi", artifacts.SizeGiB(rootfsSize))
 	}
 	document["format"] = "native"
 	document["validation"] = map[string]any{"booted": true, "restored": false}

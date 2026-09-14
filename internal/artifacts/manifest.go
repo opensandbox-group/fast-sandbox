@@ -169,8 +169,8 @@ func HostCPUModel() string {
 	return "unknown"
 }
 
-// SizeGiB rounds a byte size up to whole SI GiB, minimum one. It matches the
-// builder's machine.rootfs convention ("<N>G" of the rounded artifact size).
+// SizeGiB rounds a byte size up to whole GiB, minimum one. It matches the
+// builder's machine.rootfs convention ("<N>Gi" of the rounded artifact size).
 func SizeGiB(sizeBytes int64) int {
 	gib := (sizeBytes + (1 << 30) - 1) >> 30
 	if gib < 1 {
