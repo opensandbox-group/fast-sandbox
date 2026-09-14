@@ -31,6 +31,7 @@ Fast Sandbox documentation is organized by reader intent:
 - [OpenSandbox Execd](guides/opensandbox-execd.md)
 - [SandboxTemplate golden images](guides/sandboxtemplate-golden-images.md)
 - [Sandbox Snapshots](guides/sandbox-snapshots.md)
+- [Pause, resume, and snapshot integration](guides/pause-resume-snapshot-integration.md)
 - [Private registries](guides/private-registries.md)
 - [Secure runtimes](guides/secure-runtimes.md)
 - [Runtime node installation](guides/runtime-node-installation.md)

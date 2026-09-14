@@ -275,7 +275,6 @@ See [Private Registries](private-registries.md).
 The Fast Sandbox runtime model does not provide:
 
 - per-Sandbox Kubernetes volumes;
-- snapshot, pause, or resume;
 - persistent Sandbox storage;
 - per-request Registry credentials;
 - per-Sandbox node placement;
@@ -284,6 +283,9 @@ The Fast Sandbox runtime model does not provide:
 
 OpenSandbox should reject unsupported request fields explicitly instead of
 silently dropping them.
+
+Pause, resume, and snapshots are available on Firecracker pools; see
+[Pause, resume, and snapshot integration](pause-resume-snapshot-integration.md).
 
 ## End-to-end validation
 
