@@ -33,9 +33,16 @@ One-liners:
 ./scripts/integration-env.sh up        # two-node env + DART (tasks 1-8)
 ./scripts/integration-env.sh verify    # 2 + 5 sandboxes; verify 4 = P2P evidence
 ./scripts/integration-env.sh verify-snapshot  # live snapshot E2E (see below)
+./scripts/integration-env.sh verify-all       # every verify flow in one session
 ./scripts/integration-env.sh status    # component health + dart block_source counters
 ./scripts/integration-env.sh down      # host left clean
 ```
+
+`verify-all` runs the full battery in one go, ordered base delivery → DART
+P2P → execd API → snapshot → egress, fail-fast with the usual log dumps and
+one final stage-timings table. It assumes `up` has already built the golden
+image; the snapshot step rebuilds images and rolls the control plane, and the
+egress step recreates and finally removes its pool.
 
 `KIND_SINGLE=1` falls back to one node (cache-only, no peer traffic);
 `WARM_IMAGES=1` restores the preheat for fast delivery baselines.

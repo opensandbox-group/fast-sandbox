@@ -3823,6 +3823,24 @@ snapshot_on_error() {
 	printf '\033[1;31m[snapshot-e2e] FAILED; evidence: %s\033[0m\n' "$SNAP_E2E_DIR" >&2
 }
 
+# --- verify-all ----------------------------------------------------------------------------------
+# verify_all runs every verification flow in one session, ordered by
+# escalating invasiveness: each step owns its port-forward/daemon attach and
+# teardown, the snapshot step rebuilds images and rolls the control plane,
+# and the egress step recreates its pool and removes it again at the end.
+# Fail-fast: the usual failure dump runs on the first failing step.
+verify_all() {
+	[[ -n "$(kubectl_get "sandboxtemplate/$SBX_TEMPLATE" '{.status.manifestRef}' 2>/dev/null)" ]] \
+		|| die "no built golden image (run 'integration-env.sh up' first)"
+	run_stage "verify-all 1/5: base delivery" verify
+	run_stage "verify-all 2/5: DART P2P evidence" verify_p2p
+	run_stage "verify-all 3/5: execd HTTP API battery" verify_execd_api
+	run_stage "verify-all 4/5: live snapshot + restore" verify_snapshot
+	run_stage "verify-all 5/5: egress policy matrix" verify_egress
+	stage_summary
+	highlight "== verify-all complete: base + p2p + execd-api + snapshot + egress green =="
+}
+
 # --- status --------------------------------------------------------------------------------------
 status() {
 	log "status: components"
@@ -3922,7 +3940,7 @@ env_summary() {
 
 usage() {
 	cat <<'EOF'
-usage: integration-env.sh [--cleanup|--auto-clean] {up|down|status|verify}
+usage: integration-env.sh [--cleanup|--auto-clean] {up|down|status|verify|verify-all}
 
   up       build the whole environment (tasks 1-9) and report status
   down     teardown: kind cluster + MinIO container + credentials + sysctl
@@ -3957,6 +3975,10 @@ usage: integration-env.sh [--cleanup|--auto-clean] {up|down|status|verify}
            egress Actions-channel integration: pool apply, protocol
            cross-verification, SET_BINDING -> hooks -> REMOVE_BINDING
            lifecycle, restart replay, teardown (requires the egress image)
+  verify-all
+           run every verify flow in one session, ordered base -> p2p ->
+           execd-api -> snapshot -> egress; fail-fast with the usual log
+           dumps and a final stage-timings table
 
   --cleanup     down after an interrupted run (same recovery as down)
   --auto-clean  on up failure, run down automatically before dumping logs
@@ -3968,7 +3990,7 @@ for arg in "$@"; do
 	case "$arg" in
 		--cleanup) ACTION="down" ;;
 		--auto-clean) AUTO_CLEAN=1 ;;
-		up|down|status|verify|verify-snapshot|verify-p2p|verify-execd-api|verify-egress) ACTION="$arg" ;;
+		up|down|status|verify|verify-all|verify-snapshot|verify-p2p|verify-execd-api|verify-egress) ACTION="$arg" ;;
 		*) usage ;;
 	esac
 done
@@ -4049,6 +4071,12 @@ case "$ACTION" in
 	verify-egress)
 		trap 'on_error verify_egress' ERR
 		verify_egress
+		trap - ERR
+		;;
+	verify-all)
+		set -o errtrace
+		trap 'on_error verify-all' ERR
+		verify_all
 		trap - ERR
 		;;
 	status)
