@@ -64,6 +64,7 @@ func main() {
 	var runtimeEnvironmentNamespace string
 	var runtimeEnvironmentConfigMap string
 	var artifactStoreRoot string
+	var artifactStoreEndpoint string
 
 	flag.StringVar(&roleValue, "role", "all", "Control-plane role: fastpath, controller, or all.")
 	flag.StringVar(&metricsAddress, "metrics-bind-address", ":9091", "Metrics listen address.")
@@ -85,6 +86,7 @@ func main() {
 	flag.StringVar(&runtimeEnvironmentNamespace, "runtime-environment-namespace", envOrDefault("FAST_SANDBOX_RUNTIME_ENVIRONMENT_NAMESPACE", runtimeenv.SystemNamespace), "Namespace containing the platform runtime environment ConfigMap.")
 	flag.StringVar(&runtimeEnvironmentConfigMap, "runtime-environment-configmap", envOrDefault("FAST_SANDBOX_RUNTIME_ENVIRONMENT_CONFIGMAP", runtimeenv.ConfigMapName), "Platform runtime environment ConfigMap name.")
 	flag.StringVar(&artifactStoreRoot, "artifact-store-root", os.Getenv("FAST_SANDBOX_ARTIFACT_STORE"), "S3-compatible artifact store root (s3://bucket/prefix); enables snapshot-recorded policy resolution at sandbox create. Empty disables it.")
+	flag.StringVar(&artifactStoreEndpoint, "artifact-store-endpoint", os.Getenv("FAST_SANDBOX_ARTIFACT_ENDPOINT"), "Artifact store endpoint override (scheme://host:port) for policy resolution; empty derives it from the credential host.")
 	flag.Parse()
 
 	role, err := controlplane.ParseRole(roleValue)
@@ -223,7 +225,7 @@ func main() {
 			// Snapshot-recorded action bindings live in the published
 			// manifest; the control plane resolves them through the pool's
 			// compiled registry credential (read pair) at create time.
-			manifestPolicy = fastpath.NewStorePolicySource(durableClient, artifactStoreRoot)
+			manifestPolicy = fastpath.NewStorePolicySource(durableClient, artifactStoreRoot, artifactStoreEndpoint)
 		}
 		fastpathv2.RegisterFastPathServiceServer(grpcServer, &fastpath.Server{
 			K8sClient: durableClient, RouteCache: manager.GetClient(), Orchestrator: orchestrator,

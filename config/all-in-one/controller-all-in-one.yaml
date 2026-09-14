@@ -28,5 +28,13 @@ spec:
         # policy) from the published manifest at sandbox create time.
         - name: FAST_SANDBOX_ARTIFACT_STORE
           value: s3://sandbox-images/publish
+        # Store endpoint override (scheme+port) for the same resolution;
+        # optional so clusters without the agent config still start.
+        - name: FAST_SANDBOX_ARTIFACT_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: fast-sandbox-agent-config
+              key: artifact-endpoint
+              optional: true
         ports:
         - {name: grpc, containerPort: 9090}

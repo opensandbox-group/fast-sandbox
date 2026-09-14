@@ -213,8 +213,13 @@ type policyCacheEntry struct {
 // (index + manifest, both small); the immutable manifest needs no
 // long-lived state.
 type storePolicySource struct {
-	Client    client.Client
+	Client client.Client
+	// StoreRoot and Endpoint mirror the node agents' store configuration.
+	// Endpoint matters: pool-compiled credentials carry no endpoint (the
+	// registry rule has none), so without the override the client would
+	// default to https against a plain-HTTP store.
 	StoreRoot string
+	Endpoint  string
 
 	mu      sync.Mutex
 	clients map[string]*agentpull.Client
@@ -222,12 +227,13 @@ type storePolicySource struct {
 }
 
 // NewStorePolicySource builds the default policy source over the pool
-// registry secrets and the configured artifact store root (the same store
-// the node agents pull from).
-func NewStorePolicySource(reader client.Client, storeRoot string) ManifestPolicySource {
+// registry secrets and the configured artifact store (same store the node
+// agents pull from; endpoint empty derives from the credential host).
+func NewStorePolicySource(reader client.Client, storeRoot, endpoint string) ManifestPolicySource {
 	return &storePolicySource{
 		Client:    reader,
 		StoreRoot: storeRoot,
+		Endpoint:  endpoint,
 		clients:   map[string]*agentpull.Client{},
 		cache:     map[string]policyCacheEntry{},
 	}
@@ -253,7 +259,11 @@ func (s *storePolicySource) poolRegistryClient(ctx context.Context, pool *apiv1a
 	if len(compiled.Credentials) == 0 {
 		return nil, fmt.Errorf("pool %s registry secret carries no credentials", pool.Name)
 	}
-	pull, clientErr := agentpull.NewClient(s.StoreRoot, compiled.Credentials[0])
+	var options []agentpull.Option
+	if s.Endpoint != "" {
+		options = append(options, agentpull.WithEndpoint(s.Endpoint))
+	}
+	pull, clientErr := agentpull.NewClient(s.StoreRoot, compiled.Credentials[0], options...)
 	if clientErr != nil {
 		return nil, clientErr
 	}
@@ -319,7 +329,7 @@ func (s *Server) applyManifestRecordedBindings(ctx context.Context, request *fas
 	}
 	bindings, err := s.ManifestPolicy.ActionBindings(ctx, pool, request.Image)
 	if err != nil {
-		klog.FromContext(ctx).V(2).Info("Snapshot-recorded policy unavailable; proceeding without it", "image", request.Image, "err", err)
+		klog.FromContext(ctx).Info("Snapshot-recorded policy unavailable; proceeding without it", "image", request.Image, "err", err)
 		return explicit, nil
 	}
 	if len(bindings) == 0 {
