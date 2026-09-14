@@ -36,9 +36,16 @@ spec:
         env:
         - name: FAST_SANDBOX_RUNTIME_AGENT_SOCKET
           value: /run/fast-sandbox/firecracker/runtime.sock
+        # Live-snapshot dump spill (see docs/guides/sandbox-snapshots.md):
+        # sizeLimit must cover the largest sandbox memory (rule of thumb
+        # 2 x memory + 1Gi); production prefers a local-NVMe hostPath.
+        - name: FAST_SANDBOX_SNAPSHOT_SPILL_DIR
+          value: /spill
         volumeMounts:
         - name: agent-socket
           mountPath: /run/fast-sandbox/firecracker
+        - name: snapshot-spill
+          mountPath: /spill
       - name: egress
         image: docker.io/opensandbox/egress:latest
         # IfNotPresent: the integration environment kind-loads the image
@@ -80,6 +87,10 @@ spec:
         hostPath:
           path: /run/fast-sandbox/firecracker
           type: DirectoryOrCreate
+      - name: snapshot-spill
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
       nodeSelector:
         fast-sandbox.io/firecracker-node: "true"
   capacity:
