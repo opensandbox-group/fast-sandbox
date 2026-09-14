@@ -28,7 +28,7 @@ import (
 // OverlayBD layers keep their relative paths
 // (overlaybd/rootfs/layer.lsmt, overlaybd/memory/layer.lsmt) — a flat
 // basename would collide on the same S3 key.
-func publish(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir string, manifestBytes []byte) (string, error) {
+func publish(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir string, manifestBytes []byte, credentials publishCredentials) (string, error) {
 	aws, err := exec.LookPath(awsBin)
 	if err != nil {
 		return "", fmt.Errorf("aws CLI not found: %w", err)
@@ -51,25 +51,32 @@ func publish(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir 
 			entries = append(entries, struct{ local, key string }{layer, relative})
 		}
 	}
-	// --endpoint-url pins the S3-compatible target even with awscli v1
-	// (AWS_ENDPOINT_URL is only honored by botocore >=1.29.16 / CLI v2).
+	// The platform endpoint (injected as AWS_ENDPOINT_URL by the controller)
+	// wins over the mounted secret's endpoint; --endpoint-url pins the
+	// S3-compatible target even with awscli v1 (AWS_ENDPOINT_URL is only
+	// honored by botocore >=1.29.16 / CLI v2).
+	endpoint := os.Getenv("AWS_ENDPOINT_URL")
+	if endpoint == "" {
+		endpoint = credentials.Endpoint
+	}
+	env := credentials.awsEnv()
 	args := []string{"s3", "cp"}
-	if endpoint := os.Getenv("AWS_ENDPOINT_URL"); endpoint != "" {
+	if endpoint != "" {
 		args = append(args, "--endpoint-url", endpoint)
 	}
 	for _, entry := range entries {
-		if err := uploadWithRetry(ctx, aws, args, entry.local, base+"/"+entry.key, entry.key); err != nil {
+		if err := uploadWithRetry(ctx, aws, args, env, entry.local, base+"/"+entry.key, entry.key); err != nil {
 			return "", err
 		}
 	}
 	manifestURI := base + "/manifest.json"
-	if err := uploadWithRetry(ctx, aws, args, filepath.Join(workdir, "manifest.json"), manifestURI, "manifest.json"); err != nil {
+	if err := uploadWithRetry(ctx, aws, args, env, filepath.Join(workdir, "manifest.json"), manifestURI, "manifest.json"); err != nil {
 		return "", err
 	}
 	// The image index is uploaded last: a consumer that can resolve the
 	// index is guaranteed a complete artifact set (artifacts, checksums,
 	// and manifest are all already in place).
-	if err := publishImageIndex(ctx, aws, args, spec.Image, manifestURI, sha256Of(manifestBytes), spec.Output.Publish, spec.IndexKey); err != nil {
+	if err := publishImageIndex(ctx, aws, args, env, spec.Image, manifestURI, sha256Of(manifestBytes), spec.Output.Publish, spec.IndexKey); err != nil {
 		return "", err
 	}
 	return manifestURI, nil
@@ -104,12 +111,12 @@ func imageIndexPayload(image, manifestURI, artifactDigest string) ([]byte, error
 // root are last-writer-wins: every build is complete before its index is
 // written, so no half-published state is ever observable, but the winner
 // is not deterministic (publishers should serialize per image).
-func publishImageIndex(ctx context.Context, aws string, args []string, image, manifestURI, artifactDigest, storeRoot string, indexKey string) error {
+func publishImageIndex(ctx context.Context, aws string, args, env []string, image, manifestURI, artifactDigest, storeRoot string, indexKey string) error {
 	if strings.TrimSpace(image) == "" {
 		return fmt.Errorf("publish image index: image reference is required (empty image would collide on the empty-hash index key)")
 	}
 	for _, key := range indexKeys(image, indexKey) {
-		if err := publishOneImageIndex(ctx, aws, args, key, manifestURI, artifactDigest, storeRoot); err != nil {
+		if err := publishOneImageIndex(ctx, aws, args, env, key, manifestURI, artifactDigest, storeRoot); err != nil {
 			return err
 		}
 	}
@@ -127,7 +134,7 @@ func indexKeys(image, indexKey string) []string {
 	return keys
 }
 
-func publishOneImageIndex(ctx context.Context, aws string, args []string, key, manifestURI, artifactDigest, storeRoot string) error {
+func publishOneImageIndex(ctx context.Context, aws string, args, env []string, key, manifestURI, artifactDigest, storeRoot string) error {
 	payload, err := imageIndexPayload(key, manifestURI, artifactDigest)
 	if err != nil {
 		return err
@@ -145,15 +152,17 @@ func publishOneImageIndex(ctx context.Context, aws string, args []string, key, m
 	}
 	objectKey := "index/" + artifacts.ImageIndexKey(key) + ".json"
 	target := strings.TrimRight(storeRoot, "/") + "/" + objectKey
-	return uploadWithRetry(ctx, aws, args, local.Name(), target, objectKey)
+	return uploadWithRetry(ctx, aws, args, env, local.Name(), target, objectKey)
 }
 
 // publishRetries is how many times a transient upload failure is retried.
 const publishRetries = 3
 
 // uploadWithRetry uploads one object, retrying transient failures with
-// exponential backoff so a flaky network does not fail the whole build.
-func uploadWithRetry(ctx context.Context, aws string, args []string, local, target, name string) error {
+// exponential backoff so a flaky network does not fail the whole build. The
+// aws CLI runs with env (the mounted credential pair), never with the
+// process's ambient AWS keys shadowing it.
+func uploadWithRetry(ctx context.Context, aws string, args, env []string, local, target, name string) error {
 	backoff := 2 * time.Second
 	var lastErr error
 	for attempt := 0; attempt <= publishRetries; attempt++ {
@@ -166,6 +175,7 @@ func uploadWithRetry(ctx context.Context, aws string, args []string, local, targ
 			backoff *= 2
 		}
 		command := exec.CommandContext(ctx, aws, append(args, local, target)...)
+		command.Env = env
 		output, err := command.CombinedOutput()
 		if err != nil {
 			lastErr = fmt.Errorf("publish %s: %w: %s", name, err, output)

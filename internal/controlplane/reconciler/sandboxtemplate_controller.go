@@ -72,12 +72,14 @@ const (
 	sandboxTemplateKVMNodeLabel = "sandbox.fast.io/kvm"
 )
 
-// Publish-secret keys (imagePullSecrets-style, per the design doc).
+// sandboxTemplatePublishSecretDir is where the build Pod mounts the
+// template's publishSecretRef; the builder reads the credential keys as files
+// (secret values are never injected as env). publishCredentialsDirEnv carries
+// the path to the builder and is only set when the reference exists; unset
+// means the build relies on ambient credentials (IRSA / node metadata).
 const (
-	publishSecretKeyID     = "accessKeyId"
-	publishSecretKeySecret = "secretAccessKey"
-	publishSecretKeyRegion = "region"
-	publishSecretKeyPoint  = "endpoint"
+	sandboxTemplatePublishSecretDir = "/etc/fast-sandbox/publish-credentials"
+	publishCredentialsDirEnv        = "SANDBOX_TEMPLATE_PUBLISH_SECRET_DIR"
 )
 
 // SandboxTemplateReconciler reconciles SandboxTemplate resources by driving
@@ -532,14 +534,47 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
 		},
 	}}
-	if ref := template.Spec.Output.PublishSecretRef; ref != nil {
-		env = append(env, publishCredentialEnvRefs(ref)...)
+	// The publish credentials are mounted, not injected as env: the secret
+	// stays in the template's namespace and the builder reads the files. The
+	// platform endpoint (when configured) wins over the mounted secret's
+	// endpoint, so the build targets the store the node agents pull from.
+	volumeMounts := []corev1.VolumeMount{
+		{Name: "workspace", MountPath: sandboxTemplateBuildDir},
+		{Name: "kvm", MountPath: "/dev/kvm"},
+		{Name: "net-tun", MountPath: "/dev/net/tun"},
 	}
-	// The platform endpoint, when configured, wins over the publish
-	// secret's endpoint: the build must target the same S3-compatible
-	// address the node agents pull from.
+	volumes := []corev1.Volume{
+		{
+			Name:         "workspace",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+		{
+			Name: "kvm",
+			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+				Path: "/dev/kvm", Type: ptr(corev1.HostPathCharDev),
+			}},
+		},
+		{
+			Name: "net-tun",
+			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
+				Path: "/dev/net/tun", Type: ptr(corev1.HostPathCharDev),
+			}},
+		},
+	}
+	if ref := template.Spec.Output.PublishSecretRef; ref != nil {
+		env = append(env, corev1.EnvVar{Name: publishCredentialsDirEnv, Value: sandboxTemplatePublishSecretDir})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name: "publish-credentials", MountPath: sandboxTemplatePublishSecretDir, ReadOnly: true,
+		})
+		volumes = append(volumes, corev1.Volume{
+			Name: "publish-credentials",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: ref.Name,
+			}},
+		})
+	}
 	if endpoint != "" {
-		env = upsertEnv(env, "AWS_ENDPOINT_URL", endpoint)
+		env = append(env, corev1.EnvVar{Name: "AWS_ENDPOINT_URL", Value: endpoint})
 	}
 
 	// The build Pod runs the sandbox template builder: privileged for the
@@ -609,30 +644,9 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 						corev1.ResourceEphemeralStorage: storageLimit,
 					},
 				},
-				VolumeMounts: []corev1.VolumeMount{
-					{Name: "workspace", MountPath: sandboxTemplateBuildDir},
-					{Name: "kvm", MountPath: "/dev/kvm"},
-					{Name: "net-tun", MountPath: "/dev/net/tun"},
-				},
+				VolumeMounts: volumeMounts,
 			}},
-			Volumes: []corev1.Volume{
-				{
-					Name:         "workspace",
-					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-				},
-				{
-					Name: "kvm",
-					VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
-						Path: "/dev/kvm", Type: ptr(corev1.HostPathCharDev),
-					}},
-				},
-				{
-					Name: "net-tun",
-					VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
-						Path: "/dev/net/tun", Type: ptr(corev1.HostPathCharDev),
-					}},
-				},
-			},
+			Volumes: volumes,
 		},
 	}
 	// The Pod is owned by the template, so deleting the template cascades
@@ -731,45 +745,6 @@ func (r *SandboxTemplateReconciler) ensureRoleBinding(ctx context.Context, desir
 	current.RoleRef = desired.RoleRef
 	current.Subjects = desired.Subjects
 	return r.Update(ctx, current)
-}
-
-// upsertEnv sets name to a literal value, replacing an existing entry
-// (including a SecretKeyRef) so the platform value wins deterministically.
-func upsertEnv(env []corev1.EnvVar, name, value string) []corev1.EnvVar {
-	for index := range env {
-		if env[index].Name == name {
-			env[index].Value = value
-			env[index].ValueFrom = nil
-			return env
-		}
-	}
-	return append(env, corev1.EnvVar{Name: name, Value: value})
-}
-
-// publishCredentialEnvRefs maps the imagePullSecrets-style publish secret
-// (keys accessKeyId/secretAccessKey/endpoint/region) onto AWS_* env vars via
-// SecretKeyRef: the credentials are never copied into the Pod spec, and the
-// controller does not read tenant secrets during reconcile. The secret must
-// exist in the template's namespace — SecretKeyRef resolves against the
-// Pod's own namespace, and the build Pod now runs next to its template. All
-// keys are required (Optional=false): a missing key fails the Pod at
-// container start with CreateContainerConfigError instead of degrading
-// silently.
-func publishCredentialEnvRefs(ref *corev1.LocalObjectReference) []corev1.EnvVar {
-	key := func(secretKey, envName string) corev1.EnvVar {
-		return corev1.EnvVar{Name: envName, ValueFrom: &corev1.EnvVarSource{
-			SecretKeyRef: &corev1.SecretKeySelector{
-				LocalObjectReference: *ref,
-				Key:                  secretKey,
-			},
-		}}
-	}
-	return []corev1.EnvVar{
-		key(publishSecretKeyID, "AWS_ACCESS_KEY_ID"),
-		key(publishSecretKeySecret, "AWS_SECRET_ACCESS_KEY"),
-		key(publishSecretKeyPoint, "AWS_ENDPOINT_URL"),
-		key(publishSecretKeyRegion, "AWS_REGION"),
-	}
 }
 
 // updatePhase persists the phase and its transition condition.

@@ -39,10 +39,11 @@ import (
 )
 
 const (
-	specEnv               = "SANDBOX_TEMPLATE_SPEC"
-	workDirEnv            = "SANDBOX_TEMPLATE_WORKDIR"
-	manifestRefAnnotation = "sandbox.fast.io/manifest-ref"
-	digestAnnotation      = "sandbox.fast.io/artifact-digest"
+	specEnv                  = "SANDBOX_TEMPLATE_SPEC"
+	workDirEnv               = "SANDBOX_TEMPLATE_WORKDIR"
+	publishCredentialsDirEnv = "SANDBOX_TEMPLATE_PUBLISH_SECRET_DIR"
+	manifestRefAnnotation    = "sandbox.fast.io/manifest-ref"
+	digestAnnotation         = "sandbox.fast.io/artifact-digest"
 )
 
 // Tool paths inside the builder image.
@@ -83,6 +84,10 @@ func main() {
 // run executes the build pipeline and logs the per-stage durations.
 func run(ctx context.Context) error {
 	spec, workdir, err := loadSpecAndWorkdir()
+	if err != nil {
+		return err
+	}
+	credentials, err := loadPublishCredentials(os.Getenv(publishCredentialsDirEnv))
 	if err != nil {
 		return err
 	}
@@ -138,7 +143,7 @@ func run(ctx context.Context) error {
 	manifestRef := ""
 	if spec.Output.Publish != "" {
 		publishStarted := time.Now()
-		manifestRef, err = publish(ctx, spec, workdir, manifestBytes)
+		manifestRef, err = publish(ctx, spec, workdir, manifestBytes, credentials)
 		if err != nil {
 			return err
 		}

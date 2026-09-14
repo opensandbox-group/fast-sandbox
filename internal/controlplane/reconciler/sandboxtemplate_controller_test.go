@@ -184,31 +184,41 @@ func TestSandboxTemplateReconcileCreatesPodAndTracksPhase(t *testing.T) {
 	if !reflect.DeepEqual(specInPod, template.Spec) {
 		t.Fatalf("spec JSON round-trip mismatch:\n got %+v\nwant %+v", specInPod, template.Spec)
 	}
-	credentialEnv := map[string]string{}
-	credentialRefs := map[string]struct{ name, key string }{}
-	for _, entry := range pod.Spec.Containers[0].Env {
-		if entry.ValueFrom != nil && entry.ValueFrom.SecretKeyRef != nil {
-			credentialRefs[entry.Name] = struct{ name, key string }{entry.ValueFrom.SecretKeyRef.Name, entry.ValueFrom.SecretKeyRef.Key}
+	// The publish credentials are MOUNTED, not env-injected: the secret
+	// volume carries the reference, and the builder is pointed at the mount.
+	foundCredentialsVolume := false
+	for _, volume := range pod.Spec.Volumes {
+		if volume.Name != "publish-credentials" {
 			continue
 		}
-		credentialEnv[entry.Name] = entry.Value
+		if volume.Secret == nil || volume.Secret.SecretName != "publish-creds" {
+			t.Fatalf("expected a publish-credentials volume for secret publish-creds, got %+v", volume.VolumeSource)
+		}
+		foundCredentialsVolume = true
 	}
-	for name, ref := range map[string]struct{ name, key string }{
-		"AWS_ACCESS_KEY_ID":     {"publish-creds", "accessKeyId"},
-		"AWS_SECRET_ACCESS_KEY": {"publish-creds", "secretAccessKey"},
-		"AWS_ENDPOINT_URL":      {"publish-creds", "endpoint"},
-		"AWS_REGION":            {"publish-creds", "region"},
-	} {
-		got, ok := credentialRefs[name]
-		if !ok || got != ref {
-			t.Fatalf("expected %s to reference secret %s/%s, got %v", name, ref.name, ref.key, got)
+	if !foundCredentialsVolume {
+		t.Fatalf("expected a publish-credentials volume, got %+v", pod.Spec.Volumes)
+	}
+	foundCredentialsMount := false
+	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+		if mount.Name == "publish-credentials" && mount.MountPath == sandboxTemplatePublishSecretDir && mount.ReadOnly {
+			foundCredentialsMount = true
 		}
 	}
-	for name := range credentialEnv {
-		switch name {
-		case "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_ENDPOINT_URL", "AWS_REGION":
-			t.Fatalf("credential %s must not be inlined into the pod env", name)
+	if !foundCredentialsMount {
+		t.Fatalf("expected a read-only publish-credentials mount at %s, got %+v", sandboxTemplatePublishSecretDir, pod.Spec.Containers[0].VolumeMounts)
+	}
+	credentialsDirEnv := ""
+	for _, entry := range pod.Spec.Containers[0].Env {
+		if entry.ValueFrom != nil && entry.ValueFrom.SecretKeyRef != nil {
+			t.Fatalf("secret %s/%s must not be env-injected", entry.ValueFrom.SecretKeyRef.Name, entry.ValueFrom.SecretKeyRef.Key)
 		}
+		if entry.Name == publishCredentialsDirEnv {
+			credentialsDirEnv = entry.Value
+		}
+	}
+	if credentialsDirEnv != sandboxTemplatePublishSecretDir {
+		t.Fatalf("expected %s=%s, got %q", publishCredentialsDirEnv, sandboxTemplatePublishSecretDir, credentialsDirEnv)
 	}
 
 	// A duplicate reconcile must be a no-op (deterministic name + AlreadyExists).
@@ -657,10 +667,20 @@ func TestSandboxTemplateReconcileDefaultsPublishFromArtifactStore(t *testing.T) 
 	if endpoint == nil || endpoint.Value != "http://minio.fast-sandbox-system.svc:9000" || endpoint.ValueFrom != nil {
 		t.Fatalf("expected AWS_ENDPOINT_URL to be the platform endpoint literal, got %+v", endpoint)
 	}
-	// The credential pair still comes from the publish secret.
+	// The credential pair still comes from the publish secret, mounted as a
+	// volume rather than env-injected.
 	accessKey := builderEnvEntry(&pods[0], "AWS_ACCESS_KEY_ID")
-	if accessKey == nil || accessKey.ValueFrom == nil || accessKey.ValueFrom.SecretKeyRef == nil {
-		t.Fatalf("expected AWS_ACCESS_KEY_ID to stay a secret reference, got %+v", accessKey)
+	if accessKey != nil {
+		t.Fatalf("expected no env-injected credential, got %+v", accessKey)
+	}
+	mounted := false
+	for _, volume := range pods[0].Spec.Volumes {
+		if volume.Name == "publish-credentials" && volume.Secret != nil && volume.Secret.SecretName == "publish-creds" {
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Fatalf("expected the publish secret to be mounted, got %+v", pods[0].Spec.Volumes)
 	}
 }
 

@@ -66,7 +66,7 @@ func TestImageIndexPayload(t *testing.T) {
 // consumer side rejects empty images the same way).
 func TestPublishImageIndexRejectsEmptyImage(t *testing.T) {
 	for _, image := range []string{"", "   ", "\t\n"} {
-		err := publishImageIndex(context.Background(), "aws", []string{"s3", "cp"}, image,
+		err := publishImageIndex(context.Background(), "aws", []string{"s3", "cp"}, nil, image,
 			"s3://bucket/sandbox-images/0123456789abcdef/manifest.json",
 			"deadbeef", "s3://bucket/sandbox-images", "")
 		if err == nil {

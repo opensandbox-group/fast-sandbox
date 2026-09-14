@@ -295,13 +295,14 @@ spec:
                   publishSecretRef:
                     description: |-
                       PublishSecretRef references (imagePullSecrets-style) the secret holding
-                      the object-store credentials. The secret MUST live in the platform
-                      namespace (fast-sandbox-system), where the build Pod runs — a
-                      SecretKeyRef cannot cross namespaces. It is created and maintained out
-                      of band by the platform operator; the template only names it. Expected
-                      keys: accessKeyId, secretAccessKey, endpoint, region (all required
-                      when the reference is set). Secret contents are never copied into the
-                      CR status or the artifact manifest.
+                      the object-store credentials. The secret MUST live in the template's
+                      namespace, where the build Pod runs (a Pod can only mount Secrets from
+                      its own namespace). It is created and maintained out of band by the
+                      platform operator; the template only names it. Expected keys:
+                      accessKeyId, secretAccessKey, endpoint, region (all required when the
+                      reference is set). The controller mounts the Secret into the build Pod
+                      and the builder reads the keys as files; secret contents are never
+                      copied into the CR status, the Pod env, or the artifact manifest.
                     properties:
                       name:
                         default: ""

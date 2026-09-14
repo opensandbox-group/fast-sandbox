@@ -14,8 +14,8 @@
 > - 构建执行：实现为 controller 驱动 **Pod**（非 Job），独立于 CLI
 > - 格式：实现为 `native` / `overlaybd`（两者都产出完整快照集；设计的
 >   `ext4` / `snapshot` 细分已收敛为 `native`）
-> - `output.publish` 在实现中为必填，`publishSecretRef` 由 controller 以
->   SecretKeyRef 注入 build Pod
+> - `output.publish` 在实现中可选（默认取平台 artifact-store ConfigMap），
+>   `publishSecretRef` 由 controller 以 volume 挂载进 build Pod（builder 读文件）
 >
 > **使用文档**：字段含义与操作流程以
 > [guides/sandboxtemplate-golden-images.md](../guides/sandboxtemplate-golden-images.md)
@@ -267,21 +267,21 @@ Every build emits a content-addressed `manifest.json`:
   rewritten back onto the enforced shape rather than trusted, so the
   boundary holds by construction, not by assumption; the controller RBAC (`sandboxtemplates` create/update) and the
   builder SA are deliberately scoped, and the controller never reads
-  secrets — publish credentials reach the build Pod as SecretKeyRef
-  references resolved by the kubelet (secret lives in the template's
-  namespace, next to the Pod). Because the builder is privileged (host
+  secrets — publish credentials reach the build Pod as a mounted Secret
+  volume (secret lives in the template's namespace, next to the Pod). Because the builder is privileged (host
   `/dev/kvm` passthrough), the tenant namespace must allow privileged Pods
   (PodSecurityAdmission); this moves the privilege boundary from "control
   plane only" to "template namespace", in exchange for native cascading
   deletion: the build Pod carries a controller owner reference to the
   template, so deleting a template garbage-collects its build Pods without
   a finalizer.
-- **Publish credentials**: `output.publish` is required; when
-  `output.publishSecretRef` names an imagePullSecrets-style secret
+- **Publish credentials**: `output.publish` is optional and defaults to the
+  platform artifact store; when `output.publishSecretRef` names an
+  imagePullSecrets-style secret
   (`accessKeyId`/`secretAccessKey`/`endpoint`/`region`), the controller
-  injects them as `AWS_*` env vars (SecretKeyRef) into the build Pod. The
-  secret MUST live in the template's namespace — a SecretKeyRef resolves
-  against the Pod's own namespace; the platform operator manages it out of
+  mounts the secret into the build Pod and the builder reads the keys as
+  files. The secret MUST live in the template's namespace — a Pod can only
+  mount Secrets from its own namespace; the platform operator manages it out of
   band. Without the secret, the build relies on platform-level credentials
   (e.g. IRSA / node metadata), which must be present on KVM nodes.
 - **Build lifecycle safety**: build Pods have `activeDeadlineSeconds`
