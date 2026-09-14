@@ -203,7 +203,7 @@ s3://sandbox-images/publish/
 
 `manifest.json` records (among others):
 
-- `machine` — the vcpu/memory tuple restore validates against;
+- `machine` — the vcpu/memory/rootfs tuple restore validates against;
 - `guestNetwork` — the NIC baked into the snapshot (`eth0` + static
   guest IP/MAC); the runtime replaces only the host tap via
   `network_overrides`;

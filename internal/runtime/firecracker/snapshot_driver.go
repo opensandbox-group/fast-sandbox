@@ -624,11 +624,12 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 }
 
 // assembleSnapshotManifest builds the restore-compatible manifest of the
-// dumped set: the lineage object and the machine/guestNetwork facts baked
-// into the SOURCE image manifest are carried forward verbatim (they describe
-// the vmstate lineage and are what restore validation checks), while the
-// compatibility tuple, files, rootfsSize, format, and validation describe
-// this dump. It returns the total logical size of the artifact set.
+// dumped set: the lineage object and the machine (vcpu/memory) and
+// guestNetwork facts baked into the SOURCE image manifest are carried
+// forward verbatim (they describe the vmstate lineage and are what restore
+// validation checks), while the compatibility tuple, files, machine.rootfs,
+// format, and validation describe this dump. It returns the total logical
+// size of the artifact set.
 func assembleSnapshotManifest(stateRoot, staging, sandboxDir, firecrackerBinary string, actionBindings []runtimecontract.SnapshotActionBinding) (int64, error) {
 	state, err := loadState(sandboxDir)
 	if err != nil {
@@ -684,7 +685,11 @@ func assembleSnapshotManifest(stateRoot, staging, sandboxDir, firecrackerBinary 
 		"cpuModel":           artifacts.HostCPUModel(),
 	}
 	document["files"] = files
-	document["rootfsSize"] = fmt.Sprintf("%dG", artifacts.SizeGiB(rootfsSize))
+	// machine.rootfs reflects this dump's actual rootfs size; vcpu/memory
+	// ride forward from the source manifest untouched.
+	if machine, ok := document["machine"].(map[string]any); ok {
+		machine["rootfs"] = fmt.Sprintf("%dG", artifacts.SizeGiB(rootfsSize))
+	}
 	document["format"] = "native"
 	document["validation"] = map[string]any{"booted": true, "restored": false}
 	// Durable policy provenance: the artifact set outlives the

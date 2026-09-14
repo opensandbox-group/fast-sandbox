@@ -97,6 +97,9 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 		"machine": map[string]any{
 			"vcpu":   spec.Machine.VCPU,
 			"memory": spec.Machine.Memory,
+			// The actual rootfs size (rounded up from the declared minimum
+			// to SI GiB), matching files['rootfs.ext4'].sizeBytes.
+			"rootfs": fmt.Sprintf("%dG", rootfsGiB),
 		},
 		// The guest network baked into the snapshot (clone networking
 		// model): the restored guest owns a static eth0 address/MAC; the
@@ -110,11 +113,8 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 			"netmask": bakedGuestNetmask,
 			"mtu":     bakedGuestMTU,
 		},
-		// The actual rootfs size (rounded up from the declared minimum to SI
-		// GiB), matching files['rootfs.ext4'].sizeBytes.
-		"rootfsSize": fmt.Sprintf("%dG", rootfsGiB),
-		"format":     spec.Output.Format,
-		"files":      files,
+		"format": spec.Output.Format,
+		"files":  files,
 		"validation": map[string]any{
 			"booted":   true,
 			"restored": true,

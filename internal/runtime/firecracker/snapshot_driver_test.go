@@ -201,7 +201,7 @@ func TestCreateSnapshotDumpsPublishesAndResumes(t *testing.T) {
 	require.Equal(t, fixture.sandboxSpec.Spec.Image,
 		agent.manifest["lineage"].(map[string]any)["image"])
 	require.Equal(t, map[string]any{
-		"vcpu": "2", "memory": "1Gi",
+		"vcpu": "2", "memory": "1Gi", "rootfs": "1G",
 	}, agent.manifest["machine"])
 	require.Equal(t, map[string]any{
 		"iface": "eth0", "mac": "02:00:00:00:00:01", "ip": "172.30.0.3",
