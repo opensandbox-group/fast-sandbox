@@ -4231,9 +4231,12 @@ pause_fencing() {
 	pass "resume checkpoint fence rejected (Aborted, no write)"
 
 	# Fence: a create replay against the paused Sandbox must be refused (the
-	# CR is the resume ticket, not a create target).
+	# CR is the resume ticket, not a create target). The flags must reproduce
+	# the original create exactly (egress pool + deny binding): the FastPath
+	# idempotency check compares the request spec hash first, and only a
+	# matching intent reaches the paused-Sandbox rejection.
 	rc=0
-	out="$(fastctl run "$PAUSE_SANDBOX" --image "$SBX_IMAGE" --pool "$SBX_POOL" 2>&1)" || rc=$?
+	out="$(fastctl run "$PAUSE_SANDBOX" --image "$SBX_IMAGE" --pool "$EGRESS_POOL" --action "egress=$EGRESS_DENY_POLICY" 2>&1)" || rc=$?
 	[[ "$rc" -ne 0 ]] || fail "create replay against a paused sandbox was accepted"
 	printf '%s' "$out" | grep -qi "paused" || fail "unexpected create-replay error: $out"
 	pass "create replay rejected while paused"
