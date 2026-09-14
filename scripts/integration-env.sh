@@ -3706,7 +3706,7 @@ snapshot_evidence() {
 		echo "snapshot=$SNAPSHOT_NAME template=$SNAPSHOT_TEMPLATE source=$SNAPSHOT_TARGET restore=$SNAPSHOT_RESTORE"
 		local ref
 		ref="$(kubectl_get "sandboxsnapshot/$SNAPSHOT_NAME" '{.status.manifestRef}' 2>/dev/null || true)"
-		[[ "$ref" == s3://* ]] && echo "manifest=$(echo "$ref" | tee /dev/null)"
+		[[ "$ref" == s3://* ]] && echo "manifest=$ref"
 		echo "manifest-evidence-copy=$SNAP_E2E_DIR/manifest-$SNAPSHOT_NAME.json"
 		echo "manifest-host-store=$MINIO_DATA/$MINIO_BUCKET/$(dirname "${ref#s3://$MINIO_BUCKET/}")/"
 	} > "$SNAP_E2E_DIR/summary.txt"
