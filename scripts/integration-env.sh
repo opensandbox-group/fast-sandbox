@@ -487,6 +487,19 @@ KIND_RETAIN="${KIND_RETAIN:-0}"
 
 sudo_() { if [[ "$(id -u)" == 0 ]]; then "$@"; else sudo "$@"; fi; }
 
+# docker_ensure_image pulls ref only when it is not already present locally:
+# hosts without Docker Hub access preload images once and every later run
+# skips the (failing) pull.
+docker_ensure_image() { # ref
+	if docker image inspect "$1" >/dev/null 2>&1; then
+		log "using local image $1 (skipping pull)"
+		return 0
+	fi
+	log "pulling image $1"
+	docker pull -q "$1" >/dev/null \
+		|| die "image $1 is not present locally and the pull failed (preload it: docker pull $1)"
+}
+
 install_release_binary() { # name version url
 	local name="$1" version="$2" url="$3" tmp
 	log "installing $name $version -> /usr/local/bin/$name"
@@ -551,8 +564,8 @@ preflight() {
 		die "docker cgroup Version is 1; kind requires cgroup v2. Enable it with the kernel cmdline 'systemd.unified_cgroup_hierarchy=1' (update-grub / grub2-mkconfig) and reboot, then verify 'docker info' shows Cgroup Version: 2"
 	fi
 	[[ -e /dev/kvm ]] || die "/dev/kvm is missing on this host (KVM required)"
-	docker pull -q "$MINIO_IMAGE" >/dev/null
-	docker pull -q minio/mc >/dev/null
+	docker_ensure_image "$MINIO_IMAGE"
+	docker_ensure_image minio/mc
 	pass "preflight"
 }
 
@@ -867,7 +880,7 @@ kind_up() {
 	else
 		if [[ -n "${KIND_NODE_IMAGE:-}" ]]; then
 			log "pulling kind node image $KIND_NODE_IMAGE (this can take minutes)"
-			docker pull -q "$KIND_NODE_IMAGE" || die "kind node image pull failed (KIND_NODE_IMAGE=$KIND_NODE_IMAGE)"
+			docker_ensure_image "$KIND_NODE_IMAGE"
 			log "creating cluster with node image $KIND_NODE_IMAGE"
 			kind create cluster --name "$KIND_CLUSTER" --image "$KIND_NODE_IMAGE" \
 				"${create_args[@]}" --config "$kind_config" > "$LOGS_DIR/kind-create.log" 2>&1 \
