@@ -15,6 +15,8 @@ type MockClient struct {
 	fastpathv2.UnimplementedFastPathServiceServer
 	CreateFunc      func(ctx context.Context, req *fastpathv2.CreateSandboxRequest) (*fastpathv2.CreateSandboxResponse, error)
 	DiagnosticsFunc func(ctx context.Context, req *fastpathv2.SandboxDiagnosticsRequest) (*fastpathv2.SandboxDiagnosticsResponse, error)
+	PauseFunc       func(ctx context.Context, req *fastpathv2.PauseSandboxRequest) (*fastpathv2.PauseSandboxResponse, error)
+	ResumeFunc      func(ctx context.Context, req *fastpathv2.ResumeSandboxRequest) (*fastpathv2.ResumeSandboxResponse, error)
 }
 
 func (m *MockClient) CreateSandbox(ctx context.Context, in *fastpathv2.CreateSandboxRequest, opts ...grpc.CallOption) (*fastpathv2.CreateSandboxResponse, error) {
@@ -64,9 +66,15 @@ func (m *MockClient) DeleteSandboxSnapshot(ctx context.Context, in *fastpathv2.D
 	return &fastpathv2.DeleteSandboxSnapshotResponse{}, nil
 }
 func (m *MockClient) PauseSandbox(ctx context.Context, in *fastpathv2.PauseSandboxRequest, opts ...grpc.CallOption) (*fastpathv2.PauseSandboxResponse, error) {
+	if m.PauseFunc != nil {
+		return m.PauseFunc(ctx, in)
+	}
 	return &fastpathv2.PauseSandboxResponse{Sandbox: &fastpathv2.SandboxInfo{}}, nil
 }
 func (m *MockClient) ResumeSandbox(ctx context.Context, in *fastpathv2.ResumeSandboxRequest, opts ...grpc.CallOption) (*fastpathv2.ResumeSandboxResponse, error) {
+	if m.ResumeFunc != nil {
+		return m.ResumeFunc(ctx, in)
+	}
 	return &fastpathv2.ResumeSandboxResponse{Sandbox: &fastpathv2.SandboxInfo{}}, nil
 }
 
