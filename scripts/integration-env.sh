@@ -3083,7 +3083,17 @@ snapshot_env_up() {
 	wait_for "agent rollout ready (write credential)" 180 \
 		kubectl -n "$NS" rollout status daemonset/firecracker-runtime-agent --timeout=10s
 	wait_for "fastlet pod ready (recreated)" 180 fastlet_pod_ready
-	pass "snapshot-capable images rolled (controller + fastlet + agent, write credential wired)"
+	# Egress plane for the policy checks: image, single-fastlet pool (one
+	# deterministic plane), warm image cached (creates before the fastlet
+	# heartbeat would race into ResourceExhausted).
+	egress_image_ready
+	kubectl -n "$NS" delete sandboxpool "$EGRESS_POOL" --ignore-not-found >/dev/null
+	snapshot_policy_render_pool
+	kubectl -n "$NS" apply -f "$WORK/pool-firecracker-egress-snapshot.yaml" >/dev/null
+	wait_for "exactly one egress fastlet pod" 180 egress_single_pod
+	wait_for "egress container ready" 180 egress_container_ready
+	wait_for "egress pool warm image cached" 300 egress_warm_ready
+	pass "snapshot-capable images rolled + egress pool ready (policy checks live)"
 }
 
 # snapshot_prune_store drops artifact sets previously published by
@@ -3163,24 +3173,41 @@ snapshot_cleanup_sandbox() { # name
 # pool_idle_fastlets: >=1 idle fastlet means the heartbeat-fed placement
 # view has converged after the stage-1 restarts (the pool status is a
 # projection of the controller's in-memory registry hints).
-pool_idle_fastlets() {
-	[[ "$(kubectl_get "sandboxpool/$SBX_POOL" '{.status.idleFastlets}' 2>/dev/null || echo 0)" -ge 1 ]]
+pool_idle_fastlets() { # [pool]
+	local pool="${1:-$SBX_POOL}"
+	[[ "$(kubectl_get "sandboxpool/$pool" '{.status.idleFastlets}' 2>/dev/null || echo 0)" -ge 1 ]]
 }
 
 snapshot_source_up() {
-	# Stage 1 restarted the controller and recreated the fastlet pods: the
+	# Stage 1 restarted the controller and recreated the fastlets: the
 	# replacement controller's in-memory placement registry only learns the
-	# new fastlets through heartbeats. Gate the first create on the pool
+	# egress pool through heartbeats. Gate the first create on the pool
 	# reporting an idle fastlet instead of burning the retry window blind.
-	wait_for "pool placement converged (idle fastlets >= 1)" 180 pool_idle_fastlets
+	wait_for "egress pool placement converged (idle fastlets >= 1)" 180 pool_idle_fastlets "$EGRESS_POOL"
 	snapshot_cleanup_sandbox "$SNAPSHOT_TARGET"
 	snapshot_cleanup_sandbox "$SNAPSHOT_RESTORE"
+	snapshot_cleanup_sandbox "$SNAPSHOT_POLICY_CTRL"
+	snapshot_cleanup_sandbox "$SNAPSHOT_RESTORE_ALLOW"
 	kubectl -n "$NS" delete sandboxsnapshot "$SNAPSHOT_NAME" >/dev/null 2>&1 || true
 	wait_for "leftover snapshot CR gone" 90 snapshot_snapshot_cr_gone
 
-	fastctl_run_sandbox "$SNAPSHOT_TARGET"
+	# Control (allow): the egress plane must demonstrably serve before any
+	# deny assertion — blocked is the policy, not network breakage.
+	snapshot_policy_run "$SNAPSHOT_POLICY_CTRL" "$SBX_IMAGE" "$EGRESS_ALLOW_POLICY"
+	wait_for "control sandbox Ready" 300 sandbox_ready "$SNAPSHOT_POLICY_CTRL"
+	wait_for "control egress binding Ready" 120 egress_binding_ready "$SNAPSHOT_POLICY_CTRL"
+	wait_for "egress plane serving (control resolves example.com)" 300 egress_plane_ready "$SNAPSHOT_POLICY_CTRL"
+	wait_for "control reachable in-guest" 120 egress_guest_reachable "$SNAPSHOT_POLICY_CTRL"
+	pass "control: allow policy in effect (egress plane serving)"
+
+	# The source Sandbox carries a deny policy and it must be effective
+	# BEFORE the snapshot captures it.
+	snapshot_policy_run "$SNAPSHOT_TARGET" "$SBX_IMAGE" "$EGRESS_DENY_POLICY"
 	wait_for "source sandbox $SNAPSHOT_TARGET Ready" 300 sandbox_ready "$SNAPSHOT_TARGET"
-	pass "source sandbox $SNAPSHOT_TARGET Ready (image=$SBX_IMAGE)"
+	wait_for "source egress binding Ready" 120 egress_binding_ready "$SNAPSHOT_TARGET"
+	wait_for "source execd control intact under deny" 120 egress_execd_control "$SNAPSHOT_TARGET"
+	test_egress_denied "$SNAPSHOT_TARGET"
+	pass "source sandbox $SNAPSHOT_TARGET Ready with an effective deny policy"
 }
 
 # snapshot_ping_warm resolves the source route once and makes sure the
@@ -3264,7 +3291,7 @@ snapshot_record() { # key value
 # snapshot_run triggers the snapshot through fastpath, polls the CR to a
 # terminal phase, and extracts the driver-side pause/publish timings.
 snapshot_run() {
-	local fwd fwd_ip fwd_port t0 rpc_out rpc_ms phase last_phase="" t_terminal fastlet snapshot_id gap line
+	local fwd fwd_ip fwd_port t0 rpc_out rpc_ms phase last_phase="" t_terminal fastlet snapshot_id gap line ref dir recorded
 	fwd="$(snapshot_ping_warm "$SNAPSHOT_TARGET")"
 	fwd_ip="${fwd%% *}"
 	fwd_port="${fwd##* }"
@@ -3313,6 +3340,12 @@ snapshot_run() {
 	snapshot_id="$(kubectl_get "sandboxsnapshot/$SNAPSHOT_NAME" '{.status.snapshotID}')"
 	log "snapshotID=$snapshot_id fastlet=$fastlet"
 	snapshot_report_manifest "$SNAPSHOT_NAME"
+	ref="$(kubectl_get "sandboxsnapshot/$SNAPSHOT_NAME" '{.status.manifestRef}')"
+	dir="$(dirname "${ref#s3://$MINIO_BUCKET/}")"
+	recorded="$(mc cat "chain/$MINIO_BUCKET/$dir/manifest.json" | jq -r '.actionBindings[]? | select(.handler=="egress") | .input')"
+	[[ "$recorded" == "$EGRESS_DENY_POLICY" ]] \
+		|| fail "manifest did not record the source deny policy verbatim (got: $recorded)"
+	pass "manifest records the source policy verbatim: $recorded"
 
 	# Driver timings: pause window + publish duration from the fastlet logs.
 	log "driver timings (fastlet $fastlet):"
@@ -3427,16 +3460,12 @@ snapshot_fencing() {
 	pass "fence C admitted during A's Publishing; both Succeeded, distinct artifacts, sandbox healthy"
 }
 
-# --- network policy round-trip: a deny-policy sandbox is snapshotted, the
-# manifest records the binding verbatim, and the restore auto-applies it.
-# A control sandbox (allow) proves the plane serves, so "blocked" below is
-# policy, not network breakage; an explicit-allow restore proves override.
-SNAPSHOT_POLICY_NAME="${SNAPSHOT_POLICY_NAME:-e2e-policy-snapshot}"
-SNAPSHOT_POLICY_TEMPLATE="${SNAPSHOT_POLICY_TEMPLATE:-e2e-policy-snapshot}"
+# --- network policy: the snapshot source Sandbox carries a deny policy; the
+# snapshot must record it in the manifest and the restore must auto-apply it.
+# A control sandbox (allow) proves the egress plane serves, so "blocked" is
+# policy, not breakage; an explicit-allow restore proves override.
 SNAPSHOT_POLICY_CTRL="${SNAPSHOT_POLICY_CTRL:-sandbox-snap-ctrl}"
-SNAPSHOT_POLICY_SRC="${SNAPSHOT_POLICY_SRC:-sandbox-snap-policy-src}"
-SNAPSHOT_POLICY_RESTORE="${SNAPSHOT_POLICY_RESTORE:-sandbox-snap-policy-restore}"
-SNAPSHOT_POLICY_RESTORE_ALLOW="${SNAPSHOT_POLICY_RESTORE_ALLOW:-sandbox-snap-policy-restore-allow}"
+SNAPSHOT_RESTORE_ALLOW="${SNAPSHOT_RESTORE_ALLOW:-sandbox-snap-restore-allow}"
 
 # snapshot_policy_render_pool renders the egress pool sample with the
 # mirrored warm image (the golden template was built from the mirrored
@@ -3451,8 +3480,7 @@ snapshot_policy_render_pool() {
 }
 
 # snapshot_policy_run creates a sandbox on the egress pool, optionally with
-# an egress binding, with the same retry and CR-level leftover handling as
-# the other sandbox helpers.
+# an egress binding, with the same retry handling as the other helpers.
 snapshot_policy_run() { # name image [policy-json]
 	local name="$1" image="$2" policy="${3:-}" attempt out
 	local args=(run "$name" --image "$image" --pool "$EGRESS_POOL")
@@ -3465,80 +3493,6 @@ snapshot_policy_run() { # name image [policy-json]
 		sleep 2
 	done
 	fail "snapshot_policy_run $name failed: $out"
-}
-
-snapshot_policy_roundtrip() {
-	local name t0 ref dir recorded applied
-	for name in "$SNAPSHOT_POLICY_CTRL" "$SNAPSHOT_POLICY_SRC" "$SNAPSHOT_POLICY_RESTORE" "$SNAPSHOT_POLICY_RESTORE_ALLOW"; do
-		snapshot_cleanup_sandbox "$name"
-	done
-	kubectl -n "$NS" delete sandboxsnapshot "$SNAPSHOT_POLICY_NAME" >/dev/null 2>&1 || true
-	local attempt=0
-	while kubectl -n "$NS" get sandboxsnapshot "$SNAPSHOT_POLICY_NAME" >/dev/null 2>&1; do
-		attempt=$((attempt + 1))
-		[[ "$attempt" -ge 60 ]] && fail "leftover policy snapshot CR could not be removed"
-		sleep 2
-	done
-
-	# Egress infra: image, single-fastlet pool (one deterministic plane),
-	# warm image cached (creates before the fastlet heartbeat race into
-	# ResourceExhausted).
-	egress_image_ready
-	kubectl -n "$NS" delete sandboxpool "$EGRESS_POOL" --ignore-not-found >/dev/null
-	snapshot_policy_render_pool
-	kubectl -n "$NS" apply -f "$WORK/pool-firecracker-egress-snapshot.yaml" >/dev/null
-	wait_for "exactly one egress fastlet pod" 180 egress_single_pod
-	wait_for "egress container ready" 180 egress_container_ready
-	wait_for "egress pool warm image cached" 300 egress_warm_ready
-	port_forward_up
-
-	# Control (allow): the egress plane demonstrably serves before any deny
-	# assertion — so "blocked" below is the policy, not breakage.
-	snapshot_policy_run "$SNAPSHOT_POLICY_CTRL" "$SBX_IMAGE" "$EGRESS_ALLOW_POLICY"
-	wait_for "control sandbox Ready" 300 sandbox_ready "$SNAPSHOT_POLICY_CTRL"
-	wait_for "control egress binding Ready" 120 egress_binding_ready "$SNAPSHOT_POLICY_CTRL"
-	wait_for "egress plane serving (control resolves example.com)" 300 egress_plane_ready "$SNAPSHOT_POLICY_CTRL"
-	wait_for "control reachable in-guest" 120 egress_guest_reachable "$SNAPSHOT_POLICY_CTRL"
-	pass "control: allow policy in effect (plane serving)"
-
-	# Source (deny): policy effective before the snapshot.
-	snapshot_policy_run "$SNAPSHOT_POLICY_SRC" "$SBX_IMAGE" "$EGRESS_DENY_POLICY"
-	wait_for "policy source Ready" 300 sandbox_ready "$SNAPSHOT_POLICY_SRC"
-	wait_for "policy source egress binding Ready" 120 egress_binding_ready "$SNAPSHOT_POLICY_SRC"
-	wait_for "policy source execd control intact under deny" 120 egress_execd_control "$SNAPSHOT_POLICY_SRC"
-	test_egress_denied "$SNAPSHOT_POLICY_SRC"
-	pass "source sandbox carries the deny policy and it is effective"
-
-	# Snapshot it; the manifest must record the binding verbatim.
-	t0="$(now_ms)"
-	"$SNAPSHOTCTL_BIN" create "$FASTPATH_LOCAL" "$NS" "$SNAPSHOT_POLICY_SRC" "$SNAPSHOT_POLICY_NAME" "$SNAPSHOT_POLICY_TEMPLATE" >/dev/null
-	wait_for "policy snapshot Succeeded" 240 snapshot_phase_reaches "$SNAPSHOT_POLICY_NAME" "Succeeded"
-	snapshot_record "policy_snapshot_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
-	snapshot_report_manifest "$SNAPSHOT_POLICY_NAME"
-	ref="$(kubectl_get "sandboxsnapshot/$SNAPSHOT_POLICY_NAME" '{.status.manifestRef}')"
-	dir="$(dirname "${ref#s3://$MINIO_BUCKET/}")"
-	recorded="$(mc cat "chain/$MINIO_BUCKET/$dir/manifest.json" | jq -r '.actionBindings[] | select(.handler=="egress") | .input')"
-	[[ "$recorded" == "$EGRESS_DENY_POLICY" ]] \
-		|| fail "manifest did not record the source deny policy verbatim (got: $recorded)"
-	pass "manifest records the source policy verbatim: $recorded"
-
-	# Restore WITHOUT explicit bindings: the manifest policy auto-applies.
-	snapshot_policy_run "$SNAPSHOT_POLICY_RESTORE" "$SNAPSHOT_POLICY_TEMPLATE"
-	wait_for "restored sandbox Ready" 300 sandbox_ready "$SNAPSHOT_POLICY_RESTORE"
-	applied="$(kubectl -n "$NS" get sandbox "$SNAPSHOT_POLICY_RESTORE" -o jsonpath='{.spec.actionBindings[?(@.handler=="egress")].input}')"
-	[[ "$applied" == "$EGRESS_DENY_POLICY" ]] \
-		|| fail "restore did not auto-apply the recorded policy (spec actionBindings: ${applied:-<none>})"
-	wait_for "restored egress binding Ready" 120 egress_binding_ready "$SNAPSHOT_POLICY_RESTORE"
-	wait_for "restored execd control intact under deny" 120 egress_execd_control "$SNAPSHOT_POLICY_RESTORE"
-	test_egress_denied "$SNAPSHOT_POLICY_RESTORE"
-	pass "restore auto-applied the policy from the manifest and it is effective"
-
-	# Explicit override wins over the recorded policy.
-	snapshot_policy_run "$SNAPSHOT_POLICY_RESTORE_ALLOW" "$SNAPSHOT_POLICY_TEMPLATE" "$EGRESS_ALLOW_POLICY"
-	wait_for "override sandbox Ready" 300 sandbox_ready "$SNAPSHOT_POLICY_RESTORE_ALLOW"
-	wait_for "override egress binding Ready" 120 egress_binding_ready "$SNAPSHOT_POLICY_RESTORE_ALLOW"
-	wait_for "override reachable in-guest" 180 egress_guest_reachable "$SNAPSHOT_POLICY_RESTORE_ALLOW"
-	pass "explicit create binding overrides the recorded policy"
 }
 
 # snapshot_report_manifest prints the published manifest location (s3 URI +
@@ -3642,9 +3596,9 @@ snapshot_ensure_disk() {
 
 snapshot_restore() {
 	snapshot_ensure_disk
-	local t0 elapsed=0
+	local t0 elapsed=0 applied
 	t0="$(now_ms)"
-	fastctl_run_sandbox "$SNAPSHOT_RESTORE" "$SNAPSHOT_TEMPLATE"
+	snapshot_policy_run "$SNAPSHOT_RESTORE" "$SNAPSHOT_TEMPLATE"
 	snapshot_record "restore_run_cmd_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
 	# The restored sandbox cold-pulls the just-published 3.5GiB artifact set
 	# through the agent (DART with direct-S3 fallback): allow 10 minutes and
@@ -3665,6 +3619,25 @@ snapshot_restore() {
 		|| fail "restored sandbox image is not $SNAPSHOT_TEMPLATE"
 	show_restore_timings "$SNAPSHOT_RESTORE"
 	pass "restored sandbox Ready + /ping (image=$SNAPSHOT_TEMPLATE pulled through the snapshot index)"
+
+	# The snapshot-recorded policy must have been auto-applied (fastpath
+	# resolves the manifest from the store at create time) and it must be
+	# EFFECTIVE on the restored sandbox.
+	applied="$(kubectl -n "$NS" get sandbox "$SNAPSHOT_RESTORE" -o jsonpath='{.spec.actionBindings[?(@.handler=="egress")].input}')"
+	[[ "$applied" == "$EGRESS_DENY_POLICY" ]] \
+		|| fail "restore did not auto-apply the recorded policy (spec actionBindings: ${applied:-<none>})"
+	wait_for "restored egress binding Ready" 120 egress_binding_ready "$SNAPSHOT_RESTORE"
+	wait_for "restored execd control intact under deny" 120 egress_execd_control "$SNAPSHOT_RESTORE"
+	test_egress_denied "$SNAPSHOT_RESTORE"
+	pass "restore auto-applied the manifest policy and it is effective"
+
+	# Explicit override: an allow binding on the create wins over the
+	# recorded deny (and doubles as a post-restore reachability control).
+	snapshot_policy_run "$SNAPSHOT_RESTORE_ALLOW" "$SNAPSHOT_TEMPLATE" "$EGRESS_ALLOW_POLICY"
+	wait_for "override sandbox Ready" 300 sandbox_ready "$SNAPSHOT_RESTORE_ALLOW"
+	wait_for "override egress binding Ready" 120 egress_binding_ready "$SNAPSHOT_RESTORE_ALLOW"
+	wait_for "override reachable in-guest" 180 egress_guest_reachable "$SNAPSHOT_RESTORE_ALLOW"
+	pass "explicit create binding overrides the recorded policy"
 }
 
 snapshot_evidence() {
@@ -3726,8 +3699,7 @@ verify_snapshot() {
 	run_stage "snapshot 3: live snapshot (pause/dump/resume/publish)" snapshot_run
 	run_stage "snapshot 4: reentrancy fencing (reject in window / admit in Publishing)" snapshot_fencing
 	run_stage "snapshot 5: artifact validation (MinIO)" snapshot_validate_artifacts
-	run_stage "snapshot 6: restore from snapshot image" snapshot_restore
-	run_stage "snapshot 7: network policy round-trip (deny -> snapshot -> restore)" snapshot_policy_roundtrip
+	run_stage "snapshot 6: restore from snapshot image (+ policy auto-apply)" snapshot_restore
 	trap - EXIT
 	resolve_daemon_down
 	port_forward_down
@@ -3859,16 +3831,18 @@ usage: integration-env.sh [--cleanup|--auto-clean] {up|down|status|verify}
   verify   create 2 sandboxes, probe execd /ping, then a max-concurrency
            batch (CONCURRENCY=5 at pool capacity), delete all, assert cleanup
   verify-snapshot
-           live sandbox snapshot E2E: fastpath CreateSandboxSnapshot ->
-           SandboxSnapshot CR -> fastlet -> firecracker pause/dump/resume ->
-           runtime-agent publish to MinIO -> validate the artifact set ->
-           restore a NEW sandbox from image=<templateName> -> /ping ->
-           network policy round-trip (deny effective -> recorded in the
-           manifest -> restore auto-applies it -> explicit override wins);
-           records key timings and collects component logs into
+           live sandbox snapshot E2E on the egress pool: a deny-policy
+           source sandbox (allow control proves the plane serves) ->
+           fastpath CreateSandboxSnapshot -> CR -> fastlet -> firecracker
+           pause/dump/resume -> runtime-agent publish to MinIO (manifest
+           location printed, policy asserted recorded verbatim) ->
+           validate the artifact set -> restore from image=<templateName>
+           (policy auto-applied from the manifest and verified effective;
+           an explicit-allow restore verifies override) -> /ping; records
+           key timings and collects component logs into
            logs/snapshot-e2e-<ts>/ (env: SNAPSHOT_*,
-           SNAPSHOT_SKIP_IMAGE_REBUILD=1 skips the image refresh; the
-           policy stage needs opensandbox/egress:latest in local docker)
+           SNAPSHOT_SKIP_IMAGE_REBUILD=1 skips the image refresh; requires
+           opensandbox/egress:latest in local docker)
   verify-p2p
            DART data-plane evidence (stage 2): presigned URL -> node-local
            DART -> origin (cold) -> block cache (warm, origin delta 0);
