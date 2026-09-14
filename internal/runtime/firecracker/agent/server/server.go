@@ -205,7 +205,10 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			if err := validateIdentity(req.Identity, true); err != nil {
 				return nil, err
 			}
-			if strings.TrimSpace(req.Key) == "" {
+			// A checkpoint publishes no image index and therefore carries no
+			// key; every other (template) publication is key-addressed. The
+			// publisher validates the full kind/key combination.
+			if req.Kind != agentprotocol.PublishKindCheckpoint && strings.TrimSpace(req.Key) == "" {
 				return nil, invalidRequest("publish key is required")
 			}
 			if strings.TrimSpace(req.Dir) == "" {

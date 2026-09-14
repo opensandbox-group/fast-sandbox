@@ -18,6 +18,7 @@ import (
 	"time"
 
 	runtimecontract "fast-sandbox/internal/runtime/contract"
+	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 	agentprotocol "fast-sandbox/internal/runtime/firecracker/agent/protocol"
 	agentstate "fast-sandbox/internal/runtime/firecracker/agent/state"
 
@@ -76,10 +77,29 @@ func hexSHA256(payload []byte) string {
 
 // fakePuller counts pulls per image and seeds the cache on demand.
 type fakePuller struct {
-	mu    sync.Mutex
-	pulls map[string]int
-	fail  map[string]error
-	seed  func(stateRoot, image string) error
+	mu           sync.Mutex
+	pulls        map[string]int
+	fail         map[string]error
+	seed         func(stateRoot, image string) error
+	publishCalls []agentprotocol.PublishImageRequest
+}
+
+// PublishImage makes the fake puller publisher-capable so the service wires
+// the publish route (mirrors the real pull client satisfying both).
+func (f *fakePuller) PublishImage(_ context.Context, kind, key, dir string) (agentpull.PublishResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.publishCalls = append(f.publishCalls, agentprotocol.PublishImageRequest{Kind: kind, Key: key, Dir: dir})
+	return agentpull.PublishResult{ManifestRef: "s3://bucket/publish/test/manifest.json", ArtifactDigest: "digest-test"}, nil
+}
+
+func (f *fakePuller) lastPublish() agentprotocol.PublishImageRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.publishCalls) == 0 {
+		return agentprotocol.PublishImageRequest{}
+	}
+	return f.publishCalls[len(f.publishCalls)-1]
 }
 
 func newFakePuller() *fakePuller {
@@ -471,4 +491,32 @@ func TestServerConcurrentSameRequestID(t *testing.T) {
 	}
 	require.Equal(t, 1, fixture.puller.pullCount(testImage))
 	require.Equal(t, 1, fixture.state.Snapshot().PinCount)
+}
+
+func TestPublishRouteAcceptsCheckpointWithoutKey(t *testing.T) {
+	fixture := newServerFixture(t)
+	status, wireErr, raw := fixture.do(t, agentprotocol.RoutePublishImage, agentprotocol.PublishImageRequest{
+		Identity: identity("publish-checkpoint"),
+		Kind:     agentprotocol.PublishKindCheckpoint,
+		Dir:      "/tmp/staging",
+	})
+	require.Equal(t, http.StatusOK, status, "%s", string(raw))
+	require.Empty(t, wireErr.Code)
+	published := fixture.puller.lastPublish()
+	require.Equal(t, agentprotocol.PublishKindCheckpoint, published.Kind)
+	require.Empty(t, published.Key)
+	require.Equal(t, "/tmp/staging", published.Dir)
+}
+
+func TestPublishRouteRejectsTemplateWithoutKey(t *testing.T) {
+	fixture := newServerFixture(t)
+	status, wireErr, _ := fixture.do(t, agentprotocol.RoutePublishImage, agentprotocol.PublishImageRequest{
+		Identity: identity("publish-template"),
+		Kind:     agentprotocol.PublishKindTemplate,
+		Dir:      "/tmp/staging",
+	})
+	require.Equal(t, http.StatusBadRequest, status)
+	require.Equal(t, agentprotocol.ErrorInvalidRequest, wireErr.Code)
+	require.Contains(t, wireErr.Message, "publish key is required")
+	require.Empty(t, fixture.puller.lastPublish(), "a rejected publish must not reach the publisher")
 }
