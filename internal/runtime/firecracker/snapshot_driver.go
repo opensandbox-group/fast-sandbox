@@ -144,6 +144,9 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 		_ = os.RemoveAll(plan.staging)
 		return nil, err
 	}
+	klog.InfoS("firecracker checkpoint manifest assembled",
+		"sandboxId", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind,
+		"sizeBytes", sizeBytes, "staging", plan.staging)
 
 	client, err := d.agentClientOrNil()
 	if err != nil {
@@ -385,6 +388,9 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 	// up front, never mid-window.
 	spillDir := d.spillDirFor(plan.snapshotID, state.Config.Spec.Memory)
 	plan.spilled = spillDir != ""
+	klog.InfoS("firecracker sandbox dump starting",
+		"sandboxId", plan.sandboxID, "snapshotId", plan.snapshotID,
+		"staging", plan.staging, "jailed", plan.jailed, "spilled", plan.spilled)
 
 	// The instance root drive: the state-directory copy in direct mode, the
 	// jail-root copy in jailer mode.
@@ -456,6 +462,8 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		cleanupSpill()
 		return fmt.Errorf("pause microVM: %w", err)
 	}
+	klog.InfoS("firecracker sandbox paused for dump",
+		"sandboxId", plan.sandboxID, "snapshotId", plan.snapshotID, "spilled", plan.spilled)
 	dumpErr := func() error {
 		if !rootfsCloned {
 			if err := copyReflinkOrCopy(rootfs, stagedRootfs); err != nil {
@@ -486,6 +494,8 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		cleanupSpill()
 		return dumpErr
 	}
+	klog.InfoS("firecracker sandbox resumed after dump",
+		"sandboxId", plan.sandboxID, "snapshotId", plan.snapshotID, "pauseWindow", plan.pauseWindow.String())
 	if !plan.spilled {
 		if plan.jailed {
 			// Move the chroot-local dump into the staging directory: the
