@@ -121,6 +121,25 @@ func TestCreateSnapshotRecordsActionBindingsInManifest(t *testing.T) {
 	require.Equal(t, `{"egressPolicy":"deny-all"}`, entry["input"])
 }
 
+func TestCreateCheckpointRecordsActionBindingsInManifest(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+
+	_, err := fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "ckpt-1", Kind: fastletapi.SnapshotKindCheckpoint,
+		ActionBindings: []runtimecontract.SnapshotActionBinding{
+			{Handler: "egress", Input: `{"defaultAction":"deny"}`},
+		},
+	})
+	require.NoError(t, err)
+	recorded, ok := agent.manifest["actionBindings"].([]any)
+	require.True(t, ok, "checkpoint manifest lacks actionBindings")
+	require.Len(t, recorded, 1)
+	entry := recorded[0].(map[string]any)
+	require.Equal(t, "egress", entry["handler"])
+	require.Equal(t, `{"defaultAction":"deny"}`, entry["input"])
+}
+
 func TestCreateSnapshotFallsBackWhenSpillUnavailable(t *testing.T) {
 	fixture, agent := newSnapshotFixture(t)
 	// A spill root that does not exist: the capacity guard fails and the
