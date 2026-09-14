@@ -71,6 +71,9 @@ func (m *SandboxManager) deliveryForCreate(input *fastletapi.EnsureSandboxInput)
 func (m *SandboxManager) parkForImageDelivery(req *fastletapi.CreateSandboxRequest, input *fastletapi.EnsureSandboxInput, placeholder *SandboxMetadata, started time.Time) (*fastletapi.CreateSandboxResponse, error) {
 	sandboxUID := input.Sandbox.Identity.SandboxUID
 	message := fmt.Sprintf("sandbox image %q is being delivered to the node", input.Sandbox.Spec.Image)
+	if restore := input.Sandbox.Spec.Restore; restore != nil {
+		message = fmt.Sprintf("sandbox checkpoint %s is being pulled from the artifact store", restore.ArtifactDigest)
+	}
 	m.mu.Lock()
 	if m.sandboxes[sandboxUID] != placeholder {
 		admission := m.admissionStatusLocked()

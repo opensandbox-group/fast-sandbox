@@ -220,7 +220,7 @@ func (m *SandboxManager) runSnapshotWorker(snapshotter RuntimeSnapshotter, task 
 		return
 	}
 
-	m.setSnapshotPhase(task, fastletapi.SnapshotPhaseCreating, "")
+	m.setSnapshotPhase(task, fastletapi.SnapshotPhaseCreating, "dumping vmstate/memory and cloning the rootfs")
 	result, err := snapshotter.CreateSnapshot(ctx, &RuntimeSnapshotInput{
 		SandboxID:      sandboxUID,
 		SnapshotID:     task.snapshotID,
@@ -231,7 +231,7 @@ func (m *SandboxManager) runSnapshotWorker(snapshotter RuntimeSnapshotter, task 
 		// staged set is complete: from that moment the task no longer
 		// touches the VM and the sandbox fence releases.
 		OnPublishing: func() {
-			m.setSnapshotPhase(task, fastletapi.SnapshotPhasePublishing, "")
+			m.setSnapshotPhase(task, fastletapi.SnapshotPhasePublishing, "artifact set staged; publishing to the artifact store")
 		},
 	})
 	if err != nil || result == nil {

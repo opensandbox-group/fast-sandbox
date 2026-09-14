@@ -3890,7 +3890,7 @@ snapshot_on_error() {
 # PAUSE_SKIP_IMAGE_REBUILD=1 (skip rolling controller/fastlet/agent images
 # when the deployed ones already carry the pause chain).
 PAUSE_SANDBOX="${PAUSE_SANDBOX:-sandbox-pause-e2e}"
-PAUSE_TIMEOUT_S="${PAUSE_TIMEOUT_S:-600}"
+PAUSE_TIMEOUT_S="${PAUSE_TIMEOUT_S:-900}"
 # PAUSE_MAX_ATTEMPTS bounds the transactional retry loop (each attempt re-dumps
 # the VM after a transient failure): once exceeded the flow fails fast with the
 # controller's recorded reason instead of waiting for the timeout.
@@ -4027,7 +4027,7 @@ pause_fastlet_timings() { # fastlet
 }
 
 pause_run() {
-	local t0 state last_state="" checkpoint_id="" gen_after_pause out rc deadline_ns message attempt retries=0
+	local t0 state last_state="" last_message="" checkpoint_id="" gen_after_pause out rc deadline_ns message attempt retries=0 beat=0
 	: > "$PAUSE_PHASE_LOG"
 	t0="$(now_ms)"
 	out="$(fastctl pause "$PAUSE_SANDBOX" 2>&1)" || fail "PauseSandbox failed: $out"
@@ -4046,12 +4046,16 @@ pause_run() {
 	deadline_ns=$(( t0 + PAUSE_TIMEOUT_S * 1000000000 ))
 	while :; do
 		state="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.state}' 2>/dev/null || true)"
-		if [[ -n "$state" && "$state" != "$last_state" ]]; then
-			message="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.message}' 2>/dev/null || true)"
+		message="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.message}' 2>/dev/null || true)"
+		if [[ -n "$state" && ( "$state" != "$last_state" || "$message" != "$last_message" ) ]]; then
 			attempt="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.pauseAttempt}' 2>/dev/null || true)"
-			printf '%s\t+%ss\t%s\n' "$(date +%s%3N)" "$(ms2s $(( ($(now_ms) - t0) / 1000000 )))" "$state" >> "$PAUSE_PHASE_LOG"
+			printf '%s\t+%ss\t%s\t%s\n' "$(date +%s%3N)" "$(ms2s $(( ($(now_ms) - t0) / 1000000 )))" "$state" "$message" >> "$PAUSE_PHASE_LOG"
 			log "pause phase -> $state (+$(ms2s $(( ($(now_ms) - t0) / 1000000 )))s after PauseSandbox) attempt=${attempt:-0} message=${message:-<none>}"
-			[[ "$state" == "Pausing" ]] && pause_record "pause_to_pausing_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
+			[[ "$state" == "Pausing" && "$last_state" != "Pausing" ]] && pause_record "pause_to_pausing_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
+			if [[ "$message" == *"publishing to the artifact store"* && "$last_message" != *"publishing to the artifact store"* ]]; then
+				pause_record "pause_to_publishing_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
+				log "checkpoint staged; uploading the artifact set (+$(ms2s $(( ($(now_ms) - t0) / 1000000 )))s)"
+			fi
 			if [[ "$state" == "Ready" && "$last_state" == "Pausing" ]]; then
 				retries=$((retries + 1))
 				local reason
@@ -4063,7 +4067,16 @@ pause_run() {
 				fi
 			fi
 			last_state="$state"
+			last_message="$message"
+			beat=0
 		fi
+		# Heartbeat while a long dump/upload runs: the state only flips at the
+		# end, so silence here would look like a hang.
+		if [[ "$beat" -ge 15 ]]; then
+			log "pause still converging (+$(ms2s $(( ($(now_ms) - t0) / 1000000 )))s): state=$state message=${message:-<none>}"
+			beat=0
+		fi
+		beat=$((beat + 1))
 		if [[ -z "$checkpoint_id" ]]; then
 			checkpoint_id="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.checkpoint.checkpointID}' 2>/dev/null || true)"
 			if [[ -n "$checkpoint_id" ]]; then
@@ -4188,7 +4201,7 @@ pause_resume() {
 	wait_for "placement converged after replacement" 180 pool_idle_fastlets
 	pause_record "pause_to_resume_gap_ms" "$(( ($(now_ms) - PAUSE_PAUSED_AT_MS) / 1000000 ))"
 
-	local t0 out rc state last_state="" deadline_ns
+	local t0 out rc state last_state="" last_message="" deadline_ns beat=0
 	: > "$PAUSE_RESUME_PHASE_LOG"
 	t0="$(now_ms)"
 	out="$(fastctl resume "$PAUSE_SANDBOX" --checkpoint-id "$PAUSE_CHECKPOINT_ID" 2>&1)" \
@@ -4204,13 +4217,20 @@ pause_resume() {
 	deadline_ns=$(( t0 + PAUSE_TIMEOUT_S * 1000000000 ))
 	while :; do
 		state="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.state}' 2>/dev/null || true)"
-		if [[ -n "$state" && "$state" != "$last_state" ]]; then
-			printf '%s\t+%ss\t%s\n' "$(date +%s%3N)" "$(ms2s $(( ($(now_ms) - t0) / 1000000 )))" "$state" >> "$PAUSE_RESUME_PHASE_LOG"
-			out="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.message}' 2>/dev/null || true)"
+		out="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.message}' 2>/dev/null || true)"
+		if [[ -n "$state" && ( "$state" != "$last_state" || "$out" != "$last_message" ) ]]; then
+			printf '%s\t+%ss\t%s\t%s\n' "$(date +%s%3N)" "$(ms2s $(( ($(now_ms) - t0) / 1000000 )))" "$state" "$out" >> "$PAUSE_RESUME_PHASE_LOG"
 			log "resume phase -> $state (+$(ms2s $(( ($(now_ms) - t0) / 1000000 )))s after ResumeSandbox) message=${out:-<none>}"
-			[[ "$state" == "Resuming" ]] && pause_record "resume_to_resuming_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
+			[[ "$state" == "Resuming" && "$last_state" != "Resuming" ]] && pause_record "resume_to_resuming_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
 			last_state="$state"
+			last_message="$out"
+			beat=0
 		fi
+		if [[ "$beat" -ge 15 ]]; then
+			log "resume still converging (+$(ms2s $(( ($(now_ms) - t0) / 1000000 )))s): state=$state message=${out:-<none>}"
+			beat=0
+		fi
+		beat=$((beat + 1))
 		if sandbox_ready "$PAUSE_SANDBOX"; then
 			break
 		fi
