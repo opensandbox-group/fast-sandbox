@@ -28,6 +28,23 @@ type SandboxSpec struct {
 	Args                []string          `json:"args,omitempty"`
 	Env                 map[string]string `json:"env,omitempty"`
 	WorkingDir          string            `json:"workingDir,omitempty"`
+	// Restore, when set, materializes this runtime from a checkpoint
+	// artifact set (SnapshotKindCheckpoint) instead of booting Image from
+	// scratch: the driver delivers and validates the set, loads vmstate and
+	// memory, and resumes the guest. Only a Sandbox resume produces it.
+	Restore *RestoreSpec `json:"restore,omitempty"`
+}
+
+// RestoreSpec selects the checkpoint artifact set a runtime is restored
+// from. It is produced by a Checkpoint snapshot and consumed by
+// EnsureSandbox at resume.
+type RestoreSpec struct {
+	// ManifestRef is the s3:// URI of the checkpoint manifest, in the
+	// standard artifact-set layout (rootfs/vmstate/memory/SHA256SUMS).
+	ManifestRef string `json:"manifestRef"`
+	// ArtifactDigest is the sha256 of the manifest document; it addresses
+	// the artifact set independently of ManifestRef.
+	ArtifactDigest string `json:"artifactDigest"`
 }
 
 // RuntimeSandboxConfig is the stable runtime identity and desired
@@ -412,9 +429,27 @@ func SnapshotPhaseTerminal(phase SnapshotPhase) bool {
 	return phase == SnapshotPhaseSucceeded || phase == SnapshotPhaseFailed
 }
 
-// SnapshotIdentity fences one snapshot task. SnapshotUID/Name/Namespace
-// identify the SandboxSnapshot object; Sandbox carries the full target
-// Sandbox identity fence (validated like every other Sandbox request).
+// SnapshotKind selects what a snapshot task publishes.
+type SnapshotKind string
+
+const (
+	// SnapshotKindTemplate publishes the artifact set under a template name
+	// so later Sandbox creates can boot from it (SandboxSnapshot
+	// semantics: the set becomes a CreateSandbox image).
+	SnapshotKindTemplate SnapshotKind = "Template"
+	// SnapshotKindCheckpoint publishes an instance-private checkpoint that
+	// only the owning Sandbox resumes from: no template-index object is
+	// written, so the set is never addressable as a CreateSandbox image.
+	SnapshotKindCheckpoint SnapshotKind = "Checkpoint"
+)
+
+// SnapshotIdentity fences one snapshot task. For Template snapshots
+// SnapshotUID is the SandboxSnapshot object UID and Namespace/Name identify
+// that object; for Checkpoint snapshots SnapshotUID is the checkpoint task
+// identity derived from the owning Sandbox (UID + spec generation + pause
+// attempt) and Namespace/Name identify nothing further. Sandbox carries the
+// full target Sandbox identity fence (validated like every other Sandbox
+// request).
 type SnapshotIdentity struct {
 	SnapshotUID string          `json:"snapshotUid"`
 	Namespace   string          `json:"namespace"`
@@ -424,9 +459,12 @@ type SnapshotIdentity struct {
 
 // SnapshotSpec is the desired snapshot configuration.
 type SnapshotSpec struct {
+	// Kind selects the publish mode. Empty is treated as SnapshotKindTemplate
+	// so callers that predate checkpoints keep working.
+	Kind SnapshotKind `json:"kind,omitempty"`
 	// TemplateName is the artifact-store index key the artifact set is
-	// published under.
-	TemplateName string `json:"templateName"`
+	// published under. Required for Template, must be empty for Checkpoint.
+	TemplateName string `json:"templateName,omitempty"`
 }
 
 // SnapshotStatus is the Fastlet observation of one snapshot task. Reason

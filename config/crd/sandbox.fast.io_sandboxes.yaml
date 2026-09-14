@@ -69,6 +69,18 @@ spec:
                 items:
                   type: string
                 type: array
+              desiredState:
+                default: Running
+                description: |-
+                  DesiredState is the desired runtime lifecycle. Running (the default)
+                  keeps a live runtime; Paused checkpoints the runtime to the artifact
+                  store and releases it. Pausing requires a Ready runtime; flipping
+                  back to Running resumes the recorded checkpoint, possibly on a
+                  different Fastlet.
+                enum:
+                - Running
+                - Paused
+                type: string
               envs:
                 items:
                   description: EnvVar represents an environment variable present in
@@ -442,6 +454,57 @@ spec:
                   acceptedResetRevision:
                     format: date-time
                     type: string
+                  checkpoint:
+                    description: |-
+                      Checkpoint is the artifact-store checkpoint a Paused Sandbox resumes
+                      from. It is authoritative only while State is Pausing, Paused, or
+                      Resuming (see CheckpointActive); in any other state it must be read
+                      as "no checkpoint" and is cleared by the controller. A Paused
+                      Sandbox without a checkpoint cannot be resumed and must be reset.
+                    properties:
+                      artifactDigest:
+                        description: |-
+                          ArtifactDigest is the sha256 of the manifest document. It addresses
+                          the artifact set independently of ManifestRef.
+                        type: string
+                      checkpointID:
+                        description: |-
+                          CheckpointID is the Fastlet-side task identity that produced the
+                          checkpoint, derived from the Sandbox UID, the spec generation that
+                          requested the pause, and the pause attempt epoch.
+                        type: string
+                      fastletName:
+                        description: |-
+                          FastletName/FastletPodUID locate the Fastlet that captured the
+                          checkpoint. Diagnostics only: the Fastlet may already be gone and is
+                          never the resume target contract.
+                        type: string
+                      fastletPodUID:
+                        description: |-
+                          UID is a type that holds unique ID values, including UUIDs.  Because we
+                          don't ONLY use UUIDs, this is an alias to string.  Being a type captures
+                          intent and helps make sure that UIDs and names do not get conflated.
+                        type: string
+                      manifestRef:
+                        description: |-
+                          ManifestRef is the s3:// URI of the checkpoint manifest, published in
+                          the standard artifact-set layout (rootfs/vmstate/memory/SHA256SUMS).
+                        type: string
+                      pausedAt:
+                        description: PausedAt is when the checkpoint became durable
+                          in the store.
+                        format: date-time
+                        type: string
+                      sizeBytes:
+                        description: SizeBytes is the total logical size of the published
+                          artifact set.
+                        format: int64
+                        type: integer
+                    required:
+                    - artifactDigest
+                    - checkpointID
+                    - manifestRef
+                    type: object
                   generation:
                     format: int64
                     type: integer
@@ -450,6 +513,15 @@ spec:
                     type: string
                   message:
                     type: string
+                  pauseAttempt:
+                    description: |-
+                      PauseAttempt is the retry epoch of the pause FSM. The controller
+                      increments it before triggering a new checkpoint attempt (after a
+                      transient failure) and derives the Fastlet checkpoint task identity
+                      from it, so retrying a lost outcome replays the same task while a new
+                      attempt never reuses a terminated task id. Reset clears it.
+                    format: int64
+                    type: integer
                   state:
                     description: RuntimeState is the lifecycle of the concrete Sandbox
                       runtime.
@@ -458,6 +530,9 @@ spec:
                     - Pending
                     - Creating
                     - Ready
+                    - Pausing
+                    - Paused
+                    - Resuming
                     - Stopping
                     - Stopped
                     - Failed

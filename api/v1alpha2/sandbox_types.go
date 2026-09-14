@@ -27,6 +27,29 @@ const (
 
 const SandboxConditionReady = "Ready"
 
+// SandboxConditionSuspended reflects whether the Sandbox runtime is
+// checkpointed and released. It is True only while the pause is durably
+// complete (status.runtime.state == Paused); Pausing and Resuming are
+// reported as False with a phase-specific reason.
+const SandboxConditionSuspended = "Suspended"
+
+// SandboxDesiredState is the desired runtime lifecycle.
+// +kubebuilder:validation:Enum=Running;Paused
+type SandboxDesiredState string
+
+const (
+	// SandboxDesiredStateRunning requests a live runtime. A Sandbox that
+	// carries a checkpoint (status.runtime.checkpoint) is resumed from it
+	// instead of booting from scratch.
+	SandboxDesiredStateRunning SandboxDesiredState = "Running"
+	// SandboxDesiredStatePaused requests the runtime be checkpointed to the
+	// artifact store and released: the Sandbox stops occupying Fastlet
+	// capacity while its object, identity, and checkpoint address survive.
+	// Pausing requires a Ready runtime and is one-way through the
+	// checkpoint; resuming means flipping this field back to Running.
+	SandboxDesiredStatePaused SandboxDesiredState = "Paused"
+)
+
 // SandboxSpec defines the desired state of Sandbox.
 // +kubebuilder:validation:XValidation:rule="!has(self.actionBindings) || self.actionBindings.all(x, self.actionBindings.filter(y, y.handler == x.handler).size() == 1)",message="actionBindings must use unique Handler names"
 type SandboxSpec struct {
@@ -55,6 +78,14 @@ type SandboxSpec struct {
 	// When Spec.ResetRevision > Status.Runtime.AcceptedResetRevision, the sandbox will be rescheduled.
 	ResetRevision *metav1.Time `json:"resetRevision,omitempty"`
 
+	// DesiredState is the desired runtime lifecycle. Running (the default)
+	// keeps a live runtime; Paused checkpoints the runtime to the artifact
+	// store and releases it. Pausing requires a Ready runtime; flipping
+	// back to Running resumes the recorded checkpoint, possibly on a
+	// different Fastlet.
+	// +kubebuilder:default=Running
+	DesiredState SandboxDesiredState `json:"desiredState,omitempty"`
+
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	// PoolRef specifies which SandboxPool this sandbox should be scheduled to.
@@ -79,14 +110,25 @@ type ActionBinding struct {
 }
 
 // RuntimeState is the lifecycle of the concrete Sandbox runtime.
-// +kubebuilder:validation:Enum=Unknown;Pending;Creating;Ready;Stopping;Stopped;Failed;Unavailable
+// +kubebuilder:validation:Enum=Unknown;Pending;Creating;Ready;Pausing;Paused;Resuming;Stopping;Stopped;Failed;Unavailable
 type RuntimeState string
 
 const (
-	RuntimeUnknown     RuntimeState = "Unknown"
-	RuntimePending     RuntimeState = "Pending"
-	RuntimeCreating    RuntimeState = "Creating"
-	RuntimeReady       RuntimeState = "Ready"
+	RuntimeUnknown  RuntimeState = "Unknown"
+	RuntimePending  RuntimeState = "Pending"
+	RuntimeCreating RuntimeState = "Creating"
+	RuntimeReady    RuntimeState = "Ready"
+	// RuntimePausing means the checkpoint window is running: the Fastlet is
+	// dumping vmstate/memory/rootfs and publishing the artifact set. The
+	// runtime is neither usable nor resumable yet.
+	RuntimePausing RuntimeState = "Pausing"
+	// RuntimePaused means the checkpoint is durable in the artifact store,
+	// the runtime has been released, and the Sandbox occupies no Fastlet
+	// capacity. Setting spec.desiredState back to Running resumes it.
+	RuntimePaused RuntimeState = "Paused"
+	// RuntimeResuming means a new runtime is materializing from
+	// status.runtime.checkpoint on a (possibly different) Fastlet.
+	RuntimeResuming    RuntimeState = "Resuming"
 	RuntimeStopping    RuntimeState = "Stopping"
 	RuntimeStopped     RuntimeState = "Stopped"
 	RuntimeFailed      RuntimeState = "Failed"
@@ -101,6 +143,67 @@ type RuntimeStatus struct {
 	Message            string       `json:"message,omitempty"`
 
 	AcceptedResetRevision *metav1.Time `json:"acceptedResetRevision,omitempty"`
+
+	// PauseAttempt is the retry epoch of the pause FSM. The controller
+	// increments it before triggering a new checkpoint attempt (after a
+	// transient failure) and derives the Fastlet checkpoint task identity
+	// from it, so retrying a lost outcome replays the same task while a new
+	// attempt never reuses a terminated task id. Reset clears it.
+	// +optional
+	PauseAttempt int64 `json:"pauseAttempt,omitempty"`
+
+	// Checkpoint is the artifact-store checkpoint a Paused Sandbox resumes
+	// from. It is authoritative only while State is Pausing, Paused, or
+	// Resuming (see CheckpointActive); in any other state it must be read
+	// as "no checkpoint" and is cleared by the controller. A Paused
+	// Sandbox without a checkpoint cannot be resumed and must be reset.
+	// +optional
+	Checkpoint *CheckpointStatus `json:"checkpoint,omitempty"`
+}
+
+// CheckpointStatus describes one published checkpoint: the artifact-store
+// address a Paused Sandbox resumes from. Unlike a SandboxSnapshot it is
+// instance-private — no template-name index is written, so the set is not
+// addressable as a CreateSandbox image.
+type CheckpointStatus struct {
+	// CheckpointID is the Fastlet-side task identity that produced the
+	// checkpoint, derived from the Sandbox UID, the spec generation that
+	// requested the pause, and the pause attempt epoch.
+	CheckpointID string `json:"checkpointID"`
+
+	// ManifestRef is the s3:// URI of the checkpoint manifest, published in
+	// the standard artifact-set layout (rootfs/vmstate/memory/SHA256SUMS).
+	ManifestRef string `json:"manifestRef"`
+	// ArtifactDigest is the sha256 of the manifest document. It addresses
+	// the artifact set independently of ManifestRef.
+	ArtifactDigest string `json:"artifactDigest"`
+	// SizeBytes is the total logical size of the published artifact set.
+	// +optional
+	SizeBytes int64 `json:"sizeBytes,omitempty"`
+	// PausedAt is when the checkpoint became durable in the store.
+	// +optional
+	PausedAt *metav1.Time `json:"pausedAt,omitempty"`
+	// FastletName/FastletPodUID locate the Fastlet that captured the
+	// checkpoint. Diagnostics only: the Fastlet may already be gone and is
+	// never the resume target contract.
+	// +optional
+	FastletName string `json:"fastletName,omitempty"`
+	// +optional
+	FastletPodUID types.UID `json:"fastletPodUID,omitempty"`
+}
+
+// CheckpointActive reports whether Status.Runtime.Checkpoint is
+// authoritative: only pause-FSM states may carry a resumable checkpoint.
+func (s *RuntimeStatus) CheckpointActive() bool {
+	if s == nil || s.Checkpoint == nil {
+		return false
+	}
+	switch s.State {
+	case RuntimePausing, RuntimePaused, RuntimeResuming:
+		return true
+	default:
+		return false
+	}
 }
 
 // DataPlaneState is the lifecycle of the Sandbox interaction route.

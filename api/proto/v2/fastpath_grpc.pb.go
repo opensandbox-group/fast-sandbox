@@ -31,6 +31,8 @@ const (
 	FastPathService_CreateSandboxSnapshot_FullMethodName = "/fastpath.v2.FastPathService/CreateSandboxSnapshot"
 	FastPathService_GetSandboxSnapshot_FullMethodName    = "/fastpath.v2.FastPathService/GetSandboxSnapshot"
 	FastPathService_DeleteSandboxSnapshot_FullMethodName = "/fastpath.v2.FastPathService/DeleteSandboxSnapshot"
+	FastPathService_PauseSandbox_FullMethodName          = "/fastpath.v2.FastPathService/PauseSandbox"
+	FastPathService_ResumeSandbox_FullMethodName         = "/fastpath.v2.FastPathService/ResumeSandbox"
 )
 
 // FastPathServiceClient is the client API for FastPathService service.
@@ -53,6 +55,16 @@ type FastPathServiceClient interface {
 	CreateSandboxSnapshot(ctx context.Context, in *CreateSandboxSnapshotRequest, opts ...grpc.CallOption) (*CreateSandboxSnapshotResponse, error)
 	GetSandboxSnapshot(ctx context.Context, in *GetSandboxSnapshotRequest, opts ...grpc.CallOption) (*GetSandboxSnapshotResponse, error)
 	DeleteSandboxSnapshot(ctx context.Context, in *DeleteSandboxSnapshotRequest, opts ...grpc.CallOption) (*DeleteSandboxSnapshotResponse, error)
+	// PauseSandbox checkpoints a Ready Sandbox to the artifact store and
+	// releases its runtime. It returns after the desired state is persisted;
+	// completion (runtime_state PAUSED with the checkpoint durable) is
+	// observed via GetSandbox. Pause is a desired state, not a one-shot
+	// object: replaying the call with the same effect is idempotent.
+	PauseSandbox(ctx context.Context, in *PauseSandboxRequest, opts ...grpc.CallOption) (*PauseSandboxResponse, error)
+	// ResumeSandbox flips the desired state back to Running and schedules the
+	// checkpointed Sandbox again, possibly on another Fastlet. Completion
+	// (runtime_state READY) is observed via GetSandbox.
+	ResumeSandbox(ctx context.Context, in *ResumeSandboxRequest, opts ...grpc.CallOption) (*ResumeSandboxResponse, error)
 }
 
 type fastPathServiceClient struct {
@@ -183,6 +195,26 @@ func (c *fastPathServiceClient) DeleteSandboxSnapshot(ctx context.Context, in *D
 	return out, nil
 }
 
+func (c *fastPathServiceClient) PauseSandbox(ctx context.Context, in *PauseSandboxRequest, opts ...grpc.CallOption) (*PauseSandboxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PauseSandboxResponse)
+	err := c.cc.Invoke(ctx, FastPathService_PauseSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *fastPathServiceClient) ResumeSandbox(ctx context.Context, in *ResumeSandboxRequest, opts ...grpc.CallOption) (*ResumeSandboxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResumeSandboxResponse)
+	err := c.cc.Invoke(ctx, FastPathService_ResumeSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // FastPathServiceServer is the server API for FastPathService service.
 // All implementations must embed UnimplementedFastPathServiceServer
 // for forward compatibility.
@@ -203,6 +235,16 @@ type FastPathServiceServer interface {
 	CreateSandboxSnapshot(context.Context, *CreateSandboxSnapshotRequest) (*CreateSandboxSnapshotResponse, error)
 	GetSandboxSnapshot(context.Context, *GetSandboxSnapshotRequest) (*GetSandboxSnapshotResponse, error)
 	DeleteSandboxSnapshot(context.Context, *DeleteSandboxSnapshotRequest) (*DeleteSandboxSnapshotResponse, error)
+	// PauseSandbox checkpoints a Ready Sandbox to the artifact store and
+	// releases its runtime. It returns after the desired state is persisted;
+	// completion (runtime_state PAUSED with the checkpoint durable) is
+	// observed via GetSandbox. Pause is a desired state, not a one-shot
+	// object: replaying the call with the same effect is idempotent.
+	PauseSandbox(context.Context, *PauseSandboxRequest) (*PauseSandboxResponse, error)
+	// ResumeSandbox flips the desired state back to Running and schedules the
+	// checkpointed Sandbox again, possibly on another Fastlet. Completion
+	// (runtime_state READY) is observed via GetSandbox.
+	ResumeSandbox(context.Context, *ResumeSandboxRequest) (*ResumeSandboxResponse, error)
 	mustEmbedUnimplementedFastPathServiceServer()
 }
 
@@ -248,6 +290,12 @@ func (UnimplementedFastPathServiceServer) GetSandboxSnapshot(context.Context, *G
 }
 func (UnimplementedFastPathServiceServer) DeleteSandboxSnapshot(context.Context, *DeleteSandboxSnapshotRequest) (*DeleteSandboxSnapshotResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteSandboxSnapshot not implemented")
+}
+func (UnimplementedFastPathServiceServer) PauseSandbox(context.Context, *PauseSandboxRequest) (*PauseSandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PauseSandbox not implemented")
+}
+func (UnimplementedFastPathServiceServer) ResumeSandbox(context.Context, *ResumeSandboxRequest) (*ResumeSandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResumeSandbox not implemented")
 }
 func (UnimplementedFastPathServiceServer) mustEmbedUnimplementedFastPathServiceServer() {}
 func (UnimplementedFastPathServiceServer) testEmbeddedByValue()                         {}
@@ -486,6 +534,42 @@ func _FastPathService_DeleteSandboxSnapshot_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _FastPathService_PauseSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PauseSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FastPathServiceServer).PauseSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FastPathService_PauseSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FastPathServiceServer).PauseSandbox(ctx, req.(*PauseSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _FastPathService_ResumeSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResumeSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FastPathServiceServer).ResumeSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FastPathService_ResumeSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FastPathServiceServer).ResumeSandbox(ctx, req.(*ResumeSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // FastPathService_ServiceDesc is the grpc.ServiceDesc for FastPathService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -540,6 +624,14 @@ var FastPathService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteSandboxSnapshot",
 			Handler:    _FastPathService_DeleteSandboxSnapshot_Handler,
+		},
+		{
+			MethodName: "PauseSandbox",
+			Handler:    _FastPathService_PauseSandbox_Handler,
+		},
+		{
+			MethodName: "ResumeSandbox",
+			Handler:    _FastPathService_ResumeSandbox_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

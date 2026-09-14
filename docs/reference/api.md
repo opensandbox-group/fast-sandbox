@@ -49,6 +49,7 @@ spec:
 | `failurePolicy` | No | `Manual` or `AutoRecreate`; default `Manual` |
 | `recoveryTimeoutSeconds` | No | Durable delay before recovery action; default 60 |
 | `resetRevision` | No | Opaque monotonic reset trigger |
+| `desiredState` | No | `Running` (default) or `Paused`; `Paused` checkpoints the runtime to the artifact store and releases Fastlet capacity, flipping back to `Running` resumes the recorded checkpoint |
 | `poolRef` | Yes | Same-namespace SandboxPool |
 | `actionBindings` | No | Ordered atomic Handler/input list; order defines lifecycle invocation order |
 
@@ -61,11 +62,11 @@ User metadata is stored as ordinary Kubernetes labels. Labels under
 | --- | --- |
 | `observedGeneration` | Sandbox Spec generation represented by this Controller snapshot |
 | `placement` | Assignment attempt, Fastlet name/Pod UID, and nested recovery deadline |
-| `runtime` | Runtime state, concrete runtime generation, transition time/message, and accepted reset revision |
+| `runtime` | Runtime state, concrete runtime generation, transition time/message, accepted reset revision, pause-attempt epoch, and the checkpoint address while `Pausing`/`Paused`/`Resuming` |
 | `dataPlane` | Route state, route-generation fence, transition time, and message |
 | `infraComponents` | Per-component name, `Starting`/`Ready`/`Failed`, transition time, and message |
 | `actionBindings` | Per-Binding Handler, `Pending`/`Applying`/`Ready`/`Failed`, transition time, and message |
-| `conditions` | One aggregate standard `Ready` Condition |
+| `conditions` | Aggregate standard `Ready` plus `Suspended` (True only while durably paused) |
 
 Runtime and DataPlane use separate state enums. Input digests, invocation IDs,
 runtime IDs, and per-Handler fences remain internal and never appear in CRD
@@ -74,6 +75,24 @@ convergence requires the aggregate `Ready` Condition to be `True` with its
 `observedGeneration` equal to `metadata.generation`. A Binding transition time
 comes from Fastlet and includes an internally observed `Ready -> Applying ->
 Ready` cycle even if the Controller only polls the final `Ready` state.
+
+### Pause and resume
+
+`spec.desiredState: Paused` checkpoints a Ready Sandbox to the artifact store
+and releases its runtime. The CR, its UID/name identity, and
+`status.runtime.checkpoint` survive while the Sandbox occupies no Fastlet
+capacity; `status.runtime.state` moves `Ready -> Pausing -> Paused`. Pause is
+durable-first: `Paused` is reported only once the checkpoint set is complete
+in the store, and until then the Sandbox is neither usable nor resumable.
+
+Resume flips `desiredState` back to `Running`; the Sandbox is scheduled again
+(possibly on a different Fastlet) and restored from the recorded checkpoint
+(`status.runtime.state: Paused -> Resuming -> Ready`). The checkpoint is
+one-shot: a successful resume clears it. While paused there is no placement,
+`expireTime` still applies, a template snapshot is rejected (it requires a
+running Sandbox), and deletion removes the checkpoint along with the object.
+`status.runtime.checkpoint` is authoritative only while the runtime state is
+`Pausing`, `Paused`, or `Resuming` (`CheckpointActive`).
 
 ## SandboxPool
 
@@ -294,6 +313,8 @@ The protobuf contract is
 | `CreateSandboxSnapshot` | One-shot live checkpoint of a Ready Sandbox; `request_id` is the idempotency key, sandbox fence until `Publishing`, template-name fence until terminal |
 | `GetSandboxSnapshot` | CR-backed phase/artifact/placement observation |
 | `DeleteSandboxSnapshot` | Deletes the object (`expected_uid` fenced); never unpublishes stored artifacts |
+| `PauseSandbox` | Persist `spec.desiredState=Paused` (`expected_uid`/`expected_generation` fenced); completion (`PAUSED`, checkpoint durable) is observed via `GetSandbox` |
+| `ResumeSandbox` | Persist `spec.desiredState=Running` and schedule the recorded checkpoint, possibly cross-host; `expected_checkpoint_id` fences against a re-pause between read and resume; completion (`READY`) is observed via `GetSandbox` |
 | `GetPool`, `ListPools` | Runtime, fixed resources, components, capacity, and warm-image discovery |
 
 ### Atomic Create

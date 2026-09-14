@@ -21,6 +21,16 @@ service FastPathService {
   rpc CreateSandboxSnapshot(CreateSandboxSnapshotRequest) returns (CreateSandboxSnapshotResponse);
   rpc GetSandboxSnapshot(GetSandboxSnapshotRequest) returns (GetSandboxSnapshotResponse);
   rpc DeleteSandboxSnapshot(DeleteSandboxSnapshotRequest) returns (DeleteSandboxSnapshotResponse);
+  // PauseSandbox checkpoints a Ready Sandbox to the artifact store and
+  // releases its runtime. It returns after the desired state is persisted;
+  // completion (runtime_state PAUSED with the checkpoint durable) is
+  // observed via GetSandbox. Pause is a desired state, not a one-shot
+  // object: replaying the call with the same effect is idempotent.
+  rpc PauseSandbox(PauseSandboxRequest) returns (PauseSandboxResponse);
+  // ResumeSandbox flips the desired state back to Running and schedules the
+  // checkpointed Sandbox again, possibly on another Fastlet. Completion
+  // (runtime_state READY) is observed via GetSandbox.
+  rpc ResumeSandbox(ResumeSandboxRequest) returns (ResumeSandboxResponse);
 }
 
 message NamespacedName {
@@ -54,6 +64,21 @@ enum RuntimeState {
   RUNTIME_STATE_STOPPED = 6;
   RUNTIME_STATE_FAILED = 7;
   RUNTIME_STATE_UNAVAILABLE = 8;
+  // PAUSING: checkpoint window is running (dump + upload). Not resumable.
+  RUNTIME_STATE_PAUSING = 9;
+  // PAUSED: checkpoint durable in the artifact store, runtime released, no
+  // Fastlet capacity occupied.
+  RUNTIME_STATE_PAUSED = 10;
+  // RESUMING: a runtime is materializing from the recorded checkpoint.
+  RUNTIME_STATE_RESUMING = 11;
+}
+
+// SandboxDesiredState is the desired runtime lifecycle. Reports what the
+// caller last requested; the observed state is SandboxInfo.runtime.
+enum SandboxDesiredState {
+  SANDBOX_DESIRED_STATE_UNSPECIFIED = 0;
+  SANDBOX_DESIRED_STATE_RUNNING = 1;
+  SANDBOX_DESIRED_STATE_PAUSED = 2;
 }
 
 enum DataPlaneState {
@@ -111,6 +136,20 @@ message SandboxInfo {
   repeated InfraComponentInfo infra_components = 5;
   repeated ActionBindingInfo action_bindings = 6;
   bool ready = 7;
+  SandboxDesiredState desired_state = 8;
+  // checkpoint is the resume source of a paused Sandbox. It is set only in
+  // runtime states PAUSING, PAUSED, and RESUMING.
+  CheckpointInfo checkpoint = 9;
+}
+
+// CheckpointInfo is the published checkpoint of a paused Sandbox.
+message CheckpointInfo {
+  string checkpoint_id = 1;
+  string manifest_ref = 2;
+  string artifact_digest = 3;
+  int64 size_bytes = 4;
+  int64 paused_unix_seconds = 5;
+  string fastlet_name = 6;
 }
 
 message ActionBinding {
@@ -392,3 +431,44 @@ message DeleteSandboxSnapshotRequest {
 }
 
 message DeleteSandboxSnapshotResponse {}
+
+// PauseSandboxRequest checkpoints a Ready Sandbox. Rejected when the
+// Sandbox has no live runtime (e.g. already Paused, Pending, or Failed);
+// replaying an effective pause returns the current state.
+message PauseSandboxRequest {
+  // request_id is the idempotency/tracing key. Pause is a desired state
+  // (spec.desiredState=Paused), not a one-shot object, so the same effect
+  // is idempotent: replaying returns the current SandboxInfo.
+  string request_id = 1;
+  // sandbox is the pause target; expected_uid fences against a Sandbox
+  // recreated under the same name.
+  SandboxReference sandbox = 2;
+  // expected_generation, when non-zero, must match the Sandbox
+  // metadata.generation (CAS against concurrent spec updates).
+  int64 expected_generation = 3;
+}
+
+message PauseSandboxResponse {
+  SandboxInfo sandbox = 1;
+  int64 generation = 2;
+}
+
+// ResumeSandboxRequest resumes a Paused Sandbox from its recorded
+// checkpoint. Rejected when no checkpoint is recorded; replaying an
+// effective resume returns the current state.
+message ResumeSandboxRequest {
+  string request_id = 1;
+  SandboxReference sandbox = 2;
+  // expected_generation, when non-zero, must match the Sandbox
+  // metadata.generation (CAS against concurrent spec updates).
+  int64 expected_generation = 3;
+  // expected_checkpoint_id, when set, must match
+  // status.runtime.checkpoint.checkpointID: it fences the resume against a
+  // re-pause that happened between the caller's GetSandbox and this call.
+  string expected_checkpoint_id = 4;
+}
+
+message ResumeSandboxResponse {
+  SandboxInfo sandbox = 1;
+  int64 generation = 2;
+}
