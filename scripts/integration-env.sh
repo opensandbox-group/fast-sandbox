@@ -3924,6 +3924,12 @@ snapshot_on_error() {
 #   new placement pulls the checkpoint from the store -> guest memory
 #   restored (uptime + in-guest marker survive) -> execd /ping.
 #
+# The source runs on the egress pool with a deny policy, so the run also
+# proves the policy continuity contract: the published checkpoint manifest
+# records the binding verbatim, and the resume re-applies it from the
+# (authoritative) Sandbox spec with egress still blocked afterwards. Requires
+# opensandbox/egress:latest in local docker, like verify-snapshot.
+#
 # Evidence collected into logs/pause-e2e-<ts>/ on success AND failure: key
 # timings (pause RPC -> Pausing -> checkpoint durable -> Paused, driver dump
 # window and publish, resume -> Resuming -> Ready, first /ping, total offline
@@ -4004,16 +4010,6 @@ pause_env_up() {
 	# is preserved.
 	snapshot_prune_store
 
-	# Re-apply the standard pool (warmImages handled like up) so recreated
-	# fastlet pods carry the freshly loaded image.
-	local pool_spec="$WORK/pool-firecracker-pause.yaml"
-	if [[ "$WARM_IMAGES" == "1" ]]; then
-		render_firecracker_pool_spec "$REPO_ROOT/config/samples/pool-firecracker.yaml" "$pool_spec"
-	else
-		sed '/^  warmImages:/,$d' "$REPO_ROOT/config/samples/pool-firecracker.yaml" > "$pool_spec"
-	fi
-	kubectl apply -f "$pool_spec" >/dev/null
-
 	kubectl apply -k "$REPO_ROOT/config/all-in-one" >/dev/null
 	artifact_store_config
 	kubectl -n "$NS" rollout restart deploy/fast-sandbox-controller >/dev/null
@@ -4024,18 +4020,33 @@ pause_env_up() {
 	wait_for "agent rollout ready (write credential)" 180 \
 		kubectl -n "$NS" rollout status daemonset/firecracker-runtime-agent --timeout=10s
 	wait_for "fastlet pod ready (recreated)" 180 fastlet_pod_ready
-	if [[ "$WARM_IMAGES" == "1" ]]; then
-		wait_for "pause pool warm image cached" 300 warm_images_ready
-	fi
-	wait_for "pause pool placement converged (idle fastlets >= 1)" 180 pool_idle_fastlets
-	pass "pause-capable images rolled; standard firecracker pool ready"
+
+	# The source carries an egress binding, so the recorded network policy and
+	# its re-application on resume are verifiable: run the sandbox on the
+	# single-fastlet egress pool (same preparation as verify-snapshot).
+	egress_image_ready
+	snapshot_policy_render_pool
+	kubectl -n "$NS" apply -f "$WORK/pool-firecracker-egress-snapshot.yaml" >/dev/null
+	wait_for "exactly one egress fastlet pod" 180 egress_single_pod
+	wait_for "egress container ready" 180 egress_container_ready
+	wait_for "egress pool warm image cached" 300 egress_warm_ready
+	wait_for "egress pool placement converged (idle fastlets >= 1)" 180 pool_idle_fastlets "$EGRESS_POOL"
+	pass "pause-capable images rolled; egress pool ready (policy checks live)"
 }
 
 pause_source_up() {
 	snapshot_cleanup_sandbox "$PAUSE_SANDBOX"
-	fastctl_run_sandbox "$PAUSE_SANDBOX"
+	# The source carries a deny policy: the checkpoint must record it and the
+	# resume must re-apply it (the CR stays authoritative).
+	snapshot_policy_run "$PAUSE_SANDBOX" "$SBX_IMAGE" "$EGRESS_DENY_POLICY"
 	wait_for "pause source sandbox Ready" 600 sandbox_ready "$PAUSE_SANDBOX"
+	wait_for "source egress binding Ready" 120 egress_binding_ready "$PAUSE_SANDBOX"
+	wait_for "source execd control intact under deny" 120 egress_execd_control "$PAUSE_SANDBOX"
 	wait_for "pause source /ping" 120 probe_execd "$PAUSE_SANDBOX"
+	test_egress_denied "$PAUSE_SANDBOX"
+	[[ "$(kubectl -n "$NS" get sandbox "$PAUSE_SANDBOX" -o jsonpath='{.spec.actionBindings[?(@.handler=="egress")].input}')" == "$EGRESS_DENY_POLICY" ]] \
+		|| fail "source Sandbox does not carry the expected deny binding"
+	pass "source deny policy in effect (egress blocked, control intact)"
 
 	# Guest state that only a memory restore can preserve: the uptime must
 	# stay monotonic and the marker file must survive the pause.
@@ -4171,6 +4182,13 @@ pause_run() {
 	mc stat "chain/${PAUSE_CHECKPOINT_REF#s3://}" >/dev/null 2>&1 \
 		|| fail "checkpoint manifest missing from the store: $PAUSE_CHECKPOINT_REF"
 	pause_record "checkpoint_size_bytes" "${size:-0}"
+	# The artifact set is self-contained: the source's egress binding must be
+	# recorded verbatim in the published manifest.
+	local recorded
+	recorded="$(mc cat "chain/${PAUSE_CHECKPOINT_REF#s3://}" 2>/dev/null | jq -r '.actionBindings[]? | select(.handler=="egress") | .input')"
+	[[ "$recorded" == "$EGRESS_DENY_POLICY" ]] \
+		|| fail "checkpoint manifest did not record the egress policy (got: ${recorded:-<none>})"
+	log "checkpoint manifest records the egress policy verbatim: $recorded"
 	highlight "  checkpoint: $PAUSE_CHECKPOINT_REF"
 	highlight "  artifact store path: chain/$MINIO_BUCKET/$(dirname "${PAUSE_CHECKPOINT_REF#s3://$MINIO_BUCKET/}")/"
 	mc ls "chain/$MINIO_BUCKET/$(dirname "${PAUSE_CHECKPOINT_REF#s3://$MINIO_BUCKET/}")/" 2>/dev/null | tee -a "$WORK/run.log" >&2 || true
@@ -4269,8 +4287,7 @@ pause_resume() {
 	log "deleting the pausing Fastlet Pod $PAUSE_OLD_FASTLET to force a cross-host resume"
 	kubectl -n "$NS" delete pod "$PAUSE_OLD_FASTLET" >/dev/null 2>&1 || fail "cannot delete the pausing Fastlet Pod"
 	wait_for "pausing Fastlet Pod gone" 120 pause_old_fastlet_gone
-	wait_for "replacement Fastlet Pod ready" 180 fastlet_pod_ready
-	wait_for "placement converged after replacement" 180 pool_idle_fastlets
+	wait_for "replacement egress Fastlet Pod ready" 240 pool_idle_fastlets "$EGRESS_POOL"
 	pause_record "pause_to_resume_gap_ms" "$(( ($(now_ms) - PAUSE_PAUSED_AT_MS) / 1000000 ))"
 
 	local t0 out rc state last_state="" last_message="" deadline_ns beat=0
@@ -4347,11 +4364,20 @@ pause_resume() {
 	[[ "$spec_state" == "Running" ]] || fail "spec.state is $spec_state (want Running)"
 	[[ -z "$checkpoint_id" ]] || fail "checkpoint was not consumed by the resume (id=$checkpoint_id)"
 	[[ "$suspended" != "True" ]] || fail "Suspended condition still True after the resume"
+	# Policy continuity: the CR keeps the deny binding, the resumed egress
+	# handler must apply it, and egress must still be blocked.
+	[[ "$(kubectl -n "$NS" get sandbox "$PAUSE_SANDBOX" -o jsonpath='{.spec.actionBindings[?(@.handler=="egress")].input}')" == "$EGRESS_DENY_POLICY" ]] \
+		|| fail "resume lost the egress binding from the Sandbox spec"
+	wait_for "resumed egress binding Ready" 240 egress_binding_ready "$PAUSE_SANDBOX"
+	wait_for "resumed execd control intact under deny" 120 egress_execd_control "$PAUSE_SANDBOX"
+	test_egress_denied "$PAUSE_SANDBOX"
+	pass "resume re-applied the deny policy (egress still blocked)"
+
 	show_restore_timings "$PAUSE_SANDBOX"
 	local line
 	line="$(kubectl -n "$NS" logs --request-timeout=10s --tail=300 "$new_fastlet" 2>/dev/null | grep 'firecracker sandbox created' | tail -1)"
 	[[ -n "$line" ]] && pause_record "resume_restore_total_ms" "$(duration_to_ms "$(klog_field "$line" total)")"
-	pass "cross-host resume restored memory on $new_fastlet (uptime + marker survived, checkpoint consumed)"
+	pass "cross-host resume restored memory on $new_fastlet (uptime + marker survived, checkpoint consumed, policy re-applied)"
 }
 
 pause_evidence() {
@@ -4378,6 +4404,9 @@ pause_evidence() {
 	resume_fastlet="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.placement.fastletName}' 2>/dev/null || true)"
 	[[ -n "$resume_fastlet" ]] && kubectl -n "$NS" logs "$resume_fastlet" --since=30m --tail=800 > "$PAUSE_E2E_DIR/fastlet-resume.log" 2>&1 || true
 	kubectl -n "$NS" logs daemonset/firecracker-runtime-agent --tail=600 > "$PAUSE_E2E_DIR/agent.log" 2>&1 || true
+	if [[ "$PAUSE_CHECKPOINT_REF" == s3://* ]]; then
+		mc cat "chain/${PAUSE_CHECKPOINT_REF#s3://}" > "$PAUSE_E2E_DIR/checkpoint-manifest.json" 2>/dev/null || true
+	fi
 	local node
 	node="$(kind_node)"
 	if [[ -n "$node" && -n "$PAUSE_CHECKPOINT_DIGEST" ]]; then
@@ -4415,7 +4444,7 @@ verify_pause() {
 	trap 'pause_on_error' EXIT
 	# Stage 1 rolls the controller/fastlet: run it BEFORE the forward/daemon
 	# attach, or the rollout kills the forward mid-run.
-	run_stage "pause 1: pause-capable images + standard pool" pause_env_up
+	run_stage "pause 1: pause-capable images + egress pool" pause_env_up
 	snapshot_helpers_up
 	port_forward_up
 	resolve_daemon_up
@@ -4594,7 +4623,10 @@ usage: integration-env.sh [--cleanup|--auto-clean] {up|down|status|verify|verify
            pause/resume phase latencies, the driver dump/publish and restore
            breakdown, the total offline window, and collects component logs
            into logs/pause-e2e-<ts>/ (env: PAUSE_SANDBOX, PAUSE_TIMEOUT_S,
-           PAUSE_MAX_ATTEMPTS, PAUSE_SKIP_IMAGE_REBUILD=1)
+           PAUSE_MAX_ATTEMPTS, PAUSE_SKIP_IMAGE_REBUILD=1; the source
+           carries a deny egress policy recorded in the checkpoint manifest
+           and re-applied on resume, so it requires
+           opensandbox/egress:latest in local docker like verify-snapshot)
   verify-p2p
            DART data-plane evidence (stage 2): presigned URL -> node-local
            DART -> origin (cold) -> block cache (warm, origin delta 0);
