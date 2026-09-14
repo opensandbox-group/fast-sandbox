@@ -177,6 +177,20 @@ inherit_go_env() {
 	fi
 }
 
+# render_firecracker_pool_spec rewrites a pool sample's warmImages entry to
+# the environment's image reference. The golden template is built from
+# SBX_IMAGE (possibly mirror-rewritten) and warm lookups are byte-exact
+# (agent index/<sha256(image)>), so applying a sample as-is points the
+# preheat at a reference that was never published and the pool status loops
+# on "image is not ready" forever. Every firecracker pool apply in this
+# script must go through this renderer.
+render_firecracker_pool_spec() { # sample output
+	local sample="$1" output="$2"
+	sed -e "s|^  - alpine:3.19$|  - $SBX_IMAGE|" "$sample" > "$output"
+	grep -q "^  - $SBX_IMAGE\$" "$output" \
+		|| fail "could not render image=$SBX_IMAGE into $sample warmImages"
+}
+
 # mirror_ref rewrites an implicit Docker Hub reference to go through
 # $REGISTRY_MIRROR (see the REGISTRY_MIRROR comment above). A reference that
 # already names a registry -- a host with a dot or colon before the first '/'
@@ -1170,7 +1184,9 @@ pool_up() {
 		# Optional preheat mode: warmImages pull the artifact set on every
 		# fastlet node during up (fast delivery baselines; the second node
 		# is still served by the first node's DART peer).
-		kubectl apply -f "$REPO_ROOT/config/samples/pool-firecracker.yaml" >/dev/null
+		local warm_spec="$WORK/pool-firecracker-warm.yaml"
+		render_firecracker_pool_spec "$REPO_ROOT/config/samples/pool-firecracker.yaml" "$warm_spec"
+		kubectl apply -f "$warm_spec" >/dev/null
 		wait_for "fastlet pod running" 150 fastlet_pod_ready
 		wait_for "pool warmImages Ready" 300 warm_images_ready
 		p2p_evidence "warm preheat"
@@ -2734,7 +2750,9 @@ verify_egress() {
 	# with different policies on one egress control plane.
 	run_stage "egress 1: reset egress pool (single fastlet) + egress container ready" \
 		kubectl -n "$NS" delete sandboxpool "$EGRESS_POOL" --ignore-not-found
-	kubectl -n "$NS" apply -f config/samples/pool-firecracker-egress.yaml
+	local egress_spec="$WORK/pool-firecracker-egress.yaml"
+	render_firecracker_pool_spec "$REPO_ROOT/config/samples/pool-firecracker-egress.yaml" "$egress_spec"
+	kubectl -n "$NS" apply -f "$egress_spec"
 	wait_for "exactly one egress fastlet pod" 180 egress_single_pod
 	wait_for "egress container ready in the fastlet pod" 180 egress_container_ready
 	wait_for "egress pool warm image cached (fastlet can accept sandboxes)" \
@@ -3543,10 +3561,7 @@ snapshot_guest_uptime() { # sandbox -> seconds (may be empty)
 # reference; a raw "alpine:3.19" warm entry would never resolve).
 snapshot_policy_render_pool() {
 	local rendered="$WORK/pool-firecracker-egress-snapshot.yaml"
-	sed -e "s|^  - alpine:3.19$|  - $SBX_IMAGE|" \
-		"$REPO_ROOT/config/samples/pool-firecracker-egress.yaml" > "$rendered"
-	grep -q "^  - $SBX_IMAGE\$" "$rendered" \
-		|| fail "could not render the mirrored image into the egress pool warmImages"
+	render_firecracker_pool_spec "$REPO_ROOT/config/samples/pool-firecracker-egress.yaml" "$rendered"
 	pass "egress pool spec rendered (warmImages -> $SBX_IMAGE)"
 }
 

@@ -98,5 +98,10 @@ spec:
     cpu: "1"
     memory: 512Mi
     pids: 128
+  # warmImages lookups are byte-exact (the agent resolves index/<sha256(image)>,
+  # no normalization), so this entry MUST match the built template's
+  # spec.image. The integration environment renders it to its (possibly
+  # mirror-rewritten) SBX_IMAGE before applying; keep the default in sync
+  # when applying the sample by hand.
   warmImages:
   - alpine:3.19
