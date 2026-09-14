@@ -137,7 +137,8 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 	klog.InfoS("firecracker sandbox dumped",
 		"sandboxId", plan.sandboxID, "snapshotId", plan.snapshotID,
 		"pauseWindow", plan.pauseWindow.String(), "spillMove", plan.spillMove.String(),
-		"spilled", plan.spilled)
+		"spilled", plan.spilled, "rootfsClone", plan.rootfsClone.String(), "rootfsCopy", plan.rootfsCopy.String(),
+		"pauseAPI", plan.pauseAPI.String(), "dumpAPI", plan.dumpAPI.String(), "resumeAPI", plan.resumeAPI.String())
 
 	sizeBytes, err := assembleSnapshotManifest(plan.stateRoot, plan.staging, plan.sandboxDir, firecrackerBinary, input.ActionBindings)
 	if err != nil {
@@ -302,6 +303,11 @@ type dumpPlan struct {
 	spilled     bool
 	pauseWindow time.Duration
 	spillMove   time.Duration
+	rootfsClone time.Duration
+	rootfsCopy  time.Duration
+	pauseAPI    time.Duration
+	dumpAPI     time.Duration
+	resumeAPI   time.Duration
 }
 
 // jailRoot returns the jail root of the plan's Sandbox (jailer mode only).
@@ -450,9 +456,11 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 	// in-window full copy: it is not atomic and must happen while paused.
 	stagedRootfs := filepath.Join(plan.staging, publishedRootfsName)
 	rootfsCloned := false
+	reflinkStarted := time.Now()
 	if err := reflinkOnly(rootfs, stagedRootfs); err == nil {
 		rootfsCloned = true
 	}
+	plan.rootfsClone = time.Since(reflinkStarted)
 
 	client := d.newClient(state.APIAddress)
 	defer client.Close()
@@ -462,25 +470,33 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		cleanupSpill()
 		return fmt.Errorf("pause microVM: %w", err)
 	}
+	plan.pauseAPI = time.Since(pauseStarted)
 	klog.InfoS("firecracker sandbox paused for dump",
-		"sandboxId", plan.sandboxID, "snapshotId", plan.snapshotID, "spilled", plan.spilled)
+		"sandboxId", plan.sandboxID, "snapshotId", plan.snapshotID, "spilled", plan.spilled,
+		"rootfsCloned", rootfsCloned)
 	dumpErr := func() error {
 		if !rootfsCloned {
+			copyStarted := time.Now()
 			if err := copyReflinkOrCopy(rootfs, stagedRootfs); err != nil {
 				return fmt.Errorf("copy instance rootfs: %w", err)
 			}
+			plan.rootfsCopy = time.Since(copyStarted)
 		}
-		if err := client.CreateSnapshot(ctx, SnapshotCreateRequest{
+		dumpStarted := time.Now()
+		err := client.CreateSnapshot(ctx, SnapshotCreateRequest{
 			SnapshotType: "Full",
 			SnapshotPath: vmstateTarget,
 			MemFilePath:  memoryTarget,
-		}); err != nil {
+		})
+		plan.dumpAPI = time.Since(dumpStarted)
+		if err != nil {
 			return fmt.Errorf("create Firecracker snapshot: %w", err)
 		}
 		return nil
 	}()
 	// The VM resumes regardless of the dump outcome: the business-visible
 	// pause window closes here.
+	resumeStarted := time.Now()
 	if _, resumeErr := resumeVM(ctx, client, plan.bootTimeout); resumeErr != nil {
 		plan.pauseWindow = time.Since(pauseStarted)
 		cleanupSpill()
@@ -489,13 +505,16 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		}
 		return fmt.Errorf("resume microVM after snapshot: %w", resumeErr)
 	}
+	plan.resumeAPI = time.Since(resumeStarted)
 	plan.pauseWindow = time.Since(pauseStarted)
 	if dumpErr != nil {
 		cleanupSpill()
 		return dumpErr
 	}
 	klog.InfoS("firecracker sandbox resumed after dump",
-		"sandboxId", plan.sandboxID, "snapshotId", plan.snapshotID, "pauseWindow", plan.pauseWindow.String())
+		"sandboxId", plan.sandboxID, "snapshotId", plan.snapshotID, "pauseWindow", plan.pauseWindow.String(),
+		"rootfsClone", plan.rootfsClone.String(), "rootfsCopy", plan.rootfsCopy.String(),
+		"pauseAPI", plan.pauseAPI.String(), "dumpAPI", plan.dumpAPI.String(), "resumeAPI", plan.resumeAPI.String())
 	if !plan.spilled {
 		if plan.jailed {
 			// Move the chroot-local dump into the staging directory: the

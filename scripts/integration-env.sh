@@ -4019,6 +4019,11 @@ pause_fastlet_timings() { # fastlet
 		case "$line" in
 			*sandbox\ dumped*)
 				pause_record "checkpoint_dump_window_ms" "$(duration_to_ms "$(klog_field "$line" pauseWindow)")"
+				pause_record "checkpoint_rootfs_clone_ms" "$(duration_to_ms "$(klog_field "$line" rootfsClone)")"
+				pause_record "checkpoint_rootfs_copy_ms" "$(duration_to_ms "$(klog_field "$line" rootfsCopy)")"
+				pause_record "checkpoint_pause_api_ms" "$(duration_to_ms "$(klog_field "$line" pauseAPI)")"
+				pause_record "checkpoint_dump_api_ms" "$(duration_to_ms "$(klog_field "$line" dumpAPI)")"
+				pause_record "checkpoint_resume_api_ms" "$(duration_to_ms "$(klog_field "$line" resumeAPI)")"
 				;;
 			*snapshot\ published*)
 				pause_record "checkpoint_publish_ms" "$(duration_to_ms "$(klog_field "$line" publish)")"
