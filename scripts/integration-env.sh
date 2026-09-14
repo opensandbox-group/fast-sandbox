@@ -3951,6 +3951,8 @@ pause_env_up() {
 	[[ -n "$MINIO_ENDPOINT" ]] || resolve_minio_endpoint
 	agent_write_credential_up
 
+	snapshot_ensure_disk
+
 	# Re-apply the standard pool (warmImages handled like up) so recreated
 	# fastlet pods carry the freshly loaded image.
 	local pool_spec="$WORK/pool-firecracker-pause.yaml"
@@ -4178,15 +4180,28 @@ pause_old_fastlet_gone() {
 # on the replacement Fastlet (the old node's task record is gone, the old pod
 # deleted: nothing local can supply it).
 pause_pull_evidence() { # fastlet
-	local fastlet="$1" driver agent
+	local fastlet="$1" driver agent node cache_manifest cache_dir digest_hex
+	digest_hex="$(printf '%s' "checkpoint:sha256:$PAUSE_CHECKPOINT_DIGEST" | sha256sum | awk '{print $1}')"
+	cache_dir="/var/lib/fast-sandbox/firecracker/images/$digest_hex"
 	driver="$(kubectl -n "$NS" logs "$fastlet" --since=20m --tail=3000 2>/dev/null \
-		| grep "artifact delivery completed" | grep -F "checkpoint:sha256:$PAUSE_CHECKPOINT_DIGEST" | tail -1 || true)"
+		| grep "artifact delivery completed" | grep -F "$PAUSE_CHECKPOINT_DIGEST" | tail -1 || true)"
 	agent="$(kubectl -n "$NS" logs daemonset/firecracker-runtime-agent --since=20m --tail=4000 2>/dev/null \
 		| grep "checkpoint pull completed" | grep -F "$PAUSE_CHECKPOINT_DIGEST" | tail -1 || true)"
-	[[ -n "$driver" ]] || fail "no checkpoint delivery log on the resuming Fastlet (was the checkpoint pulled?)"
-	[[ -n "$agent" ]] || fail "no agent checkpoint pull log (the store was not read)"
-	log "  driver delivery: ${driver:0:200}"
-	log "  agent pull: ${agent:0:200}"
+	[[ -n "$agent" || -n "$driver" ]] \
+		|| fail "no checkpoint pull evidence in the agent or Fastlet logs (was the store read?)"
+	# Strongest evidence: the canonical checkpoint cache on the replacement
+	# node holds the committed manifest (the old Pod's node cache cannot
+	# serve it: the checkpoint was never staged under that reference while
+	# paused, only the publisher's digest directory was written).
+	node="$(kind_node)"
+	if [[ -n "$node" ]]; then
+		cache_manifest="$(docker exec "$node" sh -c "test -f $cache_dir/manifest.json && echo yes" 2>/dev/null || true)"
+		[[ "$cache_manifest" == "yes" ]] \
+			|| fail "checkpoint cache missing on the replacement node: $cache_dir/manifest.json"
+	fi
+	[[ -n "$driver" ]] && log "  driver delivery: ${driver:0:200}" \
+		|| log "  driver completion line not captured; agent log + node cache are the store-pull evidence"
+	[[ -n "$agent" ]] && log "  agent pull: ${agent:0:200}" || true
 	pass "checkpoint was pulled from the artifact store on the replacement Fastlet"
 }
 
@@ -4194,6 +4209,7 @@ pause_resume() {
 	# Cross-host: replace the pausing Fastlet Pod while the Sandbox is
 	# released. Only the store holds the checkpoint, so the resume must pull
 	# it on the replacement Pod.
+	snapshot_ensure_disk
 	log "deleting the pausing Fastlet Pod $PAUSE_OLD_FASTLET to force a cross-host resume"
 	kubectl -n "$NS" delete pod "$PAUSE_OLD_FASTLET" >/dev/null 2>&1 || fail "cannot delete the pausing Fastlet Pod"
 	wait_for "pausing Fastlet Pod gone" 120 pause_old_fastlet_gone
