@@ -17,10 +17,6 @@ The protobuf contract is
 [`api/proto/v2/fastpath.proto`](../../api/proto/v2/fastpath.proto). Nothing
 below requires `fastctl`; the CLI is a thin client over the same gRPC API.
 
-A Chinese field-level companion reference (request fields, CRD spec/status,
-and state machines) is available at
-[pause-resume-snapshot-integration.zh-CN.md](pause-resume-snapshot-integration.zh-CN.md).
-
 ## Choose the primitive
 
 | | Pause / Resume | Snapshot |
@@ -309,6 +305,60 @@ Declarative pause/resume has no request fencing: concurrent spec writers can
 race. If your apiserver already serializes user intent, that is equivalent;
 otherwise prefer the gRPC fences.
 
+## State machines and status enums
+
+Desired state (`spec.state`) flips between `Running` and `Paused`; the calls
+and patches declare intent, the controller converges the observed states:
+
+```text
+runtime_state:  READY ──► PAUSING ──► PAUSED ──► RESUMING ──► READY
+                  ▲           │                        (checkpoint cleared)
+                  └───────────┘
+        dump failures keep the runtime READY and serving; the controller
+        retries with a new pauseAttempt epoch (~5 s cadence)
+```
+
+Observed runtime states and their meaning:
+
+| State | Meaning |
+| --- | --- |
+| `Unknown` / `Pending` / `Creating` | No observation yet / runtime queued / runtime starting |
+| `Ready` | Running and serving; the only state that accepts snapshots and enters the pause window |
+| `Pausing` | Checkpoint window (dump + upload). The runtime still serves (durable-first) but is **not resumable**; resuming here just cancels the pause |
+| `Paused` | Checkpoint durable in the store, runtime and assignment released, zero Fastlet capacity. `GetSandbox` serves the CRD projection |
+| `Resuming` | A runtime is materializing from the checkpoint (possibly cross-host); `data_plane=PENDING`, old routes are already invalid |
+| `Stopping` / `Stopped` / `Failed` / `Unavailable` | Delete/reset path, terminated, or transiently unobservable |
+
+The `Suspended` condition marks the pause lifecycle; it is `True` only for a
+durably paused Sandbox (`Paused`, reason `CheckpointPublished`) — use it as
+the accurate "capacity released" signal:
+
+| Status | Reasons | Meaning |
+| --- | --- | --- |
+| `False` | `Resuming`, `CheckpointPublished`, dump-phase codes | Pause window in progress |
+| `False` | `PauseFailed`, `FastletUnavailable`, `PauseWaitingRuntime`, deterministic rejection codes (e.g. `SnapshotUnsupported`) | Pause blocked or rejected; the runtime stays `Ready` and serving |
+| `True` | `CheckpointPublished` | Durably paused: no capacity occupied |
+| `False` | `Resumed` | Restored from the checkpoint |
+
+Snapshot phases and fences:
+
+```text
+Pending ──► Creating ──► Publishing ──► Succeeded
+    │           │             │
+    └───────────┴─────────────┴──► Failed (terminal; retry with a new request_id)
+```
+
+The **sandbox fence** covers only `Pending`/`Creating`; a snapshot in
+`Publishing` no longer blocks the next snapshot of the same Sandbox. The
+**template-name fence** holds until the holder terminates. Terminal phases
+are monotonic, and a wedged task (10 min unadmitted, 45 min unobservable) is
+failed by the controller with its fences released.
+
+gRPC enums map one-to-one onto CRD status values: `SandboxInfo.runtime.state`
+↔ `status.runtime.state`, `SandboxInfo.state` (`RUNNING`/`PAUSED`) ↔
+`spec.state` (`Running`/`Paused`), and `SnapshotPhase` ↔ SandboxSnapshot
+`status.phase`.
+
 ## Integration checklist
 
 An apiserver exposing these operations should:
@@ -350,7 +400,7 @@ artifact validation:
   machine, identity model, non-goals
 - [Sandbox Snapshots](sandbox-snapshots.md) — snapshot internals: spill
   area, fences, artifact layout, recorded network policy
-- [Artifact manifest reference (Chinese)](artifact-manifest-reference.zh-CN.md) —
-  every field of the published manifest.json and how producers/consumers use it
+- [Artifact manifest reference](artifact-manifest-reference.md) — every
+  field of the published manifest.json and how producers/consumers use it
 - [OpenSandbox integration](opensandbox-integration.md) — create, endpoint
   resolution, and route contract around these operations

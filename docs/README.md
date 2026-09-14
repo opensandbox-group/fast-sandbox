@@ -32,7 +32,7 @@ Fast Sandbox documentation is organized by reader intent:
 - [SandboxTemplate golden images](guides/sandboxtemplate-golden-images.md)
 - [Sandbox Snapshots](guides/sandbox-snapshots.md)
 - [Pause, resume, and snapshot integration](guides/pause-resume-snapshot-integration.md)
-- [Artifact manifest reference (Chinese)](guides/artifact-manifest-reference.zh-CN.md)
+- [Artifact manifest reference](guides/artifact-manifest-reference.md)
 - [Private registries](guides/private-registries.md)
 - [Secure runtimes](guides/secure-runtimes.md)
 - [Runtime node installation](guides/runtime-node-installation.md)
