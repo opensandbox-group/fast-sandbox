@@ -3977,6 +3977,11 @@ pause_env_up() {
 	agent_write_credential_up
 
 	snapshot_ensure_disk
+	# Every successful pause publishes a fresh multi-GiB checkpoint set; the
+	# store keeps them forever (consumed checkpoints are only unreferenced,
+	# never deleted). Drop the previous runs' sets; the golden template set
+	# is preserved.
+	snapshot_prune_store
 
 	# Re-apply the standard pool (warmImages handled like up) so recreated
 	# fastlet pods carry the freshly loaded image.
