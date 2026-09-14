@@ -4203,6 +4203,19 @@ pause_run() {
 		sleep 1
 	done
 	[[ "$missed" -eq 0 ]] || fail "paused sandbox still answers /ping ($missed/3): runtime not released"
+
+	# The release runs the declarative delete path on the Fastlet, which
+	# removes the sandbox's Action bindings (egress REMOVE_BINDING) before the
+	# runtime/slot teardown: no per-subject policy may outlive a paused
+	# runtime on the node. Checked BEFORE the cross-host stage replaces the
+	# pausing Pod.
+	local egress_pod
+	egress_pod="$(egress_pool_pods_live | head -1)"
+	if [[ -n "$egress_pod" ]]; then
+		egress_subject_absent "$PAUSE_SANDBOX" "$egress_pod" \
+			|| fail "egress policy for $PAUSE_SANDBOX is still installed after the pause release"
+		pass "egress policy removed with the released runtime (resume re-registers it from the CR)"
+	fi
 	pass "pause Succeeded in $(ms2s $(( (PAUSE_PAUSED_AT_MS - t0) / 1000000 )))s: checkpoint durable, runtime released, store-addressable"
 }
 
