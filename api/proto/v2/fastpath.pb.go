@@ -147,54 +147,54 @@ func (RuntimeState) EnumDescriptor() ([]byte, []int) {
 	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{1}
 }
 
-// SandboxDesiredState is the desired runtime lifecycle. Reports what the
-// caller last requested; the observed state is SandboxInfo.runtime.
-type SandboxDesiredState int32
+// SandboxState is the desired runtime lifecycle (spec.state): what the
+// caller last requested. The observed runtime state is SandboxInfo.runtime.
+type SandboxState int32
 
 const (
-	SandboxDesiredState_SANDBOX_DESIRED_STATE_UNSPECIFIED SandboxDesiredState = 0
-	SandboxDesiredState_SANDBOX_DESIRED_STATE_RUNNING     SandboxDesiredState = 1
-	SandboxDesiredState_SANDBOX_DESIRED_STATE_PAUSED      SandboxDesiredState = 2
+	SandboxState_SANDBOX_STATE_UNSPECIFIED SandboxState = 0
+	SandboxState_SANDBOX_STATE_RUNNING     SandboxState = 1
+	SandboxState_SANDBOX_STATE_PAUSED      SandboxState = 2
 )
 
-// Enum value maps for SandboxDesiredState.
+// Enum value maps for SandboxState.
 var (
-	SandboxDesiredState_name = map[int32]string{
-		0: "SANDBOX_DESIRED_STATE_UNSPECIFIED",
-		1: "SANDBOX_DESIRED_STATE_RUNNING",
-		2: "SANDBOX_DESIRED_STATE_PAUSED",
+	SandboxState_name = map[int32]string{
+		0: "SANDBOX_STATE_UNSPECIFIED",
+		1: "SANDBOX_STATE_RUNNING",
+		2: "SANDBOX_STATE_PAUSED",
 	}
-	SandboxDesiredState_value = map[string]int32{
-		"SANDBOX_DESIRED_STATE_UNSPECIFIED": 0,
-		"SANDBOX_DESIRED_STATE_RUNNING":     1,
-		"SANDBOX_DESIRED_STATE_PAUSED":      2,
+	SandboxState_value = map[string]int32{
+		"SANDBOX_STATE_UNSPECIFIED": 0,
+		"SANDBOX_STATE_RUNNING":     1,
+		"SANDBOX_STATE_PAUSED":      2,
 	}
 )
 
-func (x SandboxDesiredState) Enum() *SandboxDesiredState {
-	p := new(SandboxDesiredState)
+func (x SandboxState) Enum() *SandboxState {
+	p := new(SandboxState)
 	*p = x
 	return p
 }
 
-func (x SandboxDesiredState) String() string {
+func (x SandboxState) String() string {
 	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
 }
 
-func (SandboxDesiredState) Descriptor() protoreflect.EnumDescriptor {
+func (SandboxState) Descriptor() protoreflect.EnumDescriptor {
 	return file_api_proto_v2_fastpath_proto_enumTypes[2].Descriptor()
 }
 
-func (SandboxDesiredState) Type() protoreflect.EnumType {
+func (SandboxState) Type() protoreflect.EnumType {
 	return &file_api_proto_v2_fastpath_proto_enumTypes[2]
 }
 
-func (x SandboxDesiredState) Number() protoreflect.EnumNumber {
+func (x SandboxState) Number() protoreflect.EnumNumber {
 	return protoreflect.EnumNumber(x)
 }
 
-// Deprecated: Use SandboxDesiredState.Descriptor instead.
-func (SandboxDesiredState) EnumDescriptor() ([]byte, []int) {
+// Deprecated: Use SandboxState.Descriptor instead.
+func (SandboxState) EnumDescriptor() ([]byte, []int) {
 	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{2}
 }
 
@@ -915,7 +915,7 @@ type SandboxInfo struct {
 	InfraComponents   []*InfraComponentInfo  `protobuf:"bytes,5,rep,name=infra_components,json=infraComponents,proto3" json:"infra_components,omitempty"`
 	ActionBindings    []*ActionBindingInfo   `protobuf:"bytes,6,rep,name=action_bindings,json=actionBindings,proto3" json:"action_bindings,omitempty"`
 	Ready             bool                   `protobuf:"varint,7,opt,name=ready,proto3" json:"ready,omitempty"`
-	DesiredState      SandboxDesiredState    `protobuf:"varint,8,opt,name=desired_state,json=desiredState,proto3,enum=fastpath.v2.SandboxDesiredState" json:"desired_state,omitempty"`
+	State             SandboxState           `protobuf:"varint,8,opt,name=state,proto3,enum=fastpath.v2.SandboxState" json:"state,omitempty"`
 	// checkpoint is the resume source of a paused Sandbox. It is set only in
 	// runtime states PAUSING, PAUSED, and RESUMING.
 	Checkpoint    *CheckpointInfo `protobuf:"bytes,9,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
@@ -1002,11 +1002,11 @@ func (x *SandboxInfo) GetReady() bool {
 	return false
 }
 
-func (x *SandboxInfo) GetDesiredState() SandboxDesiredState {
+func (x *SandboxInfo) GetState() SandboxState {
 	if x != nil {
-		return x.DesiredState
+		return x.State
 	}
-	return SandboxDesiredState_SANDBOX_DESIRED_STATE_UNSPECIFIED
+	return SandboxState_SANDBOX_STATE_UNSPECIFIED
 }
 
 func (x *SandboxInfo) GetCheckpoint() *CheckpointInfo {
@@ -3414,7 +3414,7 @@ func (*DeleteSandboxSnapshotResponse) Descriptor() ([]byte, []int) {
 type PauseSandboxRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// request_id is the idempotency/tracing key. Pause is a desired state
-	// (spec.desiredState=Paused), not a one-shot object, so the same effect
+	// (spec.state=Paused), not a one-shot object, so the same effect
 	// is idempotent: replaying returns the current SandboxInfo.
 	RequestId string `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	// sandbox is the pause target; expected_uid fences against a Sandbox
@@ -3685,7 +3685,7 @@ const file_api_proto_v2_fastpath_proto_rawDesc = "" +
 	"\ahandler\x18\x01 \x01(\tR\ahandler\x12.\n" +
 	"\x05state\x18\x02 \x01(\x0e2\x18.fastpath.v2.ActionStateR\x05state\x12?\n" +
 	"\x1clast_transition_unix_seconds\x18\x03 \x01(\x03R\x19lastTransitionUnixSeconds\x12\x18\n" +
-	"\amessage\x18\x04 \x01(\tR\amessage\"\x94\x04\n" +
+	"\amessage\x18\x04 \x01(\tR\amessage\"\xfe\x03\n" +
 	"\vSandboxInfo\x128\n" +
 	"\bidentity\x18\x01 \x01(\v2\x1c.fastpath.v2.SandboxIdentityR\bidentity\x12-\n" +
 	"\x12applied_generation\x18\x02 \x01(\x03R\x11appliedGeneration\x122\n" +
@@ -3694,8 +3694,8 @@ const file_api_proto_v2_fastpath_proto_rawDesc = "" +
 	"data_plane\x18\x04 \x01(\v2\x1a.fastpath.v2.DataPlaneInfoR\tdataPlane\x12J\n" +
 	"\x10infra_components\x18\x05 \x03(\v2\x1f.fastpath.v2.InfraComponentInfoR\x0finfraComponents\x12G\n" +
 	"\x0faction_bindings\x18\x06 \x03(\v2\x1e.fastpath.v2.ActionBindingInfoR\x0eactionBindings\x12\x14\n" +
-	"\x05ready\x18\a \x01(\bR\x05ready\x12E\n" +
-	"\rdesired_state\x18\b \x01(\x0e2 .fastpath.v2.SandboxDesiredStateR\fdesiredState\x12;\n" +
+	"\x05ready\x18\a \x01(\bR\x05ready\x12/\n" +
+	"\x05state\x18\b \x01(\x0e2\x19.fastpath.v2.SandboxStateR\x05state\x12;\n" +
 	"\n" +
 	"checkpoint\x18\t \x01(\v2\x1b.fastpath.v2.CheckpointInfoR\n" +
 	"checkpoint\"\xf3\x01\n" +
@@ -3951,11 +3951,11 @@ const file_api_proto_v2_fastpath_proto_rawDesc = "" +
 	"\x15RUNTIME_STATE_PAUSING\x10\t\x12\x18\n" +
 	"\x14RUNTIME_STATE_PAUSED\x10\n" +
 	"\x12\x1a\n" +
-	"\x16RUNTIME_STATE_RESUMING\x10\v*\x81\x01\n" +
-	"\x13SandboxDesiredState\x12%\n" +
-	"!SANDBOX_DESIRED_STATE_UNSPECIFIED\x10\x00\x12!\n" +
-	"\x1dSANDBOX_DESIRED_STATE_RUNNING\x10\x01\x12 \n" +
-	"\x1cSANDBOX_DESIRED_STATE_PAUSED\x10\x02*\x89\x02\n" +
+	"\x16RUNTIME_STATE_RESUMING\x10\v*b\n" +
+	"\fSandboxState\x12\x1d\n" +
+	"\x19SANDBOX_STATE_UNSPECIFIED\x10\x00\x12\x19\n" +
+	"\x15SANDBOX_STATE_RUNNING\x10\x01\x12\x18\n" +
+	"\x14SANDBOX_STATE_PAUSED\x10\x02*\x89\x02\n" +
 	"\x0eDataPlaneState\x12 \n" +
 	"\x1cDATA_PLANE_STATE_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18DATA_PLANE_STATE_UNKNOWN\x10\x01\x12\x1c\n" +
@@ -4024,7 +4024,7 @@ var file_api_proto_v2_fastpath_proto_msgTypes = make([]protoimpl.MessageInfo, 52
 var file_api_proto_v2_fastpath_proto_goTypes = []any{
 	(FailurePolicy)(0),                    // 0: fastpath.v2.FailurePolicy
 	(RuntimeState)(0),                     // 1: fastpath.v2.RuntimeState
-	(SandboxDesiredState)(0),              // 2: fastpath.v2.SandboxDesiredState
+	(SandboxState)(0),                     // 2: fastpath.v2.SandboxState
 	(DataPlaneState)(0),                   // 3: fastpath.v2.DataPlaneState
 	(InfraComponentState)(0),              // 4: fastpath.v2.InfraComponentState
 	(ActionState)(0),                      // 5: fastpath.v2.ActionState
@@ -4095,7 +4095,7 @@ var file_api_proto_v2_fastpath_proto_depIdxs = []int32{
 	13, // 7: fastpath.v2.SandboxInfo.data_plane:type_name -> fastpath.v2.DataPlaneInfo
 	14, // 8: fastpath.v2.SandboxInfo.infra_components:type_name -> fastpath.v2.InfraComponentInfo
 	15, // 9: fastpath.v2.SandboxInfo.action_bindings:type_name -> fastpath.v2.ActionBindingInfo
-	2,  // 10: fastpath.v2.SandboxInfo.desired_state:type_name -> fastpath.v2.SandboxDesiredState
+	2,  // 10: fastpath.v2.SandboxInfo.state:type_name -> fastpath.v2.SandboxState
 	17, // 11: fastpath.v2.SandboxInfo.checkpoint:type_name -> fastpath.v2.CheckpointInfo
 	55, // 12: fastpath.v2.CreateSandboxRequest.envs:type_name -> fastpath.v2.CreateSandboxRequest.EnvsEntry
 	56, // 13: fastpath.v2.CreateSandboxRequest.metadata:type_name -> fastpath.v2.CreateSandboxRequest.MetadataEntry

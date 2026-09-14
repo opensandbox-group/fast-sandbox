@@ -33,21 +33,21 @@ const SandboxConditionReady = "Ready"
 // reported as False with a phase-specific reason.
 const SandboxConditionSuspended = "Suspended"
 
-// SandboxDesiredState is the desired runtime lifecycle.
+// SandboxState is the desired runtime lifecycle.
 // +kubebuilder:validation:Enum=Running;Paused
-type SandboxDesiredState string
+type SandboxState string
 
 const (
-	// SandboxDesiredStateRunning requests a live runtime. A Sandbox that
-	// carries a checkpoint (status.runtime.checkpoint) is resumed from it
-	// instead of booting from scratch.
-	SandboxDesiredStateRunning SandboxDesiredState = "Running"
-	// SandboxDesiredStatePaused requests the runtime be checkpointed to the
+	// SandboxStateRunning requests a live runtime. A Sandbox that carries a
+	// checkpoint (status.runtime.checkpoint) is resumed from it instead of
+	// booting from scratch.
+	SandboxStateRunning SandboxState = "Running"
+	// SandboxStatePaused requests the runtime be checkpointed to the
 	// artifact store and released: the Sandbox stops occupying Fastlet
 	// capacity while its object, identity, and checkpoint address survive.
 	// Pausing requires a Ready runtime and is one-way through the
 	// checkpoint; resuming means flipping this field back to Running.
-	SandboxDesiredStatePaused SandboxDesiredState = "Paused"
+	SandboxStatePaused SandboxState = "Paused"
 )
 
 // SandboxSpec defines the desired state of Sandbox.
@@ -78,13 +78,13 @@ type SandboxSpec struct {
 	// When Spec.ResetRevision > Status.Runtime.AcceptedResetRevision, the sandbox will be rescheduled.
 	ResetRevision *metav1.Time `json:"resetRevision,omitempty"`
 
-	// DesiredState is the desired runtime lifecycle. Running (the default)
-	// keeps a live runtime; Paused checkpoints the runtime to the artifact
-	// store and releases it. Pausing requires a Ready runtime; flipping
-	// back to Running resumes the recorded checkpoint, possibly on a
-	// different Fastlet.
+	// State is the desired runtime lifecycle. Running (the default) keeps a
+	// live runtime; Paused checkpoints the runtime to the artifact store
+	// and releases it. Pausing requires a Ready runtime; flipping back to
+	// Running resumes the recorded checkpoint, possibly on a different
+	// Fastlet.
 	// +kubebuilder:default=Running
-	DesiredState SandboxDesiredState `json:"desiredState,omitempty"`
+	State SandboxState `json:"state,omitempty"`
 
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
@@ -124,7 +124,7 @@ const (
 	RuntimePausing RuntimeState = "Pausing"
 	// RuntimePaused means the checkpoint is durable in the artifact store,
 	// the runtime has been released, and the Sandbox occupies no Fastlet
-	// capacity. Setting spec.desiredState back to Running resumes it.
+	// capacity. Setting spec.state back to Running resumes it.
 	RuntimePaused RuntimeState = "Paused"
 	// RuntimeResuming means a new runtime is materializing from
 	// status.runtime.checkpoint on a (possibly different) Fastlet.

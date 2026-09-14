@@ -69,18 +69,6 @@ spec:
                 items:
                   type: string
                 type: array
-              desiredState:
-                default: Running
-                description: |-
-                  DesiredState is the desired runtime lifecycle. Running (the default)
-                  keeps a live runtime; Paused checkpoints the runtime to the artifact
-                  store and releases it. Pausing requires a Ready runtime; flipping
-                  back to Running resumes the recorded checkpoint, possibly on a
-                  different Fastlet.
-                enum:
-                - Running
-                - Paused
-                type: string
               envs:
                 items:
                   description: EnvVar represents an environment variable present in
@@ -273,6 +261,18 @@ spec:
                   ResetRevision is an opaque token (usually a timestamp) used to trigger a manual reset.
                   When Spec.ResetRevision > Status.Runtime.AcceptedResetRevision, the sandbox will be rescheduled.
                 format: date-time
+                type: string
+              state:
+                default: Running
+                description: |-
+                  State is the desired runtime lifecycle. Running (the default) keeps a
+                  live runtime; Paused checkpoints the runtime to the artifact store
+                  and releases it. Pausing requires a Ready runtime; flipping back to
+                  Running resumes the recorded checkpoint, possibly on a different
+                  Fastlet.
+                enum:
+                - Running
+                - Paused
                 type: string
               workingDir:
                 type: string

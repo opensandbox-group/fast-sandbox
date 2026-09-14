@@ -49,7 +49,7 @@ spec:
 | `failurePolicy` | No | `Manual` or `AutoRecreate`; default `Manual` |
 | `recoveryTimeoutSeconds` | No | Durable delay before recovery action; default 60 |
 | `resetRevision` | No | Opaque monotonic reset trigger |
-| `desiredState` | No | `Running` (default) or `Paused`; `Paused` checkpoints the runtime to the artifact store and releases Fastlet capacity, flipping back to `Running` resumes the recorded checkpoint |
+| `state` | No | `Running` (default) or `Paused`; `Paused` checkpoints the runtime to the artifact store and releases Fastlet capacity, flipping back to `Running` resumes the recorded checkpoint |
 | `poolRef` | Yes | Same-namespace SandboxPool |
 | `actionBindings` | No | Ordered atomic Handler/input list; order defines lifecycle invocation order |
 
@@ -78,14 +78,14 @@ Ready` cycle even if the Controller only polls the final `Ready` state.
 
 ### Pause and resume
 
-`spec.desiredState: Paused` checkpoints a Ready Sandbox to the artifact store
+`spec.state: Paused` checkpoints a Ready Sandbox to the artifact store
 and releases its runtime. The CR, its UID/name identity, and
 `status.runtime.checkpoint` survive while the Sandbox occupies no Fastlet
 capacity; `status.runtime.state` moves `Ready -> Pausing -> Paused`. Pause is
 durable-first: `Paused` is reported only once the checkpoint set is complete
 in the store, and until then the Sandbox is neither usable nor resumable.
 
-Resume flips `desiredState` back to `Running`; the Sandbox is scheduled again
+Resume flips `state` back to `Running`; the Sandbox is scheduled again
 (possibly on a different Fastlet) and restored from the recorded checkpoint
 (`status.runtime.state: Paused -> Resuming -> Ready`). The checkpoint is
 one-shot: a successful resume clears it. While paused there is no placement,
@@ -313,8 +313,8 @@ The protobuf contract is
 | `CreateSandboxSnapshot` | One-shot live checkpoint of a Ready Sandbox; `request_id` is the idempotency key, sandbox fence until `Publishing`, template-name fence until terminal |
 | `GetSandboxSnapshot` | CR-backed phase/artifact/placement observation |
 | `DeleteSandboxSnapshot` | Deletes the object (`expected_uid` fenced); never unpublishes stored artifacts |
-| `PauseSandbox` | Persist `spec.desiredState=Paused` (`expected_uid`/`expected_generation` fenced); completion (`PAUSED`, checkpoint durable) is observed via `GetSandbox` |
-| `ResumeSandbox` | Persist `spec.desiredState=Running` and schedule the recorded checkpoint, possibly cross-host; `expected_checkpoint_id` fences against a re-pause between read and resume; completion (`READY`) is observed via `GetSandbox` |
+| `PauseSandbox` | Persist `spec.state=Paused` (`expected_uid`/`expected_generation` fenced); completion (`PAUSED`, checkpoint durable) is observed via `GetSandbox` |
+| `ResumeSandbox` | Persist `spec.state=Running` and schedule the recorded checkpoint, possibly cross-host; `expected_checkpoint_id` fences against a re-pause between read and resume; completion (`READY`) is observed via `GetSandbox` |
 | `GetPool`, `ListPools` | Runtime, fixed resources, components, capacity, and warm-image discovery |
 
 ### Atomic Create
