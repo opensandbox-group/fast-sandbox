@@ -3220,6 +3220,9 @@ snapshot_source_up() {
 	wait_for "source egress binding Ready" 120 egress_binding_ready "$SNAPSHOT_TARGET"
 	wait_for "source execd control intact under deny" 120 egress_execd_control "$SNAPSHOT_TARGET"
 	test_egress_denied "$SNAPSHOT_TARGET"
+	SNAP_SOURCE_UPTIME_BEFORE="$(snapshot_guest_uptime "$SNAPSHOT_TARGET")" \
+		|| fail "cannot read the guest uptime before the snapshot"
+	log "source guest uptime before the snapshot: ${SNAP_SOURCE_UPTIME_BEFORE}s"
 	pass "source sandbox $SNAPSHOT_TARGET Ready with an effective deny policy"
 }
 
@@ -3377,6 +3380,21 @@ snapshot_run() {
 	done < <(kubectl -n "$NS" logs "$fastlet" --since=30m --tail=2000 2>/dev/null \
 		| grep -E "sandbox dumped|snapshot published" | tail -4)
 	pass "snapshot Succeeded in $(ms2s $(( (t_terminal - t0) / 1000000 )))s"
+
+	# The source Sandbox must still be ALIVE after the snapshot: aggregate
+	# Ready, in-guest /ping, an in-guest command execution, and a monotonic
+	# guest clock — a resumed VM keeps its uptime while a restart resets it.
+	sandbox_ready "$SNAPSHOT_TARGET" \
+		|| fail "source sandbox is not Ready after the snapshot"
+	wait_for "source /ping after the snapshot" 60 probe_execd "$SNAPSHOT_TARGET"
+	wait_for "source in-guest execution after the snapshot" 60 egress_execd_control "$SNAPSHOT_TARGET"
+	local uptime_after
+	uptime_after="$(snapshot_guest_uptime "$SNAPSHOT_TARGET")" \
+		|| fail "cannot read the guest uptime after the snapshot"
+	awk -v before="$SNAP_SOURCE_UPTIME_BEFORE" -v after="$uptime_after" 'BEGIN { exit !(after >= before) }' \
+		|| fail "guest uptime went backwards ($SNAP_SOURCE_UPTIME_BEFORE -> $uptime_after): the VM was restarted, not resumed"
+	highlight "  source guest uptime: ${SNAP_SOURCE_UPTIME_BEFORE}s -> ${uptime_after}s (resumed, not restarted)"
+	pass "source sandbox alive after the snapshot (Ready, /ping, in-guest exec, monotonic uptime)"
 }
 
 # --- reentrancy fencing: rejected inside the pause window, admitted during
@@ -3470,7 +3488,8 @@ snapshot_fencing() {
 
 	# The sandbox kept serving through the overlapping dump+upload.
 	probe_execd "$SNAPSHOT_TARGET" || fail "execd /ping failed after the fenced snapshots"
-	pass "fence C admitted during A's Publishing; both Succeeded, distinct artifacts, sandbox healthy"
+	egress_execd_control "$SNAPSHOT_TARGET" || fail "in-guest execution failed after the fenced snapshots"
+	pass "fence C admitted during A's Publishing; both Succeeded, distinct artifacts, sandbox alive and executing"
 }
 
 # --- network policy: the snapshot source Sandbox carries a deny policy; the
@@ -3478,6 +3497,21 @@ snapshot_fencing() {
 # A control sandbox (allow) proves the egress plane serves, so "blocked" is
 # policy, not breakage; an explicit-allow restore proves override.
 SNAPSHOT_POLICY_CTRL="${SNAPSHOT_POLICY_CTRL:-sandbox-snap-ctrl}"
+# Guest uptime captured before the snapshot: the post-snapshot check proves
+# the VM was PAUSED/RESUMED, not restarted (a reboot resets the clock).
+SNAP_SOURCE_UPTIME_BEFORE=""
+
+# snapshot_guest_uptime reads /proc/uptime seconds inside the guest (through
+# execd); callers guard against empty output.
+snapshot_guest_uptime() { # sandbox -> seconds (may be empty)
+	local out attempt
+	for attempt in 1 2 3; do
+		out="$(egress_execd_run "$1" '{"command":"cut -d" " -f1 /proc/uptime"}' 12 2>/dev/null | tr -d ' \r\n')"
+		[[ "$out" =~ ^[0-9]+(\.[0-9]+)?$ ]] && { printf '%s' "$out"; return 0; }
+		sleep 2
+	done
+	return 1
+}
 SNAPSHOT_RESTORE_ALLOW="${SNAPSHOT_RESTORE_ALLOW:-sandbox-snap-restore-allow}"
 
 # snapshot_policy_render_pool renders the egress pool sample with the
