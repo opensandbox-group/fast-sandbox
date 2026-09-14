@@ -581,7 +581,32 @@ preflight() {
 	[[ -e /dev/kvm ]] || die "/dev/kvm is missing on this host (KVM required)"
 	docker_ensure_image "$MINIO_IMAGE"
 	docker_ensure_image minio/mc
+	preflight_disk
 	pass "preflight"
+}
+
+# preflight_disk fails fast when the filesystems that will hold the heavy
+# data (docker images/build cache, kind nodes, MinIO artifact sets, the 60G
+# sparse XFS state root) lack headroom — an ENOSPC mid-build or mid-snapshot
+# is far more expensive to recover from than an upfront error. It also warns
+# when /data is not a separate mount, because then every "under /data" path
+# still consumes the root filesystem.
+preflight_disk() {
+	local target avail_kb
+	local min_kb=$((20 * 1024 * 1024))
+	local -a targets=("$WORK" "$MINIO_DATA" "${XFS_LOOP_FILE%/*}")
+	if [[ -d /data ]] && [[ "$(findmnt -no TARGET --target /data 2>/dev/null)" == "/" ]]; then
+		log "note: /data is not a separate mount; WORK/MinIO/XFS/docker still consume the root filesystem"
+	fi
+	for target in "${targets[@]}"; do
+		[[ -e "$target" ]] || continue
+		avail_kb="$(df -Pk "$target" 2>/dev/null | awk 'NR==2 {print $4}')"
+		[[ "$avail_kb" =~ ^[0-9]+$ ]] || continue
+		if [[ "$avail_kb" -lt "$min_kb" ]]; then
+			die "$target has $((avail_kb / 1024))MiB free; at least 20GiB is required (docker images/build cache, kind nodes, a multi-GiB artifact set, XFS state root). Free space (docker system prune -af, old /data logs and published sets) or move WORK/MINIO_DATA/XFS_LOOP_FILE/DOCKER_DATA_ROOT onto a larger mount"
+		fi
+		log "disk headroom: $target has $((avail_kb / 1024 / 1024))GiB free"
+	done
 }
 
 sysctl_set() {
