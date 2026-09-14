@@ -97,7 +97,9 @@ func (r *SandboxReconciler) triggerPause(ctx context.Context, orchestrator *orch
 		return r.handlePauseCallError(ctx, sandbox, checkpointID, err)
 	}
 	if observed == nil {
-		return ctrl.Result{RequeueAfter: ObservationPollInterval}, orchestration.ErrUnknownFastletOutcome
+		klog.FromContext(ctx).Info("Sandbox pause trigger returned no observation; retrying",
+			"sandbox", sandbox.Name, "checkpointID", checkpointID)
+		return ctrl.Result{RequeueAfter: ObservationPollInterval}, nil
 	}
 	return r.projectPauseObservation(ctx, orchestrator, sandbox, checkpointID, observed)
 }
@@ -118,7 +120,9 @@ func (r *SandboxReconciler) observePause(ctx context.Context, orchestrator *orch
 		return r.handlePauseCallError(ctx, sandbox, checkpointID, err)
 	}
 	if observed == nil {
-		return ctrl.Result{RequeueAfter: ObservationPollInterval}, orchestration.ErrUnknownFastletOutcome
+		klog.FromContext(ctx).Info("Sandbox pause observation returned no status; retrying",
+			"sandbox", sandbox.Name, "checkpointID", checkpointID)
+		return ctrl.Result{RequeueAfter: ObservationPollInterval}, nil
 	}
 	return r.projectPauseObservation(ctx, orchestrator, sandbox, checkpointID, observed)
 }
@@ -214,6 +218,8 @@ func (r *SandboxReconciler) releasePausedRuntime(ctx context.Context, orchestrat
 // the epoch advances, the old task record is dropped best-effort, and the
 // runtime stays Ready.
 func (r *SandboxReconciler) retryPause(ctx context.Context, orchestrator *orchestration.Orchestrator, sandbox *apiv1alpha2.Sandbox, checkpointID, reason, message string) (ctrl.Result, error) {
+	klog.FromContext(ctx).Info("Sandbox pause attempt failed; retrying with a new attempt epoch",
+		"sandbox", sandbox.Name, "checkpointID", checkpointID, "reason", reason, "message", message)
 	if err := orchestrator.DeleteCheckpoint(ctx, sandbox, checkpointID); err != nil {
 		var failure *fastletapi.FastletError
 		if !errors.As(err, &failure) || failure.Code != fastletapi.ErrorNotFound {
@@ -254,7 +260,12 @@ func (r *SandboxReconciler) handlePauseCallError(ctx context.Context, sandbox *a
 				r.markPauseWaiting(ctx, sandbox, string(failure.Code), failure.Message)
 		}
 	}
-	return ctrl.Result{RequeueAfter: ObservationPollInterval}, err
+	// A polling loop must keep a steady cadence: returning the error here
+	// would make controller-runtime back off exponentially and mask the
+	// checkpoint's progress.
+	klog.FromContext(ctx).Info("Sandbox pause call failed transiently; retrying",
+		"sandbox", sandbox.Name, "checkpointID", checkpointID, "err", err.Error())
+	return ctrl.Result{RequeueAfter: ObservationPollInterval}, nil
 }
 
 // markPauseWaiting records a retryable pause obstruction without touching the

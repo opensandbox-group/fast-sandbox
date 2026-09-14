@@ -12,18 +12,18 @@ import (
 
 // fakeAgentClient is a scriptable AgentClient for wiring tests.
 type fakeAgentClient struct {
-	mu         sync.Mutex
-	pins       []string
-	pinReqs    []string
-	unpins     []string
-	unpinReqs  []string
-	releases   []string
-	healthErr  error
-	digest     string
-	publishes  []string
+	mu           sync.Mutex
+	pins         []string
+	pinReqs      []string
+	unpins       []string
+	unpinReqs    []string
+	releases     []string
+	healthErr    error
+	digest       string
+	publishes    []string
 	publishKinds []string
-	publishOut PublishOutcome
-	publishErr error
+	publishOut   PublishOutcome
+	publishErr   error
 }
 
 func (f *fakeAgentClient) PinImage(_ context.Context, requestID, image string) (string, error) {

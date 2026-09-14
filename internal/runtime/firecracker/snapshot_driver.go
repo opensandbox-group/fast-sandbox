@@ -23,6 +23,7 @@ import (
 	"fast-sandbox/internal/artifacts"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
+	agentprotocol "fast-sandbox/internal/runtime/firecracker/agent/protocol"
 
 	"k8s.io/klog/v2"
 )
@@ -160,7 +161,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 		input.OnPublishing()
 	}
 	publishStarted := time.Now()
-	outcome, publishErr := client.PublishImage(ctx, "snapshot-"+plan.snapshotID, string(kind), input.TemplateName, plan.staging)
+	outcome, publishErr := client.PublishImage(ctx, "snapshot-"+plan.snapshotID, publishKind(kind), input.TemplateName, plan.staging)
 	_ = os.RemoveAll(plan.staging)
 	if publishErr != nil {
 		return nil, fmt.Errorf("publish snapshot artifacts: %w", publishErr)
@@ -174,6 +175,18 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 		ArtifactDigest: outcome.ArtifactDigest,
 		SizeBytes:      sizeBytes,
 	}, nil
+}
+
+// publishKind maps the Fastlet-side snapshot kind onto the runtime-agent's
+// publish protocol. The two enums are deliberately separate layers (the
+// Fastlet kind travels FastPath->Fastlet as JSON; the publish kind travels
+// driver->agent), so the mapping is explicit: a raw string cast here would
+// silently send "Checkpoint" where the agent expects "checkpoint".
+func publishKind(kind fastletapi.SnapshotKind) string {
+	if kind == fastletapi.SnapshotKindCheckpoint {
+		return agentprotocol.PublishKindCheckpoint
+	}
+	return agentprotocol.PublishKindTemplate
 }
 
 // DeleteSnapshot discards the staging directory of a snapshot. It never

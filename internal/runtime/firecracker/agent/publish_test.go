@@ -12,8 +12,8 @@ import (
 	"testing"
 
 	"fast-sandbox/internal/artifacts"
-	agentprotocol "fast-sandbox/internal/runtime/firecracker/agent/protocol"
 	"fast-sandbox/internal/registryconfig"
+	agentprotocol "fast-sandbox/internal/runtime/firecracker/agent/protocol"
 
 	"github.com/stretchr/testify/require"
 )

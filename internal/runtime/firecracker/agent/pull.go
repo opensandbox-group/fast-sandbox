@@ -50,7 +50,6 @@ func (c *Client) ReadImageManifest(ctx context.Context, image string) ([]byte, e
 	return c.fetchManifest(ctx, manifestKey, index.ArtifactDigest)
 }
 
-
 // dartGateway routes artifact GETs through a node-local DART instance. The
 // agent signs presigned origin URLs; DART fetches, caches and P2P-distributes
 // the blocks, and the agent still verifies the whole-object digest against

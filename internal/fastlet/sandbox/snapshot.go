@@ -246,6 +246,8 @@ func (m *SandboxManager) runSnapshotWorker(snapshotter RuntimeSnapshotter, task 
 				reason = "InsufficientStorage"
 			}
 		}
+		klog.ErrorS(err, "Sandbox snapshot task failed",
+			"sandboxID", sandboxUID, "snapshotID", task.snapshotID, "kind", task.kind, "reason", reason, "message", message)
 		m.finishSnapshotTaskWithReason(task, fastletapi.SnapshotPhaseFailed, reason, message)
 		return
 	}

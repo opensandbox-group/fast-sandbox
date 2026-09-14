@@ -3886,10 +3886,15 @@ snapshot_on_error() {
 # checkpoint store location.
 #
 # Env overrides: PAUSE_SANDBOX (sandbox name), PAUSE_TIMEOUT_S,
+# PAUSE_MAX_ATTEMPTS (retry-loop bound before failing fast),
 # PAUSE_SKIP_IMAGE_REBUILD=1 (skip rolling controller/fastlet/agent images
 # when the deployed ones already carry the pause chain).
 PAUSE_SANDBOX="${PAUSE_SANDBOX:-sandbox-pause-e2e}"
 PAUSE_TIMEOUT_S="${PAUSE_TIMEOUT_S:-600}"
+# PAUSE_MAX_ATTEMPTS bounds the transactional retry loop (each attempt re-dumps
+# the VM after a transient failure): once exceeded the flow fails fast with the
+# controller's recorded reason instead of waiting for the timeout.
+PAUSE_MAX_ATTEMPTS="${PAUSE_MAX_ATTEMPTS:-3}"
 PAUSE_SKIP_IMAGE_REBUILD="${PAUSE_SKIP_IMAGE_REBUILD:-0}"
 PAUSE_E2E_DIR=""
 PAUSE_TIMINGS=""
@@ -4022,7 +4027,7 @@ pause_fastlet_timings() { # fastlet
 }
 
 pause_run() {
-	local t0 state last_state="" checkpoint_id="" gen_after_pause out rc deadline_ns
+	local t0 state last_state="" checkpoint_id="" gen_after_pause out rc deadline_ns message attempt retries=0
 	: > "$PAUSE_PHASE_LOG"
 	t0="$(now_ms)"
 	out="$(fastctl pause "$PAUSE_SANDBOX" 2>&1)" || fail "PauseSandbox failed: $out"
@@ -4042,9 +4047,21 @@ pause_run() {
 	while :; do
 		state="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.state}' 2>/dev/null || true)"
 		if [[ -n "$state" && "$state" != "$last_state" ]]; then
+			message="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.message}' 2>/dev/null || true)"
+			attempt="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.pauseAttempt}' 2>/dev/null || true)"
 			printf '%s\t+%ss\t%s\n' "$(date +%s%3N)" "$(ms2s $(( ($(now_ms) - t0) / 1000000 )))" "$state" >> "$PAUSE_PHASE_LOG"
-			log "pause phase -> $state (+$(ms2s $(( ($(now_ms) - t0) / 1000000 )))s after PauseSandbox)"
+			log "pause phase -> $state (+$(ms2s $(( ($(now_ms) - t0) / 1000000 )))s after PauseSandbox) attempt=${attempt:-0} message=${message:-<none>}"
 			[[ "$state" == "Pausing" ]] && pause_record "pause_to_pausing_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
+			if [[ "$state" == "Ready" && "$last_state" == "Pausing" ]]; then
+				retries=$((retries + 1))
+				local reason
+				reason="$(kubectl -n "$NS" logs deploy/fast-sandbox-controller --tail=300 2>/dev/null | grep "pause attempt failed" | tail -1 || true)"
+				log "RETRY pause attempt failed ($retries/$PAUSE_MAX_ATTEMPTS): ${reason:-<no controller reason recorded>}"
+				[[ -n "$message" ]] && log "RETRY task message: $message"
+				if [[ "$retries" -ge "$PAUSE_MAX_ATTEMPTS" ]]; then
+					fail "pause failed $retries times (reasons above); aborting the retry loop"
+				fi
+			fi
 			last_state="$state"
 		fi
 		if [[ -z "$checkpoint_id" ]]; then
@@ -4189,7 +4206,8 @@ pause_resume() {
 		state="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.state}' 2>/dev/null || true)"
 		if [[ -n "$state" && "$state" != "$last_state" ]]; then
 			printf '%s\t+%ss\t%s\n' "$(date +%s%3N)" "$(ms2s $(( ($(now_ms) - t0) / 1000000 )))" "$state" >> "$PAUSE_RESUME_PHASE_LOG"
-			log "resume phase -> $state (+$(ms2s $(( ($(now_ms) - t0) / 1000000 )))s after ResumeSandbox)"
+			out="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.message}' 2>/dev/null || true)"
+			log "resume phase -> $state (+$(ms2s $(( ($(now_ms) - t0) / 1000000 )))s after ResumeSandbox) message=${out:-<none>}"
 			[[ "$state" == "Resuming" ]] && pause_record "resume_to_resuming_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
 			last_state="$state"
 		fi
@@ -4484,7 +4502,7 @@ usage: integration-env.sh [--cleanup|--auto-clean] {up|down|status|verify|verify
            pause/resume phase latencies, the driver dump/publish and restore
            breakdown, the total offline window, and collects component logs
            into logs/pause-e2e-<ts>/ (env: PAUSE_SANDBOX, PAUSE_TIMEOUT_S,
-           PAUSE_SKIP_IMAGE_REBUILD=1)
+           PAUSE_MAX_ATTEMPTS, PAUSE_SKIP_IMAGE_REBUILD=1)
   verify-p2p
            DART data-plane evidence (stage 2): presigned URL -> node-local
            DART -> origin (cold) -> block cache (warm, origin delta 0);

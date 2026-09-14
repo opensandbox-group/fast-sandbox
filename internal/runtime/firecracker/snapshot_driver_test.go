@@ -11,6 +11,7 @@ import (
 	"fast-sandbox/internal/artifacts"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
+	agentprotocol "fast-sandbox/internal/runtime/firecracker/agent/protocol"
 
 	"github.com/stretchr/testify/require"
 )
@@ -296,7 +297,8 @@ func TestCreateCheckpointPublishesWithoutTemplateIndex(t *testing.T) {
 		SandboxID: sandboxID, SnapshotID: "ckpt-1", Kind: fastletapi.SnapshotKindCheckpoint,
 	})
 	require.NoError(t, err)
-	require.Equal(t, string(fastletapi.SnapshotKindCheckpoint), agent.kind)
+	require.Equal(t, agentprotocol.PublishKindCheckpoint, agent.kind,
+		"the driver must send the agent-protocol kind, not the Fastlet enum string")
 	require.Empty(t, agent.key, "a checkpoint publishes no template index key")
 	require.Len(t, agent.manifest["files"].(map[string]any), 3)
 	require.Contains(t, result.ManifestRef, "/manifest.json")
@@ -352,4 +354,27 @@ func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
 	require.Equal(t, "10.0.0.2", document["guestNetwork"].(map[string]any)["ip"],
 		"the checkpoint lineage facts ride forward into the new checkpoint")
 	require.Equal(t, fixture.sandboxSpec.Spec.Image, document["sourceImage"])
+}
+
+func TestCreateSnapshotPublishesWithTemplateKind(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+
+	_, err := fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "snap-1", Kind: fastletapi.SnapshotKindTemplate, TemplateName: "app-v2",
+	})
+	require.NoError(t, err)
+	require.Equal(t, agentprotocol.PublishKindTemplate, agent.kind)
+	require.Equal(t, "app-v2", agent.key)
+}
+
+func TestCreateSnapshotDefaultsToTemplateKind(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+
+	_, err := fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "snap-1", TemplateName: "app-v2",
+	})
+	require.NoError(t, err)
+	require.Equal(t, agentprotocol.PublishKindTemplate, agent.kind)
 }
