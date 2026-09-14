@@ -191,4 +191,7 @@ credentials) see the sections below.
 - **Follow-ups**: [#56](https://github.com/opensandbox-group/fast-sandbox/issues/56)
   diff snapshots (pause window proportional to dirty pages),
   [#57](https://github.com/opensandbox-group/fast-sandbox/issues/57)
-  same-node prewarm of a freshly published set.
+  same-node prewarm of a freshly published set,
+  [#61](https://github.com/opensandbox-group/fast-sandbox/issues/61) overlap
+  the manifest hashing with the dump window (per-file SHA256 currently
+  serializes ~15.5 s before the upload starts).
