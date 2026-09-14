@@ -3497,22 +3497,24 @@ snapshot_fencing() {
 # A control sandbox (allow) proves the egress plane serves, so "blocked" is
 # policy, not breakage; an explicit-allow restore proves override.
 SNAPSHOT_POLICY_CTRL="${SNAPSHOT_POLICY_CTRL:-sandbox-snap-ctrl}"
+SNAPSHOT_RESTORE_ALLOW="${SNAPSHOT_RESTORE_ALLOW:-sandbox-snap-restore-allow}"
 # Guest uptime captured before the snapshot: the post-snapshot check proves
 # the VM was PAUSED/RESUMED, not restarted (a reboot resets the clock).
 SNAP_SOURCE_UPTIME_BEFORE=""
 
-# snapshot_guest_uptime reads /proc/uptime seconds inside the guest (through
-# execd); callers guard against empty output.
+# snapshot_guest_uptime reads /proc/uptime seconds inside the guest through
+# execd (the raw line is fetched and parsed host-side: embedded quotes in a
+# JSON command body are a trap). Callers guard against empty output.
 snapshot_guest_uptime() { # sandbox -> seconds (may be empty)
-	local out attempt
+	local out value attempt
 	for attempt in 1 2 3; do
-		out="$(egress_execd_run "$1" '{"command":"cut -d" " -f1 /proc/uptime"}' 12 2>/dev/null | tr -d ' \r\n')"
-		[[ "$out" =~ ^[0-9]+(\.[0-9]+)?$ ]] && { printf '%s' "$out"; return 0; }
+		out="$(egress_execd_run "$1" '{"command":"cat /proc/uptime"}' 12 2>/dev/null)"
+		value="$(printf '%s' "$out" | awk '{print $1}' | tr -d ' \r\n')"
+		[[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]] && { printf '%s' "$value"; return 0; }
 		sleep 2
 	done
 	return 1
 }
-SNAPSHOT_RESTORE_ALLOW="${SNAPSHOT_RESTORE_ALLOW:-sandbox-snap-restore-allow}"
 
 # snapshot_policy_render_pool renders the egress pool sample with the
 # mirrored warm image (the golden template was built from the mirrored
