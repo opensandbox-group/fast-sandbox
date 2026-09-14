@@ -2216,7 +2216,7 @@ verify_p2p() {
 	share_out="$(mc --json share download --expire 1h "chain-net/$MINIO_BUCKET/$probe_key" 2>/dev/null || true)"
 	presigned="$(printf '%s' "$share_out" | jq -r '.share // empty' 2>/dev/null || true)"
 	if [[ "$presigned" != http* ]]; then
-		presigned="$(printf '%s' "$share_out" | sed -n 's/^Share: //p' | head -1)"
+		presigned="$(printf '%s' "$share_out" | sed -n 's/^Share: //p')"
 	fi
 	[[ "$presigned" == http* ]] || die "mc share download returned no presigned URL for $probe_key (got '$share_out')"
 	log "verify-p2p probe object: $probe_key ($(mc stat --json "chain-net/$MINIO_BUCKET/$probe_key" 2>/dev/null | jq -r '.size' 2>/dev/null || echo '?' ) bytes)"
@@ -2340,11 +2340,10 @@ kind_node_image_present() { # image
 }
 
 egress_fastlet_pod() {
-	# Fallback used before the sandbox exists (pool readiness): pick any
-	# pod of this pool — every fastlet pod carries an egress sidecar.
-	kubectl -n "$NS" get pods \
-		-l "app=sandbox-fastlet,fast-sandbox.io/pool=$EGRESS_POOL" \
-		-o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+	# Fallback used before the sandbox exists (pool readiness): pick a live
+	# pod of this pool — every fastlet pod carries an egress sidecar. sed
+	# reads the whole list (no SIGPIPE under pipefail) and prints the first.
+	egress_pool_pods_live | sed -n '1p'
 }
 
 # egress_sandbox_pod resolves the fastlet pod a sandbox is placed on (the
@@ -2372,9 +2371,28 @@ egress_pool_pods() {
 	return 1
 }
 
+# egress_pool_pods_live lists the pool's fastlet pods that are NOT
+# terminating. A pool replacement (delete + apply) leaves the old pod behind
+# in Terminating while the replacement starts, so readiness, exec and log
+# checks must never pick the corpse.
+egress_pool_pods_live() {
+	kubectl -n "$NS" get pods \
+		-l "app=sandbox-fastlet,fast-sandbox.io/pool=$EGRESS_POOL" -o json 2>/dev/null \
+		| jq -r '[.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name] | .[]' 2>/dev/null || true
+}
+
+# egress_fastlets_gone reports that no fastlet pod of the pool is left
+# (terminating ones included); verify-egress waits on it after the delete so
+# the replacement never races the old pod's teardown.
+egress_fastlets_gone() {
+	[[ "$(kubectl -n "$NS" get pods \
+		-l "app=sandbox-fastlet,fast-sandbox.io/pool=$EGRESS_POOL" \
+		-o name 2>/dev/null | wc -l | tr -d ' ')" -eq 0 ]]
+}
+
 egress_container_ready() {
 	local pod
-	for pod in $(egress_pool_pods); do
+	for pod in $(egress_pool_pods_live); do
 		if kubectl -n "$NS" get pod "$pod" -o jsonpath='{range .status.containerStatuses[*]}{.name}{"="}{.ready}{" "}{end}' 2>/dev/null | grep -q 'egress=true'; then
 			return 0
 		fi
@@ -2404,7 +2422,7 @@ egress_status_ready() {
 
 egress_log_has() { # pattern
 	local pod found="" lines
-	for pod in $(egress_pool_pods); do
+	for pod in $(egress_pool_pods_live); do
 		lines="$(kubectl -n "$NS" logs "pod/$pod" -c egress --tail=300 2>/dev/null)"
 		log "egress log check $pod: lines=$(grep -c . <<< "$lines") match=$(grep -c "$1" <<< "$lines")"
 		if grep -q "$1" <<< "$lines"; then
@@ -2422,7 +2440,7 @@ egress_log_has() { # pattern
 # Used to distinguish a policy-update SET_BINDING from the initial one.
 egress_set_binding_count() {
 	local total=0 pod n
-	for pod in $(egress_pool_pods); do
+	for pod in $(egress_pool_pods_live); do
 		n="$(kubectl -n "$NS" logs "pod/$pod" -c egress --tail=2000 2>/dev/null | grep -c "SET_BINDING applied")"
 		total=$((total + n))
 	done
@@ -2681,7 +2699,7 @@ egress_binding_ready() { # sandbox
 egress_nft_subjects_clean() {
 	local pod rules any
 	any=""
-	for pod in $(egress_pool_pods); do
+	for pod in $(egress_pool_pods_live); do
 		rules="$(kubectl -n "$NS" exec "pod/$pod" -c egress -- nft list ruleset 2>/dev/null)"
 		[[ -n "$rules" ]] || { fail "nft CLI unavailable in the egress container; cannot verify rule unload"; return 1; }
 		any+="$rules"
@@ -2760,6 +2778,12 @@ verify_egress() {
 	# with different policies on one egress control plane.
 	run_stage "egress 1: reset egress pool (single fastlet) + egress container ready" \
 		kubectl -n "$NS" delete sandboxpool "$EGRESS_POOL" --ignore-not-found
+	# The pool delete is asynchronous for its fastlet pods: wait until they
+	# are fully gone before applying the replacement, otherwise the old pod
+	# (still Terminating, still matching the label selector) satisfies the
+	# readiness waits below and stage 2 execs into the new ContainerCreating
+	# pod. verify-snapshot leaves this pool behind, so verify-all hits it.
+	wait_for "egress pool fastlets drained before replacement" 180 egress_fastlets_gone
 	local egress_spec="$WORK/pool-firecracker-egress.yaml"
 	render_firecracker_pool_spec "$REPO_ROOT/config/samples/pool-firecracker-egress.yaml" "$egress_spec"
 	kubectl -n "$NS" apply -f "$egress_spec"
@@ -2890,7 +2914,7 @@ egress_sandbox_gone() { # sandbox
 }
 
 egress_single_pod() {
-	[[ "$(kubectl -n "$NS" get pods -l "app=sandbox-fastlet,fast-sandbox.io/pool=$EGRESS_POOL" -o name 2>/dev/null | wc -l | tr -d ' ')" -eq 1 ]]
+	[[ "$(egress_pool_pods_live | grep -c . || true)" -eq 1 ]]
 }
 
 # egress_subject_present / egress_subject_absent assert whether the sandbox's
