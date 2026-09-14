@@ -128,11 +128,18 @@ func prepareInstanceRootfs(stateRoot, image, instanceDir string) (string, error)
 	return target, nil
 }
 
+// reflinkOnly attempts a metadata-only CoW clone of source to target. It
+// never falls back to a full copy: callers that need consistency (e.g. the
+// snapshot rootfs clone) decide where a non-atomic full copy may run.
+func reflinkOnly(source, target string) error {
+	return exec.Command("cp", "--reflink=always", source, target).Run()
+}
+
 // copyReflinkOrCopy attempts a CoW reflink copy and falls back to a plain
 // copy when the host filesystem does not support reflinks (e.g. ext4): the
 // fallback pays a full rootfs copy (~1.7 GB/s) per create.
 func copyReflinkOrCopy(source, target string) error {
-	if exec.Command("cp", "--reflink=always", source, target).Run() == nil {
+	if reflinkOnly(source, target) == nil {
 		return nil
 	}
 	klog.V(4).InfoS("reflink copy unavailable, falling back to a full copy", "source", source)

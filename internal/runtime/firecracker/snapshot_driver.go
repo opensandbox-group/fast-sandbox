@@ -403,6 +403,19 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		_ = os.RemoveAll(spillDir)
 	}
 
+	// Clone the instance rootfs BEFORE pausing when the filesystem supports
+	// reflinks: the clone is atomic at the extent level (concurrent guest
+	// writes COW into new extents and never touch the copy), and
+	// disk-behind-memory is the crash-consistent direction — so a slow
+	// reflink (seconds on a loaded host) no longer sits in the
+	// business-visible pause window. Filesystems without reflinks keep the
+	// in-window full copy: it is not atomic and must happen while paused.
+	stagedRootfs := filepath.Join(plan.staging, publishedRootfsName)
+	rootfsCloned := false
+	if err := reflinkOnly(rootfs, stagedRootfs); err == nil {
+		rootfsCloned = true
+	}
+
 	client := d.newClient(state.APIAddress)
 	defer client.Close()
 	pauseStarted := time.Now()
@@ -412,8 +425,10 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		return fmt.Errorf("pause microVM: %w", err)
 	}
 	dumpErr := func() error {
-		if err := copyReflinkOrCopy(rootfs, filepath.Join(plan.staging, publishedRootfsName)); err != nil {
-			return fmt.Errorf("copy instance rootfs: %w", err)
+		if !rootfsCloned {
+			if err := copyReflinkOrCopy(rootfs, stagedRootfs); err != nil {
+				return fmt.Errorf("copy instance rootfs: %w", err)
+			}
 		}
 		if err := client.CreateSnapshot(ctx, SnapshotCreateRequest{
 			SnapshotType: "Full",
