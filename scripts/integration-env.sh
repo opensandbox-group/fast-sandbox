@@ -995,6 +995,23 @@ artifact_store_config() {
 		--dry-run=client -o yaml | kubectl apply -f - >/dev/null
 }
 
+# agent_write_credential_up installs the write-credential registry secret the
+# runtime-agent publishes snapshots/checkpoints with. MinIO root keys are
+# already read-write, so the same pair is reused as the write pair. Shared by
+# verify-snapshot and verify-pause (both roll the agent + publish).
+agent_write_credential_up() {
+	local host
+	host="${MINIO_ENDPOINT#http://}"
+	host="${host#https://}"
+	gen_registry "$host" "$MINIO_AK" "$MINIO_SK" "$MINIO_ENDPOINT" "$MINIO_AK" "$MINIO_SK" \
+		> "$WORK/agent-registry-write.json"
+	jq -e '.credentials[0].writeUsername' "$WORK/agent-registry-write.json" >/dev/null \
+		|| fail "generated agent registry carries no write credential"
+	kubectl -n "$NS" create secret generic fast-sandbox-agent-registry \
+		--from-file=registry.json="$WORK/agent-registry-write.json" \
+		--dry-run=client -o yaml | kubectl apply -f - >/dev/null
+}
+
 credentials_up() {
 	# The secrets land in the platform namespace; make sure it exists even
 	# when controller_up has not run yet (e.g. resume after a partial up).
@@ -3126,16 +3143,7 @@ snapshot_env_up() {
 
 	# Agent write credential: publish requires it. MinIO root keys are
 	# already read-write, so the same pair is reused as the write pair.
-	local host
-	host="${MINIO_ENDPOINT#http://}"
-	host="${host#https://}"
-	gen_registry "$host" "$MINIO_AK" "$MINIO_SK" "$MINIO_ENDPOINT" "$MINIO_AK" "$MINIO_SK" \
-		> "$WORK/agent-registry-write.json"
-	jq -e '.credentials[0].writeUsername' "$WORK/agent-registry-write.json" >/dev/null \
-		|| fail "generated agent registry carries no write credential"
-	kubectl -n "$NS" create secret generic fast-sandbox-agent-registry \
-		--from-file=registry.json="$WORK/agent-registry-write.json" \
-		--dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	agent_write_credential_up
 
 	# Re-apply the pool so fastletTemplate changes (the snapshot spill
 	# volume/env) reach the recreated fastlet pods — stage 1 deletes the
@@ -3216,7 +3224,7 @@ snapshot_prune_store() {
 
 snapshot_helpers_up() {
 	write_snapshotctl_source
-	log "verify-snapshot: building snapshotctl"
+	log "building snapshotctl (shared snapshot/pause fence helper)"
 	(cd "$REPO_ROOT" && GOTOOLCHAIN=local go build -o "$SNAPSHOTCTL_BIN" .integration-env-gen/snapshotctl.go)
 	pass "snapshotctl built"
 }
@@ -3857,6 +3865,474 @@ snapshot_on_error() {
 	printf '\033[1;31m[snapshot-e2e] FAILED; evidence: %s\033[0m\n' "$SNAP_E2E_DIR" >&2
 }
 
+
+# --- verify-pause: cross-host pause/resume E2E ---------------------------------
+#
+# Drives the pause/resume chain against the environment this script built:
+#
+#   fastctl pause (fastpath PauseSandbox) -> Sandbox spec.state=Paused ->
+#   controller -> fastlet checkpoint task -> firecracker driver (pause ->
+#   dump -> resume) -> runtime-agent publish to MinIO -> checkpoint address
+#   persisted in status.runtime.checkpoint -> runtime + assignment released
+#   -> (the pausing Fastlet Pod is deleted: cross-host) -> fastctl resume ->
+#   new placement pulls the checkpoint from the store -> guest memory
+#   restored (uptime + in-guest marker survive) -> execd /ping.
+#
+# Evidence collected into logs/pause-e2e-<ts>/ on success AND failure: key
+# timings (pause RPC -> Pausing -> checkpoint durable -> Paused, driver dump
+# window and publish, resume -> Resuming -> Ready, first /ping, total offline
+# window, restore breakdown), component logs (controller/fastlet/agent/
+# firecracker), CR manifests for the paused and resumed states, and the
+# checkpoint store location.
+#
+# Env overrides: PAUSE_SANDBOX (sandbox name), PAUSE_TIMEOUT_S,
+# PAUSE_SKIP_IMAGE_REBUILD=1 (skip rolling controller/fastlet/agent images
+# when the deployed ones already carry the pause chain).
+PAUSE_SANDBOX="${PAUSE_SANDBOX:-sandbox-pause-e2e}"
+PAUSE_TIMEOUT_S="${PAUSE_TIMEOUT_S:-600}"
+PAUSE_SKIP_IMAGE_REBUILD="${PAUSE_SKIP_IMAGE_REBUILD:-0}"
+PAUSE_E2E_DIR=""
+PAUSE_TIMINGS=""
+PAUSE_PHASE_LOG=""
+PAUSE_RESUME_PHASE_LOG=""
+PAUSE_SOURCE_UPTIME_BEFORE=""
+PAUSE_MARKER_VALUE=""
+PAUSE_OLD_FASTLET=""
+PAUSE_OLD_FASTLET_UID=""
+PAUSE_CHECKPOINT_ID=""
+PAUSE_CHECKPOINT_REF=""
+PAUSE_CHECKPOINT_DIGEST=""
+PAUSE_PAUSED_AT_MS=""
+PAUSE_FIRST_PING_AT_MS=""
+
+pause_record() { # key value
+	printf '%s\t%s\n' "$1" "$2" >> "$PAUSE_TIMINGS"
+}
+
+# pause_guest_run executes one shell command in the guest through execd.
+pause_guest_run() { # sandbox command
+	local body
+	body="$(jq -nc --arg c "$2" '{command:$c}')"
+	egress_execd_run "$1" "$body" 12 2>/dev/null
+}
+
+# pause_guest_marker prints the in-guest marker value (empty when missing).
+pause_guest_marker() { # sandbox
+	local out
+	out="$(pause_guest_run "$1" 'cat /tmp/e2e-pause-marker')" || return 1
+	printf '%s\n' "$out" | grep -o 'pause-marker-[0-9]*-[0-9]*' | head -1
+}
+
+# pause_env_up rolls pause-capable images and the standard firecracker pool
+# (no egress dependency; this flow needs no network policy).
+pause_env_up() {
+	# A pre-pause environment carries an older fastctl: rebuild the host CLI
+	# so the pause/resume subcommands exist before the flow uses them.
+	log "verify-pause: rebuilding fastctl (pause/resume subcommands)"
+	mkdir -p "$WORK/bin"
+	(cd "$REPO_ROOT" && GOTOOLCHAIN=local go build -o "$WORK/bin/fastctl" ./cmd/fastctl)
+	if [[ "$PAUSE_SKIP_IMAGE_REBUILD" != 1 ]]; then
+		log "verify-pause: rebuilding controller/fastlet/agent images"
+		(cd "$REPO_ROOT" && make images COMPONENT=controller >/dev/null)
+		(cd "$REPO_ROOT" && make images COMPONENT=fastlet >/dev/null)
+		(cd "$REPO_ROOT" && make images COMPONENT=firecracker-runtime-agent >/dev/null)
+		for image in "$IMG_CONTROLLER" "$IMG_FASTLET" "$IMG_AGENT"; do
+			kind load docker-image "$image" --name "$KIND_CLUSTER" >/dev/null
+		done
+	else
+		log "verify-pause: PAUSE_SKIP_IMAGE_REBUILD=1 (assuming deployed images carry the chain)"
+	fi
+	kubectl apply -k "$REPO_ROOT/config/crd" >/dev/null
+	[[ -n "$MINIO_ENDPOINT" ]] || resolve_minio_endpoint
+	agent_write_credential_up
+
+	# Re-apply the standard pool (warmImages handled like up) so recreated
+	# fastlet pods carry the freshly loaded image.
+	local pool_spec="$WORK/pool-firecracker-pause.yaml"
+	if [[ "$WARM_IMAGES" == "1" ]]; then
+		render_firecracker_pool_spec "$REPO_ROOT/config/samples/pool-firecracker.yaml" "$pool_spec"
+	else
+		sed '/^  warmImages:/,$d' "$REPO_ROOT/config/samples/pool-firecracker.yaml" > "$pool_spec"
+	fi
+	kubectl apply -f "$pool_spec" >/dev/null
+
+	kubectl apply -k "$REPO_ROOT/config/all-in-one" >/dev/null
+	artifact_store_config
+	kubectl -n "$NS" rollout restart deploy/fast-sandbox-controller >/dev/null
+	kubectl -n "$NS" rollout restart daemonset/firecracker-runtime-agent >/dev/null
+	kubectl -n "$NS" delete pod -l app=sandbox-fastlet --wait=true >/dev/null 2>&1 || true
+	wait_for "controller rollout ready" 120 \
+		kubectl -n "$NS" rollout status deploy/fast-sandbox-controller --timeout=10s
+	wait_for "agent rollout ready (write credential)" 180 \
+		kubectl -n "$NS" rollout status daemonset/firecracker-runtime-agent --timeout=10s
+	wait_for "fastlet pod ready (recreated)" 180 fastlet_pod_ready
+	if [[ "$WARM_IMAGES" == "1" ]]; then
+		wait_for "pause pool warm image cached" 300 warm_images_ready
+	fi
+	wait_for "pause pool placement converged (idle fastlets >= 1)" 180 pool_idle_fastlets
+	pass "pause-capable images rolled; standard firecracker pool ready"
+}
+
+pause_source_up() {
+	snapshot_cleanup_sandbox "$PAUSE_SANDBOX"
+	fastctl_run_sandbox "$PAUSE_SANDBOX"
+	wait_for "pause source sandbox Ready" 600 sandbox_ready "$PAUSE_SANDBOX"
+	wait_for "pause source /ping" 120 probe_execd "$PAUSE_SANDBOX"
+
+	# Guest state that only a memory restore can preserve: the uptime must
+	# stay monotonic and the marker file must survive the pause.
+	PAUSE_SOURCE_UPTIME_BEFORE="$(snapshot_guest_uptime "$PAUSE_SANDBOX")" \
+		|| fail "cannot read the guest uptime before the pause"
+	PAUSE_MARKER_VALUE="pause-marker-$(date +%s)-$RANDOM"
+	pause_guest_run "$PAUSE_SANDBOX" "echo $PAUSE_MARKER_VALUE > /tmp/e2e-pause-marker" >/dev/null \
+		|| fail "cannot write the guest marker before the pause"
+	[[ "$(pause_guest_marker "$PAUSE_SANDBOX")" == "$PAUSE_MARKER_VALUE" ]] \
+		|| fail "guest marker was not written"
+	PAUSE_OLD_FASTLET="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.placement.fastletName}')"
+	PAUSE_OLD_FASTLET_UID="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.placement.fastletPodUID}')"
+	[[ -n "$PAUSE_OLD_FASTLET" ]] || fail "source sandbox has no placement"
+	log "source: uptime=${PAUSE_SOURCE_UPTIME_BEFORE}s marker=$PAUSE_MARKER_VALUE fastlet=$PAUSE_OLD_FASTLET ($PAUSE_OLD_FASTLET_UID)"
+
+	# Fence: ResumeSandbox on a never-paused Sandbox is an idempotent
+	# success and must not bump the spec generation.
+	local gen out rc=0
+	gen="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.metadata.generation}')"
+	out="$(fastctl resume "$PAUSE_SANDBOX" 2>&1)" || rc=$?
+	[[ "$rc" -eq 0 ]] || fail "resume on a running sandbox must be idempotent success: $out"
+	[[ "$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.metadata.generation}')" == "$gen" ]] \
+		|| fail "idempotent resume bumped the spec generation"
+	pass "source sandbox Ready (marker + uptime recorded; resume-on-running idempotent)"
+}
+
+pause_fastlet_timings() { # fastlet
+	local fastlet="$1" line
+	log "checkpoint driver timings (fastlet $fastlet):"
+	while IFS= read -r line; do
+		log "  $line"
+		case "$line" in
+			*sandbox\ dumped*)
+				pause_record "checkpoint_dump_window_ms" "$(duration_to_ms "$(klog_field "$line" pauseWindow)")"
+				;;
+			*snapshot\ published*)
+				pause_record "checkpoint_publish_ms" "$(duration_to_ms "$(klog_field "$line" publish)")"
+				;;
+		esac
+	done < <(kubectl -n "$NS" logs "$fastlet" --since=30m --tail=2000 2>/dev/null \
+		| grep -E "sandbox dumped|snapshot published" | tail -4)
+}
+
+pause_run() {
+	local t0 state last_state="" checkpoint_id="" gen_after_pause out rc deadline_ns
+	: > "$PAUSE_PHASE_LOG"
+	t0="$(now_ms)"
+	out="$(fastctl pause "$PAUSE_SANDBOX" 2>&1)" || fail "PauseSandbox failed: $out"
+	log "PauseSandbox: $out"
+	gen_after_pause="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.metadata.generation}')"
+
+	# Reentrancy: pausing while the pause is in flight (or already released)
+	# is an idempotent success and never bumps the spec generation.
+	rc=0
+	out="$(fastctl pause "$PAUSE_SANDBOX" 2>&1)" || rc=$?
+	[[ "$rc" -eq 0 ]] || fail "replayed pause must be idempotent: $out"
+	[[ "$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.metadata.generation}')" == "$gen_after_pause" ]] \
+		|| fail "replayed pause bumped the spec generation"
+	pass "pause requested twice: replay idempotent (generation stable)"
+
+	deadline_ns=$(( t0 + PAUSE_TIMEOUT_S * 1000000000 ))
+	while :; do
+		state="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.state}' 2>/dev/null || true)"
+		if [[ -n "$state" && "$state" != "$last_state" ]]; then
+			printf '%s\t+%ss\t%s\n' "$(date +%s%3N)" "$(ms2s $(( ($(now_ms) - t0) / 1000000 )))" "$state" >> "$PAUSE_PHASE_LOG"
+			log "pause phase -> $state (+$(ms2s $(( ($(now_ms) - t0) / 1000000 )))s after PauseSandbox)"
+			[[ "$state" == "Pausing" ]] && pause_record "pause_to_pausing_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
+			last_state="$state"
+		fi
+		if [[ -z "$checkpoint_id" ]]; then
+			checkpoint_id="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.checkpoint.checkpointID}' 2>/dev/null || true)"
+			if [[ -n "$checkpoint_id" ]]; then
+				pause_record "pause_to_checkpoint_durable_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
+				log "checkpoint durable: id=$checkpoint_id (+$(ms2s $(( ($(now_ms) - t0) / 1000000 )))s)"
+			fi
+		fi
+		[[ "$state" == "Paused" ]] && break
+		case "$state" in
+			Failed | Stopped) fail "pause terminated as $state" ;;
+		esac
+		[[ "$(now_ms)" -gt "$deadline_ns" ]] && fail "pause did not reach Paused within ${PAUSE_TIMEOUT_S}s (state=$state)"
+		sleep 1
+	done
+	PAUSE_PAUSED_AT_MS="$(now_ms)"
+	pause_record "pause_to_paused_ms" "$(( (PAUSE_PAUSED_AT_MS - t0) / 1000000 ))"
+
+	# Durable pause assertions: CR survives, checkpoint is addressable in the
+	# store, runtime + placement are released, Suspended is True.
+	PAUSE_CHECKPOINT_ID="$checkpoint_id"
+	PAUSE_CHECKPOINT_REF="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.checkpoint.manifestRef}')"
+	PAUSE_CHECKPOINT_DIGEST="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.checkpoint.artifactDigest}')"
+	local spec_state suspended placement size
+	spec_state="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.spec.state}')"
+	suspended="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.conditions[?(@.type=="Suspended")].status}')"
+	placement="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.placement.fastletName}')"
+	size="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.checkpoint.sizeBytes}')"
+	[[ "$spec_state" == "Paused" ]] || fail "spec.state is $spec_state (want Paused)"
+	[[ -n "$PAUSE_CHECKPOINT_ID" && -n "$PAUSE_CHECKPOINT_REF" && -n "$PAUSE_CHECKPOINT_DIGEST" ]] \
+		|| fail "checkpoint facts incomplete (id=$PAUSE_CHECKPOINT_ID ref=$PAUSE_CHECKPOINT_REF digest=$PAUSE_CHECKPOINT_DIGEST)"
+	[[ "$suspended" == "True" ]] || fail "Suspended condition is ${suspended:-<unset>} (want True)"
+	[[ -z "$placement" ]] || fail "paused sandbox still holds a placement ($placement)"
+	sandbox_exists "$PAUSE_SANDBOX" || fail "paused sandbox CR disappeared"
+	mc stat "chain/${PAUSE_CHECKPOINT_REF#s3://}" >/dev/null 2>&1 \
+		|| fail "checkpoint manifest missing from the store: $PAUSE_CHECKPOINT_REF"
+	pause_record "checkpoint_size_bytes" "${size:-0}"
+	highlight "  checkpoint: $PAUSE_CHECKPOINT_REF"
+	highlight "  artifact store path: chain/$MINIO_BUCKET/$(dirname "${PAUSE_CHECKPOINT_REF#s3://$MINIO_BUCKET/}")/"
+	mc ls "chain/$MINIO_BUCKET/$(dirname "${PAUSE_CHECKPOINT_REF#s3://$MINIO_BUCKET/}")/" 2>/dev/null | tee -a "$WORK/run.log" >&2 || true
+
+	pause_fastlet_timings "$PAUSE_OLD_FASTLET"
+
+	# Once Paused the runtime is released: execd /ping must fail (the
+	# resume bring-up is timed against this below).
+	local missed=0 attempt
+	for attempt in 1 2 3; do
+		probe_execd "$PAUSE_SANDBOX" && missed=$((missed + 1))
+		sleep 1
+	done
+	[[ "$missed" -eq 0 ]] || fail "paused sandbox still answers /ping ($missed/3): runtime not released"
+	pass "pause Succeeded in $(ms2s $(( (PAUSE_PAUSED_AT_MS - t0) / 1000000 )))s: checkpoint durable, runtime released, store-addressable"
+}
+
+pause_fencing() {
+	local out rc gen
+	# Fence: a resume with a stale checkpoint id is rejected before any write.
+	rc=0
+	out="$(fastctl resume "$PAUSE_SANDBOX" --checkpoint-id wrong-checkpoint 2>&1)" || rc=$?
+	[[ "$rc" -ne 0 ]] || fail "resume with a stale checkpoint id was accepted"
+	printf '%s' "$out" | grep -q "checkpoint changed" || fail "unexpected checkpoint-fence error: $out"
+	[[ "$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.spec.state}')" == "Paused" ]] \
+		|| fail "rejected resume persisted a spec change"
+	pass "resume checkpoint fence rejected (Aborted, no write)"
+
+	# Fence: a create replay against the paused Sandbox must be refused (the
+	# CR is the resume ticket, not a create target).
+	rc=0
+	out="$(fastctl run "$PAUSE_SANDBOX" --image "$SBX_IMAGE" --pool "$SBX_POOL" 2>&1)" || rc=$?
+	[[ "$rc" -ne 0 ]] || fail "create replay against a paused sandbox was accepted"
+	printf '%s' "$out" | grep -qi "paused" || fail "unexpected create-replay error: $out"
+	pass "create replay rejected while paused"
+
+	# Fence: a template snapshot needs a Ready runtime; a paused Sandbox is
+	# not a snapshot source.
+	rc=0
+	out="$("$SNAPSHOTCTL_BIN" create "$FASTPATH_LOCAL" "$NS" "$PAUSE_SANDBOX" "e2e-pause-snap-fence" "e2e-pause-snap-fence-tpl" 2>&1)" || rc=$?
+	[[ "$rc" -ne 0 ]] || fail "snapshot creation against a paused sandbox was accepted"
+	printf '%s' "$out" | grep -qi "requires a Ready Sandbox" || fail "unexpected snapshot-fence error: $out"
+	if kubectl -n "$NS" get sandboxsnapshot "e2e-pause-snap-fence" >/dev/null 2>&1; then
+		fail "rejected snapshot must not persist a CR"
+	fi
+	pass "snapshot rejected while paused (requires a Ready runtime)"
+
+	# Fence: pausing an already-paused Sandbox is idempotent.
+	gen="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.metadata.generation}')"
+	rc=0
+	out="$(fastctl pause "$PAUSE_SANDBOX" 2>&1)" || rc=$?
+	[[ "$rc" -eq 0 ]] || fail "pause on a paused sandbox must be idempotent: $out"
+	[[ "$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.metadata.generation}')" == "$gen" ]] \
+		|| fail "pause on a paused sandbox bumped the spec generation"
+	pass "pause on a paused Sandbox idempotent"
+}
+
+pause_old_fastlet_gone() {
+	! kubectl -n "$NS" get pod "$PAUSE_OLD_FASTLET" >/dev/null 2>&1
+}
+
+# pause_pull_evidence asserts the resume pulled the checkpoint from the store
+# on the replacement Fastlet (the old node's task record is gone, the old pod
+# deleted: nothing local can supply it).
+pause_pull_evidence() { # fastlet
+	local fastlet="$1" driver agent
+	driver="$(kubectl -n "$NS" logs "$fastlet" --since=20m --tail=3000 2>/dev/null \
+		| grep "artifact delivery completed" | grep -F "checkpoint:sha256:$PAUSE_CHECKPOINT_DIGEST" | tail -1 || true)"
+	agent="$(kubectl -n "$NS" logs daemonset/firecracker-runtime-agent --since=20m --tail=4000 2>/dev/null \
+		| grep "checkpoint pull completed" | grep -F "$PAUSE_CHECKPOINT_DIGEST" | tail -1 || true)"
+	[[ -n "$driver" ]] || fail "no checkpoint delivery log on the resuming Fastlet (was the checkpoint pulled?)"
+	[[ -n "$agent" ]] || fail "no agent checkpoint pull log (the store was not read)"
+	log "  driver delivery: ${driver:0:200}"
+	log "  agent pull: ${agent:0:200}"
+	pass "checkpoint was pulled from the artifact store on the replacement Fastlet"
+}
+
+pause_resume() {
+	# Cross-host: replace the pausing Fastlet Pod while the Sandbox is
+	# released. Only the store holds the checkpoint, so the resume must pull
+	# it on the replacement Pod.
+	log "deleting the pausing Fastlet Pod $PAUSE_OLD_FASTLET to force a cross-host resume"
+	kubectl -n "$NS" delete pod "$PAUSE_OLD_FASTLET" >/dev/null 2>&1 || fail "cannot delete the pausing Fastlet Pod"
+	wait_for "pausing Fastlet Pod gone" 120 pause_old_fastlet_gone
+	wait_for "replacement Fastlet Pod ready" 180 fastlet_pod_ready
+	wait_for "placement converged after replacement" 180 pool_idle_fastlets
+	pause_record "pause_to_resume_gap_ms" "$(( ($(now_ms) - PAUSE_PAUSED_AT_MS) / 1000000 ))"
+
+	local t0 out rc state last_state="" deadline_ns
+	: > "$PAUSE_RESUME_PHASE_LOG"
+	t0="$(now_ms)"
+	out="$(fastctl resume "$PAUSE_SANDBOX" --checkpoint-id "$PAUSE_CHECKPOINT_ID" 2>&1)" \
+		|| fail "ResumeSandbox failed: $out"
+	log "ResumeSandbox: $out"
+	# Reentrancy: a resume replay while the restore is in flight is an
+	# idempotent success.
+	rc=0
+	out="$(fastctl resume "$PAUSE_SANDBOX" --checkpoint-id "$PAUSE_CHECKPOINT_ID" 2>&1)" || rc=$?
+	[[ "$rc" -eq 0 ]] || fail "replayed resume must be idempotent: $out"
+	pass "resume requested twice: replay idempotent"
+
+	deadline_ns=$(( t0 + PAUSE_TIMEOUT_S * 1000000000 ))
+	while :; do
+		state="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.state}' 2>/dev/null || true)"
+		if [[ -n "$state" && "$state" != "$last_state" ]]; then
+			printf '%s\t+%ss\t%s\n' "$(date +%s%3N)" "$(ms2s $(( ($(now_ms) - t0) / 1000000 )))" "$state" >> "$PAUSE_RESUME_PHASE_LOG"
+			log "resume phase -> $state (+$(ms2s $(( ($(now_ms) - t0) / 1000000 )))s after ResumeSandbox)"
+			[[ "$state" == "Resuming" ]] && pause_record "resume_to_resuming_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
+			last_state="$state"
+		fi
+		if sandbox_ready "$PAUSE_SANDBOX"; then
+			break
+		fi
+		case "$state" in
+			Failed | Stopped) fail "resume terminated as $state" ;;
+		esac
+		[[ "$(now_ms)" -gt "$deadline_ns" ]] && fail "resume did not reach Ready within ${PAUSE_TIMEOUT_S}s (state=$state)"
+		sleep 1
+	done
+	pause_record "resume_to_ready_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
+
+	# Cross-host placement assertions + store-pull evidence.
+	local new_fastlet new_pod_uid
+	new_fastlet="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.placement.fastletName}')"
+	new_pod_uid="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.placement.fastletPodUID}')"
+	[[ -n "$new_fastlet" ]] || fail "resumed sandbox has no placement"
+	[[ "$new_fastlet" != "$PAUSE_OLD_FASTLET" ]] || fail "resume landed on the deleted pausing Fastlet"
+	[[ "$new_pod_uid" != "$PAUSE_OLD_FASTLET_UID" ]] || fail "resume kept the old Fastlet Pod UID"
+	highlight "  resumed on $new_fastlet (was $PAUSE_OLD_FASTLET)"
+	pause_pull_evidence "$new_fastlet"
+
+	# Memory restore: /ping, monotonic uptime, the pre-pause marker file.
+	wait_for "execd /ping after resume" 180 probe_execd "$PAUSE_SANDBOX"
+	PAUSE_FIRST_PING_AT_MS="$(now_ms)"
+	pause_record "resume_to_first_ping_ms" "$(( (PAUSE_FIRST_PING_AT_MS - t0) / 1000000 ))"
+	pause_record "offline_window_ms" "$(( (PAUSE_FIRST_PING_AT_MS - PAUSE_PAUSED_AT_MS) / 1000000 ))"
+	local uptime_after marker_after
+	uptime_after="$(snapshot_guest_uptime "$PAUSE_SANDBOX")" || fail "cannot read the guest uptime after the resume"
+	awk -v before="$PAUSE_SOURCE_UPTIME_BEFORE" -v after="$uptime_after" 'BEGIN { exit !(after >= before) }' \
+		|| fail "guest uptime went backwards ($PAUSE_SOURCE_UPTIME_BEFORE -> $uptime_after): the VM was restarted, not restored"
+	highlight "  guest uptime: ${PAUSE_SOURCE_UPTIME_BEFORE}s -> ${uptime_after}s (memory restored, not rebooted)"
+	marker_after="$(pause_guest_marker "$PAUSE_SANDBOX")" || fail "cannot read the guest marker after the resume"
+	[[ "$marker_after" == "$PAUSE_MARKER_VALUE" ]] \
+		|| fail "guest marker lost (want $PAUSE_MARKER_VALUE, got ${marker_after:-<empty>})"
+	highlight "  guest marker survived: $marker_after"
+
+	# One-shot consumption + desired-state convergence.
+	local spec_state checkpoint_id suspended
+	spec_state="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.spec.state}')"
+	checkpoint_id="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.checkpoint.checkpointID}')"
+	suspended="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.conditions[?(@.type=="Suspended")].status}')"
+	[[ "$spec_state" == "Running" ]] || fail "spec.state is $spec_state (want Running)"
+	[[ -z "$checkpoint_id" ]] || fail "checkpoint was not consumed by the resume (id=$checkpoint_id)"
+	[[ "$suspended" != "True" ]] || fail "Suspended condition still True after the resume"
+	show_restore_timings "$PAUSE_SANDBOX"
+	local line
+	line="$(kubectl -n "$NS" logs --request-timeout=10s --tail=300 "$new_fastlet" 2>/dev/null | grep 'firecracker sandbox created' | tail -1)"
+	[[ -n "$line" ]] && pause_record "resume_restore_total_ms" "$(duration_to_ms "$(klog_field "$line" total)")"
+	pass "cross-host resume restored memory on $new_fastlet (uptime + marker survived, checkpoint consumed)"
+}
+
+pause_evidence() {
+	{
+		echo "=== verify-pause evidence ($(date -u +%FT%TZ)) ==="
+		echo "sandbox=$PAUSE_SANDBOX timeout_s=$PAUSE_TIMEOUT_S"
+		echo "checkpoint_id=$PAUSE_CHECKPOINT_ID"
+		echo "checkpoint_manifest=$PAUSE_CHECKPOINT_REF"
+		echo "checkpoint_digest=$PAUSE_CHECKPOINT_DIGEST"
+		echo "pause_fastlet=$PAUSE_OLD_FASTLET ($PAUSE_OLD_FASTLET_UID)"
+		echo "resume_fastlet=$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.placement.fastletName}' 2>/dev/null || true)"
+		local dir
+		dir="$(dirname "${PAUSE_CHECKPOINT_REF#s3://$MINIO_BUCKET/}")"
+		[[ "$PAUSE_CHECKPOINT_REF" == s3://* ]] && echo "checkpoint_store=chain/$MINIO_BUCKET/$dir/"
+		echo "checkpoint_host_store=$MINIO_DATA/$MINIO_BUCKET/$dir/  (MinIO internal format; read via mc)"
+	} > "$PAUSE_E2E_DIR/summary.txt"
+	kubectl -n "$NS" get sandbox "$PAUSE_SANDBOX" -o yaml > "$PAUSE_E2E_DIR/sandbox.yaml" 2>&1 || true
+	kubectl -n "$NS" describe sandbox "$PAUSE_SANDBOX" > "$PAUSE_E2E_DIR/sandbox.describe.txt" 2>&1 || true
+	kubectl -n "$NS" logs deploy/fast-sandbox-controller --tail=400 > "$PAUSE_E2E_DIR/controller.log" 2>&1 || true
+	kubectl -n "$NS" logs deploy/fast-sandbox-controller --tail=3000 2>/dev/null \
+		| grep -iE "pause|resume|checkpoint" > "$PAUSE_E2E_DIR/controller-pause.log" || true
+	[[ -n "$PAUSE_OLD_FASTLET" ]] && kubectl -n "$NS" logs "$PAUSE_OLD_FASTLET" --since=30m --tail=800 > "$PAUSE_E2E_DIR/fastlet-pause.log" 2>&1 || true
+	local resume_fastlet
+	resume_fastlet="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.placement.fastletName}' 2>/dev/null || true)"
+	[[ -n "$resume_fastlet" ]] && kubectl -n "$NS" logs "$resume_fastlet" --since=30m --tail=800 > "$PAUSE_E2E_DIR/fastlet-resume.log" 2>&1 || true
+	kubectl -n "$NS" logs daemonset/firecracker-runtime-agent --tail=600 > "$PAUSE_E2E_DIR/agent.log" 2>&1 || true
+	local node
+	node="$(kind_node)"
+	if [[ -n "$node" && -n "$PAUSE_CHECKPOINT_DIGEST" ]]; then
+		docker exec "$node" sh -c \
+			"ls -la /var/lib/fast-sandbox/firecracker/images/\$(printf '%s' 'checkpoint:sha256:$PAUSE_CHECKPOINT_DIGEST' | sha256sum | awk '{print \$1}')/ 2>/dev/null || true" \
+			> "$PAUSE_E2E_DIR/checkpoint-cache-dir.txt" 2>&1 || true
+	fi
+	log "verify-pause evidence: $PAUSE_E2E_DIR"
+}
+
+pause_timing_report() {
+	highlight "== pause/resume key timings =="
+	local key value
+	while IFS=$'\t' read -r key value; do
+		[[ -n "$key" ]] || continue
+		case "$key" in
+			*bytes) printf '  %-36s %14s\n' "$key" "$value" ;;
+			*) printf '  %-36s %13sms\n' "$key" "$value" ;;
+		esac
+	done < "$PAUSE_TIMINGS"
+	highlight "== pause phase transitions (wallclock ms / offset / phase) =="
+	cat "$PAUSE_PHASE_LOG" 2>/dev/null || true
+	highlight "== resume phase transitions (wallclock ms / offset / phase) =="
+	cat "$PAUSE_RESUME_PHASE_LOG" 2>/dev/null || true
+}
+
+verify_pause() {
+	PAUSE_E2E_DIR="$LOGS_DIR/pause-e2e-$(date +%s)"
+	mkdir -p "$PAUSE_E2E_DIR"
+	PAUSE_TIMINGS="$PAUSE_E2E_DIR/timings.tsv"
+	PAUSE_PHASE_LOG="$PAUSE_E2E_DIR/pause-phases.log"
+	PAUSE_RESUME_PHASE_LOG="$PAUSE_E2E_DIR/resume-phases.log"
+	: > "$PAUSE_TIMINGS"
+
+	trap 'pause_on_error' EXIT
+	# Stage 1 rolls the controller/fastlet: run it BEFORE the forward/daemon
+	# attach, or the rollout kills the forward mid-run.
+	run_stage "pause 1: pause-capable images + standard pool" pause_env_up
+	snapshot_helpers_up
+	port_forward_up
+	resolve_daemon_up
+	run_stage "pause 2: source sandbox Ready (marker + uptime)" pause_source_up
+	run_stage "pause 3: pause (checkpoint durable, runtime released)" pause_run
+	run_stage "pause 4: reentrancy + fence matrix" pause_fencing
+	run_stage "pause 5: cross-host resume (Fastlet Pod replaced)" pause_resume
+	trap - EXIT
+	resolve_daemon_down
+	port_forward_down
+
+	pause_evidence
+	pause_timing_report
+	stage_summary
+	highlight "== verify-pause complete; evidence: $PAUSE_E2E_DIR =="
+}
+
+pause_on_error() {
+	[[ -n "$PAUSE_E2E_DIR" ]] || return 0
+	mkdir "$PAUSE_E2E_DIR/.on-error" 2>/dev/null || return 0
+	pause_evidence || true
+	failure_dump "verify-pause" || true
+	port_forward_down || true
+	resolve_daemon_down || true
+	printf '\033[1;31m[pause-e2e] FAILED; evidence: %s\033[0m\n' "$PAUSE_E2E_DIR" >&2
+}
+
 # --- verify-all ----------------------------------------------------------------------------------
 # verify_all runs every verification flow in one session, ordered by
 # escalating invasiveness: each step owns its port-forward/daemon attach and
@@ -3866,13 +4342,14 @@ snapshot_on_error() {
 verify_all() {
 	[[ -n "$(kubectl_get "sandboxtemplate/$SBX_TEMPLATE" '{.status.manifestRef}' 2>/dev/null)" ]] \
 		|| die "no built golden image (run 'integration-env.sh up' first)"
-	run_stage "verify-all 1/5: base delivery" verify
-	run_stage "verify-all 2/5: DART P2P evidence" verify_p2p
-	run_stage "verify-all 3/5: execd HTTP API battery" verify_execd_api
-	run_stage "verify-all 4/5: live snapshot + restore" verify_snapshot
-	run_stage "verify-all 5/5: egress policy matrix" verify_egress
+	run_stage "verify-all 1/6: base delivery" verify
+	run_stage "verify-all 2/6: DART P2P evidence" verify_p2p
+	run_stage "verify-all 3/6: execd HTTP API battery" verify_execd_api
+	run_stage "verify-all 4/6: live snapshot + restore" verify_snapshot
+	run_stage "verify-all 5/6: cross-host pause/resume" verify_pause
+	run_stage "verify-all 6/6: egress policy matrix" verify_egress
 	stage_summary
-	highlight "== verify-all complete: base + p2p + execd-api + snapshot + egress green =="
+	highlight "== verify-all complete: base + p2p + execd-api + snapshot + pause + egress green =="
 }
 
 # --- status --------------------------------------------------------------------------------------
@@ -3994,6 +4471,20 @@ usage: integration-env.sh [--cleanup|--auto-clean] {up|down|status|verify|verify
            logs/snapshot-e2e-<ts>/ (env: SNAPSHOT_*,
            SNAPSHOT_SKIP_IMAGE_REBUILD=1 skips the image refresh; requires
            opensandbox/egress:latest in local docker)
+  verify-pause
+           cross-host pause/resume E2E on the standard firecracker pool:
+           sandbox with an in-guest marker + uptime -> PauseSandbox -> the
+           checkpoint is published to MinIO and the runtime + placement are
+           released (CR survives as the resume ticket) -> reentrancy/fence
+           matrix (replayed pause/resume, stale checkpoint id, create and
+           snapshot against a paused Sandbox) -> the pausing Fastlet Pod is
+           deleted -> ResumeSandbox pulls the checkpoint from the store on
+           the replacement Pod, restores guest memory (uptime + marker
+           survive) and clears the one-shot checkpoint -> /ping; records
+           pause/resume phase latencies, the driver dump/publish and restore
+           breakdown, the total offline window, and collects component logs
+           into logs/pause-e2e-<ts>/ (env: PAUSE_SANDBOX, PAUSE_TIMEOUT_S,
+           PAUSE_SKIP_IMAGE_REBUILD=1)
   verify-p2p
            DART data-plane evidence (stage 2): presigned URL -> node-local
            DART -> origin (cold) -> block cache (warm, origin delta 0);
@@ -4011,8 +4502,8 @@ usage: integration-env.sh [--cleanup|--auto-clean] {up|down|status|verify|verify
            lifecycle, restart replay, teardown (requires the egress image)
   verify-all
            run every verify flow in one session, ordered base -> p2p ->
-           execd-api -> snapshot -> egress; fail-fast with the usual log
-           dumps and a final stage-timings table
+           execd-api -> snapshot -> pause -> egress; fail-fast with the
+           usual log dumps and a final stage-timings table
 
   --cleanup     down after an interrupted run (same recovery as down)
   --auto-clean  on up failure, run down automatically before dumping logs
@@ -4024,7 +4515,7 @@ for arg in "$@"; do
 	case "$arg" in
 		--cleanup) ACTION="down" ;;
 		--auto-clean) AUTO_CLEAN=1 ;;
-		up|down|status|verify|verify-all|verify-snapshot|verify-p2p|verify-execd-api|verify-egress) ACTION="$arg" ;;
+		up|down|status|verify|verify-all|verify-snapshot|verify-pause|verify-p2p|verify-execd-api|verify-egress) ACTION="$arg" ;;
 		*) usage ;;
 	esac
 done
@@ -4090,6 +4581,12 @@ case "$ACTION" in
 		set -o errtrace
 		trap 'snapshot_on_error' ERR
 		verify_snapshot
+		trap - ERR
+		;;
+	verify-pause)
+		set -o errtrace
+		trap 'pause_on_error' ERR
+		verify_pause
 		trap - ERR
 		;;
 	verify-p2p)
