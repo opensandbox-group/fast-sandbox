@@ -3927,7 +3927,10 @@ snapshot_on_error() {
 # The source runs on the egress pool with a deny policy, so the run also
 # proves the policy continuity contract: the published checkpoint manifest
 # records the binding verbatim, and the resume re-applies it from the
-# (authoritative) Sandbox spec with egress still blocked afterwards. Requires
+# (authoritative) Sandbox spec with egress still blocked afterwards. The
+# resume runs twice: cycle 5 drops the node-local checkpoint cache and
+# replaces the pausing Fastlet (store-pull fallback + cross-host placement),
+# cycle 6 keeps both (local cache hit, no agent pull). Requires
 # opensandbox/egress:latest in local docker, like verify-snapshot.
 #
 # Evidence collected into logs/pause-e2e-<ts>/ on success AND failure: key
@@ -3952,6 +3955,8 @@ PAUSE_E2E_DIR=""
 PAUSE_TIMINGS=""
 PAUSE_PHASE_LOG=""
 PAUSE_RESUME_PHASE_LOG=""
+PAUSE_LOCAL_PHASE_LOG=""
+PAUSE_LOCAL_DIGEST=""
 PAUSE_SOURCE_UPTIME_BEFORE=""
 PAUSE_MARKER_VALUE=""
 PAUSE_OLD_FASTLET=""
@@ -4195,6 +4200,19 @@ pause_run() {
 
 	pause_fastlet_timings "$PAUSE_OLD_FASTLET"
 
+	# P1: the checkpoint was committed to the node-local cache, so a resume on
+	# this Fastlet restores locally. Best-effort by design (GC may evict it);
+	# report either way.
+	local cache_node
+	cache_node="$(kubectl -n "$NS" get pod "$PAUSE_OLD_FASTLET" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+	if [[ -n "$cache_node" ]] && pause_node_cache_present "$PAUSE_CHECKPOINT_DIGEST" "$cache_node"; then
+		pause_record "checkpoint_node_cache_present" 1
+		pass "checkpoint committed to the node-local cache on $cache_node (local resume possible)"
+	else
+		pause_record "checkpoint_node_cache_present" 0
+		log "note: node-local checkpoint cache not observed; a resume on this Fastlet will pull from the store"
+	fi
+
 	# Once Paused the runtime is released: execd /ping must fail (the
 	# resume bring-up is timed against this below).
 	local missed=0 attempt
@@ -4262,6 +4280,34 @@ pause_fencing() {
 	pass "pause on a paused Sandbox idempotent"
 }
 
+# pause_node_cache_dir prints the cache directory of a checkpoint reference on
+# the node filesystem (shared with the kind node container).
+pause_node_cache_dir() { # digest
+	local digest_hex
+	digest_hex="$(printf '%s' "checkpoint:sha256:$1" | sha256sum | awk '{print $1}')"
+	printf '/var/lib/fast-sandbox/firecracker/images/%s' "$digest_hex"
+}
+
+# pause_node_cache_present reports whether the committed checkpoint cache
+# manifest exists on the given kind node.
+pause_node_cache_present() { # digest node
+	local dir
+	dir="$(pause_node_cache_dir "$1")"
+	docker exec "$2" sh -c "test -f $dir/manifest.json" 2>/dev/null
+}
+
+# pause_drop_node_cache removes any node-local checkpoint cache of the digest
+# from every kind node: it forces the cross-host/fallback resume cycle down the
+# store-pull path regardless of where the replacement Pod lands.
+pause_drop_node_cache() { # digest
+	local dir node
+	dir="$(pause_node_cache_dir "$1")"
+	for node in $(kind get nodes --name "$KIND_CLUSTER" 2>/dev/null); do
+		docker exec "$node" rm -rf "$dir" 2>/dev/null || true
+	done
+	log "verify-pause: dropped any node-local checkpoint cache for the fallback resume"
+}
+
 pause_old_fastlet_gone() {
 	! kubectl -n "$NS" get pod "$PAUSE_OLD_FASTLET" >/dev/null 2>&1
 }
@@ -4300,6 +4346,9 @@ pause_resume() {
 	# released. Only the store holds the checkpoint, so the resume must pull
 	# it on the replacement Pod.
 	snapshot_ensure_disk
+	# Force the fallback path regardless of scheduling: without this the
+	# replacement Pod may land on the pausing node and hit the local cache.
+	pause_drop_node_cache "$PAUSE_CHECKPOINT_DIGEST"
 	log "deleting the pausing Fastlet Pod $PAUSE_OLD_FASTLET to force a cross-host resume"
 	kubectl -n "$NS" delete pod "$PAUSE_OLD_FASTLET" >/dev/null 2>&1 || fail "cannot delete the pausing Fastlet Pod"
 	wait_for "pausing Fastlet Pod gone" 120 pause_old_fastlet_gone
@@ -4402,6 +4451,73 @@ pause_resume() {
 	pass "cross-host resume restored memory on $new_fastlet (uptime + marker survived, checkpoint consumed, policy re-applied)"
 }
 
+# pause_local_resume: cycle 2 — pause and resume WITHOUT replacing the Fastlet
+# or dropping the cache. The resume must restore from the node-local checkpoint
+# cache (no store pull, no delivery attempt) and re-apply the recorded policy
+# exactly like the fallback cycle.
+pause_local_resume() {
+	local t0 state last_state="" last_message="" message deadline_ns out rc checkpoint_id cache_node since pulls local_fastlet attempts
+	: > "$PAUSE_LOCAL_PHASE_LOG"
+	rc=0
+	out="$(fastctl pause "$PAUSE_SANDBOX" 2>&1)" || fail "local cycle PauseSandbox failed: $out"
+	t0="$(now_ms)"
+	deadline_ns=$(( t0 + PAUSE_TIMEOUT_S * 1000000000 ))
+	while :; do
+		state="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.state}' 2>/dev/null || true)"
+		message="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.message}' 2>/dev/null || true)"
+		if [[ -n "$state" && ( "$state" != "$last_state" || "$message" != "$last_message" ) ]]; then
+			printf '%s\t+%ss\t%s\t%s\n' "$(date +%s%3N)" "$(ms2s $(( ($(now_ms) - t0) / 1000000 )))" "$state" "$message" >> "$PAUSE_LOCAL_PHASE_LOG"
+			log "local cycle phase -> $state (+$(ms2s $(( ($(now_ms) - t0) / 1000000 )))s) message=${message:-<none>}"
+			last_state="$state"; last_message="$message"
+		fi
+		[[ "$state" == "Paused" ]] && break
+		[[ "$(now_ms)" -gt "$deadline_ns" ]] && fail "local cycle pause did not reach Paused within ${PAUSE_TIMEOUT_S}s (state=$state)"
+		sleep 1
+	done
+	pause_record "local_pause_to_paused_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
+
+	PAUSE_LOCAL_DIGEST="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.checkpoint.artifactDigest}')"
+	checkpoint_id="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.checkpoint.checkpointID}')"
+	[[ -n "$PAUSE_LOCAL_DIGEST" && -n "$checkpoint_id" ]] || fail "local cycle checkpoint facts are missing"
+	cache_node="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.runtime.checkpoint.fastletName}')"
+	cache_node="$(kubectl -n "$NS" get pod "$cache_node" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+	pause_node_cache_present "$PAUSE_LOCAL_DIGEST" "$cache_node" \
+		|| fail "local cycle: checkpoint cache missing on $cache_node (the driver commit did not happen)"
+	pause_record "local_cache_present" 1
+
+	# Only pulls/attempts AFTER this point count: older cycles may legitimately
+	# have pulled the same or other sets.
+	since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	t0="$(now_ms)"
+	rc=0
+	out="$(fastctl resume "$PAUSE_SANDBOX" --checkpoint-id "$checkpoint_id" 2>&1)" || fail "local cycle ResumeSandbox failed: $out"
+	deadline_ns=$(( t0 + PAUSE_TIMEOUT_S * 1000000000 ))
+	until sandbox_ready "$PAUSE_SANDBOX"; do
+		[[ "$(now_ms)" -gt "$deadline_ns" ]] && fail "local cycle resume did not reach Ready within ${PAUSE_TIMEOUT_S}s"
+		sleep 1
+	done
+	pause_record "local_resume_to_ready_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
+	wait_for "local cycle execd /ping" 180 probe_execd "$PAUSE_SANDBOX"
+
+	pulls="$(kubectl -n "$NS" logs daemonset/firecracker-runtime-agent --since-time="$since" 2>/dev/null | grep -c "checkpoint pull completed.*$PAUSE_LOCAL_DIGEST" || true)"
+	pulls="${pulls:-0}"
+	pause_record "local_resume_store_pulls" "$pulls"
+	[[ "$pulls" -eq 0 ]] || fail "local resume pulled the checkpoint from the store $pulls time(s) despite the node-local cache"
+	local_fastlet="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.placement.fastletName}')"
+	if [[ -n "$local_fastlet" ]]; then
+		attempts="$(kubectl -n "$NS" logs "$local_fastlet" --since-time="$since" 2>/dev/null | grep -c "artifact delivery attempt started.*$PAUSE_LOCAL_DIGEST" || true)"
+		pause_record "local_resume_delivery_attempts" "${attempts:-0}"
+		[[ "${attempts:-0}" -eq 0 ]] || fail "local resume started a store delivery attempt ($attempts) despite the cache"
+	fi
+
+	[[ "$(kubectl -n "$NS" get sandbox "$PAUSE_SANDBOX" -o jsonpath='{.spec.actionBindings[?(@.handler=="egress")].input}')" == "$EGRESS_DENY_POLICY" ]] \
+		|| fail "local cycle lost the egress binding from the Sandbox spec"
+	wait_for "local resume egress binding Ready" 240 egress_binding_ready "$PAUSE_SANDBOX"
+	wait_for "local resume execd control intact" 120 egress_execd_control "$PAUSE_SANDBOX"
+	test_egress_denied "$PAUSE_SANDBOX"
+	pass "local resume restored from the node-local checkpoint cache (no store pull, policy re-applied)"
+}
+
 pause_evidence() {
 	{
 		echo "=== verify-pause evidence ($(date -u +%FT%TZ)) ==="
@@ -4453,6 +4569,8 @@ pause_timing_report() {
 	cat "$PAUSE_PHASE_LOG" 2>/dev/null || true
 	highlight "== resume phase transitions (wallclock ms / offset / phase) =="
 	cat "$PAUSE_RESUME_PHASE_LOG" 2>/dev/null || true
+	highlight "== local-resume cycle phase transitions (wallclock ms / offset / phase) =="
+	cat "$PAUSE_LOCAL_PHASE_LOG" 2>/dev/null || true
 }
 
 verify_pause() {
@@ -4461,6 +4579,7 @@ verify_pause() {
 	PAUSE_TIMINGS="$PAUSE_E2E_DIR/timings.tsv"
 	PAUSE_PHASE_LOG="$PAUSE_E2E_DIR/pause-phases.log"
 	PAUSE_RESUME_PHASE_LOG="$PAUSE_E2E_DIR/resume-phases.log"
+	PAUSE_LOCAL_PHASE_LOG="$PAUSE_E2E_DIR/local-resume-phases.log"
 	: > "$PAUSE_TIMINGS"
 
 	trap 'pause_on_error' EXIT
@@ -4473,7 +4592,8 @@ verify_pause() {
 	run_stage "pause 2: source sandbox Ready (marker + uptime)" pause_source_up
 	run_stage "pause 3: pause (checkpoint durable, runtime released)" pause_run
 	run_stage "pause 4: reentrancy + fence matrix" pause_fencing
-	run_stage "pause 5: cross-host resume (Fastlet Pod replaced)" pause_resume
+	run_stage "pause 5: cross-host fallback resume (cache dropped, Fastlet replaced)" pause_resume
+	run_stage "pause 6: local resume from the node cache" pause_local_resume
 	trap - EXIT
 	resolve_daemon_down
 	port_forward_down
