@@ -112,7 +112,15 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *o
 			return r.reconcilePodLost(ctx, orchestrator, sandbox)
 		}
 	}
-	assigned, newlyAssigned, err := orchestrator.AssignDeclarative(ctx, sandbox, string(sandbox.UID))
+	// A resume prefers the Fastlet that captured the checkpoint: its
+	// node-local cache turns the restore into a local load instead of a
+	// store pull. Best-effort — a missing/replaced Fastlet or a cache miss
+	// falls back to the normal Top-K / pull path.
+	preferredFastlet, preferredPodUID := "", ""
+	if checkpoint := orchestration.ResumeCheckpoint(sandbox); checkpoint != nil {
+		preferredFastlet, preferredPodUID = checkpoint.FastletName, string(checkpoint.FastletPodUID)
+	}
+	assigned, newlyAssigned, err := orchestrator.AssignDeclarativePreferring(ctx, sandbox, string(sandbox.UID), preferredFastlet, preferredPodUID)
 	if err != nil {
 		if errors.Is(err, orchestration.ErrNoCandidate) {
 			_ = r.markPending(ctx, sandbox, "NoCandidate", "No Ready Fastlet currently accepts this Pool/profile")

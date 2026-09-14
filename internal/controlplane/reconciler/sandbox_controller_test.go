@@ -619,3 +619,39 @@ func getControllerSandbox(t *testing.T, reconciler *SandboxReconciler, name stri
 	require.NoError(t, reconciler.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: name}, &sandbox))
 	return &sandbox
 }
+
+func TestResumePrefersCheckpointFastlet(t *testing.T) {
+	reconciler, registry, _, sandbox := newControllerHarness(t)
+	var pool apiv1alpha2.SandboxPool
+	require.NoError(t, reconciler.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
+	second := placement.FastletInfo{
+		ID: "fastlet-b", PodName: "fastlet-b", PodUID: "pod-b", PodIP: "10.0.0.2", NodeName: "node-b",
+		RuntimeName: apiv1alpha2.RuntimeContainer, RuntimeProfileHash: "container-runtime-profile-v1",
+		ResourceProfileHash: pool.Spec.SandboxResources.Hash(), InfraRevision: "infra-minimal-v1", InfraReady: true,
+	}
+	registry.candidates = append(registry.candidates, second)
+	registry.fastlets[second.ID] = second
+
+	current := getControllerSandbox(t, reconciler, sandbox.Name)
+	current.Finalizers = []string{FinalizerName}
+	current.Spec.State = apiv1alpha2.SandboxStateRunning
+	require.NoError(t, reconciler.Update(context.Background(), current))
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	current.Status = apiv1alpha2.SandboxStatus{
+		Runtime: apiv1alpha2.RuntimeStatus{
+			State: apiv1alpha2.RuntimePaused, Generation: 1, PauseAttempt: 1,
+			Checkpoint: &apiv1alpha2.CheckpointStatus{
+				CheckpointID: "ckpt-1", ManifestRef: "s3://bucket/publish/abc/manifest.json", ArtifactDigest: "deadbeef",
+				FastletName: "fastlet-b", FastletPodUID: "pod-b",
+			},
+		},
+		DataPlane: apiv1alpha2.DataPlaneStatus{State: apiv1alpha2.DataPlaneUnavailable, RouteGeneration: 1},
+	}
+	require.NoError(t, reconciler.Status().Update(context.Background(), current))
+
+	reconcileTwice(t, reconciler, sandbox.Name)
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	require.Equal(t, "fastlet-b", current.Status.Placement.FastletName,
+		"resume must prefer the Fastlet that captured the checkpoint")
+	require.Equal(t, types.UID("pod-b"), current.Status.Placement.FastletPodUID)
+}

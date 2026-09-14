@@ -397,3 +397,35 @@ func TestCreateSnapshotDefaultsToTemplateKind(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, agentprotocol.PublishKindTemplate, agent.kind)
 }
+
+func TestCreateCheckpointCommitsNodeLocalCache(t *testing.T) {
+	fixture, _ := newSnapshotFixture(t)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+
+	result, err := fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "ckpt-1", Kind: fastletapi.SnapshotKindCheckpoint,
+	})
+	require.NoError(t, err)
+
+	// The published set is addressable locally under the canonical checkpoint
+	// reference, so a resume on this node restores without a store pull.
+	reference := artifacts.CheckpointReference(result.ArtifactDigest)
+	require.NoError(t, verifyRestorableImage(fixture.stateRoot, reference))
+	_, statErr := os.Stat(filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(reference), rootfsImageName))
+	require.NoError(t, statErr, "checkpoint cache entry missing its rootfs")
+	_, statErr = os.Stat(filepath.Join(fixture.stateRoot, snapshotStagingDir, "ckpt-1"))
+	require.True(t, os.IsNotExist(statErr), "staging must be consumed by the cache commit")
+}
+
+func TestCreateTemplateSnapshotDoesNotCommitCheckpointCache(t *testing.T) {
+	fixture, _ := newSnapshotFixture(t)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+
+	result, err := fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "snap-1", TemplateName: "app-v2",
+	})
+	require.NoError(t, err)
+	reference := artifacts.CheckpointReference(result.ArtifactDigest)
+	require.ErrorIs(t, verifyRestorableImage(fixture.stateRoot, reference), ErrImageNotReady,
+		"template snapshots keep discarding staging (same-node prewarm is issue #57)")
+}

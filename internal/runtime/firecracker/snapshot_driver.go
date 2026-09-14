@@ -166,19 +166,92 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 	}
 	publishStarted := time.Now()
 	outcome, publishErr := client.PublishImage(ctx, "snapshot-"+plan.snapshotID, publishKind(kind), input.TemplateName, plan.staging)
-	_ = os.RemoveAll(plan.staging)
 	if publishErr != nil {
+		_ = os.RemoveAll(plan.staging)
 		return nil, fmt.Errorf("publish snapshot artifacts: %w", publishErr)
 	}
-	klog.InfoS("firecracker snapshot published",
-		"sandboxId", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "templateName", input.TemplateName,
-		"manifestRef", outcome.ManifestRef, "sizeBytes", sizeBytes, "publish", time.Since(publishStarted).String())
-	return &runtimecontract.SnapshotResult{
+	result := &runtimecontract.SnapshotResult{
 		SnapshotID:     input.SnapshotID,
 		ManifestRef:    outcome.ManifestRef,
 		ArtifactDigest: outcome.ArtifactDigest,
 		SizeBytes:      sizeBytes,
-	}, nil
+	}
+	// A checkpoint keeps the published set in the node-local image cache: a
+	// resume that still lands on this node restores locally (~ms) instead of
+	// pulling the full set back from the store (~16s per 3.5GiB). The commit
+	// is best-effort — the store copy is authoritative, and any miss (cache
+	// evicted by the image GC, or a resume on another node) falls back to the
+	// normal pull path. Template snapshots keep discarding staging; their
+	// same-node prewarm is issue #57.
+	if kind == fastletapi.SnapshotKindCheckpoint {
+		if cacheErr := d.commitCheckpointCache(result, plan.staging); cacheErr != nil {
+			klog.ErrorS(cacheErr, "checkpoint local cache commit failed; a resume will pull from the store",
+				"sandboxId", plan.sandboxID, "snapshotId", plan.snapshotID, "manifestRef", outcome.ManifestRef)
+		}
+	} else {
+		_ = os.RemoveAll(plan.staging)
+	}
+	klog.InfoS("firecracker snapshot published",
+		"sandboxId", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "templateName", input.TemplateName,
+		"manifestRef", outcome.ManifestRef, "sizeBytes", sizeBytes, "publish", time.Since(publishStarted).String())
+	return result, nil
+}
+
+// commitCheckpointCache moves a published checkpoint artifact set from its
+// staging directory into the node-local image cache, under the canonical
+// checkpoint reference (artifacts.CheckpointReference), in the standard cache
+// layout (rootfs.img/vmstate.snap/memory.snap/manifest.json). The set is
+// assembled in a non-digest staging subdirectory and renamed into place
+// atomically, so the image GC — which only considers 64-hex cache names —
+// observes either a complete entry or nothing at all. The staging directory
+// is consumed on every path.
+func (d *Driver) commitCheckpointCache(result *runtimecontract.SnapshotResult, staging string) error {
+	if result == nil || result.ArtifactDigest == "" {
+		return fmt.Errorf("%w: checkpoint result carries no artifact digest", ErrInvalidConfig)
+	}
+	reference := artifacts.CheckpointReference(result.ArtifactDigest)
+	d.mu.RLock()
+	stateRoot := d.config.StateRoot
+	d.mu.RUnlock()
+	cacheDir := filepath.Join(stateRoot, imageCacheDir, imageKey(reference))
+	if verifyRestorableImage(stateRoot, reference) == nil {
+		// A concurrent replay already committed the identical set.
+		_ = os.RemoveAll(staging)
+		d.touchImage(reference)
+		return nil
+	}
+	tmpDir := filepath.Join(stateRoot, imageCacheDir, ".staging-"+filepath.Base(staging))
+	_ = os.RemoveAll(tmpDir)
+	if err := os.MkdirAll(tmpDir, 0o750); err != nil {
+		_ = os.RemoveAll(staging)
+		return fmt.Errorf("prepare checkpoint cache staging: %w", err)
+	}
+	for from, to := range map[string]string{
+		publishedRootfsName:  rootfsImageName,
+		vmstateSnapshotName:  vmstateSnapshotName,
+		memorySnapshotName:   memorySnapshotName,
+		snapshotManifestName: snapshotManifestName,
+	} {
+		if err := os.Rename(filepath.Join(staging, from), filepath.Join(tmpDir, to)); err != nil {
+			_ = os.RemoveAll(tmpDir)
+			_ = os.RemoveAll(staging)
+			return fmt.Errorf("stage checkpoint cache entry: %w", err)
+		}
+	}
+	if err := os.Rename(tmpDir, cacheDir); err != nil {
+		_ = os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(staging)
+		// A concurrent commit won the rename; the identical set is already
+		// addressable.
+		if verifyRestorableImage(stateRoot, reference) == nil {
+			d.touchImage(reference)
+			return nil
+		}
+		return fmt.Errorf("commit checkpoint cache entry: %w", err)
+	}
+	_ = os.RemoveAll(staging)
+	d.touchImage(reference)
+	return nil
 }
 
 // publishKind maps the Fastlet-side snapshot kind onto the runtime-agent's

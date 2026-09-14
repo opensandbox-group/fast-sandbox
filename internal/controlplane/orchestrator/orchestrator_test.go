@@ -454,3 +454,24 @@ func newHarness(t *testing.T) (*Orchestrator, *fakeRegistry, *fakeFastletClient,
 	}
 	return orchestrator, registry, fastletClient, sandbox
 }
+
+func TestPreferFastletMovesResumeTargetFirst(t *testing.T) {
+	candidates := []placement.FastletInfo{
+		{ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a"},
+		{ID: "fastlet-b", PodName: "fastlet-b", PodUID: "pod-b"},
+		{ID: "fastlet-c", PodName: "fastlet-c", PodUID: "pod-c"},
+	}
+	preferred := preferFastlet(candidates, "fastlet-c", "pod-c")
+	require.Equal(t, []placement.FastletID{"fastlet-c", "fastlet-a", "fastlet-b"},
+		[]placement.FastletID{preferred[0].ID, preferred[1].ID, preferred[2].ID})
+
+	// A replaced pod under the same name falls back to the normal order.
+	replaced := preferFastlet(candidates, "fastlet-c", "other-pod")
+	require.Equal(t, placement.FastletID("fastlet-a"), replaced[0].ID)
+
+	// Empty or unmatched hints leave the order untouched.
+	require.Equal(t, candidates, preferFastlet(candidates, "", ""))
+	require.Equal(t, candidates, preferFastlet(candidates, "fastlet-z", "pod-z"))
+	// An already-first candidate is a no-op.
+	require.Equal(t, candidates, preferFastlet(candidates, "fastlet-a", "pod-a"))
+}

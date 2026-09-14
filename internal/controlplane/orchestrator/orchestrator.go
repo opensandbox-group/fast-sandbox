@@ -192,6 +192,17 @@ func AssignmentForCandidate(candidate placement.FastletInfo, attempt, instanceGe
 // first honors any FastPath-written annotation, then performs Pool validation
 // and registry selection only when no durable assignment exists.
 func (o *Orchestrator) AssignDeclarative(ctx context.Context, sandbox *apiv1alpha2.Sandbox, stableKey string) (*apiv1alpha2.Sandbox, bool, error) {
+	return o.AssignDeclarativePreferring(ctx, sandbox, stableKey, "", "")
+}
+
+// AssignDeclarativePreferring is AssignDeclarative with a resume hint: the
+// candidate matching the recorded pausing Fastlet (PodName + PodUID) is moved
+// to the front of the Top-K order, so the checkpoint's node-local cache can
+// serve the restore instead of the full pull. The hint is best-effort — a
+// missing/replaced Fastlet, a drained node, or a rejected candidate degrades
+// to the normal order and rejection retry, and a cache miss falls back to the
+// store pull in the runtime delivery layer.
+func (o *Orchestrator) AssignDeclarativePreferring(ctx context.Context, sandbox *apiv1alpha2.Sandbox, stableKey, preferredFastlet, preferredPodUID string) (*apiv1alpha2.Sandbox, bool, error) {
 	if sandbox == nil || sandbox.UID == "" {
 		return nil, false, errors.New("persisted Sandbox UID is required")
 	}
@@ -208,6 +219,7 @@ func (o *Orchestrator) AssignDeclarative(ctx context.Context, sandbox *apiv1alph
 	if err != nil {
 		return nil, false, err
 	}
+	candidates = preferFastlet(candidates, preferredFastlet, preferredPodUID)
 	runtimeInstanceID, err := idgen.GenerateRequestID()
 	if err != nil {
 		return nil, false, fmt.Errorf("generate runtime instance ID: %w", err)
@@ -225,6 +237,34 @@ func (o *Orchestrator) AssignDeclarative(ctx context.Context, sandbox *apiv1alph
 	}
 	projected, err := assignment.ProjectAssignmentToStatus(ctx, o.Client, client.ObjectKeyFromObject(sandbox))
 	return projected, won, err
+}
+
+// preferFastlet moves the candidate matching (PodName, PodUID) to the front
+// of the candidate list. UID matching keeps the hint precise across a Fastlet
+// Pod replacement under the same name; an empty or unmatched hint leaves the
+// order untouched.
+func preferFastlet(candidates []placement.FastletInfo, name, podUID string) []placement.FastletInfo {
+	if name == "" {
+		return candidates
+	}
+	for index := range candidates {
+		candidate := candidates[index]
+		if candidate.PodName != name {
+			continue
+		}
+		if podUID != "" && candidate.PodUID != podUID {
+			continue
+		}
+		if index == 0 {
+			return candidates
+		}
+		reordered := make([]placement.FastletInfo, 0, len(candidates))
+		reordered = append(reordered, candidate)
+		reordered = append(reordered, candidates[:index]...)
+		reordered = append(reordered, candidates[index+1:]...)
+		return reordered
+	}
+	return candidates
 }
 
 // ReassignDeclarativeAfterRejection atomically moves a durable assignment to
