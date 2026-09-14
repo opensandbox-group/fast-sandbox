@@ -4355,13 +4355,19 @@ pause_resume() {
 	[[ "$new_fastlet" != "$PAUSE_OLD_FASTLET" ]] || fail "resume landed on the deleted pausing Fastlet"
 	[[ "$new_pod_uid" != "$PAUSE_OLD_FASTLET_UID" ]] || fail "resume kept the old Fastlet Pod UID"
 	highlight "  resumed on $new_fastlet (was $PAUSE_OLD_FASTLET)"
-	pause_pull_evidence "$new_fastlet"
 
-	# Memory restore: /ping, monotonic uptime, the pre-pause marker file.
+	# Probe the control path BEFORE the (slow) evidence gathering: this is the
+	# business-visible recovery point, and document/log reads must not inflate
+	# it.
 	wait_for "execd /ping after resume" 180 probe_execd "$PAUSE_SANDBOX"
 	PAUSE_FIRST_PING_AT_MS="$(now_ms)"
 	pause_record "resume_to_first_ping_ms" "$(( (PAUSE_FIRST_PING_AT_MS - t0) / 1000000 ))"
 	pause_record "offline_window_ms" "$(( (PAUSE_FIRST_PING_AT_MS - PAUSE_PAUSED_AT_MS) / 1000000 ))"
+
+	pause_pull_evidence "$new_fastlet"
+
+	# Memory restore: monotonic uptime and the pre-pause marker file.
+
 	local uptime_after marker_after
 	uptime_after="$(snapshot_guest_uptime "$PAUSE_SANDBOX")" || fail "cannot read the guest uptime after the resume"
 	awk -v before="$PAUSE_SOURCE_UPTIME_BEFORE" -v after="$uptime_after" 'BEGIN { exit !(after >= before) }' \
