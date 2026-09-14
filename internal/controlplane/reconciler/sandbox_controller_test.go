@@ -49,6 +49,7 @@ type controllerFastlet struct {
 	runtimes             map[string]string
 	ensureCall           int
 	deleteCall           int
+	lastCreateRequest    *fastletapi.CreateSandboxRequest
 	snapshotCreateErr    error
 	snapshotInspectErr   error
 	snapshotInspectPhase fastletapi.SnapshotPhase
@@ -60,6 +61,7 @@ func (f *controllerFastlet) CreateSandbox(_ context.Context, _ string, request *
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.ensureCall++
+	f.lastCreateRequest = request
 	if f.ensureErr != nil {
 		return &fastletapi.CreateSandboxResponse{}, f.ensureErr
 	}
@@ -530,6 +532,81 @@ func reconcileTwice(t *testing.T, reconciler *SandboxReconciler, name string) {
 	require.NoError(t, err)
 	_, err = reconciler.Reconcile(context.Background(), requestFor(name))
 	require.NoError(t, err)
+}
+
+func TestPauseCheckpointIDIsStableAndEpochScoped(t *testing.T) {
+	sandbox := &apiv1alpha2.Sandbox{ObjectMeta: metav1.ObjectMeta{UID: types.UID("uid-1"), Generation: 3}}
+	first := pauseCheckpointID(sandbox)
+	require.Equal(t, first, pauseCheckpointID(sandbox), "the same attempt replays the same task id")
+
+	sandbox.Status.Runtime.PauseAttempt = 2
+	second := pauseCheckpointID(sandbox)
+	require.NotEqual(t, first, second, "a new attempt must never reuse a retired task id")
+	sandbox.Generation = 4
+	require.NotEqual(t, second, pauseCheckpointID(sandbox), "a new spec generation gets a new task id")
+}
+
+func TestPauseReleasesRuntimeAndRecordsCheckpoint(t *testing.T) {
+	reconciler, _, fastlet, sandbox := newControllerHarness(t)
+	placementStatus := apiv1alpha2.PlacementStatus{FastletName: "fastlet-a", FastletPodUID: "pod-a", Attempt: 1}
+	current := seedReadyControllerAssignment(t, reconciler, getControllerSandbox(t, reconciler, sandbox.Name), placementStatus)
+	fastlet.runtimes[string(current.UID)] = "running"
+	current.Spec.State = apiv1alpha2.SandboxStatePaused
+	require.NoError(t, reconciler.Update(context.Background(), current))
+
+	// Trigger (Pausing) -> observe Succeeded and persist the checkpoint ->
+	// release the runtime -> mark Paused and drop the assignment.
+	for i := 0; i < 4; i++ {
+		_, err := reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+		require.NoError(t, err)
+	}
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	require.Equal(t, apiv1alpha2.SandboxStatePaused, current.Spec.State)
+	require.Equal(t, apiv1alpha2.RuntimePaused, current.Status.Runtime.State)
+	require.NotNil(t, current.Status.Runtime.Checkpoint)
+	require.Equal(t, "deadbeef", current.Status.Runtime.Checkpoint.ArtifactDigest)
+	require.NotEmpty(t, current.Status.Runtime.Checkpoint.CheckpointID)
+	require.Empty(t, current.Status.Placement.FastletName, "a paused Sandbox occupies no Fastlet placement")
+	require.True(t, current.Status.HasCondition(apiv1alpha2.SandboxConditionSuspended, metav1.ConditionTrue, "CheckpointPublished"))
+	fastlet.mu.Lock()
+	require.GreaterOrEqual(t, fastlet.deleteCall, 1, "the runtime is released after the checkpoint is durable")
+	require.GreaterOrEqual(t, fastlet.snapshotDeleteCall, 1, "the node-local checkpoint task record is cleaned up")
+	fastlet.mu.Unlock()
+}
+
+func TestResumeFromCheckpointCarriesRestoreAndClearsIt(t *testing.T) {
+	reconciler, _, fastlet, sandbox := newControllerHarness(t)
+	current := getControllerSandbox(t, reconciler, sandbox.Name)
+	current.Finalizers = []string{FinalizerName}
+	current.Spec.State = apiv1alpha2.SandboxStateRunning
+	require.NoError(t, reconciler.Update(context.Background(), current))
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	current.Status = apiv1alpha2.SandboxStatus{
+		Runtime: apiv1alpha2.RuntimeStatus{
+			State: apiv1alpha2.RuntimePaused, Generation: 1, PauseAttempt: 1,
+			Checkpoint: &apiv1alpha2.CheckpointStatus{
+				CheckpointID: "ckpt-1", ManifestRef: "s3://bucket/publish/abc/manifest.json", ArtifactDigest: "deadbeef",
+			},
+		},
+		DataPlane: apiv1alpha2.DataPlaneStatus{State: apiv1alpha2.DataPlaneUnavailable, RouteGeneration: 1},
+	}
+	require.NoError(t, reconciler.Status().Update(context.Background(), current))
+
+	reconcileTwice(t, reconciler, sandbox.Name)
+	fastlet.mu.Lock()
+	request := fastlet.lastCreateRequest
+	fastlet.mu.Unlock()
+	require.NotNil(t, request)
+	require.NotNil(t, request.Sandbox.Restore, "a resume must restore from the checkpoint instead of booting the image")
+	require.Equal(t, "deadbeef", request.Sandbox.Restore.ArtifactDigest)
+	require.Equal(t, "s3://bucket/publish/abc/manifest.json", request.Sandbox.Restore.ManifestRef)
+
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	require.Equal(t, apiv1alpha2.RuntimeReady, current.Status.Runtime.State)
+	require.Nil(t, current.Status.Runtime.Checkpoint, "a completed resume consumes the one-shot checkpoint")
+	require.Zero(t, current.Status.Runtime.PauseAttempt)
+	require.NotEmpty(t, current.Status.Placement.FastletName)
+	require.False(t, current.Status.HasCondition(apiv1alpha2.SandboxConditionSuspended, metav1.ConditionTrue, "CheckpointPublished"))
 }
 
 func requestFor(name string) ctrl.Request {

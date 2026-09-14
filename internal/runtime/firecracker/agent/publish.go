@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"fast-sandbox/internal/artifacts"
+	agentprotocol "fast-sandbox/internal/runtime/firecracker/agent/protocol"
 )
 
 // publishArtifacts are the artifact files of a native (non-overlaybd) set,
@@ -36,11 +37,26 @@ type PublishResult struct {
 }
 
 // PublishImage uploads the artifact set staged in dir to the configured
-// store under key and returns the manifest reference and digest. It is
-// synchronous: multi-GiB memory files legitimately take minutes.
-func (c *Client) PublishImage(ctx context.Context, key, dir string) (PublishResult, error) {
-	if strings.TrimSpace(key) == "" {
-		return PublishResult{}, fmt.Errorf("publish key is required")
+// store and returns the manifest reference and digest. It is synchronous:
+// multi-GiB memory files legitimately take minutes. kind selects the
+// publication mode: a template set (default) requires key and writes the
+// image index last; a checkpoint set carries no key and writes no index —
+// the instance-private set is addressed by its returned ref + digest.
+func (c *Client) PublishImage(ctx context.Context, kind, key, dir string) (PublishResult, error) {
+	if kind == "" {
+		kind = agentprotocol.PublishKindTemplate
+	}
+	switch kind {
+	case agentprotocol.PublishKindTemplate:
+		if strings.TrimSpace(key) == "" {
+			return PublishResult{}, fmt.Errorf("publish key is required for a template artifact set")
+		}
+	case agentprotocol.PublishKindCheckpoint:
+		if strings.TrimSpace(key) != "" {
+			return PublishResult{}, fmt.Errorf("checkpoint artifact sets publish no image index; key must be empty")
+		}
+	default:
+		return PublishResult{}, fmt.Errorf("unknown publish kind %q", kind)
 	}
 	manifestBytes, err := os.ReadFile(filepath.Join(dir, publishManifestName))
 	if err != nil {
@@ -61,6 +77,10 @@ func (c *Client) PublishImage(ctx context.Context, key, dir string) (PublishResu
 	manifestURI := c.s3.storeRootURI() + "/" + base + "/" + publishManifestName
 	if err := c.putFile(ctx, dir, publishManifestName, base+"/"+publishManifestName); err != nil {
 		return PublishResult{}, fmt.Errorf("publish manifest: %w", err)
+	}
+	if kind == agentprotocol.PublishKindCheckpoint {
+		// No index: the set is complete and addressed by ref + digest only.
+		return PublishResult{ManifestRef: manifestURI, ArtifactDigest: artifactDigest}, nil
 	}
 
 	// The index is written last overall: a consumer that resolves the key is

@@ -98,6 +98,17 @@ func ImageIndexKey(reference string) string {
 	return SHA256Of([]byte(reference))
 }
 
+// CheckpointReference returns the canonical cache reference of a checkpoint
+// artifact set. A checkpoint is instance-private: it publishes no image
+// index and is never addressable as a CreateSandbox image. Producers and
+// consumers (the node cache and the driver restore path) therefore agree on
+// this synthetic reference derived from the immutable manifest digest, so
+// the standard image cache layout keyed by imageKey(reference) is reused
+// unchanged across hosts.
+func CheckpointReference(artifactDigest string) string {
+	return "checkpoint:sha256:" + artifactDigest
+}
+
 // ImageIndexPayload builds the image index document pointing at a published
 // manifest. The image field equals the key the document is written under so
 // pull-side byte matching works unchanged.

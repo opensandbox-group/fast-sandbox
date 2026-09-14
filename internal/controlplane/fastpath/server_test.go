@@ -726,3 +726,70 @@ func TestCreateRejectsExpiredDeadlineBeforeCRDWrite(t *testing.T) {
 	creates, _, _, _ := k8sClient.counts()
 	require.Zero(t, creates)
 }
+
+func TestPauseSandboxPersistsDesiredStateIdempotently(t *testing.T) {
+	server, k8sClient, _, _ := newV2Server(t)
+	_, err := server.CreateSandbox(context.Background(), createRequest("sandbox-pause"))
+	require.NoError(t, err)
+
+	response, err := server.PauseSandbox(context.Background(), &fastpathv2.PauseSandboxRequest{
+		RequestId: "pause-1", Sandbox: expectedReference("sandbox-pause", "default"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, fastpathv2.SandboxState_SANDBOX_STATE_PAUSED, response.Sandbox.State)
+
+	// Replaying an effective pause is idempotent and never bumps the spec.
+	replayed, err := server.PauseSandbox(context.Background(), &fastpathv2.PauseSandboxRequest{
+		RequestId: "pause-1", Sandbox: expectedReference("sandbox-pause", "default"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, response.Generation, replayed.Generation)
+
+	var sandbox apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "sandbox-pause"}, &sandbox))
+	require.Equal(t, apiv1alpha2.SandboxStatePaused, sandbox.Spec.State)
+
+	_, err = server.PauseSandbox(context.Background(), &fastpathv2.PauseSandboxRequest{
+		Sandbox: expectedReference("sandbox-pause", "default"), ExpectedGeneration: sandbox.Generation + 5,
+	})
+	require.Equal(t, codes.Aborted, status.Code(err))
+}
+
+func TestResumeSandboxRequiresCheckpointAndFences(t *testing.T) {
+	server, k8sClient, _, _ := newV2Server(t)
+	sandbox := &apiv1alpha2.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "paused-a", Namespace: "default", UID: types.UID("uid-paused-a")},
+		Spec:       apiv1alpha2.SandboxSpec{Image: "alpine:latest", PoolRef: "pool-a", State: apiv1alpha2.SandboxStatePaused},
+	}
+	require.NoError(t, k8sClient.Create(context.Background(), sandbox))
+
+	var current apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "paused-a"}, &current))
+	current.Status.Runtime = apiv1alpha2.RuntimeStatus{State: apiv1alpha2.RuntimePaused}
+	require.NoError(t, k8sClient.Status().Update(context.Background(), &current))
+
+	// Released without a checkpoint: resume is impossible (reset is the way out).
+	_, err := server.ResumeSandbox(context.Background(), &fastpathv2.ResumeSandboxRequest{Sandbox: expectedReference("paused-a", "default")})
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "paused-a"}, &current))
+	current.Status.Runtime.Checkpoint = &apiv1alpha2.CheckpointStatus{
+		CheckpointID: "ckpt-1", ManifestRef: "s3://bucket/publish/abc/manifest.json", ArtifactDigest: "deadbeef",
+	}
+	require.NoError(t, k8sClient.Status().Update(context.Background(), &current))
+
+	_, err = server.ResumeSandbox(context.Background(), &fastpathv2.ResumeSandboxRequest{
+		Sandbox: expectedReference("paused-a", "default"), ExpectedCheckpointId: "other",
+	})
+	require.Equal(t, codes.Aborted, status.Code(err))
+
+	response, err := server.ResumeSandbox(context.Background(), &fastpathv2.ResumeSandboxRequest{
+		Sandbox: expectedReference("paused-a", "default"), ExpectedCheckpointId: "ckpt-1",
+	})
+	require.NoError(t, err)
+	require.Equal(t, fastpathv2.SandboxState_SANDBOX_STATE_RUNNING, response.Sandbox.State)
+	require.NotNil(t, response.Sandbox.Checkpoint, "the checkpoint is reported while the resume is pending")
+
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "paused-a"}, &current))
+	require.Equal(t, apiv1alpha2.SandboxStateRunning, current.Spec.State)
+}

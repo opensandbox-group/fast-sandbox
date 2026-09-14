@@ -16,6 +16,7 @@ type RoutePublication = dataplane.RoutePublication
 type RoutePublisher = dataplane.RoutePublisher
 type ImageDelivery = runtimecontract.ImageDelivery
 type ImageDeliveryStatus = runtimecontract.ImageDeliveryStatus
+type CheckpointDelivery = runtimecontract.CheckpointDelivery
 type RuntimeSnapshotter = runtimecontract.Snapshotter
 type SnapshotResult = runtimecontract.SnapshotResult
 type RuntimeSnapshotInput = runtimecontract.SnapshotInput

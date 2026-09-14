@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"fast-sandbox/internal/artifacts"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 
 	"github.com/stretchr/testify/require"
@@ -61,6 +63,12 @@ func (m *materializingAgent) PinImage(ctx context.Context, requestID, image stri
 		}
 	}
 	return digest, nil
+}
+
+// PinCheckpoint materializes the checkpoint set through the same fake
+// commit path; the cache is keyed by the checkpoint reference.
+func (m *materializingAgent) PinCheckpoint(ctx context.Context, requestID, reference, _, _ string) (string, error) {
+	return m.PinImage(ctx, requestID, reference)
 }
 
 func (m *materializingAgent) setPinErr(err error) {
@@ -242,4 +250,49 @@ func TestDeliverImagePartialCacheIsNotDelivered(t *testing.T) {
 	// The same criterion gates the synchronous create path: a partial cache
 	// parks (or fails in local mode) before any network slot is acquired.
 	require.ErrorIs(t, verifyRestorableImage(fixture.stateRoot, image), ErrImageNotReady)
+}
+
+func TestDeliverCheckpointMaterializesAndReportsDelivered(t *testing.T) {
+	fixture := newDriverFixture(t)
+	agent := &materializingAgent{fakeAgentClient: &fakeAgentClient{}, cacheRoot: fixture.stateRoot}
+	fixture.installMaterializingAgent(agent)
+
+	restore := &fastletapi.RestoreSpec{
+		ManifestRef: "s3://bucket/publish/0123456789abcdef/manifest.json", ArtifactDigest: "checkpoint-digest",
+	}
+	reference := artifacts.CheckpointReference(restore.ArtifactDigest)
+
+	status, err := fixture.driver.DeliverCheckpoint(context.Background(), restore)
+	require.NoError(t, err)
+	require.Equal(t, runtimecontract.ImageDelivering, status, "a cold checkpoint is delivered in the background")
+	require.Eventually(t, func() bool {
+		return verifyRestorableImage(fixture.stateRoot, reference) == nil
+	}, 2*time.Second, 10*time.Millisecond)
+
+	status, err = fixture.driver.DeliverCheckpoint(context.Background(), restore)
+	require.NoError(t, err)
+	require.Equal(t, runtimecontract.ImageDelivered, status)
+	require.Equal(t, 1, agent.deliveredPins(), "a committed checkpoint cache is not pinned again")
+}
+
+func TestDeliverCheckpointRejectsIncompleteAddress(t *testing.T) {
+	fixture := newDriverFixture(t)
+	_, err := fixture.driver.DeliverCheckpoint(context.Background(), &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/m.json"})
+	require.ErrorContains(t, err, "checkpoint manifestRef and artifactDigest are required")
+}
+
+func TestRestoreReferenceUsesCheckpointDigest(t *testing.T) {
+	reference, err := restoreReference(fastletapi.SandboxSpec{
+		Image:   "app:v1",
+		Restore: &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/m.json", ArtifactDigest: "digest-cp"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, artifacts.CheckpointReference("digest-cp"), reference)
+
+	reference, err = restoreReference(fastletapi.SandboxSpec{Image: "app:v1"})
+	require.NoError(t, err)
+	require.Equal(t, "app:v1", reference)
+
+	_, err = restoreReference(fastletapi.SandboxSpec{Image: "app:v1", Restore: &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/m.json"}})
+	require.ErrorContains(t, err, "restore requires manifestRef and artifactDigest")
 }

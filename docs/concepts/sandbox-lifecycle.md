@@ -100,12 +100,38 @@ If the owning Fastlet disappears before cleanup, NodeJanitor evaluates backend r
 
 This prevents an old observation from deleting a runtime that is still owned by an active Sandbox generation.
 
+## Pause and resume
+
+`spec.state: Paused` checkpoints the Sandbox and releases its Fastlet
+capacity; the Sandbox CR stays in the cluster as the resume ticket:
+
+1. the assigned Fastlet dumps the runtime (rootfs + vmstate + memory) and
+   publishes the set to the artifact store (a checkpoint, not a template);
+2. the Controller persists the artifact address in
+   `status.runtime.checkpoint` **before** touching the runtime;
+3. the runtime and the durable assignment are released, and the Sandbox
+   reports `Paused` with the `Suspended` Condition.
+
+`Paused` is durable-first: the runtime keeps serving until the checkpoint is
+complete in the store. Resuming flips `spec.state` back to `Running`; the
+Controller schedules the checkpoint on any eligible Fastlet (cross-host) and
+restores its memory under the same Sandbox identity, advancing the route
+generation. A completed resume consumes the one-shot checkpoint
+(`status.runtime.checkpoint` is cleared; store objects follow store
+lifecycle).
+
+While paused there is no placement, `expireTime` still applies, a template
+snapshot is rejected (it requires a running runtime), and reset/expiry drop
+the checkpoint lineage. Pause failures leave the runtime running (the dump
+resumes the VM on every failure path) and retry with a new attempt epoch
+(`status.runtime.pauseAttempt`).
+
 ## Non-goals
 
 The lifecycle contract does not provide:
 
-- live migration between Fastlet Pods;
-- snapshot or restore;
-- pause or resume;
+- live migration of a live instance between Fastlet Pods;
+- snapshot or restore of a live instance (snapshots publish bootable images
+  and pause/resume restores a checkpoint, both via the artifact store);
 - persistent Sandbox storage;
 - survival of a Fastlet Pod loss.

@@ -21,6 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/util/retry"
@@ -233,6 +234,11 @@ func (s *Server) acceptCreateIntent(ctx context.Context, plan plannedCreate) (*a
 		existing.Annotations[assignment.AnnotationCreateSpecHash] != plan.sandbox.Annotations[assignment.AnnotationCreateSpecHash] {
 		return nil, status.Errorf(codes.AlreadyExists, "Sandbox name %q belongs to another create intent", plan.sandbox.Name)
 	}
+	if existing.Spec.State == apiv1alpha2.SandboxStatePaused || existing.Status.Runtime.State == apiv1alpha2.RuntimePaused {
+		// A paused Sandbox is resumed through ResumeSandbox (same identity,
+		// same checkpoint); creating it again would boot a fresh instance.
+		return nil, status.Errorf(codes.FailedPrecondition, "Sandbox %q is paused; call ResumeSandbox to resume it", plan.sandbox.Name)
+	}
 	existingEnvelope, err := assignment.AssignmentFromAnnotation(&existing)
 	if err != nil || existingEnvelope == nil {
 		return nil, status.Errorf(codes.Unavailable, "existing Sandbox assignment is not ready: %v", err)
@@ -308,6 +314,13 @@ func (s *Server) GetSandbox(ctx context.Context, request *fastpathv2.GetSandboxR
 	}
 	if err := checkGenerationFloor(sandbox, request.ExpectedGeneration); err != nil {
 		return nil, err
+	}
+	// Without a durable assignment there is no live runtime to inspect: a
+	// paused Sandbox (no placement) and a resume waiting for capacity both
+	// project the durable CRD state instead of failing the read.
+	envelope, assignmentErr := assignment.EffectiveAssignment(sandbox)
+	if assignmentErr != nil || envelope == nil {
+		return &fastpathv2.GetSandboxResponse{Sandbox: sandboxInfoFromCRD(sandbox), Generation: sandbox.Generation}, nil
 	}
 	info, _, _, err := s.inspectAssignedSandbox(ctx, sandbox)
 	if err != nil {
@@ -690,6 +703,10 @@ func sandboxInfoFromFastlet(sandbox *apiv1alpha2.Sandbox, observed *fastletapi.S
 		Identity: protoIdentity(sandbox), AppliedGeneration: observed.AppliedGeneration,
 		Runtime:   &fastpathv2.RuntimeInfo{State: protoRuntimeState(observed.Runtime.State)},
 		DataPlane: &fastpathv2.DataPlaneInfo{State: protoDataPlaneState(observed.DataPlane.State)},
+		State:     protoSandboxState(sandbox.Spec.State),
+	}
+	if sandbox.Status.Runtime.CheckpointActive() {
+		info.Checkpoint = protoCheckpoint(sandbox.Status.Runtime.Checkpoint)
 	}
 	for _, diagnostic := range observed.InfraComponents {
 		state := fastpathv2.InfraComponentState_INFRA_COMPONENT_STATE_STARTING
@@ -762,6 +779,130 @@ func protoRuntimeState(state fastletapi.RuntimeState) fastpathv2.RuntimeState {
 		return fastpathv2.RuntimeState_RUNTIME_STATE_UNAVAILABLE
 	default:
 		return fastpathv2.RuntimeState_RUNTIME_STATE_UNKNOWN
+	}
+}
+
+// protoCRDRuntimeState projects the durable CRD runtime state, including the
+// pause-FSM states that never cross the Fastlet protocol.
+func protoCRDRuntimeState(state apiv1alpha2.RuntimeState) fastpathv2.RuntimeState {
+	switch state {
+	case apiv1alpha2.RuntimePending:
+		return fastpathv2.RuntimeState_RUNTIME_STATE_PENDING
+	case apiv1alpha2.RuntimeCreating:
+		return fastpathv2.RuntimeState_RUNTIME_STATE_CREATING
+	case apiv1alpha2.RuntimeReady:
+		return fastpathv2.RuntimeState_RUNTIME_STATE_READY
+	case apiv1alpha2.RuntimePausing:
+		return fastpathv2.RuntimeState_RUNTIME_STATE_PAUSING
+	case apiv1alpha2.RuntimePaused:
+		return fastpathv2.RuntimeState_RUNTIME_STATE_PAUSED
+	case apiv1alpha2.RuntimeResuming:
+		return fastpathv2.RuntimeState_RUNTIME_STATE_RESUMING
+	case apiv1alpha2.RuntimeStopping:
+		return fastpathv2.RuntimeState_RUNTIME_STATE_STOPPING
+	case apiv1alpha2.RuntimeStopped:
+		return fastpathv2.RuntimeState_RUNTIME_STATE_STOPPED
+	case apiv1alpha2.RuntimeFailed:
+		return fastpathv2.RuntimeState_RUNTIME_STATE_FAILED
+	case apiv1alpha2.RuntimeUnavailable:
+		return fastpathv2.RuntimeState_RUNTIME_STATE_UNAVAILABLE
+	default:
+		return fastpathv2.RuntimeState_RUNTIME_STATE_UNKNOWN
+	}
+}
+
+func protoSandboxState(state apiv1alpha2.SandboxState) fastpathv2.SandboxState {
+	switch state {
+	case apiv1alpha2.SandboxStatePaused:
+		return fastpathv2.SandboxState_SANDBOX_STATE_PAUSED
+	default:
+		// The CRD defaults to Running; an omitted field is a running intent.
+		return fastpathv2.SandboxState_SANDBOX_STATE_RUNNING
+	}
+}
+
+func protoCheckpoint(checkpoint *apiv1alpha2.CheckpointStatus) *fastpathv2.CheckpointInfo {
+	if checkpoint == nil {
+		return nil
+	}
+	info := &fastpathv2.CheckpointInfo{
+		CheckpointId:   checkpoint.CheckpointID,
+		ManifestRef:    checkpoint.ManifestRef,
+		ArtifactDigest: checkpoint.ArtifactDigest,
+		SizeBytes:      checkpoint.SizeBytes,
+		FastletName:    checkpoint.FastletName,
+	}
+	if checkpoint.PausedAt != nil {
+		info.PausedUnixSeconds = checkpoint.PausedAt.Unix()
+	}
+	return info
+}
+
+// sandboxInfoFromCRD projects the durable CRD state. It is the observation
+// surface of a paused Sandbox (no live Fastlet to inspect) and the immediate
+// response of PauseSandbox/ResumeSandbox.
+func sandboxInfoFromCRD(sandbox *apiv1alpha2.Sandbox) *fastpathv2.SandboxInfo {
+	if sandbox == nil {
+		return nil
+	}
+	info := &fastpathv2.SandboxInfo{
+		Identity:          protoIdentity(sandbox),
+		AppliedGeneration: sandbox.Status.ObservedGeneration,
+		Runtime:           &fastpathv2.RuntimeInfo{State: protoCRDRuntimeState(sandbox.Status.Runtime.State)},
+		DataPlane:         &fastpathv2.DataPlaneInfo{State: protoCRDDataPlaneState(sandbox.Status.DataPlane.State)},
+		State:             protoSandboxState(sandbox.Spec.State),
+	}
+	if sandbox.Status.Runtime.CheckpointActive() {
+		info.Checkpoint = protoCheckpoint(sandbox.Status.Runtime.Checkpoint)
+	}
+	for _, component := range sandbox.Status.InfraComponents {
+		state := fastpathv2.InfraComponentState_INFRA_COMPONENT_STATE_STARTING
+		switch component.State {
+		case apiv1alpha2.InfraComponentReady:
+			state = fastpathv2.InfraComponentState_INFRA_COMPONENT_STATE_READY
+		case apiv1alpha2.InfraComponentFailed:
+			state = fastpathv2.InfraComponentState_INFRA_COMPONENT_STATE_FAILED
+		}
+		info.InfraComponents = append(info.InfraComponents, &fastpathv2.InfraComponentInfo{Name: component.Name, State: state, Message: component.Message})
+	}
+	for _, binding := range sandbox.Status.ActionBindings {
+		state := fastpathv2.ActionState_ACTION_STATE_PENDING
+		switch binding.State {
+		case apiv1alpha2.ActionApplying:
+			state = fastpathv2.ActionState_ACTION_STATE_APPLYING
+		case apiv1alpha2.ActionReady:
+			state = fastpathv2.ActionState_ACTION_STATE_READY
+		case apiv1alpha2.ActionFailed:
+			state = fastpathv2.ActionState_ACTION_STATE_FAILED
+		}
+		transition := int64(0)
+		if binding.LastTransitionTime != nil {
+			transition = binding.LastTransitionTime.Unix()
+		}
+		info.ActionBindings = append(info.ActionBindings, &fastpathv2.ActionBindingInfo{
+			Handler: binding.Handler, State: state, LastTransitionUnixSeconds: transition, Message: binding.Message,
+		})
+	}
+	info.Ready = apiMeta.IsStatusConditionTrue(sandbox.Status.Conditions, orchestration.ConditionReady)
+	return info
+}
+
+func protoCRDDataPlaneState(state apiv1alpha2.DataPlaneState) fastpathv2.DataPlaneState {
+	switch state {
+	case apiv1alpha2.DataPlanePending:
+		return fastpathv2.DataPlaneState_DATA_PLANE_STATE_PENDING
+	case apiv1alpha2.DataPlanePublishing:
+		return fastpathv2.DataPlaneState_DATA_PLANE_STATE_PUBLISHING
+	case apiv1alpha2.DataPlaneReady:
+		return fastpathv2.DataPlaneState_DATA_PLANE_STATE_READY
+	case apiv1alpha2.DataPlaneDraining:
+		return fastpathv2.DataPlaneState_DATA_PLANE_STATE_DRAINING
+	case apiv1alpha2.DataPlaneFailed:
+		return fastpathv2.DataPlaneState_DATA_PLANE_STATE_FAILED
+	case apiv1alpha2.DataPlaneUnavailable:
+		return fastpathv2.DataPlaneState_DATA_PLANE_STATE_UNAVAILABLE
+	default:
+		return fastpathv2.DataPlaneState_DATA_PLANE_STATE_UNKNOWN
 	}
 }
 

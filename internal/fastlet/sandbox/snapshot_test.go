@@ -304,3 +304,48 @@ func TestDeleteSnapshotWaitsForTerminalThenCleansArtifacts(t *testing.T) {
 func snapshotIdentityFor(snapshotUID string) fastletapi.SnapshotIdentity {
 	return snapshotRequest(snapshotUID).Identity
 }
+
+func checkpointRequest(checkpointUID string) *fastletapi.CreateSnapshotRequest {
+	request := snapshotRequest(checkpointUID)
+	request.Snapshot = fastletapi.SnapshotSpec{Kind: fastletapi.SnapshotKindCheckpoint}
+	return request
+}
+
+func TestCreateCheckpointAdmitsWithoutTemplateName(t *testing.T) {
+	runtime := newSnapshotRuntime()
+	manager := newSnapshotManager(t, runtime)
+	response, err := manager.CreateSnapshot(context.Background(), checkpointRequest("ckpt-a"))
+	require.NoError(t, err)
+	require.Equal(t, fastletapi.CreateDispositionCreated, response.Disposition)
+
+	require.Eventually(t, func() bool {
+		inspected, err := manager.InspectSnapshot(&fastletapi.InspectSnapshotRequest{Identity: snapshotIdentityFor("ckpt-a")})
+		return err == nil && inspected.Snapshot.Phase == fastletapi.SnapshotPhaseSucceeded
+	}, 2*time.Second, 10*time.Millisecond)
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	require.Equal(t, fastletapi.SnapshotKindCheckpoint, runtime.lastInput.Kind)
+	require.Empty(t, runtime.lastInput.TemplateName)
+}
+
+func TestCreateCheckpointRejectsTemplateName(t *testing.T) {
+	manager := newSnapshotManager(t, newSnapshotRuntime())
+	request := checkpointRequest("ckpt-a")
+	request.Snapshot.TemplateName = "app-v2"
+	_, err := manager.CreateSnapshot(context.Background(), request)
+	var failure *fastletapi.FastletError
+	require.ErrorAs(t, err, &failure)
+	require.Equal(t, fastletapi.ErrorConflict, failure.Code)
+	require.Contains(t, failure.Message, "templateName must be empty")
+}
+
+func TestCreateTemplateSnapshotStillRequiresTemplateName(t *testing.T) {
+	manager := newSnapshotManager(t, newSnapshotRuntime())
+	request := snapshotRequest("snap-a")
+	request.Snapshot.TemplateName = ""
+	_, err := manager.CreateSnapshot(context.Background(), request)
+	var failure *fastletapi.FastletError
+	require.ErrorAs(t, err, &failure)
+	require.Equal(t, fastletapi.ErrorConflict, failure.Code)
+	require.Contains(t, failure.Message, "templateName is required")
+}

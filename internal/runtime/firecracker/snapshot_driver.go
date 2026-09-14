@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"fast-sandbox/internal/artifacts"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 
 	"k8s.io/klog/v2"
@@ -75,12 +76,30 @@ var _ runtimecontract.Snapshotter = (*Driver)(nil)
 var snapshotMu sync.Mutex
 
 // CreateSnapshot snapshots a running Sandbox in place and publishes the
-// artifact set under the template name. The VM is always resumed; a failed
-// dump leaves the Sandbox running and discards the staging directory without
-// publishing anything.
+// artifact set. Template snapshots publish under the template name so later
+// creates boot from them; checkpoint snapshots publish an instance-private
+// set (no index) that only the owning Sandbox resumes from. The VM is always
+// resumed; a failed dump leaves the Sandbox running and discards the staging
+// directory without publishing anything.
 func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.SnapshotInput) (*runtimecontract.SnapshotResult, error) {
-	if input == nil || input.SandboxID == "" || input.SnapshotID == "" || input.TemplateName == "" {
-		return nil, fmt.Errorf("%w: sandboxId, snapshotId, and templateName are required", ErrInvalidConfig)
+	if input == nil || input.SandboxID == "" || input.SnapshotID == "" {
+		return nil, fmt.Errorf("%w: sandboxId and snapshotId are required", ErrInvalidConfig)
+	}
+	kind := input.Kind
+	if kind == "" {
+		kind = fastletapi.SnapshotKindTemplate
+	}
+	switch kind {
+	case fastletapi.SnapshotKindTemplate:
+		if input.TemplateName == "" {
+			return nil, fmt.Errorf("%w: templateName is required for a template snapshot", ErrInvalidConfig)
+		}
+	case fastletapi.SnapshotKindCheckpoint:
+		if input.TemplateName != "" {
+			return nil, fmt.Errorf("%w: checkpoint snapshots publish no template index; templateName must be empty", ErrInvalidConfig)
+		}
+	default:
+		return nil, fmt.Errorf("%w: unknown snapshot kind %q", ErrInvalidConfig, kind)
 	}
 	if err := validateSandboxID(input.SnapshotID); err != nil {
 		return nil, fmt.Errorf("%w: invalid snapshot id %q", ErrInvalidConfig, input.SnapshotID)
@@ -141,13 +160,13 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 		input.OnPublishing()
 	}
 	publishStarted := time.Now()
-	outcome, publishErr := client.PublishImage(ctx, "snapshot-"+plan.snapshotID, input.TemplateName, plan.staging)
+	outcome, publishErr := client.PublishImage(ctx, "snapshot-"+plan.snapshotID, string(kind), input.TemplateName, plan.staging)
 	_ = os.RemoveAll(plan.staging)
 	if publishErr != nil {
 		return nil, fmt.Errorf("publish snapshot artifacts: %w", publishErr)
 	}
 	klog.InfoS("firecracker snapshot published",
-		"sandboxId", plan.sandboxID, "snapshotId", plan.snapshotID, "templateName", input.TemplateName,
+		"sandboxId", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "templateName", input.TemplateName,
 		"manifestRef", outcome.ManifestRef, "sizeBytes", sizeBytes, "publish", time.Since(publishStarted).String())
 	return &runtimecontract.SnapshotResult{
 		SnapshotID:     input.SnapshotID,
@@ -500,7 +519,15 @@ func assembleSnapshotManifest(stateRoot, staging, sandboxDir, firecrackerBinary 
 	if err != nil {
 		return 0, err
 	}
-	document, err := readSourceManifest(stateRoot, state.Config.Spec.Image)
+	// The lineage manifest of the dump: the golden image manifest of a fresh
+	// boot, or the cached checkpoint manifest when the Sandbox was itself
+	// resumed from a checkpoint (the checkpoint carries every lineage field
+	// forward, and the original image may not exist on this node at all).
+	sourceRef, err := restoreReference(state.Config.Spec)
+	if err != nil {
+		return 0, err
+	}
+	document, err := readSourceManifest(stateRoot, sourceRef)
 	if err != nil {
 		return 0, err
 	}

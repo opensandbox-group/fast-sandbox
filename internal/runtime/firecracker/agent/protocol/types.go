@@ -52,10 +52,29 @@ type ErrorResponse struct {
 	Message string    `json:"message"`
 }
 
+// Publish kinds select the publication mode of an artifact set.
+const (
+	// PublishKindTemplate publishes a template set and writes the image
+	// index last, so `image`-addressed creates resolve it.
+	PublishKindTemplate = "template"
+	// PublishKindCheckpoint publishes an instance-private set with NO image
+	// index: the caller addresses it by the returned manifestRef +
+	// artifactDigest and only the owning Sandbox resumes from it. Checkpoint
+	// sets are never resolvable as CreateSandbox images.
+	PublishKindCheckpoint = "checkpoint"
+)
+
 // PinImageRequest pulls and keeps an image pinned on the node.
 type PinImageRequest struct {
 	Identity
 	Image string `json:"image"`
+	// ManifestRef/ArtifactDigest, when both set, pin an artifact set
+	// addressed directly (a pause checkpoint) instead of resolving the
+	// image index. Image must carry the canonical checkpoint reference
+	// (artifacts.CheckpointReference) so the local cache key is stable
+	// across nodes.
+	ManifestRef    string `json:"manifestRef,omitempty"`
+	ArtifactDigest string `json:"artifactDigest,omitempty"`
 }
 
 // PinImageResponse reports the pinned image manifest digest.
@@ -124,10 +143,15 @@ type ListLeasesResponse struct {
 // namespace, and the index object last overall, so consumers never observe a
 // half-published set. Idempotent: re-publishing identical bytes overwrites
 // the same keys harmlessly.
+//
+// Kind selects the publication mode: template (or empty) requires Key and
+// writes the index; checkpoint requires an empty Key and writes no index
+// (the caller addresses the returned manifestRef + artifactDigest).
 type PublishImageRequest struct {
 	Identity
-	Key string `json:"key"`
-	Dir string `json:"dir"`
+	Kind string `json:"kind,omitempty"`
+	Key  string `json:"key,omitempty"`
+	Dir  string `json:"dir"`
 }
 
 // PublishImageResponse reports the published manifest reference and digest.

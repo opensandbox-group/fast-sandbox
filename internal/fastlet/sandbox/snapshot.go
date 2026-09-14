@@ -20,15 +20,17 @@ import (
 var snapshotWorkerTimeout = 30 * time.Minute
 
 // snapshotTask is the in-memory state of one snapshot task keyed by the
-// SandboxSnapshot UID. Tasks are deliberately ephemeral: a Fastlet restart
-// loses them and the Controller terminates the object (SnapshotLost) instead
-// of resuming a half-published artifact set (snapshots are non-reentrant).
+// SandboxSnapshot UID (template snapshots) or the pause checkpoint task id
+// (checkpoints). Tasks are deliberately ephemeral: a Fastlet restart loses
+// them and the control plane terminates or retries the intent instead of
+// resuming a half-published artifact set (snapshots are non-reentrant).
 // Terminal tasks are retained until the object is deleted (the finalizer
 // cleanup path removes them): the map is bounded by the number of snapshots
 // ever taken toward this Fastlet since start, which is accepted as a small,
 // inspectable leak.
 type snapshotTask struct {
 	identity       fastletapi.SnapshotIdentity
+	kind           fastletapi.SnapshotKind
 	templateName   string
 	actionBindings []runtimecontract.SnapshotActionBinding
 	snapshotID     string
@@ -124,13 +126,16 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 		}
 	}
 	// Template-name fence — holds to terminal: concurrent publishers of one
-	// index key would race last-writer-wins on the store.
-	for _, task := range m.snapshots {
-		if !fastletapi.SnapshotPhaseTerminal(task.phase) && task.templateName == req.Snapshot.TemplateName {
-			failure := fastletError(fastletapi.ErrorSnapshotInProgress,
-				"template name is held by a snapshot that has not terminated; retry after it terminates or use another name", false)
-			m.mu.Unlock()
-			return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, failure)
+	// index key would race last-writer-wins on the store. Checkpoints carry
+	// no index key and are exempt.
+	if req.Snapshot.Kind != fastletapi.SnapshotKindCheckpoint {
+		for _, task := range m.snapshots {
+			if !fastletapi.SnapshotPhaseTerminal(task.phase) && task.templateName == req.Snapshot.TemplateName {
+				failure := fastletError(fastletapi.ErrorSnapshotInProgress,
+					"template name is held by a snapshot that has not terminated; retry after it terminates or use another name", false)
+				m.mu.Unlock()
+				return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, failure)
+			}
 		}
 	}
 	snapshotID, err := idgen.GenerateRequestID()
@@ -144,7 +149,7 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 		bindings = append(bindings, runtimecontract.SnapshotActionBinding{Handler: binding.Handler, Input: binding.Input})
 	}
 	task := &snapshotTask{
-		identity: req.Identity, templateName: req.Snapshot.TemplateName, actionBindings: bindings,
+		identity: req.Identity, kind: req.Snapshot.Kind, templateName: req.Snapshot.TemplateName, actionBindings: bindings,
 		snapshotID: snapshotID, phase: fastletapi.SnapshotPhasePending,
 	}
 	m.snapshots[req.Identity.SnapshotUID] = task
@@ -162,8 +167,17 @@ func (m *SandboxManager) validateSnapshotRequest(req *fastletapi.CreateSnapshotR
 	if req == nil || req.Identity.SnapshotUID == "" || req.Identity.Namespace == "" || req.Identity.Name == "" {
 		return fastletError(fastletapi.ErrorConflict, "snapshotUid, namespace, and name are required", false)
 	}
-	if req.Snapshot.TemplateName == "" {
-		return fastletError(fastletapi.ErrorConflict, "templateName is required", false)
+	switch req.Snapshot.Kind {
+	case "", fastletapi.SnapshotKindTemplate:
+		if req.Snapshot.TemplateName == "" {
+			return fastletError(fastletapi.ErrorConflict, "templateName is required for a template snapshot", false)
+		}
+	case fastletapi.SnapshotKindCheckpoint:
+		if req.Snapshot.TemplateName != "" {
+			return fastletError(fastletapi.ErrorConflict, "checkpoint snapshots publish no template index; templateName must be empty", false)
+		}
+	default:
+		return fastletError(fastletapi.ErrorConflict, "unknown snapshot kind "+string(req.Snapshot.Kind), false)
 	}
 	if failure := m.validateIdentityTarget(&req.Identity.Sandbox); failure != nil {
 		return failure
@@ -210,6 +224,7 @@ func (m *SandboxManager) runSnapshotWorker(snapshotter RuntimeSnapshotter, task 
 	result, err := snapshotter.CreateSnapshot(ctx, &RuntimeSnapshotInput{
 		SandboxID:      sandboxUID,
 		SnapshotID:     task.snapshotID,
+		Kind:           task.kind,
 		TemplateName:   task.templateName,
 		ActionBindings: task.actionBindings,
 		// The driver reports Publishing once the pause window closed and the

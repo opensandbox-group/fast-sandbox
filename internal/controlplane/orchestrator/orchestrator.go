@@ -313,15 +313,26 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 	if err != nil {
 		return nil, err
 	}
+	spec := fastletapi.SandboxSpec{
+		Image:              sandbox.Spec.Image,
+		RuntimeProfileHash: envelope.RuntimeProfileHash, ResourceProfileHash: envelope.ResourceProfileHash,
+		InfraRevision: envelope.InfraRevision,
+		Command:       sandbox.Spec.Command, Args: sandbox.Spec.Args, Env: envMap(sandbox.Spec.Envs), WorkingDir: sandbox.Spec.WorkingDir,
+	}
+	// A Sandbox resuming from a pause checkpoint restores its memory lineage
+	// instead of booting the image from scratch: the checkpoint reference
+	// rides in the create so Fastlet delivers the artifact set and the driver
+	// loads vmstate/memory from it (cross-host included).
+	if checkpoint := ResumeCheckpoint(sandbox); checkpoint != nil {
+		spec.Restore = &fastletapi.RestoreSpec{
+			ManifestRef:    checkpoint.ManifestRef,
+			ArtifactDigest: checkpoint.ArtifactDigest,
+		}
+	}
 	request := &fastletapi.CreateSandboxRequest{
 		RequestID: sandbox.Annotations[assignment.AnnotationRequestID], Identity: identity,
 		SpecGeneration: sandbox.Generation, ActionBindings: bindings, Completion: completion,
-		Sandbox: fastletapi.SandboxSpec{
-			Image:              sandbox.Spec.Image,
-			RuntimeProfileHash: envelope.RuntimeProfileHash, ResourceProfileHash: envelope.ResourceProfileHash,
-			InfraRevision: envelope.InfraRevision,
-			Command:       sandbox.Spec.Command, Args: sandbox.Spec.Args, Env: envMap(sandbox.Spec.Envs), WorkingDir: sandbox.Spec.WorkingDir,
-		},
+		Sandbox: spec,
 	}
 	response, createErr := o.FastletClient.CreateSandbox(ctx, fastlet.PodIP, request)
 	// A Created observation may be runtime-Creating: the Fastlet parks cold

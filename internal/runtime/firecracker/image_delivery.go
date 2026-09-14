@@ -24,9 +24,17 @@ import (
 	"sync"
 	"time"
 
+	"fast-sandbox/internal/artifacts"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 
 	"k8s.io/klog/v2"
+)
+
+// Driver implements the optional artifact-delivery extensions.
+var (
+	_ runtimecontract.ImageDelivery      = (*Driver)(nil)
+	_ runtimecontract.CheckpointDelivery = (*Driver)(nil)
 )
 
 const (
@@ -57,14 +65,38 @@ type imageDelivery struct {
 // failure is reported once (sticky window); afterwards the next call starts
 // a fresh attempt.
 func (d *Driver) DeliverImage(_ context.Context, image string) (runtimecontract.ImageDeliveryStatus, error) {
-	d.mu.RLock()
-	stateRoot := d.config.StateRoot
-	d.mu.RUnlock()
 	if strings.TrimSpace(image) == "" {
 		return "", fmt.Errorf("%w: image reference is required", ErrInvalidConfig)
 	}
-	if err := verifyRestorableImage(stateRoot, image); err == nil {
-		d.touchImage(image)
+	return d.deliverReference(image, func(ctx context.Context) error {
+		return d.pinImageForDelivery(ctx, image)
+	})
+}
+
+// DeliverCheckpoint implements runtimecontract.CheckpointDelivery: the resume
+// counterpart of DeliverImage, addressed by the checkpoint manifest ref +
+// digest instead of an image index. Both paths share the local cache layout,
+// the single-flight tracker, and the sticky failure window; only the pin call
+// differs (agent pull by ref vs. pull by image index).
+func (d *Driver) DeliverCheckpoint(_ context.Context, restore *fastletapi.RestoreSpec) (runtimecontract.ImageDeliveryStatus, error) {
+	if restore == nil || strings.TrimSpace(restore.ManifestRef) == "" || strings.TrimSpace(restore.ArtifactDigest) == "" {
+		return "", fmt.Errorf("%w: checkpoint manifestRef and artifactDigest are required", ErrInvalidConfig)
+	}
+	reference := artifacts.CheckpointReference(restore.ArtifactDigest)
+	return d.deliverReference(reference, func(ctx context.Context) error {
+		return d.pinCheckpointForDelivery(ctx, reference, restore)
+	})
+}
+
+// deliverReference is the shared asynchronous delivery engine of images and
+// checkpoints. reference keys both the local cache and the single-flight
+// tracker; pin performs one background pull attempt.
+func (d *Driver) deliverReference(reference string, pin func(context.Context) error) (runtimecontract.ImageDeliveryStatus, error) {
+	d.mu.RLock()
+	stateRoot := d.config.StateRoot
+	d.mu.RUnlock()
+	if err := verifyRestorableImage(stateRoot, reference); err == nil {
+		d.touchImage(reference)
 		return runtimecontract.ImageDelivered, nil
 	}
 	client, err := d.agentClientOrNil()
@@ -72,11 +104,11 @@ func (d *Driver) DeliverImage(_ context.Context, image string) (runtimecontract.
 		return "", err
 	}
 	if client == nil {
-		return "", fmt.Errorf("%w: %q is not cached and no runtime-agent is configured to deliver it", ErrImageNotReady, image)
+		return "", fmt.Errorf("%w: %q is not cached and no runtime-agent is configured to deliver it", ErrImageNotReady, reference)
 	}
 
 	d.mu.Lock()
-	entry := d.imageDeliveryLocked(image)
+	entry := d.imageDeliveryLocked(reference)
 	d.mu.Unlock()
 
 	entry.mu.Lock()
@@ -91,7 +123,7 @@ func (d *Driver) DeliverImage(_ context.Context, image string) (runtimecontract.
 	entry.inFlight = true
 	entry.failedErr = nil
 	entry.failedAt = time.Time{}
-	go d.runImageDeliveryAttempt(image, entry)
+	go d.runDeliveryAttempt(reference, pin, entry)
 	return runtimecontract.ImageDelivering, nil
 }
 
@@ -110,29 +142,29 @@ func (d *Driver) imageDeliveryLocked(image string) *imageDelivery {
 	return entry
 }
 
-// runImageDeliveryAttempt performs one PinImage pull in the background and
-// records the terminal result on the tracker. Success is verified locally
-// against the complete restore set: the agent journal replays a committed
-// PinImage without re-pulling, so a cache purged under a committed pin must
-// surface as a failed attempt (with a diagnosable error) instead of a
-// success that never materializes.
-func (d *Driver) runImageDeliveryAttempt(image string, entry *imageDelivery) {
+// runDeliveryAttempt performs one PinImage/PinCheckpoint pull in the
+// background and records the terminal result on the tracker. Success is
+// verified locally against the complete restore set: the agent journal
+// replays a committed PinImage without re-pulling, so a cache purged under a
+// committed pin must surface as a failed attempt (with a diagnosable error)
+// instead of a success that never materializes.
+func (d *Driver) runDeliveryAttempt(reference string, pin func(context.Context) error, entry *imageDelivery) {
 	timeout := d.deliveryAttemptTimeoutSetting()
 	if timeout <= 0 {
 		timeout = defaultImageDeliveryAttemptTimeout
 	}
 	attemptContext, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	klog.InfoS("firecracker image delivery attempt started", "image", image, "timeout", timeout.String())
-	err := d.pinImageForDelivery(attemptContext, image)
+	klog.InfoS("firecracker artifact delivery attempt started", "reference", reference, "timeout", timeout.String())
+	err := pin(attemptContext)
 	if err == nil {
 		d.mu.RLock()
 		stateRoot := d.config.StateRoot
 		d.mu.RUnlock()
-		if resolveErr := verifyRestorableImage(stateRoot, image); resolveErr != nil {
-			err = fmt.Errorf("%w: runtime-agent reports %q delivered but no committed restore set exists in the local cache (cache purged under an idempotent pin?); rebuild the environment or clear the agent journal to re-pull", ErrImageNotReady, image)
+		if resolveErr := verifyRestorableImage(stateRoot, reference); resolveErr != nil {
+			err = fmt.Errorf("%w: runtime-agent reports %q delivered but no committed restore set exists in the local cache (cache purged under an idempotent pin?); rebuild the environment or clear the agent journal to re-pull", ErrImageNotReady, reference)
 		} else {
-			d.touchImage(image)
+			d.touchImage(reference)
 		}
 	}
 
@@ -148,10 +180,10 @@ func (d *Driver) runImageDeliveryAttempt(image string, entry *imageDelivery) {
 	entry.mu.Unlock()
 
 	if err == nil {
-		klog.InfoS("firecracker image delivery completed", "image", image)
+		klog.InfoS("firecracker artifact delivery completed", "reference", reference)
 		return
 	}
-	klog.ErrorS(err, "firecracker image delivery attempt failed", "image", image)
+	klog.ErrorS(err, "firecracker artifact delivery attempt failed", "reference", reference)
 }
 
 // pinImageForDelivery pins (and thereby pulls) an image on the runtime-agent.
@@ -165,6 +197,23 @@ func (d *Driver) pinImageForDelivery(ctx context.Context, image string) error {
 		return fmt.Errorf("%w: runtime-agent disappeared while delivering %q", ErrImageNotReady, image)
 	}
 	if _, err := client.PinImage(ctx, d.warmPullRequestID(image), image); err != nil {
+		return err
+	}
+	return nil
+}
+
+// pinCheckpointForDelivery pins (and thereby pulls) a checkpoint artifact set
+// addressed by manifest ref + digest. reference is the canonical checkpoint
+// cache reference used for the idempotent warm-pull request id.
+func (d *Driver) pinCheckpointForDelivery(ctx context.Context, reference string, restore *fastletapi.RestoreSpec) error {
+	client, err := d.agentClientOrNil()
+	if err != nil {
+		return err
+	}
+	if client == nil {
+		return fmt.Errorf("%w: runtime-agent disappeared while delivering checkpoint %q", ErrImageNotReady, reference)
+	}
+	if _, err := client.PinCheckpoint(ctx, d.warmPullRequestID(reference), reference, restore.ManifestRef, restore.ArtifactDigest); err != nil {
 		return err
 	}
 	return nil

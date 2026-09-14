@@ -76,6 +76,15 @@ type ImageDelivery interface {
 	DeliverImage(ctx context.Context, image string) (ImageDeliveryStatus, error)
 }
 
+// CheckpointDelivery is the optional runtime extension for restoring a paused
+// Sandbox from an instance-private checkpoint (RestoreSpec) instead of an
+// image index. It mirrors ImageDelivery: the checkpoint artifact set is
+// pulled by its manifest ref + digest in the background and the resume parks
+// until the complete restore set is committed in the local cache.
+type CheckpointDelivery interface {
+	DeliverCheckpoint(ctx context.Context, restore *fastletapi.RestoreSpec) (ImageDeliveryStatus, error)
+}
+
 // SnapshotResult reports the artifact set produced by one snapshot.
 type SnapshotResult struct {
 	// SnapshotID is the node-local identity of the snapshot; it scopes the
@@ -105,8 +114,15 @@ type SnapshotInput struct {
 	// SnapshotID is the node-local identity of the snapshot; it scopes the
 	// staging directory and any cleanup.
 	SnapshotID string
+	// Kind selects the publication mode: Template (default when empty)
+	// publishes the set under TemplateName so later creates boot from it;
+	// Checkpoint publishes an instance-private set with no template index
+	// that only the owning Sandbox resumes from (the caller persists the
+	// result's manifest ref + digest).
+	Kind fastletapi.SnapshotKind
 	// TemplateName is the artifact-store index key the artifact set is
-	// published under.
+	// published under. Required for Template snapshots, must be empty for
+	// Checkpoint snapshots.
 	TemplateName string
 	// OnPublishing is invoked once the pause window has closed and the
 	// local artifact set is complete — right before the store upload
@@ -125,12 +141,15 @@ type SnapshotInput struct {
 // ErrSnapshotUnsupported instead of attempting a partial fallback.
 //
 // CreateSnapshot is one-shot per (SandboxID, SnapshotID) pair and blocking;
-// it must resume the Sandbox on every in-process failure path. A host or
-// Fastlet crash mid-dump can still leave the runtime paused — implementers
-// that also implement ResourceRecoverer must resume such runtimes during
-// RecoverRuntimeResources so recovery never strands a paused guest.
-// DeleteSnapshot discards node-local artifacts of a previous snapshot; it
-// never unpublishes stored objects.
+// it must resume the Sandbox on every in-process failure path (the VM is
+// never left paused behind a failed dump). A host or Fastlet crash mid-dump
+// can still leave the runtime paused — implementers that also implement
+// ResourceRecoverer must resume such runtimes during RecoverRuntimeResources
+// so recovery never strands a paused guest. On success the VM is resumed as
+// well: a Checkpoint publication does not stop the runtime by itself; the
+// control plane releases it after the checkpoint is durable (that release is
+// what makes `Paused` true). DeleteSnapshot discards node-local artifacts of
+// a previous snapshot; it never unpublishes stored objects.
 type Snapshotter interface {
 	CreateSnapshot(ctx context.Context, input *SnapshotInput) (*SnapshotResult, error)
 	DeleteSnapshot(ctx context.Context, snapshotID string) error

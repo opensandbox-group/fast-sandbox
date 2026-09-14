@@ -21,6 +21,7 @@ type fakeAgentClient struct {
 	healthErr  error
 	digest     string
 	publishes  []string
+	publishKinds []string
 	publishOut PublishOutcome
 	publishErr error
 }
@@ -36,6 +37,17 @@ func (f *fakeAgentClient) PinImage(_ context.Context, requestID, image string) (
 	return f.digest, nil
 }
 
+func (f *fakeAgentClient) PinCheckpoint(_ context.Context, requestID, reference, _, _ string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pins = append(f.pins, reference)
+	f.pinReqs = append(f.pinReqs, requestID)
+	if f.digest == "" {
+		return "sha256:" + reference, nil
+	}
+	return f.digest, nil
+}
+
 func (f *fakeAgentClient) UnpinImage(_ context.Context, requestID, image string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -44,10 +56,11 @@ func (f *fakeAgentClient) UnpinImage(_ context.Context, requestID, image string)
 	return nil
 }
 
-func (f *fakeAgentClient) PublishImage(_ context.Context, _, key, _ string) (PublishOutcome, error) {
+func (f *fakeAgentClient) PublishImage(_ context.Context, _, kind, key, _ string) (PublishOutcome, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.publishes = append(f.publishes, key)
+	f.publishKinds = append(f.publishKinds, kind)
 	if f.publishErr != nil {
 		return PublishOutcome{}, f.publishErr
 	}

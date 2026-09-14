@@ -40,11 +40,17 @@ type AgentClient interface {
 	// PinImage pulls and pins an image on the node, returning its manifest
 	// digest. Replays of requestID are idempotent.
 	PinImage(ctx context.Context, requestID, image string) (string, error)
+	// PinCheckpoint pulls and pins an instance-private checkpoint artifact
+	// set addressed by manifest ref + digest (reference is the canonical
+	// checkpoint cache reference). Replays of requestID are idempotent.
+	PinCheckpoint(ctx context.Context, requestID, reference, manifestRef, artifactDigest string) (string, error)
 	// UnpinImage drops one pin reference of an image.
 	UnpinImage(ctx context.Context, requestID, image string) error
-	// PublishImage uploads a node-local artifact set to the store under the
-	// given index key and reports the manifest reference and digest.
-	PublishImage(ctx context.Context, requestID, key, dir string) (PublishOutcome, error)
+	// PublishImage uploads a node-local artifact set to the store. kind
+	// selects template (writes the index under key) or checkpoint (no
+	// index; key must be empty) and reports the manifest reference and
+	// digest.
+	PublishImage(ctx context.Context, requestID, kind, key, dir string) (PublishOutcome, error)
 	// LeaseDevices creates a device lease for a Sandbox. The native stage
 	// returns the shared cache file paths.
 	LeaseDevices(ctx context.Context, requestID string, config *fastletapi.RuntimeSandboxConfig) (Lease, error)
@@ -102,16 +108,26 @@ func (c *agentHTTPClient) PinImage(ctx context.Context, requestID, image string)
 	return response.ManifestDigest, nil
 }
 
+func (c *agentHTTPClient) PinCheckpoint(ctx context.Context, requestID, reference, manifestRef, artifactDigest string) (string, error) {
+	var response agentprotocol.PinImageResponse
+	if err := c.doJSON(ctx, agentprotocol.RoutePinImage, agentprotocol.PinImageRequest{
+		Identity: c.identity(requestID), Image: reference, ManifestRef: manifestRef, ArtifactDigest: artifactDigest,
+	}, &response); err != nil {
+		return "", err
+	}
+	return response.ManifestDigest, nil
+}
+
 func (c *agentHTTPClient) UnpinImage(ctx context.Context, requestID, image string) error {
 	return c.doJSON(ctx, agentprotocol.RouteUnpinImage, agentprotocol.UnpinImageRequest{
 		Identity: c.identity(requestID), Image: image,
 	}, nil)
 }
 
-func (c *agentHTTPClient) PublishImage(ctx context.Context, requestID, key, dir string) (PublishOutcome, error) {
+func (c *agentHTTPClient) PublishImage(ctx context.Context, requestID, kind, key, dir string) (PublishOutcome, error) {
 	var response agentprotocol.PublishImageResponse
 	if err := c.doJSON(ctx, agentprotocol.RoutePublishImage, agentprotocol.PublishImageRequest{
-		Identity: c.identity(requestID), Key: key, Dir: dir,
+		Identity: c.identity(requestID), Kind: kind, Key: key, Dir: dir,
 	}, &response); err != nil {
 		return PublishOutcome{}, err
 	}

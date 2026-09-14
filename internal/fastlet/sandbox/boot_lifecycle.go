@@ -36,6 +36,33 @@ type imageBootWorker struct {
 	cancel   context.CancelFunc
 }
 
+// deliveryForCreate selects the asynchronous artifact-delivery path of one
+// create/resume: a Sandbox carrying Restore is delivered as a checkpoint set
+// (manifestRef + digest), everything else as an image. It reports false when
+// the runtime does not implement the matching optional extension, so callers
+// fall back to the synchronous path exactly as before.
+func (m *SandboxManager) deliveryForCreate(input *fastletapi.EnsureSandboxInput) (func(context.Context) (ImageDeliveryStatus, error), bool) {
+	if input == nil {
+		return nil, false
+	}
+	if restore := input.Sandbox.Spec.Restore; restore != nil {
+		delivery, ok := m.runtime.(CheckpointDelivery)
+		if !ok {
+			return nil, false
+		}
+		return func(ctx context.Context) (ImageDeliveryStatus, error) {
+			return delivery.DeliverCheckpoint(ctx, restore)
+		}, true
+	}
+	delivery, ok := m.runtime.(ImageDelivery)
+	if !ok {
+		return nil, false
+	}
+	return func(ctx context.Context) (ImageDeliveryStatus, error) {
+		return delivery.DeliverImage(ctx, input.Sandbox.Spec.Image)
+	}, true
+}
+
 // parkForImageDelivery parks a cold Sandbox: the placeholder transitions to
 // image-pending, the boot worker takes over delivery -> boot progression, and
 // the Create RPC returns immediately with a Created observation (runtime
@@ -101,7 +128,7 @@ func (m *SandboxManager) startImageBootWorker(metadata *SandboxMetadata, req *fa
 // cleanup of a parked Sandbox that is deleted while the worker is alive.
 func (m *SandboxManager) runImageBootWorker(ctx context.Context, metadata *SandboxMetadata, req *fastletapi.CreateSandboxRequest, input *fastletapi.EnsureSandboxInput, started time.Time) {
 	uid := metadata.Config.Identity.SandboxUID
-	delivery, ok := m.runtime.(ImageDelivery)
+	deliver, ok := m.deliveryForCreate(input)
 	if !ok {
 		m.markCreateFailed(metadata, ErrUnsupportedRuntime)
 		return
@@ -132,11 +159,11 @@ func (m *SandboxManager) runImageBootWorker(ctx context.Context, metadata *Sandb
 		}
 		m.mu.Unlock()
 
-		status, err := delivery.DeliverImage(ctx, input.Sandbox.Spec.Image)
+		status, err := deliver(ctx)
 		if err != nil {
 			failures++
 			if failures >= imageDeliveryFailLimit {
-				m.markCreateFailed(metadata, fmt.Errorf("deliver sandbox image %q: %w", input.Sandbox.Spec.Image, err))
+				m.markCreateFailed(metadata, fmt.Errorf("deliver sandbox artifacts for %q: %w", uid, err))
 				return
 			}
 			if !sleepImageBootPoll(ctx, pollDelay) {
@@ -158,7 +185,7 @@ func (m *SandboxManager) runImageBootWorker(ctx context.Context, metadata *Sandb
 		// below is identical to the synchronous create tail, so lifecycle
 		// hooks, data-plane reconciliation, and readiness observations stay
 		// the same regardless of the delivery path.
-		klog.InfoS("sandbox image delivered; booting runtime", "sandboxId", uid, "image", input.Sandbox.Spec.Image)
+		klog.InfoS("sandbox artifacts delivered; booting runtime", "sandboxId", uid, "image", input.Sandbox.Spec.Image)
 		bootCtx, cancel := context.WithTimeout(ctx, imageBootTimeout)
 		result, ensureErr := m.runtime.EnsureSandbox(bootCtx, input)
 		cancel()

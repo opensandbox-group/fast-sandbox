@@ -16,7 +16,7 @@ Fast Sandbox owns:
 - endpoint resolution, route credentials, and transparent proxying;
 - cleanup after a Fastlet Pod or node disappears.
 
-Fast Sandbox does not define an Exec/File/PTY protocol. An injected component such as OpenSandbox Execd owns those semantics. Fast Sandbox also does not provide cross-Fastlet instance survival, snapshots, pause/resume, or persistent Sandbox storage.
+Fast Sandbox does not define an Exec/File/PTY protocol. An injected component such as OpenSandbox Execd owns those semantics. Fast Sandbox also does not provide cross-Fastlet instance survival (a Fastlet Pod loss still destroys the live instance), persistent Sandbox storage, or live migration. Snapshots publish a Sandbox as a bootable image, and pause/resume checkpoints one Sandbox instance for cross-host resume.
 
 ## Deployment topology
 

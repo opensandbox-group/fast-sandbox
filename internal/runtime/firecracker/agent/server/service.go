@@ -24,13 +24,16 @@ import (
 // satisfies it; tests inject a fake.
 type imagePuller interface {
 	PullImage(ctx context.Context, stateRoot, image string) error
+	// PullCheckpoint materializes an instance-private checkpoint set
+	// addressed by manifest ref + digest (no image index).
+	PullCheckpoint(ctx context.Context, stateRoot, reference, manifestRef, artifactDigest string) error
 }
 
 // artifactPublisher publishes a node-local artifact set to the store. The
 // pull client satisfies it too; the service only wires it when the injected
 // puller also publishes (tests inject a bare fake puller).
 type artifactPublisher interface {
-	PublishImage(ctx context.Context, key, dir string) (agentpull.PublishResult, error)
+	PublishImage(ctx context.Context, kind, key, dir string) (agentpull.PublishResult, error)
 }
 
 // compatibilityPlaceholder is the stage-1 compatibility class. The full
@@ -81,9 +84,21 @@ func WithDARTProbe(dartUp func() bool) ServiceOption {
 
 // PinImage pulls the image (if not already cached) and records one pin.
 // The side effect runs inside the state's journaled two-phase execution,
-// so replays return the recorded digest without re-pulling.
+// so replays return the recorded digest without re-pulling. A request that
+// carries manifestRef + artifactDigest pins a checkpoint artifact set
+// addressed directly instead of resolving the image index.
 func (s *Service) PinImage(ctx context.Context, request agentprotocol.PinImageRequest) (agentprotocol.PinImageResponse, error) {
+	direct := request.ManifestRef != "" || request.ArtifactDigest != ""
+	if direct && (request.ManifestRef == "" || request.ArtifactDigest == "") {
+		return agentprotocol.PinImageResponse{}, invalidRequest("manifestRef and artifactDigest must be set together")
+	}
 	digest, err := s.state.PinImage(request.Identity, request.Image, func() (string, error) {
+		if direct {
+			if err := s.ensureCheckpoint(ctx, request.Image, request.ManifestRef, request.ArtifactDigest); err != nil {
+				return "", err
+			}
+			return request.ArtifactDigest, nil
+		}
 		if err := s.ensureImage(ctx, request.Image); err != nil {
 			return "", err
 		}
@@ -171,15 +186,17 @@ func (s *Service) Health(_ context.Context) (agentprotocol.HealthResponse, error
 	return response, nil
 }
 
-// PublishImage publishes a node-local snapshot artifact set under the
-// requested index key. A store without a write credential is refused with
-// ErrorForbidden (pulls keep working); the staging directory must hold a
-// complete native set including the manifest.
+// PublishImage publishes a node-local snapshot artifact set. A template set
+// is written under the requested index key; a checkpoint set writes no index
+// and is addressed by the returned manifestRef + artifactDigest. A store
+// without a write credential is refused with ErrorForbidden (pulls keep
+// working); the staging directory must hold a complete native set including
+// the manifest.
 func (s *Service) PublishImage(ctx context.Context, request agentprotocol.PublishImageRequest) (agentprotocol.PublishImageResponse, error) {
 	if s.publisher == nil {
 		return agentprotocol.PublishImageResponse{}, forbidden("artifact publishing is not configured on this agent")
 	}
-	result, err := s.publisher.PublishImage(ctx, request.Key, request.Dir)
+	result, err := s.publisher.PublishImage(ctx, request.Kind, request.Key, request.Dir)
 	if err != nil {
 		if errors.Is(err, agentpull.ErrNotWritable) {
 			return agentprotocol.PublishImageResponse{}, forbidden("%v", err)
@@ -220,6 +237,30 @@ func (s *Service) ensureImage(ctx context.Context, image string) error {
 	}
 	if !ready {
 		return fmt.Errorf("%w: %q", runtimecontract.ErrImageNotReady, image)
+	}
+	return nil
+}
+
+// ensureCheckpoint pulls a checkpoint artifact set (addressed by manifest
+// ref + digest, e.g. the canonical checkpoint reference) unless the cache
+// already holds the complete committed set.
+func (s *Service) ensureCheckpoint(ctx context.Context, reference, manifestRef, artifactDigest string) error {
+	ready, err := agentpull.ImageReady(s.stateRoot, reference)
+	if err != nil {
+		return err
+	}
+	if ready {
+		return nil
+	}
+	if err := s.pull.PullCheckpoint(ctx, s.stateRoot, reference, manifestRef, artifactDigest); err != nil {
+		return err
+	}
+	ready, err = agentpull.ImageReady(s.stateRoot, reference)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return fmt.Errorf("%w: checkpoint %q", runtimecontract.ErrImageNotReady, reference)
 	}
 	return nil
 }

@@ -72,11 +72,12 @@ func (m *SandboxManager) CreateSandbox(ctx context.Context, req *fastletapi.Crea
 		return createFailureWithDisposition(bindingFailure, currentAdmission, fastletapi.CreateDispositionRejectedBeforeSideEffects)
 	}
 	// Async artifact delivery: when the runtime supports it (Firecracker),
-	// a missing image is delivered in the background instead of blocking
-	// this create on the network. The Sandbox parks in image-pending and a
-	// boot worker boots it once the image is committed.
-	if delivery, ok := m.runtime.(ImageDelivery); ok {
-		deliverStatus, deliverErr := delivery.DeliverImage(ctx, input.Sandbox.Spec.Image)
+	// a missing image — or, for a resume, a missing checkpoint set — is
+	// delivered in the background instead of blocking this create on the
+	// network. The Sandbox parks in image-pending and a boot worker boots it
+	// once the artifacts are committed.
+	if deliver, ok := m.deliveryForCreate(&input); ok {
+		deliverStatus, deliverErr := deliver(ctx)
 		if deliverErr != nil {
 			return m.handleRuntimeCreateFailure(ctx, &input, placeholder, deliverErr)
 		}

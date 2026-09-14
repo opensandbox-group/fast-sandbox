@@ -289,8 +289,10 @@ boundary, and percentile distribution. See
 - Public named-component routing currently supports HTTP, including SSE and
   WebSocket upgrade. Generic raw TCP, gRPC, and upstream TLS are not part of
   the first component contract.
-- Snapshot, pause/resume, persistent storage, and live migration are not
-  current capabilities.
+- Snapshots publish a running Sandbox as a bootable image; pause/resume
+  checkpoints one Sandbox instance to the artifact store and resumes it on any
+  Fastlet (same Sandbox identity). Persistent storage and live migration are
+  not current capabilities.
 - BoxLite remains an explicit capability gate.
 
 Private registry credentials are configured per namespace through a static

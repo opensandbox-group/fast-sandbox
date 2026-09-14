@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"fast-sandbox/internal/artifacts"
+	agentprotocol "fast-sandbox/internal/runtime/firecracker/agent/protocol"
 	"fast-sandbox/internal/registryconfig"
 
 	"github.com/stretchr/testify/require"
@@ -100,7 +101,7 @@ func TestPublishImageUploadOrderAndIndexLayout(t *testing.T) {
 	require.NoError(t, err)
 	dir := stageArtifactSet(t)
 
-	result, err := client.PublishImage(t.Context(), "app-v2", dir)
+	result, err := client.PublishImage(t.Context(), "", "app-v2", dir)
 	require.NoError(t, err)
 
 	digest16 := artifacts.Digest16(mustManifestBytes(t, dir))
@@ -148,7 +149,7 @@ func TestPublishImageRetriesTransientFailureWithFreshBody(t *testing.T) {
 		store.failFirst["bucket/publish/"+digest16+"/"+name] = 1
 	}
 
-	result, err := client.PublishImage(t.Context(), "app-v2", dir)
+	result, err := client.PublishImage(t.Context(), "", "app-v2", dir)
 	require.NoError(t, err)
 	require.Contains(t, result.ManifestRef, digest16)
 	// Every object landed exactly once (the failed attempts are not recorded).
@@ -165,7 +166,7 @@ func TestPublishImageRefusesReadOnlyStore(t *testing.T) {
 	client, err := NewClient("s3://bucket/publish", readOnly, WithEndpoint(server.URL))
 	require.NoError(t, err)
 
-	_, err = client.PublishImage(t.Context(), "app-v2", stageArtifactSet(t))
+	_, err = client.PublishImage(t.Context(), "", "app-v2", stageArtifactSet(t))
 	require.ErrorIs(t, err, ErrNotWritable)
 	require.Empty(t, store.ordered())
 }
@@ -176,7 +177,7 @@ func TestPublishImageRequiresStagedManifest(t *testing.T) {
 	client, err := NewClient("s3://bucket/publish", writeCredential(), WithEndpoint(server.URL))
 	require.NoError(t, err)
 
-	_, err = client.PublishImage(t.Context(), "app-v2", t.TempDir())
+	_, err = client.PublishImage(t.Context(), "", "app-v2", t.TempDir())
 	require.ErrorContains(t, err, "read staged manifest")
 }
 
@@ -185,4 +186,52 @@ func mustManifestBytes(t *testing.T, dir string) []byte {
 	payload, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
 	require.NoError(t, err)
 	return payload
+}
+
+func TestPublishCheckpointSkipsIndex(t *testing.T) {
+	store := newFakePublishStore()
+	server := httptest.NewServer(http.HandlerFunc(store.handle))
+	defer server.Close()
+
+	client, err := NewClient("s3://bucket/publish", writeCredential(), WithEndpoint(server.URL))
+	require.NoError(t, err)
+	dir := stageArtifactSet(t)
+
+	result, err := client.PublishImage(t.Context(), agentprotocol.PublishKindCheckpoint, "", dir)
+	require.NoError(t, err)
+
+	digest16 := artifacts.Digest16(mustManifestBytes(t, dir))
+	base := "bucket/publish/" + digest16
+	require.Equal(t, []string{
+		base + "/rootfs.ext4",
+		base + "/vmstate.snap",
+		base + "/memory.snap",
+		base + "/SHA256SUMS",
+		base + "/manifest.json",
+	}, store.ordered(), "a checkpoint set is complete without an image index")
+	require.Equal(t, "s3://bucket/publish/"+digest16+"/manifest.json", result.ManifestRef)
+	require.Equal(t, artifacts.SHA256Of(mustManifestBytes(t, dir)), result.ArtifactDigest)
+}
+
+func TestPublishCheckpointRejectsIndexKey(t *testing.T) {
+	store := newFakePublishStore()
+	server := httptest.NewServer(http.HandlerFunc(store.handle))
+	defer server.Close()
+
+	client, err := NewClient("s3://bucket/publish", writeCredential(), WithEndpoint(server.URL))
+	require.NoError(t, err)
+	_, err = client.PublishImage(t.Context(), agentprotocol.PublishKindCheckpoint, "app-v2", stageArtifactSet(t))
+	require.ErrorContains(t, err, "key must be empty")
+	require.Empty(t, store.ordered(), "a rejected checkpoint publishes nothing")
+}
+
+func TestPublishTemplateKindRequiresKey(t *testing.T) {
+	store := newFakePublishStore()
+	server := httptest.NewServer(http.HandlerFunc(store.handle))
+	defer server.Close()
+
+	client, err := NewClient("s3://bucket/publish", writeCredential(), WithEndpoint(server.URL))
+	require.NoError(t, err)
+	_, err = client.PublishImage(t.Context(), agentprotocol.PublishKindTemplate, "", stageArtifactSet(t))
+	require.ErrorContains(t, err, "publish key is required")
 }

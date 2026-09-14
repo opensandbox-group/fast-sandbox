@@ -382,6 +382,15 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		}
 	}()
 
+	// A resume restores from an instance-private checkpoint; a fresh boot
+	// restores from the golden image set. Both address the same local cache
+	// layout through restoreReference, so every resolve/validate/prepare
+	// path below is shared between the two.
+	restoreRef, err := restoreReference(spec)
+	if err != nil {
+		return nil, err
+	}
+
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	manager := d.networkManager
@@ -402,7 +411,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// window cannot exhaust the slot pool. Local mode (no agent socket)
 	// keeps the pre-warmed behavior: a still-missing image reports
 	// ErrImageNotReady and the create fails exactly as before.
-	if err := verifyRestorableImage(stateRoot, spec.Image); err != nil {
+	if err := verifyRestorableImage(stateRoot, restoreRef); err != nil {
 		return nil, err
 	}
 
@@ -460,7 +469,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// comes from the cached manifest guestNetwork; the BakedGuestIP
 	// convention is the fallback for hand-seeded caches. Slots are prepared
 	// before the image is known, so the NAT rules are applied now.
-	guestIP, guestMTU, err := resolveBakedGuestIP(stateRoot, spec.Image, slot)
+	guestIP, guestMTU, err := resolveBakedGuestIP(stateRoot, restoreRef, slot)
 	if err != nil {
 		releaseSlot()
 		return nil, err
@@ -472,7 +481,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		// or fragmented until an ICMP needfrag recovers the path, which
 		// surfaces as intermittent network IO stalls.
 		klog.Warningf("baked guest MTU %d differs from slot MTU %d (sandbox %s, image %s); align the template or FAST_SANDBOX_NETWORK_MTU to avoid PMTU-dependent stalls",
-			guestMTU, slot.MTU, identity.SandboxUID, spec.Image)
+			guestMTU, slot.MTU, identity.SandboxUID, restoreRef)
 	}
 	if err := manager.ApplyGuest(ctx, owner, guestIP); err != nil {
 		releaseSlot()
@@ -481,18 +490,18 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 
 	rootfsStarted := time.Now()
 	_, rootfsSpan := observability.Start(ctx, "fastlet.firecracker.rootfs")
-	vmstatePath, memoryPath, err := resolveRestoreSnapshotFiles(stateRoot, spec.Image)
+	vmstatePath, memoryPath, err := resolveRestoreSnapshotFiles(stateRoot, restoreRef)
 	// The machine tuple of the golden snapshot is baked in the vmstate
 	// (v1.16 restores it from the snapshot); the manifest values are only
 	// validated here, not applied via the API (any machine-config call
 	// before snapshot/load is rejected).
 	if err == nil {
-		err = validateRestoreMachineConfig(spec, d.config, stateRoot, spec.Image)
+		err = validateRestoreMachineConfig(spec, d.config, stateRoot, restoreRef)
 	}
 	var instanceRootfs, jailRoot, apiAddress string
 	if err == nil {
 		instanceRootfs, jailRoot, apiAddress, err = d.prepareInstance(
-			stateRoot, identity.SandboxUID, spec.Image, directory, vmstatePath, memoryPath,
+			stateRoot, identity.SandboxUID, restoreRef, directory, vmstatePath, memoryPath,
 		)
 	}
 	observability.End(rootfsSpan, err)
@@ -516,7 +525,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		klog.InfoS("firecracker Create cleanup removed partial sandbox",
 			"sandboxId", identity.SandboxUID, "jailRoot", jailRoot)
 	}()
-	d.touchImage(spec.Image)
+	d.touchImage(restoreRef)
 	rootfsDur := time.Since(rootfsStarted)
 	rootfsMiB := float64(0)
 	if info, statErr := os.Stat(instanceRootfs); statErr == nil {

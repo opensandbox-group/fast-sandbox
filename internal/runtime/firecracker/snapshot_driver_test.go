@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"fast-sandbox/internal/artifacts"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 
 	"github.com/stretchr/testify/require"
@@ -34,13 +36,14 @@ func seedRunningSandbox(t *testing.T, fixture *driverFixture, phase VMPhase) str
 // call time (the driver removes staging right after).
 type snapshotAgentFake struct {
 	fakeAgentClient
+	kind        string
 	key         string
 	manifest    map[string]any
 	sums        string
 	missingFile string
 }
 
-func (f *snapshotAgentFake) PublishImage(_ context.Context, _, key, dir string) (PublishOutcome, error) {
+func (f *snapshotAgentFake) PublishImage(_ context.Context, _, kind, key, dir string) (PublishOutcome, error) {
 	payload, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
 	if err != nil {
 		return PublishOutcome{}, err
@@ -52,7 +55,7 @@ func (f *snapshotAgentFake) PublishImage(_ context.Context, _, key, dir string) 
 	if err != nil {
 		return PublishOutcome{}, err
 	}
-	f.sums, f.key = string(sums), key
+	f.sums, f.kind, f.key = string(sums), kind, key
 	for _, name := range []string{"rootfs.ext4", "vmstate.snap", "memory.snap"} {
 		if info, statErr := os.Stat(filepath.Join(dir, name)); statErr != nil || info.Size() == 0 {
 			f.missingFile = name
@@ -283,4 +286,70 @@ func TestDeleteSnapshotDiscardsStaging(t *testing.T) {
 	require.True(t, os.IsNotExist(statErr))
 	// Idempotent for unknown snapshots.
 	require.NoError(t, fixture.driver.DeleteSnapshot(context.Background(), "snap-ghost"))
+}
+
+func TestCreateCheckpointPublishesWithoutTemplateIndex(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+
+	result, err := fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "ckpt-1", Kind: fastletapi.SnapshotKindCheckpoint,
+	})
+	require.NoError(t, err)
+	require.Equal(t, string(fastletapi.SnapshotKindCheckpoint), agent.kind)
+	require.Empty(t, agent.key, "a checkpoint publishes no template index key")
+	require.Len(t, agent.manifest["files"].(map[string]any), 3)
+	require.Contains(t, result.ManifestRef, "/manifest.json")
+	require.NotEmpty(t, result.ArtifactDigest)
+}
+
+func TestCreateCheckpointRejectsTemplateName(t *testing.T) {
+	fixture, _ := newSnapshotFixture(t)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+
+	_, err := fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "ckpt-1", Kind: fastletapi.SnapshotKindCheckpoint, TemplateName: "app-v2",
+	})
+	require.ErrorContains(t, err, "templateName must be empty")
+}
+
+func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
+	fixture := newSnapshotDriverFixture(t)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+
+	// The Sandbox is itself a resume: its durable spec carries the restore
+	// reference, and the source image is NOT cached on this node.
+	dir := filepath.Join(fixture.stateRoot, sandboxStateDir, sandboxID)
+	state, err := loadState(dir)
+	require.NoError(t, err)
+	restore := &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/publish/abcdef/manifest.json", ArtifactDigest: "lineage-digest"}
+	state.Config.Spec.Restore = restore
+	require.NoError(t, saveState(dir, state))
+
+	cacheDir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(artifacts.CheckpointReference(restore.ArtifactDigest)))
+	require.NoError(t, os.MkdirAll(cacheDir, 0o750))
+	lineage, err := json.Marshal(map[string]any{
+		"schemaVersion": 1, "runtime": "firecracker",
+		"machine":      map[string]any{"vcpu": "1", "memory": "512Mi"},
+		"guestNetwork": map[string]any{"ip": "10.0.0.2", "gateway": "10.0.0.1"},
+		"kernel":       map[string]any{"name": "vmlinux"},
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "manifest.json"), lineage, 0o644))
+
+	staging := t.TempDir()
+	for _, name := range []string{"rootfs.ext4", "vmstate.snap", "memory.snap"} {
+		require.NoError(t, os.WriteFile(filepath.Join(staging, name), []byte("data-"+name), 0o640))
+	}
+	size, err := assembleSnapshotManifest(fixture.stateRoot, staging, dir, "firecracker", nil)
+	require.NoError(t, err)
+	require.Positive(t, size)
+
+	payload, err := os.ReadFile(filepath.Join(staging, "manifest.json"))
+	require.NoError(t, err)
+	var document map[string]any
+	require.NoError(t, json.Unmarshal(payload, &document))
+	require.Equal(t, "10.0.0.2", document["guestNetwork"].(map[string]any)["ip"],
+		"the checkpoint lineage facts ride forward into the new checkpoint")
+	require.Equal(t, fixture.sandboxSpec.Spec.Image, document["sourceImage"])
 }

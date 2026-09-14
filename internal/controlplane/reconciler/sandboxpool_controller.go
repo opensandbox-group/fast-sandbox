@@ -560,7 +560,10 @@ func sandboxNeedsPlacement(sandbox *apiv1alpha2.Sandbox) bool {
 		return false
 	}
 	if sandbox.Status.Runtime.State == apiv1alpha2.RuntimeStopping ||
-		sandbox.Status.Runtime.State == apiv1alpha2.RuntimeStopped {
+		sandbox.Status.Runtime.State == apiv1alpha2.RuntimeStopped ||
+		sandbox.Status.Runtime.State == apiv1alpha2.RuntimePausing ||
+		sandbox.Status.Runtime.State == apiv1alpha2.RuntimePaused ||
+		sandbox.Status.Runtime.State == apiv1alpha2.RuntimeResuming {
 		return false
 	}
 	return true

@@ -186,7 +186,66 @@ func (c *Client) PullImage(ctx context.Context, stateRoot, image string) (result
 	if err != nil {
 		return err
 	}
-	payload, err := c.fetchManifest(ctx, manifestKey, index.ArtifactDigest)
+	if err := c.materializeSet(ctx, dir, manifestKey, index.ArtifactDigest); err != nil {
+		return err
+	}
+	completed = true
+	return nil
+}
+
+// PullCheckpoint materializes a checkpoint artifact set addressed directly by
+// its manifest reference and digest — the cross-host restore path of a paused
+// Sandbox. Checkpoints carry no image index, so the caller supplies the
+// immutable digest the publisher reported; the set is staged under the
+// canonical checkpoint reference (artifacts.CheckpointReference) so both the
+// producing and the resuming node share the cache layout with images.
+func (c *Client) PullCheckpoint(ctx context.Context, stateRoot, reference, manifestRef, artifactDigest string) (resultErr error) {
+	if strings.TrimSpace(reference) == "" {
+		return fmt.Errorf("%w: checkpoint reference is required", runtimecontract.ErrInvalidConfig)
+	}
+	if strings.TrimSpace(manifestRef) == "" || strings.TrimSpace(artifactDigest) == "" {
+		return fmt.Errorf("%w: checkpoint manifestRef and artifactDigest are required", runtimecontract.ErrInvalidConfig)
+	}
+	dir := imageDir(stateRoot, reference)
+	if complete, err := cacheComplete(dir); err != nil {
+		return err
+	} else if complete {
+		return nil
+	}
+	if err := os.MkdirAll(dir, cacheDirMode); err != nil {
+		return fmt.Errorf("prepare checkpoint cache: %w", err)
+	}
+
+	klog.InfoS("firecracker agent checkpoint pull started", "reference", reference, "stateRoot", stateRoot)
+	started := time.Now()
+	completed := false
+	defer func() {
+		elapsed := time.Since(started)
+		if completed {
+			klog.InfoS("firecracker agent checkpoint pull completed", "reference", reference, "elapsed", elapsed.String())
+			return
+		}
+		klog.ErrorS(resultErr, "firecracker agent checkpoint pull failed", "reference", reference, "elapsed", elapsed.String())
+	}()
+
+	manifestKey, err := c.s3.resolveRef(manifestRef)
+	if err != nil {
+		return err
+	}
+	if err := c.materializeSet(ctx, dir, manifestKey, artifactDigest); err != nil {
+		return err
+	}
+	completed = true
+	return nil
+}
+
+// materializeSet downloads and commits one artifact set into the local cache
+// directory: the manifest (digest-verified against artifactDigest), every
+// native artifact next to it in the same per-build namespace, and the local
+// manifest as the commit point. It is shared by the index-addressed image
+// pull and the ref-addressed checkpoint pull.
+func (c *Client) materializeSet(ctx context.Context, dir, manifestKey, artifactDigest string) error {
+	payload, err := c.fetchManifest(ctx, manifestKey, artifactDigest)
 	if err != nil {
 		return err
 	}
@@ -207,11 +266,7 @@ func (c *Client) PullImage(ctx context.Context, stateRoot, image string) (result
 			return err
 		}
 	}
-	if err := commitManifest(dir, payload); err != nil {
-		return err
-	}
-	completed = true
-	return nil
+	return commitManifest(dir, payload)
 }
 
 // getArtifact streams one native artifact object. In DART mode the download

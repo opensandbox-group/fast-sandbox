@@ -97,6 +97,17 @@ func (f *fakePuller) PullImage(_ context.Context, stateRoot, image string) error
 	return f.seed(stateRoot, image)
 }
 
+func (f *fakePuller) PullCheckpoint(_ context.Context, stateRoot, reference, _, _ string) error {
+	f.mu.Lock()
+	f.pulls[reference]++
+	fail := f.fail[reference]
+	f.mu.Unlock()
+	if fail != nil {
+		return fail
+	}
+	return f.seed(stateRoot, reference)
+}
+
 func (f *fakePuller) pullCount(image string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()

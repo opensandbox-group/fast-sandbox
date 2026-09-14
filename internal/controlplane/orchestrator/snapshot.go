@@ -74,6 +74,15 @@ func (o *Orchestrator) SnapshotTarget(snapshot *apiv1alpha2.SandboxSnapshot, san
 	if snapshot == nil || snapshot.UID == "" {
 		return fastletapi.SnapshotIdentity{}, placement.FastletInfo{}, errors.New("persisted SandboxSnapshot UID is required")
 	}
+	return o.snapshotIdentityOnAssigned(sandbox, string(snapshot.UID), snapshot.Namespace, snapshot.Name)
+}
+
+// snapshotIdentityOnAssigned builds the full Fastlet-side snapshot identity of
+// one task (a SandboxSnapshot or a pause checkpoint) against the target
+// Sandbox's live durable assignment. A checkpoint task has no CR: its
+// snapshotUid is the derived checkpoint id and the namespace/name fields
+// mirror the owning Sandbox.
+func (o *Orchestrator) snapshotIdentityOnAssigned(sandbox *apiv1alpha2.Sandbox, snapshotUID, namespace, name string) (fastletapi.SnapshotIdentity, placement.FastletInfo, error) {
 	if sandbox == nil || sandbox.UID == "" {
 		return fastletapi.SnapshotIdentity{}, placement.FastletInfo{}, errors.New("target Sandbox is required")
 	}
@@ -89,7 +98,7 @@ func (o *Orchestrator) SnapshotTarget(snapshot *apiv1alpha2.SandboxSnapshot, san
 		return fastletapi.SnapshotIdentity{}, placement.FastletInfo{}, fmt.Errorf("%w: assigned Fastlet is unavailable", ErrAssignedFastletUnavailable)
 	}
 	identity := fastletapi.SnapshotIdentity{
-		SnapshotUID: string(snapshot.UID), Namespace: snapshot.Namespace, Name: snapshot.Name,
+		SnapshotUID: snapshotUID, Namespace: namespace, Name: name,
 		Sandbox: fastletapi.SandboxIdentity{
 			SandboxUID: string(sandbox.UID), Namespace: sandbox.Namespace, Name: sandbox.Name,
 			InstanceGeneration: envelope.InstanceGeneration, RuntimeInstanceID: envelope.RuntimeInstanceID,

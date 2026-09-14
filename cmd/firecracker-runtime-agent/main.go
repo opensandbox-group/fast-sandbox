@@ -189,14 +189,24 @@ func (l *livePullClient) PullImage(ctx context.Context, stateRoot, image string)
 	return client.PullImage(ctx, stateRoot, image)
 }
 
+// PullCheckpoint materializes one instance-private checkpoint set addressed
+// by manifest ref + digest with the current config.
+func (l *livePullClient) PullCheckpoint(ctx context.Context, stateRoot, reference, manifestRef, artifactDigest string) error {
+	client, err := l.current()
+	if err != nil {
+		return err
+	}
+	return client.PullCheckpoint(ctx, stateRoot, reference, manifestRef, artifactDigest)
+}
+
 // PublishImage publishes one snapshot artifact set with the current config;
 // the service wires this path because the type implements artifactPublisher.
-func (l *livePullClient) PublishImage(ctx context.Context, key, dir string) (agentpull.PublishResult, error) {
+func (l *livePullClient) PublishImage(ctx context.Context, kind, key, dir string) (agentpull.PublishResult, error) {
 	client, err := l.current()
 	if err != nil {
 		return agentpull.PublishResult{}, err
 	}
-	return client.PublishImage(ctx, key, dir)
+	return client.PublishImage(ctx, kind, key, dir)
 }
 
 // dartListenAddress derives the DART client-plane listen address from the

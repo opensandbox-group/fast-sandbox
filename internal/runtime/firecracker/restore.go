@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"fast-sandbox/internal/artifacts"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
@@ -30,6 +31,21 @@ import (
 // cachedManifestPath returns the commit-point manifest of a pulled image.
 func cachedManifestPath(stateRoot, image string) string {
 	return filepath.Join(stateRoot, imageCacheDir, imageKey(image), "manifest.json")
+}
+
+// restoreReference resolves the local cache reference a runtime restores
+// from: the canonical checkpoint reference of a resume (spec.Restore), or
+// the image reference of a fresh boot. Both the node cache and the driver
+// restore paths key off this value, so a checkpoint restored on another host
+// reuses the standard image cache layout unchanged.
+func restoreReference(spec fastletapi.SandboxSpec) (string, error) {
+	if spec.Restore == nil {
+		return spec.Image, nil
+	}
+	if spec.Restore.ManifestRef == "" || spec.Restore.ArtifactDigest == "" {
+		return "", fmt.Errorf("%w: restore requires manifestRef and artifactDigest", ErrInvalidConfig)
+	}
+	return artifacts.CheckpointReference(spec.Restore.ArtifactDigest), nil
 }
 
 // manifestMachine is the machine tuple recorded in the published manifest

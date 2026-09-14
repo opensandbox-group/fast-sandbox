@@ -84,6 +84,9 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, request ctrl.Request)
 	if expirationPending(&sandbox, now) {
 		return r.reconcileExpiration(ctx, orchestrator, &sandbox)
 	}
+	if sandbox.Spec.State == apiv1alpha2.SandboxStatePaused {
+		return r.reconcilePause(ctx, orchestrator, &sandbox)
+	}
 	return r.reconcileEnsure(ctx, orchestrator, &sandbox)
 }
 
@@ -190,6 +193,10 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *o
 	}
 	if err := r.patchStatus(ctx, assigned, func(status *apiv1alpha2.SandboxStatus) {
 		orchestration.ProjectObservedStatus(status, assigned, observed)
+		// A resume in flight is a pause-FSM state: while the restore has not
+		// reached Ready the Sandbox reads Resuming, and a completed resume
+		// clears the one-shot checkpoint.
+		projectResumeFromCheckpoint(status, assigned, observed)
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -220,6 +227,14 @@ func (r *SandboxReconciler) assignedPodLost(ctx context.Context, sandbox *apiv1a
 
 func (r *SandboxReconciler) markAssignedFastletUnavailable(ctx context.Context, sandbox *apiv1alpha2.Sandbox) error {
 	return r.patchStatus(ctx, sandbox, func(status *apiv1alpha2.SandboxStatus) {
+		if status.Runtime.Checkpoint != nil {
+			// A resume whose target Fastlet is temporarily unavailable stays
+			// visibly a resume (the checkpoint lineage is preserved).
+			setControllerStates(status, apiv1alpha2.RuntimeResuming, apiv1alpha2.DataPlanePending, "The assigned Fastlet Pod still exists, but its local registry endpoint is temporarily unavailable")
+			setSandboxReadyCondition(status, sandbox.Generation, "FastletRegistryPending", "The assigned Fastlet Pod still exists, but its local registry endpoint is temporarily unavailable")
+			setSandboxSuspendedCondition(status, sandbox.Generation, false, "Resuming", "Sandbox resume is waiting for the assigned Fastlet")
+			return
+		}
 		setControllerStates(status, apiv1alpha2.RuntimeUnavailable, apiv1alpha2.DataPlaneUnavailable, "The assigned Fastlet Pod still exists, but its local registry endpoint is temporarily unavailable")
 		setSandboxReadyCondition(status, sandbox.Generation, "FastletRegistryPending", "The assigned Fastlet Pod still exists, but its local registry endpoint is temporarily unavailable")
 	})
@@ -227,6 +242,14 @@ func (r *SandboxReconciler) markAssignedFastletUnavailable(ctx context.Context, 
 
 func (r *SandboxReconciler) markPending(ctx context.Context, sandbox *apiv1alpha2.Sandbox, reason, message string) error {
 	return r.patchStatus(ctx, sandbox, func(status *apiv1alpha2.SandboxStatus) {
+		if status.Runtime.Checkpoint != nil {
+			// A resume waiting for placement must not read as a fresh
+			// create: keep the checkpoint lineage visible.
+			setControllerStates(status, apiv1alpha2.RuntimeResuming, apiv1alpha2.DataPlanePending, message)
+			setSandboxReadyCondition(status, sandbox.Generation, reason, message)
+			setSandboxSuspendedCondition(status, sandbox.Generation, false, "Resuming", message)
+			return
+		}
 		setControllerStates(status, apiv1alpha2.RuntimePending, apiv1alpha2.DataPlanePending, message)
 		setSandboxReadyCondition(status, sandbox.Generation, reason, message)
 	})
@@ -348,8 +371,13 @@ func (r *SandboxReconciler) reconcileExpiration(ctx context.Context, orchestrato
 		sandbox = cleared
 	}
 	err = r.patchStatus(ctx, sandbox, func(status *apiv1alpha2.SandboxStatus) {
+		// An expired Sandbox is terminal: a recorded checkpoint cannot be
+		// resumed any more. Store objects stay for store-lifecycle GC.
+		status.Runtime.Checkpoint = nil
+		status.Runtime.PauseAttempt = 0
 		setControllerStates(status, apiv1alpha2.RuntimeStopped, apiv1alpha2.DataPlaneUnavailable, "Sandbox desired lifetime expired")
 		setSandboxReadyCondition(status, sandbox.Generation, orchestration.ReasonExpired, "Sandbox desired lifetime expired")
+		setSandboxSuspendedCondition(status, sandbox.Generation, false, orchestration.ReasonExpired, "Sandbox desired lifetime expired")
 	})
 	return ctrl.Result{}, err
 }
@@ -370,9 +398,14 @@ func (r *SandboxReconciler) reconcileReset(ctx context.Context, orchestrator *or
 		if status.Runtime.Generation < apiv1alpha2.InitialInstanceGeneration {
 			status.Runtime.Generation = apiv1alpha2.InitialInstanceGeneration
 		}
+		// Reset starts a fresh instance: the previous pause lineage and its
+		// checkpoint are dropped.
+		status.Runtime.Checkpoint = nil
+		status.Runtime.PauseAttempt = 0
 		status.Runtime.AcceptedResetRevision = sandbox.Spec.ResetRevision.DeepCopy()
 		setControllerStates(status, apiv1alpha2.RuntimePending, apiv1alpha2.DataPlanePending, "Sandbox reset is pending")
 		setSandboxReadyCondition(status, sandbox.Generation, "ResetRequested", "Sandbox reset is pending")
+		setSandboxSuspendedCondition(status, sandbox.Generation, false, "ResetRequested", "Sandbox reset is pending")
 	}); err != nil {
 		return ctrl.Result{}, err
 	}

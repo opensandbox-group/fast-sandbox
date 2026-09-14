@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"fast-sandbox/internal/artifacts"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 
 	"github.com/stretchr/testify/require"
@@ -422,4 +423,40 @@ func TestPullImageConcurrent(t *testing.T) {
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	require.Len(t, entries, 4)
+}
+
+func TestPullCheckpointFullFlowWithoutIndex(t *testing.T) {
+	store, client, manifestPayload, _ := publishFixture(t)
+	// A checkpoint is addressed by manifest ref + digest: drop the index so
+	// the pull cannot silently fall back to the image resolution path.
+	delete(store.objects, "index/"+imageKey(testImage)+".json")
+
+	digest := sha256Hex(manifestPayload)
+	reference := artifacts.CheckpointReference(digest)
+	manifestRef := "s3://" + testBucket + "/" + testPrefix + "/" + digest[:16] + "/manifest.json"
+	root := t.TempDir()
+
+	require.NoError(t, (&Client{s3: client}).PullCheckpoint(t.Context(), root, reference, manifestRef, digest))
+	dir := imageDir(root, reference)
+	complete, err := cacheComplete(dir)
+	require.NoError(t, err)
+	require.True(t, complete, "the checkpoint artifact set is committed in the local cache")
+
+	before := len(store.requested())
+	require.NoError(t, (&Client{s3: client}).PullCheckpoint(t.Context(), root, reference, manifestRef, digest))
+	require.Len(t, store.requested(), before, "a committed checkpoint cache is not re-pulled")
+}
+
+func TestPullCheckpointRejectsDigestMismatch(t *testing.T) {
+	_, client, manifestPayload, _ := publishFixture(t)
+	digest := sha256Hex(manifestPayload)
+	manifestRef := "s3://" + testBucket + "/" + testPrefix + "/" + digest[:16] + "/manifest.json"
+	err := (&Client{s3: client}).PullCheckpoint(t.Context(), t.TempDir(), artifacts.CheckpointReference("other"), manifestRef, strings.Repeat("0", 64))
+	require.ErrorContains(t, err, "digest mismatch")
+}
+
+func TestPullCheckpointRequiresAddress(t *testing.T) {
+	_, client, _, _ := publishFixture(t)
+	require.Error(t, (&Client{s3: client}).PullCheckpoint(t.Context(), t.TempDir(), "", "s3://b/m.json", "digest"))
+	require.Error(t, (&Client{s3: client}).PullCheckpoint(t.Context(), t.TempDir(), artifacts.CheckpointReference("d"), "", ""))
 }
