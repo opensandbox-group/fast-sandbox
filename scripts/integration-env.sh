@@ -131,8 +131,9 @@ log() { printf '\033[1;34m[firecracker-integration]\033[0m %s\n' "$*" | tee -a "
 die() { printf '\033[1;31m[firecracker-integration] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 pass() { printf '\033[1;32m[firecracker-integration] PASS\033[0m %s\n' "$*" | tee -a "$WORK/run.log" >&2; }
 fail() { printf '\033[1;31m[firecracker-integration] FAIL\033[0m %s\n' "$*" >&2; exit 1; }
-# highlight() marks a key milestone in the output (bold cyan, not logged).
-highlight() { printf '\033[1;36m%s\033[0m\n' "$*"; }
+# highlight() marks a key milestone in the output (bold cyan). It is also
+# appended to run.log so path/URL highlights stay greppable after the run.
+highlight() { printf '\033[1;36m%s\033[0m\n' "$*" | tee -a "$WORK/run.log"; }
 
 # --- Go environment (sudo-aware) ----------------------------------------------
 # The environment needs root (kind, loop devices, XFS mount, sysctl), so the
@@ -3703,6 +3704,11 @@ snapshot_evidence() {
 	{
 		echo "=== verify-snapshot evidence ($(date -u +%FT%TZ)) ==="
 		echo "snapshot=$SNAPSHOT_NAME template=$SNAPSHOT_TEMPLATE source=$SNAPSHOT_TARGET restore=$SNAPSHOT_RESTORE"
+		local ref
+		ref="$(kubectl_get "sandboxsnapshot/$SNAPSHOT_NAME" '{.status.manifestRef}' 2>/dev/null || true)"
+		[[ "$ref" == s3://* ]] && echo "manifest=$(echo "$ref" | tee /dev/null)"
+		echo "manifest-evidence-copy=$SNAP_E2E_DIR/manifest-$SNAPSHOT_NAME.json"
+		echo "manifest-host-store=$MINIO_DATA/$MINIO_BUCKET/$(dirname "${ref#s3://$MINIO_BUCKET/}")/"
 	} > "$SNAP_E2E_DIR/summary.txt"
 	kubectl -n "$NS" get sandboxsnapshot -o yaml > "$SNAP_E2E_DIR/sandboxsnapshots-all.yaml" 2>&1 || true
 	kubectl -n "$NS" get sandboxsnapshot "$SNAPSHOT_NAME" -o yaml > "$SNAP_E2E_DIR/sandboxsnapshot.yaml" 2>&1 || true
