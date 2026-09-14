@@ -30,6 +30,8 @@
 #   KIND_CLUSTER, MINIO_PORT, MINIO_AK, MINIO_SK, MINIO_IMAGE,
 #   MINIO_ENDPOINT, MINIO_DATA (default /data/fast-sandbox-minio),
 #   XFS_LOOP_FILE (default /data/fast-sandbox.img),
+#   GOCACHE/GOMODCACHE/TMPDIR (default /data/cache/{go-build,go-mod,tmp} when
+#   /data exists; explicit values win),
 #   IMAGE_<NAME> (image tags), FC_VERSION, SBX_IMAGE,
 #   WARM_IMAGES (=1: restore the preheat; default 0 = on-demand pulls)
 #
@@ -147,7 +149,9 @@ highlight() { printf '\033[1;36m%s\033[0m\n' "$*" | tee -a "$WORK/run.log"; }
 #
 # GOMODCACHE/GOCACHE are deliberately NOT inherited: root writing into the
 # caller's caches leaves root-owned directories that break their later builds.
-# Root re-downloads into its own cache, which persists across runs.
+# Root re-downloads into its own cache, which persists across runs. When the
+# heavy-data root exists, redirect_go_env puts those root caches (and TMPDIR)
+# on it instead of the root filesystem.
 GO_INHERITED_VARS=(GOPROXY GOSUMDB GOPRIVATE GOINSECURE GOFLAGS)
 
 inherit_go_env() {
@@ -175,6 +179,23 @@ inherit_go_env() {
 	else
 		log "warning: go env GOPROXY is empty; module downloads will fail unless every module is already cached (fix with: go env -w GOPROXY=...)"
 	fi
+}
+
+# redirect_go_env keeps the host-side Go build/module caches and TMPDIR off the
+# root filesystem (a 59G root disk + root's default ~3GiB caches is a recurring
+# ENOSPC source). Defaults land under the heavy-data root; explicit GOCACHE /
+# GOMODCACHE / TMPDIR and a missing /data are left untouched.
+redirect_go_env() {
+	[[ -d /data ]] || return 0
+	local cache_root=/data/cache
+	: "${GOCACHE:=$cache_root/go-build}"
+	: "${GOMODCACHE:=$cache_root/go-mod}"
+	: "${TMPDIR:=$cache_root/tmp}"
+	export GOCACHE GOMODCACHE TMPDIR
+	if ! mkdir -p "$GOCACHE" "$GOMODCACHE" "$TMPDIR" 2>/dev/null; then
+		log "warning: cannot create $cache_root/*; set GOCACHE/GOMODCACHE/TMPDIR explicitly"
+	fi
+	log "go/tmp caches: GOCACHE=$GOCACHE GOMODCACHE=$GOMODCACHE TMPDIR=$TMPDIR"
 }
 
 # render_firecracker_pool_spec rewrites a pool sample's warmImages entry to
@@ -4614,6 +4635,8 @@ mkdir -p "$WORK" "$LOGS_DIR"
 
 # Before any go/make/docker invocation, and after $WORK exists so log() works.
 inherit_go_env
+# Keep root's Go/TMP caches on the heavy-data disk (default /data/cache/*).
+redirect_go_env
 
 # Route the builder's implicit Docker Hub images through REGISTRY_MIRROR.
 apply_registry_mirror
