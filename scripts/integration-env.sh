@@ -2209,8 +2209,16 @@ verify_p2p() {
 	endpoint_host="${MINIO_ENDPOINT#http://}"
 	[[ -n "$endpoint_host" ]] || die "MINIO_ENDPOINT could not be resolved (is the MinIO container up?)"
 	mc alias set chain-net "$MINIO_ENDPOINT" "$MINIO_AK" "$MINIO_SK" >/dev/null 2>&1 || true
-	presigned="$(mc presign --expiry 1h "chain-net/$MINIO_BUCKET/$probe_key")" \
-		|| die "mc presign failed for $probe_key"
+	# mc has no "presign" subcommand; "share download" is its presigned-URL
+	# generator (the JSON field is "share"). Tolerate older builds that only
+	# print the human "Share: <url>" form.
+	local share_out
+	share_out="$(mc --json share download --expire 1h "chain-net/$MINIO_BUCKET/$probe_key" 2>/dev/null || true)"
+	presigned="$(printf '%s' "$share_out" | jq -r '.share // empty' 2>/dev/null || true)"
+	if [[ "$presigned" != http* ]]; then
+		presigned="$(printf '%s' "$share_out" | sed -n 's/^Share: //p' | head -1)"
+	fi
+	[[ "$presigned" == http* ]] || die "mc share download returned no presigned URL for $probe_key (got '$share_out')"
 	log "verify-p2p probe object: $probe_key ($(mc stat --json "chain-net/$MINIO_BUCKET/$probe_key" 2>/dev/null | jq -r '.size' 2>/dev/null || echo '?' ) bytes)"
 
 	pods="$(kubectl -n "$NS" get pods -l component=firecracker-runtime-agent -o jsonpath='{.items[*].metadata.name}')"
