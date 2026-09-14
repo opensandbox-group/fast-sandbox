@@ -15,6 +15,7 @@ import (
 
 	fastpathv2 "fast-sandbox/api/proto/v2"
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifactstore"
 	"fast-sandbox/internal/controlplane/assignment"
 	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 	"fast-sandbox/internal/observability"
@@ -214,12 +215,13 @@ type policyCacheEntry struct {
 // long-lived state.
 type storePolicySource struct {
 	Client client.Client
-	// StoreRoot and Endpoint mirror the node agents' store configuration.
-	// Endpoint matters: pool-compiled credentials carry no endpoint (the
-	// registry rule has none), so without the override the client would
-	// default to https against a plain-HTTP store.
-	StoreRoot string
-	Endpoint  string
+	// Config reads the store address from the mounted
+	// fast-sandbox-artifact-store ConfigMap on every call, so a ConfigMap
+	// edit applies to the next create without a restart. Endpoint matters:
+	// pool-compiled credentials carry no endpoint (the registry rule has
+	// none), so without the override the client would default to https
+	// against a plain-HTTP store.
+	Config artifactstore.Loader
 
 	mu      sync.Mutex
 	clients map[string]*agentpull.Client
@@ -229,20 +231,20 @@ type storePolicySource struct {
 // NewStorePolicySource builds the default policy source over the pool
 // registry secrets and the configured artifact store (same store the node
 // agents pull from; endpoint empty derives from the credential host).
-func NewStorePolicySource(reader client.Client, storeRoot, endpoint string) ManifestPolicySource {
+func NewStorePolicySource(reader client.Client, config artifactstore.Loader) ManifestPolicySource {
 	return &storePolicySource{
-		Client:    reader,
-		StoreRoot: storeRoot,
-		Endpoint:  endpoint,
-		clients:   map[string]*agentpull.Client{},
-		cache:     map[string]policyCacheEntry{},
+		Client:  reader,
+		Config:  config,
+		clients: map[string]*agentpull.Client{},
+		cache:   map[string]policyCacheEntry{},
 	}
 }
 
-// poolRegistryClient builds (once) the artifact-store read client for a
-// pool from its compiled registry secret.
-func (s *storePolicySource) poolRegistryClient(ctx context.Context, pool *apiv1alpha2.SandboxPool) (*agentpull.Client, error) {
-	key := pool.Namespace + "/" + pool.Name
+// poolRegistryClient returns the artifact-store read client for a pool,
+// rebuilding it when the resolved store configuration changed (the cache key
+// carries the address so a ConfigMap edit never reuses an old endpoint).
+func (s *storePolicySource) poolRegistryClient(ctx context.Context, pool *apiv1alpha2.SandboxPool, config artifactstore.Config) (*agentpull.Client, error) {
+	key := pool.Namespace + "/" + pool.Name + "\x00" + config.Store + "\x00" + config.Endpoint
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if cached, ok := s.clients[key]; ok {
@@ -260,10 +262,10 @@ func (s *storePolicySource) poolRegistryClient(ctx context.Context, pool *apiv1a
 		return nil, fmt.Errorf("pool %s registry secret carries no credentials", pool.Name)
 	}
 	var options []agentpull.Option
-	if s.Endpoint != "" {
-		options = append(options, agentpull.WithEndpoint(s.Endpoint))
+	if config.Endpoint != "" {
+		options = append(options, agentpull.WithEndpoint(config.Endpoint))
 	}
-	pull, clientErr := agentpull.NewClient(s.StoreRoot, compiled.Credentials[0], options...)
+	pull, clientErr := agentpull.NewClient(config.Store, compiled.Credentials[0], options...)
 	if clientErr != nil {
 		return nil, clientErr
 	}
@@ -282,14 +284,23 @@ func poolRegistrySecretName(poolName string) string {
 }
 
 func (s *storePolicySource) ActionBindings(ctx context.Context, pool *apiv1alpha2.SandboxPool, image string) ([]apiv1alpha2.ActionBinding, error) {
-	key := image + "@" + pool.Namespace + "/" + pool.Name
+	config, err := s.Config.Load()
+	if err != nil {
+		return nil, err
+	}
+	if config.Store == "" {
+		return nil, errors.New("artifact store is not configured")
+	}
+	// The store address is part of the cache key: after a ConfigMap edit an
+	// entry resolved from the old store must not be served.
+	key := image + "@" + pool.Namespace + "/" + pool.Name + "@" + config.Store + "\x00" + config.Endpoint
 	s.mu.Lock()
 	entry, ok := s.cache[key]
 	s.mu.Unlock()
 	if ok && time.Since(entry.fetchedAt) < policyCacheTTL {
 		return entry.bindings, nil
 	}
-	pull, err := s.poolRegistryClient(ctx, pool)
+	pull, err := s.poolRegistryClient(ctx, pool, config)
 	if err != nil {
 		return nil, err
 	}

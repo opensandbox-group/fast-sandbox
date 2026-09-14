@@ -3,11 +3,15 @@ package reconciler
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifactstore"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -435,7 +439,7 @@ func TestSandboxTemplateReconcileFailsStuckPendingPod(t *testing.T) {
 				sandboxTemplateNamespaceLabel:  namespace,
 				sandboxTemplateGenerationLabel: "1",
 			},
-			OwnerReferences: builderPodOwnerRefs(template),
+			OwnerReferences:   builderPodOwnerRefs(template),
 			CreationTimestamp: metav1.NewTime(time.Now().Add(-podPendingTimeout - time.Minute)),
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "build"}}},
@@ -507,7 +511,7 @@ func TestSandboxTemplatePendingTimeoutDeletesPod(t *testing.T) {
 				sandboxTemplateNamespaceLabel:  namespace,
 				sandboxTemplateGenerationLabel: "1",
 			},
-			OwnerReferences: builderPodOwnerRefs(template),
+			OwnerReferences:   builderPodOwnerRefs(template),
 			CreationTimestamp: metav1.NewTime(time.Now().Add(-podPendingTimeout - time.Minute)),
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "build"}}},
@@ -541,7 +545,7 @@ func TestSandboxTemplateEnsureBuilderRBACConvergesDrift(t *testing.T) {
 		Subjects:   []rbacv1.Subject{{Kind: "ServiceAccount", Name: "someone-else", Namespace: namespace}},
 	}
 	sa := &corev1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{Name: sandboxTemplateBuilderServiceAccount, Namespace: namespace},
+		ObjectMeta:       metav1.ObjectMeta{Name: sandboxTemplateBuilderServiceAccount, Namespace: namespace},
 		ImagePullSecrets: []corev1.LocalObjectReference{{Name: "regcred"}},
 	}
 	template := newSandboxTemplate(namespace, name)
@@ -623,4 +627,229 @@ func TestSandboxTemplateReconcileReplacesLeftoverPodOfDeletedTemplate(t *testing
 	if !owned {
 		t.Fatalf("expected the leftover to be replaced by a pod owned by the new template, got %+v", pods[0].OwnerReferences)
 	}
+}
+
+func TestSandboxTemplateReconcileDefaultsPublishFromArtifactStore(t *testing.T) {
+	namespace, name := "tenant-a", "platform-default"
+	template := newSandboxTemplate(namespace, name)
+	template.Spec.Output.Publish = ""
+	template.Spec.Output.PublishSecretRef = &corev1.LocalObjectReference{Name: "publish-creds"}
+	secret := newPublishSecret(namespace, "publish-creds")
+	reconciler := newSandboxTemplateReconciler(t, template, secret)
+	dir := t.TempDir()
+	writeArtifactStoreFile(t, dir, artifactstore.StoreKey, "s3://platform/store\n")
+	writeArtifactStoreFile(t, dir, artifactstore.EndpointKey, "http://minio.fast-sandbox-system.svc:9000")
+	reconciler.ArtifactStore = artifactstore.Loader{Dir: dir}
+	key := client.ObjectKey{Namespace: namespace, Name: name}
+
+	reconcileOnce(t, reconciler, key)
+	pods := listBuilderPods(t, reconciler, namespace)
+	if len(pods) != 1 {
+		t.Fatalf("expected one build pod, got %d", len(pods))
+	}
+	spec := builderSpecFromPod(t, &pods[0])
+	if spec.Output.Publish != "s3://platform/store" {
+		t.Fatalf("expected an empty publish to default to the platform store, got %q", spec.Output.Publish)
+	}
+	// The platform endpoint overrides the publish secret's endpoint so the
+	// build targets the same address the node agents pull from.
+	endpoint := builderEnvEntry(&pods[0], "AWS_ENDPOINT_URL")
+	if endpoint == nil || endpoint.Value != "http://minio.fast-sandbox-system.svc:9000" || endpoint.ValueFrom != nil {
+		t.Fatalf("expected AWS_ENDPOINT_URL to be the platform endpoint literal, got %+v", endpoint)
+	}
+	// The credential pair still comes from the publish secret.
+	accessKey := builderEnvEntry(&pods[0], "AWS_ACCESS_KEY_ID")
+	if accessKey == nil || accessKey.ValueFrom == nil || accessKey.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("expected AWS_ACCESS_KEY_ID to stay a secret reference, got %+v", accessKey)
+	}
+}
+
+func TestSandboxTemplateReconcileToleratesTrailingSlash(t *testing.T) {
+	namespace, name := "tenant-a", "slash"
+	template := newSandboxTemplate(namespace, name)
+	template.Spec.Output.Publish = "s3://platform/store/"
+	dir := t.TempDir()
+	writeArtifactStoreFile(t, dir, artifactstore.StoreKey, "s3://platform/store")
+	reconciler := newSandboxTemplateReconciler(t, template)
+	reconciler.ArtifactStore = artifactstore.Loader{Dir: dir}
+	key := client.ObjectKey{Namespace: namespace, Name: name}
+
+	reconcileOnce(t, reconciler, key)
+	var updated apiv1alpha2.SandboxTemplate
+	if err := reconciler.Get(context.Background(), key, &updated); err != nil {
+		t.Fatalf("get template: %v", err)
+	}
+	if updated.Status.Phase != apiv1alpha2.SandboxTemplatePhaseBuilding {
+		t.Fatalf("expected a trailing slash to match the platform store, got phase %s", updated.Status.Phase)
+	}
+}
+
+func TestSandboxTemplateReconcileRejectsPublishMismatch(t *testing.T) {
+	namespace, name := "tenant-a", "drift"
+	template := newSandboxTemplate(namespace, name)
+	dir := t.TempDir()
+	writeArtifactStoreFile(t, dir, artifactstore.StoreKey, "s3://platform/store")
+	reconciler := newSandboxTemplateReconciler(t, template)
+	reconciler.ArtifactStore = artifactstore.Loader{Dir: dir}
+	key := client.ObjectKey{Namespace: namespace, Name: name}
+
+	reconcileOnce(t, reconciler, key)
+	updated := getSandboxTemplate(t, reconciler, key)
+	if updated.Status.Phase != apiv1alpha2.SandboxTemplatePhaseFailed {
+		t.Fatalf("expected a publish mismatch to fail the build, got phase %s", updated.Status.Phase)
+	}
+	condition := findBuildCondition(t, &updated)
+	// The message must name both stores so the drift is fixable from the CR.
+	if condition.Reason != "InvalidOutput" || !strings.Contains(condition.Message, "s3://bucket/sandbox-images/") ||
+		!strings.Contains(condition.Message, "s3://platform/store") {
+		t.Fatalf("expected an InvalidOutput condition naming both stores, got %+v", condition)
+	}
+	if pods := listBuilderPods(t, reconciler, namespace); len(pods) != 0 {
+		t.Fatalf("expected no build pod for a mismatched publish, got %d", len(pods))
+	}
+}
+
+func TestSandboxTemplateReconcileRequiresPublishWithoutPlatformStore(t *testing.T) {
+	namespace, name := "tenant-a", "no-store"
+	template := newSandboxTemplate(namespace, name)
+	template.Spec.Output.Publish = ""
+	reconciler := newSandboxTemplateReconciler(t, template)
+	key := client.ObjectKey{Namespace: namespace, Name: name}
+
+	reconcileOnce(t, reconciler, key)
+	updated := getSandboxTemplate(t, reconciler, key)
+	if updated.Status.Phase != apiv1alpha2.SandboxTemplatePhaseFailed {
+		t.Fatalf("expected a missing publish target to fail the build, got phase %s", updated.Status.Phase)
+	}
+	condition := findBuildCondition(t, &updated)
+	if condition.Reason != reasonArtifactStoreUnconfigured ||
+		!strings.Contains(condition.Message, "no platform artifact store") {
+		t.Fatalf("expected a retryable ArtifactStoreUnconfigured condition, got %+v", condition)
+	}
+}
+
+func TestSandboxTemplateReconcileHealsWhenStoreAppears(t *testing.T) {
+	namespace, name := "tenant-a", "wait-for-store"
+	dir := t.TempDir()
+	template := newSandboxTemplate(namespace, name)
+	template.Spec.Output.Publish = ""
+	reconciler := newSandboxTemplateReconciler(t, template)
+	reconciler.ArtifactStore = artifactstore.Loader{Dir: dir}
+	key := client.ObjectKey{Namespace: namespace, Name: name}
+
+	// The platform store is not configured yet: the build fails, but with a
+	// retry so a ConfigMap appearing later heals the template without a spec
+	// change (the store is read live per reconcile).
+	result := reconcileOnce(t, reconciler, key)
+	if result.RequeueAfter != artifactStoreRetryInterval {
+		t.Fatalf("expected a retry when the store is unconfigured, got %v", result.RequeueAfter)
+	}
+
+	writeArtifactStoreFile(t, dir, artifactstore.StoreKey, "s3://platform/late\n")
+	reconcileOnce(t, reconciler, key)
+	updated := getSandboxTemplate(t, reconciler, key)
+	if updated.Status.Phase != apiv1alpha2.SandboxTemplatePhaseBuilding {
+		t.Fatalf("expected the template to heal once the store appears, got phase %s", updated.Status.Phase)
+	}
+	pods := listBuilderPods(t, reconciler, namespace)
+	if len(pods) != 1 {
+		t.Fatalf("expected one build pod after the store appeared, got %d", len(pods))
+	}
+	if got := builderSpecFromPod(t, &pods[0]).Output.Publish; got != "s3://platform/late" {
+		t.Fatalf("expected the late store to be used, got %q", got)
+	}
+}
+
+func TestSandboxTemplateReconcileFollowsMountedArtifactStore(t *testing.T) {
+	namespace, name := "tenant-a", "live-config"
+	dir := t.TempDir()
+	writeArtifactStoreFile(t, dir, artifactstore.StoreKey, "s3://platform/first\n")
+	writeArtifactStoreFile(t, dir, artifactstore.EndpointKey, "http://minio-1:9000")
+	template := newSandboxTemplate(namespace, name)
+	template.Spec.Output.Publish = ""
+	reconciler := newSandboxTemplateReconciler(t, template)
+	reconciler.ArtifactStore = artifactstore.Loader{Dir: dir}
+	key := client.ObjectKey{Namespace: namespace, Name: name}
+
+	reconcileOnce(t, reconciler, key)
+	pods := listBuilderPods(t, reconciler, namespace)
+	if len(pods) != 1 {
+		t.Fatalf("expected one build pod, got %d", len(pods))
+	}
+	if got := builderSpecFromPod(t, &pods[0]).Output.Publish; got != "s3://platform/first" {
+		t.Fatalf("expected the mounted store, got %q", got)
+	}
+	if got := builderEnvEntry(&pods[0], "AWS_ENDPOINT_URL"); got == nil || got.Value != "http://minio-1:9000" {
+		t.Fatalf("expected the mounted endpoint, got %+v", got)
+	}
+
+	// A ConfigMap edit (projected file swap) must reach the next build: bump
+	// the generation so a fresh pod is created without a controller restart.
+	writeArtifactStoreFile(t, dir, artifactstore.StoreKey, "s3://platform/second")
+	writeArtifactStoreFile(t, dir, artifactstore.EndpointKey, "http://minio-2:9000\n")
+	current := getSandboxTemplate(t, reconciler, key)
+	current.Generation = 2
+	if err := reconciler.Update(context.Background(), &current); err != nil {
+		t.Fatalf("update template: %v", err)
+	}
+	reconcileOnce(t, reconciler, key)
+	pods = listBuilderPods(t, reconciler, namespace)
+	if len(pods) != 1 {
+		t.Fatalf("expected one generation-2 build pod, got %d", len(pods))
+	}
+	if got := builderSpecFromPod(t, &pods[0]).Output.Publish; got != "s3://platform/second" {
+		t.Fatalf("expected the updated store to apply without a restart, got %q", got)
+	}
+	if got := builderEnvEntry(&pods[0], "AWS_ENDPOINT_URL"); got == nil || got.Value != "http://minio-2:9000" {
+		t.Fatalf("expected the updated endpoint to apply without a restart, got %+v", got)
+	}
+}
+
+func writeArtifactStoreFile(t *testing.T, dir, key, value string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, key), []byte(value), 0o644); err != nil {
+		t.Fatalf("write artifact store %s: %v", key, err)
+	}
+}
+
+func getSandboxTemplate(t *testing.T, r *SandboxTemplateReconciler, key client.ObjectKey) apiv1alpha2.SandboxTemplate {
+	t.Helper()
+	var template apiv1alpha2.SandboxTemplate
+	if err := r.Get(context.Background(), key, &template); err != nil {
+		t.Fatalf("get template: %v", err)
+	}
+	return template
+}
+
+func findBuildCondition(t *testing.T, template *apiv1alpha2.SandboxTemplate) apiv1alpha2.SandboxTemplateCondition {
+	t.Helper()
+	for _, condition := range template.Status.Conditions {
+		if condition.Type == apiv1alpha2.SandboxTemplateConditionBuildSucceeded {
+			return condition
+		}
+	}
+	t.Fatalf("expected a BuildSucceeded condition, got %+v", template.Status.Conditions)
+	return apiv1alpha2.SandboxTemplateCondition{}
+}
+
+func builderSpecFromPod(t *testing.T, pod *corev1.Pod) apiv1alpha2.SandboxTemplateSpec {
+	t.Helper()
+	entry := builderEnvEntry(pod, builderImageEnv)
+	if entry == nil {
+		t.Fatalf("build pod missing %s env", builderImageEnv)
+	}
+	var spec apiv1alpha2.SandboxTemplateSpec
+	if err := json.Unmarshal([]byte(entry.Value), &spec); err != nil {
+		t.Fatalf("SANDBOX_TEMPLATE_SPEC is not valid SandboxTemplateSpec JSON: %v", err)
+	}
+	return spec
+}
+
+func builderEnvEntry(pod *corev1.Pod, name string) *corev1.EnvVar {
+	for index := range pod.Spec.Containers[0].Env {
+		if pod.Spec.Containers[0].Env[index].Name == name {
+			return &pod.Spec.Containers[0].Env[index]
+		}
+	}
+	return nil
 }

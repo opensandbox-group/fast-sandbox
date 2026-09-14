@@ -72,6 +72,11 @@ FC_STATE_ROOT="${FC_STATE_ROOT:-$WORK/state-root}"
 AGENT_SOCKET="$WORK/runtime.sock"
 AGENT_BIN="$WORK/firecracker-runtime-agent"
 REGISTRY_FILE="$WORK/registry.json"
+# The agent reads the platform artifact store from the mounted ConfigMap
+# projection (fast-sandbox-artifact-store); this e2e runs the agent as a host
+# process, so it writes the same files the kubelet projection would.
+ARTIFACT_STORE_DIR="/etc/fast-sandbox/artifact-store"
+_artifact_store_dir_created="no"
 # The agent cache and the driver E2E must share one state root; following
 # FC_STATE_ROOT lets the operator point both at a reflink-capable mount
 # (scripts/firecracker-xfs-stateroot.sh).
@@ -173,9 +178,21 @@ stop_minio() {
     docker rm -f "$MINIO_CONTAINER" >/dev/null 2>&1 || true
 }
 
+write_artifact_store_config() {
+    if [[ ! -d "$ARTIFACT_STORE_DIR" ]]; then
+        mkdir -p "$ARTIFACT_STORE_DIR"
+        _artifact_store_dir_created="yes"
+    fi
+    printf '%s\n' "$STORE_ROOT" > "$ARTIFACT_STORE_DIR/store"
+    printf '%s\n' "$MINIO_ENDPOINT" > "$ARTIFACT_STORE_DIR/endpoint"
+}
+
 cleanup() {
     stop_agent
     stop_minio
+    if [[ "$_artifact_store_dir_created" == "yes" ]]; then
+        rm -rf "$ARTIFACT_STORE_DIR"
+    fi
     purge_fsb_resources
     purge_jail_dirs
     restore_host_state
@@ -460,11 +477,10 @@ log "starting the runtime-agent (socket=$AGENT_SOCKET, store=$STORE_ROOT)"
 rm -f "$AGENT_SOCKET"
 pkill -f "$AGENT_BIN" 2>/dev/null || true
 sleep 0.3
+write_artifact_store_config
 env FAST_SANDBOX_RUNTIME_AGENT_SOCKET="$AGENT_SOCKET" \
-    FAST_SANDBOX_ARTIFACT_STORE="$STORE_ROOT" \
     FAST_SANDBOX_STATE_ROOT="$STATE_ROOT_DIR" \
     FAST_SANDBOX_REGISTRY_CONFIG_PATH="$REGISTRY_FILE" \
-    FAST_SANDBOX_ARTIFACT_ENDPOINT="$MINIO_ENDPOINT" \
     "$AGENT_BIN" > "$WORK/agent.log" 2>&1 &
 AGENT_PID=$!
 # Readiness = the agent actually answers, not just a socket file existing.

@@ -67,6 +67,7 @@ spec:
   output:
     rootfsSize: "30Gi"
     format: overlaybd
+    # publish is optional when the platform artifact store is configured
     publish: s3://sandbox-images/publish
     publishSecretRef:
       name: sandbox-images-readwrite
@@ -155,9 +156,15 @@ Precedence: custom `probe` → execd `/ping` (when execd is injected) →
 | --- | ---: | --- | --- |
 | `output.rootfsSize` | Yes | `"30Gi"` | Logical capacity of the produced `rootfs.ext4` (Kubernetes quantity). Rounded **up** to SI GiB for oci2rootfs (`30Gi` → 33G → ~30.7 GiB sparse file) |
 | `output.format` | Yes | `overlaybd` | `native` (raw snapshot files only) or `overlaybd` (plus LSMT layers for on-demand range reads); both contain the full artifact set |
-| `output.publish` | Yes | — | S3-compatible target, e.g. `s3://sandbox-images/publish`. Digest-addressed publication; without it the build has no durable artifacts (the builder refuses to run unless `SANDBOX_TEMPLATE_ALLOW_NO_PUBLISH=1`) |
+| `output.publish` | No | platform store | S3-compatible target, e.g. `s3://sandbox-images/publish`. Empty defaults to the platform artifact store (`fast-sandbox-artifact-store` ConfigMap); a non-empty value must equal that store or the build fails with an `InvalidOutput` condition, so a template cannot silently publish where no node agent reads. Digest-addressed publication; the builder itself refuses to run with an empty target unless `SANDBOX_TEMPLATE_ALLOW_NO_PUBLISH=1` |
 | `output.publishSecretRef` | No | — | Name of the write-credential Secret in the template's namespace (`accessKeyId`/`secretAccessKey`/`endpoint`/`region`). Without it the build relies on platform-level credentials (IRSA/node metadata). Runtime nodes read with a **separate** read-only credential — write keys never reach them |
 | `output.prime` | No | — | Reserved: seed-node cache priming after a successful build; not yet implemented |
+
+The platform store comes from the `fast-sandbox-artifact-store` ConfigMap
+(`store`/`endpoint`, see [Configuration reference](../reference/configuration.md#artifact-store)),
+which the controller mounts (reading it per build) and injects into build Pods:
+the build endpoint and `spec.output.publish` can no longer drift apart from
+what the node agents pull.
 
 ## Build lifecycle
 

@@ -27,6 +27,12 @@ kubectl apply -k config/crd
 kubectl apply -k config/default
 ```
 
+`config/artifact-store` ships `fast-sandbox-artifact-store` (store root and
+optional endpoint) and is included in `config/default`. Edit the ConfigMap for
+the target environment; the controller and the runtime-agent mount it and read
+it per reconcile/pull, so the change lands without a restart. A
+`SandboxTemplate` that omits `spec.output.publish` inherits its `store`.
+
 ### Alpha API upgrade
 
 `v1alpha2` is an explicit breaking alpha revision and this release does not

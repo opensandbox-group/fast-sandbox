@@ -10,8 +10,10 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
+	"fast-sandbox/internal/artifactstore"
 	"fast-sandbox/internal/registryconfig"
 	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 	agentdart "fast-sandbox/internal/runtime/firecracker/agent/dart"
@@ -40,23 +42,14 @@ func main() {
 // deferred cleanup (lease state close, DART child stop) runs on the way out.
 func run() error {
 	socketPath := getEnv("FAST_SANDBOX_RUNTIME_AGENT_SOCKET", defaultSocketPath)
-	storeRoot := getEnv("FAST_SANDBOX_ARTIFACT_STORE", "")
 	stateRoot := getEnv("FAST_SANDBOX_STATE_ROOT", defaultStateRoot)
 	registryPath := getEnv("FAST_SANDBOX_REGISTRY_CONFIG_PATH", registryconfig.MountPath)
-	// The artifact store endpoint is usually derived from the credential
-	// Host; an explicit endpoint overrides the matching key and the
-	// connection address (e.g. a local MinIO: http://127.0.0.1:9000).
-	endpoint := getEnv("FAST_SANDBOX_ARTIFACT_ENDPOINT", "")
-
-	if storeRoot == "" {
-		return errors.New("FAST_SANDBOX_ARTIFACT_STORE is required (s3://bucket/prefix)")
-	}
+	// The artifact store is read from the mounted fast-sandbox-artifact-store
+	// ConfigMap on every pull, so a ConfigMap edit applies to the next pull
+	// without an agent restart.
+	storeConfig := artifactstore.Loader{}
 
 	registryProvider := registryconfig.NewFileProvider(registryPath)
-	credential, err := resolveCredential(registryProvider, storeRoot, endpoint)
-	if err != nil {
-		return fmt.Errorf("resolve the artifact store credential: %w", err)
-	}
 
 	// DART P2P gateway (stage 2). FAST_SANDBOX_DART_ADDR empty = local
 	// mode: artifact pulls stay on the direct header-signed S3 path.
@@ -102,9 +95,10 @@ func run() error {
 			"discover", config.Discover, "cacheDir", config.CacheDir, "peerAdvertise", config.PeerAdvertise)
 	}
 
-	pull, err := agentpull.NewClient(storeRoot, credential, pullOptions...)
-	if err != nil {
-		return fmt.Errorf("build the artifact pull client: %w", err)
+	pull := &livePullClient{config: storeConfig, registry: registryProvider, options: pullOptions}
+	if current, loadErr := storeConfig.Load(); loadErr == nil && current.Store == "" {
+		klog.InfoS("artifact store not configured yet; pulls wait for the fast-sandbox-artifact-store ConfigMap",
+			"mount", artifactstore.DefaultMountDir)
 	}
 	state, err := agentstate.New(stateRoot)
 	if err != nil {
@@ -119,7 +113,7 @@ func run() error {
 	service := agentserver.NewService(pull, state, stateRoot, serviceOptions...)
 	server := agentserver.New(service, socketPath)
 	klog.InfoS("firecracker-runtime-agent starting",
-		"socket", socketPath, "store", storeRoot, "stateRoot", stateRoot,
+		"socket", socketPath, "artifactStoreMount", artifactstore.DefaultMountDir, "stateRoot", stateRoot,
 		"registry", registryPath, "dart", dartAddr)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -136,6 +130,73 @@ func run() error {
 	}
 	klog.InfoS("firecracker-runtime-agent stopped")
 	return nil
+}
+
+// livePullClient resolves the artifact store per call and rebuilds the pull
+// client when the configuration changes: the store root and endpoint come
+// from the mounted fast-sandbox-artifact-store ConfigMap, credentials from
+// the mounted registry file. Both are kubelet-projected files that update in
+// place, so an edit applies to the next pull without an agent restart.
+type livePullClient struct {
+	config   artifactstore.Loader
+	registry registryconfig.Provider
+	options  []agentpull.Option
+
+	mu     sync.Mutex
+	key    string
+	client *agentpull.Client
+}
+
+// current returns the pull client for the current configuration, rebuilding
+// it only when the resolved store, endpoint or credential changed.
+func (l *livePullClient) current() (*agentpull.Client, error) {
+	config, err := l.config.Load()
+	if err != nil {
+		return nil, err
+	}
+	if config.Store == "" {
+		return nil, fmt.Errorf("artifact store is not configured (mount the fast-sandbox-artifact-store ConfigMap at %s)", artifactstore.DefaultMountDir)
+	}
+	credential, err := resolveCredential(l.registry, config.Store, config.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	key := strings.Join([]string{
+		config.Store, config.Endpoint,
+		credential.Username, credential.Password,
+		credential.WriteUsername, credential.WritePassword, credential.Endpoint,
+	}, "\x00")
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.client != nil && l.key == key {
+		return l.client, nil
+	}
+	client, err := agentpull.NewClient(config.Store, credential, l.options...)
+	if err != nil {
+		return nil, err
+	}
+	l.client, l.key = client, key
+	klog.InfoS("artifact pull client configured", "store", config.Store, "endpoint", config.Endpoint)
+	return client, nil
+}
+
+// PullImage pulls one image with a client built from the current config.
+func (l *livePullClient) PullImage(ctx context.Context, stateRoot, image string) error {
+	client, err := l.current()
+	if err != nil {
+		return err
+	}
+	return client.PullImage(ctx, stateRoot, image)
+}
+
+// PublishImage publishes one snapshot artifact set with the current config;
+// the service wires this path because the type implements artifactPublisher.
+func (l *livePullClient) PublishImage(ctx context.Context, key, dir string) (agentpull.PublishResult, error) {
+	client, err := l.current()
+	if err != nil {
+		return agentpull.PublishResult{}, err
+	}
+	return client.PublishImage(ctx, key, dir)
 }
 
 // dartListenAddress derives the DART client-plane listen address from the

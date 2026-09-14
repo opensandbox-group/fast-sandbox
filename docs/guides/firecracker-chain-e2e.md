@@ -27,7 +27,7 @@ Host requirements match [firecracker-runtime-e2e.md](firecracker-runtime-e2e.md)
 |---|-------|-----------|
 | 1 | Builder publish layout | `index/<sha256(image)>.json` + `digest16/{rootfs.ext4,vmstate.snap,memory.snap,SHA256SUMS,manifest.json}`; `index.artifactDigest` == sha256(manifest); every `files[]` digest matches the uploaded object |
 | 2 | SigV4 against MinIO | Agent pull succeeds over the wire (digest-verified commit proves signature correctness) |
-| 3 | Credential mapping | Read-only AK/SK + endpoint resolve via `FAST_SANDBOX_ARTIFACT_ENDPOINT`; agent connects to MinIO |
+| 3 | Credential mapping | Read-only AK/SK + endpoint resolved from the artifact-store mount (`store`/`endpoint` files); agent connects to MinIO |
 | 4 | Builder snapshot ↔ driver restore | Driver E2E restores from the pulled artifacts (`FC_SKIP_PREP`, no self-bootstrap); single + parallel + serial batches, **execd `/ping` ready on every instance** |
 | 5 | Idempotency + cleanup | Re-PinImage makes zero re-pull; driver delete unpins through the UDS API; lease lifecycle returns state to zero |
 

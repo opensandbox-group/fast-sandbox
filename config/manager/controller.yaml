@@ -33,6 +33,10 @@ spec:
         - name: FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY
           valueFrom:
             secretKeyRef: {name: fast-sandbox-route-keys, key: public-key}
+        # Shared S3 artifact store (config/artifact-store): defaults
+        # SandboxTemplate output.publish and resolves the snapshot-recorded
+        # policy of sandbox creates. The ConfigMap is mounted (not injected
+        # as env) and read per use, so an edit applies without a restart.
         ports:
         - {name: health, containerPort: 5758}
         - {name: metrics, containerPort: 9091}
@@ -43,6 +47,13 @@ spec:
         resources:
           requests: {cpu: 100m, memory: 128Mi}
           limits: {cpu: "1", memory: 512Mi}
+        volumeMounts:
+        - {name: artifact-store, mountPath: /etc/fast-sandbox/artifact-store, readOnly: true}
+      volumes:
+      - name: artifact-store
+        configMap:
+          name: fast-sandbox-artifact-store
+          optional: true
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -79,6 +90,9 @@ spec:
         - name: FAST_SANDBOX_ROUTE_SIGNING_PRIVATE_KEY
           valueFrom:
             secretKeyRef: {name: fast-sandbox-route-keys, key: private-key}
+        # Shared S3 artifact store (config/artifact-store): resolves the
+        # snapshot-recorded policy of sandbox creates; mounted and read per
+        # create so an edit applies without a restart.
         ports:
         - {name: grpc, containerPort: 9090}
         - {name: health, containerPort: 5758}
@@ -90,6 +104,13 @@ spec:
         resources:
           requests: {cpu: 100m, memory: 128Mi}
           limits: {cpu: "1", memory: 512Mi}
+        volumeMounts:
+        - {name: artifact-store, mountPath: /etc/fast-sandbox/artifact-store, readOnly: true}
+      volumes:
+      - name: artifact-store
+        configMap:
+          name: fast-sandbox-artifact-store
+          optional: true
 ---
 apiVersion: v1
 kind: Service

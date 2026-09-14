@@ -4,11 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifactstore"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -43,6 +46,13 @@ const (
 	// fails a build whose Pod never leaves Pending (e.g. no KVM node).
 	buildDeadlineSeconds = int64(2 * 60 * 60)
 	podPendingTimeout    = 10 * time.Minute
+	// artifactStoreRetryInterval retries a build that failed because no
+	// platform artifact store was configured: the store is read live, so a
+	// ConfigMap created afterwards must heal the template without a spec
+	// change. reasonArtifactStoreUnconfigured marks that retryable failure;
+	// a publish mismatch keeps the terminal InvalidOutput reason.
+	artifactStoreRetryInterval      = time.Minute
+	reasonArtifactStoreUnconfigured = "ArtifactStoreUnconfigured"
 )
 const builderImageEnv = "SANDBOX_TEMPLATE_SPEC"
 
@@ -88,6 +98,13 @@ type SandboxTemplateReconciler struct {
 	BuilderImage string
 	// BuildTTL is how long a finished build Pod is retained before cleanup.
 	BuildTTL time.Duration
+	// ArtifactStore reads the platform artifact store (s3://bucket/prefix)
+	// from the mounted fast-sandbox-artifact-store ConfigMap on every
+	// reconcile, so a ConfigMap edit applies to the next build without a
+	// restart. It defaults an empty spec.output.publish and is enforced
+	// against a non-empty one, so the builder and the node agents cannot
+	// silently diverge; empty disables both behaviors.
+	ArtifactStore artifactstore.Loader
 }
 
 // Reconcile drives one SandboxTemplate towards its desired build state.
@@ -116,10 +133,14 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.
 	// A build already applied to the current generation is terminal. The
 	// finished Pods are kept around for BuildTTL (so their annotations remain
 	// inspectable) and cleaned up opportunistically afterwards; requeue at
-	// the earliest retention expiry so a quiet cluster still reaps them.
+	// the earliest retention expiry so a quiet cluster still reaps them. The
+	// one exception is a failure caused by the platform artifact store not
+	// being configured yet: the store is read live, so that state is retried
+	// and can heal without a template change.
 	if template.Status.ObservedGeneration == template.Generation &&
 		(template.Status.Phase == apiv1alpha2.SandboxTemplatePhaseSucceeded ||
-			template.Status.Phase == apiv1alpha2.SandboxTemplatePhaseFailed) {
+			template.Status.Phase == apiv1alpha2.SandboxTemplatePhaseFailed) &&
+		!failedArtifactStoreUnconfigured(&template) {
 		if err := r.cleanupFinishedPods(ctx, &template); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -141,6 +162,37 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.
 		}
 	}
 
+	// Resolve the effective publish target before any build state is
+	// touched: the platform artifact store is the single source of truth,
+	// so a template that omits output.publish inherits the platform value,
+	// and a template that contradicts it fails here (visible on the CR)
+	// instead of publishing into a store no node agent reads. The store is
+	// resolved per reconcile, so a ConfigMap edit applies to the next build
+	// without a controller restart.
+	store, err := r.ArtifactStore.Load()
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	output, err := r.effectiveOutput(template.Spec.Output, store.Store)
+	if err != nil {
+		reason := "InvalidOutput"
+		requeueAfter := time.Duration(0)
+		if errors.Is(err, errArtifactStoreUnconfigured) {
+			// Not a spec error: retain nothing terminal and retry, because
+			// configuring the store (or creating the ConfigMap) is enough to
+			// heal the template.
+			reason = reasonArtifactStoreUnconfigured
+			requeueAfter = artifactStoreRetryInterval
+		}
+		if failErr := r.failBuild(ctx, &template, reason, err); failErr != nil {
+			return ctrl.Result{}, failErr
+		}
+		if requeueAfter > 0 {
+			return ctrl.Result{RequeueAfter: requeueAfter}, nil
+		}
+		return ctrl.Result{}, nil
+	}
+
 	pod, err := r.findBuildPod(ctx, &template)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -158,7 +210,7 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.
 		// (apiserver flake, quota) requeue with backoff instead of failing
 		// the generation permanently — only the Pod's own outcome decides
 		// Succeeded/Failed.
-		if err := r.createBuildPod(ctx, &template); err != nil {
+		if err := r.createBuildPod(ctx, &template, output, store.Endpoint); err != nil {
 			return ctrl.Result{}, err
 		}
 		template.Status.Phase = apiv1alpha2.SandboxTemplatePhaseBuilding
@@ -420,21 +472,50 @@ func (r *SandboxTemplateReconciler) listBuildPods(ctx context.Context, template 
 	return &pods, nil
 }
 
+// errArtifactStoreUnconfigured is the retryable empty-publish/no-store state:
+// unlike a publish mismatch it is fixed by configuring the platform store, so
+// the reconciler must not treat it as terminal.
+var errArtifactStoreUnconfigured = errors.New("no platform artifact store is configured")
+
+// effectiveOutput resolves the publish target for a build. The platform
+// artifact store (resolved from the shared fast-sandbox-artifact-store
+// ConfigMap) defaults an empty publish target, and a non-empty target must
+// match it: a template pointing at a different store is configuration drift,
+// not a second publish destination, so it fails the build instead of
+// publishing where no node agent reads. Trailing slashes are ignored in the
+// comparison because the builder strips them when naming objects.
+func (r *SandboxTemplateReconciler) effectiveOutput(output apiv1alpha2.OutputSpec, storeRoot string) (apiv1alpha2.OutputSpec, error) {
+	if output.Publish == "" {
+		if storeRoot == "" {
+			return output, fmt.Errorf("%w: spec.output.publish is empty (set output.publish or configure the controller artifact store)", errArtifactStoreUnconfigured)
+		}
+		output.Publish = storeRoot
+		return output, nil
+	}
+	if storeRoot != "" && strings.TrimRight(output.Publish, "/") != strings.TrimRight(storeRoot, "/") {
+		return output, fmt.Errorf("spec.output.publish %q does not match the platform artifact store %q; omit output.publish to use the platform store", output.Publish, storeRoot)
+	}
+	return output, nil
+}
+
 // createBuildPod launches the builder Pod that executes the pipeline. The
-// template spec is serialized into the environment; the builder image runs
-// the stages (convert → validate-boot → snapshot → package) and publishes
-// the artifacts. The Pod runs in the template's namespace (so it can carry
+// template spec — with the effective (platform-defaulted) output — is
+// serialized into the environment; the builder image runs the stages
+// (convert → validate-boot → snapshot → package) and publishes the
+// artifacts. The Pod runs in the template's namespace (so it can carry
 // an owner reference and the publish secret can be SecretKeyRef'd from the
 // same namespace) and has a deterministic name (<template>-build-<gen>) so
 // concurrent reconciles dedupe via AlreadyExists.
-func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template *apiv1alpha2.SandboxTemplate) error {
+func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template *apiv1alpha2.SandboxTemplate, output apiv1alpha2.OutputSpec, endpoint string) error {
 	// The build Pod self-reports its outcome by merge-patching its own
 	// annotations; provision the minimal builder RBAC (SA + Role + RoleBinding,
 	// pods/patch only) in the template's namespace, idempotently.
 	if err := r.ensureBuilderRBAC(ctx, template.Namespace); err != nil {
 		return err
 	}
-	payload, err := json.Marshal(template.Spec)
+	spec := template.Spec
+	spec.Output = output
+	payload, err := json.Marshal(spec)
 	if err != nil {
 		return err
 	}
@@ -453,6 +534,12 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 	}}
 	if ref := template.Spec.Output.PublishSecretRef; ref != nil {
 		env = append(env, publishCredentialEnvRefs(ref)...)
+	}
+	// The platform endpoint, when configured, wins over the publish
+	// secret's endpoint: the build must target the same S3-compatible
+	// address the node agents pull from.
+	if endpoint != "" {
+		env = upsertEnv(env, "AWS_ENDPOINT_URL", endpoint)
 	}
 
 	// The build Pod runs the sandbox template builder: privileged for the
@@ -646,6 +733,19 @@ func (r *SandboxTemplateReconciler) ensureRoleBinding(ctx context.Context, desir
 	return r.Update(ctx, current)
 }
 
+// upsertEnv sets name to a literal value, replacing an existing entry
+// (including a SecretKeyRef) so the platform value wins deterministically.
+func upsertEnv(env []corev1.EnvVar, name, value string) []corev1.EnvVar {
+	for index := range env {
+		if env[index].Name == name {
+			env[index].Value = value
+			env[index].ValueFrom = nil
+			return env
+		}
+	}
+	return append(env, corev1.EnvVar{Name: name, Value: value})
+}
+
 // publishCredentialEnvRefs maps the imagePullSecrets-style publish secret
 // (keys accessKeyId/secretAccessKey/endpoint/region) onto AWS_* env vars via
 // SecretKeyRef: the credentials are never copied into the Pod spec, and the
@@ -675,6 +775,21 @@ func publishCredentialEnvRefs(ref *corev1.LocalObjectReference) []corev1.EnvVar 
 // updatePhase persists the phase and its transition condition.
 func (r *SandboxTemplateReconciler) updatePhase(ctx context.Context, template *apiv1alpha2.SandboxTemplate) error {
 	return r.Status().Update(ctx, template)
+}
+
+// failedArtifactStoreUnconfigured reports whether a terminal Failed phase is
+// the retryable "platform artifact store not configured" state rather than a
+// spec error.
+func failedArtifactStoreUnconfigured(template *apiv1alpha2.SandboxTemplate) bool {
+	if template.Status.Phase != apiv1alpha2.SandboxTemplatePhaseFailed {
+		return false
+	}
+	for _, condition := range template.Status.Conditions {
+		if condition.Type == apiv1alpha2.SandboxTemplateConditionBuildSucceeded {
+			return condition.Reason == reasonArtifactStoreUnconfigured
+		}
+	}
+	return false
 }
 
 // failBuild marks the template as Failed with a condition. The condition is

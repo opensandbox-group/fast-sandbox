@@ -154,9 +154,10 @@ kubectl rollout status deploy/controller
 - 新增 `config/dev/agent-daemonset.yaml`：
   - hostPath：UDS socket 目录（`/run/fast-sandbox/firecracker`）、
     StateRoot（与 fastlet 共享）、registryconfig 文件；
-  - env：`FAST_SANDBOX_RUNTIME_AGENT_SOCKET`、
-    `FAST_SANDBOX_ARTIFACT_STORE=s3://sandbox-images/publish`、
-    `FAST_SANDBOX_STATE_ROOT`、`FAST_SANDBOX_REGISTRY_CONFIG_PATH`；
+  - env：`FAST_SANDBOX_RUNTIME_AGENT_SOCKET`、`FAST_SANDBOX_STATE_ROOT`、
+    `FAST_SANDBOX_REGISTRY_CONFIG_PATH`；
+  - mount：共享 ConfigMap `fast-sandbox-artifact-store` 挂到
+    `/etc/fast-sandbox/artifact-store`（每次 pull 读取，改 CM 无需重启）；
   - 镜像：本地构建 `firecracker-runtime-agent`（`kind load docker-image`）。
 
 ### 步骤 7：SandboxTemplate（模板制作，方案 A）

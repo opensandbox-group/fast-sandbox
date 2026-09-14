@@ -31,6 +31,26 @@ Image and route-key flags can also be supplied by environment:
 
 Only Fast-Path receives the route-signing private key. Controllers and proxies use verification public keys.
 
+## Artifact store
+
+The S3-compatible golden-image store is platform-owned and deployed as the
+`fast-sandbox-artifact-store` ConfigMap in `fast-sandbox-system`
+(`config/artifact-store`). The controller and the runtime-agent **mount** it
+(one projected file per key) and read it at use time — the controller per
+reconcile, the agent per pull — so an edit applies without restarting
+anything and no ConfigMap RBAC is involved. Builds receive the resolved
+values from the controller when their Pod is created.
+
+| Key | Meaning |
+|---|---|
+| `store` | Store root, `s3://bucket/prefix`. The controller defaults an empty `SandboxTemplate.spec.output.publish` with it and fails a template that names a different store |
+| `endpoint` | Optional S3-compatible endpoint (`scheme://host:port`); empty derives it from the credential |
+
+There is no flag or environment override for these values: the mount is the
+single source. Credentials stay separate — builds use the template's
+`output.publishSecretRef` (write) and agents use the pool-compiled registry
+Secret (read).
+
 ## Fastlet environment
 
 The Pool Controller injects platform-owned Fastlet configuration. Important groups are:

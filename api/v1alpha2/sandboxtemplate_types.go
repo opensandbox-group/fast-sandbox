@@ -117,11 +117,14 @@ type OutputSpec struct {
 	Format ArtifactFormat `json:"format"`
 
 	// Publish is the S3-compatible object store target, e.g.
-	// s3://bucket/sandbox-images/ (digest-addressed publication). Required:
-	// without a publish target the build has no durable artifacts (they only
-	// live in the build Pod's workspace).
-	// +kubebuilder:validation:Required
-	Publish string `json:"publish"`
+	// s3://bucket/sandbox-images/ (digest-addressed publication). When
+	// empty, the controller defaults it to the platform artifact store
+	// (the fast-sandbox-artifact-store ConfigMap); when set it must equal
+	// that store, so a template cannot silently drift away from the store
+	// the node agents read. Without either, the build fails with an
+	// invalid-output condition (durable artifacts have no destination).
+	// +optional
+	Publish string `json:"publish,omitempty"`
 
 	// PublishSecretRef references (imagePullSecrets-style) the secret holding
 	// the object-store credentials. The secret MUST live in the platform

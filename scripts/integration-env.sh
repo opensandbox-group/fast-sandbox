@@ -969,6 +969,18 @@ resolve_minio_endpoint() {
 	pass "MinIO reachable from the kind network"
 }
 
+# artifact_store_config writes the shared artifact-store ConfigMap
+# (config/artifact-store): the single source of truth for the builder
+# publish target, the agent pull root and the control-plane policy
+# resolution. Callers re-apply it after a kustomize sweep so the repo
+# defaults never overwrite the local MinIO values.
+artifact_store_config() {
+	kubectl -n "$NS" create configmap fast-sandbox-artifact-store \
+		--from-literal=store="$STORE_ROOT" \
+		--from-literal=endpoint="$MINIO_ENDPOINT" \
+		--dry-run=client -o yaml | kubectl apply -f - >/dev/null
+}
+
 credentials_up() {
 	# The secrets land in the platform namespace; make sure it exists even
 	# when controller_up has not run yet (e.g. resume after a partial up).
@@ -990,10 +1002,9 @@ credentials_up() {
 	kubectl -n "$NS" create secret generic fast-sandbox-agent-registry \
 		--from-file=registry.json="$WORK/agent-registry.json" \
 		--dry-run=client -o yaml | kubectl apply -f - >/dev/null
-	# Agent endpoint override (connection address for SigV4 signing).
-	kubectl -n "$NS" create configmap fast-sandbox-agent-config \
-		--from-literal=artifact-endpoint="$MINIO_ENDPOINT" \
-		--dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	# Shared artifact store: the builder publish target, agent pull root and
+	# control-plane store all come from this one ConfigMap.
+	artifact_store_config
 	# Pull credentials for the fastlet (pool-compiled registry).
 	kubectl -n "$NS" create secret docker-registry registry-minio \
 		--docker-server="$host" --docker-username="$MINIO_AK" --docker-password="$MINIO_SK" \
@@ -1012,6 +1023,10 @@ credentials_up() {
 controller_up() {
 	kubectl apply -k "$REPO_ROOT/config/crd" >/dev/null
 	kubectl apply -k "$REPO_ROOT/config/all-in-one" >/dev/null
+	# The kustomization carries the repo default store; restore the local
+	# MinIO values. Components read the mount per use, so the order relative
+	# to pod start does not matter.
+	artifact_store_config
 	for image in "$IMG_CONTROLLER" "$IMG_FASTLET" "$IMG_FASTLET_PROXY" "$IMG_SANDBOX_PROXY" "$IMG_JANITOR" "$IMG_BUILDER" "$IMG_AGENT"; do
 		kind load docker-image "$image" --name "$KIND_CLUSTER" >/dev/null
 	done
@@ -3087,6 +3102,10 @@ snapshot_env_up() {
 	# (artifact-store env for the manifest policy resolution, RBAC) reach
 	# the running controller, not just the container image.
 	kubectl apply -k "$REPO_ROOT/config/all-in-one" >/dev/null
+	# Restore the local MinIO artifact-store values the kustomize sweep
+	# just reset to the repo defaults (components read the mount per use,
+	# so no restart is needed for the store itself).
+	artifact_store_config
 	kubectl -n "$NS" rollout restart deploy/fast-sandbox-controller >/dev/null
 	kubectl -n "$NS" rollout restart daemonset/firecracker-runtime-agent >/dev/null
 	# Fastlet pods are pool-managed: deleting them lets the pool controller

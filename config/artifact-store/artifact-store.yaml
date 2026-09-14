@@ -1,0 +1,25 @@
+# artifact-store.yaml — the single source of truth for the S3-compatible
+# golden-image artifact store shared by the firecracker chain:
+#
+#   - template-builder publishes into `store` (the controller injects the
+#     value into build Pods; a template's spec.output.publish must match or
+#     be omitted)
+#   - the node runtime-agent pulls artifacts from `store`
+#   - the control plane resolves snapshot-recorded policy from `store`
+#
+# editing this ConfigMap moves the whole chain consistently; components mount
+# the projected files and read them per use (the controller per reconcile, the
+# agent per pull), so an edit lands without restarting anything. The
+# credentials stay in the per-role Secrets.
+#
+# `store` is required by the runtime-agent and the control plane. `endpoint`
+# is optional: empty derives the connection address from the credential (or
+# the store host).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fast-sandbox-artifact-store
+  namespace: fast-sandbox-system
+data:
+  store: s3://sandbox-images/publish
+  endpoint: ""

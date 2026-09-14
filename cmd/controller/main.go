@@ -13,6 +13,7 @@ import (
 
 	fastpathv2 "fast-sandbox/api/proto/v2"
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifactstore"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	"fast-sandbox/internal/controlplane"
 	"fast-sandbox/internal/controlplane/fastletcontrol"
@@ -63,8 +64,6 @@ func main() {
 	var sandboxProxyBaseURL string
 	var runtimeEnvironmentNamespace string
 	var runtimeEnvironmentConfigMap string
-	var artifactStoreRoot string
-	var artifactStoreEndpoint string
 
 	flag.StringVar(&roleValue, "role", "all", "Control-plane role: fastpath, controller, or all.")
 	flag.StringVar(&metricsAddress, "metrics-bind-address", ":9091", "Metrics listen address.")
@@ -85,8 +84,6 @@ func main() {
 	flag.IntVar(&sandboxReconcileWorkers, "sandbox-reconcile-workers", 4, "Concurrent Sandbox reconcilers (per-key serialization is guaranteed by the workqueue).")
 	flag.StringVar(&runtimeEnvironmentNamespace, "runtime-environment-namespace", envOrDefault("FAST_SANDBOX_RUNTIME_ENVIRONMENT_NAMESPACE", runtimeenv.SystemNamespace), "Namespace containing the platform runtime environment ConfigMap.")
 	flag.StringVar(&runtimeEnvironmentConfigMap, "runtime-environment-configmap", envOrDefault("FAST_SANDBOX_RUNTIME_ENVIRONMENT_CONFIGMAP", runtimeenv.ConfigMapName), "Platform runtime environment ConfigMap name.")
-	flag.StringVar(&artifactStoreRoot, "artifact-store-root", os.Getenv("FAST_SANDBOX_ARTIFACT_STORE"), "S3-compatible artifact store root (s3://bucket/prefix); enables snapshot-recorded policy resolution at sandbox create. Empty disables it.")
-	flag.StringVar(&artifactStoreEndpoint, "artifact-store-endpoint", os.Getenv("FAST_SANDBOX_ARTIFACT_ENDPOINT"), "Artifact store endpoint override (scheme://host:port) for policy resolution; empty derives it from the credential host.")
 	flag.Parse()
 
 	role, err := controlplane.ParseRole(roleValue)
@@ -174,6 +171,7 @@ func main() {
 		if err := (&reconciler.SandboxTemplateReconciler{
 			Client: manager.GetClient(), Scheme: manager.GetScheme(),
 			BuilderImage: sandboxTemplateBuilderImage, BuildTTL: 24 * time.Hour,
+			ArtifactStore: artifactstore.Loader{},
 		}).SetupWithManager(manager); err != nil {
 			klog.ErrorS(err, "Register SandboxTemplate controller")
 			os.Exit(1)
@@ -220,13 +218,12 @@ func main() {
 			os.Exit(1)
 		}
 		grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(observability.UnaryServerInterceptor("fastpath")))
-		var manifestPolicy fastpath.ManifestPolicySource
-		if artifactStoreRoot != "" {
-			// Snapshot-recorded action bindings live in the published
-			// manifest; the control plane resolves them through the pool's
-			// compiled registry credential (read pair) at create time.
-			manifestPolicy = fastpath.NewStorePolicySource(durableClient, artifactStoreRoot, artifactStoreEndpoint)
-		}
+		// Snapshot-recorded action bindings live in the published manifest;
+		// the control plane resolves them through the pool's compiled
+		// registry credential (read pair) at create time. The store address
+		// is resolved from the mounted ConfigMap per create, so an edit
+		// applies without a restart and no ConfigMap RBAC is involved.
+		manifestPolicy := fastpath.NewStorePolicySource(durableClient, artifactstore.Loader{})
 		fastpathv2.RegisterFastPathServiceServer(grpcServer, &fastpath.Server{
 			K8sClient: durableClient, RouteCache: manager.GetClient(), Orchestrator: orchestrator,
 			DiagnosticsClient: fastletClient,

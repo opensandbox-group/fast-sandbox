@@ -285,9 +285,12 @@ spec:
                   publish:
                     description: |-
                       Publish is the S3-compatible object store target, e.g.
-                      s3://bucket/sandbox-images/ (digest-addressed publication). Required:
-                      without a publish target the build has no durable artifacts (they only
-                      live in the build Pod's workspace).
+                      s3://bucket/sandbox-images/ (digest-addressed publication). When
+                      empty, the controller defaults it to the platform artifact store
+                      (the fast-sandbox-artifact-store ConfigMap); when set it must equal
+                      that store, so a template cannot silently drift away from the store
+                      the node agents read. Without either, the build fails with an
+                      invalid-output condition (durable artifacts have no destination).
                     type: string
                   publishSecretRef:
                     description: |-
@@ -321,7 +324,6 @@ spec:
                     type: string
                 required:
                 - format
-                - publish
                 - rootfsSize
                 type: object
               readiness:

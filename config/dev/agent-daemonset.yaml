@@ -5,9 +5,11 @@
 # root are shared with fastlet pods via hostPath.
 #
 # Prerequisites (created by scripts/integration-env.sh):
+#   - ConfigMap fast-sandbox-artifact-store: the shared store root/endpoint
+#     (config/artifact-store) the agent pulls from.
 #   - Secret fast-sandbox-agent-registry: the compiled registry
 #     configuration (registryconfig.Compiled JSON) whose credential carries
-#     the MinIO read-only key and endpoint for FAST_SANDBOX_ARTIFACT_STORE.
+#     the MinIO read-only key matching the mounted store endpoint.
 #
 # Apply with:
 #   kubectl apply -f config/dev/agent-daemonset.yaml
@@ -50,14 +52,8 @@ spec:
               fieldPath: metadata.uid
         - name: FAST_SANDBOX_RUNTIME_AGENT_SOCKET
           value: /run/fast-sandbox/firecracker/runtime.sock
-        - name: FAST_SANDBOX_ARTIFACT_STORE
-          value: s3://sandbox-images/publish
-        - name: FAST_SANDBOX_ARTIFACT_ENDPOINT
-          valueFrom:
-            configMapKeyRef:
-              name: fast-sandbox-agent-config
-              key: artifact-endpoint
-              optional: true
+        # Artifact store: the fast-sandbox-artifact-store ConfigMap is mounted
+        # below and read per pull, so an edit applies without a restart.
         - name: FAST_SANDBOX_STATE_ROOT
           value: /var/lib/fast-sandbox/firecracker
         - name: FAST_SANDBOX_REGISTRY_CONFIG_PATH
@@ -95,6 +91,9 @@ spec:
         - name: agent-registry
           mountPath: /etc/fast-sandbox/agent
           readOnly: true
+        - name: artifact-store
+          mountPath: /etc/fast-sandbox/artifact-store
+          readOnly: true
         - name: node-hostname
           mountPath: /etc/hostname
           readOnly: true
@@ -110,6 +109,12 @@ spec:
       - name: agent-registry
         secret:
           secretName: fast-sandbox-agent-registry
+      # Shared artifact store root/endpoint, read per pull (live ConfigMap
+      # edits land without an agent restart).
+      - name: artifact-store
+        configMap:
+          name: fast-sandbox-artifact-store
+          optional: true
       # The stable node identity for the HRW keyspace (hostNetwork used to
       # provide it through the node UTS namespace).
       - name: node-hostname

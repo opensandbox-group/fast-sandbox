@@ -118,9 +118,9 @@ with a short-TTL cache), then merges:
 
 Resolution is best-effort: an unreachable store or an image unknown to it
 (the local-only case) proceeds without recorded policy, so sandbox create
-availability never hinges on the object store. Enable it on the
-controller with `--artifact-store-root` / `FAST_SANDBOX_ARTIFACT_STORE`
-(empty disables the feature). The policy still passes the target Pool's
+availability never hinges on the object store. The store comes from the
+mounted `fast-sandbox-artifact-store` ConfigMap (an absent or empty `store`
+disables the feature). The policy still passes the target Pool's
 handler validation and drives the normal binding lifecycle.
 
 ## Rules of thumb

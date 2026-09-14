@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -11,6 +13,7 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/artifactstore"
 	"fast-sandbox/internal/registryconfig"
 
 	"github.com/stretchr/testify/require"
@@ -19,6 +22,22 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
+
+// artifactStoreMount writes the projected store/endpoint files into a temp
+// mount and returns the loader that reads them.
+func artifactStoreMount(t *testing.T, store, endpoint string) artifactstore.Loader {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, artifactstore.StoreKey), []byte(store), 0o644); err != nil {
+		t.Fatalf("write store: %v", err)
+	}
+	if endpoint != "" {
+		if err := os.WriteFile(filepath.Join(dir, artifactstore.EndpointKey), []byte(endpoint), 0o644); err != nil {
+			t.Fatalf("write endpoint: %v", err)
+		}
+	}
+	return artifactstore.Loader{Dir: dir}
+}
 
 // TestStorePolicySourceResolvesManifestBindings exercises the whole read
 // path: pool registry secret -> compiled credential -> store index ->
@@ -73,7 +92,7 @@ func TestStorePolicySourceResolvesManifestBindings(t *testing.T) {
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool, secret).Build()
 
-	source := NewStorePolicySource(k8sClient, "s3://sandbox-images/publish", "")
+	source := NewStorePolicySource(k8sClient, artifactStoreMount(t, "s3://sandbox-images/publish", ""))
 	bindings, err := source.ActionBindings(context.Background(), pool, image)
 	require.NoError(t, err)
 	require.Equal(t, []apiv1alpha2.ActionBinding{
@@ -139,7 +158,7 @@ func TestStorePolicySourceEndpointOverride(t *testing.T) {
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool, secret).Build()
 
-	source := NewStorePolicySource(k8sClient, "s3://sandbox-images/publish", store.URL)
+	source := NewStorePolicySource(k8sClient, artifactStoreMount(t, "s3://sandbox-images/publish", store.URL))
 	bindings, err := source.ActionBindings(context.Background(), pool, image)
 	require.NoError(t, err)
 	require.Equal(t, []apiv1alpha2.ActionBinding{{Handler: "egress", Input: `{"deny":true}`}}, bindings)
@@ -185,7 +204,7 @@ func TestStorePolicySourceManifestWithoutBindings(t *testing.T) {
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool, secret).Build()
 
-	source := NewStorePolicySource(k8sClient, "s3://sandbox-images/publish", "")
+	source := NewStorePolicySource(k8sClient, artifactStoreMount(t, "s3://sandbox-images/publish", ""))
 	bindings, err := source.ActionBindings(context.Background(), pool, image)
 	require.NoError(t, err)
 	require.Empty(t, bindings, "a golden-image manifest carries no recorded policy")

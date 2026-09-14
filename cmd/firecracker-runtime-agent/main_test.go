@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"fast-sandbox/internal/artifactstore"
 	"fast-sandbox/internal/registryconfig"
 
 	"github.com/stretchr/testify/require"
@@ -112,4 +113,60 @@ func TestResolveCredentialMissingHost(t *testing.T) {
 	_, err := resolveCredential(provider, "s3:///only-path", "")
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "endpoint host")
+}
+
+// TestLivePullClientRebuildsOnConfigChange pins the no-restart contract: the
+// mounted store files and the registry file are re-read per current() call,
+// and a changed store/endpoint/credential rebuilds the pull client instead of
+// reusing the old one.
+func TestLivePullClientRebuildsOnConfigChange(t *testing.T) {
+	storeDir := t.TempDir()
+	writeStore := func(store, endpoint string) {
+		t.Helper()
+		require.NoError(t, os.WriteFile(filepath.Join(storeDir, artifactstore.StoreKey), []byte(store), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(storeDir, artifactstore.EndpointKey), []byte(endpoint), 0o644))
+	}
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	writeRegistry := func(host, username, password string) {
+		t.Helper()
+		compiled, err := registryconfig.NewCompiled([]registryconfig.Credential{{
+			Host: host, Username: username, Password: password,
+		}})
+		require.NoError(t, err)
+		payload, err := compiled.Marshal()
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(registryPath, payload, 0o640))
+	}
+
+	writeStore("s3://bucket/publish", "http://minio-1:9000")
+	writeRegistry("minio-1:9000", "reader", "secret")
+	client := &livePullClient{
+		config:   artifactstore.Loader{Dir: storeDir},
+		registry: registryconfig.NewFileProvider(registryPath),
+	}
+
+	first, err := client.current()
+	require.NoError(t, err)
+	again, err := client.current()
+	require.NoError(t, err)
+	require.Same(t, first, again, "unchanged config must reuse the pull client")
+
+	// ConfigMap edit + credential rotation, both observed without restart
+	// (the same FileProvider re-reads the rewritten registry file).
+	writeStore("s3://bucket/publish", "http://minio-2:9000")
+	writeRegistry("minio-2:9000", "reader", "rotated-secret")
+
+	second, err := client.current()
+	require.NoError(t, err)
+	require.NotSame(t, first, second, "a config change must rebuild the pull client")
+}
+
+func TestLivePullClientUnconfiguredStore(t *testing.T) {
+	client := &livePullClient{
+		config:   artifactstore.Loader{Dir: filepath.Join(t.TempDir(), "absent")},
+		registry: registryconfig.NewFileProvider(filepath.Join(t.TempDir(), "absent.json")),
+	}
+	_, err := client.current()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not configured")
 }
