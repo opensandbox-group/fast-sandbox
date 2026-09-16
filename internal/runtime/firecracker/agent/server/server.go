@@ -1,6 +1,6 @@
 package server
 
-// Package server exposes the firecracker-runtime-agent management API as a
+// Package server exposes the firecracker-runtime management API as a
 // versioned JSON-over-HTTP service on a Unix socket (design docs §2.2).
 // The server layer enforces the caller identity (empty PodUID -> 403), the
 // idempotency key contract (requestId required on mutating RPCs), routes

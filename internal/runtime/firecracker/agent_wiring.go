@@ -1,7 +1,7 @@
 package firecracker
 
 // agent_wiring.go connects the driver to the node-level
-// firecracker-runtime-agent (implementation plan §7): PullImage proxies to
+// firecracker-runtime (implementation plan §7): PullImage proxies to
 // PinImage, ProbeCapabilities gates on the agent Health, and DeleteSandbox
 // releases the lease and unpins the image. When no socket is configured the
 // driver stays in local mode; when the agent is unreachable the driver

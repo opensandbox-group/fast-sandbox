@@ -51,6 +51,9 @@ type Service struct {
 	// dartUp reports the node-local DART daemon state; nil when DART is not
 	// configured (stage-1 local mode).
 	dartUp func() bool
+	// hostReady reports the node-readiness check outcome (ready flag +
+	// summary); nil when the hostready manager is not running.
+	hostReady func() (bool, string)
 }
 
 // NewService assembles the stage-1 backend. When the pull client also
@@ -80,6 +83,14 @@ func WithServiceClock(now func() time.Time) ServiceOption {
 // direct S3 fallback path).
 func WithDARTProbe(dartUp func() bool) ServiceOption {
 	return func(service *Service) { service.dartUp = dartUp }
+}
+
+// WithHostReadyProbe wires the node-readiness check outcome into Health
+// (the flag behind the node labels and the FirecrackerReady condition).
+// Like DART it is informational: the agent serves pulls regardless of the
+// host verdict.
+func WithHostReadyProbe(hostReady func() (bool, string)) ServiceOption {
+	return func(service *Service) { service.hostReady = hostReady }
 }
 
 // PinImage pulls the image (if not already cached) and records one pin.
@@ -182,6 +193,11 @@ func (s *Service) Health(_ context.Context) (agentprotocol.HealthResponse, error
 	}
 	if s.dartUp != nil {
 		response.DartUp = s.dartUp()
+	}
+	if s.hostReady != nil {
+		ready, summary := s.hostReady()
+		response.HostReady = &ready
+		response.HostState = summary
 	}
 	return response, nil
 }

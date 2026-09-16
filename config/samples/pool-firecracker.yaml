@@ -20,8 +20,9 @@
 #   - fast-sandbox-registry ConfigMap + dockerconfigjson Secret in this
 #     namespace for the OCI registry of the warm image (optional for
 #     firecracker; the snapshot pull goes through the agent/MinIO instead).
-#   - Agent DaemonSet + installer (config/dev/agent-daemonset.yaml,
-#     config/runtime-installers/firecracker.yaml).
+#   - Agent DaemonSet (config/dev/agent-daemonset.yaml): its readiness pass
+#     checks the host, installs the firecracker assets and applies the
+#     node labels below.
 #
 # Apply with:
 #   kubectl apply -f config/samples/pool-firecracker.yaml

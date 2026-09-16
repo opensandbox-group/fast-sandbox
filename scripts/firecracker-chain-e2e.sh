@@ -3,7 +3,7 @@
 # docs/design/firecracker-chain-e2e-plan.md): builder publish -> real MinIO
 # -> runtime-agent pull -> driver golden restore -> guest reachability ->
 # idempotency + cleanup. No component is faked: the builder image, the MinIO
-# store, the firecracker-runtime-agent binary, and the Firecracker driver
+# store, the firecracker-runtime binary, and the Firecracker driver
 # (via its Go E2E suite) all run for real.
 #
 # Scenarios:
@@ -70,7 +70,7 @@ FC_KERNEL="${FC_KERNEL:-$ART_DIR/vmlinux.bin}"
 FC_ROOTFS="${FC_ROOTFS:-$ART_DIR/bionic.rootfs.ext4}"
 FC_STATE_ROOT="${FC_STATE_ROOT:-$WORK/state-root}"
 AGENT_SOCKET="$WORK/runtime.sock"
-AGENT_BIN="$WORK/firecracker-runtime-agent"
+AGENT_BIN="$WORK/firecracker-runtime"
 REGISTRY_FILE="$WORK/registry.json"
 # The agent reads the platform artifact store from the mounted ConfigMap
 # projection (fast-sandbox-artifact-store); this e2e runs the agent as a host
@@ -421,7 +421,7 @@ pass "verification point 1: publish layout (index + digest16 build + SHA256SUMS)
 
 # --- runtime-agent -----------------------------------------------------------
 log "building the runtime-agent"
-(cd "$REPO_ROOT" && GOTOOLCHAIN=local go build -o "$AGENT_BIN" ./cmd/firecracker-runtime-agent)
+(cd "$REPO_ROOT" && GOTOOLCHAIN=local go build -o "$AGENT_BIN" ./cmd/firecracker-runtime)
 
 # Fresh agent state: the pull layer treats a committed cache as final
 # (idempotent, never refreshed), so a cache from an earlier run would keep
@@ -478,9 +478,15 @@ rm -f "$AGENT_SOCKET"
 pkill -f "$AGENT_BIN" 2>/dev/null || true
 sleep 0.3
 write_artifact_store_config
-env FAST_SANDBOX_RUNTIME_AGENT_SOCKET="$AGENT_SOCKET" \
-    FAST_SANDBOX_STATE_ROOT="$STATE_ROOT_DIR" \
-    FAST_SANDBOX_REGISTRY_CONFIG_PATH="$REGISTRY_FILE" \
+# The agent reads all tunables from one YAML config (the mounted ConfigMap
+# in-cluster; a plain file here). Bare-process runs also rely on the
+# built-in defaults for the rest.
+cat > "$WORK/agent.yaml" <<EOF
+socket: $AGENT_SOCKET
+stateRoot: $STATE_ROOT_DIR
+registryConfig: $REGISTRY_FILE
+EOF
+env FAST_SANDBOX_AGENT_CONFIG="$WORK/agent.yaml" \
     "$AGENT_BIN" > "$WORK/agent.log" 2>&1 &
 AGENT_PID=$!
 # Readiness = the agent actually answers, not just a socket file existing.
@@ -548,7 +554,7 @@ agent_ok() { # description response-json
         echo "=== socket listeners ===" >&2
         (ss -xlp 2>/dev/null || netstat -lxp 2>/dev/null) | grep -F "$(basename "$AGENT_SOCKET")" >&2 || true
         echo "=== agent processes ===" >&2
-        pgrep -fl firecracker-runtime-agent >&2 || true
+        pgrep -fl firecracker-runtime >&2 || true
         echo "=== agent.log (tail) ===" >&2
         tail -30 "$WORK/agent.log" >&2
         echo "=== MinIO logs (tail) ===" >&2

@@ -1,4 +1,4 @@
-// Package agent implements the node-level firecracker-runtime-agent pull
+// Package agent implements the node-level firecracker-runtime pull
 // layer of the Firecracker on-demand loading design: the consumer side of
 // the addressing chain SandboxSpec.Image -> index -> manifest ->
 // content-addressed native artifacts, materialized in the cache shared with

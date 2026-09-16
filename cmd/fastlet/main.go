@@ -112,7 +112,7 @@ func main() {
 		configurable.SetNodeCleanupClient(nodecleanup.NewClient(getEnv("FAST_SANDBOX_NODE_CLEANUP_SOCKET", nodecleanup.DefaultSocketPath)))
 	}
 	// The firecracker driver optionally talks to the node-level
-	// firecracker-runtime-agent over its UDS socket (empty env = local
+	// firecracker-runtime over its UDS socket (empty env = local
 	// mode: no remote pull, warm images and cold boots unchanged). The
 	// agent's deployment carrier is a pending decision, so the env is
 	// only injected by the deployer, never by the control plane.

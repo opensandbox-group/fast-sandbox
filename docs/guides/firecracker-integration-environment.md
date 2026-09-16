@@ -35,7 +35,7 @@
 │  │  ┌─ controller（Deployment，config/all-in-one）───────────────────┐ │ │
 │  │  ├─ SandboxTemplate CR → builder Job（privileged + /dev/kvm +   │ │ │
 │  │  │    /dev/net/tun + MinIO 凭据）→ publish 到 MinIO              │ │ │
-│  │  ├─ firecracker-runtime-agent（DaemonSet：UDS + 缓存 + registry │ │ │
+│  │  ├─ firecracker-runtime（DaemonSet：UDS + 缓存 + registry │ │ │
 │  │  │    挂载 MinIO 只读凭据）                                      │ │ │
 │  │  ├─ fastlet Pod（特权 + hostPath /dev/kvm + containerd socket + │ │ │
 │  │  │    agent UDS socket）                                          │ │ │
@@ -65,7 +65,7 @@
 | MinIO | 宿主 Docker 容器（:9000） | AK/SK（发布写 + 拉取只读可共用同一组起步） |
 | controller | Deployment（config/all-in-one） | 集群内 RBAC；CRD 由 config/crd 安装 |
 | builder Job | SandboxTemplate 驱动（privileged） | `/dev/kvm`、`/dev/net/tun`（hostPath）、MinIO 发布凭据（publishSecretRef → Job env） |
-| firecracker-runtime-agent | **DaemonSet** | UDS socket 目录、缓存目录（hostPath）、registryconfig 挂载（MinIO 只读） |
+| firecracker-runtime | **DaemonSet**（每节点） | UDS socket 目录、缓存目录（hostPath）、registryconfig 挂载（MinIO 只读）、`/opt/fast-sandbox/firecracker`（资产安装）；节点就绪循环：宿主检查 + firecracker 资产安装 + 调度 label（`sandbox.fast.io/kvm`、`fast-sandbox.io/firecracker-node`）+ `FirecrackerReady` condition |
 | fastlet | SandboxPool.fastletTemplate（特权） | `/dev/kvm`、节点 containerd socket、agent UDS socket、registryconfig、runtime plan |
 | fastlet-proxy / janitor | 节点组件 | 按现有部署形态 |
 | execd | builder bake 进快照（`opensandbox/execd:1.1.0`） | 无独立部署 |
@@ -97,8 +97,10 @@ nodes:
 ```
 
 - 创建：`kind create cluster --config config/dev/kind-firecracker.yaml`
-- 节点 label：`kubectl label node <node> fast-sandbox.io/kvm-node=true`
-  （builder Job 调度与 fastlet 亲和用）
+- 节点 label 无需手工打：firecracker-runtime agent 的就绪循环
+  （宿主检查 + firecracker 资产安装）通过后自动打
+  `sandbox.fast.io/kvm=true` + `fast-sandbox.io/firecracker-node=true`，
+  环境退化时自动摘除。裸机自查：`scripts/firecracker-host-check.sh`
 
 ## 分步搭建
 
@@ -109,7 +111,7 @@ nodes:
 # sysctl（参考 test/e2e/env/manager.go 的检查项）：
 sysctl -w fs.inotify.max_user_instances=8192
 # 构建二进制：
-make build  # 或 go build ./cmd/...（controller/fastlet/firecracker-runtime-agent/fastctl）
+make build  # 或 go build ./cmd/...（controller/fastlet/firecracker-runtime/fastctl）
 ```
 
 ### 步骤 2：Kind 集群（§前置）
@@ -136,29 +138,35 @@ kubectl rollout status deploy/controller
 
 ### 步骤 5：firecracker 节点资产 + runtime 环境
 
-- **firecracker 二进制 + jailer** 放节点容器 hostPath 目录
-  （如 `/opt/fast-sandbox/firecracker/{firecracker,jailer}`）：
-  用 `kind load` 不可行（非镜像）——**在节点容器内直接放**：
-  `docker cp` 到 kind 节点容器，或 config/runtime-installers 新增
-  firecracker installer（DaemonSet init 容器拷贝）；实现时选后者
-  （可重制）；
+- **firecracker 二进制 + jailer + kernel** 由 firecracker-runtime agent
+  安装（就绪循环下载 pinned release 到 `/opt/fast-sandbox/firecracker`，
+  校验通过才打节点 label）；裸机预检用
+  `scripts/firecracker-host-check.sh`；
 - **runtime 环境 ConfigMap**：`config/runtime-environments.yaml` 新增
   firecracker 条目——containerd socket（Kind 节点容器
   `/run/containerd/containerd.sock`）、namespace `k8s.io`、firecracker
   二进制/jailer 路径、StateRoot（节点容器内 hostPath，如
   `/var/lib/fast-sandbox/firecracker`）；
-- **节点 label**：`fast-sandbox.io/firecracker-node=true`（Pool 亲和）。
+- **节点 label**：`fast-sandbox.io/firecracker-node=true`（Pool 亲和，
+  agent 自动管理）。
 
 ### 步骤 6：agent DaemonSet
 
-- 新增 `config/dev/agent-daemonset.yaml`：
+- `config/dev/agent-daemonset.yaml`（每节点就绪 agent，取代原独立
+  installer DaemonSet）：
   - hostPath：UDS socket 目录（`/run/fast-sandbox/firecracker`）、
-    StateRoot（与 fastlet 共享）、registryconfig 文件；
-  - env：`FAST_SANDBOX_RUNTIME_AGENT_SOCKET`、`FAST_SANDBOX_STATE_ROOT`、
-    `FAST_SANDBOX_REGISTRY_CONFIG_PATH`；
+    StateRoot（与 fastlet 共享）、registryconfig 文件、
+    `/opt/fast-sandbox/firecracker`（资产安装目标）；
+  - env 仅 Downward API 身份：`FAST_SANDBOX_AGENT_CONFIG`（配置文件
+    路径）、`FAST_SANDBOX_NODE_NAME`（spec.nodeName，启用就绪循环）、
+    `FAST_SANDBOX_NODE_IP`（status.podIP，DART peer 广播）、`POD_UID`；
+    其余全部在 `config/dev/agent-config.yaml`（ConfigMap 挂载为
+    `/etc/fast-sandbox/agent-config/agent.yaml`，nodeReadiness 段每轮
+    复查热读取）；
+  - RBAC：ServiceAccount + ClusterRole（nodes get/patch），同文件内联；
   - mount：共享 ConfigMap `fast-sandbox-artifact-store` 挂到
     `/etc/fast-sandbox/artifact-store`（每次 pull 读取，改 CM 无需重启）；
-  - 镜像：本地构建 `firecracker-runtime-agent`（`kind load docker-image`）。
+  - 镜像：本地构建 `firecracker-runtime`（`kind load docker-image`）。
 
 ### 步骤 7：SandboxTemplate（模板制作，方案 A）
 
@@ -237,7 +245,7 @@ verify # 步骤 9 的断言链（sandbox Running + execd /ping）
 | Kind 节点容器 → 宿主 MinIO 通路 | Job/pod 用宿主 Docker 桥 IP（`172.17.0.1:9000`）或 kind 网络实测；写入脚本 |
 | fastlet 的 containerd socket | Kind 节点容器 `/run/containerd/containerd.sock`（hostPath 挂入 fastlet pod） |
 | /dev/kvm 两层透传 | 宿主 → Kind 节点（extraMounts）→ fastlet pod/builder Job（hostPath） |
-| firecracker 二进制/jailer 进节点 | DaemonSet init 容器拷贝到 hostPath（可重制），runtime plan 指向 |
+| firecracker 二进制/jailer 进节点 | firecracker-runtime agent 就绪循环安装到 hostPath（宿主检查通过才打 label），runtime plan 指向 |
 | execd bake | SandboxTemplate `spec.execd=opensandbox/execd:1.1.0`（chain-e2e 验证 tag） |
 | guestNetwork | builder bake 的 guest IP（172.30.0.3 约定）与 #28 per-clone netns 一致 |
 | registryconfig | fastlet/agent 挂载同一 registry.json（MinIO 只读凭据，Host=MinIO endpoint） |
@@ -250,8 +258,9 @@ verify # 步骤 9 的断言链（sandbox Running + execd /ping）
 | `config/crd`（CRD）、`config/all-in-one`（controller） | 复用 |
 | `config/dev/kind-firecracker.yaml`（KVM 透传） | **新增**（kata.yaml 精简） |
 | `config/runtime-environments.yaml`（firecracker 条目） | **新增** |
-| `config/runtime-installers/`（firecracker 二进制/jailer 安装） | **新增** |
-| `config/dev/agent-daemonset.yaml` | **新增** |
+| `config/runtime-installers/`（kata/gvisor 安装资产） | 复用（firecracker 安装已并入 agent DaemonSet，原 firecracker.yaml 已移除） |
+| `config/dev/agent-daemonset.yaml` | **新增**（含节点就绪循环：hostready 检查 + 资产安装 + label 管理） |
+| `scripts/firecracker-host-check.sh`（裸机预检脚本） | **新增** |
 | `config/samples/pool-firecracker.yaml` | **新增** |
 | `config/samples/sandbox-firecracker.yaml` | **新增** |
 | `scripts/integration-env.sh` | **新增**（up/down/status/verify） |

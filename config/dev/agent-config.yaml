@@ -1,0 +1,60 @@
+# agent-config.yaml — the firecracker-runtime agent configuration
+# (ConfigMap). Mounted at /etc/fast-sandbox/agent-config/agent.yaml; the
+# agent reads it at startup and re-reads the nodeReadiness section before
+# every readiness pass, so edits here land without a pod restart.
+#
+# Reload semantics per section:
+#   socket/stateRoot/registryConfig/hostnameFile/dart — startup only (they
+#     wire long-lived resources; changing them requires a pod restart).
+#   nodeReadiness — hot: thresholds, interval and the asset source apply
+#     on the next recheck pass. A pinned asset install is never silently
+#     replaced: changing fcVersion/kernelURL only re-downloads when the
+#     current assetsDir does not verify (clear it or point elsewhere).
+#
+# Runtime identities stay in the pod spec (Downward API env): POD_UID,
+# FAST_SANDBOX_NODE_NAME (spec.nodeName), FAST_SANDBOX_NODE_IP
+# (status.podIP).
+#
+# Apply with:
+#   kubectl apply -f config/dev/agent-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fast-sandbox-firecracker-runtime-config
+  namespace: fast-sandbox-system
+  labels:
+    app: fast-sandbox
+    component: firecracker-runtime
+data:
+  agent.yaml: |
+    # UDS socket the management API serves on (shared with fastlet pods
+    # via hostPath).
+    socket: /run/fast-sandbox/firecracker/runtime.sock
+    # Shared artifact cache / lease state root (hostPath).
+    stateRoot: /var/lib/fast-sandbox/firecracker
+    # Compiled registry credential file (MinIO pull credentials).
+    registryConfig: /etc/fast-sandbox/agent/registry.json
+    # Node hostname file (mounted from the node; a pod's own hostname is
+    # its pod name).
+    hostnameFile: /etc/hostname
+    dart:
+      # Non-empty enables the node-local DART P2P gateway; empty keeps
+      # pulls on the direct S3 path.
+      addr: http://127.0.0.1:8145
+      bin: dart
+      admin: 127.0.0.1:8147
+      cacheSize: 8GiB
+      # Peer discovery via the headless Service; empty = single-node
+      # cache-only mode.
+      discover: dns:dart.fast-sandbox-system.svc.cluster.local:9000
+      # selfID: stable HRW identity; empty = the node hostname file.
+    nodeReadiness:
+      # The host-check / firecracker-asset-install / node-label loop.
+      # Requires FAST_SANDBOX_NODE_NAME (injected by the DaemonSet).
+      enabled: true
+      assetsDir: /opt/fast-sandbox/firecracker
+      fcVersion: v1.16.1
+      kernelURL: https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260722-38359b8055fc-0/x86_64/vmlinux-6.1.176
+      interval: 5m
+      minFree: 10GiB
+      minMemory: 2GiB

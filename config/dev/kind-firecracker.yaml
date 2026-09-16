@@ -14,10 +14,12 @@
 # agent keys them by hostname (<state>/cache/dart-<hostname>).
 #
 # Usage: kind create cluster --config config/dev/kind-firecracker.yaml
-# Then label the nodes (required by the SandboxTemplate builder and the
-# fastlet scheduling; integration-env.sh up does this):
-#   kubectl label node <node> sandbox.fast.io/kvm=true
-#   kubectl label node <node> fast-sandbox.io/firecracker-node=true
+# The firecracker-runtime DaemonSet (config/dev/agent-daemonset.yaml) runs
+# on every node, checks the host (KVM/tun/kernel/storage), installs the
+# firecracker assets and applies the scheduling labels itself:
+#   sandbox.fast.io/kvm=true              (SandboxTemplate builder)
+#   fast-sandbox.io/firecracker-node=true (fastlet pools)
+# scripts/firecracker-host-check.sh verifies a bare host before install.
 #
 # See docs/guides/firecracker-integration-environment.md.
 kind: Cluster

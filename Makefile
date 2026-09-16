@@ -8,7 +8,7 @@ CONTROLLER_IMAGE ?= $(REGISTRY)/controller:dev
 JANITOR_IMAGE ?= $(REGISTRY)/janitor:dev
 BOXLITE_RUNTIME_IMAGE ?= $(REGISTRY)/boxlite-runtime:dev
 SANDBOX_ACTION_FIXTURE_IMAGE ?= $(REGISTRY)/sandbox-action-fixture:dev
-FIRECRACKER_RUNTIME_AGENT_IMAGE ?= $(REGISTRY)/firecracker-runtime-agent:dev
+FIRECRACKER_RUNTIME_IMAGE ?= $(REGISTRY)/firecracker-runtime:dev
 
 GO ?= go
 PYTHON ?= python3
@@ -26,9 +26,9 @@ E2E_TEST_TIMEOUT ?= 30m
 
 BIN_DIR := $(CURDIR)/bin
 LINUX_BIN_DIR := $(CURDIR)/.build/linux-amd64
-ALL_BINARIES := controller fastlet sandbox-init sandbox-tunnel sandbox-action-fixture fastlet-proxy sandbox-proxy janitor fastctl boxlite-runtime firecracker-runtime-agent
+ALL_BINARIES := controller fastlet sandbox-init sandbox-tunnel sandbox-action-fixture fastlet-proxy sandbox-proxy janitor fastctl boxlite-runtime firecracker-runtime
 CORE_IMAGES := controller fastlet fastlet-proxy sandbox-proxy janitor
-ALL_IMAGES := $(CORE_IMAGES) boxlite-runtime sandbox-action-fixture firecracker-runtime-agent
+ALL_IMAGES := $(CORE_IMAGES) boxlite-runtime sandbox-action-fixture firecracker-runtime
 UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./test/e2e/env/... ./test/e2e/support/... ./test/performance/...
 
 ifeq ($(DEBUG),1)
@@ -135,8 +135,8 @@ images:
 				--build-arg GOPROXY="$(GOPROXY)" \
 				-t "$(BOXLITE_RUNTIME_IMAGE)" -f build/Dockerfile.boxlite-runtime . ;; \
 			sandbox-action-fixture) docker build $(DOCKER_BUILD_FLAGS) -t "$(SANDBOX_ACTION_FIXTURE_IMAGE)" -f build/Dockerfile.sandbox-action-fixture . ;; \
-			firecracker-runtime-agent) docker build $(DOCKER_BUILD_FLAGS) \
-				-t "$(FIRECRACKER_RUNTIME_AGENT_IMAGE)" -f build/Dockerfile.firecracker-runtime-agent . ;; \
+			firecracker-runtime) docker build $(DOCKER_BUILD_FLAGS) \
+				-t "$(FIRECRACKER_RUNTIME_IMAGE)" -f build/Dockerfile.firecracker-runtime . ;; \
 		esac || exit $$?; \
 	done
 

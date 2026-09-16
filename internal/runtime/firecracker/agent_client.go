@@ -1,7 +1,7 @@
 package firecracker
 
 // agent_client.go is the driver's view of the node-level
-// firecracker-runtime-agent (implementation plan §6): a JSON-over-HTTP
+// firecracker-runtime (implementation plan §6): a JSON-over-HTTP
 // client over the UDS socket. The driver stays in "local mode" (no agent,
 // no remote pull) when no socket is configured, and falls back to the
 // local cache check when the agent is unreachable — warmImages and cold

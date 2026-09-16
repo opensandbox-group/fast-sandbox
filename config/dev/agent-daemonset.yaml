@@ -1,10 +1,34 @@
-# agent-daemonset.yaml — node-level firecracker runtime-agent.
+# agent-daemonset.yaml — node-level firecracker runtime + readiness agent.
 #
-# Serves the UDS management API (artifact pull + lease state) that the
-# fastlet firecracker driver talks to. The socket directory and the state
-# root are shared with fastlet pods via hostPath.
+# Two duties:
+#   1. Serves the UDS management API (artifact pull + lease state) that the
+#      fastlet firecracker driver talks to. The socket directory and the
+#      state root are shared with fastlet pods via hostPath.
+#   2. Node readiness (the kata-deploy pattern): checks the host for the
+#      Firecracker launch requirements (KVM, TUN, kernel, memory, StateRoot
+#      filesystem), installs the pinned Firecracker assets
+#      (binary/jailer/kernel) into nodeReadiness.assetsDir, and then
+#      labels the node ready (sandbox.fast.io/kvm +
+#      fast-sandbox.io/firecracker-node) with a FirecrackerReady condition.
+#      The labels are re-verified on every readiness pass and removed again
+#      when the host degrades, so fastlet pods never schedule onto a broken
+#      node. scripts/firecracker-host-check.sh runs the same checks
+#      standalone.
+#
+# All tunables live in the agent config ConfigMap
+# (config/dev/agent-config.yaml, mounted at /etc/fast-sandbox/agent-config/
+# agent.yaml; the nodeReadiness section hot-reloads per pass). The
+# environment below carries only the Downward API identities.
+#
+# The DaemonSet intentionally carries NO firecracker nodeSelector: the
+# agent is the component that applies those labels, so it must run on every
+# candidate node (pin it with your own coarse selector if the cluster hosts
+# unrelated node pools). The control-plane toleration keeps single-node
+# clusters servable.
 #
 # Prerequisites (created by scripts/integration-env.sh):
+#   - ConfigMap fast-sandbox-firecracker-runtime-config: the agent config
+#     (config/dev/agent-config.yaml).
 #   - ConfigMap fast-sandbox-artifact-store: the shared store root/endpoint
 #     (config/artifact-store) the agent pulls from.
 #   - Secret fast-sandbox-agent-registry: the compiled registry
@@ -12,28 +36,66 @@
 #     the MinIO read-only key matching the mounted store endpoint.
 #
 # Apply with:
+#   kubectl apply -f config/dev/agent-config.yaml
 #   kubectl apply -f config/dev/agent-daemonset.yaml
-apiVersion: apps/v1
-kind: DaemonSet
+apiVersion: v1
+kind: ServiceAccount
 metadata:
-  name: firecracker-runtime-agent
+  name: fast-sandbox-firecracker-runtime
   namespace: fast-sandbox-system
   labels:
     app: fast-sandbox
-    component: firecracker-runtime-agent
+    component: firecracker-runtime
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fast-sandbox-firecracker-runtime
+  labels:
+    app: fast-sandbox
+    component: firecracker-runtime
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  # The readiness manager reads the node to diff its labels/condition and
+  # patches metadata + the status subresource.
+  verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fast-sandbox-firecracker-runtime
+  labels:
+    app: fast-sandbox
+    component: firecracker-runtime
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: fast-sandbox-firecracker-runtime}
+subjects:
+- {kind: ServiceAccount, name: fast-sandbox-firecracker-runtime, namespace: fast-sandbox-system}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: firecracker-runtime
+  namespace: fast-sandbox-system
+  labels:
+    app: fast-sandbox
+    component: firecracker-runtime
 spec:
   selector:
     matchLabels:
       app: fast-sandbox
-      component: firecracker-runtime-agent
+      component: firecracker-runtime
   template:
     metadata:
       labels:
         app: fast-sandbox
-        component: firecracker-runtime-agent
+        component: firecracker-runtime
     spec:
-      nodeSelector:
-        fast-sandbox.io/firecracker-node: "true"
+      serviceAccountName: fast-sandbox-firecracker-runtime
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
       # The agent runs on the cluster network (NOT hostNetwork): its dart
       # child needs the cluster DNS (CoreDNS search domains) to resolve the
       # headless Service peers. It talks to fastlets over the shared UDS
@@ -43,34 +105,26 @@ spec:
       # node UTS namespace; a regular pod's hostname is its pod name).
       containers:
       - name: agent
-        image: fast-sandbox/firecracker-runtime-agent:dev
+        image: fast-sandbox/firecracker-runtime:dev
         imagePullPolicy: IfNotPresent
+        # Only Downward API identities live in env; all tunables come from
+        # the mounted agent config (nodeReadiness hot-reloads per pass).
         env:
         - name: POD_UID
           valueFrom:
             fieldRef:
               fieldPath: metadata.uid
-        - name: FAST_SANDBOX_RUNTIME_AGENT_SOCKET
-          value: /run/fast-sandbox/firecracker/runtime.sock
-        # Artifact store: the fast-sandbox-artifact-store ConfigMap is mounted
-        # below and read per pull, so an edit applies without a restart.
-        - name: FAST_SANDBOX_STATE_ROOT
-          value: /var/lib/fast-sandbox/firecracker
-        - name: FAST_SANDBOX_REGISTRY_CONFIG_PATH
-          value: /etc/fast-sandbox/agent/registry.json
-        # DART P2P gateway (stage 2): non-empty enables the node-local DART
-        # child process and routes artifact pulls through its prefix API.
-        # The image carries the pinned dart binary; see
-        # build/Dockerfile.firecracker-runtime-agent.
-        - name: FAST_SANDBOX_DART_ADDR
-          value: http://127.0.0.1:8145
-        # Peer discovery via the headless Service (config/dev/dart-service.yaml);
-        # the FQDN resolves on the cluster network. The agent falls back to
-        # direct S3 when DART is unreachable.
-        - name: FAST_SANDBOX_DART_DISCOVER
-          value: dns:dart.fast-sandbox-system.svc.cluster.local:9000
-        # Regular pods get their own cluster IP; the dart peer-listen binds
-        # it and the headless Service hands it out to peers.
+        - name: FAST_SANDBOX_AGENT_CONFIG
+          value: /etc/fast-sandbox/agent-config/agent.yaml
+        # Node readiness: spec.nodeName enables the host-check loop (the
+        # KVM/storage/assets checks, the Firecracker asset install, the
+        # scheduling labels and the FirecrackerReady condition).
+        - name: FAST_SANDBOX_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        # DART peer advertise: the dart peer-listen binds the pod IP and
+        # the headless Service hands it out to peers.
         - name: FAST_SANDBOX_NODE_IP
           valueFrom:
             fieldRef:
@@ -88,6 +142,9 @@ spec:
           mountPath: /run/fast-sandbox/firecracker
         - name: agent-state
           mountPath: /var/lib/fast-sandbox/firecracker
+        - name: agent-config
+          mountPath: /etc/fast-sandbox/agent-config
+          readOnly: true
         - name: agent-registry
           mountPath: /etc/fast-sandbox/agent
           readOnly: true
@@ -97,6 +154,8 @@ spec:
         - name: node-hostname
           mountPath: /etc/hostname
           readOnly: true
+        - name: fc-assets
+          mountPath: /opt/fast-sandbox/firecracker
       volumes:
       - name: agent-socket
         hostPath:
@@ -106,6 +165,11 @@ spec:
         hostPath:
           path: /var/lib/fast-sandbox/firecracker
           type: DirectoryOrCreate
+      # The agent config (config/dev/agent-config.yaml): the mounted file
+      # hot-reloads the nodeReadiness section on every readiness pass.
+      - name: agent-config
+        configMap:
+          name: fast-sandbox-firecracker-runtime-config
       - name: agent-registry
         secret:
           secretName: fast-sandbox-agent-registry
@@ -121,3 +185,9 @@ spec:
         hostPath:
           path: /etc/hostname
           type: File
+      # The Firecracker assets the readiness manager installs (shared with
+      # the fastlet pods via the runtime plan hostPath requirements).
+      - name: fc-assets
+        hostPath:
+          path: /opt/fast-sandbox/firecracker
+          type: DirectoryOrCreate

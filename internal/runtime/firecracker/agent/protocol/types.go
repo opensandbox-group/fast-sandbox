@@ -1,5 +1,5 @@
 // Package protocol defines the versioned UDS API shared by the
-// firecracker-runtime-agent server and the fastlet driver client. Messages
+// firecracker-runtime server and the fastlet driver client. Messages
 // are JSON over HTTP on a Unix socket (design docs §2.2).
 //
 // The served surface covers image lifecycle (PinImage / UnpinImage),
@@ -179,4 +179,11 @@ type HealthResponse struct {
 	// never depends on DART (a broken gateway keeps artifact pulls on the
 	// direct S3 fallback path).
 	DartUp bool `json:"dartUp"`
+	// HostReady reports the last node-readiness check outcome (the KVM/
+	// storage/asset check behind the scheduling labels). Nil when the
+	// readiness manager is not running (no node name configured).
+	HostReady *bool `json:"hostReady,omitempty"`
+	// HostState is the readiness summary line ("3 checks: 2 pass, 1
+	// warn, 0 fail"), or "check pending" before the first pass.
+	HostState string `json:"hostState,omitempty"`
 }

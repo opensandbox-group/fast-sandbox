@@ -109,8 +109,10 @@ SBX_SANDBOX="sandbox-firecracker"
 WARM_IMAGES="${WARM_IMAGES:-0}"
 
 # Node labels. The KVM label key is hardcoded by the SandboxTemplate
-# reconciler (sandbox.fast.io/kvm); the firecracker label selects installer/
-# agent/fastlet placement.
+# reconciler (sandbox.fast.io/kvm); the firecracker label selects agent/
+# fastlet placement. Both are applied BY the firecracker-runtime agent once
+# its host-readiness pass (KVM/TUN/kernel/storage + FC asset install)
+# succeeds — the script only waits for them in agent_up.
 KVM_NODE_LABEL="sandbox.fast.io/kvm"
 FC_NODE_LABEL="fast-sandbox.io/firecracker-node"
 
@@ -124,7 +126,7 @@ IMG_FASTLET_PROXY="${IMAGE_FASTLET_PROXY:-fast-sandbox/fastlet-proxy:dev}"
 IMG_SANDBOX_PROXY="${IMAGE_SANDBOX_PROXY:-fast-sandbox/sandbox-proxy:dev}"
 IMG_JANITOR="${IMAGE_JANITOR:-fast-sandbox/janitor:dev}"
 IMG_BUILDER="${IMAGE_BUILDER:-fast-sandbox/sandboxtemplate-builder:dev}"
-IMG_AGENT="${IMAGE_AGENT:-fast-sandbox/firecracker-runtime-agent:dev}"
+IMG_AGENT="${IMAGE_AGENT:-fast-sandbox/firecracker-runtime:dev}"
 
 AUTO_CLEAN=0
 ACTION=""
@@ -346,7 +348,7 @@ warm_images_ready() {
 }
 
 agent_pod() {
-	kubectl -n "$NS" get pods -l component=firecracker-runtime-agent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+	kubectl -n "$NS" get pods -l component=firecracker-runtime -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
 }
 
 agent_leases_drained() {
@@ -408,9 +410,9 @@ failure_dump() { # task
 		echo "--- controller logs (tail) ---"
 		kubectl logs -n "$NS" deploy/fast-sandbox-controller --tail=80 2>&1 || true
 		echo "--- agent logs (tail) ---"
-		kubectl logs -n "$NS" daemonset/firecracker-runtime-agent --tail=80 2>&1 || true
-		echo "--- installer logs (tail) ---"
-		kubectl logs -n "$NS" daemonset/firecracker-runtime-installer --all-containers --tail=80 2>&1 || true
+		kubectl logs -n "$NS" daemonset/firecracker-runtime --tail=80 2>&1 || true
+		echo "--- node readiness (labels + FirecrackerReady conditions) ---"
+		kubectl get nodes -o custom-columns='NAME:.metadata.name,KVM:.metadata.labels.sandbox\.fast\.io/kvm,FC:.metadata.labels.fast-sandbox\.io/firecracker-node,READY:.status.conditions[?(@.type=="FirecrackerReady")].status' 2>&1 || true
 		echo "--- fastlet logs (tail) ---"
 		kubectl logs -n "$NS" -l app=sandbox-fastlet --tail=80 2>&1 || true
 		echo "--- builder pods + logs (tail) ---"
@@ -763,7 +765,7 @@ build_images() {
 	(cd "$REPO_ROOT" && make images COMPONENT=fastlet-proxy >/dev/null)
 	(cd "$REPO_ROOT" && make images COMPONENT=sandbox-proxy >/dev/null)
 	(cd "$REPO_ROOT" && make images COMPONENT=janitor >/dev/null)
-	(cd "$REPO_ROOT" && make images COMPONENT=firecracker-runtime-agent >/dev/null)
+	(cd "$REPO_ROOT" && make images COMPONENT=firecracker-runtime >/dev/null)
 	log "building sandboxtemplate-builder image"
 	# The Dockerfile defaults GOPROXY to proxy.golang.org, which is unreachable
 	# on some hosts. Inherit the host's `go env GOPROXY` (same mirror the rest of
@@ -963,9 +965,7 @@ kind_up() {
 	local node
 	for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
 		docker exec "$node" sh -c 'test -e /dev/kvm' || die "KVM not visible inside the kind node container $node"
-		kubectl label node "$node" "$KVM_NODE_LABEL=true" --overwrite >/dev/null
-		kubectl label node "$node" "$FC_NODE_LABEL=true" --overwrite >/dev/null
-		log "node $node: KVM + firecracker labels applied"
+		log "node $node: KVM visible (readiness labels are applied by the firecracker-runtime agent)"
 	done
 	if [[ "$KIND_SINGLE" != "1" ]]; then
 		# Multi-node kind keeps the control-plane tainted (NoSchedule),
@@ -1122,26 +1122,45 @@ controller_up() {
 }
 
 # --- task 5: node assets + runtime environment -------------------------------------------
-installer_up() {
-	kubectl apply -f "$REPO_ROOT/config/runtime-installers/firecracker.yaml" >/dev/null
-	wait_for "firecracker installer ready" 60 \
-		kubectl -n "$NS" rollout status daemonset/firecracker-runtime-installer --timeout=15s
-	pass "firecracker/jailer/kernel installed on the node"
-}
+# (the installer DaemonSet was merged into the agent: agent_up now waits for
+# the readiness labels the agent applies after checking the host and
+# installing the firecracker assets)
 
 # --- task 6: agent DaemonSet ----------------------------------------------------------------
+node_label_ready() { # node — the agent-applied firecracker scheduling label
+	[[ "$(kubectl get node "$1" -o jsonpath='{.metadata.labels.fast-sandbox\.io/firecracker-node}')" == "true" ]]
+}
+
+node_condition_ready() { # node — the FirecrackerReady condition is True
+	[[ "$(kubectl get node "$1" -o jsonpath='{.status.conditions[?(@.type=="FirecrackerReady")].status}')" == "True" ]]
+}
+
 agent_up() {
+	kubectl apply -f "$REPO_ROOT/config/dev/agent-config.yaml" >/dev/null
 	kubectl apply -f "$REPO_ROOT/config/dev/dart-service.yaml" >/dev/null
 	kubectl apply -f "$REPO_ROOT/config/dev/agent-daemonset.yaml" >/dev/null
+	# The merged installer DaemonSet is gone: the agent installs the
+	# firecracker assets itself (superseded config/runtime-installers).
+	kubectl -n "$NS" delete daemonset/firecracker-runtime-installer --ignore-not-found >/dev/null 2>&1 || true
 	wait_for "runtime-agent DaemonSet ready" 120 \
-		kubectl -n "$NS" rollout status daemonset/firecracker-runtime-agent --timeout=10s
+		kubectl -n "$NS" rollout status daemonset/firecracker-runtime --timeout=10s
+
+	# Node readiness (the agent's own duty): every node must be labeled by
+	# its agent pass — the labels gate the fastlet pool and the template
+	# builder below, and they also prove the FC asset install succeeded.
+	local node
+	for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+		wait_for "node $node labeled ready by the agent" 300 node_label_ready "$node"
+		wait_for "node $node FirecrackerReady condition" 30 node_condition_ready "$node"
+		log "node $node: readiness labels + condition applied by the agent"
+	done
 
 	# DART P2P daemon (stage 2): every agent pod must have its node-local
 	# dart child answering on the admin plane, and agent /v1/health must
 	# report dartUp=true (a missing dart only degrades pulls to direct S3,
 	# so this is a positive wiring assertion, not a readiness gate).
 	local pod uid node pods
-	pods="$(kubectl -n "$NS" get pods -l component=firecracker-runtime-agent -o jsonpath='{.items[*].metadata.name}')"
+	pods="$(kubectl -n "$NS" get pods -l component=firecracker-runtime -o jsonpath='{.items[*].metadata.name}')"
 	for pod in $pods; do
 		uid="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.metadata.uid}')"
 		node="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.nodeName}')"
@@ -1292,7 +1311,7 @@ p2p_evidence() { # description
 		[[ "$size" =~ ^[0-9]+$ ]] || die "cannot stat published $object (publish incomplete?)"
 		expected_blocks=$((expected_blocks + (size + 4194303) / 4194304))
 	done
-	pods="$(kubectl -n "$NS" get pods -l component=firecracker-runtime-agent -o jsonpath='{.items[*].metadata.name}')"
+	pods="$(kubectl -n "$NS" get pods -l component=firecracker-runtime -o jsonpath='{.items[*].metadata.name}')"
 	for pod in $pods; do
 		node_total=0
 		while read -r source value; do
@@ -2297,7 +2316,7 @@ verify_p2p() {
 	[[ "$presigned" == http* ]] || die "mc share download returned no presigned URL for $probe_key (got '$share_out')"
 	log "verify-p2p probe object: $probe_key ($(mc stat --json "chain-net/$MINIO_BUCKET/$probe_key" 2>/dev/null | jq -r '.size' 2>/dev/null || echo '?' ) bytes)"
 
-	pods="$(kubectl -n "$NS" get pods -l component=firecracker-runtime-agent -o jsonpath='{.items[*].metadata.name}')"
+	pods="$(kubectl -n "$NS" get pods -l component=firecracker-runtime -o jsonpath='{.items[*].metadata.name}')"
 	[[ -n "$pods" ]] || die "no agent pods"
 	for pod in $pods; do
 		node="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.nodeName}')"
@@ -3185,7 +3204,7 @@ snapshot_env_up() {
 		log "verify-snapshot: rebuilding controller/fastlet/agent images"
 		(cd "$REPO_ROOT" && make images COMPONENT=controller >/dev/null)
 		(cd "$REPO_ROOT" && make images COMPONENT=fastlet >/dev/null)
-		(cd "$REPO_ROOT" && make images COMPONENT=firecracker-runtime-agent >/dev/null)
+		(cd "$REPO_ROOT" && make images COMPONENT=firecracker-runtime >/dev/null)
 		for image in "$IMG_CONTROLLER" "$IMG_FASTLET" "$IMG_AGENT"; do
 			kind load docker-image "$image" --name "$KIND_CLUSTER" >/dev/null
 		done
@@ -3226,14 +3245,14 @@ snapshot_env_up() {
 	# so no restart is needed for the store itself).
 	artifact_store_config
 	kubectl -n "$NS" rollout restart deploy/fast-sandbox-controller >/dev/null
-	kubectl -n "$NS" rollout restart daemonset/firecracker-runtime-agent >/dev/null
+	kubectl -n "$NS" rollout restart daemonset/firecracker-runtime >/dev/null
 	# Fastlet pods are pool-managed: deleting them lets the pool controller
 	# recreate them with the freshly loaded image.
 	kubectl -n "$NS" delete pod -l app=sandbox-fastlet --wait=true >/dev/null 2>&1 || true
 	wait_for "controller rollout ready" 120 \
 		kubectl -n "$NS" rollout status deploy/fast-sandbox-controller --timeout=10s
 	wait_for "agent rollout ready (write credential)" 180 \
-		kubectl -n "$NS" rollout status daemonset/firecracker-runtime-agent --timeout=10s
+		kubectl -n "$NS" rollout status daemonset/firecracker-runtime --timeout=10s
 	wait_for "fastlet pod ready (recreated)" 180 fastlet_pod_ready
 	# Egress plane for the policy checks: image, single-fastlet pool (one
 	# deterministic plane; the sample pins poolMin=poolMax=1), warm image
@@ -3856,7 +3875,7 @@ snapshot_evidence() {
 	kubectl -n "$NS" logs deploy/fast-sandbox-controller --tail=2000 2>/dev/null \
 		| grep -iE "snapshot" > "$SNAP_E2E_DIR/controller-snapshot.log" || true
 	[[ -n "$fastlet" ]] && kubectl -n "$NS" logs "$fastlet" --since=30m --tail=600 > "$SNAP_E2E_DIR/fastlet.log" 2>&1 || true
-	kubectl -n "$NS" logs daemonset/firecracker-runtime-agent --tail=300 > "$SNAP_E2E_DIR/agent.log" 2>&1 || true
+	kubectl -n "$NS" logs daemonset/firecracker-runtime --tail=300 > "$SNAP_E2E_DIR/agent.log" 2>&1 || true
 	sandbox_uid="$(kubectl -n "$NS" get sandbox "$SNAPSHOT_TARGET" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
 	node="$(kind_node)"
 	if [[ -n "$node" && -n "$sandbox_uid" ]]; then
@@ -4010,7 +4029,7 @@ pause_env_up() {
 		log "verify-pause: rebuilding controller/fastlet/agent images"
 		(cd "$REPO_ROOT" && make images COMPONENT=controller >/dev/null)
 		(cd "$REPO_ROOT" && make images COMPONENT=fastlet >/dev/null)
-		(cd "$REPO_ROOT" && make images COMPONENT=firecracker-runtime-agent >/dev/null)
+		(cd "$REPO_ROOT" && make images COMPONENT=firecracker-runtime >/dev/null)
 		for image in "$IMG_CONTROLLER" "$IMG_FASTLET" "$IMG_AGENT"; do
 			kind load docker-image "$image" --name "$KIND_CLUSTER" >/dev/null
 		done
@@ -4031,12 +4050,12 @@ pause_env_up() {
 	kubectl apply -k "$REPO_ROOT/config/all-in-one" >/dev/null
 	artifact_store_config
 	kubectl -n "$NS" rollout restart deploy/fast-sandbox-controller >/dev/null
-	kubectl -n "$NS" rollout restart daemonset/firecracker-runtime-agent >/dev/null
+	kubectl -n "$NS" rollout restart daemonset/firecracker-runtime >/dev/null
 	kubectl -n "$NS" delete pod -l app=sandbox-fastlet --wait=true >/dev/null 2>&1 || true
 	wait_for "controller rollout ready" 120 \
 		kubectl -n "$NS" rollout status deploy/fast-sandbox-controller --timeout=10s
 	wait_for "agent rollout ready (write credential)" 180 \
-		kubectl -n "$NS" rollout status daemonset/firecracker-runtime-agent --timeout=10s
+		kubectl -n "$NS" rollout status daemonset/firecracker-runtime --timeout=10s
 	wait_for "fastlet pod ready (recreated)" 180 fastlet_pod_ready
 
 	# The source carries an egress binding, so the recorded network policy and
@@ -4334,7 +4353,7 @@ pause_pull_evidence() { # fastlet
 	cache_dir="/var/lib/fast-sandbox/firecracker/images/$digest_hex"
 	driver="$(kubectl -n "$NS" logs "$fastlet" --since=20m --tail=3000 2>/dev/null \
 		| grep "artifact delivery completed" | grep -F "$PAUSE_CHECKPOINT_DIGEST" | tail -1 || true)"
-	agent="$(kubectl -n "$NS" logs daemonset/firecracker-runtime-agent --since=20m --tail=4000 2>/dev/null \
+	agent="$(kubectl -n "$NS" logs daemonset/firecracker-runtime --since=20m --tail=4000 2>/dev/null \
 		| grep "checkpoint pull completed" | grep -F "$PAUSE_CHECKPOINT_DIGEST" | tail -1 || true)"
 	[[ -n "$agent" || -n "$driver" ]] \
 		|| fail "no checkpoint pull evidence in the agent or Fastlet logs (was the store read?)"
@@ -4512,7 +4531,7 @@ pause_local_resume() {
 	pause_record "local_resume_to_ready_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
 	wait_for "local cycle execd /ping" 180 probe_execd "$PAUSE_SANDBOX"
 
-	pulls="$(kubectl -n "$NS" logs daemonset/firecracker-runtime-agent --since-time="$since" 2>/dev/null | grep -c "checkpoint pull completed.*$PAUSE_LOCAL_DIGEST" || true)"
+	pulls="$(kubectl -n "$NS" logs daemonset/firecracker-runtime --since-time="$since" 2>/dev/null | grep -c "checkpoint pull completed.*$PAUSE_LOCAL_DIGEST" || true)"
 	pulls="${pulls:-0}"
 	pause_record "local_resume_store_pulls" "$pulls"
 	[[ "$pulls" -eq 0 ]] || fail "local resume pulled the checkpoint from the store $pulls time(s) despite the node-local cache"
@@ -4554,7 +4573,7 @@ pause_evidence() {
 	local resume_fastlet
 	resume_fastlet="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.placement.fastletName}' 2>/dev/null || true)"
 	[[ -n "$resume_fastlet" ]] && kubectl -n "$NS" logs "$resume_fastlet" --since=30m --tail=800 > "$PAUSE_E2E_DIR/fastlet-resume.log" 2>&1 || true
-	kubectl -n "$NS" logs daemonset/firecracker-runtime-agent --tail=600 > "$PAUSE_E2E_DIR/agent.log" 2>&1 || true
+	kubectl -n "$NS" logs daemonset/firecracker-runtime --tail=600 > "$PAUSE_E2E_DIR/agent.log" 2>&1 || true
 	if [[ "$PAUSE_CHECKPOINT_REF" == s3://* ]]; then
 		mc cat "chain/${PAUSE_CHECKPOINT_REF#s3://}" > "$PAUSE_E2E_DIR/checkpoint-manifest.json" 2>/dev/null || true
 	fi
@@ -4678,7 +4697,7 @@ status() {
 # serving the rest).
 dart_metrics_summary() {
 	local pods pod node metrics
-	pods="$(kubectl -n "$NS" get pods -l component=firecracker-runtime-agent -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
+	pods="$(kubectl -n "$NS" get pods -l component=firecracker-runtime -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
 	[[ -n "$pods" ]] || { echo "  (no agent pods)"; return 0; }
 	for pod in $pods; do
 		node="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null)"
@@ -4870,8 +4889,7 @@ case "$ACTION" in
 		run_stage "task 3: MinIO endpoint (kind network)" resolve_minio_endpoint
 		run_stage "task 4: CRDs + controller" controller_up
 		run_stage "task 3: credentials (publish/pull)" credentials_up
-		run_stage "task 5: firecracker node assets" installer_up
-		run_stage "task 6: runtime-agent DaemonSet" agent_up
+		run_stage "task 5: firecracker node assets + runtime-agent DaemonSet" agent_up
 		run_stage "task 7: SandboxTemplate build" template_up
 		run_stage "task 8: SandboxPool + warmImages" pool_up
 		trap - ERR

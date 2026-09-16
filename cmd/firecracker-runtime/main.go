@@ -13,15 +13,19 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"fast-sandbox/internal/artifactstore"
 	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/registryconfig"
 	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 	agentdart "fast-sandbox/internal/runtime/firecracker/agent/dart"
+	agenthostready "fast-sandbox/internal/runtime/firecracker/agent/hostready"
 	agentserver "fast-sandbox/internal/runtime/firecracker/agent/server"
 	agentstate "fast-sandbox/internal/runtime/firecracker/agent/state"
 
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 )
 
@@ -35,7 +39,7 @@ const (
 
 func main() {
 	if err := run(); err != nil {
-		klog.ErrorS(err, "firecracker-runtime-agent failed")
+		klog.ErrorS(err, "firecracker-runtime failed")
 		klog.Flush()
 		os.Exit(1)
 	}
@@ -50,31 +54,45 @@ func main() {
 func run() error {
 	klog.InitFlags(nil)
 	flag.Parse()
-	shutdownTracing, err := observability.Configure(context.Background(), "firecracker-runtime-agent")
+	shutdownTracing, err := observability.Configure(context.Background(), "firecracker-runtime")
 	if err != nil {
 		return err
 	}
 	defer func() { _ = shutdownTracing(context.Background()) }()
-	socketPath := getEnv("FAST_SANDBOX_RUNTIME_AGENT_SOCKET", defaultSocketPath)
-	stateRoot := getEnv("FAST_SANDBOX_STATE_ROOT", defaultStateRoot)
-	registryPath := getEnv("FAST_SANDBOX_REGISTRY_CONFIG_PATH", registryconfig.MountPath)
+	// All tunables live in the mounted agent.yaml (the
+	// fast-sandbox-firecracker-runtime-config ConfigMap); the environment
+	// only carries the Downward API identities (POD_UID, NODE_NAME,
+	// NODE_IP) and the config path.
+	configPath := getEnv("FAST_SANDBOX_AGENT_CONFIG", defaultConfigPath)
+	config, err := loadAgentConfig(configPath)
+	if err != nil {
+		return err
+	}
+	if _, statErr := os.Stat(configPath); statErr != nil {
+		klog.InfoS("agent config file not found; running on built-in defaults",
+			"path", configPath)
+	}
+	klog.InfoS("agent config loaded", "path", configPath,
+		"dart", config.Dart.Addr, "nodeReadiness", config.NodeReadiness.Enabled)
+	socketPath := config.Socket
+	stateRoot := config.StateRoot
 	// The artifact store is read from the mounted fast-sandbox-artifact-store
 	// ConfigMap on every pull, so a ConfigMap edit applies to the next pull
 	// without an agent restart.
 	storeConfig := artifactstore.Loader{}
 
-	registryProvider := registryconfig.NewFileProvider(registryPath)
+	registryProvider := registryconfig.NewFileProvider(config.RegistryConfig)
+	serviceOptions := []agentserver.ServiceOption{}
 
-	// DART P2P gateway (stage 2). FAST_SANDBOX_DART_ADDR empty = local
-	// mode: artifact pulls stay on the direct header-signed S3 path.
-	// Non-empty = the node-local DART daemon is orchestrated as a child
-	// process and artifact bytes route through its prefix API as presigned
-	// URLs (with direct-S3 fallback when DART is unreachable).
-	dartAddr := getEnv("FAST_SANDBOX_DART_ADDR", "")
+	// DART P2P gateway. dart.addr empty = local mode: artifact pulls stay
+	// on the direct header-signed S3 path. Non-empty = the node-local DART
+	// daemon is orchestrated as a child process and artifact bytes route
+	// through its prefix API as presigned URLs (with direct-S3 fallback
+	// when DART is unreachable).
 	var pullOptions []agentpull.Option
 	var dartManager *agentdart.Manager
-	if dartAddr != "" {
-		listen, err := dartListenAddress(dartAddr)
+	if config.Dart.Addr != "" {
+		listen, err := dartListenAddress(config.Dart.Addr)
 		if err != nil {
 			return err
 		}
@@ -82,31 +100,62 @@ func run() error {
 		// block cache: the StateRoot can be shared (multi-node kind mounts
 		// one host filesystem into every node container), but two DART
 		// arenas must never point at the same directory. The node's
-		// hostname is read from /etc/hostname (mounted from the node by the
-		// DaemonSet) because a regular pod's own hostname is its pod name,
-		// which changes on restart.
-		nodeID := getEnv("FAST_SANDBOX_DART_SELF_ID", "")
+		// hostname is read from the mounted node hostname file because a
+		// regular pod's own hostname is its pod name, which changes on
+		// restart.
+		nodeID := config.Dart.SelfID
 		if nodeID == "" {
-			nodeID = nodeHostID()
+			nodeID = nodeHostID(config.HostnameFile)
 		}
 		peerPort := "9000"
-		config := agentdart.Config{
-			Binary:    getEnv("FAST_SANDBOX_DART_BIN", "dart"),
+		dartConfig := agentdart.Config{
+			Binary:    config.Dart.Bin,
 			Listen:    listen,
-			Admin:     getEnv("FAST_SANDBOX_DART_ADMIN", "127.0.0.1:8147"),
+			Admin:     config.Dart.Admin,
 			CacheDir:  filepath.Join(stateRoot, "cache", "dart-"+strings.ReplaceAll(nodeID, "/", "-")),
-			CacheSize: getEnv("FAST_SANDBOX_DART_CACHE_SIZE", "8GiB"),
-			Discover:  getEnv("FAST_SANDBOX_DART_DISCOVER", ""),
+			CacheSize: config.Dart.CacheSize,
+			Discover:  config.Dart.Discover,
 			SelfID:    nodeID,
 			Log:       os.Stderr,
 		}
 		if nodeIP := getEnv("FAST_SANDBOX_NODE_IP", ""); nodeIP != "" {
-			config.PeerAdvertise = net.JoinHostPort(nodeIP, peerPort)
+			dartConfig.PeerAdvertise = net.JoinHostPort(nodeIP, peerPort)
 		}
-		dartManager = agentdart.New(config)
-		pullOptions = append(pullOptions, agentpull.WithDART(dartAddr))
-		klog.InfoS("DART P2P gateway enabled", "addr", dartAddr,
-			"discover", config.Discover, "cacheDir", config.CacheDir, "peerAdvertise", config.PeerAdvertise)
+		dartManager = agentdart.New(dartConfig)
+		pullOptions = append(pullOptions, agentpull.WithDART(config.Dart.Addr))
+		klog.InfoS("DART P2P gateway enabled", "addr", config.Dart.Addr,
+			"discover", dartConfig.Discover, "cacheDir", dartConfig.CacheDir, "peerAdvertise", dartConfig.PeerAdvertise)
+	}
+
+	// Node readiness (host checks + Firecracker asset install + scheduling
+	// labels + FirecrackerReady condition). Enabled by config
+	// (nodeReadiness.enabled) plus FAST_SANDBOX_NODE_NAME: the DaemonSet
+	// injects spec.nodeName, so in-cluster deployments run the readiness
+	// loop while bare-process runs (chain E2E) stay check-free. The
+	// nodeReadiness section is re-read before every pass (hot reload of
+	// thresholds/interval/asset source through the mounted ConfigMap).
+	var hostReadyManager *agenthostready.Manager
+	if nodeName := getEnv("FAST_SANDBOX_NODE_NAME", ""); nodeName != "" && config.NodeReadiness.Enabled {
+		hostReadyManager = agenthostready.NewManager(agenthostready.ManagerConfig{
+			NodeName: nodeName,
+			Client:   newNodeClient(),
+			Check: agenthostready.CheckConfig{
+				StateRoot: stateRoot,
+				AssetsDir: config.NodeReadiness.AssetsDir,
+			},
+			Assets: &agenthostready.AssetConfig{
+				Dir:       config.NodeReadiness.AssetsDir,
+				FCVersion: config.NodeReadiness.FCVersion,
+				KernelURL: config.NodeReadiness.KernelURL,
+			},
+			Interval: hostReadyInterval(config.NodeReadiness.Interval),
+			Settings: readinessSettings(configPath, stateRoot),
+		})
+		serviceOptions = append(serviceOptions, agentserver.WithHostReadyProbe(hostReadyManager.Health))
+		klog.InfoS("node readiness manager enabled", "node", nodeName,
+			"assetsDir", config.NodeReadiness.AssetsDir,
+			"interval", config.NodeReadiness.Interval,
+			"config", configPath)
 	}
 
 	pull := &livePullClient{config: storeConfig, registry: registryProvider, options: pullOptions}
@@ -120,15 +169,14 @@ func run() error {
 	}
 	defer func() { _ = state.Close() }()
 
-	serviceOptions := []agentserver.ServiceOption{}
 	if dartManager != nil {
 		serviceOptions = append(serviceOptions, agentserver.WithDARTProbe(dartManager.Healthy))
 	}
 	service := agentserver.NewService(pull, state, stateRoot, serviceOptions...)
 	server := agentserver.New(service, socketPath)
-	klog.InfoS("firecracker-runtime-agent starting",
+	klog.InfoS("firecracker-runtime starting",
 		"socket", socketPath, "artifactStoreMount", artifactstore.DefaultMountDir, "stateRoot", stateRoot,
-		"registry", registryPath, "dart", dartAddr)
+		"registry", config.RegistryConfig, "dart", config.Dart.Addr)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -139,10 +187,13 @@ func run() error {
 			}
 		}()
 	}
+	if hostReadyManager != nil {
+		go hostReadyManager.Run(ctx)
+	}
 	if err := server.Serve(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
-	klog.InfoS("firecracker-runtime-agent stopped")
+	klog.InfoS("firecracker-runtime stopped")
 	return nil
 }
 
@@ -224,26 +275,97 @@ func (l *livePullClient) PublishImage(ctx context.Context, kind, key, dir string
 }
 
 // dartListenAddress derives the DART client-plane listen address from the
-// FAST_SANDBOX_DART_ADDR base (http://127.0.0.1:8145 -> 127.0.0.1:8145).
+// configured dart.addr base (http://127.0.0.1:8145 -> 127.0.0.1:8145).
 func dartListenAddress(dartAddr string) (string, error) {
 	parsed, err := url.Parse(dartAddr)
 	if err != nil || parsed.Host == "" || parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", fmt.Errorf("invalid FAST_SANDBOX_DART_ADDR %q: expected http://host:port", dartAddr)
+		return "", fmt.Errorf("invalid dart.addr %q: expected http://host:port", dartAddr)
 	}
 	return parsed.Host, nil
 }
 
-// nodeHostID derives the stable node identity: the node hostname file
-// (FAST_SANDBOX_HOSTNAME_FILE, mounted from the node by the DaemonSet),
-// falling back to the process hostname.
-func nodeHostID() string {
-	path := getEnv("FAST_SANDBOX_HOSTNAME_FILE", "/etc/hostname")
-	if payload, err := os.ReadFile(path); err == nil {
+// nodeHostID derives the stable node identity from the configured node
+// hostname file (mounted from the node by the DaemonSet), falling back to
+// the process hostname.
+func nodeHostID(hostnameFile string) string {
+	if payload, err := os.ReadFile(hostnameFile); err == nil {
 		if name := strings.TrimSpace(string(payload)); name != "" {
 			return name
 		}
 	}
 	return hostnameOrEmpty()
+}
+
+// newNodeClient builds the in-cluster node client (the DaemonSet
+// ServiceAccount grants node get/patch).
+func newNodeClient() agenthostready.NodeClient {
+	inCluster, err := rest.InClusterConfig()
+	if err != nil {
+		klog.ErrorS(err, "no in-cluster identity; node readiness runs checks-only (no labels/condition)")
+		return nil
+	}
+	clientset, err := kubernetes.NewForConfig(inCluster)
+	if err != nil {
+		klog.ErrorS(err, "build the node client failed; node readiness runs checks-only (no labels/condition)")
+		return nil
+	}
+	return agenthostready.ClientsetNodeClient{Clientset: clientset}
+}
+
+// readinessSettings builds the hot-reload callback: the mounted config
+// file is re-read before every readiness pass, so nodeReadiness edits
+// (thresholds, interval, asset source) land without a restart. The check
+// StateRoot is pinned to the startup value — the pull layer serves the
+// startup StateRoot and the readiness check must judge the same tree.
+// An invalid nodeReadiness section surfaces as a reload error (the
+// manager keeps the previous settings and logs).
+func readinessSettings(configPath, stateRoot string) func() (agenthostready.Settings, error) {
+	return func() (agenthostready.Settings, error) {
+		config, err := loadAgentConfig(configPath)
+		if err != nil {
+			return agenthostready.Settings{}, err
+		}
+		readiness := config.NodeReadiness
+		minFree, err := agenthostready.ParseBytes(readiness.MinFree)
+		if err != nil {
+			return agenthostready.Settings{}, fmt.Errorf("nodeReadiness.minFree: %w", err)
+		}
+		minMemory, err := agenthostready.ParseBytes(readiness.MinMemory)
+		if err != nil {
+			return agenthostready.Settings{}, fmt.Errorf("nodeReadiness.minMemory: %w", err)
+		}
+		interval, err := time.ParseDuration(readiness.Interval)
+		if err != nil || interval <= 0 {
+			return agenthostready.Settings{}, fmt.Errorf("nodeReadiness.interval %q: expected a positive duration like 5m", readiness.Interval)
+		}
+		return agenthostready.Settings{
+			Check: agenthostready.CheckConfig{
+				StateRoot:    stateRoot,
+				AssetsDir:    readiness.AssetsDir,
+				MinFreeBytes: minFree,
+				MinMemBytes:  minMemory,
+			},
+			Assets: &agenthostready.AssetConfig{
+				Dir:       readiness.AssetsDir,
+				FCVersion: readiness.FCVersion,
+				KernelURL: readiness.KernelURL,
+			},
+			Interval: interval,
+		}, nil
+	}
+}
+
+// hostReadyInterval parses the configured recheck cadence ("" or invalid
+// = 0, which the manager resolves to its default).
+func hostReadyInterval(value string) time.Duration {
+	if value == "" {
+		return 0
+	}
+	interval, err := time.ParseDuration(value)
+	if err != nil || interval <= 0 {
+		return 0
+	}
+	return interval
 }
 
 func hostnameOrEmpty() string {

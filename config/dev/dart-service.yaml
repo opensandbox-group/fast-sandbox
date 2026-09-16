@@ -17,12 +17,12 @@ metadata:
   namespace: fast-sandbox-system
   labels:
     app: fast-sandbox
-    component: firecracker-runtime-agent
+    component: firecracker-runtime
 spec:
   clusterIP: None
   selector:
     app: fast-sandbox
-    component: firecracker-runtime-agent
+    component: firecracker-runtime
   ports:
   - name: peer
     port: 9000

@@ -1,4 +1,4 @@
-# firecracker-runtime-agent — node-level artifact cache + lease service for
+# firecracker-runtime — node-level artifact cache + lease service for
 # the Firecracker on-demand loading chain (UDS JSON-over-HTTP API).
 #
 # The image also carries the DART P2P daemon (stage 2): the agent
@@ -35,7 +35,7 @@ RUN echo "$DART_REV" > /usr/local/share/dart-rev
 LABEL com.fast-sandbox.dart-rev="$DART_REV"
 
 WORKDIR /workspace
-COPY .build/linux-amd64/firecracker-runtime-agent .
+COPY .build/linux-amd64/firecracker-runtime .
 
 EXPOSE 8080
-ENTRYPOINT ["./firecracker-runtime-agent"]
+ENTRYPOINT ["./firecracker-runtime"]

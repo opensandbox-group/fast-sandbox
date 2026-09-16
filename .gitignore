@@ -286,4 +286,4 @@ generated/
 /.integration-env-gen/
 
 # stray agent binary built by ad-hoc go build
-/firecracker-runtime-agent
+/firecracker-runtime

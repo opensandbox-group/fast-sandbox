@@ -30,8 +30,9 @@ data:
           # the golden snapshot set from the artifact store into StateRoot,
           # and the driver restores every Sandbox from it (jailer mode with
           # per-clone netns). The binary/jailer/kernel are installed on the
-          # node by config/runtime-installers/firecracker.yaml; the paths
-          # below are the environment-side installation values.
+          # node by the agent's readiness loop (hostready: host checks +
+          # asset install + node labels); the paths below are the
+          # environment-side installation values.
           firecracker:
             firecracker:
               binaryPath: /opt/fast-sandbox/firecracker/firecracker

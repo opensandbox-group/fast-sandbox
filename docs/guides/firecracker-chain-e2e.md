@@ -41,7 +41,7 @@ Host requirements match [firecracker-runtime-e2e.md](firecracker-runtime-e2e.md)
    `publish: s3://sandbox-images/publish`, machine 1 vCPU / 512 MiB, execd
    baked (`opensandbox/execd:1.1.0`);
 4. Assert the published layout (point 1);
-5. Build and start `firecracker-runtime-agent`; pull twice via `PinImage`
+5. Build and start `firecracker-runtime`; pull twice via `PinImage`
    (points 2/3 + idempotency);
 6. Run the driver E2E cases (`TestFirecrackerDriverE2E`, `NoInfra`,
    `Concurrent`, `ConcurrentSerial`) with `FC_SKIP_PREP=1` and

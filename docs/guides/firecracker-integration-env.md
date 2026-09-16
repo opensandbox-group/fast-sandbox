@@ -80,8 +80,7 @@ root-cause read) or `NOT REPRODUCED` (API fully usable).
 | MinIO | host Docker container | host | on the kind network (container IP = endpoint); publish + pull credentials |
 | controller | Deployment (1 replica) | control plane | CRDs + RBAC + route-keys; Fast-Path gRPC :9090 |
 | builder Pod | Job (on-demand) | either KVM node | /dev/kvm, /dev/net/tun, self-mknod loop devices, publish creds |
-| runtime installer | DaemonSet (per-node) | firecracker-node ×2 | installs firecracker v1.16.1 + jailer + kernel → hostPath |
-| runtime-agent | DaemonSet (per-node) | firecracker-node ×2 | **cluster network** (not hostNetwork); UDS socket + StateRoot shared with fastlets; MinIO pull creds; orchestrates the dart child |
+| firecracker-runtime | DaemonSet (per-node, **all nodes**) | every node (labels itself) | host-readiness loop: KVM/TUN/kernel/storage checks + firecracker asset install (v1.16.1 + jailer + kernel) + applies the scheduling labels + FirecrackerReady condition; **cluster network** (not hostNetwork); UDS socket + StateRoot shared with fastlets; MinIO pull creds; orchestrates the dart child |
 | DART daemon | agent child process ×2 | inside each agent | prefix cache API :8145 (loopback), admin/metrics :8147, peer :9000 (pod IP); cache `cache/dart-<node>` under the shared StateRoot |
 | fastlet Pod | pool-managed Pod ×2 | one per node (anti-affinity) | profile hostPaths auto-injected; agent socket; registry plan |
 | firecracker VM | per-sandbox microVM | inside fastlet netns | golden restore, guest eth0 172.30.0.3, execd :44772 |
@@ -89,7 +88,12 @@ root-cause read) or `NOT REPRODUCED` (API fully usable).
 
 Node labels: `sandbox.fast.io/kvm=true` (builder, hardcoded by the
 SandboxTemplate controller) and `fast-sandbox.io/firecracker-node=true`
-(installer / agent / fastlet affinity). On multi-node kind the
+(agent/fastlet placement). Both are applied **by the firecracker-runtime
+agent itself** once its host-readiness pass (KVM/TUN/kernel/storage checks
++ firecracker asset install) succeeds — the standalone
+`scripts/firecracker-host-check.sh` runs the same checks on a bare host,
+and the agent removes the labels again when a recheck sees the host
+degraded. On multi-node kind the
 control-plane taint is removed by `up` so every workload can schedule on
 both nodes — without it the P2P topology would strand one node and no peer
 traffic could ever happen.
@@ -102,16 +106,19 @@ traffic could ever happen.
 4. **XFS StateRoot** — sparse loop image mounted at `/var/lib/fast-sandbox`,
    reflink probe, **before** `kind create` (the node bind-mounts it).
 5. **kind cluster** — TWO nodes with KVM/tun/shm/StateRoot passthrough;
-   labels applied on every node; control-plane taint removed (both nodes
+   control-plane taint removed (both nodes
    schedulable). `KIND_SINGLE=1` strips the worker (cache-only).
 6. **MinIO** — on the kind network (container IP), not the host gateway:
    docker-proxy reachability from the kind bridge is unreliable.
 7. **credentials** — publish secret (builder), agent registry.json (pull),
    pool registry (fast-sandbox-registry), agent endpoint ConfigMap.
 8. **CRDs + controller** — `config/all-in-one`, images loaded into kind.
-9. **installer** — binaries land before fastlet pods start (hostPath File
-   mounts fail otherwise).
-10. **agent** — readiness = POST /v1/health with a real podUID (read routes
+9. **agent + node readiness** — the agent DaemonSet lands on every node
+   and runs its readiness pass: host checks (KVM/TUN/kernel/StateRoot),
+   firecracker asset install onto the hostPath, then the scheduling
+   labels + FirecrackerReady condition per node. `up` waits for both per
+   node before any fastlet scheduling.
+10. **agent data plane** — readiness = POST /v1/health with a real podUID (read routes
     are POST-only and validate caller identity); per node: dart admin
     `/healthz`, agent health `dartUp:true`, and the DART **roster** must
     converge to all agent pods (DNS discovery via the headless Service).
@@ -302,21 +309,25 @@ Delivery timing with on-demand loading (two nodes, XFS StateRoot):
   (`t(probe)`), not from its create return — the latter accumulates the
   earlier sandboxes' probe/reporting time and fakes linear growth.
 
-### 6.4 Node asset installation (installer)
-- The DaemonSet downloads firecracker from GitHub releases and the kernel
+### 6.4 Node asset installation (the agent readiness loop)
+- The agent downloads firecracker from GitHub releases and the kernel
   from `s3.amazonaws.com` — fine for the integration env, **not** for
   production: use a private artifact mirror, pre-baked node images, or
-  signed hostPath assets, and pin `FC_VERSION`/`KERNEL_URL`.
+  signed hostPath assets, and pin `nodeReadiness.fcVersion`/
+  `nodeReadiness.kernelURL` in the agent config
+  (config/dev/agent-config.yaml; the download short-circuits when the
+  assets are already installed and verified).
 - The jailer/`vmlinux.bin` **must match the snapshot's baked kernel** and
   firecracker version (restore compatibility), and must exist before any
-  fastlet starts (hostPath File mounts fail otherwise).
+  fastlet starts (hostPath File mounts fail otherwise) — the readiness
+  labels only appear after the asset install verifies.
 
 ### 6.5 Network & multi-node
 - Per-clone netns: each sandbox gets a slot IP in the fastlet pod netns;
   guest eth0 is the baked 172.30.0.3 (clone model) — reachability is
   **per-fastlet-pod**, plan probes/access accordingly.
-- On multi-node clusters every node needs: installer + agent DaemonSets,
-  the `firecracker-node` label, KVM passthrough (or a device plugin), and
+- On multi-node clusters every node needs: the agent DaemonSet (which
+  self-checks and self-labels), KVM passthrough (or a device plugin), and
   the XFS StateRoot (per-node local disk, not a shared NAS — reflink and
   jailer chroot are node-local by design).
 - The agent is **per-node**; a node's cache is single-copy (PinImage
