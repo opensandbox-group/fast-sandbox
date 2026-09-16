@@ -99,8 +99,17 @@ func main() {
 		os.Exit(1)
 	}
 	endpoints := runtimeConfig.ContainerdEndpoints()
-	if ctrdSocket != "" && len(endpoints) == 1 && endpoints[0].Socket == "/run/containerd/containerd.sock" {
-		endpoints[0].Socket = ctrdSocket
+	if ctrdSocket != "" {
+		if len(endpoints) == 1 && endpoints[0].Socket == "/run/containerd/containerd.sock" {
+			endpoints[0].Socket = ctrdSocket
+		}
+	} else {
+		// --containerd-socket= (explicitly empty) disables the containerd
+		// backend: this janitor instance does not own containerd
+		// resources (e.g. the firecracker-runtime pod's sidecar; the
+		// standalone DaemonSet keeps the default socket).
+		endpoints = nil
+		klog.InfoS("containerd backend disabled (--containerd-socket is empty)")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

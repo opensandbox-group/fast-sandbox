@@ -1,21 +1,22 @@
-# agent-daemonset.yaml — node-level firecracker runtime + readiness agent.
+# agent-daemonset.yaml — node-level firecracker runtime + readiness agent,
+# with the node janitor as a sidecar container.
 #
-# Two duties:
-#   1. Serves the UDS management API (artifact pull + lease state) that the
-#      fastlet firecracker driver talks to. The socket directory and the
-#      state root are shared with fastlet pods via hostPath.
-#   2. Node readiness (the kata-deploy pattern): checks the host for the
-#      Firecracker launch requirements (KVM, TUN, kernel, memory, StateRoot
-#      filesystem), installs the pinned Firecracker assets
-#      (binary/jailer/kernel) into nodeReadiness.assetsDir, and then
-#      labels the node ready (sandbox.fast.io/kvm +
-#      fast-sandbox.io/firecracker-node) with a FirecrackerReady condition.
-#      The labels are re-verified on every readiness pass and removed again
-#      when the host degrades, so fastlet pods never schedule onto a broken
-#      node. scripts/firecracker-host-check.sh runs the same checks
-#      standalone.
+# Pod layout (two containers, one node daemon):
+#   1. agent — serves the UDS management API (artifact pull + lease state)
+#      the fastlet firecracker driver talks to, and runs the node
+#      readiness loop (the kata-deploy pattern): host checks, Firecracker
+#      asset install, the scheduling labels
+#      (sandbox.fast.io/kvm + fast-sandbox.io/firecracker-node) and the
+#      FirecrackerReady condition. scripts/firecracker-host-check.sh runs
+#      the same checks standalone.
+#   2. janitor — sweeps orphaned node resources: fastlet network state
+#      (netns/tap/veth), boxlite leftovers, and leaked VMM processes
+#      fastlets delegate over the node-cleanup UDS socket (needs the pod's
+#      hostPID visibility). The containerd backend is disabled here; the
+#      standalone config/janitor DaemonSet covers the containerd-based
+#      runtimes.
 #
-# All tunables live in the agent config ConfigMap
+# All agent tunables live in the agent config ConfigMap
 # (config/dev/agent-config.yaml, mounted at /etc/fast-sandbox/agent-config/
 # agent.yaml; the nodeReadiness section hot-reloads per pass). The
 # environment below carries only the Downward API identities.
@@ -68,6 +69,11 @@ rules:
   # condition lives under nodes/status, a separate RBAC resource from
   # plain nodes).
   verbs: ["get", "list", "watch", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  # The janitor sidecar's pod informer tracks this node's pods to detect
+  # orphans the moment their pod disappears.
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -98,8 +104,17 @@ spec:
       labels:
         app: fast-sandbox
         component: firecracker-runtime
+      annotations:
+        # The janitor sidecar's Prometheus metrics (node cleanup stats).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9092"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: fast-sandbox-firecracker-runtime
+      # The janitor sidecar needs host PID visibility to kill leaked VMM
+      # processes (fastlets delegate exact-ID cleanup over the node-cleanup
+      # UDS socket). The agent container does not use it.
+      hostPID: true
       tolerations:
       - key: node-role.kubernetes.io/control-plane
         operator: Exists
@@ -166,6 +181,41 @@ spec:
           readOnly: true
         - name: fc-assets
           mountPath: /opt/fast-sandbox/firecracker
+      # Node janitor sidecar: sweeps orphaned fastlet network state (netns/
+      # tap/veth), boxlite leftovers, and — the reason for hostPID — kills
+      # leaked VMM processes fastlets delegate over the node-cleanup UDS
+      # socket. The containerd backend is DISABLED here (--containerd-socket=):
+      # this pod targets the firecracker runtime; the standalone
+      # config/janitor DaemonSet keeps covering the containerd-based
+      # runtimes.
+      - name: janitor
+        image: fast-sandbox/janitor:dev
+        imagePullPolicy: IfNotPresent
+        command: ["/workspace/janitor"]
+        args: ["--scan-interval=2m", "--orphan-timeout=30s", "--containerd-socket="]
+        ports:
+        - name: metrics
+          containerPort: 9092
+        securityContext:
+          privileged: true
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: network-state
+          mountPath: /run/fast-sandbox/network
+        - name: network-namespaces
+          mountPath: /run/netns
+          mountPropagation: Bidirectional
+        - name: node-cleanup
+          mountPath: /run/fast-sandbox/janitor
+        - name: boxlite-state
+          mountPath: /var/lib/fast-sandbox/boxlite
+        - name: runtime-environments
+          mountPath: /etc/fast-sandbox/runtime-environments
+          readOnly: true
       volumes:
       - name: agent-socket
         hostPath:
@@ -201,3 +251,32 @@ spec:
         hostPath:
           path: /opt/fast-sandbox/firecracker
           type: DirectoryOrCreate
+      # Node cleanup state the janitor sidecar sweeps: the fastlet network
+      # state root, the host netns mount point, the boxlite state root, and
+      # the node-cleanup socket dir shared with fastlet pods (the pool
+      # controller injects the same hostPath into fastlets for the
+      # exact-ID VMM process cleanup delegation).
+      - name: network-state
+        hostPath:
+          path: /run/fast-sandbox/network
+          type: DirectoryOrCreate
+      - name: network-namespaces
+        hostPath:
+          path: /run/fast-sandbox/netns
+          type: DirectoryOrCreate
+      - name: node-cleanup
+        hostPath:
+          path: /run/fast-sandbox/janitor
+          type: DirectoryOrCreate
+      - name: boxlite-state
+        hostPath:
+          path: /var/lib/fast-sandbox/boxlite
+          type: DirectoryOrCreate
+      - name: runtime-environments
+        configMap:
+          name: fast-sandbox-runtime-environments
+          # Optional: the firecracker integration env resolves runtime plans
+          # from the built-in catalog and does not ship this ConfigMap; the
+          # janitor falls back to its defaults (containerd backend is
+          # disabled via --containerd-socket= anyway).
+          optional: true
