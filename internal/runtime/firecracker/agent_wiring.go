@@ -1,12 +1,11 @@
 package firecracker
 
-// agent_wiring.go connects the driver to the node-level
-// firecracker-runtime (implementation plan §7): PullImage proxies to
-// PinImage, ProbeCapabilities gates on the agent Health, and DeleteSandbox
-// releases the lease and unpins the image. When no socket is configured the
-// driver stays in local mode; when the agent is unreachable the driver
-// falls back to the local cache (the agent being absent must not break
-// warm images).
+// agent_wiring.go connects the driver to the node-level firecracker
+// runtime-agent: PullImage proxies to PinImage, ProbeCapabilities gates on
+// the agent Health, and DeleteSandbox releases the lease and unpins the
+// image. When no socket is configured the driver stays in local mode; when
+// the agent is unreachable the driver falls back to the local cache (the
+// agent being absent must not break warm images).
 
 import (
 	"context"
@@ -119,13 +118,13 @@ func (d *Driver) releaseAgentSandbox(ctx context.Context, sandboxID, image strin
 	}
 	if leaseID, ok := d.leaseForSandbox(sandboxID); ok {
 		if err := client.ReleaseDevices(ctx, "release-"+leaseID, leaseID); err != nil && !errorsIsAgentUnreachable(err) {
-			klog.V(2).InfoS("firecracker agent ReleaseDevices failed", "sandboxID", sandboxID, "err", err)
+			klog.V(2).InfoS("Firecracker runtime-agent ReleaseDevices failed", "sandboxID", sandboxID, "err", err)
 		}
 		d.forgetLease(sandboxID)
 	}
 	if image != "" {
 		if err := client.UnpinImage(ctx, "unpin-"+sandboxID, image); err != nil && !errorsIsAgentUnreachable(err) {
-			klog.V(2).InfoS("firecracker agent UnpinImage failed", "sandboxID", sandboxID, "err", err)
+			klog.V(2).InfoS("Firecracker runtime-agent UnpinImage failed", "sandboxID", sandboxID, "err", err)
 		}
 	}
 }

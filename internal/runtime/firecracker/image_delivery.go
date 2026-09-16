@@ -155,7 +155,7 @@ func (d *Driver) runDeliveryAttempt(reference string, pin func(context.Context) 
 	}
 	attemptContext, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	klog.InfoS("firecracker artifact delivery attempt started", "reference", reference, "timeout", timeout.String())
+	klog.InfoS("Firecracker artifact delivery attempt started", "reference", reference, "timeout", timeout.String())
 	err := pin(attemptContext)
 	if err == nil {
 		d.mu.RLock()
@@ -180,7 +180,7 @@ func (d *Driver) runDeliveryAttempt(reference string, pin func(context.Context) 
 	entry.mu.Unlock()
 
 	if err == nil {
-		klog.InfoS("firecracker artifact delivery completed", "reference", reference)
+		klog.InfoS("Firecracker artifact delivery completed", "reference", reference)
 		return
 	}
 	klog.ErrorS(err, "firecracker artifact delivery attempt failed", "reference", reference)

@@ -1,8 +1,8 @@
 package firecracker
 
-// restore.go implements the golden snapshot restore startup path
-// (implementation plan §3.3): restore is the only startup path, the cold
-// boot branch is removed. EnsureSandbox validates the request memory
+// restore.go implements the golden snapshot restore startup path: restore
+// is the only startup path, the cold boot branch is removed. EnsureSandbox
+// validates the request memory
 // against the manifest machine tuple, launches the Firecracker process via
 // the jailer (which chroots it and pins it to the slot netns; the jail root
 // holds the instance rootfs reflink copy and hard-linked snapshots), then
@@ -187,7 +187,7 @@ func restoreSnapshotPath(stateRoot, image, name string) (string, error) {
 }
 
 // vmstateSnapshotName and memorySnapshotName are the golden snapshot files
-// the pull layer commits into the image cache (implementation plan §5).
+// the pull layer commits into the image cache.
 const (
 	vmstateSnapshotName = "vmstate.snap"
 	memorySnapshotName  = "memory.snap"

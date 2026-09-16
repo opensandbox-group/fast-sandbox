@@ -90,8 +90,9 @@ type BoxLiteConfig struct {
 }
 
 // FirecrackerConfig carries the platform-owned paths and defaults for the
-// direct Firecracker runtime driver. The driver boots one Firecracker
-// microVM on demand for every Sandbox create request; nothing is pre-warmed.
+// direct Firecracker runtime driver. The driver starts one Firecracker
+// microVM per Sandbox create request, restored from the golden snapshot
+// set; nothing is pre-warmed.
 type FirecrackerConfig struct {
 	BinaryPath         string `json:"binaryPath"`
 	JailerPath         string `json:"jailerPath,omitempty"`

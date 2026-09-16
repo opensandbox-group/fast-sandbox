@@ -30,8 +30,9 @@ import (
 // bootPollInterval is the VM state polling interval after start/resume.
 const bootPollInterval = 250 * time.Millisecond
 
-// Driver boots one Firecracker microVM on demand per Sandbox create request.
-// The VM runs in the Fastlet Pod; nothing is pre-warmed.
+// Driver starts one Firecracker microVM per Sandbox create request,
+// restored from the golden snapshot set (or an instance checkpoint on
+// resume). The VM runs in the Fastlet Pod; nothing is pre-warmed.
 type Driver struct {
 	mu             sync.RWMutex
 	profile        runtimecatalog.RuntimeProfile
@@ -211,11 +212,11 @@ func (d *Driver) gcImageCache() {
 	}
 	removed, err := garbageCollectImages(stateRoot, limitBytes, useCount)
 	if err != nil {
-		klog.V(2).InfoS("firecracker image cache GC skipped", "err", err)
+		klog.V(2).InfoS("Firecracker image cache GC skipped", "err", err)
 		return
 	}
 	if len(removed) > 0 {
-		klog.InfoS("firecracker image cache GC removed unreferenced images", "digests", removed)
+		klog.InfoS("Firecracker image cache GC removed unreferenced images", "digests", removed)
 	}
 }
 
@@ -286,7 +287,7 @@ func (d *Driver) ensureResidualProcessAbsent(ctx context.Context, sandboxID stri
 		return
 	}
 	if err := client.EnsureRuntimeProcessesAbsent(ctx, runtimecatalog.ResidualProcessFirecracker, truncatedSandboxID(sandboxID)); err != nil {
-		klog.V(2).InfoS("firecracker residual process cleanup skipped", "sandboxID", sandboxID, "err", err)
+		klog.V(2).InfoS("Firecracker residual process cleanup skipped", "sandboxID", sandboxID, "err", err)
 	}
 }
 
@@ -357,8 +358,10 @@ func (d *Driver) ProbeCapabilities(ctx context.Context) CapabilityReport {
 	return report
 }
 
-// EnsureSandbox boots one Firecracker microVM on demand. The call is
-// idempotent and emits an OTel span tree correlated by the Sandbox identity.
+// EnsureSandbox starts one Firecracker microVM restored from the golden
+// snapshot set (an instance checkpoint when the request carries a resume
+// reference). The call is idempotent and emits an OTel span tree correlated
+// by the Sandbox identity.
 func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSandboxInput) (_ *SandboxMetadata, resultErr error) {
 	if input == nil {
 		return nil, fmt.Errorf("%w: Firecracker Sandbox input is required", ErrInvalidConfig)
@@ -526,7 +529,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 			d.removeJailRoot(identity.SandboxUID)
 		}
 		_ = removeSandboxDir(directory)
-		klog.InfoS("firecracker Create cleanup removed partial sandbox",
+		klog.InfoS("Firecracker Create cleanup removed partial sandbox",
 			"sandboxID", identity.SandboxUID, "jailRoot", jailRoot)
 	}()
 	d.touchImage(restoreRef)
@@ -661,7 +664,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		releaseSlot()
 		return nil, err
 	}
-	klog.InfoS("firecracker sandbox created",
+	klog.InfoS("Firecracker sandbox created",
 		"sandboxID", identity.SandboxUID,
 		"total", time.Since(createStarted).String(),
 		"acquire", acquireDur.String(),
@@ -749,7 +752,7 @@ func (d *Driver) DeleteSandbox(ctx context.Context, sandboxID string) (resultErr
 	if removeErr := removeSandboxDir(directory); removeErr != nil {
 		klog.ErrorS(removeErr, "Failed to remove sandbox state directory", "sandboxID", sandboxID)
 	}
-	klog.InfoS("firecracker sandbox deleted", "sandboxID", sandboxID)
+	klog.InfoS("Firecracker sandbox deleted", "sandboxID", sandboxID)
 	return nil
 }
 
