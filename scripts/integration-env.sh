@@ -1142,6 +1142,11 @@ agent_up() {
 	# The merged installer DaemonSet is gone: the agent installs the
 	# firecracker assets itself (superseded config/runtime-installers).
 	kubectl -n "$NS" delete daemonset/firecracker-runtime-installer --ignore-not-found >/dev/null 2>&1 || true
+	# The standalone janitor DaemonSet is superseded by the firecracker-
+	# runtime sidecar on this cluster: two janitors would race on the same
+	# node-cleanup control socket and double-sweep the same resources.
+	# (Left here by a previous e2e-env setup on a reused cluster.)
+	kubectl -n "$NS" delete daemonset/fast-sandbox-janitor --ignore-not-found >/dev/null 2>&1 || true
 	wait_for "runtime-agent DaemonSet ready" 120 \
 		kubectl -n "$NS" rollout status daemonset/firecracker-runtime --timeout=10s
 
