@@ -1151,7 +1151,9 @@ agent_up() {
 	local node
 	for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
 		wait_for "node $node labeled ready by the agent" 300 node_label_ready "$node"
-		wait_for "node $node FirecrackerReady condition" 30 node_condition_ready "$node"
+		# The condition rides the agent's recheck cadence (default 5m), so
+		# the wait must cover a full period (300 attempts x 2s).
+		wait_for "node $node FirecrackerReady condition" 300 node_condition_ready "$node"
 		log "node $node: readiness labels + condition applied by the agent"
 	done
 
