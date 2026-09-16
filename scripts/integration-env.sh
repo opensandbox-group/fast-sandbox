@@ -1806,7 +1806,7 @@ show_restore_timings() { # sandbox-name
 	local name="$1" fastlet line
 	fastlet="$(kubectl_get "sandbox/$name" '{.status.placement.fastletName}')"
 	[[ -n "$fastlet" ]] || return 0
-	line="$(kubectl -n "$NS" logs --request-timeout=10s --tail=300 "$fastlet" 2>/dev/null | grep 'firecracker sandbox created' | tail -1)"
+	line="$(kubectl -n "$NS" logs --request-timeout=10s --tail=300 "$fastlet" 2>/dev/null | grep -i 'firecracker sandbox created' | tail -1)"
 	[[ -n "$line" ]] || return 0
 	highlight "  key node: golden restore of '$name'"
 	printf '    total=%s  acquire=%s  rootfs=%s  infra=%s  launch=%s  configure=%s  boot=%s  vmStatePolls=%s\n' \
@@ -1834,7 +1834,7 @@ report_create_tail() { # name t0-ns t-run-done-ns
 	[[ -n "$fp_total" ]] || return 0
 	fastlet="$(kubectl_get "sandbox/$name" '{.status.placement.fastletName}')"
 	[[ -n "$fastlet" ]] || return 0
-	dr_line="$(kubectl -n "$NS" logs --request-timeout=10s --tail=300 "$fastlet" 2>/dev/null | grep 'firecracker sandbox created' | tail -1)"
+	dr_line="$(kubectl -n "$NS" logs --request-timeout=10s --tail=300 "$fastlet" 2>/dev/null | grep -i 'firecracker sandbox created' | tail -1)"
 	dr_total="$(klog_field "$dr_line" total | tr -d 'ms')"
 	dr_total="${dr_total%%.*}"
 	[[ -n "$dr_total" ]] || dr_total=0
@@ -4487,7 +4487,7 @@ pause_resume() {
 
 	show_restore_timings "$PAUSE_SANDBOX"
 	local line
-	line="$(kubectl -n "$NS" logs --request-timeout=10s --tail=300 "$new_fastlet" 2>/dev/null | grep 'firecracker sandbox created' | tail -1)"
+	line="$(kubectl -n "$NS" logs --request-timeout=10s --tail=300 "$new_fastlet" 2>/dev/null | grep -i 'firecracker sandbox created' | tail -1)"
 	[[ -n "$line" ]] && pause_record "resume_restore_total_ms" "$(duration_to_ms "$(klog_field "$line" total)")"
 	pass "cross-host resume restored memory on $new_fastlet (uptime + marker survived, checkpoint consumed, policy re-applied)"
 }

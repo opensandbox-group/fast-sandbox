@@ -703,7 +703,7 @@ fi
 # Raw per-sandbox lines stay in driver-e2e.log; this section prints the
 # min/avg/max of every create stage and the execd readiness delta.
 LOG="$WORK/driver-e2e.log"
-CREATES=$(grep -c "firecracker sandbox created" "$LOG" 2>/dev/null || echo 0)
+CREATES=$(grep -ic "firecracker sandbox created" "$LOG" 2>/dev/null || echo 0)
 REACHED=$(grep -c "guest reachable via slot" "$LOG" 2>/dev/null || echo 0)
 EXECD_OK=$(grep -c "execd /ping OK" "$LOG" 2>/dev/null || echo 0)
 
