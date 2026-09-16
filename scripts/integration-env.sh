@@ -4672,6 +4672,9 @@ status() {
 	log "status: components"
 	kubectl -n "$NS" get pods -o wide 2>/dev/null || true
 	echo
+	log "status: node readiness (agent-applied labels + FirecrackerReady condition)"
+	kubectl get nodes -o custom-columns='NAME:.metadata.name,KVM:.metadata.labels.sandbox\.fast\.io/kvm,FC:.metadata.labels.fast-sandbox\.io/firecracker-node,READY:.status.conditions[?(@.type=="FirecrackerReady")].status,MESSAGE:.status.conditions[?(@.type=="FirecrackerReady")].message' 2>/dev/null || true
+	echo
 	log "status: SandboxTemplate"
 	kubectl -n "$NS" get sandboxtemplate -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,MANIFEST:.status.manifestRef' 2>/dev/null || true
 	echo
