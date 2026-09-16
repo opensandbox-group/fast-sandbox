@@ -10,7 +10,7 @@
 #   ./scripts/firecracker-host-check.sh --state-root /data/fast-sandbox/firecracker
 #
 # Checked (hard failures block a node from being labeled ready):
-#   cpu-arch               x86_64 or aarch64
+#   cpu-arch               x86_64 (arm64 not supported yet)
 #   kernel-version         Linux >= 5.10 (LTS, the Firecracker CI baseline)
 #   kvm-device             /dev/kvm exists, is a character device, opens RW
 #   net-tun                /dev/net/tun exists, opens RW
@@ -79,7 +79,7 @@ log "checking the host for Firecracker launch readiness"
 # --- cpu-arch ------------------------------------------------------------------------
 case "$(uname -m)" in
 x86_64) pass "cpu-arch" "amd64 (Firecracker x86_64 assets)" ;;
-aarch64 | arm64) pass "cpu-arch" "arm64 (Firecracker aarch64 assets)" ;;
+aarch64 | arm64) fail_check "cpu-arch" "arm64 nodes are not supported yet (x86_64 only)" ;;
 *) fail_check "cpu-arch" "unsupported architecture $(uname -m): no Firecracker assets" ;;
 esac
 

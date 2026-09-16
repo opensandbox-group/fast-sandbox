@@ -21,10 +21,12 @@ import (
 const (
 	// DefaultFCVersion is the pinned Firecracker release.
 	DefaultFCVersion = "v1.16.1"
-	// DefaultKernelURL is the Amazon microvm CI kernel (6.1, ACPI +
-	// VMGenID): the quickstart 4.14 kernel's CRNG is not reseeded at
-	// snapshot resume (execd /command hangs, #1695).
-	DefaultKernelURL = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260722-38359b8055fc-0/x86_64/vmlinux-6.1.176"
+	// kernelURLTemplate is the Amazon microvm CI kernel (6.1, ACPI +
+	// VMGenID; the quickstart 4.14 kernel's CRNG is not reseeded at
+	// snapshot resume, execd /command hangs, #1695) with the %s arch
+	// segment resolved from the node (x86_64 today; aarch64 when arm64
+	// support lands).
+	kernelURLTemplate = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260722-38359b8055fc-0/%s/vmlinux-6.1.176"
 	// DefaultAssetsDir is the on-node install target (matches
 	// config/runtime-environments.yaml binaryPath/kernelPath).
 	DefaultAssetsDir = "/opt/fast-sandbox/firecracker"
@@ -40,7 +42,9 @@ type AssetConfig struct {
 	Dir string
 	// FCVersion is the pinned Firecracker release (default v1.16.1).
 	FCVersion string
-	// KernelURL is the guest kernel blob URL.
+	// KernelURL is the guest kernel blob URL; empty derives the pinned
+	// per-arch Amazon CI kernel (an explicit URL is used verbatim for
+	// both architectures).
 	KernelURL string
 	// ReleaseBase overrides the GitHub release root (tests point it at an
 	// httptest server).
@@ -52,14 +56,15 @@ type AssetConfig struct {
 }
 
 // assetArch maps the Go arch onto the Firecracker release asset arch.
+// Only amd64 is supported today: arm64 nodes fail the cpu-arch check and
+// are never labeled ready, and the installer refuses them as a second
+// line of defense.
 func assetArch() (string, error) {
 	switch runtime.GOARCH {
 	case "amd64":
 		return "x86_64", nil
-	case "arm64":
-		return "aarch64", nil
 	default:
-		return "", fmt.Errorf("unsupported architecture %s for Firecracker assets", runtime.GOARCH)
+		return "", fmt.Errorf("architecture %s is not supported yet (x86_64 only)", runtime.GOARCH)
 	}
 }
 
@@ -90,7 +95,11 @@ func (c AssetConfig) Ensure(ctx context.Context) error {
 	}
 	kernel := filepath.Join(dir, "vmlinux.bin")
 	if info, err := os.Stat(kernel); err != nil || info.Size() == 0 {
-		if err := c.installFile(ctx, c.kernelURL(), kernel); err != nil {
+		kernelURL, err := c.kernelURL()
+		if err != nil {
+			return err
+		}
+		if err := c.installFile(ctx, kernelURL, kernel); err != nil {
 			return err
 		}
 	}
@@ -228,7 +237,9 @@ func (c AssetConfig) installFile(ctx context.Context, url, path string) error {
 	return os.Rename(tmp, path)
 }
 
-// download streams url into path with the size cap.
+// download streams url into path, rejecting bodies at or over the size
+// cap (a silent truncation would hand the node a corrupt kernel that
+// still passes the non-empty verify).
 func (c AssetConfig) download(ctx context.Context, url, path string) error {
 	client := c.HTTPClient
 	if client == nil {
@@ -246,13 +257,22 @@ func (c AssetConfig) download(ctx context.Context, url, path string) error {
 	if response.StatusCode != http.StatusOK {
 		return fmt.Errorf("fetch %s: HTTP %d", url, response.StatusCode)
 	}
+	if response.ContentLength > maxAssetBytes {
+		return fmt.Errorf("fetch %s: body of %d bytes exceeds the %d byte asset cap", url, response.ContentLength, maxAssetBytes)
+	}
 	file, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	if _, err := io.Copy(file, io.LimitReader(response.Body, maxAssetBytes)); err != nil {
+	// Read one byte past the cap so an over-long body with no
+	// Content-Length is detected instead of silently truncated.
+	written, err := io.Copy(file, io.LimitReader(response.Body, maxAssetBytes+1))
+	if err != nil {
 		return fmt.Errorf("download %s: %w", url, err)
+	}
+	if written > maxAssetBytes {
+		return fmt.Errorf("download %s: body exceeds the %d byte asset cap", url, maxAssetBytes)
 	}
 	return nil
 }
@@ -271,11 +291,18 @@ func (c AssetConfig) version() string {
 	return DefaultFCVersion
 }
 
-func (c AssetConfig) kernelURL() string {
+// kernelURL resolves the guest kernel blob URL: an explicit URL is used
+// verbatim; the empty default derives the pinned per-arch Amazon CI
+// kernel (an arm64 node must never receive the x86_64 blob).
+func (c AssetConfig) kernelURL() (string, error) {
 	if c.KernelURL != "" {
-		return c.KernelURL
+		return c.KernelURL, nil
 	}
-	return DefaultKernelURL
+	arch, err := assetArch()
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(kernelURLTemplate, arch), nil
 }
 
 func (c AssetConfig) base() string {

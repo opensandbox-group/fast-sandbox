@@ -136,10 +136,10 @@ func TestReconcilerRemovesLabelsOnDegradation(t *testing.T) {
 	if patch := string(client.statusPatches[0]); !containsAll(patch, `"status":"False"`, `"reason":"HostNotReady"`) {
 		t.Fatalf("the condition must flip to False/HostNotReady: %s", patch)
 	}
-	// The transition time must be preserved across a same-status flip to
-	// False->False? No: True->False is a status change, so the transition
-	// time legitimately advances; a degraded->degraded refresh would keep
-	// it. Assert the condition state instead.
+	// True -> False is a status change, so the transition time legitimately
+	// advances; only a same-status refresh preserves it (asserted below in
+	// TestConditionPatchPreservesTransitionTime). Assert the condition
+	// state instead.
 	condition := nodeCondition(client.node, ConditionFirecrackerReady)
 	if condition == nil || condition.Status != corev1.ConditionFalse || condition.Reason != "HostNotReady" {
 		t.Fatalf("expected a False HostNotReady condition, got %+v", condition)

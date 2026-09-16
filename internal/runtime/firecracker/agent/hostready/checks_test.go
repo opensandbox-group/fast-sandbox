@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // fakeProbes assembles a Probes with every observation controlled by the
@@ -110,6 +112,9 @@ func TestRunChecksFailuresBlockReady(t *testing.T) {
 	if got := checkByName(report, "kvm-device"); got.Status != StatusFail {
 		t.Fatalf("kvm-device must fail, got %s", got.Status)
 	}
+	// The summary is the operator-visible Node condition message: it must
+	// carry the failing check, not just counts.
+	require.Contains(t, report.Summary, "kvm-device: /dev/kvm unusable: device does not exist")
 }
 
 func TestRunChecksKernelThresholds(t *testing.T) {
@@ -191,16 +196,16 @@ func TestRunChecksAssetsMissing(t *testing.T) {
 	}
 }
 
-func TestRunChecksArm64(t *testing.T) {
+func TestRunChecksArm64Unsupported(t *testing.T) {
 	probes, assets := healthyProbes(t)
 	probes.arch = "arm64"
 	probes.cpuFlags = func() ([]string, error) { return []string{"fp", "asimd"}, nil }
 	report := RunChecks(CheckConfig{StateRoot: t.TempDir(), AssetsDir: assets}, probes.probes(assets))
-	if !report.Ready {
-		t.Fatalf("arm64 without vmx/svm must stay ready: %s", report.String())
+	if report.Ready {
+		t.Fatalf("arm64 must not be labeled ready: %s", report.String())
 	}
-	if got := checkByName(report, "nested-virtualization"); got.Status != StatusWarn {
-		t.Fatalf("expected the nested check to warn on arm64, got %s", got.Status)
+	if got := checkByName(report, "cpu-arch"); got.Status != StatusFail || !strings.Contains(got.Detail, "arm64 nodes are not supported yet") {
+		t.Fatalf("cpu-arch must fail with the arm64 message, got %+v", got)
 	}
 }
 

@@ -147,20 +147,21 @@ func withDefaults(probes Probes) Probes {
 	return probes
 }
 
-// checkArch verifies the machine architecture ships Firecracker assets
-// (x86_64 and aarch64 only).
+// checkArch verifies the machine architecture. Only amd64 ships Firecracker
+// assets today; arm64 is an explicit, self-describing failure (not a
+// silent mis-install).
 func checkArch(report *Report, probes Probes) {
 	switch arch := probes.Arch(); arch {
 	case "amd64":
 		report.pass("cpu-arch", "amd64 (Firecracker x86_64 assets)")
 	case "arm64":
-		report.pass("cpu-arch", "arm64 (Firecracker aarch64 assets)")
+		report.fail("cpu-arch", "arm64 nodes are not supported yet (x86_64 only)")
 	default:
 		report.fail("cpu-arch", "unsupported architecture "+arch+": no Firecracker assets")
 	}
 }
 
-// checkKernel verifies the host kernel meets the Firecracker floor (4.14).
+// checkKernel verifies the host kernel meets the readiness floor (5.10).
 func checkKernel(report *Report, probes Probes) {
 	release, err := probes.KernelRelease()
 	if err != nil {

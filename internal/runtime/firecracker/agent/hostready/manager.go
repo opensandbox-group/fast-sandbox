@@ -29,8 +29,9 @@ type ManagerConfig struct {
 	NodeName string
 	// Check carries the paths and thresholds of the checks.
 	Check CheckConfig
-	// Assets configures the Firecracker asset installation; nil keeps
-	// the pass checks-only (no downloads, no on-node install).
+	// Assets configures the Firecracker asset installation; the agent
+	// config always produces one (a pass installs before it checks).
+	// Tests may pass nil to keep a pass checks-only.
 	Assets *AssetConfig
 	// Interval is the recheck cadence (0 = DefaultInterval).
 	Interval time.Duration

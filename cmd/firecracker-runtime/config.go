@@ -124,9 +124,9 @@ func (c *agentConfig) fillDefaults() {
 	if c.NodeReadiness.FCVersion == "" {
 		c.NodeReadiness.FCVersion = agenthostready.DefaultFCVersion
 	}
-	if c.NodeReadiness.KernelURL == "" {
-		c.NodeReadiness.KernelURL = agenthostready.DefaultKernelURL
-	}
+	// nodeReadiness.kernelURL stays empty by default: the installer
+	// derives the pinned per-arch Amazon CI kernel URL from the node
+	// architecture (an arm64 node must never fetch the x86_64 blob).
 	if c.NodeReadiness.Interval == "" {
 		c.NodeReadiness.Interval = "5m"
 	}

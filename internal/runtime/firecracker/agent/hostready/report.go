@@ -76,9 +76,13 @@ func (r *Report) pass(name, detail string) {
 	r.Checks = append(r.Checks, Check{Name: name, Status: StatusPass, Detail: detail})
 }
 
-// summarize recomputes Ready and Summary from the recorded checks.
+// summarize recomputes Ready and Summary from the recorded checks. The
+// summary is the operator-visible Node condition message, so the failing
+// checks ride along with the counts ("2 fail: kvm-device: /dev/kvm does
+// not exist; fc-assets: ...").
 func (r *Report) summarize() {
 	passes, warns, fails := 0, 0, 0
+	var failures []string
 	for _, check := range r.Checks {
 		switch check.Status {
 		case StatusPass:
@@ -87,8 +91,20 @@ func (r *Report) summarize() {
 			warns++
 		case StatusFail:
 			fails++
+			failures = append(failures, check.Name+": "+check.Detail)
 		}
 	}
 	r.Ready = fails == 0
 	r.Summary = fmt.Sprintf("%d checks: %d pass, %d warn, %d fail", len(r.Checks), passes, warns, fails)
+	if len(failures) > 0 {
+		r.Summary += " (" + strings.Join(failures, "; ") + ")"
+	}
+	// The Node condition message is a diagnostic line, not a log blob:
+	// cap it so a pathological detail cannot bloat every describe output.
+	if len(r.Summary) > maxConditionMessage {
+		r.Summary = r.Summary[:maxConditionMessage]
+	}
 }
+
+// maxConditionMessage bounds the Node condition message.
+const maxConditionMessage = 1024

@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // serveAssets spins an httptest server acting as the Firecracker release
@@ -61,6 +63,9 @@ func serveAssets(t *testing.T) *httptest.Server {
 }
 
 func TestAssetEnsureInstallsAndVerifies(t *testing.T) {
+	if _, err := assetArch(); err != nil {
+		t.Skipf("asset install only runs on supported arch: %v", err)
+	}
 	server := serveAssets(t)
 	dir := filepath.Join(t.TempDir(), "fc")
 	config := AssetConfig{
@@ -125,4 +130,45 @@ func TestAssetEnsureDownloadFailureFails(t *testing.T) {
 	if err := config.Ensure(context.Background()); err == nil {
 		t.Fatal("Ensure must fail when the release host is unreachable")
 	}
+}
+
+func TestKernelURLDerivesFromArch(t *testing.T) {
+	empty := AssetConfig{}
+	url, err := empty.kernelURL()
+	if _, archErr := assetArch(); archErr != nil {
+		require.Error(t, err, "an unsupported arch must refuse to derive a kernel URL")
+		return
+	}
+	require.NoError(t, err)
+	require.Contains(t, url, "/x86_64/vmlinux-")
+	explicit := AssetConfig{KernelURL: "https://mirror.example/vmlinux.bin"}
+	url, err = explicit.kernelURL()
+	require.NoError(t, err)
+	require.Equal(t, "https://mirror.example/vmlinux.bin", url)
+}
+
+func TestDownloadRejectsOversizedBody(t *testing.T) {
+	// A body at/over the cap must error, not silently truncate into an
+	// installable-looking blob.
+	big := make([]byte, maxAssetBytes+1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write(big)
+	}))
+	t.Cleanup(server.Close)
+	config := AssetConfig{HTTPClient: server.Client()}
+	err := config.download(context.Background(), server.URL+"/huge", filepath.Join(t.TempDir(), "out"))
+	require.ErrorContains(t, err, "asset cap")
+}
+
+func TestDownloadAcceptsBodiesUnderTheCap(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("small blob"))
+	}))
+	t.Cleanup(server.Close)
+	config := AssetConfig{HTTPClient: server.Client()}
+	out := filepath.Join(t.TempDir(), "out")
+	require.NoError(t, config.download(context.Background(), server.URL+"/ok", out))
+	payload, err := os.ReadFile(out)
+	require.NoError(t, err)
+	require.Equal(t, "small blob", string(payload))
 }

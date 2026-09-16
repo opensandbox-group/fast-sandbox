@@ -93,7 +93,11 @@ agent itself** once its host-readiness pass (KVM/TUN/kernel/storage checks
 + firecracker asset install) succeeds — the standalone
 `scripts/firecracker-host-check.sh` runs the same checks on a bare host,
 and the agent removes the labels again when a recheck sees the host
-degraded. On multi-node kind the
+degraded. Caveat (inherent to the kata-deploy pattern): the labels persist
+while the agent is NOT running — a dead/evicted agent pod or
+`nodeReadiness.enabled=false` leaves the last-applied labels in place; the
+recheck only protects a running agent against a degrading host.
+On multi-node kind the
 control-plane taint is removed by `up` so every workload can schedule on
 both nodes — without it the P2P topology would strand one node and no peer
 traffic could ever happen.

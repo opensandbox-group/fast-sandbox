@@ -26,6 +26,12 @@
 # unrelated node pools). The control-plane toleration keeps single-node
 # clusters servable.
 #
+# Degraded-host window (inherent to the kata-deploy pattern): the labels
+# persist while the agent is NOT running — a dead/evicted agent pod or
+# nodeReadiness.enabled=false leaves the last-applied labels in place and
+# fastlets keep scheduling there. Keep the DaemonSet healthy; the recheck
+# only protects against a running-but-degraded host.
+#
 # Prerequisites (created by scripts/integration-env.sh):
 #   - ConfigMap fast-sandbox-firecracker-runtime-config: the agent config
 #     (config/dev/agent-config.yaml).
@@ -133,7 +139,9 @@ spec:
           privileged: true
         readinessProbe:
           exec:
-            command: ["/bin/sh", "-ec", "curl -fsS -X POST --unix-socket /run/fast-sandbox/firecracker/runtime.sock -H 'Content-Type: application/json' -d '{\"podUid\":\"$POD_UID\",\"namespace\":\"fast-sandbox-system\"}' http://firecracker-agent/v1/health | grep -q '\"ok\":true'"]
+            # $POD_UID must expand inside sh (double quotes): a single-quoted
+            # body reaches the agent as a literal "$POD_UID".
+            command: ["/bin/sh", "-ec", "curl -fsS -X POST --unix-socket /run/fast-sandbox/firecracker/runtime.sock -H 'Content-Type: application/json' -d \"{\\\"podUid\\\":\\\"$POD_UID\\\",\\\"namespace\\\":\\\"fast-sandbox-system\\\"}\" http://firecracker-agent/v1/health | grep -q '\"ok\":true'"]
           initialDelaySeconds: 2
           periodSeconds: 5
           timeoutSeconds: 3
