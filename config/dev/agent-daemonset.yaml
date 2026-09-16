@@ -2,10 +2,10 @@
 # with the node janitor as a sidecar container.
 #
 # Pod layout (two containers, one node daemon):
-#   1. agent — serves the UDS management API (artifact pull + lease state)
-#      the fastlet firecracker driver talks to, and runs the node
-#      readiness loop (the kata-deploy pattern): host checks, Firecracker
-#      asset install, the scheduling labels
+#   1. firecracker-agent — serves the UDS management API (artifact pull +
+#      lease state) the fastlet firecracker driver talks to, and runs the
+#      node readiness loop (the kata-deploy pattern): host checks,
+#      Firecracker asset install, the scheduling labels
 #      (sandbox.fast.io/kvm + fast-sandbox.io/firecracker-node) and the
 #      FirecrackerReady condition. scripts/firecracker-host-check.sh runs
 #      the same checks standalone.
@@ -109,6 +109,9 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9092"
         prometheus.io/path: /metrics
+        # Plain `kubectl logs/exec` on this multi-container pod targets the
+        # agent without needing -c.
+        kubectl.kubernetes.io/default-container: firecracker-agent
     spec:
       serviceAccountName: fast-sandbox-firecracker-runtime
       # The janitor sidecar needs host PID visibility to kill leaked VMM
@@ -127,7 +130,7 @@ spec:
       # for the stable HRW self-id (hostNetwork used to provide it via the
       # node UTS namespace; a regular pod's hostname is its pod name).
       containers:
-      - name: agent
+      - name: firecracker-agent
         image: fast-sandbox/firecracker-runtime:dev
         imagePullPolicy: IfNotPresent
         # Only Downward API identities live in env; all tunables come from

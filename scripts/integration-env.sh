@@ -355,7 +355,7 @@ agent_leases_drained() {
 	local pod uid
 	pod="$(agent_pod)"
 	uid="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.metadata.uid}')"
-	kubectl exec -n "$NS" "$pod" -- sh -c \
+	kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c \
 		"curl -fsS --unix-socket /run/fast-sandbox/firecracker/runtime.sock -H 'Content-Type: application/json' -d '{\"podUid\":\"$uid\",\"namespace\":\"$NS\"}' http://firecracker-agent/v1/list-leases" \
 		| grep -q '"leases":\[\]'
 }
@@ -366,7 +366,7 @@ agent_leases_drained() {
 dart_roster_ready() { # pod expected-members
 	local pod="$1" expected="$2"
 	local members
-	members="$(kubectl exec -n "$NS" "$pod" -- sh -c \
+	members="$(kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c \
 		'curl -fsS --noproxy "*" http://127.0.0.1:8147/admin/members' 2>/dev/null || true)"
 	[[ "$(printf '%s' "$members" | grep -o '"id":' | wc -l | tr -d ' ')" == "$expected" ]]
 }
@@ -1167,12 +1167,12 @@ agent_up() {
 		uid="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.metadata.uid}')"
 		node="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.nodeName}')"
 		wait_for "dart admin /healthz on $node" 30 \
-			kubectl exec -n "$NS" "$pod" -- sh -c \
+			kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c \
 				"curl -fsS --noproxy '*' http://127.0.0.1:8147/healthz | grep -q ok"
 		wait_for "agent health dartUp on $node" 30 \
-			kubectl exec -n "$NS" "$pod" -- sh -c \
+			kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c \
 				"curl -fsS --noproxy '*' --unix-socket /run/fast-sandbox/firecracker/runtime.sock -H 'Content-Type: application/json' -d '{\"podUid\":\"$uid\",\"namespace\":\"$NS\"}' http://firecracker-agent/v1/health | grep -q '\"dartUp\":true'"
-		log "dart: $node dart pid=$(kubectl exec -n "$NS" "$pod" -- sh -c 'pgrep -x dart')"
+		log "dart: $node dart pid=$(kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c 'pgrep -x dart')"
 	done
 	# P2P roster: every daemon must see every other agent pod as a peer
 	# before any warm pull, so the second node's pull can be served by the
@@ -2272,7 +2272,7 @@ verify_execd_api_cleanup() { # sandbox-name
 # and the origin counter is recorded as the baseline.
 dart_source_counters() { # pod  (stdout: "cache <n>"; "peer <n>"; "origin <n>")
 	local pod="$1" metrics
-	metrics="$(kubectl exec -n "$NS" "$pod" -- sh -c 'curl -fsS --noproxy "*" http://127.0.0.1:8147/metrics' 2>/dev/null || true)"
+	metrics="$(kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c 'curl -fsS --noproxy "*" http://127.0.0.1:8147/metrics' 2>/dev/null || true)"
 	printf '%s\n' "$metrics" | grep -E '^dart_block_source_total' \
 		| sed -E 's/^dart_block_source_total\{source="([a-z]+)"\} ([0-9]+)$/\1 \2/' || true
 }
@@ -2326,12 +2326,12 @@ verify_p2p() {
 		dart_source_counters "$pod" > "$before"
 		# First read: cold blocks must come from the origin.
 		log "p2p $node: first read (cold, origin expected)"
-		kubectl exec -n "$NS" "$pod" -- sh -c \
+		kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c \
 			"curl -fsS --noproxy '*' -o /dev/null 'http://127.0.0.1:8145/dart/$presigned'" \
 			|| die "first DART read failed on $node"
 		# Second read: served from the DART block cache, origin delta = 0.
 		log "p2p $node: second read (warm, cache expected)"
-		kubectl exec -n "$NS" "$pod" -- sh -c \
+		kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c \
 			"curl -fsS --noproxy '*' -o /dev/null 'http://127.0.0.1:8145/dart/$presigned'" \
 			|| die "second DART read failed on $node"
 		dart_source_counters "$pod" > "$after"
@@ -3877,7 +3877,7 @@ snapshot_evidence() {
 	kubectl -n "$NS" logs deploy/fast-sandbox-controller --tail=2000 2>/dev/null \
 		| grep -iE "snapshot" > "$SNAP_E2E_DIR/controller-snapshot.log" || true
 	[[ -n "$fastlet" ]] && kubectl -n "$NS" logs "$fastlet" --since=30m --tail=600 > "$SNAP_E2E_DIR/fastlet.log" 2>&1 || true
-	kubectl -n "$NS" logs daemonset/firecracker-runtime --tail=300 > "$SNAP_E2E_DIR/agent.log" 2>&1 || true
+	kubectl -n "$NS" logs daemonset/firecracker-runtime -c firecracker-agent --tail=300 > "$SNAP_E2E_DIR/agent.log" 2>&1 || true
 	sandbox_uid="$(kubectl -n "$NS" get sandbox "$SNAPSHOT_TARGET" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)"
 	node="$(kind_node)"
 	if [[ -n "$node" && -n "$sandbox_uid" ]]; then
@@ -4355,7 +4355,7 @@ pause_pull_evidence() { # fastlet
 	cache_dir="/var/lib/fast-sandbox/firecracker/images/$digest_hex"
 	driver="$(kubectl -n "$NS" logs "$fastlet" --since=20m --tail=3000 2>/dev/null \
 		| grep "artifact delivery completed" | grep -F "$PAUSE_CHECKPOINT_DIGEST" | tail -1 || true)"
-	agent="$(kubectl -n "$NS" logs daemonset/firecracker-runtime --since=20m --tail=4000 2>/dev/null \
+	agent="$(kubectl -n "$NS" logs daemonset/firecracker-runtime -c firecracker-agent --since=20m --tail=4000 2>/dev/null \
 		| grep "checkpoint pull completed" | grep -F "$PAUSE_CHECKPOINT_DIGEST" | tail -1 || true)"
 	[[ -n "$agent" || -n "$driver" ]] \
 		|| fail "no checkpoint pull evidence in the agent or Fastlet logs (was the store read?)"
@@ -4533,7 +4533,7 @@ pause_local_resume() {
 	pause_record "local_resume_to_ready_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
 	wait_for "local cycle execd /ping" 180 probe_execd "$PAUSE_SANDBOX"
 
-	pulls="$(kubectl -n "$NS" logs daemonset/firecracker-runtime --since-time="$since" 2>/dev/null | grep -c "checkpoint pull completed.*$PAUSE_LOCAL_DIGEST" || true)"
+	pulls="$(kubectl -n "$NS" logs daemonset/firecracker-runtime -c firecracker-agent --since-time="$since" 2>/dev/null | grep -c "checkpoint pull completed.*$PAUSE_LOCAL_DIGEST" || true)"
 	pulls="${pulls:-0}"
 	pause_record "local_resume_store_pulls" "$pulls"
 	[[ "$pulls" -eq 0 ]] || fail "local resume pulled the checkpoint from the store $pulls time(s) despite the node-local cache"
@@ -4575,7 +4575,7 @@ pause_evidence() {
 	local resume_fastlet
 	resume_fastlet="$(kubectl_get "sandbox/$PAUSE_SANDBOX" '{.status.placement.fastletName}' 2>/dev/null || true)"
 	[[ -n "$resume_fastlet" ]] && kubectl -n "$NS" logs "$resume_fastlet" --since=30m --tail=800 > "$PAUSE_E2E_DIR/fastlet-resume.log" 2>&1 || true
-	kubectl -n "$NS" logs daemonset/firecracker-runtime --tail=600 > "$PAUSE_E2E_DIR/agent.log" 2>&1 || true
+	kubectl -n "$NS" logs daemonset/firecracker-runtime -c firecracker-agent --tail=600 > "$PAUSE_E2E_DIR/agent.log" 2>&1 || true
 	if [[ "$PAUSE_CHECKPOINT_REF" == s3://* ]]; then
 		mc cat "chain/${PAUSE_CHECKPOINT_REF#s3://}" > "$PAUSE_E2E_DIR/checkpoint-manifest.json" 2>/dev/null || true
 	fi
@@ -4706,7 +4706,7 @@ dart_metrics_summary() {
 	[[ -n "$pods" ]] || { echo "  (no agent pods)"; return 0; }
 	for pod in $pods; do
 		node="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.nodeName}' 2>/dev/null)"
-		metrics="$(kubectl exec -n "$NS" "$pod" -- sh -c 'curl -fsS --noproxy "*" http://127.0.0.1:8147/metrics' 2>/dev/null || true)"
+		metrics="$(kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c 'curl -fsS --noproxy "*" http://127.0.0.1:8147/metrics' 2>/dev/null || true)"
 		echo "  $node:"
 		if [[ -z "$metrics" ]]; then
 			echo "    (DART metrics unreachable)"
