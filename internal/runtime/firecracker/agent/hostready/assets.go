@@ -21,12 +21,11 @@ import (
 const (
 	// DefaultFCVersion is the pinned Firecracker release.
 	DefaultFCVersion = "v1.16.1"
-	// kernelURLTemplate is the Amazon microvm CI kernel (6.1, ACPI +
-	// VMGenID; the quickstart 4.14 kernel's CRNG is not reseeded at
-	// snapshot resume, execd /command hangs, #1695) with the %s arch
-	// segment resolved from the node (x86_64 today; aarch64 when arm64
-	// support lands).
-	kernelURLTemplate = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260722-38359b8055fc-0/%s/vmlinux-6.1.176"
+	// defaultKernelURL is the pinned Amazon microvm CI kernel (6.1,
+	// ACPI + VMGenID; the quickstart 4.14 kernel's CRNG is not reseeded
+	// at snapshot resume, execd /command hangs, #1695) for the only
+	// supported architecture, x86_64.
+	defaultKernelURL = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260722-38359b8055fc-0/x86_64/vmlinux-6.1.176"
 	// DefaultAssetsDir is the on-node install target (matches
 	// config/runtime-environments.yaml binaryPath/kernelPath).
 	DefaultAssetsDir = "/opt/fast-sandbox/firecracker"
@@ -95,11 +94,7 @@ func (c AssetConfig) Ensure(ctx context.Context) error {
 	}
 	kernel := filepath.Join(dir, "vmlinux.bin")
 	if info, err := os.Stat(kernel); err != nil || info.Size() == 0 {
-		kernelURL, err := c.kernelURL()
-		if err != nil {
-			return err
-		}
-		if err := c.installFile(ctx, kernelURL, kernel); err != nil {
+		if err := c.installFile(ctx, c.kernelURL(), kernel); err != nil {
 			return err
 		}
 	}
@@ -292,17 +287,14 @@ func (c AssetConfig) version() string {
 }
 
 // kernelURL resolves the guest kernel blob URL: an explicit URL is used
-// verbatim; the empty default derives the pinned per-arch Amazon CI
-// kernel (an arm64 node must never receive the x86_64 blob).
-func (c AssetConfig) kernelURL() (string, error) {
+// verbatim; the empty default is the pinned x86_64 Amazon CI kernel
+// (x86_64 is the only supported architecture — non-amd64 nodes fail the
+// cpu-arch check and assetArch() refuses them before any download).
+func (c AssetConfig) kernelURL() string {
 	if c.KernelURL != "" {
-		return c.KernelURL, nil
+		return c.KernelURL
 	}
-	arch, err := assetArch()
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf(kernelURLTemplate, arch), nil
+	return defaultKernelURL
 }
 
 func (c AssetConfig) base() string {

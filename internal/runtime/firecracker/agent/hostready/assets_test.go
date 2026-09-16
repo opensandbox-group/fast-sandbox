@@ -26,13 +26,7 @@ func serveAssets(t *testing.T) *httptest.Server {
 		buffer := &bytes.Buffer{}
 		writer := gzip.NewWriter(buffer)
 		archive := tar.NewWriter(writer)
-		// Both architectures ship in the fake tarball: the test host's
-		// GOARCH decides which pair the installer extracts.
-		names := []string{}
-		for _, arch := range []string{"x86_64", "aarch64"} {
-			names = append(names, "firecracker-v1.16.1-"+arch, "jailer-v1.16.1-"+arch)
-		}
-		for _, name := range names {
+		for _, name := range []string{"firecracker-v1.16.1-x86_64", "jailer-v1.16.1-x86_64"} {
 			if err := archive.WriteHeader(&tar.Header{Name: "release-v1.16.1/" + name, Mode: 0o755, Size: int64(len(name))}); err != nil {
 				t.Fatal(err)
 			}
@@ -132,19 +126,13 @@ func TestAssetEnsureDownloadFailureFails(t *testing.T) {
 	}
 }
 
-func TestKernelURLDerivesFromArch(t *testing.T) {
-	empty := AssetConfig{}
-	url, err := empty.kernelURL()
-	if _, archErr := assetArch(); archErr != nil {
-		require.Error(t, err, "an unsupported arch must refuse to derive a kernel URL")
-		return
-	}
-	require.NoError(t, err)
-	require.Contains(t, url, "/x86_64/vmlinux-")
-	explicit := AssetConfig{KernelURL: "https://mirror.example/vmlinux.bin"}
-	url, err = explicit.kernelURL()
-	require.NoError(t, err)
-	require.Equal(t, "https://mirror.example/vmlinux.bin", url)
+func TestKernelURLDefaultsToX86Only(t *testing.T) {
+	// x86_64 is the only supported architecture: the default kernel URL
+	// is the pinned x86_64 blob, and the installer refuses other arches
+	// before any download (assetArch, asserted via the Ensure skip).
+	require.Equal(t, defaultKernelURL, AssetConfig{}.kernelURL())
+	custom := AssetConfig{KernelURL: "https://mirror.example/vmlinux.bin"}
+	require.Equal(t, "https://mirror.example/vmlinux.bin", custom.kernelURL())
 }
 
 func TestDownloadRejectsOversizedBody(t *testing.T) {

@@ -54,10 +54,9 @@ data:
       enabled: true
       assetsDir: /opt/fast-sandbox/firecracker
       fcVersion: v1.16.1
-      # kernelURL empty = the pinned Amazon CI 6.1 kernel resolved for the
-      # node arch (x86_64 today — arm64 nodes fail the cpu-arch check
-      # before any install). Set an explicit URL only for a private
-      # mirror.
+      # kernelURL empty = the pinned Amazon CI 6.1 kernel for x86_64 (the
+      # only supported arch — arm64 nodes fail the cpu-arch check before
+      # any install). Set an explicit URL only for a private mirror.
       kernelURL: ""
       interval: 5m
       minFree: 10GiB

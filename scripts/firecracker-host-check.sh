@@ -112,8 +112,6 @@ if grep -qE '^(flags|Features)' /proc/cpuinfo 2>/dev/null; then
 		pass "nested-virtualization" "vmx (Intel VT-x)"
 	elif grep -qE '^flags.*\bsvm\b' /proc/cpuinfo; then
 		pass "nested-virtualization" "svm (AMD-V)"
-	elif [[ "$(uname -m)" == "aarch64" ]]; then
-		pass "nested-virtualization" "n/a on arm64"
 	else
 		warn "nested-virtualization" "no vmx/svm flag: bare metal is fine, nested VMs cannot run Firecracker"
 	fi
