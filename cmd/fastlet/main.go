@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -21,6 +22,7 @@ import (
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	fastletsandbox "fast-sandbox/internal/fastlet/sandbox"
 	"fast-sandbox/internal/fastlet/server"
+	"fast-sandbox/internal/fastletsettings"
 	"fast-sandbox/internal/nodecleanup"
 	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/registryconfig"
@@ -50,6 +52,7 @@ func main() {
 	nodeName := getEnv("NODE_NAME", "")
 	namespace := getEnv("NAMESPACE", "")
 	fastletPort := getEnv("FASTLET_CONTROL_PORT", ":5758")
+	settingsDir := getEnv(fastletsettings.EnvDir, fastletsettings.MountPath)
 	runtimeName := getEnv("FAST_SANDBOX_RUNTIME", "container")
 	runtimePlan, err := loadRuntimePlan(getEnv("FAST_SANDBOX_RUNTIME_PLAN_PATH", runtimeenv.PlanMountPath+"/"+runtimeenv.PlanFileName))
 	if err != nil {
@@ -67,29 +70,31 @@ func main() {
 		klog.ErrorS(runtimecontract.ErrSandboxProfileMismatch, "Injected runtime profile hash does not match runtime plan", "injected", injectedRuntimeHash, "expected", runtimeProfile.ProfileHash)
 		os.Exit(1)
 	}
-	resourceProfile, err := resourceProfileFromEnvironment()
+	resourceProfile, err := resourceProfileFromSettings(settingsDir)
 	if err != nil {
 		klog.ErrorS(err, "Failed to resolve Sandbox resource profile")
 		os.Exit(1)
 	}
-	warmImages, err := warmImagesFromEnvironment()
+	warmImages, err := warmImagesFromSettings(settingsDir)
 	if err != nil {
 		klog.ErrorS(err, "Failed to parse warmImages")
 		os.Exit(1)
 	}
-	actionHandlers, err := actionHandlersFromEnvironment()
+	actionHandlers, err := actionHandlersFromSettings(settingsDir)
 	if err != nil {
-		klog.ErrorS(err, "Failed to parse Action Handlers")
+		klog.ErrorS(err, "Failed to parse action handlers")
 		os.Exit(1)
 	}
 	actionManager, err := fastletaction.NewManager(actionHandlers, nil)
 	if err != nil {
-		klog.ErrorS(err, "Failed to configure Action Handlers")
+		klog.ErrorS(err, "Failed to configure action handlers")
 		os.Exit(1)
 	}
 
-	klog.InfoS("Fastlet Info", "PodName", podName, "PodIP", podIP, "NodeName", nodeName, "Namespace", namespace)
-	klog.InfoS("Runtime", "Name", runtimeName, "Socket", runtimeSocket)
+	klog.InfoS("Fastlet starting",
+		"podName", podName, "podIP", podIP, "nodeName", nodeName,
+		"namespace", namespace, "capacity", capacityFromEnvironment())
+	klog.InfoS("Runtime resolved", "runtime", runtimeName, "socket", runtimeSocket, "settingsDir", settingsDir)
 
 	ctx := context.Background()
 	var rt runtimecontract.Driver
@@ -111,11 +116,12 @@ func main() {
 		}
 		configurable.SetNodeCleanupClient(nodecleanup.NewClient(getEnv("FAST_SANDBOX_NODE_CLEANUP_SOCKET", nodecleanup.DefaultSocketPath)))
 	}
-	// The firecracker driver optionally talks to the node-level
-	// firecracker-runtime over its UDS socket (empty env = local
-	// mode: no remote pull, warm images and cold boots unchanged). The
-	// agent's deployment carrier is a pending decision, so the env is
-	// only injected by the deployer, never by the control plane.
+	// The firecracker driver optionally talks to the node-level firecracker
+	// runtime-agent over its UDS socket (FAST_SANDBOX_RUNTIME_AGENT_SOCKET;
+	// empty = local mode: no remote pulls, warm images behave as before).
+	// The agent's deployment carrier is a deployment decision, so the env is
+	// only injected by the deployer via the pool fastletTemplate, never by
+	// the control plane.
 	if configurable, ok := rt.(agentClientConfigurable); ok {
 		configurable.SetFastletPodUID(podUID)
 		configurable.SetAgentSocket(getEnv("FAST_SANDBOX_RUNTIME_AGENT_SOCKET", ""))
@@ -286,7 +292,7 @@ func recoverUntilReady(ctx context.Context, manager *fastletsandbox.SandboxManag
 		} else if attempt <= 1 {
 			klog.ErrorS(err, "Fastlet runtime recovery failed; readiness remains false")
 		} else {
-			klog.V(2).Info("Fastlet runtime recovery still failing", "consecutiveFailures", attempt, "err", err)
+			klog.V(2).InfoS("Fastlet runtime recovery still failing", "consecutiveFailures", attempt, "err", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -304,7 +310,7 @@ func warmCacheUntilReady(ctx context.Context, manager *fastletsandbox.SandboxMan
 		} else if attempt <= 1 {
 			klog.ErrorS(err, "Asynchronous warmImages preparation failed; retrying")
 		} else {
-			klog.V(2).Info("Asynchronous warmImages preparation still failing", "consecutiveFailures", attempt, "err", err)
+			klog.V(2).InfoS("Asynchronous warmImages preparation still failing", "consecutiveFailures", attempt, "err", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -322,7 +328,7 @@ func prepareInfraUntilReady(ctx context.Context, manager *fastletsandbox.Sandbox
 		} else if attempt <= 1 {
 			klog.ErrorS(err, "Fastlet Infra Component preparation failed; revision admission remains disabled")
 		} else {
-			klog.V(2).Info("Fastlet Infra Component preparation still failing", "consecutiveFailures", attempt, "err", err)
+			klog.V(2).InfoS("Fastlet Infra Component preparation still failing", "consecutiveFailures", attempt, "err", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -406,6 +412,70 @@ func watchProxyRoutes(ctx context.Context, manager *fastletsandbox.SandboxManage
 			klog.ErrorS(err, "Fastlet Proxy control watch disconnected; route readiness revoked")
 		}
 	}
+}
+
+// readSetting returns the settings file content when the settings ConfigMap
+// is mounted (ok=true). A missing file reports ok=false so callers can fall
+// back to the legacy environment variables used by local runs without the
+// control plane.
+func readSetting(dir, key string) ([]byte, bool, error) {
+	path := filepath.Join(dir, key)
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("read Fastlet setting %s: %w", path, err)
+	}
+	return data, true, nil
+}
+
+func warmImagesFromSettings(dir string) ([]string, error) {
+	data, ok, err := readSetting(dir, fastletsettings.WarmImagesKey)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		var images []string
+		if err := json.Unmarshal(data, &images); err != nil {
+			return nil, err
+		}
+		return images, nil
+	}
+	return warmImagesFromEnvironment()
+}
+
+func actionHandlersFromSettings(dir string) ([]apiv1alpha2.ActionHandler, error) {
+	data, ok, err := readSetting(dir, fastletsettings.ActionHandlersKey)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		var handlers []apiv1alpha2.ActionHandler
+		if err := json.Unmarshal(data, &handlers); err != nil {
+			return nil, err
+		}
+		return handlers, nil
+	}
+	return actionHandlersFromEnvironment()
+}
+
+func resourceProfileFromSettings(dir string) (apiv1alpha2.SandboxResourceProfile, error) {
+	data, ok, err := readSetting(dir, fastletsettings.ResourceProfileKey)
+	if err != nil {
+		return apiv1alpha2.SandboxResourceProfile{}, err
+	}
+	if ok {
+		var profile apiv1alpha2.SandboxResourceProfile
+		if err := json.Unmarshal(data, &profile); err != nil {
+			return apiv1alpha2.SandboxResourceProfile{}, err
+		}
+		if err := apiv1alpha2.ValidateSandboxResourceProfile(profile); err != nil {
+			return apiv1alpha2.SandboxResourceProfile{}, err
+		}
+		return profile, nil
+	}
+	return resourceProfileFromEnvironment()
 }
 
 func warmImagesFromEnvironment() ([]string, error) {

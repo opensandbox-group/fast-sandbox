@@ -51,18 +51,40 @@ single source. Credentials stay separate — builds use the template's
 `output.publishSecretRef` (write) and agents use the pool-compiled registry
 Secret (read).
 
-## Fastlet environment
+## Fastlet configuration
 
-The Pool Controller injects platform-owned Fastlet configuration. Important groups are:
+Fastlet configuration is delivered by level:
+
+- **Pool-declared declarative settings** (warmImages, actionHandlers,
+  sandboxResources) travel in an immutable, content-addressed
+  `<pool>-settings-<revision>` ConfigMap mounted at
+  `/etc/fast-sandbox/settings` as `warm-images.json`,
+  `action-handlers.json`, and `resource-profile.json`. The ConfigMap name is
+  embedded in the Pod template hash, so any settings change rolls Fastlet
+  Pods. The `FAST_SANDBOX_SETTINGS_DIR` environment variable points the
+  Fastlet at the mount; when the mount is absent (local runs without the
+  control plane) the Fastlet falls back to the legacy
+  `FAST_SANDBOX_WARM_IMAGES`, `FAST_SANDBOX_ACTION_HANDLERS`, and
+  `FAST_SANDBOX_RESOURCE_*` environment variables.
+- **Identity and coordination values** stay environment variables: pod
+  identity via the Downward API (`POD_NAME`, `POD_UID`, `POD_IP`,
+  `NODE_NAME`, `NAMESPACE`), pod resources (`CPU_LIMIT`, `MEMORY_LIMIT`),
+  and simple scalars/paths (`FASTLET_CAPACITY`, `FAST_SANDBOX_RUNTIME`,
+  `FAST_SANDBOX_RUNTIME_PROFILE_HASH`, `FAST_SANDBOX_INFRA_REVISION`, and
+  the `*_PATH` pointers to the mounted plans below).
+- **Resolved runtime and infra plans** stay in their own revisioned
+  ConfigMaps (`runtime-plan`, `infra-plan`); the Fastlet reads the full
+  containerd socket, snapshotter, and kubelet root from the runtime plan
+  file rather than duplicated environment variables.
+- **Registry credentials** stay in the compiled Secret.
+
+The Pool Controller injects the remaining platform-owned environment groups:
 
 ### Runtime
 
 - `FAST_SANDBOX_RUNTIME`;
 - `FAST_SANDBOX_RUNTIME_PROFILE_HASH`;
-- `FAST_SANDBOX_RESOURCE_CPU`;
-- `FAST_SANDBOX_RESOURCE_MEMORY`;
-- `FAST_SANDBOX_RESOURCE_PIDS`;
-- `FAST_SANDBOX_WARM_IMAGES`.
+- `FAST_SANDBOX_SETTINGS_DIR`;
 - `FAST_SANDBOX_RUNTIME_PLAN_PATH`.
 
 ### Infra

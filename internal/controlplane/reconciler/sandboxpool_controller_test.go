@@ -12,6 +12,7 @@ import (
 	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 	"fast-sandbox/internal/controlplane/placement"
 	"fast-sandbox/internal/fastlet/podcgroup"
+	"fast-sandbox/internal/fastletsettings"
 	"fast-sandbox/internal/nodecleanup"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	"fast-sandbox/internal/registryconfig"
@@ -308,20 +309,24 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	require.Equal(t, pool.Spec.SandboxResources.Hash(), pod.Annotations["fast-sandbox.io/resource-profile-hash"])
 	require.Equal(t, shortProfileIdentity(profile), pod.Labels["fast-sandbox.io/runtime-profile"])
 	require.Equal(t, "5", envValue(pod.Spec.Containers[0].Env, "FASTLET_CAPACITY"))
-	require.Equal(t, "1", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RESOURCE_CPU"))
-	require.Equal(t, "1Gi", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RESOURCE_MEMORY"))
 	require.NotEmpty(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_REVISION"))
 	require.Equal(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_REVISION"), pod.Annotations["fast-sandbox.io/infra-revision"])
 	require.Equal(t, "/etc/fast-sandbox/infra/plan.json", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_PLAN_PATH"))
 	require.Equal(t, "/etc/fast-sandbox/runtime/plan.json", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RUNTIME_PLAN_PATH"))
-	require.Equal(t, "/run/containerd/containerd.sock", envValue(pod.Spec.Containers[0].Env, "RUNTIME_SOCKET"))
-	require.Equal(t, "overlayfs", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_SNAPSHOTTER"))
-	require.Equal(t, "/var/lib/kubelet", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_KUBELET_ROOT"))
+	require.Empty(t, envValue(pod.Spec.Containers[0].Env, "RUNTIME_SOCKET"))
+	require.Empty(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_SNAPSHOTTER"))
+	require.Empty(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_KUBELET_ROOT"))
+	require.Empty(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RESOURCE_CPU"))
+	require.Empty(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RESOURCE_MEMORY"))
+	require.Empty(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RESOURCE_PIDS"))
+	require.Empty(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_WARM_IMAGES"))
+	require.Equal(t, fastletsettings.MountPath, envValue(pod.Spec.Containers[0].Env, fastletsettings.EnvDir))
+	require.NotNil(t, pod.Annotations["fast-sandbox.io/settings-revision"])
+	require.NotNil(t, volumeMountForContainer(pod, 0, fastletsettings.VolumeName))
 	require.Equal(t, runtimePlan.Revision, pod.Annotations["fast-sandbox.io/runtime-plan-revision"])
 	require.NotEmpty(t, pod.Annotations[placement.AnnotationPodTemplateHash])
 	require.Equal(t, shortRevision(pod.Annotations["fast-sandbox.io/infra-revision"]), pod.Labels["fast-sandbox.io/infra-revision"])
 	require.Equal(t, ":5758", envValue(pod.Spec.Containers[0].Env, "FASTLET_CONTROL_PORT"))
-	require.JSONEq(t, `["alpine:latest","ubuntu:24.04"]`, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_WARM_IMAGES"))
 	require.NotNil(t, pod.Spec.Containers[0].ReadinessProbe)
 	require.Equal(t, "/readyz", pod.Spec.Containers[0].ReadinessProbe.HTTPGet.Path)
 	require.Equal(t, int32(5758), pod.Spec.Containers[0].ReadinessProbe.HTTPGet.Port.IntVal)
@@ -917,6 +922,57 @@ registries:
 	compiled, err := registryconfig.ParseCompiled(projected.Data[registryconfig.SecretKey])
 	require.NoError(t, err)
 	require.Equal(t, second.Revision, compiled.Revision)
+}
+
+func TestEnsureFastletSettingsConfigMapIsContentAddressed(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	pool := &apiv1alpha2.SandboxPool{
+		TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha2.GroupVersion.String(), Kind: "SandboxPool"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "tenant-a", UID: types.UID("pool-uid")},
+		Spec: apiv1alpha2.SandboxPoolSpec{
+			Runtime:            apiv1alpha2.RuntimeContainer,
+			MaxSandboxesPerPod: 5,
+			WarmImages:         []string{"alpine:latest"},
+			SandboxResources:   testSandboxResources(),
+			FastletTemplate:    corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}}}},
+		},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool).Build()
+	reconciler := &SandboxPoolReconciler{
+		Client: k8sClient, Scheme: scheme, Catalog: runtimecatalog.Builtin(),
+		FastletProxyImage: "fastlet-proxy:test",
+	}
+
+	settings := buildFastletSettings(pool)
+	require.NoError(t, reconciler.ensureFastletSettingsConfigMap(context.Background(), pool, settings))
+	require.NoError(t, reconciler.ensureFastletSettingsConfigMap(context.Background(), pool, settings))
+
+	revision, err := settings.Revision()
+	require.NoError(t, err)
+	var projected corev1.ConfigMap
+	require.NoError(t, k8sClient.Get(context.Background(), client.ObjectKey{
+		Namespace: "tenant-a", Name: settingsConfigMapName(pool.Name, revision),
+	}, &projected))
+	require.Equal(t, `["alpine:latest"]`, projected.Data[fastletsettings.WarmImagesKey])
+	require.JSONEq(t, `[]`, projected.Data[fastletsettings.ActionHandlersKey])
+	require.JSONEq(t, `{"cpu":"1","memory":"512Mi","pids":256}`, projected.Data[fastletsettings.ResourceProfileKey])
+	require.Equal(t, revision, projected.Annotations["fast-sandbox.io/settings-revision"])
+	require.NotNil(t, projected.Immutable)
+	require.True(t, *projected.Immutable)
+
+	pool.Spec.WarmImages = append(pool.Spec.WarmImages, "busybox:latest")
+	updated := buildFastletSettings(pool)
+	updatedRevision, err := updated.Revision()
+	require.NoError(t, err)
+	require.NotEqual(t, revision, updatedRevision)
+	require.NoError(t, reconciler.ensureFastletSettingsConfigMap(context.Background(), pool, updated))
+	var rolled corev1.ConfigMap
+	require.NoError(t, k8sClient.Get(context.Background(), client.ObjectKey{
+		Namespace: "tenant-a", Name: settingsConfigMapName(pool.Name, updatedRevision),
+	}, &rolled))
+	require.Equal(t, `["alpine:latest","busybox:latest"]`, rolled.Data[fastletsettings.WarmImagesKey])
 }
 
 func testSandboxResources() apiv1alpha2.SandboxResourceProfile {

@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +18,7 @@ import (
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	"fast-sandbox/internal/controlplane/placement"
 	"fast-sandbox/internal/fastlet/podcgroup"
+	"fast-sandbox/internal/fastletsettings"
 	"fast-sandbox/internal/nodecleanup"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	"fast-sandbox/internal/registryconfig"
@@ -162,6 +162,10 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 	if err := r.ensureRuntimePlanConfigMap(ctx, &pool, runtimePlan); err != nil {
+		return ctrl.Result{}, err
+	}
+	settings := buildFastletSettings(&pool)
+	if err := r.ensureFastletSettingsConfigMap(ctx, &pool, settings); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -666,14 +670,12 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 	annotations["fast-sandbox.io/runtime-plan-revision"] = runtimePlan.Revision
 	annotations["fast-sandbox.io/resource-profile-hash"] = sandboxResources.Hash()
 	annotations["fast-sandbox.io/infra-revision"] = infraPlan.Revision
-	warmImagesJSON, err := json.Marshal(uniqueWarmImages(pool.Spec.WarmImages))
+	settings := buildFastletSettings(pool)
+	settingsRevision, err := settings.Revision()
 	if err != nil {
-		return nil, fmt.Errorf("encode warmImages: %w", err)
+		return nil, fmt.Errorf("compute Fastlet settings revision: %w", err)
 	}
-	actionHandlersJSON, err := json.Marshal(pool.Spec.ActionHandlers)
-	if err != nil {
-		return nil, fmt.Errorf("encode actionHandlers: %w", err)
-	}
+	annotations["fast-sandbox.io/settings-revision"] = settingsRevision
 
 	podSpec := pool.Spec.FastletTemplate.Spec.DeepCopy()
 	podSpec.HostNetwork = false
@@ -710,8 +712,7 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 		c.Env = append(c.Env,
 			corev1.EnvVar{Name: "FASTLET_CONTROL_PORT", Value: ":5758"},
 			corev1.EnvVar{Name: "FASTLET_PROXY_CONTROL_SOCKET", Value: "/run/fast-sandbox/proxy/control.sock"},
-			corev1.EnvVar{Name: "FAST_SANDBOX_WARM_IMAGES", Value: string(warmImagesJSON)},
-			corev1.EnvVar{Name: "FAST_SANDBOX_ACTION_HANDLERS", Value: string(actionHandlersJSON)},
+			corev1.EnvVar{Name: "FAST_SANDBOX_SETTINGS_DIR", Value: fastletsettings.MountPath},
 			corev1.EnvVar{
 				Name:      "NODE_NAME",
 				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}},
@@ -753,15 +754,9 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 				Value: profile.ProfileHash,
 			},
 			corev1.EnvVar{Name: "FAST_SANDBOX_RUNTIME_PLAN_PATH", Value: runtimeenv.PlanMountPath + "/" + runtimeenv.PlanFileName},
-			corev1.EnvVar{Name: "FAST_SANDBOX_RESOURCE_CPU", Value: sandboxResources.CPU.String()},
-			corev1.EnvVar{Name: "FAST_SANDBOX_RESOURCE_MEMORY", Value: sandboxResources.Memory.String()},
-			corev1.EnvVar{Name: "FAST_SANDBOX_RESOURCE_PIDS", Value: strconv.FormatInt(sandboxResources.PIDs, 10)},
 			corev1.EnvVar{Name: "FAST_SANDBOX_INFRA_REVISION", Value: infraPlan.Revision},
 			corev1.EnvVar{Name: "FAST_SANDBOX_INFRA_PLAN_PATH", Value: "/etc/fast-sandbox/infra/plan.json"},
 			corev1.EnvVar{Name: "FAST_SANDBOX_REGISTRY_CONFIG_PATH", Value: registryconfig.MountPath},
-			corev1.EnvVar{Name: "RUNTIME_SOCKET", Value: runtimePlan.Containerd.Socket},
-			corev1.EnvVar{Name: "FAST_SANDBOX_SNAPSHOTTER", Value: runtimePlan.Containerd.Snapshotter},
-			corev1.EnvVar{Name: "FAST_SANDBOX_KUBELET_ROOT", Value: runtimePlan.Kubelet.Root},
 			corev1.EnvVar{Name: "INFRA_DIR_IN_POD", Value: "/opt/fast-sandbox/infra"},
 		)
 		if profile.ResidualProcess != runtimecatalog.ResidualProcessNone {
@@ -773,6 +768,7 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 			corev1.VolumeMount{Name: "infra-plan", MountPath: "/etc/fast-sandbox/infra", ReadOnly: true},
 			corev1.VolumeMount{Name: "runtime-plan", MountPath: runtimeenv.PlanMountPath, ReadOnly: true},
 			corev1.VolumeMount{Name: "registry-config", MountPath: "/etc/fast-sandbox/registry", ReadOnly: true},
+			corev1.VolumeMount{Name: fastletsettings.VolumeName, MountPath: fastletsettings.MountPath, ReadOnly: true},
 			corev1.VolumeMount{Name: "proxy-control", MountPath: "/run/fast-sandbox/proxy"},
 		)
 		if profile.Driver == runtimecatalog.DriverKindContainerd {
@@ -868,6 +864,12 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 			Name: "registry-config",
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 				SecretName: registrySecretName(pool.Name),
+			}},
+		},
+		corev1.Volume{
+			Name: fastletsettings.VolumeName,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: settingsConfigMapName(pool.Name, settingsRevision)},
 			}},
 		},
 		corev1.Volume{Name: "proxy-control", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
@@ -1042,15 +1044,16 @@ func (r *SandboxPoolReconciler) boxLiteRuntimeContainer(config runtimecatalog.Bo
 
 func validatePlatformOwnedStorage(podSpec *corev1.PodSpec) error {
 	reservedVolumes := map[string]string{
-		"tmp":                "/tmp",
-		"infra-tools":        "/opt/fast-sandbox/infra",
-		"infra-plan":         "/etc/fast-sandbox/infra",
-		"runtime-plan":       runtimeenv.PlanMountPath,
-		"registry-config":    "/etc/fast-sandbox/registry",
-		"proxy-control":      "/run/fast-sandbox/proxy",
-		"node-cleanup":       filepath.Dir(nodecleanup.DefaultSocketPath),
-		"boxlite-control":    "/run/fast-sandbox/boxlite",
-		podcgroup.VolumeName: podcgroup.HostRoot,
+		"tmp":                      "/tmp",
+		"infra-tools":              "/opt/fast-sandbox/infra",
+		"infra-plan":               "/etc/fast-sandbox/infra",
+		"runtime-plan":             runtimeenv.PlanMountPath,
+		"registry-config":          "/etc/fast-sandbox/registry",
+		fastletsettings.VolumeName: fastletsettings.MountPath,
+		"proxy-control":            "/run/fast-sandbox/proxy",
+		"node-cleanup":             filepath.Dir(nodecleanup.DefaultSocketPath),
+		"boxlite-control":          "/run/fast-sandbox/boxlite",
+		podcgroup.VolumeName:       podcgroup.HostRoot,
 	}
 	for _, volume := range podSpec.Volumes {
 		if _, reserved := reservedVolumes[volume.Name]; reserved {
@@ -1182,6 +1185,25 @@ func runtimePlanConfigMapName(poolName, revision string) string {
 		poolName = strings.TrimRight(poolName[:maxPoolLength], "-.")
 	}
 	return poolName + suffix
+}
+
+func settingsConfigMapName(poolName, revision string) string {
+	suffix := "-settings-" + shortRevision(revision)
+	maxPoolLength := 253 - len(suffix)
+	if len(poolName) > maxPoolLength {
+		poolName = strings.TrimRight(poolName[:maxPoolLength], "-.")
+	}
+	return poolName + suffix
+}
+
+// buildFastletSettings projects the pool-declared declarative configuration
+// (warmImages, actionHandlers, sandboxResources) that the Fastlet consumes.
+func buildFastletSettings(pool *apiv1alpha2.SandboxPool) fastletsettings.Bundle {
+	return fastletsettings.Bundle{
+		WarmImages:      uniqueWarmImages(pool.Spec.WarmImages),
+		ActionHandlers:  pool.Spec.ActionHandlers,
+		ResourceProfile: pool.Spec.SandboxResources,
+	}
 }
 
 func registrySecretName(poolName string) string {
@@ -1475,6 +1497,61 @@ func (r *SandboxPoolReconciler) ensureRuntimePlanConfigMap(
 	return nil
 }
 
+// ensureFastletSettingsConfigMap materializes the pool-declared Fastlet
+// settings (warmImages, actionHandlers, sandboxResources) as an immutable,
+// content-addressed ConfigMap mounted into every Fastlet Pod.
+func (r *SandboxPoolReconciler) ensureFastletSettingsConfigMap(
+	ctx context.Context,
+	pool *apiv1alpha2.SandboxPool,
+	bundle fastletsettings.Bundle,
+) error {
+	files, err := bundle.Files()
+	if err != nil {
+		return fmt.Errorf("encode Fastlet settings: %w", err)
+	}
+	revision, err := bundle.Revision()
+	if err != nil {
+		return fmt.Errorf("compute Fastlet settings revision: %w", err)
+	}
+	key := client.ObjectKey{Namespace: pool.Namespace, Name: settingsConfigMapName(pool.Name, revision)}
+	var existing corev1.ConfigMap
+	err = r.Get(ctx, key, &existing)
+	if err == nil {
+		if len(existing.Data) != len(files) {
+			return fmt.Errorf("immutable Fastlet settings ConfigMap %s contains different settings", key.Name)
+		}
+		for name, value := range files {
+			if existing.Data[name] != value {
+				return fmt.Errorf("immutable Fastlet settings ConfigMap %s contains different settings", key.Name)
+			}
+		}
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+	immutable := true
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: key.Name, Namespace: key.Namespace,
+			Labels: map[string]string{
+				"fast-sandbox.io/pool":              pool.Name,
+				"fast-sandbox.io/settings-revision": shortRevision(revision),
+			},
+			Annotations: map[string]string{"fast-sandbox.io/settings-revision": revision},
+		},
+		Immutable: &immutable,
+		Data:      files,
+	}
+	if err := ctrl.SetControllerReference(pool, configMap, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.Create(ctx, configMap); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create immutable Fastlet settings ConfigMap: %w", err)
+	}
+	return nil
+}
+
 func (r *SandboxPoolReconciler) preparedFastletCount(pool *apiv1alpha2.SandboxPool, revision string) int32 {
 	if r.Registry == nil {
 		return 0
@@ -1501,6 +1578,7 @@ var runtimeOwnedEnv = map[string]struct{}{
 	"FAST_SANDBOX_WARM_IMAGES":     {},
 	"FAST_SANDBOX_ACTION_HANDLERS": {},
 	"FAST_SANDBOX_ACTIONS":         {},
+	"FAST_SANDBOX_SETTINGS_DIR":    {},
 	"NODE_NAME":                    {}, "POD_NAME": {}, "POD_IP": {}, "POD_UID": {}, "NAMESPACE": {},
 }
 
