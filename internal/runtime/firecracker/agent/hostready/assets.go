@@ -16,8 +16,9 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// Firecracker asset pins (the release the runtime plan and the kernel the
-// guest expect; must match the removed config/runtime-installers pins).
+// Firecracker asset pins: the release the runtime plan points at
+// (config/runtime-environments.yaml binaryPath/kernelPath) and the guest
+// kernel the snapshots bake.
 const (
 	// DefaultFCVersion is the pinned Firecracker release.
 	DefaultFCVersion = "v1.16.1"

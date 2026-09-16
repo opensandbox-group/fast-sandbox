@@ -1,18 +1,18 @@
-// Package main — config.go: the agent's file-based configuration. All
-// tunables live in one YAML file (the fast-sandbox-firecracker-runtime-
-// config ConfigMap, mounted at /etc/fast-sandbox/agent-config/agent.yaml);
-// the environment carries only the pod-runtime identities injected by the
-// Downward API (POD_UID, FAST_SANDBOX_NODE_NAME, FAST_SANDBOX_NODE_IP) and
-// the config path itself.
+// config.go — the agent's file-based configuration. All tunables live in
+// one YAML file (the fast-sandbox-firecracker-runtime-config ConfigMap,
+// mounted at /etc/fast-sandbox/agent-config/agent.yaml); the environment
+// carries only the pod-runtime identities injected by the Downward API
+// (POD_UID, FAST_SANDBOX_NODE_NAME, FAST_SANDBOX_NODE_IP) and the config
+// path itself.
 //
-// Reload semantics: the socket/state/registry/dart sections are read once
-// at startup (they wire long-lived resources — changing them needs a pod
-// restart); the nodeReadiness section is re-read before every recheck pass,
-// so threshold/interval/asset-source edits land through the mounted
-// ConfigMap without a restart. Changing fcVersion/kernelURL takes effect
-// on the next pass only if the assets do not already verify in
-// assetsDir (a pinned install is never silently replaced — point
-// assetsDir elsewhere or clear it).
+// Reload semantics: the socket/state/registry/hostnameFile/dart sections
+// are read once at startup (they wire long-lived resources — changing
+// them needs a pod restart); the nodeReadiness section is re-read before
+// every recheck pass, so threshold/interval/asset-source edits land
+// through the mounted ConfigMap without a restart. Changing
+// fcVersion/kernelURL takes effect on the next pass only if the assets
+// do not already verify in assetsDir (a pinned install is never silently
+// replaced — point assetsDir elsewhere or clear it).
 package main
 
 import (
@@ -126,13 +126,7 @@ func (c *agentConfig) fillDefaults() {
 	}
 	// nodeReadiness.kernelURL stays empty by default: the installer uses
 	// the pinned x86_64 Amazon CI kernel (the only supported arch).
-	if c.NodeReadiness.Interval == "" {
-		c.NodeReadiness.Interval = "5m"
-	}
-	if c.NodeReadiness.MinFree == "" {
-		c.NodeReadiness.MinFree = "10GiB"
-	}
-	if c.NodeReadiness.MinMemory == "" {
-		c.NodeReadiness.MinMemory = "2GiB"
-	}
+	// minFree/minMemory/interval are resolved by the readiness settings
+	// loader against the hostready package defaults — no duplicated
+	// default literals here.
 }

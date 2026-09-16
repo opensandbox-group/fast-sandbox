@@ -1126,7 +1126,9 @@ controller_up() {
 # the readiness labels the agent applies after checking the host and
 # installing the firecracker assets)
 
-# --- task 6: agent DaemonSet ----------------------------------------------------------------
+# --- task 5: firecracker node assets + runtime DaemonSet --------------------
+# (the agent readiness loop installs the firecracker assets and applies
+# the node labels; this task also waits for both per node)
 node_label_ready() { # node — the agent-applied firecracker scheduling label
 	[[ "$(kubectl get node "$1" -o jsonpath='{.metadata.labels.fast-sandbox\.io/firecracker-node}')" == "true" ]]
 }
@@ -1147,7 +1149,7 @@ agent_up() {
 	# node-cleanup control socket and double-sweep the same resources.
 	# (Left here by a previous e2e-env setup on a reused cluster.)
 	kubectl -n "$NS" delete daemonset/fast-sandbox-janitor --ignore-not-found >/dev/null 2>&1 || true
-	wait_for "runtime-agent DaemonSet ready" 120 \
+	wait_for "firecracker-runtime DaemonSet ready" 120 \
 		kubectl -n "$NS" rollout status daemonset/firecracker-runtime --timeout=10s
 
 	# Node readiness (the agent's own duty): every node must be labeled by
@@ -1189,7 +1191,7 @@ agent_up() {
 		wait_for "dart roster full on $node ($expected_members members)" 90 \
 			dart_roster_ready "$pod" "$expected_members"
 	done
-	pass "runtime-agent healthy (UDS /v1/health) + DART daemons up, roster=$expected_members"
+	pass "firecracker-runtime agent healthy (UDS /v1/health) + DART daemons up, roster=$expected_members"
 }
 
 # --- task 7: SandboxTemplate build -----------------------------------------------------------
@@ -4899,7 +4901,7 @@ case "$ACTION" in
 		run_stage "task 3: MinIO endpoint (kind network)" resolve_minio_endpoint
 		run_stage "task 4: CRDs + controller" controller_up
 		run_stage "task 3: credentials (publish/pull)" credentials_up
-		run_stage "task 5: firecracker node assets + runtime-agent DaemonSet" agent_up
+		run_stage "task 5: firecracker node assets + runtime DaemonSet" agent_up
 		run_stage "task 7: SandboxTemplate build" template_up
 		run_stage "task 8: SandboxPool + warmImages" pool_up
 		trap - ERR

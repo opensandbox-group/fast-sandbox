@@ -149,4 +149,3 @@ func reflinkProbe(dir string) (bool, error) {
 	}
 	return true, nil
 }
-

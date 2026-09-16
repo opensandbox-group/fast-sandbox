@@ -16,8 +16,11 @@ func TestLoadAgentConfigMissingFileYieldsDefaults(t *testing.T) {
 	require.Equal(t, "/etc/hostname", config.HostnameFile)
 	require.Empty(t, config.Dart.Addr, "dart must default to disabled (direct S3)")
 	require.False(t, config.NodeReadiness.Enabled)
-	require.Equal(t, "5m", config.NodeReadiness.Interval)
-	require.Equal(t, "10GiB", config.NodeReadiness.MinFree)
+	// Thresholds/interval resolve against the hostready package defaults
+	// in the settings loader; the raw config stays empty.
+	require.Empty(t, config.NodeReadiness.Interval)
+	require.Empty(t, config.NodeReadiness.MinFree)
+	require.Empty(t, config.NodeReadiness.MinMemory)
 }
 
 func TestLoadAgentConfigParsesAndFillsDefaults(t *testing.T) {
@@ -44,7 +47,6 @@ nodeReadiness:
 	require.True(t, config.NodeReadiness.Enabled)
 	require.Equal(t, "30s", config.NodeReadiness.Interval)
 	require.Equal(t, "5GiB", config.NodeReadiness.MinFree)
-	require.Equal(t, "2GiB", config.NodeReadiness.MinMemory, "omitted threshold must default")
 }
 
 func TestLoadAgentConfigInvalidYAMLFails(t *testing.T) {

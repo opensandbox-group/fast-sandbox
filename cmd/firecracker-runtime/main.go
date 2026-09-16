@@ -133,29 +133,19 @@ func run() error {
 	// injects spec.nodeName, so in-cluster deployments run the readiness
 	// loop while bare-process runs (chain E2E) stay check-free. The
 	// nodeReadiness section is re-read before every pass (hot reload of
-	// thresholds/interval/asset source through the mounted ConfigMap).
+	// thresholds/interval/asset source through the mounted ConfigMap), so
+	// the static config below only seeds the manager until the first
+	// reload.
 	var hostReadyManager *agenthostready.Manager
 	if nodeName := getEnv("FAST_SANDBOX_NODE_NAME", ""); nodeName != "" && config.NodeReadiness.Enabled {
 		hostReadyManager = agenthostready.NewManager(agenthostready.ManagerConfig{
 			NodeName: nodeName,
 			Client:   newNodeClient(),
-			Check: agenthostready.CheckConfig{
-				StateRoot: stateRoot,
-				AssetsDir: config.NodeReadiness.AssetsDir,
-			},
-			Assets: &agenthostready.AssetConfig{
-				Dir:       config.NodeReadiness.AssetsDir,
-				FCVersion: config.NodeReadiness.FCVersion,
-				KernelURL: config.NodeReadiness.KernelURL,
-			},
-			Interval: hostReadyInterval(config.NodeReadiness.Interval),
 			Settings: readinessSettings(configPath, stateRoot),
 		})
 		serviceOptions = append(serviceOptions, agentserver.WithHostReadyProbe(hostReadyManager.Health))
 		klog.InfoS("node readiness manager enabled", "node", nodeName,
-			"assetsDir", config.NodeReadiness.AssetsDir,
-			"interval", config.NodeReadiness.Interval,
-			"config", configPath)
+			"assetsDir", config.NodeReadiness.AssetsDir, "config", configPath)
 	}
 
 	pull := &livePullClient{config: storeConfig, registry: registryProvider, options: pullOptions}
@@ -314,11 +304,14 @@ func newNodeClient() agenthostready.NodeClient {
 
 // readinessSettings builds the hot-reload callback: the mounted config
 // file is re-read before every readiness pass, so nodeReadiness edits
-// (thresholds, interval, asset source) land without a restart. The check
-// StateRoot is pinned to the startup value — the pull layer serves the
-// startup StateRoot and the readiness check must judge the same tree.
-// An invalid nodeReadiness section surfaces as a reload error (the
-// manager keeps the previous settings and logs).
+// (thresholds, interval, asset source) land without a restart. It seeds
+// the whole manager config (the manager treats the Settings func as the
+// source of truth), with two pins:
+//   - the check StateRoot is forced to the startup value: the pull layer
+//     serves the startup StateRoot and the readiness check must judge the
+//     same tree;
+//   - an invalid nodeReadiness value surfaces as a reload error (the
+//     manager keeps the previous settings and logs), never a crash.
 func readinessSettings(configPath, stateRoot string) func() (agenthostready.Settings, error) {
 	return func() (agenthostready.Settings, error) {
 		config, err := loadAgentConfig(configPath)
@@ -326,17 +319,23 @@ func readinessSettings(configPath, stateRoot string) func() (agenthostready.Sett
 			return agenthostready.Settings{}, err
 		}
 		readiness := config.NodeReadiness
-		minFree, err := agenthostready.ParseBytes(readiness.MinFree)
-		if err != nil {
-			return agenthostready.Settings{}, fmt.Errorf("nodeReadiness.minFree: %w", err)
+		minFree := agenthostready.DefaultMinFreeBytes
+		if readiness.MinFree != "" {
+			if minFree, err = agenthostready.ParseBytes(readiness.MinFree); err != nil {
+				return agenthostready.Settings{}, fmt.Errorf("nodeReadiness.minFree: %w", err)
+			}
 		}
-		minMemory, err := agenthostready.ParseBytes(readiness.MinMemory)
-		if err != nil {
-			return agenthostready.Settings{}, fmt.Errorf("nodeReadiness.minMemory: %w", err)
+		minMemory := agenthostready.DefaultMinMemBytes
+		if readiness.MinMemory != "" {
+			if minMemory, err = agenthostready.ParseBytes(readiness.MinMemory); err != nil {
+				return agenthostready.Settings{}, fmt.Errorf("nodeReadiness.minMemory: %w", err)
+			}
 		}
-		interval, err := time.ParseDuration(readiness.Interval)
-		if err != nil || interval <= 0 {
-			return agenthostready.Settings{}, fmt.Errorf("nodeReadiness.interval %q: expected a positive duration like 5m", readiness.Interval)
+		var interval time.Duration
+		if readiness.Interval != "" {
+			if interval, err = time.ParseDuration(readiness.Interval); err != nil || interval <= 0 {
+				return agenthostready.Settings{}, fmt.Errorf("nodeReadiness.interval %q: expected a positive duration like 5m", readiness.Interval)
+			}
 		}
 		return agenthostready.Settings{
 			Check: agenthostready.CheckConfig{
@@ -353,19 +352,6 @@ func readinessSettings(configPath, stateRoot string) func() (agenthostready.Sett
 			Interval: interval,
 		}, nil
 	}
-}
-
-// hostReadyInterval parses the configured recheck cadence ("" or invalid
-// = 0, which the manager resolves to its default).
-func hostReadyInterval(value string) time.Duration {
-	if value == "" {
-		return 0
-	}
-	interval, err := time.ParseDuration(value)
-	if err != nil || interval <= 0 {
-		return 0
-	}
-	return interval
 }
 
 func hostnameOrEmpty() string {
