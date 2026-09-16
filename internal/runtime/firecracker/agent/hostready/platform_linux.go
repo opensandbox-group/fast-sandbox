@@ -54,7 +54,9 @@ func kernelRelease() (string, error) {
 	if err := unix.Uname(&uts); err != nil {
 		return "", err
 	}
-	return charsToString(uts.Release[:]), nil
+	// Utsname fields are [65]byte on linux (int8 on some other GOOSes):
+	// trim the NUL padding.
+	return strings.TrimRight(string(uts.Release[:]), "\x00"), nil
 }
 
 // cpuFlags parses the flag lines out of /proc/cpuinfo (x86 "flags",
@@ -148,19 +150,3 @@ func reflinkProbe(dir string) (bool, error) {
 	return true, nil
 }
 
-// charsToString renders a NUL-padded int8 array (Utsname fields).
-func charsToString(chars []int8) string {
-	length := 0
-	for length < len(chars) && chars[length] != 0 {
-		length++
-	}
-	return string([]byte(stringOfInt8(chars[:length])))
-}
-
-func stringOfInt8(chars []int8) string {
-	bytes := make([]byte, len(chars))
-	for i, char := range chars {
-		bytes[i] = byte(char)
-	}
-	return string(bytes)
-}
