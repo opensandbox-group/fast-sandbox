@@ -62,9 +62,11 @@ metadata:
     component: firecracker-runtime
 rules:
 - apiGroups: [""]
-  resources: ["nodes"]
+  resources: ["nodes", "nodes/status"]
   # The readiness manager reads the node to diff its labels/condition and
-  # patches metadata + the status subresource.
+  # patches metadata + the status subresource (the FirecrackerReady
+  # condition lives under nodes/status, a separate RBAC resource from
+  # plain nodes).
   verbs: ["get", "list", "watch", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
