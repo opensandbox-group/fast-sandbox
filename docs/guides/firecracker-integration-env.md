@@ -81,6 +81,7 @@ root-cause read) or `NOT REPRODUCED` (API fully usable).
 | controller | Deployment (1 replica) | control plane | CRDs + RBAC + route-keys; Fast-Path gRPC :9090 |
 | builder Pod | Job (on-demand) | either KVM node | /dev/kvm, /dev/net/tun, self-mknod loop devices, publish creds |
 | firecracker-runtime | DaemonSet (per-node, **all nodes**) | every node (labels itself) | host-readiness loop: KVM/TUN/kernel/storage checks + firecracker asset install (v1.16.1 + jailer + kernel) + applies the scheduling labels + FirecrackerReady condition; **cluster network** (not hostNetwork); UDS socket + StateRoot shared with fastlets; MinIO pull creds; orchestrates the dart child |
+| node janitor (sidecar) | container in the firecracker-runtime pod | same pods | sweeps fastlet netns/tap/veth orphans + leaked VMM processes (hostPID; fastlets delegate over the node-cleanup UDS socket); containerd backend disabled here (the standalone config/janitor DaemonSet covers containerd runtimes) |
 | DART daemon | agent child process ×2 | inside each agent | prefix cache API :8145 (loopback), admin/metrics :8147, peer :9000 (pod IP); cache `cache/dart-<node>` under the shared StateRoot |
 | fastlet Pod | pool-managed Pod ×2 | one per node (anti-affinity) | profile hostPaths auto-injected; agent socket; registry plan |
 | firecracker VM | per-sandbox microVM | inside fastlet netns | golden restore, guest eth0 172.30.0.3, execd :44772 |
