@@ -6,9 +6,8 @@
 # publish MinIO → node runtime-agent (DaemonSet) → fastlet sandbox restore →
 # execd /ping delivery verification.
 #
-# See docs/guides/firecracker-integration-environment.md and
-# docs/design/firecracker-integration-environment-plan.md (this script is
-# the "one-click" task 10 of the plan).
+# See docs/guides/firecracker-integration-env.md for the deployment guide and
+# production notes for this environment.
 #
 # Usage:
 #   ./scripts/integration-env.sh up            # full environment + chain
@@ -2411,7 +2410,6 @@ verify_execd_api() {
 # phase (SET_BINDING binding.input / LIFECYCLE_HOOK / REMOVE_BINDING); the
 # credential channel (proxy route / UID / vault) is deferred. Requires the
 # requirement-owned egress image loaded into Kind.
-# See docs/design/egress-integration-plan.md / egress-integration-plan-tasks.md.
 EGRESS_POOL="firecracker-egress-pool"
 EGRESS_IMAGE="docker.io/opensandbox/egress:latest"
 EGRESS_SBX="sandbox-egress"

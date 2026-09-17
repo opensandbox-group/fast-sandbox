@@ -4,12 +4,9 @@ SandboxTemplate turns an OCI image into a **Firecracker golden image**: a
 converted rootfs plus a validated full snapshot, published to an S3-compatible
 object store. The Firecracker runtime consumes the artifacts on demand
 (`SandboxSpec.Image` → index → manifest → digest-verified pull → restore), so
-this is the build-time half of the [on-demand loading
-design](../design/firecracker-on-demand-loading.md).
+the template is the build-time half of on-demand loading.
 
-The design and artifact contract live in
-[sandboxtemplate-golden-image-builds.md](../design/sandboxtemplate-golden-image-builds.md);
-this guide covers operating the resource end to end.
+This guide covers operating the resource end to end.
 
 ## End-to-end workflow
 
@@ -243,7 +240,5 @@ manifest.json}` (native filename mapping: `rootfs.ext4` → `rootfs.img`).
 
 ## See also
 
-- [Design: SandboxTemplate golden-image builds](../design/sandboxtemplate-golden-image-builds.md)
-- [Design: Firecracker on-demand loading](../design/firecracker-on-demand-loading.md)
 - [E2E: golden-image builder](sandboxtemplate-golden-image-e2e.md)
 - [Reference: API](../reference/api.md) (SandboxTemplate CRD fields)

@@ -21,7 +21,7 @@
 #   fast-sandbox.io/firecracker-node=true (fastlet pools)
 # scripts/firecracker-host-check.sh verifies a bare host before install.
 #
-# See docs/guides/firecracker-integration-environment.md.
+# See docs/guides/firecracker-integration-env.md.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 name: firecracker

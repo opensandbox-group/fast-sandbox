@@ -1,10 +1,9 @@
 # Firecracker full-chain E2E (builder → S3 → runtime-agent → driver restore)
 
 Reference environment and results for `scripts/firecracker-chain-e2e.sh` —
-the stage-1 closeout of the
-[Firecracker on-demand loading](../design/firecracker-on-demand-loading.md)
-design. Every component runs for real: the builder publishes through MinIO,
-the runtime-agent pulls over the wire (SigV4 + credential mapping), and the
+the stage-1 closeout of the Firecracker on-demand loading design. Every
+component runs for real: the builder publishes through MinIO, the
+runtime-agent pulls over the wire (SigV4 + credential mapping), and the
 driver restores from the pulled artifacts.
 
 ```text

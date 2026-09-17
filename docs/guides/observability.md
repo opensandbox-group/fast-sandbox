@@ -2,6 +2,33 @@
 
 Fast Sandbox uses Prometheus metrics for bounded SLO signals, OpenTelemetry traces for cross-process causality, and structured logs for lifecycle identity.
 
+## Logging conventions
+
+All services log through `k8s.io/klog/v2`. One style applies everywhere:
+
+- Messages are constant strings starting lowercase, with no trailing
+  punctuation. Values never interpolate into the message; they travel as
+  key-value pairs (`klog.InfoS("firecracker agent pull completed", "image", ref)`).
+- Call-site keys are camelCase (`sandboxName`, `attempt`). The error value
+  of `ErrorS` is always the first argument, and a secondary `err` key, when
+  present, is always last.
+- Debug details use `klog.V(2)` / `klog.V(4)`; warnings use `klog.Warningf`
+  (klog has no structured warning call).
+- Code running inside request or reconcile scopes logs through the
+  contextual logger (`klog.FromContext(ctx).Info(...)` / `.Error(err, ...)`)
+  so injected identity fields ride along.
+- `fastctl` logs via klog (`klog.V(4).InfoS` for tracing, `klog.ErrorS` for
+  failures), prints user-facing results with `fmt`, and terminates through
+  `exitWithError` / `exitWithErrorf` so klog and OTLP buffers flush before
+  `os.Exit`.
+- Self-contained node binaries (`sandbox-init`, `sandbox-tunnel`,
+  `boxlite-runtime`) intentionally use `fmt.Fprintln(os.Stderr, ...)` on
+  their startup failure paths instead of pulling in klog.
+
+Lifecycle identity keys injected by `internal/observability` are the
+exception to camelCase: they are snake_case and mirror the span attributes
+one-to-one (see the table below). Do not rename them at call sites.
+
 ## Trace propagation
 
 Processes propagate W3C Trace Context through `traceparent` and `tracestate`. Baggage is not propagated.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# firecracker-chain-e2e.sh — full-chain E2E (stage-1 closeout,
-# docs/design/firecracker-chain-e2e-plan.md): builder publish -> real MinIO
+# firecracker-chain-e2e.sh — full-chain E2E (stage-1 closeout of the
+# Firecracker on-demand loading design): builder publish -> real MinIO
 # -> runtime-agent pull -> driver golden restore -> guest reachability ->
 # idempotency + cleanup. No component is faked: the builder image, the MinIO
 # store, the firecracker-runtime binary, and the Firecracker driver
