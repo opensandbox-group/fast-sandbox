@@ -1,6 +1,6 @@
 package agent
 
-// Published manifest (design details doc §1.3): the content-addressed file
+// Published manifest: the content-addressed file
 // list of one build, downloaded at index.manifestRef and verified against
 // index.artifactDigest before any artifact is pulled.
 
@@ -44,7 +44,7 @@ type nativeFile struct {
 }
 
 // nativeArtifactNames maps published artifact names to the local cache
-// names (implementation plan §5). rootfs.ext4 is renamed to rootfs.img so
+// names. rootfs.ext4 is renamed to rootfs.img so
 // the existing resolveRootfsImage consumer needs no change; the rest keep
 // their published names. OverlayBD layers are deliberately absent: they
 // arrive with the overlaybd stage.

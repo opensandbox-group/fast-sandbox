@@ -83,7 +83,7 @@ type Slot struct {
 	// this single address (per-clone clone model); it is applied per restore
 	// by the runtime driver (ApplyGuest) because slots are prepared before
 	// the image is known. The persisted value drives teardown.
-	GuestIP string `json:"guestIP,omitempty"`
+	GuestIP      string           `json:"guestIP,omitempty"`
 	Address      string           `json:"address"`
 	IP           string           `json:"ip"`
 	Gateway      string           `json:"gateway"`

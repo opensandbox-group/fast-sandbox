@@ -220,7 +220,7 @@ func doFastletJSON[Response any](c *FastletClient, request *http.Request) (*Resp
 		return &result, failure
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return &result, fmt.Errorf("Fastlet request failed with status: %d", response.StatusCode)
+		return &result, fmt.Errorf("fastlet request failed with status: %d", response.StatusCode)
 	}
 	return &result, nil
 }

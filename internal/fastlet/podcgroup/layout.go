@@ -81,7 +81,7 @@ func Discover(root, podUID string) (Layout, error) {
 	sort.Strings(found)
 	for _, path := range found[1:] {
 		if path != found[0] {
-			return Layout{}, fmt.Errorf("Pod UID %q has inconsistent cgroup v1 paths %q and %q", podUID, found[0], path)
+			return Layout{}, fmt.Errorf("pod UID %q has inconsistent cgroup v1 paths %q and %q", podUID, found[0], path)
 		}
 	}
 	return newLayout(VersionV1, found[0]), nil
@@ -198,7 +198,7 @@ func validatePodUID(uid string) error {
 		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '-' {
 			continue
 		}
-		return fmt.Errorf("Pod UID %q contains an invalid character", uid)
+		return fmt.Errorf("pod UID %q contains an invalid character", uid)
 	}
 	return nil
 }
@@ -246,7 +246,7 @@ func discoverInHierarchy(root, podUID string) (string, error) {
 	}
 	sort.Strings(matches)
 	if len(matches) > 1 {
-		return "", fmt.Errorf("Pod UID %q matches multiple cgroups below %q: %v", podUID, root, matches)
+		return "", fmt.Errorf("pod UID %q matches multiple cgroups below %q: %v", podUID, root, matches)
 	}
 	return matches[0], nil
 }

@@ -38,7 +38,7 @@ func main() {
 	klog.InitFlags(nil)
 	flag.Parse()
 	defer klog.Flush()
-	klog.InfoS("Starting sandbox fastlet")
+	klog.InfoS("starting sandbox fastlet")
 	traceShutdown, err := observability.Configure(context.Background(), "fast-sandbox-fastlet")
 	if err != nil {
 		klog.ErrorS(err, "Configure OpenTelemetry")
@@ -91,10 +91,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	klog.InfoS("Fastlet starting",
+	klog.InfoS("fastlet starting",
 		"podName", podName, "podIP", podIP, "nodeName", nodeName,
 		"namespace", namespace, "capacity", capacityFromEnvironment())
-	klog.InfoS("Runtime resolved", "runtime", runtimeName, "socket", runtimeSocket, "settingsDir", settingsDir)
+	klog.InfoS("runtime resolved", "runtime", runtimeName, "socket", runtimeSocket, "settingsDir", settingsDir)
 
 	ctx := context.Background()
 	var rt runtimecontract.Driver
@@ -131,7 +131,7 @@ func main() {
 		klog.ErrorS(err, "Failed to load Registry configuration")
 		os.Exit(1)
 	} else {
-		klog.InfoS("Registry configuration loaded", "revision", revision)
+		klog.InfoS("registry configuration loaded", "revision", revision)
 	}
 	if configurable, ok := rt.(registryConfigurable); ok {
 		configurable.SetRegistryProvider(registryProvider)
@@ -163,7 +163,7 @@ func main() {
 			os.Exit(1)
 		}
 		configurable.SetNetworkManager(networkManager)
-		klog.InfoS("Fastlet-owned network initialized", "capacity", networkManager.Snapshot().Capacity, "cleanSlots", networkManager.Snapshot().Clean)
+		klog.InfoS("fastlet-owned network initialized", "capacity", networkManager.Snapshot().Capacity, "cleanSlots", networkManager.Snapshot().Clean)
 	}
 	infraRevision := getEnv("FAST_SANDBOX_INFRA_REVISION", "")
 	infraManager, err := newInfraManager(
@@ -185,7 +185,7 @@ func main() {
 	}
 	infraConfigurable.SetInfraManager(infraManager)
 
-	klog.InfoS("Runtime initialized successfully", "name", runtimeName)
+	klog.InfoS("runtime initialized successfully", "name", runtimeName)
 
 	proxyControlClient := fastletproxy.NewControlClient(getEnv("FASTLET_PROXY_CONTROL_SOCKET", fastletproxy.DefaultControlSocket))
 	sandboxManager, err := fastletsandbox.NewSandboxManagerWithConfig(rt, fastletsandbox.SandboxManagerConfig{
@@ -206,7 +206,7 @@ func main() {
 	go recoverUntilReady(ctx, sandboxManager, proxyControlClient)
 
 	fastletServer := server.NewFastletServer(fastletPort, sandboxManager)
-	klog.InfoS("Starting Fastlet HTTP Server", "port", fastletPort)
+	klog.InfoS("starting fastlet HTTP server", "port", fastletPort)
 
 	if err := fastletServer.Start(); err != nil {
 		klog.ErrorS(err, "Fastlet server failed")
@@ -257,7 +257,7 @@ func tuneNeighborGCThresholds() {
 	} {
 		argument := fmt.Sprintf("%s=%d", tuning.name, tuning.value)
 		if output, err := exec.Command("sysctl", "-w", argument).CombinedOutput(); err != nil {
-			klog.Warningf("raise %s failed: %v: %s", tuning.name, err, strings.TrimSpace(string(output)))
+			klog.Warningf("raise sysctl %s failed: %v: %s", tuning.name, err, strings.TrimSpace(string(output)))
 		}
 	}
 }
@@ -284,7 +284,7 @@ type agentClientConfigurable interface {
 func recoverUntilReady(ctx context.Context, manager *fastletsandbox.SandboxManager, proxyClient *fastletproxy.ControlClient) {
 	for attempt := 1; ; attempt++ {
 		if err := manager.Recover(ctx); err == nil {
-			klog.InfoS("Fastlet runtime recovery completed")
+			klog.InfoS("fastlet runtime recovery completed")
 			go warmCacheUntilReady(ctx, manager)
 			go prepareInfraUntilReady(ctx, manager)
 			go watchProxyRoutes(ctx, manager, proxyClient)
@@ -292,7 +292,7 @@ func recoverUntilReady(ctx context.Context, manager *fastletsandbox.SandboxManag
 		} else if attempt <= 1 {
 			klog.ErrorS(err, "Fastlet runtime recovery failed; readiness remains false")
 		} else {
-			klog.V(2).InfoS("Fastlet runtime recovery still failing", "consecutiveFailures", attempt, "err", err)
+			klog.V(2).InfoS("fastlet runtime recovery still failing", "consecutiveFailures", attempt, "err", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -305,12 +305,12 @@ func recoverUntilReady(ctx context.Context, manager *fastletsandbox.SandboxManag
 func warmCacheUntilReady(ctx context.Context, manager *fastletsandbox.SandboxManager) {
 	for attempt := 1; ctx.Err() == nil; attempt++ {
 		if err := manager.WarmCache(ctx); err == nil {
-			klog.InfoS("Asynchronous warmImages preparation completed")
+			klog.InfoS("asynchronous warmImages preparation completed")
 			return
 		} else if attempt <= 1 {
 			klog.ErrorS(err, "Asynchronous warmImages preparation failed; retrying")
 		} else {
-			klog.V(2).InfoS("Asynchronous warmImages preparation still failing", "consecutiveFailures", attempt, "err", err)
+			klog.V(2).InfoS("asynchronous warmImages preparation still failing", "consecutiveFailures", attempt, "err", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -323,12 +323,12 @@ func warmCacheUntilReady(ctx context.Context, manager *fastletsandbox.SandboxMan
 func prepareInfraUntilReady(ctx context.Context, manager *fastletsandbox.SandboxManager) {
 	for attempt := 1; ctx.Err() == nil; attempt++ {
 		if err := manager.PrepareInfra(ctx); err == nil {
-			klog.InfoS("Fastlet Infra Component preparation completed")
+			klog.InfoS("fastlet infra component preparation completed")
 			return
 		} else if attempt <= 1 {
 			klog.ErrorS(err, "Fastlet Infra Component preparation failed; revision admission remains disabled")
 		} else {
-			klog.V(2).InfoS("Fastlet Infra Component preparation still failing", "consecutiveFailures", attempt, "err", err)
+			klog.V(2).InfoS("fastlet infra component preparation still failing", "consecutiveFailures", attempt, "err", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -369,7 +369,7 @@ func newInfraManager(
 		return nil, err
 	}
 	if expectedRevision != "" && plan.Revision != expectedRevision {
-		return nil, fmt.Errorf("Infra plan revision %s does not match expected %s", plan.Revision, expectedRevision)
+		return nil, fmt.Errorf("infra plan revision %s does not match expected %s", plan.Revision, expectedRevision)
 	}
 	ociOpener := fastletinfra.NewContainerdOCIArtifactOpener(
 		runtimePlan.Containerd.Socket,

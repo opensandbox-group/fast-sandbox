@@ -112,7 +112,7 @@ func memAvailable() (int64, error) {
 	if total, ok := values["MemTotal"]; ok {
 		return total, nil
 	}
-	return 0, fmt.Errorf("MemAvailable/MemTotal missing in /proc/meminfo")
+	return 0, fmt.Errorf("memAvailable/MemTotal missing in /proc/meminfo")
 }
 
 // reflinkProbe clones src onto dst with FICLONE and reports whether the

@@ -209,7 +209,7 @@ func ParsePrivateKey(encoded string) (ed25519.PrivateKey, error) {
 		return ed25519.NewKeyFromSeed(data), nil
 	}
 	if len(data) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("Ed25519 private key must contain a %d-byte seed or %d-byte private key", ed25519.SeedSize, ed25519.PrivateKeySize)
+		return nil, fmt.Errorf("ed25519 private key must contain a %d-byte seed or %d-byte private key", ed25519.SeedSize, ed25519.PrivateKeySize)
 	}
 	return ed25519.PrivateKey(data), nil
 }
@@ -223,7 +223,7 @@ func ParsePublicKey(encoded string) (ed25519.PublicKey, error) {
 		return nil, fmt.Errorf("decode Ed25519 public key: %w", err)
 	}
 	if len(data) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("Ed25519 public key must contain %d bytes", ed25519.PublicKeySize)
+		return nil, fmt.Errorf("ed25519 public key must contain %d bytes", ed25519.PublicKeySize)
 	}
 	return ed25519.PublicKey(data), nil
 }

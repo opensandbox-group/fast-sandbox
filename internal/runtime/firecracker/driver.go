@@ -212,11 +212,11 @@ func (d *Driver) gcImageCache() {
 	}
 	removed, err := garbageCollectImages(stateRoot, limitBytes, useCount)
 	if err != nil {
-		klog.V(2).InfoS("Firecracker image cache GC skipped", "err", err)
+		klog.V(2).InfoS("firecracker image cache GC skipped", "err", err)
 		return
 	}
 	if len(removed) > 0 {
-		klog.InfoS("Firecracker image cache GC removed unreferenced images", "digests", removed)
+		klog.InfoS("firecracker image cache GC removed unreferenced images", "digests", removed)
 	}
 }
 
@@ -287,7 +287,7 @@ func (d *Driver) ensureResidualProcessAbsent(ctx context.Context, sandboxID stri
 		return
 	}
 	if err := client.EnsureRuntimeProcessesAbsent(ctx, runtimecatalog.ResidualProcessFirecracker, truncatedSandboxID(sandboxID)); err != nil {
-		klog.V(2).InfoS("Firecracker residual process cleanup skipped", "sandboxID", sandboxID, "err", err)
+		klog.V(2).InfoS("firecracker residual process cleanup skipped", "sandboxID", sandboxID, "err", err)
 	}
 }
 
@@ -384,7 +384,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		observability.End(createSpan, resultErr)
 		if resultErr != nil && infraPrepared && d.infraMgr != nil {
 			if removeErr := d.infraMgr.RemoveInstance(config); removeErr != nil {
-				klog.V(2).InfoS("Infra instance removal on failed create leaked resources", "sandboxID", config.Identity.SandboxUID, "err", removeErr)
+				klog.V(2).InfoS("infra instance removal on failed create leaked resources", "sandboxID", config.Identity.SandboxUID, "err", removeErr)
 			}
 		}
 	}()
@@ -435,7 +435,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 				}
 				return existingMetadata(existing), nil
 			}
-			klog.InfoS("Replacing stale Firecracker runtime owned by a previous Sandbox instance",
+			klog.InfoS("replacing stale Firecracker runtime owned by a previous Sandbox instance",
 				"sandbox", identity.SandboxUID,
 				"existingRuntimeInstanceID", existing.Config.Identity.RuntimeInstanceID,
 				"requestedRuntimeInstanceID", identity.RuntimeInstanceID,
@@ -529,7 +529,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 			d.removeJailRoot(identity.SandboxUID)
 		}
 		_ = removeSandboxDir(directory)
-		klog.InfoS("Firecracker Create cleanup removed partial sandbox",
+		klog.InfoS("firecracker Create cleanup removed partial sandbox",
 			"sandboxID", identity.SandboxUID, "jailRoot", jailRoot)
 	}()
 	d.touchImage(restoreRef)
@@ -554,7 +554,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		observability.End(infraSpan, prepareErr)
 		if prepareErr != nil {
 			if removeErr := d.infraMgr.RemoveInstance(config); removeErr != nil {
-				klog.V(2).InfoS("Infra instance removal on failed prepare leaked resources", "sandboxID", identity.SandboxUID, "err", removeErr)
+				klog.V(2).InfoS("infra instance removal on failed prepare leaked resources", "sandboxID", identity.SandboxUID, "err", removeErr)
 			}
 			releaseSlot()
 			return nil, fmt.Errorf("%w: prepare Infra Components: %v", ErrInfraUnavailable, prepareErr)
@@ -664,7 +664,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		releaseSlot()
 		return nil, err
 	}
-	klog.InfoS("Firecracker sandbox created",
+	klog.InfoS("firecracker sandbox created",
 		"sandboxID", identity.SandboxUID,
 		"total", time.Since(createStarted).String(),
 		"acquire", acquireDur.String(),
@@ -743,7 +743,7 @@ func (d *Driver) DeleteSandbox(ctx context.Context, sandboxID string) (resultErr
 	d.mu.RUnlock()
 	if infraMgr != nil {
 		if removeErr := infraMgr.RemoveSandboxInstances(sandboxID); removeErr != nil {
-			klog.V(2).InfoS("Infra instance cleanup on delete leaked resources", "sandboxID", sandboxID, "err", removeErr)
+			klog.V(2).InfoS("infra instance cleanup on delete leaked resources", "sandboxID", sandboxID, "err", removeErr)
 		}
 	}
 	d.releaseAgentSandbox(ctx, sandboxID, state.Config.Spec.Image)
@@ -752,7 +752,7 @@ func (d *Driver) DeleteSandbox(ctx context.Context, sandboxID string) (resultErr
 	if removeErr := removeSandboxDir(directory); removeErr != nil {
 		klog.ErrorS(removeErr, "Failed to remove sandbox state directory", "sandboxID", sandboxID)
 	}
-	klog.InfoS("Firecracker sandbox deleted", "sandboxID", sandboxID)
+	klog.InfoS("firecracker sandbox deleted", "sandboxID", sandboxID)
 	return nil
 }
 
@@ -842,7 +842,7 @@ func (d *Driver) resumePausedVM(ctx context.Context, state *SandboxState) {
 			"sandboxID", state.Config.Identity.SandboxUID)
 		return
 	}
-	klog.InfoS("Resumed paused microVM after crash recovery", "sandboxID", state.Config.Identity.SandboxUID)
+	klog.InfoS("resumed paused microVM after crash recovery", "sandboxID", state.Config.Identity.SandboxUID)
 }
 
 // bootTimeoutOrDefault returns the configured boot (resume) poll timeout.

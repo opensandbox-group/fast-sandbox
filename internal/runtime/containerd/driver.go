@@ -102,12 +102,12 @@ func (r *Driver) Initialize(ctx context.Context, socketPath string) error {
 				return fmt.Errorf("prepare Fastlet shim cgroup: %w", err)
 			}
 		}
-		klog.InfoS("Discovered Fastlet Pod cgroup", "version", layout.Version, "path", layout.PodPath, "systemd", layout.Systemd)
+		klog.InfoS("discovered Fastlet Pod cgroup", "version", layout.Version, "path", layout.PodPath, "systemd", layout.Systemd)
 	} else {
 		klog.InfoS("POD_UID is not set; Sandbox cgroup aggregation is disabled outside Kubernetes")
 	}
 
-	klog.InfoS("Initializing runtime", "handler", r.config.Handler, "containerdNamespace", r.containerdNamespace())
+	klog.InfoS("initializing runtime", "handler", r.config.Handler, "containerdNamespace", r.containerdNamespace())
 
 	ctx, cancel := context.WithTimeout(ctx, defaultOperationTimeout)
 	defer cancel()
@@ -138,7 +138,7 @@ func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	defer func() { finishTotal(resultErr) }()
 	logger := klog.FromContext(ctx).WithValues("sandboxID", identity.SandboxUID)
 
-	logger.Info("Creating sandbox", "image", spec.Image, "runtime", r.config.Handler, "netns", network.NamespacePath)
+	logger.Info("creating sandbox", "image", spec.Image, "runtime", r.config.Handler, "netns", network.NamespacePath)
 	ctx, cancel := context.WithTimeout(ctx, defaultOperationTimeout)
 	defer cancel()
 	ctx = r.withNamespace(ctx)
@@ -167,7 +167,7 @@ func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		defer func() {
 			if !created {
 				if removeErr := r.infraMgr.RemoveInstance(config); removeErr != nil {
-					logger.V(2).Info("Infra instance removal on failed create leaked resources", "err", removeErr)
+					logger.V(2).Info("infra instance removal on failed create leaked resources", "err", removeErr)
 				}
 			}
 		}()
@@ -176,7 +176,7 @@ func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSand
 
 	// 2. Create container
 	createStart := time.Now()
-	logger.Info("Creating containerd container object")
+	logger.Info("creating containerd container object")
 
 	containerContext, finishContainer := startContainerdCreateStage(ctx, string(r.runtimeName), "container")
 	container, err := r.client.NewContainer(
@@ -214,7 +214,7 @@ func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	logDuration := time.Since(logStarted)
 
 	// 3. Start container
-	logger.Info("Creating containerd task")
+	logger.Info("creating containerd task")
 
 	// Build CIO options based on runtime configuration
 	var cioOpts []cio.Opt
@@ -249,13 +249,13 @@ func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		logger.Error(err, "Failed to create containerd task", "logPath", logPath)
 		logFile.Close()
 		if deleteErr := container.Delete(ctx, containerd.WithSnapshotCleanup); deleteErr != nil {
-			logger.V(2).Info("Container cleanup on failed task create leaked resources", "err", deleteErr)
+			logger.V(2).Info("container cleanup on failed task create leaked resources", "err", deleteErr)
 		}
 		return nil, fmt.Errorf("failed to create task: %w", err)
 	}
 	taskCreateDuration := time.Since(taskCreateStarted)
 
-	logger.Info("Starting containerd task", "pid", task.Pid())
+	logger.Info("starting containerd task", "pid", task.Pid())
 	taskStartStarted := time.Now()
 	taskStartContext, finishTaskStart := startContainerdCreateStage(ctx, string(r.runtimeName), "task_start")
 	err = task.Start(taskStartContext)
@@ -263,10 +263,10 @@ func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	if err != nil {
 		logger.Error(err, "Failed to start containerd task")
 		if _, deleteErr := task.Delete(ctx, containerd.WithProcessKill); deleteErr != nil {
-			logger.V(2).Info("Task cleanup on failed start leaked resources", "err", deleteErr)
+			logger.V(2).Info("task cleanup on failed start leaked resources", "err", deleteErr)
 		}
 		if deleteErr := container.Delete(ctx, containerd.WithSnapshotCleanup); deleteErr != nil {
-			logger.V(2).Info("Container cleanup on failed start leaked resources", "err", deleteErr)
+			logger.V(2).Info("container cleanup on failed start leaked resources", "err", deleteErr)
 		}
 		return nil, fmt.Errorf("failed to start task: %w", err)
 	}
@@ -275,7 +275,7 @@ func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSand
 
 	totalDuration := time.Since(totalStart)
 
-	logger.Info("Runtime CreateSandbox timing",
+	logger.Info("runtime CreateSandbox timing",
 		"total_ms", totalDuration.Milliseconds(),
 		"pull_ms", pullDuration.Milliseconds(),
 		"create_ms", createDuration.Milliseconds(),
@@ -298,7 +298,7 @@ func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		metadata.InfraServices = append([]infra.ServiceEndpoint(nil), infraInstance.Services...)
 	}
 	created = true
-	logger.Info("Sandbox created successfully", "pid", task.Pid())
+	logger.Info("sandbox created successfully", "pid", task.Pid())
 	return metadata, nil
 }
 
@@ -325,7 +325,7 @@ func (r *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 			existing.UserProcessStartSource = fastletapi.UserProcessStartExistingRuntime
 			return existing, nil
 		}
-		klog.InfoS("Replacing stale runtime owned by a previous Sandbox instance",
+		klog.InfoS("replacing stale runtime owned by a previous Sandbox instance",
 			"sandbox", identity.SandboxUID,
 			"existingFastletPodUID", existing.Config.Identity.FastletPodUID,
 			"requestedFastletPodUID", identity.FastletPodUID,
@@ -563,7 +563,6 @@ func sandboxResourceSpecOpts(config *fastletapi.SandboxSpec) ([]oci.SpecOpts, er
 }
 
 // getRuntimeOptions returns runtime-specific options for containerd.
-// It uses config.OptionsType and config.ConfigPath to build the options.
 func (r *Driver) getRuntimeOptions() *runtimeoptions.Options {
 	// If OptionsType is set, include TypeUrl (required for gVisor)
 	if r.config.OptionsType != "" {

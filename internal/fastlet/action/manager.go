@@ -60,14 +60,14 @@ func (c *HTTPCaller) Status(ctx context.Context, port int32) (actionapi.HandlerS
 		return actionapi.HandlerStatus{}, err
 	}
 	if response.StatusCode != http.StatusOK {
-		return actionapi.HandlerStatus{}, fmt.Errorf("Action Handler returned HTTP %d: %s", response.StatusCode, truncate(strings.TrimSpace(string(body)), 512))
+		return actionapi.HandlerStatus{}, fmt.Errorf("action Handler returned HTTP %d: %s", response.StatusCode, truncate(strings.TrimSpace(string(body)), 512))
 	}
 	var result actionapi.HandlerStatus
 	if err := json.Unmarshal(body, &result); err != nil {
 		return result, fmt.Errorf("decode Action Handler status: %w", err)
 	}
 	if result.APIVersion != actionapi.APIVersion || result.InstanceID == "" || !result.Ready {
-		return result, fmt.Errorf("Action Handler is not ready: %s", result.Message)
+		return result, fmt.Errorf("action Handler is not ready: %s", result.Message)
 	}
 	return result, nil
 }
@@ -92,7 +92,7 @@ func (c *HTTPCaller) Invoke(ctx context.Context, port int32, invocation actionap
 		return err
 	}
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("Action Handler returned HTTP %d: %s", response.StatusCode, truncate(strings.TrimSpace(string(responseBody)), 512))
+		return fmt.Errorf("action Handler returned HTTP %d: %s", response.StatusCode, truncate(strings.TrimSpace(string(responseBody)), 512))
 	}
 	return nil
 }
@@ -385,7 +385,7 @@ func (m *Manager) registerDesired(state *sandboxState, attachment Attachment, ge
 	}
 	if state.desiredGeneration > generation ||
 		(state.desiredGeneration == generation && state.desiredSignature != "" && state.desiredSignature != signature) {
-		return fmt.Errorf("Action Binding request is stale or conflicts at Sandbox generation %d", generation)
+		return fmt.Errorf("action Binding request is stale or conflicts at Sandbox generation %d", generation)
 	}
 	if state.attachment.ID != "" && state.attachment.ID != attachment.ID {
 		if !attachmentAfter(attachment, state.attachment) {
@@ -523,7 +523,7 @@ func (m *Manager) convergeLocked(ctx context.Context, state *sandboxState) error
 			value := input.Input
 			if err := m.setBinding(ctx, state, input.Handler, generation, attachment, &value, input.Digest, replayHooks); err != nil {
 				m.notifyChanged(attachment.SandboxUID)
-				return fmt.Errorf("SetBinding %s: %w", input.Handler, err)
+				return fmt.Errorf("setBinding %s: %w", input.Handler, err)
 			}
 		}
 	}
@@ -545,7 +545,7 @@ func (m *Manager) convergeLocked(ctx context.Context, state *sandboxState) error
 			}
 			if err := m.invokeHook(ctx, state, input.Handler, generation, attachment, checkpoint); err != nil {
 				m.notifyChanged(attachment.SandboxUID)
-				return fmt.Errorf("Lifecycle Hook %s for %s: %w", checkpoint.Name, input.Handler, err)
+				return fmt.Errorf("lifecycle Hook %s for %s: %w", checkpoint.Name, input.Handler, err)
 			}
 		}
 	}
@@ -749,7 +749,7 @@ func (m *Manager) retryState(parent context.Context, state *sandboxState) {
 		if convergeErr := m.convergeLocked(ctx, state); convergeErr != nil {
 			// The retry loop swallows nothing else; without this line a
 			// persistently failing hook converge is invisible.
-			klog.V(2).InfoS("Sandbox action retry converge failed", "sandbox", state.attachment.SandboxUID, "err", convergeErr)
+			klog.V(2).InfoS("sandbox action retry converge failed", "sandbox", state.attachment.SandboxUID, "err", convergeErr)
 		}
 	}
 }
@@ -760,9 +760,9 @@ func (m *Manager) handlerInstance(name string) (string, error) {
 	m.mu.RUnlock()
 	if !found || observation.err != nil || observation.instanceID == "" {
 		if found && observation.err != nil {
-			return "", fmt.Errorf("Action Handler %s is unavailable: %w", name, observation.err)
+			return "", fmt.Errorf("action Handler %s is unavailable: %w", name, observation.err)
 		}
-		return "", fmt.Errorf("Action Handler %s has not reported Ready", name)
+		return "", fmt.Errorf("action Handler %s has not reported Ready", name)
 	}
 	return observation.instanceID, nil
 }
@@ -802,18 +802,18 @@ func (m *Manager) validateDesired(desired []DesiredInput) ([]DesiredInput, strin
 	hash := sha256.New()
 	for _, input := range desired {
 		if _, found := m.byName[input.Handler]; !found {
-			return nil, "", fmt.Errorf("Action Handler %q is not configured on this Fastlet", input.Handler)
+			return nil, "", fmt.Errorf("action Handler %q is not configured on this Fastlet", input.Handler)
 		}
 		if _, found := seen[input.Handler]; found {
 			return nil, "", fmt.Errorf("duplicate Action Binding for Handler %q", input.Handler)
 		}
 		seen[input.Handler] = struct{}{}
 		if len(input.Input) > apiv1alpha2.MaxActionBindingInputBytes {
-			return nil, "", fmt.Errorf("Action Binding %s input exceeds %d bytes", input.Handler, apiv1alpha2.MaxActionBindingInputBytes)
+			return nil, "", fmt.Errorf("action Binding %s input exceeds %d bytes", input.Handler, apiv1alpha2.MaxActionBindingInputBytes)
 		}
 		total += len(input.Input)
 		if total > apiv1alpha2.MaxSandboxActionBindingInputBytes {
-			return nil, "", fmt.Errorf("Action Binding inputs exceed %d bytes", apiv1alpha2.MaxSandboxActionBindingInputBytes)
+			return nil, "", fmt.Errorf("action Binding inputs exceed %d bytes", apiv1alpha2.MaxSandboxActionBindingInputBytes)
 		}
 		digestBytes := sha256.Sum256([]byte(input.Input))
 		digest := "sha256:" + hex.EncodeToString(digestBytes[:])

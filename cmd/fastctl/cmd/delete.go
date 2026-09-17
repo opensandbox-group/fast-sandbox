@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"log"
 
 	fastpathv2 "fast-sandbox/api/proto/v2"
 
@@ -27,16 +26,16 @@ var deleteCmd = &cobra.Command{
 			defer conn.Close()
 		}
 
-		klog.V(4).InfoS("Sending DeleteSandbox request", "sandboxName", sandboxName, "namespace", namespace)
+		klog.V(4).InfoS("sending DeleteSandbox request", "sandboxName", sandboxName, "namespace", namespace)
 		_, err := client.DeleteSandbox(context.Background(), &fastpathv2.DeleteRequest{
 			Sandbox: fastPathSandboxReference(sandboxName, namespace),
 		})
 		if err != nil {
 			klog.ErrorS(err, "DeleteSandbox request failed", "sandboxName", sandboxName, "namespace", namespace)
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 
-		klog.V(4).InfoS("DeleteSandbox request succeeded", "sandboxName", sandboxName)
+		klog.V(4).InfoS("deleteSandbox request succeeded", "sandboxName", sandboxName)
 		fmt.Printf("Sandbox %s deletion triggered\n", sandboxName)
 	},
 }

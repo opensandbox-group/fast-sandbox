@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
 
@@ -65,9 +64,9 @@ Examples:
 			seconds, err := parseExpireTime(updateExpireTime)
 			if err != nil {
 				klog.ErrorS(err, "Invalid expire-time value", "expireTime", updateExpireTime)
-				log.Fatalf("Error: invalid expire-time: %v", err)
+				exitWithErrorf("invalid expire-time: %v", err)
 			}
-			klog.V(4).InfoS("Updating expire-time", "sandboxName", sandboxName, "expireTime", seconds)
+			klog.V(4).InfoS("updating expire-time", "sandboxName", sandboxName, "expireTime", seconds)
 			req.Update = &fastpathv2.UpdateSandboxRequest_ExpiresAtUnixSeconds{
 				ExpiresAtUnixSeconds: seconds,
 			}
@@ -77,16 +76,16 @@ Examples:
 			policy, err := parseFailurePolicy(updateFailurePolicy)
 			if err != nil {
 				klog.ErrorS(err, "Invalid failure-policy value", "failurePolicy", updateFailurePolicy)
-				log.Fatalf("Error: invalid failure-policy: %v", err)
+				exitWithErrorf("invalid failure-policy: %v", err)
 			}
-			klog.V(4).InfoS("Updating failure-policy", "sandboxName", sandboxName, "failurePolicy", policy)
+			klog.V(4).InfoS("updating failure-policy", "sandboxName", sandboxName, "failurePolicy", policy)
 			req.Update = &fastpathv2.UpdateSandboxRequest_FailurePolicy{
 				FailurePolicy: policy,
 			}
 		}
 
 		if cmd.Flags().Changed("recovery-timeout") {
-			klog.V(4).InfoS("Updating recovery-timeout", "sandboxName", sandboxName, "recoveryTimeout", updateRecoveryTimeout)
+			klog.V(4).InfoS("updating recovery-timeout", "sandboxName", sandboxName, "recoveryTimeout", updateRecoveryTimeout)
 			req.Update = &fastpathv2.UpdateSandboxRequest_RecoveryTimeoutSeconds{
 				RecoveryTimeoutSeconds: updateRecoveryTimeout,
 			}
@@ -94,11 +93,11 @@ Examples:
 
 		if cmd.Flags().Changed("action") || clearActionBindings {
 			if cmd.Flags().Changed("action") && clearActionBindings {
-				log.Fatal("Error: --action and --clear-actions cannot be used together")
+				exitWithErrorf("--action and --clear-actions cannot be used together")
 			}
 			bindings, err := parseActionBindings(updateActionBindings)
 			if err != nil {
-				log.Fatalf("Error: %v", err)
+				exitWithError(err)
 			}
 			items := make([]*fastpathv2.ActionBinding, 0, len(bindings))
 			for _, binding := range bindings {
@@ -110,11 +109,11 @@ Examples:
 		}
 
 		if len(updateMetadata) > 0 {
-			klog.V(4).InfoS("Updating metadata", "sandboxName", sandboxName, "metadata", updateMetadata)
+			klog.V(4).InfoS("updating metadata", "sandboxName", sandboxName, "metadata", updateMetadata)
 			for _, item := range updateMetadata {
 				parts := strings.SplitN(item, "=", 2)
 				if len(parts) != 2 {
-					log.Fatalf("Error: invalid metadata format '%s', expected key=value", item)
+					exitWithErrorf("invalid metadata format '%s', expected key=value", item)
 				}
 				req.MetadataUpsert[parts[0]] = parts[1]
 			}
@@ -123,17 +122,17 @@ Examples:
 
 		if req.Update == nil && len(req.MetadataUpsert) == 0 && len(req.MetadataDeleteKeys) == 0 {
 			klog.ErrorS(nil, "No update field specified")
-			log.Fatal("Error: at least one update field must be specified (--expire-time, --failure-policy, --recovery-timeout, --action, --clear-actions, --metadata, or --delete-metadata)")
+			exitWithErrorf("at least one update field must be specified (--expire-time, --failure-policy, --recovery-timeout, --action, --clear-actions, --metadata, or --delete-metadata)")
 		}
 
-		klog.V(4).InfoS("Sending UpdateSandbox request", "sandboxName", sandboxName)
+		klog.V(4).InfoS("sending UpdateSandbox request", "sandboxName", sandboxName)
 		resp, err := client.UpdateSandbox(context.Background(), req)
 		if err != nil {
 			klog.ErrorS(err, "UpdateSandbox request failed", "sandboxName", sandboxName)
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 
-		klog.V(4).InfoS("UpdateSandbox request succeeded", "sandboxName", sandboxName)
+		klog.V(4).InfoS("updateSandbox request succeeded", "sandboxName", sandboxName)
 		fmt.Printf("✓ Sandbox %s update committed\n", sandboxName)
 		fmt.Printf("  Committed generation: %d\n", resp.CommittedGeneration)
 	},

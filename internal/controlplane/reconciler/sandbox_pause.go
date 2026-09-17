@@ -97,7 +97,7 @@ func (r *SandboxReconciler) triggerPause(ctx context.Context, orchestrator *orch
 		return r.handlePauseCallError(ctx, sandbox, checkpointID, err)
 	}
 	if observed == nil {
-		klog.FromContext(ctx).Info("Sandbox pause trigger returned no observation; retrying",
+		klog.FromContext(ctx).Info("sandbox pause trigger returned no observation; retrying",
 			"sandbox", sandbox.Name, "checkpointID", checkpointID)
 		return ctrl.Result{RequeueAfter: ObservationPollInterval}, nil
 	}
@@ -120,7 +120,7 @@ func (r *SandboxReconciler) observePause(ctx context.Context, orchestrator *orch
 		return r.handlePauseCallError(ctx, sandbox, checkpointID, err)
 	}
 	if observed == nil {
-		klog.FromContext(ctx).Info("Sandbox pause observation returned no status; retrying",
+		klog.FromContext(ctx).Info("sandbox pause observation returned no status; retrying",
 			"sandbox", sandbox.Name, "checkpointID", checkpointID)
 		return ctrl.Result{RequeueAfter: ObservationPollInterval}, nil
 	}
@@ -182,7 +182,7 @@ func (r *SandboxReconciler) persistPauseCheckpoint(ctx context.Context, orchestr
 	}
 	// The most safety-critical write of the FSM: the checkpoint is durable
 	// before the runtime is touched, so this transition must be visible.
-	klog.FromContext(ctx).Info("Pause checkpoint persisted; releasing runtime", "sandbox", sandbox.Name, "checkpointID", checkpointID, "manifestRef", observed.ManifestRef)
+	klog.FromContext(ctx).Info("pause checkpoint persisted; releasing runtime", "sandbox", sandbox.Name, "checkpointID", checkpointID, "manifestRef", observed.ManifestRef)
 	return r.releasePausedRuntime(ctx, orchestrator, sandbox, checkpointID)
 }
 
@@ -214,7 +214,7 @@ func (r *SandboxReconciler) releasePausedRuntime(ctx context.Context, orchestrat
 	if _, err := orchestrator.ClearAssignment(ctx, sandbox, false); err != nil {
 		return ctrl.Result{}, err
 	}
-	klog.FromContext(ctx).Info("Sandbox paused; runtime released and assignment cleared", "sandbox", sandbox.Name, "checkpointID", checkpointID)
+	klog.FromContext(ctx).Info("sandbox paused; runtime released and assignment cleared", "sandbox", sandbox.Name, "checkpointID", checkpointID)
 	return ctrl.Result{RequeueAfter: ReadyRequeueInterval}, nil
 }
 
@@ -222,7 +222,7 @@ func (r *SandboxReconciler) releasePausedRuntime(ctx context.Context, orchestrat
 // the epoch advances, the old task record is dropped best-effort, and the
 // runtime stays Ready.
 func (r *SandboxReconciler) retryPause(ctx context.Context, orchestrator *orchestration.Orchestrator, sandbox *apiv1alpha2.Sandbox, checkpointID, reason, message string) (ctrl.Result, error) {
-	klog.FromContext(ctx).Info("Sandbox pause attempt failed; retrying with a new attempt epoch",
+	klog.FromContext(ctx).Info("sandbox pause attempt failed; retrying with a new attempt epoch",
 		"sandbox", sandbox.Name, "checkpointID", checkpointID, "reason", reason, "message", message)
 	if err := orchestrator.DeleteCheckpoint(ctx, sandbox, checkpointID); err != nil {
 		var failure *fastletapi.FastletError
@@ -267,7 +267,7 @@ func (r *SandboxReconciler) handlePauseCallError(ctx context.Context, sandbox *a
 	// A polling loop must keep a steady cadence: returning the error here
 	// would make controller-runtime back off exponentially and mask the
 	// checkpoint's progress.
-	klog.FromContext(ctx).Info("Sandbox pause call failed transiently; retrying",
+	klog.FromContext(ctx).Info("sandbox pause call failed transiently; retrying",
 		"sandbox", sandbox.Name, "checkpointID", checkpointID, "err", err.Error())
 	return ctrl.Result{RequeueAfter: ObservationPollInterval}, nil
 }

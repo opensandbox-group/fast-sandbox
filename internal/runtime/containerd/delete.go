@@ -123,7 +123,7 @@ func ensureContainerdSandboxAbsent(
 	verificationErr := verifyContainerdSandboxAbsent(ctx, backend, sandboxID, snapshotName)
 	if verificationErr == nil {
 		if len(cleanupErrs) > 0 {
-			klog.InfoS("Containerd deletion converged after cleanup errors", "sandbox", sandboxID, "errors", errors.Join(cleanupErrs...))
+			klog.InfoS("containerd deletion converged after cleanup errors", "sandbox", sandboxID, "errors", errors.Join(cleanupErrs...))
 		}
 		return nil
 	}

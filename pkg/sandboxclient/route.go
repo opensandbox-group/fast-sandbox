@@ -119,7 +119,7 @@ func (r *EndpointResolver) Resolve(ctx context.Context, sandbox SandboxRef, targ
 	}
 	endpoint, err := url.Parse(resolved.GetProxyEndpoint())
 	if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
-		return Route{}, fmt.Errorf("FastPath returned invalid proxy endpoint %q", resolved.GetProxyEndpoint())
+		return Route{}, fmt.Errorf("fastPath returned invalid proxy endpoint %q", resolved.GetProxyEndpoint())
 	}
 	if r.ProxyBaseURL != "" {
 		endpoint, err = replaceRouteAuthority(endpoint, r.ProxyBaseURL)
@@ -166,7 +166,7 @@ func (r Route) RequestURL(path string, query url.Values) (*url.URL, error) {
 		path = "/"
 	}
 	if !strings.HasPrefix(path, "/") {
-		return nil, fmt.Errorf("Infra Component path %q must be absolute", path)
+		return nil, fmt.Errorf("infra Component path %q must be absolute", path)
 	}
 	result := *r.Endpoint
 	result.Path = strings.TrimRight(r.Endpoint.Path, "/") + path

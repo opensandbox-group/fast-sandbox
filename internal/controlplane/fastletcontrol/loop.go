@@ -81,7 +81,7 @@ func (l *Loop) Start(ctx context.Context) {
 		return
 	}
 	if !l.Cache.WaitForCacheSync(ctx) {
-		logger.Info("Pod informer stopped before cache sync")
+		logger.Info("pod informer stopped before cache sync")
 		return
 	}
 
@@ -341,7 +341,7 @@ func (l *Loop) probeOne(ctx context.Context, info placement.FastletInfo, timeout
 		if attempt <= 1 {
 			logger.Error(err, "Fastlet Heartbeat failed", "pod", info.PodName, "podUID", info.PodUID)
 		} else {
-			logger.V(2).Info("Fastlet Heartbeat still failing", "pod", info.PodName, "podUID", info.PodUID, "consecutiveFailures", attempt, "err", err)
+			logger.V(2).Info("fastlet heartbeat still failing", "pod", info.PodName, "podUID", info.PodUID, "consecutiveFailures", attempt, "err", err)
 		}
 		return false
 	}

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 
@@ -24,11 +23,11 @@ var filesStatCmd = &cobra.Command{
 		defer closeClient()
 		info, err := client.GetFileInfo(cmd.Context(), args[1])
 		if err != nil {
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 		entry, found := info[args[1]]
 		if !found {
-			log.Fatalf("Error: Execd response omitted file %q", args[1])
+			exitWithErrorf("Execd response omitted file %q", args[1])
 		}
 		printJSON(entry)
 	},
@@ -41,7 +40,7 @@ var filesListCmd = &cobra.Command{
 		defer closeClient()
 		entries, err := client.SearchFiles(cmd.Context(), args[1], "*")
 		if err != nil {
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 		for _, entry := range entries {
 			fmt.Println(entry.Path)
@@ -56,11 +55,11 @@ var filesReadCmd = &cobra.Command{
 		defer closeClient()
 		download, err := client.DownloadFile(cmd.Context(), args[1], "")
 		if err != nil {
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 		defer download.Close()
 		if _, err := io.Copy(os.Stdout, download); err != nil {
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 	},
 }
@@ -74,7 +73,7 @@ var filesWriteCmd = &cobra.Command{
 		if len(args) == 3 {
 			input, err = os.Open(args[2])
 			if err != nil {
-				log.Fatalf("Error: %v", err)
+				exitWithError(err)
 			}
 			defer input.Close()
 			source = input
@@ -85,7 +84,7 @@ var filesWriteCmd = &cobra.Command{
 			FileName: filepath.Base(args[1]),
 			Metadata: opensandbox.FileMetadata{Path: args[1], Mode: opensandbox.OctalMode(0o644)},
 		}); err != nil {
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 	},
 }
@@ -96,7 +95,7 @@ var filesMkdirCmd = &cobra.Command{
 		client, closeClient := commandOpenSandboxClient(cmd.Context(), args[0])
 		defer closeClient()
 		if err := client.CreateDirectory(cmd.Context(), args[1], opensandbox.OctalMode(0o755)); err != nil {
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 	},
 }
@@ -115,7 +114,7 @@ var filesRmCmd = &cobra.Command{
 			err = client.DeleteFiles(cmd.Context(), []string{args[1]})
 		}
 		if err != nil {
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 	},
 }
@@ -134,7 +133,7 @@ func commandOpenSandboxClient(ctx context.Context, sandboxName string) (*opensan
 	client, _, err := adapter.Client(ctx, sandboxReference(sandboxName))
 	if err != nil {
 		closeControl()
-		log.Fatalf("Error: %v", err)
+		exitWithError(err)
 	}
 	return client, closeControl
 }
@@ -143,7 +142,7 @@ func printJSON(value any) {
 	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(value); err != nil {
-		log.Fatalf("Error: %v", err)
+		exitWithError(err)
 	}
 }
 

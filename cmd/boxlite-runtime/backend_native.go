@@ -643,14 +643,14 @@ func (b *nativeBackend) loadRecords() error {
 		if entry.Name() != boxlitestate.RecordFileName(sandboxUID) ||
 			identity.FastletPodUID != b.podUID ||
 			record.Namespace != record.Request.FastletNamespace {
-			return fmt.Errorf("BoxLite metadata owner fence mismatch for %s", sandboxUID)
+			return fmt.Errorf("boxLite metadata owner fence mismatch for %s", sandboxUID)
 		}
 		hash, err := ensureHash(record.Request)
 		if err != nil || hash != record.SpecHash {
-			return fmt.Errorf("BoxLite metadata hash mismatch for %s", sandboxUID)
+			return fmt.Errorf("boxLite metadata hash mismatch for %s", sandboxUID)
 		}
 		if record.BundleRoot != b.expectedBundleRoot(sandboxUID, hash) {
-			return fmt.Errorf("BoxLite metadata bundle fence mismatch for %s", sandboxUID)
+			return fmt.Errorf("boxLite metadata bundle fence mismatch for %s", sandboxUID)
 		}
 		b.records[sandboxUID] = &record
 	}

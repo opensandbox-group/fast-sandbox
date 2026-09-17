@@ -72,7 +72,7 @@ func (d *LinuxNetNSDriver) Prepare(ctx context.Context, slot *Slot) (result erro
 	defer func() {
 		if result != nil {
 			if destroyErr := d.Destroy(context.Background(), slot); destroyErr != nil {
-				klog.V(2).InfoS("Slot destroy after failed preparation leaked resources", "slot", slot.ID, "err", destroyErr)
+				klog.V(2).InfoS("slot destroy after failed preparation leaked resources", "slot", slot.ID, "err", destroyErr)
 			}
 		}
 	}()

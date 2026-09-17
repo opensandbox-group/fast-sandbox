@@ -287,3 +287,8 @@ generated/
 
 # stray agent binary built by ad-hoc go build
 /firecracker-runtime
+/fastlet
+/sandboxtemplate-builder
+
+# fixture binary dropped by ad-hoc go build
+/sandbox-action-fixture

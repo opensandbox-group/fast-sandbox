@@ -92,7 +92,7 @@ func (m *SandboxManager) routePublication(metadata *SandboxMetadata) (RoutePubli
 		if endpoint.HostProcess {
 			// Host-process components are reached through the Pod-local
 			// egress route, never through a per-Sandbox component route.
-			klog.InfoS("Host-process component excluded from per-Sandbox component routes",
+			klog.InfoS("host-process component excluded from per-Sandbox component routes",
 				"component", endpoint.Component, "port", endpoint.Port, "sandboxID", metadata.Config.Identity.SandboxUID)
 			continue
 		}

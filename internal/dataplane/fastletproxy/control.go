@@ -262,7 +262,7 @@ func (c *ControlClient) Watch(ctx context.Context, consume func(Event) error) er
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("Fastlet Proxy control returned %s", response.Status)
+		return fmt.Errorf("fastlet Proxy control returned %s", response.Status)
 	}
 	scanner := bufio.NewScanner(response.Body)
 	for scanner.Scan() {

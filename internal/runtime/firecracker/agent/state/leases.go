@@ -442,7 +442,7 @@ func (s *State) recover() error {
 	if truncateLength > 0 {
 		// A crash-torn journal tail changes which intents replay; recovery
 		// decisions must be auditable.
-		klog.InfoS("Recovered agent lease journal; truncating torn tail", "truncateLength", truncateLength)
+		klog.InfoS("recovered agent lease journal; truncating torn tail", "truncateLength", truncateLength)
 		if err := s.journal.truncate(truncateLength); err != nil {
 			return fmt.Errorf("truncate agent journal tail: %w", err)
 		}

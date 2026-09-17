@@ -82,7 +82,6 @@ func TestAutoExpiry(t *testing.T) {
 			t.Logf("Sandbox is assigned and ready, runtimeState=%s", assignedSandbox.Status.Runtime.State)
 
 			// Wait for expiry (with buffer)
-			// Expiry time was set to 90 seconds, so we need to wait for that plus some buffer
 			t.Log("Waiting for sandbox to expire...")
 			expireWaitCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 			defer cancel()
@@ -292,7 +291,7 @@ func TestControlledRecovery(t *testing.T) {
 
 			// Wait for reset to be accepted
 			// Give controller more time to process reset request
-			resetWaitCtx, cancel := context.WithTimeout(ctx, 90*time.Second) // Increased from 60s
+			resetWaitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 			defer cancel()
 			_, err = fixture.WaitForSandbox(resetWaitCtx, types.NamespacedName{Name: "sb-recovery", Namespace: namespace}, func(sb *apiv1alpha2.Sandbox) bool {
 				if sb.Status.Runtime.AcceptedResetRevision == nil {
@@ -439,7 +438,7 @@ func TestPodExistence(t *testing.T) {
 				t.Fatalf("delete fastlet pod: %v", err)
 			}
 
-			// Wait for Janitor scan cycle (simulated by short wait)
+			// Wait for the Janitor scan cycle to pick up the orphaned resources
 			t.Log("Waiting for Janitor scan cycle...")
 			time.Sleep(35 * time.Second)
 

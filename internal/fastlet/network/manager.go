@@ -360,7 +360,7 @@ func (m *Manager) Release(ctx context.Context, owner Owner) error {
 		replenishCtx, cancel := context.WithTimeout(context.Background(), m.config.ReplenishTimeout)
 		defer cancel()
 		if err := m.Replenish(replenishCtx); err != nil {
-			klog.V(2).InfoS("Background slot replenish failed", "err", err)
+			klog.V(2).InfoS("background slot replenish failed", "err", err)
 		}
 	}()
 	return nil

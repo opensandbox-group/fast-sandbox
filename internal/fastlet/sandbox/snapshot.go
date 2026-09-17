@@ -258,7 +258,7 @@ func (m *SandboxManager) runSnapshotWorker(snapshotter RuntimeSnapshotter, task 
 	task.result = result
 	m.mu.Unlock()
 	m.finishSnapshotTask(task, fastletapi.SnapshotPhaseSucceeded, "")
-	klog.InfoS("Sandbox snapshot completed", "sandboxID", sandboxUID, "snapshotID", task.snapshotID,
+	klog.InfoS("sandbox snapshot completed", "sandboxID", sandboxUID, "snapshotID", task.snapshotID,
 		"manifestRef", result.ManifestRef, "sizeBytes", result.SizeBytes)
 }
 

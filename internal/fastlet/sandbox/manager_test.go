@@ -17,10 +17,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
-// ============================================================================
-// Mock Runtime
-// ============================================================================
-
 // MockRuntime is a mock implementation of the Runtime interface for testing.
 type MockRuntime struct {
 	mu             sync.Mutex
@@ -142,8 +138,6 @@ func (m *MockRuntime) Close() error {
 	return nil
 }
 
-// Helper methods for testing
-
 type sandboxCreateFixture struct {
 	fastletapi.SandboxSpec
 	SandboxID          string
@@ -254,12 +248,7 @@ func (m *MockRuntime) Reset() {
 	m.getStatusCalls = make(map[string]int)
 }
 
-// ============================================================================
-// 1. TestNewSandboxManager
-// ============================================================================
-
 func TestNewSandboxManager(t *testing.T) {
-	// NSM-01: Constructor creates manager with default capacity (5)
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -269,7 +258,6 @@ func TestNewSandboxManager(t *testing.T) {
 }
 
 func TestNewSandboxManager_CustomCapacity(t *testing.T) {
-	// NSM-02: Constructor reads capacity from FASTLET_CAPACITY env var
 	// Save and restore original env value
 	originalValue := os.Getenv("FASTLET_CAPACITY")
 	defer func() {
@@ -319,7 +307,6 @@ func TestNewSandboxManager_CustomCapacity(t *testing.T) {
 }
 
 func TestNewSandboxManager_InvalidCapacity(t *testing.T) {
-	// NSM-03: Constructor handles invalid FASTLET_CAPACITY values gracefully
 	originalValue := os.Getenv("FASTLET_CAPACITY")
 	defer func() {
 		if originalValue != "" {
@@ -400,12 +387,7 @@ func TestSandboxManagerRejectsProfileOverrides(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// 2. TestSandboxManager_CreateSandbox
-// ============================================================================
-
 func TestSandboxManager_CreateSandbox_Success(t *testing.T) {
-	// CS-01: Successfully creates a sandbox
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -430,7 +412,6 @@ func TestSandboxManager_CreateSandbox_Success(t *testing.T) {
 }
 
 func TestSandboxManager_CreateSandbox_Idempotent(t *testing.T) {
-	// CS-02: Creating an existing sandbox returns success (idempotent)
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -457,7 +438,6 @@ func TestSandboxManager_CreateSandbox_Idempotent(t *testing.T) {
 }
 
 func TestSandboxManager_CreateSandbox_RuntimeFailure(t *testing.T) {
-	// CS-03: Runtime failure returns error (runtime handles its own cleanup)
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -488,7 +468,6 @@ func TestSandboxManager_CreateSandbox_RuntimeFailure(t *testing.T) {
 }
 
 func TestSandboxManager_CreateSandbox_MultipleSandboxes(t *testing.T) {
-	// CS-04: Creating multiple sandboxes works correctly
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -524,12 +503,7 @@ func TestSandboxManager_CreateSandbox_MultipleSandboxes(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// 3. TestSandboxManager_DeleteSandbox
-// ============================================================================
-
 func TestSandboxManager_DeleteSandbox_Success(t *testing.T) {
-	// DS-01: Successfully deletes a sandbox
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -562,7 +536,6 @@ func TestSandboxManager_DeleteSandbox_Success(t *testing.T) {
 }
 
 func TestSandboxManager_DeleteSandbox_Idempotent(t *testing.T) {
-	// DS-02: Deleting already-terminating sandbox returns success (idempotent)
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -591,7 +564,6 @@ func TestSandboxManager_DeleteSandbox_Idempotent(t *testing.T) {
 }
 
 func TestSandboxManager_DeleteSandbox_NonExistent(t *testing.T) {
-	// DS-03: Deleting non-existent sandbox - should be idempotent and return success
 	// This follows the principle that DELETE operations should be idempotent
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
@@ -603,7 +575,6 @@ func TestSandboxManager_DeleteSandbox_NonExistent(t *testing.T) {
 }
 
 func TestSandboxManager_DeleteSandbox_MultipleDeletes(t *testing.T) {
-	// DS-04: Multiple rapid deletes show idempotency during "terminating" phase
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -633,12 +604,7 @@ func TestSandboxManager_DeleteSandbox_MultipleDeletes(t *testing.T) {
 	assert.Empty(t, statuses, "Sandbox should be completely removed after async delete")
 }
 
-// ============================================================================
-// 4. TestSandboxManager_GetSandboxStatuses
-// ============================================================================
-
 func TestSandboxManager_GetSandboxStatuses(t *testing.T) {
-	// GS-01: Returns statuses for active sandboxes only (deleted ones are completely removed)
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -673,7 +639,6 @@ func TestSandboxManager_GetSandboxStatuses(t *testing.T) {
 }
 
 func TestSandboxManager_GetSandboxStatuses_Empty(t *testing.T) {
-	// GS-02: Returns empty list when no sandboxes exist
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -685,7 +650,6 @@ func TestSandboxManager_GetSandboxStatuses_Empty(t *testing.T) {
 }
 
 func TestSandboxManager_GetSandboxStatuses_RuntimeStatus(t *testing.T) {
-	// GS-03: Includes runtime status in Message field
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -708,7 +672,6 @@ func TestSandboxManager_GetSandboxStatuses_RuntimeStatus(t *testing.T) {
 }
 
 func TestSandboxManager_GetSandboxStatuses_MultiplePhases(t *testing.T) {
-	// GS-04: Reports different phases for different sandbox states
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -753,10 +716,6 @@ func TestSandboxManager_GetSandboxStatuses_MultiplePhases(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// 5. TestSandboxManager_GetCapacity
-// ============================================================================
-
 func TestSandboxManager_GetCapacity(t *testing.T) {
 	// GC-01: Returns configured capacity
 	mockRuntime := NewMockRuntime()
@@ -785,12 +744,7 @@ func TestSandboxManager_GetCapacity_Custom(t *testing.T) {
 	assert.Equal(t, 20, capacity, "Capacity should match FASTLET_CAPACITY env var")
 }
 
-// ============================================================================
-// 6. TestSandboxManager_Close
-// ============================================================================
-
 func TestSandboxManager_Close(t *testing.T) {
-	// CL-01: Close propagates to runtime
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -801,7 +755,6 @@ func TestSandboxManager_Close(t *testing.T) {
 }
 
 func TestSandboxManager_Close_MultipleCalls(t *testing.T) {
-	// CL-02: Multiple close calls are handled gracefully
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -816,10 +769,6 @@ func TestSandboxManager_Close_MultipleCalls(t *testing.T) {
 	// Both should succeed
 	assert.True(t, mockRuntime.GetCloseCalled(), "Runtime Close should be called")
 }
-
-// ============================================================================
-// 8. TestSandboxManager_ListImages
-// ============================================================================
 
 func TestSandboxManager_ListImages(t *testing.T) {
 	// LI-01: ListImages propagates to runtime
@@ -847,10 +796,6 @@ func TestSandboxManager_ListImages_CustomList(t *testing.T) {
 	assert.NoError(t, err, "ListImages should succeed")
 	assert.Equal(t, customImages, images, "Should return custom images")
 }
-
-// ============================================================================
-// 9. TestSandboxManager_AsyncDeleteBehavior
-// ============================================================================
 
 func TestSandboxManager_AsyncDelete_Timeout(t *testing.T) {
 	// AD-01: Async delete handles context timeout gracefully

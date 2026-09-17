@@ -90,12 +90,6 @@ func WithNamespacePrefix(prefix string) Option {
 	}
 }
 
-func WithControllerNamespace(namespace string) Option {
-	return func(env *SuiteEnv) {
-		env.controllerNamespace = strings.TrimSpace(namespace)
-	}
-}
-
 func (e *SuiteEnv) Env() envpkg.Environment {
 	return e.env
 }

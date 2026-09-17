@@ -57,7 +57,7 @@ func (m *Manager) InitializeInstanceWithDialer(ctx context.Context, config *fast
 			// The process runs in the Fastlet Pod network namespace, so its
 			// listener is reached on Pod loopback instead of the Sandbox
 			// access address.
-			klog.V(2).InfoS("Probing host-process component on Pod loopback",
+			klog.V(2).InfoS("probing host-process component on Pod loopback",
 				"component", service.Component, "port", service.Port, "probe", service.Readiness.Type)
 			serviceErr = m.initializeServiceWithDialer(ctx, func(ctx context.Context, port uint32) (net.Conn, error) {
 				return (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port))))

@@ -57,7 +57,7 @@ type boxLiteErrorResponse = boxliteprotocol.ErrorResponse
 
 func New(profile runtimecatalog.RuntimeProfile) (*Driver, error) {
 	if profile.BoxLite == nil {
-		return nil, fmt.Errorf("BoxLite runtime profile %q has no private configuration", profile.Name)
+		return nil, fmt.Errorf("boxLite runtime profile %q has no private configuration", profile.Name)
 	}
 	return &Driver{
 		profile: profile, config: *profile.BoxLite,
@@ -365,7 +365,7 @@ func (d *Driver) doJSON(ctx context.Context, method, path string, input, output 
 		case response.StatusCode == http.StatusConflict:
 			return fmt.Errorf("%w: %s", ErrSandboxAlreadyExists, wireError.Message)
 		default:
-			return fmt.Errorf("BoxLite sidecar %s %s failed: %s: %s", method, path, wireError.Code, wireError.Message)
+			return fmt.Errorf("boxLite sidecar %s %s failed: %s: %s", method, path, wireError.Code, wireError.Message)
 		}
 	}
 	if output == nil || response.StatusCode == http.StatusNoContent {

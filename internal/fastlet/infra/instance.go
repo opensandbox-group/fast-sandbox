@@ -12,10 +12,10 @@ import (
 	"strings"
 	"time"
 
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	infracontract "fast-sandbox/internal/infra/contract"
 	"fast-sandbox/internal/observability"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
-	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	"fast-sandbox/internal/sandbox/supervisor"
 
 	"k8s.io/klog/v2"
@@ -113,7 +113,7 @@ func (m *Manager) PrepareInstance(ctx context.Context, config *fastletapi.Runtim
 	for _, prepared := range plan.Components {
 		component := prepared.Plan
 		if component.Delivery == runtimecatalog.InfraDeliveryHostProcess {
-			klog.InfoS("Infra host-process component registered for Pod-loopback readiness",
+			klog.InfoS("infra host-process component registered for Pod-loopback readiness",
 				"component", component.Name, "port", component.Endpoint.Port,
 				"sandboxID", config.Identity.SandboxUID, "probe", component.Process.Readiness.Type)
 			result.Services = append(result.Services, ServiceEndpoint{

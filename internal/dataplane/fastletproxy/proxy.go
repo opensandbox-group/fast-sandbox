@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	dataplane "fast-sandbox/internal/dataplane/contract"
 	routeauth "fast-sandbox/internal/dataplane/auth"
+	dataplane "fast-sandbox/internal/dataplane/contract"
 	"fast-sandbox/internal/observability"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -73,7 +73,7 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		}
 		if !strings.EqualFold(component.Protocol, "HTTP") {
 			metricResult = "unsupported_component_protocol"
-			requestErr = fmt.Errorf("Infra Component protocol %q is not supported", component.Protocol)
+			requestErr = fmt.Errorf("infra Component protocol %q is not supported", component.Protocol)
 			writeProxyError(writer, http.StatusNotImplemented, dataplane.ProxyErrorComponentNotReady, requestErr.Error())
 			return
 		}

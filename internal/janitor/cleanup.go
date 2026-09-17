@@ -16,7 +16,7 @@ func (j *Janitor) doCleanup(ctx context.Context, task CleanupTask) error {
 	}
 	if !decision.Eligible {
 		recordJanitorCleanup(resource.Backend, "skipped", decision.Reason)
-		klog.InfoS("Skipping resource after pre-delete revalidation", "backend", resource.Backend, "resource", resource.ResourceID, "reason", decision.Reason)
+		klog.InfoS("skipping resource after pre-delete revalidation", "backend", resource.Backend, "resource", resource.ResourceID, "reason", decision.Reason)
 		return nil
 	}
 	backend := j.backend(resource.Backend)
@@ -28,7 +28,7 @@ func (j *Janitor) doCleanup(ctx context.Context, task CleanupTask) error {
 		recordJanitorCleanup(resource.Backend, "error", "BackendCleanupFailed")
 		return fmt.Errorf("cleanup %s: %w", resource.String(), err)
 	}
-	klog.InfoS("Cleaned orphan node resource", "backend", resource.Backend, "resource", resource.ResourceID, "reason", decision.Reason)
+	klog.InfoS("cleaned orphan node resource", "backend", resource.Backend, "resource", resource.ResourceID, "reason", decision.Reason)
 	recordJanitorCleanup(resource.Backend, "cleaned", decision.Reason)
 	return nil
 }

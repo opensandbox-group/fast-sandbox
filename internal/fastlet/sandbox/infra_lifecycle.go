@@ -140,7 +140,7 @@ func (m *SandboxManager) startDataPlaneReconcile(metadata *SandboxMetadata, star
 			// The loop only writes in-memory diagnostics; without this line
 			// a sandbox flapping between infra/route-unavailable phases is
 			// invisible at default verbosity.
-			klog.V(2).InfoS("Data-plane reconcile attempt failed; retrying",
+			klog.V(2).InfoS("data-plane reconcile attempt failed; retrying",
 				"sandboxID", sandboxUID, "attempt", attempt, "retryDelay", retryDelay.String(), "err", err)
 			timer := time.NewTimer(retryDelay)
 			select {
@@ -314,7 +314,7 @@ func (m *SandboxManager) publishDataPlaneRoute(ctx context.Context, metadata *Sa
 		if routeApplied {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 			if removeErr := m.removeRoute(cleanupCtx, metadata); removeErr != nil {
-				klog.V(2).InfoS("Stale route removal after reconcile race failed", "sandboxID", sandboxUID, "err", removeErr)
+				klog.V(2).InfoS("stale route removal after reconcile race failed", "sandboxID", sandboxUID, "err", removeErr)
 			}
 			cancel()
 		}
@@ -332,7 +332,7 @@ func (m *SandboxManager) publishDataPlaneRoute(ctx context.Context, metadata *Sa
 	} else {
 		metadata.Phase = "running"
 		m.recordDiagnosticLocked(sandboxUID, "info", "fastlet", "running", "runtime, private network, Infra Components, proxy route, and Sandbox Actions are ready")
-		klog.InfoS("Sandbox data plane ready; route published", "sandboxID", sandboxUID)
+		klog.InfoS("sandbox data plane ready; route published", "sandboxID", sandboxUID)
 	}
 	m.mu.Unlock()
 	m.recordActionHook(metadata, actionapi.LifecycleHookDataPlaneReady, 2)
@@ -364,9 +364,9 @@ func (m *SandboxManager) ReconcilePendingInfra(ctx context.Context) error {
 	for _, metadata := range pending {
 		ready, err := m.reconcileDataPlaneOnce(ctx, metadata)
 		if err != nil {
-			result = errors.Join(result, fmt.Errorf("Sandbox %s: %w", metadata.Config.Identity.SandboxUID, err))
+			result = errors.Join(result, fmt.Errorf("sandbox %s: %w", metadata.Config.Identity.SandboxUID, err))
 		} else if !ready {
-			result = errors.Join(result, fmt.Errorf("Sandbox %s data plane is still initializing", metadata.Config.Identity.SandboxUID))
+			result = errors.Join(result, fmt.Errorf("sandbox %s data plane is still initializing", metadata.Config.Identity.SandboxUID))
 		}
 	}
 	m.mu.RLock()

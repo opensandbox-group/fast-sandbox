@@ -37,7 +37,7 @@ func (a AccessDescriptor) Validate() error {
 	case AccessKindLocalForward:
 		host, port, err := net.SplitHostPort(a.Address)
 		if err != nil {
-			return fmt.Errorf("LocalForward access descriptor requires loopback host:port: %w", err)
+			return fmt.Errorf("localForward access descriptor requires loopback host:port: %w", err)
 		}
 		ip := net.ParseIP(host)
 		parsedPort, portErr := strconv.ParseUint(port, 10, 16)

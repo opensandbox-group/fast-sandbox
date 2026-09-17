@@ -1,6 +1,6 @@
 package agent
 
-// The image reference index (design details doc §1.2) resolves a published
+// The image reference index resolves a published
 // build from the image reference alone: <store>/index/<sha256(image)>.json
 // points at the latest complete artifact set.
 

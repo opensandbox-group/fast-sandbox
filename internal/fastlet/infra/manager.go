@@ -65,7 +65,7 @@ func NewManagerWithConfig(config ManagerConfig) (*Manager, error) {
 		config.Plan.Revision = revision
 	}
 	if config.Plan.Revision != revision {
-		return nil, fmt.Errorf("Infra revision %s does not match compiled plan %s", config.Plan.Revision, revision)
+		return nil, fmt.Errorf("infra revision %s does not match compiled plan %s", config.Plan.Revision, revision)
 	}
 	return &Manager{config: config, plan: PreparedPlan{Plan: config.Plan}}, nil
 }
@@ -81,7 +81,7 @@ func (m *Manager) Prepare(ctx context.Context) error {
 	guestComponents := false
 	for _, component := range m.plan.Plan.Components {
 		if component.Delivery == runtimecatalog.InfraDeliveryHostProcess {
-			klog.InfoS("Infra component uses host-process delivery; artifact delivery skipped",
+			klog.InfoS("infra component uses host-process delivery; artifact delivery skipped",
 				"component", component.Name, "delivery", component.Delivery)
 			prepared.Components = append(prepared.Components, PreparedComponent{Plan: component})
 			continue

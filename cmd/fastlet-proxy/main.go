@@ -54,7 +54,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 5 * time.Minute,
 	}
 	go func() {
-		klog.InfoS("Fastlet Proxy data server listening", "address", dataServer.Addr)
+		klog.InfoS("fastlet proxy data server listening", "address", dataServer.Addr)
 		errorsChannel <- dataServer.ListenAndServe()
 	}()
 	metricsMux := http.NewServeMux()
@@ -63,7 +63,7 @@ func main() {
 		Addr: envOrDefault("FASTLET_PROXY_METRICS_ADDRESS", ":9093"), Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
-		klog.InfoS("Fastlet Proxy metrics server listening", "address", metricsServer.Addr)
+		klog.InfoS("fastlet proxy metrics server listening", "address", metricsServer.Addr)
 		errorsChannel <- metricsServer.ListenAndServe()
 	}()
 

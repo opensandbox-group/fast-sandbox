@@ -65,7 +65,7 @@ const snapshotManifestName = "manifest.json"
 // memory dump then pays tmpfs bandwidth instead of the (often
 // network-backed) StateRoot filesystem, shrinking the business-visible
 // pause window from seconds to sub-second. Empty (default) keeps the
-// legacy direct-to-staging dump.
+// direct-to-staging dump.
 const snapshotSpillDirEnv = "FAST_SANDBOX_SNAPSHOT_SPILL_DIR"
 
 // Driver implements the optional snapshot extension.
@@ -134,7 +134,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 		_ = os.RemoveAll(plan.staging)
 		return nil, dumpErr
 	}
-	klog.InfoS("Firecracker sandbox dumped",
+	klog.InfoS("firecracker sandbox dumped",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID,
 		"pauseWindow", plan.pauseWindow.String(), "spillMove", plan.spillMove.String(),
 		"spilled", plan.spilled, "rootfsClone", plan.rootfsClone.String(), "rootfsCopy", plan.rootfsCopy.String(),
@@ -145,7 +145,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 		_ = os.RemoveAll(plan.staging)
 		return nil, err
 	}
-	klog.InfoS("Firecracker checkpoint manifest assembled",
+	klog.InfoS("firecracker checkpoint manifest assembled",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind,
 		"sizeBytes", sizeBytes, "staging", plan.staging)
 
@@ -191,7 +191,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 	} else {
 		_ = os.RemoveAll(plan.staging)
 	}
-	klog.InfoS("Firecracker snapshot published",
+	klog.InfoS("firecracker snapshot published",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "templateName", input.TemplateName,
 		"manifestRef", outcome.ManifestRef, "sizeBytes", sizeBytes, "publish", time.Since(publishStarted).String())
 	return result, nil
@@ -318,7 +318,7 @@ func (d *Driver) ensureDumpCapacity(plan dumpPlan) error {
 		}
 	}
 	free := stagingFree(stateRoot)
-	klog.InfoS("Firecracker snapshot staging space insufficient; parking the task",
+	klog.InfoS("firecracker snapshot staging space insufficient; parking the task",
 		"stateRoot", stateRoot, "needBytes", need, "freeBytes", free)
 	return fmt.Errorf("%w: staging needs %d bytes, %d free", runtimecontract.ErrInsufficientStorage, need, free)
 }
@@ -397,7 +397,7 @@ func (d *Driver) snapshotSpillRoot() string {
 
 // spillDirFor resolves the per-snapshot spill directory and applies the
 // capacity guard. It returns "" when spilling is disabled or the area
-// cannot hold the dump (the caller falls back to the legacy
+// cannot hold the dump (the caller falls back to the
 // direct-to-staging dump). The guard needs the VM's memory size: unknown
 // sizes fall back rather than risk a mid-dump ENOSPC.
 func (d *Driver) spillDirFor(snapshotID, memoryQuantity string) string {
@@ -424,7 +424,7 @@ func (d *Driver) spillDirFor(snapshotID, memoryQuantity string) string {
 	}
 	free := int64(stat.Bavail) * int64(stat.Bsize)
 	if free < need {
-		klog.InfoS("Firecracker snapshot spill area too small, falling back to staging dump",
+		klog.InfoS("firecracker snapshot spill area too small, falling back to staging dump",
 			"spillRoot", root, "freeBytes", free, "needBytes", need)
 		return ""
 	}
@@ -467,7 +467,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 	// up front, never mid-window.
 	spillDir := d.spillDirFor(plan.snapshotID, state.Config.Spec.Memory)
 	plan.spilled = spillDir != ""
-	klog.InfoS("Firecracker sandbox dump starting",
+	klog.InfoS("firecracker sandbox dump starting",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID,
 		"staging", plan.staging, "jailed", plan.jailed, "spilled", plan.spilled)
 
@@ -498,7 +498,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 			// The spill root was bind-mounted into the jail at instance
 			// creation; the per-snapshot directory is reachable behind it.
 			// A sandbox created before the spill was configured (or whose
-			// bind failed) falls back to the legacy in-jail dump.
+			// bind failed) falls back to the in-jail dump.
 			if _, err := os.Stat(filepath.Join(plan.jailRoot(), jailerSpillDirName, plan.snapshotID)); err != nil {
 				plan.spilled = false
 				_ = os.RemoveAll(spillDir)
@@ -544,7 +544,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		return fmt.Errorf("pause microVM: %w", err)
 	}
 	plan.pauseAPI = time.Since(pauseStarted)
-	klog.InfoS("Firecracker sandbox paused for dump",
+	klog.InfoS("firecracker sandbox paused for dump",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "spilled", plan.spilled,
 		"rootfsCloned", rootfsCloned)
 	dumpErr := func() error {
@@ -584,7 +584,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		cleanupSpill()
 		return dumpErr
 	}
-	klog.InfoS("Firecracker sandbox resumed after dump",
+	klog.InfoS("firecracker sandbox resumed after dump",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "pauseWindow", plan.pauseWindow.String(),
 		"rootfsClone", plan.rootfsClone.String(), "rootfsCopy", plan.rootfsCopy.String(),
 		"pauseAPI", plan.pauseAPI.String(), "dumpAPI", plan.dumpAPI.String(), "resumeAPI", plan.resumeAPI.String())

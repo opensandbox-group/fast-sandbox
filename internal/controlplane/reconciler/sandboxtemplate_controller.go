@@ -221,7 +221,7 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.
 	case pod.Status.Phase == corev1.PodSucceeded:
 		// Build Pod finished: consume the reported annotations, mark the
 		// build succeeded, and clear the finished Pod.
-		logger.Info("Sandbox template build pod succeeded", "template", template.Name, "pod", pod.Name)
+		logger.Info("sandbox template build pod succeeded", "template", template.Name, "pod", pod.Name)
 		template.Status.ManifestRef = pod.Annotations[sandboxTemplateManifestRefAnnot]
 		template.Status.ArtifactDigest = pod.Annotations[sandboxTemplateArtifactDigestAnn]
 		template.Status.Phase = apiv1alpha2.SandboxTemplatePhaseSucceeded
@@ -409,7 +409,7 @@ func (r *SandboxTemplateReconciler) cleanupStalePods(ctx context.Context, templa
 			// never adopt, delete immediately. If it is already being
 			// garbage-collected, nothing to do.
 			if pod.DeletionTimestamp == nil {
-				klog.FromContext(ctx).V(1).Info("Deleting un-owned stale template build pod", "template", template.Name, "pod", pod.Name, "podNamespace", pod.Namespace)
+				klog.FromContext(ctx).V(1).Info("deleting un-owned stale template build pod", "template", template.Name, "pod", pod.Name, "podNamespace", pod.Namespace)
 				if err := r.Delete(ctx, pod, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
 					return err
 				}
@@ -425,7 +425,7 @@ func (r *SandboxTemplateReconciler) cleanupStalePods(ctx context.Context, templa
 		if pod.DeletionTimestamp != nil {
 			continue
 		}
-		klog.FromContext(ctx).V(1).Info("Deleting stale template build pod from a previous generation", "template", template.Name, "pod", pod.Name, "podNamespace", pod.Namespace)
+		klog.FromContext(ctx).V(1).Info("deleting stale template build pod from a previous generation", "template", template.Name, "pod", pod.Name, "podNamespace", pod.Namespace)
 		if err := r.Delete(ctx, pod, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}

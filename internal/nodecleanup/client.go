@@ -62,7 +62,7 @@ func (c *Client) EnsureRuntimeProcessesAbsent(
 	}
 	message, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if readErr != nil {
-		return fmt.Errorf("NodeJanitor returned %s and its response could not be read: %w", resp.Status, readErr)
+		return fmt.Errorf("nodeJanitor returned %s and its response could not be read: %w", resp.Status, readErr)
 	}
-	return fmt.Errorf("NodeJanitor returned %s: %s", resp.Status, bytes.TrimSpace(message))
+	return fmt.Errorf("nodeJanitor returned %s: %s", resp.Status, bytes.TrimSpace(message))
 }

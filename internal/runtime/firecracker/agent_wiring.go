@@ -118,13 +118,13 @@ func (d *Driver) releaseAgentSandbox(ctx context.Context, sandboxID, image strin
 	}
 	if leaseID, ok := d.leaseForSandbox(sandboxID); ok {
 		if err := client.ReleaseDevices(ctx, "release-"+leaseID, leaseID); err != nil && !errorsIsAgentUnreachable(err) {
-			klog.V(2).InfoS("Firecracker runtime-agent ReleaseDevices failed", "sandboxID", sandboxID, "err", err)
+			klog.V(2).InfoS("firecracker runtime-agent ReleaseDevices failed", "sandboxID", sandboxID, "err", err)
 		}
 		d.forgetLease(sandboxID)
 	}
 	if image != "" {
 		if err := client.UnpinImage(ctx, "unpin-"+sandboxID, image); err != nil && !errorsIsAgentUnreachable(err) {
-			klog.V(2).InfoS("Firecracker runtime-agent UnpinImage failed", "sandboxID", sandboxID, "err", err)
+			klog.V(2).InfoS("firecracker runtime-agent UnpinImage failed", "sandboxID", sandboxID, "err", err)
 		}
 	}
 }

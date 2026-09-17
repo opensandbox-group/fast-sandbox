@@ -98,7 +98,7 @@ func main() {
 	go func() {
 		if watchCache.WaitForCacheSync(ctx) {
 			cacheReady.Store(true)
-			klog.InfoS("Sandbox Proxy watch cache synchronized")
+			klog.InfoS("sandbox proxy watch cache synchronized")
 		}
 	}()
 
@@ -121,7 +121,7 @@ func main() {
 		metricsMux.Handle("GET /metrics", promhttp.Handler())
 		metricsServer = &http.Server{Addr: metricsAddress, Handler: metricsMux, ReadHeaderTimeout: 5 * time.Second}
 		go func() {
-			klog.InfoS("Sandbox Proxy metrics server listening", "address", metricsAddress)
+			klog.InfoS("sandbox proxy metrics server listening", "address", metricsAddress)
 			if serveErr := metricsServer.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 				klog.ErrorS(serveErr, "Sandbox Proxy metrics server exited")
 				cancel()
@@ -137,7 +137,7 @@ func main() {
 			_ = metricsServer.Shutdown(shutdownContext)
 		}
 	}()
-	klog.InfoS("Sandbox Proxy listening", "address", address)
+	klog.InfoS("sandbox proxy listening", "address", address)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		klog.ErrorS(err, "Sandbox Proxy server exited")
 		os.Exit(1)

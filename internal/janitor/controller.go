@@ -22,7 +22,7 @@ func NewJanitor(kubeClient kubernetes.Interface, ctrdClient *containerd.Client, 
 		kubeClient:   kubeClient,
 		nodeName:     nodeName,
 		queue:        workqueue.NewNamedRateLimitingQueue(workqueue.DefaultItemBasedRateLimiter(), "janitor"),
-		ScanInterval: 2 * time.Minute, // 默认值
+		ScanInterval: 2 * time.Minute,
 	}
 	if ctrdClient != nil {
 		janitor.AddBackend(NewContainerdBackend(ctrdClient, "/run/containerd/fifo", "k8s.io"))
@@ -31,9 +31,8 @@ func NewJanitor(kubeClient kubernetes.Interface, ctrdClient *containerd.Client, 
 }
 
 func (j *Janitor) Run(ctx context.Context) error {
-	klog.InfoS("Starting Node Janitor", "node", j.nodeName)
+	klog.InfoS("starting Node Janitor", "node", j.nodeName)
 
-	// 1. 初始化 Informer
 	factory := informers.NewSharedInformerFactoryWithOptions(j.kubeClient, time.Hour,
 		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
 			opts.FieldSelector = "spec.nodeName=" + j.nodeName
@@ -44,7 +43,6 @@ func (j *Janitor) Run(ctx context.Context) error {
 		DeleteFunc: func(obj interface{}) {
 			pod, ok := obj.(*corev1.Pod)
 			if !ok {
-				// 处理已经完全删除的情况
 				tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 				if !ok {
 					return
@@ -64,16 +62,14 @@ func (j *Janitor) Run(ctx context.Context) error {
 	}
 	defer j.queue.ShutDown()
 
-	// 2. 启动 Worker
 	go wait.UntilWithContext(ctx, j.runWorker, time.Second)
 
-	// 3. 启动定时扫描
 	if j.ScanInterval <= 0 {
 		j.ScanInterval = 2 * time.Minute
 	}
 	ticker := time.NewTicker(j.ScanInterval)
 	defer ticker.Stop()
-	// 初始扫描
+	// Scan once at startup instead of waiting a full interval.
 	j.Scan(ctx)
 
 	for {
@@ -90,7 +86,7 @@ func (j *Janitor) handlePodDeletion(ctx context.Context, pod *corev1.Pod) {
 	// Only Fastlet Pods carry the pool label; other Pod deletions never
 	// own node-local runtime resources.
 	if pool, ok := pod.Labels["fast-sandbox.io/pool"]; ok {
-		klog.InfoS("Detected Fastlet Pod deletion, scanning node resources", "pod", pod.Name, "podUID", pod.UID, "pool", pool)
+		klog.InfoS("detected Fastlet Pod deletion, scanning node resources", "pod", pod.Name, "podUID", pod.UID, "pool", pool)
 		go j.Scan(ctx)
 		// The first scan can race the Sandbox reconciler's durable FastletPodLost
 		// observation. Retry after the orphan grace period instead of leaving the

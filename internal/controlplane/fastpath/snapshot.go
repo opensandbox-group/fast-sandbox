@@ -187,9 +187,6 @@ func (s *Server) checkSnapshotReentrancy(ctx context.Context, sandbox *apiv1alph
 
 func snapshotSelfKey(namespace, name string) string { return namespace + "/" + name }
 
-// acceptSnapshotIntent persists the snapshot intent idempotently: an
-// AlreadyExists with the same request-id and spec hash replays the persisted
-// object, anything else is a conflict.
 // ManifestPolicySource resolves snapshot-recorded action bindings for an
 // image from the artifact store. The manifest is the ONLY policy record:
 // it outlives the SandboxSnapshot CR (deleting the CR keeps the
@@ -365,18 +362,21 @@ func (s *Server) applyManifestRecordedBindings(ctx context.Context, request *fas
 		merged = append(merged, binding)
 	}
 	if len(merged) != len(explicit) {
-		klog.FromContext(ctx).Info("Re-applying snapshot-recorded action bindings",
+		klog.FromContext(ctx).Info("re-applying snapshot-recorded action bindings",
 			"image", request.Image, "recorded", len(bindings), "applied", len(merged)-len(explicit))
 	}
 	return merged, nil
 }
 
+// acceptSnapshotIntent persists the snapshot intent idempotently: an
+// AlreadyExists with the same request-id and spec hash replays the persisted
+// object, anything else is a conflict.
 func (s *Server) acceptSnapshotIntent(ctx context.Context, snapshot *apiv1alpha2.SandboxSnapshot) (*apiv1alpha2.SandboxSnapshot, error) {
 	createErr := s.K8sClient.Create(ctx, snapshot)
 	if createErr == nil {
 		// A durable intent write: operators must be able to see that a
 		// snapshot object now exists even if the trigger later fails.
-		klog.FromContext(ctx).Info("SandboxSnapshot intent created", "snapshot", snapshot.Name)
+		klog.FromContext(ctx).Info("snapshot intent created", "snapshot", snapshot.Name)
 		return snapshot, nil
 	} else if !apierrors.IsAlreadyExists(createErr) {
 		return nil, grpcKubernetesError(createErr)

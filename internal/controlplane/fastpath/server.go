@@ -1077,18 +1077,18 @@ func apiActionBindings(bindings []*fastpathv2.ActionBinding) ([]apiv1alpha2.Acti
 			return nil, errors.New("Action Binding Handler is required")
 		}
 		if problems := kvalidation.IsDNS1123Label(binding.Handler); len(problems) > 0 {
-			return nil, fmt.Errorf("Action Binding Handler %q is invalid: %s", binding.Handler, problems[0])
+			return nil, fmt.Errorf("action Binding Handler %q is invalid: %s", binding.Handler, problems[0])
 		}
 		if _, found := seen[binding.Handler]; found {
 			return nil, fmt.Errorf("duplicate Action Binding Handler %q", binding.Handler)
 		}
 		seen[binding.Handler] = struct{}{}
 		if len(binding.Input) > apiv1alpha2.MaxActionBindingInputBytes {
-			return nil, fmt.Errorf("Action Binding %s input exceeds %d bytes", binding.Handler, apiv1alpha2.MaxActionBindingInputBytes)
+			return nil, fmt.Errorf("action Binding %s input exceeds %d bytes", binding.Handler, apiv1alpha2.MaxActionBindingInputBytes)
 		}
 		total += len(binding.Input)
 		if total > apiv1alpha2.MaxSandboxActionBindingInputBytes {
-			return nil, fmt.Errorf("Action Binding inputs exceed %d bytes", apiv1alpha2.MaxSandboxActionBindingInputBytes)
+			return nil, fmt.Errorf("action Binding inputs exceed %d bytes", apiv1alpha2.MaxSandboxActionBindingInputBytes)
 		}
 		result = append(result, apiv1alpha2.ActionBinding{Handler: binding.Handler, Input: binding.Input})
 	}

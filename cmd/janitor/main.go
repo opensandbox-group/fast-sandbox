@@ -131,7 +131,7 @@ func main() {
 	if metricsAddress != "" {
 		metricsServer = &http.Server{Addr: metricsAddress, Handler: promhttp.Handler(), ReadHeaderTimeout: 5 * time.Second}
 		go func() {
-			klog.InfoS("Janitor metrics server listening", "address", metricsAddress)
+			klog.InfoS("janitor metrics server listening", "address", metricsAddress)
 			if serveErr := metricsServer.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 				klog.ErrorS(serveErr, "Janitor metrics server exited")
 				stop()
@@ -169,7 +169,7 @@ func main() {
 	j.K8sClient = k8sClient
 	j.OrphanTimeout = orphanTimeout
 	j.ScanInterval = scanInterval
-	klog.InfoS("Starting Janitor", "node", nodeName, "orphan-timeout", orphanTimeout, "scan-interval", scanInterval, "metricsAddress", metricsAddress, "controlSocket", controlSocket)
+	klog.InfoS("starting janitor", "node", nodeName, "orphanTimeout", orphanTimeout, "scanInterval", scanInterval, "metricsAddress", metricsAddress, "controlSocket", controlSocket)
 	if err := j.Run(ctx); err != nil {
 		klog.ErrorS(err, "Janitor exited with error")
 		os.Exit(1)

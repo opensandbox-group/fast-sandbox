@@ -6,7 +6,7 @@ import "errors"
 
 // bindMount is Linux-only (jailer mode): macOS builds exist for compilation
 // and unit tests only, so this stub always fails and the caller falls back
-// to the legacy staging dump.
+// to the direct-to-staging dump.
 func bindMount(_, _ string) error {
 	return errors.New("bind mounts are not supported on this platform")
 }

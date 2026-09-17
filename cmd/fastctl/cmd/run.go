@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -77,21 +76,21 @@ Priority: Flags > Config File > Interactive Input
 		}
 
 		if configFile != "" {
-			klog.V(4).InfoS("Loading config from file", "file", configFile)
+			klog.V(4).InfoS("loading config from file", "file", configFile)
 			data, err := os.ReadFile(configFile)
 			if err != nil {
 				klog.ErrorS(err, "Failed to read config file", "file", configFile)
-				log.Fatalf("Failed to read config file: %v", err)
+				exitWithErrorf("Failed to read config file: %v", err)
 			}
 			if err := yaml.Unmarshal(data, &config); err != nil {
 				klog.ErrorS(err, "Failed to parse config file", "file", configFile)
-				log.Fatalf("Failed to parse config file: %v", err)
+				exitWithErrorf("Failed to parse config file: %v", err)
 			}
 		} else if image == "" {
 			fmt.Println("Entering interactive mode...")
 			if err := runInteractive(name, &config); err != nil {
 				klog.ErrorS(err, "Interactive mode failed", "name", name)
-				log.Fatalf("Interactive mode failed: %v", err)
+				exitWithErrorf("Interactive mode failed: %v", err)
 			}
 		}
 
@@ -106,7 +105,7 @@ Priority: Flags > Config File > Interactive Input
 		}
 		if config.Image == "" {
 			klog.ErrorS(nil, "Image is required but not provided", "name", name)
-			log.Fatal("Error: image is required (via flag, file, or interactive mode)")
+			exitWithErrorf("image is required (via flag, file, or interactive mode)")
 		}
 
 		client, conn := getClient()
@@ -120,7 +119,7 @@ Priority: Flags > Config File > Interactive Input
 			createRequestID = name
 		}
 		if createRequestID != name {
-			log.Fatal("Error: --request-id must equal the Sandbox name")
+			exitWithErrorf("--request-id must equal the Sandbox name")
 		}
 		metadata := make(map[string]string, len(config.Metadata)+len(runMetadata))
 		for key, value := range config.Metadata {
@@ -129,7 +128,7 @@ Priority: Flags > Config File > Interactive Input
 		for _, item := range runMetadata {
 			parts := strings.SplitN(item, "=", 2)
 			if len(parts) != 2 {
-				log.Fatalf("Error: invalid metadata %q; expected key=value", item)
+				exitWithErrorf("invalid metadata %q; expected key=value", item)
 			}
 			metadata[parts[0]] = parts[1]
 		}
@@ -137,12 +136,12 @@ Priority: Flags > Config File > Interactive Input
 		if config.FailurePolicy == "" {
 			failurePolicy = fastpathv2.FailurePolicy_MANUAL
 		} else if err != nil {
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 		if runFailurePolicy != "" {
 			failurePolicy, err = parseFailurePolicy(runFailurePolicy)
 			if err != nil {
-				log.Fatalf("Error: %v", err)
+				exitWithError(err)
 			}
 		}
 		expiresAt := config.ExpiresAt
@@ -157,7 +156,7 @@ Priority: Flags > Config File > Interactive Input
 		if cmd.Flags().Changed("action") {
 			actionBindings, err = parseActionBindings(runActionBindings)
 			if err != nil {
-				log.Fatalf("Error: %v", err)
+				exitWithError(err)
 			}
 		}
 		apiBindings := make([]*fastpathv2.ActionBinding, 0, len(actionBindings))
@@ -178,17 +177,17 @@ Priority: Flags > Config File > Interactive Input
 			ActionBindings: apiBindings,
 			Completion:     fastpathv2.CreateCompletion_CREATE_COMPLETION_READY,
 		}
-		klog.V(4).InfoS("Sending CreateSandbox request", "name", name, "image", config.Image, "pool", config.PoolRef, "namespace", req.Namespace)
+		klog.V(4).InfoS("sending CreateSandbox request", "name", name, "image", config.Image, "pool", config.PoolRef, "namespace", req.Namespace)
 
 		resp, err := client.CreateSandbox(context.Background(), req)
 		if err != nil {
 			klog.ErrorS(err, "CreateSandbox request failed", "name", name)
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 
 		info := resp.GetSandbox()
 		if info == nil {
-			log.Fatalf("Error: CreateSandbox returned no Sandbox observation")
+			exitWithErrorf("CreateSandbox returned no Sandbox observation")
 		}
 		// Cold images are delivered asynchronously: the create returns as
 		// soon as the Sandbox is accepted (runtime Creating) and the
@@ -200,7 +199,7 @@ Priority: Flags > Config File > Interactive Input
 			info = waitForSandboxReady(context.Background(), client, name, namespace)
 		}
 
-		klog.V(4).InfoS("Sandbox created successfully", "name", name, "sandboxUid", info.GetIdentity().GetUid(), "sandboxName", info.GetIdentity().GetName(), "ready", info.GetReady(), "duration", time.Since(start))
+		klog.V(4).InfoS("sandbox created successfully", "name", name, "sandboxUid", info.GetIdentity().GetUid(), "sandboxName", info.GetIdentity().GetName(), "ready", info.GetReady(), "duration", time.Since(start))
 		fmt.Printf("🎉 Sandbox runtime created successfully in %v\n", time.Since(start))
 		fmt.Printf("Name:      %s\n", info.GetIdentity().GetName())
 		fmt.Printf("UID:       %s\n", info.GetIdentity().GetUid())
@@ -221,11 +220,11 @@ func waitForSandboxReady(ctx context.Context, client fastpathv2.FastPathServiceC
 		})
 		if err != nil {
 			klog.ErrorS(err, "GetSandbox while waiting for readiness failed", "name", name)
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 		info := response.GetSandbox()
 		if info == nil {
-			log.Fatalf("Error: GetSandbox returned no Sandbox observation")
+			exitWithErrorf("GetSandbox returned no Sandbox observation")
 		}
 		if info.GetReady() {
 			return info
@@ -234,11 +233,11 @@ func waitForSandboxReady(ctx context.Context, client fastpathv2.FastPathServiceC
 		case fastpathv2.RuntimeState_RUNTIME_STATE_FAILED,
 			fastpathv2.RuntimeState_RUNTIME_STATE_UNAVAILABLE,
 			fastpathv2.RuntimeState_RUNTIME_STATE_STOPPED:
-			log.Fatalf("Error: Sandbox %s reached terminal state %s", name, info.GetRuntime().GetState())
+			exitWithErrorf("Sandbox %s reached terminal state %s", name, info.GetRuntime().GetState())
 		}
 		select {
 		case <-ctx.Done():
-			log.Fatalf("Error: waiting for Sandbox %s to become ready: %v", name, ctx.Err())
+			exitWithErrorf("waiting for Sandbox %s to become ready: %v", name, ctx.Err())
 		case <-ticker.C:
 		}
 	}

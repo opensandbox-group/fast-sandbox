@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 
 	fastpathv2 "fast-sandbox/api/proto/v2"
@@ -31,17 +30,17 @@ var getCmd = &cobra.Command{
 			defer conn.Close()
 		}
 
-		klog.V(4).InfoS("Sending GetSandbox request", "sandboxName", sandboxName, "namespace", namespace)
+		klog.V(4).InfoS("sending GetSandbox request", "sandboxName", sandboxName, "namespace", namespace)
 		resp, err := client.GetSandbox(context.Background(), &fastpathv2.GetSandboxRequest{
 			Sandbox: fastPathSandboxReference(sandboxName, namespace),
 		})
 		if err != nil {
 			klog.ErrorS(err, "GetSandbox request failed", "sandboxName", sandboxName, "namespace", namespace)
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 
 		info := resp.GetSandbox()
-		klog.V(4).InfoS("GetSandbox request succeeded", "sandboxUid", info.GetIdentity().GetUid(), "sandboxName", info.GetIdentity().GetName(), "runtimeState", info.GetRuntime().GetState(), "dataPlaneState", info.GetDataPlane().GetState(), "outputFormat", outputFormat)
+		klog.V(4).InfoS("getSandbox request succeeded", "sandboxUid", info.GetIdentity().GetUid(), "sandboxName", info.GetIdentity().GetName(), "runtimeState", info.GetRuntime().GetState(), "dataPlaneState", info.GetDataPlane().GetState(), "outputFormat", outputFormat)
 		if outputFormat == "json" {
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "  ")

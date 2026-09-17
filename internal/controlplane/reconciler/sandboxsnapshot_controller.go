@@ -285,15 +285,15 @@ func (r *SandboxSnapshotReconciler) reconcileDeletion(ctx context.Context, snaps
 			if errors.As(err, &failure) && failure.Code == fastletapi.ErrorRuntimeUnavailable {
 				// The artifacts may still exist but the runtime is down;
 				// proceed so object deletion is not wedged on cleanup.
-				klog.FromContext(ctx).Info("Skipping node-side snapshot cleanup: runtime unavailable", "snapshot", snapshot.Name)
+				klog.FromContext(ctx).Info("skipping node-side snapshot cleanup: runtime unavailable", "snapshot", snapshot.Name)
 			} else if errors.Is(err, orchestration.ErrAssignedFastletUnavailable) {
-				klog.FromContext(ctx).Info("Skipping node-side snapshot cleanup: assigned Fastlet unavailable", "snapshot", snapshot.Name)
+				klog.FromContext(ctx).Info("skipping node-side snapshot cleanup: assigned Fastlet unavailable", "snapshot", snapshot.Name)
 			} else {
 				return ctrl.Result{RequeueAfter: SnapshotRetryInterval}, err
 			}
 		}
 	} else if resolveErr != nil || result != nil {
-		klog.FromContext(ctx).Info("Skipping node-side snapshot cleanup: target Sandbox no longer resolvable", "snapshot", snapshot.Name)
+		klog.FromContext(ctx).Info("skipping node-side snapshot cleanup: target Sandbox no longer resolvable", "snapshot", snapshot.Name)
 	}
 	return ctrl.Result{}, retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		var current apiv1alpha2.SandboxSnapshot

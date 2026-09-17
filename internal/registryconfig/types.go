@@ -234,7 +234,7 @@ func (p *FileProvider) Revision() string {
 	if err != nil {
 		// Serving the last-good revision is deliberate (fail-open for a
 		// transient read failure), but the degraded state must be visible.
-		klog.V(2).InfoS("Registry configuration read failed; serving last-good revision", "path", p.path, "err", err)
+		klog.V(2).InfoS("registry configuration read failed; serving last-good revision", "path", p.path, "err", err)
 		p.mu.RLock()
 		defer p.mu.RUnlock()
 		return p.compiled.Revision

@@ -308,7 +308,7 @@ func (o *Orchestrator) ReassignDeclarativeAfterRejection(ctx context.Context, sa
 		}
 		// A major identity transition: the sandbox moves to a different
 		// fastlet with attempt+1 / routeGeneration+1. Always traceable.
-		klog.FromContext(ctx).Info("Reassigned sandbox to a different Fastlet after runtime rejection",
+		klog.FromContext(ctx).Info("reassigned sandbox to a different Fastlet after runtime rejection",
 			"sandbox", sandbox.Name, "fromFastlet", current.FastletName, "toFastlet", candidate.PodName,
 			"attempt", next.Attempt, "routeGeneration", next.RouteGeneration)
 		return updated, true, nil
@@ -748,7 +748,7 @@ func (o *Orchestrator) recordFeedback(id placement.FastletID, err error) {
 	}
 	// The feedback blacklists the fastlet for a short window (scheduling-
 	// visible via RejectedUntil); leave one line explaining why.
-	klog.V(2).InfoS("Recording fastlet rejection feedback; candidate penalized", "fastlet", id, "code", failure.Code)
+	klog.V(2).InfoS("recording fastlet rejection feedback; candidate penalized", "fastlet", id, "code", failure.Code)
 	now := time.Now()
 	if o.Now != nil {
 		now = o.Now()
@@ -773,7 +773,7 @@ func compileActionBindings(bindings []apiv1alpha2.ActionBinding) ([]fastletapi.A
 	for _, binding := range bindings {
 		total += len(binding.Input)
 		if len(binding.Input) > apiv1alpha2.MaxActionBindingInputBytes || total > apiv1alpha2.MaxSandboxActionBindingInputBytes {
-			return nil, fmt.Errorf("Action Binding inputs exceed configured size limits")
+			return nil, fmt.Errorf("action Binding inputs exceed configured size limits")
 		}
 		result = append(result, fastletapi.ActionBindingInput{Handler: binding.Handler, Input: binding.Input})
 	}

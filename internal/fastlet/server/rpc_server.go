@@ -56,7 +56,7 @@ func (s *FastletServer) Handler() http.Handler {
 	mux.HandleFunc("/api/v2/fastlet/diagnostics/sandbox", s.handleSandboxDiagnostics)
 	mux.HandleFunc("/api/v2/fastlet/draining", s.handleSetDraining)
 
-	klog.InfoS("Starting fastlet HTTP server", "addr", s.addr)
+	klog.InfoS("starting fastlet HTTP server", "addr", s.addr)
 	return traceFastletAPI(mux)
 }
 

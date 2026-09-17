@@ -237,7 +237,7 @@ func main() {
 			grpcServer.GracefulStop()
 		}()
 		go func() {
-			klog.InfoS("FastPath serving", "address", fastPathAddress, "leaderElection", false)
+			klog.InfoS("fastPath serving", "address", fastPathAddress, "leaderElection", false)
 			if err := grpcServer.Serve(listener); err != nil {
 				klog.ErrorS(err, "FastPath gRPC server exited")
 			}
@@ -247,7 +247,7 @@ func main() {
 	go func() {
 		klog.ErrorS(http.ListenAndServe("localhost:6060", nil), "pprof server exited")
 	}()
-	klog.InfoS("Starting control plane", "role", role, "leaderElection", role.LeaderElection())
+	klog.InfoS("starting control plane", "role", role, "leaderElection", role.LeaderElection())
 	if err := manager.Start(runContext); err != nil {
 		klog.ErrorS(err, "Control-plane manager exited")
 		os.Exit(1)

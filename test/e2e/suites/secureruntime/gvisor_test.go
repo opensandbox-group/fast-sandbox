@@ -89,8 +89,8 @@ func TestGVisorSandbox(t *testing.T) {
 
 // TestGVisorIsolation verifies that the sandbox actually runs in gVisor runtime.
 // gVisor containers have distinct characteristics that can be verified:
-// 1. /proc/sys/kernel/osrelease contains "gVisor" or shows a different kernel
-// 2. runsc-sandbox process exists on the host node
+// 1. the guest kernel version reported inside the sandbox differs from the host
+// 2. containerd metadata identifies the io.containerd.runsc.v1 handler
 func TestGVisorIsolation(t *testing.T) {
 	suiteenv.RequireGVisor(t)
 

@@ -216,7 +216,7 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *o
 		return ctrl.Result{}, err
 	}
 	if newlyAssigned {
-		klog.FromContext(ctx).Info("Sandbox assigned and runtime ensured", "sandbox", sandbox.Name, "fastlet", assigned.Status.Placement.FastletName)
+		klog.FromContext(ctx).Info("sandbox assigned and runtime ensured", "sandbox", sandbox.Name, "fastlet", assigned.Status.Placement.FastletName)
 	}
 	if observationReady(assigned, observed) {
 		return ctrl.Result{RequeueAfter: ReadyRequeueInterval}, nil

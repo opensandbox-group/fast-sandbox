@@ -51,6 +51,9 @@ func main() {
 			handler.invoke(address, writer, request)
 		})
 		go func() {
+			// The key=value fields of this line are asserted by the Sandbox
+			// Actions E2E suite (sandbox_actions_test.go greps the fixture
+			// Pod logs); keep the format stable or update the suite with it.
 			log.Printf("sandbox Action fixture listening on %s instance=%s", address, instanceID)
 			if err := http.ListenAndServe(address, mux); err != nil {
 				log.Fatal(err)

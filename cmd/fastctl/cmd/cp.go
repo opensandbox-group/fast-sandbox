@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,7 +23,7 @@ var cpCmd = &cobra.Command{
 		sourceRemote, sourceOK := parseSandboxPath(args[0])
 		destinationRemote, destinationOK := parseSandboxPath(args[1])
 		if sourceOK == destinationOK {
-			log.Fatal("Error: exactly one side of cp must be sandbox:path")
+			exitWithErrorf("exactly one side of cp must be sandbox:path")
 		}
 		adapter, closeClient := commandOpenSandboxExecd()
 		defer closeClient()
@@ -32,37 +31,37 @@ var cpCmd = &cobra.Command{
 		if sourceOK {
 			client, _, err := adapter.Client(ctx, sandboxReference(sourceRemote.Sandbox))
 			if err != nil {
-				log.Fatalf("Error: %v", err)
+				exitWithError(err)
 			}
 			output, err := os.Create(args[1])
 			if err != nil {
-				log.Fatalf("Error: %v", err)
+				exitWithError(err)
 			}
 			defer output.Close()
 			download, err := client.DownloadFile(ctx, sourceRemote.Path, "")
 			if err != nil {
-				log.Fatalf("Error: %v", err)
+				exitWithError(err)
 			}
 			defer download.Close()
 			if _, err := io.Copy(output, download); err != nil {
-				log.Fatalf("Error: %v", err)
+				exitWithError(err)
 			}
 			return
 		}
 		input, err := os.Open(args[0])
 		if err != nil {
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 		defer input.Close()
 		client, _, err := adapter.Client(ctx, sandboxReference(destinationRemote.Sandbox))
 		if err != nil {
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 		if err := client.UploadFile(ctx, input, opensandbox.UploadFileOptions{
 			FileName: filepath.Base(destinationRemote.Path),
 			Metadata: opensandbox.FileMetadata{Path: destinationRemote.Path, Mode: opensandbox.OctalMode(0o644)},
 		}); err != nil {
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 	},
 }

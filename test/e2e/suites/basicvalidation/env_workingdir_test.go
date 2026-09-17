@@ -238,9 +238,9 @@ func createValidationPool(namespace, name string) *apiv1alpha2.SandboxPool {
 		Spec: apiv1alpha2.SandboxPoolSpec{
 			Capacity: apiv1alpha2.PoolCapacity{
 				PoolMin: 1,
-				PoolMax: 10, // Increased for parallel tests
+				PoolMax: 10,
 			},
-			MaxSandboxesPerPod: 20, // Increased capacity
+			MaxSandboxesPerPod: 20,
 			Runtime:            apiv1alpha2.RuntimeContainer,
 			SandboxResources: apiv1alpha2.SandboxResourceProfile{
 				CPU: resource.MustParse("100m"), Memory: resource.MustParse("64Mi"), PIDs: 64,
@@ -269,7 +269,7 @@ func waitForPoolReady(ctx context.Context, t *testing.T, fixture *fixtures.Fixtu
 
 func waitForAssignedSandbox(ctx context.Context, t *testing.T, fixture *fixtures.FixtureClient, namespace, name string) *apiv1alpha2.Sandbox {
 	t.Helper()
-	waitCtx, cancel := context.WithTimeout(ctx, 90*time.Second) // Increased from 60s to 90s
+	waitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 
 	sandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: name, Namespace: namespace}, func(sb *apiv1alpha2.Sandbox) bool {

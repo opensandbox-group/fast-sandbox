@@ -83,7 +83,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	if group, err := user.LookupGroup(socketGroup); err == nil {
 		if gid, convErr := strconv.Atoi(group.Gid); convErr == nil {
 			if err := os.Chown(s.socketPath, -1, gid); err != nil {
-				klog.Warningf("runtime-agent socket group %q: %v", socketGroup, err)
+				klog.Warningf("chown runtime-agent socket group %q failed: %v", socketGroup, err)
 			}
 		}
 	} else {

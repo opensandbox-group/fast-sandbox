@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"strconv"
 	"time"
@@ -27,14 +26,14 @@ var execCmd = &cobra.Command{
 	Args:  cobra.MinimumNArgs(2),
 	Run: func(cmd *cobra.Command, args []string) {
 		if execStdin {
-			log.Fatal("Error: --stdin requires an interactive Execd session and is not supported by this command")
+			exitWithErrorf("--stdin requires an interactive Execd session and is not supported by this command")
 		}
 		if execTTY {
-			log.Fatal("Error: --tty requires the Execd PTY extension and is not supported by this command")
+			exitWithErrorf("--tty requires the Execd PTY extension and is not supported by this command")
 		}
 		command, err := sandboxclient.ShellJoin(args[1:])
 		if err != nil {
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 		control, connection := getClient()
 		if connection != nil {
@@ -42,7 +41,7 @@ var execCmd = &cobra.Command{
 		}
 		result, err := runOpenSandboxCommand(cmd.Context(), newOpenSandboxExecd(control), sandboxReference(args[0]), command, execTimeout)
 		if err != nil {
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 		if result.ErrorName != "" {
 			fmt.Fprintf(os.Stderr, "%s: %s\n", result.ErrorName, result.ErrorValue)

@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"log"
 
 	fastpathv2 "fast-sandbox/api/proto/v2"
 
@@ -42,7 +41,7 @@ this call.`,
 		})
 		if err != nil {
 			klog.ErrorS(err, "ResumeSandbox request failed", "sandboxName", sandboxName, "namespace", namespace)
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 		fmt.Printf("Sandbox %s resume requested\n", sandboxName)
 		fmt.Printf("  state: %s (watch status.runtime.state until READY)\n", response.GetSandbox().GetState())

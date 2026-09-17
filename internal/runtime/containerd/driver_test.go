@@ -21,10 +21,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// ============================================================================
-// 1. TestNewContainerdRuntime
-// ============================================================================
-
 func newTestContainerdRuntime() *Driver {
 	return newWithConfig(
 		apiv1alpha2.RuntimeContainer,
@@ -258,10 +254,6 @@ func TestValidateExistingRuntimeProfile(t *testing.T) {
 	require.ErrorIs(t, validateExistingRuntimeProfile(existing, &requested), ErrSandboxProfileMismatch)
 }
 
-// ============================================================================
-// 2. Test DiscoverCgroupPath
-// ============================================================================
-
 func TestContainerdRuntime_DiscoverCgroupPath_Success(t *testing.T) {
 	// C-01: Successfully discovers cgroup path from cgroup v2 format (0::/path)
 	tests := []struct {
@@ -397,10 +389,6 @@ func TestContainerdRuntime_DiscoverCgroupPath_InvalidContent(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// 3. Test Initialize
-// ============================================================================
-
 func TestContainerdRuntime_Initialize_ShortMode(t *testing.T) {
 	// I-01: Skip actual containerd connection in short mode
 	if testing.Short() {
@@ -472,12 +460,7 @@ func TestContainerdRuntime_Initialize_EnvVars(t *testing.T) {
 	assert.Nil(t, cr.infraMgr, "Infra manager is injected by Fastlet composition after runtime initialization")
 }
 
-// ============================================================================
-// 4. Test CreateSandbox Validation
-// ============================================================================
-
 func TestContainerdRuntime_CreateSandbox_Validation(t *testing.T) {
-	// CS-01: Validates input - missing sandbox ID
 	cr := &Driver{
 		client: nil, // Not initialized, should fail before using client
 	}
@@ -485,23 +468,20 @@ func TestContainerdRuntime_CreateSandbox_Validation(t *testing.T) {
 	ctx := context.Background()
 
 	tests := []struct {
-		name        string
-		input       *fastletapi.EnsureSandboxInput
-		expectError string
+		name  string
+		input *fastletapi.EnsureSandboxInput
 	}{
 		{
 			name: "empty sandbox ID",
 			input: &fastletapi.EnsureSandboxInput{Sandbox: fastletapi.RuntimeSandboxConfig{
 				Spec: fastletapi.SandboxSpec{Image: "alpine:latest"}, Identity: fastletapi.SandboxIdentity{Name: "test-claim"},
 			}},
-			expectError: "sandbox ID cannot be empty",
 		},
 		{
 			name: "empty image",
 			input: &fastletapi.EnsureSandboxInput{Sandbox: fastletapi.RuntimeSandboxConfig{
 				Identity: fastletapi.SandboxIdentity{SandboxUID: "sb-123", Name: "test-claim"},
 			}},
-			expectError: "image cannot be empty",
 		},
 		{
 			name: "valid config",
@@ -510,7 +490,6 @@ func TestContainerdRuntime_CreateSandbox_Validation(t *testing.T) {
 					Args: []string{"-c", "echo hello"}, WorkingDir: "/tmp", Env: map[string]string{"PATH": "/usr/bin", "HOME": "/root"}},
 				Identity: fastletapi.SandboxIdentity{SandboxUID: "sb-123", Name: "test-claim"},
 			}},
-			expectError: "", // Should fail at client access, not validation
 		},
 	}
 
@@ -533,12 +512,7 @@ func TestContainerdRuntime_CreateSandbox_Validation(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// 5. Test DeleteSandbox
-// ============================================================================
-
 func TestContainerdRuntime_DeleteSandbox_NotFound(t *testing.T) {
-	// DS-01: Handles deletion of non-existent container gracefully
 	// Note: With nil client, this will panic. Test documents this behavior.
 	cr := &Driver{
 		client: nil,
@@ -557,10 +531,6 @@ func TestContainerdRuntime_DeleteSandbox_NotFound(t *testing.T) {
 	// Should either panic or error with nil client
 	assert.True(t, panicked || err != nil, "DeleteSandbox should panic or error without initialized client")
 }
-
-// ============================================================================
-// 6. Test prepareLabels
-// ============================================================================
 
 func TestContainerdRuntime_prepareLabels(t *testing.T) {
 	// PL-01: Generates correct labels for sandbox
@@ -641,10 +611,6 @@ func TestContainerdRuntime_prepareLabels_EmptyFastletFields(t *testing.T) {
 	assert.Equal(t, "0", labels["fast-sandbox.io/assignment-attempt"])
 }
 
-// ============================================================================
-// 8. Test envMapToSlice
-// ============================================================================
-
 func TestEnvMapToSlice(t *testing.T) {
 	// E-01: Converts environment map to slice correctly
 	tests := []struct {
@@ -697,10 +663,6 @@ func TestEnvMapToSlice(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// 9. Test snapShotName
-// ============================================================================
-
 func TestSnapShotName(t *testing.T) {
 	// SN-01: Generates snapshot name from container ID
 	tests := []struct {
@@ -729,10 +691,6 @@ func TestSnapShotName(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// 10. Test SetNamespace
-// ============================================================================
-
 func TestContainerdRuntime_SetNamespace(t *testing.T) {
 	// NS-01: Sets namespace correctly
 	cr := &Driver{}
@@ -746,12 +704,7 @@ func TestContainerdRuntime_SetNamespace(t *testing.T) {
 	assert.Equal(t, "another-namespace", cr.fastletNamespace)
 }
 
-// ============================================================================
-// 11. Test Close
-// ============================================================================
-
 func TestContainerdRuntime_Close(t *testing.T) {
-	// CL-01: Close handles nil client gracefully
 	cr := &Driver{
 		client: nil,
 	}
@@ -761,7 +714,6 @@ func TestContainerdRuntime_Close(t *testing.T) {
 }
 
 func TestContainerdRuntime_Close_NotInitialized(t *testing.T) {
-	// CL-02: Close on newly created runtime is safe
 	cr := newTestContainerdRuntime()
 
 	err := cr.Close()

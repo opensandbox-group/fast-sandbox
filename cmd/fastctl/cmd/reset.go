@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
 
 	fastpathv2 "fast-sandbox/api/proto/v2"
@@ -35,7 +34,7 @@ preserving the sandbox configuration.`,
 
 		// set cur time as ResetRevision
 		resetRevision := time.Now().Format(time.RFC3339Nano)
-		klog.V(4).InfoS("Triggering sandbox reset", "sandboxName", sandboxName, "resetRevision", resetRevision)
+		klog.V(4).InfoS("triggering sandbox reset", "sandboxName", sandboxName, "resetRevision", resetRevision)
 
 		req := &fastpathv2.UpdateSandboxRequest{
 			Sandbox: fastPathSandboxReference(sandboxName, namespace),
@@ -47,10 +46,10 @@ preserving the sandbox configuration.`,
 		_, err := client.UpdateSandbox(context.Background(), req)
 		if err != nil {
 			klog.ErrorS(err, "UpdateSandbox request failed for reset", "sandboxName", sandboxName)
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 
-		klog.V(4).InfoS("Sandbox reset triggered successfully", "sandboxName", sandboxName)
+		klog.V(4).InfoS("sandbox reset triggered successfully", "sandboxName", sandboxName)
 		fmt.Printf("✓ Sandbox %s reset triggered\n", sandboxName)
 		fmt.Printf("  The sandbox will be rescheduled to a new fastlet\n")
 	},

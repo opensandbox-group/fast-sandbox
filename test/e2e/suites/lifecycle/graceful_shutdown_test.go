@@ -116,7 +116,7 @@ done
 
 			// Wait for sandbox to transition to Terminating
 			// Give controller more time to process deletion and call Fastlet
-			termCtx, cancelTermWait := context.WithTimeout(ctx, 90*time.Second) // Increased from 45s
+			termCtx, cancelTermWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelTermWait()
 			terminatingSandbox, err := fixture.WaitForSandbox(termCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha2.Sandbox) bool {
 				return sb.DeletionTimestamp != nil && sb.Status.DataPlane.State == apiv1alpha2.DataPlaneDraining

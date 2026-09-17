@@ -1,7 +1,7 @@
 package assignment
 
 const (
-	// LabelCreatedBy 标识 sandbox 的创建方式
+	// LabelCreatedBy records which component created the sandbox.
 	LabelCreatedBy = "sandbox.fast.io/created-by"
 	// AnnotationRequestID stores the FastPath Create idempotency key.
 	AnnotationRequestID = "sandbox.fast.io/request-id"

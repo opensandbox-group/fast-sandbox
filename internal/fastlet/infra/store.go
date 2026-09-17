@@ -241,11 +241,11 @@ func extractTarSafely(ctx context.Context, reader *tar.Reader, root string, maxB
 			continue
 		}
 		if filepath.IsAbs(name) || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("Infra archive path %q escapes extraction root", header.Name)
+			return fmt.Errorf("infra archive path %q escapes extraction root", header.Name)
 		}
 		target := filepath.Join(root, name)
 		if target != root && !strings.HasPrefix(target, root+string(filepath.Separator)) {
-			return fmt.Errorf("Infra archive path %q escapes extraction root", header.Name)
+			return fmt.Errorf("infra archive path %q escapes extraction root", header.Name)
 		}
 		switch header.Typeflag {
 		case tar.TypeDir:
@@ -272,10 +272,10 @@ func extractTarSafely(ctx context.Context, reader *tar.Reader, root string, maxB
 		case tar.TypeSymlink:
 			link, resolved, err := safeSymlinkTarget(root, target, header.Linkname)
 			if err != nil {
-				return fmt.Errorf("Infra archive symlink %q: %w", header.Name, err)
+				return fmt.Errorf("infra archive symlink %q: %w", header.Name, err)
 			}
 			if !pathWithinRoot(root, resolved) {
-				return fmt.Errorf("Infra archive symlink %q escapes extraction root", header.Name)
+				return fmt.Errorf("infra archive symlink %q escapes extraction root", header.Name)
 			}
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return err
@@ -289,11 +289,11 @@ func extractTarSafely(ctx context.Context, reader *tar.Reader, root string, maxB
 				link = strings.TrimPrefix(link, string(filepath.Separator))
 			}
 			if link == "." || link == ".." || strings.HasPrefix(link, ".."+string(filepath.Separator)) {
-				return fmt.Errorf("Infra archive hard link %q escapes extraction root", header.Name)
+				return fmt.Errorf("infra archive hard link %q escapes extraction root", header.Name)
 			}
 			resolved := filepath.Join(root, link)
 			if !pathWithinRoot(root, resolved) {
-				return fmt.Errorf("Infra archive hard link %q escapes extraction root", header.Name)
+				return fmt.Errorf("infra archive hard link %q escapes extraction root", header.Name)
 			}
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return err
@@ -302,7 +302,7 @@ func extractTarSafely(ctx context.Context, reader *tar.Reader, root string, maxB
 				return err
 			}
 		default:
-			return fmt.Errorf("Infra archive entry %q has unsupported type %d", header.Name, header.Typeflag)
+			return fmt.Errorf("infra archive entry %q has unsupported type %d", header.Name, header.Typeflag)
 		}
 	}
 }

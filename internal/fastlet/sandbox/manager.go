@@ -131,7 +131,7 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 	}
 	if config.InfraManager != nil {
 		if config.InfraRevision != "" && config.InfraManager.Revision() != config.InfraRevision {
-			return nil, fmt.Errorf("Infra revision %s does not match manager revision %s", config.InfraRevision, config.InfraManager.Revision())
+			return nil, fmt.Errorf("infra revision %s does not match manager revision %s", config.InfraRevision, config.InfraManager.Revision())
 		}
 	}
 	manager := &SandboxManager{
@@ -398,7 +398,7 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 		m.cacheProtection.Unprotect(expected.Config.Spec.Image, fastletcache.ProtectActive)
 		m.cacheProtection.ProtectHotUntil(expected.Config.Spec.Image, m.clock.Now().Add(time.Hour))
 		m.recordDiagnosticLocked(sandboxID, "info", "fastlet", "deleted", "proxy route and runtime resources were deleted")
-		klog.InfoS("Sandbox deletion completed", "sandboxID", sandboxID)
+		klog.InfoS("sandbox deletion completed", "sandboxID", sandboxID)
 	}
 }
 

@@ -3,7 +3,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"text/tabwriter"
 
@@ -27,16 +26,16 @@ var listCmd = &cobra.Command{
 			defer conn.Close()
 		}
 
-		klog.V(4).InfoS("Sending ListSandboxes request", "namespace", namespace)
+		klog.V(4).InfoS("sending ListSandboxes request", "namespace", namespace)
 		resp, err := client.ListSandboxes(context.Background(), &fastpathv2.ListSandboxesRequest{
 			Namespace: namespace,
 		})
 		if err != nil {
 			klog.ErrorS(err, "ListSandboxes request failed", "namespace", namespace)
-			log.Fatalf("Error: %v", err)
+			exitWithError(err)
 		}
 
-		klog.V(4).InfoS("ListSandboxes request succeeded", "namespace", namespace, "count", len(resp.Items))
+		klog.V(4).InfoS("listSandboxes request succeeded", "namespace", namespace, "count", len(resp.Items))
 		w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
 		fmt.Fprintln(w, "NAME\tUID\tNAMESPACE\tGENERATION")
 		for _, item := range resp.Items {

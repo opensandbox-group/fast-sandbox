@@ -1,7 +1,7 @@
 package firecracker
 
 // restore.go implements the golden snapshot restore startup path: restore
-// is the only startup path, the cold boot branch is removed. EnsureSandbox
+// is the only startup path. EnsureSandbox
 // validates the request memory
 // against the manifest machine tuple, launches the Firecracker process via
 // the jailer (which chroots it and pins it to the slot netns; the jail root

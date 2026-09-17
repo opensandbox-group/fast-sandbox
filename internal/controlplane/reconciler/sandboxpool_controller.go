@@ -93,7 +93,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	profile := runtimePlan.Profile
 	if profile.Capabilities.DefaultState == runtimecatalog.CapabilityUnsupported {
-		logger.V(1).Info("Pool runtime unsupported by this node", "reason", profile.Capabilities.Reason)
+		logger.V(1).Info("pool runtime unsupported by this node", "reason", profile.Capabilities.Reason)
 		if condErr := r.updatePoolCondition(ctx, &pool, metav1.Condition{
 			Type:    apiv1alpha2.PoolConditionRuntimeReady,
 			Status:  metav1.ConditionFalse,
@@ -105,7 +105,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 	if profile.Capabilities.DefaultState == runtimecatalog.CapabilityDegraded {
-		logger.V(1).Info("Pool runtime degraded on this node", "reason", profile.Capabilities.Reason)
+		logger.V(1).Info("pool runtime degraded on this node", "reason", profile.Capabilities.Reason)
 		if condErr := r.updatePoolCondition(ctx, &pool, metav1.Condition{
 			Type:    apiv1alpha2.PoolConditionRuntimeReady,
 			Status:  metav1.ConditionFalse,
@@ -117,7 +117,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 	if err := apiv1alpha2.ValidateSandboxResourceProfile(pool.Spec.SandboxResources); err != nil {
-		logger.V(1).Info("Pool sandbox resource profile is invalid", "reason", err.Error())
+		logger.V(1).Info("pool sandbox resource profile is invalid", "reason", err.Error())
 		if condErr := r.updatePoolCondition(ctx, &pool, metav1.Condition{
 			Type:    apiv1alpha2.PoolConditionRuntimeReady,
 			Status:  metav1.ConditionFalse,
@@ -130,7 +130,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	compiledRegistry, err := r.ensureRegistrySecret(ctx, &pool)
 	if err != nil {
-		logger.V(1).Info("Pool registry configuration is invalid", "reason", boundedStatusMessage(err.Error()))
+		logger.V(1).Info("pool registry configuration is invalid", "reason", boundedStatusMessage(err.Error()))
 		if condErr := r.updatePoolCondition(ctx, &pool, metav1.Condition{
 			Type: apiv1alpha2.PoolConditionRegistryReady, Status: metav1.ConditionFalse,
 			Reason: apiv1alpha2.ReasonRegistryInvalid, Message: boundedStatusMessage(err.Error()),
@@ -145,7 +145,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	})
 	infraPlan, err := r.resolveInfraPlan(&pool, profile)
 	if err != nil {
-		logger.V(1).Info("Pool Infra Components are invalid", "reason", err.Error())
+		logger.V(1).Info("pool Infra Components are invalid", "reason", err.Error())
 		if condErr := r.updatePoolCondition(ctx, &pool, metav1.Condition{
 			Type: apiv1alpha2.PoolConditionInfraReady, Status: metav1.ConditionFalse,
 			Reason: apiv1alpha2.ReasonInfraComponentsInvalid, Message: err.Error(),
@@ -237,7 +237,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	if currentCount < desiredPods {
 		diff := desiredPods - currentCount
-		logger.Info("Scaling up fastlet pool", "diff", diff)
+		logger.Info("scaling up fastlet pool", "diff", diff)
 		for i := int32(0); i < diff; i++ {
 			pod := desiredPod.DeepCopy()
 			if err := r.Create(ctx, pod); err != nil {
@@ -247,7 +247,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 	if needsPlannedUpgradeSurge(childPods.Items, desiredPods, desiredPodHash) {
-		logger.Info("Creating Fastlet surge Pod before planned upgrade drain", "desiredPods", desiredPods, "templateHash", desiredPodHash)
+		logger.Info("creating Fastlet surge Pod before planned upgrade drain", "desiredPods", desiredPods, "templateHash", desiredPodHash)
 		if err := r.Create(ctx, desiredPod.DeepCopy()); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -517,7 +517,7 @@ func (r *SandboxPoolReconciler) reconcileDraining(
 			if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 				return ctrl.Result{}, true, err
 			}
-			klog.FromContext(ctx).Info("Deleted drained Fastlet Pod", "pod", pod.Name, "empty", empty, "timedOut", timedOut)
+			klog.FromContext(ctx).Info("deleted drained Fastlet Pod", "pod", pod.Name, "empty", empty, "timedOut", timedOut)
 		}
 	}
 	return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
@@ -556,14 +556,14 @@ func (r *SandboxPoolReconciler) requestDrain(ctx context.Context, pod *corev1.Po
 		return false, errors.New("Fastlet drain client is not configured")
 	}
 	if pod.Status.PodIP == "" {
-		return false, fmt.Errorf("Fastlet Pod %s has no Pod IP", pod.Name)
+		return false, fmt.Errorf("fastlet Pod %s has no Pod IP", pod.Name)
 	}
 	response, err := r.FastletDrainer.SetDraining(ctx, pod.Status.PodIP, &fastletapi.SetDrainingRequest{Draining: draining, Reason: reason})
 	if err != nil {
 		return false, err
 	}
 	if response == nil || response.Draining != draining {
-		return false, fmt.Errorf("Fastlet Pod %s returned an inconsistent drain state", pod.Name)
+		return false, fmt.Errorf("fastlet Pod %s returned an inconsistent drain state", pod.Name)
 	}
 	if draining && pod.Annotations[placement.AnnotationDrainAckedAt] == "" {
 		before := pod.DeepCopy()
@@ -825,7 +825,7 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 		)
 		podSpec.Containers = append(podSpec.Containers, r.boxLiteRuntimeContainer(*profile.BoxLite))
 		if runtimeResourceOwner != "boxlite-runtime" {
-			return nil, fmt.Errorf("BoxLite runtime resource owner must be boxlite-runtime, got %q", runtimeResourceOwner)
+			return nil, fmt.Errorf("boxLite runtime resource owner must be boxlite-runtime, got %q", runtimeResourceOwner)
 		}
 		if err := applyFastletResources(&podSpec.Containers[len(podSpec.Containers)-1], profile.Deployment.Overhead, sandboxResources, getFastletCapacity(pool)); err != nil {
 			return nil, err
@@ -1152,7 +1152,7 @@ func (r *SandboxPoolReconciler) loadRuntimeEnvironmentConfig(ctx context.Context
 	}
 	raw, found := source.Data[runtimeenv.ConfigMapKey]
 	if !found {
-		return runtimeenv.Config{}, fmt.Errorf("ConfigMap %s/%s must contain %s", namespace, name, runtimeenv.ConfigMapKey)
+		return runtimeenv.Config{}, fmt.Errorf("configMap %s/%s must contain %s", namespace, name, runtimeenv.ConfigMapKey)
 	}
 	return runtimeenv.Parse([]byte(raw))
 }
@@ -1241,7 +1241,7 @@ func (r *SandboxPoolReconciler) ensureRegistrySecret(ctx context.Context, pool *
 	}
 	raw, found := source.Data[registryconfig.ConfigMapKey]
 	if !found {
-		return registryconfig.Compiled{}, fmt.Errorf("ConfigMap %s must contain %s", registryconfig.ConfigMapName, registryconfig.ConfigMapKey)
+		return registryconfig.Compiled{}, fmt.Errorf("configMap %s must contain %s", registryconfig.ConfigMapName, registryconfig.ConfigMapKey)
 	}
 	var config registryconfig.Config
 	if err := yaml.UnmarshalStrict([]byte(raw), &config); err != nil {
@@ -1276,11 +1276,11 @@ func (r *SandboxPoolReconciler) registryCredentialFromSecret(
 		return registryconfig.Credential{}, fmt.Errorf("read Registry Secret %s: %w", rule.SecretRef.Name, err)
 	}
 	if secret.Type != corev1.SecretTypeDockerConfigJson {
-		return registryconfig.Credential{}, fmt.Errorf("Registry Secret %s must have type %s", secret.Name, corev1.SecretTypeDockerConfigJson)
+		return registryconfig.Credential{}, fmt.Errorf("registry Secret %s must have type %s", secret.Name, corev1.SecretTypeDockerConfigJson)
 	}
 	content := secret.Data[corev1.DockerConfigJsonKey]
 	if len(content) == 0 {
-		return registryconfig.Credential{}, fmt.Errorf("Registry Secret %s has no %s data", secret.Name, corev1.DockerConfigJsonKey)
+		return registryconfig.Credential{}, fmt.Errorf("registry Secret %s has no %s data", secret.Name, corev1.DockerConfigJsonKey)
 	}
 	var dockerConfig dockerConfigJSON
 	if err := json.Unmarshal(content, &dockerConfig); err != nil {
@@ -1296,7 +1296,7 @@ func (r *SandboxPoolReconciler) registryCredentialFromSecret(
 		}
 	}
 	if !found {
-		return registryconfig.Credential{}, fmt.Errorf("Registry Secret %s has no credentials for host %s", secret.Name, rule.Host)
+		return registryconfig.Credential{}, fmt.Errorf("registry Secret %s has no credentials for host %s", secret.Name, rule.Host)
 	}
 	if auth.Username == "" && auth.Password == "" && auth.Auth != "" {
 		decoded, err := base64.StdEncoding.DecodeString(auth.Auth)
@@ -1310,7 +1310,7 @@ func (r *SandboxPoolReconciler) registryCredentialFromSecret(
 		auth.Username, auth.Password = username, password
 	}
 	if auth.Username == "" && auth.Password == "" && auth.IdentityToken == "" {
-		return registryconfig.Credential{}, fmt.Errorf("Registry Secret %s has empty credentials for host %s", secret.Name, rule.Host)
+		return registryconfig.Credential{}, fmt.Errorf("registry Secret %s has empty credentials for host %s", secret.Name, rule.Host)
 	}
 	credential := registryconfig.Credential{
 		Host: rule.Host, RepositoryPrefix: rule.RepositoryPrefix,
@@ -1678,12 +1678,12 @@ func ensureBoundedPodContainers(podSpec *corev1.PodSpec, runtimeResourceOwner st
 			continue
 		}
 		if err := validateContainerHasLimits(container); err != nil {
-			return fmt.Errorf("Fastlet sidecar resources: %w", err)
+			return fmt.Errorf("fastlet sidecar resources: %w", err)
 		}
 	}
 	for index := range podSpec.InitContainers {
 		if err := validateContainerHasLimits(&podSpec.InitContainers[index]); err != nil {
-			return fmt.Errorf("Fastlet init container resources: %w", err)
+			return fmt.Errorf("fastlet init container resources: %w", err)
 		}
 	}
 	return nil

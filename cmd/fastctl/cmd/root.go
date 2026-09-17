@@ -27,6 +27,10 @@ var (
 	endpoint      string
 	namespace     string
 	proxyEndpoint string
+
+	// traceShutdown terminates the OTLP exporter installed by Execute.
+	// Command failure paths use it so spans are not lost on os.Exit.
+	traceShutdown observability.Shutdown
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -38,17 +42,40 @@ It provides a developer-friendly interface to manage sandboxes with millisecond 
 }
 
 func Execute() {
-	traceShutdown, traceErr := observability.Configure(context.Background(), "fastctl")
+	shutdown, traceErr := observability.Configure(context.Background(), "fastctl")
 	if traceErr != nil {
 		fmt.Fprintln(os.Stderr, "configure OpenTelemetry:", traceErr)
 		os.Exit(1)
 	}
+	traceShutdown = shutdown
 	if err := rootCmd.Execute(); err != nil {
-		shutdownTracing(traceShutdown)
-		fmt.Println(err)
-		os.Exit(1)
+		exitWithError(err)
 	}
-	shutdownTracing(traceShutdown)
+	shutdownTracing(shutdown)
+}
+
+// exitWithError reports a command failure and terminates with status 1.
+// os.Exit skips deferred cleanups, so the OTLP exporter and klog buffers
+// are flushed here first; the message goes to stderr exactly like the
+// error path of Execute.
+func exitWithError(err error) {
+	if traceShutdown != nil {
+		shutdownTracing(traceShutdown)
+	}
+	klog.Flush()
+	fmt.Fprintln(os.Stderr, "Error:", err)
+	os.Exit(1)
+}
+
+// exitWithErrorf is exitWithError for usage and input-validation failures
+// that carry no underlying error value.
+func exitWithErrorf(format string, args ...any) {
+	if traceShutdown != nil {
+		shutdownTracing(traceShutdown)
+	}
+	klog.Flush()
+	fmt.Fprintf(os.Stderr, "Error: "+format+"\n", args...)
+	os.Exit(1)
 }
 
 func init() {
@@ -119,7 +146,7 @@ var clientFactory = defaultClientFactory
 
 func defaultClientFactory() (fastpathv2.FastPathServiceClient, *grpc.ClientConn, error) {
 	ep := viper.GetString("endpoint")
-	klog.V(4).InfoS("Creating gRPC client connection", "endpoint", ep)
+	klog.V(4).InfoS("creating gRPC client connection", "endpoint", ep)
 
 	conn, err := grpc.Dial(ep,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -129,19 +156,14 @@ func defaultClientFactory() (fastpathv2.FastPathServiceClient, *grpc.ClientConn,
 		klog.ErrorS(err, "Failed to connect to gRPC endpoint", "endpoint", ep)
 		return nil, nil, fmt.Errorf("failed to connect to %s: %v", ep, err)
 	}
-	klog.V(4).InfoS("Successfully connected to gRPC endpoint", "endpoint", ep)
+	klog.V(4).InfoS("successfully connected to gRPC endpoint", "endpoint", ep)
 	return fastpathv2.NewFastPathServiceClient(conn), conn, nil
 }
 
 func getClient() (fastpathv2.FastPathServiceClient, *grpc.ClientConn) {
 	client, conn, err := clientFactory()
 	if err != nil {
-		// log.Fatalf would os.Exit under the hood and skip the klog and
-		// OTLP flushes; fail through the same path as Execute instead.
-		klog.ErrorS(err, "Failed to connect to FastPath")
-		klog.Flush()
-		fmt.Fprintln(os.Stderr, "Error:", err)
-		os.Exit(1)
+		exitWithError(err)
 	}
 	return client, conn
 }

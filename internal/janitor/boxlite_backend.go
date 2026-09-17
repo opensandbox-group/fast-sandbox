@@ -50,7 +50,7 @@ func (b *BoxLiteBackend) Scan(ctx context.Context) ([]ResourceIdentity, error) {
 			return nil, fmt.Errorf("read BoxLite home %s owner fence: %w", entry.Name(), err)
 		}
 		if boxlitestate.SafeSegment(owner.FastletPodUID) != entry.Name() {
-			return nil, fmt.Errorf("BoxLite home %s does not match owner Pod UID", entry.Name())
+			return nil, fmt.Errorf("boxLite home %s does not match owner Pod UID", entry.Name())
 		}
 		metadataRoot := filepath.Join(home, boxlitestate.MetadataDirectoryName)
 		metadata, err := os.ReadDir(metadataRoot)
@@ -110,7 +110,7 @@ func (b *BoxLiteBackend) Cleanup(_ context.Context, expected ResourceIdentity) e
 	}
 	defer lock.Close()
 	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		return fmt.Errorf("BoxLite Runtime still owns state lock: %w", err)
+		return fmt.Errorf("boxLite Runtime still owns state lock: %w", err)
 	}
 	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN) //nolint:errcheck
 
