@@ -557,7 +557,6 @@ func sandboxResourceSpecOpts(config *fastletapi.SandboxSpec) ([]oci.SpecOpts, er
 	return opts, nil
 }
 
-// getRuntimeOptions returns runtime-specific options for containerd.
 func (r *Driver) getRuntimeOptions() *runtimeoptions.Options {
 	// If OptionsType is set, include TypeUrl (required for gVisor)
 	if r.config.OptionsType != "" {
@@ -567,7 +566,6 @@ func (r *Driver) getRuntimeOptions() *runtimeoptions.Options {
 		}
 	}
 
-	// For other runtimes, only include ConfigPath if set
 	if r.config.ConfigPath != "" {
 		return &runtimeoptions.Options{
 			ConfigPath: r.config.ConfigPath,

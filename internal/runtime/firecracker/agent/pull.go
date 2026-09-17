@@ -1,6 +1,6 @@
 package agent
 
-// PullImage chain (implementation plan §3): SandboxSpec.Image -> index ->
+// PullImage chain: SandboxSpec.Image -> index ->
 // manifest -> digest-verified download into
 // <StateRoot>/images/<sha256(image)>/.
 
@@ -176,7 +176,7 @@ func (c *Client) PullImage(ctx context.Context, stateRoot, image string) (result
 		return err
 	}
 	// The index image field must match the requested reference byte for
-	// byte: no normalization, no default tags (details doc §1.2).
+	// byte: no normalization, no default tags.
 	if index.Image != image {
 		return fmt.Errorf("image index for %q belongs to %q: reference mismatch", image, index.Image)
 	}

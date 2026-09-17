@@ -12,7 +12,6 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// resetCmd represents the reset command
 var resetCmd = &cobra.Command{
 	Use:     "reset <sandbox-name>",
 	Aliases: []string{"restart"},
@@ -32,7 +31,6 @@ preserving the sandbox configuration.`,
 			defer conn.Close()
 		}
 
-		// set cur time as ResetRevision
 		resetRevision := time.Now().Format(time.RFC3339Nano)
 		klog.V(4).InfoS("triggering sandbox reset", "sandboxName", sandboxName, "resetRevision", resetRevision)
 

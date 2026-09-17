@@ -434,7 +434,6 @@ func secureRuntimeDockerOutput(ctx context.Context, t *testing.T, args ...string
 	return string(output)
 }
 
-// TestGVisorMultipleSandboxes tests creating multiple sandboxes in the same pool.
 func TestGVisorMultipleSandboxes(t *testing.T) {
 	suiteenv.RequireGVisor(t)
 

@@ -107,8 +107,7 @@ func listCachedImages(stateRoot string) ([]string, error) {
 
 // instanceRootfsName is the per-Sandbox writable copy of the cached rootfs.
 // The cached image stays immutable and content-addressed; the instance copy
-// is the VM root drive. OverlayBD-native storage replaces the copy in a later
-// phase.
+// is the VM root drive.
 const instanceRootfsName = "rootfs.img"
 
 // prepareInstanceRootfs copies the cached rootfs image into the Sandbox state

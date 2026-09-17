@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// Publish-secret keys (imagePullSecrets-style, per the design doc).
+// Publish-secret keys (imagePullSecrets-style).
 const (
 	publishSecretKeyID     = "accessKeyId"
 	publishSecretKeySecret = "secretAccessKey"

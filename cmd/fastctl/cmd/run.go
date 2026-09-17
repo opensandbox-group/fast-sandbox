@@ -16,7 +16,6 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// SandboxConfig for yaml
 type SandboxConfig struct {
 	Image                  string                `yaml:"image"`
 	PoolRef                string                `yaml:"pool_ref"`
@@ -48,7 +47,6 @@ var (
 	runActionBindings  []string
 )
 
-// runCmd represents the run command
 var runCmd = &cobra.Command{
 	Use:   "run <sandbox-name> [command] [args...]",
 	Short: "Create a new sandbox via Fast-Path API",

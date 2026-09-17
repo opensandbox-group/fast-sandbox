@@ -229,7 +229,6 @@ func TestUpdateReset(t *testing.T) {
 				t.Fatalf("wait for sandbox running via fastctl: %v", err)
 			}
 
-			// Test 1: fastctl get command
 			t.Log("Testing fastctl get command...")
 			info, err := ctl.GetJSON(ctx, "sb-update-test")
 			if err != nil {
@@ -240,7 +239,6 @@ func TestUpdateReset(t *testing.T) {
 			}
 			t.Log("✓ fastctl get command works")
 
-			// Test 2: fastctl update --metadata
 			t.Log("Testing fastctl update --metadata...")
 			output, err = ctl.UpdateMetadata(ctx, "sb-update-test", "test=e2e", "env=cli")
 			if err != nil || !strings.Contains(string(output), "update committed") {
@@ -248,7 +246,6 @@ func TestUpdateReset(t *testing.T) {
 			}
 			t.Log("✓ fastctl update --metadata works")
 
-			// Test 3: fastctl reset command
 			t.Log("Testing fastctl reset command...")
 			output, err = ctl.Reset(ctx, "sb-update-test")
 			if err != nil || !strings.Contains(string(output), "reset triggered") {

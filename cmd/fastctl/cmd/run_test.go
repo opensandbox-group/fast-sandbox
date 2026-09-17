@@ -114,7 +114,6 @@ func TestRunCommand(t *testing.T) {
 	if capturedReq.RequestId != "my-sandbox" {
 		t.Errorf("expected request_id to equal Sandbox name, got %q", capturedReq.RequestId)
 	}
-	// ... other assert
 }
 
 func TestRunCommandWithFile(t *testing.T) {
@@ -141,7 +140,6 @@ working_dir: /workspace
 	image = ""
 	requestID = ""
 
-	// exec: run my-sandbox -f config.yaml --pool=override-pool
 	rootCmd.SetArgs([]string{"run", "my-sandbox", "-f", tmpFile.Name(), "--pool=override-pool"})
 	if err := rootCmd.Execute(); err != nil {
 		t.Fatalf("Execute failed: %v", err)

@@ -230,8 +230,9 @@ func TestHeartbeatLoopBoundsConcurrency(t *testing.T) {
 	client := &fakeHeartbeatClient{delay: 5 * time.Millisecond, response: func(request fastletapi.HeartbeatRequest) *fastletapi.HeartbeatResponse {
 		return heartbeatFor("", "boot-a", 1, 1, true)
 	}}
-	// Return each watched Pod UID so ApplyHeartbeat succeeds; concurrency is
-	// measured independently of result application.
+	// Responses deliberately carry a non-matching Pod UID: result application
+	// rejects them, while this test measures dispatch concurrency, not applied
+	// results.
 	client.response = func(fastletapi.HeartbeatRequest) *fastletapi.HeartbeatResponse {
 		return heartbeatFor("wrong-but-safe-for-bound-test", "boot-a", 1, 1, true)
 	}

@@ -255,7 +255,6 @@ func TestValidateExistingRuntimeProfile(t *testing.T) {
 }
 
 func TestContainerdRuntime_DiscoverCgroupPath_Success(t *testing.T) {
-	// C-01: Successfully discovers cgroup path from cgroup v2 format (0::/path)
 	tests := []struct {
 		name     string
 		content  string
@@ -299,8 +298,6 @@ func TestContainerdRuntime_DiscoverCgroupPath_Success(t *testing.T) {
 			cgroupPath := filepath.Join(tmpDir, "cgroup")
 			require.NoError(t, os.WriteFile(cgroupPath, []byte(tt.content), 0644))
 
-			// Test the logic directly by reading and parsing
-
 			data, err := os.ReadFile(cgroupPath)
 			require.NoError(t, err)
 
@@ -324,7 +321,6 @@ func TestContainerdRuntime_DiscoverCgroupPath_Success(t *testing.T) {
 }
 
 func TestContainerdRuntime_DiscoverCgroupPath_InvalidContent(t *testing.T) {
-	// C-02: Handles invalid /proc/self/cgroup content gracefully
 	tests := []struct {
 		name        string
 		content     string
@@ -388,20 +384,17 @@ func TestContainerdRuntime_DiscoverCgroupPath_InvalidContent(t *testing.T) {
 }
 
 func TestContainerdRuntime_Initialize_ShortMode(t *testing.T) {
-	// I-01: Skip actual containerd connection in short mode
 	if testing.Short() {
 		t.Skip("Skipping containerd initialization test in short mode")
 	}
 
 	// This test would require an actual containerd socket
-	// In CI/short mode, we skip it
 	cr := newTestContainerdRuntime()
 
 	ctx := context.Background()
 	err := cr.Initialize(ctx, "/run/containerd/containerd.sock")
 
 	// This will likely fail in test environment unless containerd is running
-	// The test verifies that the Initialize method is called correctly
 	if err != nil {
 		assert.Contains(t, err.Error(), "failed to create containerd client")
 	} else {
@@ -410,7 +403,6 @@ func TestContainerdRuntime_Initialize_ShortMode(t *testing.T) {
 }
 
 func TestContainerdRuntime_Initialize_DefaultSocketPath(t *testing.T) {
-	// I-02: Uses default socket path when empty string provided
 	if testing.Short() {
 		t.Skip("Skipping containerd initialization test in short mode")
 	}
@@ -419,7 +411,6 @@ func TestContainerdRuntime_Initialize_DefaultSocketPath(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Initialize with empty socket path - should use default
 	err := cr.Initialize(ctx, "")
 
 	// Verify the default path was set (even if connection fails)
@@ -432,7 +423,6 @@ func TestContainerdRuntime_Initialize_DefaultSocketPath(t *testing.T) {
 }
 
 func TestContainerdRuntime_Initialize_EnvVars(t *testing.T) {
-	// I-03: Reads environment variables for configuration
 	testPodName := "test-fastlet-pod"
 	testPodUID := "test-uid-12345"
 	os.Setenv("POD_NAME", testPodName)
@@ -502,7 +492,6 @@ func TestContainerdRuntime_CreateSandbox_Validation(t *testing.T) {
 
 			_, err := cr.CreateSandbox(ctx, tt.input, fastletapi.RuntimeAllocation{})
 
-			// Should either panic or error due to nil client
 			assert.True(t, panicked || err != nil, "CreateSandbox should panic or error without initialized client")
 		})
 	}
@@ -524,12 +513,10 @@ func TestContainerdRuntime_DeleteSandbox_NotFound(t *testing.T) {
 	ctx := context.Background()
 	err := cr.DeleteSandbox(ctx, "non-existent-sandbox")
 
-	// Should either panic or error with nil client
 	assert.True(t, panicked || err != nil, "DeleteSandbox should panic or error without initialized client")
 }
 
 func TestContainerdRuntime_prepareLabels(t *testing.T) {
-	// PL-01: Generates correct labels for sandbox
 	cr := &Driver{
 		fastletPodName:   "test-fastlet",
 		fastletPodUID:    "fastlet-uid-123",
@@ -583,7 +570,6 @@ func TestContainerdRuntime_prepareLabels(t *testing.T) {
 }
 
 func TestContainerdRuntime_prepareLabels_EmptyFastletFields(t *testing.T) {
-	// PL-02: Handles empty fastlet fields
 	cr := &Driver{
 		fastletPodName:   "",
 		fastletPodUID:    "",
@@ -608,7 +594,6 @@ func TestContainerdRuntime_prepareLabels_EmptyFastletFields(t *testing.T) {
 }
 
 func TestEnvMapToSlice(t *testing.T) {
-	// E-01: Converts environment map to slice correctly
 	tests := []struct {
 		name     string
 		env      map[string]string
@@ -660,7 +645,6 @@ func TestEnvMapToSlice(t *testing.T) {
 }
 
 func TestSnapShotName(t *testing.T) {
-	// SN-01: Generates snapshot name from container ID
 	tests := []struct {
 		containerID string
 		expected    string
@@ -688,7 +672,6 @@ func TestSnapShotName(t *testing.T) {
 }
 
 func TestContainerdRuntime_SetNamespace(t *testing.T) {
-	// NS-01: Sets namespace correctly
 	cr := &Driver{}
 
 	assert.Equal(t, "", cr.fastletNamespace, "Initial namespace should be empty")

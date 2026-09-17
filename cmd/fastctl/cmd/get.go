@@ -46,7 +46,6 @@ var getCmd = &cobra.Command{
 			enc.SetIndent("", "  ")
 			enc.Encode(resp)
 		} else {
-			// Default YAML-like output
 			y, _ := yaml.Marshal(resp)
 			fmt.Print(string(y))
 		}

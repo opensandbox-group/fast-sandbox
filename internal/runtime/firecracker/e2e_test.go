@@ -443,7 +443,7 @@ func bootVM(ctx context.Context, client *Client, timeoutSeconds int32) (int, err
 }
 
 // prepareE2EGoldenSnapshot produces (or reuses) the golden snapshot set of
-// the E2E image (方式 B self-bootstrap, golden-restore plan §5): a
+// the E2E image: a
 // preparation VM cold-boots the kernel once with a NIC and a static guest
 // IP, pauses, and dumps a Full snapshot; the golden set is assembled into
 // the driver cache layout:

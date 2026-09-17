@@ -512,7 +512,6 @@ func TestSandboxManager_DeleteSandbox_Success(t *testing.T) {
 	require.NoError(t, err, "DeleteSandbox should succeed")
 	assert.NotNil(t, resp)
 
-	// Sandbox should be in terminating phase
 	statuses := manager.GetSandboxStatuses(ctx)
 	require.Len(t, statuses, 1, "Should have one status")
 	assert.Equal(t, spec.SandboxID, statuses[0].SandboxID)
@@ -522,7 +521,6 @@ func TestSandboxManager_DeleteSandbox_Success(t *testing.T) {
 	// Wait for async deletion to complete
 	time.Sleep(100 * time.Millisecond)
 
-	// Sandbox should be completely removed (direct deletion)
 	statuses = manager.GetSandboxStatuses(ctx)
 	assert.Empty(t, statuses, "Sandbox should be completely removed after async delete")
 }
@@ -589,7 +587,6 @@ func TestSandboxManager_DeleteSandbox_MultipleDeletes(t *testing.T) {
 	// Wait for async delete to complete
 	time.Sleep(100 * time.Millisecond)
 
-	// Verify sandbox was completely removed (direct deletion)
 	statuses := manager.GetSandboxStatuses(ctx)
 	assert.Empty(t, statuses, "Sandbox should be completely removed after async delete")
 }
@@ -700,7 +697,6 @@ func TestSandboxManager_GetSandboxStatuses_MultiplePhases(t *testing.T) {
 }
 
 func TestSandboxManager_GetCapacity(t *testing.T) {
-	// GC-01: Returns configured capacity
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -709,7 +705,6 @@ func TestSandboxManager_GetCapacity(t *testing.T) {
 }
 
 func TestSandboxManager_GetCapacity_Custom(t *testing.T) {
-	// GC-02: Returns custom capacity when FASTLET_CAPACITY is set
 	originalValue := os.Getenv("FASTLET_CAPACITY")
 	defer func() {
 		if originalValue != "" {
@@ -754,7 +749,6 @@ func TestSandboxManager_Close_MultipleCalls(t *testing.T) {
 }
 
 func TestSandboxManager_ListImages(t *testing.T) {
-	// LI-01: ListImages propagates to runtime
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -766,7 +760,6 @@ func TestSandboxManager_ListImages(t *testing.T) {
 }
 
 func TestSandboxManager_ListImages_CustomList(t *testing.T) {
-	// LI-02: ListImages returns custom images from runtime
 	mockRuntime := NewMockRuntime()
 	customImages := []string{"custom:latest", "another:v1.0"}
 	mockRuntime.SetListImages(customImages)
@@ -781,7 +774,6 @@ func TestSandboxManager_ListImages_CustomList(t *testing.T) {
 }
 
 func TestSandboxManager_AsyncDelete_Timeout(t *testing.T) {
-	// AD-01: Async delete handles context timeout gracefully
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 
@@ -798,13 +790,11 @@ func TestSandboxManager_AsyncDelete_Timeout(t *testing.T) {
 	// Wait for async delete to complete (should complete within timeout)
 	time.Sleep(200 * time.Millisecond)
 
-	// Verify sandbox was completely removed (direct deletion)
 	statuses := manager.GetSandboxStatuses(ctx)
 	assert.Empty(t, statuses, "Sandbox should be completely removed after async delete")
 }
 
 func TestSandboxManager_AsyncDelete_RuntimeError(t *testing.T) {
-	// AD-02: Async delete handles runtime errors gracefully
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)
 

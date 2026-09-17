@@ -1,5 +1,5 @@
 // Package state implements the durable lease and reference-count state of
-// the firecracker-runtime (implementation plan §5):
+// the firecracker-runtime:
 //
 //   - per-Sandbox device leases (native stage: cache file paths);
 //   - per-image reference counts (pin count + active lease count);

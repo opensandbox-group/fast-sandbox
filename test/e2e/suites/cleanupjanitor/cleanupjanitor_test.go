@@ -60,7 +60,6 @@ func TestNamespaceAware(t *testing.T) {
 			case <-time.After(10 * time.Second):
 			}
 
-			// Verify sandbox still exists after janitor scan
 			existingSandbox := &apiv1alpha2.Sandbox{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "sb-ns-test", Namespace: namespace}, existingSandbox); err != nil {
 				t.Fatalf("sandbox should still exist after janitor scan: %v", err)
@@ -105,7 +104,6 @@ func TestJanitorRecovery(t *testing.T) {
 				t.Fatalf("create sandbox: %v", err)
 			}
 
-			// Wait for sandbox to be assigned
 			waitForAssignedSandbox(ctx, t, fixture, namespace, "sb-orphan")
 
 			// Simulate orphan scenario: remove finalizers and delete CRD

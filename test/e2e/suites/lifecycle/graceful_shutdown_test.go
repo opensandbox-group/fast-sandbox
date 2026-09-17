@@ -121,7 +121,6 @@ done
 				return sb.DeletionTimestamp != nil && sb.Status.DataPlane.State == apiv1alpha2.DataPlaneDraining
 			})
 			if err != nil {
-				// Log current state for debugging
 				currentSandbox := &apiv1alpha2.Sandbox{}
 				if getErr := k8sClient.Get(ctx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, currentSandbox); getErr == nil {
 					assignedFastlet := ""

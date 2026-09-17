@@ -82,8 +82,7 @@ func (d *Driver) warmPullRequestID(image string) string {
 	return "warm-pull-" + d.podUID + "-" + imageKey(image)
 }
 
-// rememberLease records the runtime-agent lease of a Sandbox (populated
-// when a later phase wires LeaseDevices into EnsureSandbox).
+// rememberLease records the runtime-agent lease of a Sandbox.
 func (d *Driver) rememberLease(sandboxID, leaseID string) {
 	d.mu.Lock()
 	if d.sandboxLeases == nil {

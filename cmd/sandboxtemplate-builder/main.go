@@ -9,7 +9,7 @@
 // annotations so the controller can surface manifestRef and artifactDigest
 // on the template status.
 //
-// The pipeline is organized in per-stage files mirroring the design doc:
+// The pipeline is organized in per-stage files:
 //
 //	oci.go      — pull the source image into an OCI layout (+ execd extraction)
 //	convert.go  — materialize the layout into a sparse ext4 rootfs and inject the runtime

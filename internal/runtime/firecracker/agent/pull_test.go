@@ -126,7 +126,7 @@ func testManifest(artifacts map[string][]byte) []byte {
 }
 
 // publishFixture publishes a complete artifact set for testImage into a fake
-// store exactly like the builder does (details doc §1): artifacts first,
+// store exactly like the builder does: artifacts first,
 // then the manifest, then the index. It returns the store, the s3 client,
 // the manifest bytes, and the artifact contents.
 func publishFixture(t *testing.T) (*fakeStore, *s3Client, []byte, map[string][]byte) {
@@ -161,8 +161,6 @@ func TestPullImageFullFlow(t *testing.T) {
 
 	require.NoError(t, (&Client{s3: client}).PullImage(context.Background(), root, testImage))
 
-	// Cache layout matches the implementation plan: rootfs.ext4 renamed to
-	// rootfs.img, the rest keeping their names, plus the commit manifest.
 	dir := imageDir(root, testImage)
 	names := map[string]string{"rootfs.img": "rootfs.ext4", "vmstate.snap": "vmstate.snap", "memory.snap": "memory.snap"}
 	for cacheName, publishName := range names {

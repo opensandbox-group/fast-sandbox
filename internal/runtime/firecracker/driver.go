@@ -59,9 +59,8 @@ type Driver struct {
 	newAgentClient func(socketPath string) (AgentClient, error)
 	agentClient    AgentClient
 	// sandboxLeases records the runtime-agent lease of each Sandbox that
-	// requested one. No production path populates it yet — LeaseDevices
-	// wiring lands with the device-lease phase — so it stays empty outside
-	// tests.
+	// requested one. No production path populates it yet, so it stays empty
+	// outside tests.
 	sandboxLeases map[string]string
 	// imageGCInterval is the period of the independent cache GC loop; it is a
 	// field (not a constant) so tests can shorten it.

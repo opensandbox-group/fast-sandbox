@@ -33,7 +33,6 @@ var (
 	traceShutdown observability.Shutdown
 )
 
-// rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:   "fastctl",
 	Short: "Fast Sandbox Control - High performance container management",
@@ -81,7 +80,6 @@ func exitWithErrorf(format string, args ...any) {
 func init() {
 	cobra.OnInitialize(initConfig)
 
-	//  Flags
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is ./.fastctl/config.json)")
 	rootCmd.PersistentFlags().StringVar(&endpoint, "endpoint", "localhost:9090", "Fast-Path gRPC endpoint (env: "+fastPathEndpointEnv+")")
 	rootCmd.PersistentFlags().StringVarP(&namespace, "namespace", "n", "fast-sandbox", "Kubernetes resource namespace")
@@ -90,7 +88,6 @@ func init() {
 	mustBindConfigSources(viper.GetViper(), rootCmd.PersistentFlags())
 }
 
-// initConfig reads in config file and ENV variables if set.
 func initConfig() {
 	// Tests and embedders may reset Viper after package initialization.
 	// Rebinding here also makes the precedence explicit at command execution:

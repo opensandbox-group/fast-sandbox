@@ -2,9 +2,7 @@ package server
 
 // Service implements the Backend interface: it ties the pull layer
 // (agent.Client), the durable state (agent/state), and the shared
-// node cache (<StateRoot>/images/<sha256(image)>/) together. The native
-// stage returns cache file paths as devices; overlaybd ublk devices arrive
-// with stage 3.
+// node cache (<StateRoot>/images/<sha256(image)>/) together. The native stage returns cache file paths as devices.
 
 import (
 	"context"
@@ -36,9 +34,7 @@ type artifactPublisher interface {
 	PublishImage(ctx context.Context, kind, key, dir string) (agentpull.PublishResult, error)
 }
 
-// compatibilityPlaceholder is the stage-1 compatibility class. The full
-// class (CPU/kernel/Firecracker digests, design doc §8) arrives with the
-// snapshot stages.
+// compatibilityPlaceholder is the stage-1 compatibility class.
 const compatibilityPlaceholder = "native-stage-1"
 
 // Service is the concrete agent backend.

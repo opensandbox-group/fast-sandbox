@@ -23,7 +23,6 @@ var (
 	clearActionBindings   bool
 )
 
-// updateCmd represents the update command
 var updateCmd = &cobra.Command{
 	Use:   "update <sandbox-name>",
 	Short: "Update sandbox configuration",

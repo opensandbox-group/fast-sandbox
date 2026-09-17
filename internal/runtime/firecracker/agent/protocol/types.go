@@ -1,12 +1,11 @@
 // Package protocol defines the versioned UDS API shared by the
 // firecracker-runtime server and the fastlet driver client. Messages
-// are JSON over HTTP on a Unix socket (design docs §2.2).
+// are JSON over HTTP on a Unix socket.
 //
 // The served surface covers image lifecycle (PinImage / UnpinImage),
 // device leases (LeaseDevices / ReleaseDevices / ListLeases), node
 // capability reporting (Compatibility / Health), and artifact publication
-// (PublishImage). Snapshot RPCs (PinSnapshot / LeaseSnapshotDevices /
-// SealSnapshot) arrive with stage 4.
+// (PublishImage).
 package protocol
 
 import "time"
@@ -91,9 +90,8 @@ type UnpinImageRequest struct {
 }
 
 // LeaseDevicesRequest creates a device lease for one Sandbox. In the native
-// stage the lease returns the shared cache file paths; the device semantics
-// arrive with the overlaybd stage. MemSizeMiB and RootfsWritable are carried
-// now so the protocol is stable across stages.
+// stage the lease returns the shared cache file paths. MemSizeMiB and
+// RootfsWritable are carried now so the protocol is stable across stages.
 type LeaseDevicesRequest struct {
 	Identity
 	SandboxID      string `json:"sandboxId"`
@@ -161,8 +159,8 @@ type PublishImageResponse struct {
 	ArtifactDigest string `json:"artifactDigest"`
 }
 
-// CompatibilityResponse returns the node compatibility class (stage 3
-// restore validation; a placeholder in the native stage).
+// CompatibilityResponse returns the node compatibility class (a placeholder
+// in the native stage).
 type CompatibilityResponse struct {
 	CompatibilityClass string `json:"compatibilityClass"`
 }

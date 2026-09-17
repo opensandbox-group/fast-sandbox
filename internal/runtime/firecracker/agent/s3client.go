@@ -52,8 +52,7 @@ const (
 
 // s3Client implements path-style, SigV4-signed GETs and PUTs against an
 // S3-compatible store (AWS S3, Aliyun OSS, MinIO) with a read-only access
-// key pair plus an optional write key pair (live-snapshot publishing). Range
-// GETs arrive with the overlaybd stage.
+// key pair plus an optional write key pair (live-snapshot publishing).
 type s3Client struct {
 	endpoint  string // scheme://host[:port], e.g. https://oss-cn-hangzhou.aliyuncs.com
 	region    string
