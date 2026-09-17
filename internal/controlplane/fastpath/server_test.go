@@ -793,3 +793,33 @@ func TestResumeSandboxRequiresCheckpointAndFences(t *testing.T) {
 	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "paused-a"}, &current))
 	require.Equal(t, apiv1alpha2.SandboxStateRunning, current.Spec.State)
 }
+
+func TestGetSandboxMissingReturnsNotFound(t *testing.T) {
+	server, _, _, _ := newV2Server(t)
+
+	_, err := server.GetSandbox(context.Background(), &fastpathv2.GetSandboxRequest{
+		Sandbox: expectedReference("does-not-exist", "default"),
+	})
+	require.Error(t, err)
+	statusErr, ok := status.FromError(err)
+	require.True(t, ok, "GetSandbox must surface a gRPC status error, got %T: %v", err, err)
+	require.Equal(t, codes.NotFound, statusErr.Code(),
+		"a missing Sandbox CRD must map to codes.NotFound (OSEP-0007 fleets contract), got %s: %s",
+		statusErr.Code(), statusErr.Message())
+}
+
+func TestGetSandboxMissingWithoutRouteCacheReturnsNotFound(t *testing.T) {
+	server, k8sClient, _, _ := newV2Server(t)
+	emptyCache := fake.NewClientBuilder().WithScheme(k8sClient.Client.Scheme()).Build()
+	server.RouteCache = emptyCache
+
+	_, err := server.GetSandbox(context.Background(), &fastpathv2.GetSandboxRequest{
+		Sandbox: expectedReference("does-not-exist", "default"),
+	})
+	require.Error(t, err)
+	statusErr, ok := status.FromError(err)
+	require.True(t, ok, "GetSandbox must surface a gRPC status error, got %T: %v", err, err)
+	require.Equal(t, codes.NotFound, statusErr.Code(),
+		"a missing Sandbox CRD must map to codes.NotFound even without a warm RouteCache, got %s: %s",
+		statusErr.Code(), statusErr.Message())
+}
