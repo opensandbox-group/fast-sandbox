@@ -51,9 +51,6 @@ func main() {
 			handler.invoke(address, writer, request)
 		})
 		go func() {
-			// The key=value fields of this line are asserted by the Sandbox
-			// Actions E2E suite (sandbox_actions_test.go greps the fixture
-			// Pod logs); keep the format stable or update the suite with it.
 			log.Printf("sandbox Action fixture listening on %s instance=%s", address, instanceID)
 			if err := http.ListenAndServe(address, mux); err != nil {
 				log.Fatal(err)
@@ -89,6 +86,10 @@ func (f *fixture) invoke(address string, writer http.ResponseWriter, request *ht
 	targetPort := address[strings.LastIndex(address, ":")+1:]
 	if invocation.Operation == actionapi.OperationRemoveBinding {
 		if _, delayed := f.removeDelayPorts[targetPort]; delayed {
+			// The key=value fields of the request log lines (here, below, and
+			// in logInvocation) are asserted by the Sandbox Actions E2E suite
+			// (sandbox_actions_test.go greps the fixture Pod logs); keep the
+			// format stable or update the suite with it.
 			log.Printf("targetPort=%s operation=%s sandboxUid=%s invocationId=%s injectedRemoveDelay=true", targetPort, invocation.Operation, invocation.Sandbox.UID, invocation.InvocationID)
 			elapsed, cancelled := waitForCancellation(request.Context())
 			log.Printf("targetPort=%s operation=%s sandboxUid=%s invocationId=%s injectedRemoveDelayComplete=true cancelled=%t elapsedMillis=%d", targetPort, invocation.Operation, invocation.Sandbox.UID, invocation.InvocationID, cancelled, elapsed.Milliseconds())
@@ -169,6 +170,7 @@ func logInvocation(address string, invocation actionapi.Request, duplicate bool)
 	if invocation.Hook != nil {
 		hook = fmt.Sprintf("%s/%d", invocation.Hook.Name, invocation.Hook.Sequence)
 	}
+	// Format asserted by the Actions E2E suite; see the note in invoke.
 	log.Printf("targetPort=%s operation=%s input=%s hook=%s sandboxUid=%s generation=%d attachmentId=%s invocationId=%s duplicate=%t", targetPort, invocation.Operation, input, hook, invocation.Sandbox.UID, invocation.Revision.SpecGeneration, invocation.Revision.AttachmentID, invocation.InvocationID, duplicate)
 }
 

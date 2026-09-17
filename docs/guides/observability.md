@@ -6,9 +6,12 @@ Fast Sandbox uses Prometheus metrics for bounded SLO signals, OpenTelemetry trac
 
 All services log through `k8s.io/klog/v2`. One style applies everywhere:
 
-- Messages are constant strings starting lowercase, with no trailing
-  punctuation. Values never interpolate into the message; they travel as
-  key-value pairs (`klog.InfoS("firecracker agent pull completed", "image", ref)`).
+- Messages are constant strings starting lowercase — except when the first
+  word is an acronym, a proper noun, or an environment-variable name (e.g.
+  `S3 PUT succeeded after retries`, `DART P2P gateway enabled`, `POD_UID is
+  not set`) — and carry no trailing punctuation. Values never interpolate
+  into the message; they travel as key-value pairs
+  (`klog.InfoS("firecracker agent pull completed", "image", ref)`).
 - Call-site keys are camelCase (`sandboxName`, `attempt`). The error value
   of `ErrorS` is always the first argument, and a secondary `err` key, when
   present, is always last.

@@ -78,17 +78,17 @@ Priority: Flags > Config File > Interactive Input
 			data, err := os.ReadFile(configFile)
 			if err != nil {
 				klog.ErrorS(err, "Failed to read config file", "file", configFile)
-				exitWithErrorf("Failed to read config file: %v", err)
+				exitWithErrorf("failed to read config file: %v", err)
 			}
 			if err := yaml.Unmarshal(data, &config); err != nil {
 				klog.ErrorS(err, "Failed to parse config file", "file", configFile)
-				exitWithErrorf("Failed to parse config file: %v", err)
+				exitWithErrorf("failed to parse config file: %v", err)
 			}
 		} else if image == "" {
 			fmt.Println("Entering interactive mode...")
 			if err := runInteractive(name, &config); err != nil {
 				klog.ErrorS(err, "Interactive mode failed", "name", name)
-				exitWithErrorf("Interactive mode failed: %v", err)
+				exitWithErrorf("interactive mode failed: %v", err)
 			}
 		}
 
