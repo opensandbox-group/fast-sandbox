@@ -144,7 +144,6 @@ func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	ctx = r.withNamespace(ctx)
 	ctx = withContainerdCreateRPCMetrics(ctx, string(r.runtimeName))
 
-	// 1. Image preparation
 	pullStart := time.Now()
 	imageContext, finishImage := startContainerdCreateStage(ctx, string(r.runtimeName), "image")
 	image, err := r.prepareImage(imageContext, spec.Image)
@@ -174,7 +173,6 @@ func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	}
 	labels := r.prepareLabels(config, allocation)
 
-	// 2. Create container
 	createStart := time.Now()
 	logger.Info("creating containerd container object")
 
@@ -213,10 +211,8 @@ func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	finishLog(nil)
 	logDuration := time.Since(logStarted)
 
-	// 3. Start container
 	logger.Info("creating containerd task")
 
-	// Build CIO options based on runtime configuration
 	var cioOpts []cio.Opt
 	if r.config.NeedsTTY {
 		cioOpts = append(cioOpts, cio.WithTerminal)
@@ -459,7 +455,6 @@ func (r *Driver) prepareSpecOpts(ctx context.Context, config *fastletapi.Runtime
 		specOpts = append(specOpts, cgroupOpt)
 	}
 
-	// Add TTY option if required by runtime (e.g., gVisor)
 	if r.config.NeedsTTY {
 		specOpts = append(specOpts, oci.WithTTY)
 	}

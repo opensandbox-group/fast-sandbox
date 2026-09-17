@@ -403,7 +403,6 @@ func TestSandboxManager_CreateSandbox_Success(t *testing.T) {
 	assert.Equal(t, spec.SandboxID, resp.Sandbox.SandboxID, "SandboxID should match")
 	assert.Greater(t, resp.Sandbox.CreatedAt, int64(0), "CreatedAt should be set")
 
-	// Verify sandbox is in manager's cache
 	statuses := manager.GetSandboxStatuses(ctx)
 	require.Len(t, statuses, 1, "Should have one sandbox status")
 	assert.Equal(t, spec.SandboxID, statuses[0].SandboxID)
@@ -433,7 +432,6 @@ func TestSandboxManager_CreateSandbox_Idempotent(t *testing.T) {
 	require.NotNil(t, resp2.Sandbox)
 	assert.Equal(t, spec.SandboxID, resp2.Sandbox.SandboxID)
 
-	// Verify runtime CreateSandbox was NOT called again (cached)
 	assert.False(t, mockRuntime.GetCreateCalled(), "Runtime CreateSandbox should not be called for existing sandbox")
 }
 
@@ -444,7 +442,6 @@ func TestSandboxManager_CreateSandbox_RuntimeFailure(t *testing.T) {
 	ctx := context.Background()
 	spec := runtimeSpecForTest("test-sandbox-fail", "test-claim", "alpine:latest")
 
-	// Set mock to return error
 	expectedErr := errors.New("runtime create failed")
 	mockRuntime.SetCreateError(expectedErr)
 
@@ -459,7 +456,6 @@ func TestSandboxManager_CreateSandbox_RuntimeFailure(t *testing.T) {
 	// Wait for any potential async cleanup
 	time.Sleep(100 * time.Millisecond)
 
-	// Verify sandbox was not added to the manager's cache
 	statuses := manager.GetSandboxStatuses(ctx)
 	assert.Empty(t, statuses, "Failed sandbox should not be in cache")
 
@@ -485,11 +481,9 @@ func TestSandboxManager_CreateSandbox_MultipleSandboxes(t *testing.T) {
 		assert.Equal(t, fastletapi.CreateDispositionCreated, resp.Disposition)
 	}
 
-	// Verify all sandboxes are in status
 	statuses := manager.GetSandboxStatuses(ctx)
 	assert.Len(t, statuses, 3, "Should have three sandbox statuses")
 
-	// Create a map for easier lookup
 	statusMap := make(map[string]fastletapi.SandboxStatus)
 	for _, status := range statuses {
 		statusMap[status.SandboxID] = status
@@ -510,11 +504,9 @@ func TestSandboxManager_DeleteSandbox_Success(t *testing.T) {
 	ctx := context.Background()
 	spec := runtimeSpecForTest("test-sandbox-delete", "test-claim", "alpine:latest")
 
-	// Create sandbox first
 	_, err := ensureSandboxForTest(ctx, manager, spec)
 	require.NoError(t, err)
 
-	// Delete sandbox
 	resp, err := deleteSandboxForTest(manager, spec.SandboxID)
 
 	require.NoError(t, err, "DeleteSandbox should succeed")
@@ -542,7 +534,6 @@ func TestSandboxManager_DeleteSandbox_Idempotent(t *testing.T) {
 	ctx := context.Background()
 	spec := runtimeSpecForTest("test-sandbox-delete-idempotent", "test-claim", "alpine:latest")
 
-	// Create sandbox first
 	_, err := ensureSandboxForTest(ctx, manager, spec)
 	require.NoError(t, err)
 
@@ -581,7 +572,6 @@ func TestSandboxManager_DeleteSandbox_MultipleDeletes(t *testing.T) {
 	ctx := context.Background()
 	spec := runtimeSpecForTest("test-sandbox-multiple-delete", "test-claim", "alpine:latest")
 
-	// Create sandbox first
 	_, err := ensureSandboxForTest(ctx, manager, spec)
 	require.NoError(t, err)
 
@@ -610,7 +600,6 @@ func TestSandboxManager_GetSandboxStatuses(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Create two active sandboxes
 	spec1 := runtimeSpecForTest("active-sb-1", "claim-1", "alpine:latest")
 	spec2 := runtimeSpecForTest("active-sb-2", "claim-2", "nginx:latest")
 
@@ -619,20 +608,17 @@ func TestSandboxManager_GetSandboxStatuses(t *testing.T) {
 	_, err = ensureSandboxForTest(ctx, manager, spec2)
 	require.NoError(t, err)
 
-	// Delete one sandbox
 	_, err = deleteSandboxForTest(manager, spec1.SandboxID)
 	require.NoError(t, err)
 
 	// Wait for async delete to complete
 	time.Sleep(100 * time.Millisecond)
 
-	// Get statuses
 	statuses := manager.GetSandboxStatuses(ctx)
 
 	// Should have only the active sandbox (deleted one is completely removed)
 	require.Len(t, statuses, 1, "Should have one status (only active)")
 
-	// Check active sandbox is still running
 	activeStatus := statuses[0]
 	assert.Equal(t, spec2.SandboxID, activeStatus.SandboxID)
 	assert.Equal(t, fastletapi.RuntimeStateReady, activeStatus.Runtime.State, "Active sandbox should be running")
@@ -666,7 +652,6 @@ func TestSandboxManager_GetSandboxStatuses_RuntimeStatus(t *testing.T) {
 	// into an ambiguous top-level message.
 	assert.NotEmpty(t, statuses[0].Runtime.Message, "runtime message should contain driver status")
 
-	// Verify GetSandboxStatus was called on runtime
 	callCount := mockRuntime.GetStatusCallCount(spec.SandboxID)
 	assert.Greater(t, callCount, 0, "GetSandboxStatus should be called on runtime")
 }
@@ -677,7 +662,6 @@ func TestSandboxManager_GetSandboxStatuses_MultiplePhases(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Create sandboxes
 	specs := []*sandboxCreateFixture{
 		runtimeSpecForTest("sb-1", "claim-1", "alpine:latest"),
 		runtimeSpecForTest("sb-2", "claim-2", "nginx:latest"),
@@ -698,7 +682,6 @@ func TestSandboxManager_GetSandboxStatuses_MultiplePhases(t *testing.T) {
 
 	statuses := manager.GetSandboxStatuses(ctx)
 
-	// Create a map for easier lookup
 	statusMap := make(map[string]fastletapi.SandboxStatus)
 	for _, status := range statuses {
 		statusMap[status.SandboxID] = status
@@ -805,11 +788,9 @@ func TestSandboxManager_AsyncDelete_Timeout(t *testing.T) {
 	ctx := context.Background()
 	spec := runtimeSpecForTest("test-sandbox-timeout", "test-claim", "alpine:latest")
 
-	// Create sandbox first
 	_, err := ensureSandboxForTest(ctx, manager, spec)
 	require.NoError(t, err)
 
-	// Delete sandbox (async)
 	resp, err := deleteSandboxForTest(manager, spec.SandboxID)
 	require.NoError(t, err)
 	assert.NotNil(t, resp)
@@ -830,14 +811,11 @@ func TestSandboxManager_AsyncDelete_RuntimeError(t *testing.T) {
 	ctx := context.Background()
 	spec := runtimeSpecForTest("test-sandbox-delete-error", "test-claim", "alpine:latest")
 
-	// Create sandbox first
 	_, err := ensureSandboxForTest(ctx, manager, spec)
 	require.NoError(t, err)
 
-	// Set delete error
 	mockRuntime.SetDeleteError(errors.New("delete failed"))
 
-	// Delete sandbox (async)
 	resp, err := deleteSandboxForTest(manager, spec.SandboxID)
 	require.NoError(t, err)
 	assert.NotNil(t, resp)

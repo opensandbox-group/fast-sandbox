@@ -114,7 +114,6 @@ done
 				t.Fatalf("delete sandbox: %v", err)
 			}
 
-			// Wait for sandbox to transition to Terminating
 			// Give controller more time to process deletion and call Fastlet
 			termCtx, cancelTermWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelTermWait()

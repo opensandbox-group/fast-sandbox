@@ -295,7 +295,6 @@ func TestContainerdRuntime_DiscoverCgroupPath_Success(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create a temporary cgroup file
 			tmpDir := t.TempDir()
 			cgroupPath := filepath.Join(tmpDir, "cgroup")
 			require.NoError(t, os.WriteFile(cgroupPath, []byte(tt.content), 0644))
@@ -360,7 +359,6 @@ func TestContainerdRuntime_DiscoverCgroupPath_InvalidContent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create a temporary cgroup file
 			tmpDir := t.TempDir()
 			cgroupPath := filepath.Join(tmpDir, "cgroup")
 			require.NoError(t, os.WriteFile(cgroupPath, []byte(tt.content), 0644))
@@ -435,7 +433,6 @@ func TestContainerdRuntime_Initialize_DefaultSocketPath(t *testing.T) {
 
 func TestContainerdRuntime_Initialize_EnvVars(t *testing.T) {
 	// I-03: Reads environment variables for configuration
-	// Set up test environment variables
 	testPodName := "test-fastlet-pod"
 	testPodUID := "test-uid-12345"
 	os.Setenv("POD_NAME", testPodName)
@@ -454,7 +451,6 @@ func TestContainerdRuntime_Initialize_EnvVars(t *testing.T) {
 	ctx := context.Background()
 	_ = cr.Initialize(ctx, "") // Connection may fail, but env vars should be read
 
-	// Verify environment variables were read
 	assert.Equal(t, testPodName, cr.fastletPodName)
 	assert.Equal(t, testPodUID, cr.fastletPodUID)
 	assert.Nil(t, cr.infraMgr, "Infra manager is injected by Fastlet composition after runtime initialization")

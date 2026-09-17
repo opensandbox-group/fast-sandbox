@@ -34,7 +34,6 @@ func TestAutoExpiry(t *testing.T) {
 			}
 			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
 
-			// Create pool
 			pool := createFaultPool(namespace, "expiry-pool")
 			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
 				t.Fatalf("create sandbox pool: %v", err)
@@ -49,7 +48,6 @@ func TestAutoExpiry(t *testing.T) {
 			// Calculate expiry time (90 seconds from now to allow enough time for scheduling)
 			expiryTime := metav1.NewTime(time.Now().Add(90 * time.Second))
 
-			// Create sandbox with expiry
 			sandbox := &apiv1alpha2.Sandbox{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: apiv1alpha2.GroupVersion.String(),
@@ -70,7 +68,6 @@ func TestAutoExpiry(t *testing.T) {
 				t.Fatalf("create sandbox: %v", err)
 			}
 
-			// Wait for sandbox to be assigned first
 			waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 			assignedSandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: "sb-expiry-test", Namespace: namespace}, func(sb *apiv1alpha2.Sandbox) bool {
@@ -156,7 +153,6 @@ func TestMemoryLeak(t *testing.T) {
 			}
 			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
 
-			// Create pool
 			pool := createFaultPool(namespace, "memory-test-pool")
 			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
 				t.Fatalf("create sandbox pool: %v", err)
@@ -168,7 +164,6 @@ func TestMemoryLeak(t *testing.T) {
 				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
-			// Create 5 sandboxes
 			t.Log("Creating 5 sandboxes...")
 			for i := 1; i <= 5; i++ {
 				sandbox := createFaultSandbox(namespace, "sb-mem-%d", pool.Name, i)
@@ -180,7 +175,6 @@ func TestMemoryLeak(t *testing.T) {
 			// Wait for all to be assigned
 			time.Sleep(10 * time.Second)
 
-			// Delete 3 sandboxes
 			t.Log("Deleting 3 sandboxes...")
 			for i := 1; i <= 3; i++ {
 				name := types.NamespacedName{Name: sandboxName("sb-mem-%d", i), Namespace: namespace}
@@ -193,14 +187,12 @@ func TestMemoryLeak(t *testing.T) {
 			// Wait for deletion
 			time.Sleep(5 * time.Second)
 
-			// Create new sandbox to verify registry still works
 			t.Log("Creating new sandbox to verify registry...")
 			newSandbox := createFaultSandbox(namespace, "sb-mem-new", pool.Name, 0)
 			if err := k8sClient.Create(ctx, newSandbox); err != nil {
 				t.Fatalf("create new sandbox: %v", err)
 			}
 
-			// Wait for new sandbox to be assigned
 			waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 			if _, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: "sb-mem-new", Namespace: namespace}, func(sb *apiv1alpha2.Sandbox) bool {
@@ -210,7 +202,6 @@ func TestMemoryLeak(t *testing.T) {
 			}
 			t.Log("✓ New sandbox assigned successfully, registry working correctly")
 
-			// Create more sandboxes to further verify
 			for i := 1; i <= 3; i++ {
 				sandbox := createFaultSandbox(namespace, "sb-mem-verify-%d", pool.Name, i)
 				if err := k8sClient.Create(ctx, sandbox); err != nil {
@@ -244,7 +235,6 @@ func TestControlledRecovery(t *testing.T) {
 			}
 			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
 
-			// Create pool
 			pool := createFaultPool(namespace, "recovery-pool")
 			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
 				t.Fatalf("create sandbox pool: %v", err)
@@ -256,13 +246,11 @@ func TestControlledRecovery(t *testing.T) {
 				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
-			// Create sandbox
 			sandbox := createFaultSandbox(namespace, "sb-recovery", pool.Name, 0)
 			if err := k8sClient.Create(ctx, sandbox); err != nil {
 				t.Fatalf("create sandbox: %v", err)
 			}
 
-			// Wait for sandbox to be running
 			waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 			runningSandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: "sb-recovery", Namespace: namespace}, func(sb *apiv1alpha2.Sandbox) bool {
@@ -289,7 +277,6 @@ func TestControlledRecovery(t *testing.T) {
 				t.Fatalf("update sandbox with reset revision: %v", err)
 			}
 
-			// Wait for reset to be accepted
 			// Give controller more time to process reset request
 			resetWaitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 			defer cancel()
@@ -321,7 +308,6 @@ func TestControlledRecovery(t *testing.T) {
 				if err := k8sClient.Get(ctx, types.NamespacedName{Name: "sb-recovery", Namespace: namespace}, autoRecreateSandbox); err != nil {
 					return err
 				}
-				// Set AutoRecreate policy
 				autoRecreateSandbox.Spec.FailurePolicy = apiv1alpha2.FailurePolicyAutoRecreate
 				autoRecreateSandbox.Spec.RecoveryTimeoutSeconds = 15
 				return k8sClient.Update(ctx, autoRecreateSandbox)
@@ -332,7 +318,6 @@ func TestControlledRecovery(t *testing.T) {
 
 			time.Sleep(2 * time.Second)
 
-			// Get current assigned pod
 			currentSandbox := &apiv1alpha2.Sandbox{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: "sb-recovery", Namespace: namespace}, currentSandbox); err != nil {
 				t.Fatalf("get sandbox: %v", err)
@@ -342,14 +327,12 @@ func TestControlledRecovery(t *testing.T) {
 			}
 			currentPod := currentSandbox.Status.Placement.FastletName
 
-			// Delete the fastlet pod to trigger disconnect
 			t.Logf("Deleting fastlet pod %s to trigger AutoRecreate...", currentPod)
 			fastletPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: currentPod, Namespace: namespace}}
 			if err := k8sClient.Delete(ctx, fastletPod); err != nil && !errors.IsNotFound(err) {
 				t.Logf("Warning: delete fastlet pod: %v", err)
 			}
 
-			// Wait for sandbox to be rescheduled to a new pod
 			t.Log("Waiting for AutoRecreate to trigger...")
 			recreateWaitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 			defer cancel()
@@ -385,7 +368,6 @@ func TestPodExistence(t *testing.T) {
 			}
 			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
 
-			// Create pool
 			pool := createFaultPool(namespace, "existence-pool")
 			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
 				t.Fatalf("create sandbox pool: %v", err)
@@ -397,7 +379,6 @@ func TestPodExistence(t *testing.T) {
 				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
-			// Create sandbox
 			sandbox := &apiv1alpha2.Sandbox{
 				TypeMeta: metav1.TypeMeta{
 					APIVersion: apiv1alpha2.GroupVersion.String(),
@@ -417,7 +398,6 @@ func TestPodExistence(t *testing.T) {
 				t.Fatalf("create sandbox: %v", err)
 			}
 
-			// Wait for sandbox to be running
 			waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 			runningSandbox, err := fixture.WaitForSandbox(waitCtx, types.NamespacedName{Name: "sb-existence", Namespace: namespace}, func(sb *apiv1alpha2.Sandbox) bool {
@@ -442,7 +422,6 @@ func TestPodExistence(t *testing.T) {
 			t.Log("Waiting for Janitor scan cycle...")
 			time.Sleep(35 * time.Second)
 
-			// Check sandbox status
 			existingSandbox := &apiv1alpha2.Sandbox{}
 			err = k8sClient.Get(ctx, types.NamespacedName{Name: "sb-existence", Namespace: namespace}, existingSandbox)
 			if err != nil {

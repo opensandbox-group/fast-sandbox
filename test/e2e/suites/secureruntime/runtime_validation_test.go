@@ -82,7 +82,6 @@ func TestRuntimeValidationUnsupportedBoxLite(t *testing.T) {
 				t.Fatalf("create pool: %v", err)
 			}
 
-			// Wait for condition to be updated
 			conditionCtx, cancelCondition := context.WithTimeout(ctx, 30*time.Second)
 			defer cancelCondition()
 
@@ -217,7 +216,6 @@ func TestRuntimeValidationContainerDefault(t *testing.T) {
 				t.Fatalf("create container pool: %v", err)
 			}
 
-			// Wait for ready fastlet pods
 			poolWaitCtx, cancelPoolWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelPoolWait()
 			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
@@ -245,13 +243,11 @@ func TestRuntimeValidationContainerDefault(t *testing.T) {
 				t.Fatalf("fastlet memory request = %q, want overhead + 5 slots = 1408Mi", got)
 			}
 
-			// Create sandbox
 			sandbox := newSecureRuntimeSandbox(namespace, "sb-container", pool.Name)
 			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox); err != nil {
 				t.Fatalf("create sandbox: %v", err)
 			}
 
-			// Wait for sandbox running
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 60*time.Second)
 			defer cancelRunWait()
 			running, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha2.Sandbox) bool {

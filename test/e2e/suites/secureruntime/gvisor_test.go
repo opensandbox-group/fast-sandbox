@@ -46,13 +46,11 @@ func TestGVisorSandbox(t *testing.T) {
 			}
 			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
 
-			// Create gVisor pool
 			pool := newSecureRuntimePool(namespace, "gvisor-pool", apiv1alpha2.RuntimeGVisor, 1, 1)
 			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
 				t.Fatalf("create gvisor pool: %v", err)
 			}
 
-			// Wait for ready fastlet pods
 			poolWaitCtx, cancelPoolWait := context.WithTimeout(ctx, 90*time.Second)
 			defer cancelPoolWait()
 			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
@@ -64,13 +62,11 @@ func TestGVisorSandbox(t *testing.T) {
 				t.Fatalf("wait for gVisor RuntimeReady: %v", err)
 			}
 
-			// Create sandbox
 			sandbox := newSecureRuntimeSandbox(namespace, "sb-gvisor", pool.Name)
 			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox); err != nil {
 				t.Fatalf("create sandbox: %v", err)
 			}
 
-			// Wait for sandbox running
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 60*time.Second)
 			defer cancelRunWait()
 			_, err := fixture.WaitForSandbox(runCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, func(sb *apiv1alpha2.Sandbox) bool {
@@ -107,7 +103,6 @@ func TestGVisorIsolation(t *testing.T) {
 			}
 			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
 
-			// Create gVisor pool
 			pool := newSecureRuntimePool(namespace, "gvisor-iso-pool", apiv1alpha2.RuntimeGVisor, 1, 1)
 			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
 				t.Fatalf("create gvisor pool: %v", err)
@@ -155,7 +150,6 @@ func TestGVisorIsolation(t *testing.T) {
 				t.Fatalf("wait for running sandbox: %v", err)
 			}
 
-			// Get the fastlet pod where the sandbox runs
 			fastletPod := &corev1.Pod{}
 			if err := k8sClient.Get(ctx, types.NamespacedName{Name: createdSandbox.Status.Placement.FastletName, Namespace: namespace}, fastletPod); err != nil {
 				t.Fatalf("get fastlet pod: %v", err)
@@ -457,7 +451,6 @@ func TestGVisorMultipleSandboxes(t *testing.T) {
 			}
 			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
 
-			// Create pool with capacity for multiple sandboxes
 			pool := newSecureRuntimePool(namespace, "gvisor-multi-pool", apiv1alpha2.RuntimeGVisor, 1, 3)
 			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
 				t.Fatalf("create gvisor pool: %v", err)
@@ -469,7 +462,6 @@ func TestGVisorMultipleSandboxes(t *testing.T) {
 				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
-			// Create multiple sandboxes
 			sandboxNames := []string{"sb-gvisor-1", "sb-gvisor-2", "sb-gvisor-3"}
 			for _, name := range sandboxNames {
 				sandbox := newSecureRuntimeSandbox(namespace, name, pool.Name)
@@ -478,7 +470,6 @@ func TestGVisorMultipleSandboxes(t *testing.T) {
 				}
 			}
 
-			// Wait for all sandboxes to be running
 			runCtx, cancelRunWait := context.WithTimeout(ctx, 120*time.Second)
 			defer cancelRunWait()
 			for _, name := range sandboxNames {

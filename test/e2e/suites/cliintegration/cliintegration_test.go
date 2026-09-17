@@ -185,7 +185,6 @@ func TestUpdateReset(t *testing.T) {
 			}
 			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
 
-			// Create pool
 			pool := createCLIPool(namespace, "update-pool")
 			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
 				t.Fatalf("create sandbox pool: %v", err)
@@ -197,7 +196,6 @@ func TestUpdateReset(t *testing.T) {
 				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
-			// Start port-forward to controller
 			ctrlNS := testSuite.ControllerNamespace()
 			endpoint, pf, err := e2eenv.StartControllerPortForward(ctx, ctrlNS)
 			if err != nil {
@@ -291,7 +289,6 @@ func TestCLIRun(t *testing.T) {
 			}
 			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
 
-			// Create pool
 			pool := createCLIPool(namespace, "run-pool")
 			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
 				t.Fatalf("create sandbox pool: %v", err)
@@ -303,7 +300,6 @@ func TestCLIRun(t *testing.T) {
 				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
-			// Start port-forward to controller
 			ctrlNS := testSuite.ControllerNamespace()
 			endpoint, pf, err := e2eenv.StartControllerPortForward(ctx, ctrlNS)
 			if err != nil {

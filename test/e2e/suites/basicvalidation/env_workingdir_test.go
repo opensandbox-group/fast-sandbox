@@ -134,7 +134,6 @@ func TestFastPathEnvAndWorkingDir(t *testing.T) {
 			}
 			waitForPoolReady(ctx, t, fixture, namespace, pool.Name)
 
-			// Wait for fastlet capacity to sync to controller registry
 			// Fastlet control loop runs every 2s, give it time to register capacity
 			t.Log("Waiting for fastlet capacity to sync...")
 			time.Sleep(5 * time.Second)

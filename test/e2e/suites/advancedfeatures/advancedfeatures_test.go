@@ -71,7 +71,6 @@ func TestInlineInfraComponentWiring(t *testing.T) {
 				t.Fatalf("wait for ready fastlet pods: %v", err)
 			}
 
-			// Get the fastlet pod
 			podList := &corev1.PodList{}
 			if err := k8sClient.List(ctx, podList); err != nil {
 				t.Fatalf("list pods: %v", err)

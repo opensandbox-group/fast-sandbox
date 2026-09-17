@@ -53,7 +53,7 @@ func TestNamespaceAware(t *testing.T) {
 				t.Fatalf("sandbox not assigned")
 			}
 
-			// Wait for Janitor scan cycle (simulated by short wait)
+			// Wait for the Janitor scan cycle to observe the orphan
 			select {
 			case <-ctx.Done():
 				t.Fatalf("context cancelled during janitor wait: %v", ctx.Err())
@@ -121,7 +121,6 @@ func TestJanitorRecovery(t *testing.T) {
 				t.Fatalf("delete sandbox crd: %v", err)
 			}
 
-			// Wait for CRD to be deleted
 			deleteCtx, cancelDelete := context.WithTimeout(ctx, 30*time.Second)
 			defer cancelDelete()
 			for {

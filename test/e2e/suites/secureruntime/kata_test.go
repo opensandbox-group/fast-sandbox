@@ -39,13 +39,11 @@ func TestKataQemuSandbox(t *testing.T) {
 			}
 			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
 
-			// Create Kata QEMU pool
 			pool := newSecureRuntimePool(namespace, "kata-qemu-pool", apiv1alpha2.RuntimeKataQemu, 1, 1)
 			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
 				t.Fatalf("create kata pool: %v", err)
 			}
 
-			// Wait for ready fastlet pods
 			poolWaitCtx, cancelPoolWait := context.WithTimeout(ctx, 120*time.Second) // Kata needs more time
 			defer cancelPoolWait()
 			if _, err := fixture.WaitForReadyFastletPods(poolWaitCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
