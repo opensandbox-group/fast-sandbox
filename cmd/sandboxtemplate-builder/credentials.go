@@ -62,6 +62,12 @@ func (c publishCredentials) awsEnv() []string {
 	env := setEnv(os.Environ(), "AWS_ACCESS_KEY_ID", c.AccessKeyID)
 	env = setEnv(env, "AWS_SECRET_ACCESS_KEY", c.SecretAccessKey)
 	env = setEnv(env, "AWS_REGION", c.Region)
+	// CLI v2 defaults to CRC32 trailing checksums, which stream uploads as
+	// "STREAMING-UNSIGNED-PAYLOAD-TRAILER" — an extension S3-compatible
+	// stores like Aliyun OSS reject with NotImplemented on UploadPart.
+	// "when_required" restores the classic SigV4 body upload that every
+	// S3-compatible endpoint accepts.
+	env = setEnv(env, "AWS_REQUEST_CHECKSUM_CALCULATION", "when_required")
 	return env
 }
 
