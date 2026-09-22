@@ -9,6 +9,13 @@
 
 ARG DART_REV=a85f39f13d81241b3d57f7f7fe7b7c84d58b7aa2
 
+# Firecracker assets baked in (fc-assets stage below): the hostready
+# installer copies them onto the node instead of downloading. The pins must
+# match hostready.DefaultFCVersion / defaultKernelURL (asserted by
+# assets_test.go); config pins still route around the bundle to downloads.
+ARG FC_VERSION=v1.16.1
+ARG FC_KERNEL_URL=https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260722-38359b8055fc-0/x86_64/vmlinux-6.1.176
+
 # --- dart (P2P daemon, pinned) ------------------------------------------------
 FROM golang:1.25 AS dart-build
 
@@ -25,6 +32,25 @@ RUN git init /src/dart \
     && git checkout --detach FETCH_HEAD \
     && CGO_ENABLED=0 go build -o /out/dart ./cmd/dart
 
+# --- firecracker assets (bundled, pinned) -------------------------------------
+# x86_64 only (matches the assetArch gate); find tolerates any tarball
+# nesting; the manifest self-check fails the build on a bad extraction.
+FROM alpine:3.19 AS fc-assets
+
+ARG FC_VERSION
+ARG FC_KERNEL_URL
+RUN apk add --no-cache curl \
+    && mkdir /bundle /stage \
+    && curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-x86_64.tgz" -o /stage/fc.tgz \
+    && tar -xzf /stage/fc.tgz -C /stage \
+    && find /stage -type f -name "firecracker-${FC_VERSION}-x86_64" -exec mv {} /bundle/firecracker \; \
+    && find /stage -type f -name "jailer-${FC_VERSION}-x86_64" -exec mv {} /bundle/jailer \; \
+    && curl -fsSL "${FC_KERNEL_URL}" -o /bundle/vmlinux.bin \
+    && chmod 0755 /bundle/firecracker /bundle/jailer \
+    && cd /bundle \
+    && sha256sum firecracker jailer vmlinux.bin > SHA256SUMS \
+    && sha256sum -c SHA256SUMS
+
 # --- runtime image -----------------------------------------------------------
 FROM alpine:3.19
 RUN apk add --no-cache curl
@@ -33,6 +59,8 @@ ARG DART_REV
 COPY --from=dart-build /out/dart /usr/local/bin/dart
 RUN echo "$DART_REV" > /usr/local/share/dart-rev
 LABEL com.fast-sandbox.dart-rev="$DART_REV"
+
+COPY --from=fc-assets /bundle /usr/local/share/fast-sandbox/fc-assets
 
 WORKDIR /workspace
 COPY .build/linux-amd64/firecracker-runtime .

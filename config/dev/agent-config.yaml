@@ -51,6 +51,8 @@ data:
     nodeReadiness:
       # The host-check / firecracker-asset-install / node-label loop.
       # Requires FAST_SANDBOX_NODE_NAME (injected by the DaemonSet).
+      # The asset install prefers the release/kernel bundled in the agent
+      # image; these pins route to downloads when set away from it.
       enabled: true
       assetsDir: /opt/fast-sandbox/firecracker
       fcVersion: v1.16.1

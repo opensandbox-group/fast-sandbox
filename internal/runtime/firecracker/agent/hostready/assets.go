@@ -75,6 +75,10 @@ type AssetConfig struct {
 	// ReleaseBase overrides the GitHub release root (tests point it at an
 	// httptest server).
 	ReleaseBase string
+	// BundleDir is the in-image copy of the pinned assets (Dockerfile
+	// fc-assets stage); empty = defaultBundleDir. Served instead of the
+	// download path when the config keeps the stock pins.
+	BundleDir string
 	// HTTPClient fetches the assets (nil = a timed-out default client).
 	HTTPClient *http.Client
 	// VerifyBinary runs "<path> --version" (nil = exec the binary).
@@ -109,6 +113,12 @@ func (c AssetConfig) Ensure(ctx context.Context) error {
 	arch, err := assetArch()
 	if err != nil {
 		return err
+	}
+	// Zero-network source first; the downloads below per-file skip
+	// whatever the bundle installed, so a bad bundle only costs a log.
+	if err := c.installFromBundle(dir); err != nil {
+		klog.InfoS("bundled firecracker assets unusable; falling back to downloads",
+			"bundle", c.bundleDir(), "err", err)
 	}
 	binary := filepath.Join(dir, "firecracker")
 	jailer := filepath.Join(dir, "jailer")
