@@ -118,6 +118,7 @@ func (m *Manager) Run(ctx context.Context) {
 
 // pass runs one full check/install/label cycle.
 func (m *Manager) pass(ctx context.Context) {
+	klog.InfoS("host readiness pass started")
 	if m.current.Assets != nil {
 		if err := m.current.Assets.Ensure(ctx); err != nil {
 			// The fc-assets check below fails on the same condition;

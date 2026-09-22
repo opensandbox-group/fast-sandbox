@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"k8s.io/klog/v2"
 )
@@ -36,6 +38,30 @@ const (
 	maxAssetBytes = 1 << 30
 )
 
+// Fallback download timeouts (AssetConfig.HTTPClient == nil); the body
+// transfer stays unbounded.
+const (
+	defaultDialTimeout           = 10 * time.Second
+	defaultTLSHandshakeTimeout   = 10 * time.Second
+	defaultResponseHeaderTimeout = 30 * time.Second
+	// downloadProgressInterval is the byte stride of the progress logs.
+	downloadProgressInterval = 8 << 20
+)
+
+// defaultHTTPClient is the nil-HTTPClient fallback: like
+// http.DefaultClient, but with explicit connect/TLS/response-header
+// timeouts.
+var defaultHTTPClient = func() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{
+		Timeout:   defaultDialTimeout,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	transport.TLSHandshakeTimeout = defaultTLSHandshakeTimeout
+	transport.ResponseHeaderTimeout = defaultResponseHeaderTimeout
+	return &http.Client{Transport: transport}
+}()
+
 // AssetConfig describes the Firecracker asset installation.
 type AssetConfig struct {
 	// Dir is the install target (default DefaultAssetsDir).
@@ -49,7 +75,7 @@ type AssetConfig struct {
 	// ReleaseBase overrides the GitHub release root (tests point it at an
 	// httptest server).
 	ReleaseBase string
-	// HTTPClient fetches the assets (nil = default client).
+	// HTTPClient fetches the assets (nil = a timed-out default client).
 	HTTPClient *http.Client
 	// VerifyBinary runs "<path> --version" (nil = exec the binary).
 	VerifyBinary func(path string) error
@@ -237,16 +263,15 @@ func (c AssetConfig) installFile(ctx context.Context, url, path string) error {
 // cap (a silent truncation would hand the node a corrupt kernel that
 // still passes the non-empty verify).
 func (c AssetConfig) download(ctx context.Context, url, path string) error {
-	client := c.HTTPClient
-	if client == nil {
-		client = http.DefaultClient
-	}
+	start := time.Now()
+	klog.InfoS("asset download started", "url", url, "dest", path)
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
-	response, err := client.Do(request)
+	response, err := c.httpClient().Do(request)
 	if err != nil {
+		klog.ErrorS(err, "asset download failed", "url", url, "elapsed", time.Since(start).Round(time.Millisecond))
 		return fmt.Errorf("fetch %s: %w", url, err)
 	}
 	defer response.Body.Close()
@@ -263,14 +288,42 @@ func (c AssetConfig) download(ctx context.Context, url, path string) error {
 	defer file.Close()
 	// Read one byte past the cap so an over-long body with no
 	// Content-Length is detected instead of silently truncated.
-	written, err := io.Copy(file, io.LimitReader(response.Body, maxAssetBytes+1))
+	written, err := io.Copy(file, io.LimitReader(&progressReader{reader: response.Body, url: url}, maxAssetBytes+1))
 	if err != nil {
+		klog.ErrorS(err, "asset download failed", "url", url, "bytes", written, "elapsed", time.Since(start).Round(time.Millisecond))
 		return fmt.Errorf("download %s: %w", url, err)
 	}
 	if written > maxAssetBytes {
 		return fmt.Errorf("download %s: body exceeds the %d byte asset cap", url, maxAssetBytes)
 	}
+	klog.InfoS("asset download finished", "url", url, "dest", path, "bytes", written, "duration", time.Since(start).Round(time.Millisecond))
 	return nil
+}
+
+// httpClient returns the injected client or the timed-out default.
+func (c AssetConfig) httpClient() *http.Client {
+	if c.HTTPClient != nil {
+		return c.HTTPClient
+	}
+	return defaultHTTPClient
+}
+
+// progressReader logs a heartbeat every downloadProgressInterval bytes.
+type progressReader struct {
+	reader  io.Reader
+	url     string
+	written int64
+	marked  int64
+}
+
+func (p *progressReader) Read(buffer []byte) (int, error) {
+	n, err := p.reader.Read(buffer)
+	p.written += int64(n)
+	if p.written-p.marked >= downloadProgressInterval {
+		klog.InfoS("asset download in progress", "url", p.url, "bytes", p.written)
+		p.marked = p.written
+	}
+	return n, err
 }
 
 func (c AssetConfig) dir() string {

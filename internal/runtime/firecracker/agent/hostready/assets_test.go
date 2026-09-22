@@ -160,3 +160,26 @@ func TestDownloadAcceptsBodiesUnderTheCap(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "small blob", string(payload))
 }
+
+func TestDefaultHTTPClientCarriesTimeouts(t *testing.T) {
+	require.NotSame(t, http.DefaultClient, AssetConfig{}.httpClient())
+	transport, ok := defaultHTTPClient.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.Equal(t, defaultTLSHandshakeTimeout, transport.TLSHandshakeTimeout)
+	require.Equal(t, defaultResponseHeaderTimeout, transport.ResponseHeaderTimeout)
+	require.NotNil(t, transport.DialContext)
+	require.True(t, transport.Proxy != nil)
+}
+
+func TestDownloadWithDefaultClientStillWorks(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("default client blob"))
+	}))
+	t.Cleanup(server.Close)
+	config := AssetConfig{}
+	out := filepath.Join(t.TempDir(), "out")
+	require.NoError(t, config.download(context.Background(), server.URL+"/ok", out))
+	payload, err := os.ReadFile(out)
+	require.NoError(t, err)
+	require.Equal(t, "default client blob", string(payload))
+}
