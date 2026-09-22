@@ -25,7 +25,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="${WORK:-$PWD/.sandboxtemplate-e2e}"
-IMAGE="${SANDBOX_TEMPLATE_IMAGE:-alpine:3.19}"
+IMAGE="${SANDBOX_TEMPLATE_IMAGE:-opensandbox/fsb-sandbox-golden:latest}"
 # Formats to exercise; defaults to both. --format may be repeated or a
 # comma-separated list to run a subset.
 FORMATS=()
@@ -69,20 +69,46 @@ fi
 command -v docker >/dev/null || die "missing required command: docker"
 command -v go >/dev/null || die "missing required command: go (for --local mode and spec checks)"
 command -v jq >/dev/null || die "missing required command: jq (manifest assertions)"
+command -v debugfs >/dev/null || die "missing required command: debugfs (e2fsprogs, guest env file assertions)"
 
 log "workspace: $WORK (formats=${FORMATS[*]}, local=$LOCAL_MODE)"
 rm -rf "$WORK"
 mkdir -p "$WORK/input"
 
 # --- test image --------------------------------------------------------------
+# The env contract is asserted end to end, so the pipeline always builds from
+# a tiny image derived on top of the requested base: the derivation adds two
+# known ENVs — E2E_IMAGE_ONLY (must be inherited untouched) and
+# E2E_OVERRIDE_ME (shadowed by the same name in spec.envs) — plus a spec-only
+# env and a console-printing entrypoint in spec.json. Tarball inputs are
+# loaded into the local daemon first (the build itself stays offline: FROM
+# resolves locally and there is no RUN).
 IMAGE_TAR="$WORK/input/image.tar"
-if [[ "$IMAGE" != *.tar ]]; then
-    log "exporting test image $IMAGE"
-    docker pull -q "$IMAGE" >/dev/null 2>&1 || die "docker pull failed: $IMAGE"
-    docker save "$IMAGE" -o "$IMAGE_TAR" >/dev/null 2>&1 || die "docker save failed"
+ENV_IMAGE="sandboxtemplate-e2e:env"
+if [[ "$IMAGE" == *.tar ]]; then
+    log "loading test image tarball $IMAGE"
+    load_output=$(docker load -i "$IMAGE") || die "docker load failed: $IMAGE"
+    base_ref=$(sed -n 's/^Loaded image: //p' <<<"$load_output" | head -1)
+    if [[ -z "$base_ref" ]]; then
+        base_ref=$(sed -n 's/^Loaded image ID: //p' <<<"$load_output" | head -1)
+        [[ -n "$base_ref" ]] || die "docker load produced no image reference for $IMAGE"
+        docker tag "$base_ref" "sandboxtemplate-e2e:env-base" >/dev/null 2>&1 || die "docker tag failed"
+        base_ref="sandboxtemplate-e2e:env-base"
+    fi
 else
-    cp "$IMAGE" "$IMAGE_TAR"
+    docker pull -q "$IMAGE" >/dev/null 2>&1 || die "docker pull failed: $IMAGE"
+    base_ref="$IMAGE"
 fi
+log "building env-verification image $ENV_IMAGE (base: $base_ref)"
+ENV_CTX="$WORK/input/env-ctx"
+mkdir -p "$ENV_CTX"
+cat > "$ENV_CTX/Dockerfile" <<EOF
+FROM $base_ref
+ENV E2E_IMAGE_ONLY=from-image
+ENV E2E_OVERRIDE_ME=from-image
+EOF
+docker build -q -t "$ENV_IMAGE" "$ENV_CTX" >/dev/null 2>&1 || die "env-verification image build failed"
+docker save "$ENV_IMAGE" -o "$IMAGE_TAR" >/dev/null 2>&1 || die "docker save failed"
 
 # --- runner ------------------------------------------------------------------
 if [[ "$LOCAL_MODE" -eq 1 ]]; then
@@ -130,15 +156,15 @@ for fmt in "${FORMATS[@]}"; do
     mkdir -p "$FMT_DIR/build"
     printf '{
   "image": "%s",
-  "entrypoint": ["/bin/sh"],
+  "entrypoint": ["/bin/sh", "-c", "echo E2E_ENV image_only=$E2E_IMAGE_ONLY override=$E2E_OVERRIDE_ME spec_only=$E2E_SPEC_ONLY path=$PATH > /dev/console; exec tail -f /dev/null"],
   "kernel": "vmlinux.bin",
   "machine": {"vcpu": "2", "memory": "1Gi"},
   "init": "/usr/local/sbin/sandbox-init",
-  "envs": [{"name": "E2E", "value": "1"}],
+  "envs": [{"name": "E2E_OVERRIDE_ME", "value": "from-spec"}, {"name": "E2E_SPEC_ONLY", "value": "from-spec"}],
   "readiness": {"warmupSeconds": 15},
   "output": {"rootfsSize": "10Gi", "format": "%s"}
 }
-' "$IMAGE" "$fmt" > "$FMT_DIR/spec.json"
+' "$ENV_IMAGE" "$fmt" > "$FMT_DIR/spec.json"
     log "running the conversion pipeline (format=$fmt)"
     set +e
     run_pipeline "$FMT_DIR" 2> "$FMT_DIR/pipeline.log"
@@ -171,6 +197,27 @@ for fmt in "${FORMATS[@]}"; do
     assert "snapshot restore produced a guest heartbeat" grep -q "SANDBOX_HEARTBEAT" "$BUILD/restore.console.log"
     assert "manifest records the baked guest network" jq -e '.guestNetwork.iface == "eth0" and .guestNetwork.ip == "172.30.0.3" and .guestNetwork.mac == "02:00:00:00:00:01" and .guestNetwork.gateway == "172.30.0.1"' "$BUILD/manifest.json"
     assert "boot args bake the static guest IP" grep -q "ip=172.30.0.3::172.30.0.1:255.255.255.0::eth0:off" "$BUILD/boot.console.log"
+
+    # --- env contract --------------------------------------------------------
+    # /etc/sandbox-init.env is the only env source the guest init sources.
+    # Extract it from the rootfs and assert the exact merge semantics:
+    # the image's Config.Env is inherited, spec.envs are attached, and a
+    # spec env overrides a same-name image env (exactly one export left).
+    guest_env="$BUILD/sandbox-init.env"
+    debugfs -R "cat /etc/sandbox-init.env" "$BUILD/rootfs.ext4" > "$guest_env" 2>/dev/null \
+        || die "debugfs could not read /etc/sandbox-init.env (format=$fmt)"
+    assert "guest env file exports the inherited image PATH" grep -q '^export PATH=' "$guest_env"
+    assert "guest env file inherits the image-only env" grep -qx "export E2E_IMAGE_ONLY='from-image'" "$guest_env"
+    assert "guest env file keeps the spec-only env" grep -qx "export E2E_SPEC_ONLY='from-spec'" "$guest_env"
+    assert "guest env file lets the spec env override the image env" grep -qx "export E2E_OVERRIDE_ME='from-spec'" "$guest_env"
+    assert "guest env file drops the overridden image value" test "$(grep -cx "export E2E_OVERRIDE_ME='from-image'" "$guest_env")" -eq 0
+    assert "guest env file exports the overridden name exactly once" test "$(grep -cx 'export E2E_OVERRIDE_ME=.*' "$guest_env")" -eq 1
+    # The spec entrypoint echoes the live env to /dev/console before the
+    # readiness marker: this proves the init actually sourced the merged
+    # file inside the guest, not just that the file content looks right.
+    assert "running guest sees the inherited image env" grep -q "image_only=from-image" "$BUILD/boot.console.log"
+    assert "running guest sees the spec-only env" grep -q "spec_only=from-spec" "$BUILD/boot.console.log"
+    assert "running guest sees the overridden env value" grep -q "override=from-spec" "$BUILD/boot.console.log"
     if [[ "$fmt" == "overlaybd" ]]; then
         assert "overlaybd rootfs layer exists" test -s "$BUILD/overlaybd/rootfs/layer.lsmt"
         assert "overlaybd memory layer exists" test -s "$BUILD/overlaybd/memory/layer.lsmt"

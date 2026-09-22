@@ -83,7 +83,7 @@ STORE_ROOT="s3://$MINIO_BUCKET/publish"
 FC_VERSION="${FC_VERSION:-v1.16.1}"
 # The template source image doubles as the artifact key (the builder pulls
 # it from a registry; index/digest16 are keyed by sha256 of this reference).
-SBX_IMAGE="${SBX_IMAGE:-alpine:3.19}"
+SBX_IMAGE="${SBX_IMAGE:-opensandbox/fsb-sandbox-golden:latest}"
 EXECD="${EXECD:-opensandbox/execd:1.1.0}"
 
 # Docker Hub is unreachable from many hosts. The docker.io mirror baked into
