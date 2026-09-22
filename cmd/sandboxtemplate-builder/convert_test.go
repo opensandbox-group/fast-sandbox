@@ -16,8 +16,7 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 )
 
-// TestWriteImageEnv verifies the pull stage persists the source image's OCI
-// Config.Env verbatim for the convert and manifest stages.
+// TestWriteImageEnv: the pull stage persists the image's OCI Config.Env.
 func TestWriteImageEnv(t *testing.T) {
 	image, err := mutate.Config(empty.Image, v1.Config{Env: []string{"PATH=/usr/bin", "JAVA_HOME=/opt/java"}})
 	if err != nil {
@@ -36,9 +35,7 @@ func TestWriteImageEnv(t *testing.T) {
 	}
 }
 
-// TestMergeGuestEnvs verifies the guest env merge: the source image's
-// Config.Env is inherited, spec envs win on name conflicts, unusable image
-// entries are skipped, and spec envs stay strict.
+// TestMergeGuestEnvs: image env inherited, spec env wins, spec envs strict.
 func TestMergeGuestEnvs(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -115,8 +112,7 @@ func TestMergeGuestEnvs(t *testing.T) {
 	}
 }
 
-// TestReadImageEnvsMissingFileIsNoInheritance verifies a workdir without the
-// pull-stage env file does not fail the convert stage.
+// TestReadImageEnvsMissingFileIsNoInheritance: missing file, no failure.
 func TestReadImageEnvsMissingFileIsNoInheritance(t *testing.T) {
 	envs, err := readImageEnvs(t.TempDir())
 	if err != nil {
@@ -127,9 +123,7 @@ func TestReadImageEnvsMissingFileIsNoInheritance(t *testing.T) {
 	}
 }
 
-// TestMergeGuestEnvsNamesAreSorted verifies the merge output renders in
-// sorted name order so builds of the same inputs stay byte-identical
-// (injectRuntime sorts the names before rendering the exports).
+// TestMergeGuestEnvsNamesAreSorted: deterministic byte-identical rendering.
 func TestMergeGuestEnvsNamesAreSorted(t *testing.T) {
 	workdir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(workdir, imageEnvFileName),

@@ -27,15 +27,12 @@ import (
 // with --platform linux/amd64).
 var linuxAMD64 = v1.Platform{OS: "linux", Architecture: "amd64"}
 
-// imageEnvFileName is the workdir file where the pull stage persists the
-// source image's OCI Config.Env (the merged Dockerfile ENV). The convert
-// stage merges it into the guest /etc/sandbox-init.env and the manifest
-// stage records it under lineage.imageEnvs.
+// imageEnvFileName is the workdir file holding the source image's OCI
+// Config.Env, written by the pull stage and merged by the convert stage.
 const imageEnvFileName = "image-config.env"
 
 // writeImageEnv persists the source image's OCI Config.Env for the convert
-// and manifest stages. An image without config envs produces an empty file:
-// readers treat missing and empty alike.
+// stage. An image without config envs produces an empty file.
 func writeImageEnv(image v1.Image, workdir string) error {
 	config, err := image.ConfigFile()
 	if err != nil {

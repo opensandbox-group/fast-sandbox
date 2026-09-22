@@ -77,9 +77,8 @@ func stageConvert(spec apiv1alpha2.SandboxTemplateSpec, workdir string) (string,
 		"--size", fmt.Sprintf("%dG", sizeGiB), "--platform", "linux/amd64").CombinedOutput(); err != nil {
 		return "", fmt.Errorf("oci2rootfs: %w: %s", err, output)
 	}
-	// Repair pass: exit 1 means "errors corrected" (e.g. oci2rootfs writes a
-	// low ref count for multi-hardlink inodes) and is success; anything else
-	// is fatal. The read-only verify below still guards the result.
+	// e2fsck exit 1 means "errors corrected" (e.g. oci2rootfs writes a low
+	// ref count for multi-hardlink inodes) — a repaired rootfs is success.
 	if output, err := exec.Command("e2fsck", "-fy", rootfs).CombinedOutput(); err != nil {
 		var exitErr *exec.ExitError
 		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
@@ -226,11 +225,9 @@ func entrypointCommand(spec apiv1alpha2.SandboxTemplateSpec) string {
 // exported by the guest init, so a crafted name must not break it.
 var validEnvName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// readImageEnvs parses the source image's OCI Config.Env that the pull
-// stage persisted in the workdir. A missing file means no inherited env;
-// any other read error fails the build. Entries without "=" or with a name
-// that is not a valid shell variable name are skipped: the file is sourced
-// by the guest init, so a crafted entry must not break it.
+// readImageEnvs parses the source image's OCI Config.Env persisted by the
+// pull stage; a missing file means no inherited env. Entries that are not
+// KEY=VALUE with a valid shell variable name are skipped.
 func readImageEnvs(workdir string) (map[string]string, error) {
 	envs := map[string]string{}
 	payload, err := os.ReadFile(filepath.Join(workdir, imageEnvFileName))
@@ -254,11 +251,9 @@ func readImageEnvs(workdir string) (map[string]string, error) {
 	return envs, nil
 }
 
-// mergeGuestEnvs inherits the source image's OCI Config.Env the way a
-// container runtime would when starting the image, then overlays the spec
-// envs: a spec env with the same name wins. The returned map is keyed by
-// name, so duplicate spec names resolve to the last entry. Spec envs stay
-// strict: valueFrom is unsupported and invalid names fail the build.
+// mergeGuestEnvs layers the spec envs over the inherited image env; a spec
+// env with the same name wins, and duplicate spec names resolve to the last
+// entry. Spec envs stay strict: no valueFrom, valid shell names only.
 func mergeGuestEnvs(spec apiv1alpha2.SandboxTemplateSpec, workdir string) (map[string]string, error) {
 	merged, err := readImageEnvs(workdir)
 	if err != nil {

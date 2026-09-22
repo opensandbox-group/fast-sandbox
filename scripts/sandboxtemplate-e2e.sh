@@ -76,13 +76,11 @@ rm -rf "$WORK"
 mkdir -p "$WORK/input"
 
 # --- test image --------------------------------------------------------------
-# The env contract is asserted end to end, so the pipeline always builds from
-# a tiny image derived on top of the requested base: the derivation adds two
-# known ENVs — E2E_IMAGE_ONLY (must be inherited untouched) and
-# E2E_OVERRIDE_ME (shadowed by the same name in spec.envs) — plus a spec-only
-# env and a console-printing entrypoint in spec.json. Tarball inputs are
-# loaded into the local daemon first (the build itself stays offline: FROM
-# resolves locally and there is no RUN).
+# The env contract needs known ENV layers, so the pipeline always builds from
+# a tiny image derived on top of the requested base: E2E_IMAGE_ONLY (must be
+# inherited) and E2E_OVERRIDE_ME (shadowed by spec.envs); the spec adds a
+# spec-only env and a console-printing entrypoint. Tarball inputs are loaded
+# into the local daemon first; the build itself stays offline.
 IMAGE_TAR="$WORK/input/image.tar"
 ENV_IMAGE="sandboxtemplate-e2e:env"
 if [[ "$IMAGE" == *.tar ]]; then
@@ -203,10 +201,8 @@ for fmt in "${FORMATS[@]}"; do
     assert "manifest marks the template booted and restore-validated" jq -e '.validation.booted == true and .validation.restored == true' "$BUILD/manifest.json"
 
     # --- env contract --------------------------------------------------------
-    # /etc/sandbox-init.env is the only env source the guest init sources.
-    # Extract it from the rootfs and assert the exact merge semantics:
-    # the image's Config.Env is inherited, spec.envs are attached, and a
-    # spec env overrides a same-name image env (exactly one export left).
+    # Assert the exact merge semantics from both sides: the baked
+    # /etc/sandbox-init.env and the live guest env echoed to the console.
     guest_env="$BUILD/sandbox-init.env"
     debugfs -R "cat /etc/sandbox-init.env" "$BUILD/rootfs.ext4" > "$guest_env" 2>/dev/null \
         || die "debugfs could not read /etc/sandbox-init.env (format=$fmt)"
@@ -226,8 +222,7 @@ for fmt in "${FORMATS[@]}"; do
     # it in the live guest proves the image PATH beat the init's hardcoded one.
     assert "running guest PATH inherits the image's /opt/sandbox-bin override" grep -q "path=/opt/sandbox-bin:" "$BUILD/boot.console.log"
 
-    # Positive evidence of the env verification (asserts above print FAIL on
-    # failure; this shows what was actually verified):
+    # Positive evidence of what was verified:
     log "guest /etc/sandbox-init.env as baked into the rootfs:"
     sed 's/^/    /' "$guest_env"
     log "live guest env (entrypoint console echo):"
