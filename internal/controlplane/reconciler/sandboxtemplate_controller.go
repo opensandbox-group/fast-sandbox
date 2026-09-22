@@ -135,8 +135,10 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.
 	}
 
 	// A build already applied to the current generation is terminal. The
-	// finished Pods are kept around for BuildTTL (so their annotations remain
-	// inspectable) and cleaned up opportunistically afterwards; requeue at
+	// finished Pods are kept around for BuildTTL (so their annotations and
+	// container logs remain inspectable — failures included, the builder
+	// deletes its own workspace with the Pod) and cleaned up
+	// opportunistically afterwards; requeue at
 	// the earliest retention expiry so a quiet cluster still reaps them. The
 	// one exception is a failure caused by the platform artifact store not
 	// being configured yet: the store is read live, so that state is retried
@@ -822,7 +824,8 @@ func upsertCondition(template *apiv1alpha2.SandboxTemplate, condition apiv1alpha
 
 // cleanupPod removes a finished build Pod so future generations start from a
 // clean slate. When BuildTTL is set, the Pod is kept that long (so its
-// annotations remain inspectable) before being deleted.
+// annotations and container logs remain inspectable — failed builds included,
+// via podCompletionTime's fallbacks) before being deleted.
 func (r *SandboxTemplateReconciler) cleanupPod(ctx context.Context, pod *corev1.Pod) error {
 	if pod.DeletionTimestamp != nil {
 		return nil
@@ -835,13 +838,35 @@ func (r *SandboxTemplateReconciler) cleanupPod(ctx context.Context, pod *corev1.
 	return r.Delete(ctx, pod, client.PropagationPolicy(metav1.DeletePropagationBackground))
 }
 
-// podCompletionTime returns when the Pod finished (kubelet marks the Pod
-// Ready condition with reason PodCompleted once all containers exit).
+// podCompletionTime returns when the Pod finished. Succeeded pods carry a
+// PodReady condition with reason PodCompleted, but FAILED pods never do: the
+// kubelet marks the same condition reason PodFailed instead. Falling back to
+// the latest container termination time (and finally the pod start time)
+// is what keeps failed builds inside the BuildTTL retention — without a
+// stable completion time cleanupPod deletes them immediately and the
+// forensics scene (builder logs, serial consoles in the workspace) is lost.
+// Every fallback must therefore be stable per pod, or repeated reconciles
+// would reset the TTL clock forever.
 func podCompletionTime(pod *corev1.Pod) *time.Time {
 	for _, condition := range pod.Status.Conditions {
 		if condition.Type == corev1.PodReady && condition.Reason == "PodCompleted" {
 			return &condition.LastTransitionTime.Time
 		}
+	}
+	var latest time.Time
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.State.Terminated == nil || status.State.Terminated.FinishedAt.Time.IsZero() {
+			continue
+		}
+		if finished := status.State.Terminated.FinishedAt.Time; finished.After(latest) {
+			latest = finished
+		}
+	}
+	if !latest.IsZero() {
+		return &latest
+	}
+	if pod.Status.StartTime != nil && !pod.Status.StartTime.Time.IsZero() {
+		return &pod.Status.StartTime.Time
 	}
 	return nil
 }

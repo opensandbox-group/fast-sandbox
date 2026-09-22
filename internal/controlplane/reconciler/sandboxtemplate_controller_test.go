@@ -403,6 +403,58 @@ func TestSandboxTemplateReconcileBuildTTLRetainsPod(t *testing.T) {
 	}
 }
 
+func TestSandboxTemplateReconcileFailedPodRetainedForTTL(t *testing.T) {
+	namespace, name := "tenant-a", "failed-ttl"
+	template := newSandboxTemplate(namespace, name)
+	reconciler := newSandboxTemplateReconciler(t, template)
+	key := client.ObjectKey{Namespace: namespace, Name: name}
+
+	reconcileOnce(t, reconciler, key)
+	pods := listBuilderPods(t, reconciler, namespace)
+	pod := &pods[0]
+	// Real kubelet failure shape: failed pods never carry the PodCompleted
+	// Ready condition (the kubelet marks it PodFailed), so the completion
+	// time must come from the container's Terminated state — without that
+	// fallback the failed Pod would be deleted immediately and its builder
+	// logs would be unrecoverable.
+	pod.Status.Phase = corev1.PodFailed
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "build",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 1, Message: "boom", FinishedAt: metav1.Now(),
+		}},
+	}}
+	if err := reconciler.Status().Update(context.Background(), pod); err != nil {
+		t.Fatalf("update pod status: %v", err)
+	}
+
+	reconcileOnce(t, reconciler, key)
+	if pods := listBuilderPods(t, reconciler, namespace); len(pods) != 1 {
+		t.Fatalf("expected the failed pod to be retained within BuildTTL, got %d", len(pods))
+	}
+	// The terminal reconcile requeues for the retention expiry so a quiet
+	// cluster still reaps the retained pod.
+	if result := reconcileOnce(t, reconciler, key); result.RequeueAfter <= 0 {
+		t.Fatalf("expected a requeue for BuildTTL expiry, got %v", result.RequeueAfter)
+	}
+
+	pods = listBuilderPods(t, reconciler, namespace)
+	pod = &pods[0]
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "build",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			ExitCode: 1, FinishedAt: metav1.NewTime(time.Now().Add(-2 * time.Hour)),
+		}},
+	}}
+	if err := reconciler.Status().Update(context.Background(), pod); err != nil {
+		t.Fatalf("update pod status: %v", err)
+	}
+	reconcileOnce(t, reconciler, key)
+	if pods := listBuilderPods(t, reconciler, namespace); len(pods) != 0 {
+		t.Fatalf("expected the failed pod to be cleaned up after BuildTTL, got %d", len(pods))
+	}
+}
+
 func TestSandboxTemplateBuildPodOwnedByTemplate(t *testing.T) {
 	namespace, name := "tenant-a", "gone"
 	template := newSandboxTemplate(namespace, name)
