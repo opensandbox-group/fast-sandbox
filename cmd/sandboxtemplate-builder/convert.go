@@ -77,8 +77,15 @@ func stageConvert(spec apiv1alpha2.SandboxTemplateSpec, workdir string) (string,
 		"--size", fmt.Sprintf("%dG", sizeGiB), "--platform", "linux/amd64").CombinedOutput(); err != nil {
 		return "", fmt.Errorf("oci2rootfs: %w: %s", err, output)
 	}
+	// Repair pass: exit 1 means "errors corrected" (e.g. oci2rootfs writes a
+	// low ref count for multi-hardlink inodes) and is success; anything else
+	// is fatal. The read-only verify below still guards the result.
 	if output, err := exec.Command("e2fsck", "-fy", rootfs).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("e2fsck: %w: %s", err, output)
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+			return "", fmt.Errorf("e2fsck: %w: %s", err, output)
+		}
+		klog.V(2).InfoS("e2fsck corrected rootfs inconsistencies", "output", strings.TrimSpace(string(output)))
 	}
 	if err := ensureLoopDevices(); err != nil {
 		return "", err
