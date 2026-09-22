@@ -190,7 +190,9 @@ type SandboxTemplateSpec struct {
 
 	// Envs is injected as /etc/sandbox-init.env in the guest (literal
 	// values only; valueFrom is not supported). The source image's own
-	// Config.Env is not merged.
+	// OCI Config.Env (the merged Dockerfile ENV) is inherited like a
+	// container runtime would; an env with the same name here overrides
+	// the inherited value.
 	// +optional
 	Envs []corev1.EnvVar `json:"envs,omitempty"`
 

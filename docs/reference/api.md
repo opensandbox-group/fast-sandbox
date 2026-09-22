@@ -216,7 +216,7 @@ spec:
 | `entrypoint` | No | `["tail","-f","/dev/null"]` | Guest business command as an argv list |
 | `execd` | No | — | OpenSandbox execd image injected into the guest rootfs |
 | `init` | No | `/usr/local/sbin/sandbox-init` | Injected guest PID 1 (readiness marker + heartbeat) |
-| `envs` | No | — | Literal `EnvVar` array written to `/etc/sandbox-init.env`; `valueFrom` unsupported, image `Config.Env` not merged, published verbatim in the manifest |
+| `envs` | No | — | Literal `EnvVar` array written to `/etc/sandbox-init.env`; `valueFrom` unsupported, overrides the inherited image `Config.Env` per name, published verbatim in the manifest |
 | `readiness.probe` | No | — | Custom gate first: `tcp://host:port` or `cmd://<command>` |
 | `readiness.warmupSeconds` | Yes | `60` | Fallback time-based warmup |
 | `readiness.healthCheck` | No | — | Fallback health command; empty uses image `CMD-SHELL` |

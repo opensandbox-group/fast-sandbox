@@ -130,8 +130,10 @@ readiness and network are baked into the snapshot.
 ### `spec.envs`
 
 Optional. Literal `EnvVar` array written verbatim into
-`/etc/sandbox-init.env`. `valueFrom` is not supported, and the source image's
-own `Config.Env` is not merged. Do not place secrets here — they are published
+`/etc/sandbox-init.env`. `valueFrom` is not supported. The source image's own
+OCI `Config.Env` (the merged Dockerfile `ENV`) is inherited the way a
+container runtime would; an env here with the same name overrides the
+inherited value. Do not place secrets here — they are published
 verbatim in the manifest; use `publishSecretRef` for credentials.
 
 ### `spec.readiness`

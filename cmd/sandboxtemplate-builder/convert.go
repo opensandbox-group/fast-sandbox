@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -163,16 +164,19 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 	}
 
 	envLines := []string{"export ENTRYPOINT=" + shellQuote(entrypointCommand(spec))}
-	for _, entry := range spec.Envs {
-		if entry.ValueFrom != nil {
-			return fmt.Errorf("env %q: valueFrom is not supported in sandbox envs (only literal values)", entry.Name)
-		}
-		if !validEnvName.MatchString(entry.Name) {
-			return fmt.Errorf("env name %q is not a valid shell variable name", entry.Name)
-		}
+	merged, err := mergeGuestEnvs(spec, workdir)
+	if err != nil {
+		return err
+	}
+	names := make([]string, 0, len(merged))
+	for name := range merged {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
 		// shellQuote, not %q: the guest init sources this file, and a
 		// bare value containing $ or backticks would be expanded by sh.
-		envLines = append(envLines, fmt.Sprintf("export %s=%s", entry.Name, shellQuote(entry.Value)))
+		envLines = append(envLines, fmt.Sprintf("export %s=%s", name, shellQuote(merged[name])))
 	}
 	if err := os.WriteFile(filepath.Join(mountPoint, "etc", "sandbox-init.env"),
 		[]byte(strings.Join(envLines, "\n")+"\n"), 0o600); err != nil {
@@ -214,6 +218,56 @@ func entrypointCommand(spec apiv1alpha2.SandboxTemplateSpec) string {
 // validEnvName matches POSIX shell variable names; sandbox envs are
 // exported by the guest init, so a crafted name must not break it.
 var validEnvName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// readImageEnvs parses the source image's OCI Config.Env that the pull
+// stage persisted in the workdir. A missing file means no inherited env;
+// any other read error fails the build. Entries without "=" or with a name
+// that is not a valid shell variable name are skipped: the file is sourced
+// by the guest init, so a crafted entry must not break it.
+func readImageEnvs(workdir string) (map[string]string, error) {
+	envs := map[string]string{}
+	payload, err := os.ReadFile(filepath.Join(workdir, imageEnvFileName))
+	if errors.Is(err, os.ErrNotExist) {
+		return envs, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", imageEnvFileName, err)
+	}
+	for _, line := range strings.Split(string(payload), "\n") {
+		if line == "" {
+			continue
+		}
+		name, value, ok := strings.Cut(line, "=")
+		if !ok || !validEnvName.MatchString(name) {
+			klog.V(2).InfoS("skipping unusable source-image env entry", "entry", line)
+			continue
+		}
+		envs[name] = value
+	}
+	return envs, nil
+}
+
+// mergeGuestEnvs inherits the source image's OCI Config.Env the way a
+// container runtime would when starting the image, then overlays the spec
+// envs: a spec env with the same name wins. The returned map is keyed by
+// name, so duplicate spec names resolve to the last entry. Spec envs stay
+// strict: valueFrom is unsupported and invalid names fail the build.
+func mergeGuestEnvs(spec apiv1alpha2.SandboxTemplateSpec, workdir string) (map[string]string, error) {
+	merged, err := readImageEnvs(workdir)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range spec.Envs {
+		if entry.ValueFrom != nil {
+			return nil, fmt.Errorf("env %q: valueFrom is not supported in sandbox envs (only literal values)", entry.Name)
+		}
+		if !validEnvName.MatchString(entry.Name) {
+			return nil, fmt.Errorf("env name %q is not a valid shell variable name", entry.Name)
+		}
+		merged[entry.Name] = entry.Value
+	}
+	return merged, nil
+}
 
 // renderGuestInit renders the in-guest init script: mounts, runtime bootstrap,
 // entrypoint, readiness wait (probe > execd ping > warmup + healthcheck), the

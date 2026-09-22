@@ -27,6 +27,27 @@ import (
 // with --platform linux/amd64).
 var linuxAMD64 = v1.Platform{OS: "linux", Architecture: "amd64"}
 
+// imageEnvFileName is the workdir file where the pull stage persists the
+// source image's OCI Config.Env (the merged Dockerfile ENV). The convert
+// stage merges it into the guest /etc/sandbox-init.env and the manifest
+// stage records it under lineage.imageEnvs.
+const imageEnvFileName = "image-config.env"
+
+// writeImageEnv persists the source image's OCI Config.Env for the convert
+// and manifest stages. An image without config envs produces an empty file:
+// readers treat missing and empty alike.
+func writeImageEnv(image v1.Image, workdir string) error {
+	config, err := image.ConfigFile()
+	if err != nil {
+		return fmt.Errorf("read image config: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, imageEnvFileName),
+		[]byte(strings.Join(config.Config.Env, "\n")+"\n"), 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", imageEnvFileName, err)
+	}
+	return nil
+}
+
 // pullOCILayout pulls spec.Image into an OCI layout directory under workdir,
 // ready for oci2rootfs, and returns the image manifest digest. When
 // SANDBOX_TEMPLATE_IMAGE_TAR is set, the layout is produced from a local
@@ -56,6 +77,9 @@ func pullOCILayout(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, wo
 	if err := writeOCILayout(image, workdir); err != nil {
 		return "", err
 	}
+	if err := writeImageEnv(image, workdir); err != nil {
+		return "", err
+	}
 	if spec.Execd != "" {
 		if err := extractExecd(ctx, spec.Execd, filepath.Join(workdir, "execd-root")); err != nil {
 			return "", err
@@ -70,6 +94,9 @@ func pullOCILayoutFromTar(ctx context.Context, spec apiv1alpha2.SandboxTemplateS
 		return "", fmt.Errorf("load image tarball: %w", err)
 	}
 	if err := writeOCILayout(image, workdir); err != nil {
+		return "", err
+	}
+	if err := writeImageEnv(image, workdir); err != nil {
 		return "", err
 	}
 	if spec.Execd != "" {
