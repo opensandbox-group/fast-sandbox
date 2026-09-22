@@ -180,10 +180,13 @@ for fmt in "${FORMATS[@]}"; do
     BUILD="$FMT_DIR/build"
     # Assertions are recorded (not fatal) so a broken format does not abort
     # the remaining formats; the final exit code is non-zero if any failed.
+    # Successes are printed too: the output is the verification evidence.
     assert() {
         if [[ $# -lt 2 ]]; then die "assert: usage <description> <command...>"; fi
         local description=$1; shift
-        if ! "$@" >/dev/null 2>&1; then
+        if "$@" >/dev/null 2>&1; then
+            echo "  ok: $description (format=$fmt)"
+        else
             echo "  FAIL: $description (format=$fmt)" >&2
             overall=1
         fi
@@ -197,6 +200,7 @@ for fmt in "${FORMATS[@]}"; do
     assert "snapshot restore produced a guest heartbeat" grep -q "SANDBOX_HEARTBEAT" "$BUILD/restore.console.log"
     assert "manifest records the baked guest network" jq -e '.guestNetwork.iface == "eth0" and .guestNetwork.ip == "172.30.0.3" and .guestNetwork.mac == "02:00:00:00:00:01" and .guestNetwork.gateway == "172.30.0.1"' "$BUILD/manifest.json"
     assert "boot args bake the static guest IP" grep -q "ip=172.30.0.3::172.30.0.1:255.255.255.0::eth0:off" "$BUILD/boot.console.log"
+    assert "manifest marks the template booted and restore-validated" jq -e '.validation.booted == true and .validation.restored == true' "$BUILD/manifest.json"
 
     # --- env contract --------------------------------------------------------
     # /etc/sandbox-init.env is the only env source the guest init sources.
@@ -218,6 +222,16 @@ for fmt in "${FORMATS[@]}"; do
     assert "running guest sees the inherited image env" grep -q "image_only=from-image" "$BUILD/boot.console.log"
     assert "running guest sees the spec-only env" grep -q "spec_only=from-spec" "$BUILD/boot.console.log"
     assert "running guest sees the overridden env value" grep -q "override=from-spec" "$BUILD/boot.console.log"
+    # fsb-sandbox-golden overrides PATH with /opt/sandbox-bin first: seeing
+    # it in the live guest proves the image PATH beat the init's hardcoded one.
+    assert "running guest PATH inherits the image's /opt/sandbox-bin override" grep -q "path=/opt/sandbox-bin:" "$BUILD/boot.console.log"
+
+    # Positive evidence of the env verification (asserts above print FAIL on
+    # failure; this shows what was actually verified):
+    log "guest /etc/sandbox-init.env as baked into the rootfs:"
+    sed 's/^/    /' "$guest_env"
+    log "live guest env (entrypoint console echo):"
+    grep -h "E2E_ENV" "$BUILD/boot.console.log" | sed 's/^/    /' || true
     if [[ "$fmt" == "overlaybd" ]]; then
         assert "overlaybd rootfs layer exists" test -s "$BUILD/overlaybd/rootfs/layer.lsmt"
         assert "overlaybd memory layer exists" test -s "$BUILD/overlaybd/memory/layer.lsmt"
@@ -239,6 +253,7 @@ for fmt in "${FORMATS[@]}"; do
     jq . "$BUILD/manifest.json" 2>/dev/null || cat "$BUILD/manifest.json"
     du -h "$BUILD/rootfs.ext4" "$BUILD/vmstate.snap" "$BUILD/memory.snap" 2>/dev/null || true
     grep -h "SANDBOX_READY" "$BUILD/boot.console.log" | tail -1
+    log "template usable (format=$fmt): guest booted to readiness, env contract verified, snapshot restored with heartbeat"
 done
 
 if [[ $overall -ne 0 ]]; then
