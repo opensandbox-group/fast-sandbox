@@ -655,6 +655,17 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 			Volumes: volumes,
 		},
 	}
+	// Merge the platform-provided builder Pod template overlay (mounted
+	// fast-sandbox-builder-pod-template ConfigMap) into the enforced spec
+	// before the owner reference: only scheduling fields are mergeable, the
+	// platform-owned shape above stays authoritative.
+	overlayRaw, err := loadBuilderPodTemplateOverlay(builderPodTemplateDir)
+	if err != nil {
+		return err
+	}
+	if err := applyBuilderPodTemplateOverlay(&pod.Spec, overlayRaw); err != nil {
+		return err
+	}
 	// The Pod is owned by the template, so deleting the template cascades
 	// to it via the garbage collector.
 	if err := ctrl.SetControllerReference(template, pod, r.Scheme); err != nil {
