@@ -51,7 +51,6 @@ const (
 )
 
 // SandboxSpec defines the desired state of Sandbox.
-// +kubebuilder:validation:XValidation:rule="!has(self.actionBindings) || self.actionBindings.all(x, self.actionBindings.filter(y, y.handler == x.handler).size() == 1)",message="actionBindings must use unique Handler names"
 type SandboxSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Image      string          `json:"image"`

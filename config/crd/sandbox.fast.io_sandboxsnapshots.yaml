@@ -88,9 +88,6 @@ spec:
             - sandboxRef
             - templateName
             type: object
-            x-kubernetes-validations:
-            - message: SandboxSnapshot spec is immutable
-              rule: self == oldSelf
           status:
             description: |-
               SandboxSnapshotStatus reports the observed state of one snapshot attempt.

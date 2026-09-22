@@ -174,9 +174,6 @@ spec:
                               - reference
                               type: object
                           type: object
-                          x-kubernetes-validations:
-                          - message: exactly one of image or archive is required
-                            rule: has(self.image) != has(self.archive)
                       required:
                       - mappings
                       - source
@@ -248,9 +245,6 @@ spec:
                               minimum: 1
                               type: integer
                           type: object
-                          x-kubernetes-validations:
-                          - message: exactly one of httpGet or tcpConnect is required
-                            rule: has(self.httpGet) != has(self.tcpConnect)
                         restartPolicy:
                           default: OnFailure
                           description: InfraRestartPolicy controls process restart
@@ -291,9 +285,6 @@ spec:
                 - boxlite
                 - firecracker
                 type: string
-                x-kubernetes-validations:
-                - message: runtime is immutable
-                  rule: self == oldSelf
               sandboxResources:
                 description: |-
                   SandboxResources is the immutable resource profile applied to each
@@ -320,9 +311,6 @@ spec:
                 - memory
                 - pids
                 type: object
-                x-kubernetes-validations:
-                - message: sandboxResources is immutable
-                  rule: self == oldSelf
               warmImages:
                 description: |-
                   WarmImages are asynchronously pulled and protected from ordinary cache GC.
@@ -338,11 +326,6 @@ spec:
             - runtime
             - sandboxResources
             type: object
-            x-kubernetes-validations:
-            - message: existing Action Handler names cannot be removed or renamed
-              rule: '!has(oldSelf.actionHandlers) || (has(self.actionHandlers) &&
-                oldSelf.actionHandlers.all(x, self.actionHandlers.exists(y, y.name
-                == x.name)))'
           status:
             description: SandboxPoolStatus defines the observed state of SandboxPool.
             properties:

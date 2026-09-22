@@ -64,7 +64,6 @@ type InfraArtifactArchive struct {
 }
 
 // InfraArtifactSource contains exactly one immutable source.
-// +kubebuilder:validation:XValidation:rule="has(self.image) != has(self.archive)",message="exactly one of image or archive is required"
 type InfraArtifactSource struct {
 	Image   *InfraArtifactImage   `json:"image,omitempty"`
 	Archive *InfraArtifactArchive `json:"archive,omitempty"`
@@ -112,7 +111,6 @@ type InfraHTTPGet struct {
 type InfraTCPConnect struct{}
 
 // InfraHealthCheck contains exactly one probe kind.
-// +kubebuilder:validation:XValidation:rule="has(self.httpGet) != has(self.tcpConnect)",message="exactly one of httpGet or tcpConnect is required"
 type InfraHealthCheck struct {
 	HTTPGet    *InfraHTTPGet    `json:"httpGet,omitempty"`
 	TCPConnect *InfraTCPConnect `json:"tcpConnect,omitempty"`
@@ -190,7 +188,6 @@ type ActionHandler struct {
 }
 
 // SandboxPoolSpec defines the desired state of SandboxPool.
-// +kubebuilder:validation:XValidation:rule="!has(oldSelf.actionHandlers) || (has(self.actionHandlers) && oldSelf.actionHandlers.all(x, self.actionHandlers.exists(y, y.name == x.name)))",message="existing Action Handler names cannot be removed or renamed"
 type SandboxPoolSpec struct {
 	Capacity PoolCapacity `json:"capacity"`
 
@@ -198,12 +195,10 @@ type SandboxPoolSpec struct {
 	MaxSandboxesPerPod int32 `json:"maxSandboxesPerPod"`
 
 	// Runtime selects one immutable, platform-owned runtime profile.
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="runtime is immutable"
 	Runtime RuntimeName `json:"runtime"`
 
 	// SandboxResources is the immutable resource profile applied to each
 	// Sandbox created from this Pool.
-	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="sandboxResources is immutable"
 	SandboxResources SandboxResourceProfile `json:"sandboxResources"`
 
 	// WarmImages are asynchronously pulled and protected from ordinary cache GC.

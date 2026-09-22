@@ -65,7 +65,6 @@ type SandboxRef struct {
 
 // SandboxSnapshotSpec defines the desired snapshot. The spec is immutable:
 // a snapshot is one-shot; re-snapshotting requires a new object.
-// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="SandboxSnapshot spec is immutable"
 type SandboxSnapshotSpec struct {
 	// SandboxRef is the running Sandbox to snapshot. The Sandbox must be
 	// Ready and assigned when the snapshot is triggered.

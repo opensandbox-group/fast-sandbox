@@ -280,10 +280,6 @@ spec:
             - image
             - poolRef
             type: object
-            x-kubernetes-validations:
-            - message: actionBindings must use unique Handler names
-              rule: '!has(self.actionBindings) || self.actionBindings.all(x, self.actionBindings.filter(y,
-                y.handler == x.handler).size() == 1)'
           status:
             description: SandboxStatus defines the observed state of Sandbox.
             properties:
