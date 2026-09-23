@@ -32,8 +32,7 @@ const (
 // between the two outputs via the cache. The serialization and checksum
 // conventions live in internal/artifacts so every producer (builder, live
 // snapshot driver, runtime-agent) emits byte-identical layouts. cpuTemplate
-// is the static CPU template the snapshot was taken with ("" = raw host
-// CPUID fallback, recorded as "none").
+// is what the snapshot stage reported (see compatibilityCPUTemplate).
 func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, workdir, cpuTemplate string) ([]byte, error) {
 	cache := map[string]string{}
 	rootfsGiB, err := sizeGiB(spec.Output.RootfsSize)
@@ -89,12 +88,10 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 	if err != nil {
 		return nil, fmt.Errorf("checksum kernel: %w", err)
 	}
-	// Snapshot compatibility (design): the structured CPU identity is what
-	// consumers match against node identities before restoring a snapshot;
-	// cpuModelName is the /proc/cpuinfo marketing string, display-only (8163
-	// and 8269CY share vendor/family/model). cpuTemplate records how the
-	// snapshot was masked ("T2"/"T2A", or "none" when the raw host CPUID
-	// fallback ran — such artifacts are host-CPU specific by construction).
+	// Snapshot compatibility: vendor/family/model is the CPUID identity
+	// consumers match before restoring (8163 and 8269CY share identity 6/85);
+	// cpuModelName is display-only. cpuTemplate records how the snapshot was
+	// masked; field semantics live in docs/guides/artifact-manifest-reference.md.
 	identity := artifacts.HostCPUIdentity()
 	compatibility := map[string]any{
 		"vendor":             identity.Vendor,

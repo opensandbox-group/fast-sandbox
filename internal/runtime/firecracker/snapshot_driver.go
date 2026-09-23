@@ -623,13 +623,11 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 }
 
 // assembleSnapshotManifest builds the restore-compatible manifest of the
-// dumped set: the lineage object, the machine (vcpu/memory), guestNetwork,
-// and compatibility facts baked into the SOURCE image manifest are carried
-// forward verbatim — they describe the vmstate's CPU state and lineage and
-// are what restore validation and compatibility matching check (the dumped
-// vmstate is compatible with exactly the hosts the source was). Only files,
-// machine.rootfs, format, and validation describe this dump. It returns the
-// total logical size of the artifact set.
+// dumped set. lineage, machine (vcpu/memory), guestNetwork, and
+// compatibility ride forward from the SOURCE manifest verbatim — the dumped
+// vmstate carries the source snapshot's CPU state, so its compatibility
+// identity is the source's. Only files, machine.rootfs, format, and
+// validation describe this dump. Returns the total logical artifact size.
 func assembleSnapshotManifest(stateRoot, staging, sandboxDir string, actionBindings []runtimecontract.SnapshotActionBinding) (int64, error) {
 	state, err := loadState(sandboxDir)
 	if err != nil {
@@ -679,9 +677,7 @@ func assembleSnapshotManifest(stateRoot, staging, sandboxDir string, actionBindi
 		document["lineage"] = lineage
 	}
 	lineage["image"] = state.Config.Spec.Image
-	// compatibility rides forward from the source manifest untouched (see
-	// the function comment): the dump's vmstate carries the source
-	// snapshot's CPU state, so its compatibility identity is the source's.
+	// compatibility rides forward untouched — see assembleSnapshotManifest.
 	document["files"] = files
 	// machine.rootfs reflects this dump's actual rootfs size; vcpu/memory
 	// ride forward from the source manifest untouched.
