@@ -201,14 +201,6 @@ func writeBundleFixture(t *testing.T, dir string) {
 	}
 }
 
-// closedServer returns the URL of an already-closed server: any request
-// against it fails, proving the code under test stayed off the network.
-func closedServer() string {
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	server.Close()
-	return server.URL
-}
-
 // mustGlob is filepath.Glob for assertions.
 func mustGlob(t *testing.T, pattern string) []string {
 	t.Helper()
@@ -221,23 +213,32 @@ func TestAssetEnsureInstallsFromBundle(t *testing.T) {
 	if _, err := assetArch(); err != nil {
 		t.Skipf("asset install only runs on supported arch: %v", err)
 	}
-	// Stock pins + a served bundle: Ensure installs everything without
-	// touching the network (closed release host).
+	// The bundle is only served under stock pins (stock version, no
+	// ReleaseBase override), so the config below must keep both. The
+	// content assertions are the zero-network proof: a fallback to the
+	// real release host would install different bytes.
 	bundle := filepath.Join(t.TempDir(), "bundle")
 	writeBundleFixture(t, bundle)
 	dir := filepath.Join(t.TempDir(), "fc")
-	closed := closedServer()
 	config := AssetConfig{
 		Dir:          dir,
 		BundleDir:    bundle,
-		ReleaseBase:  closed,
 		VerifyBinary: statOKVerifyBinary,
 	}
 	require.NoError(t, config.Ensure(context.Background()))
-	for _, name := range []string{"firecracker", "jailer"} {
-		info, err := os.Stat(filepath.Join(dir, name))
-		require.NoError(t, err, name)
-		require.NotZero(t, info.Size(), name)
+	for _, asset := range []struct {
+		name string
+		want []byte
+	}{
+		{name: "firecracker", want: []byte("fake firecracker binary")},
+		{name: "jailer", want: []byte("fake jailer binary")},
+	} {
+		info, err := os.Stat(filepath.Join(dir, asset.name))
+		require.NoError(t, err, asset.name)
+		require.NotZero(t, info.Size(), asset.name)
+		installed, err := os.ReadFile(filepath.Join(dir, asset.name))
+		require.NoError(t, err, asset.name)
+		require.Equal(t, asset.want, installed, asset.name)
 	}
 	require.Empty(t, mustGlob(t, filepath.Join(dir, "*.download")), "no partial files may remain")
 }

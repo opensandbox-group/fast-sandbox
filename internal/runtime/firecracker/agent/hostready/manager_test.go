@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -57,12 +58,12 @@ func TestManagerHealthBeforeFirstPass(t *testing.T) {
 
 func TestManagerReloadsSettingsEachPass(t *testing.T) {
 	probes, assets := healthyProbes(t)
-	passes := 0
+	var passes atomic.Int32
 	manager := NewManager(ManagerConfig{
 		Check:  CheckConfig{StateRoot: t.TempDir(), AssetsDir: assets},
 		Probes: probes.probes(assets),
 		Settings: func() (Settings, error) {
-			passes++
+			passes.Add(1)
 			return Settings{Check: CheckConfig{StateRoot: t.TempDir(), AssetsDir: assets}, Interval: time.Millisecond}, nil
 		},
 	})
@@ -75,7 +76,7 @@ func TestManagerReloadsSettingsEachPass(t *testing.T) {
 	// Several fast passes (1ms interval) must complete; the Settings func
 	// is re-read before every pass.
 	deadline := time.After(5 * time.Second)
-	for passes < 3 {
+	for passes.Load() < 3 {
 		select {
 		case <-done:
 			t.Fatal("Run must keep looping while the context is live")
