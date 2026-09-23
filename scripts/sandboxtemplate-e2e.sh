@@ -249,13 +249,13 @@ for fmt in "${FORMATS[@]}"; do
     # fsb-sandbox-golden overrides PATH with /opt/sandbox-bin first: seeing
     # it in the live guest proves the image PATH beat the init's hardcoded one.
     assert "running guest PATH inherits the image's /opt/sandbox-bin override" grep -q "path=/opt/sandbox-bin:" "$BUILD/boot.console.log"
-    fi
 
     # Positive evidence of what was verified:
     log "guest /etc/sandbox-init.env as baked into the rootfs:"
     sed 's/^/    /' "$guest_env"
     log "live guest env (entrypoint console echo):"
     grep -h "E2E_ENV" "$BUILD/boot.console.log" | sed 's/^/    /' || true
+    fi
     if [[ "$fmt" == "overlaybd" ]]; then
         assert "overlaybd rootfs layer exists" test -s "$BUILD/overlaybd/rootfs/layer.lsmt"
         assert "overlaybd memory layer exists" test -s "$BUILD/overlaybd/memory/layer.lsmt"
