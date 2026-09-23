@@ -892,10 +892,10 @@ func TestCheckRestoreCompatibility(t *testing.T) {
 
 	// Same identity as the snapshot: admitted.
 	local := artifacts.CPUIdentity{Vendor: artifacts.VendorAuthenticAMD, Family: 26, Model: 17}
-	require.NoError(t, checkRestoreCompatibility(compat, ok, local, "1.16.1", image))
+	require.NoError(t, checkRestoreCompatibility(compat, local, "1.16.1", image))
 
 	// A different identity is rejected before staging.
-	err = checkRestoreCompatibility(compat, ok,
+	err = checkRestoreCompatibility(compat,
 		artifacts.CPUIdentity{Vendor: artifacts.VendorGenuineIntel, Family: 6, Model: 85}, "1.16.1", image)
 	require.ErrorIs(t, err, ErrIncompatibleArtifact)
 
@@ -912,7 +912,7 @@ func TestCheckRestoreCompatibility(t *testing.T) {
 	_, ok, err = readCachedManifestCompatibility(stateRoot, image)
 	require.NoError(t, err)
 	require.False(t, ok)
-	require.NoError(t, checkRestoreCompatibility(artifacts.SnapshotCompatibility{}, ok, local, "1.16.1", image))
+	require.NoError(t, checkRestoreCompatibility(artifacts.SnapshotCompatibility{}, local, "1.16.1", image))
 }
 
 func TestResolveRestoreSnapshotFilesRequiresBothArtifacts(t *testing.T) {

@@ -181,18 +181,14 @@ func readCachedManifestCompatibility(stateRoot, image string) (artifacts.Snapsho
 }
 
 // checkRestoreCompatibility is the restore-admission core: fail fast on an
-// incompatible artifact before any snapshot file is staged. A legacy
-// manifest is admitted with a warning (OSEP-0024 Phase 1 backward
-// compatibility); everything else defers to the tiered matcher.
-func checkRestoreCompatibility(compat artifacts.SnapshotCompatibility, hasCompat bool, local artifacts.CPUIdentity, localFirecrackerVersion, image string) error {
-	if !hasCompat {
-		klog.InfoS("cached manifest carries no structured compatibility; admitting restore without CPU checks",
-			"image", image)
-		return nil
-	}
+// incompatible artifact before any snapshot file is staged. An absent or
+// legacy compatibility block (zero value → Match reports
+// ErrLegacyCompatibility) is admitted with a warning; everything else
+// defers to the tiered matcher.
+func checkRestoreCompatibility(compat artifacts.SnapshotCompatibility, local artifacts.CPUIdentity, localFirecrackerVersion, image string) error {
 	if err := artifacts.MatchRestoreCompatibility(compat, local, localFirecrackerVersion); err != nil {
 		if errors.Is(err, artifacts.ErrLegacyCompatibility) {
-			klog.InfoS("cached manifest compatibility is legacy; admitting restore without CPU checks", "image", image)
+			klog.InfoS("restore admitted without CPU checks: manifest carries no structured compatibility", "image", image)
 			return nil
 		}
 		klog.ErrorS(err, "restore compatibility admission rejected", "image", image)
@@ -209,14 +205,14 @@ func (d *Driver) firecrackerVersion() string {
 }
 
 // validateRestoreCompatibility admits a restore only if the cached
-// manifest's compatibility block matches this node (tiered match: template
-// allowlist for masked snapshots, identity equality for unmasked ones).
+// manifest's compatibility block matches this node (see
+// artifacts.MatchRestoreCompatibility for the tiered contract).
 func (d *Driver) validateRestoreCompatibility(stateRoot, image string) error {
-	compat, ok, err := readCachedManifestCompatibility(stateRoot, image)
+	compat, _, err := readCachedManifestCompatibility(stateRoot, image)
 	if err != nil {
 		return err
 	}
-	return checkRestoreCompatibility(compat, ok, artifacts.HostCPUIdentity(), d.firecrackerVersion(), image)
+	return checkRestoreCompatibility(compat, artifacts.HostCPUIdentity(), d.firecrackerVersion(), image)
 }
 
 // machineVCPUs parses the manifest vcpu quantity into a vCPU count.

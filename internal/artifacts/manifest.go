@@ -258,10 +258,23 @@ type SnapshotCompatibility struct {
 }
 
 // fms is one allowlist entry: the exact CPUID identity (vendor plus the full
-// family/model/stepping triple) a static template is permitted on. The
-// entries mirror the pinned Firecracker release; a new VMM version adds its
-// own row instead of mutating this one, because admission requires manifest
-// and node versions to be equal before the table is consulted.
+// family/model/stepping triple) a static template is permitted on.
+type fms struct {
+	vendor   string
+	family   int
+	model    int
+	stepping int
+}
+
+func (m fms) String() string {
+	return fmt.Sprintf("%s family %d model %d stepping %d", m.vendor, m.family, m.model, m.stepping)
+}
+
+// cpuTemplateAllowlists pins, per Firecracker release, the CPUs each static
+// template is permitted on (mirrors upstream static_cpu_templates). A new
+// VMM version adds its own row instead of mutating this one — admission
+// requires manifest and node versions to be equal before consulting the
+// table (see MatchRestoreCompatibility).
 var cpuTemplateAllowlists = map[string]map[string][]fms{
 	"1.16.1": {
 		"T2": {
@@ -273,17 +286,6 @@ var cpuTemplateAllowlists = map[string]map[string][]fms{
 			{vendor: VendorAuthenticAMD, family: 25, model: 1, stepping: 1}, // EPYC Milan
 		},
 	},
-}
-
-type fms struct {
-	vendor   string
-	family   int
-	model    int
-	stepping int
-}
-
-func (m fms) String() string {
-	return fmt.Sprintf("%s family %d model %d stepping %d", m.vendor, m.family, m.model, m.stepping)
 }
 
 // Admission errors returned by MatchRestoreCompatibility. A legacy manifest
