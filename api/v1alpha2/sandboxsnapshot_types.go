@@ -63,8 +63,11 @@ type SandboxRef struct {
 	UID types.UID `json:"uid,omitempty"`
 }
 
-// SandboxSnapshotSpec defines the desired snapshot. The spec is immutable:
-// a snapshot is one-shot; re-snapshotting requires a new object.
+// SandboxSnapshotSpec defines the desired snapshot. The spec is immutable
+// by convention: a snapshot is one-shot and re-snapshotting requires a new
+// object. These CRDs ship without CEL (x-kubernetes-validations) for legacy
+// (< 1.25) API servers, so the API server will accept spec edits; do not
+// rely on API-level rejection.
 type SandboxSnapshotSpec struct {
 	// SandboxRef is the running Sandbox to snapshot. The Sandbox must be
 	// Ready and assigned when the snapshot is triggered.

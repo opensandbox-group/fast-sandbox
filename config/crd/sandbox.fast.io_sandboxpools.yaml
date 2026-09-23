@@ -273,8 +273,11 @@ spec:
                 minimum: 1
                 type: integer
               runtime:
-                description: Runtime selects one immutable, platform-owned runtime
-                  profile.
+                description: |-
+                  Runtime selects one immutable, platform-owned runtime profile.
+                  Immutability is convention-only: these CRDs ship without CEL
+                  (x-kubernetes-validations) so legacy (< 1.25) API servers can load
+                  them, and enforcement lives in Go (pool reconciler validation).
                 enum:
                 - container
                 - gvisor
@@ -288,7 +291,8 @@ spec:
               sandboxResources:
                 description: |-
                   SandboxResources is the immutable resource profile applied to each
-                  Sandbox created from this Pool.
+                  Sandbox created from this Pool. As with Runtime, immutability is
+                  convention-only: no CEL rule enforces it at the API server.
                 properties:
                   cpu:
                     anyOf:

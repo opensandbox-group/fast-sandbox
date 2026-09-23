@@ -195,10 +195,14 @@ type SandboxPoolSpec struct {
 	MaxSandboxesPerPod int32 `json:"maxSandboxesPerPod"`
 
 	// Runtime selects one immutable, platform-owned runtime profile.
+	// Immutability is convention-only: these CRDs ship without CEL
+	// (x-kubernetes-validations) so legacy (< 1.25) API servers can load
+	// them, and enforcement lives in Go (pool reconciler validation).
 	Runtime RuntimeName `json:"runtime"`
 
 	// SandboxResources is the immutable resource profile applied to each
-	// Sandbox created from this Pool.
+	// Sandbox created from this Pool. As with Runtime, immutability is
+	// convention-only: no CEL rule enforces it at the API server.
 	SandboxResources SandboxResourceProfile `json:"sandboxResources"`
 
 	// WarmImages are asynchronously pulled and protected from ordinary cache GC.
