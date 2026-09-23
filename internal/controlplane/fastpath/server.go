@@ -270,6 +270,8 @@ func (s *Server) provisionRuntime(ctx context.Context, accepted *acceptedCreate,
 		if orchestration.IsCandidateRejection(callErr) && index+1 < len(accepted.candidates) {
 			orchestration.RecordTopKRetry("candidate_rejected")
 			s.Orchestrator.RecordCandidateFeedback(candidate.ID, callErr)
+			klog.FromContext(ctx).Info("fastlet candidate rejected; advancing to the next candidate",
+				"fastlet", candidate.ID, "sandbox", accepted.sandbox.Name, "err", callErr)
 			continue
 		}
 		if !orchestration.IsCandidateRejection(callErr) {
