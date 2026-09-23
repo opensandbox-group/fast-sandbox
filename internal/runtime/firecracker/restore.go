@@ -170,6 +170,7 @@ func readCachedManifestCompatibility(stateRoot, image string) (artifacts.Snapsho
 		Compatibility artifacts.SnapshotCompatibility `json:"compatibility"`
 	}
 	if err := json.Unmarshal(payload, &document); err != nil {
+		//nolint:nilerr // a pre-structured manifest (string cpuModel) cannot decode into the structured shape; treat it as legacy and admit with a warning
 		return artifacts.SnapshotCompatibility{}, false, nil
 	}
 	compat := document.Compatibility
