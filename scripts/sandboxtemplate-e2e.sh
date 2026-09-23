@@ -11,12 +11,18 @@
 #   restore validation → manifest + SHA256SUMS.
 #
 # With --local the builder binary is compiled on the host and the pipeline
-# runs directly against the host toolchain instead.
+# runs directly against the host toolchain instead — completely docker-free:
+# the source image is either remote-pulled by the builder itself (--image
+# <ref>) or read from an existing docker-save tarball (--image <path.tar>);
+# the env-contract assertions (which need the docker-derived env image) are
+# skipped in this mode.
 #
 # Requirements:
 #   - Linux x86_64 with /dev/kvm (root; the script re-invokes itself with sudo)
-#   - docker (to export the test image and run the builder container),
-#     go toolchain (--local mode), e2fsprogs, jq (manifest display/assertions)
+#   - docker (default mode only: image prep + builder container),
+#   - --local mode instead needs on the host: go, oci2rootfs, firecracker
+#     (v1.16.x), the guest kernel at /usr/local/share/firecracker/vmlinux.bin,
+#     e2fsprogs, jq (manifest display/assertions)
 #
 # Usage:
 #   ./scripts/sandboxtemplate-e2e.sh [--image <ref|tar>] [--format native|overlaybd] [--local]
@@ -66,7 +72,9 @@ fi
 
 [[ "$(uname -m)" == "x86_64" ]] || die "requires x86_64"
 [[ -e /dev/kvm ]] || die "/dev/kvm is missing"
-command -v docker >/dev/null || die "missing required command: docker"
+if [[ $LOCAL_MODE -eq 0 ]]; then
+    command -v docker >/dev/null || die "missing required command: docker (or use --local to run against the host toolchain)"
+fi
 command -v go >/dev/null || die "missing required command: go (for --local mode and spec checks)"
 command -v jq >/dev/null || die "missing required command: jq (manifest assertions)"
 command -v debugfs >/dev/null || die "missing required command: debugfs (e2fsprogs, guest env file assertions)"
@@ -76,37 +84,53 @@ rm -rf "$WORK"
 mkdir -p "$WORK/input"
 
 # --- test image --------------------------------------------------------------
-# The env contract needs known ENV layers, so the pipeline always builds from
-# a tiny image derived on top of the requested base: E2E_IMAGE_ONLY (must be
-# inherited) and E2E_OVERRIDE_ME (shadowed by spec.envs); the spec adds a
-# spec-only env and a console-printing entrypoint. Tarball inputs are loaded
-# into the local daemon first; the build itself stays offline.
+# Docker mode: derive the tiny env-verification image on top of the requested
+# base (E2E_IMAGE_ONLY must be inherited and E2E_OVERRIDE_ME shadowed by
+# spec.envs) and export it as a tarball; the build itself stays offline.
+# Local mode: docker-free by design — a *.tar --image is used verbatim (a
+# docker-save tarball of a single image), a ref is remote-pulled by the
+# builder itself (SANDBOX_TEMPLATE_IMAGE_TAR unset), and the env-contract
+# assertions are skipped.
 IMAGE_TAR="$WORK/input/image.tar"
 ENV_IMAGE="sandboxtemplate-e2e:env"
-if [[ "$IMAGE" == *.tar ]]; then
-    log "loading test image tarball $IMAGE"
-    load_output=$(docker load -i "$IMAGE") || die "docker load failed: $IMAGE"
-    base_ref=$(sed -n 's/^Loaded image: //p' <<<"$load_output" | head -1)
-    if [[ -z "$base_ref" ]]; then
-        base_ref=$(sed -n 's/^Loaded image ID: //p' <<<"$load_output" | head -1)
-        [[ -n "$base_ref" ]] || die "docker load produced no image reference for $IMAGE"
-        docker tag "$base_ref" "sandboxtemplate-e2e:env-base" >/dev/null 2>&1 || die "docker tag failed"
-        base_ref="sandboxtemplate-e2e:env-base"
+if [[ $LOCAL_MODE -eq 0 ]]; then
+    if [[ "$IMAGE" == *.tar ]]; then
+        log "loading test image tarball $IMAGE"
+        load_output=$(docker load -i "$IMAGE") || die "docker load failed: $IMAGE"
+        base_ref=$(sed -n 's/^Loaded image: //p' <<<"$load_output" | head -1)
+        if [[ -z "$base_ref" ]]; then
+            base_ref=$(sed -n 's/^Loaded image ID: //p' <<<"$load_output" | head -1)
+            [[ -n "$base_ref" ]] || die "docker load produced no image reference for $IMAGE"
+            docker tag "$base_ref" "sandboxtemplate-e2e:env-base" >/dev/null 2>&1 || die "docker tag failed"
+            base_ref="sandboxtemplate-e2e:env-base"
+        fi
+    else
+        docker pull -q "$IMAGE" >/dev/null 2>&1 || die "docker pull failed: $IMAGE"
+        base_ref="$IMAGE"
     fi
-else
-    docker pull -q "$IMAGE" >/dev/null 2>&1 || die "docker pull failed: $IMAGE"
-    base_ref="$IMAGE"
-fi
-log "building env-verification image $ENV_IMAGE (base: $base_ref)"
-ENV_CTX="$WORK/input/env-ctx"
-mkdir -p "$ENV_CTX"
-cat > "$ENV_CTX/Dockerfile" <<EOF
+    log "building env-verification image $ENV_IMAGE (base: $base_ref)"
+    ENV_CTX="$WORK/input/env-ctx"
+    mkdir -p "$ENV_CTX"
+    cat > "$ENV_CTX/Dockerfile" <<EOF
 FROM $base_ref
 ENV E2E_IMAGE_ONLY=from-image
 ENV E2E_OVERRIDE_ME=from-image
 EOF
-docker build -q -t "$ENV_IMAGE" "$ENV_CTX" >/dev/null 2>&1 || die "env-verification image build failed"
-docker save "$ENV_IMAGE" -o "$IMAGE_TAR" >/dev/null 2>&1 || die "docker save failed"
+    docker build -q -t "$ENV_IMAGE" "$ENV_CTX" >/dev/null 2>&1 || die "env-verification image build failed"
+    docker save "$ENV_IMAGE" -o "$IMAGE_TAR" >/dev/null 2>&1 || die "docker save failed"
+    SPEC_IMAGE=$ENV_IMAGE
+else
+    if [[ "$IMAGE" == *.tar ]]; then
+        [[ -s "$IMAGE" ]] || die "image tarball not found: $IMAGE"
+        cp "$IMAGE" "$IMAGE_TAR"
+        SPEC_IMAGE="e2e-local:${IMAGE##*/}"
+    else
+        # Remote pull happens inside the builder (go-containerregistry);
+        # an empty SANDBOX_TEMPLATE_IMAGE_TAR selects that path.
+        IMAGE_TAR=""
+        SPEC_IMAGE=$IMAGE
+    fi
+fi
 
 # --- runner ------------------------------------------------------------------
 if [[ "$LOCAL_MODE" -eq 1 ]]; then
@@ -162,7 +186,7 @@ for fmt in "${FORMATS[@]}"; do
   "readiness": {"warmupSeconds": 15},
   "output": {"rootfsSize": "10Gi", "format": "%s"}
 }
-' "$ENV_IMAGE" "$fmt" > "$FMT_DIR/spec.json"
+' "$SPEC_IMAGE" "$fmt" > "$FMT_DIR/spec.json"
     log "running the conversion pipeline (format=$fmt)"
     set +e
     run_pipeline "$FMT_DIR" 2> "$FMT_DIR/pipeline.log"
@@ -203,6 +227,10 @@ for fmt in "${FORMATS[@]}"; do
     # --- env contract --------------------------------------------------------
     # Assert the exact merge semantics from both sides: the baked
     # /etc/sandbox-init.env and the live guest env echoed to the console.
+    # Only meaningful for the docker-derived env image (E2E_IMAGE_ONLY /
+    # E2E_OVERRIDE_ME baked into the image ENV); local mode runs an
+    # arbitrary ref/tar without that derivation, so the block is skipped.
+    if [[ $LOCAL_MODE -eq 0 ]]; then
     guest_env="$BUILD/sandbox-init.env"
     debugfs -R "cat /etc/sandbox-init.env" "$BUILD/rootfs.ext4" > "$guest_env" 2>/dev/null \
         || die "debugfs could not read /etc/sandbox-init.env (format=$fmt)"
@@ -221,6 +249,7 @@ for fmt in "${FORMATS[@]}"; do
     # fsb-sandbox-golden overrides PATH with /opt/sandbox-bin first: seeing
     # it in the live guest proves the image PATH beat the init's hardcoded one.
     assert "running guest PATH inherits the image's /opt/sandbox-bin override" grep -q "path=/opt/sandbox-bin:" "$BUILD/boot.console.log"
+    fi
 
     # Positive evidence of what was verified:
     log "guest /etc/sandbox-init.env as baked into the rootfs:"
