@@ -363,7 +363,7 @@ func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
 	for _, name := range []string{"rootfs.ext4", "vmstate.snap", "memory.snap"} {
 		require.NoError(t, os.WriteFile(filepath.Join(staging, name), []byte("data-"+name), 0o640))
 	}
-	size, err := assembleSnapshotManifest(fixture.stateRoot, staging, dir, "firecracker", nil)
+	size, err := assembleSnapshotManifest(fixture.stateRoot, staging, dir, nil)
 	require.NoError(t, err)
 	require.Positive(t, size)
 

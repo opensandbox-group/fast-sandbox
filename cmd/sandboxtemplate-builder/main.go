@@ -129,9 +129,10 @@ func run(ctx context.Context) error {
 		}
 	}
 
-	// Stage 5: manifest + checksums.
+	// Stage 5: manifest + checksums. The compatibility block records the
+	// CPU template the snapshot stage actually booted with.
 	manifestStarted := time.Now()
-	manifestBytes, err := stageManifest(spec, sourceDigest, kernel, rootfs, vmstate, memory, layers, workdir)
+	manifestBytes, err := stageManifest(spec, sourceDigest, kernel, rootfs, vmstate, memory, layers, workdir, phases.CPUTemplate)
 	if err != nil {
 		return err
 	}

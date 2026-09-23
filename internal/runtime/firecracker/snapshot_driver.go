@@ -115,7 +115,6 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 		bootTimeout: d.config.BootTimeoutSeconds,
 		spillRoot:   d.snapshotSpillRoot(),
 	}
-	firecrackerBinary := d.config.BinaryPath
 	d.mu.RUnlock()
 	plan.sandboxDir = filepath.Join(plan.stateRoot, sandboxStateDir, plan.sandboxID)
 	plan.staging = filepath.Join(plan.stateRoot, snapshotStagingDir, plan.snapshotID)
@@ -140,7 +139,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 		"spilled", plan.spilled, "rootfsClone", plan.rootfsClone.String(), "rootfsCopy", plan.rootfsCopy.String(),
 		"pauseAPI", plan.pauseAPI.String(), "dumpAPI", plan.dumpAPI.String(), "resumeAPI", plan.resumeAPI.String())
 
-	sizeBytes, err := assembleSnapshotManifest(plan.stateRoot, plan.staging, plan.sandboxDir, firecrackerBinary, input.ActionBindings)
+	sizeBytes, err := assembleSnapshotManifest(plan.stateRoot, plan.staging, plan.sandboxDir, input.ActionBindings)
 	if err != nil {
 		_ = os.RemoveAll(plan.staging)
 		return nil, err
@@ -624,13 +623,14 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 }
 
 // assembleSnapshotManifest builds the restore-compatible manifest of the
-// dumped set: the lineage object and the machine (vcpu/memory) and
-// guestNetwork facts baked into the SOURCE image manifest are carried
-// forward verbatim (they describe the vmstate lineage and are what restore
-// validation checks), while the compatibility tuple, files, machine.rootfs,
-// format, and validation describe this dump. It returns the total logical
-// size of the artifact set.
-func assembleSnapshotManifest(stateRoot, staging, sandboxDir, firecrackerBinary string, actionBindings []runtimecontract.SnapshotActionBinding) (int64, error) {
+// dumped set: the lineage object, the machine (vcpu/memory), guestNetwork,
+// and compatibility facts baked into the SOURCE image manifest are carried
+// forward verbatim — they describe the vmstate's CPU state and lineage and
+// are what restore validation and compatibility matching check (the dumped
+// vmstate is compatible with exactly the hosts the source was). Only files,
+// machine.rootfs, format, and validation describe this dump. It returns the
+// total logical size of the artifact set.
+func assembleSnapshotManifest(stateRoot, staging, sandboxDir string, actionBindings []runtimecontract.SnapshotActionBinding) (int64, error) {
 	state, err := loadState(sandboxDir)
 	if err != nil {
 		return 0, err
@@ -679,11 +679,9 @@ func assembleSnapshotManifest(stateRoot, staging, sandboxDir, firecrackerBinary 
 		document["lineage"] = lineage
 	}
 	lineage["image"] = state.Config.Spec.Image
-	document["compatibility"] = map[string]any{
-		"firecrackerVersion": artifacts.FirecrackerVersion(firecrackerBinary),
-		"hostKernel":         artifacts.HostKernelRelease(),
-		"cpuModel":           artifacts.HostCPUModel(),
-	}
+	// compatibility rides forward from the source manifest untouched (see
+	// the function comment): the dump's vmstate carries the source
+	// snapshot's CPU state, so its compatibility identity is the source's.
 	document["files"] = files
 	// machine.rootfs reflects this dump's actual rootfs size; vcpu/memory
 	// ride forward from the source manifest untouched.

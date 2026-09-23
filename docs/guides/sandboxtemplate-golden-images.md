@@ -207,7 +207,10 @@ s3://sandbox-images/publish/
   guest IP/MAC); the runtime replaces only the host tap via
   `network_overrides`;
 - `files` — publish filename → `{sha256, sizeBytes}` for digest-verified pull;
-- `compatibility` — firecracker version / host kernel / CPU model;
+- `compatibility` — the structured CPU identity (vendor/cpuFamily/cpuModel)
+  of the build host, the pinned CPU template (`T2`/`T2A`, or `none` when a
+  host refused it and the raw CPUID was baked in), firecracker version and
+  host kernel;
 - `lineage` — build provenance carried by every derived snapshot: `image`,
   `imageDigest`, `execd`, `kernel`, `entrypoint`, `init`, `envs`;
 - `validation` — build gates.

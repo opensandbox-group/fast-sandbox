@@ -104,3 +104,26 @@ func TestLastMarkerLineMissingLogFallsBackToMarker(t *testing.T) {
 		t.Fatalf("lastMarkerLine = %q, want %q", got, startupFailedMarker)
 	}
 }
+
+// TestCPUTemplateForVendor: the pinned static template follows the host CPU
+// vendor — T2 on Intel, T2A on AMD (the two vendor-native baselines) — and
+// an unknown vendor pins none (the snapshot then carries the raw host
+// CPUID; hosts whose model refuses the vendor template take the
+// bootPreparationVM fallback).
+func TestCPUTemplateForVendor(t *testing.T) {
+	tests := []struct {
+		vendor string
+		want   string
+	}{
+		{"GenuineIntel", "T2"},
+		{"AuthenticAMD", "T2A"},
+		{"unknown", ""},
+		{"", ""},
+		{"GenuineBochs", ""},
+	}
+	for _, test := range tests {
+		if got := cpuTemplateForVendor(test.vendor); got != test.want {
+			t.Fatalf("cpuTemplateForVendor(%q) = %q, want %q", test.vendor, got, test.want)
+		}
+	}
+}

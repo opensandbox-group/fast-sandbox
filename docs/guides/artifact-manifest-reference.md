@@ -22,9 +22,13 @@ set's `artifactDigest` — changing any byte produces a different artifact set.
   },
   "machine": { "vcpu": "2", "memory": "2Gi", "rootfs": "30Gi" },
   "compatibility": {
+    "vendor": "GenuineIntel",
+    "cpuFamily": 6,
+    "cpuModel": 85,
+    "cpuModelName": "Intel(R) Xeon(R) Platinum 8163 CPU @ 2.50GHz",
+    "cpuTemplate": "T2",
     "firecrackerVersion": "1.16.1",
-    "hostKernel": "5.10.134-18.al8.x86_64",
-    "cpuModel": "Intel(R) Xeon(R) Platinum 8163 CPU @ 2.50GHz"
+    "hostKernel": "5.10.134-18.al8.x86_64"
   },
   "guestNetwork": {
     "iface": "eth0",
@@ -61,7 +65,7 @@ set's `artifactDigest` — changing any byte produces a different artifact set.
 | `lineage.init` | Path of the injected guest PID 1 (default `/usr/local/sbin/sandbox-init`; empty means no injection — the image's own init is responsible). A recorded build-time fact |
 | `lineage.envs` | The template envs published **verbatim** (no `valueFrom` support); written into the guest's `/etc/sandbox-init.env` at build time on top of the source image's inherited OCI `Config.Env` (not recorded here — recover it from `lineage.imageDigest` via the registry), overriding it per name. Never put secrets here — anyone who can read the manifest can read these values; credentials belong in `publishSecretRef` |
 | `machine` | The snapshot's resource triad: `vcpu` and `memory` are resource quantities (e.g. `"2"`, `"2Gi"`); `rootfs` is the actual rootfs capacity (the declared minimum rounded up to whole GiB, e.g. `"30Gi"`, matching `files["rootfs.ext4"].sizeBytes`). `vcpu`/`memory` are the restore-authoritative configuration — Firecracker refuses to restore with a memory size different from the one the vmstate was created with, so the create request's cpu/mem are only validated: a request below the snapshot memory is rejected explicitly. Snapshots inherit `vcpu`/`memory` verbatim from the source image; `rootfs` is rewritten per capture from the actual artifacts |
-| `compatibility` | Capture environment triple: `firecrackerVersion` (the Firecracker binary version), `hostKernel` (host `uname -r`), `cpuModel` (first host CPU model name). Useful for troubleshooting and, by design, for matching "which nodes can restore this snapshot"; the restore path does not enforce it today — informational. Rewritten at every capture, never inherited |
+| `compatibility` | Snapshot CPU provenance and capture environment. `vendor`/`cpuFamily`/`cpuModel` are the structured CPUID identity of the first `/proc/cpuinfo` processor — the fields consumers match before restoring (8163 and 8269CY share family 6 model 85); `cpuModelName` is the marketing string, display-only. `cpuTemplate` records how the snapshot was CPUID-masked: `"T2"` (Intel) / `"T2A"` (AMD) — portable across the template's allowlist — or `"none"` when the host refused the pinned template and the raw host CPUID was baked in (such artifacts are host-CPU specific by construction). `firecrackerVersion` (the Firecracker binary version) and `hostKernel` (host `uname -r`) complete the capture environment. The restore path does not enforce these fields yet (planned: OSEP-0024 Phase 1 admission). Template builds record the build host; snapshots and checkpoints carry `compatibility` forward **verbatim from the source manifest** — the dumped vmstate carries the source's CPU state, so its compatibility is the source's |
 | `guestNetwork` | The guest static network baked into the snapshot (clone networking model): `iface`/`mac`/`ip`/`gateway`/`netmask`/`mtu`. At restore the guest side is unchanged (it lives in the memory image); the node replaces only the host tap. Consumers read `ip`/`gateway`/`netmask`/`mtu` — `mtu` 0 means an older manifest, falling back to the kernel default. Inherited verbatim |
 | `format` | `native` or `overlaybd`; both formats contain the complete snapshot set, differing in the extra LSMT layers (for on-demand loading). Snapshots/checkpoints are always `native` |
 | `files` | Per-artifact list: keys are publish-relative names, values are `{sha256, sizeBytes}` — sparse-aware digests and logical sizes. The pull side downloads each file and verifies its digest (already-verified files are skipped; corrupt ones are re-pulled). Fixed members: `rootfs.ext4` (renamed `rootfs.img` in the local cache), `vmstate.snap`, `memory.snap`; template builds with `format=overlaybd` add `overlaybd/rootfs/layer.lsmt` and `overlaybd/memory/layer.lsmt` |

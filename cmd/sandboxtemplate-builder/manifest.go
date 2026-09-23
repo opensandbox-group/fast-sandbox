@@ -31,14 +31,16 @@ const (
 // and SHA256SUMS in the workdir. Checksums are computed once and shared
 // between the two outputs via the cache. The serialization and checksum
 // conventions live in internal/artifacts so every producer (builder, live
-// snapshot driver, runtime-agent) emits byte-identical layouts.
-func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, workdir string) ([]byte, error) {
+// snapshot driver, runtime-agent) emits byte-identical layouts. cpuTemplate
+// is the static CPU template the snapshot was taken with ("" = raw host
+// CPUID fallback, recorded as "none").
+func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, workdir, cpuTemplate string) ([]byte, error) {
 	cache := map[string]string{}
 	rootfsGiB, err := sizeGiB(spec.Output.RootfsSize)
 	if err != nil {
 		return nil, err
 	}
-	manifest, err := buildManifest(spec, sourceDigest, kernel, rootfs, vmstate, memory, layers, cache, rootfsGiB)
+	manifest, err := buildManifest(spec, sourceDigest, kernel, rootfs, vmstate, memory, layers, cache, rootfsGiB, cpuTemplate)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +63,7 @@ func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 // declared minimum with the real artifact size. The lineage object records
 // where the set came from and what was baked in at build time; snapshot
 // and checkpoint producers carry it forward verbatim across generations.
-func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, cache map[string]string, rootfsGiB int) (map[string]any, error) {
+func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, cache map[string]string, rootfsGiB int, cpuTemplate string) (map[string]any, error) {
 	files := map[string]any{}
 	staged := []struct{ name, path string }{
 		{rootfsImageName, rootfs},
@@ -87,6 +89,22 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 	if err != nil {
 		return nil, fmt.Errorf("checksum kernel: %w", err)
 	}
+	// Snapshot compatibility (design): the structured CPU identity is what
+	// consumers match against node identities before restoring a snapshot;
+	// cpuModelName is the /proc/cpuinfo marketing string, display-only (8163
+	// and 8269CY share vendor/family/model). cpuTemplate records how the
+	// snapshot was masked ("T2"/"T2A", or "none" when the raw host CPUID
+	// fallback ran — such artifacts are host-CPU specific by construction).
+	identity := artifacts.HostCPUIdentity()
+	compatibility := map[string]any{
+		"vendor":             identity.Vendor,
+		"cpuFamily":          identity.Family,
+		"cpuModel":           identity.Model,
+		"cpuModelName":       identity.ModelName,
+		"cpuTemplate":        compatibilityCPUTemplate(cpuTemplate),
+		"firecrackerVersion": artifacts.FirecrackerVersion(firecrackerBin),
+		"hostKernel":         artifacts.HostKernelRelease(),
+	}
 	return map[string]any{
 		"schemaVersion": 1,
 		"runtime":       "firecracker",
@@ -105,13 +123,7 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 			// credentials.
 			"envs": spec.Envs,
 		},
-		// Snapshot compatibility tuple (design): consumers match these
-		// against node labels before restoring a snapshot.
-		"compatibility": map[string]any{
-			"firecrackerVersion": artifacts.FirecrackerVersion(firecrackerBin),
-			"hostKernel":         artifacts.HostKernelRelease(),
-			"cpuModel":           artifacts.HostCPUModel(),
-		},
+		"compatibility": compatibility,
 		"machine": map[string]any{
 			"vcpu":   spec.Machine.VCPU,
 			"memory": spec.Machine.Memory,
@@ -138,6 +150,16 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 			"restored": true,
 		},
 	}, nil
+}
+
+// compatibilityCPUTemplate normalizes the snapshot-stage CPU template for
+// the manifest: an empty template means the raw host CPUID fallback ran and
+// is recorded as "none".
+func compatibilityCPUTemplate(cpuTemplate string) string {
+	if cpuTemplate == "" {
+		return "none"
+	}
+	return cpuTemplate
 }
 
 // writeChecksums writes SHA256SUMS covering only the published artifact set

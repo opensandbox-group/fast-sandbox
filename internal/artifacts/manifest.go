@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -157,21 +158,59 @@ func HostKernelRelease() string {
 	return strings.TrimSpace(string(output))
 }
 
-// HostCPUModel returns the first CPU model name from /proc/cpuinfo.
-func HostCPUModel() string {
+// CPUIdentity is the structured CPU identity of the host that produced an
+// artifact set. Vendor/family/model is the CPUID identity snapshots must be
+// matched against before a restore (8163 and 8269CY share family 6 model
+// 85); ModelName is the /proc/cpuinfo marketing string, display-only. Family
+// and model are 0 with vendor "unknown" when the host CPU cannot be read.
+type CPUIdentity struct {
+	Vendor    string `json:"vendor"`
+	Family    int    `json:"cpuFamily"`
+	Model     int    `json:"cpuModel"`
+	ModelName string `json:"cpuModelName"`
+}
+
+// HostCPUIdentity returns the CPU identity of the first /proc/cpuinfo
+// processor.
+func HostCPUIdentity() CPUIdentity {
 	payload, err := os.ReadFile("/proc/cpuinfo")
 	if err != nil {
-		return unknownProvenanceValue
+		return CPUIdentity{Vendor: unknownProvenanceValue}
 	}
+	return parseCPUIdentity(payload)
+}
+
+// parseCPUIdentity extracts the vendor_id / cpu family / model / model name
+// of the first processor block from /proc/cpuinfo content. Unparsable
+// numeric fields stay 0 and a missing vendor reports "unknown".
+func parseCPUIdentity(payload []byte) CPUIdentity {
+	identity := CPUIdentity{Vendor: unknownProvenanceValue}
 	for _, line := range strings.Split(string(payload), "\n") {
-		if strings.HasPrefix(line, "model name") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				return strings.TrimSpace(parts[1])
+		name, value, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		name, value = strings.TrimSpace(name), strings.TrimSpace(value)
+		switch name {
+		case "vendor_id":
+			if identity.Vendor == unknownProvenanceValue {
+				identity.Vendor = value
+			}
+		case "cpu family":
+			if identity.Family == 0 {
+				identity.Family, _ = strconv.Atoi(value)
+			}
+		case "model":
+			if identity.Model == 0 {
+				identity.Model, _ = strconv.Atoi(value)
+			}
+		case "model name":
+			if identity.ModelName == "" {
+				identity.ModelName = value
 			}
 		}
 	}
-	return unknownProvenanceValue
+	return identity
 }
 
 // SizeGiB rounds a byte size up to whole GiB, minimum one. It matches the
