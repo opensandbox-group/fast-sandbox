@@ -44,6 +44,13 @@ const (
 	downloadProgressInterval = 8 << 20
 )
 
+// Asset file names inside the assets dir. The release tarballs carry
+// version-suffixed binaries; the local copies use these bare names.
+const (
+	assetFirecracker = "firecracker"
+	assetJailer      = "jailer"
+)
+
 // defaultHTTPClient is the nil-HTTPClient fallback: like
 // http.DefaultClient, but with explicit connect/TLS/response-header
 // timeouts.
@@ -112,8 +119,8 @@ func (c AssetConfig) Ensure(ctx context.Context) error {
 		klog.InfoS("bundled firecracker assets unusable; falling back to downloads",
 			"bundle", c.bundleDir(), "err", err)
 	}
-	binary := filepath.Join(dir, "firecracker")
-	jailer := filepath.Join(dir, "jailer")
+	binary := filepath.Join(dir, assetFirecracker)
+	jailer := filepath.Join(dir, assetJailer)
 	if c.binaryMissing(binary) || c.binaryMissing(jailer) {
 		version := c.version()
 		url := fmt.Sprintf("%s/download/%s/firecracker-%s-%s.tgz", c.base(), version, version, arch)
@@ -135,7 +142,7 @@ func (c AssetConfig) verify() error {
 	if verify == nil {
 		verify = verifyBinary
 	}
-	for _, name := range []string{"firecracker", "jailer"} {
+	for _, name := range []string{assetFirecracker, assetJailer} {
 		if err := verify(filepath.Join(dir, name)); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
@@ -168,8 +175,8 @@ func (c AssetConfig) installTarball(ctx context.Context, url, dir, arch string) 
 		return err
 	}
 	for name, target := range map[string]string{
-		"firecracker": filepath.Join(dir, "firecracker"),
-		"jailer":      filepath.Join(dir, "jailer"),
+		assetFirecracker: filepath.Join(dir, assetFirecracker),
+		assetJailer:      filepath.Join(dir, assetJailer),
 	} {
 		matches, err := filepath.Glob(filepath.Join(tmp, name+"-*-"+arch))
 		if err != nil || len(matches) != 1 {

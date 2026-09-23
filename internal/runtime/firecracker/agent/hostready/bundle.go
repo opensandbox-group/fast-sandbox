@@ -38,8 +38,8 @@ func (c AssetConfig) installFromBundle(dir string) error {
 		name    string
 		allowed bool
 	}{
-		{name: "firecracker", allowed: stockBinary},
-		{name: "jailer", allowed: stockBinary},
+		{name: assetFirecracker, allowed: stockBinary},
+		{name: assetJailer, allowed: stockBinary},
 	}
 	var failures []error
 	for _, entry := range entries {
@@ -78,6 +78,7 @@ func copyVerified(src, dst, want string) error {
 		return fmt.Errorf("sha256 mismatch: got %s, want %s", got, want)
 	}
 	tmp := dst + ".download"
+	//nolint:gosec // the staged bundle binaries are executed (firecracker/jailer); they need 0o755
 	if err := os.WriteFile(tmp, payload, 0o755); err != nil {
 		return err
 	}

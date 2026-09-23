@@ -304,8 +304,8 @@ func checkStateRootFS(report *Report, probes Probes, config CheckConfig) {
 // boots one (#84). The manager installs missing assets before the checks;
 // in check-only mode a missing install surfaces here.
 func checkAssets(report *Report, config CheckConfig, probes Probes) {
-	binary := filepath.Join(config.AssetsDir, "firecracker")
-	jailer := filepath.Join(config.AssetsDir, "jailer")
+	binary := filepath.Join(config.AssetsDir, assetFirecracker)
+	jailer := filepath.Join(config.AssetsDir, assetJailer)
 	for _, path := range []string{binary, jailer} {
 		if err := probes.VerifyBinary(path); err != nil {
 			report.fail("fc-assets", path+" --version failed: "+err.Error())
