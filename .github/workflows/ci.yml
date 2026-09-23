@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: gofmt/gci + golangci-lint
+        run: make lint
+
+  unit-test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Run unit tests
+        run: make test SCOPE=unit
+
+  unit-test-race:
+    name: Unit tests (race)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Run unit tests with race detector
+        run: make test SCOPE=race
+
+  generated-code:
+    name: Generated code up to date
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Regenerate protos, deepcopy and CRDs
+        run: make generate
+      - name: Check for stale generated output
+        run: |
+          if ! git diff --exit-code -- api/proto/v2 api/v1alpha2/zz_generated.deepcopy.go config/crd sdk/python/fast_sandbox/proto; then
+            echo "::error::Generated output is out of date. Run 'make generate' and commit the result."
+            git status --short
+            exit 1
+          fi
