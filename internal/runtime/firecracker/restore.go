@@ -152,11 +152,6 @@ func validateRestoreMachineConfig(spec fastletapi.SandboxSpec, config runtimecat
 	return nil
 }
 
-// ErrIncompatibleArtifact reports a snapshot whose compatibility (CPU
-// provenance or Firecracker version) cannot be restored on this node; the
-// error chain names the failing dimension. See artifacts.MatchRestoreCompatibility.
-var ErrIncompatibleArtifact = errors.New("snapshot incompatible with this node")
-
 // readCachedManifestCompatibility loads the compatibility block from the
 // cached manifest. It reports false for manifests without the structured
 // fields (published before the builder recorded CPU provenance, or

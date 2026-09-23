@@ -236,18 +236,26 @@ func (m *SandboxManager) handleRuntimeCreateFailure(ctx context.Context, input *
 	}
 	admission := m.admissionStatusLocked()
 	m.mu.Unlock()
+	// A runtime artifact incompatibility (restore CPU/version admission) is
+	// a deterministic node-vs-request mismatch, not a runtime fault: report
+	// ProfileMismatch without the retryable flag so the orchestrator moves
+	// to the next candidate without re-queuing this node for the same image.
 	code := fastletapi.ErrorRuntimeUnavailable
+	retryable := true
 	if errors.Is(runtimeErr, ErrNetworkUnavailable) {
 		code = fastletapi.ErrorNetworkUnavailable
 	} else if errors.Is(runtimeErr, ErrInfraUnavailable) {
 		code = fastletapi.ErrorInfraUnavailable
+	} else if errors.Is(runtimeErr, ErrIncompatibleArtifact) {
+		code = fastletapi.ErrorProfileMismatch
+		retryable = false
 	}
 	message := runtimeErr.Error()
 	if cleanupErr != nil {
 		message = fmt.Sprintf("%s; cleanup failed: %v", message, cleanupErr)
 	}
 	m.recordDiagnostic(sandboxUID, "error", "runtime", string(disposition), message)
-	return createFailureWithDisposition(fastletErrorWithCause(code, message, true, errors.Join(runtimeErr, cleanupErr)), admission, disposition)
+	return createFailureWithDisposition(fastletErrorWithCause(code, message, retryable, errors.Join(runtimeErr, cleanupErr)), admission, disposition)
 }
 
 func (m *SandboxManager) commitRuntimeCreate(req *fastletapi.CreateSandboxRequest, input fastletapi.EnsureSandboxInput, placeholder, metadata *SandboxMetadata) (fastletapi.SandboxStatus, fastletapi.AdmissionStatus, bool, *fastletapi.FastletError) {

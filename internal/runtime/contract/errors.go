@@ -10,8 +10,14 @@ var (
 	ErrRuntimeCapabilityUnavailable = errors.New("runtime capability unavailable")
 	ErrNetworkUnavailable           = errors.New("sandbox network unavailable")
 	ErrInfraUnavailable             = errors.New("sandbox Infra Components unavailable")
-	ErrSandboxProfileMismatch       = errors.New("sandbox profile mismatch")
-	ErrInvalidConfig                = errors.New("invalid sandbox config")
+	// ErrIncompatibleArtifact reports that a snapshot artifact cannot be
+	// restored on this node: its compatibility block (CPU provenance or
+	// Firecracker version) fails the restore admission. Deterministic for
+	// this node/artifact pair — see firecracker restore.go for the tiered
+	// match.
+	ErrIncompatibleArtifact   = errors.New("snapshot incompatible with this node")
+	ErrSandboxProfileMismatch = errors.New("sandbox profile mismatch")
+	ErrInvalidConfig          = errors.New("invalid sandbox config")
 	// ErrImageNotReady reports that a rootfs image has not been converted
 	// and cached yet. It is shared between the driver's local cache and the
 	// firecracker runtime-agent pull layer so both can fail a create with

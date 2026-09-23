@@ -15,6 +15,7 @@ var (
 	ErrSandboxNotFound       = runtimecontract.ErrSandboxNotFound
 	ErrRuntimeNotInitialized = runtimecontract.ErrRuntimeNotInitialized
 	ErrInfraUnavailable      = runtimecontract.ErrInfraUnavailable
+	ErrIncompatibleArtifact  = runtimecontract.ErrIncompatibleArtifact
 )
 
 var validateExistingRuntimeProfile = runtimecontract.ValidateProfile

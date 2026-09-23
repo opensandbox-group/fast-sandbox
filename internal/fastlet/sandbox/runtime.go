@@ -32,6 +32,7 @@ var (
 	ErrRuntimeNotInitialized  = runtimecontract.ErrRuntimeNotInitialized
 	ErrNetworkUnavailable     = runtimecontract.ErrNetworkUnavailable
 	ErrInfraUnavailable       = runtimecontract.ErrInfraUnavailable
+	ErrIncompatibleArtifact   = runtimecontract.ErrIncompatibleArtifact
 	ErrSandboxProfileMismatch = runtimecontract.ErrSandboxProfileMismatch
 	ErrInvalidConfig          = runtimecontract.ErrInvalidConfig
 	ErrImageNotReady          = runtimecontract.ErrImageNotReady
