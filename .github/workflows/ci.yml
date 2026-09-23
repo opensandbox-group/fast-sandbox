@@ -15,8 +15,6 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      GOTOOLCHAIN: auto
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -24,6 +22,8 @@ jobs:
           go-version-file: go.mod
       - name: gofmt/gci + golangci-lint
         run: make lint
+        env:
+          GOTOOLCHAIN: auto
 
   unit-test:
     name: Unit tests
