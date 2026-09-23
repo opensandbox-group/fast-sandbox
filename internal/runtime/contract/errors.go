@@ -10,11 +10,8 @@ var (
 	ErrRuntimeCapabilityUnavailable = errors.New("runtime capability unavailable")
 	ErrNetworkUnavailable           = errors.New("sandbox network unavailable")
 	ErrInfraUnavailable             = errors.New("sandbox Infra Components unavailable")
-	// ErrIncompatibleArtifact reports that a snapshot artifact cannot be
-	// restored on this node: its compatibility block (CPU provenance or
-	// Firecracker version) fails the restore admission. Deterministic for
-	// this node/artifact pair — see firecracker restore.go for the tiered
-	// match.
+	// ErrIncompatibleArtifact reports a snapshot whose compatibility block
+	// (CPU provenance / Firecracker version) fails the restore admission.
 	ErrIncompatibleArtifact   = errors.New("snapshot incompatible with this node")
 	ErrSandboxProfileMismatch = errors.New("sandbox profile mismatch")
 	ErrInvalidConfig          = errors.New("invalid sandbox config")

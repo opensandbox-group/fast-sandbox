@@ -236,10 +236,9 @@ func (m *SandboxManager) handleRuntimeCreateFailure(ctx context.Context, input *
 	}
 	admission := m.admissionStatusLocked()
 	m.mu.Unlock()
-	// A runtime artifact incompatibility (restore CPU/version admission) is
-	// a deterministic node-vs-request mismatch, not a runtime fault: report
-	// ProfileMismatch without the retryable flag so the orchestrator moves
-	// to the next candidate without re-queuing this node for the same image.
+	// Deterministic node-vs-artifact mismatch, not a runtime fault: the
+	// orchestrator moves to the next candidate and never re-queues this
+	// node for the same image.
 	code := fastletapi.ErrorRuntimeUnavailable
 	retryable := true
 	if errors.Is(runtimeErr, ErrNetworkUnavailable) {

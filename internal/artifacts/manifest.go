@@ -181,12 +181,8 @@ const (
 	VendorAuthenticAMD = "AuthenticAMD"
 )
 
-// CPUIdentity is the structured CPU identity of the host that produced an
-// artifact set. Vendor/family/model is the CPUID identity snapshots must be
-// matched against before a restore (8163 and 8269CY share family 6 model
-// 85); Stepping distinguishes the entries of a static-template allowlist;
-// ModelName is the /proc/cpuinfo marketing string, display-only. Numeric
-// fields are 0 with vendor "unknown" when the host CPU cannot be read.
+// CPUIdentity is the host's CPUID identity from /proc/cpuinfo (the model
+// name is display-only).
 type CPUIdentity struct {
 	Vendor    string `json:"vendor"`
 	Family    int    `json:"cpuFamily"`
@@ -205,9 +201,8 @@ func HostCPUIdentity() CPUIdentity {
 	return parseCPUIdentity(payload)
 }
 
-// parseCPUIdentity extracts the vendor_id / cpu family / model / stepping /
-// model name of the first processor block from /proc/cpuinfo content.
-// Unparsable numeric fields stay 0 and a missing vendor reports "unknown".
+// parseCPUIdentity parses the first processor block of /proc/cpuinfo
+// content; unparsable fields stay 0 / "unknown".
 func parseCPUIdentity(payload []byte) CPUIdentity {
 	identity := CPUIdentity{Vendor: unknownProvenanceValue}
 	for _, line := range strings.Split(string(payload), "\n") {
@@ -242,10 +237,8 @@ func parseCPUIdentity(payload []byte) CPUIdentity {
 	return identity
 }
 
-// SnapshotCompatibility mirrors the manifest compatibility block (see
-// docs/guides/artifact-manifest-reference.md): the CPU provenance of a
-// snapshot set plus its capture environment. Manifests produced before the
-// structured fields leave the zero-ish shape (empty Vendor and CPUTemplate).
+// SnapshotCompatibility mirrors the manifest compatibility block. Zero
+// Vendor and CPUTemplate means a pre-structured (legacy) manifest.
 type SnapshotCompatibility struct {
 	Vendor             string `json:"vendor"`
 	CPUFamily          int    `json:"cpuFamily"`
@@ -257,8 +250,8 @@ type SnapshotCompatibility struct {
 	HostKernel         string `json:"hostKernel"`
 }
 
-// fms is one allowlist entry: the exact CPUID identity (vendor plus the full
-// family/model/stepping triple) a static template is permitted on.
+// fms is one allowlist entry: an exact vendor/family/model/stepping
+// identity.
 type fms struct {
 	vendor   string
 	family   int
@@ -271,10 +264,7 @@ func (m fms) String() string {
 }
 
 // cpuTemplateAllowlists pins, per Firecracker release, the CPUs each static
-// template is permitted on (mirrors upstream static_cpu_templates). A new
-// VMM version adds its own row instead of mutating this one — admission
-// requires manifest and node versions to be equal before consulting the
-// table (see MatchRestoreCompatibility).
+// template permits (mirrors upstream static_cpu_templates).
 var cpuTemplateAllowlists = map[string]map[string][]fms{
 	"1.16.1": {
 		"T2": {
@@ -288,9 +278,8 @@ var cpuTemplateAllowlists = map[string]map[string][]fms{
 	},
 }
 
-// Admission errors returned by MatchRestoreCompatibility. A legacy manifest
-// (ErrLegacyCompatibility) is admitted with a warning by the caller; the
-// rest reject the restore.
+// Admission errors from MatchRestoreCompatibility: legacy is admitted with
+// a warning by the caller, the rest reject the restore.
 var (
 	ErrLegacyCompatibility        = errors.New("manifest carries no structured compatibility")
 	ErrFirecrackerVersionMismatch = errors.New("firecracker version mismatch")
@@ -299,21 +288,17 @@ var (
 )
 
 // MatchRestoreCompatibility decides whether a node may restore a snapshot
-// whose manifest compatibility is compat. The tiered contract:
+// with the given compatibility block:
 //
-//   - a template-masked snapshot ("T2"/"T2A") restores on any CPU in that
-//     template's allowlist for the recorded Firecracker version — the mask
-//     normalizes the guest CPUID, so build-host identity equality is not
-//     required;
-//   - an unmasked snapshot (cpuTemplate "none") restores only on nodes with
-//     the identical vendor/family/model identity (stepping is recorded but
-//     deliberately not compared, matching the OSEP-0024 Phase 1 identity);
-//   - a legacy manifest without structured fields reports
-//     ErrLegacyCompatibility and is the caller's decision to admit.
+//   - "T2"/"T2A": node CPU must be in that template's per-version allowlist
+//     (the mask normalizes the guest CPUID, so build-host identity does not
+//     matter);
+//   - "none": node vendor/family/model must equal the snapshot identity
+//     (stepping is recorded but not compared);
+//   - legacy block: ErrLegacyCompatibility, the caller may admit with a
+//     warning.
 //
-// The manifest and node Firecracker versions must be equal in every tier:
-// the allowlist table is per version, and cross-version vmstate restores
-// are unsupported anyway.
+// Manifest and node Firecracker versions must be equal in every tier.
 func MatchRestoreCompatibility(compat SnapshotCompatibility, local CPUIdentity, localFirecrackerVersion string) error {
 	if compat.CPUTemplate == "" && compat.Vendor == "" {
 		return ErrLegacyCompatibility

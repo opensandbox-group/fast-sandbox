@@ -44,8 +44,8 @@ const (
 	downloadProgressInterval = 8 << 20
 )
 
-// Asset file names inside the assets dir. The release tarballs carry
-// version-suffixed binaries; the local copies use these bare names.
+// Asset file names in the assets dir; release tarballs carry
+// version-suffixed binaries.
 const (
 	assetFirecracker = "firecracker"
 	assetJailer      = "jailer"

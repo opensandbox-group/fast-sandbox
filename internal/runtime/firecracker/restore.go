@@ -153,11 +153,7 @@ func validateRestoreMachineConfig(spec fastletapi.SandboxSpec, config runtimecat
 }
 
 // readCachedManifestCompatibility loads the compatibility block from the
-// cached manifest. It reports false for manifests without the structured
-// fields (published before the builder recorded CPU provenance, or
-// hand-seeded caches), and also treats an undecodable block as absent: pre-
-// structured manifests carry a string cpuModel that cannot decode into the
-// structured shape.
+// cached manifest; ok=false for an absent, legacy, or undecodable block.
 func readCachedManifestCompatibility(stateRoot, image string) (artifacts.SnapshotCompatibility, bool, error) {
 	payload, err := os.ReadFile(cachedManifestPath(stateRoot, image))
 	if err != nil {
@@ -170,7 +166,7 @@ func readCachedManifestCompatibility(stateRoot, image string) (artifacts.Snapsho
 		Compatibility artifacts.SnapshotCompatibility `json:"compatibility"`
 	}
 	if err := json.Unmarshal(payload, &document); err != nil {
-		//nolint:nilerr // a pre-structured manifest (string cpuModel) cannot decode into the structured shape; treat it as legacy and admit with a warning
+		//nolint:nilerr // undecodable = pre-structured legacy manifest; admitted with a warning
 		return artifacts.SnapshotCompatibility{}, false, nil
 	}
 	compat := document.Compatibility
@@ -180,11 +176,9 @@ func readCachedManifestCompatibility(stateRoot, image string) (artifacts.Snapsho
 	return compat, true, nil
 }
 
-// checkRestoreCompatibility is the restore-admission core: fail fast on an
-// incompatible artifact before any snapshot file is staged. An absent or
-// legacy compatibility block (zero value → Match reports
-// ErrLegacyCompatibility) is admitted with a warning; everything else
-// defers to the tiered matcher.
+// checkRestoreCompatibility fails the restore before staging unless the
+// compatibility block matches this node; a legacy block is admitted with a
+// warning.
 func checkRestoreCompatibility(compat artifacts.SnapshotCompatibility, local artifacts.CPUIdentity, localFirecrackerVersion, image string) error {
 	if err := artifacts.MatchRestoreCompatibility(compat, local, localFirecrackerVersion); err != nil {
 		if errors.Is(err, artifacts.ErrLegacyCompatibility) {
@@ -197,16 +191,15 @@ func checkRestoreCompatibility(compat artifacts.SnapshotCompatibility, local art
 	return nil
 }
 
-// firecrackerVersion resolves the local VMM binary version once; admission
-// needs it on every Create and the exec is not free.
+// firecrackerVersion resolves the local VMM binary version once.
 func (d *Driver) firecrackerVersion() string {
 	d.versionOnce.Do(func() { d.fcVersion = artifacts.FirecrackerVersion(d.config.BinaryPath) })
 	return d.fcVersion
 }
 
 // validateRestoreCompatibility admits a restore only if the cached
-// manifest's compatibility block matches this node (see
-// artifacts.MatchRestoreCompatibility for the tiered contract).
+// manifest's compatibility matches this node (see
+// artifacts.MatchRestoreCompatibility).
 func (d *Driver) validateRestoreCompatibility(stateRoot, image string) error {
 	compat, _, err := readCachedManifestCompatibility(stateRoot, image)
 	if err != nil {
