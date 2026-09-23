@@ -175,7 +175,13 @@ func TestDeliverImageIsSingleFlight(t *testing.T) {
 		}()
 	}
 	for range 2 {
-		require.Equal(t, runtimecontract.ImageDelivering, <-statuses)
+		status := <-statuses
+		// The fake delivery is fast: a caller either coalesces into the
+		// single in-flight attempt (Delivering) or polls after the commit
+		// (Delivered). Both are correct single-flight outcomes.
+		require.Contains(t,
+			[]runtimecontract.ImageDeliveryStatus{runtimecontract.ImageDelivering, runtimecontract.ImageDelivered},
+			status)
 	}
 	require.Eventually(t, func() bool {
 		_, resolveErr := resolveRootfsImage(fixture.stateRoot, fixture.sandboxSpec.Spec.Image)
