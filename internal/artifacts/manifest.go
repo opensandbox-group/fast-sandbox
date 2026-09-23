@@ -140,9 +140,24 @@ func FirecrackerVersion(binary string) string {
 	if err != nil {
 		return unknownProvenanceValue
 	}
-	fields := strings.Fields(string(output))
+	return parseFirecrackerVersion(string(output))
+}
+
+// parseFirecrackerVersion extracts the version from `firecracker --version`
+// output ("Firecracker v1.16.1"): the first field carrying a v-prefixed
+// version token. Older releases printed the bare "v" as a separate token
+// with the version following; both forms parse identically.
+func parseFirecrackerVersion(output string) string {
+	fields := strings.Fields(output)
 	for index, field := range fields {
-		if field == "v" && index+1 < len(fields) {
+		version, ok := strings.CutPrefix(field, "v")
+		if !ok {
+			continue
+		}
+		if version != "" {
+			return version
+		}
+		if index+1 < len(fields) {
 			return strings.TrimPrefix(fields[index+1], "v")
 		}
 	}

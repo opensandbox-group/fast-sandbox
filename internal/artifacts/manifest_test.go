@@ -4,6 +4,27 @@ import (
 	"testing"
 )
 
+// TestParseFirecrackerVersion: both historical output shapes parse — the
+// attached "v1.16.1" token (current releases) and the bare "v" token
+// followed by the version (older releases).
+func TestParseFirecrackerVersion(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{name: "attached v-token", output: "Firecracker v1.16.1\n", want: "1.16.1"},
+		{name: "bare v-token", output: "Firecracker v 1.16.1\n", want: "1.16.1"},
+		{name: "no version", output: "Firecracker\n", want: unknownProvenanceValue},
+		{name: "empty", output: "", want: unknownProvenanceValue},
+	}
+	for _, test := range tests {
+		if got := parseFirecrackerVersion(test.output); got != test.want {
+			t.Fatalf("%s: parseFirecrackerVersion(%q) = %q, want %q", test.name, test.output, got, test.want)
+		}
+	}
+}
+
 // TestParseCPUIdentityIntel: a standard /proc/cpuinfo processor block yields
 // the full structured identity.
 func TestParseCPUIdentityIntel(t *testing.T) {
