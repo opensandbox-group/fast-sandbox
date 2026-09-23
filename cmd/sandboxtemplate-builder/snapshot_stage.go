@@ -253,9 +253,9 @@ func (vm *vmm) stop() {
 // are bootPreparationVM's concern.
 func cpuTemplateForVendor(vendor string) string {
 	switch vendor {
-	case "GenuineIntel":
+	case artifacts.VendorGenuineIntel:
 		return "T2"
-	case "AuthenticAMD":
+	case artifacts.VendorAuthenticAMD:
 		return "T2A"
 	default:
 		return ""

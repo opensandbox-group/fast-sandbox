@@ -1,6 +1,7 @@
 package artifacts
 
 import (
+	"errors"
 	"testing"
 )
 
@@ -26,7 +27,7 @@ func TestParseFirecrackerVersion(t *testing.T) {
 }
 
 // TestParseCPUIdentityIntel: a standard /proc/cpuinfo processor block yields
-// the full structured identity.
+// the full structured identity, stepping included.
 func TestParseCPUIdentityIntel(t *testing.T) {
 	payload := []byte("processor\t: 0\n" +
 		"vendor_id\t: GenuineIntel\n" +
@@ -35,11 +36,126 @@ func TestParseCPUIdentityIntel(t *testing.T) {
 		"model name\t: Intel(R) Xeon(R) Platinum 8269CY CPU @ 2.60GHz\n" +
 		"stepping\t: 7\n")
 	identity := parseCPUIdentity(payload)
-	if identity.Vendor != "GenuineIntel" || identity.Family != 6 || identity.Model != 85 {
-		t.Fatalf("identity = %+v, want GenuineIntel family 6 model 85", identity)
+	if identity.Vendor != "GenuineIntel" || identity.Family != 6 || identity.Model != 85 || identity.Stepping != 7 {
+		t.Fatalf("identity = %+v, want GenuineIntel family 6 model 85 stepping 7", identity)
 	}
 	if identity.ModelName != "Intel(R) Xeon(R) Platinum 8269CY CPU @ 2.60GHz" {
 		t.Fatalf("model name = %q", identity.ModelName)
+	}
+}
+
+// TestMatchRestoreCompatibility covers the tiered admission contract: the
+// template allowlist tier, the unmasked identity-equality tier, legacy
+// manifests, and the Firecracker version gate.
+func TestMatchRestoreCompatibility(t *testing.T) {
+	intelCL := CPUIdentity{Vendor: VendorGenuineIntel, Family: 6, Model: 85, Stepping: 7}
+	amdTurin := CPUIdentity{Vendor: VendorAuthenticAMD, Family: 26, Model: 17}
+
+	t2CLSnapshot := SnapshotCompatibility{
+		Vendor: VendorGenuineIntel, CPUFamily: 6, CPUModel: 85, CPUStepping: 7,
+		CPUTemplate: "T2", FirecrackerVersion: "1.16.1",
+	}
+
+	tests := []struct {
+		name    string
+		compat  SnapshotCompatibility
+		local   CPUIdentity
+		fcLocal string
+		wantErr error
+	}{
+		{
+			name:    "T2 snapshot restores on another allowlisted model (identity tier replaced)",
+			compat:  t2CLSnapshot,
+			local:   CPUIdentity{Vendor: VendorGenuineIntel, Family: 6, Model: 106, Stepping: 6},
+			fcLocal: "1.16.1",
+		},
+		{
+			name:    "T2 snapshot restores on a same-model different-stepping host",
+			compat:  t2CLSnapshot,
+			local:   CPUIdentity{Vendor: VendorGenuineIntel, Family: 6, Model: 85, Stepping: 4},
+			fcLocal: "1.16.1",
+		},
+		{
+			name:    "T2 snapshot rejected on a host outside the allowlist",
+			compat:  t2CLSnapshot,
+			local:   amdTurin,
+			fcLocal: "1.16.1",
+			wantErr: ErrCPUIncompatible,
+		},
+		{
+			name:    "T2 snapshot rejected on same vendor/family/model but unlisted stepping",
+			compat:  t2CLSnapshot,
+			local:   CPUIdentity{Vendor: VendorGenuineIntel, Family: 6, Model: 85, Stepping: 5},
+			fcLocal: "1.16.1",
+			wantErr: ErrCPUIncompatible,
+		},
+		{
+			name:    "T2A snapshot restores on Milan",
+			compat:  SnapshotCompatibility{Vendor: VendorAuthenticAMD, CPUTemplate: "T2A", FirecrackerVersion: "1.16.1"},
+			local:   CPUIdentity{Vendor: VendorAuthenticAMD, Family: 25, Model: 1, Stepping: 1},
+			fcLocal: "1.16.1",
+		},
+		{
+			name:    "T2A snapshot rejected on Turin",
+			compat:  SnapshotCompatibility{Vendor: VendorAuthenticAMD, CPUFamily: 26, CPUModel: 17, CPUTemplate: "T2A", FirecrackerVersion: "1.16.1"},
+			local:   amdTurin,
+			fcLocal: "1.16.1",
+			wantErr: ErrCPUIncompatible,
+		},
+		{
+			name:    "unmasked snapshot restores on the identical identity",
+			compat:  SnapshotCompatibility{Vendor: VendorAuthenticAMD, CPUFamily: 26, CPUModel: 17, CPUStepping: 0, CPUTemplate: "none", FirecrackerVersion: "1.16.1"},
+			local:   amdTurin,
+			fcLocal: "1.16.1",
+		},
+		{
+			name:    "unmasked snapshot ignores stepping (Phase 1 identity)",
+			compat:  SnapshotCompatibility{Vendor: VendorAuthenticAMD, CPUFamily: 26, CPUModel: 17, CPUStepping: 0, CPUTemplate: "none", FirecrackerVersion: "1.16.1"},
+			local:   CPUIdentity{Vendor: VendorAuthenticAMD, Family: 26, Model: 17, Stepping: 2},
+			fcLocal: "1.16.1",
+		},
+		{
+			name:    "unmasked snapshot rejected on a different model",
+			compat:  SnapshotCompatibility{Vendor: VendorGenuineIntel, CPUFamily: 6, CPUModel: 85, CPUTemplate: "none", FirecrackerVersion: "1.16.1"},
+			local:   amdTurin,
+			fcLocal: "1.16.1",
+			wantErr: ErrCPUIncompatible,
+		},
+		{
+			name:    "firecracker version gate fires before the CPU tier",
+			compat:  t2CLSnapshot,
+			local:   intelCL,
+			fcLocal: "1.17.0",
+			wantErr: ErrFirecrackerVersionMismatch,
+		},
+		{
+			name:    "unknown template row for an unmatched version",
+			compat:  SnapshotCompatibility{Vendor: VendorGenuineIntel, CPUTemplate: "T2", FirecrackerVersion: "9.9.9"},
+			local:   intelCL,
+			fcLocal: "9.9.9",
+			wantErr: ErrUnknownCPUTemplate,
+		},
+		{
+			name:    "legacy manifest reports the legacy sentinel",
+			compat:  SnapshotCompatibility{},
+			local:   intelCL,
+			fcLocal: "1.16.1",
+			wantErr: ErrLegacyCompatibility,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := MatchRestoreCompatibility(test.compat, test.local, test.fcLocal)
+			if test.wantErr == nil {
+				if err != nil {
+					t.Fatalf("MatchRestoreCompatibility() = %v, want nil", err)
+				}
+				return
+			}
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("MatchRestoreCompatibility() = %v, want %v", err, test.wantErr)
+			}
+		})
 	}
 }
 

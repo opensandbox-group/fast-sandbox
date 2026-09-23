@@ -90,6 +90,10 @@ type Driver struct {
 	// snapshot staging capacity gate (tests shorten it; 0 selects the
 	// default).
 	snapshotCapacityWait time.Duration
+	// fcVersion caches the local Firecracker binary version, resolved once
+	// for the restore compatibility admission (see restore.go).
+	versionOnce sync.Once
+	fcVersion   string
 }
 
 // defaultImageGCInterval bounds the image cache by usage without coupling GC
@@ -510,6 +514,12 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// before snapshot/load is rejected).
 	if err == nil {
 		err = validateRestoreMachineConfig(spec, d.config, stateRoot, restoreRef)
+	}
+	// Compatibility admission before any staging: a snapshot whose CPU
+	// provenance or Firecracker version mismatches this node must fail with
+	// a structured error, not at snapshot/load with an MSR/XSTATE fault.
+	if err == nil {
+		err = d.validateRestoreCompatibility(stateRoot, restoreRef)
 	}
 	var instanceRootfs, jailRoot, apiAddress string
 	if err == nil {

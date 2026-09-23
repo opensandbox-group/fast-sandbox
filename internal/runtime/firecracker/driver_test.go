@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 	infracatalog "fast-sandbox/internal/catalog/infra"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
@@ -860,6 +861,58 @@ func TestValidateRestoreMachineConfigFallsBackWithoutManifest(t *testing.T) {
 
 	require.NoError(t, validateRestoreMachineConfig(fastletapi.SandboxSpec{CPU: "2", Memory: "1Gi"}, config, stateRoot, image))
 	require.ErrorIs(t, validateRestoreMachineConfig(fastletapi.SandboxSpec{CPU: "not-a-quantity"}, config, stateRoot, image), ErrInvalidConfig)
+}
+
+// TestCheckRestoreCompatibility: the driver-side admission reads the cached
+// manifest compatibility, admits a legacy manifest with a warning, and
+// rejects an incompatible node with ErrIncompatibleArtifact.
+func TestCheckRestoreCompatibility(t *testing.T) {
+	stateRoot := t.TempDir()
+	image := "example.com/app:v1"
+	dir := filepath.Join(stateRoot, imageCacheDir, imageKey(image))
+	require.NoError(t, os.MkdirAll(dir, 0o750))
+
+	// Structured compatibility decodes cleanly.
+	manifest, err := json.Marshal(map[string]any{
+		"compatibility": map[string]any{
+			"vendor":             "AuthenticAMD",
+			"cpuFamily":          26,
+			"cpuModel":           17,
+			"cpuTemplate":        "none",
+			"firecrackerVersion": "1.16.1",
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), manifest, 0o640))
+
+	compat, ok, err := readCachedManifestCompatibility(stateRoot, image)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "none", compat.CPUTemplate)
+
+	// Same identity as the snapshot: admitted.
+	local := artifacts.CPUIdentity{Vendor: artifacts.VendorAuthenticAMD, Family: 26, Model: 17}
+	require.NoError(t, checkRestoreCompatibility(compat, ok, local, "1.16.1", image))
+
+	// A different identity is rejected before staging.
+	err = checkRestoreCompatibility(compat, ok,
+		artifacts.CPUIdentity{Vendor: artifacts.VendorGenuineIntel, Family: 6, Model: 85}, "1.16.1", image)
+	require.ErrorIs(t, err, ErrIncompatibleArtifact)
+
+	// A pre-structured manifest (string cpuModel) cannot decode into the
+	// structured shape and is treated as legacy: admitted with a warning.
+	legacy, err := json.Marshal(map[string]any{
+		"compatibility": map[string]any{
+			"firecrackerVersion": "1.16.1",
+			"cpuModel":           "Intel(R) Xeon(R) Platinum 8163 CPU @ 2.50GHz",
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), legacy, 0o640))
+	_, ok, err = readCachedManifestCompatibility(stateRoot, image)
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.NoError(t, checkRestoreCompatibility(artifacts.SnapshotCompatibility{}, ok, local, "1.16.1", image))
 }
 
 func TestResolveRestoreSnapshotFilesRequiresBothArtifacts(t *testing.T) {

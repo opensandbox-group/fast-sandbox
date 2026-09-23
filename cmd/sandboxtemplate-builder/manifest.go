@@ -97,6 +97,7 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 		"vendor":             identity.Vendor,
 		"cpuFamily":          identity.Family,
 		"cpuModel":           identity.Model,
+		"cpuStepping":        identity.Stepping,
 		"cpuModelName":       identity.ModelName,
 		"cpuTemplate":        compatibilityCPUTemplate(cpuTemplate),
 		"firecrackerVersion": artifacts.FirecrackerVersion(firecrackerBin),

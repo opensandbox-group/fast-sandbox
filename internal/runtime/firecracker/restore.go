@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/klog/v2"
 
 	"fast-sandbox/internal/artifacts"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
@@ -149,6 +150,76 @@ func validateRestoreMachineConfig(spec fastletapi.SandboxSpec, config runtimecat
 		}
 	}
 	return nil
+}
+
+// ErrIncompatibleArtifact reports a snapshot whose compatibility (CPU
+// provenance or Firecracker version) cannot be restored on this node; the
+// error chain names the failing dimension. See artifacts.MatchRestoreCompatibility.
+var ErrIncompatibleArtifact = errors.New("snapshot incompatible with this node")
+
+// readCachedManifestCompatibility loads the compatibility block from the
+// cached manifest. It reports false for manifests without the structured
+// fields (published before the builder recorded CPU provenance, or
+// hand-seeded caches), and also treats an undecodable block as absent: pre-
+// structured manifests carry a string cpuModel that cannot decode into the
+// structured shape.
+func readCachedManifestCompatibility(stateRoot, image string) (artifacts.SnapshotCompatibility, bool, error) {
+	payload, err := os.ReadFile(cachedManifestPath(stateRoot, image))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return artifacts.SnapshotCompatibility{}, false, nil
+		}
+		return artifacts.SnapshotCompatibility{}, false, err
+	}
+	var document struct {
+		Compatibility artifacts.SnapshotCompatibility `json:"compatibility"`
+	}
+	if err := json.Unmarshal(payload, &document); err != nil {
+		return artifacts.SnapshotCompatibility{}, false, nil
+	}
+	compat := document.Compatibility
+	if compat.Vendor == "" && compat.CPUTemplate == "" {
+		return artifacts.SnapshotCompatibility{}, false, nil
+	}
+	return compat, true, nil
+}
+
+// checkRestoreCompatibility is the restore-admission core: fail fast on an
+// incompatible artifact before any snapshot file is staged. A legacy
+// manifest is admitted with a warning (OSEP-0024 Phase 1 backward
+// compatibility); everything else defers to the tiered matcher.
+func checkRestoreCompatibility(compat artifacts.SnapshotCompatibility, hasCompat bool, local artifacts.CPUIdentity, localFirecrackerVersion, image string) error {
+	if !hasCompat {
+		klog.InfoS("cached manifest carries no structured compatibility; admitting restore without CPU checks",
+			"image", image)
+		return nil
+	}
+	if err := artifacts.MatchRestoreCompatibility(compat, local, localFirecrackerVersion); err != nil {
+		if errors.Is(err, artifacts.ErrLegacyCompatibility) {
+			klog.InfoS("cached manifest compatibility is legacy; admitting restore without CPU checks", "image", image)
+			return nil
+		}
+		return fmt.Errorf("%w: %w", ErrIncompatibleArtifact, err)
+	}
+	return nil
+}
+
+// firecrackerVersion resolves the local VMM binary version once; admission
+// needs it on every Create and the exec is not free.
+func (d *Driver) firecrackerVersion() string {
+	d.versionOnce.Do(func() { d.fcVersion = artifacts.FirecrackerVersion(d.config.BinaryPath) })
+	return d.fcVersion
+}
+
+// validateRestoreCompatibility admits a restore only if the cached
+// manifest's compatibility block matches this node (tiered match: template
+// allowlist for masked snapshots, identity equality for unmasked ones).
+func (d *Driver) validateRestoreCompatibility(stateRoot, image string) error {
+	compat, ok, err := readCachedManifestCompatibility(stateRoot, image)
+	if err != nil {
+		return err
+	}
+	return checkRestoreCompatibility(compat, ok, artifacts.HostCPUIdentity(), d.firecrackerVersion(), image)
 }
 
 // machineVCPUs parses the manifest vcpu quantity into a vCPU count.

@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -173,15 +175,23 @@ func HostKernelRelease() string {
 	return strings.TrimSpace(string(output))
 }
 
+// CPU vendors as they appear in /proc/cpuinfo vendor_id.
+const (
+	VendorGenuineIntel = "GenuineIntel"
+	VendorAuthenticAMD = "AuthenticAMD"
+)
+
 // CPUIdentity is the structured CPU identity of the host that produced an
 // artifact set. Vendor/family/model is the CPUID identity snapshots must be
 // matched against before a restore (8163 and 8269CY share family 6 model
-// 85); ModelName is the /proc/cpuinfo marketing string, display-only. Family
-// and model are 0 with vendor "unknown" when the host CPU cannot be read.
+// 85); Stepping distinguishes the entries of a static-template allowlist;
+// ModelName is the /proc/cpuinfo marketing string, display-only. Numeric
+// fields are 0 with vendor "unknown" when the host CPU cannot be read.
 type CPUIdentity struct {
 	Vendor    string `json:"vendor"`
 	Family    int    `json:"cpuFamily"`
 	Model     int    `json:"cpuModel"`
+	Stepping  int    `json:"cpuStepping"`
 	ModelName string `json:"cpuModelName"`
 }
 
@@ -195,9 +205,9 @@ func HostCPUIdentity() CPUIdentity {
 	return parseCPUIdentity(payload)
 }
 
-// parseCPUIdentity extracts the vendor_id / cpu family / model / model name
-// of the first processor block from /proc/cpuinfo content. Unparsable
-// numeric fields stay 0 and a missing vendor reports "unknown".
+// parseCPUIdentity extracts the vendor_id / cpu family / model / stepping /
+// model name of the first processor block from /proc/cpuinfo content.
+// Unparsable numeric fields stay 0 and a missing vendor reports "unknown".
 func parseCPUIdentity(payload []byte) CPUIdentity {
 	identity := CPUIdentity{Vendor: unknownProvenanceValue}
 	for _, line := range strings.Split(string(payload), "\n") {
@@ -219,6 +229,10 @@ func parseCPUIdentity(payload []byte) CPUIdentity {
 			if identity.Model == 0 {
 				identity.Model, _ = strconv.Atoi(value)
 			}
+		case "stepping":
+			if identity.Stepping == 0 {
+				identity.Stepping, _ = strconv.Atoi(value)
+			}
 		case "model name":
 			if identity.ModelName == "" {
 				identity.ModelName = value
@@ -226,6 +240,107 @@ func parseCPUIdentity(payload []byte) CPUIdentity {
 		}
 	}
 	return identity
+}
+
+// SnapshotCompatibility mirrors the manifest compatibility block (see
+// docs/guides/artifact-manifest-reference.md): the CPU provenance of a
+// snapshot set plus its capture environment. Manifests produced before the
+// structured fields leave the zero-ish shape (empty Vendor and CPUTemplate).
+type SnapshotCompatibility struct {
+	Vendor             string `json:"vendor"`
+	CPUFamily          int    `json:"cpuFamily"`
+	CPUModel           int    `json:"cpuModel"`
+	CPUStepping        int    `json:"cpuStepping"`
+	CPUModelName       string `json:"cpuModelName"`
+	CPUTemplate        string `json:"cpuTemplate"`
+	FirecrackerVersion string `json:"firecrackerVersion"`
+	HostKernel         string `json:"hostKernel"`
+}
+
+// fms is one allowlist entry: the exact CPUID identity (vendor plus the full
+// family/model/stepping triple) a static template is permitted on. The
+// entries mirror the pinned Firecracker release; a new VMM version adds its
+// own row instead of mutating this one, because admission requires manifest
+// and node versions to be equal before the table is consulted.
+var cpuTemplateAllowlists = map[string]map[string][]fms{
+	"1.16.1": {
+		"T2": {
+			{vendor: VendorGenuineIntel, family: 6, model: 85, stepping: 4},  // Skylake-SP
+			{vendor: VendorGenuineIntel, family: 6, model: 85, stepping: 7},  // Cascade Lake-SP
+			{vendor: VendorGenuineIntel, family: 6, model: 106, stepping: 6}, // Ice Lake-SP
+		},
+		"T2A": {
+			{vendor: VendorAuthenticAMD, family: 25, model: 1, stepping: 1}, // EPYC Milan
+		},
+	},
+}
+
+type fms struct {
+	vendor   string
+	family   int
+	model    int
+	stepping int
+}
+
+func (m fms) String() string {
+	return fmt.Sprintf("%s family %d model %d stepping %d", m.vendor, m.family, m.model, m.stepping)
+}
+
+// Admission errors returned by MatchRestoreCompatibility. A legacy manifest
+// (ErrLegacyCompatibility) is admitted with a warning by the caller; the
+// rest reject the restore.
+var (
+	ErrLegacyCompatibility        = errors.New("manifest carries no structured compatibility")
+	ErrFirecrackerVersionMismatch = errors.New("firecracker version mismatch")
+	ErrUnknownCPUTemplate         = errors.New("unknown cpu template")
+	ErrCPUIncompatible            = errors.New("snapshot CPU incompatible with this node")
+)
+
+// MatchRestoreCompatibility decides whether a node may restore a snapshot
+// whose manifest compatibility is compat. The tiered contract:
+//
+//   - a template-masked snapshot ("T2"/"T2A") restores on any CPU in that
+//     template's allowlist for the recorded Firecracker version — the mask
+//     normalizes the guest CPUID, so build-host identity equality is not
+//     required;
+//   - an unmasked snapshot (cpuTemplate "none") restores only on nodes with
+//     the identical vendor/family/model identity (stepping is recorded but
+//     deliberately not compared, matching the OSEP-0024 Phase 1 identity);
+//   - a legacy manifest without structured fields reports
+//     ErrLegacyCompatibility and is the caller's decision to admit.
+//
+// The manifest and node Firecracker versions must be equal in every tier:
+// the allowlist table is per version, and cross-version vmstate restores
+// are unsupported anyway.
+func MatchRestoreCompatibility(compat SnapshotCompatibility, local CPUIdentity, localFirecrackerVersion string) error {
+	if compat.CPUTemplate == "" && compat.Vendor == "" {
+		return ErrLegacyCompatibility
+	}
+	if compat.FirecrackerVersion != localFirecrackerVersion {
+		return fmt.Errorf("%w: snapshot built with %q, node runs %q", ErrFirecrackerVersionMismatch, compat.FirecrackerVersion, localFirecrackerVersion)
+	}
+	switch compat.CPUTemplate {
+	case "T2", "T2A":
+		allowlist, ok := cpuTemplateAllowlists[compat.FirecrackerVersion][compat.CPUTemplate]
+		if !ok {
+			return fmt.Errorf("%w: %q has no %q allowlist row", ErrUnknownCPUTemplate, compat.FirecrackerVersion, compat.CPUTemplate)
+		}
+		localFMS := fms{vendor: local.Vendor, family: local.Family, model: local.Model, stepping: local.Stepping}
+		for _, entry := range allowlist {
+			if entry == localFMS {
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: template %q permits %v, node is %s", ErrCPUIncompatible, compat.CPUTemplate, allowlist, localFMS)
+	case "", "none":
+		if compat.Vendor == local.Vendor && compat.CPUFamily == local.Family && compat.CPUModel == local.Model {
+			return nil
+		}
+		return fmt.Errorf("%w: unmasked snapshot identity is %s family %d model %d, node is %s family %d model %d",
+			ErrCPUIncompatible, compat.Vendor, compat.CPUFamily, compat.CPUModel, local.Vendor, local.Family, local.Model)
+	default:
+		return fmt.Errorf("%w: %q", ErrUnknownCPUTemplate, compat.CPUTemplate)
+	}
 }
 
 // SizeGiB rounds a byte size up to whole GiB, minimum one. It matches the
