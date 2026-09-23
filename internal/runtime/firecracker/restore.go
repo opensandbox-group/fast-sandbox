@@ -194,7 +194,7 @@ func checkRestoreCompatibility(compat artifacts.SnapshotCompatibility, hasCompat
 			klog.InfoS("cached manifest compatibility is legacy; admitting restore without CPU checks", "image", image)
 			return nil
 		}
-		klog.WarningS("restore compatibility admission rejected", "image", image, "reason", err)
+		klog.ErrorS(err, "restore compatibility admission rejected", "image", image)
 		return fmt.Errorf("%w: %w", ErrIncompatibleArtifact, err)
 	}
 	return nil
