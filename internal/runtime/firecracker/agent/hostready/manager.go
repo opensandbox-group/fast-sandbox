@@ -2,10 +2,13 @@ package hostready
 
 import (
 	"context"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"k8s.io/klog/v2"
+
+	"fast-sandbox/internal/artifacts"
 )
 
 // DefaultInterval is the recheck cadence: frequent enough to pull the
@@ -128,8 +131,13 @@ func (m *Manager) pass(ctx context.Context) {
 	}
 	report := RunChecks(m.current.Check, m.config.Probes)
 	if m.reconciler != nil {
-		if err := m.reconciler.Apply(ctx, report); err != nil {
-			klog.ErrorS(err, "node readiness convergence failed", "ready", report.Ready)
+		// The CPU tier is a fact of hardware + the installed binary;
+		// resolved every pass so a first-pass asset install is reflected.
+		cpuTemplate := artifacts.CompatibilityCPUTemplate(
+			artifacts.FirecrackerVersion(filepath.Join(m.current.Check.AssetsDir, assetFirecracker)),
+			artifacts.HostCPUIdentity())
+		if err := m.reconciler.Apply(ctx, report, cpuTemplate); err != nil {
+			klog.ErrorS(err, "node readiness convergence failed", "ready", report.Ready, "cpuTemplate", cpuTemplate)
 		}
 	}
 	m.mu.Lock()

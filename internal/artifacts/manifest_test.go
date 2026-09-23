@@ -5,6 +5,30 @@ import (
 	"testing"
 )
 
+// TestCompatibilityCPUTemplate: the node-side tier resolution behind the
+// scheduling label — allowlist membership maps to the template, everything
+// else (Turin, an unknown version) lands on "none".
+func TestCompatibilityCPUTemplate(t *testing.T) {
+	tests := []struct {
+		name     string
+		version  string
+		identity CPUIdentity
+		want     string
+	}{
+		{name: "cascade lake", version: "1.16.1", identity: CPUIdentity{Vendor: VendorGenuineIntel, Family: 6, Model: 85, Stepping: 7}, want: "T2"},
+		{name: "ice lake", version: "1.16.1", identity: CPUIdentity{Vendor: VendorGenuineIntel, Family: 6, Model: 106, Stepping: 6}, want: "T2"},
+		{name: "milan", version: "1.16.1", identity: CPUIdentity{Vendor: VendorAuthenticAMD, Family: 25, Model: 1, Stepping: 1}, want: "T2A"},
+		{name: "turin", version: "1.16.1", identity: CPUIdentity{Vendor: VendorAuthenticAMD, Family: 26, Model: 17}, want: "none"},
+		{name: "skylake wrong stepping", version: "1.16.1", identity: CPUIdentity{Vendor: VendorGenuineIntel, Family: 6, Model: 85, Stepping: 5}, want: "none"},
+		{name: "unknown version", version: "9.9.9", identity: CPUIdentity{Vendor: VendorGenuineIntel, Family: 6, Model: 85, Stepping: 7}, want: "none"},
+	}
+	for _, test := range tests {
+		if got := CompatibilityCPUTemplate(test.version, test.identity); got != test.want {
+			t.Fatalf("%s: CompatibilityCPUTemplate = %q, want %q", test.name, got, test.want)
+		}
+	}
+}
+
 // TestParseFirecrackerVersion: both historical output shapes parse — the
 // attached "v1.16.1" token (current releases) and the bare "v" token
 // followed by the version (older releases).

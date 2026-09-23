@@ -278,6 +278,22 @@ var cpuTemplateAllowlists = map[string]map[string][]fms{
 	},
 }
 
+// CompatibilityCPUTemplate reports which template tier the identity
+// supports under the given Firecracker version: "T2", "T2A", or "none"
+// (only identity-matched unmasked snapshots). An unknown version yields
+// "none".
+func CompatibilityCPUTemplate(version string, identity CPUIdentity) string {
+	entry := fms{vendor: identity.Vendor, family: identity.Family, model: identity.Model, stepping: identity.Stepping}
+	for template, allowlist := range cpuTemplateAllowlists[version] {
+		for _, candidate := range allowlist {
+			if candidate == entry {
+				return template
+			}
+		}
+	}
+	return "none"
+}
+
 // Admission errors from MatchRestoreCompatibility: legacy is admitted with
 // a warning by the caller, the rest reject the restore.
 var (

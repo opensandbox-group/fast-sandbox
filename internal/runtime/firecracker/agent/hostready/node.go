@@ -22,8 +22,12 @@ const (
 	// SandboxTemplate builder schedules on it).
 	LabelKVM = "sandbox.fast.io/kvm"
 	// LabelFirecrackerNode marks the node as ready for firecracker
-	// fastlet pods (pools nodeSelector onto it).
+	// fastlets (pools nodeSelector onto it).
 	LabelFirecrackerNode = "fast-sandbox.io/firecracker-node"
+	// LabelCPUTemplate marks which snapshot CPU template tier the node
+	// restores: "T2", "T2A", or "none" (identity-matched unmasked
+	// snapshots only). See docs/guides/snapshot-cpu-compatibility.md.
+	LabelCPUTemplate = "sandbox.fast.io/cpu-template"
 	// ConditionFirecrackerReady is the Node condition reporting the last
 	// check pass (True when ready, False with the failing summary).
 	ConditionFirecrackerReady = "FirecrackerReady"
@@ -73,13 +77,15 @@ func NewNodeReconciler(client NodeClient, nodeName string) *NodeReconciler {
 	return &NodeReconciler{client: client, nodeName: nodeName}
 }
 
-// Apply converges labels + condition onto the report outcome.
-func (r *NodeReconciler) Apply(ctx context.Context, report Report) error {
+// Apply converges labels + condition onto the report outcome. cpuTemplate
+// is the node's compatibility tier ("T2"/"T2A"/"none") for the
+// LabelCPUTemplate scheduling label; empty removes the label.
+func (r *NodeReconciler) Apply(ctx context.Context, report Report, cpuTemplate string) error {
 	node, err := r.client.GetNode(ctx, r.nodeName)
 	if err != nil {
 		return fmt.Errorf("get node %s: %w", r.nodeName, err)
 	}
-	if patch := labelPatch(node, report.Ready); patch != nil {
+	if patch := labelPatch(node, report.Ready, cpuTemplate); patch != nil {
 		if err := r.client.PatchNode(ctx, r.nodeName, patch); err != nil {
 			return fmt.Errorf("patch node %s labels: %w", r.nodeName, err)
 		}
@@ -95,14 +101,18 @@ func (r *NodeReconciler) Apply(ctx context.Context, report Report) error {
 // labelPatch returns the metadata patch moving the labels to the desired
 // state, or nil when they already match. Removal uses a null value (the
 // strategic merge delete form).
-func labelPatch(node *corev1.Node, ready bool) []byte {
+func labelPatch(node *corev1.Node, ready bool, cpuTemplate string) []byte {
 	desired := map[string]string{
 		LabelKVM:             "",
 		LabelFirecrackerNode: "",
+		LabelCPUTemplate:     "",
 	}
 	if ready {
 		desired[LabelKVM] = "true"
 		desired[LabelFirecrackerNode] = "true"
+		if cpuTemplate != "" {
+			desired[LabelCPUTemplate] = cpuTemplate
+		}
 	}
 	labels := map[string]interface{}{}
 	changed := false

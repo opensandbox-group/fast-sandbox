@@ -7,8 +7,11 @@
 #      node readiness loop (the kata-deploy pattern): host checks,
 #      Firecracker asset install, the scheduling labels
 #      (sandbox.fast.io/kvm + fast-sandbox.io/firecracker-node) and the
-#      FirecrackerReady condition. scripts/firecracker-host-check.sh runs
-#      the same checks standalone.
+#      FirecrackerReady condition, plus the snapshot CPU compatibility
+#      label sandbox.fast.io/cpu-template (T2 / T2A / none — which golden
+#      snapshot tiers the node restores; see
+#      docs/guides/snapshot-cpu-compatibility.md). scripts/
+#      firecracker-host-check.sh runs the same checks standalone.
 #   2. janitor — sweeps orphaned node resources: fastlet network state
 #      (netns/tap/veth), boxlite leftovers, and leaked VMM processes
 #      fastlets delegate over the node-cleanup UDS socket (needs the pod's
