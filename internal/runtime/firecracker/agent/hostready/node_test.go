@@ -83,7 +83,7 @@ func notReadyReport() Report {
 func TestReconcilerLabelsAndConditionOnReady(t *testing.T) {
 	client := &fakeNodeClient{node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}}
 	reconciler := NewNodeReconciler(client, "node-1")
-	if err := reconciler.Apply(context.Background(), readyReport(), "T2"); err != nil {
+	if err := reconciler.Apply(context.Background(), readyReport(), "T2", ""); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	if len(client.labelPatches) != 1 || len(client.statusPatches) != 1 {
@@ -99,10 +99,10 @@ func TestReconcilerIdempotentOnUnchangedState(t *testing.T) {
 	client := &fakeNodeClient{node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}}
 	reconciler := NewNodeReconciler(client, "node-1")
 	report := readyReport()
-	if err := reconciler.Apply(context.Background(), report, "T2"); err != nil {
+	if err := reconciler.Apply(context.Background(), report, "T2", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := reconciler.Apply(context.Background(), report, "T2"); err != nil {
+	if err := reconciler.Apply(context.Background(), report, "T2", ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(client.labelPatches) != 1 || len(client.statusPatches) != 1 {
@@ -121,7 +121,7 @@ func TestReconcilerRemovesLabelsOnDegradation(t *testing.T) {
 		LastTransitionTime: metav1.NewTime(time.Now().Add(-time.Hour)),
 	}}
 	reconciler := NewNodeReconciler(client, "node-1")
-	if err := reconciler.Apply(context.Background(), notReadyReport(), "T2"); err != nil {
+	if err := reconciler.Apply(context.Background(), notReadyReport(), "T2", ""); err != nil {
 		t.Fatal(err)
 	}
 	if len(client.labelPatches) != 1 {
@@ -177,18 +177,21 @@ func TestReconcilerCPUCompatibilityLabel(t *testing.T) {
 	client := &fakeNodeClient{node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}}
 	reconciler := NewNodeReconciler(client, "node-1")
 
-	if err := reconciler.Apply(context.Background(), readyReport(), "T2A"); err != nil {
+	if err := reconciler.Apply(context.Background(), readyReport(), "none", "AuthenticAMD-26-17"); err != nil {
 		t.Fatal(err)
 	}
-	if got := client.node.Labels[LabelCPUTemplate]; got != "T2A" {
-		t.Fatalf("cpu-template label = %q, want T2A", got)
+	if got := client.node.Labels[LabelCPUTemplate]; got != "none" {
+		t.Fatalf("cpu-template label = %q, want none", got)
+	}
+	if got := client.node.Labels[LabelCPUIdentity]; got != "AuthenticAMD-26-17" {
+		t.Fatalf("cpu-identity label = %q, want AuthenticAMD-26-17", got)
 	}
 
-	if err := reconciler.Apply(context.Background(), notReadyReport(), "T2A"); err != nil {
+	if err := reconciler.Apply(context.Background(), notReadyReport(), "none", "AuthenticAMD-26-17"); err != nil {
 		t.Fatal(err)
 	}
-	if patch := string(client.labelPatches[len(client.labelPatches)-1]); !containsAll(patch, `"sandbox.fast.io/cpu-template":null`) {
-		t.Fatalf("the degraded patch must null the cpu-template label: %s", patch)
+	if patch := string(client.labelPatches[len(client.labelPatches)-1]); !containsAll(patch, `"sandbox.fast.io/cpu-template":null`, `"sandbox.fast.io/cpu-identity":null`) {
+		t.Fatalf("the degraded patch must null the cpu labels: %s", patch)
 	}
 
 	// A stale tier on an already-ready node (e.g. the binary version became
@@ -197,11 +200,24 @@ func TestReconcilerCPUCompatibilityLabel(t *testing.T) {
 		LabelKVM: "true", LabelFirecrackerNode: "true", LabelCPUTemplate: "T2A",
 	}}}}
 	staleReconciler := NewNodeReconciler(stale, "node-1")
-	if err := staleReconciler.Apply(context.Background(), readyReport(), ""); err != nil {
+	if err := staleReconciler.Apply(context.Background(), readyReport(), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if patch := string(stale.labelPatches[len(stale.labelPatches)-1]); !containsAll(patch, `"sandbox.fast.io/cpu-template":null`) {
 		t.Fatalf("an unknown tier must null a stale cpu-template label: %s", patch)
+	}
+
+	// A template-tier node loses a stale identity label: the allowlist, not
+	// the identity, decides what it restores.
+	template := &fakeNodeClient{node: &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1", Labels: map[string]string{
+		LabelKVM: "true", LabelFirecrackerNode: "true", LabelCPUTemplate: "T2A", LabelCPUIdentity: "AuthenticAMD-25-1",
+	}}}}
+	templateReconciler := NewNodeReconciler(template, "node-1")
+	if err := templateReconciler.Apply(context.Background(), readyReport(), "T2A", ""); err != nil {
+		t.Fatal(err)
+	}
+	if patch := string(template.labelPatches[len(template.labelPatches)-1]); !containsAll(patch, `"sandbox.fast.io/cpu-identity":null`) {
+		t.Fatalf("a template-tier node must null a stale cpu-identity label: %s", patch)
 	}
 }
 

@@ -294,6 +294,16 @@ func CompatibilityCPUTemplate(version string, identity CPUIdentity) string {
 	return "none"
 }
 
+// CPUIdentityLabel renders the identity for a node scheduling label
+// ("vendor-family-model", the none-tier match key); empty when the vendor
+// is unknown.
+func CPUIdentityLabel(identity CPUIdentity) string {
+	if identity.Vendor == "" || identity.Vendor == unknownProvenanceValue {
+		return ""
+	}
+	return fmt.Sprintf("%s-%d-%d", identity.Vendor, identity.Family, identity.Model)
+}
+
 // Admission errors from MatchRestoreCompatibility: legacy is admitted with
 // a warning by the caller, the rest reject the restore.
 var (

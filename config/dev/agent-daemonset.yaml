@@ -8,8 +8,9 @@
 #      Firecracker asset install, the scheduling labels
 #      (sandbox.fast.io/kvm + fast-sandbox.io/firecracker-node) and the
 #      FirecrackerReady condition, plus the snapshot CPU compatibility
-#      label sandbox.fast.io/cpu-template (T2 / T2A / none — which golden
-#      snapshot tiers the node restores; see
+#      labels sandbox.fast.io/cpu-template (T2 / T2A / none — which golden
+#      snapshot tiers the node restores) and, on none-tier nodes,
+#      sandbox.fast.io/cpu-identity (vendor-family-model; see
 #      docs/guides/snapshot-cpu-compatibility.md). scripts/
 #      firecracker-host-check.sh runs the same checks standalone.
 #   2. janitor — sweeps orphaned node resources: fastlet network state

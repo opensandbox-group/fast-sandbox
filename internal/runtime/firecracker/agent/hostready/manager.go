@@ -133,10 +133,15 @@ func (m *Manager) pass(ctx context.Context) {
 	if m.reconciler != nil {
 		// The CPU tier is a fact of hardware + the installed binary;
 		// resolved every pass so a first-pass asset install is reflected.
+		identity := artifacts.HostCPUIdentity()
 		cpuTemplate := artifacts.CompatibilityCPUTemplate(
 			artifacts.FirecrackerVersion(filepath.Join(m.current.Check.AssetsDir, assetFirecracker)),
-			artifacts.HostCPUIdentity())
-		if err := m.reconciler.Apply(ctx, report, cpuTemplate); err != nil {
+			identity)
+		cpuIdentity := ""
+		if cpuTemplate == "none" {
+			cpuIdentity = artifacts.CPUIdentityLabel(identity)
+		}
+		if err := m.reconciler.Apply(ctx, report, cpuTemplate, cpuIdentity); err != nil {
 			klog.ErrorS(err, "node readiness convergence failed", "ready", report.Ready, "cpuTemplate", cpuTemplate)
 		}
 	}

@@ -28,6 +28,10 @@ const (
 	// restores: "T2", "T2A", or "none" (identity-matched unmasked
 	// snapshots only). See docs/guides/snapshot-cpu-compatibility.md.
 	LabelCPUTemplate = "sandbox.fast.io/cpu-template"
+	// LabelCPUIdentity carries the vendor-family-model identity of a
+	// "none"-tier node — the scheduling key for unmasked snapshots. Set
+	// only alongside LabelCPUTemplate: "none".
+	LabelCPUIdentity = "sandbox.fast.io/cpu-identity"
 	// ConditionFirecrackerReady is the Node condition reporting the last
 	// check pass (True when ready, False with the failing summary).
 	ConditionFirecrackerReady = "FirecrackerReady"
@@ -79,13 +83,14 @@ func NewNodeReconciler(client NodeClient, nodeName string) *NodeReconciler {
 
 // Apply converges labels + condition onto the report outcome. cpuTemplate
 // is the node's compatibility tier ("T2"/"T2A"/"none") for the
-// LabelCPUTemplate scheduling label; empty removes the label.
-func (r *NodeReconciler) Apply(ctx context.Context, report Report, cpuTemplate string) error {
+// LabelCPUTemplate scheduling label; empty removes the label. cpuIdentity
+// (vendor-family-model) accompanies it on "none" nodes.
+func (r *NodeReconciler) Apply(ctx context.Context, report Report, cpuTemplate, cpuIdentity string) error {
 	node, err := r.client.GetNode(ctx, r.nodeName)
 	if err != nil {
 		return fmt.Errorf("get node %s: %w", r.nodeName, err)
 	}
-	if patch := labelPatch(node, report.Ready, cpuTemplate); patch != nil {
+	if patch := labelPatch(node, report.Ready, cpuTemplate, cpuIdentity); patch != nil {
 		if err := r.client.PatchNode(ctx, r.nodeName, patch); err != nil {
 			return fmt.Errorf("patch node %s labels: %w", r.nodeName, err)
 		}
@@ -101,17 +106,21 @@ func (r *NodeReconciler) Apply(ctx context.Context, report Report, cpuTemplate s
 // labelPatch returns the metadata patch moving the labels to the desired
 // state, or nil when they already match. Removal uses a null value (the
 // strategic merge delete form).
-func labelPatch(node *corev1.Node, ready bool, cpuTemplate string) []byte {
+func labelPatch(node *corev1.Node, ready bool, cpuTemplate, cpuIdentity string) []byte {
 	desired := map[string]string{
 		LabelKVM:             "",
 		LabelFirecrackerNode: "",
 		LabelCPUTemplate:     "",
+		LabelCPUIdentity:     "",
 	}
 	if ready {
 		desired[LabelKVM] = "true"
 		desired[LabelFirecrackerNode] = "true"
 		if cpuTemplate != "" {
 			desired[LabelCPUTemplate] = cpuTemplate
+		}
+		if cpuTemplate == "none" && cpuIdentity != "" {
+			desired[LabelCPUIdentity] = cpuIdentity
 		}
 	}
 	labels := map[string]interface{}{}

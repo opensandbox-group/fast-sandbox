@@ -108,28 +108,36 @@ top-k candidate.
 
 ## Node labels
 
-The `firecracker-runtime` DaemonSet agent stamps one scheduling label on
+The `firecracker-runtime` DaemonSet agent stamps scheduling labels on
 every healthy node (removed while the node is degraded):
 
 ```
-sandbox.fast.io/cpu-template: "T2" | "T2A" | "none"
+sandbox.fast.io/cpu-template:  "T2" | "T2A" | "none"
+sandbox.fast.io/cpu-identity:  "AuthenticAMD-26-17"   # "none" nodes only
 ```
 
-`T2`/`T2A` mean "restores template-masked snapshots of this tier";
-`none` means "restores only identity-matched unmasked snapshots" — the
-identity check itself stays in the admission path, so a `none` label is
-not a pin to a specific image.
+`T2`/`T2A` mean "restores template-masked snapshots of this tier" — the
+allowlist decides what fits, so no identity label is needed. `none`
+means "restores only identity-matched unmasked snapshots", and the
+`cpu-identity` label (`vendor-family-model`, matching the admission's
+none-tier key) says which ones; nodes whose CPU is unreadable get the
+tier but no identity label.
 
 Scheduling examples:
 
 ```yaml
-# Keep golden-image builds on the portable tier (omit for none-tier builds).
+# Keep golden-image builds on the portable tier.
 nodeSelector:
   sandbox.fast.io/cpu-template: "T2"
 
 # A SandboxPool whose template image is tier T2A.
 nodeSelector:
   sandbox.fast.io/cpu-template: "T2A"
+
+# A none-tier image (built on EPYC 9T95) stays on its identity pool.
+nodeSelector:
+  sandbox.fast.io/cpu-template: "none"
+  sandbox.fast.io/cpu-identity: "AuthenticAMD-26-17"
 ```
 
 Mixed pools work without labels: an incompatible candidate is rejected

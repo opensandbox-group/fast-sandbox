@@ -68,6 +68,17 @@ func TestParseCPUIdentityIntel(t *testing.T) {
 	}
 }
 
+// TestCPUIdentityLabel: the scheduling-label rendering of the none-tier
+// identity; an unknown vendor renders empty (no label).
+func TestCPUIdentityLabel(t *testing.T) {
+	if got, want := CPUIdentityLabel(CPUIdentity{Vendor: VendorAuthenticAMD, Family: 26, Model: 17}), "AuthenticAMD-26-17"; got != want {
+		t.Fatalf("CPUIdentityLabel = %q, want %q", got, want)
+	}
+	if got := CPUIdentityLabel(CPUIdentity{Vendor: "unknown"}); got != "" {
+		t.Fatalf("CPUIdentityLabel = %q, want empty", got)
+	}
+}
+
 // TestMatchRestoreCompatibility covers the tiered admission contract: the
 // template allowlist tier, the unmasked identity-equality tier, legacy
 // manifests, and the Firecracker version gate.
