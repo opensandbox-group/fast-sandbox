@@ -4,7 +4,7 @@
 # every readiness pass, so edits here land without a pod restart.
 #
 # Reload semantics per section:
-#   socket/stateRoot/registryConfig/hostnameFile/dart — startup only (they
+#   socket/stateRoot/registryConfig/hostnameFile/p2p — startup only (they
 #     wire long-lived resources; changing them requires a pod restart).
 #   nodeReadiness — hot: thresholds, interval and the asset source apply
 #     on the next recheck pass. A pinned asset install is never silently
@@ -37,17 +37,31 @@ data:
     # Node hostname file (mounted from the node; a pod's own hostname is
     # its pod name).
     hostnameFile: /etc/hostname
-    dart:
-      # Non-empty enables the node-local DART P2P gateway; empty keeps
-      # pulls on the direct S3 path.
-      addr: http://127.0.0.1:8145
-      bin: dart
-      admin: 127.0.0.1:8147
-      cacheSize: 8GiB
-      # Peer discovery via the headless Service; empty = single-node
-      # cache-only mode.
-      discover: dns:dart.fast-sandbox-system.svc.cluster.local:9000
-      # selfID: stable HRW identity; empty = the node hostname file.
+    # Peer-to-peer artifact distribution. Exactly one provider may be
+    # configured; omitting p2p entirely keeps pulls on the direct
+    # header-signed S3 path.
+    p2p:
+      # dart: the node-local DART P2P daemon, orchestrated as a child
+      # process of the agent. A non-empty addr enables it.
+      dart:
+        addr: http://127.0.0.1:8145
+        bin: dart
+        admin: 127.0.0.1:8147
+        cacheSize: 8GiB
+        # Peer discovery via the headless Service; empty = single-node
+        # cache-only mode.
+        discover: dns:dart.fast-sandbox-system.svc.cluster.local:9000
+        # selfID: stable HRW identity; empty = the node hostname file.
+      # gateway: an EXTERNAL P2P gateway that already runs on the node.
+      # When gateway.addr is set, no dart child starts; artifact pulls go
+      # through it with the presign -> GET <addr><routePrefix><url>
+      # contract and the direct-S3 fallback stays. Mutually exclusive
+      # with p2p.dart.addr.
+      # gateway:
+      #   addr: http://127.0.0.1:7500
+      #   # Prefix route in front of presigned upstream URLs; empty =
+      #   # "/dart/" (DART's route).
+      #   routePrefix: /peer-blocks/
     nodeReadiness:
       # The host-check / firecracker-asset-install / node-label loop.
       # Requires FAST_SANDBOX_NODE_NAME (injected by the DaemonSet).

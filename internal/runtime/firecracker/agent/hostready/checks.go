@@ -87,8 +87,8 @@ const (
 )
 
 // stateRootSubdirs is the directory layout the agent and the driver expect
-// under the StateRoot (the pull cache, the DART arenas, the jailer chroot
-// base). Created on every pass; existing dirs are a no-op.
+// under the StateRoot (the pull cache, the P2P block caches, the jailer
+// chroot base). Created on every pass; existing dirs are a no-op.
 var stateRootSubdirs = []string{"images", "cache", "jails"}
 
 // RunChecks executes every host check in order and returns the report.

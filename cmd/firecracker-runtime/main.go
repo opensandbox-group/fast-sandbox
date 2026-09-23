@@ -6,12 +6,14 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -49,8 +51,8 @@ func main() {
 // run assembles the agent. It returns an error when the agent cannot serve.
 // Deferred cleanup (server stop, lease state close) runs only on a normal
 // return — the error path exits via os.Exit(1) in main after a klog.Flush.
-// The DART child stops when its Run goroutine observes the signal context
-// canceled (SIGTERM/SIGINT), not via defer.
+// The dart child (dart mode) stops when its Run goroutine observes the
+// signal context canceled (SIGTERM/SIGINT), not via defer.
 func run() error {
 	klog.InitFlags(nil)
 	flag.Parse()
@@ -73,7 +75,7 @@ func run() error {
 			"path", configPath)
 	}
 	klog.InfoS("agent config loaded", "path", configPath,
-		"dart", config.Dart.Addr, "nodeReadiness", config.NodeReadiness.Enabled)
+		"p2p", config.p2pMode(), "nodeReadiness", config.NodeReadiness.Enabled)
 	socketPath := config.Socket
 	stateRoot := config.StateRoot
 	// The artifact store is read from the mounted fast-sandbox-artifact-store
@@ -84,37 +86,45 @@ func run() error {
 	registryProvider := registryconfig.NewFileProvider(config.RegistryConfig)
 	serviceOptions := []agentserver.ServiceOption{}
 
-	// DART P2P gateway. dart.addr empty = local mode: artifact pulls stay
-	// on the direct header-signed S3 path. Non-empty = the node-local DART
-	// daemon is orchestrated as a child process and artifact bytes route
-	// through its prefix API as presigned URLs (with direct-S3 fallback
-	// when DART is unreachable).
+	// P2P distribution: exactly one of direct S3 (default), the node-local
+	// dart child (p2p.dart.addr) or an external gateway (p2p.gateway.addr)
+	// is active. Artifact bytes always fall back to direct S3 when the
+	// gateway is unreachable.
 	var pullOptions []agentpull.Option
 	var dartManager *agentdart.Manager
-	if config.Dart.Addr != "" {
-		listen, err := dartListenAddress(config.Dart.Addr)
+	var p2pProbe func() bool
+	var gatewayProbers []*gatewayProber
+	if gateway := config.P2P.Gateway; gateway.Addr != "" {
+		pullOptions = append(pullOptions, agentpull.WithPeerGateway(gateway.Addr, gateway.RoutePrefix))
+		prober := newGatewayProber(gateway.Addr)
+		gatewayProbers = append(gatewayProbers, prober)
+		p2pProbe = prober.Healthy
+		klog.InfoS("P2P gateway enabled (external provider)", "addr", gateway.Addr,
+			"routePrefix", gateway.RoutePrefix)
+	} else if config.P2P.Dart.Addr != "" {
+		listen, err := dartListenAddress(config.P2P.Dart.Addr)
 		if err != nil {
 			return err
 		}
 		// A stable identity anchors the HRW keyspace AND names the per-node
 		// block cache: the StateRoot can be shared (multi-node kind mounts
-		// one host filesystem into every node container), but two DART
+		// one host filesystem into every node container), but two dart
 		// arenas must never point at the same directory. The node's
 		// hostname is read from the mounted node hostname file because a
 		// regular pod's own hostname is its pod name, which changes on
 		// restart.
-		nodeID := config.Dart.SelfID
+		nodeID := config.P2P.Dart.SelfID
 		if nodeID == "" {
 			nodeID = nodeHostID(config.HostnameFile)
 		}
 		peerPort := "9000"
 		dartConfig := agentdart.Config{
-			Binary:    config.Dart.Bin,
+			Binary:    config.P2P.Dart.Bin,
 			Listen:    listen,
-			Admin:     config.Dart.Admin,
-			CacheDir:  filepath.Join(stateRoot, "cache", "dart-"+strings.ReplaceAll(nodeID, "/", "-")),
-			CacheSize: config.Dart.CacheSize,
-			Discover:  config.Dart.Discover,
+			Admin:     config.P2P.Dart.Admin,
+			CacheDir:  filepath.Join(stateRoot, "cache", "p2p-"+strings.ReplaceAll(nodeID, "/", "-")),
+			CacheSize: config.P2P.Dart.CacheSize,
+			Discover:  config.P2P.Dart.Discover,
 			SelfID:    nodeID,
 			Log:       os.Stderr,
 		}
@@ -122,8 +132,9 @@ func run() error {
 			dartConfig.PeerAdvertise = net.JoinHostPort(nodeIP, peerPort)
 		}
 		dartManager = agentdart.New(dartConfig)
-		pullOptions = append(pullOptions, agentpull.WithDART(config.Dart.Addr))
-		klog.InfoS("DART P2P gateway enabled", "addr", config.Dart.Addr,
+		pullOptions = append(pullOptions, agentpull.WithPeerGateway(config.P2P.Dart.Addr, ""))
+		p2pProbe = dartManager.Healthy
+		klog.InfoS("P2P gateway enabled (node-local dart)", "addr", config.P2P.Dart.Addr,
 			"discover", dartConfig.Discover, "cacheDir", dartConfig.CacheDir, "peerAdvertise", dartConfig.PeerAdvertise)
 	}
 
@@ -159,23 +170,26 @@ func run() error {
 	}
 	defer func() { _ = state.Close() }()
 
-	if dartManager != nil {
-		serviceOptions = append(serviceOptions, agentserver.WithDARTProbe(dartManager.Healthy))
+	if p2pProbe != nil {
+		serviceOptions = append(serviceOptions, agentserver.WithP2PProbe(p2pProbe))
 	}
 	service := agentserver.NewService(pull, state, stateRoot, serviceOptions...)
 	server := agentserver.New(service, socketPath)
 	klog.InfoS("firecracker-runtime starting",
 		"socket", socketPath, "artifactStoreMount", artifactstore.DefaultMountDir, "stateRoot", stateRoot,
-		"registry", config.RegistryConfig, "dart", config.Dart.Addr)
+		"registry", config.RegistryConfig, "p2p", config.p2pMode())
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 	if dartManager != nil {
 		go func() {
 			if err := dartManager.Run(ctx); err != nil {
-				klog.ErrorS(err, "DART supervisor stopped with an error")
+				klog.ErrorS(err, "P2P supervisor stopped with an error")
 			}
 		}()
+	}
+	for _, prober := range gatewayProbers {
+		go prober.Run(ctx)
 	}
 	if hostReadyManager != nil {
 		go hostReadyManager.Run(ctx)
@@ -264,14 +278,63 @@ func (l *livePullClient) PublishImage(ctx context.Context, kind, key, dir string
 	return client.PublishImage(ctx, kind, key, dir)
 }
 
-// dartListenAddress derives the DART client-plane listen address from the
-// configured dart.addr base (http://127.0.0.1:8145 -> 127.0.0.1:8145).
+// dartListenAddress derives the dart client-plane listen address from the
+// configured p2p.dart.addr base (http://127.0.0.1:8145 -> 127.0.0.1:8145).
 func dartListenAddress(dartAddr string) (string, error) {
 	parsed, err := url.Parse(dartAddr)
 	if err != nil || parsed.Host == "" || parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", fmt.Errorf("invalid dart.addr %q: expected http://host:port", dartAddr)
+		return "", fmt.Errorf("invalid p2p.dart.addr %q: expected http://host:port", dartAddr)
 	}
 	return parsed.Host, nil
+}
+
+// gatewayProbeInterval is the external-gateway probe cadence (mirrors the
+// dart manager's admin-plane probe loop).
+const gatewayProbeInterval = 2 * time.Second
+
+// healthProbeTimeout bounds one gateway probe request.
+const healthProbeTimeout = time.Second
+
+// gatewayProber periodically probes an external P2P gateway and caches the
+// verdict, so Health never blocks on the gateway (the dart manager follows
+// the same background-probe pattern). Any non-5xx answer counts as up: 4xx
+// on the bare base URL still proves the gateway serves; 5xx means it is
+// failing requests and pulls fall back to direct S3.
+type gatewayProber struct {
+	base string
+	http *http.Client
+	up   atomic.Bool
+}
+
+func newGatewayProber(base string) *gatewayProber {
+	return &gatewayProber{base: base, http: &http.Client{Timeout: healthProbeTimeout}}
+}
+
+// Healthy reports the last probe verdict.
+func (p *gatewayProber) Healthy() bool { return p.up.Load() }
+
+// Run probes until ctx is done.
+func (p *gatewayProber) Run(ctx context.Context) {
+	ticker := time.NewTicker(gatewayProbeInterval)
+	defer ticker.Stop()
+	for {
+		p.probe()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (p *gatewayProber) probe() {
+	response, err := p.http.Get(p.base)
+	if err != nil {
+		p.up.Store(false)
+		return
+	}
+	_ = response.Body.Close()
+	p.up.Store(response.StatusCode < http.StatusInternalServerError)
 }
 
 // nodeHostID derives the stable node identity from the configured node

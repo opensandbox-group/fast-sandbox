@@ -11,16 +11,16 @@
 
 A bare-metal KVM host running the full fast-sandbox Firecracker chain with
 one command. **P2P is the standard data plane**: the kind cluster carries
-TWO nodes, every node runs a runtime-agent with a node-local DART daemon,
-and artifact pulls are on-demand (no preheat) — the first sandbox create
-on each node pulls the golden snapshot set through DART, with the second
-node served by the first node's peer instead of the origin.
+TWO nodes, every node runs a runtime-agent with a node-local P2P daemon
+(dart), and artifact pulls are on-demand (no preheat) — the first sandbox
+create on each node pulls the golden snapshot set through the P2P gateway,
+with the second node served by the first node's peer instead of the origin.
 
 ```
 SandboxTemplate (builder Pod, in-cluster)
   → golden snapshot published to MinIO
   → node runtime-agent (DaemonSet ×2) — dart child per node
-  → on-demand PinImage at the first sandbox create (presign → DART:
+  → on-demand PinImage at the first sandbox create (presign → P2P:
      cache → peer → origin; origin fetched ≈ once per 4MiB block)
   → SandboxPool schedules fastlet Pods (×2, one per node, 5 slots each)
   → per-sandbox Firecracker VM restore (jailer --netns, shared snapshot)
@@ -30,16 +30,16 @@ SandboxTemplate (builder Pod, in-cluster)
 One-liners:
 
 ```bash
-./scripts/integration-env.sh up        # two-node env + DART (tasks 1-8)
+./scripts/integration-env.sh up        # two-node env + P2P/dart (tasks 1-8)
 ./scripts/integration-env.sh verify    # 2 + 5 sandboxes; verify 4 = P2P evidence
 ./scripts/integration-env.sh verify-snapshot  # live snapshot E2E (see below)
 ./scripts/integration-env.sh verify-all       # every verify flow in one session
-./scripts/integration-env.sh status    # component health + dart block_source counters
+./scripts/integration-env.sh status    # component health + P2P block_source counters (dart metrics)
 ./scripts/integration-env.sh down      # host left clean
 ```
 
-`verify-all` runs the full battery in one go, ordered base delivery → DART
-P2P → execd API → snapshot → egress, fail-fast with the usual log dumps and
+`verify-all` runs the full battery in one go, ordered base delivery → P2P →
+execd API → snapshot → egress, fail-fast with the usual log dumps and
 one final stage-timings table. It assumes `up` has already built the golden
 image; the snapshot step rebuilds images and rolls the control plane, and the
 egress step recreates and finally removes its pool.
@@ -82,7 +82,7 @@ root-cause read) or `NOT REPRODUCED` (API fully usable).
 | builder Pod | Job (on-demand) | either KVM node | /dev/kvm, /dev/net/tun, self-mknod loop devices, publish creds |
 | firecracker-runtime | DaemonSet (per-node, **all nodes**) | every node (labels itself) | host-readiness loop: KVM/TUN/kernel/storage checks + firecracker asset install (v1.16.1 + jailer + kernel) + applies the scheduling labels + FirecrackerReady condition; **cluster network** (not hostNetwork); UDS socket + StateRoot shared with fastlets; MinIO pull creds; orchestrates the dart child |
 | node janitor (sidecar) | container in the firecracker-runtime pod | same pods | sweeps fastlet netns/tap/veth orphans + leaked VMM processes (hostPID; fastlets delegate over the node-cleanup UDS socket); containerd backend disabled here (the standalone config/janitor DaemonSet covers containerd runtimes) |
-| DART daemon | agent child process ×2 | inside each agent | prefix cache API :8145 (loopback), admin/metrics :8147, peer :9000 (pod IP); cache `cache/dart-<node>` under the shared StateRoot |
+| DART daemon (P2P provider) | agent child process ×2 | inside each agent | prefix cache API :8145 (loopback), admin/metrics :8147, peer :9000 (pod IP); cache `cache/p2p-<node>` under the shared StateRoot |
 | fastlet Pod | pool-managed Pod ×2 | one per node (anti-affinity) | profile hostPaths auto-injected; agent socket; registry plan |
 | firecracker VM | per-sandbox microVM | inside fastlet netns | golden restore, guest eth0 172.30.0.3, execd :44772 |
 | verify CLI | host binaries | host | fastctl + gen-endpoint + port-forwards |
@@ -125,13 +125,13 @@ traffic could ever happen.
    node before any fastlet scheduling.
 10. **agent data plane** — readiness = POST /v1/health with a real podUID (read routes
     are POST-only and validate caller identity); per node: dart admin
-    `/healthz`, agent health `dartUp:true`, and the DART **roster** must
+    `/healthz`, agent health `p2pUp:true`, and the P2P **roster** must
     converge to all agent pods (DNS discovery via the headless Service).
 11. **template build** — builder Pod → publish → manifest assertions
     (index/manifest/artifactDigest/sizeBytes/guestNetwork).
 12. **pool** — 2 fastlet pods (poolMin=2, podAntiAffinity spreads them one
     per node). Default **on-demand** (no warmImages): the first sandbox
-    create on each node pulls through DART. `WARM_IMAGES=1` preheats both
+    create on each node pulls through the P2P gateway. `WARM_IMAGES=1` preheats both
     nodes and captures the same P2P evidence at `up` time.
 
 ## 4. Verification and the delivery baseline
@@ -177,8 +177,8 @@ empty and the first sandbox create on each node triggers the pull. The
 firecracker driver asks the node runtime-agent for the image at create time
 (`PinImage` proxy) when the local cache misses — a create never fails with
 "image not ready" without trying the pull first. Artifact bytes flow
-`agent → presign → GET <dart>/dart/<url>`; DART serves from its block
-cache, then its peers, and only then the origin.
+`agent → presign → GET <dart>/dart/<url>`; the P2P gateway serves from
+its block cache, then its peers, and only then the origin.
 
 `verify` ends with **stage 4 — P2P evidence**, read from each node's DART
 admin plane (`dart_block_source_total{source="cache|peer|origin"}`):
@@ -188,7 +188,7 @@ admin plane (`dart_block_source_total{source="cache|peer|origin"}`):
   count (±4): rootfs/vmstate/memory pulled once per 4MiB block, not once
   per node;
 - with ≥2 active nodes the peer counter must be > 0 (the second node's
-  pull came from the first node's DART, not the store).
+  pull came from the first node's peer, not the store).
 
 Reference result on the test host (alpine:3.19 golden set, 897 blocks):
 
@@ -200,10 +200,10 @@ p2p evidence (verify delivery): expected origin=897 blocks;
 - `origin=897` — the S3 store was fetched exactly once per block across
   both nodes;
 - `peer=513` — 57% of the second node's cold pull was served by the first
-  node's DART peer;
-- `cache=0` is expected in this flow: each block passes through DART once
-  on its way to the agent's committed cache (origin), and later sandboxes
-  read the committed files, not DART blocks again. DART cache counters
+  node's peer;
+- `cache=0` is expected in this flow: each block passes through the P2P
+  layer once on its way to the agent's committed cache (origin), and later
+  sandboxes read the committed files, not P2P blocks again. The cache counters
   only move when a block is re-read through the gateway (e.g. after a
   cache purge).
 
@@ -262,7 +262,7 @@ Delivery timing with on-demand loading (two nodes, XFS StateRoot):
   DNS) and the roster never converged. The agent now runs on the cluster
   network and resolves the Service FQDN.
 - **A normal pod's hostname is its pod name**: the stable HRW identity
-  (and the per-node dart cache directory name) comes from the node's
+  (and the per-node P2P cache directory name) comes from the node's
   `/etc/hostname`, mounted into the agent DaemonSet. hostNetwork used to
   provide it through the node UTS namespace.
 - **Creates do not pin; warm pulls pin once**: a cached image never
@@ -338,17 +338,56 @@ Delivery timing with on-demand loading (two nodes, XFS StateRoot):
 - The agent is **per-node**; a node's cache is single-copy (PinImage
   dedup). The agent socket + StateRoot hostPath must be mounted
   identically in the agent DaemonSet and every fastlet.
-- **DART peers ride the cluster network**: the agent runs without
+- **P2P peers ride the cluster network**: the agent runs without
   hostNetwork so the dart child can resolve the headless Service; the
   peer listen binds the pod IP (`status.podIP`) and peers reach each
-  other across nodes through the CNI. The DART admin/metrics plane binds
+  other across nodes through the CNI. The dart admin/metrics plane binds
   the pod loopback and is unauthenticated — it belongs inside the cluster
   trust domain (upstream model).
-- **DART block caches are per node, even on a shared StateRoot**: two node
+- **P2P block caches are per node, even on a shared StateRoot**: two node
   containers may mount the same host filesystem (kind), but two arenas
   must never share a directory — the agent keys the cache by node
-  (`<stateRoot>/cache/dart-<node-hostname>`). `down` purges the whole
-  `cache/` tree.
+  (`<stateRoot>/cache/p2p-<node-hostname>`). `down` purges the whole
+  `cache/` tree. The directory was renamed from `cache/dart-<node>` when
+  the config became provider-generic; an in-place upgrade leaves the old
+  directories behind (purge semantics unchanged — delete them once, or
+  let the block cache re-warm).
+
+#### 6.5.1 The `p2p:` config (peer-distribution providers)
+
+The agent config carries one `p2p:` section with two **mutually
+exclusive** providers — exactly one of {disabled, dart, external} is
+active (configuring both is a startup error):
+
+| Mode | Config | Behavior |
+|---|---|---|
+| disabled (default) | omit `p2p` | direct header-signed S3 pulls, no listeners |
+| dart | `p2p.dart.addr` non-empty | agent starts the node-local dart child; pulls route through its prefix API, direct-S3 fallback on failure |
+| external | `p2p.gateway.addr` non-empty | no child process; pulls route through an incumbent P2P gateway |
+
+```yaml
+p2p:
+  dart:                     # mode "dart": node-local child process
+    addr: http://127.0.0.1:8145
+    bin: dart
+    admin: 127.0.0.1:8147
+    cacheSize: 8GiB
+    discover: dns:dart.fast-sandbox-system.svc.cluster.local:9000
+    # selfID: stable HRW identity; empty = the node hostname file
+  gateway:                  # mode "external": an already-running gateway
+    addr: http://127.0.0.1:7500
+    routePrefix: /peer-blocks/   # the gateway's presign route; empty = "/dart/"
+```
+
+Notes:
+
+- The pull contract is provider-agnostic: presign on the agent, then
+  `GET <addr><routePrefix><presigned-url>`; metadata (index/manifest)
+  always stays on the direct header-signed path so 404 semantics survive.
+- Health reports the active provider as `p2pUp` (dart: admin-plane probe;
+  external: gateway reachability).
+- The old top-level `dart:` section still parses for one release (loads
+  with a deprecation warning, behaves as `p2p.dart`).
 
 ### 6.6 Control plane behavior to know
 - **fastpath fast-path rejects, never queues**: a full pool →
@@ -381,7 +420,7 @@ Delivery timing with on-demand loading (two nodes, XFS StateRoot):
 - The store endpoint must be reachable from: builder Pod, agent DaemonSet
   (both in-cluster) — a host-side MinIO needs the same routing story as the
   kind-network container-IP trick.
-- The agent hands DART **presigned** origin URLs (SigV4 query signing, ~1 h
+- The agent hands the P2P gateway **presigned** origin URLs (SigV4 query signing, ~1 h
   TTL); the access key pair never leaves the agent. The presigned signature
   is validated server-side by real MinIO/OSS in the live checks
   (`internal/runtime/firecracker/agent/live_minio_test.go`,
@@ -403,7 +442,7 @@ Delivery timing with on-demand loading (two nodes, XFS StateRoot):
 | `KIND_CLUSTER` / `KIND_NODE_IMAGE` / `KIND_RETAIN` / `KIND_SINGLE` | firecracker / - / 0 / 0 | kind knobs; mirror override, retain-for-debug; 1 = single node (no worker, no peer traffic) |
 | `MINIO_PORT` / `MINIO_AK` / `MINIO_SK` / `MINIO_ENDPOINT` | 9000 / ... | store credentials; endpoint auto = container IP |
 | `SBX_IMAGE` / `EXECD` / `FC_VERSION` | alpine:3.19 / execd:1.1.0 / v1.16.1 | the chain keys |
-| `WARM_IMAGES` | 0 | on-demand is standard: no pool preheat, the first sandbox create on each node pulls the artifact set through DART (peer distribution across the two nodes), evidenced in verify 4. 1 restores the preheat for fast delivery baselines |
+| `WARM_IMAGES` | 0 | on-demand is standard: no pool preheat, the first sandbox create on each node pulls the artifact set through the P2P gateway (peer distribution across the two nodes), evidenced in verify 4. 1 restores the preheat for fast delivery baselines |
 | `CONCURRENCY` | 5 | per-fastlet slot capacity for the batch |
 | `EXECD_API_SBX` | sandbox-execd-api | sandbox name used by `verify-execd-api` |
 | `EXECD_API_KEEP_SANDBOX` | 0 | 1 keeps the sandbox + jail after the battery and prints the guest-console (firecracker.log) tail command for execd-side diagnosis |

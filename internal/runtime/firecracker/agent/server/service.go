@@ -44,9 +44,8 @@ type Service struct {
 	state     *agentstate.State
 	stateRoot string
 	now       func() time.Time
-	// dartUp reports the node-local DART daemon state; nil when DART is not
-	// configured (stage-1 local mode).
-	dartUp func() bool
+	// p2pUp reports the peer-distribution state; nil when P2P is off.
+	p2pUp func() bool
 	// hostReady reports the node-readiness check outcome (ready flag +
 	// summary); nil when the hostready manager is not running.
 	hostReady func() (bool, string)
@@ -73,17 +72,15 @@ func WithServiceClock(now func() time.Time) ServiceOption {
 	return func(service *Service) { service.now = now }
 }
 
-// WithDARTProbe wires the node-local DART daemon state into Health: dartUp
-// reports whether the DART admin plane answered its last probe. The agent's
-// own health stays independent of DART (a broken gateway keeps pulls on the
-// direct S3 fallback path).
-func WithDARTProbe(dartUp func() bool) ServiceOption {
-	return func(service *Service) { service.dartUp = dartUp }
+// WithP2PProbe wires the peer-distribution state into Health. Informational
+// only: a broken gateway keeps pulls on the direct S3 fallback path.
+func WithP2PProbe(p2pUp func() bool) ServiceOption {
+	return func(service *Service) { service.p2pUp = p2pUp }
 }
 
 // WithHostReadyProbe wires the node-readiness check outcome into Health
 // (the flag behind the node labels and the FirecrackerReady condition).
-// Like DART it is informational: the agent serves pulls regardless of the
+// Like P2P it is informational: the agent serves pulls regardless of the
 // host verdict.
 func WithHostReadyProbe(hostReady func() (bool, string)) ServiceOption {
 	return func(service *Service) { service.hostReady = hostReady }
@@ -187,8 +184,8 @@ func (s *Service) Health(_ context.Context) (agentprotocol.HealthResponse, error
 		PinCount:   snapshot.PinCount,
 		ImageCount: snapshot.ImageCount,
 	}
-	if s.dartUp != nil {
-		response.DartUp = s.dartUp()
+	if s.p2pUp != nil {
+		response.P2PUp = s.p2pUp()
 	}
 	if s.hostReady != nil {
 		ready, summary := s.hostReady()

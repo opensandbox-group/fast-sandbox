@@ -7,11 +7,11 @@
 # source under /sys.
 #
 # Two nodes are required for the P2P assertions: each node runs its own
-# runtime-agent + DART daemon, and the second node's warm pull must be
-# served by the first node's peer (origin fetched ~once for the cluster).
-# The StateRoot host mount is shared by both node containers (single XFS
-# loop image on the host); the DART block caches stay per-node because the
-# agent keys them by hostname (<state>/cache/dart-<hostname>).
+# runtime-agent + P2P daemon (dart), and the second node's warm pull must
+# be served by the first node's peer (origin fetched ~once for the
+# cluster). The StateRoot host mount is shared by both node containers
+# (single XFS loop image on the host); the P2P block caches stay per-node
+# because the agent keys them by hostname (<state>/cache/p2p-<hostname>).
 #
 # Usage: kind create cluster --config config/dev/kind-firecracker.yaml
 # The firecracker-runtime DaemonSet (config/dev/agent-daemonset.yaml) runs

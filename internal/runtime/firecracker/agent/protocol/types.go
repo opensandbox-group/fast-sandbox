@@ -172,11 +172,11 @@ type HealthResponse struct {
 	LeaseCount int   `json:"leaseCount"`
 	PinCount   int   `json:"pinCount"`
 	ImageCount int   `json:"imageCount"`
-	// DartUp reports whether the node-local DART P2P daemon answered its
-	// last admin-plane probe. It is informational: the agent's own health
-	// never depends on DART (a broken gateway keeps artifact pulls on the
-	// direct S3 fallback path).
-	DartUp bool `json:"dartUp"`
+	// P2PUp reports whether the peer-distribution provider (node-local
+	// dart daemon or external gateway) answered its last probe.
+	// Informational: agent health never depends on it (a broken gateway
+	// keeps pulls on the direct S3 fallback path).
+	P2PUp bool `json:"p2pUp"`
 	// HostReady reports the last node-readiness check outcome (the KVM/
 	// storage/asset check behind the scheduling labels). Nil when the
 	// readiness manager is not running (no node name configured).

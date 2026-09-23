@@ -16,7 +16,7 @@
 #   ./scripts/integration-env.sh verify-snapshot # live sandbox snapshot E2E
 #     (requires the egress image in local docker:
 #      docker pull opensandbox/egress:latest)
-#   ./scripts/integration-env.sh verify-p2p    # DART data-plane evidence (stage 2)
+#   ./scripts/integration-env.sh verify-p2p    # P2P data-plane evidence (stage 2)
 #   ./scripts/integration-env.sh down          # teardown, host left clean
 #   ./scripts/integration-env.sh --cleanup     # down after an interrupted run
 #   ./scripts/integration-env.sh up --auto-clean   # down automatically on failure
@@ -104,7 +104,8 @@ SBX_SANDBOX="sandbox-firecracker"
 # WARM_IMAGES=1 restores the pool warmImages preheat (optional). Default 0:
 # on-demand is the standard stage-2 flow — the agent cache starts empty and
 # the FIRST sandbox create on each node triggers the PinImage pull through
-# DART (peer distribution across the two nodes), which `verify` measures.
+# the P2P data plane (peer distribution across the two nodes), which
+# `verify` measures.
 WARM_IMAGES="${WARM_IMAGES:-0}"
 
 # Node labels. The KVM label key is hardcoded by the SandboxTemplate
@@ -359,10 +360,10 @@ agent_leases_drained() {
 		| grep -q '"leases":\[\]'
 }
 
-# dart_roster_ready reports whether the node-local DART daemon has joined the
-# cluster: its admin /admin/members must list all agent pods (each hostNetwork
-# pod IP == a node, so every member is a peer).
-dart_roster_ready() { # pod expected-members
+# p2p_roster_ready reports whether the node-local P2P daemon (dart) has
+# joined the cluster: its admin /admin/members must list all agent pods
+# (each hostNetwork pod IP == a node, so every member is a peer).
+p2p_roster_ready() { # pod expected-members
 	local pod="$1" expected="$2"
 	local members
 	members="$(kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c \
@@ -664,12 +665,12 @@ sysctl_restore() {
 XFS_STATEROOT="${XFS_STATEROOT:-1}"
 # The loop image backing the StateRoot lives on /data for the same reason
 # as MINIO_DATA: it is SPARSE and grows with every artifact the node caches
-# (golden set, snapshot staging, DART caches). On a full root disk the
+# (golden set, snapshot staging, P2P block caches). On a full root disk the
 # sparse file cannot extend and XFS turns write failures into EIO even
 # while reporting free space. Override XFS_LOOP_FILE to relocate.
 XFS_LOOP_FILE="${XFS_LOOP_FILE:-/data/fast-sandbox.img}"
 # The default comfortably covers the snapshot workflows: the golden set
-# (~3G) + two 8GiB DART block caches + transient dump staging (~4G) + the
+# (~3G) + two 8GiB P2P block caches + transient dump staging (~4G) + the
 # cold pull of a second multi-GiB published snapshot set, with headroom for
 # repeated verify-snapshot runs. Override down for constrained hosts.
 XFS_SIZE="${XFS_SIZE:-60G}"
@@ -1163,10 +1164,11 @@ agent_up() {
 		log "node $node: readiness labels + condition applied by the agent"
 	done
 
-	# DART P2P daemon (stage 2): every agent pod must have its node-local
-	# dart child answering on the admin plane, and agent /v1/health must
-	# report dartUp=true (a missing dart only degrades pulls to direct S3,
-	# so this is a positive wiring assertion, not a readiness gate).
+	# P2P daemon (stage 2, node-local dart child): every agent pod must
+	# have the daemon answering on the admin plane, and agent /v1/health
+	# must report p2pUp=true (a missing daemon only degrades pulls to
+	# direct S3, so this is a positive wiring assertion, not a readiness
+	# gate).
 	local pod uid node pods
 	pods="$(kubectl -n "$NS" get pods -l component=firecracker-runtime -o jsonpath='{.items[*].metadata.name}')"
 	for pod in $pods; do
@@ -1175,10 +1177,10 @@ agent_up() {
 		wait_for "dart admin /healthz on $node" 30 \
 			kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c \
 				"curl -fsS --noproxy '*' http://127.0.0.1:8147/healthz | grep -q ok"
-		wait_for "agent health dartUp on $node" 30 \
+		wait_for "agent health p2pUp on $node" 30 \
 			kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c \
-				"curl -fsS --noproxy '*' --unix-socket /run/fast-sandbox/firecracker/runtime.sock -H 'Content-Type: application/json' -d '{\"podUid\":\"$uid\",\"namespace\":\"$NS\"}' http://firecracker-agent/v1/health | grep -q '\"dartUp\":true'"
-		log "dart: $node dart pid=$(kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c 'pgrep -x dart')"
+				"curl -fsS --noproxy '*' --unix-socket /run/fast-sandbox/firecracker/runtime.sock -H 'Content-Type: application/json' -d '{\"podUid\":\"$uid\",\"namespace\":\"$NS\"}' http://firecracker-agent/v1/health | grep -q '\"p2pUp\":true'"
+		log "p2p: $node dart pid=$(kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c 'pgrep -x dart')"
 	done
 	# P2P roster: every daemon must see every other agent pod as a peer
 	# before any warm pull, so the second node's pull can be served by the
@@ -1187,10 +1189,10 @@ agent_up() {
 	expected_members="$(printf '%s' "$pods" | wc -w | tr -d ' ')"
 	for pod in $pods; do
 		node="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.nodeName}')"
-		wait_for "dart roster full on $node ($expected_members members)" 90 \
-			dart_roster_ready "$pod" "$expected_members"
+		wait_for "p2p roster full on $node ($expected_members members)" 90 \
+			p2p_roster_ready "$pod" "$expected_members"
 	done
-	pass "firecracker-runtime agent healthy (UDS /v1/health) + DART daemons up, roster=$expected_members"
+	pass "firecracker-runtime agent healthy (UDS /v1/health) + P2P daemons up, roster=$expected_members"
 }
 
 # --- task 7: SandboxTemplate build -----------------------------------------------------------
@@ -1279,7 +1281,7 @@ pool_up() {
 	if [[ "$WARM_IMAGES" == "1" ]]; then
 		# Optional preheat mode: warmImages pull the artifact set on every
 		# fastlet node during up (fast delivery baselines; the second node
-		# is still served by the first node's DART peer).
+		# is still served by the first node's P2P peer).
 		local warm_spec="$WORK/pool-firecracker-warm.yaml"
 		render_firecracker_pool_spec "$REPO_ROOT/config/samples/pool-firecracker.yaml" "$warm_spec"
 		kubectl apply -f "$warm_spec" >/dev/null
@@ -1291,17 +1293,18 @@ pool_up() {
 		# On-demand is the standard stage-2 flow: apply the pool spec
 		# WITHOUT the warmImages entry (it is the last section of the
 		# manifest). No preheat — the first sandbox create on each node
-		# pulls the artifact set through DART; the evidence lands in the
+		# pulls the artifact set through the P2P gateway; the evidence lands in the
 		# verify stage (verify 5: P2P evidence).
 		local cold_spec="$WORK/pool-firecracker-cold.yaml"
 		sed '/^  warmImages:/,$d' "$REPO_ROOT/config/samples/pool-firecracker.yaml" > "$cold_spec"
 		kubectl apply -f "$cold_spec" >/dev/null
 		wait_for "fastlet pod running" 150 fastlet_pod_ready
-		pass "fastlet Running, on-demand pull (default: first sandbox pulls through DART)"
+		pass "fastlet Running, on-demand pull (default: first sandbox pulls through P2P)"
 	fi
 }
 
-# p2p_evidence asserts the stage-2 outcome from the DART block counters: the
+# p2p_evidence asserts the stage-2 outcome from the dart block-source
+# counters (the metric itself stays DART-named): the
 # published artifact set (rootfs/vmstate/memory) is pulled once per 4MiB
 # block from the origin cluster-wide, and when more than one node served
 # traffic the second node must have been fed by the first node's peer
@@ -1328,13 +1331,13 @@ p2p_evidence() { # description
 				peer) peer_total=$((peer_total + value)); node_total=$((node_total + value)) ;;
 				cache) cache_total=$((cache_total + value)); node_total=$((node_total + value)) ;;
 			esac
-		done < <(dart_source_counters "$pod")
+		done < <(p2p_source_counters "$pod")
 		[[ "$node_total" -gt 0 ]] && active_nodes=$((active_nodes + 1))
 	done
 	log "p2p evidence ($description): expected origin=$expected_blocks blocks; cluster origin=$origin_total peer=$peer_total cache=$cache_total active-nodes=$active_nodes"
 	[[ "$origin_total" -ge "$expected_blocks" ]] || fail "cluster origin $origin_total < expected $expected_blocks blocks"
 	[[ "$origin_total" -le $((expected_blocks + 4)) ]] \
-		|| fail "origin amplified: $origin_total > $((expected_blocks + 4)): pulls were not deduplicated by DART"
+		|| fail "origin amplified: $origin_total > $((expected_blocks + 4)): pulls were not deduplicated by the P2P layer"
 	if [[ "$active_nodes" -ge 2 ]]; then
 		[[ "$peer_total" -gt 0 ]] || fail "no peer traffic across $active_nodes nodes: the second node was not served by the peer"
 		pass "P2P evidence ($description): origin ~1 fetch per block (cluster=$origin_total/$expected_blocks), peer=$peer_total, nodes=$active_nodes"
@@ -1883,7 +1886,7 @@ verify() {
 	run_stage "verify 1: sandbox create + execd /ping (fastctl)" verify_sandbox "$SBX_SANDBOX"
 	run_stage "verify 2: clone sandbox (shared snapshot, per-clone netns)" verify_sandbox "$second"
 	run_stage "verify 3: max concurrency (2 fastlets, 10 slots)" verify_concurrent
-	run_stage "verify 4: P2P evidence (origin ~1 fetch/block via DART)" p2p_evidence "verify delivery"
+	run_stage "verify 4: P2P evidence (origin ~1 fetch/block via P2P)" p2p_evidence "verify delivery"
 	run_stage "verify 5: delete all ($((CONCURRENCY + 2))) + cleanup" verify_delete_all
 	trap - EXIT
 	resolve_daemon_down
@@ -2270,20 +2273,20 @@ verify_execd_api_cleanup() { # sandbox-name
 	pass "sandbox $name deleted; workspace clean"
 }
 
-# --- verify-p2p: DART data-plane evidence (stage 2) ---------------------------
+# --- verify-p2p: P2P data-plane evidence (stage 2, against the dart node) -----
 # Proves the wiring end to end on the real store: agent-signed presigned URL
 # -> node-local DART prefix route -> origin fetch (first read) -> DART block
 # cache (second read, zero new origin blocks). Cross-node peer hits need a
 # second worker; on the single-node topology the cache-hit half is asserted
 # and the origin counter is recorded as the baseline.
-dart_source_counters() { # pod  (stdout: "cache <n>"; "peer <n>"; "origin <n>")
+p2p_source_counters() { # pod  (stdout: "cache <n>"; "peer <n>"; "origin <n>"; parses DART's own metric)
 	local pod="$1" metrics
 	metrics="$(kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c 'curl -fsS --noproxy "*" http://127.0.0.1:8147/metrics' 2>/dev/null || true)"
 	printf '%s\n' "$metrics" | grep -E '^dart_block_source_total' \
 		| sed -E 's/^dart_block_source_total\{source="([a-z]+)"\} ([0-9]+)$/\1 \2/' || true
 }
 
-dart_source_delta() { # before-file after-file -> "cache <n> peer <n> origin <n>"
+p2p_source_delta() { # before-file after-file -> "cache <n> peer <n> origin <n>"
 	local source delta line_before line_after value_before value_after
 	for source in cache peer origin; do
 		line_before="$(grep "^$source " "$1" || true)"
@@ -2329,7 +2332,7 @@ verify_p2p() {
 	for pod in $pods; do
 		node="$(kubectl -n "$NS" get pod "$pod" -o jsonpath='{.spec.nodeName}')"
 		before="$(mktemp)"; after="$(mktemp)"
-		dart_source_counters "$pod" > "$before"
+		p2p_source_counters "$pod" > "$before"
 		# First read: cold blocks must come from the origin.
 		log "p2p $node: first read (cold, origin expected)"
 		kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c \
@@ -2340,17 +2343,17 @@ verify_p2p() {
 		kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c \
 			"curl -fsS --noproxy '*' -o /dev/null 'http://127.0.0.1:8145/dart/$presigned'" \
 			|| die "second DART read failed on $node"
-		dart_source_counters "$pod" > "$after"
+		p2p_source_counters "$pod" > "$after"
 		while read -r source delta; do
 			case "$source" in
 				cache) cache_delta="$delta" ;;
 				peer) peer_delta="$delta" ;;
 				origin) origin_delta="$delta" ;;
 			esac
-		done < <(dart_source_delta "$before" "$after")
+		done < <(p2p_source_delta "$before" "$after")
 		log "p2p $node: block_source deltas cache=+$cache_delta peer=+$peer_delta origin=+$origin_delta"
 		if [[ "$cache_delta" -gt 0 && "$origin_delta" -eq 0 ]]; then
-			pass "p2p $node: warm read served by the DART block cache (origin delta = 0)"
+			pass "p2p $node: warm read served by the P2P block cache (origin delta = 0)"
 		else
 			fail "p2p $node: warm read did not hit the cache (cache=+$cache_delta origin=+$origin_delta)"
 		fi
@@ -3794,7 +3797,7 @@ snapshot_restore_progress() { # sandbox
 }
 
 # snapshot_ensure_disk reclaims space before the restore's cold pull: the
-# DART block caches (8GiB per node, both under the shared StateRoot) are the
+# P2P block caches (8GiB per node, both under the shared StateRoot) are the
 # biggest safe-to-drop chunk, and stale snapshot staging directories may
 # survive interrupted runs. Threshold: 8GiB free (the artifact set is
 # multi-GiB and the pull writes it as a non-sparse temp file).
@@ -3803,8 +3806,8 @@ snapshot_ensure_disk() {
 	avail_kb="$(df -Pk "$mount" 2>/dev/null | awk 'NR==2 {print $4}')"
 	[[ "$avail_kb" =~ ^[0-9]+$ ]] || return 0
 	if [[ "$avail_kb" -lt "$need_kb" ]]; then
-		log "verify-snapshot: low space on $mount ($((avail_kb / 1024))MiB free); purging DART block caches, stale staging, and stale pull temp files"
-		sudo_ rm -rf "$mount"/firecracker/cache/dart-* 2>/dev/null || true
+		log "verify-snapshot: low space on $mount ($((avail_kb / 1024))MiB free); purging P2P block caches, stale staging, and stale pull temp files"
+		sudo_ rm -rf "$mount"/firecracker/cache/p2p-* 2>/dev/null || true
 		sudo_ rm -rf "$mount"/firecracker/snapshots/* 2>/dev/null || true
 		sudo_ find "$mount"/firecracker/images -maxdepth 2 -name '*.tmp-*' -delete 2>/dev/null || true
 	fi
@@ -3819,7 +3822,7 @@ snapshot_restore() {
 	snapshot_policy_run "$SNAPSHOT_RESTORE" "$SNAPSHOT_TEMPLATE"
 	snapshot_record "restore_run_cmd_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
 	# The restored sandbox cold-pulls the just-published 3.5GiB artifact set
-	# through the agent (DART with direct-S3 fallback): allow 10 minutes and
+	# through the agent (P2P with direct-S3 fallback): allow 10 minutes and
 	# surface the Ready condition every 15s instead of blocking silently.
 	until sandbox_ready "$SNAPSHOT_RESTORE"; do
 		if (( elapsed % 15 == 0 )); then
@@ -4663,7 +4666,7 @@ verify_all() {
 	[[ -n "$(kubectl_get "sandboxtemplate/$SBX_TEMPLATE" '{.status.manifestRef}' 2>/dev/null)" ]] \
 		|| die "no built golden image (run 'integration-env.sh up' first)"
 	run_stage "verify-all 1/6: base delivery" verify
-	run_stage "verify-all 2/6: DART P2P evidence" verify_p2p
+	run_stage "verify-all 2/6: P2P evidence" verify_p2p
 	run_stage "verify-all 3/6: execd HTTP API battery" verify_execd_api
 	run_stage "verify-all 4/6: live snapshot + restore" verify_snapshot
 	run_stage "verify-all 5/6: cross-host pause/resume" verify_pause
@@ -4689,8 +4692,8 @@ status() {
 	log "status: Sandboxes"
 	kubectl -n "$NS" get sandbox -o wide 2>/dev/null || true
 	echo
-	log "status: DART P2P (block_source/cache/peer/origin per node)"
-	dart_metrics_summary || true
+	log "status: P2P (dart block_source/cache/peer/origin per node)"
+	p2p_metrics_summary || true
 	echo
 	log "status: MinIO"
 	docker ps --filter "name=$MINIO_CONTAINER" --format '{{.Names}} {{.Status}}' 2>/dev/null || true
@@ -4701,11 +4704,12 @@ status() {
 	fi
 }
 
-# dart_metrics_summary prints the DART block-source counters and member count
+# p2p_metrics_summary prints the P2P block-source counters (DART's own
+# dart_block_source_total metric) and member count
 # per agent node — the stage-2 acceptance evidence (origin amplification:
 # N nodes pulling the same image should show origin fetches ~once, peers
 # serving the rest).
-dart_metrics_summary() {
+p2p_metrics_summary() {
 	local pods pod node metrics
 	pods="$(kubectl -n "$NS" get pods -l component=firecracker-runtime -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
 	[[ -n "$pods" ]] || { echo "  (no agent pods)"; return 0; }
@@ -4714,7 +4718,7 @@ dart_metrics_summary() {
 		metrics="$(kubectl exec -n "$NS" "$pod" -c firecracker-agent -- sh -c 'curl -fsS --noproxy "*" http://127.0.0.1:8147/metrics' 2>/dev/null || true)"
 		echo "  $node:"
 		if [[ -z "$metrics" ]]; then
-			echo "    (DART metrics unreachable)"
+			echo "    (P2P metrics unreachable)"
 			continue
 		fi
 		printf '%s\n' "$metrics" | grep -E '^dart_block_source_total\{source="(cache|peer|origin)"\}' \

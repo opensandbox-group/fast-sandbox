@@ -8,7 +8,7 @@ All services log through `k8s.io/klog/v2`. One style applies everywhere:
 
 - Messages are constant strings starting lowercase — except when the first
   word is an acronym, a proper noun, or an environment-variable name (e.g.
-  `S3 PUT succeeded after retries`, `DART P2P gateway enabled`, `POD_UID is
+  `S3 PUT succeeded after retries`, `P2P gateway enabled`, `POD_UID is
   not set`) — and carry no trailing punctuation. Values never interpolate
   into the message; they travel as key-value pairs
   (`klog.InfoS("firecracker agent pull completed", "image", ref)`).

@@ -82,7 +82,7 @@ func TestLivePresignedGETAgainstMinIO(t *testing.T) {
 
 // TestLivePullThroughDART exercises the exact stage-2 agent path against a
 // real DART instance: presign -> GET <dart>/dart/<presigned-url> -> origin
-// fetch -> whole-object digest. A second read proves the DART block cache
+// fetch -> whole-object digest. A second read proves the block cache
 // serves it (the origin counter stops moving; asserted via the admin
 // metrics the operator can curl).
 func TestLivePullThroughDART(t *testing.T) {
@@ -91,8 +91,8 @@ func TestLivePullThroughDART(t *testing.T) {
 	if dartBase == "" {
 		t.Skip("FS_LIVE_DART_ADDR not set; the DART-leg of the live check is opt-in")
 	}
-	client := &Client{s3: liveS3Client(endpoint, accessKey, secretKey, bucket), dart: &dartGateway{
-		base: dartBase, http: &http.Client{Timeout: 10 * time.Minute},
+	client := &Client{s3: liveS3Client(endpoint, accessKey, secretKey, bucket), peer: &peerGateway{
+		base: dartBase, routePrefix: defaultPeerRoutePrefix, http: &http.Client{Timeout: 10 * time.Minute},
 	}}
 
 	for read := 1; read <= 2; read++ {
@@ -157,8 +157,8 @@ func TestLivePeerHitThroughTwoDARTNodes(t *testing.T) {
 	}
 	origin := func() int { return dartCounter(t, adminA, "origin") + dartCounter(t, adminB, "origin") }
 	readVia := func(name, base string) {
-		client := &Client{s3: liveS3Client(endpoint, accessKey, secretKey, bucket), dart: &dartGateway{
-			base: base, http: &http.Client{Timeout: 10 * time.Minute},
+		client := &Client{s3: liveS3Client(endpoint, accessKey, secretKey, bucket), peer: &peerGateway{
+			base: base, routePrefix: defaultPeerRoutePrefix, http: &http.Client{Timeout: 10 * time.Minute},
 		}}
 		body, err := client.getArtifact(context.Background(), key)
 		require.NoError(t, err)

@@ -2,8 +2,11 @@ package main
 
 import (
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -169,4 +172,48 @@ func TestLivePullClientUnconfiguredStore(t *testing.T) {
 	_, err := client.current()
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "not configured")
+}
+
+// TestGatewayProberClassifiesStatuses pins the external-gateway health
+// verdict: any non-5xx answer proves the gateway serves; 5xx and transport
+// errors count as down (pulls would be on the direct-S3 fallback).
+func TestGatewayProberClassifiesStatuses(t *testing.T) {
+	var status atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(int(status.Load()))
+	}))
+	t.Cleanup(server.Close)
+
+	prober := newGatewayProber(server.URL)
+	prober.base = server.URL
+	status.Store(http.StatusOK)
+	prober.probe()
+	require.True(t, prober.Healthy(), "200 must count as up")
+
+	status.Store(http.StatusNotFound)
+	prober.probe()
+	require.True(t, prober.Healthy(), "4xx on the bare base URL still proves the gateway serves")
+
+	status.Store(http.StatusBadGateway)
+	prober.probe()
+	require.False(t, prober.Healthy(), "5xx must count as down")
+
+	prober.base = "http://127.0.0.1:1"
+	prober.probe()
+	require.False(t, prober.Healthy(), "transport errors must count as down")
+}
+
+// TestGatewayProberCachesVerdict pins the non-blocking contract: Healthy
+// reads the cached verdict without touching the gateway.
+func TestGatewayProberCachesVerdict(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	prober := newGatewayProber(server.URL)
+	require.False(t, prober.Healthy(), "no probe yet")
+	prober.probe()
+	server.Close() // the gateway disappears...
+	require.True(t, prober.Healthy(), "Healthy must serve the cached verdict, not re-probe")
 }

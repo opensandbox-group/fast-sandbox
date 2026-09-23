@@ -117,7 +117,7 @@ func cacheComplete(dir string) (bool, error) {
 // mismatching file is deleted and re-pulled, and the download lands in a
 // temporary file that is renamed into place only after the whole content
 // verifies. The object is fetched through the client, which routes artifact
-// bytes over DART when configured (falling back to direct S3).
+// bytes over the P2P gateway when configured (falling back to direct S3).
 func stageFile(ctx context.Context, c *Client, dir, storeKey string, file nativeFile) error {
 	target := filepath.Join(dir, file.cache)
 	match, err := fileMatches(target, file)

@@ -23,13 +23,12 @@ import (
 )
 
 // Client pulls published Firecracker artifacts for an image reference into
-// the node-local cache. When a DART P2P gateway is configured (WithDART)
-// artifact bytes route through it with a direct header-signed S3 fallback.
+// the node-local cache. With a P2P peer gateway (WithPeerGateway) artifact
+// bytes route through it, falling back to direct header-signed S3.
 type Client struct {
 	s3 *s3Client
-	// dart is the DART P2P gateway configuration; nil keeps the pull on the
-	// direct header-signed S3 path.
-	dart *dartGateway
+	// peer is the P2P peer gateway; nil keeps pulls on the direct path.
+	peer *peerGateway
 }
 
 // ReadImageManifest fetches the published manifest document of an image
@@ -50,13 +49,13 @@ func (c *Client) ReadImageManifest(ctx context.Context, image string) ([]byte, e
 	return c.fetchManifest(ctx, manifestKey, index.ArtifactDigest)
 }
 
-// dartGateway routes artifact GETs through a node-local DART instance. The
-// agent signs presigned origin URLs; DART fetches, caches and P2P-distributes
-// the blocks, and the agent still verifies the whole-object digest against
-// the manifest.
-type dartGateway struct {
-	base string // e.g. http://127.0.0.1:8145 (prefix route /dart/<upstream-url>)
-	http *http.Client
+// peerGateway routes artifact GETs through a P2P peer gateway (the
+// node-local DART daemon, or an external provider) speaking
+// GET <base><routePrefix><presigned-url>.
+type peerGateway struct {
+	base        string // e.g. http://127.0.0.1:8145
+	routePrefix string // e.g. "/dart/"
+	http        *http.Client
 }
 
 // NewClient builds a pull client for a store root (s3://bucket/prefix) with
@@ -72,14 +71,15 @@ func NewClient(storeRoot string, credential registryconfig.Credential, options .
 		return nil, err
 	}
 	client := &Client{s3: s3}
-	if config.dartBase != "" {
+	if config.peerBase != "" {
 		httpClient := config.httpClient
 		if httpClient == nil {
 			httpClient = &http.Client{Timeout: defaultS3RequestTimeout}
 		}
-		client.dart = &dartGateway{
-			base: strings.TrimRight(config.dartBase, "/"),
-			http: httpClient,
+		client.peer = &peerGateway{
+			base:        strings.TrimRight(config.peerBase, "/"),
+			routePrefix: normalizePeerRoutePrefix(config.peerRoutePrefix),
+			http:        httpClient,
 		}
 	}
 	return client, nil
@@ -89,10 +89,11 @@ func NewClient(storeRoot string, credential registryconfig.Credential, options .
 type Option func(*optionsConfig)
 
 type optionsConfig struct {
-	region     string
-	endpoint   string
-	httpClient *http.Client
-	dartBase   string
+	region          string
+	endpoint        string
+	httpClient      *http.Client
+	peerBase        string
+	peerRoutePrefix string
 }
 
 // WithRegion overrides the SigV4 signing region (default us-east-1).
@@ -112,13 +113,33 @@ func WithHTTPClient(client *http.Client) Option {
 	return func(config *optionsConfig) { config.httpClient = client }
 }
 
-// WithDART routes artifact downloads through the node-local DART P2P gateway
-// at base (e.g. http://127.0.0.1:8145). Metadata (image index and manifest)
-// stays on the direct header-signed path: their 404 semantics must survive
-// exactly, and DART collapses origin errors into 502. Empty base = direct
-// mode.
-func WithDART(base string) Option {
-	return func(config *optionsConfig) { config.dartBase = base }
+// defaultPeerRoutePrefix is DART's route; a legacy gateway can own any
+// prefix.
+const defaultPeerRoutePrefix = "/dart/"
+
+// normalizePeerRoutePrefix coerces the prefix into "/<prefix>/".
+func normalizePeerRoutePrefix(prefix string) string {
+	if prefix == "" {
+		return defaultPeerRoutePrefix
+	}
+	if !strings.HasPrefix(prefix, "/") {
+		prefix = "/" + prefix
+	}
+	if !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	return prefix
+}
+
+// WithPeerGateway routes artifact downloads through the P2P peer gateway
+// at base, as presign -> GET <base><routePrefix><presigned-url> (empty
+// routePrefix = DART's "/dart/"). Metadata (index/manifest) stays direct:
+// its 404 semantics must survive exactly. Empty base = direct mode.
+func WithPeerGateway(base, routePrefix string) Option {
+	return func(config *optionsConfig) {
+		config.peerBase = base
+		config.peerRoutePrefix = routePrefix
+	}
 }
 
 // PullImage resolves the addressing chain for image and materializes the
@@ -268,17 +289,15 @@ func (c *Client) materializeSet(ctx context.Context, dir, manifestKey, artifactD
 	return commitManifest(dir, payload)
 }
 
-// getArtifact streams one native artifact object. In DART mode the download
-// goes through the P2P gateway as presign -> GET <dart>/dart/<url>; a DART
-// transport failure or a gateway error (502 origin error / 400 prefix
-// drift) falls back to the direct header-signed S3 path, so a broken or
-// missing DART degrades to stage-1 behavior without failing the pull.
-// Without a DART gateway the call is the plain direct GET.
+// getArtifact streams one native artifact object through the peer gateway
+// when configured; a gateway transport failure or gateway error (502/400
+// prefix drift) falls back to direct S3, so a broken gateway degrades to
+// stage-1 behavior without failing the pull.
 func (c *Client) getArtifact(ctx context.Context, storeKey string) (io.ReadCloser, error) {
-	if c.dart == nil {
+	if c.peer == nil {
 		return c.s3.get(ctx, storeKey)
 	}
-	body, err := c.getArtifactViaDART(ctx, storeKey)
+	body, err := c.getArtifactViaGateway(ctx, storeKey)
 	if err == nil {
 		return body, nil
 	}
@@ -287,37 +306,36 @@ func (c *Client) getArtifact(ctx context.Context, storeKey string) (io.ReadClose
 	}
 	var status *httpError
 	if errors.As(err, &status) && status.StatusCode >= 200 && status.StatusCode < 500 && status.StatusCode != http.StatusBadRequest {
-		// A definitive client-class answer from the origin through DART
-		// (excluding 400, which is a DART routing/prefix problem): do not
-		// fall back, the origin would answer the same.
+		// A definitive client-class answer from the origin through the
+		// gateway (excluding 400, which is a routing/prefix problem): do
+		// not fall back, the origin would answer the same.
 		return nil, err
 	}
 	// Transport error, gateway error (502/503) or prefix drift (400): the
-	// DART instance cannot serve this object; fall back to the direct
+	// gateway cannot serve this object; fall back to the direct
 	// header-signed path (which carries its own retry loop). Never silent:
 	// origin-bandwidth spikes are diagnosed from exactly this line.
-	klog.ErrorS(err, "DART artifact fetch failed; falling back to direct S3", "storeKey", storeKey, "err", err)
+	klog.ErrorS(err, "P2P gateway artifact fetch failed; falling back to direct S3", "storeKey", storeKey, "err", err)
 	return c.s3.get(ctx, storeKey)
 }
 
-// getArtifactViaDART performs one presigned GET through the DART prefix
-// route. DART surfaces origin failures as 502 "origin error" and routing
-// problems as 400, so a non-200 answer here is an httpError for the caller
-// to classify.
-func (c *Client) getArtifactViaDART(ctx context.Context, storeKey string) (io.ReadCloser, error) {
+// getArtifactViaGateway performs one presigned GET through the gateway
+// prefix route; a non-200 answer (502 origin error, 400 routing) becomes
+// an httpError for the caller to classify.
+func (c *Client) getArtifactViaGateway(ctx context.Context, storeKey string) (io.ReadCloser, error) {
 	presigned, err := c.s3.presignGET(storeKey)
 	if err != nil {
 		return nil, err
 	}
-	target := c.dart.base + "/dart/" + presigned
+	target := c.peer.base + c.peer.routePrefix + presigned
 	if _, err := url.Parse(target); err != nil {
-		return nil, fmt.Errorf("build DART request URL: %w", err)
+		return nil, fmt.Errorf("build peer gateway request URL: %w", err)
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return nil, err
 	}
-	response, err := c.dart.http.Do(request)
+	response, err := c.peer.http.Do(request)
 	if err != nil {
 		return nil, err
 	}

@@ -1,9 +1,8 @@
 package agent
 
-// Stage-2 P2P tests: SigV4 query presigning (B) and the DART routing of
-// artifact downloads with direct-S3 fallback (C). Metadata (image index,
-// manifest) intentionally stays on the direct header-signed path, so its
-// 404 semantics (ErrImageNotReady) survive DART's origin-error collapsing.
+// Stage-2 P2P tests: SigV4 query presigning (B) and peer-gateway routing
+// with direct-S3 fallback (C). Metadata stays direct, so its 404 semantics
+// survive a gateway's origin-error collapsing.
 
 import (
 	"context"
@@ -23,26 +22,31 @@ import (
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
 
-// fakeDART stands in for a node-local DART instance: it accepts prefix-mode
-// requests (/dart/<full upstream URL>) and proxies them to the origin. The
-// gateway can be switched into a 502 "origin error" mode to simulate a
-// broken upstream path.
-type fakeDART struct {
+// fakeGateway stands in for a P2P peer gateway: prefix-mode requests
+// (/<prefix>/<upstream URL>) proxied to the origin, with an optional 502
+// "origin error" mode.
+type fakeGateway struct {
 	mu     sync.Mutex
 	server *httptest.Server
+	prefix string
 	hits   []string
 	fail   bool
 }
 
-func newFakeDART(t *testing.T) *fakeDART {
+func newFakeGateway(t *testing.T) *fakeGateway {
 	t.Helper()
-	gateway := &fakeDART{}
+	return newFakeGatewayWithPrefix(t, "/dart/")
+}
+
+func newFakeGatewayWithPrefix(t *testing.T, prefix string) *fakeGateway {
+	t.Helper()
+	gateway := &fakeGateway{prefix: prefix}
 	gateway.server = httptest.NewServer(http.HandlerFunc(gateway.ServeHTTP))
 	t.Cleanup(gateway.server.Close)
 	return gateway
 }
 
-func (d *fakeDART) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (d *fakeGateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	uri := r.RequestURI
 	d.mu.Lock()
 	fail := d.fail
@@ -51,11 +55,11 @@ func (d *fakeDART) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "origin error: upstream fetch failed", http.StatusBadGateway)
 		return
 	}
-	if !strings.HasPrefix(uri, "/dart/") {
+	if !strings.HasPrefix(uri, d.prefix) {
 		http.Error(w, "cannot resolve origin", http.StatusBadRequest)
 		return
 	}
-	upstream := uri[len("/dart/"):]
+	upstream := uri[len(d.prefix):]
 	if !strings.HasPrefix(upstream, "http://") && !strings.HasPrefix(upstream, "https://") {
 		http.Error(w, "upstream URL must include a scheme", http.StatusBadRequest)
 		return
@@ -73,10 +77,10 @@ func (d *fakeDART) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, response.Body)
 }
 
-func (d *fakeDART) url() string { return d.server.URL }
+func (d *fakeGateway) url() string { return d.server.URL }
 
 // hitCount returns how many prefix-mode requests reached the gateway.
-func (d *fakeDART) hitCount() int {
+func (d *fakeGateway) hitCount() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return len(d.hits)
@@ -196,17 +200,17 @@ func verifyPresignedSignature(t *testing.T, accessKey, secretKey, region string,
 	return nil
 }
 
-// --- C: artifact routing through DART with direct-S3 fallback --------------
+// --- C: artifact routing through a peer gateway with direct-S3 fallback ----
 
-func TestPullImageArtifactsViaDART(t *testing.T) {
+func TestPullImageArtifactsViaPeerGateway(t *testing.T) {
 	store, client, _, artifacts := publishFixture(t)
-	gateway := newFakeDART(t)
-	dartClient := &Client{s3: client, dart: &dartGateway{
-		base: gateway.url(), http: &http.Client{Timeout: time.Minute},
+	gateway := newFakeGateway(t)
+	peerClient := &Client{s3: client, peer: &peerGateway{
+		base: gateway.url(), routePrefix: "/dart/", http: &http.Client{Timeout: time.Minute},
 	}}
 	root := t.TempDir()
 
-	require.NoError(t, dartClient.PullImage(context.Background(), root, testImage))
+	require.NoError(t, peerClient.PullImage(context.Background(), root, testImage))
 
 	dir := imageDir(root, testImage)
 	for cacheName, content := range map[string][]byte{
@@ -221,7 +225,7 @@ func TestPullImageArtifactsViaDART(t *testing.T) {
 
 	// Every object reached the store exactly once: the index and manifest
 	// DIRECT (metadata keeps exact 404 semantics), the three artifacts via
-	// the DART proxy forwarding the presigned upstream (a direct fetch would
+	// the gateway forwarding the presigned upstream (a direct fetch would
 	// double the artifact keys).
 	buildDir := sha256Hex(testManifest(artifacts))[:16]
 	require.Equal(t, 1, store.countRequested("index/"+imageKey(testImage)+".json"))
@@ -230,65 +234,90 @@ func TestPullImageArtifactsViaDART(t *testing.T) {
 	require.Equal(t, 1, store.countRequested(buildDir+"/vmstate.snap"))
 	require.Equal(t, 1, store.countRequested(buildDir+"/memory.snap"))
 
-	require.Equal(t, 3, gateway.hitCount(), "three artifacts must go through DART")
+	require.Equal(t, 3, gateway.hitCount(), "three artifacts must go through the peer gateway")
 	for _, upstream := range gateway.hits {
 		parsed, err := url.Parse(upstream)
 		require.NoError(t, err)
 		require.True(t, strings.HasPrefix(upstream, "http://"), upstream)
 		query := parsed.Query()
-		require.NotEmpty(t, query.Get("X-Amz-Signature"), "DART upstream must be presigned")
+		require.NotEmpty(t, query.Get("X-Amz-Signature"), "gateway upstream must be presigned")
 		require.Equal(t, "host", query.Get("X-Amz-SignedHeaders"))
-		require.NotContains(t, upstream, "index/", "metadata must not go through DART")
-		require.NotContains(t, upstream, "manifest.json", "metadata must not go through DART")
+		require.NotContains(t, upstream, "index/", "metadata must not go through the peer gateway")
+		require.NotContains(t, upstream, "manifest.json", "metadata must not go through the peer gateway")
 	}
 }
 
-func TestPullImageDARTUnreachableFallsBackToDirect(t *testing.T) {
-	store, client, _, _ := publishFixture(t)
-	gateway := newFakeDART(t)
-	dartBase := gateway.url()
-	gateway.server.Close() // simulate a dead DART process
-
-	dartClient := &Client{s3: client, dart: &dartGateway{
-		base: dartBase, http: &http.Client{Timeout: time.Second},
+func TestPeerGatewayCustomRoutePrefix(t *testing.T) {
+	// A legacy gateway may own any prefix; the pull client must honor it.
+	store, client, _, artifacts := publishFixture(t)
+	gateway := newFakeGatewayWithPrefix(t, "/peer-blocks/")
+	peerClient := &Client{s3: client, peer: &peerGateway{
+		base: gateway.url(), routePrefix: "/peer-blocks/", http: &http.Client{Timeout: time.Minute},
 	}}
-	require.NoError(t, dartClient.PullImage(context.Background(), t.TempDir(), testImage))
+	require.NoError(t, peerClient.PullImage(context.Background(), t.TempDir(), testImage))
+	// The fake only counts requests under "/peer-blocks/", so the hit count
+	// proves the artifacts routed through the configured prefix.
+	require.Equal(t, 3, gateway.hitCount(), "artifacts must route through the configured prefix")
+	buildDir := sha256Hex(testManifest(artifacts))[:16]
+	require.Equal(t, 1, store.countRequested(buildDir+"/rootfs.ext4"), "origin fetch stays deduplicated through the custom-prefix gateway")
+}
 
-	// Transport failure to DART falls back to the direct path: every object
-	// (index + manifest + 3 artifacts) was fetched from the store directly.
+func TestPullImagePeerGatewayUnreachableFallsBackToDirect(t *testing.T) {
+	store, client, _, _ := publishFixture(t)
+	gateway := newFakeGateway(t)
+	gatewayBase := gateway.url()
+	gateway.server.Close() // simulate a dead gateway process
+
+	peerClient := &Client{s3: client, peer: &peerGateway{
+		base: gatewayBase, routePrefix: "/dart/", http: &http.Client{Timeout: time.Second},
+	}}
+	require.NoError(t, peerClient.PullImage(context.Background(), t.TempDir(), testImage))
+
+	// Transport failure to the gateway falls back to the direct path: every
+	// object (index + manifest + 3 artifacts) was fetched from the store
+	// directly.
 	require.Equal(t, 5, len(store.requested()))
 	require.Zero(t, gateway.hitCount())
 }
 
-func TestPullImageDARTGatewayErrorFallsBackToDirect(t *testing.T) {
+func TestPullImagePeerGatewayErrorFallsBackToDirect(t *testing.T) {
 	store, client, _, _ := publishFixture(t)
-	gateway := newFakeDART(t)
+	gateway := newFakeGateway(t)
 	gateway.mu.Lock()
-	gateway.fail = true // DART answers 502 "origin error"
+	gateway.fail = true // the gateway answers 502 "origin error"
 	gateway.mu.Unlock()
 
-	dartClient := &Client{s3: client, dart: &dartGateway{
-		base: gateway.url(), http: &http.Client{Timeout: time.Second},
+	peerClient := &Client{s3: client, peer: &peerGateway{
+		base: gateway.url(), routePrefix: "/dart/", http: &http.Client{Timeout: time.Second},
 	}}
-	require.NoError(t, dartClient.PullImage(context.Background(), t.TempDir(), testImage))
+	require.NoError(t, peerClient.PullImage(context.Background(), t.TempDir(), testImage))
 
 	require.Equal(t, 5, len(store.requested()), "gateway errors must fall back to direct S3")
 }
 
-func TestPullImageDARTKeepsImageNotReadySemantics(t *testing.T) {
+func TestPullImagePeerGatewayKeepsImageNotReadySemantics(t *testing.T) {
 	// The index lives only in the store, and it is fetched DIRECT even in
-	// DART mode: a missing build must keep surfacing ErrImageNotReady
-	// (DART would collapse the origin 404 into a 502).
+	// gateway mode: a missing build must keep surfacing ErrImageNotReady
+	// (the gateway would collapse the origin 404 into a 502).
 	store, client, _, _ := publishFixture(t)
 	store.mu.Lock()
 	delete(store.objects, "index/"+imageKey(testImage)+".json")
 	store.mu.Unlock()
-	gateway := newFakeDART(t)
+	gateway := newFakeGateway(t)
 
-	dartClient := &Client{s3: client, dart: &dartGateway{
-		base: gateway.url(), http: &http.Client{Timeout: time.Second},
+	peerClient := &Client{s3: client, peer: &peerGateway{
+		base: gateway.url(), routePrefix: "/dart/", http: &http.Client{Timeout: time.Second},
 	}}
-	err := dartClient.PullImage(context.Background(), t.TempDir(), testImage)
+	err := peerClient.PullImage(context.Background(), t.TempDir(), testImage)
 	require.ErrorIs(t, err, runtimecontract.ErrImageNotReady)
-	require.Zero(t, gateway.hitCount(), "no artifact request may reach DART without an index")
+	require.Zero(t, gateway.hitCount(), "no artifact request may reach the gateway without an index")
+}
+
+func TestNormalizePeerRoutePrefix(t *testing.T) {
+	require.Equal(t, "/dart/", normalizePeerRoutePrefix(""))
+	require.Equal(t, "/dart/", normalizePeerRoutePrefix(defaultPeerRoutePrefix))
+	require.Equal(t, "/p2p/", normalizePeerRoutePrefix("/p2p/"))
+	require.Equal(t, "/p2p/", normalizePeerRoutePrefix("/p2p"))
+	require.Equal(t, "/p2p/", normalizePeerRoutePrefix("p2p/"))
+	require.Equal(t, "/p2p/", normalizePeerRoutePrefix("p2p"))
 }

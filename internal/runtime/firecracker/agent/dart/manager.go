@@ -9,7 +9,7 @@
 // health probing, crash restart with exponential backoff, and graceful
 // shutdown (SIGTERM, bounded wait, then kill). A broken DART never fails
 // the agent: the pull client treats it as an opaque gateway and falls back
-// to the direct S3 path, and agent UDS health stays green with DartUp
+// to the direct S3 path, and agent UDS health stays green with P2PUp
 // reporting the daemon state.
 package dart
 
@@ -52,7 +52,7 @@ type Config struct {
 	// Binary is the DART executable ("" = "dart" from PATH).
 	Binary string
 	// Listen is the client-plane listen address ("" = 127.0.0.1:8145), the
-	// address the pull client's WithDART base points at.
+	// address the pull client's WithPeerGateway base points at.
 	Listen string
 	// Admin is the admin-plane address serving /healthz and /metrics
 	// ("" = 127.0.0.1:8147). A full URL (http://host:port) is also

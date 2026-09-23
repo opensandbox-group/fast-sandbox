@@ -9,30 +9,29 @@ import (
 	agentstate "fast-sandbox/internal/runtime/firecracker/agent/state"
 )
 
-// TestServiceHealthDartProbe wires the node-local DART state into Health:
-// DartUp follows the probe, and the agent's own OK stays independent of the
-// DART daemon (a broken gateway keeps pulls on the direct-S3 fallback).
-func TestServiceHealthDartProbe(t *testing.T) {
+// TestServiceHealthP2PProbe wires the peer-distribution state into Health:
+// P2PUp follows the probe, agent OK stays independent of it.
+func TestServiceHealthP2PProbe(t *testing.T) {
 	stateRoot := t.TempDir()
 	state, err := agentstate.New(stateRoot)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = state.Close() })
 
 	probed := true
-	service := NewService(newFakePuller(), state, stateRoot, WithDARTProbe(func() bool { return probed }))
+	service := NewService(newFakePuller(), state, stateRoot, WithP2PProbe(func() bool { return probed }))
 	health, err := service.Health(context.Background())
 	require.NoError(t, err)
 	require.True(t, health.OK)
-	require.True(t, health.DartUp, "Health must reflect the DART probe")
+	require.True(t, health.P2PUp, "Health must reflect the P2P probe")
 
 	probed = false
 	health, err = service.Health(context.Background())
 	require.NoError(t, err)
-	require.True(t, health.OK, "agent health stays green when DART is down")
-	require.False(t, health.DartUp)
+	require.True(t, health.OK, "agent health stays green when the P2P provider is down")
+	require.False(t, health.P2PUp)
 }
 
-func TestServiceHealthWithoutDARTProbe(t *testing.T) {
+func TestServiceHealthWithoutP2PProbe(t *testing.T) {
 	stateRoot := t.TempDir()
 	state, err := agentstate.New(stateRoot)
 	require.NoError(t, err)
@@ -41,5 +40,5 @@ func TestServiceHealthWithoutDARTProbe(t *testing.T) {
 	service := NewService(newFakePuller(), state, stateRoot)
 	health, err := service.Health(context.Background())
 	require.NoError(t, err)
-	require.False(t, health.DartUp, "no DART probe configured = stage-1 local mode")
+	require.False(t, health.P2PUp, "no P2P probe configured = direct-S3 mode")
 }
