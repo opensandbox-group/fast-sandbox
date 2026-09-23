@@ -118,9 +118,14 @@ func runSnapshotStage(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := waitForMarker(bootLog, "SANDBOX_READY", readinessTimeout(spec)); err != nil {
+	marker, err := waitForAnyMarker(bootLog, readinessTimeout(spec), "SANDBOX_READY", startupFailedMarker)
+	if err != nil {
 		vm.stop()
 		return err
+	}
+	if marker == startupFailedMarker {
+		vm.stop()
+		return fmt.Errorf("guest init startup failed: %s", lastMarkerLine(bootLog, startupFailedMarker))
 	}
 	bootToReadyMs := time.Since(phaseStarted).Milliseconds()
 
@@ -172,7 +177,7 @@ func runSnapshotStage(args []string) error {
 	// heartbeat loop instead of the one-shot readiness marker. The restore
 	// timeout scales with the guest memory (the memory image is read back in
 	// full, bounded by host storage speed).
-	if err := waitForMarker(restoreLog, "SANDBOX_HEARTBEAT", restoreTimeout(spec)); err != nil {
+	if _, err := waitForAnyMarker(restoreLog, restoreTimeout(spec), "SANDBOX_HEARTBEAT"); err != nil {
 		return err
 	}
 	restoreToHeartbeatMs := time.Since(restoreStarted).Milliseconds()
@@ -358,10 +363,15 @@ func configureVM(vm *vmm, kernel, rootfs, bootArgs string, spec apiv1alpha2.Sand
 // directory (the driver's instanceRootfsName).
 const snapshotDriveName = "rootfs.img"
 
-// ensureBuildTap creates the host tap backing the baked NIC.
+// ensureBuildTap creates the host tap backing the baked NIC and brings it
+// UP: a DOWN tap makes every guest-TX write fail with EIO, which Firecracker
+// logs into the shared console log.
 func ensureBuildTap() error {
 	if output, err := exec.Command("ip", "tuntap", "add", "dev", buildTap, "mode", "tap").CombinedOutput(); err != nil {
 		return fmt.Errorf("create build tap %s: %w: %s", buildTap, err, strings.TrimSpace(string(output)))
+	}
+	if output, err := exec.Command("ip", "link", "set", "dev", buildTap, "up").CombinedOutput(); err != nil {
+		return fmt.Errorf("bring build tap %s up: %w: %s", buildTap, err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
@@ -439,18 +449,19 @@ func waitForFile(path string, timeout time.Duration) error {
 	}
 }
 
-// waitForMarker polls a log file for a marker, reading only the appended
-// bytes since the last poll (the heartbeat loop keeps growing the file).
-// The previous poll's tail is kept so a marker split across two reads (the
-// console writes are not atomic) still matches. Returns the tail of the
-// file on timeout for diagnostics.
-func waitForMarker(logPath, marker string, timeout time.Duration) error {
+// waitForAnyMarker polls a log file for the first of the markers to appear,
+// reading only appended bytes (the heartbeat loop keeps growing the file)
+// and keeping the previous tail so a marker split across reads still
+// matches. Returns the matched marker, or an error carrying the file tail.
+func waitForAnyMarker(logPath string, timeout time.Duration, markers ...string) (string, error) {
 	deadline := time.Now().Add(timeout)
 	var offset int64
 	var previousTail []byte
 	overlap := 4096
-	if len(marker) > overlap {
-		overlap = len(marker)
+	for _, marker := range markers {
+		if len(marker) > overlap {
+			overlap = len(marker)
+		}
 	}
 	for {
 		if payload, newOffset, ok := readSince(logPath, offset); ok {
@@ -459,8 +470,8 @@ func waitForMarker(logPath, marker string, timeout time.Duration) error {
 			if len(previousTail) > 0 {
 				window = append(append([]byte{}, previousTail...), payload...)
 			}
-			if bytes.Contains(window, []byte(marker)) {
-				return nil
+			if matched := matchMarker(window, markers); matched != "" {
+				return matched, nil
 			}
 			if len(payload) >= overlap {
 				previousTail = payload[len(payload)-overlap:]
@@ -479,10 +490,39 @@ func waitForMarker(logPath, marker string, timeout time.Duration) error {
 				}
 				tail = string(payload)
 			}
-			return fmt.Errorf("timed out waiting for %q in %s\n%s", marker, logPath, tail)
+			return "", fmt.Errorf("timed out waiting for %q in %s\n%s", strings.Join(markers, "|"), logPath, tail)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// matchMarker returns the first of the markers contained in window, or "".
+func matchMarker(window []byte, markers []string) string {
+	for _, marker := range markers {
+		if bytes.Contains(window, []byte(marker)) {
+			return marker
+		}
+	}
+	return ""
+}
+
+// lastMarkerLine returns the last console line containing marker, so a
+// startup-failure error names the exact reason the init printed.
+func lastMarkerLine(logPath, marker string) string {
+	payload, err := os.ReadFile(logPath)
+	if err != nil {
+		return marker
+	}
+	found := ""
+	for _, line := range strings.Split(string(payload), "\n") {
+		if strings.Contains(line, marker) {
+			found = line
+		}
+	}
+	if found == "" {
+		return marker
+	}
+	return strings.TrimSpace(found)
 }
 
 // readSince returns the bytes appended to path after offset (the file may

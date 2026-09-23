@@ -90,8 +90,8 @@ ENV OCI2ROOTFS_REV=${OCI2ROOTFS_REV}
 
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates coreutils curl e2fsprogs iproute2 jq libaio1 libzstd1 \
-        mount procps tar unzip util-linux \
+        busybox-static ca-certificates coreutils curl e2fsprogs iproute2 jq libaio1 \
+        libzstd1 mount procps tar unzip util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 # awscli v2: the ubuntu package is v1 whose botocore ignores the

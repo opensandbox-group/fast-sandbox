@@ -150,6 +150,7 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 			klog.V(2).InfoS("execd file missing from execd image", "file", name, execdAssetName, spec.Execd)
 		}
 	}
+	injectStaticBusybox(mountPoint)
 
 	// The guest init is always injected (default path when spec.init is
 	// empty) at the exact path the spec declares; the boot args pass the
@@ -205,6 +206,35 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 		return err
 	}
 	return nil
+}
+
+// injectStaticBusybox copies the builder image's static busybox into the
+// rootfs; absence only logs, and the init surfaces the gap at the gate.
+func injectStaticBusybox(mountPoint string) {
+	if !injectBusyboxFrom(hostBusyboxCandidates, mountPoint) {
+		klog.V(2).InfoS("no static busybox in the builder image; guest init falls back to image-local ip/ifconfig",
+			"candidates", hostBusyboxCandidates)
+	}
+}
+
+// injectBusyboxFrom copies the first readable candidate into the rootfs and
+// reports whether one was injected.
+func injectBusyboxFrom(candidates []string, mountPoint string) bool {
+	for _, candidate := range candidates {
+		payload, err := os.ReadFile(candidate)
+		if err != nil {
+			continue
+		}
+		target := filepath.Join(mountPoint, guestBusyboxPath)
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return false
+		}
+		if err := os.WriteFile(target, payload, 0o755); err != nil { //nolint:gosec // executable helper inside the built rootfs image
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 // entrypointCommand renders the spec entrypoint (default tail -f /dev/null)
@@ -271,11 +301,26 @@ func mergeGuestEnvs(spec apiv1alpha2.SandboxTemplateSpec, workdir string) (map[s
 	return merged, nil
 }
 
-// renderGuestInit renders the in-guest init script: mounts, runtime bootstrap,
-// entrypoint, readiness wait (probe > execd ping > warmup + healthcheck), the
-// one-shot SANDBOX_READY marker, and a heartbeat loop so the host can verify
-// the guest is alive after a snapshot restore (the init does not re-run after
-// resume).
+// startupFailedMarker is the console line the guest init prints before
+// exiting on an unusable environment (no loopback tool, nc missing, invalid
+// probe); the snapshot stage fails fast on it.
+const startupFailedMarker = "SANDBOX_STARTUP_FAILED"
+
+// guestBusyboxPath is where the builder's static busybox lands in the guest
+// rootfs, backing the init's loopback setup on images without ip/ifconfig.
+// The filename must stay "busybox": applets dispatch on argv[0].
+const guestBusyboxPath = "/usr/local/lib/sandbox-busybox/busybox"
+
+// hostBusyboxCandidates lists where the builder image's busybox-static
+// package installs the static binary.
+var hostBusyboxCandidates = []string{"/bin/busybox", "/usr/bin/busybox"}
+
+// renderGuestInit renders the in-guest init script: mounts, loopback setup,
+// runtime bootstrap (the entrypoint runs as the bootstrap's user command when
+// execd is injected), readiness wait (probe > execd ping > warmup +
+// healthcheck), the one-shot SANDBOX_READY marker, and a heartbeat loop so
+// the host can verify the guest is alive after a snapshot restore (the init
+// does not re-run after resume).
 func renderGuestInit(spec apiv1alpha2.SandboxTemplateSpec) string {
 	var readiness []string
 	if spec.Readiness.Probe != "" {
@@ -293,6 +338,18 @@ func renderGuestInit(spec apiv1alpha2.SandboxTemplateSpec) string {
 	if len(readiness) > 0 {
 		readinessBlock = "\n" + strings.Join(readiness, "\n")
 	}
+	// Gates that dial 127.0.0.1 (execd ping, tcp://127.* probes) need lo UP,
+	// which images without ip/ifconfig cannot do alone: fail those builds
+	// fast instead of timing out. The injected busybox is the last resort.
+	loChain := `ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || ` +
+		guestBusyboxPath + ` ip link set lo up 2>/dev/null`
+	loGate := loChain + ` || echo "loopback setup skipped: no ip/ifconfig in the guest image"`
+	if spec.Execd != "" && spec.Readiness.Probe == "" || strings.HasPrefix(spec.Readiness.Probe, "tcp://127.") {
+		loGate = loChain + ` || {
+  echo "SANDBOX_STARTUP_FAILED no_loopback_tool"
+  exit 1
+}`
+	}
 	return `#!/bin/sh
 set -eu
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -303,14 +360,16 @@ mkdir -p /dev/pts /dev/shm /run /tmp
 mountpoint -q /dev/pts || mount -t devpts devpts /dev/pts
 mountpoint -q /run || mount -t tmpfs tmpfs /run
 mountpoint -q /tmp || mount -t tmpfs tmpfs /tmp
-ip link set lo up 2>/dev/null || true
+` + loGate + `
 exec </dev/console >/dev/console 2>&1
 hostname sandbox
 [ -f /etc/sandbox-init.env ] && . /etc/sandbox-init.env
 if [ -x /opt/opensandbox/bootstrap.sh ]; then
-  setsid /bin/sh /opt/opensandbox/bootstrap.sh &
-fi
-if [ -n "${ENTRYPOINT:-}" ]; then
+  # The entrypoint becomes the bootstrap's user command: bootstrap.sh TERMs
+  # execd once its command exits, and its no-command fallback (an
+  # interactive shell) exits instantly on the EOF serial console stdin.
+  BOOTSTRAP_CMD="${ENTRYPOINT:-tail -f /dev/null}" setsid /bin/sh /opt/opensandbox/bootstrap.sh &
+elif [ -n "${ENTRYPOINT:-}" ]; then
   setsid /bin/sh -c "$ENTRYPOINT" &
 fi
 ` + readinessBlock + `

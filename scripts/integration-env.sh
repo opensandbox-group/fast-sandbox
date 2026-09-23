@@ -2742,7 +2742,7 @@ egress_plane_ready() { # sandbox  (netns liveness; gate only, never assert polic
 egress_guest_reachable() { # sandbox  (IN-GUEST end-to-end)
 	local out rc=0
 	if out="$(egress_execd_run "$1" \
-		'{"command":"timeout 6 nslookup example.com 2>&1"}' 12)"; then
+		'{"command":"timeout 6 sh -c '\''nslookup example.com 2>&1 || /usr/local/lib/sandbox-busybox/busybox nslookup example.com 2>&1'\''"}' 12)"; then
 		rc=0
 	else
 		rc=1
@@ -2752,14 +2752,14 @@ egress_guest_reachable() { # sandbox  (IN-GUEST end-to-end)
 }
 
 # egress_probe_ip extracts the first IPv4 A record resolved IN-GUEST (the
-# proxy's Server header line carries ':53' and is skipped by the bare-IP
-# match).
+# proxy's Server line carries ':53'; busybox prints results as "Address N:").
 egress_probe_ip() { # sandbox -> ip
 	local out
-	if ! out="$(egress_execd_run "$1" '{"command":"timeout 6 nslookup example.com 2>&1"}' 12)"; then
+	if ! out="$(egress_execd_run "$1" \
+		'{"command":"timeout 6 sh -c '\''nslookup example.com 2>&1 || /usr/local/lib/sandbox-busybox/busybox nslookup example.com 2>&1'\''"}' 12)"; then
 		return 1
 	fi
-	awk '/^Address:/ { if ($2 ~ /^[0-9.]+$/) { print $2; exit } }' <<<"$out"
+	awk '$1 == "Address:" || $1 == "Address" { if ($NF ~ /^[0-9.]+$/) { print $NF; exit } }' <<<"$out"
 }
 
 # egress_ip_reachable asserts IP-direct (DNS-free) TCP from the guest is

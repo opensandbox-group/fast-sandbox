@@ -143,3 +143,81 @@ func TestMergeGuestEnvsNamesAreSorted(t *testing.T) {
 		t.Fatalf("names not sorted: %v", names)
 	}
 }
+
+// TestRenderGuestInitLoopbackGate: when the readiness gate dials loopback
+// (execd ping, or a tcp://127.* probe), an image without ip/ifconfig must
+// fail loudly instead of silently running down the readiness timeout;
+// otherwise loopback setup stays best-effort so warmup-only templates keep
+// building on such images.
+func TestRenderGuestInitLoopbackGate(t *testing.T) {
+	tests := []struct {
+		name    string
+		spec    apiv1alpha2.SandboxTemplateSpec
+		wantSub string
+		wantNot string
+	}{
+		{
+			name:    "execd gate requires loopback",
+			spec:    apiv1alpha2.SandboxTemplateSpec{Execd: "opensandbox/execd:1.1.0"},
+			wantSub: `echo "SANDBOX_STARTUP_FAILED no_loopback_tool"`,
+		},
+		{
+			name:    "loopback probe requires loopback",
+			spec:    apiv1alpha2.SandboxTemplateSpec{Readiness: apiv1alpha2.ReadinessSpec{Probe: "tcp://127.0.0.1:44772"}},
+			wantSub: `echo "SANDBOX_STARTUP_FAILED no_loopback_tool"`,
+		},
+		{
+			name:    "warmup-only readiness keeps loopback best-effort",
+			spec:    apiv1alpha2.SandboxTemplateSpec{},
+			wantSub: `echo "loopback setup skipped`,
+			wantNot: `echo "SANDBOX_STARTUP_FAILED no_loopback_tool"`,
+		},
+		{
+			name:    "remote probe keeps loopback best-effort",
+			spec:    apiv1alpha2.SandboxTemplateSpec{Readiness: apiv1alpha2.ReadinessSpec{Probe: "tcp://10.0.0.1:80"}},
+			wantSub: `echo "loopback setup skipped`,
+			wantNot: `echo "SANDBOX_STARTUP_FAILED no_loopback_tool"`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			script := renderGuestInit(test.spec)
+			if !strings.Contains(script, "ifconfig lo up 2>/dev/null") {
+				t.Fatalf("init lacks the ifconfig fallback for loopback setup")
+			}
+			if !strings.Contains(script, guestBusyboxPath+" ip link set lo up") {
+				t.Fatalf("init lacks the injected-busybox fallback for loopback setup")
+			}
+			if !strings.Contains(script, test.wantSub) {
+				t.Fatalf("init does not contain %q", test.wantSub)
+			}
+			if test.wantNot != "" && strings.Contains(script, test.wantNot) {
+				t.Fatalf("init must not contain %q for this readiness gate", test.wantNot)
+			}
+		})
+	}
+}
+
+// TestInjectBusyboxFrom: the builder's static busybox lands at the path the
+// init's fallback chain references; no readable candidate reports false.
+func TestInjectBusyboxFrom(t *testing.T) {
+	workdir := t.TempDir()
+	source := filepath.Join(workdir, "busybox")
+	if err := os.WriteFile(source, []byte("#!elf"), 0o755); err != nil {
+		t.Fatalf("stage busybox source: %v", err)
+	}
+	rootfs := t.TempDir()
+	if !injectBusyboxFrom([]string{filepath.Join(workdir, "missing"), source}, rootfs) {
+		t.Fatalf("injectBusyboxFrom reported no injection for an existing candidate")
+	}
+	payload, err := os.ReadFile(filepath.Join(rootfs, guestBusyboxPath))
+	if err != nil {
+		t.Fatalf("injected busybox missing: %v", err)
+	}
+	if string(payload) != "#!elf" {
+		t.Fatalf("injected busybox = %q, want the source payload", payload)
+	}
+	if injectBusyboxFrom([]string{filepath.Join(workdir, "missing")}, rootfs) {
+		t.Fatalf("injectBusyboxFrom reported injection without a readable candidate")
+	}
+}
