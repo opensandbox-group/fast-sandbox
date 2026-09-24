@@ -155,7 +155,7 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 // is recorded as "none".
 func compatibilityCPUTemplate(cpuTemplate string) string {
 	if cpuTemplate == "" {
-		return "none"
+		return artifacts.CPUTemplateNone
 	}
 	return cpuTemplate
 }

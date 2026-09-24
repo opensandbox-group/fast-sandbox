@@ -250,6 +250,19 @@ type SnapshotCompatibility struct {
 	HostKernel         string `json:"hostKernel"`
 }
 
+// Snapshot CPU template tiers — the manifest cpuTemplate vocabulary.
+const (
+	CPUTemplateT2   = "T2"
+	CPUTemplateT2A  = "T2A"
+	CPUTemplateNone = "none"
+)
+
+// KnownFirecrackerVersion reports whether the version is a resolved value
+// rather than the unknown sentinel.
+func KnownFirecrackerVersion(version string) bool {
+	return version != "" && version != unknownProvenanceValue
+}
+
 // fms is one allowlist entry: an exact vendor/family/model/stepping
 // identity.
 type fms struct {
@@ -267,12 +280,12 @@ func (m fms) String() string {
 // template permits (mirrors upstream static_cpu_templates).
 var cpuTemplateAllowlists = map[string]map[string][]fms{
 	"1.16.1": {
-		"T2": {
+		CPUTemplateT2: {
 			{vendor: VendorGenuineIntel, family: 6, model: 85, stepping: 4},  // Skylake-SP
 			{vendor: VendorGenuineIntel, family: 6, model: 85, stepping: 7},  // Cascade Lake-SP
 			{vendor: VendorGenuineIntel, family: 6, model: 106, stepping: 6}, // Ice Lake-SP
 		},
-		"T2A": {
+		CPUTemplateT2A: {
 			{vendor: VendorAuthenticAMD, family: 25, model: 1, stepping: 1}, // EPYC Milan
 		},
 	},
@@ -291,7 +304,7 @@ func CompatibilityCPUTemplate(version string, identity CPUIdentity) string {
 			}
 		}
 	}
-	return "none"
+	return CPUTemplateNone
 }
 
 // CPUIdentityLabel renders the identity for a node scheduling label
@@ -319,8 +332,9 @@ var (
 //   - "T2"/"T2A": node CPU must be in that template's per-version allowlist
 //     (the mask normalizes the guest CPUID, so build-host identity does not
 //     matter);
-//   - "none": node vendor/family/model must equal the snapshot identity
-//     (stepping is recorded but not compared);
+//   - "none": node vendor/family/model/stepping must equal the snapshot
+//     identity (exact FMS — steppings within one model can differ in CPUID
+//     features); an unresolved identity on either side fails closed;
 //   - legacy block: ErrLegacyCompatibility, the caller may admit with a
 //     warning.
 //
@@ -333,7 +347,7 @@ func MatchRestoreCompatibility(compat SnapshotCompatibility, local CPUIdentity, 
 		return fmt.Errorf("%w: snapshot built with %q, node runs %q", ErrFirecrackerVersionMismatch, compat.FirecrackerVersion, localFirecrackerVersion)
 	}
 	switch compat.CPUTemplate {
-	case "T2", "T2A":
+	case CPUTemplateT2, CPUTemplateT2A:
 		allowlist, ok := cpuTemplateAllowlists[compat.FirecrackerVersion][compat.CPUTemplate]
 		if !ok {
 			return fmt.Errorf("%w: %q has no %q allowlist row", ErrUnknownCPUTemplate, compat.FirecrackerVersion, compat.CPUTemplate)
@@ -345,12 +359,19 @@ func MatchRestoreCompatibility(compat SnapshotCompatibility, local CPUIdentity, 
 			}
 		}
 		return fmt.Errorf("%w: template %q permits %v, node is %s", ErrCPUIncompatible, compat.CPUTemplate, allowlist, localFMS)
-	case "", "none":
-		if compat.Vendor == local.Vendor && compat.CPUFamily == local.Family && compat.CPUModel == local.Model {
+	case "", CPUTemplateNone:
+		// Exact FMS equality: steppings within one model can differ in CPUID
+		// features (Skylake-SP vs Cascade Lake-SP AVX512_VNNI), and an
+		// unresolved identity on either side must fail closed rather than
+		// match vacuously.
+		if compat.Vendor == "" || compat.Vendor == unknownProvenanceValue || local.Vendor == "" || local.Vendor == unknownProvenanceValue {
+			return fmt.Errorf("%w: unresolved CPU identity (snapshot vendor %q, node vendor %q)", ErrCPUIncompatible, compat.Vendor, local.Vendor)
+		}
+		if compat.Vendor == local.Vendor && compat.CPUFamily == local.Family && compat.CPUModel == local.Model && compat.CPUStepping == local.Stepping {
 			return nil
 		}
-		return fmt.Errorf("%w: unmasked snapshot identity is %s family %d model %d, node is %s family %d model %d",
-			ErrCPUIncompatible, compat.Vendor, compat.CPUFamily, compat.CPUModel, local.Vendor, local.Family, local.Model)
+		return fmt.Errorf("%w: unmasked snapshot identity is %s family %d model %d stepping %d, node is %s family %d model %d stepping %d",
+			ErrCPUIncompatible, compat.Vendor, compat.CPUFamily, compat.CPUModel, compat.CPUStepping, local.Vendor, local.Family, local.Model, local.Stepping)
 	default:
 		return fmt.Errorf("%w: %q", ErrUnknownCPUTemplate, compat.CPUTemplate)
 	}

@@ -27,6 +27,7 @@ import (
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
 
 // cachedManifestPath returns the commit-point manifest of a pulled image.
@@ -152,28 +153,21 @@ func validateRestoreMachineConfig(spec fastletapi.SandboxSpec, config runtimecat
 	return nil
 }
 
-// readCachedManifestCompatibility loads the compatibility block from the
-// cached manifest; ok=false for an absent, legacy, or undecodable block.
-func readCachedManifestCompatibility(stateRoot, image string) (artifacts.SnapshotCompatibility, bool, error) {
-	payload, err := os.ReadFile(cachedManifestPath(stateRoot, image))
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return artifacts.SnapshotCompatibility{}, false, nil
-		}
-		return artifacts.SnapshotCompatibility{}, false, err
-	}
+// decodeCachedManifestCompatibility extracts the compatibility block from a
+// manifest document; ok=false for an absent, legacy, or undecodable block.
+func decodeCachedManifestCompatibility(payload []byte) (artifacts.SnapshotCompatibility, bool) {
 	var document struct {
 		Compatibility artifacts.SnapshotCompatibility `json:"compatibility"`
 	}
 	if err := json.Unmarshal(payload, &document); err != nil {
 		//nolint:nilerr // undecodable = pre-structured legacy manifest; admitted with a warning
-		return artifacts.SnapshotCompatibility{}, false, nil
+		return artifacts.SnapshotCompatibility{}, false
 	}
 	compat := document.Compatibility
 	if compat.Vendor == "" && compat.CPUTemplate == "" {
-		return artifacts.SnapshotCompatibility{}, false, nil
+		return artifacts.SnapshotCompatibility{}, false
 	}
-	return compat, true, nil
+	return compat, true
 }
 
 // checkRestoreCompatibility fails the restore before staging unless the
@@ -191,20 +185,43 @@ func checkRestoreCompatibility(compat artifacts.SnapshotCompatibility, local art
 	return nil
 }
 
-// firecrackerVersion resolves the local VMM binary version once.
+// firecrackerVersion resolves the local VMM binary version, caching only
+// successful lookups: a transient failure ("unknown" — binary mid-upgrade,
+// exec error) must not poison the restore admission for the process
+// lifetime.
 func (d *Driver) firecrackerVersion() string {
-	d.versionOnce.Do(func() { d.fcVersion = artifacts.FirecrackerVersion(d.config.BinaryPath) })
-	return d.fcVersion
+	d.mu.RLock()
+	cached := d.fcVersion
+	d.mu.RUnlock()
+	if artifacts.KnownFirecrackerVersion(cached) {
+		return cached
+	}
+	resolved := artifacts.FirecrackerVersion(d.config.BinaryPath)
+	if artifacts.KnownFirecrackerVersion(resolved) {
+		d.mu.Lock()
+		d.fcVersion = resolved
+		d.mu.Unlock()
+	}
+	return resolved
 }
 
 // validateRestoreCompatibility admits a restore only if the cached
 // manifest's compatibility matches this node (see
-// artifacts.MatchRestoreCompatibility).
+// artifacts.MatchRestoreCompatibility). A missing manifest is tiered: an
+// agent-delivered set commits manifest.json last, so its absence is a
+// delivery in flight (or an interrupted pull) and the create retries
+// (ErrImageNotReady) rather than fail-opening as legacy; only a local-mode
+// hand-seeded cache is admitted without checks.
 func (d *Driver) validateRestoreCompatibility(stateRoot, image string) error {
-	compat, _, err := readCachedManifestCompatibility(stateRoot, image)
+	payload, err := os.ReadFile(cachedManifestPath(stateRoot, image))
 	if err != nil {
-		return err
+		if errors.Is(err, os.ErrNotExist) && d.agentSocket != "" {
+			return fmt.Errorf("%w: %q has no committed manifest yet", runtimecontract.ErrImageNotReady, image)
+		}
+		klog.InfoS("cached manifest absent; admitting restore without CPU checks", "image", image)
+		return nil
 	}
+	compat, _ := decodeCachedManifestCompatibility(payload)
 	return checkRestoreCompatibility(compat, artifacts.HostCPUIdentity(), d.firecrackerVersion(), image)
 }
 

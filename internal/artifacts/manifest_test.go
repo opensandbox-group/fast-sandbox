@@ -144,10 +144,18 @@ func TestMatchRestoreCompatibility(t *testing.T) {
 			fcLocal: "1.16.1",
 		},
 		{
-			name:    "unmasked snapshot ignores stepping (Phase 1 identity)",
+			name:    "unmasked snapshot rejected on unmatched stepping (exact FMS)",
 			compat:  SnapshotCompatibility{Vendor: VendorAuthenticAMD, CPUFamily: 26, CPUModel: 17, CPUStepping: 0, CPUTemplate: "none", FirecrackerVersion: "1.16.1"},
 			local:   CPUIdentity{Vendor: VendorAuthenticAMD, Family: 26, Model: 17, Stepping: 2},
 			fcLocal: "1.16.1",
+			wantErr: ErrCPUIncompatible,
+		},
+		{
+			name:    "unmasked snapshot rejected when both identities are unresolved (fail closed)",
+			compat:  SnapshotCompatibility{Vendor: "unknown", CPUTemplate: "none", FirecrackerVersion: "1.16.1"},
+			local:   CPUIdentity{Vendor: "unknown"},
+			fcLocal: "1.16.1",
+			wantErr: ErrCPUIncompatible,
 		},
 		{
 			name:    "unmasked snapshot rejected on a different model",

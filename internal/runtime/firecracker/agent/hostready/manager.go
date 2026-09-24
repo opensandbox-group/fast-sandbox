@@ -138,7 +138,7 @@ func (m *Manager) pass(ctx context.Context) {
 			artifacts.FirecrackerVersion(filepath.Join(m.current.Check.AssetsDir, assetFirecracker)),
 			identity)
 		cpuIdentity := ""
-		if cpuTemplate == "none" {
+		if cpuTemplate == artifacts.CPUTemplateNone {
 			cpuIdentity = artifacts.CPUIdentityLabel(identity)
 		}
 		if err := m.reconciler.Apply(ctx, report, cpuTemplate, cpuIdentity); err != nil {

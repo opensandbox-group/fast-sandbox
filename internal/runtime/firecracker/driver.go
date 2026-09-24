@@ -90,10 +90,9 @@ type Driver struct {
 	// snapshot staging capacity gate (tests shorten it; 0 selects the
 	// default).
 	snapshotCapacityWait time.Duration
-	// fcVersion caches the local Firecracker binary version, resolved once
-	// for the restore compatibility admission (see restore.go).
-	versionOnce sync.Once
-	fcVersion   string
+	// fcVersion caches the last successfully resolved local Firecracker
+	// binary version (restore admission); unresolved lookups are retried.
+	fcVersion string
 }
 
 // defaultImageGCInterval bounds the image cache by usage without coupling GC

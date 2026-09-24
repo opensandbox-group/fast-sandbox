@@ -43,7 +43,13 @@ the snapshot, and restore admission enforces the matching rule.
 |---|---|---|---|
 | `T2` | Intel host that accepts T2 | Any CPU in the T2 allowlist | Skylake-SP `6/85/4`, Cascade Lake-SP `6/85/7`, Ice Lake-SP `6/106/6` |
 | `T2A` | AMD EPYC Milan (stepping 1) | Any CPU in the T2A allowlist | Milan `25/1/1` (CPUID EAX `0x00a00f11`) |
-| `none` | Host that refused the pinned template (e.g. Sapphire Rapids, Emerald Rapids, EPYC Genoa/Turin) | Only the identical vendor/family/model | — |
+| `none` | Host that refused the pinned template (e.g. Sapphire Rapids, Emerald Rapids, EPYC Genoa/Turin) | Only the identical CPUID identity: vendor/family/model/**stepping** | — |
+
+The `none` tier compares **exact FMS including stepping**: steppings within
+one model can differ in CPUID features — Skylake-SP (8163, stepping 4) lacks
+`AVX512_VNNI` while Cascade Lake-SP (8269CY, stepping 7) has it — so a raw
+snapshot restoring across that skew would fault guest code at execution
+time, exactly the post-load failure class admission exists to eliminate.
 
 Rules that apply to every tier:
 
@@ -55,6 +61,14 @@ Rules that apply to every tier:
 - **`hostKernel` is recorded but not enforced** in this phase.
 - **Legacy manifests** without the structured compatibility fields (or
   with the pre-structured string `cpuModel`) are admitted with a warning.
+  The warning is sticky for a checkpoint chain: a checkpoint inherits its
+  compatibility block from its source, so a legacy ancestor keeps the
+  chain on the legacy path until the image is rebuilt. An
+  agent-delivered artifact set without *any* committed manifest is not
+  treated as legacy — the pull commits the manifest last, so a missing
+  manifest during a create fails with `ErrImageNotReady` and retries
+  until the commit point lands (the legacy fallback applies only to
+  local-mode, hand-seeded caches).
 
 ### Authoritative basis for the allowlists
 

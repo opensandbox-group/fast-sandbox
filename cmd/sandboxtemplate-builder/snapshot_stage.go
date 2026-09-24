@@ -29,7 +29,8 @@ type snapshotPhaseTimings struct {
 	BootToReadyMs        int64 `json:"bootToReadyMs"`
 	SnapshotCreateMs     int64 `json:"snapshotCreateMs"`
 	RestoreToHeartbeatMs int64 `json:"restoreToHeartbeatMs"`
-	// CPUTemplate as reported by bootPreparationVM; "" = raw-CPUID fallback.
+	// CPUTemplate is the tier in effect ("T2"/"T2A"/"none"), normalized by
+	// compatibilityCPUTemplate.
 	CPUTemplate string `json:"cpuTemplate"`
 }
 
@@ -190,10 +191,15 @@ func runSnapshotStage(args []string) error {
 		BootToReadyMs:        bootToReadyMs,
 		SnapshotCreateMs:     snapshotCreateMs,
 		RestoreToHeartbeatMs: restoreToHeartbeatMs,
-		CPUTemplate:          cpuTemplate,
+		CPUTemplate:          compatibilityCPUTemplate(cpuTemplate),
 	}
-	if payload, err := json.Marshal(phases); err == nil {
-		_ = os.WriteFile(filepath.Join(workdir, "snapshot-phases.json"), payload, 0o644) //nolint:gosec // diagnostic timing report, non-sensitive
+	if payload, err := json.Marshal(phases); err != nil {
+		return fmt.Errorf("marshal snapshot stage report: %w", err)
+	} else if err := os.WriteFile(filepath.Join(workdir, "snapshot-phases.json"), payload, 0o644); err != nil { //nolint:gosec // published stage report, world-readable like every staged artifact
+		// The report carries the effective CPU template — admission
+		// provenance, not diagnostics: a lost report must not publish a
+		// template-masked snapshot labeled "none".
+		return fmt.Errorf("write snapshot stage report: %w", err)
 	}
 	klog.InfoS("snapshot stage phases",
 		"format", spec.Output.Format,
@@ -251,9 +257,9 @@ func (vm *vmm) stop() {
 func cpuTemplateForVendor(vendor string) string {
 	switch vendor {
 	case artifacts.VendorGenuineIntel:
-		return "T2"
+		return artifacts.CPUTemplateT2
 	case artifacts.VendorAuthenticAMD:
-		return "T2A"
+		return artifacts.CPUTemplateT2A
 	default:
 		return ""
 	}
@@ -277,7 +283,7 @@ func bootPreparationVM(socket, logPath, workdir, kernel, rootfs, bootArgs string
 	if !errors.Is(err, errInstanceStart) {
 		return nil, "", err
 	}
-	klog.InfoS("host CPU refuses the pinned static CPU template; booting the preparation VM with the host CPUID instead (the snapshot becomes host-CPU specific and must be restored on CPU-compatible hosts)",
+	klog.InfoS("InstanceStart failed with the pinned static CPU template; retrying the preparation VM with the host CPUID (if the template is not at fault, the retry fails identically and reports the real error)",
 		"cpuTemplate", cpuTemplate, "cpuVendor", cpuVendor, "err", err)
 	vm, err = bootVMM(socket, logPath, workdir, kernel, rootfs, bootArgs, spec, "")
 	if err != nil {

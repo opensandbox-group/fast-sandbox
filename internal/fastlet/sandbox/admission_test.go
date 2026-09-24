@@ -18,6 +18,7 @@ import (
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
 
 type admissionRuntime struct {
@@ -449,6 +450,22 @@ func TestDuplicateEnsureCreatesRuntimeOnce(t *testing.T) {
 	group.Wait()
 	ensureCalls, _ := runtime.counts()
 	require.Equal(t, 1, ensureCalls)
+}
+
+// TestEnsureIncompatibleArtifactMapsToProfileMismatch pins the rejection
+// mapping the candidate-advance behavior relies on: a restore-admission
+// failure is a deterministic ProfileMismatch (not retryable) with the
+// rejected-before-side-effects disposition.
+func TestEnsureIncompatibleArtifactMapsToProfileMismatch(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	runtime.ensureError = fmt.Errorf("%w: unmasked snapshot identity mismatch", runtimecontract.ErrIncompatibleArtifact)
+	manager := newAdmissionManager(t, runtime, 1)
+	response, err := manager.CreateSandbox(context.Background(), ensureRequest("sandbox-a", 1, 1))
+	requireFastletCode(t, err, fastletapi.ErrorProfileMismatch)
+	var failure *fastletapi.FastletError
+	require.True(t, errors.As(err, &failure))
+	require.False(t, failure.Retryable)
+	require.Equal(t, fastletapi.CreateDispositionRejectedBeforeSideEffects, response.Disposition)
 }
 
 func TestEnsureFailureReleasesCapacity(t *testing.T) {
