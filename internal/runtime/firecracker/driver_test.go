@@ -229,6 +229,7 @@ type driverFixture struct {
 	launcher    *fakeProcessRunner
 	server      *statefulFakeServer
 	killCalls   []int
+	alignCalls  []string
 	stateRoot   string
 	manager     *fastletnetwork.Manager
 	sandboxSpec fastletapi.RuntimeSandboxConfig
@@ -259,8 +260,12 @@ func newDriverFixture(t *testing.T) *driverFixture {
 			fixture.killCalls = append(fixture.killCalls, pid)
 			return nil
 		},
-		probeProcess:         func(int) error { return nil },
-		waitSocket:           func(context.Context, string, time.Duration) error { return nil },
+		probeProcess: func(int) error { return nil },
+		waitSocket:   func(context.Context, string, time.Duration) error { return nil },
+		alignJailKVM: func(hostPath, jailPath string) error {
+			fixture.alignCalls = append(fixture.alignCalls, hostPath+"->"+jailPath)
+			return nil
+		},
 		processes:            make(map[string]Process),
 		imageGCInterval:      defaultImageGCInterval,
 		imageCacheLimitBytes: defaultImageCacheLimitBytes,
@@ -457,6 +462,8 @@ func TestEnsureSandboxBootsVM(t *testing.T) {
 	require.Len(t, fixture.launcher.started, 1)
 	require.Equal(t, "/usr/local/bin/firecracker", fixture.launcher.started[0][0])
 	require.Contains(t, fixture.launcher.started[0], "--api-sock")
+	// Direct mode has no jail and no jailed KVM device to align.
+	require.Empty(t, fixture.alignCalls)
 
 	// The guest data plane is applied from the manifest guestNetwork: the
 	// bound slot records the baked guest address all slots translate to.
@@ -1070,6 +1077,9 @@ func TestEnsureSandboxJailerMode(t *testing.T) {
 	// The jail root holds the instance rootfs copy and the hard-linked
 	// snapshot files; the persisted API address points at the jail socket.
 	jailRoot := jailerRoot(filepath.Join(fixture.stateRoot, jailerChrootBaseDir), "firecracker", "sandbox-1")
+	// The jailed KVM device is aligned with the host device numbers between
+	// the jailer launch and the first restore API call.
+	require.Equal(t, []string{hostKVMDevicePath + "->" + jailedKVMDevicePath(jailRoot)}, fixture.alignCalls)
 	content, err := os.ReadFile(filepath.Join(jailRoot, rootfsImageName))
 	require.NoError(t, err)
 	require.Equal(t, "rootfs-image-data", string(content))
@@ -1096,6 +1106,27 @@ func TestEnsureSandboxJailerMode(t *testing.T) {
 	require.Len(t, loads[0].NetworkOverrides, 1)
 	require.Equal(t, "eth0", loads[0].NetworkOverrides[0].IfaceID)
 	require.Equal(t, slot.GuestTap, loads[0].NetworkOverrides[0].HostDevName)
+}
+
+// TestEnsureSandboxJailerKVMAlignFailure fails the jailed KVM device
+// alignment: the create fails with the alignment error (not a confusing KVM
+// ENODEV inside snapshot/load), the VMM is killed, the slot is released, and
+// the partial jail is removed.
+func TestEnsureSandboxJailerKVMAlignFailure(t *testing.T) {
+	fixture := newDriverFixture(t)
+	fixture.enableJailer()
+	fixture.prepareCachedImage(t, fixture.sandboxSpec.Spec.Image)
+	require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
+	fixture.driver.alignJailKVM = func(string, string) error { return errors.New("mknod broke") }
+
+	_, err := fixture.driver.EnsureSandbox(context.Background(), ensureInput(&fixture.sandboxSpec))
+	require.ErrorIs(t, err, ErrRuntimeNotInitialized)
+	require.Contains(t, err.Error(), "align jailed KVM device")
+	require.NotEmpty(t, fixture.launcher.processes)
+	require.True(t, fixture.launcher.processes[0].killed, "the half-booted VMM must be killed")
+	require.Equal(t, 0, fixture.manager.Snapshot().Bound)
+	_, statErr := os.Stat(jailerRoot(filepath.Join(fixture.stateRoot, jailerChrootBaseDir), "firecracker", "sandbox-1"))
+	require.True(t, os.IsNotExist(statErr))
 }
 
 func TestDeleteSandboxRemovesJailRoot(t *testing.T) {

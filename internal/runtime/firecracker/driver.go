@@ -34,14 +34,18 @@ const bootPollInterval = 250 * time.Millisecond
 // restored from the golden snapshot set (or an instance checkpoint on
 // resume). The VM runs in the Fastlet Pod; nothing is pre-warmed.
 type Driver struct {
-	mu             sync.RWMutex
-	profile        runtimecatalog.RuntimeProfile
-	config         runtimecatalog.FirecrackerConfig
-	namespace      string
-	podUID         string
-	initialized    bool
-	runner         fastletnetwork.CommandRunner
-	launcher       ProcessRunner
+	mu          sync.RWMutex
+	profile     runtimecatalog.RuntimeProfile
+	config      runtimecatalog.FirecrackerConfig
+	namespace   string
+	podUID      string
+	initialized bool
+	runner      fastletnetwork.CommandRunner
+	launcher    ProcessRunner
+	// alignJailKVM rebinds the jailed /dev/kvm inode to the host device
+	// numbers before the first restore API call (jailer mode only; see
+	// kvm_device.go; tests stub it).
+	alignJailKVM   func(hostPath, jailPath string) error
 	newClient      func(socketPath string) *Client
 	stat           func(string) (os.FileInfo, error)
 	killProcess    func(pid int) error
@@ -108,7 +112,8 @@ func New(profile runtimecatalog.RuntimeProfile) (*Driver, error) {
 		profile: profile, config: *profile.Firecracker,
 		runner: fastletnetwork.ExecRunner{}, launcher: ExecProcessRunner{},
 		newClient: NewClient, stat: os.Stat, killProcess: killPID, probeProcess: pidAlive,
-		waitSocket: waitForAPISocket, processes: make(map[string]Process),
+		alignJailKVM: defaultAlignJailKVM,
+		waitSocket:   waitForAPISocket, processes: make(map[string]Process),
 		imageGCInterval:      defaultImageGCInterval,
 		imageCacheLimitBytes: defaultImageCacheLimitBytes,
 	}, nil
@@ -644,6 +649,23 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		return nil, err
 	}
 	launchDur := time.Since(launchStarted)
+
+	// Jailer mode only: the jailer bound the jailed /dev/kvm to the upstream
+	// default device number; rebind it to the host numbers before the
+	// restore opens the device, so a vendor KVM minor cannot surface as a
+	// confusing ENODEV inside snapshot/load (kvm_device.go). The failure
+	// kills the half-booted VMM and fails the create with the alignment
+	// error instead.
+	if jailRoot != "" {
+		_, alignSpan := observability.Start(ctx, "fastlet.firecracker.kvm_align")
+		err = d.alignJailKVM(hostKVMDevicePath, jailedKVMDevicePath(jailRoot))
+		observability.End(alignSpan, err)
+		if err != nil {
+			d.killAndForget(identity.SandboxUID, process.PID())
+			releaseSlot()
+			return nil, fmt.Errorf("%w: align jailed KVM device: %w", ErrRuntimeNotInitialized, err)
+		}
+	}
 
 	client := d.newClient(state.APIAddress)
 	defer client.Close()

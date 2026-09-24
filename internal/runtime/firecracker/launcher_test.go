@@ -25,6 +25,9 @@ func (f *fakeProcess) Wait() error { return nil }
 type fakeProcessRunner struct {
 	started [][]string
 	err     error
+	// processes records every process handed out so tests can assert the
+	// killAndForget path (tracked processes die via Kill, not killProcess).
+	processes []*fakeProcess
 }
 
 func (f *fakeProcessRunner) Start(_ context.Context, name string, args []string, _ string) (Process, error) {
@@ -32,7 +35,9 @@ func (f *fakeProcessRunner) Start(_ context.Context, name string, args []string,
 	if f.err != nil {
 		return nil, f.err
 	}
-	return &fakeProcess{pid: 4242}, nil
+	process := &fakeProcess{pid: 4242}
+	f.processes = append(f.processes, process)
+	return process, nil
 }
 
 func TestBuildArgvTruncatesID(t *testing.T) {
