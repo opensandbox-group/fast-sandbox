@@ -121,6 +121,7 @@ func newNetworkManagerWithDriverForTest(t *testing.T, driver fastletnetwork.Driv
 	}, driver, newMemoryStateStore())
 	require.NoError(t, err)
 	require.NoError(t, manager.Initialize(context.Background()))
+	t.Cleanup(manager.Quiesce)
 	return manager
 }
 
@@ -702,6 +703,9 @@ func TestDeleteSandboxRetriesFailedSlotRelease(t *testing.T) {
 	require.NoError(t, fixture.driver.DeleteSandbox(context.Background(), "sandbox-1"))
 	require.NoDirExists(t, directory)
 	require.Equal(t, 2, flaky.destroyCalls)
+	// The converged Release spawned a background replenish; the replacement
+	// slot is transiently Destroying while it is being prepared.
+	manager.Quiesce()
 	require.Zero(t, manager.Snapshot().Destroying)
 	require.Zero(t, manager.Snapshot().Bound)
 }

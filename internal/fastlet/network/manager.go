@@ -60,16 +60,17 @@ func DefaultConfig(capacity int, podUID string) Config {
 }
 
 type Manager struct {
-	mu        sync.RWMutex
-	prepareMu sync.Mutex
-	config    Config
-	driver    Driver
-	store     StateStore
-	ipam      *IPv4IPAM
-	slots     map[string]*Slot
-	closed    chan struct{} // closed by Close: no more slot preparation
-	hit       atomic.Uint64
-	miss      atomic.Uint64
+	mu          sync.RWMutex
+	prepareMu   sync.Mutex
+	config      Config
+	driver      Driver
+	store       StateStore
+	ipam        *IPv4IPAM
+	slots       map[string]*Slot
+	closed      chan struct{} // closed by Close: no more slot preparation
+	replenishWG sync.WaitGroup
+	hit         atomic.Uint64
+	miss        atomic.Uint64
 }
 
 func NewManager(config Config, driver Driver, store StateStore) (*Manager, error) {
@@ -356,7 +357,9 @@ func (m *Manager) Release(ctx context.Context, owner Owner) error {
 	if err := m.markAndDestroy(ctx, target.ID); err != nil {
 		return err
 	}
+	m.replenishWG.Add(1)
 	go func() {
+		defer m.replenishWG.Done()
 		replenishCtx, cancel := context.WithTimeout(context.Background(), m.config.ReplenishTimeout)
 		defer cancel()
 		if err := m.Replenish(replenishCtx); err != nil {
@@ -365,6 +368,13 @@ func (m *Manager) Release(ctx context.Context, owner Owner) error {
 	}()
 	return nil
 }
+
+// Quiesce waits for any background replenish spawned by Release to finish.
+// Snapshot phases right after a Release are only deterministic once the
+// replacement slot's asynchronous preparation has settled, and the
+// preparation writes durable state — callers (and tests) that must observe
+// a settled manager wait here.
+func (m *Manager) Quiesce() { m.replenishWG.Wait() }
 
 // destroyFailedSlot tears down a slot whose preparation failed; a destroy
 // failure here leaks host network resources, so it is never silent.

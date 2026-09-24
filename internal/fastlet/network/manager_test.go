@@ -64,6 +64,10 @@ func newTestManager(t *testing.T, capacity int, root string, driver Driver, ids 
 	}
 	manager, err := NewManager(config, driver, NewFileStateStore(filepath.Join(root, config.PodUID)))
 	require.NoError(t, err)
+	// Quiesce before TempDir cleanup: a Release inside the test spawns a
+	// background replenish that keeps writing state files after the body
+	// returns, racing the RemoveAll with "directory not empty".
+	t.Cleanup(manager.Quiesce)
 	return manager
 }
 
