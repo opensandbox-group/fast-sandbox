@@ -3,10 +3,9 @@
 Golden snapshots embed the build host's CPU state (CPUID mask, MSRs,
 XSTATE). Restoring one on the wrong CPU is a hard failure at
 `snapshot/load` — or worse, undefined behavior — so the runtime enforces
-a compatibility check before staging (OSEP-0024 Phase 1), and the agent
-labels each node with the snapshot tiers it can restore. This document
-defines the tiers, their authoritative basis, and how to schedule
-against them.
+a compatibility check before staging, and the agent labels each node
+with the snapshot tiers it can restore. This document defines the
+tiers, their authoritative basis, and how to schedule against them.
 
 ## The compatibility contract
 
@@ -108,7 +107,7 @@ Rules that apply to every tier:
 T2A only applies to EPYC Milan — it is the only AMD static template
 upstream. Turin/Genoa golden images are therefore always tier `none`
 today; supporting them portably needs an upstream static template or a
-custom template (OSEP-0024 later phase).
+custom template (future work).
 
 ## Restore admission
 
@@ -175,10 +174,6 @@ at admission and the orchestrator tries the next node.
 
 ## References
 
-- OSEP-0024 (design and later phases):
-  [opensandbox-group/OpenSandbox#1990](https://github.com/opensandbox-group/OpenSandbox/pull/1990)
-- Tracking issue:
-  [opensandbox-group/fast-sandbox#82](https://github.com/opensandbox-group/fast-sandbox/issues/82)
 - Implementation: `internal/artifacts/manifest.go` (identity, allowlists,
   `MatchRestoreCompatibility`), `internal/runtime/firecracker/restore.go`
   (admission), `internal/runtime/firecracker/agent/hostready` (labels)
