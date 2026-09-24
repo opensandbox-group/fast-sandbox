@@ -123,7 +123,7 @@ func reflinkProbe(dir string) (bool, error) {
 		return false, err
 	}
 	defer os.Remove(src.Name())
-	if _, err := src.Write([]byte("fast-sandbox reflink probe")); err != nil {
+	if _, err := src.WriteString("fast-sandbox reflink probe"); err != nil {
 		src.Close()
 		return false, err
 	}
