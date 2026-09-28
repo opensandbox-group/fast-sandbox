@@ -49,9 +49,11 @@ involvement). It is a single-host data-plane tool.
 - **Deployment assumption**: ublkd is pre-deployed via systemd (upstream unit
   template `/opt/overlaybd/overlaybd-ublkd.service`); the CLI only checks socket
   reachability at startup and never launches the daemon itself.
-- **Caveats**: `resize` needs kernel 6.11+ (UBLK_F_UPDATE_SIZE) and is out of scope;
-  daemon-owned devices must be deleted through its API; mounting a writable image
-  twice is rejected by the daemon (upper-layer exclusivity protection).
+- **Caveats**: daemon-owned devices must be deleted through its API; mounting a
+  writable image twice is rejected by the daemon (upper-layer exclusivity
+  protection). Build-time shrinking does not use the online `UBLK_F_UPDATE_SIZE`
+  operation that requires kernel 6.11+: it deletes the device, resizes the upper
+  offline, and adds the device again.
 
 ### ADR-003 Template resolution: pull manifests with oras, generate config.v1.json in the CLI
 
@@ -136,6 +138,100 @@ involvement). It is a single-host data-plane tool.
 - **Open input**: the device-allocation interface of that networking stack (to be
   captured in a follow-up ADR once provided).
 
+### ADR-011 Template building: `template-vm build` via cold-boot snapshotting (build iteration)
+
+- **Decision**: `template-vm build --source <OCI or overlaybd image> --output <name:tag>`
+  converts a remote source into a local template pair (`<tag>_rootfs` /
+  `<tag>_snapfiles`). The CLI resolves registry manifests with ORAS. For an
+  ordinary OCI/Docker tar image it invokes the `accelerated-container-image`
+  userspace `convertor`, produces Native OverlayBD locally, and then enters the
+  same build path as an already accelerated source. template-vm never invokes
+  the docker CLI.
+- **Read-path divergence between build and create**: create stays manifest-only
+  (lowers are addressed by `digest` + `repoBlobUrl` and range-read remotely).
+  Build resolves and classifies the host-platform manifest first. Native sources
+  are downloaded with ORAS; ordinary OCI sources are converted with
+  `--no-upload --dump-manifest --reserve`. Both paths finish with Native layers
+  under `blobs/sha256/`, referenced through `lowers[].file` during the build.
+- **Source format gate**: the whole manifest is classified before layer download.
+  An all-Native image proceeds directly; an all-standard OCI/Docker tar image is
+  converted. Turbo OCI, tar-wrapped OverlayBD, mixed Native/tar manifests, and
+  unknown media types are rejected. Converted output is validated as Native and
+  original OCI tar blobs never enter the final artifact.
+- **Converter prerequisite**: download `accelerated-container-image` separately
+  and run `make bin/convertor`; install it at
+  `/opt/overlaybd/snapshotter/convertor` or override `--overlaybd-convertor`.
+  Builds always pass `--no-upload`. Private registry credentials may come from
+  `--username username:password` or `--auth-file` and are forwarded to convertor.
+- **Rootfs target size**: `--disk-size-gb` accepts a positive whole-GiB value,
+  defaults to 20, and may be overridden. Because the source virtual size is baked
+  into its LSMT headers (commonly 64–256 GiB regardless of content size), build
+  first probes it with a lowers-only device and creates the initial upper at
+  `max(ceil(source size), target)`. While unmounted, it runs `e2fsck -fy`,
+  `resize2fs <device> <target>G` when needed, and `e2fsck -fn`. Only after ext4
+  reaches the target does it delete the ublk device, run
+  `overlaybd-resize --config ... --size <target>`, update the retained config's
+  upper vsize, and add the device again. BLKGETSIZE64 and `dumpe2fs -h` must both
+  report the exact target before boot. metadata.json keeps the existing
+  `disk_size_mb` field and stores `disk_size_gb × 1024`.
+- **Snapshot capture**: inject an init script into the writable rootfs (built-in
+  redis sample by default, `--init-script-file` overrides) → cold-boot
+  Firecracker (boot args carry `init=<init-path>`) → wait for the ready pattern
+  on the serial log (default `Ready to accept connections`, configurable;
+  on timeout the serial tail is printed) → pause → Full Snapshot
+  (`vmstate.bin` + `memfile`) → terminate Firecracker.
+- **snapfiles without raw import**: `overlaybd-create --hybrid` creates a blank
+  writable device with no lowers → `mkfs.ext4` → rw-mount → write
+  `/vmstate.bin`, `/memfile`, `/metadata.json` → sync → umount → ublkd del →
+  `overlaybd-commit` seals it into a read-only layer. Rejected:
+  `build/sandboxtemplate-builder/overlaybd-import-raw.cpp` is not part of this
+  pipeline.
+- **Sealing order**: commit the snapfiles upper first, then delete the rootfs
+  ublk device and commit the rootfs upper; both commit outputs become the
+  incremental read-only layers of the new template pair.
+
+### ADR-012 Build artifact layout and publish contract (build iteration)
+
+- **Decision**: build emits self-contained LOCAL artifacts only; **nothing is
+  pushed to a registry in this iteration**:
+  ```text
+  <output-dir>/<name>_<tag>/
+    blobs/sha256/<source layer digests + two committed layer digests + config digest>
+    manifest/source-<tag>.json
+            <name>_<tag>_rootfs.json
+            <name>_<tag>_snapfiles.json
+            index.json
+  ```
+- **Self-containment**: the rootfs manifest preserves the source layer
+  descriptors (order and attributes) and appends the rootfs commit layer; every
+  referenced blob (inherited layers and the generated minimal config) must exist
+  under the local `blobs/sha256/`. Build validates every digest, size, and JSON
+  schema in a sibling staging directory, then atomically publishes the final
+  directory; it refuses to overwrite an existing artifact.
+- **Commit-layer convention**: mediaType is
+  `...overlaybd.image.layer.v1.zfile` (default `-z` compression) or
+  `...overlaybd.image.layer.v1.lsmt` (`--no-compress`), annotated with
+  `containerd.io/snapshot/overlaybd/blob-digest == own digest`, matching the
+  native-layer rule of strict consumers.
+- **index.json (layout index)**: records `source_ref`, the source manifest
+  file/digest, and both images' manifest files/digests (schema_version=1). The
+  future push iteration consumes it as the ONLY input: read a target manifest →
+  upload every blob it references from `blobs/sha256/` → commit the manifest
+  (ORAS SDK). Because source blobs are already local, the pair can publish to
+  any registry with no cross-registry blob copy.
+
+### ADR-013 Registry credential matching canonicalization (build iteration)
+
+- **Decision**: ORAS client credential selection canonicalizes docker config
+  auths keys the same way as the reference: strip scheme, trailing slashes and
+  `/v1` or `/v2` API suffixes; map Docker Hub aliases (`docker.io`,
+  `index.docker.io`, `registry.hub.docker.com`, ...) to
+  `registry-1.docker.io`; then match the longest registry/repository prefix.
+- **Rationale**: the standard key written by `docker login` is
+  `https://index.docker.io/v1/`; without canonicalization Hub credentials never
+  match and silently degrade to anonymous access (tolerable for public images,
+  a 401 for private ones).
+
 ## Create flow (strictly ordered; failures roll back in reverse)
 
 1. Parse template.json; verify sandbox_id is free (state directory absent).
@@ -152,6 +248,30 @@ involvement). It is a single-host data-plane tool.
    File backend) → networking (NetworkProvider or none) → `PATCH /vm` resume.
 8. Persist the state file; print sandbox info (id, pid, ublk devices, socket path).
 
+## Build flow (strictly ordered; failures roll back in reverse; build iteration)
+
+1. Validate flags; ping ublkd; read `--auth-file` or
+   `--username username:password`.
+2. Resolve the source manifest with ORAS (traversing one image-index level and
+   selecting `linux/<host arch>`) and classify it before downloading layers.
+3. Download Native config/layers directly, or pass an ordinary OCI manifest
+   digest and credentials to `convertor --no-upload --dump-manifest --reserve`.
+   Validate and import its manifest/config/`overlaybd.commit` files into the
+   local artifact, then probe the unified Native lowers-only device.
+4. rootfs: create and add a hybrid upper sized to `max(source, --disk-size-gb)` →
+   offline `e2fsck -fy` → `resize2fs <target>G` when needed → `e2fsck -fn` → when
+   upper size differs, delete the device, run `overlaybd-resize`, update config
+   vsize, and add again → verify block-device and ext4 geometry equal the target.
+5. rw-mount the verified rootfs, inject the init script (0755), sync, umount.
+6. Cold-boot Firecracker (1 vCPU / 1 GiB by default) → wait for the serial ready
+   pattern → pause → Full Snapshot → terminate Firecracker.
+7. snapfiles: blank hybrid upper → `/v1/add` → `mkfs.ext4` → rw-mount → write
+   vmstate.bin/memfile/metadata.json → sync → umount → ublkd del → commit.
+8. Delete the rootfs ublk device → commit the rootfs upper; move both committed
+   layers into `blobs/sha256/`.
+9. Emit the minimal config blob, both manifests and index.json; validate the
+   whole layout → clean the work directory → print the artifact summary.
+
 ## Risks and mitigations
 
 | Risk | Mitigation |
@@ -161,4 +281,11 @@ involvement). It is a single-host data-plane tool.
 | In-disk layout is only a verbal convention | Verify with a real image during integration; paths centralized in one constants block |
 | Concurrent cred.json clobbering | Atomic write (tmp+rename) + file lock |
 | ublkd device leakage (CLI crash) | state.json records dev_ids; delete is idempotent; a janitor may be added later |
-| Kernel requirements | Baseline ublk support suffices (overlaybd upstream validated on a 5.10 backport kernel; 6.11+ only needed for resize) |
+| Kernel requirements | Baseline ublk support suffices; build changes capacity offline with delete/resize/add and does not require online UBLK_F_UPDATE_SIZE |
+| Missing resize utilities | Require `e2fsck`, `resize2fs`, `dumpe2fs`, and `/opt/overlaybd/bin/overlaybd-resize`; any failure triggers reverse rollback |
+| Ordinary OCI conversion fails or emits corrupt output | Force convertor no-upload mode and verify every manifest/config/layer digest and size before any ublk operation |
+| Source is Turbo OCI, tar-wrapped, mixed, or unknown | Reject during manifest classification; only an all-standard-tar image enters convertor (ADR-011) |
+| Private registry credential exposure | ORAS and convertor reuse one credential and template-vm never logs full argv; document that the external convertor's argv-only API remains visible to the same user/root while running |
+| Upper shrunk before ext4 (EXT4 bad geometry) | Always resize ext4 offline on the initial large device before deleting/resizing/adding the upper, then verify both geometries exactly (ADR-011) |
+| No uniform guest workload start convention | Init-script injection (built-in redis sample default) + `--init-script-file`/`--ready-pattern` overrides; readiness is a serial pattern, not mere process start |
+| Local artifacts drifting from registry state | No push in this iteration; index.json pins source_ref and every digest as the single publish input for reconciliation (ADR-012) |
