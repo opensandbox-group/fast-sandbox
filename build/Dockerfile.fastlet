@@ -13,7 +13,6 @@ WORKDIR /workspace
 RUN apk add --no-cache iproute2 iptables e2fsprogs tcpdump coreutils
 COPY .build/linux-amd64/fastlet .
 COPY .build/linux-amd64/sandbox-init /opt/fast-sandbox/bin/sandbox-init
-COPY .build/linux-amd64/sandbox-tunnel /opt/fast-sandbox/bin/sandbox-tunnel
 
 # Default envs; can be overridden by Pod spec
 ENV FASTLET_CONTROL_PORT=":5758"

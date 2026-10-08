@@ -54,8 +54,6 @@ spec:
         - name: network-namespaces
           mountPath: /run/netns
           mountPropagation: Bidirectional
-        - name: boxlite-state
-          mountPath: /var/lib/fast-sandbox/boxlite
         - name: runtime-environments
           mountPath: /etc/fast-sandbox/runtime-environments
           readOnly: true
@@ -79,10 +77,6 @@ spec:
       - name: network-namespaces
         hostPath:
           path: /run/fast-sandbox/netns
-          type: DirectoryOrCreate
-      - name: boxlite-state
-        hostPath:
-          path: /var/lib/fast-sandbox/boxlite
           type: DirectoryOrCreate
       - name: runtime-environments
         configMap:

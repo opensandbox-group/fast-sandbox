@@ -24,7 +24,6 @@ and platform-owned runtime implementation details.
 Image and route-key flags can also be supplied by environment:
 
 - `FASTLET_PROXY_IMAGE`;
-- `BOXLITE_RUNTIME_IMAGE`;
 - `FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY`;
 - `FAST_SANDBOX_ROUTE_SIGNING_PRIVATE_KEY`;
 - `FAST_SANDBOX_PROXY_BASE_URL`.
@@ -143,7 +142,6 @@ Data and metrics listeners are separate.
 | `--orphan-timeout` | `30s` |
 | `--scan-interval` | `2m` |
 | `--network-state-root` | `/run/fast-sandbox/network` |
-| `--boxlite-state-root` | `/var/lib/fast-sandbox/boxlite` |
 | `--metrics-address` | `:9092` |
 | `--runtime-environments-file` | `/etc/fast-sandbox/runtime-environments/runtime-environments.yaml` |
 

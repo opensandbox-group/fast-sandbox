@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"time"
 
 	"k8s.io/klog/v2"
@@ -45,23 +44,6 @@ func (m *SandboxManager) initializeInfraInstance(ctx context.Context, metadata *
 			switch access.Kind {
 			case dataplane.AccessKindDirectIP:
 				instance, err = m.infraManager.InitializeInstance(ctx, &metadata.Config, access.Address)
-			case dataplane.AccessKindLocalForward:
-				endpoint := access.Address
-				instance, err = m.infraManager.InitializeInstanceWithDialer(ctx, &metadata.Config, func(ctx context.Context, targetPort uint32) (net.Conn, error) {
-					connection, dialErr := (&net.Dialer{}).DialContext(ctx, "tcp", endpoint)
-					if dialErr != nil {
-						return nil, dialErr
-					}
-					preamble, encodeErr := dataplane.EncodeLocalForwardPreamble(targetPort, access.Credential)
-					if encodeErr == nil {
-						encodeErr = dataplane.WriteLocalForwardPreamble(connection, preamble)
-					}
-					if encodeErr != nil {
-						_ = connection.Close()
-						return nil, encodeErr
-					}
-					return connection, nil
-				})
 			default:
 				err = fmt.Errorf("unsupported Infra access kind %q", access.Kind)
 			}

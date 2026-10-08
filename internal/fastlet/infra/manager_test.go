@@ -52,25 +52,12 @@ func TestManagerRetriesTransientArtifactPreparationFailure(t *testing.T) {
 	require.Equal(t, 2, resolver.calls)
 }
 
-func TestManagerPreparesTunnelForBoxLite(t *testing.T) {
-	manager, _ := testManager(t, apiv1alpha2.RuntimeBoxLite)
-	require.NoError(t, manager.Prepare(context.Background()))
-	plan, err := manager.Plan()
-	require.NoError(t, err)
-	require.Equal(t, runtimecatalog.InfraDeliveryArtifactVolume, plan.Components[0].Plan.Delivery)
-	require.NotNil(t, plan.Supervisor)
-	require.NotNil(t, plan.Tunnel)
-	require.FileExists(t, plan.Tunnel.PodPath)
-	require.Len(t, manager.ArtifactReferences(), 3)
-}
-
 func TestManagerPreparesHostProcessComponentWithoutArtifactOrSupervisor(t *testing.T) {
 	manager, resolver := testHostProcessManager(t)
 	require.NoError(t, manager.Prepare(context.Background()))
 	plan, err := manager.Plan()
 	require.NoError(t, err)
 	require.Nil(t, plan.Supervisor)
-	require.Nil(t, plan.Tunnel)
 	require.Len(t, plan.Components, 1)
 	require.Equal(t, runtimecatalog.InfraDeliveryHostProcess, plan.Components[0].Plan.Delivery)
 	require.Empty(t, plan.Components[0].Mappings)
@@ -133,8 +120,6 @@ func testManager(t *testing.T, runtimeName apiv1alpha2.RuntimeName) (*Manager, *
 	require.NoError(t, err)
 	sandboxInit := filepath.Join(root, "sandbox-init")
 	require.NoError(t, os.WriteFile(sandboxInit, []byte("sandbox-init"), 0555))
-	sandboxTunnel := filepath.Join(root, "sandbox-tunnel")
-	require.NoError(t, os.WriteFile(sandboxTunnel, []byte("sandbox-tunnel"), 0555))
 	runtimeProfile, err := runtimecatalog.Builtin().Resolve(runtimeName)
 	require.NoError(t, err)
 	plan := testInfraPlan(t, runtimeProfile)
@@ -143,7 +128,7 @@ func testManager(t *testing.T, runtimeName apiv1alpha2.RuntimeName) (*Manager, *
 	}}
 	manager, err := NewManagerWithConfig(ManagerConfig{
 		Plan: plan, RuntimeProfile: runtimeProfile, Store: store, Resolver: resolver,
-		SandboxInitPath: sandboxInit, SandboxTunnelPath: sandboxTunnel,
+		SandboxInitPath: sandboxInit,
 	})
 	require.NoError(t, err)
 	return manager, resolver

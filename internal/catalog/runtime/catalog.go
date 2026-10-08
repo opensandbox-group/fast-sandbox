@@ -20,7 +20,6 @@ type DriverKind string
 
 const (
 	DriverKindContainerd  DriverKind = "containerd"
-	DriverKindBoxLite     DriverKind = "boxlite"
 	DriverKindFirecracker DriverKind = "firecracker"
 )
 
@@ -29,7 +28,6 @@ type NetworkMode string
 const (
 	NetworkModeLinuxNetNS  NetworkMode = "linux-netns"
 	NetworkModeGuestNetNS  NetworkMode = "guest-netns"
-	NetworkModeBoxLite     NetworkMode = "boxlite-gvproxy"
 	NetworkModeFirecracker NetworkMode = "firecracker-tap"
 )
 
@@ -38,13 +36,12 @@ const DefaultContainerdNamespace = "k8s.io"
 type InfraDeliveryMode string
 
 const (
-	InfraDeliveryBindMount      InfraDeliveryMode = "bind-mount"
-	InfraDeliveryImageLayer     InfraDeliveryMode = "image-layer"
-	InfraDeliveryPreinstalled   InfraDeliveryMode = "preinstalled"
-	InfraDeliveryTemplateBake   InfraDeliveryMode = "template-bake"
-	InfraDeliveryGuestCopy      InfraDeliveryMode = "guest-copy"
-	InfraDeliveryArtifactVolume InfraDeliveryMode = "artifact-volume"
-	InfraDeliveryHostProcess    InfraDeliveryMode = "host-process"
+	InfraDeliveryBindMount    InfraDeliveryMode = "bind-mount"
+	InfraDeliveryImageLayer   InfraDeliveryMode = "image-layer"
+	InfraDeliveryPreinstalled InfraDeliveryMode = "preinstalled"
+	InfraDeliveryTemplateBake InfraDeliveryMode = "template-bake"
+	InfraDeliveryGuestCopy    InfraDeliveryMode = "guest-copy"
+	InfraDeliveryHostProcess  InfraDeliveryMode = "host-process"
 )
 
 type CapabilityState string
@@ -78,17 +75,6 @@ type ContainerdConfig struct {
 	NeedsTTY    bool   `json:"needsTTY,omitempty"`
 }
 
-type BoxLiteConfig struct {
-	StateRoot       string `json:"stateRoot"`
-	BinaryPath      string `json:"binaryPath"`
-	ProxyBinary     string `json:"proxyBinary"`
-	ControlSocket   string `json:"controlSocket"`
-	ProtocolVersion string `json:"protocolVersion"`
-	TunnelGuestPort uint32 `json:"tunnelGuestPort"`
-	DefaultVCPUs    int32  `json:"defaultVCPUs"`
-	DefaultMemory   string `json:"defaultMemory"`
-}
-
 // FirecrackerConfig carries the platform-owned paths and defaults for the
 // direct Firecracker runtime driver. The driver starts one Firecracker
 // microVM per Sandbox create request, restored from the golden snapshot
@@ -118,13 +104,11 @@ type HostPathRequirement struct {
 }
 
 type DeploymentRequirements struct {
-	Privileged    bool                  `json:"privileged"`
-	RequiresKVM   bool                  `json:"requiresKVM,omitempty"`
-	Sidecar       string                `json:"sidecar,omitempty"`
-	ResourceOwner string                `json:"resourceOwner,omitempty"`
-	NodeSelector  map[string]string     `json:"nodeSelector,omitempty"`
-	HostPaths     []HostPathRequirement `json:"hostPaths,omitempty"`
-	Overhead      corev1.ResourceList   `json:"overhead,omitempty"`
+	Privileged   bool                  `json:"privileged"`
+	RequiresKVM  bool                  `json:"requiresKVM,omitempty"`
+	NodeSelector map[string]string     `json:"nodeSelector,omitempty"`
+	HostPaths    []HostPathRequirement `json:"hostPaths,omitempty"`
+	Overhead     corev1.ResourceList   `json:"overhead,omitempty"`
 }
 
 type Capabilities struct {
@@ -144,7 +128,6 @@ type RuntimeDefinition struct {
 	ProfileHash        string                  `json:"profileHash"`
 	Driver             DriverKind              `json:"driver"`
 	Containerd         *ContainerdConfig       `json:"containerd,omitempty"`
-	BoxLite            *BoxLiteConfig          `json:"boxlite,omitempty"`
 	Firecracker        *FirecrackerConfig      `json:"firecracker,omitempty"`
 	Deployment         DeploymentRequirements  `json:"deployment"`
 	Capabilities       Capabilities            `json:"capabilities"`
@@ -257,10 +240,6 @@ func cloneProfile(profile RuntimeProfile) RuntimeProfile {
 	if profile.Containerd != nil {
 		value := *profile.Containerd
 		clone.Containerd = &value
-	}
-	if profile.BoxLite != nil {
-		value := *profile.BoxLite
-		clone.BoxLite = &value
 	}
 	if profile.Firecracker != nil {
 		value := *profile.Firecracker

@@ -14,8 +14,6 @@ const (
 	runscContainerdConfigPath = "/etc/containerd/runsc.toml"
 	// kvmDevicePath is the host KVM character device required by VM runtimes.
 	kvmDevicePath = "/dev/kvm"
-	// boxliteStateRootDir is the host state root directory of the BoxLite runtime.
-	boxliteStateRootDir = "/var/lib/fast-sandbox/boxlite"
 	// firecrackerStateRootDir is the host state root directory of the Firecracker runtime.
 	firecrackerStateRootDir = "/var/lib/fast-sandbox/firecracker"
 	// firecrackerBinaryPath is the host Firecracker binary installed by hostready.
@@ -72,24 +70,6 @@ func builtinProfiles() map[apiv1alpha2.RuntimeName]RuntimeProfile {
 			"/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-dragonball.toml",
 			kataPaths,
 		),
-		apiv1alpha2.RuntimeBoxLite: {
-			Name: apiv1alpha2.RuntimeBoxLite, Version: builtinProfileVersion, Driver: DriverKindBoxLite,
-			BoxLite: &BoxLiteConfig{
-				StateRoot: boxliteStateRootDir, BinaryPath: "/usr/local/bin/boxlite", ProxyBinary: "gvproxy",
-				ControlSocket: "/run/fast-sandbox/boxlite/runtime.sock", ProtocolVersion: "v1", TunnelGuestPort: 19090,
-				DefaultVCPUs: 1, DefaultMemory: "1Gi",
-			},
-			Deployment: DeploymentRequirements{
-				Privileged: true, RequiresKVM: true, Sidecar: "boxlite-runtime", ResourceOwner: "boxlite-runtime", Overhead: overhead("200m", "256Mi"),
-				HostPaths: []HostPathRequirement{
-					{Name: "dev-kvm", HostPath: kvmDevicePath, MountPath: kvmDevicePath, Type: corev1.HostPathCharDev},
-					{Name: "boxlite-state", HostPath: boxliteStateRootDir, MountPath: boxliteStateRootDir, Type: corev1.HostPathDirectoryOrCreate},
-				},
-			},
-			Capabilities:       Capabilities{DefaultState: CapabilityUnsupported, SupportsNetwork: true, SupportsRecovery: true, Reason: "BoxLiteResourceEnforcementIncomplete"},
-			NetworkMode:        NetworkModeBoxLite,
-			InfraDeliveryModes: []InfraDeliveryMode{InfraDeliveryTemplateBake, InfraDeliveryPreinstalled, InfraDeliveryArtifactVolume},
-		},
 		apiv1alpha2.RuntimeFirecracker: withResidualProcess(
 			RuntimeProfile{
 				Name: apiv1alpha2.RuntimeFirecracker, Version: builtinProfileVersion, Driver: DriverKindFirecracker,

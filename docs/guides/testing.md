@@ -1,6 +1,6 @@
 # Testing
 
-Pure Go and generated-file checks can run on any supported development host. Kubernetes, kind, containerd, Linux networking, gVisor, Kata, BoxLite, and E2E validation require Linux.
+Pure Go and generated-file checks can run on any supported development host. Kubernetes, kind, containerd, Linux networking, gVisor, Kata, Firecracker, and E2E validation require Linux.
 
 ## Public test interface
 
@@ -37,13 +37,11 @@ Run runtime capability gates:
 make e2e SUITE=runtime RUNTIME=container
 make e2e SUITE=runtime RUNTIME=gvisor
 make e2e SUITE=runtime RUNTIME=kata
-make e2e SUITE=runtime RUNTIME=boxlite
+make e2e SUITE=runtime RUNTIME=firecracker
 ```
 
 A skipped runtime test is not a passing capability gate. The Kata Firecracker
-test is a positive runtime, network, Infra, proxy, and recovery test; the
-BoxLite gate continues to prove fail-closed behavior until its requirements
-are satisfied.
+test is a positive runtime, network, Infra, proxy, and recovery test.
 
 ## Suite coverage
 
@@ -54,7 +52,7 @@ are satisfied.
 | `lifecycle` | create, delete, and graceful shutdown |
 | `scheduling` | Pool selection, capacity, image affinity, autoscaling |
 | `cliintegration` | fastctl lifecycle, diagnostics, and SDK adapters |
-| `secureruntime` | container, gVisor, Kata, and BoxLite capability behavior |
+| `secureruntime` | container, gVisor, Kata, and Firecracker capability behavior |
 | `drain` | scale-down, ready surge, and persisted drain |
 | `faultrecovery` | Pod loss and generation fencing |
 | `cleanupjanitor` | orphan cleanup backends |

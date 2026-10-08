@@ -22,9 +22,8 @@ import (
 )
 
 const (
-	SandboxInitContainerPath   = "/.fast/bin/sandbox-init"
-	SandboxTunnelContainerPath = "/.fast/bin/sandbox-tunnel"
-	InstanceConfigPath         = "/.fast/run/infra.json"
+	SandboxInitContainerPath = "/.fast/bin/sandbox-init"
+	InstanceConfigPath       = "/.fast/run/infra.json"
 )
 
 // Shared mount(8) options of the guest component bind mounts.
@@ -87,17 +86,11 @@ func (m *Manager) PrepareInstance(ctx context.Context, config *fastletapi.Runtim
 	if plan.Revision != config.Spec.InfraRevision {
 		return PreparedInstance{}, errors.New("Sandbox Infra revision does not match prepared plan")
 	}
-	if len(plan.Components) == 0 && plan.Tunnel == nil {
+	if len(plan.Components) == 0 {
 		return PreparedInstance{SandboxUID: config.Identity.SandboxUID}, nil
 	}
 
 	result := PreparedInstance{SandboxUID: config.Identity.SandboxUID}
-	if plan.Tunnel != nil {
-		result.Mounts = append(result.Mounts, Mount{
-			Source: plan.Tunnel.HostPath, GuestSource: plan.Tunnel.PodPath,
-			Destination: SandboxTunnelContainerPath, Options: []string{"ro", mountOptionNoSuid, mountOptionNoDev},
-		})
-	}
 	if len(plan.Components) == 0 {
 		return result, nil
 	}

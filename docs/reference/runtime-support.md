@@ -11,7 +11,6 @@ of each upstream runtime.
 | `kata-clh` | containerd/Kata | slot netns to guest NIC | guest-visible artifact mapping | Yes | Validated |
 | `kata-fc` | containerd/Kata | slot netns to guest NIC | guest-visible artifact mapping | Yes | Validated; block snapshotter required |
 | `kata-dragonball` | containerd/Kata Rust | slot netns to guest NIC | guest-visible artifact mapping | Yes | Validated; compatibility binding required |
-| `boxlite` | BoxLite sidecar | authenticated LocalForward | artifact volume | No | Unsupported; fail closed |
 
 ## Validation meaning
 
@@ -51,13 +50,4 @@ compatibility configuration. The validation covers runtime creation, resource
 limits, private networking, proxy access, Fastlet restart recovery, and
 idempotent cleanup under nested KVM.
 
-BoxLite is integrated through a versioned Pod-local UDS sidecar and
-runtime-owned LocalForward tunnel. The profile remains unavailable because
-host-enforced resource semantics are incomplete. BoxLite 0.9.7 accepts Registry
-credentials only when its runtime is initialized, so projected credential
-rotation is not hot-applied to an existing BoxLite runtime. Containerd workload
-pulls and OCI Infra artifact pulls do hot-reload the namespace Registry
-projection.
-
-See [Secure runtimes](../guides/secure-runtimes.md) and
-[BoxLite runtime](../concepts/boxlite-runtime.md).
+See [Secure runtimes](../guides/secure-runtimes.md).

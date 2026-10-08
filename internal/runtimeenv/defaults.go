@@ -24,7 +24,6 @@ func DefaultConfig() Config {
 				apiv1alpha2.RuntimeKataDragonball: {
 					ConfigPath: "/opt/kata/share/defaults/kata-containers/runtime-rs/configuration-dragonball-fast-sandbox.toml",
 				},
-				apiv1alpha2.RuntimeBoxLite: {},
 			},
 		},
 	}}

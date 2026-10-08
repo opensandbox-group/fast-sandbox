@@ -14,7 +14,7 @@
 #      docs/guides/snapshot-cpu-compatibility.md). scripts/
 #      firecracker-host-check.sh runs the same checks standalone.
 #   2. janitor — sweeps orphaned node resources: fastlet network state
-#      (netns/tap/veth), boxlite leftovers, and leaked VMM processes
+#      (netns/tap/veth) and leaked VMM processes
 #      fastlets delegate over the node-cleanup UDS socket (needs the pod's
 #      hostPID visibility). The containerd backend is disabled here; the
 #      standalone config/janitor DaemonSet covers the containerd-based
@@ -189,7 +189,7 @@ spec:
         - name: fc-assets
           mountPath: /opt/fast-sandbox/firecracker
       # Node janitor sidecar: sweeps orphaned fastlet network state (netns/
-      # tap/veth), boxlite leftovers, and — the reason for hostPID — kills
+      # tap/veth) and — the reason for hostPID — kills
       # leaked VMM processes fastlets delegate over the node-cleanup UDS
       # socket. The containerd backend is DISABLED here (--containerd-socket=):
       # this pod targets the firecracker runtime; the standalone
@@ -218,8 +218,6 @@ spec:
           mountPropagation: Bidirectional
         - name: node-cleanup
           mountPath: /run/fast-sandbox/janitor
-        - name: boxlite-state
-          mountPath: /var/lib/fast-sandbox/boxlite
         - name: runtime-environments
           mountPath: /etc/fast-sandbox/runtime-environments
           readOnly: true
@@ -259,7 +257,7 @@ spec:
           path: /opt/fast-sandbox/firecracker
           type: DirectoryOrCreate
       # Node cleanup state the janitor sidecar sweeps: the fastlet network
-      # state root, the host netns mount point, the boxlite state root, and
+      # state root, the host netns mount point, and
       # the node-cleanup socket dir shared with fastlet pods (the pool
       # controller injects the same hostPath into fastlets for the
       # exact-ID VMM process cleanup delegation).
@@ -274,10 +272,6 @@ spec:
       - name: node-cleanup
         hostPath:
           path: /run/fast-sandbox/janitor
-          type: DirectoryOrCreate
-      - name: boxlite-state
-        hostPath:
-          path: /var/lib/fast-sandbox/boxlite
           type: DirectoryOrCreate
       - name: runtime-environments
         configMap:

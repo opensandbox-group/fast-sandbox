@@ -72,16 +72,6 @@ func (p *HostCapabilityProber) Probe(_ context.Context, profile runtimecatalog.R
 				p.missing(&report, "runsc", "RuntimeBinaryUnavailable")
 			}
 		}
-	case runtimecatalog.DriverKindBoxLite:
-		if profile.BoxLite == nil {
-			p.missing(&report, "boxlite runtime configuration", "RuntimeProfileInvalid")
-			break
-		}
-		if profile.BoxLite.ControlSocket == "" || profile.BoxLite.ProtocolVersion == "" || profile.BoxLite.TunnelGuestPort == 0 {
-			p.missing(&report, "BoxLite sidecar protocol configuration", "RuntimeProfileInvalid")
-			break
-		}
-		p.requirePath(&report, profile.BoxLite.ControlSocket, "BoxLiteSidecarUnavailable")
 	case runtimecatalog.DriverKindFirecracker:
 		if profile.Firecracker == nil {
 			p.missing(&report, "firecracker runtime configuration", "RuntimeProfileInvalid")

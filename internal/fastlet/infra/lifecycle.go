@@ -34,8 +34,8 @@ func (m *Manager) InitializeInstance(ctx context.Context, config *fastletapi.Run
 	})
 }
 
-// InitializeInstanceWithDialer supports runtimes such as BoxLite whose guest
-// loopback is reached through a runtime-specific LocalForward transport.
+// InitializeInstanceWithDialer initializes guest components through the
+// supplied transport and is also used by lifecycle tests.
 func (m *Manager) InitializeInstanceWithDialer(ctx context.Context, config *fastletapi.RuntimeSandboxConfig, dial TargetDialer) (PreparedInstance, error) {
 	if config == nil || dial == nil {
 		return PreparedInstance{}, errors.New("Sandbox spec and target dialer are required for Infra initialization")

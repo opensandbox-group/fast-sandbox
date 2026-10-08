@@ -48,7 +48,7 @@ func ensureLoopDevices() error {
 
 // deliverGuestInfra performs the GuestCopy Infra delivery by loop-mounting the
 // per-instance rootfs and copying every prepared artifact to its guest
-// destination (sandbox-init, sandbox-tunnel, infra.json, component mappings).
+// destination (sandbox-init, infra.json, component mappings).
 // Kernel-journaled writes survive the guest's later read-write mount, which
 // non-journaled debugfs writes do not. The mount costs nothing extra because
 // the instance image is a reflink copy with no dirty pages.

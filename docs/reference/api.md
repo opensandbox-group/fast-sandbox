@@ -159,7 +159,7 @@ spec:
 | `fastletTemplate` | Yes | Kubernetes Pod template with platform-owned fields protected; runtime-owner limits define the optional aggregate overcommit budget |
 
 Runtime names are `container`, `gvisor`, `kata-qemu`, `kata-clh`, `kata-fc`,
-`kata-dragonball`, and `boxlite`.
+`kata-dragonball`, and `firecracker`.
 
 Pool status exposes Fastlet capacity, runtime/Infra/Fastlet revisions, prepared
 Fastlet counts, and per-image warm-cache aggregation. Handler and Registry

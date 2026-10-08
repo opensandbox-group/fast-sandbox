@@ -12,6 +12,7 @@ func TestValidateRuntime(t *testing.T) {
 	require.NoError(t, (&SandboxPoolSpec{Runtime: RuntimeKataDragonball}).ValidateRuntime())
 	require.NoError(t, (&SandboxPoolSpec{Runtime: RuntimeFirecracker}).ValidateRuntime())
 	require.Error(t, (&SandboxPoolSpec{}).ValidateRuntime())
+	require.Error(t, (&SandboxPoolSpec{Runtime: RuntimeName("boxlite")}).ValidateRuntime())
 	require.Error(t, (&SandboxPoolSpec{Runtime: RuntimeName("unknown")}).ValidateRuntime())
 }
 

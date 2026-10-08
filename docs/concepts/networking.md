@@ -67,14 +67,10 @@ Deployment owners remain responsible for cluster NetworkPolicy, DNS, registry, m
 
 ## Access descriptors
 
-Networking produces a local AccessDescriptor for Fastlet Proxy:
-
-- `DirectIP` contains a private IP; Fastlet Proxy appends the requested target port.
-- `LocalForward` contains a loopback host/port and per-Sandbox credential for a runtime-owned tunnel.
+Networking produces a local `DirectIP` AccessDescriptor for Fastlet Proxy. It
+contains a private IP; Fastlet Proxy appends the requested target port.
 
 Access descriptors are local Fastlet state. They are not stored in the Sandbox CRD.
-
-BoxLite uses `LocalForward` because its guest network is owned by BoxLite/gvproxy rather than the Linux netns driver.
 
 ## Recovery
 

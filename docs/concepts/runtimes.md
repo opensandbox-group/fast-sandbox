@@ -39,7 +39,7 @@ environment configuration is restricted to platform administrators.
 | `kata-clh` | containerd | Kata shim with Cloud Hypervisor configuration |
 | `kata-fc` | containerd | Kata shim with Firecracker configuration |
 | `kata-dragonball` | containerd | Kata Rust shim with Dragonball configuration |
-| `boxlite` | BoxLite | Pod-local BoxLite runtime sidecar |
+| `firecracker` | direct Firecracker | Fastlet-managed microVM restore |
 
 The names define stable profiles, not unconditional production support. See [Runtime support](../reference/runtime-support.md).
 
@@ -49,7 +49,7 @@ A resolved runtime plan fixes:
 
 - driver kind and backend configuration;
 - privileged mode and host paths;
-- KVM and sidecar requirements;
+- KVM requirements;
 - runtime overhead;
 - network mode;
 - Infra delivery modes;
@@ -115,25 +115,12 @@ makes upgrades and rollback explicit.
 
 Kata supports Infra delivery through OCI bind mounts, image/template baking, preinstalled artifacts, or runtime-specific guest copy.
 
-## BoxLite
-
-BoxLite does not use a containerd runtime handler. Fastlet talks to a `boxlite-runtime` sidecar over a versioned Pod-local Unix socket. The sidecar contains native/CGO integration and owns BoxLite state.
-
-The implementation is grouped under `internal/runtime/boxlite`: `protocol`
-owns the versioned DTOs, `driver` is the pure-Go Fastlet adapter, `server`
-serves the Pod-local API, and `state` owns durable recovery records.
-
-BoxLite networking produces a local-forward access descriptor rather than a Fastlet-managed netns. The current profile remains fail closed because the upstream API cannot yet prove the required host-enforced per-Box resource contract.
-
-See [BoxLite runtime](boxlite-runtime.md) for the implemented adapter, capability
-gaps, and proposed Prepared Runtime architecture.
-
 ## Fixed Pool resources and aggregate overcommit
 
 Every Sandbox in one Pool uses the same immutable CPU, memory, and PID limits. Fastlet passes those values to the selected RuntimeDriver and is the enforcement boundary.
 
 By default, the Pool Controller sizes both the request and limit of the
-resource-owning Fastlet or runtime sidecar from:
+resource-owning Fastlet from:
 
 ```text
 per-Sandbox resources * maxSandboxesPerPod + runtime overhead

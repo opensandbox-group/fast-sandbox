@@ -20,10 +20,9 @@ import (
 const DefaultDataAddress = ":5780"
 
 type Proxy struct {
-	Store       *Store
-	Verifier    *routeauth.Verifier
-	Transport   http.RoundTripper
-	DialContext DialContextFunc
+	Store     *Store
+	Verifier  *routeauth.Verifier
+	Transport http.RoundTripper
 }
 
 func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -125,18 +124,6 @@ func (p *Proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 				MaxIdleConns: 256, MaxIdleConnsPerHost: 32, IdleConnTimeout: 90 * time.Second,
 			}
 		}
-	case dataplane.AccessKindLocalForward:
-		metricAccess = string(dataplane.AccessKindLocalForward)
-		transport, err = newLocalForwardTransport(route.Access, targetPort, p.DialContext)
-		if err != nil {
-			metricResult = "invalid_access"
-			requestErr = err
-			writeProxyError(writer, http.StatusNotImplemented, dataplane.ProxyErrorRouteUnavailable, "local-forward route is invalid: "+err.Error())
-			return
-		}
-		// DialContext ignores this logical authority and connects to the
-		// runtime-local endpoint after writing the target-port preamble.
-		upstream = "sandbox.local"
 	default:
 		metricResult = "unsupported_access"
 		requestErr = fmt.Errorf("route access kind %q is not supported", route.Access.Kind)

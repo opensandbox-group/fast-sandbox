@@ -196,7 +196,6 @@ func Revision(components []Component) (string, error) {
 func selectDelivery(runtimeModes []runtimecatalog.InfraDeliveryMode) (runtimecatalog.InfraDeliveryMode, bool) {
 	for _, preferred := range []runtimecatalog.InfraDeliveryMode{
 		runtimecatalog.InfraDeliveryBindMount,
-		runtimecatalog.InfraDeliveryArtifactVolume,
 		runtimecatalog.InfraDeliveryGuestCopy,
 	} {
 		for _, supported := range runtimeModes {

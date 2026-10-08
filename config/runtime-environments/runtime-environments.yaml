@@ -25,7 +25,6 @@ data:
             configPath: /opt/kata/share/defaults/kata-containers/configuration-fc-fast-sandbox.toml
           kata-dragonball:
             configPath: /opt/kata/share/defaults/kata-containers/runtime-rs/configuration-dragonball-fast-sandbox.toml
-          boxlite: {}
           # Firecracker on-demand loading: the node-level runtime-agent pulls
           # the golden snapshot set from the artifact store into StateRoot,
           # and the driver restores every Sandbox from it (jailer mode with
