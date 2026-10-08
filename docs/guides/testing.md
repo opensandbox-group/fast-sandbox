@@ -15,7 +15,7 @@ make test SCOPE=network
 
 ## E2E interface
 
-Run every suite:
+Run every Kubernetes suite:
 
 ```bash
 make e2e
@@ -37,11 +37,22 @@ Run runtime capability gates:
 make e2e SUITE=runtime RUNTIME=container
 make e2e SUITE=runtime RUNTIME=gvisor
 make e2e SUITE=runtime RUNTIME=kata
-make e2e SUITE=runtime RUNTIME=firecracker
 ```
 
 A skipped runtime test is not a passing capability gate. The Kata Firecracker
 test is a positive runtime, network, Infra, proxy, and recovery test.
+
+The Kubernetes suite also checks that a direct Firecracker pool without a
+ready Fastlet heartbeat keeps sandboxes unassigned. This readiness check does
+not boot or restore a Firecracker VM.
+
+Direct Firecracker uses separate host-level suites, outside `make e2e`:
+`scripts/firecracker-e2e.sh` validates the driver lifecycle, and
+`scripts/firecracker-chain-e2e.sh` validates the builder, artifact store,
+runtime-agent, and driver restore chain. These require root, `/dev/kvm`,
+`/dev/net/tun`, and an XFS StateRoot with reflink enabled. See
+[Firecracker runtime driver E2E](firecracker-runtime-e2e.md) and
+[Firecracker full-chain E2E](firecracker-chain-e2e.md) for setup and commands.
 
 ## Suite coverage
 
@@ -52,7 +63,7 @@ test is a positive runtime, network, Infra, proxy, and recovery test.
 | `lifecycle` | create, delete, and graceful shutdown |
 | `scheduling` | Pool selection, capacity, image affinity, autoscaling |
 | `cliintegration` | fastctl lifecycle, diagnostics, and SDK adapters |
-| `secureruntime` | container, gVisor, Kata, and Firecracker capability behavior |
+| `secureruntime` | container, gVisor, Kata (including Kata Firecracker), and direct Firecracker heartbeat gating |
 | `drain` | scale-down, ready surge, and persisted drain |
 | `faultrecovery` | Pod loss and generation fencing |
 | `cleanupjanitor` | orphan cleanup backends |

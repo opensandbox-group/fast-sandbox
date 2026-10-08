@@ -9,8 +9,10 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
@@ -20,64 +22,75 @@ import (
 	"fast-sandbox/test/e2e/support/suiteenv"
 )
 
-func TestRuntimeValidationUnsupportedFirecracker(t *testing.T) {
+func TestFirecrackerPoolWaitsForRuntimeHeartbeat(t *testing.T) {
 	suiteenv.RequireBasic(t)
 
-	feature := features.New("firecracker-capability-gate").
+	feature := features.New("firecracker-runtime-heartbeat").
 		WithLabel("suite", "secureruntime").
 		WithLabel("tier", "validation").
-		Assess("Firecracker remains fail closed until the KVM E2E suite passes", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+		Assess("a configured Firecracker pool cannot assign sandboxes without a ready Fastlet heartbeat", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
 			k8sClient := testSuite.MustKubeClient(t)
 			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
 
-			namespace := testSuite.AllocateNamespace("unsupported-firecracker")
+			namespace := testSuite.AllocateNamespace("firecracker-heartbeat")
 			if err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
 				t.Fatalf("create namespace: %v", err)
 			}
 			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
 
-			// The Firecracker driver is registered but its production capability
-			// gate stays closed until the driver lifecycle and KVM E2E pass.
-			pool := newSecureRuntimePool(namespace, "unsupported-firecracker-pool", apiv1alpha2.RuntimeFirecracker, 1, 1)
+			// Withhold the child heartbeat deterministically, regardless of whether
+			// this host has Firecracker/KVM assets. This is a readiness test, not a
+			// driver lifecycle test or an assertion that Firecracker is unsupported.
+			pool := newSecureRuntimePool(namespace, "firecracker-heartbeat-pool", apiv1alpha2.RuntimeFirecracker, 1, 1)
+			pool.Spec.FastletTemplate.Spec.NodeSelector = map[string]string{
+				"fast-sandbox.io/e2e-runtime-heartbeat": namespace,
+			}
+			var matchingNodes corev1.NodeList
+			if err := k8sClient.List(ctx, &matchingNodes, client.MatchingLabels(pool.Spec.FastletTemplate.Spec.NodeSelector)); err != nil {
+				t.Fatalf("check test node selector: %v", err)
+			}
+			if len(matchingNodes.Items) != 0 {
+				t.Fatal("test node selector must not match any node")
+			}
 			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
-				t.Fatalf("create pool: %v", err)
+				t.Fatalf("create Firecracker pool: %v", err)
 			}
 
-			conditionCtx, cancelCondition := context.WithTimeout(ctx, 30*time.Second)
-			defer cancelCondition()
-
-			var runtimeReady *metav1.Condition
-			for {
-				updatedPool := &apiv1alpha2.SandboxPool{}
-				if err := k8sClient.Get(conditionCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, updatedPool); err != nil {
-					t.Fatalf("get pool: %v", err)
+			poolKey := types.NamespacedName{Name: pool.Name, Namespace: namespace}
+			if err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+				var updatedPool apiv1alpha2.SandboxPool
+				if err := k8sClient.Get(ctx, poolKey, &updatedPool); err != nil {
+					return false, err
 				}
-				for _, c := range updatedPool.Status.Conditions {
-					if c.Type == apiv1alpha2.PoolConditionRuntimeReady {
-						runtimeReady = &c
-						break
-					}
+				condition := apiMeta.FindStatusCondition(updatedPool.Status.Conditions, apiv1alpha2.PoolConditionRuntimeReady)
+				if condition == nil || condition.ObservedGeneration != updatedPool.Generation {
+					return false, nil
 				}
-				if runtimeReady != nil || conditionCtx.Err() != nil {
-					break
+				if condition.Status != metav1.ConditionFalse || condition.Reason != apiv1alpha2.ReasonRuntimeCapabilityPending {
+					return false, fmt.Errorf("expected RuntimeReady=False/RuntimeCapabilityPending, got %s/%s: %s", condition.Status, condition.Reason, condition.Message)
 				}
-				time.Sleep(500 * time.Millisecond)
+				return true, nil
+			}); err != nil {
+				t.Fatalf("wait for Firecracker heartbeat condition: %v", err)
 			}
 
-			if runtimeReady == nil {
-				t.Fatal("expected RuntimeReady condition to be set")
+			sandbox := newSecureRuntimeSandbox(namespace, "sb-firecracker-pending", pool.Name)
+			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox); err != nil {
+				t.Fatalf("create sandbox: %v", err)
 			}
-			if runtimeReady.Status != metav1.ConditionFalse {
-				t.Errorf("expected RuntimeReady condition to be False, got: %v", runtimeReady.Status)
+			sandboxKey := types.NamespacedName{Name: sandbox.Name, Namespace: namespace}
+			pendingCtx, cancelPending := context.WithTimeout(ctx, 30*time.Second)
+			defer cancelPending()
+			if _, err := fixture.WaitForSandbox(pendingCtx, sandboxKey, func(sb *apiv1alpha2.Sandbox) bool {
+				condition := apiMeta.FindStatusCondition(sb.Status.Conditions, apiv1alpha2.SandboxConditionReady)
+				return sb.Status.Placement.FastletName == "" && sb.Status.Runtime.State == apiv1alpha2.RuntimePending &&
+					condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == "NoCandidate"
+			}); err != nil {
+				t.Fatalf("wait for unassigned Pending sandbox: %v", err)
 			}
-			if runtimeReady.Reason != apiv1alpha2.ReasonRuntimeUnsupported {
-				t.Errorf("expected Reason to be RuntimeUnsupported, got: %v", runtimeReady.Reason)
+			if err := fixture.EnsureSandboxRemainsUnassigned(ctx, sandboxKey, 5*time.Second); err != nil {
+				t.Fatalf("ensure sandbox stays unassigned without a ready runtime heartbeat: %v", err)
 			}
-			if runtimeReady.Message != "FirecrackerDriverUnimplemented" {
-				t.Errorf("unexpected Firecracker capability message: %q", runtimeReady.Message)
-			}
-
-			t.Logf("Pool condition correctly shows error: %s", runtimeReady.Message)
 
 			return ctx
 		}).

@@ -79,7 +79,7 @@ help:
 	@echo "      Prepare a reusable kind environment without running tests."
 	@echo ""
 	@echo "  make e2e [SUITE=all|controlplane|network|proxy|infra|sdk|quickstart|runtime|drain|<suite>]"
-	@echo "           [RUNTIME=container|gvisor|kata|firecracker]"
+	@echo "           [RUNTIME=container|gvisor|kata]"
 	@echo "      Run E2E tests; each suite prepares the runtime profile it needs."
 	@echo ""
 	@echo "  make quickstart [RUNTIME=...] [INFRA=execd|minimal] [ACTIONS=disabled|demo]"
@@ -236,7 +236,6 @@ e2e:
 				container) flags="-run ^TestRuntimeValidationContainerDefault$$" ;; \
 				gvisor) flags="-run ^TestGVisor" ;; \
 				kata) flags="-p 1 -failfast -run ^TestKata" ;; \
-				firecracker) flags="-run ^TestRuntimeValidationUnsupportedFirecracker$$" ;; \
 				*) echo "unknown runtime gate RUNTIME=$(RUNTIME)" >&2; exit 2 ;; \
 			esac ;; \
 		*) \
