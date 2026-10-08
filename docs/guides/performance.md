@@ -54,8 +54,7 @@ changing lifecycle ordering.
   asynchronous and is outside the reported Create latency.
 - Kata Firecracker and Dragonball were validated after this measurement run
   and therefore have no comparable Create result in this dated baseline. A
-  later comparison is reported separately below. BoxLite was a capability-gate
-  test only.
+  later comparison is reported separately below.
 
 ### RuntimeReady observations
 

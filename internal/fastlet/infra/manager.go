@@ -29,17 +29,15 @@ type PreparedComponent struct {
 type PreparedPlan struct {
 	infracatalog.Plan
 	Supervisor *PreparedArtifact   `json:"supervisor,omitempty"`
-	Tunnel     *PreparedArtifact   `json:"tunnel,omitempty"`
 	Components []PreparedComponent `json:"preparedComponents,omitempty"`
 }
 
 type ManagerConfig struct {
-	Plan              infracatalog.Plan
-	RuntimeProfile    runtimecatalog.RuntimeProfile
-	Store             *ArtifactStore
-	Resolver          ArtifactResolver
-	SandboxInitPath   string
-	SandboxTunnelPath string
+	Plan            infracatalog.Plan
+	RuntimeProfile  runtimecatalog.RuntimeProfile
+	Store           *ArtifactStore
+	Resolver        ArtifactResolver
+	SandboxInitPath string
 }
 
 // Manager prepares an immutable Pool revision outside the Sandbox create
@@ -120,18 +118,6 @@ func (m *Manager) Prepare(ctx context.Context) error {
 		}
 		prepared.Supervisor = &supervisor
 	}
-	if m.config.RuntimeProfile.NetworkMode == runtimecatalog.NetworkModeBoxLite {
-		if m.config.SandboxTunnelPath == "" {
-			m.err = errors.New("sandbox-tunnel path is required by the BoxLite runtime")
-			return m.err
-		}
-		tunnel, err := importTrustedFile(ctx, m.config.Store, m.config.SandboxTunnelPath)
-		if err != nil {
-			m.err = fmt.Errorf("prepare sandbox-tunnel: %w", err)
-			return m.err
-		}
-		prepared.Tunnel = &tunnel
-	}
 	m.plan = prepared
 	m.prepared = true
 	return nil
@@ -169,9 +155,6 @@ func (m *Manager) ArtifactReferences() []string {
 	if plan.Supervisor != nil {
 		references = append(references, plan.Supervisor.Digest)
 	}
-	if plan.Tunnel != nil {
-		references = append(references, plan.Tunnel.Digest)
-	}
 	for _, component := range plan.Components {
 		if component.Plan.Delivery == runtimecatalog.InfraDeliveryHostProcess {
 			continue
@@ -191,10 +174,6 @@ func clonePreparedPlan(plan PreparedPlan) PreparedPlan {
 	if plan.Supervisor != nil {
 		value := *plan.Supervisor
 		clone.Supervisor = &value
-	}
-	if plan.Tunnel != nil {
-		value := *plan.Tunnel
-		clone.Tunnel = &value
 	}
 	return clone
 }

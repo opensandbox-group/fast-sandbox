@@ -13,7 +13,7 @@ Upstream SDK
   -> ResolveEndpoint(Sandbox, component name or user port)
   -> Sandbox Proxy
   -> Fastlet Proxy
-  -> DirectIP or LocalForward
+  -> DirectIP
   -> Infra Component or user service
 ```
 
@@ -23,7 +23,7 @@ Trusted platform ingress can request a direct route:
 Upstream SDK
   -> platform ingress
   -> Fastlet Proxy
-  -> DirectIP or LocalForward
+  -> DirectIP
   -> Infra Component or user service
 ```
 
@@ -45,7 +45,7 @@ sequenceDiagram
   SP->>SP: verify credential and assignment fences
   SP->>LP: transparent request
   LP->>LP: verify route and generation
-  LP->>S: private IP or local tunnel
+  LP->>S: private IP
   S-->>SDK: streaming native response
 ```
 
@@ -70,7 +70,7 @@ Fastlet Proxy is a platform-owned sidecar in every Fastlet Pod. It:
 - resolves a component name to its locally published protocol and port;
 - selects the local AccessDescriptor;
 - removes Fast Sandbox route credentials before forwarding;
-- dials the private IP or runtime-local tunnel.
+- dials the private IP.
 
 Keeping it separate from the Fastlet process isolates streaming/data-plane lifetime from runtime control operations while retaining one Fastlet Pod deployment unit.
 
@@ -118,11 +118,9 @@ Fast Sandbox uses the dedicated
 upstream hop. The application `Authorization` header is not consumed or
 rewritten.
 
-## DirectIP and LocalForward
+## DirectIP
 
 `DirectIP` is used by runtimes that consume a Fastlet-owned network slot. The proxy dials the private IP with the caller's target port.
-
-`LocalForward` is used when the runtime owns guest networking. The proxy connects to a loopback tunnel, sends a target-port and credential preamble, and the runtime sidecar forwards to the correct guest.
 
 ## Protocol ownership
 

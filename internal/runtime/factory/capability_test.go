@@ -11,7 +11,6 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
-	boxlitedriver "fast-sandbox/internal/runtime/boxlite/driver"
 	"fast-sandbox/internal/runtime/containerd"
 	firecrackerdriver "fast-sandbox/internal/runtime/firecracker"
 )
@@ -29,18 +28,11 @@ func TestHostCapabilityProberContainerAvailable(t *testing.T) {
 
 func TestHostCapabilityProberFailsClosed(t *testing.T) {
 	catalog := runtimecatalog.Builtin()
-
-	boxlite, err := catalog.Resolve(apiv1alpha2.RuntimeBoxLite)
-	require.NoError(t, err)
-	report := NewHostCapabilityProber().Probe(context.Background(), boxlite, "")
-	require.Equal(t, runtimecatalog.CapabilityUnsupported, report.State)
-	require.Equal(t, "BoxLiteResourceEnforcementIncomplete", report.Reason)
-
 	kata, err := catalog.Resolve(apiv1alpha2.RuntimeKataQemu)
 	require.NoError(t, err)
 	prober := NewHostCapabilityProber()
 	prober.stat = func(path string) (os.FileInfo, error) { return nil, os.ErrNotExist }
-	report = prober.Probe(context.Background(), kata, "/missing/containerd.sock")
+	report := prober.Probe(context.Background(), kata, "/missing/containerd.sock")
 	require.Equal(t, runtimecatalog.CapabilityDegraded, report.State)
 	require.Equal(t, "KVMUnavailable", report.Reason)
 	require.Contains(t, report.Missing, "/dev/kvm")
@@ -127,13 +119,6 @@ func TestBuildRuntimeDriverSelection(t *testing.T) {
 	driver, err := buildDriver(container)
 	require.NoError(t, err)
 	require.IsType(t, &containerd.Driver{}, driver)
-
-	boxlite, err := catalog.Resolve(apiv1alpha2.RuntimeBoxLite)
-	require.NoError(t, err)
-	driver, err = buildDriver(boxlite)
-	require.NoError(t, err)
-	require.IsType(t, &boxlitedriver.Driver{}, driver)
-
 	firecracker, err := catalog.Resolve(apiv1alpha2.RuntimeFirecracker)
 	require.NoError(t, err)
 	driver, err = buildDriver(firecracker)

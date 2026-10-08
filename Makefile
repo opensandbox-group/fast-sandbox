@@ -6,7 +6,6 @@ FASTLET_PROXY_IMAGE ?= $(REGISTRY)/fastlet-proxy:dev
 SANDBOX_PROXY_IMAGE ?= $(REGISTRY)/sandbox-proxy:dev
 CONTROLLER_IMAGE ?= $(REGISTRY)/controller:dev
 JANITOR_IMAGE ?= $(REGISTRY)/janitor:dev
-BOXLITE_RUNTIME_IMAGE ?= $(REGISTRY)/boxlite-runtime:dev
 SANDBOX_ACTION_FIXTURE_IMAGE ?= $(REGISTRY)/sandbox-action-fixture:dev
 FIRECRACKER_RUNTIME_IMAGE ?= $(REGISTRY)/firecracker-runtime:dev
 
@@ -26,9 +25,9 @@ E2E_TEST_TIMEOUT ?= 30m
 
 BIN_DIR := $(CURDIR)/bin
 LINUX_BIN_DIR := $(CURDIR)/.build/linux-amd64
-ALL_BINARIES := controller fastlet sandbox-init sandbox-tunnel sandbox-action-fixture fastlet-proxy sandbox-proxy janitor fastctl boxlite-runtime firecracker-runtime
+ALL_BINARIES := controller fastlet sandbox-init sandbox-action-fixture fastlet-proxy sandbox-proxy janitor fastctl firecracker-runtime
 CORE_IMAGES := controller fastlet fastlet-proxy sandbox-proxy janitor
-ALL_IMAGES := $(CORE_IMAGES) boxlite-runtime sandbox-action-fixture firecracker-runtime
+ALL_IMAGES := $(CORE_IMAGES) sandbox-action-fixture firecracker-runtime
 UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./test/e2e/env/... ./test/e2e/support/... ./test/performance/...
 
 ifeq ($(DEBUG),1)
@@ -80,7 +79,7 @@ help:
 	@echo "      Prepare a reusable kind environment without running tests."
 	@echo ""
 	@echo "  make e2e [SUITE=all|controlplane|network|proxy|infra|sdk|quickstart|runtime|drain|<suite>]"
-	@echo "           [RUNTIME=container|gvisor|kata|boxlite]"
+	@echo "           [RUNTIME=container|gvisor|kata]"
 	@echo "      Run E2E tests; each suite prepares the runtime profile it needs."
 	@echo ""
 	@echo "  make quickstart [RUNTIME=...] [INFRA=execd|minimal] [ACTIONS=disabled|demo]"
@@ -119,9 +118,8 @@ images:
 	mkdir -p "$(LINUX_BIN_DIR)"; \
 	for component in $$components; do \
 		case "$$component" in \
-			fastlet) binaries="fastlet sandbox-init sandbox-tunnel" ;; \
+			fastlet) binaries="fastlet sandbox-init" ;; \
 			sandbox-action-fixture) binaries="sandbox-action-fixture" ;; \
-			boxlite-runtime) binaries="" ;; \
 			*) binaries="$$component" ;; \
 		esac; \
 		for binary in $$binaries; do \
@@ -136,9 +134,6 @@ images:
 			fastlet-proxy) docker build $(DOCKER_BUILD_FLAGS) -t "$(FASTLET_PROXY_IMAGE)" -f build/Dockerfile.fastlet-proxy . ;; \
 			sandbox-proxy) docker build $(DOCKER_BUILD_FLAGS) -t "$(SANDBOX_PROXY_IMAGE)" -f build/Dockerfile.sandbox-proxy . ;; \
 			janitor) docker build $(DOCKER_BUILD_FLAGS) -t "$(JANITOR_IMAGE)" -f build/Dockerfile.janitor . ;; \
-			boxlite-runtime) docker build $(DOCKER_BUILD_FLAGS) \
-				--build-arg GOPROXY="$(GOPROXY)" \
-				-t "$(BOXLITE_RUNTIME_IMAGE)" -f build/Dockerfile.boxlite-runtime . ;; \
 			sandbox-action-fixture) docker build $(DOCKER_BUILD_FLAGS) -t "$(SANDBOX_ACTION_FIXTURE_IMAGE)" -f build/Dockerfile.sandbox-action-fixture . ;; \
 			firecracker-runtime) docker build $(DOCKER_BUILD_FLAGS) \
 				-t "$(FIRECRACKER_RUNTIME_IMAGE)" -f build/Dockerfile.firecracker-runtime . ;; \
@@ -241,8 +236,6 @@ e2e:
 				container) flags="-run ^TestRuntimeValidationContainerDefault$$" ;; \
 				gvisor) flags="-run ^TestGVisor" ;; \
 				kata) flags="-p 1 -failfast -run ^TestKata" ;; \
-				boxlite) flags="-run ^TestRuntimeValidationUnsupportedBoxLite$$" ;; \
-				firecracker) flags="-run ^TestRuntimeValidationUnsupportedFirecracker$$" ;; \
 				*) echo "unknown runtime gate RUNTIME=$(RUNTIME)" >&2; exit 2 ;; \
 			esac ;; \
 		*) \

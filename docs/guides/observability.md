@@ -24,9 +24,8 @@ All services log through `k8s.io/klog/v2`. One style applies everywhere:
   failures), prints user-facing results with `fmt`, and terminates through
   `exitWithError` / `exitWithErrorf` so klog and OTLP buffers flush before
   `os.Exit`.
-- Self-contained node binaries (`sandbox-init`, `sandbox-tunnel`,
-  `boxlite-runtime`) intentionally use `fmt.Fprintln(os.Stderr, ...)` on
-  their startup failure paths instead of pulling in klog.
+- The self-contained `sandbox-init` binary intentionally writes startup
+  failures directly to stderr instead of pulling in klog.
 
 Lifecycle identity keys injected by `internal/observability` are the
 exception to camelCase: they are snake_case and mirror the span attributes

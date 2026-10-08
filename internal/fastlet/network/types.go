@@ -27,8 +27,7 @@ const (
 type AccessKind = dataplane.AccessKind
 
 const (
-	AccessKindDirectIP     = dataplane.AccessKindDirectIP
-	AccessKindLocalForward = dataplane.AccessKindLocalForward
+	AccessKindDirectIP = dataplane.AccessKindDirectIP
 )
 
 // Owner fences a network binding with the same identity used by Fastlet

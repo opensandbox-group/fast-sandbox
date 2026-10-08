@@ -76,7 +76,7 @@ Runtime adapters implement the same logical mapping differently:
 | --- | --- |
 | container / gVisor | read-only artifact mount |
 | Kata | artifact mount visible to the guest |
-| BoxLite | runtime artifact volume and guest mapping |
+| Firecracker | guest copy into the restored rootfs |
 
 ## Process supervision
 

@@ -19,7 +19,6 @@ type ResourceBackend string
 const (
 	BackendContainerd   ResourceBackend = "containerd"
 	BackendLinuxNetwork ResourceBackend = "linux-network"
-	BackendBoxLite      ResourceBackend = "boxlite"
 )
 
 // ResourceIdentity is the common fencing identity for every node-local

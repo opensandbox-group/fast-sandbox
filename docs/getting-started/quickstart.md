@@ -142,9 +142,6 @@ gVisor setup installs and validates runsc. Kata QEMU, Cloud Hypervisor,
 Firecracker, and Dragonball require KVM; when the development host is itself a
 VM, it must expose nested KVM. The Firecracker setup also installs a compatible
 guest kernel and configures containerd's blockfile snapshotter.
-BoxLite has no Quick Start profile because its Fast Sandbox capability gate is
-not satisfied.
-
 ## Declarative creation
 
 Fast-Path is optional. The Controller can create a Sandbox directly from a CRD:

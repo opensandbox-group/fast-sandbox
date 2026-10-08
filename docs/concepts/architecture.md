@@ -29,7 +29,7 @@ flowchart LR
   SP["Sandbox Proxy<br/>multi-active"]
   FPOD["Fastlet Pod<br/>Fastlet + Fastlet Proxy"]
   Driver["RuntimeDriver"]
-  Runtime["runc / gVisor / Kata / BoxLite"]
+  Runtime["runc / gVisor / Kata / Firecracker"]
   Infra["Private network<br/>Infra Components"]
   Janitor["NodeJanitor<br/>per node"]
 
@@ -98,7 +98,7 @@ flowchart TB
   subgraph Pod["Fastlet Pod"]
     Control["Fastlet<br/>lifecycle control"]
     Proxy["Fastlet Proxy<br/>data traffic"]
-    Driver["RuntimeDriver<br/>runc / gVisor / Kata / BoxLite"]
+    Driver["RuntimeDriver<br/>runc / gVisor / Kata / Firecracker"]
     Sandboxes["Sandbox 1 ... N"]
 
     Control --> Driver --> Sandboxes
@@ -111,8 +111,7 @@ A Fastlet Pod contains:
 - the Fastlet control server;
 - an atomic admission store;
 - Runtime, Network, Infra, and cache managers;
-- a Fastlet Proxy sidecar;
-- an optional BoxLite runtime sidecar.
+- a Fastlet Proxy sidecar.
 
 The Fastlet Pod UID is a physical ownership fence. Reusing a Pod name never makes an old runtime or route valid.
 
@@ -126,8 +125,8 @@ internal/
   controlplane/          Fast-Path, reconcilers, assignment, placement
   dataplane/             shared contract, route auth, both proxies
   fastlet/               admission, lifecycle, network, Infra, cache, server
-  runtime/               neutral contract, factory, containerd, BoxLite
-  sandbox/               in-Sandbox supervisor and tunnel
+  runtime/               neutral contract, factory, containerd, Firecracker
+  sandbox/               in-Sandbox supervisor
   catalog/               platform-owned Runtime profiles and Infra helpers
   protocol/fastlet/      Controller-to-Fastlet control protocol
   janitor/               node cleanup
@@ -145,7 +144,7 @@ runtime adapters do not own Fastlet admission.
 
 ## NodeJanitor
 
-NodeJanitor runs on trusted nodes and cleans orphan containerd resources, network namespaces and rules, Infra instance state, and BoxLite state. It performs a fresh Kubernetes ownership check and an orphan-age check before deletion.
+NodeJanitor runs on trusted nodes and cleans orphan containerd resources, network namespaces and rules, Infra instance state, and residual runtime processes. It performs a fresh Kubernetes ownership check and an orphan-age check before deletion.
 
 ## Further reading
 

@@ -225,7 +225,6 @@ backend and direct-ingress contract, and
 | Kata Cloud Hypervisor | `kata-clh` | Yes | Validated |
 | Kata Firecracker | `kata-fc` | Yes | Validated; block snapshotter required |
 | Kata Dragonball | `kata-dragonball` | Yes | Validated; compatibility binding required |
-| BoxLite | `boxlite` | No | Experimental integration; fail closed |
 
 This table describes Fast Sandbox validation status, not the upstream runtimes'
 general capabilities.
@@ -293,8 +292,6 @@ boundary, and percentile distribution. See
   checkpoints one Sandbox instance to the artifact store and resumes it on any
   Fastlet (same Sandbox identity). Persistent storage and live migration are
   not current capabilities.
-- BoxLite remains an explicit capability gate.
-
 Private registry credentials are configured per namespace through a static
 ConfigMap and referenced Secrets; Pools do not embed credentials. See
 [Private registries](docs/guides/private-registries.md).

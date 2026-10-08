@@ -125,7 +125,7 @@
   <text x="1160" y="204" class="mono sandbox-title">Sandbox</text>
   <text x="1160" y="226" class="mono sandbox-note">user workload + Infra Component</text>
   <text x="1160" y="249" class="mono control-detail">
-    <tspan>runc · gVisor · Kata · </tspan><tspan fill="#a1a1aa" opacity="0.72">BoxLite</tspan>
+    <tspan>runc · gVisor · Kata · Firecracker</tspan>
   </text>
   <text x="1160" y="271" class="mono control-detail">network slot · private network</text>
   </g>

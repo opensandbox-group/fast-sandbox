@@ -35,7 +35,6 @@ func main() {
 	var orphanTimeout time.Duration
 	var scanInterval time.Duration
 	var networkStateRoot string
-	var boxLiteStateRoot string
 	var metricsAddress string
 	var runtimeEnvironmentsFile string
 	var controlSocket string
@@ -46,7 +45,6 @@ func main() {
 	flag.DurationVar(&orphanTimeout, "orphan-timeout", 30*time.Second, "Minimum age before an orphan resource can be cleaned")
 	flag.DurationVar(&scanInterval, "scan-interval", 2*time.Minute, "Interval for full container scan")
 	flag.StringVar(&networkStateRoot, "network-state-root", "/run/fast-sandbox/network", "Host-mounted Fastlet Linux network state root")
-	flag.StringVar(&boxLiteStateRoot, "boxlite-state-root", "/var/lib/fast-sandbox/boxlite", "Host-mounted BoxLite state root")
 	flag.StringVar(&metricsAddress, "metrics-address", ":9092", "Prometheus metrics listen address; empty disables the server")
 	flag.StringVar(&runtimeEnvironmentsFile, "runtime-environments-file", runtimeenv.ConfigFilePath, "Path to the platform runtime environment configuration")
 	flag.StringVar(&controlSocket, "control-socket", nodecleanup.DefaultSocketPath, "Unix socket used by Fastlet for fenced host-process cleanup")
@@ -165,7 +163,6 @@ func main() {
 		fastletnetwork.NewLinuxNetNSDriver(fastletnetwork.LinuxDriverConfig{}),
 		hostProcessCleaner,
 	))
-	j.AddBackend(janitor.NewBoxLiteBackend(boxLiteStateRoot))
 	j.K8sClient = k8sClient
 	j.OrphanTimeout = orphanTimeout
 	j.ScanInterval = scanInterval

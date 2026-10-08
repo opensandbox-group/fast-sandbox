@@ -232,10 +232,8 @@ healthCheck:
   timeoutSeconds: 10
 ```
 
-Fastlet probes through the runtime-local access descriptor:
-
-- a private IP for `DirectIP`;
-- a local runtime tunnel for `LocalForward`.
+Fastlet probes the private IP from the runtime-local `DirectIP` access
+descriptor.
 
 Health traffic does not traverse Sandbox Proxy.
 
@@ -275,7 +273,7 @@ The public mapping contract is runtime-neutral:
 | --- | --- |
 | container / gVisor | Read-only artifact mount |
 | Kata | Guest-visible artifact volume or copy before process start |
-| BoxLite | Runtime artifact volume and guest mapping |
+| Firecracker | Guest copy into the restored rootfs before process start |
 
 The destination paths, process command, health semantics, and named endpoint
 remain the same.

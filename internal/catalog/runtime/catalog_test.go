@@ -14,7 +14,6 @@ import (
 func TestBuiltinCatalogProfiles(t *testing.T) {
 	catalog := Builtin()
 	expectedNames := []apiv1alpha2.RuntimeName{
-		apiv1alpha2.RuntimeBoxLite,
 		apiv1alpha2.RuntimeContainer,
 		apiv1alpha2.RuntimeFirecracker,
 		apiv1alpha2.RuntimeGVisor,
@@ -38,18 +37,6 @@ func TestBuiltinCatalogProfiles(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, profile.ProfileHash, hash)
 	}
-
-	boxlite, err := catalog.Resolve(apiv1alpha2.RuntimeBoxLite)
-	require.NoError(t, err)
-	require.Equal(t, DriverKindBoxLite, boxlite.Driver)
-	require.Equal(t, CapabilityUnsupported, boxlite.Capabilities.DefaultState)
-	require.Equal(t, "BoxLiteResourceEnforcementIncomplete", boxlite.Capabilities.Reason)
-	require.Equal(t, "/run/fast-sandbox/boxlite/runtime.sock", boxlite.BoxLite.ControlSocket)
-	require.Equal(t, "v1", boxlite.BoxLite.ProtocolVersion)
-	require.Equal(t, uint32(19090), boxlite.BoxLite.TunnelGuestPort)
-	require.Equal(t, "boxlite-runtime", boxlite.Deployment.Sidecar)
-	require.Equal(t, "boxlite-runtime", boxlite.Deployment.ResourceOwner)
-	require.True(t, boxlite.Deployment.RequiresKVM)
 
 	kata, err := catalog.Resolve(apiv1alpha2.RuntimeKataFc)
 	require.NoError(t, err)
@@ -119,10 +106,6 @@ func TestRuntimeProfilesUsingFastletNetworkHaveRequiredMounts(t *testing.T) {
 		require.True(t, hasHostPath(profile.Deployment.HostPaths, "/run/fast-sandbox/netns"), "%s is missing the named-netns mount", name)
 		require.True(t, hasHostPath(profile.Deployment.HostPaths, "/run/fast-sandbox/network"), "%s is missing the network-state mount", name)
 	}
-
-	boxlite, err := catalog.Resolve(apiv1alpha2.RuntimeBoxLite)
-	require.NoError(t, err)
-	require.False(t, boxlite.UsesFastletNetNS())
 }
 
 func hostPath(requirements []HostPathRequirement, path string) HostPathRequirement {

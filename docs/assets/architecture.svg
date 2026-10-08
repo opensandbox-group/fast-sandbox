@@ -183,7 +183,7 @@
   <text x="1006" y="336" class="mono sandbox-title">RuntimeDriver</text>
   <text x="1006" y="358" class="mono sandbox-note">containerd · gVisor · Kata</text>
   <text x="1006" y="376" class="mono sandbox-note">Kata: QEMU · CLH · FC · Dragonball</text>
-  <text x="1006" y="394" class="mono sandbox-note">BoxLite sidecar</text>
+  <text x="1006" y="394" class="mono sandbox-note">direct Firecracker runtime</text>
 
   <line x1="1168" y1="410" x2="1168" y2="558" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
   <text x="1176" y="500" class="mono lbl">isolated runtimes</text>
@@ -191,7 +191,7 @@
   <rect x="984" y="430" width="368" height="100" rx="5" fill="#fbfbfa" stroke="#a1a1aa"/>
   <text x="1006" y="466" class="mono sandbox-title">Fastlet Proxy · sidecar</text>
   <text x="1006" y="490" class="mono sandbox-note">route publication · fence verify</text>
-  <text x="1006" y="512" class="mono sandbox-note">DirectIP · LocalForward</text>
+  <text x="1006" y="512" class="mono sandbox-note">DirectIP</text>
 
   <line x1="1168" y1="530" x2="1128" y2="558" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arrow-violet)"/>
 

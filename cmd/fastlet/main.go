@@ -382,8 +382,7 @@ func newInfraManager(
 		Resolver: fastletinfra.NewPlatformResolverWithOptions(fastletinfra.PlatformResolverOptions{
 			OCI: ociOpener,
 		}),
-		SandboxInitPath:   getEnv("FAST_SANDBOX_SANDBOX_INIT_PATH", "/opt/fast-sandbox/bin/sandbox-init"),
-		SandboxTunnelPath: getEnv("FAST_SANDBOX_SANDBOX_TUNNEL_PATH", "/opt/fast-sandbox/bin/sandbox-tunnel"),
+		SandboxInitPath: getEnv("FAST_SANDBOX_SANDBOX_INIT_PATH", "/opt/fast-sandbox/bin/sandbox-init"),
 	})
 }
 

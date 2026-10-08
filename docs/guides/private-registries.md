@@ -75,18 +75,10 @@ Secret for each Pool. Fastlet Pods mount that Secret.
 Pool status includes `RegistryReady`, the target generation, and applied/total
 Fastlet counts.
 
-BoxLite 0.9.7 is a known exception: the upstream runtime accepts Registry
-configuration only at runtime initialization. The BoxLite sidecar consumes the
-same compiled file on startup but cannot hot-apply credential rotation. It also
-cannot distinguish different credentials for repository prefixes on one host,
-so Fast Sandbox rejects that ambiguous BoxLite configuration. BoxLite remains
-capability-gated for independent resource-enforcement reasons.
-
 ## Security
 
 - FastPath, Sandbox CRs, and Pool reads never return Registry credentials.
 - The Controller reads only same-namespace referenced Secrets.
-- The compiled Secret is mounted read-only only into the Fastlet and the
-  BoxLite runtime sidecar when selected.
+- The compiled Secret is mounted read-only into the Fastlet.
 - Registry credentials are used for workload images and OCI Infra artifact
   images; HTTPS archive authentication is not supported.

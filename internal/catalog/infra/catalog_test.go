@@ -49,7 +49,6 @@ func TestCompileNormalizesInlineComponentsForEachSupportedRuntime(t *testing.T) 
 		apiv1alpha2.RuntimeKataClh,
 		apiv1alpha2.RuntimeKataFc,
 		apiv1alpha2.RuntimeKataDragonball,
-		apiv1alpha2.RuntimeBoxLite,
 	} {
 		runtimeProfile, err := runtimecatalog.Builtin().Resolve(runtimeName)
 		require.NoError(t, err)

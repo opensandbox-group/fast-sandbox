@@ -26,12 +26,7 @@ func TestInternalDependencyBoundaries(t *testing.T) {
 		{
 			name:      "runtime contract is implementation neutral",
 			directory: "internal/runtime/contract",
-			forbidden: []string{"fast-sandbox/internal/fastlet", "fast-sandbox/internal/runtime/boxlite", "fast-sandbox/internal/runtime/containerd"},
-		},
-		{
-			name:      "BoxLite protocol does not import Fastlet implementation",
-			directory: "internal/runtime/boxlite/protocol",
-			forbidden: []string{"fast-sandbox/internal/fastlet"},
+			forbidden: []string{"fast-sandbox/internal/fastlet", "fast-sandbox/internal/runtime/containerd"},
 		},
 		{
 			name:      "Sandbox-side components do not import Fastlet implementation",

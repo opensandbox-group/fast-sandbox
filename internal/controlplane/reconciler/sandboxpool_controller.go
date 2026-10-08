@@ -50,7 +50,6 @@ type SandboxPoolReconciler struct {
 	Catalog                     *runtimecatalog.Catalog
 	FastletDrainer              FastletDrainer
 	FastletProxyImage           string
-	BoxLiteRuntimeImage         string
 	RouteVerifyPublicKey        string
 	RuntimeEnvironmentNamespace string
 	RuntimeEnvironmentConfigMap string
@@ -70,8 +69,6 @@ const (
 const (
 	// poolLabelKey labels platform-owned Fastlet Pods and derived objects with their owning SandboxPool.
 	poolLabelKey = "fast-sandbox.io/pool"
-	// boxliteRuntimeName is the reserved name of the platform-owned BoxLite runtime sidecar.
-	boxliteRuntimeName = "boxlite-runtime"
 	// envFastletProxyControlSocket carries the fastlet-proxy control socket path into containers.
 	envFastletProxyControlSocket = "FASTLET_PROXY_CONTROL_SOCKET"
 	// envPodName projects the Fastlet Pod name into the container environment.
@@ -96,8 +93,6 @@ const (
 	proxyRunDir = "/run/fast-sandbox/proxy"
 	// nodeCleanupVolumeName is the reserved volume exposing the node-cleanup socket directory.
 	nodeCleanupVolumeName = "node-cleanup"
-	// boxliteRunDir is the shared runtime directory for the BoxLite control socket.
-	boxliteRunDir = "/run/fast-sandbox/boxlite"
 	// fastletProxyContainerName is the name of the Fastlet Proxy sidecar container.
 	fastletProxyContainerName = "fastlet-proxy"
 	// tmpVolumeName is the reserved scratch volume name.
@@ -106,8 +101,6 @@ const (
 	registryConfigVolumeName = "registry-config"
 	// proxyControlVolumeName is the reserved volume sharing the proxy control socket.
 	proxyControlVolumeName = "proxy-control"
-	// boxliteControlVolumeName is the reserved volume sharing the BoxLite control socket.
-	boxliteControlVolumeName = "boxlite-control"
 )
 
 // Reconcile manages the lifecycle of Fastlet Pods based on the demand from Sandboxes.
@@ -727,7 +720,7 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 		return nil, errors.New("fastletTemplate.spec.containers must contain the fastlet container")
 	}
 	for _, container := range podSpec.Containers[1:] {
-		if container.Name == fastletProxyContainerName || container.Name == boxliteRuntimeName {
+		if container.Name == fastletProxyContainerName {
 			return nil, fmt.Errorf("%s is a platform-owned sidecar name", container.Name)
 		}
 	}
@@ -739,15 +732,12 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 	}
 
 	runtimeResourceOwner := podSpec.Containers[0].Name
-	if profile.Deployment.ResourceOwner != "" {
-		runtimeResourceOwner = profile.Deployment.ResourceOwner
-	}
 	if len(podSpec.Containers) > 0 {
 		c := &podSpec.Containers[0]
 		if c.SecurityContext == nil {
 			c.SecurityContext = &corev1.SecurityContext{}
 		}
-		c.SecurityContext.Privileged = boolPtr(profile.Deployment.Privileged && profile.Deployment.Sidecar == "")
+		c.SecurityContext.Privileged = boolPtr(profile.Deployment.Privileged)
 		c.Env = removeRuntimeOwnedEnv(c.Env)
 
 		c.Env = append(c.Env,
@@ -857,21 +847,6 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 			InitialDelaySeconds: 0, PeriodSeconds: 2, TimeoutSeconds: 1, FailureThreshold: 1,
 		},
 	})
-	if profile.Deployment.Sidecar != "" {
-		if profile.Deployment.Sidecar != boxliteRuntimeName || profile.BoxLite == nil {
-			return nil, fmt.Errorf("runtime profile %q requests unknown platform sidecar %q", profile.Name, profile.Deployment.Sidecar)
-		}
-		podSpec.Containers[0].VolumeMounts = append(podSpec.Containers[0].VolumeMounts,
-			corev1.VolumeMount{Name: boxliteControlVolumeName, MountPath: boxliteRunDir},
-		)
-		podSpec.Containers = append(podSpec.Containers, r.boxLiteRuntimeContainer(*profile.BoxLite))
-		if runtimeResourceOwner != boxliteRuntimeName {
-			return nil, fmt.Errorf("boxLite runtime resource owner must be boxlite-runtime, got %q", runtimeResourceOwner)
-		}
-		if err := applyFastletResources(&podSpec.Containers[len(podSpec.Containers)-1], profile.Deployment.Overhead, sandboxResources, getFastletCapacity(pool)); err != nil {
-			return nil, err
-		}
-	}
 	if err := ensureBoundedPodContainers(podSpec, runtimeResourceOwner); err != nil {
 		return nil, err
 	}
@@ -933,12 +908,6 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 		})
 	}
 	runtimeContainer := &podSpec.Containers[0]
-	if profile.Deployment.Sidecar != "" {
-		podSpec.Volumes = append(podSpec.Volumes,
-			corev1.Volume{Name: boxliteControlVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-		)
-		runtimeContainer = &podSpec.Containers[len(podSpec.Containers)-1]
-	}
 	if err := mergeRuntimeHostPaths(podSpec, runtimeContainer, profile.Deployment.HostPaths); err != nil {
 		return nil, err
 	}
@@ -1047,42 +1016,6 @@ func podConditionTrue(conditions []corev1.PodCondition, conditionType corev1.Pod
 	return false
 }
 
-func (r *SandboxPoolReconciler) boxLiteRuntimeContainer(config runtimecatalog.BoxLiteConfig) corev1.Container {
-	image := r.BoxLiteRuntimeImage
-	if image == "" {
-		image = "fast-sandbox/boxlite-runtime:dev"
-	}
-	return corev1.Container{
-		Name:            boxliteRuntimeName,
-		Image:           image,
-		ImagePullPolicy: corev1.PullIfNotPresent,
-		Args: []string{
-			"--socket", config.ControlSocket,
-			"--state-root", config.StateRoot,
-		},
-		Env: []corev1.EnvVar{
-			{
-				Name:      envPodUID,
-				ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}},
-			},
-			{Name: "FAST_SANDBOX_INFRA_STORE_ROOT", Value: infraHostPath},
-			{Name: envFastSandboxRegistryConfigPath, Value: registryconfig.MountPath},
-		},
-		SecurityContext: &corev1.SecurityContext{Privileged: boolPtr(true)},
-		VolumeMounts: []corev1.VolumeMount{
-			{Name: boxliteControlVolumeName, MountPath: boxliteRunDir},
-			{Name: infraToolsVolumeName, MountPath: infraHostPath, ReadOnly: true},
-			{Name: registryConfigVolumeName, MountPath: registryConfigDir, ReadOnly: true},
-		},
-		ReadinessProbe: &corev1.Probe{
-			ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{
-				"/usr/local/bin/boxlite-runtime", "--probe-socket", config.ControlSocket,
-			}}},
-			InitialDelaySeconds: 0, PeriodSeconds: 2, TimeoutSeconds: 4, FailureThreshold: 1,
-		},
-	}
-}
-
 func validatePlatformOwnedStorage(podSpec *corev1.PodSpec) error {
 	reservedVolumes := map[string]string{
 		tmpVolumeName:              tmpDir,
@@ -1093,7 +1026,6 @@ func validatePlatformOwnedStorage(podSpec *corev1.PodSpec) error {
 		fastletsettings.VolumeName: fastletsettings.MountPath,
 		proxyControlVolumeName:     proxyRunDir,
 		nodeCleanupVolumeName:      filepath.Dir(nodecleanup.DefaultSocketPath),
-		boxliteControlVolumeName:   boxliteRunDir,
 		podcgroup.VolumeName:       podcgroup.HostRoot,
 	}
 	for _, volume := range podSpec.Volumes {

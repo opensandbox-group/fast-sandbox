@@ -17,7 +17,6 @@ Fast Sandbox documentation is organized by reader intent:
 - [Control plane](concepts/control-plane.md)
 - [Sandbox lifecycle](concepts/sandbox-lifecycle.md)
 - [Runtime model](concepts/runtimes.md)
-- [BoxLite runtime](concepts/boxlite-runtime.md)
 - [Private networking](concepts/networking.md)
 - [Data plane](concepts/data-plane.md)
 - [Infra Components](concepts/infra-components.md)

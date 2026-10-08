@@ -30,7 +30,6 @@ environments:
         configPath: /opt/kata/share/defaults/kata-containers/configuration-fc-fast-sandbox.toml
       kata-dragonball:
         configPath: /opt/kata/share/defaults/kata-containers/runtime-rs/configuration-dragonball-fast-sandbox.toml
-      boxlite: {}
 ```
 
 An environment describes one node installation: the containerd endpoint and

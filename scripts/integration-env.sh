@@ -2038,7 +2038,7 @@ execd_route_resolve() { # sandbox-name
 }
 
 # execd_base_url prints the base curl URL of the resolved execd route
-# (http://127.0.0.1:<local-forward><route-path>).
+# (http://127.0.0.1:<forwarded-port><route-path>).
 execd_base_url() {
 	printf 'http://127.0.0.1:%s%s' "$EXECD_API_LPORT" "$EXECD_API_URI"
 }
@@ -2663,8 +2663,8 @@ egress_execd_ping() { # sandbox -> rc 0 when /ping answers 200 (through fastlet-
 		# unauthenticated probe answers 401/403 only when the route exists
 		# in the store of the proxy actually reached — and 404 (route not
 		# found) when it does not. A 401/403 here while the credential
-		# probe 404s means the local forward lands on a DIFFERENT proxy
-		# than the sandbox's fastlet (issue #37 local-forward drift), not a
+		# probe 404s means the forwarded local port lands on a DIFFERENT proxy
+		# than the sandbox's fastlet (issue #37 forward-target drift), not a
 		# missing route.
 		no_cred="$(curl -sS -m 5 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)"
 		log "egress proxy ping for $sbx: diag no-credential on same local port -> http=${no_cred:-000} (401/403=route present here, 404=route absent here)"

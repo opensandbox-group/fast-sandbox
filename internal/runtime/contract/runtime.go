@@ -136,7 +136,7 @@ type SnapshotInput struct {
 }
 
 // Snapshotter is the optional runtime extension for snapshotting a running
-// Sandbox in place. Runtimes that cannot snapshot (containerd, kata, boxlite)
+// Sandbox in place. Runtimes that cannot snapshot (containerd and kata)
 // simply do not implement it; Fastlet then rejects the request with
 // ErrSnapshotUnsupported instead of attempting a partial fallback.
 //

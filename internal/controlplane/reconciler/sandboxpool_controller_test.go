@@ -666,81 +666,6 @@ func TestConstructKataFCPodDelegatesHostProcessCleanupWithoutHostPID(t *testing.
 	require.Nil(t, volumeMountForNamedContainer(t, pod, "fastlet-proxy", "node-cleanup"))
 }
 
-func TestConstructPodInjectsBoxLiteRuntimeSidecarAsResourceOwner(t *testing.T) {
-	scheme := runtime.NewScheme()
-	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
-	reconciler := &SandboxPoolReconciler{
-		Scheme: scheme, Catalog: runtimecatalog.Builtin(),
-		FastletProxyImage: "fastlet-proxy:test", BoxLiteRuntimeImage: "boxlite-runtime:test",
-	}
-	pool := &apiv1alpha2.SandboxPool{
-		ObjectMeta: metav1.ObjectMeta{Name: "boxlite-pool", Namespace: "default", UID: types.UID("pool-uid")},
-		Spec: apiv1alpha2.SandboxPoolSpec{
-			Runtime: apiv1alpha2.RuntimeBoxLite, MaxSandboxesPerPod: 3,
-			SandboxResources: apiv1alpha2.SandboxResourceProfile{
-				CPU: resource.MustParse("1"), Memory: resource.MustParse("1Gi"), PIDs: 128,
-			},
-			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-				Containers: []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}},
-			}},
-		},
-	}
-	profile, err := reconciler.resolveRuntimeProfile(pool)
-	require.NoError(t, err)
-	pod, err := reconciler.constructPod(pool, profile)
-	require.NoError(t, err)
-	require.Len(t, pod.Spec.Containers, 3)
-
-	fastlet := containerForName(t, pod, "fastlet")
-	boxLite := containerForName(t, pod, "boxlite-runtime")
-	require.Equal(t, "boxlite-runtime:test", boxLite.Image)
-	require.False(t, *fastlet.SecurityContext.Privileged)
-	require.True(t, *boxLite.SecurityContext.Privileged)
-	require.Equal(t, "50m", fastlet.Resources.Requests.Cpu().String())
-	require.Equal(t, "64Mi", fastlet.Resources.Requests.Memory().String())
-	require.Equal(t, "250m", fastlet.Resources.Limits.Cpu().String())
-	require.Equal(t, "256Mi", fastlet.Resources.Limits.Memory().String())
-	cpu := boxLite.Resources.Requests[corev1.ResourceCPU]
-	memory := boxLite.Resources.Requests[corev1.ResourceMemory]
-	require.Equal(t, "3200m", cpu.String())
-	require.Equal(t, "3328Mi", memory.String())
-	require.Equal(t, "boxlite-runtime", resourceFieldContainer(fastlet.Env, "CPU_LIMIT"))
-	require.Equal(t, "boxlite-runtime", resourceFieldContainer(fastlet.Env, "MEMORY_LIMIT"))
-	require.Equal(t, "/run/fast-sandbox/boxlite/runtime.sock", envValueFromArgs(boxLite.Args, "--socket"))
-	require.Equal(t, "/var/lib/fast-sandbox/boxlite", envValueFromArgs(boxLite.Args, "--state-root"))
-	require.Equal(t, []string{
-		"/usr/local/bin/boxlite-runtime", "--probe-socket", "/run/fast-sandbox/boxlite/runtime.sock",
-	}, boxLite.ReadinessProbe.Exec.Command)
-	require.NotNil(t, volumeMountForNamedContainer(t, pod, "fastlet", "boxlite-control"))
-	require.NotNil(t, volumeMountForNamedContainer(t, pod, "boxlite-runtime", "boxlite-control"))
-	require.True(t, volumeMountForNamedContainer(t, pod, "boxlite-runtime", "infra-tools").ReadOnly)
-	require.True(t, volumeMountForNamedContainer(t, pod, "boxlite-runtime", "registry-config").ReadOnly)
-	require.Equal(t, registryconfig.MountPath, envValue(boxLite.Env, "FAST_SANDBOX_REGISTRY_CONFIG_PATH"))
-	require.NotNil(t, volumeMountForNamedContainer(t, pod, "boxlite-runtime", "dev-kvm"))
-	require.NotNil(t, volumeMountForNamedContainer(t, pod, "boxlite-runtime", "boxlite-state"))
-	require.Nil(t, volumeMountForNamedContainer(t, pod, "fastlet", "dev-kvm"))
-}
-
-func TestConstructPodRejectsPlatformBoxLiteSidecarOverride(t *testing.T) {
-	scheme := runtime.NewScheme()
-	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
-	reconciler := &SandboxPoolReconciler{Scheme: scheme, Catalog: runtimecatalog.Builtin()}
-	pool := &apiv1alpha2.SandboxPool{
-		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default", UID: types.UID("pool-uid")},
-		Spec: apiv1alpha2.SandboxPoolSpec{
-			Runtime: apiv1alpha2.RuntimeContainer, MaxSandboxesPerPod: 3, SandboxResources: testSandboxResources(),
-			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{
-				{Name: "fastlet", Image: "fastlet:test"},
-				{Name: "boxlite-runtime", Image: "user-controlled:test"},
-			}}},
-		},
-	}
-	profile, err := reconciler.resolveRuntimeProfile(pool)
-	require.NoError(t, err)
-	_, err = reconciler.constructPod(pool, profile)
-	require.ErrorContains(t, err, "platform-owned sidecar name")
-}
-
 func TestConstructPodRejectsReservedControlMountFromUserSidecarOrInitContainer(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
@@ -762,7 +687,7 @@ func TestConstructPodRejectsReservedControlMountFromUserSidecarOrInitContainer(t
 
 	base.Spec.FastletTemplate.Spec.Containers = base.Spec.FastletTemplate.Spec.Containers[:1]
 	base.Spec.FastletTemplate.Spec.InitContainers = []corev1.Container{{
-		Name: "user-init", Image: "user:test", VolumeMounts: []corev1.VolumeMount{{Name: "user", MountPath: "/run/fast-sandbox/boxlite"}},
+		Name: "user-init", Image: "user:test", VolumeMounts: []corev1.VolumeMount{{Name: "user", MountPath: "/run/fast-sandbox/proxy"}},
 	}}
 	_, err = reconciler.constructPod(base, profile)
 	require.ErrorContains(t, err, "reserved by the platform")
@@ -1049,24 +974,6 @@ func volumeMountForNamedContainer(t *testing.T, pod *corev1.Pod, containerName, 
 		}
 	}
 	return nil
-}
-
-func resourceFieldContainer(env []corev1.EnvVar, name string) string {
-	for _, item := range env {
-		if item.Name == name && item.ValueFrom != nil && item.ValueFrom.ResourceFieldRef != nil {
-			return item.ValueFrom.ResourceFieldRef.ContainerName
-		}
-	}
-	return ""
-}
-
-func envValueFromArgs(args []string, name string) string {
-	for index := 0; index+1 < len(args); index++ {
-		if args[index] == name {
-			return args[index+1]
-		}
-	}
-	return ""
 }
 
 func TestUpdatePoolConditionRetriesConflictByRefetchingLatest(t *testing.T) {

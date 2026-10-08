@@ -131,8 +131,6 @@ remote command.
 
 The inline component contract is runtime-neutral. Container, gVisor, Kata QEMU,
 and Kata Cloud Hypervisor Quick Starts inject the same Execd definition.
-BoxLite uses its artifact-volume path but remains capability-gated by incomplete
-resource enforcement.
 
 Fast Sandbox does not ship envd or Rocklet. They can be added later as other
 Pool components without changing the core routing protocol.
