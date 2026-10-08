@@ -276,7 +276,7 @@ func checkStateRootDirs(report *Report, config CheckConfig) {
 
 // checkStateRootFS reports the StateRoot filesystem type, verifies the free
 // space floor, and probes reflink support (CoW rootfs copies turn a ~2.5s
-// clone into ~1ms on XFS/btrfs).
+// clone into ~1ms on XFS). Non-XFS or failed reflink checks block readiness.
 func checkStateRootFS(report *Report, probes Probes, config CheckConfig) {
 	fs, err := probes.StatFS(config.StateRoot)
 	if err != nil {
@@ -284,6 +284,10 @@ func checkStateRootFS(report *Report, probes Probes, config CheckConfig) {
 		return
 	}
 	free := fmt.Sprintf("%d GiB free of %d GiB", fs.FreeBytes>>30, fs.TotalBytes>>30)
+	if fs.Type != "xfs" {
+		report.fail("stateroot-filesystem", fmt.Sprintf("StateRoot %s must use XFS with reflink=1; found type %s", config.StateRoot, fs.Type))
+		return
+	}
 	if fs.FreeBytes < config.MinFreeBytes {
 		report.fail("stateroot-filesystem", fmt.Sprintf("type %s, %s (minimum %d GiB)", fs.Type, free, config.MinFreeBytes>>30))
 		return
@@ -291,11 +295,11 @@ func checkStateRootFS(report *Report, probes Probes, config CheckConfig) {
 	reflinked, reflinkErr := probes.ReflinkProbe(config.StateRoot)
 	switch {
 	case reflinkErr != nil:
-		report.warn("stateroot-filesystem", fmt.Sprintf("type %s, %s; reflink probe failed: %s", fs.Type, free, reflinkErr.Error()))
+		report.fail("stateroot-filesystem", fmt.Sprintf("type %s, %s; reflink probe failed: %s", fs.Type, free, reflinkErr.Error()))
 	case reflinked:
 		report.pass("stateroot-filesystem", fmt.Sprintf("type %s, %s; reflink CoW supported", fs.Type, free))
 	default:
-		report.warn("stateroot-filesystem", fmt.Sprintf("type %s, %s; no reflink (rootfs copies fall back to full writes)", fs.Type, free))
+		report.fail("stateroot-filesystem", fmt.Sprintf("type %s, %s; XFS reflink=1 is required", fs.Type, free))
 	}
 }
 

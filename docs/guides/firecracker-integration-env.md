@@ -291,14 +291,24 @@ Delivery timing with on-demand loading (two nodes, XFS StateRoot):
 - `fs.inotify.max_user_instances` ≥ 8192 (kubelet/containerd watchers).
 
 ### 6.2 StateRoot filesystem — the single biggest latency lever
-- Put the node StateRoot on **reflink-capable XFS** (or Btrfs). Without it
-  every sandbox pays a full multi-GiB rootfs copy (~2.5 s); with it the
-  per-instance rootfs is a CoW reflink (~1 ms).
+- Put the node StateRoot on **XFS with `reflink=1`**. The Firecracker Fastlet
+  refuses to start on any other filesystem, including ext4 and Btrfs.
+  Initialization also probes an actual `cp --reflink=always` clone; disabled
+  reflink, missing GNU coreutils, and an unwritable StateRoot block startup.
+  The node readiness check treats non-XFS or unavailable reflink as a hard
+  failure instead of a warning. There is no opt-out for a slow deployment.
+  A per-instance rootfs CoW clone takes ~1 ms instead of a multi-GiB copy.
 - The cache, the agent journal, and the per-sandbox jails **must share one
   filesystem** (reflink only works within a filesystem) and one StateRoot
   (`/var/lib/fast-sandbox/firecracker`) across agent + all fastlets.
 - Size: sparse rootfs (2 GiB declared) × concurrency + snapshot cache;
   monitor real usage (`du`, not `ls` — sparse).
+
+Existing ext4/Btrfs deployments must drain sandboxes and stop Fastlets before
+migrating. Preserve the old StateRoot, provision an XFS mount with
+`scripts/firecracker-xfs-stateroot.sh --loop`, copy the preserved state into
+the new mount, and restart the runtime Pods. Do not format an existing state
+disk or mount over live sandbox state.
 
 ### 6.3 Cold-start measurement pitfalls
 - Reusing an already-Ready sandbox makes `run → first-200` meaningless

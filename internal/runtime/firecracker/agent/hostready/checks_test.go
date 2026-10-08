@@ -139,15 +139,11 @@ func TestRunChecksWarningsKeepReady(t *testing.T) {
 	probes, assets := healthyProbes(t)
 	probes.cpuFlags = func() ([]string, error) { return []string{"fpu"}, nil }
 	probes.memAvailable = func() (int64, error) { return 512 << 20, nil }
-	probes.reflinkProbe = func(string) (bool, error) { return false, nil }
-	probes.statFS = func(string) (FsStat, error) {
-		return FsStat{Type: "ext4", FreeBytes: 20 << 30, TotalBytes: 40 << 30}, nil
-	}
 	report := RunChecks(CheckConfig{StateRoot: t.TempDir(), AssetsDir: assets}, probes.probes(assets))
 	if !report.Ready {
 		t.Fatalf("warnings must not block readiness: %s", report.String())
 	}
-	for _, name := range []string{"nested-virtualization", "memory-available", "stateroot-filesystem"} {
+	for _, name := range []string{"nested-virtualization", "memory-available"} {
 		if got := checkByName(report, name); got.Status != StatusWarn {
 			t.Fatalf("expected %s to warn, got %s: %s", name, got.Status, got.Detail)
 		}
@@ -178,6 +174,34 @@ func TestRunChecksStateRootFailures(t *testing.T) {
 	report = RunChecks(CheckConfig{StateRoot: t.TempDir(), AssetsDir: assets}, probes.probes(assets))
 	if report.Ready {
 		t.Fatalf("insufficient free space must block readiness: %s", report.String())
+	}
+}
+
+func TestRunChecksRequiresXFSAndReflink(t *testing.T) {
+	for _, fsType := range []string{"ext4", "btrfs", "tmpfs", "overlay", ""} {
+		t.Run("filesystem="+fsType, func(t *testing.T) {
+			probes, assets := healthyProbes(t)
+			probes.statFS = func(string) (FsStat, error) {
+				return FsStat{Type: fsType, FreeBytes: 100 << 30, TotalBytes: 200 << 30}, nil
+			}
+			probes.reflinkProbe = func(string) (bool, error) {
+				t.Fatal("non-XFS must be rejected before probing reflink")
+				return true, nil
+			}
+			report := RunChecks(CheckConfig{StateRoot: t.TempDir(), AssetsDir: assets}, probes.probes(assets))
+			require.False(t, report.Ready)
+			require.Equal(t, StatusFail, checkByName(report, "stateroot-filesystem").Status)
+			require.Contains(t, report.Summary, "must use XFS with reflink=1")
+		})
+	}
+	for _, probeErr := range []error{nil, errors.New("FICLONE failed")} {
+		t.Run("reflink unavailable", func(t *testing.T) {
+			probes, assets := healthyProbes(t)
+			probes.reflinkProbe = func(string) (bool, error) { return false, probeErr }
+			report := RunChecks(CheckConfig{StateRoot: t.TempDir(), AssetsDir: assets}, probes.probes(assets))
+			require.False(t, report.Ready)
+			require.Equal(t, StatusFail, checkByName(report, "stateroot-filesystem").Status)
+		})
 	}
 }
 

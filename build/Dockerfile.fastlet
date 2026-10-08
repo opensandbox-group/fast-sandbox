@@ -8,7 +8,9 @@ FROM golang:1.25-alpine
 WORKDIR /workspace
 # tcpdump: per-slot dataplane diagnosis from inside the fastlet netns
 # (kubectl exec ... -- ip netns exec <slot> tcpdump -i vmtap0)
-RUN apk add --no-cache iproute2 iptables e2fsprogs tcpdump
+# Firecracker calls cp --reflink=always for writable rootfs/snapshot clones.
+# BusyBox cp cannot perform that clone, even on a reflink-capable StateRoot.
+RUN apk add --no-cache iproute2 iptables e2fsprogs tcpdump coreutils
 COPY .build/linux-amd64/fastlet .
 COPY .build/linux-amd64/sandbox-init /opt/fast-sandbox/bin/sandbox-init
 COPY .build/linux-amd64/sandbox-tunnel /opt/fast-sandbox/bin/sandbox-tunnel

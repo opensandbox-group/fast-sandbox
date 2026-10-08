@@ -51,6 +51,7 @@ type Driver struct {
 	killProcess    func(pid int) error
 	probeProcess   func(pid int) error
 	waitSocket     func(ctx context.Context, socketPath string, timeout time.Duration) error
+	checkStorage   func(context.Context, string) error
 	networkManager *fastletnetwork.Manager
 	infraMgr       *fastletinfra.Manager
 	prepareInfra   func(ctx context.Context, config *fastletapi.RuntimeSandboxConfig) (fastletinfra.PreparedInstance, error)
@@ -114,6 +115,7 @@ func New(profile runtimecatalog.RuntimeProfile) (*Driver, error) {
 		newClient: NewClient, stat: os.Stat, killProcess: killPID, probeProcess: pidAlive,
 		alignJailKVM: defaultAlignJailKVM,
 		waitSocket:   waitForAPISocket, processes: make(map[string]Process),
+		checkStorage:         checkStateRootStorage,
 		imageGCInterval:      defaultImageGCInterval,
 		imageCacheLimitBytes: defaultImageCacheLimitBytes,
 	}, nil
@@ -121,7 +123,7 @@ func New(profile runtimecatalog.RuntimeProfile) (*Driver, error) {
 
 // Initialize validates the boot configuration, prepares the StateRoot, and
 // starts the independent image cache GC loop.
-func (d *Driver) Initialize(_ context.Context, _ string) error {
+func (d *Driver) Initialize(ctx context.Context, _ string) error {
 	d.mu.Lock()
 	if d.initialized {
 		d.mu.Unlock()
@@ -134,6 +136,14 @@ func (d *Driver) Initialize(_ context.Context, _ string) error {
 	if err := os.MkdirAll(d.config.StateRoot, 0o750); err != nil {
 		d.mu.Unlock()
 		return fmt.Errorf("prepare Firecracker StateRoot: %w", err)
+	}
+	checkStorage := d.checkStorage
+	if checkStorage == nil {
+		checkStorage = checkStateRootStorage
+	}
+	if err := checkStorage(ctx, d.config.StateRoot); err != nil {
+		d.mu.Unlock()
+		return fmt.Errorf("validate Firecracker StateRoot storage: %w", err)
 	}
 	d.initialized = true
 	interval := d.imageGCInterval

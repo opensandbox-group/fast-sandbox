@@ -266,6 +266,7 @@ func newDriverFixture(t *testing.T) *driverFixture {
 			fixture.alignCalls = append(fixture.alignCalls, hostPath+"->"+jailPath)
 			return nil
 		},
+		checkStorage:         func(context.Context, string) error { return nil },
 		processes:            make(map[string]Process),
 		imageGCInterval:      defaultImageGCInterval,
 		imageCacheLimitBytes: defaultImageCacheLimitBytes,
