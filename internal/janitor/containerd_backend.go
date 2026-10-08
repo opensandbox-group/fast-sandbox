@@ -11,6 +11,7 @@ import (
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/errdefs"
 )
@@ -81,7 +82,7 @@ func (b *ContainerdBackend) Cleanup(ctx context.Context, expected ResourceIdenti
 	}
 
 	var result error
-	task, err := container.Task(ctx, nil)
+	task, err := container.Task(ctx, cio.Load)
 	if err == nil {
 		exit, waitErr := task.Wait(ctx)
 		if waitErr != nil && !errdefs.IsNotFound(waitErr) {
