@@ -8,6 +8,7 @@ import (
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/errdefs"
 	"k8s.io/klog/v2"
 )
@@ -59,7 +60,7 @@ type containerdDeleteContainerAdapter struct {
 }
 
 func (c containerdDeleteContainerAdapter) Task(ctx context.Context) (containerdDeleteTask, error) {
-	task, err := c.container.Task(ctx, nil)
+	task, err := c.container.Task(ctx, cio.Load)
 	if err != nil {
 		return nil, err
 	}
