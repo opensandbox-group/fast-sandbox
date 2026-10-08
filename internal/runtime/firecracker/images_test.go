@@ -152,6 +152,7 @@ func TestImageGCLoopRunsIndependently(t *testing.T) {
 	})
 	require.NoError(t, err)
 	driver.imageGCInterval = 30 * time.Millisecond
+	driver.checkStorage = func(context.Context, string) error { return nil }
 	require.NoError(t, driver.Initialize(context.Background(), ""))
 	t.Cleanup(func() { _ = driver.Close() })
 

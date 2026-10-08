@@ -11,7 +11,7 @@ Use it to reproduce the suite on a fresh host or to triage failures.
 | Machine | Bare-metal with `/dev/kvm` and `/dev/net/tun` (VT-x); root runner |
 | Reference host | `agent-sandbox033067064046.sg52` — 96 logical CPUs, 504 GiB, Alibaba Cloud Linux 3 (kernel 5.10.134) |
 | Tools | `ip`, `iptables`, `sysctl`, `ping`, `tar`, `curl`; docker not required |
-| StateRoot | **xfs/btrfs (reflink-capable), never ext4** — provision with `scripts/firecracker-xfs-stateroot.sh --loop`; without reflink every instance rootfs pays a full ~3 GiB copy (~1.8 s per create) instead of a CoW reflink (~1 ms) |
+| StateRoot | **XFS with `reflink=1` required** — provision with `scripts/firecracker-xfs-stateroot.sh --loop`; Fastlet startup rejects non-XFS and failed `cp --reflink=always` probes instead of accepting a slow rootfs copy |
 | Disk headroom | Keep ≥ 20% free; high occupancy measurably inflates GuestCopy/rootfs timing (see Results) |
 
 ## Runtime assets
@@ -100,7 +100,7 @@ shared `memory.snap` is COW-read by concurrent clones.
 
 | Issue | Symptom | Mitigation |
 |-------|---------|------------|
-| Non-reflink StateRoot | ~1.8 s/rootfs copy | xfs/btrfs StateRoot (deployment requirement) |
+| Non-reflink StateRoot | Startup rejected | XFS with `reflink=1` and GNU coreutils required |
 | Stale netns from a failed teardown (`ip netns del` EBUSY racing a dying VMM) | Stale netns still owns the slot IP on the bridge: answers ARP/pings locally, refuses TCP — the live netns's iptables counters stay 0 | Teardown deletes the host veth **before** the netns; delete retry 5×500 ms; every E2E environment purges stale `fsb*` netns and bridge devices first |
 | `net.ipv4.conf.all.proxy_arp` | Every netns proxy-answers the whole CIDR; host neighbour cache points slot IPs at random netns | Proxy ARP on the tap interface only |
 | Guest address assigned to the tap | Netns shadows the guest (fake ICMP, TCP refused) | `/32` route + IPAM reserves the baked guest address |

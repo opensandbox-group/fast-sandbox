@@ -164,20 +164,22 @@ if [[ -z "$FS_FREE" ]]; then
 	fail_check "stateroot-filesystem" "cannot stat the filesystem of $STATE_ROOT"
 elif [[ "$FS_FREE" -lt "$MIN_FREE" ]]; then
 	fail_check "stateroot-filesystem" "type $FS_TYPE, $((FS_FREE >> 30)) GiB free (minimum $((MIN_FREE >> 30)) GiB)"
+elif [[ "$FS_TYPE" != "xfs" ]]; then
+	fail_check "stateroot-filesystem" "StateRoot $STATE_ROOT must use XFS with reflink=1; found type $FS_TYPE"
 else
-	# Reflink support: xfs/btrfs CoW-clone the sandbox rootfs in ~ms; on
-	# other filesystems every copy is a full write.
-	case "$FS_TYPE" in
-	xfs | btrfs)
+	# XFS can be formatted without reflink, and BusyBox cp cannot clone it.
+	# Probe a real clone instead of inferring support from the filesystem name.
+	PROBE_DIR="$(mktemp -d "$STATE_ROOT/.host-check-reflink.XXXXXX" 2>/dev/null)" || PROBE_DIR=""
+	if [[ -z "$PROBE_DIR" ]]; then
+		fail_check "stateroot-filesystem" "cannot create a reflink probe in $STATE_ROOT"
+	elif printf 'fast-sandbox reflink probe\n' > "$PROBE_DIR/source" && cp --reflink=always "$PROBE_DIR/source" "$PROBE_DIR/clone" 2>/dev/null; then
 		pass "stateroot-filesystem" "type $FS_TYPE, $((FS_FREE >> 30)) GiB free; reflink CoW supported"
-		;;
-	ext4 | tmpfs | overlay | unknown)
-		warn "stateroot-filesystem" "type $FS_TYPE, $((FS_FREE >> 30)) GiB free; no reflink (rootfs copies fall back to full writes)"
-		;;
-	*)
-		warn "stateroot-filesystem" "type $FS_TYPE, $((FS_FREE >> 30)) GiB free; reflink support unknown"
-		;;
-	esac
+	else
+		fail_check "stateroot-filesystem" "reflink clone failed; enable XFS reflink=1 and install GNU cp (coreutils)"
+	fi
+	if [[ -n "$PROBE_DIR" ]]; then
+		rm -rf "$PROBE_DIR"
+	fi
 fi
 
 # --- fc-assets ---------------------------------------------------------------------------
