@@ -23,10 +23,11 @@ INFRA ?= execd
 ACTIONS ?= disabled
 PROFILE ?= basic
 E2E_TEST_TIMEOUT ?= 30m
+ACCELERATED_CONTAINER_IMAGE_DIR ?= $(abspath $(CURDIR)/../accelerated-container-image)
 
 BIN_DIR := $(CURDIR)/bin
 LINUX_BIN_DIR := $(CURDIR)/.build/linux-amd64
-ALL_BINARIES := controller fastlet sandbox-init sandbox-tunnel sandbox-action-fixture fastlet-proxy sandbox-proxy janitor fastctl boxlite-runtime firecracker-runtime
+ALL_BINARIES := controller fastlet sandbox-init sandbox-tunnel sandbox-action-fixture fastlet-proxy sandbox-proxy janitor fastctl boxlite-runtime firecracker-runtime template-vm
 CORE_IMAGES := controller fastlet fastlet-proxy sandbox-proxy janitor
 ALL_IMAGES := $(CORE_IMAGES) boxlite-runtime sandbox-action-fixture firecracker-runtime
 UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./test/e2e/env/... ./test/e2e/support/... ./test/performance/...
@@ -56,13 +57,19 @@ GOLANGCI_LINT_VERSION := v2.13.2
 GOLANGCI_LINT := $(TOOLS_BIN)/golangci-lint
 
 .PHONY: help build images generate verify test e2e env quickstart quickstart-forward tidy lint
-.PHONY: _network-test
+.PHONY: template-vm template-vm-convertor _network-test
 
 help:
 	@echo "Fast Sandbox developer interface"
 	@echo ""
 	@echo "  make build [COMPONENT=all] [DEBUG=0|1]"
 	@echo "      Build host binaries. COMPONENT may be any cmd/ directory name."
+	@echo ""
+	@echo "  make template-vm"
+	@echo "      Build the template-vm host binary."
+	@echo ""
+	@echo "  make template-vm-convertor [ACCELERATED_CONTAINER_IMAGE_DIR=...]"
+	@echo "      Build the userspace OverlayBD convertor prerequisite."
 	@echo ""
 	@echo "  make images [COMPONENT=all|core|<image>]"
 	@echo "      Build Linux binaries and development container images."
@@ -106,6 +113,16 @@ build:
 		echo "==> build $$component"; \
 		$(GO) build $(GO_BUILD_FLAGS) -o "$(BIN_DIR)/$$component" "./cmd/$$component" || exit $$?; \
 	done
+
+template-vm:
+	@$(MAKE) build COMPONENT=template-vm
+
+template-vm-convertor:
+	@test -f "$(ACCELERATED_CONTAINER_IMAGE_DIR)/Makefile" || { \
+		echo "accelerated-container-image checkout not found at $(ACCELERATED_CONTAINER_IMAGE_DIR)" >&2; \
+		exit 2; \
+	}
+	@$(MAKE) -C "$(ACCELERATED_CONTAINER_IMAGE_DIR)" bin/convertor
 
 images:
 	@case " $(ALL_IMAGES) " in \

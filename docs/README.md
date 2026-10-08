@@ -43,6 +43,8 @@ Fast Sandbox documentation is organized by reader intent:
 - [Testing](guides/testing.md)
 - [Firecracker runtime E2E](guides/firecracker-runtime-e2e.md)
 - [Firecracker full-chain E2E](guides/firecracker-chain-e2e.md)
+- [template-vm CLI user guide](guides/template-vm-user-guide.en.md)
+- [template-vm 命令行使用指南](guides/template-vm-user-guide.md)
 
 ## Reference
 
@@ -70,6 +72,7 @@ Designs that require review across contributors belong in a GitHub Issue,
 Pull Request, or the owning project's formal proposal process. They must not
 depend on ignored local files.
 
-All documentation except the root `README_ZH.md` is maintained in U.S. English.
+Documentation is maintained in U.S. English by default. Explicitly required
+localized companion guides may coexist with and link to their English version.
 Branch-specific plans, implementation logs, and superseded designs are not
 part of the published documentation set.
