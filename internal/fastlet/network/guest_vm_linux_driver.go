@@ -2,11 +2,14 @@ package network
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/netip"
 	"strconv"
 	"time"
+
+	"fast-sandbox/internal/guestnetwork"
 )
 
 // arpWarmupDialTimeout bounds the warm-up datagram dial in ApplyGuest.
@@ -59,6 +62,7 @@ func (d *GuestVMNetNSDriver) Prepare(ctx context.Context, slot *Slot) error {
 	}
 	commands := [][]string{
 		nsTap("tuntap", "add", netDevFlag, guestVMDefaultTapName, "mode", "tap"),
+		nsTap(linkSubcommand, ipSetSubcommand, guestVMDefaultTapName, "address", guestnetwork.GatewayMAC),
 		nsTap(linkSubcommand, ipSetSubcommand, guestVMDefaultTapName, "mtu", strconv.Itoa(slot.MTU)),
 		nsTap(linkSubcommand, ipSetSubcommand, guestVMDefaultTapName, "up"),
 		// Proxy ARP on the TAP only, so the guest can resolve its baked
@@ -194,7 +198,9 @@ func BakedGuestIP(slot *Slot) (string, error) {
 	return guest.String(), nil
 }
 
-// Validate extends the Linux validation with the in-namespace tap check.
+// Validate checks the TAP identity before recovered slots become available.
+// The manager rebuilds invalid Clean slots and rejects invalid Bound slots;
+// validation must never change an active interface's MAC.
 func (d *GuestVMNetNSDriver) Validate(ctx context.Context, slot *Slot) error {
 	if err := d.LinuxNetNSDriver.Validate(ctx, slot); err != nil {
 		return err
@@ -202,8 +208,18 @@ func (d *GuestVMNetNSDriver) Validate(ctx context.Context, slot *Slot) error {
 	if slot.GuestTap == "" {
 		return fmt.Errorf("guest-VM slot has no tap name")
 	}
-	if _, err := d.runner.Run(ctx, d.ipCommand, "-n", slot.NetNSName, linkSubcommand, "show", netDevFlag, guestVMDefaultTapName); err != nil {
+	output, err := d.runner.Run(ctx, d.ipCommand, "-j", "-n", slot.NetNSName, linkSubcommand, "show", netDevFlag, guestVMDefaultTapName)
+	if err != nil {
 		return fmt.Errorf("guest tap %s: %w", guestVMDefaultTapName, err)
+	}
+	var links []struct {
+		Address string `json:"address"`
+	}
+	if err := json.Unmarshal(output, &links); err != nil {
+		return fmt.Errorf("decode guest tap %s: %w", guestVMDefaultTapName, err)
+	}
+	if len(links) != 1 || links[0].Address != guestnetwork.GatewayMAC {
+		return fmt.Errorf("guest tap %s must use gateway MAC %s: %s", guestVMDefaultTapName, guestnetwork.GatewayMAC, output)
 	}
 	return nil
 }

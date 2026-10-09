@@ -20,6 +20,7 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/guestnetwork"
 )
 
 // snapshotPhaseTimings is the outcome report the snapshot stage writes to
@@ -391,6 +392,9 @@ const snapshotDriveName = "rootfs.img"
 func ensureBuildTap() error {
 	if output, err := exec.Command("ip", "tuntap", "add", "dev", buildTap, "mode", "tap").CombinedOutput(); err != nil {
 		return fmt.Errorf("create build tap %s: %w: %s", buildTap, err, strings.TrimSpace(string(output)))
+	}
+	if output, err := exec.Command("ip", "link", "set", "dev", buildTap, "address", guestnetwork.GatewayMAC).CombinedOutput(); err != nil {
+		return fmt.Errorf("set build tap %s gateway MAC: %w: %s", buildTap, err, strings.TrimSpace(string(output)))
 	}
 	if output, err := exec.Command("ip", "link", "set", "dev", buildTap, "up").CombinedOutput(); err != nil {
 		return fmt.Errorf("bring build tap %s up: %w: %s", buildTap, err, strings.TrimSpace(string(output)))

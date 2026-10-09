@@ -320,6 +320,34 @@ func TestManagerRetriesInterruptedDestroyOnInitialize(t *testing.T) {
 	require.Equal(t, 1, second.Snapshot().Clean)
 }
 
+func TestManagerInvalidRecoveredSlotIdentity(t *testing.T) {
+	for _, bound := range []bool{false, true} {
+		t.Run(fmt.Sprintf("bound=%t", bound), func(t *testing.T) {
+			root := t.TempDir()
+			first := newTestManager(t, 1, root, &fakeDriver{}, "old-tap")
+			require.NoError(t, first.Initialize(context.Background()))
+			if bound {
+				_, err := first.Acquire(context.Background(), owner("sandbox-a", 1))
+				require.NoError(t, err)
+			}
+			driver := &fakeDriver{invalidSlot: map[string]error{"old-tap": errors.New("gateway MAC mismatch")}}
+			reloaded := newTestManager(t, 1, root, driver, "fixed-tap")
+			err := reloaded.Initialize(context.Background())
+			if bound {
+				require.ErrorIs(t, err, ErrStateInconsistent)
+				require.Empty(t, driver.destroyed)
+				require.Empty(t, driver.prepared)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, []string{"old-tap"}, driver.destroyed)
+			slot, err := reloaded.Acquire(context.Background(), owner("sandbox-a", 1))
+			require.NoError(t, err)
+			require.Equal(t, "fixed-tap", slot.ID)
+		})
+	}
+}
+
 const (
 	testEventuallyTimeout  = 2e9
 	testEventuallyInterval = 10e6

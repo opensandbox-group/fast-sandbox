@@ -6,7 +6,43 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"fast-sandbox/internal/guestnetwork"
 )
+
+func TestEnsureBuildTapSetsGatewayMACBeforeLinkUp(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "ip.log")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TAP_COMMAND_LOG\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "ip"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TAP_COMMAND_LOG", logPath)
+	if err := ensureBuildTap(); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := strings.Split(strings.TrimSpace(string(payload)), "\n")
+	if len(commands) != 3 || commands[1] != "link set dev "+buildTap+" address "+guestnetwork.GatewayMAC || commands[2] != "link set dev "+buildTap+" up" {
+		t.Fatalf("build TAP commands = %q", commands)
+	}
+}
+
+func TestEnsureBuildTapRejectsGatewayMACFailure(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\ncase \"$*\" in *address*) exit 1;; esac\n"
+	if err := os.WriteFile(filepath.Join(dir, "ip"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	if err := ensureBuildTap(); err == nil || !strings.Contains(err.Error(), "gateway MAC") {
+		t.Fatalf("ensureBuildTap error = %v, want gateway MAC failure", err)
+	}
+}
 
 // TestWaitForAnyMarkerReturnsTheMatchedMarker: the boot gate distinguishes
 // guest readiness from the init's startup-failure exit path.

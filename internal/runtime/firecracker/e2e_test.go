@@ -30,6 +30,7 @@ import (
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
+	"fast-sandbox/internal/guestnetwork"
 	"fast-sandbox/internal/observability"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
@@ -430,7 +431,7 @@ func runE2EOnce(t *testing.T, useInfra bool) {
 // args, machine tuple): a cached set from an older recipe is incompatible
 // with the current restore driver (e.g. it lacks the baked NIC that
 // network_overrides expects), so the reuse check must reject it.
-const e2ePrepVersion = 2
+const e2ePrepVersion = 3
 
 // bootVM starts the microVM and waits until the machine state is Running.
 // It serves the golden-snapshot prep path only (cold boot: InstanceStart);
@@ -518,6 +519,8 @@ func prepareE2EGoldenSnapshot(t *testing.T, binary, kernel, rootfs, stateRoot, i
 	defer func() {
 		_, _ = exec.Command("ip", "link", "del", prepTap).CombinedOutput()
 	}()
+	output, err := exec.Command("ip", "link", "set", "dev", prepTap, "address", guestnetwork.GatewayMAC).CombinedOutput()
+	require.NoError(t, err, "set prep tap gateway MAC: %s", output)
 
 	prepDir := t.TempDir()
 	apiSock := filepath.Join(prepDir, "api.sock")
