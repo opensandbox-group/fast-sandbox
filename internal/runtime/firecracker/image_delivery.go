@@ -116,6 +116,12 @@ func (d *Driver) deliverReference(reference string, pin func(context.Context) er
 	if entry.inFlight {
 		return runtimecontract.ImageDelivering, nil
 	}
+	// Another attempt may have committed after the initial cache check but
+	// before this caller acquired the tracker lock. Do not pin it again.
+	if err := verifyRestorableImage(stateRoot, reference); err == nil {
+		d.touchImage(reference)
+		return runtimecontract.ImageDelivered, nil
+	}
 	if entry.failedErr != nil && time.Since(entry.failedAt) < d.deliveryFailureWindowSetting() {
 		failed := entry.failedErr
 		return "", failed

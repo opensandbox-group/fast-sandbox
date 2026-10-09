@@ -190,6 +190,34 @@ func TestDeliverImageIsSingleFlight(t *testing.T) {
 	require.Equal(t, 1, agent.deliveredPins(), "concurrent deliveries must coalesce into one attempt")
 }
 
+func TestDeliverImageRechecksCacheAfterInitialMiss(t *testing.T) {
+	fixture := newDriverFixture(t)
+	image := fixture.sandboxSpec.Spec.Image
+	agent := &materializingAgent{fakeAgentClient: &fakeAgentClient{}, cacheRoot: fixture.stateRoot}
+	fixture.installMaterializingAgent(agent)
+	fixture.driver.newAgentClient = func(string) (AgentClient, error) {
+		// Commit after the caller's initial cache miss but before it locks
+		// the delivery tracker, simulating another completed delivery.
+		fixture.prepareCachedImage(t, image)
+		return agent, nil
+	}
+
+	status, err := fixture.driver.DeliverImage(context.Background(), image)
+	require.NoError(t, err)
+	fixture.driver.mu.Lock()
+	entry := fixture.driver.imageDeliveryLocked(image)
+	fixture.driver.mu.Unlock()
+	// Quiesce any erroneous background attempt before checking the result
+	// or allowing the fixture's cache directory to be removed.
+	require.Eventually(t, func() bool {
+		entry.mu.Lock()
+		defer entry.mu.Unlock()
+		return !entry.inFlight
+	}, 5*time.Second, 20*time.Millisecond)
+	require.Equal(t, runtimecontract.ImageDelivered, status)
+	require.Zero(t, agent.deliveredPins(), "a completed cache must not trigger another delivery")
+}
+
 func TestDeliverImageReportsFailureOnceThenRecoversAfterWindow(t *testing.T) {
 	fixture := newDriverFixture(t)
 	agent := &materializingAgent{fakeAgentClient: &fakeAgentClient{}, cacheRoot: fixture.stateRoot}
