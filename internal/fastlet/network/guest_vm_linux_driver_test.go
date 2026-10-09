@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"fast-sandbox/internal/guestnetwork"
 )
 
 func TestGuestVMIP(t *testing.T) {
@@ -42,11 +44,18 @@ func guestVMSlotForTest(root string) *Slot {
 // command sequence is assertable.
 type failCheckRunner struct {
 	commands []string
+	tapJSON  string
 }
 
 func (r *failCheckRunner) Run(_ context.Context, command string, args ...string) ([]byte, error) {
 	line := command + " " + strings.Join(args, " ")
 	r.commands = append(r.commands, line)
+	if strings.Contains(line, "-j -n ns-1 link show dev vmtap0") {
+		if r.tapJSON != "" {
+			return []byte(r.tapJSON), nil
+		}
+		return []byte(`[{"address":"` + guestnetwork.GatewayMAC + `"}]`), nil
+	}
 	if strings.Contains(line, "link show dev fsb0") || strings.Contains(line, " -C ") {
 		return nil, errors.New("not found")
 	}
@@ -67,6 +76,8 @@ func TestGuestVMNetNSDriverPrepare(t *testing.T) {
 	// The tap is created INSIDE the slot netns with the fixed name, no
 	// bridge membership.
 	require.Contains(t, joined, "ip netns exec ns-1 ip tuntap add dev vmtap0 mode tap")
+	require.Contains(t, joined, "ip netns exec ns-1 ip link set vmtap0 address "+guestnetwork.GatewayMAC)
+	require.Less(t, strings.Index(joined, "address "+guestnetwork.GatewayMAC), strings.Index(joined, "link set vmtap0 up"))
 	require.Contains(t, joined, "ip netns exec ns-1 ip link set vmtap0 mtu 1400")
 	require.Contains(t, joined, "ip netns exec ns-1 ip link set vmtap0 up")
 	require.NotContains(t, joined, "link set vmtap0 master")
@@ -183,7 +194,16 @@ func TestGuestVMNetNSDriverValidate(t *testing.T) {
 	require.NoError(t, driver.Validate(context.Background(), slot))
 
 	joined := strings.Join(runner.commands, "\n")
-	require.Contains(t, joined, "ip -n ns-1 link show dev vmtap0")
+	require.Contains(t, joined, "ip -j -n ns-1 link show dev vmtap0")
+
+	for _, payload := range []string{`[{"address":"d6:1f:c2:4e:4d:6e"}]`, `[]`, `[{"address":""}]`, `invalid json`} {
+		runner.tapJSON = payload
+		require.Error(t, driver.Validate(context.Background(), slot), payload)
+	}
+	// Validation rejects stale identities without rewriting active interfaces.
+	for _, command := range runner.commands {
+		require.NotContains(t, command, "link set")
+	}
 
 	slot.GuestTap = ""
 	require.Error(t, driver.Validate(context.Background(), slot))

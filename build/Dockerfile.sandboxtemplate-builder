@@ -65,6 +65,7 @@ RUN go mod download
 # snapshot producer (checksums, manifest encoding, index layout).
 COPY api ./api
 COPY internal/artifacts ./internal/artifacts
+COPY internal/guestnetwork ./internal/guestnetwork
 COPY cmd/sandboxtemplate-builder ./cmd/sandboxtemplate-builder
 RUN CGO_ENABLED=0 go build -o /out/sandboxtemplate-builder ./cmd/sandboxtemplate-builder
 

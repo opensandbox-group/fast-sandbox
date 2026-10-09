@@ -28,6 +28,26 @@ flowchart LR
 
 The runtime receives the namespace path. For Kata, the containerd shim translates the namespace interface into a guest NIC.
 
+## Firecracker gateway identity
+
+Firecracker snapshots preserve the guest NIC configuration and neighbour cache.
+The template builder and runtime therefore use `02:00:00:00:00:02` for the
+guest-facing TAP MAC, distinct from the baked guest NIC MAC. Proxy ARP on the
+runtime TAP advertises this stable identity for the guest's default gateway.
+Each TAP lives in a separate slot network namespace and is not attached directly
+to the shared bridge, so this MAC can be reused across concurrent sandboxes.
+
+Fastlet validates this identity when loading durable network slots. Invalid
+`Clean` slots are destroyed and prepared again before admission. An invalid
+`Bound` slot prevents startup; Fastlet does not rewrite an active TAP's MAC.
+
+Roll out the updated template builder and Fastlets together, draining live
+Firecracker sandboxes before replacing their Fastlets. Rebuild templates with
+the updated builder and create new checkpoints from those templates. Checkpoints
+that already contain a different cached gateway MAC are not migrated by this
+change. Validate the first network request after restore, including concurrent
+restores, rather than relying on runtime Ready alone.
+
 ## Slot lifecycle
 
 A slot has three phases:
