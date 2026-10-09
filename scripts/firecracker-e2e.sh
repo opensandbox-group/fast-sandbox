@@ -4,7 +4,7 @@
 # Requirements:
 #   - Linux x86_64 with KVM (/dev/kvm) and /dev/net/tun
 #   - root (netns, tap, iptables setup) — the script re-invokes itself with sudo
-#   - ip, iptables, sysctl, ping, tar, curl
+#   - ip, iptables, sysctl, ping, tcpdump, tar, curl
 #
 # The script downloads a firecracker release and the firecracker quickstart
 # kernel/rootfs, then runs:
@@ -64,6 +64,7 @@ die() { printf '\033[1;31m[e2e] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 #   host veth  fh<13 hex>       resourceName("fh", podUID, slotID, 15)
 # (the guest tap vmtap0 lives INSIDE the slot netns and vanishes with it;
 # fc* host taps only exist as leftovers of older E2E versions).
+# Preparation owns an isolated fc-prep-<hex> netns.
 # Stale copies from earlier runs (crashed script, interrupted test) survive
 # `ip netns del` and carry the same private addresses, which corrupts ARP on
 # the shared bridge. purge_fsb_resources removes every fsb netns and every
@@ -80,7 +81,7 @@ kill_firecracker_vms() {
     # Firecracker processes this E2E family launched carry --id e2e-sandbox-*.
     # The jailer execs firecracker (same PID), so matching the firecracker
     # argv covers both launch modes.
-    for pid in $(pgrep -f "firecracker .*--id e2e-sandbox-" 2>/dev/null || true); do
+    for pid in $(pgrep -f "firecracker .*--id e2e-(sandbox-|prep)" 2>/dev/null || true); do
         kill "$pid" 2>/dev/null || true
     done
     # Netns deletion races the dying VMM holding the namespace (EBUSY), so
@@ -101,10 +102,10 @@ purge_jail_dirs() {
 
 purge_fsb_resources() {
     kill_firecracker_vms
-    for path in /var/run/netns/fsb*; do
+    for path in /var/run/netns/fsb* /var/run/netns/fc-prep-*; do
         [[ -e "$path" ]] || continue
         name="$(basename "$path")"
-        [[ "$name" =~ $fsb_netns_pattern ]] || continue
+        [[ "$name" =~ $fsb_netns_pattern ]] || [[ "$name" =~ ^fc-prep-[0-9a-f]+$ ]] || continue
         if is_live_netns "$name"; then
             for attempt in 1 2 3; do
                 ip netns del "$name" 2>/dev/null && break
@@ -189,7 +190,7 @@ fi
 [[ -e /dev/kvm ]] || die "/dev/kvm is missing (enable KVM/nested virt)"
 [[ -w /dev/kvm ]] || die "/dev/kvm is not writable"
 [[ -e /dev/net/tun ]] || die "/dev/net/tun is missing"
-for cmd in ip iptables sysctl ping tar curl; do
+for cmd in ip iptables sysctl ping tcpdump tar curl; do
     command -v "$cmd" >/dev/null || die "missing required command: $cmd"
 done
 

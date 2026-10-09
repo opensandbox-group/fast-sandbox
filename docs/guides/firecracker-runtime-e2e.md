@@ -10,7 +10,7 @@ Use it to reproduce the suite on a fresh host or to triage failures.
 |------|-------|
 | Machine | Bare-metal with `/dev/kvm` and `/dev/net/tun` (VT-x); root runner |
 | Reference host | `agent-sandbox033067064046.sg52` — 96 logical CPUs, 504 GiB, Alibaba Cloud Linux 3 (kernel 5.10.134) |
-| Tools | `ip`, `iptables`, `sysctl`, `ping`, `tar`, `curl`; docker not required |
+| Tools | `ip`, `iptables`, `sysctl`, `ping`, `tcpdump`, `tar`, `curl`; docker not required |
 | StateRoot | **XFS with `reflink=1` required** — provision with `scripts/firecracker-xfs-stateroot.sh --loop`; Fastlet startup rejects non-XFS and failed `cp --reflink=always` probes instead of accepting a slow rootfs copy |
 | Disk headroom | Keep ≥ 20% free; high occupancy measurably inflates GuestCopy/rootfs timing (see Results) |
 
@@ -29,7 +29,11 @@ preparation VM produces the set; restored Sandboxes never boot a kernel).
 
 The set is self-bootstrapped once per StateRoot (prep VM → Pause →
 `PUT /snapshot/create`) and cached; a `.prep-version` marker rejects stale
-recipes. Artifacts download on first run.
+recipes. Preparation uses an isolated network namespace with an UP TAP
+and gateway `172.30.0.1`, and waits for a guest echo reply before pausing.
+A permanent host-side guest neighbor prevents host ARP requests from seeding
+the guest cache; the guest must resolve the gateway itself to return the reply.
+Artifacts download on first run.
 
 ## Restore startup (v1.16 semantics)
 
@@ -73,7 +77,8 @@ clones and made safe by namespace isolation (upstream clone model).
 
 ## Test cases
 
-One script invocation runs all cases against the same golden snapshot set:
+The script runs the following cases. The cached-gateway regression prepares
+its own fresh snapshot; other cases reuse the shared golden snapshot set:
 
 | Test | Covers |
 |------|--------|
@@ -81,6 +86,7 @@ One script invocation runs all cases against the same golden snapshot set:
 | `TestFirecrackerDriverE2ENoInfra` | Pure restore baseline without GuestCopy |
 | `TestFirecrackerDriverE2EConcurrent` | 5 VMs restored **in parallel**; per-instance reachability + **execd `/ping` ready on every slot** (the sandbox-usable SLO) |
 | `TestFirecrackerDriverE2EConcurrentSerial` | Same batch **sequentially** (production default path); both batches print per-stage min/avg/max |
+| `TestFirecrackerDriverE2ECachedGatewayMAC` | Fresh snapshot with a resolved gateway neighbor; 5 concurrent clones must return their first ICMP reply within 1 second with the cached gateway MAC. A changed-TAP-MAC negative control must lose that reply. No guest ARP flush, probe retry, or recreate; always performs local prep, including with `FC_SKIP_PREP=1` |
 | `TestFirecrackerDriverE2EImageGC` | LFU cache GC: unreferenced images evicted, live Sandbox pins its image |
 
 ## Results (reference host, 2026-08-29, xfs StateRoot)
