@@ -431,7 +431,7 @@ func runE2EOnce(t *testing.T, useInfra bool) {
 // args, machine tuple): a cached set from an older recipe is incompatible
 // with the current restore driver (e.g. it lacks the baked NIC that
 // network_overrides expects), so the reuse check must reject it.
-const e2ePrepVersion = 3
+const e2ePrepVersion = 4
 
 // bootVM starts the microVM and waits until the machine state is Running.
 // It serves the golden-snapshot prep path only (cold boot: InstanceStart);
@@ -511,27 +511,38 @@ func prepareE2EGoldenSnapshot(t *testing.T, binary, kernel, rootfs, stateRoot, i
 	require.NoError(t, copyFile(rootfs, rootfsImg))
 	require.NoError(t, os.WriteFile(versionMarker, []byte(fmt.Sprint(e2ePrepVersion)), 0o640))
 
-	// The prep VM needs a host tap so the baked NIC has a backing device.
+	// Isolate preparation from the runtime bridge, including its gateway IP.
+	// A successful echo reply below must resolve the gateway through this TAP.
+	prepNS := "fc-prep-" + strconv.FormatInt(time.Now().UnixNano(), 16)
+	output, err := exec.Command("ip", "netns", "add", prepNS).CombinedOutput()
+	require.NoError(t, err, "create prep namespace: %s", output)
+	defer func() { _, _ = exec.Command("ip", "netns", "del", prepNS).CombinedOutput() }()
 	prepTap := "fc-prep-tap"
-	if output, err := exec.Command("ip", "tuntap", "add", "dev", prepTap, "mode", "tap").CombinedOutput(); err != nil {
-		require.Failf(t, "create prep tap %s: %v\n%s", prepTap, err.Error(), output)
+	for _, args := range [][]string{
+		{"tuntap", "add", "dev", prepTap, "mode", "tap"},
+		{"link", "set", "dev", prepTap, "address", guestnetwork.GatewayMAC},
+		{"addr", "add", "172.30.0.1/24", "dev", prepTap},
+		{"link", "set", "dev", prepTap, "up"},
+		// Suppress host ARP requests: the guest must learn the gateway from
+		// its own solicited ARP exchange, not from an incoming host request.
+		{"neigh", "replace", e2ePrepGuestIP, "lladdr", e2ePrepMAC, "nud", "permanent", "dev", prepTap},
+	} {
+		output, err := exec.Command("ip", append([]string{"-n", prepNS}, args...)...).CombinedOutput()
+		require.NoError(t, err, "prepare TAP %v: %s", args, output)
 	}
-	defer func() {
-		_, _ = exec.Command("ip", "link", "del", prepTap).CombinedOutput()
-	}()
-	output, err := exec.Command("ip", "link", "set", "dev", prepTap, "address", guestnetwork.GatewayMAC).CombinedOutput()
-	require.NoError(t, err, "set prep tap gateway MAC: %s", output)
 
 	prepDir := t.TempDir()
 	apiSock := filepath.Join(prepDir, "api.sock")
 	logPath := filepath.Join(prepDir, "firecracker.log")
-	process, err := launch(context.Background(), ExecProcessRunner{}, launchConfig{
+	config := launchConfig{
 		BinaryPath: binary, SandboxID: "e2e-prep", APIAddress: apiSock,
 		// cwd = cache image dir so the relative "rootfs.img" drive path
 		// baked in the vmstate resolves to the golden rootfs here and to
 		// each instance's reflink copy on restore.
 		WorkingDir: dir, LogPath: logPath,
-	})
+	}
+	args := append([]string{"netns", "exec", prepNS, binary}, config.buildArgv()...)
+	process, err := (ExecProcessRunner{}).StartInDir(context.Background(), dir, "ip", args, logPath)
 	require.NoError(t, err)
 	defer process.Kill()
 
@@ -565,6 +576,12 @@ func prepareE2EGoldenSnapshot(t *testing.T, binary, kernel, rootfs, stateRoot, i
 	// not be started before it (a second InstanceStart is rejected).
 	_, err = bootVM(context.Background(), client, 90)
 	require.NoError(t, err)
+	// Running only describes the VMM. Wait for the guest to boot and return
+	// traffic to the gateway, ensuring a resolved gateway neighbor is baked.
+	require.Eventually(t, func() bool {
+		output, err = exec.Command("ip", "netns", "exec", prepNS, "ping", "-c", "1", "-W", "1", e2ePrepGuestIP).CombinedOutput()
+		return err == nil
+	}, 90*time.Second, 100*time.Millisecond, "prep guest did not resolve gateway: %s", output)
 	require.NoError(t, client.Pause(context.Background()))
 	require.NoError(t, waitVMState(context.Background(), client, "Paused", 30*time.Second))
 
