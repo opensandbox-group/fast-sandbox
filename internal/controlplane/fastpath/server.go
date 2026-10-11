@@ -282,21 +282,22 @@ func (s *Server) provisionRuntime(ctx context.Context, accepted *acceptedCreate,
 		if callErr == nil {
 			return nil, status.Error(codes.Unavailable, "Fastlet Create returned no Sandbox observation; Sandbox intent is persisted for Controller recovery")
 		}
-		if orchestration.IsCandidateRejection(callErr) && accepted.created && index+1 == len(accepted.candidates) && len(tried) < maxCreateCandidateAttempts {
+		if !orchestration.IsCandidateRejection(callErr) {
+			return nil, status.Errorf(codes.Unavailable, "Sandbox intent is persisted and Controller will retry: %v", callErr)
+		}
+		hasBudget := len(tried) < maxCreateCandidateAttempts
+		if accepted.created && index+1 == len(accepted.candidates) && hasBudget {
 			// Only a definite rejection permits widening placement. Unknown
 			// outcomes and replayed intents must retain their durable identity.
 			if err := s.refreshCreateCandidates(ctx, accepted, candidate, tried); err != nil {
 				return nil, err
 			}
 		}
-		if orchestration.IsCandidateRejection(callErr) && index+1 < len(accepted.candidates) && len(tried) < maxCreateCandidateAttempts {
+		if index+1 < len(accepted.candidates) && hasBudget {
 			orchestration.RecordTopKRetry("candidate_rejected")
 			klog.FromContext(ctx).Info("fastlet candidate rejected; advancing to the next candidate",
 				"fastlet", candidate.ID, "sandbox", accepted.sandbox.Name, "err", callErr)
 			continue
-		}
-		if !orchestration.IsCandidateRejection(callErr) {
-			return nil, status.Errorf(codes.Unavailable, "Sandbox intent is persisted and Controller will retry: %v", callErr)
 		}
 		if err := s.rollbackRejectedCreate(ctx, accepted, callErr); err != nil {
 			return nil, err

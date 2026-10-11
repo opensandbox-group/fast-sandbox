@@ -17,18 +17,15 @@ func (o *Orchestrator) BeginFastPathCreate(key types.NamespacedName) func() {
 	}
 	o.activeCreates[key]++
 	o.activeCreatesMu.Unlock()
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			o.activeCreatesMu.Lock()
-			defer o.activeCreatesMu.Unlock()
-			if o.activeCreates[key] <= 1 {
-				delete(o.activeCreates, key)
-			} else {
-				o.activeCreates[key]--
-			}
-		})
-	}
+	return sync.OnceFunc(func() {
+		o.activeCreatesMu.Lock()
+		defer o.activeCreatesMu.Unlock()
+		if o.activeCreates[key] <= 1 {
+			delete(o.activeCreates, key)
+		} else {
+			o.activeCreates[key]--
+		}
+	})
 }
 
 func (o *Orchestrator) FastPathCreateActive(key types.NamespacedName) bool {

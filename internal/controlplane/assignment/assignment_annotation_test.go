@@ -142,3 +142,32 @@ func TestCASStopsOnChangedAnnotationBeforeLaggingProjection(t *testing.T) {
 	_, err = CASAssignmentAnnotation(context.Background(), k8s, client.ObjectKeyFromObject(sandbox), second, first)
 	require.ErrorIs(t, err, ErrAssignmentProjectionConflict)
 }
+
+func TestCASAssignmentRejectsMissingAuthoritativeAnnotation(t *testing.T) {
+	for _, projected := range []bool{false, true} {
+		name := "unassigned"
+		wantErr := ErrAssignmentAnnotationChanged
+		sandbox := &apiv1alpha2.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: "sandbox-a", Namespace: "default"}}
+		if projected {
+			name = "status only"
+			wantErr = ErrAssignmentAnnotationMissing
+			sandbox.Status.Placement = testAssignmentEnvelope().StatusPlacement()
+		}
+		t.Run(name, func(t *testing.T) {
+			scheme := runtime.NewScheme()
+			require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+			k8s := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sandbox).Build()
+			expected := testAssignmentEnvelope()
+			next := expected
+			next.Attempt++
+			next.RouteGeneration++
+			next.RuntimeInstanceID = "next-runtime"
+			key := client.ObjectKeyFromObject(sandbox)
+			_, err := CASAssignmentAnnotation(context.Background(), k8s, key, expected, next)
+			require.ErrorIs(t, err, wantErr)
+			var current apiv1alpha2.Sandbox
+			require.NoError(t, k8s.Get(context.Background(), key, &current))
+			require.Empty(t, current.Annotations[AnnotationAssignment])
+		})
+	}
+}
