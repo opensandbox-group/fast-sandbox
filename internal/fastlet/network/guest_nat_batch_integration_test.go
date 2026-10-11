@@ -38,7 +38,7 @@ func TestGuestNATBatchPrivileged(t *testing.T) {
 	require.NoError(t, err)
 	slot := &Slot{NetNSName: name, IP: "172.30.253.2", GuestNATBatch: true}
 	driver := NewGuestVMNetNSDriver(LinuxDriverConfig{})
-	require.True(t, driver.batchNAT)
+	require.NotNil(t, driver.restoreRunner)
 	initial := fmt.Sprintf("*nat\n:%s - [0:0]\n:%s - [0:0]\n:UNRELATED - [0:0]\n-A PREROUTING -j %s\n-A POSTROUTING -j %s\n-A UNRELATED -d 198.51.100.1/32 -j RETURN\nCOMMIT\n", guestDNATChain, guestSNATChain, guestDNATChain, guestSNATChain)
 	require.NoError(t, driver.restoreGuestNAT(ctx, slot, initial))
 	_, err = runner.Run(ctx, "ip", "netns", "exec", name, "iptables", "-A", "FORWARD", "-d", "198.51.100.1/32", "-j", "REJECT")

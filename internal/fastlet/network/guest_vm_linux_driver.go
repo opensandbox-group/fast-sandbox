@@ -26,6 +26,13 @@ const (
 	guestVMDefaultTapName = "vmtap0"
 	guestDNATChain        = "FSB_GUEST_DNAT"
 	guestSNATChain        = "FSB_GUEST_SNAT"
+	guestNATChains        = "*nat\n:" + guestDNATChain + " - [0:0]\n:" + guestSNATChain + " - [0:0]\n"
+	guestNATPrepareRules  = guestNATChains +
+		"-A PREROUTING -j " + guestDNATChain + "\n" +
+		"-A POSTROUTING -j " + guestSNATChain + "\nCOMMIT\n"
+	guestNATApplyRules = guestNATChains +
+		"-A " + guestDNATChain + " -d %s/32 -j DNAT --to-destination %s\n" +
+		"-A " + guestSNATChain + " -s %s/32 -j SNAT --to-source %s\nCOMMIT\n"
 )
 
 // GuestVMNetNSDriver extends LinuxNetNSDriver with the per-clone netns data
@@ -40,7 +47,7 @@ const (
 type GuestVMNetNSDriver struct {
 	LinuxNetNSDriver
 	iptablesRestoreCommand string
-	batchNAT               bool
+	restoreRunner          inputCommandRunner
 }
 
 // NewGuestVMNetNSDriver wraps a LinuxNetNSDriver with the guest-VM additions.
@@ -50,11 +57,12 @@ func NewGuestVMNetNSDriver(config LinuxDriverConfig) *GuestVMNetNSDriver {
 	if driver.iptablesRestoreCommand == "" {
 		driver.iptablesRestoreCommand = driver.iptablesCommand + "-restore"
 	}
-	_, driver.batchNAT = driver.runner.(inputCommandRunner)
+	driver.restoreRunner, _ = driver.runner.(inputCommandRunner)
 	switch driver.runner.(type) {
 	case ExecRunner, *ExecRunner:
-		_, err := exec.LookPath(driver.iptablesRestoreCommand)
-		driver.batchNAT = err == nil
+		if _, err := exec.LookPath(driver.iptablesRestoreCommand); err != nil {
+			driver.restoreRunner = nil
+		}
 	}
 	return driver
 }
@@ -133,9 +141,8 @@ func (d *GuestVMNetNSDriver) Prepare(ctx context.Context, slot *Slot) error {
 			return fmt.Errorf("prepare guest-VM namespace rules: %w", err)
 		}
 	}
-	if d.batchNAT {
-		payload := fmt.Sprintf("*nat\n:%s - [0:0]\n:%s - [0:0]\n-A PREROUTING -j %s\n-A POSTROUTING -j %s\nCOMMIT\n", guestDNATChain, guestSNATChain, guestDNATChain, guestSNATChain)
-		if err := d.restoreGuestNAT(ctx, slot, payload); err != nil {
+	if d.restoreRunner != nil {
+		if err := d.restoreGuestNAT(ctx, slot, guestNATPrepareRules); err != nil {
 			return fmt.Errorf("prepare guest NAT chains: %w", err)
 		}
 		slot.GuestNATBatch = true
@@ -182,8 +189,7 @@ func (d *GuestVMNetNSDriver) ApplyGuest(ctx context.Context, slot *Slot, guestIP
 	}
 	if slot.GuestNATBatch {
 		natCtx, finishNAT := startGuestApplyStage(ctx, "nat_apply")
-		payload := fmt.Sprintf("*nat\n:%s - [0:0]\n:%s - [0:0]\n-A %s -d %s/32 -j DNAT --to-destination %s\n-A %s -s %s/32 -j SNAT --to-source %s\nCOMMIT\n",
-			guestDNATChain, guestSNATChain, guestDNATChain, slot.IP, guestIP, guestSNATChain, guestIP, slot.IP)
+		payload := fmt.Sprintf(guestNATApplyRules, slot.IP, guestIP, guestIP, slot.IP)
 		err := d.restoreGuestNAT(natCtx, slot, payload)
 		finishNAT(err)
 		if err != nil {
@@ -209,11 +215,10 @@ func (d *GuestVMNetNSDriver) ApplyGuest(ctx context.Context, slot *Slot, guestIP
 }
 
 func (d *GuestVMNetNSDriver) restoreGuestNAT(ctx context.Context, slot *Slot, payload string) error {
-	runner, ok := d.runner.(inputCommandRunner)
-	if !ok {
+	if d.restoreRunner == nil {
 		return fmt.Errorf("guest NAT batch requires a stdin command runner")
 	}
-	_, err := runner.RunInput(ctx, []byte(payload), d.ipCommand,
+	_, err := d.restoreRunner.RunInput(ctx, []byte(payload), d.ipCommand,
 		ipObjectNetns, execSubcommand, slot.NetNSName, d.iptablesRestoreCommand, "--noflush")
 	return err
 }

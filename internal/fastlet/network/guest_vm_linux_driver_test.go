@@ -313,3 +313,34 @@ func TestGuestNATBatchRecoveryRejectsMissingHook(t *testing.T) {
 		require.NotContains(t, cmd, " -F ")
 	}
 }
+
+func TestGuestNATBatchRunnerCapabilities(t *testing.T) {
+	missing := t.TempDir() + "/missing-restore"
+	restore := t.TempDir() + "/iptables-restore"
+	require.NoError(t, os.WriteFile(restore, []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	for _, test := range []struct {
+		name   string
+		config LinuxDriverConfig
+		batch  bool
+	}{
+		{name: "legacy injected runner", config: LinuxDriverConfig{Runner: &failCheckRunner{}}},
+		{name: "stdin injected runner", config: LinuxDriverConfig{Runner: &batchRunner{}}, batch: true},
+		{name: "missing executable", config: LinuxDriverConfig{Runner: ExecRunner{}, IPTablesRestoreCommand: missing}},
+		{name: "available executable", config: LinuxDriverConfig{Runner: &ExecRunner{}, IPTablesRestoreCommand: restore}, batch: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			driver := NewGuestVMNetNSDriver(test.config)
+			require.Equal(t, test.batch, driver.restoreRunner != nil)
+		})
+	}
+}
+
+func TestGuestNATBatchSlotRequiresStdinRunner(t *testing.T) {
+	runner := &failCheckRunner{}
+	driver := NewGuestVMNetNSDriver(LinuxDriverConfig{Runner: runner})
+	slot := guestVMSlotForTest(t.TempDir())
+	slot.GuestNATBatch = true
+	require.ErrorContains(t, driver.ApplyGuest(context.Background(), slot, "10.17.0.9"), "requires a stdin command runner")
+	require.Equal(t, []string{"ip -n ns-1 route replace 10.17.0.9/32 dev vmtap0"}, runner.commands,
+		"a persisted batch slot must not fall back to per-rule NAT")
+}
