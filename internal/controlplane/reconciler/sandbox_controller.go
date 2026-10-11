@@ -137,6 +137,12 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *o
 		return ctrl.Result{}, err
 	}
 
+	// Keep the status projection above available to the active Fast-Path CAS,
+	// but let that RPC own runtime calls and candidate switches until it exits.
+	if orchestrator.FastPathCreateActive(client.ObjectKeyFromObject(assigned)) {
+		return ctrl.Result{RequeueAfter: ObservationPollInterval}, nil
+	}
+
 	var observed *fastletapi.SandboxStatus
 	if newlyAssigned {
 		observed, err = orchestrator.EnsureRuntime(ctx, assigned)

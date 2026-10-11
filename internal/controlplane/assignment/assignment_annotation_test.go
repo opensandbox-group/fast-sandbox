@@ -127,3 +127,18 @@ func (c *metadataRaceClient) Patch(ctx context.Context, object client.Object, pa
 	}
 	return c.Client.Patch(ctx, object, patch, options...)
 }
+
+func TestCASStopsOnChangedAnnotationBeforeLaggingProjection(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	first := testAssignmentEnvelope()
+	second := first
+	second.Attempt, second.RouteGeneration, second.RuntimeInstanceID = 2, 2, "runtime-b"
+	sandbox := &apiv1alpha2.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: "sandbox-a", Namespace: "default"}, Status: apiv1alpha2.SandboxStatus{Placement: first.StatusPlacement(), Runtime: apiv1alpha2.RuntimeStatus{Generation: 1}, DataPlane: apiv1alpha2.DataPlaneStatus{RouteGeneration: 1}}}
+	require.NoError(t, SetAssignmentAnnotation(sandbox, second))
+	k8s := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&apiv1alpha2.Sandbox{}).WithObjects(sandbox).Build()
+	_, err := CASAssignmentAnnotation(context.Background(), k8s, client.ObjectKeyFromObject(sandbox), first, second)
+	require.ErrorIs(t, err, ErrAssignmentAnnotationChanged)
+	_, err = CASAssignmentAnnotation(context.Background(), k8s, client.ObjectKeyFromObject(sandbox), second, first)
+	require.ErrorIs(t, err, ErrAssignmentProjectionConflict)
+}

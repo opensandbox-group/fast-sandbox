@@ -235,9 +235,22 @@ func CASAssignmentAnnotation(
 	if err := k8sClient.Get(ctx, key, &current); err != nil {
 		return nil, err
 	}
-	currentEnvelope, err := EffectiveAssignment(&current)
+	// A changed authoritative annotation is not a delayed status projection.
+	// Check the complete fence before reporting a projection conflict so a
+	// caller waiting for status never waits on another assignment.
+	annotated, err := AssignmentFromAnnotation(&current)
 	if err != nil {
 		return nil, err
+	}
+	if annotated != nil && !assignmentEnvelopeEqual(*annotated, expected) {
+		return nil, ErrAssignmentAnnotationChanged
+	}
+	currentEnvelope, err := EffectiveAssignment(&current)
+	if err != nil {
+		return nil, fmt.Errorf("%w: annotation attempt=%d instanceGeneration=%d routeGeneration=%d; status fastlet=%s podUID=%s attempt=%d instanceGeneration=%d routeGeneration=%d",
+			err, expected.Attempt, expected.InstanceGeneration, expected.RouteGeneration,
+			current.Status.Placement.FastletName, current.Status.Placement.FastletPodUID,
+			current.Status.Placement.Attempt, current.Status.Runtime.Generation, current.Status.DataPlane.RouteGeneration)
 	}
 	if currentEnvelope == nil || !assignmentEnvelopeEqual(*currentEnvelope, expected) {
 		return nil, ErrAssignmentAnnotationChanged

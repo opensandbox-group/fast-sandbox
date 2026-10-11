@@ -143,3 +143,19 @@ Trace tests must verify:
 - one trace ID across both proxy hops and the final upstream.
 
 Cluster validation should connect a temporary Collector and confirm that Create, asynchronous Reconcile, and Infra proxy traces can be found independently.
+
+## Assignment projection convergence
+
+`fast_sandbox_create_stage_latency_seconds{stage="assignment_projection_wait",result}`
+measures the bounded wait used only when a rejected candidate's current durable
+assignment has not yet been projected into status. Logs record the Sandbox,
+expected attempt and route generation, wait duration, and final error. The
+complete annotation is compared before status; a real assignment change aborts
+immediately. This stage is included in Create RPC latency, not Firecracker
+runtime stage latency. Absent samples mean no projection wait occurred.
+
+The colocated Controller still projects status during an active Fast-Path
+Create, but defers runtime ensure/reassignment using a process-local tracker.
+The tracker does not add a Kubernetes IO or a persisted lease, and is released
+on every RPC exit. It is not shared across separate processes; assignment
+changes from another writer remain fenced and abort the switch.

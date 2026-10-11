@@ -90,7 +90,33 @@ The Orchestrator:
 4. ranks by load and a stable tie-breaker;
 5. returns a bounded Top-K candidate list.
 
-The candidate list bounds network calls and retry work. It is not a reservation.
+The candidate list is not a reservation. A newly accepted Fast-Path create
+refreshes Top-K after a batch of proven side-effect-free rejections, excluding
+every Fastlet already tried by that request. Compatibility revisions are
+filtered before Top-K. Refreshes use only the local Registry and retain the
+initial assignment's runtime, resource, and Infra profiles. Work is bounded by
+32 distinct Fastlet attempts and the caller deadline; the first-create happy
+path still uses two Kubernetes IOs. Every reassignment uses an assignment CAS.
+Replayed existing intents remain pinned to their persisted assignment.
+
+During a proven-rejection candidate switch, Fast-Path waits up to two seconds
+(with bounded exponential backoff and the caller deadline) if the full durable
+assignment still matches but status has not caught up. It rechecks the complete
+annotation on every attempt, retains the strict status-projection check, and
+does not call the next Fastlet until CAS succeeds. A changed assignment,
+non-projection error, cancellation, or an exhausted wait stops the switch and
+retains the intent for reconciliation. This adds no wait or Kubernetes IO to
+the first-candidate success path; it does not permit reassigning an ambiguous
+runtime outcome.
+
+The colocated Fast-Path and Controller share a process-local active-create
+tracker, acquired before persisting the intent and released when the RPC exits.
+Reconciliation continues projecting the annotation into status while an RPC
+is active, but defers runtime ensure/reassignment until the RPC releases it.
+This avoids competing candidate switches in the same process without another
+Kubernetes write. Declarative-only reconciliation and crash recovery remain
+unchanged. Separate processes do not share this tracker; the durable CAS and
+fencing still reject their concurrent identity changes.
 
 ## Atomic admission
 
@@ -109,7 +135,7 @@ This prevents stale or inconsistent Registries across Fast-Path replicas from ex
 
 | Result | Scheduler action |
 |---|---|
-| Explicit rejection before side effects | Record local feedback and try the next Top-K candidate |
+| Explicit rejection before side effects | Record local feedback and try the next candidate; refresh Top-K within the request's bounded budget for a newly accepted intent |
 | Idempotently present | Return the existing identity |
 | Transport ambiguity | Retry the same assignment and identity |
 | Create in progress | Retry or let Reconciliation continue |

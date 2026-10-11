@@ -655,3 +655,25 @@ func TestResumePrefersCheckpointFastlet(t *testing.T) {
 		"resume must prefer the Fastlet that captured the checkpoint")
 	require.Equal(t, types.UID("pod-b"), current.Status.Placement.FastletPodUID)
 }
+
+func TestActiveFastPathCreateProjectsStatusAndDefersRuntimeUntilRelease(t *testing.T) {
+	reconciler, _, fastlet, sandbox := newControllerHarness(t)
+	release := reconciler.Orchestrator.BeginFastPathCreate(client.ObjectKeyFromObject(sandbox))
+	defer release()
+	reconcileTwice(t, reconciler, sandbox.Name)
+	current := getControllerSandbox(t, reconciler, sandbox.Name)
+	envelope, err := assignment.EffectiveAssignment(current)
+	require.NoError(t, err)
+	require.NotNil(t, envelope, "status must still converge for Fast-Path CAS")
+	fastlet.mu.Lock()
+	require.Equal(t, 0, fastlet.ensureCall)
+	fastlet.mu.Unlock()
+	release()
+	_, err = reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+	require.NoError(t, err)
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	require.Equal(t, apiv1alpha2.RuntimeReady, current.Status.Runtime.State)
+	fastlet.mu.Lock()
+	require.Equal(t, 1, fastlet.ensureCall)
+	fastlet.mu.Unlock()
+}
