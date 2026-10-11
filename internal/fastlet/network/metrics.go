@@ -1,14 +1,20 @@
 package network
 
 import (
+	"context"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+
+	"fast-sandbox/internal/observability"
 )
 
 // resultLabel distinguishes acquire/persist outcomes on the slot metrics.
-const resultLabel = "result"
+const (
+	resultLabel       = "result"
+	metricResultError = "error"
+)
 
 var (
 	networkSlotAcquireTotal = promauto.NewCounterVec(prometheus.CounterOpts{
@@ -58,7 +64,26 @@ func observeSlotAcquire(result string, started time.Time) {
 func observeSlotPersist(started time.Time, err error) {
 	result := "success"
 	if err != nil {
-		result = "error"
+		result = metricResultError
 	}
 	networkSlotPersistLatency.WithLabelValues(result).Observe(time.Since(started).Seconds())
+}
+
+var guestApplyStageLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "fast_sandbox_network_guest_apply_stage_latency_seconds",
+	Help:    "Latency of guest network apply stages; driver_apply contains route/NAT/ARP leaves.",
+	Buckets: prometheus.ExponentialBuckets(.00025, 2, 16),
+}, []string{"stage", "result"})
+
+func startGuestApplyStage(ctx context.Context, stage string) (context.Context, func(error)) {
+	started := time.Now()
+	stageContext, span := observability.Start(ctx, "fastlet.network.guest_apply."+stage)
+	return stageContext, func(err error) {
+		result := "success"
+		if err != nil {
+			result = metricResultError
+		}
+		guestApplyStageLatency.WithLabelValues(stage, result).Observe(time.Since(started).Seconds())
+		observability.End(span, err)
+	}
 }

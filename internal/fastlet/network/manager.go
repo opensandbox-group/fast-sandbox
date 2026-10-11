@@ -212,7 +212,7 @@ func (m *Manager) Reconcile(ctx context.Context, runtimeOwners []Owner) error {
 func (m *Manager) Acquire(ctx context.Context, owner Owner) (_ *Slot, resultErr error) {
 	started := time.Now()
 	ctx, span := observability.Start(ctx, "fastlet.network.acquire")
-	result := "error"
+	result := metricResultError
 	defer func() {
 		observeSlotAcquire(result, started)
 		observability.End(span, resultErr)
@@ -307,6 +307,7 @@ type guestDataPlane interface {
 // concurrent release cannot be overwritten. Drivers without a guest data
 // plane (container runtimes) record nothing.
 func (m *Manager) ApplyGuest(ctx context.Context, owner Owner, guestIP string) error {
+	_, finishLookup := startGuestApplyStage(ctx, "owner_lookup")
 	m.mu.Lock()
 	var applied *Slot
 	for _, slot := range m.slots {
@@ -317,23 +318,33 @@ func (m *Manager) ApplyGuest(ctx context.Context, owner Owner, guestIP string) e
 	}
 	m.mu.Unlock()
 	if applied == nil {
+		finishLookup(ErrSlotNotFound)
 		return ErrSlotNotFound
 	}
+	finishLookup(nil)
 	if guestDriver, ok := m.driver.(guestDataPlane); ok {
-		if err := guestDriver.ApplyGuest(ctx, applied, guestIP); err != nil {
+		driverCtx, finishDriver := startGuestApplyStage(ctx, "driver_apply")
+		err := guestDriver.ApplyGuest(driverCtx, applied, guestIP)
+		finishDriver(err)
+		if err != nil {
 			return err
 		}
 	} else {
 		applied.GuestIP = guestIP
 	}
+	_, finishWait := startGuestApplyStage(ctx, "persist_lock_wait")
 	m.mu.Lock()
+	finishWait(nil)
 	defer m.mu.Unlock()
 	current := m.slots[applied.ID]
 	if current == nil || current.Phase != SlotPhaseBound || !current.Owner.Equal(owner) {
 		return ErrSlotNotFound
 	}
 	*current = *applied
-	return m.store.Save(ctx, current)
+	persistCtx, finishPersist := startGuestApplyStage(ctx, "persist")
+	err := m.store.Save(persistCtx, current)
+	finishPersist(err)
+	return err
 }
 
 // Release destroys a used slot. It never returns that slot directly to the

@@ -1,6 +1,7 @@
 package network
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -34,10 +35,24 @@ type CommandRunner interface {
 	Run(ctx context.Context, command string, args ...string) ([]byte, error)
 }
 
+// inputCommandRunner can send a restore transaction without a shell or a
+// temporary file. Existing injected runners can retain the legacy path.
+type inputCommandRunner interface {
+	RunInput(ctx context.Context, input []byte, command string, args ...string) ([]byte, error)
+}
+
 type ExecRunner struct{}
 
 func (ExecRunner) Run(ctx context.Context, command string, args ...string) ([]byte, error) {
-	output, err := exec.CommandContext(ctx, command, args...).CombinedOutput()
+	return ExecRunner{}.RunInput(ctx, nil, command, args...)
+}
+
+func (ExecRunner) RunInput(ctx context.Context, input []byte, command string, args ...string) ([]byte, error) {
+	process := exec.CommandContext(ctx, command, args...)
+	if input != nil {
+		process.Stdin = bytes.NewReader(input)
+	}
+	output, err := process.CombinedOutput()
 	if err != nil {
 		return output, fmt.Errorf("%s %s: %w: %s", command, strings.Join(args, " "), err, strings.TrimSpace(string(output)))
 	}
@@ -45,11 +60,12 @@ func (ExecRunner) Run(ctx context.Context, command string, args ...string) ([]by
 }
 
 type LinuxDriverConfig struct {
-	Runner          CommandRunner
-	ResolverPath    string
-	IPCommand       string
-	IPTablesCommand string
-	SysctlCommand   string
+	Runner                 CommandRunner
+	ResolverPath           string
+	IPCommand              string
+	IPTablesCommand        string
+	IPTablesRestoreCommand string
+	SysctlCommand          string
 }
 
 type LinuxNetNSDriver struct {
