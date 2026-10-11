@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os/exec"
 	"strconv"
 	"time"
 
@@ -21,7 +22,11 @@ const arpWarmupDialTimeout = 300 * time.Millisecond
 // and carries no Pod identity. Slot.GuestTap keeps the field with this
 // value so the runtime driver can reference the tap in the restore
 // network_overrides without coupling to the network driver.
-const guestVMDefaultTapName = "vmtap0"
+const (
+	guestVMDefaultTapName = "vmtap0"
+	guestDNATChain        = "FSB_GUEST_DNAT"
+	guestSNATChain        = "FSB_GUEST_SNAT"
+)
 
 // GuestVMNetNSDriver extends LinuxNetNSDriver with the per-clone netns data
 // plane for guest-VM runtimes (Firecracker). The VMM process enters the slot
@@ -34,11 +39,24 @@ const guestVMDefaultTapName = "vmtap0"
 // runtimes keep using LinuxNetNSDriver and never see the tap or the rules.
 type GuestVMNetNSDriver struct {
 	LinuxNetNSDriver
+	iptablesRestoreCommand string
+	batchNAT               bool
 }
 
 // NewGuestVMNetNSDriver wraps a LinuxNetNSDriver with the guest-VM additions.
 func NewGuestVMNetNSDriver(config LinuxDriverConfig) *GuestVMNetNSDriver {
-	return &GuestVMNetNSDriver{LinuxNetNSDriver: *NewLinuxNetNSDriver(config)}
+	driver := &GuestVMNetNSDriver{LinuxNetNSDriver: *NewLinuxNetNSDriver(config)}
+	driver.iptablesRestoreCommand = config.IPTablesRestoreCommand
+	if driver.iptablesRestoreCommand == "" {
+		driver.iptablesRestoreCommand = driver.iptablesCommand + "-restore"
+	}
+	_, driver.batchNAT = driver.runner.(inputCommandRunner)
+	switch driver.runner.(type) {
+	case ExecRunner, *ExecRunner:
+		_, err := exec.LookPath(driver.iptablesRestoreCommand)
+		driver.batchNAT = err == nil
+	}
+	return driver
 }
 
 // Prepare runs the standard Linux preparation, then builds the static
@@ -115,6 +133,13 @@ func (d *GuestVMNetNSDriver) Prepare(ctx context.Context, slot *Slot) error {
 			return fmt.Errorf("prepare guest-VM namespace rules: %w", err)
 		}
 	}
+	if d.batchNAT {
+		payload := fmt.Sprintf("*nat\n:%s - [0:0]\n:%s - [0:0]\n-A PREROUTING -j %s\n-A POSTROUTING -j %s\nCOMMIT\n", guestDNATChain, guestSNATChain, guestDNATChain, guestSNATChain)
+		if err := d.restoreGuestNAT(ctx, slot, payload); err != nil {
+			return fmt.Errorf("prepare guest NAT chains: %w", err)
+		}
+		slot.GuestNATBatch = true
+	}
 	return nil
 }
 
@@ -123,7 +148,8 @@ func (d *GuestVMNetNSDriver) Prepare(ctx context.Context, slot *Slot) error {
 // the ingress DNAT (slot IP -> guest IP) / egress source NAT (guest IP ->
 // slot IP) rules. Every slot translates its slot IP to the SAME baked guest
 // address (per-clone clone model); slot.IP+1 is NOT the guest address
-// except for the first slot. Idempotent (check-then-add).
+// except for the first slot. New slots replace dedicated chains; old slots
+// retain idempotent check-then-add.
 func (d *GuestVMNetNSDriver) ApplyGuest(ctx context.Context, slot *Slot, guestIP string) error {
 	if slot == nil || slot.NetNSName == "" || slot.IP == "" {
 		return fmt.Errorf("incomplete guest-VM slot")
@@ -131,6 +157,10 @@ func (d *GuestVMNetNSDriver) ApplyGuest(ctx context.Context, slot *Slot, guestIP
 	address, err := netip.ParseAddr(guestIP)
 	if err != nil || !address.Is4() {
 		return fmt.Errorf("invalid baked guest IP %q", guestIP)
+	}
+	slotAddress, err := netip.ParseAddr(slot.IP)
+	if err != nil || !slotAddress.Is4() {
+		return fmt.Errorf("invalid slot IP %q", slot.IP)
 	}
 	if slot.IP == guestIP {
 		// The slot netns eth0 owns the slot IP; if it equals the guest
@@ -140,18 +170,57 @@ func (d *GuestVMNetNSDriver) ApplyGuest(ctx context.Context, slot *Slot, guestIP
 		return fmt.Errorf("baked guest IP %q collides with the slot IP", guestIP)
 	}
 	slot.GuestIP = guestIP
-	nsTap := func(arguments ...string) []string {
-		return append([]string{ipObjectNetns, execSubcommand, slot.NetNSName, d.ipCommand}, arguments...)
-	}
-	nsIPTables := func(arguments ...string) []string {
-		return append([]string{ipObjectNetns, execSubcommand, slot.NetNSName, d.iptablesCommand}, arguments...)
-	}
 	// Ingress delivery: the baked guest address is routed via the tap. The
 	// address is deliberately NOT assigned to the tap: a local address
 	// would shadow the guest (the netns kernel would answer for the guest
 	// IP itself and refuse TCP with no listener).
-	if _, err := d.runner.Run(ctx, d.ipCommand, nsTap("route", "replace", guestIP+"/32", netDevFlag, guestVMDefaultTapName)...); err != nil {
+	routeCtx, finishRoute := startGuestApplyStage(ctx, "route_replace")
+	_, err = d.runner.Run(routeCtx, d.ipCommand, "-n", slot.NetNSName, "route", "replace", guestIP+"/32", netDevFlag, guestVMDefaultTapName)
+	finishRoute(err)
+	if err != nil {
 		return fmt.Errorf("apply guest delivery route: %w", err)
+	}
+	if slot.GuestNATBatch {
+		natCtx, finishNAT := startGuestApplyStage(ctx, "nat_apply")
+		payload := fmt.Sprintf("*nat\n:%s - [0:0]\n:%s - [0:0]\n-A %s -d %s/32 -j DNAT --to-destination %s\n-A %s -s %s/32 -j SNAT --to-source %s\nCOMMIT\n",
+			guestDNATChain, guestSNATChain, guestDNATChain, slot.IP, guestIP, guestSNATChain, guestIP, slot.IP)
+		err := d.restoreGuestNAT(natCtx, slot, payload)
+		finishNAT(err)
+		if err != nil {
+			return fmt.Errorf("apply guest NAT batch: %w", err)
+		}
+	} else if err := d.applyLegacyGuestNAT(ctx, slot, guestIP); err != nil {
+		return err
+	}
+	// ARP warm-up: one datagram to the slot IP forces the host bridge to
+	// resolve the address against the netns eth0 (which owns it) right
+	// away, instead of letting the first business packet hit a stale or
+	// incomplete neighbour entry. The netns answers ARP independently of
+	// the VM state; the DNATed datagram itself is dropped until the guest
+	// resumes, which is harmless. Best-effort.
+	_, finishARP := startGuestApplyStage(ctx, "arp_warmup")
+	conn, dialErr := net.DialTimeout("udp", net.JoinHostPort(slot.IP, "9"), arpWarmupDialTimeout)
+	if dialErr == nil {
+		_, dialErr = conn.Write([]byte{0})
+		_ = conn.Close()
+	}
+	finishARP(dialErr)
+	return nil
+}
+
+func (d *GuestVMNetNSDriver) restoreGuestNAT(ctx context.Context, slot *Slot, payload string) error {
+	runner, ok := d.runner.(inputCommandRunner)
+	if !ok {
+		return fmt.Errorf("guest NAT batch requires a stdin command runner")
+	}
+	_, err := runner.RunInput(ctx, []byte(payload), d.ipCommand,
+		ipObjectNetns, execSubcommand, slot.NetNSName, d.iptablesRestoreCommand, "--noflush")
+	return err
+}
+
+func (d *GuestVMNetNSDriver) applyLegacyGuestNAT(ctx context.Context, slot *Slot, guestIP string) error {
+	nsIPTables := func(arguments ...string) []string {
+		return append([]string{ipObjectNetns, execSubcommand, slot.NetNSName, d.iptablesCommand}, arguments...)
 	}
 	rules := [][]string{
 		// Ingress: the uniquely addressed slot IP is DNATed to the baked
@@ -161,20 +230,17 @@ func (d *GuestVMNetNSDriver) ApplyGuest(ctx context.Context, slot *Slot, guestIP
 		// unique slot IP so upstream source-IP dispatch keeps working.
 		nsIPTables("-t", "nat", "-A", "POSTROUTING", "-s", guestIP+"/32", "-j", "SNAT", "--to-source", slot.IP),
 	}
-	for _, arguments := range rules {
-		if err := checkThenAdd(ctx, d.runner, d.ipCommand, arguments); err != nil {
+	for index, arguments := range rules {
+		stage := "dnat"
+		if index == 1 {
+			stage = "snat"
+		}
+		natCtx, finishNAT := startGuestApplyStage(ctx, stage)
+		err := checkThenAdd(natCtx, d.runner, d.ipCommand, arguments)
+		finishNAT(err)
+		if err != nil {
 			return fmt.Errorf("apply guest NAT rules: %w", err)
 		}
-	}
-	// ARP warm-up: one datagram to the slot IP forces the host bridge to
-	// resolve the address against the netns eth0 (which owns it) right
-	// away, instead of letting the first business packet hit a stale or
-	// incomplete neighbour entry. The netns answers ARP independently of
-	// the VM state; the DNATed datagram itself is dropped until the guest
-	// resumes, which is harmless. Best-effort.
-	if conn, dialErr := net.DialTimeout("udp", net.JoinHostPort(slot.IP, "9"), arpWarmupDialTimeout); dialErr == nil {
-		_, _ = conn.Write([]byte{0})
-		_ = conn.Close()
 	}
 	return nil
 }
@@ -221,6 +287,14 @@ func (d *GuestVMNetNSDriver) Validate(ctx context.Context, slot *Slot) error {
 	if len(links) != 1 || links[0].Address != guestnetwork.GatewayMAC {
 		return fmt.Errorf("guest tap %s must use gateway MAC %s: %s", guestVMDefaultTapName, guestnetwork.GatewayMAC, output)
 	}
+	if slot.GuestNATBatch {
+		for _, hook := range []struct{ chain, target string }{{"PREROUTING", guestDNATChain}, {"POSTROUTING", guestSNATChain}} {
+			if _, err := d.runner.Run(ctx, d.ipCommand, ipObjectNetns, execSubcommand, slot.NetNSName,
+				d.iptablesCommand, "-t", "nat", "-C", hook.chain, "-j", hook.target); err != nil {
+				return fmt.Errorf("guest NAT hook %s: %w", hook.chain, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -238,7 +312,7 @@ func (d *GuestVMNetNSDriver) Destroy(ctx context.Context, slot *Slot) error {
 			return append([]string{ipObjectNetns, execSubcommand, slot.NetNSName, d.iptablesCommand}, arguments...)
 		}
 		var rules [][]string
-		if slot.GuestIP != "" {
+		if slot.GuestIP != "" && !slot.GuestNATBatch {
 			rules = append(rules,
 				nsIPTables("-t", "nat", "-D", "PREROUTING", "-d", slot.IP+"/32", "-j", "DNAT", "--to-destination", slot.GuestIP),
 				nsIPTables("-t", "nat", "-D", "POSTROUTING", "-s", slot.GuestIP+"/32", "-j", "SNAT", "--to-source", slot.IP),

@@ -82,17 +82,20 @@ type Slot struct {
 	// this single address (per-clone clone model); it is applied per restore
 	// by the runtime driver (ApplyGuest) because slots are prepared before
 	// the image is known. The persisted value drives teardown.
-	GuestIP      string           `json:"guestIP,omitempty"`
-	Address      string           `json:"address"`
-	IP           string           `json:"ip"`
-	Gateway      string           `json:"gateway"`
-	PrivateCIDR  string           `json:"privateCidr"`
-	DNSPath      string           `json:"dnsPath"`
-	MTU          int              `json:"mtu"`
-	EgressDevice string           `json:"egressDevice"`
-	Access       AccessDescriptor `json:"access"`
-	CreatedAt    time.Time        `json:"createdAt"`
-	BoundAt      *time.Time       `json:"boundAt,omitempty"`
+	GuestIP string `json:"guestIP,omitempty"`
+	// GuestNATBatch marks dedicated NAT chains prepared before admission.
+	// Missing on old durable slots: keep their legacy NAT path until release.
+	GuestNATBatch bool             `json:"guestNATBatch,omitempty"`
+	Address       string           `json:"address"`
+	IP            string           `json:"ip"`
+	Gateway       string           `json:"gateway"`
+	PrivateCIDR   string           `json:"privateCidr"`
+	DNSPath       string           `json:"dnsPath"`
+	MTU           int              `json:"mtu"`
+	EgressDevice  string           `json:"egressDevice"`
+	Access        AccessDescriptor `json:"access"`
+	CreatedAt     time.Time        `json:"createdAt"`
+	BoundAt       *time.Time       `json:"boundAt,omitempty"`
 }
 
 type Driver interface {

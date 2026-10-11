@@ -48,6 +48,33 @@ that already contain a different cached gateway MAC are not migrated by this
 change. Validate the first network request after restore, including concurrent
 restores, rather than relying on runtime Ready alone.
 
+## Firecracker guest NAT updates
+
+New guest-VM slots prepare dedicated `FSB_GUEST_DNAT` and `FSB_GUEST_SNAT`
+chains and their hooks before admission. Restore replaces only these chains in
+one `iptables-restore --noflush` batch; unrelated NAT chains and all filter rules
+are preserved. Reapplying the same guest address does not accumulate rules.
+The guest route uses `ip -n <namespace> route replace`.
+
+The durable slot records `guestNATBatch` only after chain preparation succeeds.
+Old slots without this optional field keep the legacy check-then-add path until
+they are destroyed and replenished. Recovery validates the new hooks without
+rewriting active rules. A failed restore is not committed as successfully
+applied guest state. Slot ownership/generation checks remain unchanged.
+
+The default Fastlet image includes `iptables-restore` matching `iptables`.
+If the executable is unavailable, new slots retain the legacy path; once a slot
+has batch chains, a failed batch is an error rather than a fallback that could
+leave conflicting rules. Injected command runners can support stdin batches
+through `RunInput`; runners without it retain the legacy path.
+
+`fast_sandbox_network_guest_apply_stage_latency_seconds{stage,result}` further
+separates owner lookup, driver apply, persistence lock wait/write, and the
+guest-VM driver's route, NAT, and best-effort ARP warm-up. New batch slots
+record the combined `nat_apply` stage; legacy slots retain `dnat` and `snat`.
+Do not compare a missing legacy stage to zero latency. Driver apply
+contains the route/NAT/ARP leaves; these must also not be added twice.
+
 ## Slot lifecycle
 
 A slot has three phases:

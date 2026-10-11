@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"strings"
@@ -132,7 +133,7 @@ func TestGuestVMNetNSDriverApplyGuest(t *testing.T) {
 	joined := strings.Join(runner.commands, "\n")
 	// Ingress delivery: /32 route to the baked guest address via the tap
 	// (NOT a local address: a local address would shadow the guest).
-	require.Contains(t, joined, "ip netns exec ns-1 ip route replace 10.17.0.9/32 dev vmtap0")
+	require.Contains(t, joined, "ip -n ns-1 route replace 10.17.0.9/32 dev vmtap0")
 	require.NotContains(t, joined, "ip netns exec ns-1 ip addr add 10.17.0.9/32")
 	// Ingress DNAT (slot IP -> baked guest IP) and egress source NAT
 	// (baked guest IP -> slot IP).
@@ -207,4 +208,108 @@ func TestGuestVMNetNSDriverValidate(t *testing.T) {
 
 	slot.GuestTap = ""
 	require.Error(t, driver.Validate(context.Background(), slot))
+}
+
+// batchRunner preserves the legacy command fake and records stdin transactions.
+type batchRunner struct {
+	failCheckRunner
+	inputs   []string
+	inputErr error
+}
+
+func (r *batchRunner) RunInput(ctx context.Context, input []byte, command string, args ...string) ([]byte, error) {
+	r.inputs = append(r.inputs, string(input))
+	if r.inputErr != nil {
+		return nil, r.inputErr
+	}
+	return r.Run(ctx, command, args...)
+}
+
+func TestGuestNATBatchPrepareAndReplay(t *testing.T) {
+	runner := &batchRunner{}
+	driver := NewGuestVMNetNSDriver(LinuxDriverConfig{Runner: runner})
+	slot := guestVMSlotForTest(t.TempDir())
+	require.NoError(t, driver.Prepare(context.Background(), slot))
+	require.True(t, slot.GuestNATBatch)
+	require.Contains(t, runner.inputs[0], "-A PREROUTING -j FSB_GUEST_DNAT")
+	require.Contains(t, runner.inputs[0], "-A POSTROUTING -j FSB_GUEST_SNAT")
+	for range 2 {
+		runner.commands = nil
+		require.NoError(t, driver.ApplyGuest(context.Background(), slot, "10.17.0.9"))
+		require.Len(t, runner.commands, 2)
+		require.Equal(t, "ip -n ns-1 route replace 10.17.0.9/32 dev vmtap0", runner.commands[0])
+		require.Equal(t, "ip netns exec ns-1 iptables-restore --noflush", runner.commands[1])
+	}
+	require.Equal(t, runner.inputs[1], runner.inputs[2])
+	require.Contains(t, runner.inputs[1], "-A FSB_GUEST_DNAT -d 10.17.0.2/32 -j DNAT --to-destination 10.17.0.9")
+	require.Contains(t, runner.inputs[1], "-A FSB_GUEST_SNAT -s 10.17.0.9/32 -j SNAT --to-source 10.17.0.2")
+	require.NotContains(t, runner.inputs[1], "-A PREROUTING")
+	require.NotContains(t, runner.inputs[1], "-F")
+	require.NoError(t, driver.ApplyGuest(context.Background(), slot, "10.17.0.10"))
+	require.NotContains(t, runner.inputs[3], "10.17.0.9")
+}
+
+func TestGuestNATBatchFailureDoesNotFallback(t *testing.T) {
+	runner := &batchRunner{inputErr: errors.New("transaction failed")}
+	driver := NewGuestVMNetNSDriver(LinuxDriverConfig{Runner: runner})
+	slot := guestVMSlotForTest(t.TempDir())
+	require.ErrorContains(t, driver.Prepare(context.Background(), slot), "prepare guest NAT chains")
+	require.False(t, slot.GuestNATBatch)
+	slot.GuestNATBatch = true
+	runner.commands = nil
+	require.ErrorContains(t, driver.ApplyGuest(context.Background(), slot, "10.17.0.9"), "apply guest NAT batch")
+	require.Len(t, runner.commands, 1) // route succeeds, no per-rule fallback
+}
+
+func TestGuestNATBatchOldSlotKeepsLegacy(t *testing.T) {
+	runner := &batchRunner{}
+	driver := NewGuestVMNetNSDriver(LinuxDriverConfig{Runner: runner})
+	slot := guestVMSlotForTest(t.TempDir())
+	require.NoError(t, driver.ApplyGuest(context.Background(), slot, "10.17.0.9"))
+	require.Empty(t, runner.inputs)
+	require.Len(t, runner.commands, 5)
+}
+
+func TestExecRunnerInputAndCancellation(t *testing.T) {
+	output, err := (ExecRunner{}).RunInput(context.Background(), []byte("transaction\n"), "sh", "-c", "cat")
+	require.NoError(t, err)
+	require.Equal(t, "transaction\n", string(output))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = (ExecRunner{}).RunInput(ctx, []byte("transaction"), "sh", "-c", "cat")
+	require.Error(t, err)
+}
+
+func TestGuestNATBatchStateCompatibility(t *testing.T) {
+	var old Slot
+	require.NoError(t, json.Unmarshal([]byte(`{"guestIP":"10.17.0.9"}`), &old))
+	require.False(t, old.GuestNATBatch)
+	data, err := json.Marshal(old)
+	require.NoError(t, err)
+	require.NotContains(t, string(data), "guestNATBatch")
+	store := NewFileStateStore(t.TempDir())
+	old.ID = "compat-slot"
+	old.GuestNATBatch = true
+	require.NoError(t, store.Save(context.Background(), &old))
+	loaded, err := store.LoadAll(context.Background())
+	require.NoError(t, err)
+	require.Len(t, loaded, 1)
+	require.True(t, loaded[0].GuestNATBatch)
+}
+
+func TestGuestNATBatchRecoveryRejectsMissingHook(t *testing.T) {
+	root := t.TempDir()
+	runner := &failCheckRunner{}
+	driver := NewGuestVMNetNSDriver(LinuxDriverConfig{Runner: runner})
+	slot := guestVMSlotForTest(root)
+	slot.GuestTap = guestVMDefaultTapName
+	require.NoError(t, os.MkdirAll(slot.NetNSPath, 0o755))
+	require.NoError(t, os.WriteFile(slot.DNSPath, []byte("nameserver 10.0.0.1"), 0o600))
+	require.NoError(t, driver.Validate(context.Background(), slot)) // old slot
+	slot.GuestNATBatch = true
+	require.ErrorContains(t, driver.Validate(context.Background(), slot), "guest NAT hook")
+	for _, cmd := range runner.commands {
+		require.NotContains(t, cmd, " -A ")
+		require.NotContains(t, cmd, " -F ")
+	}
 }
