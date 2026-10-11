@@ -15,6 +15,7 @@ import (
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kvalidation "k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -50,7 +51,9 @@ type Server struct {
 var _ fastpathv2.FastPathServiceServer = &Server{}
 
 const (
-	metadataLabelPrefix = "metadata.sandbox.fast.io/"
+	metadataLabelPrefix             = "metadata.sandbox.fast.io/"
+	maxCreateCandidateAttempts      = 32
+	assignmentProjectionWaitTimeout = 2 * time.Second
 )
 
 type createCompletion struct {
@@ -123,6 +126,8 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSa
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
 	sandbox := newSandboxCRD(request, bindings, createSpecHash)
+	releaseCreate := orchestrator.BeginFastPathCreate(client.ObjectKeyFromObject(sandbox))
+	defer releaseCreate()
 	rankedFastlets, envelope, err := s.selectFastletsForPool(ctx, orchestrator, pool, sandbox, request.RequestId)
 	if err != nil {
 		return nil, err
@@ -139,8 +144,9 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	acceptedObserved = true
 	prepDur := time.Since(prepStarted)
 
+	runtimeStarted := time.Now()
 	observed, err := s.provisionRuntime(ctx, accepted, completion.fastlet)
-	runtimeDur := time.Since(prepStarted)
+	runtimeDur := time.Since(runtimeStarted)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +196,7 @@ func newSandboxCRD(request *fastpathv2.CreateSandboxRequest, bindings []apiv1alp
 
 func (s *Server) selectFastletsForPool(ctx context.Context, orchestrator *orchestration.Orchestrator, pool *apiv1alpha2.SandboxPool, sandbox *apiv1alpha2.Sandbox, stableKey string) ([]placement.FastletInfo, assignment.AssignmentEnvelope, error) {
 	_, finishCandidates := startCreateStage(ctx, "candidate_selection")
-	rankedFastlets, err := orchestrator.FastPathCandidates(sandbox, stableKey)
+	rankedFastlets, err := orchestrator.FastPathCandidatesMatching(sandbox, stableKey, orchestration.RuntimeParameters{FastletRevision: pool.Status.FastletRevision}, nil)
 	finishCandidates(err)
 	if err != nil {
 		if errors.Is(err, orchestration.ErrNoCandidate) {
@@ -251,7 +257,16 @@ func (s *Server) acceptCreateIntent(ctx context.Context, plan plannedCreate) (*a
 }
 
 func (s *Server) provisionRuntime(ctx context.Context, accepted *acceptedCreate, completion fastletapi.CreateCompletion) (*fastletapi.SandboxStatus, error) {
-	for index, candidate := range accepted.candidates {
+	tried := make(map[placement.FastletID]struct{})
+	for index := 0; index < len(accepted.candidates) && len(tried) < maxCreateCandidateAttempts; index++ {
+		candidate := accepted.candidates[index]
+		if _, duplicate := tried[candidate.ID]; duplicate {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
+		tried[candidate.ID] = struct{}{}
 		if index > 0 {
 			orchestration.RecordTopKRetry("attempt")
 			if err := s.advanceCreateAssignment(ctx, accepted, candidate); err != nil {
@@ -267,26 +282,65 @@ func (s *Server) provisionRuntime(ctx context.Context, accepted *acceptedCreate,
 		if callErr == nil {
 			return nil, status.Error(codes.Unavailable, "Fastlet Create returned no Sandbox observation; Sandbox intent is persisted for Controller recovery")
 		}
-		if orchestration.IsCandidateRejection(callErr) && index+1 < len(accepted.candidates) {
+		if !orchestration.IsCandidateRejection(callErr) {
+			return nil, status.Errorf(codes.Unavailable, "Sandbox intent is persisted and Controller will retry: %v", callErr)
+		}
+		hasBudget := len(tried) < maxCreateCandidateAttempts
+		if accepted.created && index+1 == len(accepted.candidates) && hasBudget {
+			// Only a definite rejection permits widening placement. Unknown
+			// outcomes and replayed intents must retain their durable identity.
+			if err := s.refreshCreateCandidates(ctx, accepted, candidate, tried); err != nil {
+				return nil, err
+			}
+		}
+		if index+1 < len(accepted.candidates) && hasBudget {
 			orchestration.RecordTopKRetry("candidate_rejected")
-			s.Orchestrator.RecordCandidateFeedback(candidate.ID, callErr)
 			klog.FromContext(ctx).Info("fastlet candidate rejected; advancing to the next candidate",
 				"fastlet", candidate.ID, "sandbox", accepted.sandbox.Name, "err", callErr)
 			continue
 		}
-		if !orchestration.IsCandidateRejection(callErr) {
-			return nil, status.Errorf(codes.Unavailable, "Sandbox intent is persisted and Controller will retry: %v", callErr)
-		}
-		if accepted.created {
-			uid := accepted.sandbox.UID
-			rollbackErr := s.K8sClient.Delete(ctx, accepted.sandbox, client.Preconditions{UID: &uid})
-			if rollbackErr != nil && !apierrors.IsNotFound(rollbackErr) {
-				return nil, status.Errorf(codes.Unavailable, "all Fastlet candidates rejected and intent rollback failed: rejection=%v rollback=%v", callErr, rollbackErr)
-			}
+		if err := s.rollbackRejectedCreate(ctx, accepted, callErr); err != nil {
+			return nil, err
 		}
 		return nil, status.Errorf(codes.ResourceExhausted, "all Fastlet candidates rejected admission: %v", callErr)
 	}
 	return nil, status.Error(codes.ResourceExhausted, orchestration.ErrNoCandidate.Error())
+}
+
+// Only an intent accepted by this call can be rolled back after all attempts
+// have proven absence of runtime side effects. Existing intents stay durable.
+func (s *Server) rollbackRejectedCreate(ctx context.Context, accepted *acceptedCreate, rejection error) error {
+	if !accepted.created {
+		return nil
+	}
+	uid := accepted.sandbox.UID
+	err := s.K8sClient.Delete(ctx, accepted.sandbox, client.Preconditions{UID: &uid})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return status.Errorf(codes.Unavailable, "all Fastlet candidates rejected and intent rollback failed: rejection=%v rollback=%v", rejection, err)
+	}
+	return nil
+}
+
+// refreshCreateCandidates keeps refresh selection registry-only and preserves
+// the original profiles; the caller advances the durable assignment with CAS.
+func (s *Server) refreshCreateCandidates(ctx context.Context, accepted *acceptedCreate, candidate placement.FastletInfo, tried map[placement.FastletID]struct{}) error {
+	parameters := orchestration.RuntimeParameters{
+		RuntimeName: candidate.RuntimeName, RuntimeProfileHash: accepted.assignment.RuntimeProfileHash,
+		ResourceProfileHash: accepted.assignment.ResourceProfileHash, InfraRevision: accepted.assignment.InfraRevision,
+		FastletRevision: candidate.FastletRevision,
+	}
+	_, finishSelection := startCreateStage(ctx, "candidate_selection")
+	more, selectionErr := s.Orchestrator.FastPathCandidatesMatching(accepted.sandbox, accepted.sandbox.Name, parameters, tried)
+	finishSelection(selectionErr)
+	if selectionErr != nil && !errors.Is(selectionErr, orchestration.ErrNoCandidate) {
+		return status.Errorf(codes.Unavailable, "candidate refresh failed; intent retained: %v", selectionErr)
+	}
+	remaining := maxCreateCandidateAttempts - len(tried)
+	if len(more) > remaining {
+		more = more[:remaining]
+	}
+	accepted.candidates = append(accepted.candidates, more...)
+	return nil
 }
 
 func (s *Server) advanceCreateAssignment(ctx context.Context, accepted *acceptedCreate, candidate placement.FastletInfo) error {
@@ -298,12 +352,53 @@ func (s *Server) advanceCreateAssignment(ctx context.Context, accepted *accepted
 	if err != nil {
 		return status.Errorf(codes.FailedPrecondition, "invalid Fastlet candidate: %v", err)
 	}
-	sandbox, err := assignment.CASAssignmentAnnotation(ctx, s.K8sClient, client.ObjectKeyFromObject(accepted.sandbox), accepted.assignment, next)
+	sandbox, err := s.casCreateAssignment(ctx, accepted, next)
 	if err != nil {
+		if ctx.Err() != nil {
+			return status.FromContextError(ctx.Err()).Err()
+		}
 		return status.Errorf(codes.Aborted, "assignment changed concurrently: %v", err)
 	}
 	accepted.sandbox, accepted.assignment = sandbox, next
 	return nil
+}
+
+// Consecutive proven rejections can advance the annotation faster than the
+// reconciler projects it. Retain both the complete annotation CAS and strict
+// EffectiveAssignment check; only wait for this one projection error.
+func (s *Server) casCreateAssignment(ctx context.Context, accepted *acceptedCreate, next assignment.AssignmentEnvelope) (*apiv1alpha2.Sandbox, error) {
+	key := client.ObjectKeyFromObject(accepted.sandbox)
+	sandbox, err := assignment.CASAssignmentAnnotation(ctx, s.K8sClient, key, accepted.assignment, next)
+	if !errors.Is(err, assignment.ErrAssignmentProjectionConflict) {
+		return sandbox, err
+	}
+	started := time.Now()
+	stageCtx, finish := startCreateStage(ctx, "assignment_projection_wait")
+	waitCtx, cancel := context.WithTimeout(stageCtx, assignmentProjectionWaitTimeout)
+	defer cancel()
+	klog.FromContext(ctx).Info("waiting for assignment status projection",
+		"sandbox", key.Name, "attempt", accepted.assignment.Attempt,
+		"routeGeneration", accepted.assignment.RouteGeneration, "err", err)
+	err = (wait.Backoff{
+		Duration: 10 * time.Millisecond, Factor: 2, Jitter: .1, Cap: 200 * time.Millisecond, Steps: 32,
+	}).DelayFunc().Until(waitCtx, true, true, func(ctx context.Context) (bool, error) {
+		var attemptErr error
+		sandbox, attemptErr = assignment.CASAssignmentAnnotation(ctx, s.K8sClient, key, accepted.assignment, next)
+		if errors.Is(attemptErr, assignment.ErrAssignmentProjectionConflict) {
+			return false, nil
+		}
+		return attemptErr == nil, attemptErr
+	})
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		err = fmt.Errorf("projection did not converge within %s: %w", assignmentProjectionWaitTimeout, assignment.ErrAssignmentProjectionConflict)
+	}
+	finish(err)
+	klog.FromContext(ctx).Info("assignment status projection wait finished",
+		"sandbox", key.Name, "attempt", accepted.assignment.Attempt,
+		"routeGeneration", accepted.assignment.RouteGeneration, "duration", time.Since(started).String(), "err", err)
+	return sandbox, err
 }
 
 func (s *Server) GetSandbox(ctx context.Context, request *fastpathv2.GetSandboxRequest) (*fastpathv2.GetSandboxResponse, error) {

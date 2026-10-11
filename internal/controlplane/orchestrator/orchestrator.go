@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -54,12 +55,14 @@ type Registry interface {
 }
 
 type Orchestrator struct {
-	Client        client.Client
-	Registry      Registry
-	FastletClient FastletClient
-	Catalog       *runtimecatalog.Catalog
-	TopK          int
-	Now           func() time.Time
+	Client          client.Client
+	Registry        Registry
+	FastletClient   FastletClient
+	Catalog         *runtimecatalog.Catalog
+	TopK            int
+	Now             func() time.Time
+	activeCreatesMu sync.Mutex
+	activeCreates   map[types.NamespacedName]int
 }
 
 // RuntimeParameters are used only by the declarative Controller to validate a
@@ -141,12 +144,21 @@ func (o *Orchestrator) Candidates(ctx context.Context, sandbox *apiv1alpha2.Sand
 // FastPathCandidates is intentionally registry-only. Calling it cannot issue
 // a Kubernetes API request, which keeps the first-create happy path at two IOs.
 func (o *Orchestrator) FastPathCandidates(sandbox *apiv1alpha2.Sandbox, stableKey string) ([]placement.FastletInfo, error) {
+	return o.FastPathCandidatesMatching(sandbox, stableKey, RuntimeParameters{}, nil)
+}
+
+// FastPathCandidatesMatching filters before Top-K without additional Kubernetes IO.
+// Exclusions are scoped to this create and do not change Registry admission.
+func (o *Orchestrator) FastPathCandidatesMatching(sandbox *apiv1alpha2.Sandbox, stableKey string, parameters RuntimeParameters, excluded map[placement.FastletID]struct{}) ([]placement.FastletInfo, error) {
 	if sandbox == nil {
 		return nil, errors.New("Sandbox is required")
 	}
 	candidates := o.topK(placement.CandidateRequest{
 		Namespace: sandbox.Namespace, PoolName: sandbox.Spec.PoolRef,
 		Image: sandbox.Spec.Image, StableKey: stableKey,
+		RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
+		ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
+		FastletRevision: parameters.FastletRevision, ExcludedFastlets: excluded,
 	})
 	if len(candidates) == 0 {
 		return nil, ErrNoCandidate

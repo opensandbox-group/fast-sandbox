@@ -87,6 +87,8 @@ type CandidateRequest struct {
 	Image               string
 	StableKey           string
 	Now                 time.Time
+	// ExcludedFastlets is request-local; selection never reserves capacity.
+	ExcludedFastlets map[FastletID]struct{}
 }
 
 type LocalFeedback struct {
@@ -322,6 +324,9 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 }
 
 func hardFilter(info FastletInfo, request CandidateRequest, staleAfter time.Duration) bool {
+	if _, excluded := request.ExcludedFastlets[info.ID]; excluded {
+		return false
+	}
 	if info.Namespace != request.Namespace || info.PoolName != request.PoolName {
 		return false
 	}

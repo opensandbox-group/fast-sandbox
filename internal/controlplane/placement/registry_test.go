@@ -107,6 +107,20 @@ func TestTopKDoesNotMutateAdmission(t *testing.T) {
 	require.Equal(t, 0, stored.Used())
 }
 
+func TestTopKExcludesPreviouslyTriedFastletsBeforeRanking(t *testing.T) {
+	registry := NewInMemoryRegistry()
+	seedFastlet(t, registry, readyFastlet("tried-hit", 0, 5, "alpine:latest"))
+	seedFastlet(t, registry, readyFastlet("spare-miss", 0, 5))
+	request := candidate("alpine:latest", "request-a")
+	request.ExcludedFastlets = map[FastletID]struct{}{"tried-hit": {}}
+	selected := registry.TopK(request, 1)
+	require.Len(t, selected, 1)
+	require.Equal(t, FastletID("spare-miss"), selected[0].ID)
+	stored, _ := registry.GetFastletByID("tried-hit")
+	require.Zero(t, stored.Used())
+	require.Len(t, registry.TopK(candidate("alpine:latest", "request-b"), 2), 2, "exclusion is request-local")
+}
+
 func TestTopKHardFiltersStaleDrainingProfilesAndCapacity(t *testing.T) {
 	registry := NewInMemoryRegistry()
 	stale := readyFastlet("stale", 0, 5)

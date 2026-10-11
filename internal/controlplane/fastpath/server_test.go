@@ -3,6 +3,7 @@ package fastpath
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -34,10 +35,117 @@ type fastpathRegistry struct {
 	feedback   []placement.FastletID
 }
 
-func (r *fastpathRegistry) TopK(placement.CandidateRequest, int) []placement.FastletInfo {
+func (r *fastpathRegistry) TopK(request placement.CandidateRequest, k int) []placement.FastletInfo {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return append([]placement.FastletInfo(nil), r.candidates...)
+	var selected []placement.FastletInfo
+	for _, candidate := range r.candidates {
+		if _, excluded := request.ExcludedFastlets[candidate.ID]; excluded {
+			continue
+		}
+		if request.FastletRevision != "" && candidate.FastletRevision != request.FastletRevision ||
+			request.RuntimeProfileHash != "" && candidate.RuntimeProfileHash != request.RuntimeProfileHash ||
+			request.ResourceProfileHash != "" && candidate.ResourceProfileHash != request.ResourceProfileHash ||
+			request.InfraRevision != "" && candidate.InfraRevision != request.InfraRevision {
+			continue
+		}
+		selected = append(selected, candidate)
+		if len(selected) == k {
+			break
+		}
+	}
+	return selected
+}
+
+func TestDefiniteRejectionsRefreshCandidatesBeyondInitialTopK(t *testing.T) {
+	for _, ambiguous := range []bool{false, true} {
+		t.Run(fmt.Sprint("ambiguous=", ambiguous), func(t *testing.T) {
+			server, k8sClient, registry, fastlet := newV2Server(t)
+			registry.candidates = nil
+			fastlet.createFailures = make(map[string]error)
+			for i := 0; i < 4; i++ {
+				candidate := testCandidate(fmt.Sprintf("fastlet-%d", i), fmt.Sprintf("pod-%d", i), fmt.Sprintf("10.0.0.%d", i+1))
+				registry.candidates = append(registry.candidates, candidate)
+				registry.fastlets[candidate.ID] = candidate
+				if i < 3 {
+					fastlet.createFailures[candidate.PodIP] = capacityRejection()
+				} else if ambiguous {
+					fastlet.createFailures[candidate.PodIP] = errors.New("response lost")
+				}
+			}
+			_, err := server.CreateSandbox(context.Background(), createRequest("refresh"))
+			if ambiguous {
+				require.Equal(t, codes.Unavailable, status.Code(err))
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"}, fastlet.createIPs)
+			var persisted apiv1alpha2.Sandbox
+			require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "refresh"}, &persisted))
+			envelope, err := assignment.AssignmentFromAnnotation(&persisted)
+			require.NoError(t, err)
+			require.Equal(t, int64(4), envelope.Attempt)
+			require.Equal(t, int64(4), envelope.RouteGeneration)
+			require.Equal(t, int64(1), envelope.InstanceGeneration)
+			require.Equal(t, "fastlet-3", envelope.FastletName)
+			require.Len(t, registry.feedback, 3, "each rejection is fed back exactly once")
+		})
+	}
+}
+
+func capacityRejection() error {
+	return &fastletapi.CreateCallError{Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects,
+		Failure: &fastletapi.FastletError{Code: fastletapi.ErrorCapacityRejected, Message: "full", Retryable: true}}
+}
+
+func TestCandidateRefreshIsBoundedAndRollsBackNewIntent(t *testing.T) {
+	server, k8sClient, registry, fastlet := newV2Server(t)
+	registry.candidates = nil
+	for i := 0; i < maxCreateCandidateAttempts+5; i++ {
+		candidate := testCandidate(fmt.Sprintf("fastlet-%d", i), fmt.Sprintf("pod-%d", i), fmt.Sprintf("10.0.0.%d", i+1))
+		registry.candidates = append(registry.candidates, candidate)
+	}
+	fastlet.createFailure = capacityRejection()
+	_, err := server.CreateSandbox(context.Background(), createRequest("bounded"))
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	require.Len(t, fastlet.createIPs, maxCreateCandidateAttempts)
+	var persisted apiv1alpha2.Sandbox
+	require.True(t, apierrors.IsNotFound(k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "bounded"}, &persisted)))
+}
+
+func TestCandidateRefreshKeepsAssignmentProfiles(t *testing.T) {
+	server, _, registry, fastlet := newV2Server(t)
+	for i := 1; i < 5; i++ {
+		candidate := testCandidate(fmt.Sprintf("fastlet-%d", i), fmt.Sprintf("pod-%d", i), fmt.Sprintf("10.0.0.%d", i+1))
+		if i == 3 {
+			candidate.ResourceProfileHash = "different"
+		}
+		registry.candidates = append(registry.candidates, candidate)
+	}
+	fastlet.createFailures = map[string]error{"10.0.0.1": capacityRejection(), "10.0.0.2": capacityRejection(), "10.0.0.3": capacityRejection()}
+	_, err := server.CreateSandbox(context.Background(), createRequest("profiles"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.5"}, fastlet.createIPs)
+}
+
+func TestPoolRevisionIsFilteredBeforeInitialTopK(t *testing.T) {
+	server, k8sClient, registry, fastlet := newV2Server(t)
+	var pool apiv1alpha2.SandboxPool
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
+	pool.Status.FastletRevision = "current"
+	require.NoError(t, k8sClient.Client.Update(context.Background(), &pool))
+	registry.candidates = nil
+	for i := 0; i < 4; i++ {
+		candidate := testCandidate(fmt.Sprintf("fastlet-%d", i), fmt.Sprintf("pod-%d", i), fmt.Sprintf("10.0.0.%d", i+1))
+		candidate.FastletRevision = "old"
+		if i == 3 {
+			candidate.FastletRevision = "current"
+		}
+		registry.candidates = append(registry.candidates, candidate)
+	}
+	_, err := server.CreateSandbox(context.Background(), createRequest("revision"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.4"}, fastlet.createIPs)
 }
 
 func (r *fastpathRegistry) GetFastletByID(id placement.FastletID) (placement.FastletInfo, bool) {
