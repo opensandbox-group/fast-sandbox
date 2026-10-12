@@ -219,6 +219,13 @@ The consumer-side cache layout is
 `<StateRoot>/images/<sha256(image)>/{rootfs.img, vmstate.snap, memory.snap,
 manifest.json}` (native filename mapping: `rootfs.ext4` → `rootfs.img`).
 
+New artifact downloads rebuild sparse holes for aligned 32 KiB all-zero
+chunks instead of writing those zeros to disk. Logical sizes and SHA256
+digests remain unchanged, including trailing zeros. This reduces local
+allocation and writes on sparse-capable filesystems, but does not reduce
+network traffic or object-store size. Existing matching cache files are
+left unchanged; this is not an automatic migration of older dense caches.
+
 ## Consuming the artifacts
 
 - Set `SandboxPool.spec.warmImages` to the template's `spec.image` reference
