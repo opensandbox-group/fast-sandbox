@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -22,10 +23,13 @@ const (
 	defaultBootArgs = "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw"
 
 	// defaultInitPath is where the init script is written inside the rootfs.
-	defaultInitPath = "/template-vm-init"
+	defaultInitPath = "/fsb-vm-init"
 
 	// defaultReadyPattern is the redis-server readiness line on stdout.
 	defaultReadyPattern = "Ready to accept connections"
+
+	// buildVMID is the Firecracker --id of the one-shot build VM.
+	buildVMID = "fsb-vm-build"
 )
 
 // defaultInitScript renders the init script baked into the rootfs for the
@@ -48,9 +52,8 @@ func injectInitScript(rootfsDevPath, mountPoint, initPath string, script []byte)
 		return err
 	}
 	defer func() { _ = unmount(mountPoint) }()
-	target := filepath.Join(mountPoint, initPath)
-	if err := os.WriteFile(target, script, 0o755); err != nil {
-		return fmt.Errorf("write init script %s: %w", target, err)
+	if err := writeGuestFile(mountPoint, initPath, script, 0o755); err != nil {
+		return err
 	}
 	syncFilesystems()
 	if err := unmount(mountPoint); err != nil {
@@ -59,10 +62,58 @@ func injectInitScript(rootfsDevPath, mountPoint, initPath string, script []byte)
 	return nil
 }
 
+// validateInitPath requires a clean absolute guest path that can be passed
+// as a single init= kernel argument.
+func validateInitPath(initPath string) error {
+	if !path.IsAbs(initPath) || path.Clean(initPath) != initPath || initPath == "/" ||
+		strings.ContainsAny(initPath, " \t\r\n") {
+		return fmt.Errorf("--init-path must be a clean absolute guest file path without whitespace, got %q", initPath)
+	}
+	return nil
+}
+
+// writeGuestFile writes payload to guestPath inside the mounted guest
+// filesystem at rootDir. The image is untrusted: every lookup goes through
+// os.Root, so a symlink in the image (e.g. /init -> /host/etc/passwd or an
+// absolute link) can never redirect the write onto the host. A symlink in
+// the final component is replaced instead of followed, so the script never
+// overwrites another guest file either.
+func writeGuestFile(rootDir, guestPath string, payload []byte, mode os.FileMode) error {
+	if err := validateInitPath(guestPath); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(rootDir)
+	if err != nil {
+		return fmt.Errorf("open guest root %s: %w", rootDir, err)
+	}
+	defer root.Close()
+	name := strings.TrimPrefix(guestPath, "/")
+	if dir := path.Dir(name); dir != "." {
+		if err := root.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create guest directory %s: %w", dir, err)
+		}
+	}
+	if info, err := root.Lstat(name); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if err := root.Remove(name); err != nil {
+			return fmt.Errorf("replace guest symlink %s: %w", guestPath, err)
+		}
+	}
+	if err := root.WriteFile(name, payload, mode); err != nil {
+		return fmt.Errorf("write guest file %s: %w", guestPath, err)
+	}
+	// WriteFile keeps the mode of an existing file and applies the umask.
+	if err := root.Chmod(name, mode); err != nil {
+		return fmt.Errorf("chmod guest file %s: %w", guestPath, err)
+	}
+	return nil
+}
+
 // coldBootAndSnapshot launches a 1-shot Firecracker on rootfsDevPath, waits
 // for the ready pattern in the serial log, pauses the VM and captures a Full
-// snapshot into snapDir. The Firecracker process is always killed before
-// returning; the produced file paths are returned.
+// snapshot into snapDir. The drive is attached through the relative
+// rootfs.dev link inside the Firecracker working directory, so the vmstate
+// records no host device path. The Firecracker process is always stopped
+// before returning; the produced file paths are returned.
 func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, rootfsDevPath string) (vmstatePath, memfilePath string, err error) {
 	runtimeDir := filepath.Join(workDir, "fc")
 	if err := os.MkdirAll(runtimeDir, 0o750); err != nil {
@@ -70,18 +121,25 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 	}
 	apiSocket := filepath.Join(runtimeDir, apiSocketName)
 	serialLog := filepath.Join(runtimeDir, serialLogName)
+	if _, err := linkRootfsDrive(runtimeDir, rootfsDevPath); err != nil {
+		return "", "", err
+	}
 
 	bootArgs := options.bootArgs
 	if strings.TrimSpace(bootArgs) == "" {
 		bootArgs = defaultBootArgs + " init=" + options.initPath
 	}
 
-	pid, err := launchFirecracker(global.firecrackerBin, apiSocket, "tvm-build", serialLog)
+	process, err := launchFirecracker(global.firecrackerBin, runtimeDir, apiSocket, buildVMID, serialLog)
 	if err != nil {
 		return "", "", err
 	}
 	// The build VM never outlives this function, success or failure.
-	defer func() { _ = killProcess(pid) }()
+	defer func() {
+		if stopErr := terminateProcess(process, firecrackerStopGrace); stopErr != nil && err == nil {
+			err = fmt.Errorf("stop build VM: %w", stopErr)
+		}
+	}()
 
 	client := newFirecrackerClient(apiSocket)
 	defer client.close()
@@ -95,7 +153,7 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 	}
 	if err := client.addDrive(ctx, drive{
 		DriveID:      options.rootfsDriveID,
-		PathOnHost:   rootfsDevPath,
+		PathOnHost:   rootfsDriveLink,
 		IsRootDevice: true,
 		IsReadOnly:   false,
 	}); err != nil {

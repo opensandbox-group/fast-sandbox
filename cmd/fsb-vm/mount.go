@@ -151,15 +151,3 @@ func isMounted(mountPoint string) bool {
 	}
 	return self.Dev != parent.Dev
 }
-
-// processAlive reports whether the process with pid is still running.
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	return process.Signal(syscall.Signal(0)) == nil
-}

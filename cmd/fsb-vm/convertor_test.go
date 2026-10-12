@@ -53,7 +53,7 @@ func TestBuildConvertorArgs(t *testing.T) {
 	want := []string{
 		"--repository", "registry.example.com/team/app",
 		"--input-digest", source.ManifestDesc.Digest.String(),
-		"--overlaybd", "template-vm-local",
+		"--overlaybd", "fsb-vm-local",
 		"--oci",
 		"--mkfs=true",
 		"--vsize", "30",

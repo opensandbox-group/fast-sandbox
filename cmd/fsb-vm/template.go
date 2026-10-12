@@ -61,6 +61,10 @@ func loadTemplate(path string) (templateFile, error) {
 	if strings.TrimSpace(template.SandboxID) == "" {
 		return templateFile{}, fmt.Errorf("template %s: sandbox_id is required", path)
 	}
+	// The id names directories under the state and runtime roots.
+	if err := validateSandboxID(template.SandboxID); err != nil {
+		return templateFile{}, fmt.Errorf("template %s: %w", path, err)
+	}
 	if strings.TrimSpace(template.Template.Repo) == "" {
 		return templateFile{}, fmt.Errorf("template %s: template.repo is required", path)
 	}

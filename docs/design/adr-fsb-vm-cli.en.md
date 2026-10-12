@@ -1,4 +1,4 @@
-# ADR: template-vm CLI — A Standalone CLI That Creates VMs from Remote Templates
+# ADR: fsb-vm CLI — A Standalone CLI That Creates VMs from Remote Templates
 
 > Document type: Architecture Decision Record (ADR)
 >
@@ -6,7 +6,7 @@
 >
 > Status: Confirmed (converged after three design-interview rounds)
 >
-> Companion glossary: [template-vm-cli-glossary.md](./template-vm-cli-glossary.md) (Chinese)
+> Companion glossary: [fsb-vm-cli-glossary.md](./fsb-vm-cli-glossary.md) (Chinese)
 
 ## Context
 
@@ -23,7 +23,7 @@ involvement). It is a single-host data-plane tool.
 
 ### ADR-001 Code location: a standalone binary inside the fast-sandbox repo
 
-- **Decision**: the code lives in `fast-sandbox/cmd/template-vm/` (Go, cobra), as a
+- **Decision**: the code lives in `fast-sandbox/cmd/fsb-vm/` (Go, cobra), as a
   sibling of fastctl. It is NOT wired into fastctl's subcommand tree and does NOT
   reuse the fastpath gRPC stack.
 - **Rationale**: the user explicitly requested a standalone CLI hosted in the
@@ -66,17 +66,18 @@ involvement). It is a single-host data-plane tool.
   `upper` (read-only). `repoBlobUrl` points at
   `https://<registry>/v2/<repo>/blobs`; overlaybd performs range reads against it
   at runtime.
-- **Credential handoff**: the dockerAuth (a docker config json string) is merged into
-  overlaybd's global credential file (default `/opt/overlaybd/cred.json`; overlaybd
-  lazily reloads it per remote_path), otherwise on-demand pulls fail with 401.
-  The merge must be atomic (tmp+rename) and file-locked so concurrent CLI
-  instances cannot clobber each other.
+- **Credential handoff**: select the credential with ORAS semantics, then write it to
+  overlaybd's global credential file (default `/opt/overlaybd/cred.json`) under the
+  actual blob URL's `<canonical registry host>/<repository>` prefix. Docker Hub aliases
+  map to `registry-1.docker.io`; keys are serialized longest first so overlaybd's
+  “first match” rule behaves as longest-prefix matching. A file lock serializes merges,
+  and tmp + fsync + rename prevents clobbering and partial files.
 
 ### ADR-004 Kernel: host-local, validated against metadata, flag-overridable
 
 - **Decision**: the kernel is not distributed with the images. The
   `metadata.json.kernel_version` maps to a vmlinux under a host convention
-  directory (default `/opt/template-vm/kernels/vmlinux-<kernel_version>`,
+  directory (default `/opt/fsb-vm/kernels/vmlinux-<kernel_version>`,
   overridable with `--kernel`). A missing file is a hard error.
 
 ### ADR-005 memfile: raw memory file mmap (Firecracker File backend)
@@ -98,15 +99,15 @@ involvement). It is a single-host data-plane tool.
 - **Risk**: the convention is currently only verbal; verify paths and the FS type
   against a real sample image during integration testing.
 
-### ADR-007 Machine spec source: metadata.json is authoritative, flags may override
+### ADR-007 Machine spec and drive path source: metadata.json is authoritative
 
-- **Decision**: `vcpu_count / memory_mb / disk_size_mb` etc. come from
-  metadata.json; the CLI offers `--vcpu / --memory-mb / --kernel` overrides.
-  Pre-flight validation: `hypervisor_type` currently supports only `firecracker`
-  (any other value, e.g. `dragonball`, fails with Unsupported — a VMM abstraction
-  seam is reserved); `cpu_arch` must match the host; the local firecracker binary
-  version must be compatible with `firecracker_version` (mismatch is an error by
-  default, downgraded to a warning with `--force`).
+- **Decision**: `vcpu_count / memory_mb / disk_size_mb` are fixed by the snapshot;
+  create exposes no `--vcpu` or `--memory-mb` override. Only `--kernel` may override
+  the host kernel file path. Pre-flight validation accepts only `firecracker`, requires
+  the host CPU architecture, and checks the local Firecracker version (`--force` may
+  downgrade only version errors). `rootfs_drive_path` must be the relative path
+  `rootfs.dev`; old templates with no field or a host absolute device path must be
+  rebuilt, and `--force` cannot bypass this requirement.
 
 ### ADR-008 rootfs upper: hybrid writable layer, no commit by default
 
@@ -119,14 +120,24 @@ involvement). It is a single-host data-plane tool.
 
 - **Decision**: semantics follow aenv (start = bring a sandbox up from a template;
   no start/resume distinction). The MVP has three commands:
-  - `template-vm create -f template.json [--kernel ...] [--vcpu ...] [--network=none]`
-  - `template-vm list`: enumerate the state directory + verify pid liveness
-  - `template-vm delete <sandbox_id>`: kill firecracker → umount snapfiles →
-    ublkd `del` both devices → remove the state directory (strictly reversed
-    order; every step reports failures but cleanup continues best-effort)
-- **Layout**: state directory `/var/lib/template-vm/sandboxes/<id>/` (upper,
+  - `fsb-vm create -f template.json [--kernel ...] [--network=none]`
+  - `fsb-vm list`: enumerate state and verify `(pid, starttime, boot_id)` identity
+  - `fsb-vm delete <sandbox_id>`: safely stop Firecracker → unmount snapfiles →
+    delete both ublk devices by absolute config-path ownership → remove directories
+    only after every resource is released
+- **Concurrency and identifiers**: `sandbox_id` must be one safe directory name.
+  Non-blocking per-ID flock serializes create/delete, and create atomically claims the
+  state directory with `Mkdir`, eliminating check-then-create races.
+- **Recoverable state**: state.json is written as `creating` before the first allocation
+  and atomically updated after each resource change; it becomes `running` after resume
+  and `deleting` during teardown. Failures retain state and the writable upper for a
+  retry. Reusable dev_ids are not ownership: delete acts only while ublkd currently
+  lists a device under the sandbox's deterministic config path.
+- **Process safety**: state records PID, `/proc/<pid>/stat` starttime, and boot_id;
+  identity is rechecked before signals are sent through pidfd, preventing PID-reuse kills.
+- **Layout**: state directory `/var/lib/fsb-vm/sandboxes/<id>/` (upper,
   config.v1.json, mount point, state.json); runtime directory
-  `/run/template-vm/sandboxes/<id>/` (api socket, serial log).
+  `/run/fsb-vm/sandboxes/<id>/` (api socket, serial log, `rootfs.dev` link).
 
 ### ADR-010 Networking: NetworkProvider abstraction, MVP supports none
 
@@ -138,14 +149,14 @@ involvement). It is a single-host data-plane tool.
 - **Open input**: the device-allocation interface of that networking stack (to be
   captured in a follow-up ADR once provided).
 
-### ADR-011 Template building: `template-vm build` via cold-boot snapshotting (build iteration)
+### ADR-011 Template building: `fsb-vm build` via cold-boot snapshotting (build iteration)
 
-- **Decision**: `template-vm build --source <OCI or overlaybd image> --output <name:tag>`
+- **Decision**: `fsb-vm build --source <OCI or overlaybd image> --output <name:tag>`
   converts a remote source into a local template pair (`<tag>_rootfs` /
   `<tag>_snapfiles`). The CLI resolves registry manifests with ORAS. For an
   ordinary OCI/Docker tar image it invokes the `accelerated-container-image`
   userspace `convertor`, produces Native OverlayBD locally, and then enters the
-  same build path as an already accelerated source. template-vm never invokes
+  same build path as an already accelerated source. fsb-vm never invokes
   the docker CLI.
 - **Read-path divergence between build and create**: create stays manifest-only
   (lowers are addressed by `digest` + `repoBlobUrl` and range-read remotely).
@@ -175,11 +186,15 @@ involvement). It is a single-host data-plane tool.
   report the exact target before boot. metadata.json keeps the existing
   `disk_size_mb` field and stores `disk_size_gb × 1024`.
 - **Snapshot capture**: inject an init script into the writable rootfs (built-in
-  redis sample by default, `--init-script-file` overrides) → cold-boot
-  Firecracker (boot args carry `init=<init-path>`) → wait for the ready pattern
-  on the serial log (default `Ready to accept connections`, configurable;
-  on timeout the serial tail is printed) → pause → Full Snapshot
-  (`vmstate.bin` + `memfile`) → terminate Firecracker.
+  redis sample by default, `--init-script-file` overrides). `--init-path` must be a
+  clean absolute guest path. Every lookup is constrained by `os.Root`, and a final
+  symlink is replaced, so untrusted image contents cannot redirect the write onto the
+  host or another guest file. Then cold-boot Firecracker with `init=<init-path>` →
+  wait for the serial ready pattern → pause → Full Snapshot → terminate Firecracker.
+- **Portable drive path**: build creates `rootfs.dev -> /dev/ublkbN` in Firecracker's
+  working directory and configures the drive with relative path `rootfs.dev`, so vmstate
+  contains no host dev_id. Create reconstructs that link in its own runtime directory and
+  launches Firecracker with that cwd before snapshot load; no post-load drive PATCH is used.
 - **snapfiles without raw import**: `overlaybd-create --hybrid` creates a blank
   writable device with no lowers → `mkfs.ext4` → rw-mount → write
   `/vmstate.bin`, `/memfile`, `/metadata.json` → sync → umount → ublkd del →
@@ -202,12 +217,12 @@ involvement). It is a single-host data-plane tool.
             <name>_<tag>_snapfiles.json
             index.json
   ```
-- **Self-containment**: the rootfs manifest preserves the source layer
-  descriptors (order and attributes) and appends the rootfs commit layer; every
-  referenced blob (inherited layers and the generated minimal config) must exist
-  under the local `blobs/sha256/`. Build validates every digest, size, and JSON
-  schema in a sibling staging directory, then atomically publishes the final
-  directory; it refuses to overwrite an existing artifact.
+- **Self-containment and concurrency**: the rootfs manifest preserves the source layer
+  descriptors and appends the rootfs commit layer; every referenced blob must exist
+  under `blobs/sha256/`. Each build uses an independent `MkdirTemp` scratch directory.
+  A non-blocking per-output flock makes a concurrent build of the same output fail
+  immediately. Build validates every digest, size, and JSON schema in a sibling staging
+  directory, then atomically publishes the final directory and refuses overwrites.
 - **Commit-layer convention**: mediaType is
   `...overlaybd.image.layer.v1.zfile` (default `-z` compression) or
   `...overlaybd.image.layer.v1.lsmt` (`--no-compress`), annotated with
@@ -220,38 +235,38 @@ involvement). It is a single-host data-plane tool.
   (ORAS SDK). Because source blobs are already local, the pair can publish to
   any registry with no cross-registry blob copy.
 
-### ADR-013 Registry credential matching canonicalization (build iteration)
+### ADR-013 Registry credential matching and OverlayBD handoff canonicalization
 
-- **Decision**: ORAS client credential selection canonicalizes docker config
-  auths keys the same way as the reference: strip scheme, trailing slashes and
-  `/v1` or `/v2` API suffixes; map Docker Hub aliases (`docker.io`,
-  `index.docker.io`, `registry.hub.docker.com`, ...) to
-  `registry-1.docker.io`; then match the longest registry/repository prefix.
-- **Rationale**: the standard key written by `docker login` is
-  `https://index.docker.io/v1/`; without canonicalization Hub credentials never
-  match and silently degrade to anonymous access (tolerable for public images,
-  a 401 for private ones).
+- **Decision**: ORAS credential selection strips scheme, trailing slashes, and `/v1`
+  or `/v2`; maps Docker Hub aliases to `registry-1.docker.io`; then chooses the longest
+  registry/repository prefix. For OverlayBD, the selected credential is re-keyed to the
+  blob URL's canonical host/repository prefix and serialized with longest keys first.
+- **Rationale**: `docker login` commonly writes `https://index.docker.io/v1/`, which
+  otherwise fails to match Hub references. OverlayBD independently returns the first
+  exact URL-prefix match in JSON order; without re-keying and ordering, ORAS can
+  authenticate while remote block reads still fail with 401.
 
 ## Create flow (strictly ordered; failures roll back in reverse)
 
-1. Parse template.json; verify sandbox_id is free (state directory absent).
-2. oras-pull the rootfs and snapfiles manifests → ordered layer digest lists.
-3. Merge dockerAuth into `/opt/overlaybd/cred.json` (atomic write).
-4. rootfs: create the hybrid upper (data/index) → generate config.v1.json with
-   upper → ublkd `/v1/add` → record dev_id.
-5. snapfiles: generate read-only config.v1.json → `/v1/add` → mount -o ro →
-   read metadata.json / validate (ADR-007).
-6. Resolve the kernel path (ADR-004); launch the version-matched firecracker
-   (api socket under the runtime directory).
-7. Resume: `PUT /drives/rootfs` (path=/dev/ublkbN, drive_id consistent with
-   vmstate; PATCH first if not) → `PUT /snapshot/load` (vmstate.bin + memfile
-   File backend) → networking (NetworkProvider or none) → `PATCH /vm` resume.
-8. Persist the state file; print sandbox info (id, pid, ublk devices, socket path).
+1. Parse template.json; strictly validate sandbox_id; take its non-blocking lock;
+   atomically claim the directories; write `creating` state.
+2. ORAS-pull the rootfs and snapfiles manifests → ordered layer digest lists.
+3. Canonicalize dockerAuth for OverlayBD blob URL prefixes and merge cred.json.
+4. rootfs: persist config ownership before allocation → create hybrid upper →
+   ublkd `/v1/add` → update the device record.
+5. snapfiles: persist config ownership before allocation → `/v1/add` → mount ro →
+   read and validate metadata.json.
+6. Resolve the kernel; create `rootfs.dev` in the runtime directory; launch
+   Firecracker with that cwd; persist `(pid, starttime, boot_id)`.
+7. `PUT /snapshot/load` directly (relative `rootfs.dev` already resolves; memfile uses
+   the File backend) → networking → `PATCH /vm` resume.
+8. Set state to `running` and print sandbox info. Any failure invokes the same retryable
+   teardown; incomplete cleanup retains state.
 
 ## Build flow (strictly ordered; failures roll back in reverse; build iteration)
 
-1. Validate flags; ping ublkd; read `--auth-file` or
-   `--username username:password`.
+1. Validate flags; ping ublkd; read `--auth-file` or `--username`; acquire a
+   non-blocking output lock and create an independent temporary scratch directory.
 2. Resolve the source manifest with ORAS (traversing one image-index level and
    selecting `linux/<host arch>`) and classify it before downloading layers.
 3. Download Native config/layers directly, or pass an ordinary OCI manifest
@@ -279,13 +294,16 @@ involvement). It is a single-host data-plane tool.
 | Existing templates with hypervisor_type=dragonball cannot be resumed | Hard pre-flight validation with a clear error; VMM abstraction reserved |
 | vmstate version incompatible with the host firecracker | `firecracker_version` check; `--force` escape hatch |
 | In-disk layout is only a verbal convention | Verify with a real image during integration; paths centralized in one constants block |
-| Concurrent cred.json clobbering | Atomic write (tmp+rename) + file lock |
-| ublkd device leakage (CLI crash) | state.json records dev_ids; delete is idempotent; a janitor may be added later |
+| cred.json clobbering or keys that do not match blob URLs | File lock + tmp/fsync/rename; canonical host/repository keys ordered longest first |
+| ublkd device leakage after a CLI crash | Persist config ownership before/after allocation; delete matches current ublkd config identity and retains state on failure |
+| PID reuse kills an unrelated process | `(pid, starttime, boot_id)` identity plus pidfd signaling |
+| vmstate pins a host device path | Relative `rootfs.dev` supplied through build/create cwd; old templates must be rebuilt |
+| Malicious init-path symlink escapes the image | Clean absolute guest path validation plus `os.Root`-confined writes |
 | Kernel requirements | Baseline ublk support suffices; build changes capacity offline with delete/resize/add and does not require online UBLK_F_UPDATE_SIZE |
 | Missing resize utilities | Require `e2fsck`, `resize2fs`, `dumpe2fs`, and `/opt/overlaybd/bin/overlaybd-resize`; any failure triggers reverse rollback |
 | Ordinary OCI conversion fails or emits corrupt output | Force convertor no-upload mode and verify every manifest/config/layer digest and size before any ublk operation |
 | Source is Turbo OCI, tar-wrapped, mixed, or unknown | Reject during manifest classification; only an all-standard-tar image enters convertor (ADR-011) |
-| Private registry credential exposure | ORAS and convertor reuse one credential and template-vm never logs full argv; document that the external convertor's argv-only API remains visible to the same user/root while running |
+| Private registry credential exposure | ORAS and convertor reuse one credential and fsb-vm never logs full argv; document that the external convertor's argv-only API remains visible to the same user/root while running |
 | Upper shrunk before ext4 (EXT4 bad geometry) | Always resize ext4 offline on the initial large device before deleting/resizing/adding the upper, then verify both geometries exactly (ADR-011) |
 | No uniform guest workload start convention | Init-script injection (built-in redis sample default) + `--init-script-file`/`--ready-pattern` overrides; readiness is a serial pattern, not mere process start |
 | Local artifacts drifting from registry state | No push in this iteration; index.json pins source_ref and every digest as the single publish input for reconciliation (ADR-012) |

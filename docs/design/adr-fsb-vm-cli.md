@@ -1,4 +1,4 @@
-# ADR: template-vm CLI —— 从远程 template 创建 VM 的独立 CLI
+# ADR: fsb-vm CLI —— 从远程 template 创建 VM 的独立 CLI
 
 > 文档类型：架构决策记录（ADR）
 >
@@ -6,7 +6,7 @@
 >
 > 状态：已确认（三轮设计访谈收敛）
 >
-> 配套术语表：[template-vm-cli-glossary.md](./template-vm-cli-glossary.md)
+> 配套术语表：[fsb-vm-cli-glossary.md](./fsb-vm-cli-glossary.md)
 
 ## 背景
 
@@ -23,7 +23,7 @@ sandbox项目的实现。
 
 ### ADR-001 代码落点：fast-sandbox 仓库内独立二进制
 
-- **决策**：代码放 `fast-sandbox/cmd/template-vm/`（Go，cobra），与 fastctl 平级；
+- **决策**：代码放 `fast-sandbox/cmd/fsb-vm/`（Go，cobra），与 fastctl 平级；
   不挂进 fastctl 子命令树，不复用 fastpath gRPC。
 - **理由**：用户明确「独立 CLI + 放 fast-sandbox 仓库」。与 fast-sandbox 控制面
   零交互，独立二进制避免 `internal/architecture/dependencies_test.go` 的分层
@@ -57,14 +57,16 @@ sandbox项目的实现。
 - **细节**：rootfs 的 config 含 `upper`（本地 hybrid 可写层，先创建空 data/index
   再 add）；snapfiles 的 config 无 `upper`（只读）。`repoBlobUrl` 指向
   `https://<registry>/v2/<repo>/blobs`，overlaybd 运行时按 range 拉块。
-- **凭证转写**：dockerAuth（docker config json）合入 overlaybd 全局凭证文件
-  （默认 `/opt/overlaybd/cred.json`，overlaybd 按 remote_path 惰性 reload），
-  否则按需拉块 401。合入需原子写 + 备份，避免并发 CLI 实例互相覆盖。
+- **凭证转写**：先按 ORAS 规则选择 dockerAuth 凭证，再以 OverlayBD 实际 blob URL 的
+  `<规范化 registry host>/<repository>` 前缀为 key 写入全局凭证文件（默认
+  `/opt/overlaybd/cred.json`）。Docker Hub 别名统一为 `registry-1.docker.io`，key 按长度
+  降序序列化，确保 OverlayBD 的“首个匹配”语义等价于最长前缀匹配。合入由文件锁串行化，
+  并使用 tmp + fsync + rename 原子提交，避免并发 CLI 实例互相覆盖或产生半写文件。
 
 ### ADR-004 kernel：宿主机本地，metadata 校验 + flag 覆盖
 
 - **决策**：kernel 不随镜像分发。`metadata.json.kernel_version` 映射到宿主机约定
-  目录下的 vmlinux（默认约定 `/opt/template-vm/kernels/vmlinux-<kernel_version>`，
+  目录下的 vmlinux（默认约定 `/opt/fsb-vm/kernels/vmlinux-<kernel_version>`，
   可用 `--kernel` 显式覆盖）；文件缺失则报错。
 
 ### ADR-005 memfile：裸内存文件 mmap（Firecracker Backend File）
@@ -81,13 +83,14 @@ sandbox项目的实现。
   `/metadata.json`。**既有规范，CLI 适配**；构建侧改动需版本化公告。
 - **风险**：规范目前仅有口头约定，联调时需用真实样例镜像验证路径与 FS 类型。
 
-### ADR-007 规格来源：metadata.json 权威 + flag 覆盖
+### ADR-007 规格与设备路径来源：metadata.json 权威
 
-- **决策**：`vcpu_count / memory_mb / disk_size_mb` 等以 metadata.json 为准；
-  CLI 提供 `--vcpu / --memory-mb / --kernel` 覆盖。启动前校验：
-  `hypervisor_type` 当前仅支持 `firecracker`（其他值报 Unsupported，预留 VMM
-  抽象接口）；`cpu_arch` 与宿主一致；本机 firecracker 二进制版本与
-  `firecracker_version` 兼容（不兼容默认报错，`--force` 可降级为警告）。
+- **决策**：`vcpu_count / memory_mb / disk_size_mb` 等规格由快照决定，create 不提供
+  `--vcpu` 或 `--memory-mb` 覆盖；仅允许 `--kernel` 覆盖宿主 kernel 文件路径。启动前校验：
+  `hypervisor_type` 当前仅支持 `firecracker`；`cpu_arch` 与宿主一致；本机 firecracker
+  版本与 `firecracker_version` 兼容（不兼容默认报错，`--force` 仅可降级版本错误）。
+  `rootfs_drive_path` 必须为相对路径 `rootfs.dev`，旧模板缺失该字段或记录宿主绝对设备路径时
+  必须重新 build，`--force` 不能绕过。
 
 ### ADR-008 rootfs upper：hybrid 可写层，默认不 commit
 
@@ -99,14 +102,21 @@ sandbox项目的实现。
 
 - **决策**：参考 aenv 语义（start = 从模板直接拉起，不区分 start/resume），
   MVP 三命令：
-  - `template-vm create -f template.json [--kernel ...] [--vcpu ...] [--network=none]`
-  - `template-vm list`：枚举状态目录 + 校验 pid 存活
-  - `template-vm delete <sandbox_id>`：杀 firecracker → umount snapfiles →
-    ublkd `del` 两个设备 → 清理状态目录（顺序严格逆序，任何一步失败都报告并继续
-    尽最大努力清理）
-- **布局**：状态目录 `/var/lib/template-vm/sandboxes/<id>/`（upper、
-  config.v1.json、挂载点、state.json）；运行目录 `/run/template-vm/sandboxes/<id>/`
-  （api socket、serial 日志）。
+  - `fsb-vm create -f template.json [--kernel ...] [--network=none]`
+  - `fsb-vm list`：枚举状态目录，以 `(pid, starttime, boot_id)` 校验进程身份
+  - `fsb-vm delete <sandbox_id>`：安全停止 firecracker → umount snapfiles →
+    按 config 绝对路径归属删除两个 ublk 设备 → 仅在全部成功后删除目录
+- **并发与标识**：`sandbox_id` 必须匹配安全的单目录名规则；同 ID 的 create/delete 使用
+  非阻塞 flock 串行化，create 再以 `Mkdir` 原子占用状态目录，消除检查后创建竞态。
+- **可恢复状态**：state.json 在分配首个资源前以 `creating` 写入，并在每次资源变化后原子更新；
+  VM 恢复后转为 `running`，delete 转为 `deleting`。停止 VMM 或清理资源失败时保留状态与 upper，
+  用户可重试 delete。dev_id 可复用，不能作为所有权依据；设备仅在 ublkd 当前仍将其列在该
+  sandbox 的确定性 config 路径下时删除。
+- **进程安全**：状态记录 PID、`/proc/<pid>/stat` starttime 和 boot_id；发信号前复核身份，
+  并通过 pidfd 发送 SIGTERM/SIGKILL，避免 PID 复用误杀。
+- **布局**：状态目录 `/var/lib/fsb-vm/sandboxes/<id>/`（upper、
+  config.v1.json、挂载点、state.json）；运行目录 `/run/fsb-vm/sandboxes/<id>/`
+  （api socket、serial 日志、`rootfs.dev` 设备链接）。
 
 ### ADR-010 网络：NetworkProvider 抽象，MVP 支持 none
 
@@ -116,13 +126,13 @@ sandbox项目的实现。
   不阻塞快照恢复主链路。
 - **未决输入**：网络体系的设备分配接口（待用户提供后另起 ADR 补充）。
 
-### ADR-011 模板构建：`template-vm build` 冷启动快照法（build 迭代补充）
+### ADR-011 模板构建：`fsb-vm build` 冷启动快照法（build 迭代补充）
 
-- **决策**：`template-vm build --source <OCI 或 overlaybd 镜像> --output <name:tag>`
+- **决策**：`fsb-vm build --source <OCI 或 overlaybd 镜像> --output <name:tag>`
   把远程源镜像转换为本地产物形式的模板对（`<tag>_rootfs` / `<tag>_snapfiles`）。
   CLI 先用 ORAS 解析 registry manifest；普通 OCI/Docker tar 镜像调用
   `accelerated-container-image` 的用户态 `convertor` 转成 Native OverlayBD 后，再进入
-  与原生加速镜像相同的构建链路。template-vm 不调用 docker CLI。
+  与原生加速镜像相同的构建链路。fsb-vm 不调用 docker CLI。
 - **build 与 create 的读取路径分歧**：create 保持 manifest-only（lowers 以
   `digest`+`repoBlobUrl` 远程按需 range read）；build 先解析并分类宿主平台 manifest。
   Native 源经 ORAS 下载；普通 OCI 源用 `convertor --no-upload --dump-manifest --reserve`
@@ -145,10 +155,15 @@ sandbox项目的实现。
   重新 add。最终以 BLKGETSIZE64 和 `dumpe2fs -h` 同时校验设备与 ext4 几何精确等于目标。
   metadata.json 保留既有 `disk_size_mb` 字段，写入 `disk_size_gb × 1024`。
 - **快照拍摄**：向可写 rootfs 注入 init 脚本（内置 redis 样例默认脚本，
-  `--init-script-file` 覆盖）→ 冷启动 Firecracker（boot args 含
-  `init=<init-path>`）→ 等待串口出现 ready pattern（默认
-  `Ready to accept connections`，可配，超时输出串口尾部）→ pause →
+  `--init-script-file` 覆盖）。`--init-path` 必须是 clean 绝对 guest 路径，写入全程经
+  `os.Root` 约束，最终分量若为符号链接则替换，镜像内容不能把写操作重定向到宿主机或其他
+  guest 文件。随后冷启动 Firecracker（boot args 含 `init=<init-path>`）→ 等待串口出现
+  ready pattern（默认 `Ready to accept connections`，可配，超时输出串口尾部）→ pause →
   Full Snapshot（`vmstate.bin` + `memfile`）→ 终止 Firecracker。
+- **可移植盘路径**：build 在 Firecracker 工作目录创建 `rootfs.dev -> /dev/ublkbN`，并以
+  相对路径 `rootfs.dev` 配置 rootfs；vmstate 因而不记录宿主 dev_id。create 在自己的运行
+  目录重建同名链接，并以该目录为 Firecracker cwd，在 snapshot load 前提供正确设备；load
+  后不再 PATCH drive。
 - **snapfiles 不经 raw 导入**：`overlaybd-create --hybrid` 建无 lower 的空可写盘 →
   `mkfs.ext4` → rw 挂载 → 写入 `/vmstate.bin`、`/memfile`、`/metadata.json` →
   sync → umount → ublkd del → `overlaybd-commit` 封装为只读层。排除项：
@@ -167,10 +182,11 @@ sandbox项目的实现。
             <name>_<tag>_snapfiles.json
             index.json
   ```
-- **自包含性**：rootfs manifest 保持源 layer descriptor 顺序与属性、追加 rootfs
+- **自包含性与并发**：rootfs manifest 保持源 layer descriptor 顺序与属性、追加 rootfs
   commit 层；全部引用 blob（含继承层与生成的最小 config）必须存在于本地
-  `blobs/sha256/`。build 在同级临时目录中逐项校验 digest/size/JSON schema，全部
-  通过后才原子发布最终目录；同名产物已存在时拒绝覆盖。
+  `blobs/sha256/`。每次 build 使用 `MkdirTemp` 创建独立 scratch；同一 output 使用非阻塞
+  flock，已有构建时立即失败。build 在同级 staging 目录中逐项校验 digest/size/JSON schema，
+  全部通过后才原子发布最终目录；同名产物已存在时拒绝覆盖。
 - **commit 层约定**：mediaType 为 `...overlaybd.image.layer.v1.zfile`（默认 `-z`
   压缩）或 `...overlaybd.image.layer.v1.lsmt`（`--no-compress`），并打
   `containerd.io/snapshot/overlaybd/blob-digest == 自身 digest` 注解，与严格消费侧
@@ -180,34 +196,36 @@ sandbox项目的实现。
   目标 manifest → 从 `blobs/sha256/` 上传其引用的全部 blob → 提交 manifest
   （ORAS SDK）。因源 blobs 已落盘，可发布到任意 registry，无跨 registry blob copy。
 
-### ADR-013 registry 凭证匹配归一化（build 迭代补充）
+### ADR-013 registry 凭证匹配与 OverlayBD 交接归一化（build 迭代补充）
 
 - **决策**：ORAS client 的凭证选取对 docker config 的 auths key 做与引用一致的
   归一化：去 scheme/尾斜杠/`/v1`、`/v2` API 尾巴，Docker Hub 别名
   （`docker.io`、`index.docker.io`、`registry.hub.docker.com` 等）统一映射到
-  `registry-1.docker.io`；之后按最长 registry/repository 前缀匹配。
+  `registry-1.docker.io`；之后按最长 registry/repository 前缀匹配。交给 OverlayBD 时，
+  将选中的凭证重新 keyed 为 blob URL 的规范化 host/repository 前缀，并按 key 长度降序写出。
 - **理由**：`docker login` 写入的标准 key 是 `https://index.docker.io/v1/`，不归一
-  则 Hub 凭证永远匹配不到、静默降级为匿名（公开镜像可容忍，私有镜像 401）。
+  则 Hub 凭证永远匹配不到、静默降级为匿名；OverlayBD 又按 JSON 文件顺序返回第一个精确
+  前缀匹配，若不重建 key 和排序，ORAS 可认证而远程块读取仍会 401。
 
 ## create 主流程（编排顺序，严格分步、失败逆序回滚）
 
-1. 解析 template.json；校验 sandbox_id 未占用（状态目录不存在）。
-2. oras 拉取 rootfs / snapfiles 两个 manifest → 层 digest 列表。
-3. dockerAuth 合入 `/opt/overlaybd/cred.json`（原子写）。
-4. rootfs：创建 hybrid upper（data/index）→ 生成含 upper 的 config.v1.json →
-   ublkd `/v1/add` → 记录 dev_id。
-5. snapfiles：生成只读 config.v1.json → `/v1/add` → mount -o ro →
+1. 解析 template.json；严格校验 sandbox_id；获取同 ID 非阻塞锁并以 `Mkdir` 原子占用目录；
+   写入 `creating` state。
+2. ORAS 拉取 rootfs / snapfiles 两个 manifest → 层 digest 列表。
+3. 将 dockerAuth 规范化为 OverlayBD blob URL 前缀后合入 `/opt/overlaybd/cred.json`。
+4. rootfs：分配前先持久化 config 所有权 → 创建 hybrid upper → ublkd `/v1/add` → 更新设备记录。
+5. snapfiles：分配前先持久化 config 所有权 → `/v1/add` → mount -o ro →
    读 metadata.json / 校验（ADR-007）。
-6. 解析 kernel 路径（ADR-004）；启动匹配版本的 firecracker（api socket 于
-   运行目录）。
-7. 恢复：`PUT /drives/rootfs`（path=/dev/ublkbN，drive_id 与 vmstate 一致；
-   不一致则先 PATCH）→ `PUT /snapshot/load`（vmstate.bin + memfile File backend）
+6. 解析 kernel 路径；在运行目录建立 `rootfs.dev` 链接并以该目录为 cwd 启动 Firecracker；
+   持久化 `(pid, starttime, boot_id)`。
+7. `PUT /snapshot/load`（vmstate 中的相对 `rootfs.dev` 已可解析，memfile 使用 File backend）
    → 网络（NetworkProvider 或 none）→ `PATCH /vm` resume。
-8. 落状态文件，输出 sandbox 信息（id、pid、ublk 设备、socket 路径）。
+8. state 转为 `running`，输出 sandbox 信息。任一步失败调用同一可重试 teardown；清理不完整则保留状态。
 
 ## build 主流程（编排顺序，严格分步、失败逆序回滚；build 迭代补充）
 
-1. 校验参数；ping ublkd；读取 `--auth-file` 或 `--username username:password`。
+1. 校验参数；ping ublkd；读取 `--auth-file` 或 `--username username:password`；对 output
+   获取非阻塞锁并创建独立临时 scratch。
 2. ORAS 解析源 manifest（穿透一层 image index，按 `linux/<宿主 arch>` 选子 manifest）
    并在下载 layers 前分类（ADR-011）。
 3. Native 源直接下载 config/layers；普通 OCI 源把选中的 manifest digest 和凭证传给
@@ -233,8 +251,11 @@ sandbox项目的实现。
 | hypervisor_type=dragonball 的存量模板无法恢复 | 启动前硬校验 + 明确报错；VMM 抽象预留 |
 | vmstate 版本与宿主 firecracker 不兼容 | `firecracker_version` 校验；`--force` 逃生门 |
 | 盘内布局仅口头约定 | 联调用真实镜像验证；路径集中为一个常量区块 |
-| cred.json 并发覆盖 | 原子写（tmp+rename）+ 文件锁 |
-| ublkd 设备泄漏（CLI 崩溃后） | state.json 记录 dev_id；delete 幂等；后续可加 janitor |
+| cred.json 并发覆盖或 key 与 blob URL 不匹配 | 文件锁 + tmp/fsync/rename；规范化 host/repository key 并按最长 key 优先 |
+| ublkd 设备泄漏（CLI 崩溃后） | 分配前后渐进持久化 config 所有权；delete 按 ublkd 当前 config 身份回收，失败保留状态供重试 |
+| PID 复用导致误杀 | `(pid, starttime, boot_id)` 身份校验 + pidfd 发信号 |
+| vmstate 固化宿主设备路径 | build/create 在各自 cwd 提供相对 `rootfs.dev`；旧模板强制重建 |
+| 恶意镜像通过 init 路径符号链接逃逸 | clean 绝对 guest 路径校验 + `os.Root` 约束写入 |
 | 内核要求 | ublk 基础能力即可；build 通过 del/resize/add 离线变更容量，不依赖 6.11+ 的在线 UBLK_F_UPDATE_SIZE |
 | 缺少缩盘工具 | build 启动前确保 `e2fsck`、`resize2fs`、`dumpe2fs` 和 `/opt/overlaybd/bin/overlaybd-resize` 可执行；任一步失败即逆序回滚 |
 | 普通 OCI 转换失败或产物损坏 | 固定调用外部 convertor 的 no-upload 模式；按源层序号定位产物并逐项校验 manifest/config/layer digest 与 size，失败时不进入 ublk 阶段 |

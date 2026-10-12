@@ -1,8 +1,8 @@
-# template-vm 命令行使用指南
+# fsb-vm 命令行使用指南
 
-[English version](template-vm-user-guide.en.md)
+[English version](fsb-vm-user-guide.en.md)
 
-`template-vm` 在单机上直接驱动 OverlayBD ublkd 和 Firecracker，用于：
+`fsb-vm` 在单机上直接驱动 OverlayBD ublkd 和 Firecracker，用于：
 
 1. 从普通 OCI/Docker 镜像或 Native OverlayBD 镜像构建本地模板产物；
 2. 将 registry 中的一对 rootfs/snapfiles 模板恢复为运行中的 Firecracker VM；
@@ -15,20 +15,20 @@
 ```bash
 cd ./fast-sandbox
 export FAST_SANDBOX_ROOT="$PWD"
-export TEMPLATE_VM="$FAST_SANDBOX_ROOT/bin/template-vm"
+export FSB_VM="$FAST_SANDBOX_ROOT/bin/fsb-vm"
 export ACCELERATED_CONTAINER_IMAGE_DIR="$FAST_SANDBOX_ROOT/../accelerated-container-image"
 export CONVERTOR="$ACCELERATED_CONTAINER_IMAGE_DIR/bin/convertor"
-export TEMPLATE_VM_ASSETS="$FAST_SANDBOX_ROOT/.template-vm"
-export FIRECRACKER="$TEMPLATE_VM_ASSETS/firecracker"
-export KERNEL="$TEMPLATE_VM_ASSETS/vmlinux-6.1.176"
-export INIT_SCRIPT="$TEMPLATE_VM_ASSETS/init.sh"
-export TEMPLATE_FILE="$TEMPLATE_VM_ASSETS/template.json"
-export DOCKER_CONFIG_FILE="$TEMPLATE_VM_ASSETS/docker-config.json"
-export BUILD_WORK_DIR="$TEMPLATE_VM_ASSETS/builds"
-export BUILD_OUTPUT_DIR="$TEMPLATE_VM_ASSETS/artifacts"
-export STATE_DIR="$TEMPLATE_VM_ASSETS/state"
-export RUNTIME_DIR="$TEMPLATE_VM_ASSETS/runtime"
-mkdir -p "$TEMPLATE_VM_ASSETS"
+export FSB_VM_ASSETS="$FAST_SANDBOX_ROOT/.fsb-vm"
+export FIRECRACKER="$FSB_VM_ASSETS/firecracker"
+export KERNEL="$FSB_VM_ASSETS/vmlinux-6.1.176"
+export INIT_SCRIPT="$FSB_VM_ASSETS/init.sh"
+export TEMPLATE_FILE="$FSB_VM_ASSETS/template.json"
+export DOCKER_CONFIG_FILE="$FSB_VM_ASSETS/docker-config.json"
+export BUILD_WORK_DIR="$FSB_VM_ASSETS/builds"
+export BUILD_OUTPUT_DIR="$FSB_VM_ASSETS/artifacts"
+export STATE_DIR="$FSB_VM_ASSETS/state"
+export RUNTIME_DIR="$FSB_VM_ASSETS/runtime"
+mkdir -p "$FSB_VM_ASSETS"
 ```
 
 将 Firecracker、内核、init 脚本、模板文件和可选 Docker config 放到上述变量指定的位置，或根据实际情况修改变量值。
@@ -76,7 +76,7 @@ cd "$FAST_SANDBOX_ROOT"
 如果 checkout 位于 fast-sandbox 相邻目录，也可以只编译依赖：
 
 ```bash
-make template-vm-convertor
+make fsb-vm-convertor
 ```
 
 使用 fast-sandbox 根目录下的其他 checkout：
@@ -84,42 +84,42 @@ make template-vm-convertor
 ```bash
 export ACCELERATED_CONTAINER_IMAGE_DIR="$FAST_SANDBOX_ROOT/third_party/accelerated-container-image"
 export CONVERTOR="$ACCELERATED_CONTAINER_IMAGE_DIR/bin/convertor"
-make template-vm-convertor \
+make fsb-vm-convertor \
   ACCELERATED_CONTAINER_IMAGE_DIR="$ACCELERATED_CONTAINER_IMAGE_DIR"
 ```
 
-convertor 仅在普通 OCI/Docker 输入时使用；Native OverlayBD 输入不会依赖它。`template-vm` 始终以 `--no-upload` 调用 convertor。
+convertor 仅在普通 OCI/Docker 输入时使用；Native OverlayBD 输入不会依赖它。`fsb-vm` 始终以 `--no-upload` 调用 convertor。
 
 ## 2. 编译
 
 在 fast-sandbox 仓库根目录执行：
 
 ```bash
-go test ./cmd/template-vm/
-go vet ./cmd/template-vm/
-make template-vm
+go test ./cmd/fsb-vm/
+go vet ./cmd/fsb-vm/
+make fsb-vm
 ```
 
 输出文件为：
 
 ```text
-$FAST_SANDBOX_ROOT/bin/template-vm
+$FAST_SANDBOX_ROOT/bin/fsb-vm
 ```
 
 也可以直接编译：
 
 ```bash
-go build -o "$TEMPLATE_VM" ./cmd/template-vm/
+go build -o "$FSB_VM" ./cmd/fsb-vm/
 ```
 
 查看帮助：
 
 ```bash
-"$TEMPLATE_VM" --help
-"$TEMPLATE_VM" build --help
-"$TEMPLATE_VM" create --help
-"$TEMPLATE_VM" list --help
-"$TEMPLATE_VM" delete --help
+"$FSB_VM" --help
+"$FSB_VM" build --help
+"$FSB_VM" create --help
+"$FSB_VM" list --help
+"$FSB_VM" delete --help
 ```
 
 ## 3. 基本命令
@@ -137,19 +137,19 @@ go build -o "$TEMPLATE_VM" ./cmd/template-vm/
 | --- | --- | --- |
 | `--ublkd-socket` | `/var/run/overlaybd-ublk/ublkd.sock` | ublkd 控制 socket |
 | `--cred-file` | `/opt/overlaybd/cred.json` | OverlayBD 全局凭证文件 |
-| `--kernel-dir` | `/opt/template-vm/kernels` | `create` 默认查找 `vmlinux-<version>` 的目录 |
-| `--state-dir` | `/var/lib/template-vm/sandboxes` | 持久化 sandbox 状态根目录 |
-| `--runtime-dir` | `/run/template-vm/sandboxes` | API socket 和串口日志目录 |
+| `--kernel-dir` | `/opt/fsb-vm/kernels` | `create` 默认查找 `vmlinux-<version>` 的目录 |
+| `--state-dir` | `/var/lib/fsb-vm/sandboxes` | 持久化 sandbox 状态根目录 |
+| `--runtime-dir` | `/run/fsb-vm/sandboxes` | API socket 和串口日志目录 |
 | `--firecracker` | `firecracker` | Firecracker 可执行文件 |
 | `--overlaybd-convertor` | `/opt/overlaybd/snapshotter/convertor` | OCI userspace convertor |
-| `--build-work-dir` | `/var/lib/template-vm/builds` | 构建临时目录根路径 |
-| `--build-output-dir` | `/var/lib/template-vm/artifacts` | 本地 artifact 根路径 |
+| `--build-work-dir` | `/var/lib/fsb-vm/builds` | 构建临时目录根路径 |
+| `--build-output-dir` | `/var/lib/fsb-vm/artifacts` | 本地 artifact 根路径 |
 | `--plain-http` | `false` | 对 registry 使用明文 HTTP |
 
 全局参数放在子命令之前，例如：
 
 ```bash
-sudo "$TEMPLATE_VM" --plain-http --state-dir "$STATE_DIR" list
+sudo "$FSB_VM" --plain-http --state-dir "$STATE_DIR" list
 ```
 
 ## 4. 构建模板
@@ -157,7 +157,7 @@ sudo "$TEMPLATE_VM" --plain-http --state-dir "$STATE_DIR" list
 最小命令：
 
 ```bash
-sudo "$TEMPLATE_VM" build \
+sudo "$FSB_VM" build \
   --source <registry>/<repository>:<tag> \
   --output <name>:<template-id> \
   --kernel "$KERNEL"
@@ -185,14 +185,14 @@ sudo "$TEMPLATE_VM" build \
 | `--keep-work-dir` | `false` | 成功后保留构建临时目录 |
 | `--no-compress` | `false` | 提交层时禁用 zfile 压缩 |
 
-`build` 不会自动执行源镜像 OCI config 中的 Entrypoint、Cmd 或 Env。对于非 Redis 工作负载，应使用 `--init-script-file` 提供 init，并让脚本在服务真正就绪后输出与 `--ready-pattern` 完全匹配的稳定文本。
+`build` 不会自动执行源镜像 OCI config 中的 Entrypoint、Cmd 或 Env。对于非 Redis 工作负载，应使用 `--init-script-file` 提供 init，并让脚本在服务真正就绪后输出与 `--ready-pattern` 完全匹配的稳定文本。`--init-path` 必须是无空白的 clean 绝对 guest 路径；写入受 `os.Root` 约束，不会跟随镜像中的符号链接逃逸到宿主机。每次 build 使用独立临时目录；同一 `--output` 的并发构建通过非阻塞锁立即拒绝第二个请求。
 
 ### 4.1 从 Native OverlayBD 镜像构建
 
 以下公开测试镜像是 Native OverlayBD，构建时会直接拉取其 Native 层并绕过 convertor：
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --firecracker "$FIRECRACKER" \
   --build-work-dir "$BUILD_WORK_DIR" \
   --build-output-dir "$BUILD_OUTPUT_DIR" \
@@ -201,7 +201,7 @@ sudo "$TEMPLATE_VM" \
   --output code-interpreter:v1.0.0 \
   --kernel "$KERNEL" \
   --init-script-file "$INIT_SCRIPT" \
-  --ready-pattern template-vm-code-interpreter-ready \
+  --ready-pattern fsb-vm-code-interpreter-ready \
   --ready-timeout 10m
 ```
 
@@ -212,7 +212,7 @@ sudo "$TEMPLATE_VM" \
 将 `--source` 指向普通 OCI/Docker 镜像：
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --overlaybd-convertor "$CONVERTOR" \
   --build-work-dir "$BUILD_WORK_DIR" \
   --build-output-dir "$BUILD_OUTPUT_DIR" \
@@ -242,7 +242,7 @@ sudo "$TEMPLATE_VM" \
 直接传入凭证：
 
 ```bash
-sudo "$TEMPLATE_VM" build \
+sudo "$FSB_VM" build \
   --source registry.example.com/team/application:latest \
   --output application:v1 \
   --kernel "$KERNEL" \
@@ -252,19 +252,19 @@ sudo "$TEMPLATE_VM" build \
 密码可以包含 `:`；用户名不能为空。也可以使用 Docker config：
 
 ```bash
-sudo "$TEMPLATE_VM" build \
+sudo "$FSB_VM" build \
   --source registry.example.com/team/application:latest \
   --output application:v1 \
   --kernel "$KERNEL" \
   --auth-file "$DOCKER_CONFIG_FILE"
 ```
 
-`--username` 与 `--auth-file` 互斥。普通 OCI 输入会把同一凭证用于初始 manifest 解析和 convertor 拉层。外部 convertor 只支持通过 argv 接收凭证，因此运行期间同用户或 root 可能从进程信息中看到凭证；`template-vm` 自身不会打印完整命令，并会对错误输出中的凭证脱敏。
+`--username` 与 `--auth-file` 互斥。普通 OCI 输入会把同一凭证用于初始 manifest 解析和 convertor 拉层。外部 convertor 只支持通过 argv 接收凭证，因此运行期间同用户或 root 可能从进程信息中看到凭证；`fsb-vm` 自身不会打印完整命令，并会对错误输出中的凭证脱敏。
 
 明文 HTTP registry 需要在子命令前增加：
 
 ```bash
-sudo "$TEMPLATE_VM" --plain-http build ...
+sudo "$FSB_VM" --plain-http build ...
 ```
 
 ### 4.4 磁盘大小
@@ -272,7 +272,7 @@ sudo "$TEMPLATE_VM" --plain-http build ...
 rootfs 默认是 20 GiB，可指定其他正整数 GiB：
 
 ```bash
-sudo "$TEMPLATE_VM" build ... --disk-size-gb 30
+sudo "$FSB_VM" build ... --disk-size-gb 30
 ```
 
 当源 ext4 文件系统大于目标容量时，工具先缩小文件系统，再 detach ublk 设备、修改 OverlayBD upper vsize、重新 attach，并校验块设备和 ext4 几何。目标容量必须能容纳实际文件系统数据。
@@ -314,7 +314,7 @@ registry.example.com/team/application:v1_snapfiles
 
 发布工具必须先上传这两个 manifest 引用的全部 `blobs/sha256/*`，再按对应 tag 上传 rootfs 和 snapfiles manifest。`manifest/index.json` 记录了 manifest 文件名和 digest，可供发布脚本读取。
 
-当前 CLI 尚未提供 `push` 子命令。完整的本地 registry 上传命令参见 [template-vm 手工 E2E 验证](template-vm-manual-e2e.md#7-将本地产物上传到临时-registry)。生产环境应使用能够保留 OCI manifest 和 OverlayBD layer media type 的发布流程。
+当前 CLI 尚未提供 `push` 子命令。完整的本地 registry 上传命令参见 [fsb-vm 手工 E2E 验证](fsb-vm-manual-e2e.md#7-将本地产物上传到临时-registry)。生产环境应使用能够保留 OCI manifest 和 OverlayBD layer media type 的发布流程。
 
 ## 6. 准备 template.json
 
@@ -368,7 +368,7 @@ registry.example.com/team/application:v1_snapfiles
 ## 7. 运行 VM
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --firecracker "$FIRECRACKER" \
   --state-dir "$STATE_DIR" \
   --runtime-dir "$RUNTIME_DIR" \
@@ -379,16 +379,15 @@ sudo "$TEMPLATE_VM" \
 
 `--network` 当前只支持 `none`。`create` 将：
 
-1. 拉取 rootfs/snapfiles manifests；
-2. 创建并挂载 ublk 设备；
-3. 从 snapfiles 加载 Firecracker snapshot；
-4. 将恢复后的 rootfs drive 重定向到新设备；
-5. 恢复 VM 并写入 `state.json`。
+1. 严格校验并原子占用 `sandbox_id`，写入 `creating` 状态；
+2. 拉取 manifests，创建 rootfs/snapfiles ublk 设备并渐进记录所有权；
+3. 在 runtime 目录建立 `rootfs.dev` 链接，以该目录为 cwd 加载 Firecracker snapshot；
+4. 恢复 VM，将 `state.json` 更新为 `running`。
 
-默认根据模板 metadata 中的 `kernel_version` 检查 `/opt/template-vm/kernels/vmlinux-<version>`。可显式覆盖：
+默认根据模板 metadata 中的 `kernel_version` 检查 `/opt/fsb-vm/kernels/vmlinux-<version>`。可显式覆盖：
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --state-dir "$STATE_DIR" \
   --runtime-dir "$RUNTIME_DIR" \
   create \
@@ -399,7 +398,7 @@ sudo "$TEMPLATE_VM" \
 对于明文 HTTP registry：
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --plain-http \
   --state-dir "$STATE_DIR" \
   --runtime-dir "$RUNTIME_DIR" \
@@ -411,7 +410,7 @@ sudo "$TEMPLATE_VM" \
 ## 8. 查询 VM
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --state-dir "$STATE_DIR" \
   --runtime-dir "$RUNTIME_DIR" \
   list
@@ -424,12 +423,12 @@ SANDBOX_ID       STATUS   PID    ROOTFS_DEV   SNAPFILES_DEV   API_SOCKET
 application-demo running  12345  /dev/ublkb0  /dev/ublkb1     $RUNTIME_DIR/application-demo/api.sock
 ```
 
-状态由已记录的 Firecracker PID 是否存活决定。无法读取 `state.json` 的目录显示为 `corrupt`。使用自定义目录时，`list`、`create` 和 `delete` 必须传入相同的 `--state-dir` 与 `--runtime-dir`。
+状态由已记录的 Firecracker `(PID, starttime, boot_id)` 身份是否仍匹配决定，而非只检查 PID 数字。无法读取 `state.json` 的目录显示为 `corrupt`。使用自定义目录时，`list`、`create` 和 `delete` 必须传入相同的 `--state-dir` 与 `--runtime-dir`。
 
 ## 9. 清理 VM
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --state-dir "$STATE_DIR" \
   --runtime-dir "$RUNTIME_DIR" \
   delete application-demo
@@ -442,12 +441,12 @@ sudo "$TEMPLATE_VM" \
 3. 删除 rootfs 和 snapfiles ublk 设备；
 4. 删除 sandbox state 和 runtime 目录。
 
-各步骤采用 best-effort：某一步失败时仍继续执行后续清理，最后返回非零错误并在 stderr 输出警告。不要直接删除 state 目录；`state.json` 保存了 PID、mount point 和 ublk dev_id，丢失它可能造成资源泄漏。
+Firecracker 停止失败时不会继续释放仍被 VMM 占用的设备；其他安全步骤会尽量执行。只有资源全部释放后才删除目录。任何失败都会保留 `deleting` 状态和 writable upper，可重新运行同一 delete 重试。设备按 ublkd 当前列出的绝对 config 路径确认归属，不会仅凭可复用的 dev_id 删除；进程信号通过 pidfd 发送，并校验 starttime 与 boot_id。
 
 清理后可核对：
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --state-dir "$STATE_DIR" \
   --runtime-dir "$RUNTIME_DIR" \
   list
@@ -465,4 +464,4 @@ sudo curl -fsS \
 - `build` 不继承 OCI Entrypoint、Cmd 或 Env，工作负载启动必须由 init 脚本定义。
 - create/delete 状态是本机状态，不是分布式控制面资源。
 
-需要完整的 privileged E2E、artifact digest 校验、临时 registry 发布和残留资源排查时，参见 [template-vm 手工 E2E 验证](template-vm-manual-e2e.md)。
+需要完整的 privileged E2E、artifact digest 校验、临时 registry 发布和残留资源排查时，参见 [fsb-vm 手工 E2E 验证](fsb-vm-manual-e2e.md)。

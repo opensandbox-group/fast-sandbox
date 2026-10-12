@@ -1,8 +1,8 @@
-# template-vm CLI user guide
+# fsb-vm CLI user guide
 
-[中文版](template-vm-user-guide.md)
+[中文版](fsb-vm-user-guide.md)
 
-`template-vm` directly controls OverlayBD ublkd and Firecracker on one host. It can:
+`fsb-vm` directly controls OverlayBD ublkd and Firecracker on one host. It can:
 
 1. build local template artifacts from an ordinary OCI/Docker image or a Native OverlayBD image;
 2. restore a rootfs/snapfiles template pair from a registry as a running Firecracker VM;
@@ -15,20 +15,20 @@ All commands in this guide use the fast-sandbox project as their root. Set these
 ```bash
 cd ./fast-sandbox
 export FAST_SANDBOX_ROOT="$PWD"
-export TEMPLATE_VM="$FAST_SANDBOX_ROOT/bin/template-vm"
+export FSB_VM="$FAST_SANDBOX_ROOT/bin/fsb-vm"
 export ACCELERATED_CONTAINER_IMAGE_DIR="$FAST_SANDBOX_ROOT/../accelerated-container-image"
 export CONVERTOR="$ACCELERATED_CONTAINER_IMAGE_DIR/bin/convertor"
-export TEMPLATE_VM_ASSETS="$FAST_SANDBOX_ROOT/.template-vm"
-export FIRECRACKER="$TEMPLATE_VM_ASSETS/firecracker"
-export KERNEL="$TEMPLATE_VM_ASSETS/vmlinux-6.1.176"
-export INIT_SCRIPT="$TEMPLATE_VM_ASSETS/init.sh"
-export TEMPLATE_FILE="$TEMPLATE_VM_ASSETS/template.json"
-export DOCKER_CONFIG_FILE="$TEMPLATE_VM_ASSETS/docker-config.json"
-export BUILD_WORK_DIR="$TEMPLATE_VM_ASSETS/builds"
-export BUILD_OUTPUT_DIR="$TEMPLATE_VM_ASSETS/artifacts"
-export STATE_DIR="$TEMPLATE_VM_ASSETS/state"
-export RUNTIME_DIR="$TEMPLATE_VM_ASSETS/runtime"
-mkdir -p "$TEMPLATE_VM_ASSETS"
+export FSB_VM_ASSETS="$FAST_SANDBOX_ROOT/.fsb-vm"
+export FIRECRACKER="$FSB_VM_ASSETS/firecracker"
+export KERNEL="$FSB_VM_ASSETS/vmlinux-6.1.176"
+export INIT_SCRIPT="$FSB_VM_ASSETS/init.sh"
+export TEMPLATE_FILE="$FSB_VM_ASSETS/template.json"
+export DOCKER_CONFIG_FILE="$FSB_VM_ASSETS/docker-config.json"
+export BUILD_WORK_DIR="$FSB_VM_ASSETS/builds"
+export BUILD_OUTPUT_DIR="$FSB_VM_ASSETS/artifacts"
+export STATE_DIR="$FSB_VM_ASSETS/state"
+export RUNTIME_DIR="$FSB_VM_ASSETS/runtime"
+mkdir -p "$FSB_VM_ASSETS"
 ```
 
 Place Firecracker, the kernel, the init script, the template manifest, and the optional Docker config at the paths represented by these variables, or adjust the variable values for the host.
@@ -76,7 +76,7 @@ cd "$FAST_SANDBOX_ROOT"
 If its checkout is adjacent to fast-sandbox, build only the dependency with:
 
 ```bash
-make template-vm-convertor
+make fsb-vm-convertor
 ```
 
 To use a different checkout under the fast-sandbox root:
@@ -84,42 +84,42 @@ To use a different checkout under the fast-sandbox root:
 ```bash
 export ACCELERATED_CONTAINER_IMAGE_DIR="$FAST_SANDBOX_ROOT/third_party/accelerated-container-image"
 export CONVERTOR="$ACCELERATED_CONTAINER_IMAGE_DIR/bin/convertor"
-make template-vm-convertor \
+make fsb-vm-convertor \
   ACCELERATED_CONTAINER_IMAGE_DIR="$ACCELERATED_CONTAINER_IMAGE_DIR"
 ```
 
-The convertor is used only for ordinary OCI/Docker inputs. Native OverlayBD inputs do not require it. `template-vm` always invokes the convertor with `--no-upload`.
+The convertor is used only for ordinary OCI/Docker inputs. Native OverlayBD inputs do not require it. `fsb-vm` always invokes the convertor with `--no-upload`.
 
 ## 2. Build the CLI
 
 From the fast-sandbox repository root:
 
 ```bash
-go test ./cmd/template-vm/
-go vet ./cmd/template-vm/
-make template-vm
+go test ./cmd/fsb-vm/
+go vet ./cmd/fsb-vm/
+make fsb-vm
 ```
 
 The output is:
 
 ```text
-$FAST_SANDBOX_ROOT/bin/template-vm
+$FAST_SANDBOX_ROOT/bin/fsb-vm
 ```
 
 Alternatively, build it directly:
 
 ```bash
-go build -o "$TEMPLATE_VM" ./cmd/template-vm/
+go build -o "$FSB_VM" ./cmd/fsb-vm/
 ```
 
 Inspect the command help:
 
 ```bash
-"$TEMPLATE_VM" --help
-"$TEMPLATE_VM" build --help
-"$TEMPLATE_VM" create --help
-"$TEMPLATE_VM" list --help
-"$TEMPLATE_VM" delete --help
+"$FSB_VM" --help
+"$FSB_VM" build --help
+"$FSB_VM" create --help
+"$FSB_VM" list --help
+"$FSB_VM" delete --help
 ```
 
 ## 3. Command overview
@@ -137,19 +137,19 @@ Common global options:
 | --- | --- | --- |
 | `--ublkd-socket` | `/var/run/overlaybd-ublk/ublkd.sock` | ublkd control socket |
 | `--cred-file` | `/opt/overlaybd/cred.json` | OverlayBD global credential file |
-| `--kernel-dir` | `/opt/template-vm/kernels` | Default directory for `vmlinux-<version>` during create |
-| `--state-dir` | `/var/lib/template-vm/sandboxes` | Persistent sandbox state root |
-| `--runtime-dir` | `/run/template-vm/sandboxes` | API socket and serial-log root |
+| `--kernel-dir` | `/opt/fsb-vm/kernels` | Default directory for `vmlinux-<version>` during create |
+| `--state-dir` | `/var/lib/fsb-vm/sandboxes` | Persistent sandbox state root |
+| `--runtime-dir` | `/run/fsb-vm/sandboxes` | API socket and serial-log root |
 | `--firecracker` | `firecracker` | Firecracker executable |
 | `--overlaybd-convertor` | `/opt/overlaybd/snapshotter/convertor` | OCI userspace convertor |
-| `--build-work-dir` | `/var/lib/template-vm/builds` | Build scratch root |
-| `--build-output-dir` | `/var/lib/template-vm/artifacts` | Local artifact root |
+| `--build-work-dir` | `/var/lib/fsb-vm/builds` | Build scratch root |
+| `--build-output-dir` | `/var/lib/fsb-vm/artifacts` | Local artifact root |
 | `--plain-http` | `false` | Use plain HTTP for registry requests |
 
 Place global options before the subcommand, for example:
 
 ```bash
-sudo "$TEMPLATE_VM" --plain-http --state-dir "$STATE_DIR" list
+sudo "$FSB_VM" --plain-http --state-dir "$STATE_DIR" list
 ```
 
 ## 4. Build a template
@@ -157,7 +157,7 @@ sudo "$TEMPLATE_VM" --plain-http --state-dir "$STATE_DIR" list
 Minimal invocation:
 
 ```bash
-sudo "$TEMPLATE_VM" build \
+sudo "$FSB_VM" build \
   --source <registry>/<repository>:<tag> \
   --output <name>:<template-id> \
   --kernel "$KERNEL"
@@ -185,14 +185,14 @@ Common build options:
 | `--keep-work-dir` | `false` | Keep build scratch after success |
 | `--no-compress` | `false` | Disable zfile compression when committing layers |
 
-`build` does not execute the source image's OCI Entrypoint, Cmd, or Env automatically. For non-Redis workloads, provide `--init-script-file` and make the script print a stable string matching `--ready-pattern` only after the service is ready.
+`build` does not execute the source image's OCI Entrypoint, Cmd, or Env automatically. For non-Redis workloads, provide `--init-script-file` and make the script print a stable string matching `--ready-pattern` only after the service is ready. `--init-path` must be a clean absolute guest path without whitespace; `os.Root`-confined writes prevent image symlinks from escaping onto the host. Every build uses an independent temporary scratch directory, and a non-blocking per-output lock rejects a second concurrent build of the same `--output`.
 
 ### 4.1 Build from a Native OverlayBD image
 
 The following public test image is Native OverlayBD. The build downloads its Native layers directly and bypasses the convertor:
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --firecracker "$FIRECRACKER" \
   --build-work-dir "$BUILD_WORK_DIR" \
   --build-output-dir "$BUILD_OUTPUT_DIR" \
@@ -201,7 +201,7 @@ sudo "$TEMPLATE_VM" \
   --output code-interpreter:v1.0.0 \
   --kernel "$KERNEL" \
   --init-script-file "$INIT_SCRIPT" \
-  --ready-pattern template-vm-code-interpreter-ready \
+  --ready-pattern fsb-vm-code-interpreter-ready \
   --ready-timeout 10m
 ```
 
@@ -212,7 +212,7 @@ Every layer in the selected manifest must be Native OverlayBD. Turbo OCI, tar-wr
 Point `--source` to an ordinary OCI/Docker image:
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --overlaybd-convertor "$CONVERTOR" \
   --build-work-dir "$BUILD_WORK_DIR" \
   --build-output-dir "$BUILD_OUTPUT_DIR" \
@@ -242,7 +242,7 @@ An anonymous registry requires no authentication option.
 Pass credentials directly:
 
 ```bash
-sudo "$TEMPLATE_VM" build \
+sudo "$FSB_VM" build \
   --source registry.example.com/team/application:latest \
   --output application:v1 \
   --kernel "$KERNEL" \
@@ -252,19 +252,19 @@ sudo "$TEMPLATE_VM" build \
 The password may contain `:`; the username must not be empty. Alternatively, use a Docker config:
 
 ```bash
-sudo "$TEMPLATE_VM" build \
+sudo "$FSB_VM" build \
   --source registry.example.com/team/application:latest \
   --output application:v1 \
   --kernel "$KERNEL" \
   --auth-file "$DOCKER_CONFIG_FILE"
 ```
 
-`--username` and `--auth-file` are mutually exclusive. For ordinary OCI input, the same credentials authenticate initial manifest resolution and convertor layer reads. The external convertor accepts credentials only through argv, so the same user or root may observe them in process information while it runs. `template-vm` does not print the complete command and redacts credentials from converter errors.
+`--username` and `--auth-file` are mutually exclusive. For ordinary OCI input, the same credentials authenticate initial manifest resolution and convertor layer reads. The external convertor accepts credentials only through argv, so the same user or root may observe them in process information while it runs. `fsb-vm` does not print the complete command and redacts credentials from converter errors.
 
 For a plain HTTP registry, place this global option before the subcommand:
 
 ```bash
-sudo "$TEMPLATE_VM" --plain-http build ...
+sudo "$FSB_VM" --plain-http build ...
 ```
 
 ### 4.4 Disk size
@@ -272,7 +272,7 @@ sudo "$TEMPLATE_VM" --plain-http build ...
 The default rootfs size is 20 GiB. Specify another positive integer GiB value with:
 
 ```bash
-sudo "$TEMPLATE_VM" build ... --disk-size-gb 30
+sudo "$FSB_VM" build ... --disk-size-gb 30
 ```
 
 When the source ext4 filesystem is larger than the target, the command shrinks the filesystem first, detaches the ublk device, changes the OverlayBD upper vsize, reattaches the device, and verifies both block-device and ext4 geometry. The target must be large enough for the actual filesystem data.
@@ -314,7 +314,7 @@ registry.example.com/team/application:v1_snapfiles
 
 The publishing process must upload every `blobs/sha256/*` object referenced by the two manifests before uploading the rootfs and snapfiles manifests under their tags. `manifest/index.json` records their filenames and digests for a publishing script.
 
-The CLI does not currently have a `push` subcommand. See [template-vm manual E2E validation](template-vm-manual-e2e.md#7-将本地产物上传到临时-registry) for complete local-registry upload commands. A production publishing process must preserve the OCI manifest and OverlayBD layer media types.
+The CLI does not currently have a `push` subcommand. See [fsb-vm manual E2E validation](fsb-vm-manual-e2e.md#7-将本地产物上传到临时-registry) for complete local-registry upload commands. A production publishing process must preserve the OCI manifest and OverlayBD layer media types.
 
 ## 6. Prepare template.json
 
@@ -368,7 +368,7 @@ escape it in `template.json`:
 ## 7. Run a VM
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --firecracker "$FIRECRACKER" \
   --state-dir "$STATE_DIR" \
   --runtime-dir "$RUNTIME_DIR" \
@@ -379,16 +379,15 @@ sudo "$TEMPLATE_VM" \
 
 `--network` currently supports only `none`. `create`:
 
-1. pulls the rootfs and snapfiles manifests;
-2. creates and mounts the ublk devices;
-3. loads the Firecracker snapshot from snapfiles;
-4. redirects the restored rootfs drive to the new device;
-5. resumes the VM and writes `state.json`.
+1. strictly validates and atomically claims `sandbox_id`, then writes `creating` state;
+2. pulls manifests, creates rootfs/snapfiles devices, and progressively records ownership;
+3. creates `rootfs.dev` in the runtime directory and loads the snapshot with that cwd;
+4. resumes the VM and changes `state.json` to `running`.
 
-By default, it checks `/opt/template-vm/kernels/vmlinux-<version>` using `kernel_version` from template metadata. Override the path when necessary:
+By default, it checks `/opt/fsb-vm/kernels/vmlinux-<version>` using `kernel_version` from template metadata. Override the path when necessary:
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --state-dir "$STATE_DIR" \
   --runtime-dir "$RUNTIME_DIR" \
   create \
@@ -399,7 +398,7 @@ sudo "$TEMPLATE_VM" \
 For a plain HTTP registry:
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --plain-http \
   --state-dir "$STATE_DIR" \
   --runtime-dir "$RUNTIME_DIR" \
@@ -411,7 +410,7 @@ Do not reuse a `sandbox_id` that still exists locally.
 ## 8. Inspect VMs
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --state-dir "$STATE_DIR" \
   --runtime-dir "$RUNTIME_DIR" \
   list
@@ -424,12 +423,12 @@ SANDBOX_ID       STATUS   PID    ROOTFS_DEV   SNAPFILES_DEV   API_SOCKET
 application-demo running  12345  /dev/ublkb0  /dev/ublkb1     $RUNTIME_DIR/application-demo/api.sock
 ```
 
-Status is derived from whether the recorded Firecracker PID is alive. A directory whose `state.json` cannot be read is shown as `corrupt`. When using custom directories, pass the same `--state-dir` and `--runtime-dir` to `list`, `create`, and `delete`.
+Status requires the recorded Firecracker `(PID, starttime, boot_id)` identity to still match; the PID number alone is insufficient. A directory whose `state.json` cannot be read is shown as `corrupt`. When using custom directories, pass the same `--state-dir` and `--runtime-dir` to `list`, `create`, and `delete`.
 
 ## 9. Delete a VM
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --state-dir "$STATE_DIR" \
   --runtime-dir "$RUNTIME_DIR" \
   delete application-demo
@@ -442,12 +441,12 @@ Cleanup proceeds in this order:
 3. delete the rootfs and snapfiles ublk devices;
 4. remove sandbox state and runtime directories.
 
-Each step is best-effort. A failure does not prevent later cleanup steps, but the command returns a nonzero error and writes warnings to stderr. Do not delete the state directory manually: `state.json` contains the PID, mount point, and ublk device IDs required for cleanup.
+If Firecracker cannot be stopped, delete does not release devices that the VMM may still hold; other safe steps are attempted where possible. Directories are removed only after every resource is released. Any failure retains `deleting` state and the writable upper so the same delete can be retried. Device ownership is verified by the absolute config path currently reported by ublkd, never by a reusable dev_id alone. Signals use pidfd after starttime and boot_id validation.
 
 Verify cleanup with:
 
 ```bash
-sudo "$TEMPLATE_VM" \
+sudo "$FSB_VM" \
   --state-dir "$STATE_DIR" \
   --runtime-dir "$RUNTIME_DIR" \
   list
@@ -465,4 +464,4 @@ sudo curl -fsS \
 - `build` does not inherit OCI Entrypoint, Cmd, or Env; the init script defines workload startup.
 - create/delete state is local host state, not a distributed control-plane resource.
 
-For privileged E2E steps, artifact digest verification, local registry publishing, and orphan-resource troubleshooting, see [template-vm manual E2E validation](template-vm-manual-e2e.md).
+For privileged E2E steps, artifact digest verification, local registry publishing, and orphan-resource troubleshooting, see [fsb-vm manual E2E validation](fsb-vm-manual-e2e.md).

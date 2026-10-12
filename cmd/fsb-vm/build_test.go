@@ -51,6 +51,7 @@ func validBuildOptions(t *testing.T) *buildOptions {
 		vcpu:        1,
 		memoryMB:    1024,
 		diskSizeGiB: defaultBuildDiskSizeGiB,
+		initPath:    defaultInitPath,
 	}
 }
 

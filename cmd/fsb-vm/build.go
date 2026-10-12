@@ -1,8 +1,9 @@
-// Package main: the template-vm build command.
+// Package main: the fsb-vm build command.
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -146,6 +147,9 @@ func validateBuildOptions(options *buildOptions) error {
 	if _, err := kernelVersionFromPath(options.kernel, options.kernelVersion); err != nil {
 		return err
 	}
+	if err := validateInitPath(options.initPath); err != nil {
+		return err
+	}
 	if options.initScriptFile != "" {
 		if _, err := os.Stat(options.initScriptFile); err != nil {
 			return fmt.Errorf("init script %s: %w", options.initScriptFile, err)
@@ -275,24 +279,36 @@ func newBuildRootfsOps(ublkd *ublkdClient) buildRootfsOps {
 	}
 }
 
-type buildRootfsAttachment struct {
+// deviceAttachment tracks one ublk device the build attached. detach is
+// idempotent and is shared by the explicit release and the rollback step:
+// once the device is released the rollback becomes a no-op, so a dev_id that
+// ublkd may already have handed to another device is never deleted twice.
+type deviceAttachment struct {
 	devID    int
 	devPath  string
 	attached bool
+	release  func(context.Context, int) error
 }
 
-func (attachment *buildRootfsAttachment) detach(ctx context.Context, ops buildRootfsOps) error {
+// attachDevice records a freshly added device and arms its rollback.
+func attachDevice(devID int, devPath string, release func(context.Context, int) error, undo *rollback) *deviceAttachment {
+	attachment := &deviceAttachment{devID: devID, devPath: devPath, attached: true, release: release}
+	undo.push(func() { _ = attachment.detach(context.Background()) })
+	return attachment
+}
+
+func (attachment *deviceAttachment) detach(ctx context.Context) error {
 	if !attachment.attached {
 		return nil
 	}
-	if err := ops.deleteDevice(ctx, attachment.devID); err != nil {
+	if err := attachment.release(ctx, attachment.devID); err != nil {
 		return err
 	}
 	attachment.attached = false
 	return nil
 }
 
-func prepareBuildRootfs(ctx context.Context, workDir string, fetched fetchedImage, targetGiB int, undo *rollback, ops buildRootfsOps) (*buildRootfsAttachment, error) {
+func prepareBuildRootfs(ctx context.Context, workDir string, fetched fetchedImage, targetGiB int, undo *rollback, ops buildRootfsOps) (*deviceAttachment, error) {
 	targetBytes, err := diskSizeBytes(targetGiB)
 	if err != nil {
 		return nil, err
@@ -317,8 +333,7 @@ func prepareBuildRootfs(ctx context.Context, workDir string, fetched fetchedImag
 	if err != nil {
 		return nil, err
 	}
-	attachment := &buildRootfsAttachment{devID: devID, devPath: devPath, attached: true}
-	undo.push(func() { _ = attachment.detach(context.Background(), ops) })
+	attachment := attachDevice(devID, devPath, ops.deleteDevice, undo)
 
 	if err := ops.repairFilesystem(ctx, attachment.devPath); err != nil {
 		return nil, err
@@ -336,7 +351,7 @@ func prepareBuildRootfs(ctx context.Context, workDir string, fetched fetchedImag
 		}
 	}
 	if initialGiB != targetGiB {
-		if err := attachment.detach(ctx, ops); err != nil {
+		if err := attachment.detach(ctx); err != nil {
 			return nil, err
 		}
 		if err := ops.resizeUpper(ctx, configPath, targetGiB); err != nil {
@@ -428,6 +443,17 @@ func runBuild(ctx context.Context, options *buildOptions) error {
 	}
 
 	artifactName := sanitizeFileName(options.output)
+	// Builds of the same output would race on the staging and final artifact
+	// directories; a second one fails fast instead of queueing.
+	releaseOutput, err := tryLock(global.buildOutputDir, artifactName)
+	if errors.Is(err, errBusy) {
+		return fmt.Errorf("a build of %s is already in progress", options.output)
+	}
+	if err != nil {
+		return err
+	}
+	defer releaseOutput()
+
 	layout, finalLayout, err := createStagedArtifactLayout(global.buildOutputDir, artifactName)
 	if err != nil {
 		return err
@@ -437,12 +463,14 @@ func runBuild(ctx context.Context, options *buildOptions) error {
 	stagingRoot := layout.root
 	undo.push(func() { _ = os.RemoveAll(stagingRoot) })
 
-	workDir := filepath.Join(global.buildWorkDir, artifactName)
-	if err := os.RemoveAll(workDir); err != nil {
-		return fmt.Errorf("clean work dir %s: %w", workDir, err)
+	// Every build gets a private scratch directory: a fixed per-output path
+	// would let one build wipe the uppers and devices of another.
+	if err := os.MkdirAll(global.buildWorkDir, 0o750); err != nil {
+		return fmt.Errorf("create build work root %s: %w", global.buildWorkDir, err)
 	}
-	if err := os.MkdirAll(workDir, 0o750); err != nil {
-		return fmt.Errorf("create work dir %s: %w", workDir, err)
+	workDir, err := os.MkdirTemp(global.buildWorkDir, artifactName+"-")
+	if err != nil {
+		return fmt.Errorf("create work dir under %s: %w", global.buildWorkDir, err)
 	}
 	undo.push(func() {
 		if !options.keepWorkDir {
@@ -515,12 +543,12 @@ func runBuild(ctx context.Context, options *buildOptions) error {
 	if err != nil {
 		return err
 	}
-	undo.push(func() { _ = ublkd.Del(context.Background(), snapDevID) })
-	if err := mkfsExt4(ctx, snapDevPath); err != nil {
+	snapfiles := attachDevice(snapDevID, snapDevPath, ublkd.Del, undo)
+	if err := mkfsExt4(ctx, snapfiles.devPath); err != nil {
 		return err
 	}
 	snapMount := filepath.Join(workDir, "mnt-snapfiles")
-	if err := mountReadWrite(snapDevPath, snapMount); err != nil {
+	if err := mountReadWrite(snapfiles.devPath, snapMount); err != nil {
 		return err
 	}
 	undo.push(func() { _ = unmount(snapMount) })
@@ -541,7 +569,7 @@ func runBuild(ctx context.Context, options *buildOptions) error {
 	if err := unmount(snapMount); err != nil {
 		return err
 	}
-	if err := ublkd.Del(ctx, snapDevID); err != nil {
+	if err := snapfiles.detach(ctx); err != nil {
 		return err
 	}
 
@@ -557,7 +585,7 @@ func runBuild(ctx context.Context, options *buildOptions) error {
 		return fmt.Errorf("install snapfiles layer: %w", err)
 	}
 
-	if err := rootfs.detach(ctx, rootfsOps); err != nil {
+	if err := rootfs.detach(ctx); err != nil {
 		return err
 	}
 	rootfsData, rootfsIndex := buildUpperPaths(workDir, "rootfs")

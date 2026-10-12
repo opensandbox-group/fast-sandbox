@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -19,8 +20,9 @@ func newListCommand() *cobra.Command {
 	}
 }
 
-// runList enumerates the state directory and reports each sandbox's recorded
-// devices plus its live/dead status derived from the firecracker pid
+// runList enumerates the state directory and reports each sandbox's phase,
+// recorded devices and liveness. A running sandbox whose recorded Firecracker
+// identity no longer matches a live process is reported as stopped
 // (ADR-009).
 func runList() error {
 	ids, err := listSandboxIDs(global.stateDir)
@@ -35,13 +37,17 @@ func runList() error {
 			fmt.Fprintf(writer, "%s\t%s\t-\t-\t-\t-\n", id, "corrupt")
 			continue
 		}
-		status := "stopped"
-		if processAlive(state.FirecrackerPID) {
-			status = "running"
+		status := string(state.Phase)
+		if state.Phase == phaseRunning && !state.Firecracker.alive() {
+			status = "stopped"
 		}
-		fmt.Fprintf(writer, "%s\t%s\t%d\t%s\t%s\t%s\n",
-			state.SandboxID, status, state.FirecrackerPID,
-			state.RootfsDevPath, state.SnapfilesDevPath, state.APISocket)
+		pid := "-"
+		if state.Firecracker != nil {
+			pid = strconv.Itoa(state.Firecracker.PID)
+		}
+		fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			state.SandboxID, status, pid,
+			state.Rootfs.path(), state.Snapfiles.path(), state.APISocket)
 	}
 	return writer.Flush()
 }

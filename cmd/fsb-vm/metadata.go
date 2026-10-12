@@ -13,9 +13,9 @@ import (
 )
 
 // vmMetadata is the authoritative VM specification read from the snapfiles
-// device (/metadata.json). Flags may override the machine sizing fields;
-// hypervisor_type / cpu_arch / firecracker_version drive pre-flight
-// validation (ADR-007).
+// device (/metadata.json). The machine sizing is fixed by the snapshot and
+// only reported; hypervisor_type / cpu_arch / firecracker_version drive
+// pre-flight validation (ADR-007).
 type vmMetadata struct {
 	VCPUCount          int             `json:"vcpu_count"`
 	MemoryMB           int             `json:"memory_mb"`
@@ -31,6 +31,9 @@ type vmMetadata struct {
 	EnvdVersion        string          `json:"envd_version"`
 	DefaultUser        string          `json:"default_user"`
 	DefaultWorkdir     string          `json:"default_workdir"`
+	// RootfsDrivePath is the path_on_host the rootfs drive was attached with
+	// at build time and is therefore recorded in the vmstate.
+	RootfsDrivePath string `json:"rootfs_drive_path"`
 }
 
 // metadataNetwork mirrors the network object; host_dev_name (cnid-*) belongs
@@ -55,36 +58,17 @@ func loadMetadata(path string) (vmMetadata, error) {
 	return metadata, nil
 }
 
-// specOverrides carries the create-flag machine overrides. A zero value means
-// "keep the metadata value".
-type specOverrides struct {
-	vcpu     int
-	memoryMB int
-}
-
-// resolvedSpec is the effective machine spec after applying overrides.
-type resolvedSpec struct {
-	vcpu     int
-	memoryMB int
-}
-
-// resolveSpec applies the flag overrides on top of the authoritative
-// metadata values.
-func (m vmMetadata) resolveSpec(overrides specOverrides) resolvedSpec {
-	spec := resolvedSpec{vcpu: m.VCPUCount, memoryMB: m.MemoryMB}
-	if overrides.vcpu > 0 {
-		spec.vcpu = overrides.vcpu
-	}
-	if overrides.memoryMB > 0 {
-		spec.memoryMB = overrides.memoryMB
-	}
-	return spec
-}
-
 // validate performs the pre-flight checks of ADR-007. firecrackerBin is the
 // resolved binary; force downgrades the firecracker version mismatch from an
-// error to a warning.
+// error to a warning. The rootfs drive path check is never downgraded: a
+// template whose vmstate pins a host device path cannot restore elsewhere.
 func (m vmMetadata) validate(firecrackerBin string, force bool) error {
+	if m.RootfsDrivePath != rootfsDriveLink {
+		if m.RootfsDrivePath == "" {
+			return fmt.Errorf("template metadata has no rootfs_drive_path: it predates host-independent drive paths; rebuild the template")
+		}
+		return fmt.Errorf("unsupported rootfs_drive_path %q (want %q); rebuild the template", m.RootfsDrivePath, rootfsDriveLink)
+	}
 	if hv := strings.TrimSpace(m.HypervisorType); hv != "" && hv != hypervisorFirecracker {
 		return fmt.Errorf("unsupported hypervisor_type %q: only %q is implemented", hv, hypervisorFirecracker)
 	}
@@ -199,6 +183,7 @@ func buildSnapfilesMetadata(options *buildOptions, sourceRef string, createdAt t
 			CPUArch:            hostCPUArch(),
 			CreatedAt:          createdAt.UTC().Format(time.RFC3339),
 			DefaultWorkdir:     "/data",
+			RootfsDrivePath:    rootfsDriveLink,
 		},
 		SchemaVersion: metadataSchemaVersion,
 		SourceImage:   sourceRef,

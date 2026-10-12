@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 )
 
@@ -52,13 +53,6 @@ type snapshotLoadRequest struct {
 	ResumeVM     bool               `json:"resume_vm"`
 }
 
-// drivePatch mirrors PATCH /drives/{drive_id}: redirect a restored drive to a
-// new host backing path (the freshly attached /dev/ublkbN).
-type drivePatch struct {
-	DriveID    string `json:"drive_id"`
-	PathOnHost string `json:"path_on_host"`
-}
-
 type versionResponse struct {
 	Version string `json:"version"`
 }
@@ -78,14 +72,11 @@ func (c *firecrackerClient) version(ctx context.Context) (string, error) {
 }
 
 // loadSnapshot restores the microVM from a Full snapshot; resume_vm=false
-// leaves the VM paused for post-load drive redirection.
+// leaves the VM paused until the network is acquired. Firecracker opens every
+// disk recorded in the vmstate during this call, so the rootfs drive path
+// must already resolve (see rootfsDriveLink).
 func (c *firecrackerClient) loadSnapshot(ctx context.Context, request snapshotLoadRequest) error {
 	return c.do(ctx, http.MethodPut, "/snapshot/load", request, nil)
-}
-
-// updateDrive redirects a restored drive's backing path (PATCH /drives/{id}).
-func (c *firecrackerClient) updateDrive(ctx context.Context, driveID, pathOnHost string) error {
-	return c.do(ctx, http.MethodPatch, "/drives/"+driveID, drivePatch{DriveID: driveID, PathOnHost: pathOnHost}, nil)
 }
 
 // resume moves the restored (paused) VM to Running (PATCH /vm).
@@ -218,32 +209,66 @@ func (c *firecrackerClient) do(ctx context.Context, method, path string, input, 
 // firecrackerIDLimit matches Firecracker's --id length ceiling.
 const firecrackerIDLimit = 32
 
+// defaultRootfsDriveID is the drive_id the rootfs device is registered under
+// when the template is built; it is baked into the snapshot vmstate.
+const defaultRootfsDriveID = "rootfs"
+
+// rootfsDriveLink is the relative path_on_host of the rootfs drive. The build
+// attaches the drive through this name, so the vmstate records it instead of
+// the build host's /dev/ublkbN. Firecracker resolves it against its working
+// directory, where a symlink of this name points at the device attached on
+// the current host; the same snapshot therefore restores whatever dev_id
+// ublkd hands out (the convention of internal/runtime/firecracker restore).
+const rootfsDriveLink = "rootfs.dev"
+
+// linkRootfsDrive (re)creates <dir>/rootfs.dev pointing at devPath.
+func linkRootfsDrive(dir, devPath string) (string, error) {
+	link := filepath.Join(dir, rootfsDriveLink)
+	if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("remove stale rootfs drive link %s: %w", link, err)
+	}
+	if err := os.Symlink(devPath, link); err != nil {
+		return "", fmt.Errorf("link rootfs drive %s -> %s: %w", link, devPath, err)
+	}
+	return link, nil
+}
+
 // launchFirecracker starts the firecracker binary detached from the CLI
-// process, writing stdout/stderr to logPath. The VM deliberately outlives the
-// command context; only an explicit kill (via delete) terminates it.
-func launchFirecracker(bin, apiSocket, sandboxID, logPath string) (int, error) {
+// process with workDir as its working directory (relative drive paths resolve
+// there), writing stdout/stderr to logPath. The VM deliberately outlives the
+// command context; only an explicit terminate (via delete) stops it. The
+// returned record identifies the process for later signalling.
+func launchFirecracker(bin, workDir, apiSocket, vmID, logPath string) (processRecord, error) {
 	// A stale socket from a crashed run blocks the new bind.
 	_ = os.Remove(apiSocket)
-	id := sandboxID
+	id := vmID
 	if len(id) > firecrackerIDLimit {
 		id = id[:firecrackerIDLimit]
 	}
 	command := exec.Command(bin, "--id", id, "--api-sock", apiSocket)
+	command.Dir = workDir
 	if logPath != "" {
 		logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
 		if err != nil {
-			return 0, fmt.Errorf("open firecracker log %s: %w", logPath, err)
+			return processRecord{}, fmt.Errorf("open firecracker log %s: %w", logPath, err)
 		}
 		defer logFile.Close()
 		command.Stdout = logFile
 		command.Stderr = logFile
 	}
 	if err := command.Start(); err != nil {
-		return 0, fmt.Errorf("start firecracker: %w", err)
+		return processRecord{}, fmt.Errorf("start firecracker: %w", err)
+	}
+	// Capture the identity while the child cannot have been reaped yet: Wait
+	// has not run, so the PID still names this process (alive or zombie).
+	record, err := recordProcess(command.Process.Pid)
+	if err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		return processRecord{}, err
 	}
 	// Reap the child asynchronously so it does not linger as a zombie after
-	// the short-lived CLI exits; the PID is persisted for later signalling.
-	pid := command.Process.Pid
+	// the short-lived CLI exits.
 	go func() { _ = command.Wait() }()
-	return pid, nil
+	return record, nil
 }

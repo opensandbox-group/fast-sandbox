@@ -1,4 +1,4 @@
-// Command template-vm restores a running Firecracker microVM on the local
+// Command fsb-vm restores a running Firecracker microVM on the local
 // host from a template stored in a remote OCI registry.
 //
 // A template is a pair of overlaybd images
@@ -10,7 +10,7 @@
 //
 // It is a single-host data-plane tool: it bypasses every fast-sandbox
 // control plane (no fastpath/CRD/reconciler) and does not reuse the fastpath
-// gRPC stack. See docs/design/adr-template-vm-cli.en.md.
+// gRPC stack. See docs/design/adr-fsb-vm-cli.en.md.
 //
 // The implementation is organized per concern, mirroring the ADR:
 //

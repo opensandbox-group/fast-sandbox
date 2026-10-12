@@ -13,16 +13,16 @@ import (
 const (
 	defaultUblkdSocket     = "/var/run/overlaybd-ublk/ublkd.sock"
 	defaultCredFile        = "/opt/overlaybd/cred.json"
-	defaultKernelDir       = "/opt/template-vm/kernels"
-	defaultStateDir        = "/var/lib/template-vm/sandboxes"
-	defaultRuntimeDir      = "/run/template-vm/sandboxes"
+	defaultKernelDir       = "/opt/fsb-vm/kernels"
+	defaultStateDir        = "/var/lib/fsb-vm/sandboxes"
+	defaultRuntimeDir      = "/run/fsb-vm/sandboxes"
 	defaultFirecrackerBin  = "firecracker"
 	defaultOverlaybdCreate = "/opt/overlaybd/bin/overlaybd-create"
 	defaultOverlaybdCommit = "/opt/overlaybd/bin/overlaybd-commit"
 	defaultOverlaybdResize = "/opt/overlaybd/bin/overlaybd-resize"
 	defaultConvertor       = "/opt/overlaybd/snapshotter/convertor"
-	defaultBuildWorkDir    = "/var/lib/template-vm/builds"
-	defaultBuildOutputDir  = "/var/lib/template-vm/artifacts"
+	defaultBuildWorkDir    = "/var/lib/fsb-vm/builds"
+	defaultBuildOutputDir  = "/var/lib/fsb-vm/artifacts"
 )
 
 // config holds the resolved global options shared by every subcommand. It is
@@ -60,13 +60,32 @@ func (c *config) sandboxRuntime(id string) string {
 }
 
 var rootCmd = &cobra.Command{
-	Use:   "template-vm",
+	Use:   "fsb-vm",
 	Short: "Restore a Firecracker microVM from a remote overlaybd template",
-	Long: `template-vm restores a running microVM on the local host from a template
+	Long: `fsb-vm restores a running microVM on the local host from a template
 stored in a remote OCI registry (a pair of overlaybd images). It bypasses
 every control plane and drives overlaybd-ublkd and Firecracker directly.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
+	PersistentPreRunE: func(_ *cobra.Command, _ []string) error {
+		return global.absolutize()
+	},
+}
+
+// absolutize resolves the directory roots against the working directory.
+// Every derived path must be absolute and stable across invocations: ublkd
+// reports the config path given to /v1/add verbatim and teardown matches
+// devices on it, Firecracker is launched in another working directory, and a
+// lost Firecracker is found by its exact --api-sock argument.
+func (c *config) absolutize() error {
+	for _, path := range []*string{&c.credFile, &c.kernelDir, &c.stateDir, &c.runtimeDir, &c.buildWorkDir, &c.buildOutputDir} {
+		absolute, err := filepath.Abs(*path)
+		if err != nil {
+			return fmt.Errorf("resolve %s: %w", *path, err)
+		}
+		*path = absolute
+	}
+	return nil
 }
 
 // Execute runs the root command and maps errors to a non-zero exit code.

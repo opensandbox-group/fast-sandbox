@@ -43,7 +43,7 @@ func buildConvertorArgs(source resolvedBuildSource, outputDir string, targetGiB 
 	args := []string{
 		"--repository", source.Ref.Registry + "/" + source.Ref.Repository,
 		"--input-digest", source.ManifestDesc.Digest.String(),
-		"--overlaybd", "template-vm-local",
+		"--overlaybd", "fsb-vm-local",
 		"--oci",
 		"--mkfs=true",
 		"--vsize", strconv.Itoa(targetGiB),

@@ -26,7 +26,7 @@ ACCELERATED_CONTAINER_IMAGE_DIR ?= $(abspath $(CURDIR)/../accelerated-container-
 
 BIN_DIR := $(CURDIR)/bin
 LINUX_BIN_DIR := $(CURDIR)/.build/linux-amd64
-ALL_BINARIES := controller fastlet sandbox-init sandbox-action-fixture fastlet-proxy sandbox-proxy janitor fastctl firecracker-runtime template-vm
+ALL_BINARIES := controller fastlet sandbox-init sandbox-action-fixture fastlet-proxy sandbox-proxy janitor fastctl firecracker-runtime fsb-vm
 CORE_IMAGES := controller fastlet fastlet-proxy sandbox-proxy janitor
 ALL_IMAGES := $(CORE_IMAGES) sandbox-action-fixture firecracker-runtime
 UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./test/e2e/env/... ./test/e2e/support/... ./test/performance/...
@@ -56,7 +56,7 @@ GOLANGCI_LINT_VERSION := v2.13.2
 GOLANGCI_LINT := $(TOOLS_BIN)/golangci-lint
 
 .PHONY: help build images generate verify test e2e env quickstart quickstart-forward tidy lint
-.PHONY: template-vm template-vm-convertor _network-test
+.PHONY: fsb-vm fsb-vm-convertor _network-test
 
 help:
 	@echo "Fast Sandbox developer interface"
@@ -64,10 +64,10 @@ help:
 	@echo "  make build [COMPONENT=all] [DEBUG=0|1]"
 	@echo "      Build host binaries. COMPONENT may be any cmd/ directory name."
 	@echo ""
-	@echo "  make template-vm"
-	@echo "      Build the template-vm host binary."
+	@echo "  make fsb-vm"
+	@echo "      Build the fsb-vm host binary."
 	@echo ""
-	@echo "  make template-vm-convertor [ACCELERATED_CONTAINER_IMAGE_DIR=...]"
+	@echo "  make fsb-vm-convertor [ACCELERATED_CONTAINER_IMAGE_DIR=...]"
 	@echo "      Build the userspace OverlayBD convertor prerequisite."
 	@echo ""
 	@echo "  make images [COMPONENT=all|core|<image>]"
@@ -113,10 +113,10 @@ build:
 		$(GO) build $(GO_BUILD_FLAGS) -o "$(BIN_DIR)/$$component" "./cmd/$$component" || exit $$?; \
 	done
 
-template-vm:
-	@$(MAKE) build COMPONENT=template-vm
+fsb-vm:
+	@$(MAKE) build COMPONENT=fsb-vm
 
-template-vm-convertor:
+fsb-vm-convertor:
 	@test -f "$(ACCELERATED_CONTAINER_IMAGE_DIR)/Makefile" || { \
 		echo "accelerated-container-image checkout not found at $(ACCELERATED_CONTAINER_IMAGE_DIR)" >&2; \
 		exit 2; \

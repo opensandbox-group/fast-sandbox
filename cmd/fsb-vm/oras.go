@@ -21,7 +21,7 @@ import (
 	"oras.land/oras-go/v2/registry/remote/retry"
 )
 
-// This file is the ORAS-based registry access layer of template-vm
+// This file is the ORAS-based registry access layer of fsb-vm
 // (ADR-003): the create flow resolves manifests only (lowers stay remote and
 // overlaybd range-reads them), while the build flow additionally downloads
 // the source manifest and every layer blob into the local artifact layout so

@@ -1,12 +1,12 @@
-# Glossary: template-vm CLI
+# Glossary: fsb-vm CLI
 
 > 文档类型：术语表
 >
 > 日期：2026-09-10
 >
-> 配套 ADR：[adr-template-vm-cli.md](./adr-template-vm-cli.md)
+> 配套 ADR：[adr-fsb-vm-cli.md](./adr-fsb-vm-cli.md)
 
-本术语表统一「从远程 template 创建 VM」的 CLI 工具（下称 **template-vm**）涉及的
+本术语表统一「从远程 template 创建 VM」的 CLI 工具（下称 **fsb-vm**）涉及的
 全部领域名词。
 
 ## 输入与标识
@@ -17,8 +17,8 @@
 | **Template（模板）** | 远程 OCI registry 中**一对** overlaybd 镜像的合称，由 `repo + template_id` 唯一标识。不含 K8s SandboxTemplate CRD 语义（本工具不经过任何控制面）。 |
 | **rootfs 镜像** | `${repo}:${template_id}_rootfs`。overlaybd 格式，承载 VM 系统盘全部数据，恢复时以 virtio-blk 通入 guest。 |
 | **snapfiles 镜像** | `${repo}:${template_id}_snapfiles`。overlaybd 格式，盘内为 ext4 文件系统，存放恢复 VM 必需的描述信息与内存状态（见「盘内布局约定」）。 |
-| **sandbox_id** | 用户在 template.json 中指定的本地唯一标识（如 `tianping-test`），是本地状态目录、ublk 设备归属、list/delete 的主键。 |
-| **build 命令** | `template-vm build --source <远程 OCI 或 overlaybd 镜像> --output <name:tag>`：Native OverlayBD 源直接构建；普通 OCI 源先经用户态 convertor 本地转换，再生成模板对（ADR-011）。 |
+| **sandbox_id** | 用户在 template.json 中指定的本地唯一标识（如 `tianping-test`），必须是 1–64 字符的安全单目录名。它是状态目录、设备归属和 list/delete 的主键；同 ID 的 create/delete 由非阻塞 flock 串行化，并由 `Mkdir` 原子占用。 |
+| **build 命令** | `fsb-vm build --source <远程 OCI 或 overlaybd 镜像> --output <name:tag>`：Native OverlayBD 源直接构建；普通 OCI 源先经用户态 convertor 本地转换，再生成模板对（ADR-011）。 |
 | **--output（逻辑名）** | build 的本地逻辑输出名（如 `code-interpreter:v1.0.0`），不含 registry 部分；派生 `<tag>_rootfs` / `<tag>_snapfiles` 两个镜像名，与 template.json 的命名契约一致。 |
 | **--disk-size-gb** | build 的 rootfs 目标容量，单位为整数 GiB，默认 20；可指定其他正整数，并作为普通 OCI 转换的 `--vsize`。构建后 metadata 仍按既有 schema 写 `disk_size_mb = disk_size_gb × 1024`。 |
 | **--username** | build 的 registry 直接凭证，格式 `username:password`，与 `--auth-file` 互斥。普通 OCI 转换时原样传给外部 convertor；密码可包含 `:`。 |
@@ -46,22 +46,25 @@
 |------|------|
 | **vmstate.bin** | VMM 私有序列化的虚拟机状态（vCPU 寄存器、设备状态、VM 配置）。版本敏感：恢复侧 VMM 版本必须与拍摄侧兼容。 |
 | **memfile** | guest 物理内存的**裸文件**（非 LSMT 层）。恢复时 VMM 直接 `mmap` 它；按需加载发生在块层：page fault → ext4 → ublk → overlaybd 远端 range read。 |
-| **metadata.json** | snapfiles 盘内的 VM 规格**权威**来源。字段含 `vcpu_count / memory_mb / disk_size_mb / firecracker_version / kernel_version / hypervisor_type / network{host_dev_name, mac} / cpu_arch / cpu_model / envd_version / default_user / default_workdir / created_at` 等。CLI flag 可覆盖其中规格类字段。 |
+| **metadata.json** | snapfiles 盘内的 VM 规格**权威**来源。字段含 `vcpu_count / memory_mb / disk_size_mb / firecracker_version / kernel_version / hypervisor_type / rootfs_drive_path / network{...}` 等。create 不允许覆盖 vCPU 或内存；`rootfs_drive_path` 必须为 `rootfs.dev`。 |
 | **hypervisor_type** | metadata.json 字段，决定恢复路径分派。当前仅实现 `firecracker`；`dragonball` 等其他值报 `Unsupported`（预留 VMM 抽象）。 |
 | **envd** | guest 内 agent（OpenSandbox 运行时），metadata.json 记录其版本；本期 CLI 不依赖 exec 通道，字段仅作记录与兼容校验参考。 |
-| **init 脚本注入** | build 冷启动前向可写 rootfs 写入的启动脚本（默认 guest 路径 `/template-vm-init`，0755），随 rootfs commit 层密封；内置 redis 样例脚本，`--init-script-file` 覆盖。 |
+| **init 脚本注入** | build 冷启动前向可写 rootfs 写入的启动脚本（默认 guest 路径 `/fsb-vm-init`，0755）。路径必须是 clean 绝对 guest 路径；写入经 `os.Root` 约束且替换最终符号链接，防止不可信镜像把写操作重定向到宿主机或其他 guest 文件。 |
 | **ready pattern** | build 判定 guest workload 就绪的串口日志特征串（默认 `Ready to accept connections`，超时输出串口尾部）。进程启动不等于就绪，以该 pattern 为准。 |
+| **rootfs.dev** | build 与 create 各自在 Firecracker cwd 内建立的相对设备链接，指向本次分配的 `/dev/ublkbN`。vmstate 仅记录 `rootfs.dev`，因此不绑定宿主 dev_id，snapshot load 后无需 PATCH drive。 |
+| **进程身份** | `(pid, /proc/<pid>/stat starttime, boot_id)` 三元组。信号通过 pidfd 发送，避免 PID 被复用后误杀无关进程。 |
+| **设备所有权** | ublkd `/v1/list` 当前返回的绝对 config 路径。dev_id 可复用，仅用于展示；delete 只删除仍归属 sandbox 确定性 config 路径的设备。 |
 
 ## 布局与运行时
 
 | 术语 | 定义 |
 |------|------|
 | **盘内布局约定** | snapfiles ublk 设备（ext4）挂载后的固定路径：`/vmstate.bin`、`/memfile`、`/metadata.json`。为既有规范，CLI 适配之。 |
-| **状态目录（home）** | `/var/lib/template-vm/sandboxes/<sandbox_id>/`：upper data/index、config.v1.json、snapfiles 挂载点、状态记录文件（pid、dev_id、挂载点）。持久，delete 时清理。 |
-| **运行目录（runtime）** | `/run/template-vm/sandboxes/<sandbox_id>/`：firecracker API socket、serial 日志。易失，宿主机重启即失效。 |
+| **状态目录（home）** | `/var/lib/fsb-vm/sandboxes/<sandbox_id>/`：upper、config、挂载点与渐进式 state.json。state 阶段为 creating/running/deleting；记录设备 config 所有权和 `(pid,starttime,boot_id)`。delete 失败时保留以便重试。 |
+| **运行目录（runtime）** | `/run/fsb-vm/sandboxes/<sandbox_id>/`：Firecracker API socket、serial 日志与 `rootfs.dev` 链接。Firecracker 以此为 cwd，使 vmstate 中的相对盘路径可移植。 |
 | **kernel 解析** | metadata.json 的 `kernel_version` → 宿主机本地 vmlinux 路径（约定目录 + flag 覆盖）。kernel 不随镜像分发。 |
-| **凭证转写** | template.json 的 `auth.dockerAuth`（docker config json 字符串）→ overlaybd 全局凭证文件（默认 `/opt/overlaybd/cred.json`，`credentialFilePath`）。CLI 负责合入，否则按需拉块返回 401。 |
+| **凭证转写** | 从 template.json 的 dockerAuth 按 ORAS 规则选出凭证，再以 OverlayBD blob URL 的规范化 host/repository 前缀为 key 写入 `/opt/overlaybd/cred.json`。key 按长度降序，适配 OverlayBD 首个匹配语义；写入使用 flock + tmp/fsync/rename。 |
 | **既有网络体系** | metadata.json `network.host_dev_name`（形如 `cnid-*`）所属的网络栈。CLI 通过 NetworkProvider 抽象对接；接口规范待网络侧提供，MVP 支持 `--network=none` 跳过。 |
 | **build 产物布局（artifact layout）** | `<output-dir>/<name>_<tag>/` 下的自包含结构：`blobs/sha256/`（源层 + 双 commit 层 + config，按 digest 寻址）与 `manifest/`（源 manifest、双镜像 manifest、index.json）。在同级临时目录完成校验后原子发布，拒绝覆盖同名已有产物；后续 ORAS push 的唯一输入（ADR-012）。 |
 | **index.json（布局索引）** | `manifest/index.json`：记录 `source_ref`、源 manifest 文件/digest、双镜像 manifest 文件/digest（schema_version=1），供发布对账。 |
-| **工作目录（work dir）** | build 的临时目录（默认 `/var/lib/template-vm/builds/<name>_<tag>/`）：upper data/index、ublk config、挂载点、快照临时文件。成功即清理（`--keep-work-dir` 保留）；失败严格逆序回滚。 |
+| **工作目录（work dir）** | build 在 `/var/lib/fsb-vm/builds/` 下通过 `MkdirTemp` 创建的独立 scratch，包含 upper、ublk config、挂载点和快照临时文件。成功即清理（`--keep-work-dir` 保留）；同 output 由非阻塞 flock 排他，冲突立即失败。 |

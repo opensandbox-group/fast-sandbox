@@ -1,0 +1,318 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/spf13/cobra"
+)
+
+// createOptions holds the create-command flags (ADR-007/009/010). The machine
+// sizing is fixed by the snapshot, so create takes no vCPU/memory flags.
+type createOptions struct {
+	templateFile string
+	kernel       string
+	network      string
+	force        bool
+}
+
+func newCreateCommand() *cobra.Command {
+	options := &createOptions{}
+	command := &cobra.Command{
+		Use:   "create -f template.json",
+		Short: "Restore and start a microVM from a remote template",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runCreate(cmd.Context(), options)
+		},
+	}
+	flags := command.Flags()
+	flags.StringVarP(&options.templateFile, "file", "f", "", "path to template.json (required)")
+	flags.StringVar(&options.kernel, "kernel", "", "override the resolved vmlinux path")
+	flags.StringVar(&options.network, "network", networkNone, "network provider (only 'none' is supported)")
+	flags.BoolVar(&options.force, "force", false, "downgrade version-compatibility errors to warnings")
+	_ = command.MarkFlagRequired("file")
+	return command
+}
+
+// rollback accumulates compensating actions executed in reverse order when
+// the build flow fails partway.
+type rollback struct {
+	steps []func()
+}
+
+func (r *rollback) push(step func()) { r.steps = append(r.steps, step) }
+
+func (r *rollback) run() {
+	for index := len(r.steps) - 1; index >= 0; index-- {
+		r.steps[index]()
+	}
+}
+
+func (r *rollback) disarm() { r.steps = nil }
+
+func runCreate(ctx context.Context, options *createOptions) error {
+	provider, err := selectNetworkProvider(options.network)
+	if err != nil {
+		return err
+	}
+	template, err := loadTemplate(options.templateFile)
+	if err != nil {
+		return err
+	}
+	dockerAuth, err := parseDockerConfig(template.Template.Auth.DockerAuth)
+	if err != nil {
+		return err
+	}
+
+	// Startup reachability check: the daemon is pre-deployed via systemd; the
+	// CLI never launches it (ADR-002).
+	ublkd := newUblkdClient(global.ublkdSocket)
+	if err := ublkd.Ping(ctx); err != nil {
+		return err
+	}
+
+	release, err := lockSandbox(template.SandboxID)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	layout := newSandboxLayout(template.SandboxID)
+	if err := claimSandbox(layout, template.SandboxID); err != nil {
+		return err
+	}
+	state := &sandboxState{
+		SandboxID:    template.SandboxID,
+		Phase:        phaseCreating,
+		RootfsRef:    template.rootfsRef(),
+		SnapfilesRef: template.snapfilesRef(),
+		Network:      provider.Name(),
+		MountPoint:   layout.mountPoint,
+		APISocket:    layout.apiSocket,
+		SerialLog:    layout.serialLog,
+		CreatedAt:    time.Now().UTC().Format(time.RFC3339),
+	}
+	// The creating record is the first durable write: from here on a crash
+	// leaves state.json behind, and delete reclaims whatever was allocated.
+	if err := writeState(layout.home, state); err != nil {
+		return errors.Join(err, removeSandboxDirs(layout))
+	}
+
+	created := false
+	defer func() {
+		if created {
+			return
+		}
+		if err := releaseSandbox(context.Background(), ublkd, layout, state); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: rollback of sandbox %s is incomplete; state kept in %s, retry with `delete %s`: %v\n",
+				template.SandboxID, layout.home, template.SandboxID, err)
+			return
+		}
+		if err := removeSandboxDirs(layout); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		}
+	}()
+	persist := func() error { return writeState(layout.home, state) }
+
+	// Step 2: resolve both manifests into ordered lower-layer lists.
+	rootfsImage, err := resolveImage(ctx, state.RootfsRef, dockerAuth)
+	if err != nil {
+		return err
+	}
+	snapfilesImage, err := resolveImage(ctx, state.SnapfilesRef, dockerAuth)
+	if err != nil {
+		return err
+	}
+
+	// Step 3: hand the credential to overlaybd's global cred.json before any
+	// device add, or overlaybd's on-demand pulls fail with 401.
+	handoff, err := overlaybdCredentials(dockerAuth, state.RootfsRef, state.SnapfilesRef)
+	if err != nil {
+		return err
+	}
+	if err := mergeCredentials(global.credFile, handoff); err != nil {
+		return err
+	}
+
+	// Step 4/5: the snapfiles device is attached and mounted first (a minor
+	// reordering of the ADR's illustrative sequence) because metadata.json —
+	// which lives on it — supplies the disk size that sets the rootfs hybrid
+	// upper's virtual size. Attaching snapfiles read-only carries no such
+	// dependency, so it is the safe first step.
+	snapfilesConfig, err := writeSnapfilesConfig(layout.home, snapfilesImage)
+	if err != nil {
+		return err
+	}
+	snapfilesDevPath, err := addSandboxDevice(ctx, ublkd, snapfilesConfig, &state.Snapfiles, persist)
+	if err != nil {
+		return err
+	}
+	if err := mountReadOnly(snapfilesDevPath, layout.mountPoint); err != nil {
+		return err
+	}
+
+	metadata, err := loadMetadata(filepath.Join(layout.mountPoint, inDiskMetadata))
+	if err != nil {
+		return err
+	}
+	if err := metadata.validate(global.firecrackerBin, options.force); err != nil {
+		return err
+	}
+	state.VCPU, state.MemoryMB = metadata.VCPUCount, metadata.MemoryMB
+
+	// rootfs device: create the hybrid writable upper sized from the
+	// authoritative disk size, then attach it.
+	rootfsConfig, err := writeRootfsConfig(ctx, layout.home, rootfsImage, metadata.DiskSizeMB)
+	if err != nil {
+		return err
+	}
+	rootfsDevPath, err := addSandboxDevice(ctx, ublkd, rootfsConfig, &state.Rootfs, persist)
+	if err != nil {
+		return err
+	}
+
+	// Step 6: resolve the kernel path (ADR-004). Firecracker snapshot restore
+	// carries the guest kernel in the memory state, but the ADR requires the
+	// host-local vmlinux to be present and version-matched.
+	if _, err := resolveKernel(global.kernelDir, metadata.KernelVersion, options.kernel); err != nil {
+		return err
+	}
+
+	// Step 7: point the snapshot's relative rootfs drive path at this host's
+	// device, launch Firecracker inside the runtime directory and resume.
+	if _, err := linkRootfsDrive(layout.runtime, rootfsDevPath); err != nil {
+		return err
+	}
+	process, err := launchFirecracker(global.firecrackerBin, layout.runtime, layout.apiSocket, template.SandboxID, layout.serialLog)
+	if err != nil {
+		return err
+	}
+	state.Firecracker = &process
+	if err := persist(); err != nil {
+		return err
+	}
+	if err := resumeVM(ctx, layout, metadata, provider); err != nil {
+		return err
+	}
+
+	// Step 8: mark the sandbox running and report.
+	state.Phase = phaseRunning
+	if err := persist(); err != nil {
+		return err
+	}
+	created = true
+	printSandbox(state)
+	return nil
+}
+
+// claimSandbox atomically takes ownership of the sandbox id: os.Mkdir fails
+// if the home already exists, so two creates can never share (and later roll
+// back) the same directories even without the operation lock.
+func claimSandbox(layout sandboxLayout, sandboxID string) error {
+	if err := os.MkdirAll(filepath.Dir(layout.home), 0o750); err != nil {
+		return fmt.Errorf("create state directory: %w", err)
+	}
+	if err := os.Mkdir(layout.home, 0o750); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("sandbox %q already exists at %s", sandboxID, layout.home)
+		}
+		return fmt.Errorf("create sandbox home %s: %w", layout.home, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(layout.runtime), 0o750); err != nil {
+		_ = os.Remove(layout.home)
+		return fmt.Errorf("create runtime directory root: %w", err)
+	}
+	if err := os.Mkdir(layout.runtime, 0o750); err != nil {
+		_ = os.Remove(layout.home)
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("sandbox %q has a leftover runtime directory %s; run `delete %s` first", sandboxID, layout.runtime, sandboxID)
+		}
+		return fmt.Errorf("create runtime directory %s: %w", layout.runtime, err)
+	}
+	return nil
+}
+
+// addSandboxDevice attaches config through ublkd, recording the device in
+// *record before the add (so a crash mid-add leaves a trace) and completing
+// the record once ublkd replies. It returns the /dev/ublkbN path.
+func addSandboxDevice(ctx context.Context, ublkd *ublkdClient, config string, record **deviceRecord, persist func() error) (string, error) {
+	*record = &deviceRecord{Config: config, DevID: -1}
+	if err := persist(); err != nil {
+		return "", err
+	}
+	devID, devPath, err := ublkd.Add(ctx, config)
+	if err != nil {
+		return "", err
+	}
+	(*record).DevID, (*record).DevPath = devID, devPath
+	return devPath, persist()
+}
+
+// resumeVM drives the Firecracker restore sequence: LoadSnapshot must be the
+// first API call (v1.16 rejects prior device/machine config) and opens the
+// rootfs drive through the relative rootfs.dev link; the network is then
+// acquired and the VM resumed (ADR create flow §7).
+func resumeVM(ctx context.Context, layout sandboxLayout, metadata vmMetadata, provider networkProvider) error {
+	client := newFirecrackerClient(layout.apiSocket)
+	defer client.close()
+
+	readyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := client.waitReady(readyCtx); err != nil {
+		return err
+	}
+
+	if err := client.loadSnapshot(ctx, snapshotLoadRequest{
+		SnapshotPath: filepath.Join(layout.mountPoint, inDiskVMState),
+		MemBackend: snapshotMemBackend{
+			BackendType: "File",
+			BackendPath: filepath.Join(layout.mountPoint, inDiskMemfile),
+		},
+		ResumeVM: false,
+	}); err != nil {
+		return fmt.Errorf("load snapshot: %w", err)
+	}
+
+	if _, cleanup, err := provider.Acquire(ctx, metadata); err != nil {
+		return fmt.Errorf("acquire network: %w", err)
+	} else {
+		// The cleanup callback is a no-op for the none provider; teardown of
+		// a real device is owned by delete once the networking integration
+		// lands (ADR-010).
+		_ = cleanup
+	}
+
+	if err := client.resume(ctx); err != nil {
+		return fmt.Errorf("resume VM: %w", err)
+	}
+	return nil
+}
+
+// resolveKernel maps metadata.kernel_version to a host-local vmlinux path
+// (ADR-004). An explicit override wins; a missing file is a hard error.
+func resolveKernel(kernelDir, kernelVersion, override string) (string, error) {
+	path := override
+	if path == "" {
+		path = filepath.Join(kernelDir, "vmlinux-"+kernelVersion)
+	}
+	if _, err := os.Stat(path); err != nil {
+		return "", fmt.Errorf("kernel %s not found (kernel_version %q): %w", path, kernelVersion, err)
+	}
+	return path, nil
+}
+
+// printSandbox reports the created sandbox on stdout.
+func printSandbox(state *sandboxState) {
+	fmt.Printf("sandbox %s created\n", state.SandboxID)
+	fmt.Printf("  firecracker pid : %d\n", state.Firecracker.PID)
+	fmt.Printf("  api socket      : %s\n", state.APISocket)
+	fmt.Printf("  rootfs device   : %s (dev_id %d)\n", state.Rootfs.DevPath, state.Rootfs.DevID)
+	fmt.Printf("  snapfiles device: %s (dev_id %d)\n", state.Snapfiles.DevPath, state.Snapfiles.DevID)
+	fmt.Printf("  vcpu / memory   : %d / %d MiB\n", state.VCPU, state.MemoryMB)
+	fmt.Printf("  network         : %s\n", state.Network)
+}

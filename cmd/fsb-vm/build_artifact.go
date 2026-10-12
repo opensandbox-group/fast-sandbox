@@ -18,7 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// This file owns the local artifact layout produced by `template-vm build`:
+// This file owns the local artifact layout produced by `fsb-vm build`:
 //
 //	<output-dir>/
 //	  blobs/sha256/<source layer digests + committed layers + config>
@@ -224,6 +224,10 @@ func writeFileAtomic(path string, payload []byte, mode os.FileMode) error {
 		return err
 	}
 	if _, err := temp.Write(payload); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
 		_ = temp.Close()
 		return err
 	}
