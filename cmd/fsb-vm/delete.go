@@ -135,7 +135,7 @@ func stopFirecracker(recorded *processRecord, apiSocket string) error {
 	target := recorded
 	if !target.alive() {
 		found, err := findProcessByArgs("--api-sock", apiSocket)
-		if err != nil {
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 		target = found

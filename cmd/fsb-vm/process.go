@@ -125,7 +125,7 @@ func findProcessByArgs(flag, value string) (*processRecord, error) {
 			}
 		}
 	}
-	return nil, nil
+	return nil, os.ErrNotExist
 }
 
 // terminateProcess stops the recorded process: SIGTERM, then SIGKILL if it

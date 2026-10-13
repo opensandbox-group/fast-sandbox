@@ -104,7 +104,7 @@ func writeConfig(path string, config OverlayBDBSConfig) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal overlaybd config: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0o640); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return "", fmt.Errorf("write overlaybd config %s: %w", path, err)
 	}
 	return path, nil

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -55,7 +54,7 @@ func repoBlobURL(ref registry.Reference, plainHTTP bool) string {
 		scheme = "http"
 	}
 	host := canonicalRegistryHost(ref.Registry)
-	return scheme + "://" + path.Join(host, "v2", ref.Repository) + "/blobs"
+	return scheme + "://" + host + "/v2/" + strings.Trim(ref.Repository, "/") + "/blobs"
 }
 
 // parseRegistryReference parses ref and canonicalizes the Docker Hub aliases.
@@ -99,7 +98,7 @@ func (e authEntry) credential() (auth.Credential, error) {
 // reports whether a non-anonymous credential was found.
 func credentialFor(config dockerConfig, ref registry.Reference) (auth.Credential, bool, error) {
 	host := canonicalRegistryHost(ref.Registry)
-	full := path.Join(host, ref.Repository)
+	full := host + "/" + strings.Trim(ref.Repository, "/")
 	best := ""
 	bestLength := 0
 	for key := range config.Auths {

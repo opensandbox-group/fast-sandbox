@@ -57,10 +57,6 @@ type versionResponse struct {
 	Version string `json:"version"`
 }
 
-type instanceInfoResponse struct {
-	State string `json:"state"`
-}
-
 // version reports the Firecracker version served on the socket; it doubles as
 // the socket-readiness probe.
 func (c *firecrackerClient) version(ctx context.Context) (string, error) {
@@ -143,15 +139,6 @@ func (c *firecrackerClient) pause(ctx context.Context) error {
 // createSnapshot captures a Full snapshot of the paused VM.
 func (c *firecrackerClient) createSnapshot(ctx context.Context, request snapshotCreateRequest) error {
 	return c.do(ctx, http.MethodPut, "/snapshot/create", request, nil)
-}
-
-// state returns the current machine state.
-func (c *firecrackerClient) state(ctx context.Context) (string, error) {
-	var response instanceInfoResponse
-	if err := c.do(ctx, http.MethodGet, "/", nil, &response); err != nil {
-		return "", err
-	}
-	return response.State, nil
 }
 
 // waitReady polls the API socket until Firecracker answers GET /version or the

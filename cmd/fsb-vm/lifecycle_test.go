@@ -120,7 +120,7 @@ func TestFindProcessByArgs(t *testing.T) {
 		t.Fatalf("found = %+v, want pid 201", found)
 	}
 	missing, err := findProcessByArgs("--api-sock", "/run/other/api.sock")
-	if err != nil || missing != nil {
+	if !errors.Is(err, os.ErrNotExist) || missing != nil {
 		t.Fatalf("unrelated socket: found %+v, %v", missing, err)
 	}
 }

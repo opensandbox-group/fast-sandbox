@@ -425,21 +425,9 @@ func runBuild(ctx context.Context, options *buildOptions) error {
 	}
 
 	ref, _ := parseRegistryReference(options.source)
-	dockerCfg := dockerConfig{Auths: map[string]authEntry{}}
-	if options.authFile != "" {
-		payload, err := os.ReadFile(options.authFile)
-		if err != nil {
-			return fmt.Errorf("read auth file %s: %w", options.authFile, err)
-		}
-		if dockerCfg, err = parseDockerConfig(string(payload)); err != nil {
-			return err
-		}
-	} else if options.username != "" {
-		entry, err := parseUsernamePassword(options.username)
-		if err != nil {
-			return err
-		}
-		dockerCfg.Auths[ref.Registry+"/"+ref.Repository] = entry
+	dockerCfg, err := buildCredentials(options, ref.Registry, ref.Repository)
+	if err != nil {
+		return err
 	}
 
 	artifactName := sanitizeFileName(options.output)
@@ -463,20 +451,10 @@ func runBuild(ctx context.Context, options *buildOptions) error {
 	stagingRoot := layout.root
 	undo.push(func() { _ = os.RemoveAll(stagingRoot) })
 
-	// Every build gets a private scratch directory: a fixed per-output path
-	// would let one build wipe the uppers and devices of another.
-	if err := os.MkdirAll(global.buildWorkDir, 0o750); err != nil {
-		return fmt.Errorf("create build work root %s: %w", global.buildWorkDir, err)
-	}
-	workDir, err := os.MkdirTemp(global.buildWorkDir, artifactName+"-")
+	workDir, err := createBuildWorkDir(artifactName, options.keepWorkDir, undo)
 	if err != nil {
-		return fmt.Errorf("create work dir under %s: %w", global.buildWorkDir, err)
+		return err
 	}
-	undo.push(func() {
-		if !options.keepWorkDir {
-			_ = os.RemoveAll(workDir)
-		}
-	})
 
 	// Step 1: resolve and classify the selected platform before downloading
 	// layers. Standard OCI layers are converted locally to native overlaybd.
@@ -531,6 +509,85 @@ func runBuild(ctx context.Context, options *buildOptions) error {
 	}
 
 	// Step 6: build the snapfiles device from a blank ublk disk.
+	if err := captureSnapfiles(ctx, ublkd, options, workDir, vmstatePath, memfilePath, undo); err != nil {
+		return err
+	}
+
+	// Step 7: seal both uppers into read-only layer blobs.
+	compress := !options.noCompress
+	snapDesc, err := sealUpper(ctx, layout, workDir, "snapfiles", compress)
+	if err != nil {
+		return err
+	}
+	if err := rootfs.detach(ctx); err != nil {
+		return err
+	}
+	rootfsDesc, err := sealUpper(ctx, layout, workDir, "rootfs", compress)
+	if err != nil {
+		return err
+	}
+
+	// Steps 8-9: write the manifests and layout index, then publish.
+	pair, err := writeTemplateManifests(layout, options.source, output, fetched, rootfsDesc, snapDesc)
+	if err != nil {
+		return err
+	}
+	if err := publishArtifactLayout(layout, finalLayout); err != nil {
+		return err
+	}
+
+	undo.disarm()
+	if !options.keepWorkDir {
+		_ = os.RemoveAll(workDir)
+	}
+	printBuildResult(finalLayout, output, pair.rootfs, pair.snapfiles)
+	return nil
+}
+
+// buildCredentials assembles the registry credentials for the build source
+// from --auth-file, or else from --username.
+func buildCredentials(options *buildOptions, registryHost, repository string) (dockerConfig, error) {
+	if options.authFile != "" {
+		payload, err := os.ReadFile(options.authFile)
+		if err != nil {
+			return dockerConfig{}, fmt.Errorf("read auth file %s: %w", options.authFile, err)
+		}
+		return parseDockerConfig(string(payload))
+	}
+	dockerCfg := dockerConfig{Auths: map[string]authEntry{}}
+	if options.username != "" {
+		entry, err := parseUsernamePassword(options.username)
+		if err != nil {
+			return dockerConfig{}, err
+		}
+		dockerCfg.Auths[registryHost+"/"+repository] = entry
+	}
+	return dockerCfg, nil
+}
+
+// createBuildWorkDir gives every build a private scratch directory: a fixed
+// per-output path would let one build wipe the uppers and devices of
+// another. Rollback removes it unless keep is set.
+func createBuildWorkDir(artifactName string, keep bool, undo *rollback) (string, error) {
+	if err := os.MkdirAll(global.buildWorkDir, 0o750); err != nil {
+		return "", fmt.Errorf("create build work root %s: %w", global.buildWorkDir, err)
+	}
+	workDir, err := os.MkdirTemp(global.buildWorkDir, artifactName+"-")
+	if err != nil {
+		return "", fmt.Errorf("create work dir under %s: %w", global.buildWorkDir, err)
+	}
+	undo.push(func() {
+		if !keep {
+			_ = os.RemoveAll(workDir)
+		}
+	})
+	return workDir, nil
+}
+
+// captureSnapfiles formats a blank ublk disk, copies the snapshot files and
+// metadata.json onto it, then unmounts and detaches it so its upper can be
+// sealed.
+func captureSnapfiles(ctx context.Context, ublkd *ublkdClient, options *buildOptions, workDir, vmstatePath, memfilePath string, undo *rollback) error {
 	sizeGiB, err := snapfilesSizeGiB(options, vmstatePath, memfilePath)
 	if err != nil {
 		return err
@@ -562,80 +619,77 @@ func runBuild(ctx context.Context, options *buildOptions) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(snapMount, inDiskMetadata), metadataPayload, 0o640); err != nil {
+	if err := os.WriteFile(filepath.Join(snapMount, inDiskMetadata), metadataPayload, 0o600); err != nil {
 		return fmt.Errorf("write metadata.json: %w", err)
 	}
 	syncFilesystems()
 	if err := unmount(snapMount); err != nil {
 		return err
 	}
-	if err := snapfiles.detach(ctx); err != nil {
-		return err
-	}
+	return snapfiles.detach(ctx)
+}
 
-	// Step 7: seal both uppers into read-only layer blobs.
-	compress := !options.noCompress
-	snapData, snapIndex := buildUpperPaths(workDir, "snapfiles")
-	snapLayerPath := filepath.Join(workDir, "snapfiles.layer")
-	if err := commitLayer(ctx, snapData, snapIndex, snapLayerPath, compress); err != nil {
-		return err
+// sealUpper commits the detached upper of stage into a read-only layer blob
+// and installs it into the artifact layout.
+func sealUpper(ctx context.Context, layout artifactLayout, workDir, stage string, compress bool) (ocispec.Descriptor, error) {
+	data, index := buildUpperPaths(workDir, stage)
+	layerPath := filepath.Join(workDir, stage+".layer")
+	if err := commitLayer(ctx, data, index, layerPath, compress); err != nil {
+		return ocispec.Descriptor{}, err
 	}
-	snapDesc, err := installCommittedLayer(layout, snapLayerPath, compress)
+	desc, err := installCommittedLayer(layout, layerPath, compress)
 	if err != nil {
-		return fmt.Errorf("install snapfiles layer: %w", err)
+		return ocispec.Descriptor{}, fmt.Errorf("install %s layer: %w", stage, err)
 	}
+	return desc, nil
+}
 
-	if err := rootfs.detach(ctx); err != nil {
-		return err
-	}
-	rootfsData, rootfsIndex := buildUpperPaths(workDir, "rootfs")
-	rootfsLayerPath := filepath.Join(workDir, "rootfs.layer")
-	if err := commitLayer(ctx, rootfsData, rootfsIndex, rootfsLayerPath, compress); err != nil {
-		return err
-	}
-	rootfsDesc, err := installCommittedLayer(layout, rootfsLayerPath, compress)
-	if err != nil {
-		return fmt.Errorf("install rootfs layer: %w", err)
-	}
+// manifestDigests are the manifest digests of a built template pair.
+type manifestDigests struct {
+	rootfs    digest.Digest
+	snapfiles digest.Digest
+}
 
-	// Step 8: config blob + the two manifests + layout index.
+// writeTemplateManifests writes the config blob and the two manifests into
+// the staging layout, validates the complete layout, and only then writes
+// its index.
+func writeTemplateManifests(layout artifactLayout, source string, output outputNames, fetched fetchedImage, rootfsDesc, snapDesc ocispec.Descriptor) (manifestDigests, error) {
 	configDesc, err := layout.installBytes(minimalImageConfig(), ocispec.MediaTypeImageConfig)
 	if err != nil {
-		return err
+		return manifestDigests{}, err
 	}
 	rootfsLayers := append(append([]ocispec.Descriptor{}, fetched.Layers...), rootfsDesc)
 	rootfsManifest, rootfsManifestDesc, err := assembleManifest(configDesc, rootfsLayers)
 	if err != nil {
-		return err
+		return manifestDigests{}, err
 	}
 	snapManifest, snapManifestDesc, err := assembleManifest(configDesc, []ocispec.Descriptor{snapDesc})
 	if err != nil {
-		return err
+		return manifestDigests{}, err
 	}
 	rootfsFile := sanitizeFileName(output.rootfsName()) + ".json"
 	snapFile := sanitizeFileName(output.snapfilesName()) + ".json"
 	if err := writeFileAtomic(layout.manifestPath(rootfsFile), rootfsManifest, 0o640); err != nil {
-		return fmt.Errorf("write %s: %w", rootfsFile, err)
+		return manifestDigests{}, fmt.Errorf("write %s: %w", rootfsFile, err)
 	}
 	if err := writeFileAtomic(layout.manifestPath(snapFile), snapManifest, 0o640); err != nil {
-		return fmt.Errorf("write %s: %w", snapFile, err)
+		return manifestDigests{}, fmt.Errorf("write %s: %w", snapFile, err)
 	}
 
-	// Step 9: validate the complete staging layout before publishing its index.
 	sourceManifest, err := os.ReadFile(fetched.ManifestPath)
 	if err != nil {
-		return fmt.Errorf("read stored source manifest: %w", err)
+		return manifestDigests{}, fmt.Errorf("read stored source manifest: %w", err)
 	}
 	if err := verifyDescriptorBytes(fetched.ManifestDesc, sourceManifest, "stored source manifest"); err != nil {
-		return err
+		return manifestDigests{}, err
 	}
 	if err := layout.validateLayout(sourceManifest, rootfsManifest, snapManifest); err != nil {
-		return err
+		return manifestDigests{}, err
 	}
 	if err := layout.writeLayoutIndex(layoutIndex{
-		SourceRef: options.source,
+		SourceRef: source,
 		SourceManifest: layoutIndexEntry{
-			Name:           options.source,
+			Name:           source,
 			ManifestFile:   filepath.Base(fetched.ManifestPath),
 			ManifestDigest: fetched.ManifestDesc.Digest.String(),
 		},
@@ -644,19 +698,9 @@ func runBuild(ctx context.Context, options *buildOptions) error {
 			{Name: output.snapfilesName(), ManifestFile: snapFile, ManifestDigest: snapManifestDesc.Digest.String()},
 		},
 	}); err != nil {
-		return err
+		return manifestDigests{}, err
 	}
-	if err := publishArtifactLayout(layout, finalLayout); err != nil {
-		return err
-	}
-	layout = finalLayout
-
-	undo.disarm()
-	if !options.keepWorkDir {
-		_ = os.RemoveAll(workDir)
-	}
-	printBuildResult(layout, output, rootfsManifestDesc.Digest, snapManifestDesc.Digest)
-	return nil
+	return manifestDigests{rootfs: rootfsManifestDesc.Digest, snapfiles: snapManifestDesc.Digest}, nil
 }
 
 // installCommittedLayer moves an overlaybd-commit output into the blob store

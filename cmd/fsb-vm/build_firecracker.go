@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -65,7 +64,7 @@ func injectInitScript(rootfsDevPath, mountPoint, initPath string, script []byte)
 // validateInitPath requires a clean absolute guest path that can be passed
 // as a single init= kernel argument.
 func validateInitPath(initPath string) error {
-	if !path.IsAbs(initPath) || path.Clean(initPath) != initPath || initPath == "/" ||
+	if !filepath.IsAbs(initPath) || filepath.Clean(initPath) != initPath || initPath == "/" ||
 		strings.ContainsAny(initPath, " \t\r\n") {
 		return fmt.Errorf("--init-path must be a clean absolute guest file path without whitespace, got %q", initPath)
 	}
@@ -88,7 +87,7 @@ func writeGuestFile(rootDir, guestPath string, payload []byte, mode os.FileMode)
 	}
 	defer root.Close()
 	name := strings.TrimPrefix(guestPath, "/")
-	if dir := path.Dir(name); dir != "." {
+	if dir := filepath.Dir(name); dir != "." {
 		if err := root.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("create guest directory %s: %w", dir, err)
 		}
