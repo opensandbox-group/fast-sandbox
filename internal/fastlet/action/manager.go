@@ -701,13 +701,27 @@ func (m *Manager) Delete(ctx context.Context, sandboxUID string) error {
 	}
 	attachment, generation := state.attachment, state.desiredGeneration
 	state.mu.Unlock()
+	// REMOVE_BINDING is sequenced best-effort: this Delete forgets the state
+	// and the terminal fence prevents any re-send, so a lost call leaves a
+	// stale subject (policy + credential vault) registered on the Handler
+	// while the slot IP may already be reused by a new sandbox. Deliberately
+	// observability-only for now (OSEP-0022): error-level logging is enough to
+	// discover the problem; a durable diagnostic trace and ack-gated slot
+	// release stay deferred until the observed failure frequency justifies
+	// designing them. The log is per-handler because errors.Join alone would
+	// hide which Handler holds the stale subject.
 	var result error
 	for index := len(order) - 1; index >= 0; index-- {
 		name := order[index]
 		handler := m.byName[name]
 		instanceID, _ := m.handlerInstance(name)
 		request := buildRequest(actionapi.OperationRemoveBinding, stableInvocationID(actionapi.OperationRemoveBinding, name, instanceID, generation, attachment, "", "terminal"), generation, attachment)
-		result = errors.Join(result, m.caller.Invoke(ctx, handler.TargetHTTPPort, request))
+		if err := m.caller.Invoke(ctx, handler.TargetHTTPPort, request); err != nil {
+			klog.ErrorS(err, "REMOVE_BINDING failed; Handler may retain a stale subject for a reused slot IP",
+				"sandboxUID", attachment.SandboxUID, "handler", name, "attachmentID", attachment.ID,
+				"instanceGeneration", attachment.InstanceGeneration, "routeGeneration", attachment.RouteGeneration)
+			result = errors.Join(result, err)
+		}
 		if ctx.Err() != nil {
 			result = errors.Join(result, ctx.Err())
 			break

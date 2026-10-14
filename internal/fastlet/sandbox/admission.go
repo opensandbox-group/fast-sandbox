@@ -13,6 +13,7 @@ import (
 	"fast-sandbox/internal/observability"
 	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	"k8s.io/klog/v2"
 )
 
 type Clock interface {
@@ -462,11 +463,19 @@ func (m *SandboxManager) DeleteSandboxContext(ctx context.Context, req *fastleta
 	m.recordDiagnosticLocked(req.Identity.SandboxUID, "info", "admission", sandboxStateTerminating, "declarative deletion accepted; new Binding and Hook work is fenced")
 	m.signalReadinessChangedLocked()
 	m.mu.Unlock()
+	// Best-effort Handler cleanup stays ahead of runtime and network teardown
+	// and cannot block deletion. Decision recorded for OSEP-0022: we ship
+	// error-level logging only — durable diagnostics and ack-gated slot
+	// release are deferred until the observed failure frequency justifies
+	// designing them. A lost REMOVE_BINDING leaves a stale subject on the
+	// Handler while its slot IP can be reused, so this log line is the
+	// operator's only signal today.
 	if metadata != nil && m.actionManager != nil {
 		deleteCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		err := m.actionManager.Delete(deleteCtx, req.Identity.SandboxUID)
 		cancel()
 		if err != nil {
+			klog.ErrorS(err, "best-effort REMOVE_BINDING before teardown failed", "sandboxUID", req.Identity.SandboxUID)
 			m.recordDiagnostic(req.Identity.SandboxUID, "error", "action", "delete-best-effort-failed", fmt.Sprintf("best-effort delete of Sandbox Action Bindings failed: %v", err))
 		}
 	}
