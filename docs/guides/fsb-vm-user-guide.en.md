@@ -314,7 +314,7 @@ registry.example.com/team/application:v1_snapfiles
 
 The publishing process must upload every `blobs/sha256/*` object referenced by the two manifests before uploading the rootfs and snapfiles manifests under their tags. `manifest/index.json` records their filenames and digests for a publishing script.
 
-The CLI does not currently have a `push` subcommand. See [fsb-vm manual E2E validation](fsb-vm-manual-e2e.md#7-将本地产物上传到临时-registry) for complete local-registry upload commands. A production publishing process must preserve the OCI manifest and OverlayBD layer media types.
+The CLI does not currently have a `push` subcommand. See the [publication contract](../design/adr-fsb-vm-cli.en.md#adr-012-build-artifact-layout-and-publish-contract-build-iteration) for artifact layout and upload ordering. A production publishing process must preserve the OCI manifest and OverlayBD layer media types.
 
 ## 6. Prepare template.json
 
@@ -464,4 +464,4 @@ sudo curl -fsS \
 - `build` does not inherit OCI Entrypoint, Cmd, or Env; the init script defines workload startup.
 - create/delete state is local host state, not a distributed control-plane resource.
 
-For privileged E2E steps, artifact digest verification, local registry publishing, and orphan-resource troubleshooting, see [fsb-vm manual E2E validation](fsb-vm-manual-e2e.md).
+For build/create sequencing and artifact ownership, see the [fsb-vm design](../design/adr-fsb-vm-cli.en.md).

@@ -314,7 +314,7 @@ registry.example.com/team/application:v1_snapfiles
 
 发布工具必须先上传这两个 manifest 引用的全部 `blobs/sha256/*`，再按对应 tag 上传 rootfs 和 snapfiles manifest。`manifest/index.json` 记录了 manifest 文件名和 digest，可供发布脚本读取。
 
-当前 CLI 尚未提供 `push` 子命令。完整的本地 registry 上传命令参见 [fsb-vm 手工 E2E 验证](fsb-vm-manual-e2e.md#7-将本地产物上传到临时-registry)。生产环境应使用能够保留 OCI manifest 和 OverlayBD layer media type 的发布流程。
+当前 CLI 尚未提供 `push` 子命令。产物布局与上传顺序参见 [发布契约](../design/adr-fsb-vm-cli.md#adr-012-build-本地产物布局与发布契约build-迭代补充)。生产环境应使用能够保留 OCI manifest 和 OverlayBD layer media type 的发布流程。
 
 ## 6. 准备 template.json
 
@@ -464,4 +464,4 @@ sudo curl -fsS \
 - `build` 不继承 OCI Entrypoint、Cmd 或 Env，工作负载启动必须由 init 脚本定义。
 - create/delete 状态是本机状态，不是分布式控制面资源。
 
-需要完整的 privileged E2E、artifact digest 校验、临时 registry 发布和残留资源排查时，参见 [fsb-vm 手工 E2E 验证](fsb-vm-manual-e2e.md)。
+构建、创建步骤和产物所有权说明见 [fsb-vm 设计](../design/adr-fsb-vm-cli.md)。
