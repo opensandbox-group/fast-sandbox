@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -370,7 +371,9 @@ func TestDeviceAttachmentReleasesOnce(t *testing.T) {
 	}
 	// A later failure runs the rollback; dev_id 5 may already belong to
 	// another device by then.
-	undo.run()
+	if err := undo.run(); err != nil {
+		t.Fatal(err)
+	}
 	if fmt.Sprint(released) != "[5]" {
 		t.Fatalf("released = %v, want exactly one release", released)
 	}
@@ -511,6 +514,58 @@ func TestWriteGuestFileStaysInsideRoot(t *testing.T) {
 	if err := writeGuestFile(guest, "/opt/fsb/init", []byte("x"), 0o755); err != nil {
 		t.Fatalf("nested path: %v", err)
 	}
+}
+
+func TestWriteGuestFileReplacesSpecialFiles(t *testing.T) {
+	guest := t.TempDir()
+	assertFreshScript := func(t *testing.T, name string) {
+		t.Helper()
+		if err := writeGuestFile(guest, "/"+name, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatalf("writeGuestFile: %v", err)
+		}
+		info, err := os.Lstat(filepath.Join(guest, name))
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o755 {
+			t.Fatalf("guest %s = %v, %v; want regular 0755 file", name, info, err)
+		}
+		if payload, _ := os.ReadFile(filepath.Join(guest, name)); string(payload) != "#!/bin/sh\n" {
+			t.Fatalf("guest %s payload = %q", name, payload)
+		}
+	}
+
+	// A FIFO would block the open (or route the write to a reader); it is
+	// unlinked and replaced by a regular file. Device nodes take the same
+	// path but need CAP_MKNOD to set up.
+	t.Run("fifo", func(t *testing.T) {
+		if err := syscall.Mkfifo(filepath.Join(guest, "fifo-init"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		assertFreshScript(t, "fifo-init")
+	})
+
+	// A hard link shares its inode with another guest file, which must keep
+	// its content.
+	t.Run("hard link", func(t *testing.T) {
+		shared := filepath.Join(guest, "shared")
+		if err := os.WriteFile(shared, []byte("shared"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(shared, filepath.Join(guest, "link-init")); err != nil {
+			t.Fatal(err)
+		}
+		assertFreshScript(t, "link-init")
+		if payload, _ := os.ReadFile(shared); string(payload) != "shared" {
+			t.Fatalf("hard-linked file overwritten: %q", payload)
+		}
+	})
+
+	t.Run("directory", func(t *testing.T) {
+		if err := os.Mkdir(filepath.Join(guest, "dir-init"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeGuestFile(guest, "/dir-init", []byte("x"), 0o755); err == nil || !strings.Contains(err.Error(), "directory") {
+			t.Fatalf("directory target error = %v", err)
+		}
+	})
 }
 
 func TestMetadataRequiresRelativeRootfsDrive(t *testing.T) {

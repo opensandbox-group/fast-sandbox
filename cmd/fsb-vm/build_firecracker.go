@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -45,12 +46,13 @@ exec /usr/local/bin/redis-server --protected-mode no
 
 // injectInitScript mounts the writable rootfs device, writes initPath (an
 // absolute guest path) with mode 0755, syncs and unmounts. The script
-// becomes part of the committed rootfs upper layer.
-func injectInitScript(rootfsDevPath, mountPoint, initPath string, script []byte) error {
+// becomes part of the committed rootfs upper layer. The mount joins the
+// rollback so the device is never detached while still mounted.
+func injectInitScript(rootfsDevPath, mountPoint, initPath string, script []byte, undo *rollback) error {
 	if err := mountReadWrite(rootfsDevPath, mountPoint); err != nil {
 		return err
 	}
-	defer func() { _ = unmount(mountPoint) }()
+	undo.push("mount "+mountPoint, func() error { return unmount(mountPoint) })
 	if err := writeGuestFile(mountPoint, initPath, script, 0o755); err != nil {
 		return err
 	}
@@ -74,9 +76,11 @@ func validateInitPath(initPath string) error {
 // writeGuestFile writes payload to guestPath inside the mounted guest
 // filesystem at rootDir. The image is untrusted: every lookup goes through
 // os.Root, so a symlink in the image (e.g. /init -> /host/etc/passwd or an
-// absolute link) can never redirect the write onto the host. A symlink in
-// the final component is replaced instead of followed, so the script never
-// overwrites another guest file either.
+// absolute link) can never redirect the write onto the host. Whatever the
+// image left at the final component (a symlink, a device node or FIFO that
+// would route the write to host I/O, a hard link shared with another guest
+// file) is unlinked and a fresh regular file is created with O_EXCL, so the
+// script is only ever written into a new inode of the guest filesystem.
 func writeGuestFile(rootDir, guestPath string, payload []byte, mode os.FileMode) error {
 	if err := validateInitPath(guestPath); err != nil {
 		return err
@@ -92,15 +96,28 @@ func writeGuestFile(rootDir, guestPath string, payload []byte, mode os.FileMode)
 			return fmt.Errorf("create guest directory %s: %w", dir, err)
 		}
 	}
-	if info, err := root.Lstat(name); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		if err := root.Remove(name); err != nil {
-			return fmt.Errorf("replace guest symlink %s: %w", guestPath, err)
+	if info, err := root.Lstat(name); err == nil {
+		if info.IsDir() {
+			return fmt.Errorf("guest path %s is a directory", guestPath)
 		}
+		if err := root.Remove(name); err != nil {
+			return fmt.Errorf("replace guest %s %s: %w", info.Mode().Type(), guestPath, err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect guest file %s: %w", guestPath, err)
 	}
-	if err := root.WriteFile(name, payload, mode); err != nil {
+	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+	if err != nil {
+		return fmt.Errorf("create guest file %s: %w", guestPath, err)
+	}
+	if _, err := file.Write(payload); err != nil {
+		_ = file.Close()
 		return fmt.Errorf("write guest file %s: %w", guestPath, err)
 	}
-	// WriteFile keeps the mode of an existing file and applies the umask.
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close guest file %s: %w", guestPath, err)
+	}
+	// The create mode is filtered by the umask.
 	if err := root.Chmod(name, mode); err != nil {
 		return fmt.Errorf("chmod guest file %s: %w", guestPath, err)
 	}
@@ -112,8 +129,10 @@ func writeGuestFile(rootDir, guestPath string, payload []byte, mode os.FileMode)
 // snapshot into snapDir. The drive is attached through the relative
 // rootfs.dev link inside the Firecracker working directory, so the vmstate
 // records no host device path. The Firecracker process is always stopped
-// before returning; the produced file paths are returned.
-func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, rootfsDevPath string) (vmstatePath, memfilePath string, err error) {
+// before returning; it also joins the rollback, so a VMM that could not be
+// stopped keeps the rootfs device it holds attached. The produced file
+// paths are returned.
+func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, rootfsDevPath string, undo *rollback) (vmstatePath, memfilePath string, err error) {
 	runtimeDir := filepath.Join(workDir, "fc")
 	if err := os.MkdirAll(runtimeDir, 0o750); err != nil {
 		return "", "", fmt.Errorf("create firecracker runtime dir: %w", err)
@@ -134,6 +153,9 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 		return "", "", err
 	}
 	// The build VM never outlives this function, success or failure.
+	undo.push(fmt.Sprintf("build VM (pid %d)", process.PID), func() error {
+		return terminateProcess(process, firecrackerStopGrace)
+	})
 	defer func() {
 		if stopErr := terminateProcess(process, firecrackerStopGrace); stopErr != nil && err == nil {
 			err = fmt.Errorf("stop build VM: %w", stopErr)

@@ -24,12 +24,14 @@ func mountReadWrite(device, mountPoint string) error {
 	return mountExt4(device, mountPoint, "rw")
 }
 
-// mountExt4 mounts device at mountPoint with the given ext4 mount mode.
+// mountExt4 mounts device at mountPoint with the given ext4 mount mode. The
+// filesystems come from untrusted images, so device nodes and setuid bits on
+// them are never honoured on the host.
 func mountExt4(device, mountPoint, mode string) error {
 	if err := os.MkdirAll(mountPoint, 0o750); err != nil {
 		return fmt.Errorf("create mount point %s: %w", mountPoint, err)
 	}
-	command := exec.Command("mount", "-t", "ext4", "-o", mode, device, mountPoint)
+	command := exec.Command("mount", "-t", "ext4", "-o", mode+",nodev,nosuid", device, mountPoint)
 	if output, err := command.CombinedOutput(); err != nil {
 		return fmt.Errorf("mount %s at %s: %w: %s", device, mountPoint, err, output)
 	}

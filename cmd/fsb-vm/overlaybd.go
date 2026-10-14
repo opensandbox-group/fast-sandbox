@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -137,8 +136,9 @@ func gibCeil(sizeMB int) int {
 // probeSourceVirtualSize attaches the downloaded source lowers read-only via
 // ublkd (no upper) and reads the resulting device size: the device presents
 // the source stack's virtual size, which the rootfs upper must match. The
-// probe device is always detached before returning.
-func probeSourceVirtualSize(ctx context.Context, ublkd *ublkdClient, workDir string, fetched fetchedImage) (size int64, retErr error) {
+// probe device is detached once measured; on failure the build rollback
+// detaches it.
+func probeSourceVirtualSize(ctx context.Context, ublkd *ublkdClient, workDir string, fetched fetchedImage, undo *rollback) (int64, error) {
 	config := OverlayBDBSConfig{
 		Lowers:     localLowers(fetched),
 		ResultFile: filepath.Join(workDir, "probe."+overlaybdResultName),
@@ -151,17 +151,18 @@ func probeSourceVirtualSize(ctx context.Context, ublkd *ublkdClient, workDir str
 	if err != nil {
 		return 0, err
 	}
-	defer func() {
-		if err := ublkd.Del(context.Background(), devID); err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("detach probe device %d: %w", devID, err))
-		}
-	}()
-	size, err = blockDeviceSize(devPath)
+	// The probe device reads the local lower blobs: it joins the rollback so
+	// a failed detach keeps them, and is released here once measured.
+	probe := attachDevice(devID, devPath, ublkd.Del, undo)
+	size, err := blockDeviceSize(devPath)
 	if err != nil {
 		return 0, err
 	}
 	if size <= 0 {
 		return 0, fmt.Errorf("probe device %s reports non-positive size %d", devPath, size)
+	}
+	if err := probe.detach(ctx); err != nil {
+		return 0, fmt.Errorf("detach probe device %d: %w", devID, err)
 	}
 	return size, nil
 }

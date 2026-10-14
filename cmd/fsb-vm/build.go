@@ -118,6 +118,13 @@ func validateBuildOptions(options *buildOptions) error {
 	if strings.TrimSpace(options.kernel) == "" {
 		return fmt.Errorf("--kernel is required")
 	}
+	// Firecracker runs in its own working directory, so a relative kernel
+	// path must be pinned to the CLI's cwd before it is sent to the VMM.
+	kernel, err := filepath.Abs(options.kernel)
+	if err != nil {
+		return fmt.Errorf("resolve kernel %s: %w", options.kernel, err)
+	}
+	options.kernel = kernel
 	if _, err := os.Stat(options.kernel); err != nil {
 		return fmt.Errorf("kernel %s: %w", options.kernel, err)
 	}
@@ -250,7 +257,7 @@ func copyFile(src, dst string, mode os.FileMode) error {
 }
 
 type buildRootfsOps struct {
-	probeSourceSize  func(context.Context, string, fetchedImage) (int64, error)
+	probeSourceSize  func(context.Context, string, fetchedImage, *rollback) (int64, error)
 	writeConfig      func(context.Context, string, fetchedImage, int) (string, error)
 	addDevice        func(context.Context, string) (int, string, error)
 	deleteDevice     func(context.Context, int) error
@@ -264,8 +271,8 @@ type buildRootfsOps struct {
 
 func newBuildRootfsOps(ublkd *ublkdClient) buildRootfsOps {
 	return buildRootfsOps{
-		probeSourceSize: func(ctx context.Context, workDir string, fetched fetchedImage) (int64, error) {
-			return probeSourceVirtualSize(ctx, ublkd, workDir, fetched)
+		probeSourceSize: func(ctx context.Context, workDir string, fetched fetchedImage, undo *rollback) (int64, error) {
+			return probeSourceVirtualSize(ctx, ublkd, workDir, fetched, undo)
 		},
 		writeConfig:      writeBuildRootfsConfig,
 		addDevice:        ublkd.Add,
@@ -290,11 +297,19 @@ type deviceAttachment struct {
 	release  func(context.Context, int) error
 }
 
-// attachDevice records a freshly added device and arms its rollback.
+// attachDevice records a freshly added device and arms its rollback. A
+// failed release stops the rollback, so the config and upper the device
+// still reads are not deleted underneath it.
 func attachDevice(devID int, devPath string, release func(context.Context, int) error, undo *rollback) *deviceAttachment {
 	attachment := &deviceAttachment{devID: devID, devPath: devPath, attached: true, release: release}
-	undo.push(func() { _ = attachment.detach(context.Background()) })
+	undo.pushDescribed(attachment.String, func() error {
+		return attachment.detach(context.Background())
+	})
 	return attachment
+}
+
+func (attachment *deviceAttachment) String() string {
+	return fmt.Sprintf("ublk device %d (%s)", attachment.devID, attachment.devPath)
 }
 
 func (attachment *deviceAttachment) detach(ctx context.Context) error {
@@ -313,7 +328,7 @@ func prepareBuildRootfs(ctx context.Context, workDir string, fetched fetchedImag
 	if err != nil {
 		return nil, err
 	}
-	sourceBytes, err := ops.probeSourceSize(ctx, workDir, fetched)
+	sourceBytes, err := ops.probeSourceSize(ctx, workDir, fetched, undo)
 	if err != nil {
 		return nil, err
 	}
@@ -412,8 +427,10 @@ func prepareBuildSource(ctx context.Context, repository remoteSource, resolved r
 }
 
 // runBuild executes the build pipeline in strict order; any failure rolls
-// the partially built state back in reverse (devices, mounts, workdir).
-func runBuild(ctx context.Context, options *buildOptions) error {
+// the partially built state back in reverse (VMM, mounts, devices, workdir).
+// A rollback that cannot release a resource keeps everything it depends on
+// and reports it alongside the build error.
+func runBuild(ctx context.Context, options *buildOptions) (err error) {
 	if err := validateBuildOptions(options); err != nil {
 		return err
 	}
@@ -447,9 +464,13 @@ func runBuild(ctx context.Context, options *buildOptions) error {
 		return err
 	}
 	undo := &rollback{}
-	defer undo.run()
+	defer func() {
+		if rollbackErr := undo.run(); rollbackErr != nil {
+			err = errors.Join(err, rollbackErr)
+		}
+	}()
 	stagingRoot := layout.root
-	undo.push(func() { _ = os.RemoveAll(stagingRoot) })
+	undo.push("staging "+stagingRoot, func() error { return os.RemoveAll(stagingRoot) })
 
 	workDir, err := createBuildWorkDir(artifactName, options.keepWorkDir, undo)
 	if err != nil {
@@ -498,12 +519,12 @@ func runBuild(ctx context.Context, options *buildOptions) error {
 			return fmt.Errorf("read init script %s: %w", options.initScriptFile, err)
 		}
 	}
-	if err := injectInitScript(rootfs.devPath, filepath.Join(workDir, "mnt-rootfs"), options.initPath, initScript); err != nil {
+	if err := injectInitScript(rootfs.devPath, filepath.Join(workDir, "mnt-rootfs"), options.initPath, initScript, undo); err != nil {
 		return err
 	}
 
 	// Step 5: cold boot, wait for readiness, capture the Full snapshot.
-	vmstatePath, memfilePath, err := coldBootAndSnapshot(ctx, options, workDir, rootfs.devPath)
+	vmstatePath, memfilePath, err := coldBootAndSnapshot(ctx, options, workDir, rootfs.devPath, undo)
 	if err != nil {
 		return err
 	}
@@ -576,10 +597,11 @@ func createBuildWorkDir(artifactName string, keep bool, undo *rollback) (string,
 	if err != nil {
 		return "", fmt.Errorf("create work dir under %s: %w", global.buildWorkDir, err)
 	}
-	undo.push(func() {
-		if !keep {
-			_ = os.RemoveAll(workDir)
+	undo.push("work dir "+workDir, func() error {
+		if keep {
+			return nil
 		}
+		return os.RemoveAll(workDir)
 	})
 	return workDir, nil
 }
@@ -608,7 +630,7 @@ func captureSnapfiles(ctx context.Context, ublkd *ublkdClient, options *buildOpt
 	if err := mountReadWrite(snapfiles.devPath, snapMount); err != nil {
 		return err
 	}
-	undo.push(func() { _ = unmount(snapMount) })
+	undo.push("mount "+snapMount, func() error { return unmount(snapMount) })
 	if err := copyFile(vmstatePath, filepath.Join(snapMount, inDiskVMState), 0o640); err != nil {
 		return err
 	}

@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -40,17 +41,45 @@ func newCreateCommand() *cobra.Command {
 }
 
 // rollback accumulates compensating actions executed in reverse order when
-// the build flow fails partway.
+// the build flow fails partway. Steps are pushed in dependency order (a
+// directory before the devices, mounts and VMM backed by its files), so the
+// first step that fails stops the rollback: every earlier step guards a
+// resource the failed one may still use, such as the config and upper of a
+// live device or a local lower blob. Those are kept for a retry and listed
+// in the returned error.
 type rollback struct {
-	steps []func()
+	steps []rollbackStep
 }
 
-func (r *rollback) push(step func()) { r.steps = append(r.steps, step) }
+type rollbackStep struct {
+	describe func() string
+	undo     func() error
+}
 
-func (r *rollback) run() {
-	for index := len(r.steps) - 1; index >= 0; index-- {
-		r.steps[index]()
+func (r *rollback) push(resource string, undo func() error) {
+	r.pushDescribed(func() string { return resource }, undo)
+}
+
+// pushDescribed registers a step whose resource description is rendered
+// only when the rollback reports it (a reattached device changes its id).
+func (r *rollback) pushDescribed(describe func() string, undo func() error) {
+	r.steps = append(r.steps, rollbackStep{describe: describe, undo: undo})
+}
+
+func (r *rollback) run() error {
+	steps := r.steps
+	r.steps = nil
+	for index := len(steps) - 1; index >= 0; index-- {
+		if err := steps[index].undo(); err != nil {
+			kept := make([]string, 0, index+1)
+			for _, step := range steps[:index+1] {
+				kept = append(kept, step.describe())
+			}
+			return fmt.Errorf("rollback stopped at %s: %w; kept for retry: %s",
+				steps[index].describe(), err, strings.Join(kept, ", "))
+		}
 	}
+	return nil
 }
 
 func (r *rollback) disarm() { r.steps = nil }

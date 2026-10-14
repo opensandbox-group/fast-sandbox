@@ -144,6 +144,19 @@ func TestValidateBuildOptions(t *testing.T) {
 		t.Errorf("password containing colons must pass: %v", err)
 	}
 
+	// Firecracker runs in its own working directory: a relative kernel is
+	// resolved against the CLI's cwd.
+	options = validBuildOptions(t)
+	t.Chdir(filepath.Dir(options.kernel))
+	want := options.kernel
+	options.kernel = filepath.Base(want)
+	if err := validateBuildOptions(options); err != nil {
+		t.Fatalf("relative kernel must pass: %v", err)
+	}
+	if options.kernel != want {
+		t.Errorf("kernel = %q, want absolute %q", options.kernel, want)
+	}
+
 	// An explicit kernel version rescues a bare vmlinux filename.
 	options = validBuildOptions(t)
 	bare := filepath.Join(t.TempDir(), "vmlinux")
@@ -364,7 +377,7 @@ func TestPrepareBuildRootfsShrinkAndReattach(t *testing.T) {
 	addCount := 0
 	targetBytes := int64(30 << 30)
 	ops := buildRootfsOps{
-		probeSourceSize: func(context.Context, string, fetchedImage) (int64, error) {
+		probeSourceSize: func(context.Context, string, fetchedImage, *rollback) (int64, error) {
 			events = append(events, "probe")
 			return 256 << 30, nil
 		},
@@ -430,7 +443,9 @@ func TestPrepareBuildRootfsShrinkAndReattach(t *testing.T) {
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("events = %v\nwant   = %v", events, want)
 	}
-	undo.run()
+	if err := undo.run(); err != nil {
+		t.Fatal(err)
+	}
 	if events[len(events)-1] != "del:7" {
 		t.Errorf("rollback detached %q, want new device", events[len(events)-1])
 	}
@@ -440,7 +455,7 @@ func TestPrepareBuildRootfsRollback(t *testing.T) {
 	t.Run("before detach", func(t *testing.T) {
 		var deleted []int
 		ops := buildRootfsOps{
-			probeSourceSize: func(context.Context, string, fetchedImage) (int64, error) { return 20 << 30, nil },
+			probeSourceSize: func(context.Context, string, fetchedImage, *rollback) (int64, error) { return 20 << 30, nil },
 			writeConfig:     func(context.Context, string, fetchedImage, int) (string, error) { return "config", nil },
 			addDevice:       func(context.Context, string) (int, string, error) { return 2, "/dev/old", nil },
 			deleteDevice: func(_ context.Context, id int) error {
@@ -453,9 +468,40 @@ func TestPrepareBuildRootfsRollback(t *testing.T) {
 		if _, err := prepareBuildRootfs(context.Background(), "work", fetchedImage{}, 20, undo, ops); err == nil {
 			t.Fatal("prepare must fail")
 		}
-		undo.run()
+		if err := undo.run(); err != nil {
+			t.Fatal(err)
+		}
 		if !reflect.DeepEqual(deleted, []int{2}) {
 			t.Errorf("deleted = %v", deleted)
+		}
+	})
+
+	// A device that cannot be detached still reads the work dir's upper
+	// files: the work dir must survive the rollback for a retry.
+	t.Run("detach failure keeps work dir", func(t *testing.T) {
+		workDir := filepath.Join(t.TempDir(), "work")
+		if err := os.Mkdir(workDir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		ops := buildRootfsOps{
+			probeSourceSize:  func(context.Context, string, fetchedImage, *rollback) (int64, error) { return 20 << 30, nil },
+			writeConfig:      func(context.Context, string, fetchedImage, int) (string, error) { return "config", nil },
+			addDevice:        func(context.Context, string) (int, string, error) { return 2, "/dev/old", nil },
+			deleteDevice:     func(context.Context, int) error { return errors.New("device busy") },
+			repairFilesystem: func(context.Context, string) error { return errors.New("repair failed") },
+		}
+		undo := &rollback{}
+		undo.push("work dir "+workDir, func() error { return os.RemoveAll(workDir) })
+		if _, err := prepareBuildRootfs(context.Background(), workDir, fetchedImage{}, 20, undo, ops); err == nil {
+			t.Fatal("prepare must fail")
+		}
+		err := undo.run()
+		if err == nil || !strings.Contains(err.Error(), "device busy") ||
+			!strings.Contains(err.Error(), "ublk device 2 (/dev/old)") || !strings.Contains(err.Error(), "work dir "+workDir) {
+			t.Fatalf("rollback error = %v", err)
+		}
+		if _, err := os.Stat(workDir); err != nil {
+			t.Errorf("work dir removed despite attached device: %v", err)
 		}
 	})
 
@@ -463,7 +509,7 @@ func TestPrepareBuildRootfsRollback(t *testing.T) {
 		var deleted []int
 		addCount := 0
 		ops := buildRootfsOps{
-			probeSourceSize: func(context.Context, string, fetchedImage) (int64, error) { return 256 << 30, nil },
+			probeSourceSize: func(context.Context, string, fetchedImage, *rollback) (int64, error) { return 256 << 30, nil },
 			writeConfig:     func(context.Context, string, fetchedImage, int) (string, error) { return "config", nil },
 			addDevice: func(context.Context, string) (int, string, error) {
 				addCount++
@@ -487,7 +533,9 @@ func TestPrepareBuildRootfsRollback(t *testing.T) {
 		if _, err := prepareBuildRootfs(context.Background(), "work", fetchedImage{}, 20, undo, ops); err == nil {
 			t.Fatal("device-size mismatch must fail")
 		}
-		undo.run()
+		if err := undo.run(); err != nil {
+			t.Fatal(err)
+		}
 		if !reflect.DeepEqual(deleted, []int{2, 7}) {
 			t.Errorf("deleted = %v", deleted)
 		}
@@ -497,7 +545,7 @@ func TestPrepareBuildRootfsRollback(t *testing.T) {
 		var deleted []int
 		filesystemChecks := 0
 		ops := buildRootfsOps{
-			probeSourceSize: func(context.Context, string, fetchedImage) (int64, error) { return 20 << 30, nil },
+			probeSourceSize: func(context.Context, string, fetchedImage, *rollback) (int64, error) { return 20 << 30, nil },
 			writeConfig:     func(context.Context, string, fetchedImage, int) (string, error) { return "config", nil },
 			addDevice:       func(context.Context, string) (int, string, error) { return 2, "/dev/rootfs", nil },
 			deleteDevice: func(_ context.Context, id int) error {
@@ -521,7 +569,9 @@ func TestPrepareBuildRootfsRollback(t *testing.T) {
 		if _, err := prepareBuildRootfs(context.Background(), "work", fetchedImage{}, 20, undo, ops); err == nil || !strings.Contains(err.Error(), "ext4 filesystem") {
 			t.Fatalf("filesystem mismatch error = %v", err)
 		}
-		undo.run()
+		if err := undo.run(); err != nil {
+			t.Fatal(err)
+		}
 		if !reflect.DeepEqual(deleted, []int{2}) {
 			t.Errorf("deleted = %v", deleted)
 		}
@@ -535,20 +585,46 @@ func stringInt(value int) string {
 func TestRollback(t *testing.T) {
 	order := []int{}
 	undo := &rollback{}
-	undo.push(func() { order = append(order, 1) })
-	undo.push(func() { order = append(order, 2) })
-	undo.push(func() { order = append(order, 3) })
-	undo.run()
+	step := func(id int, err error) func() error {
+		return func() error {
+			order = append(order, id)
+			return err
+		}
+	}
+	undo.push("one", step(1, nil))
+	undo.push("two", step(2, nil))
+	undo.push("three", step(3, nil))
+	if err := undo.run(); err != nil {
+		t.Fatal(err)
+	}
 	if !reflect.DeepEqual(order, []int{3, 2, 1}) {
 		t.Errorf("rollback order = %v, want reverse", order)
+	}
+
+	// A failed step stops the rollback: the earlier steps may be what the
+	// failed resource still depends on, so they are kept and reported.
+	order = nil
+	undo = &rollback{}
+	undo.push("work dir", step(1, nil))
+	undo.push("device", step(2, errors.New("busy")))
+	undo.push("mount", step(3, nil))
+	err := undo.run()
+	if !reflect.DeepEqual(order, []int{3, 2}) {
+		t.Errorf("rollback order = %v, want stop at failed step", order)
+	}
+	if err == nil || !strings.Contains(err.Error(), "rollback stopped at device: busy") ||
+		!strings.Contains(err.Error(), "kept for retry: work dir, device") {
+		t.Errorf("rollback error = %v", err)
 	}
 
 	// disarm drops every pending step.
 	order = nil
 	undo = &rollback{}
-	undo.push(func() { order = append(order, 1) })
+	undo.push("one", step(1, nil))
 	undo.disarm()
-	undo.run()
+	if err := undo.run(); err != nil {
+		t.Fatal(err)
+	}
 	if len(order) != 0 {
 		t.Errorf("disarmed rollback ran %v", order)
 	}
