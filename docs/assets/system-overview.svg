@@ -1,192 +1,131 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="760" viewBox="0 0 1440 760" role="img" aria-labelledby="title description">
-  <title id="title">Fast Sandbox system overview</title>
-  <desc id="description">Fast Sandbox control plane and data plane, from network-slot management to Sandbox-private networking and pluggable Infra Components, on a Kubernetes foundation.</desc>
-
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1100" viewBox="0 0 1440 1100" role="img" aria-labelledby="title description">
+  <title id="title">Fast Sandbox: Firecracker microVMs on Kubernetes</title>
+  <desc id="description">OpenSandbox Server connects to the Fast Sandbox Fast-Path for placement and direct creation. Kubernetes CRDs persist intent and reconcilers converge lifecycle and Pool capacity. A warm Fastlet Pod on a KVM worker hosts multiple isolated Firecracker microVMs. Application traffic passes through OpenSandbox Ingress and Fastlet Proxy. A SandboxTemplate builder publishes reusable snapshots to an artifact store; snapshot delivery groups P2P caching with OverlayBD and ublk snapshot on-demand loading.</desc>
   <defs>
-    <pattern id="grid" width="24" height="24" patternUnits="userSpaceOnUse">
-      <path d="M 24 0 L 0 0 0 24" fill="none" stroke="#e7e7e4" stroke-width="1"/>
-    </pattern>
-    <marker id="arrow-blue" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-      <path d="M0,0 L8,4 L0,8" fill="none" stroke="#2563eb" stroke-width="1.5"/>
-    </marker>
-    <marker id="arrow-violet" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-      <path d="M0,0 L8,4 L0,8" fill="none" stroke="#7c3aed" stroke-width="1.5"/>
-    </marker>
+    <marker id="control-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#2563eb" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <marker id="traffic-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#13876c" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <marker id="artifact-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#af6c16" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></marker>
     <style>
-      .mono {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      }
-      .sans {
-        font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      }
-      .product {
-        fill: #18181b;
-        font-size: 24px;
-        font-weight: 600;
-      }
-      .breadcrumb {
-        fill: #71717a;
-        font-size: 17px;
-        font-weight: 400;
-      }
-      .section {
-        fill: #71717a;
-        font-size: 14px;
-        font-weight: 500;
-        letter-spacing: 0.04em;
-      }
-      .node-title {
-        fill: #18181b;
-        font-size: 20px;
-        font-weight: 500;
-      }
-      .node-note {
-        fill: #71717a;
-        font-size: 13px;
-        font-weight: 400;
-      }
-      .runtime {
-        fill: #52525b;
-        font-size: 12px;
-        font-weight: 400;
-      }
-      .sandbox-title {
-        fill: #18181b;
-        font-size: 15px;
-        font-weight: 500;
-      }
-      .sandbox-note {
-        fill: #71717a;
-        font-size: 11px;
-        font-weight: 400;
-      }
-      .control-detail {
-        fill: #52525b;
-        font-size: 10px;
-        font-weight: 400;
-      }
-      .foundation-title {
-        fill: #172554;
-        font-size: 28px;
-        font-weight: 500;
-      }
-      .foundation-note {
-        fill: #475569;
-        font-size: 14px;
-        font-weight: 400;
-      }
-      .foundation-token {
-        fill: #1e3a8a;
-        font-size: 12px;
-        font-weight: 500;
-      }
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; fill: #152b45; }
+      .headline { font-size: 42px; font-weight: 700; }
+      .subtitle { font-size: 23px; fill: #526277; }
+      .group-title { font-size: 27px; font-weight: 650; }
+      .title { font-size: 26px; font-weight: 650; }
+      .note { font-size: 20px; fill: #526277; }
+      .vm-title { font-size: 22px; font-weight: 650; }
+      .vm-note { font-size: 19px; fill: #3c6559; }
+      .edge-label { font-size: 20px; font-weight: 550; }
+      .control { fill: none; stroke: #2563eb; stroke-width: 2.6; stroke-linejoin: round; stroke-linecap: round; marker-end: url(#control-arrow); }
+      .traffic { fill: none; stroke: #13876c; stroke-width: 2.6; stroke-linejoin: round; stroke-linecap: round; marker-end: url(#traffic-arrow); }
+      .artifact { fill: none; stroke: #af6c16; stroke-width: 2.6; stroke-linejoin: round; stroke-linecap: round; marker-end: url(#artifact-arrow); }
+      .control-label { fill: #2563eb; }
+      .traffic-label { fill: #13876c; }
+      .artifact-label { fill: #95601c; }
     </style>
   </defs>
+  <rect width="1440" height="1100" fill="#ffffff"/>
 
-  <rect width="1440" height="760" fill="#fbfbfa"/>
-  <rect width="1440" height="760" fill="url(#grid)" opacity="0.48"/>
-  <rect x="24" y="24" width="1392" height="712" rx="10" fill="none" stroke="#d4d4d0"/>
-
-  <circle cx="62" cy="57" r="5" fill="#22c55e"/>
-  <text x="78" y="64" class="mono product">fast-sandbox</text>
-  <text x="260" y="64" class="mono breadcrumb">/ system overview</text>
-  <text x="1378" y="63" text-anchor="end" class="mono breadcrumb">kubernetes-native runtime plane</text>
-  <line x1="48" y1="88" x2="1392" y2="88" stroke="#d4d4d0"/>
-
-  <text x="64" y="125" class="mono section">01 / control plane</text>
-  <line x1="64" y1="142" x2="1376" y2="142" stroke="#d4d4d0" stroke-dasharray="3 6"/>
-
-  <rect x="64" y="168" width="236" height="104" rx="7" fill="#fbfbfa" stroke="#a1a1aa"/>
-  <text x="86" y="213" class="mono node-title">fastctl / SDK</text>
-  <text x="86" y="241" class="mono node-note">imperative API client</text>
-
-  <line x1="300" y1="220" x2="360" y2="220" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
-
-  <g transform="translate(-64 0)">
-  <rect x="434" y="168" width="360" height="104" rx="7" fill="#fbfbfa" stroke="#a1a1aa"/>
-  <text x="456" y="202" class="mono node-title">fast-path × N / reconciler</text>
-  <text x="456" y="229" class="mono node-note">multi-active / leader-elected</text>
-  <text x="456" y="253" class="mono runtime">Top-K · image affinity / converge state</text>
-
-  <rect x="854" y="154" width="586" height="142" rx="8" fill="#f8fbff" fill-opacity="0.58" stroke="#93c5fd" stroke-dasharray="4 4"/>
-  <text x="870" y="176" class="mono section" fill="#2563eb">Fastlet Pod</text>
-
-  <line x1="794" y1="220" x2="874" y2="220" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
-
-  <rect x="884" y="187" width="166" height="94" rx="5" fill="#fbfbfa" stroke="#a1a1aa"/>
-  <text x="967" y="211" text-anchor="middle" class="mono sandbox-title">Fastlet</text>
-  <text x="967" y="233" text-anchor="middle" class="mono sandbox-note">admission · runtime</text>
-  <text x="967" y="252" text-anchor="middle" class="mono sandbox-note">network · image cache</text>
-  <text x="967" y="271" text-anchor="middle" class="mono sandbox-note">Infra · recovery</text>
-
-  <line x1="1050" y1="234" x2="1134" y2="234" stroke="#2563eb" stroke-width="1.5" marker-end="url(#arrow-blue)"/>
-
-  <rect x="1144" y="181" width="276" height="106" rx="5" fill="#fbfbfa" stroke="#93c5fd"/>
-  <text x="1160" y="204" class="mono sandbox-title">Sandbox</text>
-  <text x="1160" y="226" class="mono sandbox-note">user workload + Infra Component</text>
-  <text x="1160" y="249" class="mono control-detail">
-    <tspan>runc · gVisor · Kata · Firecracker</tspan>
-  </text>
-  <text x="1160" y="271" class="mono control-detail">network slot · private network</text>
-  </g>
-
-  <text x="64" y="329" class="mono section">02 / data plane</text>
-  <line x1="64" y1="346" x2="1376" y2="346" stroke="#d4d4d0" stroke-dasharray="3 6"/>
-
-  <rect x="64" y="386" width="236" height="96" rx="7" fill="#fbfbfa" stroke="#a1a1aa"/>
-  <text x="86" y="426" class="mono node-title">fastctl / SDKs</text>
-  <text x="86" y="454" class="mono node-note">native · OpenSandbox</text>
-
-  <line x1="300" y1="434" x2="360" y2="434" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arrow-violet)"/>
-
-  <g transform="translate(-40 0)">
-  <rect x="410" y="386" width="250" height="96" rx="7" fill="#fbfbfa" stroke="#a1a1aa"/>
-  <text x="432" y="420" class="mono node-title">Data-plane entry</text>
-  <text x="432" y="447" class="mono node-note">Sandbox Proxy · central</text>
-  <text x="432" y="469" class="mono node-note">OpenSandbox · direct</text>
-  </g>
-
-  <g transform="translate(-64 0)">
-  <rect x="724" y="360" width="716" height="142" rx="8" fill="#faf8ff" fill-opacity="0.45" stroke="#c4b5fd" stroke-dasharray="4 5"/>
-  <text x="744" y="379" class="mono section" fill="#7c3aed">Fastlet Pod</text>
-
-  <line x1="684" y1="434" x2="744" y2="434" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arrow-violet)"/>
-
-  <rect x="754" y="394" width="230" height="80" rx="7" fill="#fbfbfa" stroke="#a1a1aa"/>
-  <text x="776" y="426" class="mono node-title">Fastlet Proxy</text>
-  <text x="776" y="454" class="mono node-note">pod-local named routing</text>
-
-  <line x1="984" y1="434" x2="1074" y2="434" stroke="#7c3aed" stroke-width="1.5" marker-end="url(#arrow-violet)"/>
-
-  <rect x="1084" y="374" width="336" height="100" rx="7" fill="#f8fbff" stroke="#93c5fd" stroke-dasharray="4 4"/>
-  <text x="1100" y="394" class="mono section" fill="#2563eb">Sandbox · private network</text>
-
-  <rect x="1098" y="405" width="130" height="56" rx="5" fill="#fbfbfa" stroke="#cbd5e1"/>
-  <text x="1163" y="429" text-anchor="middle" class="mono sandbox-title">user workload</text>
-  <text x="1163" y="449" text-anchor="middle" class="mono sandbox-note">OCI image</text>
-
-  <rect x="1242" y="405" width="164" height="56" rx="5" fill="#fbfbfa" stroke="#c4b5fd"/>
-  <text x="1324" y="429" text-anchor="middle" class="mono sandbox-title">Infra Component</text>
-  <text x="1324" y="449" text-anchor="middle" class="mono sandbox-note">execd · envd · custom</text>
-
-  <text x="869" y="494" text-anchor="middle" class="mono control-detail">ingress · transparent / no translation</text>
-  <text x="1252" y="494" text-anchor="middle" class="mono control-detail">egress · private CIDR → MASQUERADE → Pod network</text>
-  </g>
-
-  <rect x="64" y="548" width="1312" height="142" rx="8" fill="#eff6ff" stroke="#bfdbfe"/>
-  <text x="88" y="582" class="mono section" fill="#3b82f6">03 / foundation</text>
-  <text x="88" y="632" class="mono foundation-title">built on Kubernetes</text>
-  <text x="88" y="663" class="mono foundation-note">portable control, durable state, native operations</text>
-
-  <rect x="680" y="570" width="200" height="40" rx="5" fill="#f8fbff" stroke="#bfdbfe"/>
-  <text x="780" y="595" text-anchor="middle" class="mono foundation-token">[ Sandbox CRD ]</text>
-  <rect x="896" y="570" width="200" height="40" rx="5" fill="#f8fbff" stroke="#bfdbfe"/>
-  <text x="996" y="595" text-anchor="middle" class="mono foundation-token">[ SandboxPool CRD ]</text>
-  <rect x="1112" y="570" width="200" height="40" rx="5" fill="#f8fbff" stroke="#bfdbfe"/>
-  <text x="1212" y="595" text-anchor="middle" class="mono foundation-token">[ Runtime · Kata / gVisor ]</text>
-
-  <rect x="788" y="624" width="200" height="40" rx="5" fill="#f8fbff" stroke="#bfdbfe"/>
-  <text x="888" y="649" text-anchor="middle" class="mono foundation-token">[ Fastlet Pods ]</text>
-  <rect x="1004" y="624" width="200" height="40" rx="5" fill="#f8fbff" stroke="#bfdbfe"/>
-  <text x="1104" y="649" text-anchor="middle" class="mono foundation-token">[ NodeJanitor DaemonSet ]</text>
+  <text x="64" y="62" class="headline">Fast Sandbox</text>
+  <text x="64" y="94" class="subtitle">Kubernetes capacity. Firecracker isolation. Snapshot-based startup.</text>
+  <rect x="64" y="310" width="1312" height="602" rx="14" fill="#f7fafe" stroke="#b6cbe0" stroke-width="1.6"/>
+  <text x="88" y="348" class="group-title">Kubernetes</text>
+  <rect x="88" y="374" width="660" height="422" rx="10" fill="#ffffff" stroke="#d2deea" stroke-width="1.6"/>
+  <text x="112" y="414" class="group-title">Fast Sandbox control plane</text>
+  <text x="112" y="448" class="note">Also supports standalone API / SDK</text>
+  <rect x="800" y="374" width="552" height="514" rx="10" fill="#f0f6fa" stroke="#bacfdd" stroke-width="1.6"/>
+  <text x="824" y="413" class="group-title">KVM worker node</text>
+  <rect x="824" y="448" width="504" height="342" rx="10" fill="#ffffff" stroke="#9eb9c8" stroke-width="1.6"/>
+  <text x="844" y="480" class="group-title">Warm Fastlet Pod</text>
+  <path d="M 189 160 V 128 H 1173 V 160" class="traffic"/>
+  <text x="746" y="116" class="edge-label traffic-label">exec / files / application traffic</text>
+  <path d="M 314 208 H 400" class="control"/>
+  <text x="343" y="196" class="edge-label control-label">API</text>
+  <path d="M 562 256 V 500" class="control"/>
+  <text x="581" y="292" class="edge-label control-label">lifecycle</text>
+  <path d="M 1173 256 V 448 H 1198 V 500" class="traffic"/>
+  <text x="1190" y="294" class="edge-label traffic-label">HTTP / SSE / WS</text>
+  <path d="M 724 541 H 846" class="control"/>
+  <text x="764" y="526" class="edge-label control-label">create</text>
+  <path d="M 404 541 H 237 V 650" class="control"/>
+  <text x="133" y="606" class="edge-label control-label">persist intent</text>
+  <path d="M 362 711 H 444" class="control"/>
+  <text x="374" y="696" class="edge-label control-label">watch</text>
+  <path d="M 724 711 H 786 V 568 H 846" class="control" stroke-dasharray="7 6"/>
+  <text x="699" y="630" class="edge-label control-label">reconcile</text>
+  <path d="M 584 772 V 814" class="control" stroke-dasharray="7 6"/>
+  <text x="602" y="806" class="edge-label control-label">build</text>
+  <path d="M 954 582 V 617" class="control" style="marker-end:none"/>
+  <path d="M 915 617 H 1237" class="control" style="marker-end:none"/>
+  <path d="M 915 617 V 644" class="control"/>
+  <path d="M 1076 617 V 644" class="control"/>
+  <path d="M 1237 617 V 644" class="control"/>
+  <text x="1076" y="606" class="edge-label control-label" text-anchor="middle">restore</text>
+  <path d="M 1306 541 H 1318 V 706 H 1306" class="traffic"/>
+  <path d="M 1076 814 V 769" class="artifact"/>
+  <text x="1093" y="808" class="edge-label artifact-label">snapshot blocks</text>
+  <path d="M 240 878 V 999 H 444" class="artifact"/>
+  <text x="293" y="985" class="edge-label artifact-label">publish</text>
+  <path d="M 744 999 H 1400 V 846 H 1328" class="artifact"/>
+  <text x="1118" y="982" class="edge-label artifact-label">pull / prewarm</text>
+  <rect x="64" y="160" width="250" height="96" rx="9" fill="#ffffff" stroke="#9bb4ca" stroke-width="1.6"/>
+  <text x="84" y="197" class="title">Your application</text>
+  <text x="84" y="232" class="note">OpenSandbox SDK</text>
+  <rect x="400" y="160" width="324" height="96" rx="9" fill="#f1f6fe" stroke="#8daedb" stroke-width="1.6"/>
+  <text x="420" y="197" class="title">OpenSandbox Server</text>
+  <text x="420" y="232" class="note">Templates + lifecycle API</text>
+  <rect x="970" y="160" width="406" height="96" rx="9" fill="#eff8f4" stroke="#92bdae" stroke-width="1.6"/>
+  <text x="990" y="197" class="title">OpenSandbox Ingress</text>
+  <text x="990" y="232" class="note">Authenticated application routes</text>
+  <rect x="404" y="500" width="320" height="82" rx="9" fill="#f1f6fe" stroke="#8daedb" stroke-width="1.6"/>
+  <text x="424" y="538" class="title">Fast-Path</text>
+  <text x="424" y="565" class="note">Placement + direct create</text>
+  <rect x="112" y="650" width="250" height="122" rx="9" fill="#f7fafe" stroke="#b3c9df" stroke-width="1.6"/>
+  <text x="132" y="686" class="title">Kubernetes API</text>
+  <text x="132" y="721" class="note">Sandbox / Pool</text>
+  <text x="132" y="750" class="note">Template / Snapshot</text>
+  <rect x="444" y="650" width="280" height="122" rx="9" fill="#ffffff" stroke="#b3c9df" stroke-width="1.6"/>
+  <text x="464" y="686" class="title">Reconciler</text>
+  <text x="464" y="721" class="note">Lifecycle convergence</text>
+  <text x="464" y="750" class="note">Pool capacity</text>
+  <rect x="846" y="500" width="216" height="82" rx="9" fill="#f1f6fe" stroke="#8daedb" stroke-width="1.6"/>
+  <text x="866" y="538" class="title">Fastlet</text>
+  <text x="866" y="565" class="note">Atomic admission</text>
+  <rect x="1090" y="500" width="216" height="82" rx="9" fill="#eff8f4" stroke="#92bdae" stroke-width="1.6"/>
+  <text x="1110" y="538" class="title">Fastlet Proxy</text>
+  <text x="1110" y="565" class="note">Endpoint routing</text>
+  <rect x="846" y="644" width="138" height="125" rx="7" fill="#eff8f4" stroke="#7fad9c" stroke-width="1.6"/>
+  <text x="915" y="676" class="vm-title" text-anchor="middle">microVM 1</text>
+  <text x="915" y="706" class="vm-note" text-anchor="middle">Firecracker</text>
+  <line x1="860" y1="718" x2="970" y2="718" stroke="#bad7cc"/>
+  <text x="915" y="740" class="vm-note" text-anchor="middle">Guest + app</text>
+  <text x="915" y="760" class="vm-note" text-anchor="middle">Private net</text>
+  <rect x="1007" y="644" width="138" height="125" rx="7" fill="#eff8f4" stroke="#7fad9c" stroke-width="1.6"/>
+  <text x="1076" y="676" class="vm-title" text-anchor="middle">microVM 2</text>
+  <text x="1076" y="706" class="vm-note" text-anchor="middle">Firecracker</text>
+  <line x1="1021" y1="718" x2="1131" y2="718" stroke="#bad7cc"/>
+  <text x="1076" y="740" class="vm-note" text-anchor="middle">Guest + app</text>
+  <text x="1076" y="760" class="vm-note" text-anchor="middle">Private net</text>
+  <rect x="1168" y="644" width="138" height="125" rx="7" fill="#eff8f4" stroke="#7fad9c" stroke-width="1.6"/>
+  <text x="1237" y="676" class="vm-title" text-anchor="middle">microVM N</text>
+  <text x="1237" y="706" class="vm-note" text-anchor="middle">Firecracker</text>
+  <line x1="1182" y1="718" x2="1292" y2="718" stroke="#bad7cc"/>
+  <text x="1237" y="740" class="vm-note" text-anchor="middle">Guest + app</text>
+  <text x="1237" y="760" class="vm-note" text-anchor="middle">Private net</text>
+  <rect x="112" y="814" width="612" height="64" rx="9" fill="#fff9ee" stroke="#d7bc8e" stroke-width="1.6"/>
+  <text x="132" y="843" class="title">SandboxTemplate builder</text>
+  <text x="132" y="868" class="note">OCI image → initialized guest → snapshot</text>
+  <rect x="824" y="814" width="504" height="64" rx="9" fill="#fff9ee" stroke="#d7bc8e" stroke-width="1.6"/>
+  <text x="844" y="843" class="title">Snapshot delivery</text>
+  <text x="844" y="868" class="note">P2P / OverlayBD + ublk on-demand loading</text>
+  <rect x="444" y="955" width="300" height="88" rx="9" fill="#fff9ee" stroke="#d7bc8e" stroke-width="1.6"/>
+  <text x="464" y="990" class="title">Artifact store</text>
+  <text x="464" y="1024" class="note">rootfs + VM state + memory</text>
+  <text x="770" y="1030" class="subtitle">Build once. Restore many.</text>
+  <text x="64" y="1080" class="title">One warm Pod. Multiple isolated microVMs.</text>
+  <line x1="815" y1="1073" x2="845" y2="1073" stroke="#2563eb" stroke-width="3"/>
+  <text x="856" y="1080" class="note">Lifecycle</text>
+  <line x1="991" y1="1073" x2="1021" y2="1073" stroke="#13876c" stroke-width="3"/>
+  <text x="1032" y="1080" class="note">App traffic</text>
+  <line x1="1196" y1="1073" x2="1226" y2="1073" stroke="#af6c16" stroke-width="3"/>
+  <text x="1237" y="1080" class="note">Artifacts</text>
 </svg>

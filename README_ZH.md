@@ -1,265 +1,208 @@
 # Fast Sandbox
 
-一个 Kubernetes 原生 runtime plane，在预热的 Fastlet Pod 中创建相互隔离的
-container、gVisor 和 Kata Sandbox。
+**构建在 Kubernetes 之上的高性能 Sandbox 运行时，基于 Firecracker microVM。**
 
-[English](README.md) · [Quick Start](docs/getting-started/quickstart.md) · [完整文档](docs/README.md) · [架构原理](docs/concepts/architecture.md)
+[English](README.md) · [通过 OpenSandbox 使用](#通过-opensandbox-使用推荐) · [独立部署](#独立部署) · [完整文档](docs/README.md) · [架构](docs/concepts/architecture.md)
+
+Fast Sandbox 将 Firecracker microVM 的虚拟机隔离与快照启动能力带到 Kubernetes，
+面向需要频繁创建和回收执行环境的场景：AI Agent、代码解释器，以及按需开发和测试沙箱。
+
+Kubernetes 管理资源容量和生命周期期望状态。预热的 **Fastlet Pod** 承载多个 Sandbox，
+Firecracker 运行时从预先构建的快照恢复每个实例。创建 Sandbox 时直接复用已有容量，
+无需为每次请求重新调度和启动一个 Kubernetes Pod。
+
+推荐通过 [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) 使用，
+它已经集成 Fast Sandbox，提供 API、SDK、入口网关和命令执行能力。也可以独立部署
+Fast Sandbox，作为你自己的平台的 Sandbox 调度与运行时层。
 
 ![Fast Sandbox 系统总览](docs/assets/system-overview.svg)
 
-Fast Sandbox 将多活的命令式 Create 路径与基于 CRD 的声明式生命周期管理结合起来。
-Create 请求首先持久化初始意图，随后由 Fastlet 原子 admission 并启动 runtime；
-删除、reset、过期、恢复和 Pool 管理则通过 Kubernetes Reconcile 持续收敛。
+## 核心能力
 
-用户镜像始终控制业务 workload。Pool 定义的
-[Infra Component](docs/concepts/infra-components.md) 无需重建用户镜像，即可加入受管理的进程、
-经过健康检查的命名 endpoint，以及协议透明的数据面访问。
+- **Firecracker microVM 隔离**：每个 Firecracker Sandbox 拥有独立的 microVM、
+  客体内核、私有网络命名空间和实例 rootfs。
+- **从快照快速启动**：构建并初始化一次环境，随后从保存的虚拟机和内存状态恢复新实例。
+  通过 XFS reflink 克隆 rootfs，避免在创建路径中复制整个磁盘文件。
+- **预热池与高密度部署**：SandboxPool 维护就绪的 Fastlet Pod，每个 Fastlet 在配置的
+  资源和容量限制内接纳多个实例。
+- **专门的快速创建路径**：多活 Fast-Path 持久化 Sandbox 意图、选择就绪 Fastlet
+  并直接调用。Fastlet 负责原子容量准入，Kubernetes Reconcile 负责生命周期收敛。
+- **共享快照分发与按需加载**：节点 runtime-agent 为本节点 Fastlet 缓存快照产物，
+  P2P 分发减少重复回源。基于 OverlayBD + ublk 的 `fsb-vm` 路径按需读取 rootfs 和内存快照的
+  数据块，无需在启动前下载全部产物。
+- **状态保存与复用**：暂停实例以释放容量，随后在兼容的 Fastlet 上恢复；也可以把运行中
+  的 Sandbox 发布为可重复使用的镜像。
+- **Kubernetes 原生运维**：通过 CRD 管理 Sandbox、Pool、模板和快照，支持声明式
+  生命周期管理和状态观测。
 
-## 为什么选择 Fast Sandbox
+[工作原理](docs/concepts/architecture.md)
 
-- **预热 runtime pool**：复用已经就绪的 Fastlet Pod，不要求每个 Sandbox 都创建一个
-  Kubernetes Pod。
-- **多种隔离 runtime**：Pool 通过一个不可变 runtime 字段选择 container、gVisor、
-  Kata QEMU 或 Kata Cloud Hypervisor。
-- **原子的 CRD-first Create**：创建 runtime 前持久化 image、command、expiry、
-  metadata 和 placement intent，并提供 request 级幂等。
-- **可组合的 Infra Component**：通过 Pool contract 注入不可变 artifact 和受监管进程。
-- **Sandbox 独立私网**：每个实例拥有独立地址空间和 NAT 出口，不需要全局 host port 分配。
-- **命名且协议透明的路由**：通过带鉴权的 Proxy 暴露 Component 原生 HTTP、SSE 和
-  WebSocket 流量，不翻译应用协议。
-- **Kubernetes 原生生命周期**：不部署可选的 Fast-Path 时，仍可通过 CRD 创建和管理
-  Sandbox。
+## 通过 OpenSandbox 使用（推荐）
 
-## Quick Start
-
-Quick Start 在 Linux 主机上准备一个可交互的 kind 环境。它不会运行 E2E suite，也不会
-自动创建 Sandbox。
-
-```bash
-make quickstart
-```
-
-在终端 1 中保持本地 endpoint 转发：
-
-```bash
-make quickstart-forward
-```
-
-在终端 2 中创建 Sandbox，并访问 Pool 提供的 `execd` Component：
-
-```bash
-bin/fastctl run quickstart-execd-sandbox \
-  --image docker.io/library/alpine:latest \
-  --pool quickstart-execd-pool -- /bin/sleep 3600
-
-bin/fastctl opensandbox exec quickstart-execd-sandbox \
-  --component execd -- uname -a
-
-bin/fastctl delete quickstart-execd-sandbox
-```
-
-首次运行时，Quick Start 会创建本地 `.fastctl/config.json` 并写入转发 endpoint。
-如果文件已经存在则绝不修改，命令输出会提示如何通过环境变量临时覆盖。
-
-选择其他 runtime：
-
-```bash
-make quickstart RUNTIME=gvisor
-make quickstart RUNTIME=kata-qemu
-make quickstart RUNTIME=kata-clh
-```
-
-文件传输、diagnostics、声明式 CRD 创建和排障说明见
-[完整 Quick Start](docs/getting-started/quickstart.md)。
-
-## 架构
-
-控制面将延迟敏感的创建过程与声明式收敛分离：
+[OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) 已经集成 Fast Sandbox。
+通过它的 API 和 SDK，可以构建模板、创建 microVM Sandbox、执行命令、操作文件，以及
+管理暂停恢复和快照。Fast Sandbox 负责 Pool 调度、预热容量和 Firecracker 生命周期，
+OpenSandbox 提供面向应用的接口和带鉴权的入口网关。
 
 ```text
-fastctl / SDK
-      |
-      v
-多活 Fast-Path -------- 持久化意图 -------> Sandbox CRD
-      |                                        ^
-      | 原子 admission                         |
-      v                                        |
-Fastlet Pod <---------- 选主 Reconciler -------+
+你的应用 -> OpenSandbox API / SDK
+                  -> Fast Sandbox -> Fastlet -> Firecracker microVM
 ```
 
-- **Fast-Path Server**：多活，负责幂等 Create、内存 Top-K placement、直接 Fastlet
-  admission、readiness wait 和 endpoint resolution。
-- **Reconciler**：选主，负责 Sandbox 和 SandboxPool 的声明式生命周期，包括声明式创建、
-  删除、过期、drain 和恢复。
-- **Fastlet Pod**：Pool 管理的 runtime 边界。每个 Fastlet Pod 承载多个隔离 runtime，
-  并负责 admission、私有网络、Infra 进程、健康检查和本地 Proxy。
+完整开发环境从最新 OpenSandbox 代码搭建。准备一台裸金属 Linux 主机，需要 KVM、Docker、
+Go ≥ 1.25、cgroup v2 和 sudo，并安装 `uv` 用于 CLI 和 SDK 验证。脚本会准备 Kind 集群、
+对象存储、golden image、运行时、Server 和入口网关，并验证 Sandbox 创建和访问。
+首次搭建包含镜像构建和下载。
 
-数据面同时支持集中入口和可信集成直连两种路径：
+```bash
+git clone https://github.com/opensandbox-group/OpenSandbox.git
+cd OpenSandbox
+
+WARM_IMAGES=1 ./scripts/fast-sandbox-env/integration-env.sh up
+./scripts/fast-sandbox-env/integration-env.sh status
+./scripts/fast-sandbox-env/integration-env.sh sdk-e2e
+```
+
+生命周期 API 地址为 `http://127.0.0.1:18080`，环境的 API Key 为 `fast-sandbox-env`。
+从 OpenSandbox 模板列表中选择构建状态为 `Succeeded` 的模板，然后通过 Python SDK 使用：
+
+```python
+import asyncio
+from datetime import timedelta
+
+from opensandbox.config import ConnectionConfig
+from opensandbox.sandbox import Sandbox
+
+
+async def main():
+    sandbox = await Sandbox.create_from_template(
+        "tpl_<succeeded-template-id>",
+        timeout=timedelta(minutes=10),
+        ready_timeout=timedelta(minutes=5),
+        connection_config=ConnectionConfig(
+            domain="127.0.0.1:18080",
+            protocol="http",
+            api_key="fast-sandbox-env",
+        ),
+    )
+    try:
+        result = await sandbox.commands.run("echo hello-firecracker")
+        for message in result.logs.stdout:
+            print(message.text)
+    finally:
+        await sandbox.destroy()
+
+
+asyncio.run(main())
+```
+
+当前 OpenSandbox Server 在 `runtime.type = "kubernetes"` 下集成 Fast Sandbox。
+携带 `templateId` 的模板创建请求会选择 Fast Sandbox 后端，对应 Python SDK 的
+`Sandbox.create_from_template()`。集成环境会自动配置这条链路，并使用 OpenSandbox
+锁定的 Fast Sandbox 版本构建运行时。
+
+详见 [OpenSandbox 集成环境](https://github.com/opensandbox-group/OpenSandbox/tree/main/scripts/fast-sandbox-env)、
+[Helm 部署指南](https://github.com/opensandbox-group/OpenSandbox/blob/main/manifests/HELM-DEPLOYMENT.md#fast-sandbox-runtime-firecracker) 和
+[Python SDK](https://github.com/opensandbox-group/OpenSandbox/tree/main/sdks/sandbox/python)。
+体验完成后，在 OpenSandbox 目录执行
+`./scripts/fast-sandbox-env/integration-env.sh down` 清理开发环境。
+
+## 独立部署
+
+如果你的平台已经有 Sandbox API，或者需要自己的应用协议，可以独立部署 Fast Sandbox，
+作为 Sandbox 调度与运行时层。通过 Fast-Path gRPC API、Fast Sandbox SDK 或 Kubernetes
+CRD 接入，复用 Pool 调度、原子容量准入、microVM 创建、端点解析和资源清理能力。
 
 ```text
-Fast Sandbox 原生客户端
-  -> Sandbox Proxy
-  -> Fastlet Proxy
-  -> Sandbox 私网
-  -> 命名 Infra Component
-
-OpenSandbox 客户端
-  -> OpenSandbox Ingress
-  -> Fastlet Proxy
-  -> Sandbox 私网
-  -> 命名 Infra Component
+你的 Sandbox API -> Fast-Path / Kubernetes CRD -> Fastlet -> Firecracker microVM
 ```
 
-OpenSandbox 直连路径首先通过 Fast-Path 解析带 generation fencing 的路由，随后连接到
-被分配的 Fastlet Proxy，不需要额外经过 Sandbox Proxy。
+在本仓库中运行独立 Firecracker 开发环境，需要 Linux、KVM、`/dev/net/tun`、Docker、
+root 或 sudo，以及足够的磁盘空间。脚本会准备双节点 Kind 集群、XFS reflink 状态存储、
+MinIO、runtime-agent、golden image 和 Firecracker Pool：
 
-| 部署单元 | 可用性 | 职责 |
-|---|---|---|
-| Fast-Path Server | 多活 Deployment | Create、placement、readiness 和 endpoint resolution |
-| Sandbox/Pool Reconciler | 选主 Deployment | 声明式生命周期、Pool 扩缩容、drain 和恢复 |
-| Sandbox Proxy | 可选的多活 Deployment | 集中的带鉴权 HTTP/流式入口 |
-| Fastlet Pod | Pool 管理的 Pod | 原子 admission、runtime、网络、Infra supervision 和本地 Proxy |
-| NodeJanitor | 每节点 DaemonSet | 带 fencing 的孤儿资源清理 |
+```bash
+# 预热快照产物，并保留现有 Docker data-root 配置。
+DOCKER_DATA_ROOT= WARM_IMAGES=1 ./scripts/integration-env.sh up
 
-完整原理见 [Architecture](docs/concepts/architecture.md)、
-[Control plane](docs/concepts/control-plane.md) 和
-[Private networking](docs/concepts/networking.md)。
-
-## Infra Component
-
-一个 Infra Component 使用一个不可变 artifact、一个受监管进程、一个健康检查和一个
-命名 endpoint 扩展用户镜像：
-
-```yaml
-apiVersion: sandbox.fast.io/v1alpha2
-kind: SandboxPool
-metadata:
-  name: opensandbox-pool
-  namespace: fast-sandbox
-spec:
-  runtime: container
-  infraComponents:
-    - name: execd
-      artifact:
-        source:
-          image:
-            reference: ghcr.io/opensandbox/execd@sha256:<digest>
-        mappings:
-          - sourcePath: /execd
-            targetPath: /.fast/components/execd/execd
-      process:
-        command: [/.fast/components/execd/execd, --port, "44772"]
-        restartPolicy: OnFailure
-        healthCheck:
-          httpGet:
-            path: /ping
-          timeoutSeconds: 10
-      endpoint:
-        protocol: HTTP
-        port: 44772
+# 创建 Sandbox，经路由验证 execd /ping，然后删除测试实例。
+./scripts/integration-env.sh verify
+./scripts/integration-env.sh status
+./scripts/integration-env.sh down
 ```
 
-Component name 是不可变路由键，不是展示名称。Fastlet state、健康记录、
-Fast-Path resolution、Proxy、SDK adapter 和 fastctl 都使用同一个名称。Pool 更新会
-产生新的不可变 Component revision，不会热修改已经运行的 Sandbox。
+详见 [独立部署](docs/guides/deployment.md)、
+[Firecracker 环境搭建](docs/guides/firecracker-integration-env.md) 和
+[API 参考](docs/reference/api.md)。如果希望通过 container 运行时体验控制面，可使用
+`make quickstart`，并参考 [Quick Start](docs/getting-started/quickstart.md)。
 
-`RuntimeReady` 表示 runtime、私有网络、Component 进程和用户进程已经创建；
-`ComponentReady` 表示一个 Component 通过健康检查，并且本地路由已经发布；
-`DataPlaneReady` 表示 Pool 中的全部 Component 均已就绪。Create 在
-`RuntimeReady` 时返回；调用方可以通过 Fast-Path 直接等待某个 Component，无需等待
-CRD status 传播。
+## 性能
 
-Artifact mapping、进程 supervision、健康检查和命名路由语义见
-[Infra Components](docs/concepts/infra-components.md)。
+Fast Sandbox 通过复用就绪 Fastlet、预先准备网络槽位、缓存快照产物、reflink 克隆 rootfs，
+以及恢复已初始化的 microVM，降低创建延迟。
 
-## OpenSandbox 集成
+[OpenSandbox ACK 性能报告](https://github.com/opensandbox-group/OpenSandbox/blob/main/docs/architecture/fast-sandbox/performance.md)
+在 2026-10-08 测量了完整 Python SDK 创建链路：从 `Sandbox.create_from_template()`
+发起请求，经过生命周期 Server、FastPath、入口网关，直到客体首次 `/ping` 成功：
 
-[OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) 是一等集成对象，
-但不是 Fast Sandbox 的协议依赖：
+| 预热 SDK 创建 | 成功数 | p50 | p99 | 均值 |
+| --- | ---: | ---: | ---: | ---: |
+| 串行复测 | 100/100 | 77.9 ms | 112.5 ms | 78.2 ms |
+| 并发 10 | 100/100 | 102.7 ms | 125.4 ms | 102.4 ms |
 
-- 生命周期操作使用 Fast-Path API；
-- OpenSandbox Ingress 将 `namespace/name/component` 解析为完整 upstream route；
-- 可信 Ingress 流量可以直接连接 Fastlet Proxy；
-- OpenSandbox Execd 是 Pool 定义的、名为 `execd` 的 Infra Component；
-- fastctl 使用 OpenSandbox 官方 SDK 实现 exec 和文件操作；
-- Execd 可选的 access-token 机制保持关闭。Fast Sandbox route credential 保护外部
-  访问，应用 Header 则原样透传。
+测试使用双节点 ACK KVM 环境、AMD EPYC 9T95 CPU、Firecracker 1.16.1、XFS reflink
+存储、已缓存的 Alpine + Execd 模板（1 vCPU / 2 GiB 内存）和 20 个预热槽位。
+SDK 就绪轮询间隔为 10 ms，默认值为 200 ms；单次延迟不包含删除和批次回收等待。
 
-Fast Sandbox 不定义 Exec 或 File 协议。其他 Component 可以用另一个名称提供完全不同的
-原生 API。
+这些是有明确日期的工程测量，不是生产 SLA，也不是对当前最新代码的重新测量。
+并发 20 的测试仅成功 51/100 次，报告记录了容量拒绝和一次就绪超时，因此不能据此推导
+持续吞吐能力。首次产物下载是另一项成本。环境、版本、失败情况和运行时分段数据见
+[原始样本](https://github.com/opensandbox-group/OpenSandbox/blob/main/docs/public/benchmarks/fast-sandbox-ack-2026-10-08.json)。
 
-后端和直连 Ingress 契约见
-[OpenSandbox integration](docs/guides/opensandbox-integration.md)，exec 和文件操作见
-[OpenSandbox Execd](docs/guides/opensandbox-execd.md)。
+Fast Sandbox API 的 Create 默认等待聚合 `Ready`；显式选择 `RuntimeReady` 可以提前
+返回，不等待组件和路由就绪。基准测试需要注明完成边界和缓存状态，测量工具见
+[性能指南](docs/guides/performance.md)。
 
-## Runtime 支持
+## 应用协议
 
-| Runtime | Pool 值 | Quick Start | Fast Sandbox 状态 |
-|---|---|---:|---|
-| OCI container | `container` | 支持 | 已验证 |
-| gVisor | `gvisor` | 支持 | 已验证 |
-| Kata QEMU | `kata-qemu` | 支持 | 已验证 |
-| Kata Cloud Hypervisor | `kata-clh` | 支持 | 已验证 |
-| Kata Firecracker | `kata-fc` | 支持 | 已验证；需要 block snapshotter |
-| Kata Dragonball | `kata-dragonball` | 支持 | 已验证；需要兼容配置 |
+应用在客体内暴露自己的协议，HTTP、SSE 和 WebSocket 流量可通过带鉴权的代理访问。
+可选的 [Infra Component](docs/concepts/infra-components.md) 提供受管理的进程、健康检查
+和命名端点。OpenSandbox Execd 可以在构建阶段写入 Firecracker 模板，提供命令执行和
+文件操作能力。
 
-这个表描述 Fast Sandbox 的验收状态，不代表上游 runtime 的通用能力。
+## 运行时选择与当前范围
 
-## Fast Sandbox 与 Agent Sandbox
+直接运行的 `firecracker` 是本文介绍的快照恢复路径。Fast Sandbox 同时支持通过
+containerd 运行 `container`、`gvisor`、`kata-qemu`、`kata-clh`、`kata-fc` 和
+`kata-dragonball`。其中 `kata-fc` 使用 Kata 的 Firecracker 集成，启动路径与
+`firecracker` 不同。具体配置见 [运行时模型](docs/concepts/runtimes.md) 和
+[运行时支持](docs/reference/runtime-support.md)。
 
-[Kubernetes SIGs Agent Sandbox](https://github.com/kubernetes-sigs/agent-sandbox)
-和 Fast Sandbox 解决相邻问题，但采用不同的 workload 单元：
+OverlayBD 按需加载当前通过主机侧的 [`fsb-vm` 路径](docs/guides/fsb-vm-user-guide.en.md)
+提供；OpenSandbox/Kubernetes 集成使用完整缓存的 native 快照产物。
 
-| | Fast Sandbox | Agent Sandbox |
-|---|---|---|
-| 核心抽象 | 预热 Fastlet Pod 内的 runtime instance | 有状态的单例 Sandbox Pod |
-| 预热容量 | 一个 Fastlet Pod 承载多个 runtime | `SandboxWarmPool` 预备 Sandbox Pod |
-| 主要关注点 | 高密度 runtime 创建和独立的 Component 数据面 | 稳定 Pod identity、持久化和休眠流程 |
-
-这只是架构对比，不是性能结论。
-
-## 性能语义
-
-Create 延迟终止于 `RuntimeReady`。Component 健康检查和路由发布独立推进到
-`DataPlaneReady`；因此，OpenSandbox 用户可见的创建边界可能晚于单纯的 runtime 创建边界。
-
-没有 commit、环境、runtime、缓存状态、并发度、测量边界和分位数分布时，项目不发布单一
-延迟数字。详见 [Performance](docs/guides/performance.md)。
-
-## API 状态与当前范围
-
-- 当前 CRD 和 Fast-Path API 版本为 `v1alpha2`。这是 alpha API，后续仍可能演进；
-  当前分支不接受 `v1alpha1` 对象。
-- SandboxPool 和 Sandbox 是 namespace-scoped 资源。Namespace 隔离是资源边界，
-  不是完整的租户认证模型。
-- Sandbox 实例与一个 Fastlet Pod 绑定。Pod 消失后实例失效，`AutoRecreate` 可以创建
-  新 generation。
-- 公共命名 Component 路由目前支持 HTTP，包括 SSE 和 WebSocket upgrade。通用 raw TCP、
-  gRPC 和 upstream TLS 不属于第一版 Component contract。
-- Snapshot、pause/resume、持久化存储和 live migration 不是当前能力。
-- Secure Runtime 延迟高度依赖宿主环境。当前 warm、并发为 1 的工程测试中，
-  `kata-fc` 在非嵌套 KVM 宿主机上约为 561 ms，在资源受限的嵌套 KVM VM 中约为
-  5.47 s。这些数据是诊断基线，不是发布级性能承诺。
-私有镜像仓库凭证通过 namespace 级静态 ConfigMap 和被引用的 Secret 配置，Pool 不直接
-保存凭证。详见 [Private registries](docs/guides/private-registries.md)。
+- 当前 CRD 和 Fast-Path API 版本为 `v1alpha2`，仍处于 alpha 阶段。
+- Firecracker 需要兼容的 KVM 主机和快照产物；直接运行时需要支持 reflink 的 XFS
+  状态目录。
+- Firecracker Sandbox 使用已发布的快照产物；OCI 镜像需要先通过 `SandboxTemplate`
+  构建，再用于该运行时。
+- 暂停恢复和运行中快照由 Firecracker 运行时实现；跨主机恢复要求主机满足快照兼容条件。
+- Fastlet Pod 丢失会销毁其中的运行实例，自动重建会创建新一代实例。当前范围不包含
+  持久化存储和热迁移。
 
 ## 文档
 
-除本文件外，项目文档统一使用英文：
-
 - [文档索引](docs/README.md)
-- [Architecture](docs/concepts/architecture.md)
-- [Runtime model](docs/concepts/runtimes.md)
-- [Private networking](docs/concepts/networking.md)
-- [Infra Components](docs/concepts/infra-components.md)
-- [OpenSandbox integration](docs/guides/opensandbox-integration.md)
-- [OpenSandbox Execd](docs/guides/opensandbox-execd.md)
-- [Infra Components reference](docs/reference/infra-components.md)
-- [Private registries](docs/guides/private-registries.md)
-- [Deployment](docs/guides/deployment.md)
-- [Testing](docs/guides/testing.md)
-- [API reference](docs/reference/api.md)
+- [Firecracker 部署与验证](docs/guides/firecracker-integration-env.md)
+- [Golden image 构建](docs/guides/sandboxtemplate-golden-images.md)
+- [运行中快照](docs/guides/sandbox-snapshots.md)
+- [暂停与恢复](docs/guides/pause-resume-snapshot-integration.md)
+- [快照 CPU 兼容性](docs/guides/snapshot-cpu-compatibility.md)
+- [私有网络](docs/concepts/networking.md)
+- [部署指南](docs/guides/deployment.md)
+- [可观测性](docs/guides/observability.md)
+- [API 参考](docs/reference/api.md) · [CLI 参考](docs/reference/fastctl.md)
 
-## License
+## 许可证
 
 [Apache-2.0](LICENSE)

@@ -1,315 +1,232 @@
 # Fast Sandbox
 
-A Kubernetes-native runtime plane for creating isolated container, gVisor, and
-Kata sandboxes inside warm Fastlet Pods.
+**A high-performance Sandbox runtime on Kubernetes, powered by Firecracker microVMs.**
 
-[Chinese](README_ZH.md) | [Quick Start](docs/getting-started/quickstart.md) | [Documentation](docs/README.md) | [Architecture](docs/concepts/architecture.md)
+[中文](README_ZH.md) · [Use with OpenSandbox](#use-with-opensandbox-recommended) · [Standalone deployment](#standalone-deployment) · [Documentation](docs/README.md) · [Architecture](docs/concepts/architecture.md)
+
+Fast Sandbox brings Firecracker microVM isolation and snapshot-based startup to
+Kubernetes. It is built for workloads that frequently create and recycle
+execution environments: AI agents, code interpreters, and on-demand development
+or test sandboxes.
+
+Kubernetes manages capacity and desired lifecycle state. Warm **Fastlet Pods**
+each host multiple Sandboxes, while the Firecracker runtime restores each
+instance from a prepared snapshot. Creating a Sandbox reuses that capacity
+without scheduling and starting a new Kubernetes Pod for every request.
+
+We recommend using Fast Sandbox through [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox),
+which already integrates this runtime with its API, SDKs, ingress, and command
+execution. You can also deploy Fast Sandbox independently as the Sandbox
+scheduling and runtime layer for your own platform.
 
 ![Fast Sandbox system overview](docs/assets/system-overview.svg)
 
-Fast Sandbox combines a multi-active imperative Create path with declarative
-CRD lifecycle management. The Create request persists its initial intent before
-a Fastlet atomically admits and starts the runtime; delete, reset, expiry,
-recovery, and Pool management converge through Kubernetes reconciliation.
-
-The user image remains in control of the workload. Pool-defined
-[Infra Components](docs/concepts/infra-components.md) add managed processes,
-health-checked named endpoints, and protocol-transparent data-plane access
-without rebuilding that image.
-
 ## Why Fast Sandbox
 
-- **Warm runtime pools** reuse ready Fastlet Pods instead of creating one
-  Kubernetes Pod for every Sandbox.
-- **Multiple isolation runtimes** select container, gVisor, Kata QEMU, or Kata
-  Cloud Hypervisor through one immutable Pool runtime.
-- **Atomic CRD-first Create** persists image, command, expiry, metadata, and
-  placement intent before runtime creation, with request-level idempotency.
-- **Composable Infra Components** inject immutable artifacts and supervised
-  processes directly from the Pool contract.
-- **Sandbox Actions** reconcile opaque per-Sandbox state through Pod-local,
-  generation-fenced lifecycle handlers.
-- **Private Sandbox networking** gives every instance a private address space
-  and NAT egress without global host-port allocation.
-- **Named, protocol-transparent routes** expose component-native HTTP, SSE, and
-  WebSocket traffic through authenticated proxies without translating the
-  application protocol.
-- **Kubernetes-native lifecycle** continues to work through CRDs when the
-  optional Fast-Path deployment is absent.
+- **Firecracker microVM isolation.** Each Firecracker Sandbox has its own
+  microVM, guest kernel, private network namespace, and instance rootfs.
+- **Snapshot-based startup.** Initialize an environment once, then restore new
+  instances from saved VM and memory state. XFS reflink clones the rootfs
+  without a full disk copy on the creation path.
+- **Warm, high-density capacity.** A SandboxPool maintains ready Fastlet Pods;
+  each Fastlet admits multiple instances within configured resource and
+  capacity limits.
+- **A dedicated creation path.** Multi-active Fast-Path servers persist Sandbox
+  intent, select a ready Fastlet, and call it directly. Fastlet owns atomic
+  admission; Kubernetes reconciliation handles lifecycle convergence.
+- **Shared artifacts and on-demand loading.** A node runtime-agent caches
+  snapshots for local Fastlets; P2P delivery reduces repeated origin downloads.
+  The OverlayBD + ublk-backed `fsb-vm` path reads rootfs and memory snapshot blocks on
+  demand, so startup does not require downloading the entire artifact set.
+- **Checkpoint and reuse.** Pause an instance to release capacity and resume
+  it on a compatible Fastlet, or publish a running Sandbox as a reusable image.
+- **Kubernetes-native operations.** CRDs describe Sandboxes, Pools, templates,
+  and snapshots, with declarative lifecycle management and observable status.
 
-## Quick Start
+[How it works](docs/concepts/architecture.md)
 
-Quick Start prepares an interactive kind environment on a Linux host. It does
-not run an E2E suite or create a Sandbox automatically.
+## Use with OpenSandbox (recommended)
 
-```bash
-make quickstart
-```
-
-Keep the local endpoints exposed in terminal 1:
-
-```bash
-make quickstart-forward
-```
-
-In terminal 2, create a Sandbox and use its Pool-provided `execd` component:
-
-```bash
-bin/fastctl run quickstart-execd-sandbox \
-  --image docker.io/library/alpine:latest \
-  --pool quickstart-execd-pool -- /bin/sleep 3600
-
-bin/fastctl opensandbox exec quickstart-execd-sandbox \
-  --component execd -- uname -a
-
-bin/fastctl delete quickstart-execd-sandbox
-```
-
-On the first run, Quick Start creates a local `.fastctl/config.json` containing
-the forwarded endpoints. An existing file is never modified; the command output
-shows the environment-variable override when manual configuration is needed.
-
-Select another runtime with:
-
-```bash
-make quickstart RUNTIME=gvisor
-make quickstart RUNTIME=kata-qemu
-make quickstart RUNTIME=kata-clh
-make quickstart RUNTIME=kata-fc
-make quickstart RUNTIME=kata-dragonball
-```
-
-See the [full Quick Start](docs/getting-started/quickstart.md) for file transfer,
-diagnostics, declarative CRD creation, and troubleshooting.
-
-## Architecture
-
-The control plane separates latency-sensitive creation from declarative
-convergence:
+[OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) already integrates
+Fast Sandbox. Use its public API and SDKs to build templates, create microVM
+Sandboxes, execute commands, manage files, and drive pause/resume and snapshots.
+Fast Sandbox supplies Pool placement, warm capacity, and Firecracker lifecycle;
+OpenSandbox supplies the application-facing interface and authenticated ingress.
 
 ```text
-fastctl / SDK
-      |
-      v
-Multi-active Fast-Path ---- persist intent ----> Sandbox CRD
-      |                                            ^
-      | atomic admission                           |
-      v                                            |
-Fastlet Pod <---------- leader-elected Reconciler -+
+Your application -> OpenSandbox API / SDK
+                         -> Fast Sandbox -> Fastlet -> Firecracker microVM
 ```
 
-- **Fast-Path Servers** are multi-active. They provide idempotent Create,
-  in-memory Top-K placement, direct Fastlet admission, readiness waits, and
-  endpoint resolution.
-- **Reconcilers** are leader-elected. They converge Sandbox and SandboxPool
-  lifecycle, including declarative creation, deletion, expiry, drain, and
-  recovery.
-- **Fastlet Pods** are Pool-managed runtime boundaries. Each one hosts multiple
-  isolated runtimes and owns their admission, private networking, Infra
-  processes, health, and local proxy.
+For a complete development environment, start from the latest OpenSandbox
+checkout on a bare-metal Linux host with KVM, Docker, Go ≥ 1.25, cgroup v2,
+and sudo. Install `uv` for the CLI and SDK verification. The script prepares
+the Kind cluster, artifact store, golden image, runtime, server, and ingress,
+then verifies Sandbox creation and access. First setup builds and downloads images.
 
-The data plane supports a centralized path and a direct trusted-integration
-path:
+```bash
+git clone https://github.com/opensandbox-group/OpenSandbox.git
+cd OpenSandbox
+
+WARM_IMAGES=1 ./scripts/fast-sandbox-env/integration-env.sh up
+./scripts/fast-sandbox-env/integration-env.sh status
+./scripts/fast-sandbox-env/integration-env.sh sdk-e2e
+```
+
+The lifecycle API listens on `http://127.0.0.1:18080`; the environment's API key
+is `fast-sandbox-env`. Choose a template whose build has reached `Succeeded`
+from the OpenSandbox template catalog, then use the Python SDK:
+
+```python
+import asyncio
+from datetime import timedelta
+
+from opensandbox.config import ConnectionConfig
+from opensandbox.sandbox import Sandbox
+
+
+async def main():
+    sandbox = await Sandbox.create_from_template(
+        "tpl_<succeeded-template-id>",
+        timeout=timedelta(minutes=10),
+        ready_timeout=timedelta(minutes=5),
+        connection_config=ConnectionConfig(
+            domain="127.0.0.1:18080",
+            protocol="http",
+            api_key="fast-sandbox-env",
+        ),
+    )
+    try:
+        result = await sandbox.commands.run("echo hello-firecracker")
+        for message in result.logs.stdout:
+            print(message.text)
+    finally:
+        await sandbox.destroy()
+
+
+asyncio.run(main())
+```
+
+In the current OpenSandbox server, Fast Sandbox is integrated under
+`runtime.type = "kubernetes"`. Template-based creation (`templateId`, exposed
+as `Sandbox.create_from_template()` in Python) selects the Fast Sandbox backend.
+The integration environment wires this configuration automatically and builds
+Fast Sandbox from the revision pinned by OpenSandbox.
+
+See the [OpenSandbox integration environment](https://github.com/opensandbox-group/OpenSandbox/tree/main/scripts/fast-sandbox-env),
+[Helm deployment guide](https://github.com/opensandbox-group/OpenSandbox/blob/main/manifests/HELM-DEPLOYMENT.md#fast-sandbox-runtime-firecracker),
+and [Python SDK](https://github.com/opensandbox-group/OpenSandbox/tree/main/sdks/sandbox/python).
+Clean up the development stack with
+`./scripts/fast-sandbox-env/integration-env.sh down` from the OpenSandbox checkout.
+
+## Standalone deployment
+
+Deploy Fast Sandbox independently when your platform already has a Sandbox API
+or needs its own workload protocols. Use the Fast-Path gRPC API, Fast Sandbox
+SDKs, or Kubernetes CRDs to connect your control plane to Pool scheduling,
+atomic admission, microVM creation, endpoint resolution, and cleanup.
 
 ```text
-Native client
-  -> Sandbox Proxy
-  -> Fastlet Proxy
-  -> Sandbox private network
-  -> named Infra Component
-
-OpenSandbox client
-  -> OpenSandbox Ingress
-  -> Fastlet Proxy
-  -> Sandbox private network
-  -> named Infra Component
+Your Sandbox API -> Fast-Path / Kubernetes CRDs -> Fastlet -> Firecracker microVM
 ```
 
-The direct OpenSandbox path resolves a generation-fenced route through
-Fast-Path, then connects to the assigned Fastlet Proxy. It does not require an
-extra hop through Sandbox Proxy.
+From this repository, the standalone Firecracker development environment needs
+Linux with KVM, `/dev/net/tun`, Docker, root or sudo, and sufficient disk space.
+It prepares a two-node Kind cluster, XFS reflink state storage, MinIO,
+runtime-agents, a golden image, and a Firecracker Pool:
 
-| Deployment unit | Availability | Responsibility |
-|---|---|---|
-| Fast-Path Server | Multi-active Deployment | Create, placement, readiness and endpoint resolution |
-| Sandbox/Pool Reconcilers | Leader-elected Deployment | Declarative lifecycle, Pool scaling, drain and recovery |
-| Sandbox Proxy | Optional multi-active Deployment | Central authenticated HTTP and streaming entry point |
-| Fastlet Pod | Pool-managed Pod | Atomic admission, runtime, network, Infra supervision and local proxy |
-| NodeJanitor | Per-node DaemonSet | Fenced orphan cleanup |
+```bash
+# Prewarm artifacts and retain the existing Docker data-root configuration.
+DOCKER_DATA_ROOT= WARM_IMAGES=1 ./scripts/integration-env.sh up
 
-Read [Architecture](docs/concepts/architecture.md),
-[Control plane](docs/concepts/control-plane.md), and
-[Private networking](docs/concepts/networking.md) for the complete model.
-
-## Infra Components
-
-An Infra Component augments the user image with one immutable artifact, one
-supervised process, one health check, and one named endpoint:
-
-```yaml
-apiVersion: sandbox.fast.io/v1alpha2
-kind: SandboxPool
-metadata:
-  name: opensandbox-pool
-  namespace: fast-sandbox
-spec:
-  runtime: container
-  infraComponents:
-    - name: execd
-      artifact:
-        source:
-          image:
-            reference: ghcr.io/opensandbox/execd@sha256:<digest>
-        mappings:
-          - sourcePath: /execd
-            targetPath: /.fast/components/execd/execd
-      process:
-        command: [/.fast/components/execd/execd, --port, "44772"]
-        restartPolicy: OnFailure
-        healthCheck:
-          httpGet:
-            path: /ping
-          timeoutSeconds: 10
-      endpoint:
-        protocol: HTTP
-        port: 44772
+# Create Sandboxes, verify execd /ping through their routes, and delete them.
+./scripts/integration-env.sh verify
+./scripts/integration-env.sh status
+./scripts/integration-env.sh down
 ```
 
-The component name is an immutable routing key, not a display label. Fastlet
-state, health, Fast-Path resolution, proxies, SDK adapters, and fastctl all use
-the same name. A Pool update creates a new immutable component revision;
-existing Sandboxes are not hot-patched.
-
-`RuntimeReady` means the concrete runtime and its private network identity are
-available. `ComponentReady` means one component passed health.
-`DataPlaneReady` means Infra Components are ready and the interaction route is
-published. Aggregate `Ready` additionally requires every Action Binding to
-have applied its input and reached subscribed lifecycle Hooks. Create defaults
-to this aggregate boundary; callers may explicitly request `RuntimeReady` for
-an earlier return without waiting for CRD status propagation.
-
-See [Infra Components](docs/concepts/infra-components.md) for artifact mapping,
-process supervision, health, and named-routing semantics.
-See [Sandbox Actions](docs/guides/sandbox-actions.md) for generic Pod-local
-lifecycle handlers and opaque desired input.
-
-## OpenSandbox integration
-
-[OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) is a first-class
-integration, not a protocol dependency:
-
-- lifecycle operations use the Fast-Path API;
-- OpenSandbox Ingress resolves `namespace/name/component` into a complete
-  upstream route;
-- trusted ingress traffic can connect directly to Fastlet Proxy;
-- OpenSandbox Execd is a Pool-defined Infra Component named `execd`;
-- fastctl uses the official OpenSandbox SDK for exec and file operations;
-- Execd's optional access-token mechanism is disabled. Fast Sandbox route
-  credentials protect external access while application headers pass through
-  unchanged.
-
-Fast Sandbox does not define Exec or File protocols. Another component may
-provide a different native API under another component name.
-
-See [OpenSandbox integration](docs/guides/opensandbox-integration.md) for the
-backend and direct-ingress contract, and
-[OpenSandbox Execd](docs/guides/opensandbox-execd.md) for exec and file usage.
-
-## Runtime support
-
-| Runtime | Pool value | Quick Start | Fast Sandbox status |
-|---|---|---:|---|
-| OCI container | `container` | Yes | Validated |
-| gVisor | `gvisor` | Yes | Validated |
-| Kata QEMU | `kata-qemu` | Yes | Validated |
-| Kata Cloud Hypervisor | `kata-clh` | Yes | Validated |
-| Kata Firecracker | `kata-fc` | Yes | Validated; block snapshotter required |
-| Kata Dragonball | `kata-dragonball` | Yes | Validated; compatibility binding required |
-
-This table describes Fast Sandbox validation status, not the upstream runtimes'
-general capabilities.
-
-Secure-runtime latency is strongly environment-dependent. In the current warm,
-concurrency-1 engineering measurements, `kata-fc` reached `RuntimeReady` in
-about 561 ms on a non-nested KVM host and 5.47 s in a resource-constrained
-nested-KVM VM. These are diagnostic baselines, not release claims. See
-[Performance](docs/guides/performance.md#kata-331-secure-runtime-comparison).
-
-## Fast Sandbox and Agent Sandbox
-
-[Kubernetes SIGs Agent Sandbox](https://github.com/kubernetes-sigs/agent-sandbox)
-and Fast Sandbox solve adjacent problems with different workload units:
-
-| | Fast Sandbox | Agent Sandbox |
-|---|---|---|
-| Primary abstraction | Runtime instance inside a warm Fastlet Pod | Stateful singleton Sandbox Pod |
-| Warm capacity | One Fastlet Pod hosts multiple runtimes | `SandboxWarmPool` prepares Sandbox Pods |
-| Main focus | High-density runtime creation and a separate component data plane | Stable Pod identity, persistence, and hibernation workflows |
-
-This is an architectural comparison, not a performance claim.
+See [Standalone deployment](docs/guides/deployment.md),
+[Firecracker setup](docs/guides/firecracker-integration-env.md), and
+[API reference](docs/reference/api.md). To explore the control plane with a
+container runtime, use `make quickstart` and follow the
+[Quick Start](docs/getting-started/quickstart.md).
 
 ## Performance
 
-The latest published warm, concurrency-1 engineering sample is summarized
-below. It was reported on 2026-08-09 at commit
-`cde6d5c8e82f568ae3dbfd919ea7284713603f13`; it used a warm Alpine image,
-pre-created network slots, no Infra Components, a single-node Kind cluster with
-containerd 1.7.18, and a non-nested KVM host with 104 vCPUs and 187 GiB RAM.
+Fast Sandbox targets low creation latency by reusing ready Fastlets, preparing
+network slots, caching snapshots, cloning rootfs files with reflink, and
+restoring initialized microVMs.
 
-| Runtime | Boundary | N | Mean | p50 | p95 | Max |
-|---|---|---:|---:|---:|---:|---:|
-| container (`runc`) | `RUNTIME_READY` | 20 | 72.4 ms | 72.7 ms | 80.2 ms | 83.1 ms |
-| Kata Firecracker | `RUNTIME_READY` | 20 | 560.6 ms | 559.6 ms | 622.8 ms | 626.9 ms |
+The [OpenSandbox ACK report](https://github.com/opensandbox-group/OpenSandbox/blob/main/docs/architecture/fast-sandbox/performance.md)
+measured the complete Python SDK create path on 2026-10-08, from
+`Sandbox.create_from_template()` through the lifecycle server, FastPath, ingress
+gateway, and the guest's first successful `/ping`:
 
-With only 20 samples, this report uses maximum rather than presenting an
-unstable p99. Aggregate `READY`, `ResolveEndpoint`, and sustained concurrent
-throughput were not measured in that run and are not implied by this table.
-These are reproducible engineering observations, not a production SLA. See the
-[full report and benchmark command](docs/guides/performance.md#create-load-tool).
+| Warm SDK create | Success | p50 | p99 | Mean |
+| --- | ---: | ---: | ---: | ---: |
+| Serial repeat | 100/100 | 77.9 ms | 112.5 ms | 78.2 ms |
+| Concurrency 10 | 100/100 | 102.7 ms | 125.4 ms | 102.4 ms |
 
-The default Create latency ends at aggregate `Ready`. Performance experiments
-may explicitly request the earlier `RuntimeReady` boundary; component health,
-route publication and Action convergence then continue independently. Reports
-must always name the selected completion boundary.
+The runs used two ACK KVM nodes with AMD EPYC 9T95 CPUs, Firecracker 1.16.1,
+XFS reflink storage, cached Alpine + Execd templates (1 vCPU / 2 GiB memory),
+and 20 prepared slots. The SDK polled readiness every 10 ms, compared with its
+200 ms default. Deletion and batch reclamation pauses are excluded.
 
-Fast Sandbox does not publish an unqualified headline latency. Results must
-record the commit, environment, runtime, cache state, concurrency, measurement
-boundary, and percentile distribution. See
-[Performance](docs/guides/performance.md).
+These are dated engineering measurements, not production SLAs or measurements
+of the latest checkout. The concurrency-20 run succeeded in only 51/100 attempts;
+the report includes capacity rejections and a readiness timeout. It does not
+establish sustainable throughput. Cold artifact delivery is a separate cost.
+See the [raw samples](https://github.com/opensandbox-group/OpenSandbox/blob/main/docs/public/benchmarks/fast-sandbox-ack-2026-10-08.json)
+for environment, versions, failures, and runtime-stage timings.
 
-## API status and current scope
+At the Fast Sandbox API layer, Create defaults to aggregate `Ready`. Explicit
+`RuntimeReady` completion returns earlier, before component and route readiness.
+Benchmarks must name their completion boundary and cache state. See
+[Performance](docs/guides/performance.md) for measurement tools.
 
-- The current CRD and Fast-Path API version is `v1alpha2`. It is an alpha API
-  and may evolve; this branch does not accept `v1alpha1` objects.
-- SandboxPool and Sandbox are namespace-scoped resources. Namespace isolation
-  is a resource boundary, not a complete tenant authentication model.
-- A Sandbox is bound to one Fastlet Pod. Pod loss destroys that instance;
-  `AutoRecreate` may create a new generation.
-- Public named-component routing currently supports HTTP, including SSE and
-  WebSocket upgrade. Generic raw TCP, gRPC, and upstream TLS are not part of
-  the first component contract.
-- Snapshots publish a running Sandbox as a bootable image; pause/resume
-  checkpoints one Sandbox instance to the artifact store and resumes it on any
-  Fastlet (same Sandbox identity). Persistent storage and live migration are
-  not current capabilities.
-Private registry credentials are configured per namespace through a static
-ConfigMap and referenced Secrets; Pools do not embed credentials. See
-[Private registries](docs/guides/private-registries.md).
+## Application protocols
+
+Applications expose their own protocols inside the guest; HTTP, SSE, and
+WebSocket traffic can pass through authenticated proxies. Optional
+[Infra Components](docs/concepts/infra-components.md) add managed processes,
+health checks, and named endpoints. OpenSandbox Execd can be baked into the
+Firecracker template for command execution and file operations.
+
+## Runtime options and current scope
+
+The direct `firecracker` runtime is the snapshot-restore path described above.
+Fast Sandbox also supports `container`, `gvisor`, `kata-qemu`, `kata-clh`,
+`kata-fc`, and `kata-dragonball` through containerd. `kata-fc` uses Kata's
+Firecracker integration and has a different startup path from `firecracker`.
+See [Runtime model](docs/concepts/runtimes.md) and
+[Runtime support](docs/reference/runtime-support.md) for profile details.
+
+OverlayBD on-demand loading currently uses the host-side
+[`fsb-vm` path](docs/guides/fsb-vm-user-guide.en.md). The OpenSandbox/Kubernetes
+integration uses fully cached native snapshot artifacts.
+
+- The CRD and Fast-Path API version is `v1alpha2` and is still alpha.
+- Firecracker requires compatible KVM hosts and snapshot artifacts; the direct
+  runtime requires an XFS state directory with reflink support.
+- Firecracker Sandboxes consume published snapshots. Prepare an OCI image with
+  `SandboxTemplate` before using it on this runtime.
+- Pause/resume and live snapshots are implemented by the Firecracker runtime;
+  cross-host restore requires snapshot-compatible hosts.
+- Fastlet Pod loss destroys its live instances. Automatic recreation creates a
+  new generation. Persistent storage and live migration are outside the scope.
 
 ## Documentation
 
 - [Documentation index](docs/README.md)
-- [Architecture](docs/concepts/architecture.md)
-- [Runtime model](docs/concepts/runtimes.md)
+- [Firecracker deployment and verification](docs/guides/firecracker-integration-env.md)
+- [Golden-image builds](docs/guides/sandboxtemplate-golden-images.md)
+- [Live snapshots](docs/guides/sandbox-snapshots.md)
+- [Pause and resume](docs/guides/pause-resume-snapshot-integration.md)
+- [Snapshot CPU compatibility](docs/guides/snapshot-cpu-compatibility.md)
 - [Private networking](docs/concepts/networking.md)
-- [Infra Components](docs/concepts/infra-components.md)
-- [OpenSandbox integration](docs/guides/opensandbox-integration.md)
-- [OpenSandbox Execd](docs/guides/opensandbox-execd.md)
-- [Infra Components reference](docs/reference/infra-components.md)
-- [Private registries](docs/guides/private-registries.md)
 - [Deployment](docs/guides/deployment.md)
-- [Testing](docs/guides/testing.md)
-- [API reference](docs/reference/api.md)
+- [Observability](docs/guides/observability.md)
+- [API reference](docs/reference/api.md) · [CLI reference](docs/reference/fastctl.md)
 
 ## License
 
