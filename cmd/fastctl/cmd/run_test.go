@@ -77,6 +77,9 @@ func (m *MockClient) ResumeSandbox(ctx context.Context, in *fastpathv2.ResumeSan
 	}
 	return &fastpathv2.ResumeSandboxResponse{Sandbox: &fastpathv2.SandboxInfo{}}, nil
 }
+func (m *MockClient) InvokeHandlerAction(ctx context.Context, in *fastpathv2.InvokeHandlerActionRequest, opts ...grpc.CallOption) (*fastpathv2.InvokeHandlerActionResponse, error) {
+	return &fastpathv2.InvokeHandlerActionResponse{Result: &fastpathv2.HandlerActionResult{}}, nil
+}
 
 func TestRunCommand(t *testing.T) {
 	mockClient := &MockClient{}
