@@ -3,6 +3,7 @@ package fastpath
 import (
 	"context"
 	"errors"
+	"net/http"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -76,8 +77,15 @@ func (s *Server) InvokeHandlerAction(ctx context.Context, request *fastpathv2.In
 	if callErr != nil {
 		return nil, status.Errorf(codes.Unavailable, "invoke handler on Fastlet: %v", callErr)
 	}
-	if response == nil || response.Status == 0 {
+	if response == nil {
 		return nil, status.Error(codes.Unavailable, "Fastlet returned no handler result")
+	}
+	// HTTP statuses are 100-599; anything else (the 0 no-result sentinel, a
+	// negative wire value, or an out-of-range code) means the relay response
+	// is malformed and must not be passed through as a plausible handler
+	// outcome — the uint32 conversion would silently wrap negatives.
+	if response.Status < http.StatusContinue || response.Status > 599 {
+		return nil, status.Errorf(codes.Unavailable, "Fastlet returned invalid handler status %d", response.Status)
 	}
 	return &fastpathv2.InvokeHandlerActionResponse{
 		Result: &fastpathv2.HandlerActionResult{Status: uint32(response.Status), Body: response.Body},

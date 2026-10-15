@@ -363,9 +363,10 @@ type InvokeHandlerRequest struct {
 }
 
 // InvokeHandlerResponse carries the handler's HTTP response verbatim. Status
-// is the handler's HTTP status code: 0 means the relay produced no handler
-// result. Error is reserved for relay failures (unknown Sandbox, undeclared
-// handler, unreachable handler) and never carries the handler's own outcome.
+// is the handler's HTTP status code (100-599): 0 means the relay produced no
+// handler result, and FastPath rejects any other value as Unavailable. Error
+// is reserved for relay failures (unknown Sandbox, undeclared handler,
+// unreachable handler) and never carries the handler's own outcome.
 type InvokeHandlerResponse struct {
 	Status int32         `json:"status"`
 	Body   []byte        `json:"body,omitempty"`

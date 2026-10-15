@@ -158,4 +158,17 @@ func TestInvokeHandlerActionSurfacesFastletFailures(t *testing.T) {
 		_, err = server.InvokeHandlerAction(context.Background(), relayRequest("relay-h", "egress", []byte(`{}`)))
 		require.Equal(t, codes.Unavailable, status.Code(err))
 	})
+	t.Run("malformed handler status", func(t *testing.T) {
+		server, _, _, fastlet := newV2Server(t)
+		_, err := server.CreateSandbox(context.Background(), createRequest("relay-i"))
+		require.NoError(t, err)
+		for _, malformed := range []int32{-1, 42, 600, -2147483648} {
+			fastlet.mu.Lock()
+			fastlet.invokeResponse = &fastletapi.InvokeHandlerResponse{Status: malformed, Body: []byte(`{"ok":true}`)}
+			fastlet.mu.Unlock()
+			_, err = server.InvokeHandlerAction(context.Background(), relayRequest("relay-i", "egress", []byte(`{}`)))
+			require.Equal(t, codes.Unavailable, status.Code(err), "status %d", malformed)
+			require.Contains(t, status.Convert(err).Message(), "invalid handler status")
+		}
+	})
 }
