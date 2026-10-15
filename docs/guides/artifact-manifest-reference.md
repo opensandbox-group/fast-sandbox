@@ -53,6 +53,13 @@ set's `artifactDigest` — changing any byte produces a different artifact set.
 
 ## Field reference
 
+The `freePageReporting` boolean records whether the builder observed guest
+support for the default reporting device. A custom kernel without the required
+interfaces records `false`. It is inherited unchanged by live snapshots and
+checkpoints; restore uses the saved balloon device and guest state. Older
+manifests omit it, which does not establish reporting support.
+See [Memory reclamation](memory-reclamation.md).
+
 | Field | Meaning and purpose |
 | --- | --- |
 | `schemaVersion` | Manifest schema version, currently always `1`. Forward-compatibility marker; no consumer branches on it yet |

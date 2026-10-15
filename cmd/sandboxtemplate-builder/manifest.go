@@ -31,15 +31,15 @@ const (
 // and SHA256SUMS in the workdir. Checksums are computed once and shared
 // between the two outputs via the cache. The serialization and checksum
 // conventions live in internal/artifacts so every producer (builder, live
-// snapshot driver, runtime-agent) emits byte-identical layouts. cpuTemplate
-// is what the snapshot stage reported (see compatibilityCPUTemplate).
-func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, workdir, cpuTemplate string) ([]byte, error) {
+// snapshot driver, runtime-agent) emits byte-identical layouts. phases records
+// the CPU template and guest capabilities observed by the snapshot stage.
+func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, workdir string, phases snapshotPhaseTimings) ([]byte, error) {
 	cache := map[string]string{}
 	rootfsGiB, err := sizeGiB(spec.Output.RootfsSize)
 	if err != nil {
 		return nil, err
 	}
-	manifest, err := buildManifest(spec, sourceDigest, kernel, rootfs, vmstate, memory, layers, cache, rootfsGiB, cpuTemplate)
+	manifest, err := buildManifest(spec, sourceDigest, kernel, rootfs, vmstate, memory, layers, cache, rootfsGiB, phases)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +62,7 @@ func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 // declared minimum with the real artifact size. The lineage object records
 // where the set came from and what was baked in at build time; snapshot
 // and checkpoint producers carry it forward verbatim across generations.
-func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, cache map[string]string, rootfsGiB int, cpuTemplate string) (map[string]any, error) {
+func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory string, layers []string, cache map[string]string, rootfsGiB int, phases snapshotPhaseTimings) (map[string]any, error) {
 	files := map[string]any{}
 	staged := []struct{ name, path string }{
 		{rootfsImageName, rootfs},
@@ -99,11 +99,11 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 		"cpuModel":           identity.Model,
 		"cpuStepping":        identity.Stepping,
 		"cpuModelName":       identity.ModelName,
-		"cpuTemplate":        compatibilityCPUTemplate(cpuTemplate),
+		"cpuTemplate":        compatibilityCPUTemplate(phases.CPUTemplate),
 		"firecrackerVersion": artifacts.FirecrackerVersion(firecrackerBin),
 		"hostKernel":         artifacts.HostKernelRelease(),
 	}
-	return map[string]any{
+	document := map[string]any{
 		"schemaVersion": 1,
 		"runtime":       "firecracker",
 		"lineage": map[string]any{
@@ -147,7 +147,9 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 			"booted":   true,
 			"restored": true,
 		},
-	}, nil
+	}
+	document["freePageReporting"] = phases.FreePageReporting
+	return document, nil
 }
 
 // compatibilityCPUTemplate normalizes the snapshot-stage CPU template for

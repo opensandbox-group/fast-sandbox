@@ -15,6 +15,7 @@ import (
 	"fast-sandbox/internal/observability"
 	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
 
 type Clock interface {
@@ -180,6 +181,11 @@ func (m *SandboxManager) reserveSandboxForCreate(req *fastletapi.CreateSandboxRe
 		}
 		if active >= m.capacity {
 			return reject(fastletError(fastletapi.ErrorCapacityRejected, "Fastlet admission capacity is exhausted", true), fastletapi.CreateDispositionRejectedBeforeSideEffects)
+		}
+	}
+	if checker, ok := m.runtime.(runtimecontract.ResourceAdmissionChecker); ok {
+		if err := checker.CheckRuntimeResourceAdmission(); err != nil {
+			return reject(fastletError(fastletapi.ErrorCapacityRejected, err.Error(), true), fastletapi.CreateDispositionRejectedBeforeSideEffects)
 		}
 	}
 	if !m.runtimeResourceAvailable() {

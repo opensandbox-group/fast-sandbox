@@ -106,6 +106,10 @@ func main() {
 		os.Exit(1)
 	}
 	defer rt.Close()
+	if err := configureMemoryPressure(ctx, rt); err != nil {
+		klog.ErrorS(err, "Failed to configure memory pressure admission")
+		os.Exit(1)
+	}
 
 	rt.SetNamespace(namespace)
 	if runtimeProfile.ResidualProcess != runtimecatalog.ResidualProcessNone {
@@ -528,6 +532,15 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func configureMemoryPressure(ctx context.Context, rt runtimecontract.Driver) error {
+	if configurable, ok := rt.(interface {
+		ConfigureMemoryPressure(context.Context, string) error
+	}); ok {
+		return configurable.ConfigureMemoryPressure(ctx, getEnv("FAST_SANDBOX_MEMORY_PRESSURE_POLICY", ""))
+	}
+	return nil
 }
 
 func shutdownTracing(shutdown observability.Shutdown) {

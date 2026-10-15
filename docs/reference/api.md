@@ -246,6 +246,11 @@ template cascades to its Pods via the garbage collector), pinned to
 `sandbox.fast.io/kvm=true` nodes; editing the spec triggers a rebuild
 (generation bump). Finished Pods are reaped after the build TTL (24 h).
 
+New golden snapshots configure free-page reporting by default; no template
+field is required. Existing snapshots need rebuilding to acquire it. See
+[Memory reclamation](../guides/memory-reclamation.md) for guest kernel support
+and compatibility.
+
 See the [SandboxTemplate guide](../guides/sandboxtemplate-golden-images.md)
 for the end-to-end workflow, artifact layout, and consumption contract.
 

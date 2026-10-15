@@ -163,6 +163,12 @@ type ResourceAdmission interface {
 	RuntimeResourceAvailable() bool
 }
 
+// ResourceAdmissionChecker provides an optional pre-side-effect pressure gate.
+// A rejection is retryable capacity feedback, never an ambiguous create result.
+type ResourceAdmissionChecker interface {
+	CheckRuntimeResourceAdmission() error
+}
+
 type AccessDescriptorProvider interface {
 	GetAccessDescriptor(sandboxID string) (dataplane.AccessDescriptor, error)
 }

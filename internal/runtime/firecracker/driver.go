@@ -34,14 +34,16 @@ const bootPollInterval = 250 * time.Millisecond
 // restored from the golden snapshot set (or an instance checkpoint on
 // resume). The VM runs in the Fastlet Pod; nothing is pre-warmed.
 type Driver struct {
-	mu          sync.RWMutex
-	profile     runtimecatalog.RuntimeProfile
-	config      runtimecatalog.FirecrackerConfig
-	namespace   string
-	podUID      string
-	initialized bool
-	runner      fastletnetwork.CommandRunner
-	launcher    ProcessRunner
+	mu                   sync.RWMutex
+	memoryPressure       *memoryPressureGate
+	memoryPressureCancel context.CancelFunc
+	profile              runtimecatalog.RuntimeProfile
+	config               runtimecatalog.FirecrackerConfig
+	namespace            string
+	podUID               string
+	initialized          bool
+	runner               fastletnetwork.CommandRunner
+	launcher             ProcessRunner
 	// alignJailKVM rebinds the jailed /dev/kvm inode to the host device
 	// numbers before the first restore API call (jailer mode only; see
 	// kvm_device.go; tests stub it).
@@ -809,6 +811,7 @@ func (d *Driver) ListManagedSandboxes(_ context.Context) ([]*SandboxMetadata, er
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	namespace := d.namespace
+	podUID := d.podUID
 	d.mu.RUnlock()
 	directories, err := listSandboxDirs(stateRoot)
 	if err != nil {
@@ -817,7 +820,7 @@ func (d *Driver) ListManagedSandboxes(_ context.Context) ([]*SandboxMetadata, er
 	managed := make([]*SandboxMetadata, 0, len(directories))
 	for _, directory := range directories {
 		state, err := loadState(directory)
-		if err != nil || (namespace != "" && state.Config.Identity.Namespace != namespace) {
+		if err != nil || (namespace != "" && state.Config.Identity.Namespace != namespace) || (podUID != "" && state.Config.Identity.FastletPodUID != podUID) {
 			continue
 		}
 		managed = append(managed, existingMetadata(state))
@@ -832,6 +835,7 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	manager := d.networkManager
+	podUID := d.podUID
 	d.mu.RUnlock()
 	directories, err := listSandboxDirs(stateRoot)
 	if err != nil {
@@ -843,6 +847,12 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 			// Corrupt state: recovery cannot classify the sandbox. Never
 			// silent — the sandbox may leak a VM or a network slot.
 			klog.ErrorS(err, "Firecracker recovery skipped a sandbox with unreadable state", "stateDirectory", directory)
+			continue
+		}
+		// StateRoot is shared by all Fastlets on the node, while PID
+		// numbers are pod-local. Probing a foreign PID can misclassify a
+		// live VM and remove its state or jail. Its owner/janitor handles it.
+		if podUID != "" && state.Config.Identity.FastletPodUID != podUID {
 			continue
 		}
 		alive, probeErr := d.probeVM(ctx, state)
@@ -924,6 +934,9 @@ func (d *Driver) GetAccessDescriptor(sandboxID string) (dataplane.AccessDescript
 func (d *Driver) Close() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.memoryPressureCancel != nil {
+		d.memoryPressureCancel()
+	}
 	for sandboxID, process := range d.processes {
 		_ = process.Kill()
 		delete(d.processes, sandboxID)

@@ -40,6 +40,35 @@ type admissionRuntime struct {
 	resourceReady *bool
 }
 
+type pressureAdmissionRuntime struct {
+	*admissionRuntime
+	pressure error
+}
+
+func (r *pressureAdmissionRuntime) CheckRuntimeResourceAdmission() error { return r.pressure }
+
+func TestPressureRejectionHasNoSideEffectsAndPreservesReplay(t *testing.T) {
+	rt := &pressureAdmissionRuntime{admissionRuntime: newAdmissionRuntime(), pressure: errors.New("memory pressure admission")}
+	m := newAdmissionManager(t, rt, 2)
+	req := ensureRequest("pressure-test", 1, 1)
+	response, err := m.CreateSandbox(context.Background(), req)
+	requireFastletCode(t, err, fastletapi.ErrorCapacityRejected)
+	require.Equal(t, fastletapi.CreateDispositionRejectedBeforeSideEffects, response.Disposition)
+	ensure, deletes := rt.counts()
+	require.Zero(t, ensure)
+	require.Zero(t, deletes)
+	admission, _, _ := m.State()
+	require.Zero(t, admission.Used)
+	rt.pressure = nil
+	_, err = m.CreateSandbox(context.Background(), req)
+	require.NoError(t, err)
+	rt.pressure = errors.New("pressure returned")
+	_, err = m.CreateSandbox(context.Background(), req)
+	require.NoError(t, err, "existing identity remains replayable under pressure")
+	ensure, _ = rt.counts()
+	require.Equal(t, 1, ensure)
+}
+
 type failingDeleteActionCaller struct {
 	deleteCalls atomic.Int32
 }

@@ -352,9 +352,10 @@ func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
 	require.NoError(t, os.MkdirAll(cacheDir, 0o750))
 	lineage, err := json.Marshal(map[string]any{
 		"schemaVersion": 1, "runtime": "firecracker",
-		"machine":      map[string]any{"vcpu": "1", "memory": "512Mi"},
-		"guestNetwork": map[string]any{"ip": "10.0.0.2", "gateway": "10.0.0.1"},
-		"kernel":       map[string]any{"name": "vmlinux"},
+		"machine":           map[string]any{"vcpu": "1", "memory": "512Mi"},
+		"guestNetwork":      map[string]any{"ip": "10.0.0.2", "gateway": "10.0.0.1"},
+		"kernel":            map[string]any{"name": "vmlinux"},
+		"freePageReporting": true,
 	})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, "manifest.json"), lineage, 0o644))
@@ -373,6 +374,7 @@ func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
 	require.NoError(t, json.Unmarshal(payload, &document))
 	require.Equal(t, "10.0.0.2", document["guestNetwork"].(map[string]any)["ip"],
 		"the checkpoint lineage facts ride forward into the new checkpoint")
+	require.Equal(t, true, document["freePageReporting"], "reporting capability must survive checkpoint generations")
 	require.Equal(t, fixture.sandboxSpec.Spec.Image,
 		document["lineage"].(map[string]any)["image"])
 }

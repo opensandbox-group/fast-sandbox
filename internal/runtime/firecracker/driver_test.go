@@ -756,6 +756,32 @@ func TestRecoverRuntimeResourcesCleansDeadVM(t *testing.T) {
 	require.Equal(t, 0, fixture.manager.Snapshot().Bound)
 }
 
+func TestRecoveryPreservesOtherFastletState(t *testing.T) {
+	fixture := newDriverFixture(t)
+	fixture.driver.SetFastletPodUID("this-pod")
+	fixture.driver.probeProcess = func(int) error { return os.ErrNotExist }
+	for _, owner := range []string{"this-pod", "other-pod"} {
+		config := fixture.sandboxSpec
+		config.Identity.SandboxUID = owner
+		config.Identity.FastletPodUID = owner
+		directory, err := ensureSandboxDir(fixture.stateRoot, owner)
+		require.NoError(t, err)
+		require.NoError(t, saveState(directory, &SandboxState{
+			Config: config, Phase: PhaseRunning, PID: 777, APIAddress: filepath.Join(directory, "dead.sock"),
+		}))
+	}
+	managed, err := fixture.driver.ListManagedSandboxes(context.Background())
+	require.NoError(t, err)
+	require.Len(t, managed, 1)
+	require.Equal(t, "this-pod", managed[0].Config.Identity.SandboxUID)
+	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil))
+	_, err = loadState(filepath.Join(fixture.stateRoot, sandboxStateDir, "other-pod"))
+	require.NoError(t, err, "foreign state must survive even when its PID is absent in this Pod")
+	_, err = loadState(filepath.Join(fixture.stateRoot, sandboxStateDir, "this-pod"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+	require.Equal(t, []int{777}, fixture.killCalls)
+}
+
 func TestRecoverRuntimeResourcesKeepsAliveVM(t *testing.T) {
 	fixture := newDriverFixture(t)
 	fixture.prepareCachedImage(t, fixture.sandboxSpec.Spec.Image)
