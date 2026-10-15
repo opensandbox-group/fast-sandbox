@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	"k8s.io/klog/v2"
+
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	fastletcache "fast-sandbox/internal/fastlet/cache"
@@ -13,7 +15,6 @@ import (
 	"fast-sandbox/internal/observability"
 	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
-	"k8s.io/klog/v2"
 )
 
 type Clock interface {
