@@ -23,6 +23,7 @@ type FastletAdmissionClient interface {
 	InspectSandbox(ctx context.Context, fastletIP string, req *InspectSandboxRequest) (*InspectSandboxResponse, error)
 	DeleteSandbox(ctx context.Context, fastletIP string, req *DeleteSandboxRequest) (*DeleteSandboxResponse, error)
 	ReconcileBindings(ctx context.Context, fastletIP string, req *ReconcileBindingsRequest) (*ReconcileBindingsResponse, error)
+	InvokeHandler(ctx context.Context, fastletIP string, req *InvokeHandlerRequest) (*InvokeHandlerResponse, error)
 	CreateSnapshot(ctx context.Context, fastletIP string, req *CreateSnapshotRequest) (*CreateSnapshotResponse, error)
 	InspectSnapshot(ctx context.Context, fastletIP string, req *InspectSnapshotRequest) (*InspectSnapshotResponse, error)
 	DeleteSnapshot(ctx context.Context, fastletIP string, req *DeleteSnapshotRequest) (*DeleteSnapshotResponse, error)
@@ -107,6 +108,13 @@ func (c *FastletClient) ReconcileBindings(ctx context.Context, fastletIP string,
 		ctx = withFastletIdentity(ctx, req.Identity)
 	}
 	return postFastletJSON[ReconcileBindingsRequest, ReconcileBindingsResponse](c, ctx, fastletIP, "/api/v2/fastlet/bindings/reconcile", req)
+}
+
+func (c *FastletClient) InvokeHandler(ctx context.Context, fastletIP string, req *InvokeHandlerRequest) (*InvokeHandlerResponse, error) {
+	if req != nil {
+		ctx = withFastletIdentity(ctx, req.Identity)
+	}
+	return postFastletJSON[InvokeHandlerRequest, InvokeHandlerResponse](c, ctx, fastletIP, "/api/v2/fastlet/handlers/invoke", req)
 }
 
 func (c *FastletClient) CreateSnapshot(ctx context.Context, fastletIP string, req *CreateSnapshotRequest) (*CreateSnapshotResponse, error) {
@@ -235,6 +243,8 @@ func responseFastletError(response any) *FastletError {
 	case *DeleteSandboxResponse:
 		return typed.Error
 	case *ReconcileBindingsResponse:
+		return typed.Error
+	case *InvokeHandlerResponse:
 		return typed.Error
 	case *SandboxDiagnosticsResponse:
 		return typed.Error

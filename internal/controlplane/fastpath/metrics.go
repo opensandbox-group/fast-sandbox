@@ -40,6 +40,11 @@ var (
 		Help:    "Latency of bounded synchronous FastPath CreateSandbox stages.",
 		Buckets: prometheus.ExponentialBuckets(.00025, 2, 15),
 	}, []string{"stage", metricsResultLabel})
+	handlerRelayDuration = controlPlaneMetricFactory.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "fastpath_invoke_handler_action_duration_seconds",
+		Help:    "Duration of InvokeHandlerAction RPC calls",
+		Buckets: prometheus.ExponentialBuckets(.005, 2, 14),
+	}, []string{metricsResultLabel})
 )
 
 func grpcMetricResult(err error) string {

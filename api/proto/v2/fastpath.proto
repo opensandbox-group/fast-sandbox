@@ -31,6 +31,13 @@ service FastPathService {
   // checkpointed Sandbox again, possibly on another Fastlet. Completion
   // (runtime_state READY) is observed via GetSandbox.
   rpc ResumeSandbox(ResumeSandboxRequest) returns (ResumeSandboxResponse);
+  // InvokeHandlerAction relays an opaque payload to a Pool-declared Action
+  // Handler of the Sandbox's Pool through the hosting Fastlet, and returns
+  // the handler's HTTP status and body verbatim as the per-handler result.
+  // The control plane validates the tenant-scoped sandbox ownership and the
+  // handler declaration, but never interprets the payload or the handler's
+  // response: the handler's response is the synchronous ack.
+  rpc InvokeHandlerAction(InvokeHandlerActionRequest) returns (InvokeHandlerActionResponse);
 }
 
 message NamespacedName {
@@ -471,4 +478,29 @@ message ResumeSandboxRequest {
 message ResumeSandboxResponse {
   SandboxInfo sandbox = 1;
   int64 generation = 2;
+}
+
+// InvokeHandlerActionRequest relays one opaque payload to a Pool-declared
+// Action Handler. The relay is handler-agnostic: any handler declared by the
+// Sandbox's Pool is addressable, and the payload bytes are never inspected.
+message InvokeHandlerActionRequest {
+  // sandbox is the tenant-scoped relay target; expected_uid fences against a
+  // Sandbox recreated under the same name.
+  SandboxReference sandbox = 1;
+  // handler is the Pool-declared Action Handler name.
+  string handler = 2;
+  // payload is opaque bytes relayed to the handler verbatim.
+  bytes payload = 3;
+}
+
+// HandlerActionResult is the handler's HTTP response returned verbatim: a
+// 4xx/5xx handler status is propagated as the result, not mapped to an RPC
+// error.
+message HandlerActionResult {
+  uint32 status = 1;
+  bytes body = 2;
+}
+
+message InvokeHandlerActionResponse {
+  HandlerActionResult result = 1;
 }

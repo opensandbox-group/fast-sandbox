@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
@@ -177,6 +178,10 @@ type fastpathFastlet struct {
 	diagnostics    *fastletapi.SandboxDiagnosticsResponse
 	diagnosticsErr error
 	snapshotErr    error
+	invokeResponse *fastletapi.InvokeHandlerResponse
+	invokeFailure  error
+	invokeRequests []*fastletapi.InvokeHandlerRequest
+	invokeIPs      []string
 }
 
 func (f *fastpathFastlet) CreateSandbox(_ context.Context, fastletIP string, request *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error) {
@@ -257,6 +262,20 @@ func (f *fastpathFastlet) ReconcileBindings(_ context.Context, _ string, request
 		bindings = append(bindings, fastletapi.ActionBindingStatus{Handler: binding.Handler, State: "Ready"})
 	}
 	return &fastletapi.ReconcileBindingsResponse{Sandbox: testObservedStatus(request.Identity.SandboxUID, "running", request.SpecGeneration, bindings)}, nil
+}
+
+func (f *fastpathFastlet) InvokeHandler(_ context.Context, fastletIP string, request *fastletapi.InvokeHandlerRequest) (*fastletapi.InvokeHandlerResponse, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.invokeRequests = append(f.invokeRequests, request)
+	f.invokeIPs = append(f.invokeIPs, fastletIP)
+	if f.invokeFailure != nil {
+		return nil, f.invokeFailure
+	}
+	if f.invokeResponse != nil {
+		return f.invokeResponse, nil
+	}
+	return &fastletapi.InvokeHandlerResponse{Status: http.StatusOK, Body: []byte(`{"ok":true}`)}, nil
 }
 
 func testObservedStatus(uid, phase string, generation int64, bindings []fastletapi.ActionBindingStatus) *fastletapi.SandboxStatus {
