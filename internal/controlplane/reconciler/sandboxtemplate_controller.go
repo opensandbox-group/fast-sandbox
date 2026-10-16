@@ -28,6 +28,7 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifactstore"
+	"fast-sandbox/internal/registryconfig"
 )
 
 const (
@@ -82,6 +83,19 @@ const (
 const (
 	sandboxTemplatePublishSecretDir = "/etc/fast-sandbox/publish-credentials"
 	publishCredentialsDirEnv        = "SANDBOX_TEMPLATE_PUBLISH_SECRET_DIR"
+)
+
+// Registry config mount for the build Pod. The builder pulls the source and
+// execd images itself through go-containerregistry, which authenticates
+// anonymously unless credentials are supplied; a private registry then answers
+// 401. The controller compiles the namespace's fast-sandbox-registry config
+// into a per-template Secret and mounts it here, and the builder resolves pull
+// credentials from it (registryConfigDirEnv matches the fastlet wiring so the
+// builder reuses the same env/path).
+const (
+	sandboxTemplateRegistryConfigDir = "/etc/fast-sandbox/registry"
+	registryConfigDirEnv             = "FAST_SANDBOX_REGISTRY_CONFIG_PATH"
+	templateRegistryConfigVolumeName = "registry-config"
 )
 
 // SandboxTemplateReconciler reconciles SandboxTemplate resources by driving
@@ -614,6 +628,28 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 			}},
 		})
 	}
+	// Compile the namespace's registry configuration (same source the fastlet
+	// uses) and, when it yields any credentials, persist it as a per-template
+	// Secret and mount it so the builder can authenticate private image pulls.
+	// An empty set leaves the build on anonymous pulls (public images still
+	// build), so no Secret/mount is created.
+	registryCompiled, err := compileRegistryConfig(ctx, r.Client, template.Namespace)
+	if err != nil {
+		return err
+	}
+	registrySecretName := buildPodName(template) + "-registry"
+	if len(registryCompiled.Credentials) > 0 {
+		env = append(env, corev1.EnvVar{Name: registryConfigDirEnv, Value: registryconfig.MountPath})
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name: templateRegistryConfigVolumeName, MountPath: sandboxTemplateRegistryConfigDir, ReadOnly: true,
+		})
+		volumes = append(volumes, corev1.Volume{
+			Name: templateRegistryConfigVolumeName,
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: registrySecretName,
+			}},
+		})
+	}
 	if endpoint != "" {
 		env = append(env, corev1.EnvVar{Name: "AWS_ENDPOINT_URL", Value: endpoint})
 	}
@@ -706,10 +742,71 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 	if err := ctrl.SetControllerReference(template, pod, r.Scheme); err != nil {
 		return err
 	}
+	// Persist the compiled registry Secret before creating the Pod so the mount
+	// resolves. It is owner-ref'd to the template, so it is garbage-collected
+	// with the template alongside the build Pod.
+	if len(registryCompiled.Credentials) > 0 {
+		if err := r.persistTemplateRegistrySecret(ctx, template, registrySecretName, registryCompiled); err != nil {
+			return err
+		}
+	}
 	if err := r.Create(ctx, pod); err != nil && !apierrors.IsAlreadyExists(err) {
 		return err
 	}
 	return nil
+}
+
+// persistTemplateRegistrySecret writes the compiled registry.json into a
+// per-template Opaque Secret the build Pod mounts, modeled on the pool
+// reconciler's persistRegistrySecret: it creates the Secret or, when it already
+// exists with different content, rewrites it. The Secret is owner-ref'd to the
+// template so it is garbage-collected with the template.
+func (r *SandboxTemplateReconciler) persistTemplateRegistrySecret(
+	ctx context.Context,
+	template *apiv1alpha2.SandboxTemplate,
+	name string,
+	compiled registryconfig.Compiled,
+) error {
+	content, err := compiled.Marshal()
+	if err != nil {
+		return err
+	}
+	key := client.ObjectKey{Namespace: template.Namespace, Name: name}
+	var secret corev1.Secret
+	err = r.Get(ctx, key, &secret)
+	if apierrors.IsNotFound(err) {
+		secret = corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      key.Name,
+				Namespace: key.Namespace,
+				Labels: map[string]string{
+					sandboxTemplateBuildLabel:     templateLabelValue(template.Name),
+					sandboxTemplateNamespaceLabel: template.Namespace,
+				},
+			},
+			Type: corev1.SecretTypeOpaque,
+			Data: map[string][]byte{registryconfig.SecretKey: content},
+		}
+		if err := ctrl.SetControllerReference(template, &secret, r.Scheme); err != nil {
+			return err
+		}
+		if err := r.Create(ctx, &secret); err != nil && !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if secret.Type == corev1.SecretTypeOpaque && string(secret.Data[registryconfig.SecretKey]) == string(content) {
+		return nil
+	}
+	secret.Type = corev1.SecretTypeOpaque
+	if secret.Data == nil {
+		secret.Data = make(map[string][]byte)
+	}
+	secret.Data[registryconfig.SecretKey] = content
+	return r.Update(ctx, &secret)
 }
 
 // ensureBuilderRBAC converges the builder ServiceAccount, Role and
