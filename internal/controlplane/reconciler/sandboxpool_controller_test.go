@@ -17,6 +17,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
@@ -76,6 +77,113 @@ registries:
 		Namespace: "tenant-a", Name: registrySecretName("pool-a"),
 	}, &projected))
 	require.Equal(t, previous, projected.Data[registryconfig.SecretKey], "an invalid update must retain the last compiled Secret")
+}
+
+func TestPoolRegistryConditionConvergesWithoutRepeatedStatusWrites(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		fastlet bool
+		applied bool
+	}{
+		{name: "empty pool"},
+		{name: "configuration propagating", fastlet: true},
+		{name: "configuration applied", fastlet: true, applied: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			scheme := runtime.NewScheme()
+			require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+			require.NoError(t, corev1.AddToScheme(scheme))
+			pool := &apiv1alpha2.SandboxPool{
+				ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default", UID: "pool-a-uid", Generation: 1},
+				Spec: apiv1alpha2.SandboxPoolSpec{
+					Runtime: apiv1alpha2.RuntimeContainer, MaxSandboxesPerPod: 5,
+					SandboxResources: testSandboxResources(),
+					FastletTemplate:  corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}}}},
+				},
+				Status: apiv1alpha2.SandboxPoolStatus{Conditions: []metav1.Condition{{
+					Type: apiv1alpha2.PoolConditionInfraReady, Status: metav1.ConditionFalse,
+					Reason: apiv1alpha2.ReasonInfraComponentsInvalid, Message: "previous invalid configuration",
+				}}},
+			}
+			if test.fastlet {
+				pool.Spec.Capacity.PoolMin = 1
+			}
+			source := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: registryconfig.ConfigMapName, Namespace: pool.Namespace},
+				Data:       map[string]string{registryconfig.ConfigMapKey: "registries: ["},
+			}
+			statusWrites := 0
+			k8sClient := fake.NewClientBuilder().WithScheme(scheme).
+				WithStatusSubresource(&apiv1alpha2.SandboxPool{}).
+				WithObjects(pool, source).
+				WithInterceptorFuncs(interceptor.Funcs{
+					SubResourceUpdate: func(ctx context.Context, c client.Client, name string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+						err := c.SubResource(name).Update(ctx, obj, opts...)
+						if _, ok := obj.(*apiv1alpha2.SandboxPool); err == nil && ok && name == "status" {
+							statusWrites++
+						}
+						return err
+					},
+				}).Build()
+			registry := placement.NewInMemoryRegistry()
+			reconciler := &SandboxPoolReconciler{Client: k8sClient, Scheme: scheme, Catalog: runtimecatalog.Builtin(), Registry: registry}
+			if test.fastlet {
+				plan, err := runtimeenv.ResolveDefault(reconciler.Catalog, pool.Spec.Runtime)
+				require.NoError(t, err)
+				pod, err := reconciler.constructPodWithRuntimePlan(pool, plan)
+				require.NoError(t, err)
+				pod.Name, pod.GenerateName, pod.UID = "fastlet-a", "", "pod-a"
+				pod.Status.Phase = corev1.PodRunning
+				pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+				require.NoError(t, k8sClient.Create(ctx, pod))
+				revision := "previous-revision"
+				if test.applied {
+					compiled, err := registryconfig.NewCompiled(nil)
+					require.NoError(t, err)
+					revision = compiled.Revision
+				}
+				seedControllerRegistry(t, registry, placement.FastletInfo{
+					ID: "default/fastlet-a", Namespace: pool.Namespace, PoolName: pool.Name,
+					PodName: pod.Name, PodUID: string(pod.UID), PodReady: true, RuntimeReady: true,
+					LastHeartbeat: time.Now(), RegistryRevision: revision,
+				})
+			}
+
+			// An invalid configuration must still report its error, then recover
+			// when the source is removed (the valid anonymous-registry default).
+			_, err := reconciler.Reconcile(ctx, poolRequest(pool))
+			require.NoError(t, err)
+			require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool))
+			condition := apiMeta.FindStatusCondition(pool.Status.Conditions, apiv1alpha2.PoolConditionRegistryReady)
+			require.NotNil(t, condition)
+			require.Equal(t, metav1.ConditionFalse, condition.Status)
+			require.Equal(t, apiv1alpha2.ReasonRegistryInvalid, condition.Reason)
+			require.NoError(t, k8sClient.Delete(ctx, source))
+			_, err = reconciler.Reconcile(ctx, poolRequest(pool))
+			require.NoError(t, err)
+			require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool))
+			condition = apiMeta.FindStatusCondition(pool.Status.Conditions, apiv1alpha2.PoolConditionRegistryReady)
+			require.NotNil(t, condition)
+			if test.fastlet && !test.applied {
+				require.Equal(t, metav1.ConditionFalse, condition.Status)
+				require.Equal(t, "RegistryPropagating", condition.Reason)
+			} else {
+				require.Equal(t, metav1.ConditionTrue, condition.Status)
+				require.Equal(t, apiv1alpha2.ReasonRegistryAvailable, condition.Reason)
+			}
+			require.True(t, apiMeta.IsStatusConditionTrue(pool.Status.Conditions, apiv1alpha2.PoolConditionInfraReady))
+
+			// Check actual writes: comparing only final status would miss a
+			// condition that flips twice and ends each reconcile unchanged.
+			statusWrites = 0
+			for range 3 {
+				_, err = reconciler.Reconcile(ctx, poolRequest(pool))
+				require.NoError(t, err)
+			}
+			require.Zero(t, statusWrites, "stable reconciles must not publish intermediate conditions")
+		})
+	}
 }
 
 func TestRegistryWriteCredentialCompilesFromWriteSecretRef(t *testing.T) {

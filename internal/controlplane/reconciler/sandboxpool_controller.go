@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -178,10 +178,9 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
-	_ = r.updatePoolCondition(ctx, &pool, metav1.Condition{
-		Type: apiv1alpha2.PoolConditionRegistryReady, Status: metav1.ConditionTrue,
-		Reason: apiv1alpha2.ReasonRegistryAvailable, Message: "Registry configuration is valid and compiled",
-	})
+	// Only publish RegistryReady after the rollout check below; an intermediate
+	// message would flip each reconcile and continuously retrigger our watch.
+	logger.V(4).Info("pool registry configuration compiled", "revision", compiledRegistry.Revision)
 	infraPlan, err := r.resolveInfraPlan(&pool, profile)
 	if err != nil {
 		logger.V(1).Info("pool Infra Components are invalid", "reason", err.Error())
@@ -1809,12 +1808,14 @@ type poolObservation struct {
 
 func (o poolObservation) apply(pool *apiv1alpha2.SandboxPool) bool {
 	status := &pool.Status
+	// omitempty turns empty WarmImages into nil on API reads; treat both as equal
+	// to avoid repeated status writes and watch-triggered reconciles.
 	if status.CurrentPods == o.currentPods &&
 		status.ReadyPods == o.readyPods && status.IdleFastlets == o.idleFastlets &&
 		status.BusyFastlets == o.busyFastlets &&
 		status.RuntimeRevision == o.runtimeRevision && status.InfraRevision == o.infraRevision &&
 		status.FastletRevision == o.fastletRevision && status.PreparedFastlets == o.preparedFastlets &&
-		reflect.DeepEqual(status.WarmImages, o.warmImages) {
+		slices.Equal(status.WarmImages, o.warmImages) {
 		return false
 	}
 	status.CurrentPods = o.currentPods
