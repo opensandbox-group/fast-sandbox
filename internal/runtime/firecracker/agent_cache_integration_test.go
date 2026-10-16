@@ -10,9 +10,14 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
+	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/controlplane/placement"
+	fastletcache "fast-sandbox/internal/fastlet/cache"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	"fast-sandbox/internal/registryconfig"
 	"fast-sandbox/internal/runtime/firecracker/agent"
 )
@@ -92,6 +97,45 @@ func TestAgentPullFeedsDriverCache(t *testing.T) {
 	require.NoError(t, client.PullImage(context.Background(), stateRoot, image))
 	driver := &Driver{config: firecrackerConfigForTest(t, stateRoot)}
 	require.NoError(t, driver.PullImage(context.Background(), image))
+
+	t.Run("placement prefers the pulled image cache", func(t *testing.T) {
+		tracker := fastletcache.NewTracker(driver, "boot-cached", fastletcache.DefaultMaxInventory)
+		snapshot, err := tracker.Snapshot(context.Background(), fastletapi.CacheCursor{ForceFull: true})
+		require.NoError(t, err)
+		require.True(t, snapshot.Complete)
+		require.Equal(t, []string{imageKey(image)}, snapshot.Images)
+
+		registry := placement.NewInMemoryRegistry()
+		now := time.Now()
+		for _, node := range []struct {
+			id    placement.FastletID
+			used  int
+			cache fastletapi.CacheSnapshot
+		}{
+			{id: "cached", used: 4, cache: snapshot},
+			{id: "empty", cache: fastletapi.CacheSnapshot{Epoch: "boot-empty", Revision: 1, Full: true, Complete: true}},
+		} {
+			podUID := "uid-" + string(node.id)
+			registry.UpsertPod(placement.FastletInfo{
+				ID: node.id, Namespace: "default", PoolName: "pool-a", PodName: string(node.id),
+				PodUID: podUID, PodReady: true, RuntimeName: apiv1alpha2.RuntimeFirecracker,
+			})
+			require.NoError(t, registry.ApplyHeartbeat(node.id, podUID, &fastletapi.HeartbeatResponse{
+				FastletStatus: fastletapi.FastletStatus{
+					FastletPodUID: podUID, RuntimeReady: true, InfraReady: true,
+					Admission: fastletapi.AdmissionStatus{Capacity: 5, Used: node.used, Running: node.used},
+				},
+				Sequence: 1, Cache: node.cache,
+			}, now))
+		}
+		candidates := registry.TopK(placement.CandidateRequest{
+			Namespace: "default", PoolName: "pool-a", RuntimeName: apiv1alpha2.RuntimeFirecracker,
+			Image: image, StableKey: "sandbox-a", Now: now,
+		}, 2)
+		require.Len(t, candidates, 2)
+		require.Equal(t, placement.FastletID("cached"), candidates[0].ID,
+			"the pulled image cache should outweigh the empty Fastlet's lower utilization")
+	})
 }
 
 func sha256HexTest(payload []byte) string {
