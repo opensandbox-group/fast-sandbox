@@ -59,9 +59,9 @@ func TestSandboxPoolCRDValidation(t *testing.T) {
 				Spec: apiv1alpha2.SandboxPoolSpec{
 					Runtime:            apiv1alpha2.RuntimeContainer,
 					MaxSandboxesPerPod: 1,
-					SandboxResources: apiv1alpha2.SandboxResourceProfile{
-						CPU: resource.MustParse("1"), Memory: resource.MustParse("1Gi"), PIDs: 256,
-					},
+					SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+						resource.MustParse("1"), resource.MustParse("1Gi"), 256,
+					),
 					Capacity:        apiv1alpha2.PoolCapacity{},
 					FastletTemplate: corev1.PodTemplateSpec{},
 				},
@@ -88,7 +88,8 @@ func TestSandboxPoolCRDValidation(t *testing.T) {
 				if err := k8sClient.Get(ctx, clientObjectKey(pool), pool); err != nil {
 					return err
 				}
-				pool.Spec.SandboxResources.Memory = resource.MustParse("2Gi")
+				memory := resource.MustParse("2Gi")
+				pool.Spec.SandboxResources.Memory = &memory
 				return k8sClient.Update(ctx, pool)
 			})
 			if err != nil {

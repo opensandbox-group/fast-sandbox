@@ -34,6 +34,10 @@ func TestAdmissionMetricsUseBoundedOutcomeLabels(t *testing.T) {
 func TestAdmissionStatusMetricsReflectLatestSnapshot(t *testing.T) {
 	recordAdmissionStatus(fastletapi.AdmissionStatus{
 		Capacity: 8, Used: 7, Creating: 1, Running: 3, Deleting: 1,
+		Resources: &fastletapi.ResourceAdmissionStatus{
+			Version: "v1", Epoch: "epoch-a", Revision: 4,
+			State: fastletapi.AdmissionStateBlocked, Reason: fastletapi.AdmissionReasonFastletMemoryHighWatermark,
+		},
 	})
 
 	require.Equal(t, float64(8), gatheredMetricValue(t, "fast_sandbox_fastlet_admission_slots", map[string]string{"state": "capacity"}))
@@ -41,6 +45,9 @@ func TestAdmissionStatusMetricsReflectLatestSnapshot(t *testing.T) {
 	require.Equal(t, float64(1), gatheredMetricValue(t, "fast_sandbox_fastlet_admission_slots", map[string]string{"state": "creating"}))
 	require.Equal(t, float64(3), gatheredMetricValue(t, "fast_sandbox_fastlet_admission_slots", map[string]string{"state": "running"}))
 	require.Equal(t, float64(1), gatheredMetricValue(t, "fast_sandbox_fastlet_admission_slots", map[string]string{"state": "deleting"}))
+	require.Equal(t, float64(1), gatheredMetricValue(t, "fast_sandbox_fastlet_resource_admission_state", map[string]string{
+		"state": string(fastletapi.AdmissionStateBlocked), "reason": string(fastletapi.AdmissionReasonFastletMemoryHighWatermark),
+	}))
 }
 
 func TestUserProcessStartMetricsRejectUnprovenSupervisorStart(t *testing.T) {

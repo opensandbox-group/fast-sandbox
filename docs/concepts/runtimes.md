@@ -117,21 +117,30 @@ Kata supports Infra delivery through OCI bind mounts, image/template baking, pre
 
 ## Fixed Pool resources and aggregate overcommit
 
-Every Sandbox in one Pool uses the same immutable CPU, memory, and PID limits. Fastlet passes those values to the selected RuntimeDriver and is the enforcement boundary.
+Every Sandbox in one Pool uses the same immutable CPU, memory, and PID
+profile. Legacy Pools declare only limits. Resource-aware Pools declare both
+requests and limits: Fastlet charges requests to its local commitment ledger,
+and passes limits to the selected RuntimeDriver for enforcement.
 
-By default, the Pool Controller sizes both the request and limit of the
-resource-owning Fastlet from:
+By default, the Pool Controller sizes the request and limit of the
+resource-owning Fastlet from the Sandbox request and keeps them equal:
 
 ```text
-per-Sandbox resources * maxSandboxesPerPod + runtime overhead
+per-Sandbox request * maxSandboxesPerPod + runtime overhead
 ```
 
-This default does not overcommit. An operator can opt into aggregate CPU or
-memory overcommit by setting a lower limit on the resource-owning container in
-`fastletTemplate`. For example, ten Sandboxes can each retain a `1` CPU limit
-while the Fastlet runtime owner has a `5` CPU aggregate limit. Per-Sandbox
-limits still isolate noisy neighbors, while the Kubernetes Pod cgroup caps
+This default does not overcommit the Fastlet itself. An operator enables a
+specific density by setting explicit resource-owner requests and limits in
+`fastletTemplate`, while keeping `maxSandboxesPerPod` as an independent actor
+bound. CPU and memory commitments are checked separately before every Create.
+Per-Sandbox limits isolate noisy neighbors, and the Kubernetes Pod cgroup caps
 their combined execution.
+
+Fastlet also observes its runtime-owner memory cgroup. Sustained high usage,
+memory PSI, a new OOM event, or node memory pressure blocks new admissions;
+low-watermark recovery reopens admission. CPU remains a hard static
+commitment dimension, but live CPU pressure is not a hard gate in the first
+resource-aware version.
 
 Containerd-backed runtimes do not remain in containerd's top-level cgroup.
 Fastlet discovers its Kubernetes Pod cgroup from the Pod UID and the mounted

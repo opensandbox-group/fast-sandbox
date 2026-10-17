@@ -76,6 +76,8 @@ type RuntimeParameters struct {
 	ResourceProfileHash string
 	InfraRevision       string
 	FastletRevision     string
+	ResourceMode        apiv1alpha2.SandboxResourceMode
+	ResourceDemand      placement.ResourceDemand
 }
 
 func (o *Orchestrator) ResolveRuntime(ctx context.Context, sandbox *apiv1alpha2.Sandbox) (RuntimeParameters, error) {
@@ -117,12 +119,17 @@ func (o *Orchestrator) ResolveRuntime(ctx context.Context, sandbox *apiv1alpha2.
 		// a compatibility fallback for unit tests and pre-v1alpha2 objects.
 		runtimeProfileHash = profile.ProfileHash
 	}
-	return RuntimeParameters{
+	parameters := RuntimeParameters{
 		RuntimeName: pool.Spec.Runtime, RuntimeProfileHash: runtimeProfileHash,
 		ResourceProfileHash: pool.Spec.SandboxResources.Hash(),
 		InfraRevision:       infraPlan.Revision,
 		FastletRevision:     pool.Status.FastletRevision,
-	}, nil
+		ResourceMode:        pool.Spec.SandboxResources.ResourceMode(),
+	}
+	if requests, ok := pool.Spec.SandboxResources.RequestResources(); ok {
+		parameters.ResourceDemand = placement.ResourceDemand{CPU: requests.CPU, Memory: requests.Memory}
+	}
+	return parameters, nil
 }
 
 func (o *Orchestrator) Candidates(ctx context.Context, sandbox *apiv1alpha2.Sandbox, stableKey string) ([]placement.FastletInfo, RuntimeParameters, error) {
@@ -135,7 +142,8 @@ func (o *Orchestrator) Candidates(ctx context.Context, sandbox *apiv1alpha2.Sand
 		RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
 		ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
 		FastletRevision: parameters.FastletRevision,
-		Image:           sandbox.Spec.Image, StableKey: stableKey,
+		ResourceMode:    parameters.ResourceMode, Demand: parameters.ResourceDemand,
+		Image: sandbox.Spec.Image, StableKey: stableKey,
 	})
 	if len(candidates) == 0 {
 		return nil, parameters, ErrNoCandidate
@@ -161,6 +169,7 @@ func (o *Orchestrator) FastPathCandidatesMatching(sandbox *apiv1alpha2.Sandbox, 
 		RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
 		ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
 		FastletRevision: parameters.FastletRevision, ExcludedFastlets: excluded,
+		ResourceMode: parameters.ResourceMode, Demand: parameters.ResourceDemand,
 	})
 	if len(candidates) == 0 {
 		return nil, ErrNoCandidate
@@ -424,7 +433,7 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 			createErr = fmt.Errorf("%w: %w", ErrUnknownFastletOutcome, createErr)
 		}
 	}
-	o.recordFeedback(fastlet.ID, createErr)
+	o.recordFeedback(fastlet.ID, response, createErr)
 	return response, createErr
 }
 
@@ -782,7 +791,7 @@ func IsCandidateRejection(err error) bool {
 	}
 }
 
-func (o *Orchestrator) recordFeedback(id placement.FastletID, err error) {
+func (o *Orchestrator) recordFeedback(id placement.FastletID, response *fastletapi.CreateSandboxResponse, err error) {
 	var failure *fastletapi.FastletError
 	if !errors.As(err, &failure) {
 		return
@@ -794,7 +803,12 @@ func (o *Orchestrator) recordFeedback(id placement.FastletID, err error) {
 	if o.Now != nil {
 		now = o.Now()
 	}
-	o.Registry.RecordFeedback(id, placement.LocalFeedback{Code: failure.Code, ObservedAt: now})
+	feedback := placement.LocalFeedback{Code: failure.Code, Reason: failure.Reason, ObservedAt: now}
+	if response != nil {
+		admission := response.Admission
+		feedback.Admission = &admission
+	}
+	o.Registry.RecordFeedback(id, feedback)
 }
 
 func setReadyCondition(status *apiv1alpha2.SandboxStatus, generation int64, ready bool, reason, message string) {

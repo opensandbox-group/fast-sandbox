@@ -35,6 +35,10 @@ var (
 		Name: "fast_sandbox_fastlet_admission_slots",
 		Help: "Current Fastlet slot accounting by state.",
 	}, []string{"state"})
+	fastletResourceAdmissionState = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "fast_sandbox_fastlet_resource_admission_state",
+		Help: "Current resource-aware Fastlet admission state and bounded dominant reason.",
+	}, []string{"state", "reason"})
 	runtimeCreateLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "fast_sandbox_runtime_create_latency_seconds",
 		Help:    "Runtime Ensure latency from the Fastlet process boundary.",
@@ -72,6 +76,9 @@ func recordAdmission(operation string, err error) {
 		var failure *fastletapi.FastletError
 		if errors.As(err, &failure) {
 			result, reason = "rejected", string(failure.Code)
+			if failure.Reason != "" {
+				reason = string(failure.Reason)
+			}
 		}
 	}
 	fastletAdmissionTotal.WithLabelValues(operation, result, reason).Inc()
@@ -83,6 +90,14 @@ func recordAdmissionStatus(status fastletapi.AdmissionStatus) {
 	fastletAdmissionSlots.WithLabelValues("creating").Set(float64(status.Creating))
 	fastletAdmissionSlots.WithLabelValues("running").Set(float64(status.Running))
 	fastletAdmissionSlots.WithLabelValues("deleting").Set(float64(status.Deleting))
+	fastletResourceAdmissionState.Reset()
+	if status.Resources != nil {
+		reason := string(status.Resources.Reason)
+		if reason == "" {
+			reason = "none"
+		}
+		fastletResourceAdmissionState.WithLabelValues(string(status.Resources.State), reason).Set(1)
+	}
 }
 
 func metricResult(err error) string {

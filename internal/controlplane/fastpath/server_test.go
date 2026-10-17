@@ -701,6 +701,11 @@ func TestGetAndListPoolsExposeCapabilitiesWithoutRegistryProjection(t *testing.T
 	require.NoError(t, err)
 	require.Equal(t, "container", info.Runtime)
 	require.Equal(t, "500m", info.SandboxCpu)
+	require.Equal(t, fastpathv2.SandboxResourceMode_SANDBOX_RESOURCE_MODE_LEGACY_SLOT, info.SandboxResourceProfile.Mode)
+	require.Nil(t, info.SandboxResourceProfile.Requests)
+	require.Equal(t, "500m", info.SandboxResourceProfile.Limits.Cpu)
+	require.Equal(t, "512Mi", info.SandboxResourceProfile.Limits.Memory)
+	require.Equal(t, int64(128), info.SandboxResourceProfile.Pids)
 	require.Equal(t, int32(2), info.ReadyFastlets)
 	require.Equal(t, "execd", info.Components[0].Name)
 	require.Equal(t, uint32(44772), info.Components[0].Port)
@@ -709,6 +714,29 @@ func TestGetAndListPoolsExposeCapabilitiesWithoutRegistryProjection(t *testing.T
 	listed, err := server.ListPools(context.Background(), &fastpathv2.ListPoolsRequest{Namespace: "default"})
 	require.NoError(t, err)
 	require.Len(t, listed.Items, 1)
+}
+
+func TestPoolInfoExposesResourceAwareRequestsAndLimits(t *testing.T) {
+	pool := discoveryPool("pool-aware", "default")
+	pool.Spec.SandboxResources = apiv1alpha2.SandboxResourceProfile{
+		Requests: &apiv1alpha2.SandboxComputeResources{
+			CPU: resource.MustParse("1"), Memory: resource.MustParse("5Gi"),
+		},
+		Limits: &apiv1alpha2.SandboxComputeResources{
+			CPU: resource.MustParse("2"), Memory: resource.MustParse("10Gi"),
+		},
+		PIDs: 256,
+	}
+
+	info := poolInfo(pool)
+	require.Equal(t, "2", info.SandboxCpu)
+	require.Equal(t, "10Gi", info.SandboxMemory)
+	require.Equal(t, fastpathv2.SandboxResourceMode_SANDBOX_RESOURCE_MODE_RESOURCE_AWARE, info.SandboxResourceProfile.Mode)
+	require.Equal(t, "1", info.SandboxResourceProfile.Requests.Cpu)
+	require.Equal(t, "5Gi", info.SandboxResourceProfile.Requests.Memory)
+	require.Equal(t, "2", info.SandboxResourceProfile.Limits.Cpu)
+	require.Equal(t, "10Gi", info.SandboxResourceProfile.Limits.Memory)
+	require.Equal(t, int64(256), info.SandboxResourceProfile.Pids)
 }
 
 func TestGetSandboxDiagnosticsUsesAnnotationAndDegrades(t *testing.T) {
@@ -751,7 +779,7 @@ func discoveryPool(name, namespace string) *apiv1alpha2.SandboxPool {
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec: apiv1alpha2.SandboxPoolSpec{
 			Runtime: apiv1alpha2.RuntimeContainer, Capacity: apiv1alpha2.PoolCapacity{PoolMin: 1, PoolMax: 1}, MaxSandboxesPerPod: 8,
-			SandboxResources: apiv1alpha2.SandboxResourceProfile{CPU: resource.MustParse("500m"), Memory: resource.MustParse("512Mi"), PIDs: 128},
+			SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(resource.MustParse("500m"), resource.MustParse("512Mi"), 128),
 			ActionHandlers:   []apiv1alpha2.ActionHandler{{Name: "audit", TargetHTTPPort: 18081}, {Name: "egress", TargetHTTPPort: 18080}},
 			InfraComponents: []apiv1alpha2.InfraComponent{{
 				Name: "execd", Endpoint: apiv1alpha2.InfraEndpoint{Protocol: "HTTP", Port: 44772},

@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -61,7 +62,11 @@ func TestFastletInfoFromPodUsesWatchIdentityAndReadiness(t *testing.T) {
 			Labels:      map[string]string{"app": "sandbox-fastlet", "fast-sandbox.io/pool": "pool-a", "fast-sandbox.io/runtime": "container"},
 			Annotations: map[string]string{"fast-sandbox.io/runtime-profile-hash": "runtime-hash", "fast-sandbox.io/resource-profile-hash": "resource-hash"},
 		},
-		Spec: corev1.PodSpec{NodeName: "node-a"},
+		Spec: corev1.PodSpec{NodeName: "node-a", Containers: []corev1.Container{{
+			Name: "fastlet", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse("750m"), corev1.ResourceMemory: resource.MustParse("3Gi"),
+			}},
+		}}},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning, PodIP: "10.0.0.1",
 			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
@@ -72,6 +77,8 @@ func TestFastletInfoFromPodUsesWatchIdentityAndReadiness(t *testing.T) {
 	require.True(t, info.PodReady)
 	require.Equal(t, "runtime-hash", info.RuntimeProfileHash)
 	require.Equal(t, "resource-hash", info.ResourceProfileHash)
+	require.Equal(t, int64(750), info.ResourceCapacity.CPU.MilliValue())
+	require.Equal(t, int64(3*1024*1024*1024), info.ResourceCapacity.Memory.Value())
 }
 
 func TestDrainAnnotationImmediatelyExcludesPodAndHeartbeatCannotClearIt(t *testing.T) {

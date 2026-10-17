@@ -19,11 +19,9 @@ func TestValidateRuntime(t *testing.T) {
 func TestValidateSandboxPoolUpdate(t *testing.T) {
 	base := SandboxPoolSpec{
 		Runtime: RuntimeContainer,
-		SandboxResources: SandboxResourceProfile{
-			CPU:    resource.MustParse("1"),
-			Memory: resource.MustParse("1Gi"),
-			PIDs:   256,
-		},
+		SandboxResources: NewLegacySandboxResourceProfile(
+			resource.MustParse("1"), resource.MustParse("1Gi"), 256,
+		),
 	}
 
 	same := *base.DeepCopy()
@@ -34,7 +32,8 @@ func TestValidateSandboxPoolUpdate(t *testing.T) {
 	require.ErrorIs(t, ValidateSandboxPoolUpdate(&base, &runtimeChanged), ErrRuntimeImmutable)
 
 	resourcesChanged := *base.DeepCopy()
-	resourcesChanged.SandboxResources.Memory = resource.MustParse("2Gi")
+	changedMemory := resource.MustParse("2Gi")
+	resourcesChanged.SandboxResources.Memory = &changedMemory
 	require.ErrorIs(t, ValidateSandboxPoolUpdate(&base, &resourcesChanged), ErrResourcesImmutable)
 }
 
@@ -145,21 +144,52 @@ func TestValidateHostProcessInfraComponent(t *testing.T) {
 }
 
 func TestSandboxResourceProfileHashIsCanonical(t *testing.T) {
-	a := SandboxResourceProfile{CPU: resource.MustParse("1"), Memory: resource.MustParse("1024Mi"), PIDs: 256}
-	b := SandboxResourceProfile{CPU: resource.MustParse("1000m"), Memory: resource.MustParse("1Gi"), PIDs: 256}
+	a := NewLegacySandboxResourceProfile(resource.MustParse("1"), resource.MustParse("1024Mi"), 256)
+	b := NewLegacySandboxResourceProfile(resource.MustParse("1000m"), resource.MustParse("1Gi"), 256)
 	require.Equal(t, a.Hash(), b.Hash())
 	b.PIDs++
 	require.NotEqual(t, a.Hash(), b.Hash())
+
+	awareA := SandboxResourceProfile{
+		Requests: &SandboxComputeResources{CPU: resource.MustParse("1"), Memory: resource.MustParse("5Gi")},
+		Limits:   &SandboxComputeResources{CPU: resource.MustParse("2"), Memory: resource.MustParse("10Gi")},
+		PIDs:     256,
+	}
+	awareB := SandboxResourceProfile{
+		Requests: &SandboxComputeResources{CPU: resource.MustParse("1000m"), Memory: resource.MustParse("5120Mi")},
+		Limits:   &SandboxComputeResources{CPU: resource.MustParse("2000m"), Memory: resource.MustParse("10240Mi")},
+		PIDs:     256,
+	}
+	require.Equal(t, awareA.Hash(), awareB.Hash())
+	require.NotEqual(t, a.Hash(), awareA.Hash())
 }
 
 func TestValidateSandboxResourceProfile(t *testing.T) {
-	valid := SandboxResourceProfile{CPU: resource.MustParse("500m"), Memory: resource.MustParse("256Mi"), PIDs: 128}
-	require.NoError(t, ValidateSandboxResourceProfile(valid))
+	legacy := NewLegacySandboxResourceProfile(resource.MustParse("500m"), resource.MustParse("256Mi"), 128)
+	require.NoError(t, ValidateSandboxResourceProfile(legacy))
+	require.Equal(t, SandboxResourceModeLegacySlot, legacy.ResourceMode())
+
+	aware := SandboxResourceProfile{
+		Requests: &SandboxComputeResources{CPU: resource.MustParse("250m"), Memory: resource.MustParse("128Mi")},
+		Limits:   &SandboxComputeResources{CPU: resource.MustParse("500m"), Memory: resource.MustParse("256Mi")},
+		PIDs:     128,
+	}
+	require.NoError(t, ValidateSandboxResourceProfile(aware))
+	require.Equal(t, SandboxResourceModeResourceAware, aware.ResourceMode())
+
 	require.ErrorIs(t, ValidateSandboxResourceProfile(SandboxResourceProfile{}), ErrInvalidSandboxResourceProfile)
-	require.ErrorIs(t, ValidateSandboxResourceProfile(SandboxResourceProfile{
-		CPU: resource.MustParse("1"),
-	}), ErrInvalidSandboxResourceProfile)
-	require.ErrorIs(t, ValidateSandboxResourceProfile(SandboxResourceProfile{
-		CPU: resource.MustParse("1m"), Memory: resource.MustParse("256Mi"), PIDs: 128,
-	}), ErrInvalidSandboxResourceProfile)
+	missingMemory := resource.MustParse("1Gi")
+	require.ErrorIs(t, ValidateSandboxResourceProfile(SandboxResourceProfile{Memory: &missingMemory, PIDs: 128}), ErrInvalidSandboxResourceProfile)
+	require.ErrorIs(t, ValidateSandboxResourceProfile(NewLegacySandboxResourceProfile(
+		resource.MustParse("1m"), resource.MustParse("256Mi"), 128,
+	)), ErrInvalidSandboxResourceProfile)
+
+	mixed := legacy
+	mixed.Requests = aware.Requests
+	mixed.Limits = aware.Limits
+	require.ErrorIs(t, ValidateSandboxResourceProfile(mixed), ErrInvalidSandboxResourceProfile)
+
+	requestsExceedLimits := aware
+	requestsExceedLimits.Requests = &SandboxComputeResources{CPU: resource.MustParse("1"), Memory: resource.MustParse("512Mi")}
+	require.ErrorIs(t, ValidateSandboxResourceProfile(requestsExceedLimits), ErrInvalidSandboxResourceProfile)
 }

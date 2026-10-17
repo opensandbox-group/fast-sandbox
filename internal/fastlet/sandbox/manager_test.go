@@ -355,9 +355,9 @@ func TestNewSandboxManager_InvalidCapacity(t *testing.T) {
 }
 
 func TestSandboxManagerRejectsProfileOverrides(t *testing.T) {
-	profile := apiv1alpha2.SandboxResourceProfile{
-		CPU: resource.MustParse("500m"), Memory: resource.MustParse("256Mi"), PIDs: 128,
-	}
+	profile := apiv1alpha2.NewLegacySandboxResourceProfile(
+		resource.MustParse("500m"), resource.MustParse("256Mi"), 128,
+	)
 	manager, err := NewSandboxManagerWithConfig(NewMockRuntime(), SandboxManagerConfig{
 		Capacity: 5, RuntimeProfileHash: "runtime-hash", ResourceProfile: &profile,
 	})

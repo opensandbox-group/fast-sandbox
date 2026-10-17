@@ -307,9 +307,10 @@ capacity still prevents the extra aggregate request from admitting more actors
 than `maxSandboxesPerPod`.
 
 This proposal does not add or change a user-visible Fastlet overhead contract.
-The Fastlet reports the final effective runtime-owner request delivered through
-immutable settings and validates the runtime limit against its cgroup, so
-placement does not need to reproduce Pod construction logic.
+The Fastlet loads the final effective runtime-owner request from immutable
+settings and validates the runtime limit against its cgroup. FastPath reads the
+same request from the watched Pod, so placement does not need to reproduce Pod
+construction logic or receive the static capacity in every heartbeat.
 
 ### Capacity delivery to Fastlet
 
@@ -375,6 +376,64 @@ The immutable resource profile hash must include:
 Fastlet rejects a Create whose resource profile hash differs from its prepared
 Pool profile. A caller cannot submit a smaller request to bypass the ledger or
 a larger limit to bypass Pool isolation.
+
+### Public Pool discovery
+
+`GetPool` and `ListPools` continue to expose the legacy flat resource fields
+for compatibility and add one structured resource profile at field 17:
+
+```proto
+enum SandboxResourceMode {
+  SANDBOX_RESOURCE_MODE_UNSPECIFIED = 0;
+  SANDBOX_RESOURCE_MODE_LEGACY_SLOT = 1;
+  SANDBOX_RESOURCE_MODE_RESOURCE_AWARE = 2;
+}
+
+message ComputeResourceProfile {
+  string cpu = 1;
+  string memory = 2;
+}
+
+message SandboxResourceProfileInfo {
+  SandboxResourceMode mode = 1;
+  ComputeResourceProfile requests = 2;
+  ComputeResourceProfile limits = 3;
+  int64 pids = 4;
+}
+
+message PoolInfo {
+  // Existing fields 1 through 16 remain unchanged.
+  SandboxResourceProfileInfo sandbox_resource_profile = 17;
+}
+```
+
+For a `LegacySlot` Pool, `requests` is absent and `limits` mirrors the existing
+flat CPU and memory fields. For a `ResourceAware` Pool, both `requests` and
+`limits` are populated, while the existing flat CPU and memory fields continue
+to return the limit values for older clients.
+
+This phase does not add dynamic capacity or Fastlet health summaries to the
+public `PoolInfo` contract. Effective free capacity and blocked or unknown
+Fastlet counts remain internal Registry, controller, heartbeat, and metrics
+data until their aggregation, freshness, and external consumers are defined.
+
+### FastPath-to-Fastlet Create request
+
+The `CreateSandboxRequest` and nested `SandboxSpec` wire shapes do not change.
+The existing `cpu`, `memory`, and `pids` fields continue to represent runtime
+limits. The normal control-plane path leaves them empty; Fastlet validates any
+non-empty compatibility value and injects the limits from its immutable Pool
+profile before calling the RuntimeDriver.
+
+`resourceProfileHash` is also an existing field. Its wire representation is
+unchanged, but the ResourceAware hash covers CPU and memory requests and
+limits, the PID limit, and a schema discriminator.
+
+The request does not add `cpuRequest` or `memoryRequest`. Fastlet obtains ledger
+demand from its immutable settings, preventing the caller from supplying a
+second resource-request authority. The Create response changes separately: its
+existing admission object gains the minimal resource status, and its error may
+carry a bounded admission reason.
 
 ## Fastlet commitment ledger
 
@@ -454,8 +513,12 @@ optimistic release can exceed the physical boundary.
 
 ### Heartbeat schema
 
-The existing slot `AdmissionStatus` remains present. A versioned resource
-snapshot is added beside it:
+The existing slot `AdmissionStatus` remains present. Because one Fastlet has
+one immutable Pool resource profile, FastPath can derive static commitment as
+`admission.used * sandbox request` and read capacity from the watched
+runtime-owner Pod request. The heartbeat therefore adds only the dynamic
+admission decision and the ordering needed to reconcile it with immediate
+Create feedback:
 
 ```yaml
 admission:
@@ -469,36 +532,31 @@ admission:
     version: v1
     epoch: 7f2c8f95-6db5-48c3-8c77-b4d8e9bb47c0
     revision: 108
-    observedAt: 2026-10-16T10:30:01Z
-
-    capacity:
-      cpu: "10"
-      memory: 50Gi
-    committed:
-      cpu: "9"
-      memory: 45Gi
-    runtimeLimit:
-      cpu: "10"
-      memory: 50Gi
-    observedUsage:
-      cpu: "7.2"
-      memory: 46Gi
-
     state: OPEN
-    conditions:
-      - scope: FASTLET
-        resource: memory
-        state: OPEN
-        reason: BELOW_LOW_WATERMARK
-      - scope: NODE
-        resource: memory
-        state: OPEN
-        reason: NODE_MEMORY_AVAILABLE
-        nodeUID: node-123
 ```
 
-The wire representation may use typed quantities rather than YAML strings,
-but it must preserve quantity semantics without floating-point rounding.
+The corresponding protocol type is intentionally small:
+
+```go
+type ResourceAdmissionStatus struct {
+    Version  string          `json:"version"`
+    Epoch    string          `json:"epoch"`
+    Revision uint64          `json:"revision"`
+    State    AdmissionState  `json:"state"`
+    Reason   AdmissionReason `json:"reason,omitempty"`
+}
+```
+
+`reason` is present only when it explains the selected non-`OPEN` state. Its
+bounded enum identifies the resource and whether the cause is Fastlet- or
+node-scoped, so separate `scope` and `resource` fields are unnecessary. Fastlet
+may retain multiple raw conditions internally for local metrics and logs, but
+FastPath needs only the aggregate decision and its dominant reason.
+
+The heartbeat does not repeat `mode`, capacity, commitment, runtime limit,
+observed usage, or a Fastlet timestamp. Mode and static quantities already
+come from the Pool and watched Pod, observed usage remains a Fastlet-local
+metric, and Registry uses its own receive time for freshness.
 
 ### States
 
@@ -539,8 +597,9 @@ reason labels and must not include Sandbox IDs or unbounded error strings.
 ### Epoch, revision, and freshness
 
 `epoch` identifies one Fastlet process incarnation. `revision` is monotonic
-within the epoch and increments whenever capacity, commitment, usage, state,
-or conditions change in a placement-relevant way.
+within the epoch and increments whenever the slot or commitment ledger, state,
+or selected reason changes. It versions the complete `AdmissionStatus`, not
+only the nested resource fields.
 
 Registry accepts a snapshot only when:
 
@@ -549,8 +608,8 @@ Registry accepts a snapshot only when:
 3. the epoch matches the accepted incarnation and the revision is newer; or
 4. a new epoch supplies a complete initial snapshot after reconnect/recovery.
 
-`observedAt` is diagnostic because host clocks may differ. Registry records
-its own local receive time and uses that time for heartbeat staleness.
+Registry records its local receive time and uses that time for heartbeat
+staleness, avoiding dependence on Fastlet clock synchronization.
 
 ### Immediate rejection feedback
 
@@ -569,6 +628,7 @@ admission:
     epoch: 7f2c8f95-6db5-48c3-8c77-b4d8e9bb47c0
     revision: 109
     state: BLOCKED
+    reason: FASTLET_MEMORY_HIGH_WATERMARK
 ```
 
 Registry applies this response immediately and records a rejection fence at
@@ -676,8 +736,8 @@ PSI as ranking or `DEGRADED` signals.
 
 Dynamic CPU `BLOCKED` policy is deferred until measurements demonstrate that a
 sustained threshold improves behavior without creating unnecessary scale-out.
-The protocol includes CPU conditions now so that this later extension does not
-require another wire-shape redesign.
+New bounded CPU reasons can describe CPU guidance later without another
+wire-shape redesign.
 
 ### Memory
 
@@ -725,11 +785,13 @@ Startup, observer failure, missing cgroup data, or stale samples produce
 ### Fastlet scope and node scope
 
 Fastlet-scoped conditions describe the runtime-owner cgroup and local runtime.
-Node-scoped conditions describe pressure shared by multiple Fastlets.
+Node-scoped conditions describe pressure shared by multiple Fastlets. Fastlet
+selects the dominant reason for the heartbeat and keeps the underlying
+condition set for local diagnostics.
 
 The initial design treats node pressure as a gate, not as a numeric byte budget.
-Registry keys node conditions by Node UID and must not add the same node
-headroom once for every Fastlet on that node.
+Registry resolves the Fastlet's watched Pod to its Kubernetes node and must not
+add the same node headroom once for every Fastlet on that node.
 
 Kubernetes remains the single numeric reservation authority for Fastlet Pod
 requests on a node. If a future design needs an additional node-wide inner
@@ -744,6 +806,12 @@ For one Fastlet and one fixed Pool profile:
 
 ```text
 slotFree = slotCapacity - usedSlots
+
+capacityCPU    = watchedRuntimeOwnerPodRequestCPU
+capacityMemory = watchedRuntimeOwnerPodRequestMemory
+
+committedCPU    = usedSlots * sandboxRequestCPU
+committedMemory = usedSlots * sandboxRequestMemory
 
 cpuFreeSandboxes =
     floor((capacityCPU - committedCPU) / sandboxRequestCPU)
@@ -780,8 +848,9 @@ nominalCapacity =
         plannedMemoryCapacity)
 ```
 
-Once a Fastlet reports a fresh complete snapshot, reported effective capacity
-replaces the planned value.
+Once a Fastlet reports a fresh admission snapshot, the Controller derives
+effective capacity from the watched Pod request, the immutable Pool profile,
+the reported slot ledger, and the dynamic admission state.
 
 ### Scale-up
 
@@ -933,8 +1002,11 @@ the Pool's admitted density without an explicit operator decision.
 #### Phase 0: schema and shadow telemetry
 
 - Add the API, protocol version, capabilities, Registry fields, and metrics.
-- Report resource snapshots without changing candidate eligibility.
-- Compare reported commitments with reconstructed Sandbox lifecycle state.
+- Report minimal resource admission snapshots without changing candidate
+  eligibility, while emitting detailed capacity, commitment, and usage as
+  Fastlet-local metrics.
+- Compare the local commitment ledger with reconstructed Sandbox lifecycle
+  state.
 - Validate that telemetry freshness and cardinality are operationally safe.
 
 #### Phase 1: Fastlet static ledger and memory gate

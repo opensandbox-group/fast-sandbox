@@ -226,9 +226,9 @@ func ActionFixtureImage() string {
 // SmallSandboxResourceProfile keeps e2e Pool capacity arithmetic realistic
 // while fitting several isolated Fastlet Pods on a single-node kind cluster.
 func SmallSandboxResourceProfile() apiv1alpha2.SandboxResourceProfile {
-	return apiv1alpha2.SandboxResourceProfile{
-		CPU: resource.MustParse("50m"), Memory: resource.MustParse("64Mi"), PIDs: 64,
-	}
+	return apiv1alpha2.NewLegacySandboxResourceProfile(
+		resource.MustParse("50m"), resource.MustParse("64Mi"), 64,
+	)
 }
 
 func sanitizeDNSLabel(value string) string {

@@ -17,6 +17,7 @@ import (
 	fastletaction "fast-sandbox/internal/fastlet/action"
 	fastletcache "fast-sandbox/internal/fastlet/cache"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
+	"fast-sandbox/internal/fastletsettings"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	"fast-sandbox/internal/registryconfig"
 	"fast-sandbox/pkg/util/idgen"
@@ -27,6 +28,8 @@ type SandboxManagerConfig struct {
 	RuntimeName        apiv1alpha2.RuntimeName
 	RuntimeProfileHash string
 	ResourceProfile    *apiv1alpha2.SandboxResourceProfile
+	ResourceAdmission  *fastletsettings.ResourceAdmissionSettings
+	ResourceEpoch      string
 	FastletPodUID      string
 	Clock              Clock
 	RecoverOnStart     bool
@@ -47,6 +50,14 @@ type SandboxManager struct {
 	runtimeProfileHash  string
 	resourceProfile     *apiv1alpha2.SandboxResourceProfile
 	resourceProfileHash string
+	resourceAdmission   *fastletsettings.ResourceAdmissionSettings
+	resourceEpoch       string
+	resourceRevision    uint64
+	resourceLastUsed    int
+	resourceLastState   fastletapi.AdmissionState
+	resourceLastReason  fastletapi.AdmissionReason
+	resourceState       fastletapi.AdmissionState
+	resourceReason      fastletapi.AdmissionReason
 	infraRevision       string
 	infraManager        *fastletinfra.Manager
 	actionManager       *fastletaction.Manager
@@ -119,6 +130,33 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		profile = &copied
 		resourceHash = copied.Hash()
 	}
+	var resourceAdmission *fastletsettings.ResourceAdmissionSettings
+	resourceEpoch := config.ResourceEpoch
+	if config.ResourceAdmission != nil {
+		if profile == nil {
+			return nil, fmt.Errorf("%w: resource admission settings require a Sandbox resource profile", ErrInvalidConfig)
+		}
+		if err := config.ResourceAdmission.Validate(*profile); err != nil {
+			return nil, err
+		}
+		copied := *config.ResourceAdmission
+		copied.Capacity = apiv1alpha2.SandboxComputeResources{
+			CPU: config.ResourceAdmission.Capacity.CPU.DeepCopy(), Memory: config.ResourceAdmission.Capacity.Memory.DeepCopy(),
+		}
+		copied.RuntimeLimit = apiv1alpha2.SandboxComputeResources{
+			CPU: config.ResourceAdmission.RuntimeLimit.CPU.DeepCopy(), Memory: config.ResourceAdmission.RuntimeLimit.Memory.DeepCopy(),
+		}
+		resourceAdmission = &copied
+		if resourceEpoch == "" {
+			var err error
+			resourceEpoch, err = idgen.GenerateRequestID()
+			if err != nil {
+				return nil, fmt.Errorf("generate resource admission epoch: %w", err)
+			}
+		}
+	} else if profile != nil && profile.ResourceMode() == apiv1alpha2.SandboxResourceModeResourceAware {
+		return nil, fmt.Errorf("%w: ResourceAware profile requires resource admission settings", ErrInvalidConfig)
+	}
 	var cacheSource fastletcache.ImageSource
 	if source, ok := runtime.(RuntimeArtifactCache); ok {
 		cacheSource = source
@@ -138,6 +176,8 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		runtime: runtime, runtimeName: string(config.RuntimeName), capacity: config.Capacity,
 		runtimeProfileHash: config.RuntimeProfileHash,
 		resourceProfile:    profile, resourceProfileHash: resourceHash,
+		resourceAdmission: resourceAdmission, resourceEpoch: resourceEpoch, resourceLastUsed: -1,
+		resourceState: fastletapi.AdmissionStateOpen,
 		infraRevision: config.InfraRevision,
 		infraManager:  config.InfraManager, infraReady: config.InfraManager == nil,
 		actionManager: config.ActionManager,
@@ -305,6 +345,25 @@ func (m *SandboxManager) ResourceProfileHash() string {
 	return m.resourceProfileHash
 }
 
+// SetResourceAdmissionState applies the latest local pressure decision. The
+// next admission snapshot advances its revision when the state or reason
+// changes, allowing Create feedback to fence older heartbeats.
+func (m *SandboxManager) SetResourceAdmissionState(state fastletapi.AdmissionState, reason fastletapi.AdmissionReason) error {
+	switch state {
+	case fastletapi.AdmissionStateOpen, fastletapi.AdmissionStateDegraded, fastletapi.AdmissionStateBlocked, fastletapi.AdmissionStateUnknown:
+	default:
+		return fmt.Errorf("%w: unsupported resource admission state %q", ErrInvalidConfig, state)
+	}
+	if state == fastletapi.AdmissionStateOpen {
+		reason = ""
+	}
+	m.mu.Lock()
+	m.resourceState = state
+	m.resourceReason = reason
+	m.mu.Unlock()
+	return nil
+}
+
 func (m *SandboxManager) RuntimeProfileHash() string {
 	return m.runtimeProfileHash
 }
@@ -329,16 +388,20 @@ func (m *SandboxManager) validateProfiles(spec *fastletapi.SandboxSpec) error {
 	if spec.ResourceProfileHash != m.resourceProfileHash {
 		return fmt.Errorf("%w: resource profile hash %q does not match Fastlet profile %q", ErrSandboxProfileMismatch, spec.ResourceProfileHash, m.resourceProfileHash)
 	}
+	limits, ok := m.resourceProfile.LimitResources()
+	if !ok {
+		return fmt.Errorf("%w: Fastlet resource profile has no runtime limits", ErrSandboxProfileMismatch)
+	}
 	if spec.CPU != "" {
 		cpu, err := resource.ParseQuantity(spec.CPU)
-		if err != nil || cpu.Cmp(m.resourceProfile.CPU) != 0 {
-			return fmt.Errorf("%w: cpu %q does not match %s", ErrSandboxProfileMismatch, spec.CPU, m.resourceProfile.CPU.String())
+		if err != nil || cpu.Cmp(limits.CPU) != 0 {
+			return fmt.Errorf("%w: cpu %q does not match %s", ErrSandboxProfileMismatch, spec.CPU, limits.CPU.String())
 		}
 	}
 	if spec.Memory != "" {
 		memory, err := resource.ParseQuantity(spec.Memory)
-		if err != nil || memory.Cmp(m.resourceProfile.Memory) != 0 {
-			return fmt.Errorf("%w: memory %q does not match %s", ErrSandboxProfileMismatch, spec.Memory, m.resourceProfile.Memory.String())
+		if err != nil || memory.Cmp(limits.Memory) != 0 {
+			return fmt.Errorf("%w: memory %q does not match %s", ErrSandboxProfileMismatch, spec.Memory, limits.Memory.String())
 		}
 	}
 	if spec.PIDs != 0 && spec.PIDs != m.resourceProfile.PIDs {
@@ -346,8 +409,8 @@ func (m *SandboxManager) validateProfiles(spec *fastletapi.SandboxSpec) error {
 	}
 	// The Fastlet profile is authoritative. The control plane sends only the
 	// profile identity; runtime-enforced values are injected atomically here.
-	spec.CPU = m.resourceProfile.CPU.String()
-	spec.Memory = m.resourceProfile.Memory.String()
+	spec.CPU = limits.CPU.String()
+	spec.Memory = limits.Memory.String()
 	spec.PIDs = m.resourceProfile.PIDs
 	return m.validateInfraRevision(spec)
 }

@@ -152,7 +152,7 @@ spec:
 | `capacity` | Yes | Pool size and idle-buffer bounds |
 | `maxSandboxesPerPod` | Yes | Fastlet-authoritative admission limit |
 | `runtime` | Yes | Immutable runtime name |
-| `sandboxResources` | Yes | Immutable per-Sandbox CPU, memory, and PID limits; their sum may exceed an explicitly lower Fastlet aggregate limit |
+| `sandboxResources` | Yes | Immutable legacy limits (`cpu`/`memory`) or resource-aware `requests`/`limits`, plus the per-Sandbox PID limit |
 | `warmImages` | No | Asynchronous, GC-protected cache inputs |
 | `infraComponents` | No | Inline immutable artifact/process/health/endpoint definitions |
 | `actionHandlers` | No | Named Pod-loopback Binding receivers and their lifecycle Hook subscriptions |
@@ -160,6 +160,25 @@ spec:
 
 Runtime names are `container`, `gvisor`, `kata-qemu`, `kata-clh`, `kata-fc`,
 `kata-dragonball`, and `firecracker`.
+
+Existing Pools keep the flat `cpu` and `memory` representation. New
+resource-aware Pools use the mutually exclusive shape below; `requests`
+drive Fastlet commitment admission and Pool elasticity, while `limits` remain
+the per-Sandbox runtime ceilings:
+
+```yaml
+sandboxResources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  pids: 256
+```
+
+The two representations cannot be mixed. A request must be positive and no
+greater than its matching limit.
 
 Pool status exposes Fastlet capacity, runtime/Infra/Fastlet revisions, prepared
 Fastlet counts, and per-image warm-cache aggregation. Handler and Registry

@@ -88,9 +88,9 @@ func registryRotationPool(namespace string) *apiv1alpha2.SandboxPool {
 			Capacity:           apiv1alpha2.PoolCapacity{PoolMin: 1, PoolMax: 1},
 			MaxSandboxesPerPod: 1,
 			Runtime:            apiv1alpha2.RuntimeContainer,
-			SandboxResources: apiv1alpha2.SandboxResourceProfile{
-				CPU: resource.MustParse("100m"), Memory: resource.MustParse("128Mi"), PIDs: 64,
-			},
+			SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+				resource.MustParse("100m"), resource.MustParse("128Mi"), 64,
+			),
 			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
 				Name: "fastlet", Image: suiteenv.FastletImage(), ImagePullPolicy: corev1.PullIfNotPresent,
 			}}}},
