@@ -505,9 +505,9 @@ func newSecureRuntimePool(namespace, name string, runtimeName apiv1alpha2.Runtim
 			},
 			MaxSandboxesPerPod: 5,
 			Runtime:            runtimeName,
-			SandboxResources: apiv1alpha2.SandboxResourceProfile{
-				CPU: resource.MustParse("250m"), Memory: resource.MustParse("256Mi"), PIDs: 128,
-			},
+			SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+				resource.MustParse("250m"), resource.MustParse("256Mi"), 128,
+			),
 			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Tolerations: []corev1.Toleration{

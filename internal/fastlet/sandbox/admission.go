@@ -169,18 +169,19 @@ func (m *SandboxManager) reserveSandboxForCreate(req *fastletapi.CreateSandboxRe
 	if m.draining {
 		return reject(fastletError(fastletapi.ErrorDraining, m.drainReason, true), fastletapi.CreateDispositionRejectedBeforeSideEffects)
 	}
-	if len(m.sandboxes) >= m.capacity {
-		// A terminal create-failed Sandbox is projected but occupies no
-		// capacity: it must not block new creates.
-		active := 0
-		for _, managed := range m.sandboxes {
-			if managed.Phase != sandboxStateCreateFailed {
-				active++
-			}
+	// A terminal create-failed Sandbox is projected but occupies no slot or
+	// resource commitment: it must not block new creates.
+	active := 0
+	for _, managed := range m.sandboxes {
+		if managed.Phase != sandboxStateCreateFailed {
+			active++
 		}
-		if active >= m.capacity {
-			return reject(fastletError(fastletapi.ErrorCapacityRejected, "Fastlet admission capacity is exhausted", true), fastletapi.CreateDispositionRejectedBeforeSideEffects)
-		}
+	}
+	if active >= m.capacity {
+		return reject(admissionError(fastletapi.AdmissionReasonSlotFull, "Fastlet admission capacity is exhausted"), fastletapi.CreateDispositionRejectedBeforeSideEffects)
+	}
+	if failure := m.resourceCapacityFailureLocked(active); failure != nil {
+		return reject(failure, fastletapi.CreateDispositionRejectedBeforeSideEffects)
 	}
 	if !m.runtimeResourceAvailable() {
 		return reject(fastletError(fastletapi.ErrorNetworkUnavailable, "Fastlet has no clean runtime/network resource available", true), fastletapi.CreateDispositionRejectedBeforeSideEffects)
@@ -735,8 +736,56 @@ func (m *SandboxManager) admissionStatusLocked() fastletapi.AdmissionStatus {
 		}
 	}
 	status.Used = status.Creating + status.Running + status.Deleting
+	if m.resourceAdmission != nil {
+		state, reason := m.resourceAdmissionStateLocked()
+		if status.Used != m.resourceLastUsed || state != m.resourceLastState || reason != m.resourceLastReason {
+			m.resourceRevision++
+			m.resourceLastUsed = status.Used
+			m.resourceLastState = state
+			m.resourceLastReason = reason
+		}
+		status.Resources = &fastletapi.ResourceAdmissionStatus{
+			Version: "v1", Epoch: m.resourceEpoch, Revision: m.resourceRevision,
+			State: state, Reason: reason,
+		}
+	}
 	recordAdmissionStatus(status)
 	return status
+}
+
+func (m *SandboxManager) resourceAdmissionStateLocked() (fastletapi.AdmissionState, fastletapi.AdmissionReason) {
+	if m.recovering {
+		return fastletapi.AdmissionStateUnknown, fastletapi.AdmissionReasonRecoveryIncomplete
+	}
+	return m.resourceState, m.resourceReason
+}
+
+func (m *SandboxManager) resourceCapacityFailureLocked(active int) *fastletapi.FastletError {
+	if m.resourceAdmission == nil || m.resourceProfile == nil {
+		return nil
+	}
+	requests, ok := m.resourceProfile.RequestResources()
+	if !ok {
+		return admissionError(fastletapi.AdmissionReasonUnsupportedProtocol, "Fastlet resource admission profile is unavailable")
+	}
+	nextCPU := requests.CPU.DeepCopy()
+	nextCPU.Mul(int64(active + 1))
+	if nextCPU.Cmp(m.resourceAdmission.Capacity.CPU) > 0 {
+		return admissionError(fastletapi.AdmissionReasonStaticCPUExhausted, "Fastlet CPU commitment capacity is exhausted")
+	}
+	nextMemory := requests.Memory.DeepCopy()
+	nextMemory.Mul(int64(active + 1))
+	if nextMemory.Cmp(m.resourceAdmission.Capacity.Memory) > 0 {
+		return admissionError(fastletapi.AdmissionReasonStaticMemoryExhausted, "Fastlet memory commitment capacity is exhausted")
+	}
+	state, reason := m.resourceAdmissionStateLocked()
+	if state == fastletapi.AdmissionStateBlocked || state == fastletapi.AdmissionStateUnknown {
+		if reason == "" {
+			reason = fastletapi.AdmissionReasonTelemetryMissing
+		}
+		return admissionError(reason, "Fastlet resource admission is "+string(state))
+	}
+	return nil
 }
 
 // sandboxStatusLocked returns the point-in-time Fastlet observation. Callers
@@ -822,6 +871,12 @@ func apiInfraDiagnostics(
 
 func fastletError(code fastletapi.FastletErrorCode, message string, retryable bool) *fastletapi.FastletError {
 	return &fastletapi.FastletError{Code: code, Message: message, Retryable: retryable}
+}
+
+func admissionError(reason fastletapi.AdmissionReason, message string) *fastletapi.FastletError {
+	return &fastletapi.FastletError{
+		Code: fastletapi.ErrorCapacityRejected, Reason: reason, Message: message, Retryable: true,
+	}
 }
 
 func fastletErrorWithCause(code fastletapi.FastletErrorCode, message string, retryable bool, cause error) *fastletapi.FastletError {

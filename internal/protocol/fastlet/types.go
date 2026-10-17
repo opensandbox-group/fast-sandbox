@@ -209,6 +209,7 @@ const (
 
 type FastletError struct {
 	Code      FastletErrorCode `json:"code"`
+	Reason    AdmissionReason  `json:"reason,omitempty"`
 	Message   string           `json:"message"`
 	Retryable bool             `json:"retryable"`
 	Cause     error            `json:"-"`
@@ -240,11 +241,47 @@ type SandboxIdentity struct {
 }
 
 type AdmissionStatus struct {
-	Capacity int `json:"capacity"`
-	Creating int `json:"creating"`
-	Running  int `json:"running"`
-	Deleting int `json:"deleting"`
-	Used     int `json:"used"`
+	Capacity  int                      `json:"capacity"`
+	Creating  int                      `json:"creating"`
+	Running   int                      `json:"running"`
+	Deleting  int                      `json:"deleting"`
+	Used      int                      `json:"used"`
+	Resources *ResourceAdmissionStatus `json:"resources,omitempty"`
+}
+
+type AdmissionState string
+
+const (
+	AdmissionStateOpen     AdmissionState = "OPEN"
+	AdmissionStateDegraded AdmissionState = "DEGRADED"
+	AdmissionStateBlocked  AdmissionState = "BLOCKED"
+	AdmissionStateUnknown  AdmissionState = "UNKNOWN"
+)
+
+type AdmissionReason string
+
+const (
+	AdmissionReasonSlotFull                   AdmissionReason = "SLOT_FULL"
+	AdmissionReasonStaticCPUExhausted         AdmissionReason = "STATIC_CPU_EXHAUSTED"
+	AdmissionReasonStaticMemoryExhausted      AdmissionReason = "STATIC_MEMORY_EXHAUSTED"
+	AdmissionReasonFastletMemoryHighWatermark AdmissionReason = "FASTLET_MEMORY_HIGH_WATERMARK"
+	AdmissionReasonFastletMemoryPSI           AdmissionReason = "FASTLET_MEMORY_PSI"
+	AdmissionReasonFastletOOMEvent            AdmissionReason = "FASTLET_OOM_EVENT"
+	AdmissionReasonNodeMemoryPressure         AdmissionReason = "NODE_MEMORY_PRESSURE"
+	AdmissionReasonCPUSaturation              AdmissionReason = "CPU_SATURATION"
+	AdmissionReasonCPUThrottling              AdmissionReason = "CPU_THROTTLING"
+	AdmissionReasonTelemetryStale             AdmissionReason = "TELEMETRY_STALE"
+	AdmissionReasonTelemetryMissing           AdmissionReason = "TELEMETRY_MISSING"
+	AdmissionReasonRecoveryIncomplete         AdmissionReason = "RECOVERY_INCOMPLETE"
+	AdmissionReasonUnsupportedProtocol        AdmissionReason = "UNSUPPORTED_PROTOCOL"
+)
+
+type ResourceAdmissionStatus struct {
+	Version  string          `json:"version"`
+	Epoch    string          `json:"epoch"`
+	Revision uint64          `json:"revision"`
+	State    AdmissionState  `json:"state"`
+	Reason   AdmissionReason `json:"reason,omitempty"`
 }
 
 type CreateSandboxRequest struct {

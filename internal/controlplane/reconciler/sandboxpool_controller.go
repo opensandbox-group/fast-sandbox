@@ -203,7 +203,10 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.ensureRuntimePlanConfigMap(ctx, &pool, runtimePlan); err != nil {
 		return ctrl.Result{}, err
 	}
-	settings := buildFastletSettings(&pool)
+	settings, err := buildFastletSettings(&pool, profile)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.ensureFastletSettingsConfigMap(ctx, &pool, settings); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -234,6 +237,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
+	resourceAware := pool.Spec.SandboxResources.ResourceMode() == apiv1alpha2.SandboxResourceModeResourceAware
 	var activeCount, pendingCount int32
 	childIdentities := make(map[string]struct{}, len(childPods.Items))
 	for index := range childPods.Items {
@@ -246,7 +250,14 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				if _, exists := childIdentities[identity]; exists {
 					activeCount++
 				}
-			} else if sandboxNeedsPlacement(&sb) {
+			}
+			if resourceAware && sandboxNeedsResourceCapacity(&sb) {
+				// A Fastlet rejection happens after the durable assignment CAS.
+				// Keep that Pending Sandbox in the demand ledger until it is
+				// Ready, otherwise the replacement Fastlet can be drained before
+				// the Controller retries the assignment on it.
+				pendingCount++
+			} else if !resourceAware && sandboxNeedsPlacement(&sb) {
 				pendingCount++
 			}
 		}
@@ -257,8 +268,17 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		maxPerPod = 1
 	}
 
-	totalNeededSlots := activeCount + pendingCount + pool.Spec.Capacity.BufferMin
-	desiredPods := (totalNeededSlots + maxPerPod - 1) / maxPerPod
+	desiredPod, err := r.constructPodWithRuntimePlan(&pool, runtimePlan)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	desiredPods := int32(0)
+	if resourceAware {
+		desiredPods = r.resourceAwareDesiredPods(&pool, childPods.Items, pendingCount, desiredPod)
+	} else {
+		totalNeededSlots := activeCount + pendingCount + pool.Spec.Capacity.BufferMin
+		desiredPods = (totalNeededSlots + maxPerPod - 1) / maxPerPod
+	}
 
 	if desiredPods < pool.Spec.Capacity.PoolMin {
 		desiredPods = pool.Spec.Capacity.PoolMin
@@ -268,10 +288,6 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	currentCount := int32(len(childPods.Items))
-	desiredPod, err := r.constructPodWithRuntimePlan(&pool, runtimePlan)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
 	desiredPodHash := desiredPod.Annotations[placement.AnnotationPodTemplateHash]
 
 	if currentCount < desiredPods {
@@ -389,6 +405,97 @@ func (r *SandboxPoolReconciler) fastletUtilizationCounts(
 		}
 	}
 	return idle, busy
+}
+
+func (r *SandboxPoolReconciler) resourceAwareDesiredPods(
+	pool *apiv1alpha2.SandboxPool,
+	pods []corev1.Pod,
+	pendingSandboxes int32,
+	plannedPod *corev1.Pod,
+) int32 {
+	current := int32(len(pods))
+	nominal := nominalResourceCapacity(pool, plannedPod)
+	if nominal <= 0 {
+		nominal = 1
+	}
+	requests, ok := pool.Spec.SandboxResources.RequestResources()
+	if !ok {
+		return current
+	}
+	demand := placement.ResourceDemand{CPU: requests.CPU, Memory: requests.Memory}
+	now := r.now()
+	children := childPodIdentities(pods)
+	observed := make(map[string]placement.FastletInfo, len(pods))
+	if r.Registry != nil {
+		for _, info := range r.Registry.GetAllFastlets() {
+			if info.Namespace != pool.Namespace || info.PoolName != pool.Name {
+				continue
+			}
+			identity := info.PodName + "/" + info.PodUID
+			if _, exists := children[identity]; exists {
+				observed[identity] = info
+			}
+		}
+	}
+
+	var availableFree int32
+	removableFree := make([]int32, 0, len(pods))
+	for index := range pods {
+		pod := &pods[index]
+		identity := podIdentity(pod)
+		info, exists := observed[identity]
+		if !exists || info.LastHeartbeat.IsZero() {
+			if pod.DeletionTimestamp == nil && pod.Status.Phase != corev1.PodFailed && pod.Status.Phase != corev1.PodSucceeded {
+				availableFree += nominal
+			}
+			continue
+		}
+		free := placement.EffectiveFreeCapacity(info, demand, now, placement.DefaultObservationStaleAfter)
+		availableFree += free
+		if info.Used() == 0 && !info.Draining && !info.DrainRequested {
+			removableFree = append(removableFree, free)
+		}
+	}
+
+	desiredFree := pendingSandboxes + pool.Spec.Capacity.BufferMin
+	desired := current
+	if availableFree < desiredFree {
+		deficit := desiredFree - availableFree
+		desired += (deficit + nominal - 1) / nominal
+		return desired
+	}
+	if pendingSandboxes > 0 {
+		return desired
+	}
+
+	retainedFree := max(pool.Spec.Capacity.BufferMax, pool.Spec.Capacity.BufferMin)
+	sort.Slice(removableFree, func(i, j int) bool { return removableFree[i] < removableFree[j] })
+	for _, free := range removableFree {
+		if desired <= pool.Spec.Capacity.PoolMin || availableFree-free < retainedFree {
+			break
+		}
+		availableFree -= free
+		desired--
+	}
+	return desired
+}
+
+func nominalResourceCapacity(pool *apiv1alpha2.SandboxPool, pod *corev1.Pod) int32 {
+	if pool == nil || pod == nil || len(pod.Spec.Containers) == 0 {
+		return 0
+	}
+	requests, ok := pool.Spec.SandboxResources.RequestResources()
+	if !ok || requests.CPU.Sign() <= 0 || requests.Memory.Sign() <= 0 {
+		return 0
+	}
+	ownerRequests := pod.Spec.Containers[0].Resources.Requests
+	cpu := ownerRequests.Cpu().MilliValue() / requests.CPU.MilliValue()
+	memory := ownerRequests.Memory().Value() / requests.Memory.Value()
+	capacity := min(int64(getFastletCapacity(pool)), cpu, memory)
+	if capacity <= 0 {
+		return 0
+	}
+	return int32(capacity)
 }
 
 func childPodIdentities(pods []corev1.Pod) map[string]struct{} {
@@ -639,6 +746,22 @@ func sandboxNeedsPlacement(sandbox *apiv1alpha2.Sandbox) bool {
 	return true
 }
 
+func sandboxNeedsResourceCapacity(sandbox *apiv1alpha2.Sandbox) bool {
+	if sandbox == nil || sandbox.DeletionTimestamp != nil {
+		return false
+	}
+	switch sandbox.Status.Runtime.State {
+	case apiv1alpha2.RuntimeReady,
+		apiv1alpha2.RuntimeStopping,
+		apiv1alpha2.RuntimeStopped,
+		apiv1alpha2.RuntimePausing,
+		apiv1alpha2.RuntimePaused:
+		return false
+	default:
+		return true
+	}
+}
+
 func podIdentity(pod *corev1.Pod) string {
 	return pod.Name + "/" + string(pod.UID)
 }
@@ -704,7 +827,10 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 	annotations["fast-sandbox.io/runtime-plan-revision"] = runtimePlan.Revision
 	annotations["fast-sandbox.io/resource-profile-hash"] = sandboxResources.Hash()
 	annotations["fast-sandbox.io/infra-revision"] = infraPlan.Revision
-	settings := buildFastletSettings(pool)
+	settings, err := buildFastletSettings(pool, profile)
+	if err != nil {
+		return nil, err
+	}
 	settingsRevision, err := settings.Revision()
 	if err != nil {
 		return nil, fmt.Errorf("compute Fastlet settings revision: %w", err)
@@ -1170,13 +1296,36 @@ func settingsConfigMapName(poolName, revision string) string {
 }
 
 // buildFastletSettings projects the pool-declared declarative configuration
-// (warmImages, actionHandlers, sandboxResources) that the Fastlet consumes.
-func buildFastletSettings(pool *apiv1alpha2.SandboxPool) fastletsettings.Bundle {
-	return fastletsettings.Bundle{
+// and, for ResourceAware Pools, the post-defaulting runtime-owner resources.
+func buildFastletSettings(pool *apiv1alpha2.SandboxPool, profile runtimecatalog.RuntimeProfile) (fastletsettings.Bundle, error) {
+	bundle := fastletsettings.Bundle{
 		WarmImages:      uniqueWarmImages(pool.Spec.WarmImages),
 		ActionHandlers:  pool.Spec.ActionHandlers,
 		ResourceProfile: pool.Spec.SandboxResources,
 	}
+	if pool.Spec.SandboxResources.ResourceMode() != apiv1alpha2.SandboxResourceModeResourceAware {
+		return bundle, nil
+	}
+	if len(pool.Spec.FastletTemplate.Spec.Containers) == 0 {
+		return fastletsettings.Bundle{}, errors.New("fastletTemplate.spec.containers must contain the fastlet container")
+	}
+	runtimeOwner := pool.Spec.FastletTemplate.Spec.Containers[0].DeepCopy()
+	if err := applyFastletResources(runtimeOwner, profile.Deployment.Overhead, pool.Spec.SandboxResources, getFastletCapacity(pool)); err != nil {
+		return fastletsettings.Bundle{}, err
+	}
+	requestCPU, requestMemory := runtimeOwner.Resources.Requests.Cpu(), runtimeOwner.Resources.Requests.Memory()
+	limitCPU, limitMemory := runtimeOwner.Resources.Limits.Cpu(), runtimeOwner.Resources.Limits.Memory()
+	bundle.ResourceAdmission = &fastletsettings.ResourceAdmissionSettings{
+		Version: "v1", Mode: apiv1alpha2.SandboxResourceModeResourceAware,
+		Capacity: apiv1alpha2.SandboxComputeResources{
+			CPU: requestCPU.DeepCopy(), Memory: requestMemory.DeepCopy(),
+		},
+		RuntimeLimit: apiv1alpha2.SandboxComputeResources{
+			CPU: limitCPU.DeepCopy(), Memory: limitMemory.DeepCopy(),
+		},
+		ResourceProfileHash: pool.Spec.SandboxResources.Hash(),
+	}
+	return bundle, nil
 }
 
 func registrySecretName(poolName string) string {
@@ -1580,12 +1729,39 @@ func mergeNodeSelector(podSpec *corev1.PodSpec, required map[string]string) erro
 }
 
 func applyFastletResources(container *corev1.Container, overhead corev1.ResourceList, sandbox apiv1alpha2.SandboxResourceProfile, capacity int32) error { //nolint:gocognit // pre-existing resource-merge logic; refactor tracked separately
+	limits, ok := sandbox.LimitResources()
+	if !ok {
+		return apiv1alpha2.ErrInvalidSandboxResourceProfile
+	}
+	requests := limits
+	if configured, resourceAware := sandbox.RequestResources(); resourceAware {
+		requests = configured
+	}
 	defaultAggregate := overhead.DeepCopy()
 	if defaultAggregate == nil {
 		defaultAggregate = corev1.ResourceList{}
 	}
-	addScaledQuantity(defaultAggregate, corev1.ResourceCPU, sandbox.CPU, int64(capacity))
-	addScaledQuantity(defaultAggregate, corev1.ResourceMemory, sandbox.Memory, int64(capacity))
+	addScaledQuantity(defaultAggregate, corev1.ResourceCPU, requests.CPU, int64(capacity))
+	addScaledQuantity(defaultAggregate, corev1.ResourceMemory, requests.Memory, int64(capacity))
+	minimumRequest := overhead.DeepCopy()
+	if minimumRequest == nil {
+		minimumRequest = corev1.ResourceList{}
+	}
+	addScaledQuantity(minimumRequest, corev1.ResourceCPU, requests.CPU, 1)
+	addScaledQuantity(minimumRequest, corev1.ResourceMemory, requests.Memory, 1)
+	minimumLimit := overhead.DeepCopy()
+	if minimumLimit == nil {
+		minimumLimit = corev1.ResourceList{}
+	}
+	addScaledQuantity(minimumLimit, corev1.ResourceCPU, limits.CPU, 1)
+	addScaledQuantity(minimumLimit, corev1.ResourceMemory, limits.Memory, 1)
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		aggregateQuantity := defaultAggregate[name]
+		minimumQuantity := minimumLimit[name]
+		if aggregateQuantity.Cmp(minimumQuantity) < 0 {
+			defaultAggregate[name] = minimumQuantity.DeepCopy()
+		}
+	}
 	if container.Resources.Requests == nil {
 		container.Resources.Requests = corev1.ResourceList{}
 	}
@@ -1608,12 +1784,16 @@ func applyFastletResources(container *corev1.Container, overhead corev1.Resource
 		}
 
 		if hasLimit {
-			minimum := overhead[name]
-			if !minimum.IsZero() && limit.Cmp(minimum) < 0 {
-				return fmt.Errorf("runtime owner container %q limit %s=%s is below runtime overhead %s", container.Name, name, limit.String(), minimum.String())
+			minimum := minimumLimit[name]
+			if limit.Cmp(minimum) < 0 {
+				return fmt.Errorf("runtime owner container %q limit %s=%s is below one Sandbox limit plus runtime overhead %s", container.Name, name, limit.String(), minimum.String())
 			}
 			if hasRequest && request.Cmp(limit) > 0 {
 				return fmt.Errorf("runtime owner container %q request %s=%s exceeds aggregate limit %s", container.Name, name, request.String(), limit.String())
+			}
+			minimumCommitment := minimumRequest[name]
+			if hasRequest && request.Cmp(minimumCommitment) < 0 {
+				return fmt.Errorf("runtime owner container %q request %s=%s cannot commit one Sandbox request plus runtime overhead %s", container.Name, name, request.String(), minimumCommitment.String())
 			}
 			if !hasRequest {
 				request = defaultQuantity.DeepCopy()
@@ -1631,6 +1811,10 @@ func applyFastletResources(container *corev1.Container, overhead corev1.Resource
 		limit = defaultQuantity.DeepCopy()
 		if hasRequest && request.Cmp(limit) > 0 {
 			limit = request.DeepCopy()
+		}
+		minimumCommitment := minimumRequest[name]
+		if hasRequest && request.Cmp(minimumCommitment) < 0 {
+			return fmt.Errorf("runtime owner container %q request %s=%s cannot commit one Sandbox request plus runtime overhead %s", container.Name, name, request.String(), minimumCommitment.String())
 		}
 		container.Resources.Limits[name] = limit
 		if !hasRequest {

@@ -326,6 +326,24 @@ message WarmImageInfo {
   string last_error = 7;
 }
 
+enum SandboxResourceMode {
+  SANDBOX_RESOURCE_MODE_UNSPECIFIED = 0;
+  SANDBOX_RESOURCE_MODE_LEGACY_SLOT = 1;
+  SANDBOX_RESOURCE_MODE_RESOURCE_AWARE = 2;
+}
+
+message ComputeResourceProfile {
+  string cpu = 1;
+  string memory = 2;
+}
+
+message SandboxResourceProfileInfo {
+  SandboxResourceMode mode = 1;
+  ComputeResourceProfile requests = 2;
+  ComputeResourceProfile limits = 3;
+  int64 pids = 4;
+}
+
 message PoolInfo {
   string namespace = 1;
   string name = 2;
@@ -343,6 +361,7 @@ message PoolInfo {
   int32 prepared_fastlets = 14;
   repeated ComponentCapability components = 15;
   repeated WarmImageInfo warm_images = 16;
+  SandboxResourceProfileInfo sandbox_resource_profile = 17;
 }
 
 message GetPoolRequest {

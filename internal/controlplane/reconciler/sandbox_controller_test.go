@@ -473,9 +473,9 @@ func newControllerHarness(t *testing.T) (*SandboxReconciler, *controllerRegistry
 		Spec: apiv1alpha2.SandboxPoolSpec{
 			Runtime: apiv1alpha2.RuntimeContainer, Capacity: apiv1alpha2.PoolCapacity{PoolMin: 1, PoolMax: 1},
 			MaxSandboxesPerPod: 8,
-			SandboxResources: apiv1alpha2.SandboxResourceProfile{
-				CPU: resource.MustParse("1"), Memory: resource.MustParse("512Mi"), PIDs: 256,
-			},
+			SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+				resource.MustParse("1"), resource.MustParse("512Mi"), 256,
+			),
 			FastletTemplate: corev1.PodTemplateSpec{},
 		},
 	}

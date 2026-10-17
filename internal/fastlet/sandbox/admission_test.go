@@ -11,12 +11,14 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	dataplane "fast-sandbox/internal/dataplane/contract"
 	fastletaction "fast-sandbox/internal/fastlet/action"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
+	"fast-sandbox/internal/fastletsettings"
 	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
@@ -313,6 +315,41 @@ func newAdmissionManager(t *testing.T, runtime RuntimeDriver, capacity int) *San
 	return manager
 }
 
+func newResourceAwareAdmissionManager(
+	t *testing.T,
+	runtime RuntimeDriver,
+	slots int,
+	capacityCPU string,
+	capacityMemory string,
+) (*SandboxManager, apiv1alpha2.SandboxResourceProfile) {
+	t.Helper()
+	profile := apiv1alpha2.SandboxResourceProfile{
+		Requests: &apiv1alpha2.SandboxComputeResources{
+			CPU: resource.MustParse("1"), Memory: resource.MustParse("5Gi"),
+		},
+		Limits: &apiv1alpha2.SandboxComputeResources{
+			CPU: resource.MustParse("2"), Memory: resource.MustParse("10Gi"),
+		},
+		PIDs: 256,
+	}
+	settings := &fastletsettings.ResourceAdmissionSettings{
+		Version: "v1", Mode: apiv1alpha2.SandboxResourceModeResourceAware,
+		Capacity: apiv1alpha2.SandboxComputeResources{
+			CPU: resource.MustParse(capacityCPU), Memory: resource.MustParse(capacityMemory),
+		},
+		RuntimeLimit: apiv1alpha2.SandboxComputeResources{
+			CPU: resource.MustParse(capacityCPU), Memory: resource.MustParse(capacityMemory),
+		},
+		ResourceProfileHash: profile.Hash(),
+	}
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: slots, FastletPodUID: "pod-uid-a", ResourceProfile: &profile,
+		ResourceAdmission: settings, ResourceEpoch: "resource-epoch-a",
+	})
+	require.NoError(t, err)
+	return manager, profile
+}
+
 func ensureRequest(uid string, generation, attempt int64) *fastletapi.CreateSandboxRequest {
 	return &fastletapi.CreateSandboxRequest{
 		RequestID:      "request-" + uid,
@@ -324,6 +361,12 @@ func ensureRequest(uid string, generation, attempt int64) *fastletapi.CreateSand
 		},
 		Sandbox: fastletapi.SandboxSpec{Image: "alpine:latest"},
 	}
+}
+
+func resourceAwareRequest(uid string, profile apiv1alpha2.SandboxResourceProfile) *fastletapi.CreateSandboxRequest {
+	request := ensureRequest(uid, 1, 1)
+	request.Sandbox.ResourceProfileHash = profile.Hash()
+	return request
 }
 
 type admissionRoutePublisher struct {
@@ -430,6 +473,60 @@ func TestAdmissionNeverExceedsCapacityUnderConcurrency(t *testing.T) {
 	admission, _, _ := manager.State()
 	require.Equal(t, 5, admission.Used)
 	require.Equal(t, 5, admission.Running)
+}
+
+func TestResourceAwareAdmissionUsesTighterCPUCommitment(t *testing.T) {
+	manager, profile := newResourceAwareAdmissionManager(t, newAdmissionRuntime(), 10, "8", "50Gi")
+	for index := 0; index < 8; index++ {
+		response, err := manager.CreateSandbox(context.Background(), resourceAwareRequest(fmt.Sprintf("sandbox-%d", index), profile))
+		require.NoError(t, err)
+		require.Equal(t, fastletapi.CreateDispositionCreated, response.Disposition)
+	}
+
+	rejected, err := manager.CreateSandbox(context.Background(), resourceAwareRequest("sandbox-rejected", profile))
+	requireFastletCode(t, err, fastletapi.ErrorCapacityRejected)
+	require.Equal(t, fastletapi.CreateDispositionRejectedBeforeSideEffects, rejected.Disposition)
+	require.Equal(t, fastletapi.AdmissionReasonStaticCPUExhausted, rejected.Error.Reason)
+	require.Equal(t, 8, rejected.Admission.Used)
+	require.NotNil(t, rejected.Admission.Resources)
+	require.Equal(t, "resource-epoch-a", rejected.Admission.Resources.Epoch)
+}
+
+func TestResourceAwareAdmissionUsesTighterMemoryCommitment(t *testing.T) {
+	manager, profile := newResourceAwareAdmissionManager(t, newAdmissionRuntime(), 10, "10", "25Gi")
+	for index := 0; index < 5; index++ {
+		_, err := manager.CreateSandbox(context.Background(), resourceAwareRequest(fmt.Sprintf("sandbox-%d", index), profile))
+		require.NoError(t, err)
+	}
+
+	rejected, err := manager.CreateSandbox(context.Background(), resourceAwareRequest("sandbox-rejected", profile))
+	requireFastletCode(t, err, fastletapi.ErrorCapacityRejected)
+	require.Equal(t, fastletapi.AdmissionReasonStaticMemoryExhausted, rejected.Error.Reason)
+	require.Equal(t, 5, rejected.Admission.Used)
+}
+
+func TestResourceAdmissionRevisionOrdersPressureFeedback(t *testing.T) {
+	manager, profile := newResourceAwareAdmissionManager(t, newAdmissionRuntime(), 10, "10", "50Gi")
+	initial, _, _ := manager.State()
+	require.Equal(t, fastletapi.AdmissionStateOpen, initial.Resources.State)
+	require.Equal(t, uint64(1), initial.Resources.Revision)
+
+	created, err := manager.CreateSandbox(context.Background(), resourceAwareRequest("sandbox-a", profile))
+	require.NoError(t, err)
+	require.Equal(t, uint64(2), created.Admission.Resources.Revision)
+
+	require.NoError(t, manager.SetResourceAdmissionState(
+		fastletapi.AdmissionStateBlocked,
+		fastletapi.AdmissionReasonFastletMemoryHighWatermark,
+	))
+	rejected, err := manager.CreateSandbox(context.Background(), resourceAwareRequest("sandbox-b", profile))
+	requireFastletCode(t, err, fastletapi.ErrorCapacityRejected)
+	require.Equal(t, fastletapi.AdmissionReasonFastletMemoryHighWatermark, rejected.Error.Reason)
+	require.Equal(t, fastletapi.AdmissionStateBlocked, rejected.Admission.Resources.State)
+	require.Equal(t, uint64(3), rejected.Admission.Resources.Revision)
+
+	repeated, _, _ := manager.State()
+	require.Equal(t, rejected.Admission.Resources.Revision, repeated.Resources.Revision)
 }
 
 func TestDuplicateEnsureCreatesRuntimeOnce(t *testing.T) {

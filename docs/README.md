@@ -53,6 +53,15 @@ Fast Sandbox documentation is organized by reader intent:
 - [Configuration](reference/configuration.md)
 - [Runtime support](reference/runtime-support.md)
 
+## Design proposals and decisions
+
+These documents record proposed or accepted architecture decisions. A proposed
+design does not replace the current concept or reference contract until its
+implementation is complete.
+
+- [Resource-aware overcommit placement](design/resource-aware-overcommit-placement.md)
+  — proposed in [Issue #115](https://github.com/opensandbox-group/fast-sandbox/issues/115)
+
 ## Documentation policy
 
 Published documentation describes the current product contract:

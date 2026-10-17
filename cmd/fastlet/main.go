@@ -23,11 +23,14 @@ import (
 	fastletaction "fast-sandbox/internal/fastlet/action"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
+	"fast-sandbox/internal/fastlet/podcgroup"
+	fastletresourceadmission "fast-sandbox/internal/fastlet/resourceadmission"
 	fastletsandbox "fast-sandbox/internal/fastlet/sandbox"
 	"fast-sandbox/internal/fastlet/server"
 	"fast-sandbox/internal/fastletsettings"
 	"fast-sandbox/internal/nodecleanup"
 	"fast-sandbox/internal/observability"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	"fast-sandbox/internal/registryconfig"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 	runtimefactory "fast-sandbox/internal/runtime/factory"
@@ -73,6 +76,11 @@ func main() {
 	resourceProfile, err := resourceProfileFromSettings(settingsDir)
 	if err != nil {
 		klog.ErrorS(err, "Failed to resolve Sandbox resource profile")
+		os.Exit(1)
+	}
+	resourceAdmission, err := resourceAdmissionFromSettings(settingsDir, resourceProfile)
+	if err != nil {
+		klog.ErrorS(err, "Failed to resolve resource admission settings")
 		os.Exit(1)
 	}
 	warmImages, err := warmImagesFromSettings(settingsDir)
@@ -199,7 +207,8 @@ func main() {
 	proxyControlClient := fastletproxy.NewControlClient(getEnv("FASTLET_PROXY_CONTROL_SOCKET", fastletproxy.DefaultControlSocket))
 	sandboxManager, err := fastletsandbox.NewSandboxManagerWithConfig(rt, fastletsandbox.SandboxManagerConfig{
 		Capacity: capacityFromEnvironment(), RuntimeName: runtimeProfile.Name, RuntimeProfileHash: runtimeProfile.ProfileHash, ResourceProfile: &resourceProfile,
-		FastletPodUID: podUID, RecoverOnStart: true,
+		ResourceAdmission: resourceAdmission,
+		FastletPodUID:     podUID, RecoverOnStart: true,
 		WarmImages:     warmImages,
 		RoutePublisher: fastletproxy.NewRoutePublisher(proxyControlClient),
 		InfraRevision:  infraManager.Revision(), InfraManager: infraManager,
@@ -211,6 +220,11 @@ func main() {
 		os.Exit(1)
 	}
 	defer sandboxManager.Close()
+	if resourceAdmission != nil {
+		if err := startResourceAdmissionObserver(ctx, sandboxManager, resourceAdmission, podUID, runtimeProfile.Driver == runtimecatalog.DriverKindContainerd); err != nil {
+			klog.ErrorS(err, "Resource admission telemetry is unavailable; admission remains UNKNOWN")
+		}
+	}
 	actionManager.Start(ctx)
 	go recoverUntilReady(ctx, sandboxManager, proxyControlClient)
 
@@ -221,6 +235,96 @@ func main() {
 		klog.ErrorS(err, "Fastlet server failed")
 		os.Exit(1)
 	}
+}
+
+func startResourceAdmissionObserver(
+	ctx context.Context,
+	manager *fastletsandbox.SandboxManager,
+	settings *fastletsettings.ResourceAdmissionSettings,
+	podUID string,
+	aggregatePodCgroup bool,
+) error {
+	if manager == nil || settings == nil {
+		return errors.New("resource admission manager and settings are required")
+	}
+	if err := manager.SetResourceAdmissionState(fastletapi.AdmissionStateUnknown, fastletapi.AdmissionReasonTelemetryMissing); err != nil {
+		return err
+	}
+	config, err := memoryObserverConfigFromEnvironment()
+	if err != nil {
+		return err
+	}
+	limit := settings.RuntimeLimit.Memory.Value()
+	if limit <= 0 {
+		return errors.New("resource admission runtime memory limit must be positive")
+	}
+	var reader fastletresourceadmission.Reader
+	if aggregatePodCgroup {
+		layout, discoverErr := podcgroup.Discover(podcgroup.HostRoot, podUID)
+		if discoverErr != nil {
+			return discoverErr
+		}
+		if layout.Version != podcgroup.VersionV2 {
+			return fmt.Errorf("resource admission observer requires cgroup v2, found %s", layout.Version)
+		}
+		path := filepath.Join(podcgroup.HostRoot, strings.TrimPrefix(filepath.Clean(layout.PodPath), string(filepath.Separator)))
+		reader, err = fastletresourceadmission.NewCgroupPathReader(path, "/proc/meminfo", uint64(limit))
+	} else {
+		reader, err = fastletresourceadmission.NewSelfCgroupReader(uint64(limit))
+	}
+	if err != nil {
+		return err
+	}
+	observer, err := fastletresourceadmission.NewObserver(reader, manager, config)
+	if err != nil {
+		return err
+	}
+	go observer.Run(ctx)
+	return nil
+}
+
+func memoryObserverConfigFromEnvironment() (fastletresourceadmission.Config, error) {
+	config := fastletresourceadmission.DefaultConfig()
+	var err error
+	config.Interval, err = time.ParseDuration(getEnv("FAST_SANDBOX_MEMORY_OBSERVER_INTERVAL", config.Interval.String()))
+	if err != nil {
+		return config, fmt.Errorf("parse FAST_SANDBOX_MEMORY_OBSERVER_INTERVAL: %w", err)
+	}
+	floatValues := []struct {
+		name   string
+		target *float64
+	}{
+		{"FAST_SANDBOX_MEMORY_HIGH_WATERMARK", &config.HighWatermark},
+		{"FAST_SANDBOX_MEMORY_LOW_WATERMARK", &config.LowWatermark},
+		{"FAST_SANDBOX_MEMORY_PSI_AVG10_THRESHOLD", &config.PSIAvg10Threshold},
+		{"FAST_SANDBOX_NODE_MEMORY_LOW_WATERMARK", &config.NodeLowWatermark},
+		{"FAST_SANDBOX_NODE_MEMORY_RECOVERY_WATERMARK", &config.NodeRecoveryWatermark},
+	}
+	for _, value := range floatValues {
+		parsed, parseErr := strconv.ParseFloat(getEnv(value.name, strconv.FormatFloat(*value.target, 'f', -1, 64)), 64)
+		if parseErr != nil {
+			return config, fmt.Errorf("parse %s: %w", value.name, parseErr)
+		}
+		*value.target = parsed
+	}
+	intValues := []struct {
+		name   string
+		target *int
+	}{
+		{"FAST_SANDBOX_MEMORY_HIGH_SAMPLES", &config.HighSamples},
+		{"FAST_SANDBOX_MEMORY_RECOVERY_SAMPLES", &config.RecoverySamples},
+	}
+	for _, value := range intValues {
+		parsed, parseErr := strconv.Atoi(getEnv(value.name, strconv.Itoa(*value.target)))
+		if parseErr != nil {
+			return config, fmt.Errorf("parse %s: %w", value.name, parseErr)
+		}
+		*value.target = parsed
+	}
+	if err := config.Validate(); err != nil {
+		return config, err
+	}
+	return config, nil
 }
 
 func newNetworkManager(capacity int, podUID string, networkMode runtimecatalog.NetworkMode) (*fastletnetwork.Manager, error) {
@@ -492,6 +596,27 @@ func resourceProfileFromSettings(dir string) (apiv1alpha2.SandboxResourceProfile
 	return resourceProfileFromEnvironment()
 }
 
+func resourceAdmissionFromSettings(dir string, profile apiv1alpha2.SandboxResourceProfile) (*fastletsettings.ResourceAdmissionSettings, error) {
+	data, ok, err := readSetting(dir, fastletsettings.ResourceAdmissionKey)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		if profile.ResourceMode() == apiv1alpha2.SandboxResourceModeResourceAware {
+			return nil, fmt.Errorf("%s is required for a ResourceAware Pool", fastletsettings.ResourceAdmissionKey)
+		}
+		return nil, nil
+	}
+	var settings fastletsettings.ResourceAdmissionSettings
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return nil, err
+	}
+	if err := settings.Validate(profile); err != nil {
+		return nil, err
+	}
+	return &settings, nil
+}
+
 func warmImagesFromEnvironment() ([]string, error) {
 	value := getEnv("FAST_SANDBOX_WARM_IMAGES", "[]")
 	var images []string
@@ -523,7 +648,7 @@ func resourceProfileFromEnvironment() (apiv1alpha2.SandboxResourceProfile, error
 	if err != nil {
 		return apiv1alpha2.SandboxResourceProfile{}, err
 	}
-	profile := apiv1alpha2.SandboxResourceProfile{CPU: cpu, Memory: memory, PIDs: pids}
+	profile := apiv1alpha2.NewLegacySandboxResourceProfile(cpu, memory, pids)
 	if err := apiv1alpha2.ValidateSandboxResourceProfile(profile); err != nil {
 		return apiv1alpha2.SandboxResourceProfile{}, err
 	}

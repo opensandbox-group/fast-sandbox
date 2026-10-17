@@ -27,11 +27,25 @@ const (
 	RuntimeFirecracker RuntimeName = "firecracker"
 )
 
-// SandboxResourceProfile defines the fixed resource limit for every Sandbox in
-// a Pool. Fastlet is the component that enforces these values at runtime.
-type SandboxResourceProfile struct {
+// SandboxComputeResources is one CPU and memory resource vector.
+type SandboxComputeResources struct {
 	CPU    resource.Quantity `json:"cpu"`
 	Memory resource.Quantity `json:"memory"`
+}
+
+// SandboxResourceProfile defines the fixed resource profile for every Sandbox
+// in a Pool. Legacy Pools use the flat CPU and Memory limits. Resource-aware
+// Pools use Requests for Fastlet commitment and Limits for runtime isolation.
+// The two representations are mutually exclusive and validated in Go so the
+// CRD remains loadable by Kubernetes versions that do not support CEL.
+type SandboxResourceProfile struct {
+	// CPU and Memory are the deprecated legacy per-Sandbox limits.
+	CPU    *resource.Quantity `json:"cpu,omitempty"`
+	Memory *resource.Quantity `json:"memory,omitempty"`
+
+	Requests *SandboxComputeResources `json:"requests,omitempty"`
+	Limits   *SandboxComputeResources `json:"limits,omitempty"`
+
 	// +kubebuilder:validation:Minimum=1
 	PIDs int64 `json:"pids"`
 }

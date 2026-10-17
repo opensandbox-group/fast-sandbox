@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 )
 
@@ -284,9 +285,7 @@ func ValidateSandboxPoolUpdate(oldSpec, newSpec *SandboxPoolSpec) error {
 	if oldSpec.Runtime != newSpec.Runtime {
 		return ErrRuntimeImmutable
 	}
-	if oldSpec.SandboxResources.CPU.Cmp(newSpec.SandboxResources.CPU) != 0 ||
-		oldSpec.SandboxResources.Memory.Cmp(newSpec.SandboxResources.Memory) != 0 ||
-		oldSpec.SandboxResources.PIDs != newSpec.SandboxResources.PIDs {
+	if !apiequality.Semantic.DeepEqual(oldSpec.SandboxResources, newSpec.SandboxResources) {
 		return ErrResourcesImmutable
 	}
 	newNames := make(map[string]struct{}, len(newSpec.ActionHandlers))

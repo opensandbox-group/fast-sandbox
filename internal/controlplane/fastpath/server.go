@@ -711,13 +711,31 @@ func (s *Server) ListPools(ctx context.Context, request *fastpathv2.ListPoolsReq
 }
 
 func poolInfo(pool *apiv1alpha2.SandboxPool) *fastpathv2.PoolInfo {
+	limits, _ := pool.Spec.SandboxResources.LimitResources()
+	resourceProfile := &fastpathv2.SandboxResourceProfileInfo{
+		Limits: &fastpathv2.ComputeResourceProfile{Cpu: limits.CPU.String(), Memory: limits.Memory.String()},
+		Pids:   pool.Spec.SandboxResources.PIDs,
+	}
+	switch pool.Spec.SandboxResources.ResourceMode() {
+	case apiv1alpha2.SandboxResourceModeLegacySlot:
+		resourceProfile.Mode = fastpathv2.SandboxResourceMode_SANDBOX_RESOURCE_MODE_LEGACY_SLOT
+	case apiv1alpha2.SandboxResourceModeResourceAware:
+		resourceProfile.Mode = fastpathv2.SandboxResourceMode_SANDBOX_RESOURCE_MODE_RESOURCE_AWARE
+		requests, _ := pool.Spec.SandboxResources.RequestResources()
+		resourceProfile.Requests = &fastpathv2.ComputeResourceProfile{
+			Cpu: requests.CPU.String(), Memory: requests.Memory.String(),
+		}
+	default:
+		resourceProfile.Mode = fastpathv2.SandboxResourceMode_SANDBOX_RESOURCE_MODE_UNSPECIFIED
+	}
 	info := &fastpathv2.PoolInfo{
 		Namespace: pool.Namespace, Name: pool.Name, Runtime: string(pool.Spec.Runtime),
-		SandboxCpu: pool.Spec.SandboxResources.CPU.String(), SandboxMemory: pool.Spec.SandboxResources.Memory.String(),
+		SandboxCpu: limits.CPU.String(), SandboxMemory: limits.Memory.String(),
 		SandboxPids: pool.Spec.SandboxResources.PIDs, MaxSandboxesPerPod: pool.Spec.MaxSandboxesPerPod,
 		TotalFastlets: pool.Status.CurrentPods, ReadyFastlets: pool.Status.ReadyPods, IdleFastlets: pool.Status.IdleFastlets,
 		RuntimeRevision: pool.Status.RuntimeRevision, InfraRevision: pool.Status.InfraRevision,
 		FastletRevision: pool.Status.FastletRevision, PreparedFastlets: pool.Status.PreparedFastlets,
+		SandboxResourceProfile: resourceProfile,
 	}
 	for _, component := range pool.Spec.InfraComponents {
 		healthKind := "TCP"

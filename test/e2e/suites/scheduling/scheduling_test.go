@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -62,17 +63,15 @@ func TestResourceSlotCapacity(t *testing.T) {
 				t.Fatalf("create sandbox 3: %v", err)
 			}
 
-			// CRD-first persists a durable assignment before Fastlet admission.
-			// Capacity rejection therefore leaves the third declarative intent
-			// assigned but Pending; it must never become a third runtime while
-			// the first two slots remain occupied.
+			// Depending on heartbeat timing, placement either filters the full
+			// Fastlet immediately or Fastlet rejects a durable assignment. Both
+			// paths must leave the third Sandbox Pending without a third runtime.
 			pendingCtx, cancelPending := context.WithTimeout(ctx, 30*time.Second)
 			defer cancelPending()
 			if _, err := fixture.WaitForSandbox(pendingCtx, types.NamespacedName{Name: "sb-slot-3", Namespace: namespace}, func(sb *apiv1alpha2.Sandbox) bool {
-				return sb.Status.Placement.FastletName != "" &&
-					sb.Annotations["sandbox.fast.io/assignment"] != ""
+				return sb.Status.Runtime.State == apiv1alpha2.RuntimePending
 			}); err != nil {
-				t.Fatalf("wait for capacity-rejected Sandbox to retain its durable assignment: %v", err)
+				t.Fatalf("wait for capacity-blocked Sandbox to remain Pending: %v", err)
 			}
 			ensureCtx, cancelEnsure := context.WithTimeout(ctx, 30*time.Second)
 			defer cancelEnsure()
@@ -93,9 +92,6 @@ func ensureSandboxRemainsCapacityBlocked(ctx context.Context, k8sClient client.C
 		var sandbox apiv1alpha2.Sandbox
 		if err := k8sClient.Get(ctx, name, &sandbox); err != nil {
 			return err
-		}
-		if sandbox.Status.Placement.FastletName == "" || sandbox.Annotations["sandbox.fast.io/assignment"] == "" {
-			return fmt.Errorf("durable assignment disappeared")
 		}
 		if sandbox.Status.Runtime.State == apiv1alpha2.RuntimeReady {
 			return fmt.Errorf("runtime became Ready despite exhausted capacity")
@@ -164,6 +160,86 @@ func TestAutoScaling(t *testing.T) {
 		Feature()
 
 	testSuite.Env().Test(t, feature)
+}
+
+func TestResourceAwareOvercommitScaling(t *testing.T) {
+	suiteenv.RequireBasic(t)
+
+	feature := features.New("resource-aware-overcommit-scaling").
+		WithLabel("suite", "scheduling").
+		WithLabel("tier", "smoke").
+		Assess("resource commitment scales before the slot limit", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+			k8sClient := testSuite.MustKubeClient(t)
+			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
+
+			namespace := testSuite.AllocateNamespace("resource-aware")
+			if err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
+				t.Fatalf("create namespace: %v", err)
+			}
+			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
+
+			pool := createResourceAwareSchedulingPool(namespace, "resource-aware-pool")
+			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
+				t.Fatalf("create resource-aware sandbox pool: %v", err)
+			}
+			initialCtx, cancelInitial := context.WithTimeout(ctx, 90*time.Second)
+			defer cancelInitial()
+			if _, err := fixture.WaitForReadyFastletPods(initialCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for initial resource-aware fastlet: %v", err)
+			}
+
+			for index := 1; index <= 3; index++ {
+				sandbox := createSchedulingSandbox(namespace, fmt.Sprintf("sb-resource-%d", index), pool.Name)
+				if _, err := fixture.CreateSandbox(ctx, namespace, sandbox); err != nil {
+					t.Fatalf("create resource-aware sandbox %d: %v", index, err)
+				}
+			}
+
+			scaleCtx, cancelScale := context.WithTimeout(ctx, 120*time.Second)
+			defer cancelScale()
+			if _, err := fixture.WaitForReadyFastletPods(scaleCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 2); err != nil {
+				t.Fatalf("wait for resource commitment scale-out: %v", err)
+			}
+
+			assignments := make(map[string]int)
+			for index := 1; index <= 3; index++ {
+				assigned := waitForAssignedSandbox(ctx, t, fixture, namespace, fmt.Sprintf("sb-resource-%d", index))
+				assignments[assigned.Status.Placement.FastletName]++
+			}
+			if len(assignments) != 2 {
+				t.Fatalf("resource-aware placement used %d Fastlets, want 2: %v", len(assignments), assignments)
+			}
+			for fastlet, count := range assignments {
+				if count > 2 {
+					t.Fatalf("Fastlet %s admitted %d Sandboxes above its resource commitment capacity 2", fastlet, count)
+				}
+			}
+			return ctx
+		}).
+		Feature()
+
+	testSuite.Env().Test(t, feature)
+}
+
+func createResourceAwareSchedulingPool(namespace, name string) *apiv1alpha2.SandboxPool {
+	pool := createSchedulingPool(namespace, name, 1, 2, 4)
+	pool.Spec.SandboxResources = apiv1alpha2.SandboxResourceProfile{
+		Requests: &apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("100m"), Memory: resource.MustParse("128Mi")},
+		Limits:   &apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("200m"), Memory: resource.MustParse("256Mi")},
+		PIDs:     64,
+	}
+	pool.Spec.FastletTemplate.Spec.Containers[0].Resources = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("200m"), corev1.ResourceMemory: resource.MustParse("256Mi")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")},
+	}
+	pool.Spec.FastletTemplate.Spec.Containers[0].Env = []corev1.EnvVar{
+		{Name: "FAST_SANDBOX_MEMORY_HIGH_WATERMARK", Value: "0.99"},
+		{Name: "FAST_SANDBOX_MEMORY_LOW_WATERMARK", Value: "0.95"},
+		{Name: "FAST_SANDBOX_MEMORY_PSI_AVG10_THRESHOLD", Value: "0"},
+		{Name: "FAST_SANDBOX_NODE_MEMORY_LOW_WATERMARK", Value: "0"},
+		{Name: "FAST_SANDBOX_NODE_MEMORY_RECOVERY_WATERMARK", Value: "0"},
+	}
+	return pool
 }
 
 func createSchedulingPool(namespace, name string, min, max, maxPerPod int32) *apiv1alpha2.SandboxPool {

@@ -123,9 +123,9 @@ func privateNetworkPool(namespace, name string) *apiv1alpha2.SandboxPool {
 		Spec: apiv1alpha2.SandboxPoolSpec{
 			Capacity: apiv1alpha2.PoolCapacity{PoolMin: 1, PoolMax: 1}, MaxSandboxesPerPod: 2,
 			Runtime: apiv1alpha2.RuntimeContainer,
-			SandboxResources: apiv1alpha2.SandboxResourceProfile{
-				CPU: resource.MustParse("50m"), Memory: resource.MustParse("64Mi"), PIDs: 64,
-			},
+			SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+				resource.MustParse("50m"), resource.MustParse("64Mi"), 64,
+			),
 			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
 				Name: "fastlet", Image: suiteenv.FastletImage(),
 			}}}},

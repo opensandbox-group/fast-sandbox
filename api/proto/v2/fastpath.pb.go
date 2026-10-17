@@ -464,6 +464,55 @@ func (EndpointAccessMode) EnumDescriptor() ([]byte, []int) {
 	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{7}
 }
 
+type SandboxResourceMode int32
+
+const (
+	SandboxResourceMode_SANDBOX_RESOURCE_MODE_UNSPECIFIED    SandboxResourceMode = 0
+	SandboxResourceMode_SANDBOX_RESOURCE_MODE_LEGACY_SLOT    SandboxResourceMode = 1
+	SandboxResourceMode_SANDBOX_RESOURCE_MODE_RESOURCE_AWARE SandboxResourceMode = 2
+)
+
+// Enum value maps for SandboxResourceMode.
+var (
+	SandboxResourceMode_name = map[int32]string{
+		0: "SANDBOX_RESOURCE_MODE_UNSPECIFIED",
+		1: "SANDBOX_RESOURCE_MODE_LEGACY_SLOT",
+		2: "SANDBOX_RESOURCE_MODE_RESOURCE_AWARE",
+	}
+	SandboxResourceMode_value = map[string]int32{
+		"SANDBOX_RESOURCE_MODE_UNSPECIFIED":    0,
+		"SANDBOX_RESOURCE_MODE_LEGACY_SLOT":    1,
+		"SANDBOX_RESOURCE_MODE_RESOURCE_AWARE": 2,
+	}
+)
+
+func (x SandboxResourceMode) Enum() *SandboxResourceMode {
+	p := new(SandboxResourceMode)
+	*p = x
+	return p
+}
+
+func (x SandboxResourceMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SandboxResourceMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_api_proto_v2_fastpath_proto_enumTypes[8].Descriptor()
+}
+
+func (SandboxResourceMode) Type() protoreflect.EnumType {
+	return &file_api_proto_v2_fastpath_proto_enumTypes[8]
+}
+
+func (x SandboxResourceMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SandboxResourceMode.Descriptor instead.
+func (SandboxResourceMode) EnumDescriptor() ([]byte, []int) {
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{8}
+}
+
 // SnapshotPhase is the lifecycle of one SandboxSnapshot. Pending means the
 // intent is persisted but not yet accepted by a fastlet; Creating covers the
 // pause/dump/resume window on the node; Publishing uploads the artifact set
@@ -510,11 +559,11 @@ func (x SnapshotPhase) String() string {
 }
 
 func (SnapshotPhase) Descriptor() protoreflect.EnumDescriptor {
-	return file_api_proto_v2_fastpath_proto_enumTypes[8].Descriptor()
+	return file_api_proto_v2_fastpath_proto_enumTypes[9].Descriptor()
 }
 
 func (SnapshotPhase) Type() protoreflect.EnumType {
-	return &file_api_proto_v2_fastpath_proto_enumTypes[8]
+	return &file_api_proto_v2_fastpath_proto_enumTypes[9]
 }
 
 func (x SnapshotPhase) Number() protoreflect.EnumNumber {
@@ -523,7 +572,7 @@ func (x SnapshotPhase) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SnapshotPhase.Descriptor instead.
 func (SnapshotPhase) EnumDescriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{8}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{9}
 }
 
 type NamespacedName struct {
@@ -2657,31 +2706,152 @@ func (x *WarmImageInfo) GetLastError() string {
 	return ""
 }
 
+type ComputeResourceProfile struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Cpu           string                 `protobuf:"bytes,1,opt,name=cpu,proto3" json:"cpu,omitempty"`
+	Memory        string                 `protobuf:"bytes,2,opt,name=memory,proto3" json:"memory,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ComputeResourceProfile) Reset() {
+	*x = ComputeResourceProfile{}
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ComputeResourceProfile) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ComputeResourceProfile) ProtoMessage() {}
+
+func (x *ComputeResourceProfile) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ComputeResourceProfile.ProtoReflect.Descriptor instead.
+func (*ComputeResourceProfile) Descriptor() ([]byte, []int) {
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *ComputeResourceProfile) GetCpu() string {
+	if x != nil {
+		return x.Cpu
+	}
+	return ""
+}
+
+func (x *ComputeResourceProfile) GetMemory() string {
+	if x != nil {
+		return x.Memory
+	}
+	return ""
+}
+
+type SandboxResourceProfileInfo struct {
+	state         protoimpl.MessageState  `protogen:"open.v1"`
+	Mode          SandboxResourceMode     `protobuf:"varint,1,opt,name=mode,proto3,enum=fastpath.v2.SandboxResourceMode" json:"mode,omitempty"`
+	Requests      *ComputeResourceProfile `protobuf:"bytes,2,opt,name=requests,proto3" json:"requests,omitempty"`
+	Limits        *ComputeResourceProfile `protobuf:"bytes,3,opt,name=limits,proto3" json:"limits,omitempty"`
+	Pids          int64                   `protobuf:"varint,4,opt,name=pids,proto3" json:"pids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SandboxResourceProfileInfo) Reset() {
+	*x = SandboxResourceProfileInfo{}
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SandboxResourceProfileInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SandboxResourceProfileInfo) ProtoMessage() {}
+
+func (x *SandboxResourceProfileInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SandboxResourceProfileInfo.ProtoReflect.Descriptor instead.
+func (*SandboxResourceProfileInfo) Descriptor() ([]byte, []int) {
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *SandboxResourceProfileInfo) GetMode() SandboxResourceMode {
+	if x != nil {
+		return x.Mode
+	}
+	return SandboxResourceMode_SANDBOX_RESOURCE_MODE_UNSPECIFIED
+}
+
+func (x *SandboxResourceProfileInfo) GetRequests() *ComputeResourceProfile {
+	if x != nil {
+		return x.Requests
+	}
+	return nil
+}
+
+func (x *SandboxResourceProfileInfo) GetLimits() *ComputeResourceProfile {
+	if x != nil {
+		return x.Limits
+	}
+	return nil
+}
+
+func (x *SandboxResourceProfileInfo) GetPids() int64 {
+	if x != nil {
+		return x.Pids
+	}
+	return 0
+}
+
 type PoolInfo struct {
-	state              protoimpl.MessageState `protogen:"open.v1"`
-	Namespace          string                 `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
-	Name               string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	Runtime            string                 `protobuf:"bytes,3,opt,name=runtime,proto3" json:"runtime,omitempty"`
-	SandboxCpu         string                 `protobuf:"bytes,4,opt,name=sandbox_cpu,json=sandboxCpu,proto3" json:"sandbox_cpu,omitempty"`
-	SandboxMemory      string                 `protobuf:"bytes,5,opt,name=sandbox_memory,json=sandboxMemory,proto3" json:"sandbox_memory,omitempty"`
-	SandboxPids        int64                  `protobuf:"varint,6,opt,name=sandbox_pids,json=sandboxPids,proto3" json:"sandbox_pids,omitempty"`
-	MaxSandboxesPerPod int32                  `protobuf:"varint,7,opt,name=max_sandboxes_per_pod,json=maxSandboxesPerPod,proto3" json:"max_sandboxes_per_pod,omitempty"`
-	TotalFastlets      int32                  `protobuf:"varint,8,opt,name=total_fastlets,json=totalFastlets,proto3" json:"total_fastlets,omitempty"`
-	ReadyFastlets      int32                  `protobuf:"varint,9,opt,name=ready_fastlets,json=readyFastlets,proto3" json:"ready_fastlets,omitempty"`
-	IdleFastlets       int32                  `protobuf:"varint,10,opt,name=idle_fastlets,json=idleFastlets,proto3" json:"idle_fastlets,omitempty"`
-	RuntimeRevision    string                 `protobuf:"bytes,11,opt,name=runtime_revision,json=runtimeRevision,proto3" json:"runtime_revision,omitempty"`
-	InfraRevision      string                 `protobuf:"bytes,12,opt,name=infra_revision,json=infraRevision,proto3" json:"infra_revision,omitempty"`
-	FastletRevision    string                 `protobuf:"bytes,13,opt,name=fastlet_revision,json=fastletRevision,proto3" json:"fastlet_revision,omitempty"`
-	PreparedFastlets   int32                  `protobuf:"varint,14,opt,name=prepared_fastlets,json=preparedFastlets,proto3" json:"prepared_fastlets,omitempty"`
-	Components         []*ComponentCapability `protobuf:"bytes,15,rep,name=components,proto3" json:"components,omitempty"`
-	WarmImages         []*WarmImageInfo       `protobuf:"bytes,16,rep,name=warm_images,json=warmImages,proto3" json:"warm_images,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	state                  protoimpl.MessageState      `protogen:"open.v1"`
+	Namespace              string                      `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
+	Name                   string                      `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	Runtime                string                      `protobuf:"bytes,3,opt,name=runtime,proto3" json:"runtime,omitempty"`
+	SandboxCpu             string                      `protobuf:"bytes,4,opt,name=sandbox_cpu,json=sandboxCpu,proto3" json:"sandbox_cpu,omitempty"`
+	SandboxMemory          string                      `protobuf:"bytes,5,opt,name=sandbox_memory,json=sandboxMemory,proto3" json:"sandbox_memory,omitempty"`
+	SandboxPids            int64                       `protobuf:"varint,6,opt,name=sandbox_pids,json=sandboxPids,proto3" json:"sandbox_pids,omitempty"`
+	MaxSandboxesPerPod     int32                       `protobuf:"varint,7,opt,name=max_sandboxes_per_pod,json=maxSandboxesPerPod,proto3" json:"max_sandboxes_per_pod,omitempty"`
+	TotalFastlets          int32                       `protobuf:"varint,8,opt,name=total_fastlets,json=totalFastlets,proto3" json:"total_fastlets,omitempty"`
+	ReadyFastlets          int32                       `protobuf:"varint,9,opt,name=ready_fastlets,json=readyFastlets,proto3" json:"ready_fastlets,omitempty"`
+	IdleFastlets           int32                       `protobuf:"varint,10,opt,name=idle_fastlets,json=idleFastlets,proto3" json:"idle_fastlets,omitempty"`
+	RuntimeRevision        string                      `protobuf:"bytes,11,opt,name=runtime_revision,json=runtimeRevision,proto3" json:"runtime_revision,omitempty"`
+	InfraRevision          string                      `protobuf:"bytes,12,opt,name=infra_revision,json=infraRevision,proto3" json:"infra_revision,omitempty"`
+	FastletRevision        string                      `protobuf:"bytes,13,opt,name=fastlet_revision,json=fastletRevision,proto3" json:"fastlet_revision,omitempty"`
+	PreparedFastlets       int32                       `protobuf:"varint,14,opt,name=prepared_fastlets,json=preparedFastlets,proto3" json:"prepared_fastlets,omitempty"`
+	Components             []*ComponentCapability      `protobuf:"bytes,15,rep,name=components,proto3" json:"components,omitempty"`
+	WarmImages             []*WarmImageInfo            `protobuf:"bytes,16,rep,name=warm_images,json=warmImages,proto3" json:"warm_images,omitempty"`
+	SandboxResourceProfile *SandboxResourceProfileInfo `protobuf:"bytes,17,opt,name=sandbox_resource_profile,json=sandboxResourceProfile,proto3" json:"sandbox_resource_profile,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
 }
 
 func (x *PoolInfo) Reset() {
 	*x = PoolInfo{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[31]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2693,7 +2863,7 @@ func (x *PoolInfo) String() string {
 func (*PoolInfo) ProtoMessage() {}
 
 func (x *PoolInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[31]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2706,7 +2876,7 @@ func (x *PoolInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PoolInfo.ProtoReflect.Descriptor instead.
 func (*PoolInfo) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{31}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *PoolInfo) GetNamespace() string {
@@ -2821,6 +2991,13 @@ func (x *PoolInfo) GetWarmImages() []*WarmImageInfo {
 	return nil
 }
 
+func (x *PoolInfo) GetSandboxResourceProfile() *SandboxResourceProfileInfo {
+	if x != nil {
+		return x.SandboxResourceProfile
+	}
+	return nil
+}
+
 type GetPoolRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Namespace     string                 `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
@@ -2831,7 +3008,7 @@ type GetPoolRequest struct {
 
 func (x *GetPoolRequest) Reset() {
 	*x = GetPoolRequest{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[32]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2843,7 +3020,7 @@ func (x *GetPoolRequest) String() string {
 func (*GetPoolRequest) ProtoMessage() {}
 
 func (x *GetPoolRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[32]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2856,7 +3033,7 @@ func (x *GetPoolRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPoolRequest.ProtoReflect.Descriptor instead.
 func (*GetPoolRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{32}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *GetPoolRequest) GetNamespace() string {
@@ -2882,7 +3059,7 @@ type ListPoolsRequest struct {
 
 func (x *ListPoolsRequest) Reset() {
 	*x = ListPoolsRequest{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[33]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2894,7 +3071,7 @@ func (x *ListPoolsRequest) String() string {
 func (*ListPoolsRequest) ProtoMessage() {}
 
 func (x *ListPoolsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[33]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2907,7 +3084,7 @@ func (x *ListPoolsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListPoolsRequest.ProtoReflect.Descriptor instead.
 func (*ListPoolsRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{33}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *ListPoolsRequest) GetNamespace() string {
@@ -2926,7 +3103,7 @@ type ListPoolsResponse struct {
 
 func (x *ListPoolsResponse) Reset() {
 	*x = ListPoolsResponse{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[34]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2938,7 +3115,7 @@ func (x *ListPoolsResponse) String() string {
 func (*ListPoolsResponse) ProtoMessage() {}
 
 func (x *ListPoolsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[34]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2951,7 +3128,7 @@ func (x *ListPoolsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListPoolsResponse.ProtoReflect.Descriptor instead.
 func (*ListPoolsResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{34}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *ListPoolsResponse) GetItems() []*PoolInfo {
@@ -2987,7 +3164,7 @@ type CreateSandboxSnapshotRequest struct {
 
 func (x *CreateSandboxSnapshotRequest) Reset() {
 	*x = CreateSandboxSnapshotRequest{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[35]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2999,7 +3176,7 @@ func (x *CreateSandboxSnapshotRequest) String() string {
 func (*CreateSandboxSnapshotRequest) ProtoMessage() {}
 
 func (x *CreateSandboxSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[35]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3012,7 +3189,7 @@ func (x *CreateSandboxSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSandboxSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*CreateSandboxSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{35}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *CreateSandboxSnapshotRequest) GetRequestId() string {
@@ -3072,7 +3249,7 @@ type SandboxSnapshotInfo struct {
 
 func (x *SandboxSnapshotInfo) Reset() {
 	*x = SandboxSnapshotInfo{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[36]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3084,7 +3261,7 @@ func (x *SandboxSnapshotInfo) String() string {
 func (*SandboxSnapshotInfo) ProtoMessage() {}
 
 func (x *SandboxSnapshotInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[36]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3097,7 +3274,7 @@ func (x *SandboxSnapshotInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SandboxSnapshotInfo.ProtoReflect.Descriptor instead.
 func (*SandboxSnapshotInfo) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{36}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *SandboxSnapshotInfo) GetIdentity() *SandboxIdentity {
@@ -3193,7 +3370,7 @@ type CreateSandboxSnapshotResponse struct {
 
 func (x *CreateSandboxSnapshotResponse) Reset() {
 	*x = CreateSandboxSnapshotResponse{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[37]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3205,7 +3382,7 @@ func (x *CreateSandboxSnapshotResponse) String() string {
 func (*CreateSandboxSnapshotResponse) ProtoMessage() {}
 
 func (x *CreateSandboxSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[37]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3218,7 +3395,7 @@ func (x *CreateSandboxSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSandboxSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*CreateSandboxSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{37}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *CreateSandboxSnapshotResponse) GetSnapshot() *SandboxSnapshotInfo {
@@ -3239,7 +3416,7 @@ type GetSandboxSnapshotRequest struct {
 
 func (x *GetSandboxSnapshotRequest) Reset() {
 	*x = GetSandboxSnapshotRequest{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[38]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3251,7 +3428,7 @@ func (x *GetSandboxSnapshotRequest) String() string {
 func (*GetSandboxSnapshotRequest) ProtoMessage() {}
 
 func (x *GetSandboxSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[38]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3264,7 +3441,7 @@ func (x *GetSandboxSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSandboxSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*GetSandboxSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{38}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *GetSandboxSnapshotRequest) GetSnapshot() *NamespacedName {
@@ -3290,7 +3467,7 @@ type GetSandboxSnapshotResponse struct {
 
 func (x *GetSandboxSnapshotResponse) Reset() {
 	*x = GetSandboxSnapshotResponse{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[39]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3302,7 +3479,7 @@ func (x *GetSandboxSnapshotResponse) String() string {
 func (*GetSandboxSnapshotResponse) ProtoMessage() {}
 
 func (x *GetSandboxSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[39]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3315,7 +3492,7 @@ func (x *GetSandboxSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSandboxSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*GetSandboxSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{39}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *GetSandboxSnapshotResponse) GetSnapshot() *SandboxSnapshotInfo {
@@ -3337,7 +3514,7 @@ type DeleteSandboxSnapshotRequest struct {
 
 func (x *DeleteSandboxSnapshotRequest) Reset() {
 	*x = DeleteSandboxSnapshotRequest{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[40]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3349,7 +3526,7 @@ func (x *DeleteSandboxSnapshotRequest) String() string {
 func (*DeleteSandboxSnapshotRequest) ProtoMessage() {}
 
 func (x *DeleteSandboxSnapshotRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[40]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3362,7 +3539,7 @@ func (x *DeleteSandboxSnapshotRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteSandboxSnapshotRequest.ProtoReflect.Descriptor instead.
 func (*DeleteSandboxSnapshotRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{40}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *DeleteSandboxSnapshotRequest) GetSnapshot() *SandboxReference {
@@ -3380,7 +3557,7 @@ type DeleteSandboxSnapshotResponse struct {
 
 func (x *DeleteSandboxSnapshotResponse) Reset() {
 	*x = DeleteSandboxSnapshotResponse{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[41]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3392,7 +3569,7 @@ func (x *DeleteSandboxSnapshotResponse) String() string {
 func (*DeleteSandboxSnapshotResponse) ProtoMessage() {}
 
 func (x *DeleteSandboxSnapshotResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[41]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3405,7 +3582,7 @@ func (x *DeleteSandboxSnapshotResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteSandboxSnapshotResponse.ProtoReflect.Descriptor instead.
 func (*DeleteSandboxSnapshotResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{41}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{43}
 }
 
 // PauseSandboxRequest checkpoints a Ready Sandbox. Rejected when the
@@ -3429,7 +3606,7 @@ type PauseSandboxRequest struct {
 
 func (x *PauseSandboxRequest) Reset() {
 	*x = PauseSandboxRequest{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[42]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3441,7 +3618,7 @@ func (x *PauseSandboxRequest) String() string {
 func (*PauseSandboxRequest) ProtoMessage() {}
 
 func (x *PauseSandboxRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[42]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3454,7 +3631,7 @@ func (x *PauseSandboxRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PauseSandboxRequest.ProtoReflect.Descriptor instead.
 func (*PauseSandboxRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{42}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *PauseSandboxRequest) GetRequestId() string {
@@ -3488,7 +3665,7 @@ type PauseSandboxResponse struct {
 
 func (x *PauseSandboxResponse) Reset() {
 	*x = PauseSandboxResponse{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[43]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3500,7 +3677,7 @@ func (x *PauseSandboxResponse) String() string {
 func (*PauseSandboxResponse) ProtoMessage() {}
 
 func (x *PauseSandboxResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[43]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3513,7 +3690,7 @@ func (x *PauseSandboxResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PauseSandboxResponse.ProtoReflect.Descriptor instead.
 func (*PauseSandboxResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{43}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *PauseSandboxResponse) GetSandbox() *SandboxInfo {
@@ -3550,7 +3727,7 @@ type ResumeSandboxRequest struct {
 
 func (x *ResumeSandboxRequest) Reset() {
 	*x = ResumeSandboxRequest{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[44]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3562,7 +3739,7 @@ func (x *ResumeSandboxRequest) String() string {
 func (*ResumeSandboxRequest) ProtoMessage() {}
 
 func (x *ResumeSandboxRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[44]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3575,7 +3752,7 @@ func (x *ResumeSandboxRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeSandboxRequest.ProtoReflect.Descriptor instead.
 func (*ResumeSandboxRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{44}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *ResumeSandboxRequest) GetRequestId() string {
@@ -3616,7 +3793,7 @@ type ResumeSandboxResponse struct {
 
 func (x *ResumeSandboxResponse) Reset() {
 	*x = ResumeSandboxResponse{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[45]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3628,7 +3805,7 @@ func (x *ResumeSandboxResponse) String() string {
 func (*ResumeSandboxResponse) ProtoMessage() {}
 
 func (x *ResumeSandboxResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[45]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3641,7 +3818,7 @@ func (x *ResumeSandboxResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ResumeSandboxResponse.ProtoReflect.Descriptor instead.
 func (*ResumeSandboxResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{45}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *ResumeSandboxResponse) GetSandbox() *SandboxInfo {
@@ -3684,7 +3861,7 @@ type InvokeHandlerActionRequest struct {
 
 func (x *InvokeHandlerActionRequest) Reset() {
 	*x = InvokeHandlerActionRequest{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[46]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3696,7 +3873,7 @@ func (x *InvokeHandlerActionRequest) String() string {
 func (*InvokeHandlerActionRequest) ProtoMessage() {}
 
 func (x *InvokeHandlerActionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[46]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3709,7 +3886,7 @@ func (x *InvokeHandlerActionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InvokeHandlerActionRequest.ProtoReflect.Descriptor instead.
 func (*InvokeHandlerActionRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{46}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *InvokeHandlerActionRequest) GetSandbox() *SandboxReference {
@@ -3760,7 +3937,7 @@ type HandlerActionResult struct {
 
 func (x *HandlerActionResult) Reset() {
 	*x = HandlerActionResult{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[47]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3772,7 +3949,7 @@ func (x *HandlerActionResult) String() string {
 func (*HandlerActionResult) ProtoMessage() {}
 
 func (x *HandlerActionResult) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[47]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3785,7 +3962,7 @@ func (x *HandlerActionResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HandlerActionResult.ProtoReflect.Descriptor instead.
 func (*HandlerActionResult) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{47}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *HandlerActionResult) GetStatus() uint32 {
@@ -3811,7 +3988,7 @@ type InvokeHandlerActionResponse struct {
 
 func (x *InvokeHandlerActionResponse) Reset() {
 	*x = InvokeHandlerActionResponse{}
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[48]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3823,7 +4000,7 @@ func (x *InvokeHandlerActionResponse) String() string {
 func (*InvokeHandlerActionResponse) ProtoMessage() {}
 
 func (x *InvokeHandlerActionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_v2_fastpath_proto_msgTypes[48]
+	mi := &file_api_proto_v2_fastpath_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3836,7 +4013,7 @@ func (x *InvokeHandlerActionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use InvokeHandlerActionResponse.ProtoReflect.Descriptor instead.
 func (*InvokeHandlerActionResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{48}
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *InvokeHandlerActionResponse) GetResult() *HandlerActionResult {
@@ -4036,7 +4213,15 @@ const file_api_proto_v2_fastpath_proto_rawDesc = "" +
 	"\x0ffailed_fastlets\x18\x05 \x01(\x05R\x0efailedFastlets\x12/\n" +
 	"\x13observed_generation\x18\x06 \x01(\x03R\x12observedGeneration\x12\x1d\n" +
 	"\n" +
-	"last_error\x18\a \x01(\tR\tlastError\"\x90\x05\n" +
+	"last_error\x18\a \x01(\tR\tlastError\"B\n" +
+	"\x16ComputeResourceProfile\x12\x10\n" +
+	"\x03cpu\x18\x01 \x01(\tR\x03cpu\x12\x16\n" +
+	"\x06memory\x18\x02 \x01(\tR\x06memory\"\xe4\x01\n" +
+	"\x1aSandboxResourceProfileInfo\x124\n" +
+	"\x04mode\x18\x01 \x01(\x0e2 .fastpath.v2.SandboxResourceModeR\x04mode\x12?\n" +
+	"\brequests\x18\x02 \x01(\v2#.fastpath.v2.ComputeResourceProfileR\brequests\x12;\n" +
+	"\x06limits\x18\x03 \x01(\v2#.fastpath.v2.ComputeResourceProfileR\x06limits\x12\x12\n" +
+	"\x04pids\x18\x04 \x01(\x03R\x04pids\"\xf3\x05\n" +
 	"\bPoolInfo\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x18\n" +
@@ -4058,7 +4243,8 @@ const file_api_proto_v2_fastpath_proto_rawDesc = "" +
 	"components\x18\x0f \x03(\v2 .fastpath.v2.ComponentCapabilityR\n" +
 	"components\x12;\n" +
 	"\vwarm_images\x18\x10 \x03(\v2\x1a.fastpath.v2.WarmImageInfoR\n" +
-	"warmImages\"K\n" +
+	"warmImages\x12a\n" +
+	"\x18sandbox_resource_profile\x18\x11 \x01(\v2'.fastpath.v2.SandboxResourceProfileInfoR\x16sandboxResourceProfile\"K\n" +
 	"\x0eGetPoolRequest\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\x12\x1b\n" +
 	"\tpool_name\x18\x02 \x01(\tR\bpoolName\"0\n" +
@@ -4181,7 +4367,11 @@ const file_api_proto_v2_fastpath_proto_rawDesc = "" +
 	"\x1fCREATE_COMPLETION_RUNTIME_READY\x10\x02*A\n" +
 	"\x12EndpointAccessMode\x12\x11\n" +
 	"\rCENTRAL_PROXY\x10\x00\x12\x18\n" +
-	"\x14DIRECT_FASTLET_PROXY\x10\x01*\xc0\x01\n" +
+	"\x14DIRECT_FASTLET_PROXY\x10\x01*\x8d\x01\n" +
+	"\x13SandboxResourceMode\x12%\n" +
+	"!SANDBOX_RESOURCE_MODE_UNSPECIFIED\x10\x00\x12%\n" +
+	"!SANDBOX_RESOURCE_MODE_LEGACY_SLOT\x10\x01\x12(\n" +
+	"$SANDBOX_RESOURCE_MODE_RESOURCE_AWARE\x10\x02*\xc0\x01\n" +
 	"\rSnapshotPhase\x12\x1e\n" +
 	"\x1aSNAPSHOT_PHASE_UNSPECIFIED\x10\x00\x12\x1a\n" +
 	"\x16SNAPSHOT_PHASE_PENDING\x10\x01\x12\x1b\n" +
@@ -4220,8 +4410,8 @@ func file_api_proto_v2_fastpath_proto_rawDescGZIP() []byte {
 	return file_api_proto_v2_fastpath_proto_rawDescData
 }
 
-var file_api_proto_v2_fastpath_proto_enumTypes = make([]protoimpl.EnumInfo, 9)
-var file_api_proto_v2_fastpath_proto_msgTypes = make([]protoimpl.MessageInfo, 55)
+var file_api_proto_v2_fastpath_proto_enumTypes = make([]protoimpl.EnumInfo, 10)
+var file_api_proto_v2_fastpath_proto_msgTypes = make([]protoimpl.MessageInfo, 57)
 var file_api_proto_v2_fastpath_proto_goTypes = []any{
 	(FailurePolicy)(0),                    // 0: fastpath.v2.FailurePolicy
 	(RuntimeState)(0),                     // 1: fastpath.v2.RuntimeState
@@ -4231,154 +4421,161 @@ var file_api_proto_v2_fastpath_proto_goTypes = []any{
 	(ActionState)(0),                      // 5: fastpath.v2.ActionState
 	(CreateCompletion)(0),                 // 6: fastpath.v2.CreateCompletion
 	(EndpointAccessMode)(0),               // 7: fastpath.v2.EndpointAccessMode
-	(SnapshotPhase)(0),                    // 8: fastpath.v2.SnapshotPhase
-	(*NamespacedName)(nil),                // 9: fastpath.v2.NamespacedName
-	(*SandboxReference)(nil),              // 10: fastpath.v2.SandboxReference
-	(*SandboxIdentity)(nil),               // 11: fastpath.v2.SandboxIdentity
-	(*RuntimeInfo)(nil),                   // 12: fastpath.v2.RuntimeInfo
-	(*DataPlaneInfo)(nil),                 // 13: fastpath.v2.DataPlaneInfo
-	(*InfraComponentInfo)(nil),            // 14: fastpath.v2.InfraComponentInfo
-	(*ActionBindingInfo)(nil),             // 15: fastpath.v2.ActionBindingInfo
-	(*SandboxInfo)(nil),                   // 16: fastpath.v2.SandboxInfo
-	(*CheckpointInfo)(nil),                // 17: fastpath.v2.CheckpointInfo
-	(*ActionBinding)(nil),                 // 18: fastpath.v2.ActionBinding
-	(*CreateSandboxRequest)(nil),          // 19: fastpath.v2.CreateSandboxRequest
-	(*CreateSandboxResponse)(nil),         // 20: fastpath.v2.CreateSandboxResponse
-	(*GetSandboxRequest)(nil),             // 21: fastpath.v2.GetSandboxRequest
-	(*GetSandboxResponse)(nil),            // 22: fastpath.v2.GetSandboxResponse
-	(*SandboxSummary)(nil),                // 23: fastpath.v2.SandboxSummary
-	(*ListSandboxesRequest)(nil),          // 24: fastpath.v2.ListSandboxesRequest
-	(*ListSandboxesResponse)(nil),         // 25: fastpath.v2.ListSandboxesResponse
-	(*DeleteRequest)(nil),                 // 26: fastpath.v2.DeleteRequest
-	(*DeleteResponse)(nil),                // 27: fastpath.v2.DeleteResponse
-	(*ReplaceActionBindings)(nil),         // 28: fastpath.v2.ReplaceActionBindings
-	(*UpdateSandboxRequest)(nil),          // 29: fastpath.v2.UpdateSandboxRequest
-	(*UpdateSandboxResponse)(nil),         // 30: fastpath.v2.UpdateSandboxResponse
-	(*SandboxDiagnosticsRequest)(nil),     // 31: fastpath.v2.SandboxDiagnosticsRequest
-	(*SandboxDiagnosticEvent)(nil),        // 32: fastpath.v2.SandboxDiagnosticEvent
-	(*SandboxDiagnosticsResponse)(nil),    // 33: fastpath.v2.SandboxDiagnosticsResponse
-	(*EndpointTarget)(nil),                // 34: fastpath.v2.EndpointTarget
-	(*ResolveEndpointRequest)(nil),        // 35: fastpath.v2.ResolveEndpointRequest
-	(*ResolvedEndpoint)(nil),              // 36: fastpath.v2.ResolvedEndpoint
-	(*ResolveEndpointResponse)(nil),       // 37: fastpath.v2.ResolveEndpointResponse
-	(*ComponentCapability)(nil),           // 38: fastpath.v2.ComponentCapability
-	(*WarmImageInfo)(nil),                 // 39: fastpath.v2.WarmImageInfo
-	(*PoolInfo)(nil),                      // 40: fastpath.v2.PoolInfo
-	(*GetPoolRequest)(nil),                // 41: fastpath.v2.GetPoolRequest
-	(*ListPoolsRequest)(nil),              // 42: fastpath.v2.ListPoolsRequest
-	(*ListPoolsResponse)(nil),             // 43: fastpath.v2.ListPoolsResponse
-	(*CreateSandboxSnapshotRequest)(nil),  // 44: fastpath.v2.CreateSandboxSnapshotRequest
-	(*SandboxSnapshotInfo)(nil),           // 45: fastpath.v2.SandboxSnapshotInfo
-	(*CreateSandboxSnapshotResponse)(nil), // 46: fastpath.v2.CreateSandboxSnapshotResponse
-	(*GetSandboxSnapshotRequest)(nil),     // 47: fastpath.v2.GetSandboxSnapshotRequest
-	(*GetSandboxSnapshotResponse)(nil),    // 48: fastpath.v2.GetSandboxSnapshotResponse
-	(*DeleteSandboxSnapshotRequest)(nil),  // 49: fastpath.v2.DeleteSandboxSnapshotRequest
-	(*DeleteSandboxSnapshotResponse)(nil), // 50: fastpath.v2.DeleteSandboxSnapshotResponse
-	(*PauseSandboxRequest)(nil),           // 51: fastpath.v2.PauseSandboxRequest
-	(*PauseSandboxResponse)(nil),          // 52: fastpath.v2.PauseSandboxResponse
-	(*ResumeSandboxRequest)(nil),          // 53: fastpath.v2.ResumeSandboxRequest
-	(*ResumeSandboxResponse)(nil),         // 54: fastpath.v2.ResumeSandboxResponse
-	(*InvokeHandlerActionRequest)(nil),    // 55: fastpath.v2.InvokeHandlerActionRequest
-	(*HandlerActionResult)(nil),           // 56: fastpath.v2.HandlerActionResult
-	(*InvokeHandlerActionResponse)(nil),   // 57: fastpath.v2.InvokeHandlerActionResponse
-	nil,                                   // 58: fastpath.v2.CreateSandboxRequest.EnvsEntry
-	nil,                                   // 59: fastpath.v2.CreateSandboxRequest.MetadataEntry
-	nil,                                   // 60: fastpath.v2.ListSandboxesRequest.MetadataEntry
-	nil,                                   // 61: fastpath.v2.UpdateSandboxRequest.MetadataUpsertEntry
-	nil,                                   // 62: fastpath.v2.ResolveEndpointResponse.RequiredHeadersEntry
-	nil,                                   // 63: fastpath.v2.CreateSandboxSnapshotRequest.MetadataEntry
+	(SandboxResourceMode)(0),              // 8: fastpath.v2.SandboxResourceMode
+	(SnapshotPhase)(0),                    // 9: fastpath.v2.SnapshotPhase
+	(*NamespacedName)(nil),                // 10: fastpath.v2.NamespacedName
+	(*SandboxReference)(nil),              // 11: fastpath.v2.SandboxReference
+	(*SandboxIdentity)(nil),               // 12: fastpath.v2.SandboxIdentity
+	(*RuntimeInfo)(nil),                   // 13: fastpath.v2.RuntimeInfo
+	(*DataPlaneInfo)(nil),                 // 14: fastpath.v2.DataPlaneInfo
+	(*InfraComponentInfo)(nil),            // 15: fastpath.v2.InfraComponentInfo
+	(*ActionBindingInfo)(nil),             // 16: fastpath.v2.ActionBindingInfo
+	(*SandboxInfo)(nil),                   // 17: fastpath.v2.SandboxInfo
+	(*CheckpointInfo)(nil),                // 18: fastpath.v2.CheckpointInfo
+	(*ActionBinding)(nil),                 // 19: fastpath.v2.ActionBinding
+	(*CreateSandboxRequest)(nil),          // 20: fastpath.v2.CreateSandboxRequest
+	(*CreateSandboxResponse)(nil),         // 21: fastpath.v2.CreateSandboxResponse
+	(*GetSandboxRequest)(nil),             // 22: fastpath.v2.GetSandboxRequest
+	(*GetSandboxResponse)(nil),            // 23: fastpath.v2.GetSandboxResponse
+	(*SandboxSummary)(nil),                // 24: fastpath.v2.SandboxSummary
+	(*ListSandboxesRequest)(nil),          // 25: fastpath.v2.ListSandboxesRequest
+	(*ListSandboxesResponse)(nil),         // 26: fastpath.v2.ListSandboxesResponse
+	(*DeleteRequest)(nil),                 // 27: fastpath.v2.DeleteRequest
+	(*DeleteResponse)(nil),                // 28: fastpath.v2.DeleteResponse
+	(*ReplaceActionBindings)(nil),         // 29: fastpath.v2.ReplaceActionBindings
+	(*UpdateSandboxRequest)(nil),          // 30: fastpath.v2.UpdateSandboxRequest
+	(*UpdateSandboxResponse)(nil),         // 31: fastpath.v2.UpdateSandboxResponse
+	(*SandboxDiagnosticsRequest)(nil),     // 32: fastpath.v2.SandboxDiagnosticsRequest
+	(*SandboxDiagnosticEvent)(nil),        // 33: fastpath.v2.SandboxDiagnosticEvent
+	(*SandboxDiagnosticsResponse)(nil),    // 34: fastpath.v2.SandboxDiagnosticsResponse
+	(*EndpointTarget)(nil),                // 35: fastpath.v2.EndpointTarget
+	(*ResolveEndpointRequest)(nil),        // 36: fastpath.v2.ResolveEndpointRequest
+	(*ResolvedEndpoint)(nil),              // 37: fastpath.v2.ResolvedEndpoint
+	(*ResolveEndpointResponse)(nil),       // 38: fastpath.v2.ResolveEndpointResponse
+	(*ComponentCapability)(nil),           // 39: fastpath.v2.ComponentCapability
+	(*WarmImageInfo)(nil),                 // 40: fastpath.v2.WarmImageInfo
+	(*ComputeResourceProfile)(nil),        // 41: fastpath.v2.ComputeResourceProfile
+	(*SandboxResourceProfileInfo)(nil),    // 42: fastpath.v2.SandboxResourceProfileInfo
+	(*PoolInfo)(nil),                      // 43: fastpath.v2.PoolInfo
+	(*GetPoolRequest)(nil),                // 44: fastpath.v2.GetPoolRequest
+	(*ListPoolsRequest)(nil),              // 45: fastpath.v2.ListPoolsRequest
+	(*ListPoolsResponse)(nil),             // 46: fastpath.v2.ListPoolsResponse
+	(*CreateSandboxSnapshotRequest)(nil),  // 47: fastpath.v2.CreateSandboxSnapshotRequest
+	(*SandboxSnapshotInfo)(nil),           // 48: fastpath.v2.SandboxSnapshotInfo
+	(*CreateSandboxSnapshotResponse)(nil), // 49: fastpath.v2.CreateSandboxSnapshotResponse
+	(*GetSandboxSnapshotRequest)(nil),     // 50: fastpath.v2.GetSandboxSnapshotRequest
+	(*GetSandboxSnapshotResponse)(nil),    // 51: fastpath.v2.GetSandboxSnapshotResponse
+	(*DeleteSandboxSnapshotRequest)(nil),  // 52: fastpath.v2.DeleteSandboxSnapshotRequest
+	(*DeleteSandboxSnapshotResponse)(nil), // 53: fastpath.v2.DeleteSandboxSnapshotResponse
+	(*PauseSandboxRequest)(nil),           // 54: fastpath.v2.PauseSandboxRequest
+	(*PauseSandboxResponse)(nil),          // 55: fastpath.v2.PauseSandboxResponse
+	(*ResumeSandboxRequest)(nil),          // 56: fastpath.v2.ResumeSandboxRequest
+	(*ResumeSandboxResponse)(nil),         // 57: fastpath.v2.ResumeSandboxResponse
+	(*InvokeHandlerActionRequest)(nil),    // 58: fastpath.v2.InvokeHandlerActionRequest
+	(*HandlerActionResult)(nil),           // 59: fastpath.v2.HandlerActionResult
+	(*InvokeHandlerActionResponse)(nil),   // 60: fastpath.v2.InvokeHandlerActionResponse
+	nil,                                   // 61: fastpath.v2.CreateSandboxRequest.EnvsEntry
+	nil,                                   // 62: fastpath.v2.CreateSandboxRequest.MetadataEntry
+	nil,                                   // 63: fastpath.v2.ListSandboxesRequest.MetadataEntry
+	nil,                                   // 64: fastpath.v2.UpdateSandboxRequest.MetadataUpsertEntry
+	nil,                                   // 65: fastpath.v2.ResolveEndpointResponse.RequiredHeadersEntry
+	nil,                                   // 66: fastpath.v2.CreateSandboxSnapshotRequest.MetadataEntry
 }
 var file_api_proto_v2_fastpath_proto_depIdxs = []int32{
-	9,  // 0: fastpath.v2.SandboxReference.namespaced_name:type_name -> fastpath.v2.NamespacedName
+	10, // 0: fastpath.v2.SandboxReference.namespaced_name:type_name -> fastpath.v2.NamespacedName
 	1,  // 1: fastpath.v2.RuntimeInfo.state:type_name -> fastpath.v2.RuntimeState
 	3,  // 2: fastpath.v2.DataPlaneInfo.state:type_name -> fastpath.v2.DataPlaneState
 	4,  // 3: fastpath.v2.InfraComponentInfo.state:type_name -> fastpath.v2.InfraComponentState
 	5,  // 4: fastpath.v2.ActionBindingInfo.state:type_name -> fastpath.v2.ActionState
-	11, // 5: fastpath.v2.SandboxInfo.identity:type_name -> fastpath.v2.SandboxIdentity
-	12, // 6: fastpath.v2.SandboxInfo.runtime:type_name -> fastpath.v2.RuntimeInfo
-	13, // 7: fastpath.v2.SandboxInfo.data_plane:type_name -> fastpath.v2.DataPlaneInfo
-	14, // 8: fastpath.v2.SandboxInfo.infra_components:type_name -> fastpath.v2.InfraComponentInfo
-	15, // 9: fastpath.v2.SandboxInfo.action_bindings:type_name -> fastpath.v2.ActionBindingInfo
+	12, // 5: fastpath.v2.SandboxInfo.identity:type_name -> fastpath.v2.SandboxIdentity
+	13, // 6: fastpath.v2.SandboxInfo.runtime:type_name -> fastpath.v2.RuntimeInfo
+	14, // 7: fastpath.v2.SandboxInfo.data_plane:type_name -> fastpath.v2.DataPlaneInfo
+	15, // 8: fastpath.v2.SandboxInfo.infra_components:type_name -> fastpath.v2.InfraComponentInfo
+	16, // 9: fastpath.v2.SandboxInfo.action_bindings:type_name -> fastpath.v2.ActionBindingInfo
 	2,  // 10: fastpath.v2.SandboxInfo.state:type_name -> fastpath.v2.SandboxState
-	17, // 11: fastpath.v2.SandboxInfo.checkpoint:type_name -> fastpath.v2.CheckpointInfo
-	58, // 12: fastpath.v2.CreateSandboxRequest.envs:type_name -> fastpath.v2.CreateSandboxRequest.EnvsEntry
-	59, // 13: fastpath.v2.CreateSandboxRequest.metadata:type_name -> fastpath.v2.CreateSandboxRequest.MetadataEntry
+	18, // 11: fastpath.v2.SandboxInfo.checkpoint:type_name -> fastpath.v2.CheckpointInfo
+	61, // 12: fastpath.v2.CreateSandboxRequest.envs:type_name -> fastpath.v2.CreateSandboxRequest.EnvsEntry
+	62, // 13: fastpath.v2.CreateSandboxRequest.metadata:type_name -> fastpath.v2.CreateSandboxRequest.MetadataEntry
 	0,  // 14: fastpath.v2.CreateSandboxRequest.failure_policy:type_name -> fastpath.v2.FailurePolicy
-	18, // 15: fastpath.v2.CreateSandboxRequest.action_bindings:type_name -> fastpath.v2.ActionBinding
+	19, // 15: fastpath.v2.CreateSandboxRequest.action_bindings:type_name -> fastpath.v2.ActionBinding
 	6,  // 16: fastpath.v2.CreateSandboxRequest.completion:type_name -> fastpath.v2.CreateCompletion
-	16, // 17: fastpath.v2.CreateSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
+	17, // 17: fastpath.v2.CreateSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
 	6,  // 18: fastpath.v2.CreateSandboxResponse.completion:type_name -> fastpath.v2.CreateCompletion
-	10, // 19: fastpath.v2.GetSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
-	16, // 20: fastpath.v2.GetSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
-	11, // 21: fastpath.v2.SandboxSummary.identity:type_name -> fastpath.v2.SandboxIdentity
-	60, // 22: fastpath.v2.ListSandboxesRequest.metadata:type_name -> fastpath.v2.ListSandboxesRequest.MetadataEntry
-	23, // 23: fastpath.v2.ListSandboxesResponse.items:type_name -> fastpath.v2.SandboxSummary
-	10, // 24: fastpath.v2.DeleteRequest.sandbox:type_name -> fastpath.v2.SandboxReference
-	18, // 25: fastpath.v2.ReplaceActionBindings.items:type_name -> fastpath.v2.ActionBinding
-	10, // 26: fastpath.v2.UpdateSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	11, // 19: fastpath.v2.GetSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	17, // 20: fastpath.v2.GetSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
+	12, // 21: fastpath.v2.SandboxSummary.identity:type_name -> fastpath.v2.SandboxIdentity
+	63, // 22: fastpath.v2.ListSandboxesRequest.metadata:type_name -> fastpath.v2.ListSandboxesRequest.MetadataEntry
+	24, // 23: fastpath.v2.ListSandboxesResponse.items:type_name -> fastpath.v2.SandboxSummary
+	11, // 24: fastpath.v2.DeleteRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	19, // 25: fastpath.v2.ReplaceActionBindings.items:type_name -> fastpath.v2.ActionBinding
+	11, // 26: fastpath.v2.UpdateSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
 	0,  // 27: fastpath.v2.UpdateSandboxRequest.failure_policy:type_name -> fastpath.v2.FailurePolicy
-	28, // 28: fastpath.v2.UpdateSandboxRequest.action_bindings:type_name -> fastpath.v2.ReplaceActionBindings
-	61, // 29: fastpath.v2.UpdateSandboxRequest.metadata_upsert:type_name -> fastpath.v2.UpdateSandboxRequest.MetadataUpsertEntry
-	11, // 30: fastpath.v2.UpdateSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxIdentity
-	16, // 31: fastpath.v2.SandboxDiagnosticsResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
-	32, // 32: fastpath.v2.SandboxDiagnosticsResponse.events:type_name -> fastpath.v2.SandboxDiagnosticEvent
-	10, // 33: fastpath.v2.ResolveEndpointRequest.sandbox:type_name -> fastpath.v2.SandboxReference
-	34, // 34: fastpath.v2.ResolveEndpointRequest.target:type_name -> fastpath.v2.EndpointTarget
+	29, // 28: fastpath.v2.UpdateSandboxRequest.action_bindings:type_name -> fastpath.v2.ReplaceActionBindings
+	64, // 29: fastpath.v2.UpdateSandboxRequest.metadata_upsert:type_name -> fastpath.v2.UpdateSandboxRequest.MetadataUpsertEntry
+	12, // 30: fastpath.v2.UpdateSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxIdentity
+	17, // 31: fastpath.v2.SandboxDiagnosticsResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
+	33, // 32: fastpath.v2.SandboxDiagnosticsResponse.events:type_name -> fastpath.v2.SandboxDiagnosticEvent
+	11, // 33: fastpath.v2.ResolveEndpointRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	35, // 34: fastpath.v2.ResolveEndpointRequest.target:type_name -> fastpath.v2.EndpointTarget
 	7,  // 35: fastpath.v2.ResolveEndpointRequest.access_mode:type_name -> fastpath.v2.EndpointAccessMode
-	36, // 36: fastpath.v2.ResolveEndpointResponse.endpoint:type_name -> fastpath.v2.ResolvedEndpoint
-	62, // 37: fastpath.v2.ResolveEndpointResponse.required_headers:type_name -> fastpath.v2.ResolveEndpointResponse.RequiredHeadersEntry
-	38, // 38: fastpath.v2.PoolInfo.components:type_name -> fastpath.v2.ComponentCapability
-	39, // 39: fastpath.v2.PoolInfo.warm_images:type_name -> fastpath.v2.WarmImageInfo
-	40, // 40: fastpath.v2.ListPoolsResponse.items:type_name -> fastpath.v2.PoolInfo
-	10, // 41: fastpath.v2.CreateSandboxSnapshotRequest.sandbox:type_name -> fastpath.v2.SandboxReference
-	63, // 42: fastpath.v2.CreateSandboxSnapshotRequest.metadata:type_name -> fastpath.v2.CreateSandboxSnapshotRequest.MetadataEntry
-	11, // 43: fastpath.v2.SandboxSnapshotInfo.identity:type_name -> fastpath.v2.SandboxIdentity
-	8,  // 44: fastpath.v2.SandboxSnapshotInfo.phase:type_name -> fastpath.v2.SnapshotPhase
-	45, // 45: fastpath.v2.CreateSandboxSnapshotResponse.snapshot:type_name -> fastpath.v2.SandboxSnapshotInfo
-	9,  // 46: fastpath.v2.GetSandboxSnapshotRequest.snapshot:type_name -> fastpath.v2.NamespacedName
-	45, // 47: fastpath.v2.GetSandboxSnapshotResponse.snapshot:type_name -> fastpath.v2.SandboxSnapshotInfo
-	10, // 48: fastpath.v2.DeleteSandboxSnapshotRequest.snapshot:type_name -> fastpath.v2.SandboxReference
-	10, // 49: fastpath.v2.PauseSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
-	16, // 50: fastpath.v2.PauseSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
-	10, // 51: fastpath.v2.ResumeSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
-	16, // 52: fastpath.v2.ResumeSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
-	10, // 53: fastpath.v2.InvokeHandlerActionRequest.sandbox:type_name -> fastpath.v2.SandboxReference
-	56, // 54: fastpath.v2.InvokeHandlerActionResponse.result:type_name -> fastpath.v2.HandlerActionResult
-	19, // 55: fastpath.v2.FastPathService.CreateSandbox:input_type -> fastpath.v2.CreateSandboxRequest
-	26, // 56: fastpath.v2.FastPathService.DeleteSandbox:input_type -> fastpath.v2.DeleteRequest
-	29, // 57: fastpath.v2.FastPathService.UpdateSandbox:input_type -> fastpath.v2.UpdateSandboxRequest
-	24, // 58: fastpath.v2.FastPathService.ListSandboxes:input_type -> fastpath.v2.ListSandboxesRequest
-	21, // 59: fastpath.v2.FastPathService.GetSandbox:input_type -> fastpath.v2.GetSandboxRequest
-	31, // 60: fastpath.v2.FastPathService.GetSandboxDiagnostics:input_type -> fastpath.v2.SandboxDiagnosticsRequest
-	35, // 61: fastpath.v2.FastPathService.ResolveEndpoint:input_type -> fastpath.v2.ResolveEndpointRequest
-	41, // 62: fastpath.v2.FastPathService.GetPool:input_type -> fastpath.v2.GetPoolRequest
-	42, // 63: fastpath.v2.FastPathService.ListPools:input_type -> fastpath.v2.ListPoolsRequest
-	44, // 64: fastpath.v2.FastPathService.CreateSandboxSnapshot:input_type -> fastpath.v2.CreateSandboxSnapshotRequest
-	47, // 65: fastpath.v2.FastPathService.GetSandboxSnapshot:input_type -> fastpath.v2.GetSandboxSnapshotRequest
-	49, // 66: fastpath.v2.FastPathService.DeleteSandboxSnapshot:input_type -> fastpath.v2.DeleteSandboxSnapshotRequest
-	51, // 67: fastpath.v2.FastPathService.PauseSandbox:input_type -> fastpath.v2.PauseSandboxRequest
-	53, // 68: fastpath.v2.FastPathService.ResumeSandbox:input_type -> fastpath.v2.ResumeSandboxRequest
-	55, // 69: fastpath.v2.FastPathService.InvokeHandlerAction:input_type -> fastpath.v2.InvokeHandlerActionRequest
-	20, // 70: fastpath.v2.FastPathService.CreateSandbox:output_type -> fastpath.v2.CreateSandboxResponse
-	27, // 71: fastpath.v2.FastPathService.DeleteSandbox:output_type -> fastpath.v2.DeleteResponse
-	30, // 72: fastpath.v2.FastPathService.UpdateSandbox:output_type -> fastpath.v2.UpdateSandboxResponse
-	25, // 73: fastpath.v2.FastPathService.ListSandboxes:output_type -> fastpath.v2.ListSandboxesResponse
-	22, // 74: fastpath.v2.FastPathService.GetSandbox:output_type -> fastpath.v2.GetSandboxResponse
-	33, // 75: fastpath.v2.FastPathService.GetSandboxDiagnostics:output_type -> fastpath.v2.SandboxDiagnosticsResponse
-	37, // 76: fastpath.v2.FastPathService.ResolveEndpoint:output_type -> fastpath.v2.ResolveEndpointResponse
-	40, // 77: fastpath.v2.FastPathService.GetPool:output_type -> fastpath.v2.PoolInfo
-	43, // 78: fastpath.v2.FastPathService.ListPools:output_type -> fastpath.v2.ListPoolsResponse
-	46, // 79: fastpath.v2.FastPathService.CreateSandboxSnapshot:output_type -> fastpath.v2.CreateSandboxSnapshotResponse
-	48, // 80: fastpath.v2.FastPathService.GetSandboxSnapshot:output_type -> fastpath.v2.GetSandboxSnapshotResponse
-	50, // 81: fastpath.v2.FastPathService.DeleteSandboxSnapshot:output_type -> fastpath.v2.DeleteSandboxSnapshotResponse
-	52, // 82: fastpath.v2.FastPathService.PauseSandbox:output_type -> fastpath.v2.PauseSandboxResponse
-	54, // 83: fastpath.v2.FastPathService.ResumeSandbox:output_type -> fastpath.v2.ResumeSandboxResponse
-	57, // 84: fastpath.v2.FastPathService.InvokeHandlerAction:output_type -> fastpath.v2.InvokeHandlerActionResponse
-	70, // [70:85] is the sub-list for method output_type
-	55, // [55:70] is the sub-list for method input_type
-	55, // [55:55] is the sub-list for extension type_name
-	55, // [55:55] is the sub-list for extension extendee
-	0,  // [0:55] is the sub-list for field type_name
+	37, // 36: fastpath.v2.ResolveEndpointResponse.endpoint:type_name -> fastpath.v2.ResolvedEndpoint
+	65, // 37: fastpath.v2.ResolveEndpointResponse.required_headers:type_name -> fastpath.v2.ResolveEndpointResponse.RequiredHeadersEntry
+	8,  // 38: fastpath.v2.SandboxResourceProfileInfo.mode:type_name -> fastpath.v2.SandboxResourceMode
+	41, // 39: fastpath.v2.SandboxResourceProfileInfo.requests:type_name -> fastpath.v2.ComputeResourceProfile
+	41, // 40: fastpath.v2.SandboxResourceProfileInfo.limits:type_name -> fastpath.v2.ComputeResourceProfile
+	39, // 41: fastpath.v2.PoolInfo.components:type_name -> fastpath.v2.ComponentCapability
+	40, // 42: fastpath.v2.PoolInfo.warm_images:type_name -> fastpath.v2.WarmImageInfo
+	42, // 43: fastpath.v2.PoolInfo.sandbox_resource_profile:type_name -> fastpath.v2.SandboxResourceProfileInfo
+	43, // 44: fastpath.v2.ListPoolsResponse.items:type_name -> fastpath.v2.PoolInfo
+	11, // 45: fastpath.v2.CreateSandboxSnapshotRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	66, // 46: fastpath.v2.CreateSandboxSnapshotRequest.metadata:type_name -> fastpath.v2.CreateSandboxSnapshotRequest.MetadataEntry
+	12, // 47: fastpath.v2.SandboxSnapshotInfo.identity:type_name -> fastpath.v2.SandboxIdentity
+	9,  // 48: fastpath.v2.SandboxSnapshotInfo.phase:type_name -> fastpath.v2.SnapshotPhase
+	48, // 49: fastpath.v2.CreateSandboxSnapshotResponse.snapshot:type_name -> fastpath.v2.SandboxSnapshotInfo
+	10, // 50: fastpath.v2.GetSandboxSnapshotRequest.snapshot:type_name -> fastpath.v2.NamespacedName
+	48, // 51: fastpath.v2.GetSandboxSnapshotResponse.snapshot:type_name -> fastpath.v2.SandboxSnapshotInfo
+	11, // 52: fastpath.v2.DeleteSandboxSnapshotRequest.snapshot:type_name -> fastpath.v2.SandboxReference
+	11, // 53: fastpath.v2.PauseSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	17, // 54: fastpath.v2.PauseSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
+	11, // 55: fastpath.v2.ResumeSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	17, // 56: fastpath.v2.ResumeSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
+	11, // 57: fastpath.v2.InvokeHandlerActionRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	59, // 58: fastpath.v2.InvokeHandlerActionResponse.result:type_name -> fastpath.v2.HandlerActionResult
+	20, // 59: fastpath.v2.FastPathService.CreateSandbox:input_type -> fastpath.v2.CreateSandboxRequest
+	27, // 60: fastpath.v2.FastPathService.DeleteSandbox:input_type -> fastpath.v2.DeleteRequest
+	30, // 61: fastpath.v2.FastPathService.UpdateSandbox:input_type -> fastpath.v2.UpdateSandboxRequest
+	25, // 62: fastpath.v2.FastPathService.ListSandboxes:input_type -> fastpath.v2.ListSandboxesRequest
+	22, // 63: fastpath.v2.FastPathService.GetSandbox:input_type -> fastpath.v2.GetSandboxRequest
+	32, // 64: fastpath.v2.FastPathService.GetSandboxDiagnostics:input_type -> fastpath.v2.SandboxDiagnosticsRequest
+	36, // 65: fastpath.v2.FastPathService.ResolveEndpoint:input_type -> fastpath.v2.ResolveEndpointRequest
+	44, // 66: fastpath.v2.FastPathService.GetPool:input_type -> fastpath.v2.GetPoolRequest
+	45, // 67: fastpath.v2.FastPathService.ListPools:input_type -> fastpath.v2.ListPoolsRequest
+	47, // 68: fastpath.v2.FastPathService.CreateSandboxSnapshot:input_type -> fastpath.v2.CreateSandboxSnapshotRequest
+	50, // 69: fastpath.v2.FastPathService.GetSandboxSnapshot:input_type -> fastpath.v2.GetSandboxSnapshotRequest
+	52, // 70: fastpath.v2.FastPathService.DeleteSandboxSnapshot:input_type -> fastpath.v2.DeleteSandboxSnapshotRequest
+	54, // 71: fastpath.v2.FastPathService.PauseSandbox:input_type -> fastpath.v2.PauseSandboxRequest
+	56, // 72: fastpath.v2.FastPathService.ResumeSandbox:input_type -> fastpath.v2.ResumeSandboxRequest
+	58, // 73: fastpath.v2.FastPathService.InvokeHandlerAction:input_type -> fastpath.v2.InvokeHandlerActionRequest
+	21, // 74: fastpath.v2.FastPathService.CreateSandbox:output_type -> fastpath.v2.CreateSandboxResponse
+	28, // 75: fastpath.v2.FastPathService.DeleteSandbox:output_type -> fastpath.v2.DeleteResponse
+	31, // 76: fastpath.v2.FastPathService.UpdateSandbox:output_type -> fastpath.v2.UpdateSandboxResponse
+	26, // 77: fastpath.v2.FastPathService.ListSandboxes:output_type -> fastpath.v2.ListSandboxesResponse
+	23, // 78: fastpath.v2.FastPathService.GetSandbox:output_type -> fastpath.v2.GetSandboxResponse
+	34, // 79: fastpath.v2.FastPathService.GetSandboxDiagnostics:output_type -> fastpath.v2.SandboxDiagnosticsResponse
+	38, // 80: fastpath.v2.FastPathService.ResolveEndpoint:output_type -> fastpath.v2.ResolveEndpointResponse
+	43, // 81: fastpath.v2.FastPathService.GetPool:output_type -> fastpath.v2.PoolInfo
+	46, // 82: fastpath.v2.FastPathService.ListPools:output_type -> fastpath.v2.ListPoolsResponse
+	49, // 83: fastpath.v2.FastPathService.CreateSandboxSnapshot:output_type -> fastpath.v2.CreateSandboxSnapshotResponse
+	51, // 84: fastpath.v2.FastPathService.GetSandboxSnapshot:output_type -> fastpath.v2.GetSandboxSnapshotResponse
+	53, // 85: fastpath.v2.FastPathService.DeleteSandboxSnapshot:output_type -> fastpath.v2.DeleteSandboxSnapshotResponse
+	55, // 86: fastpath.v2.FastPathService.PauseSandbox:output_type -> fastpath.v2.PauseSandboxResponse
+	57, // 87: fastpath.v2.FastPathService.ResumeSandbox:output_type -> fastpath.v2.ResumeSandboxResponse
+	60, // 88: fastpath.v2.FastPathService.InvokeHandlerAction:output_type -> fastpath.v2.InvokeHandlerActionResponse
+	74, // [74:89] is the sub-list for method output_type
+	59, // [59:74] is the sub-list for method input_type
+	59, // [59:59] is the sub-list for extension type_name
+	59, // [59:59] is the sub-list for extension extendee
+	0,  // [0:59] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_v2_fastpath_proto_init() }
@@ -4402,8 +4599,8 @@ func file_api_proto_v2_fastpath_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_v2_fastpath_proto_rawDesc), len(file_api_proto_v2_fastpath_proto_rawDesc)),
-			NumEnums:      9,
-			NumMessages:   55,
+			NumEnums:      10,
+			NumMessages:   57,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
