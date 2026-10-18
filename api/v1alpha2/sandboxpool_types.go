@@ -268,6 +268,9 @@ type SandboxPoolStatus struct {
 	InfraRevision    string `json:"infraRevision,omitempty"`
 	FastletRevision  string `json:"fastletRevision,omitempty"`
 	PreparedFastlets int32  `json:"preparedFastlets,omitempty"`
+	// ResourceScaleDownCandidateSince is the start of the current continuous
+	// ResourceAware excess-capacity window. It resets as soon as demand returns.
+	ResourceScaleDownCandidateSince *metav1.Time `json:"resourceScaleDownCandidateSince,omitempty"`
 
 	WarmImages []WarmImageStatus  `json:"warmImages,omitempty"`
 	Conditions []metav1.Condition `json:"conditions,omitempty"`

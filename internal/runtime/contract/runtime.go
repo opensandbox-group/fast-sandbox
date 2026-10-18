@@ -187,10 +187,10 @@ func ValidateProfile(existing *Metadata, requested *fastletapi.RuntimeSandboxCon
 	if existing == nil || requested == nil {
 		return fmt.Errorf("%w: existing and requested runtime specs are required", ErrSandboxProfileMismatch)
 	}
-	if existing.Config.Spec.RuntimeProfileHash != requested.Spec.RuntimeProfileHash ||
-		existing.Config.Spec.ResourceProfileHash != requested.Spec.ResourceProfileHash ||
-		existing.Config.Spec.InfraRevision != requested.Spec.InfraRevision ||
-		existing.Config.Spec.CPU != requested.Spec.CPU || existing.Config.Spec.Memory != requested.Spec.Memory || existing.Config.Spec.PIDs != requested.Spec.PIDs {
+	if existing.Config.Desired.RuntimeProfileHash != requested.Desired.RuntimeProfileHash ||
+		existing.Config.Desired.ResourceProfileHash != requested.Desired.ResourceProfileHash ||
+		existing.Config.Desired.InfraRevision != requested.Desired.InfraRevision ||
+		existing.Config.Limits != requested.Limits {
 		return fmt.Errorf("%w: existing runtime identity %q has different runtime/resource profile", ErrSandboxProfileMismatch, requested.Identity.SandboxUID)
 	}
 	return nil

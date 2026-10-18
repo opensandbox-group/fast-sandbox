@@ -152,12 +152,20 @@ func (m *SandboxManager) prepareCreateInput(req *fastletapi.CreateSandboxRequest
 	if identity.RouteGeneration <= 0 {
 		identity.RouteGeneration = 1
 	}
+	if err := m.validateProfiles(&req.Sandbox); err != nil {
+		return fastletapi.EnsureSandboxInput{}, fastletError(fastletapi.ErrorProfileMismatch, err.Error(), false)
+	}
+	limits, err := m.resolvedRuntimeLimits()
+	if err != nil {
+		return fastletapi.EnsureSandboxInput{}, fastletError(fastletapi.ErrorProfileMismatch, err.Error(), false)
+	}
 	input := fastletapi.EnsureSandboxInput{
 		RequestID: req.RequestID,
-		Sandbox:   fastletapi.RuntimeSandboxConfig{Identity: identity, Spec: req.Sandbox},
-	}
-	if err := m.validateProfiles(&input.Sandbox.Spec); err != nil {
-		return fastletapi.EnsureSandboxInput{}, fastletError(fastletapi.ErrorProfileMismatch, err.Error(), false)
+		Sandbox: fastletapi.RuntimeSandboxConfig{
+			Identity: identity,
+			Desired:  req.Sandbox.DeepCopy(),
+			Limits:   limits,
+		},
 	}
 	return input, nil
 }
@@ -252,7 +260,7 @@ func (m *SandboxManager) ensureRuntimeForCreate(ctx context.Context, createStart
 
 func (m *SandboxManager) handleRuntimeCreateFailure(ctx context.Context, input *fastletapi.EnsureSandboxInput, placeholder *SandboxMetadata, runtimeErr error) (*fastletapi.CreateSandboxResponse, error) {
 	sandboxUID := input.Sandbox.Identity.SandboxUID
-	m.cacheProtection.ProtectHotUntil(input.Sandbox.Spec.Image, m.clock.Now().Add(time.Hour))
+	m.cacheProtection.ProtectHotUntil(input.Sandbox.Desired.Image, m.clock.Now().Add(time.Hour))
 	cleanupErr := m.runtime.DeleteSandbox(ctx, sandboxUID)
 	if m.actionManager != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -298,7 +306,7 @@ func (m *SandboxManager) commitRuntimeCreate(req *fastletapi.CreateSandboxReques
 	if len(req.ActionBindings) == 0 {
 		metadata.AppliedGeneration = req.SpecGeneration
 	}
-	m.cacheProtection.Protect(input.Sandbox.Spec.Image, fastletcache.ProtectActive)
+	m.cacheProtection.Protect(input.Sandbox.Desired.Image, fastletcache.ProtectActive)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	sandboxUID := input.Sandbox.Identity.SandboxUID
@@ -563,7 +571,7 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit 
 			metadata.Phase = sandboxStateUnknown
 		}
 		if m.infraManager != nil {
-			if metadata.Config.Spec.InfraRevision != m.infraRevision {
+			if metadata.Config.Desired.InfraRevision != m.infraRevision {
 				return fmt.Errorf("recovered Sandbox %s Infra revision does not match Fastlet", identity.SandboxUID)
 			}
 			metadata.Phase = sandboxStateInfraPending
@@ -597,7 +605,7 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit 
 	}
 	activeImages := make([]string, 0, len(recovered))
 	for _, metadata := range recovered {
-		activeImages = append(activeImages, metadata.Config.Spec.Image)
+		activeImages = append(activeImages, metadata.Config.Desired.Image)
 	}
 	m.cacheProtection.Replace(fastletcache.ProtectActive, activeImages)
 	m.mu.Lock()
@@ -724,8 +732,8 @@ func validateIdentityFence(expectedPodUID string, existing *SandboxMetadata, req
 
 func sameSandboxClaim(existing *SandboxMetadata, requested *fastletapi.RuntimeSandboxConfig) bool {
 	return existing.Config.Identity.Namespace == requested.Identity.Namespace && existing.Config.Identity.Name == requested.Identity.Name &&
-		existing.Config.Spec.RuntimeProfileHash == requested.Spec.RuntimeProfileHash && existing.Config.Spec.ResourceProfileHash == requested.Spec.ResourceProfileHash &&
-		existing.Config.Spec.InfraRevision == requested.Spec.InfraRevision
+		existing.Config.Desired.RuntimeProfileHash == requested.Desired.RuntimeProfileHash && existing.Config.Desired.ResourceProfileHash == requested.Desired.ResourceProfileHash &&
+		existing.Config.Desired.InfraRevision == requested.Desired.InfraRevision
 }
 
 func identityAtOrBefore(generation, attempt int64, highWater fastletapi.SandboxIdentity) bool {
@@ -799,15 +807,20 @@ func (m *SandboxManager) resourceCapacityFailureLocked(active int) *fastletapi.F
 	if !ok {
 		return admissionError(fastletapi.AdmissionReasonUnsupportedProtocol, "Fastlet resource admission profile is unavailable")
 	}
-	nextCPU := requests.CPU.DeepCopy()
-	nextCPU.Mul(int64(active + 1))
-	if nextCPU.Cmp(m.resourceAdmission.Capacity.CPU) > 0 {
-		return admissionError(fastletapi.AdmissionReasonStaticCPUExhausted, "Fastlet CPU commitment capacity is exhausted")
+	if m.staticResourceAdmission {
+		nextCPU := requests.CPU.DeepCopy()
+		nextCPU.Mul(int64(active + 1))
+		if nextCPU.Cmp(m.resourceAdmission.Capacity.CPU) > 0 {
+			return admissionError(fastletapi.AdmissionReasonStaticCPUExhausted, "Fastlet CPU commitment capacity is exhausted")
+		}
+		nextMemory := requests.Memory.DeepCopy()
+		nextMemory.Mul(int64(active + 1))
+		if nextMemory.Cmp(m.resourceAdmission.Capacity.Memory) > 0 {
+			return admissionError(fastletapi.AdmissionReasonStaticMemoryExhausted, "Fastlet memory commitment capacity is exhausted")
+		}
 	}
-	nextMemory := requests.Memory.DeepCopy()
-	nextMemory.Mul(int64(active + 1))
-	if nextMemory.Cmp(m.resourceAdmission.Capacity.Memory) > 0 {
-		return admissionError(fastletapi.AdmissionReasonStaticMemoryExhausted, "Fastlet memory commitment capacity is exhausted")
+	if !m.resourceAdmission.MemoryAdmission {
+		return nil
 	}
 	state, reason := m.resourceAdmissionStateLocked()
 	if state == fastletapi.AdmissionStateBlocked || state == fastletapi.AdmissionStateUnknown {

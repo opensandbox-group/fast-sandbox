@@ -156,7 +156,7 @@ spec:
 | `warmImages` | No | Asynchronous, GC-protected cache inputs |
 | `infraComponents` | No | Inline immutable artifact/process/health/endpoint definitions |
 | `actionHandlers` | No | Named Pod-loopback Binding receivers and their lifecycle Hook subscriptions |
-| `fastletTemplate` | Yes | Kubernetes Pod template with platform-owned fields protected; runtime-owner limits define the optional aggregate overcommit budget |
+| `fastletTemplate` | Yes | Kubernetes Pod template for image, environment, scheduling, security, and sidecars; ResourceAware runtime-owner CPU and memory are Controller-derived |
 
 Runtime names are `container`, `gvisor`, `kata-qemu`, `kata-clh`, `kata-fc`,
 `kata-dragonball`, and `firecracker`.
@@ -180,8 +180,31 @@ sandboxResources:
 The two representations cannot be mixed. A request must be positive and no
 greater than its matching limit.
 
+In `ResourceAware` mode, the first container must not set CPU or memory
+requests or limits. The Controller derives the per-Fastlet commitment capacity
+as `sandboxResources.requests * maxSandboxesPerPod`, then derives the
+runtime-owner request and limit as fixed runtime overhead plus the larger of
+that commitment capacity and one Sandbox limit. Sidecars retain their own
+independent Kubernetes resources. In `LegacySlot` mode, explicit first-container
+resources and the existing aggregate overcommit behavior remain supported.
+
+CPU and memory ratios are intentionally independent:
+
+```text
+CPU ratio    = limits.cpu / requests.cpu
+Memory ratio = limits.memory / requests.memory
+```
+
+CPU is compressible and the initial implementation uses live CPU signals for
+observability rather than hard admission. Memory pressure can reclaim, stall,
+or OOM workloads, so ResourceAware Fastlets additionally block new creates on
+memory watermarks, PSI, OOM events, node pressure, or stale telemetry. This
+gate does not reclaim, pause, migrate, or evict existing Sandboxes.
+
 Pool status exposes Fastlet capacity, runtime/Infra/Fastlet revisions, prepared
-Fastlet counts, and per-image warm-cache aggregation. Handler and Registry
+Fastlet counts, and per-image warm-cache aggregation. In ResourceAware mode,
+`resourceScaleDownCandidateSince` persists the beginning of a continuous
+excess-capacity window and is cleared when demand returns. Handler and Registry
 rollout details are not duplicated as nested status. Conditions are
 `RuntimeReady`, `InfraReady`, and `RegistryReady`.
 

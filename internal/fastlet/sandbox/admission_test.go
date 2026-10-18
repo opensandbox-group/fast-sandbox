@@ -336,6 +336,7 @@ func newResourceAwareAdmissionManager(
 	}
 	settings := &fastletsettings.ResourceAdmissionSettings{
 		Version: "v1", Mode: apiv1alpha2.SandboxResourceModeResourceAware,
+		StaticAdmission: true, MemoryAdmission: true,
 		Capacity: apiv1alpha2.SandboxComputeResources{
 			CPU: resource.MustParse(capacityCPU), Memory: resource.MustParse(capacityMemory),
 		},
@@ -361,7 +362,7 @@ func ensureRequest(uid string, generation, attempt int64) *fastletapi.CreateSand
 			InstanceGeneration: generation, RuntimeInstanceID: fmt.Sprintf("runtime-%s-%d-%d", uid, generation, attempt),
 			AssignmentAttempt: attempt, RouteGeneration: 1, FastletPodUID: "pod-uid-a",
 		},
-		Sandbox: fastletapi.SandboxSpec{Image: "alpine:latest"},
+		Sandbox: fastletapi.SandboxDesiredSpec{Image: "alpine:latest"},
 	}
 }
 
@@ -505,6 +506,17 @@ func TestResourceAwareAdmissionUsesTighterMemoryCommitment(t *testing.T) {
 	requireFastletCode(t, err, fastletapi.ErrorCapacityRejected)
 	require.Equal(t, fastletapi.AdmissionReasonStaticMemoryExhausted, rejected.Error.Reason)
 	require.Equal(t, 5, rejected.Admission.Used)
+}
+
+func TestResourceAwareAdmissionFeatureGatesAreIndependent(t *testing.T) {
+	manager, _ := newResourceAwareAdmissionManager(t, newAdmissionRuntime(), 10, "2", "10Gi")
+	manager.staticResourceAdmission = false
+	manager.resourceAdmission.MemoryAdmission = false
+	manager.resourceState = fastletapi.AdmissionStateBlocked
+	manager.resourceReason = fastletapi.AdmissionReasonFastletMemoryHighWatermark
+
+	require.Nil(t, manager.resourceCapacityFailureLocked(2),
+		"shadow telemetry may remain active while static and memory admission decisions are disabled")
 }
 
 func TestResourceAdmissionRevisionOrdersPressureFeedback(t *testing.T) {

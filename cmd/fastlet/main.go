@@ -55,55 +55,24 @@ func main() {
 	nodeName := getEnv("NODE_NAME", "")
 	namespace := getEnv("NAMESPACE", "")
 	fastletPort := getEnv("FASTLET_CONTROL_PORT", ":5758")
-	settingsDir := getEnv(fastletsettings.EnvDir, fastletsettings.MountPath)
-	runtimeName := getEnv("FAST_SANDBOX_RUNTIME", "container")
-	runtimePlan, err := loadRuntimePlan(getEnv("FAST_SANDBOX_RUNTIME_PLAN_PATH", runtimeenv.PlanMountPath+"/"+runtimeenv.PlanFileName))
+	startup, err := loadFastletStartupSettings()
 	if err != nil {
-		klog.ErrorS(err, "Failed to load runtime plan")
+		klog.ErrorS(err, "Failed to load Fastlet startup settings")
 		os.Exit(1)
 	}
+	runtimePlan := startup.runtimePlan
 	runtimeProfile := runtimePlan.Profile
-	if runtimeProfile.Name != apiv1alpha2.RuntimeName(runtimeName) {
-		klog.ErrorS(runtimecontract.ErrSandboxProfileMismatch, "Runtime plan name does not match injected runtime", "plan", runtimeProfile.Name, "injected", runtimeName)
-		os.Exit(1)
-	}
+	runtimeName := string(runtimeProfile.Name)
 	runtimeSocket := runtimePlan.Containerd.Socket
-	injectedRuntimeHash := getEnv("FAST_SANDBOX_RUNTIME_PROFILE_HASH", runtimeProfile.ProfileHash)
-	if injectedRuntimeHash != runtimeProfile.ProfileHash {
-		klog.ErrorS(runtimecontract.ErrSandboxProfileMismatch, "Injected runtime profile hash does not match runtime plan", "injected", injectedRuntimeHash, "expected", runtimeProfile.ProfileHash)
-		os.Exit(1)
-	}
-	resourceProfile, err := resourceProfileFromSettings(settingsDir)
-	if err != nil {
-		klog.ErrorS(err, "Failed to resolve Sandbox resource profile")
-		os.Exit(1)
-	}
-	resourceAdmission, err := resourceAdmissionFromSettings(settingsDir, resourceProfile)
-	if err != nil {
-		klog.ErrorS(err, "Failed to resolve resource admission settings")
-		os.Exit(1)
-	}
-	warmImages, err := warmImagesFromSettings(settingsDir)
-	if err != nil {
-		klog.ErrorS(err, "Failed to parse warmImages")
-		os.Exit(1)
-	}
-	actionHandlers, err := actionHandlersFromSettings(settingsDir)
-	if err != nil {
-		klog.ErrorS(err, "Failed to parse action handlers")
-		os.Exit(1)
-	}
-	actionManager, err := fastletaction.NewManager(actionHandlers, nil)
-	if err != nil {
-		klog.ErrorS(err, "Failed to configure action handlers")
-		os.Exit(1)
-	}
+	resourceProfile := startup.resourceProfile
+	resourceAdmission := startup.resourceAdmission
+	actionManager := startup.actionManager
 	actionManager.SetVaultHandler(fastletaction.VaultHandlerFromEnv())
 
 	klog.InfoS("fastlet starting",
 		"podName", podName, "podIP", podIP, "nodeName", nodeName,
 		"namespace", namespace, "capacity", capacityFromEnvironment())
-	klog.InfoS("runtime resolved", "runtime", runtimeName, "socket", runtimeSocket, "settingsDir", settingsDir)
+	klog.InfoS("runtime resolved", "runtime", runtimeName, "socket", runtimeSocket, "settingsDir", startup.settingsDir)
 
 	ctx := context.Background()
 	var rt runtimecontract.Driver
@@ -210,7 +179,7 @@ func main() {
 		Capacity: capacityFromEnvironment(), RuntimeName: runtimeProfile.Name, RuntimeProfileHash: runtimeProfile.ProfileHash, ResourceProfile: &resourceProfile,
 		ResourceAdmission: resourceAdmission,
 		FastletPodUID:     podUID, RecoverOnStart: true,
-		WarmImages:     warmImages,
+		WarmImages:     startup.warmImages,
 		RoutePublisher: fastletproxy.NewRoutePublisher(proxyControlClient),
 		InfraRevision:  infraManager.Revision(), InfraManager: infraManager,
 		RegistryProvider: registryProvider,
@@ -221,7 +190,7 @@ func main() {
 		os.Exit(1)
 	}
 	defer sandboxManager.Close()
-	if resourceAdmission != nil {
+	if resourceAdmission != nil && resourceAdmission.MemoryAdmission {
 		if err := startResourceAdmissionObserver(ctx, sandboxManager, resourceAdmission, podUID, runtimeProfile.Driver == runtimecatalog.DriverKindContainerd); err != nil {
 			klog.ErrorS(err, "Resource admission telemetry is unavailable; admission remains UNKNOWN")
 		}
@@ -236,6 +205,59 @@ func main() {
 		klog.ErrorS(err, "Fastlet server failed")
 		os.Exit(1)
 	}
+}
+
+type fastletStartupSettings struct {
+	settingsDir       string
+	runtimePlan       runtimeenv.ResolvedRuntimePlan
+	resourceProfile   apiv1alpha2.SandboxResourceProfile
+	resourceAdmission *fastletsettings.ResourceAdmissionSettings
+	warmImages        []string
+	actionManager     *fastletaction.Manager
+}
+
+func loadFastletStartupSettings() (fastletStartupSettings, error) {
+	settingsDir := getEnv(fastletsettings.EnvDir, fastletsettings.MountPath)
+	runtimeName := getEnv("FAST_SANDBOX_RUNTIME", "container")
+	runtimePlan, err := loadRuntimePlan(getEnv("FAST_SANDBOX_RUNTIME_PLAN_PATH", runtimeenv.PlanMountPath+"/"+runtimeenv.PlanFileName))
+	if err != nil {
+		return fastletStartupSettings{}, fmt.Errorf("load runtime plan: %w", err)
+	}
+	if runtimePlan.Profile.Name != apiv1alpha2.RuntimeName(runtimeName) {
+		return fastletStartupSettings{}, fmt.Errorf("%w: runtime plan name %q does not match injected runtime %q", runtimecontract.ErrSandboxProfileMismatch, runtimePlan.Profile.Name, runtimeName)
+	}
+	injectedRuntimeHash := getEnv("FAST_SANDBOX_RUNTIME_PROFILE_HASH", runtimePlan.Profile.ProfileHash)
+	if injectedRuntimeHash != runtimePlan.Profile.ProfileHash {
+		return fastletStartupSettings{}, fmt.Errorf("%w: injected runtime profile hash %q does not match runtime plan %q", runtimecontract.ErrSandboxProfileMismatch, injectedRuntimeHash, runtimePlan.Profile.ProfileHash)
+	}
+	resourceProfile, err := resourceProfileFromSettings(settingsDir)
+	if err != nil {
+		return fastletStartupSettings{}, fmt.Errorf("resolve Sandbox resource profile: %w", err)
+	}
+	resourceAdmissionValue, resourceAdmissionFound, err := resourceAdmissionFromSettings(settingsDir, resourceProfile)
+	if err != nil {
+		return fastletStartupSettings{}, fmt.Errorf("resolve resource admission settings: %w", err)
+	}
+	var resourceAdmission *fastletsettings.ResourceAdmissionSettings
+	if resourceAdmissionFound {
+		resourceAdmission = &resourceAdmissionValue
+	}
+	warmImages, err := warmImagesFromSettings(settingsDir)
+	if err != nil {
+		return fastletStartupSettings{}, fmt.Errorf("parse warmImages: %w", err)
+	}
+	actionHandlers, err := actionHandlersFromSettings(settingsDir)
+	if err != nil {
+		return fastletStartupSettings{}, fmt.Errorf("parse action handlers: %w", err)
+	}
+	actionManager, err := fastletaction.NewManager(actionHandlers, nil)
+	if err != nil {
+		return fastletStartupSettings{}, fmt.Errorf("configure action handlers: %w", err)
+	}
+	return fastletStartupSettings{
+		settingsDir: settingsDir, runtimePlan: runtimePlan, resourceProfile: resourceProfile,
+		resourceAdmission: resourceAdmission, warmImages: warmImages, actionManager: actionManager,
+	}, nil
 }
 
 func startResourceAdmissionObserver(
@@ -598,25 +620,25 @@ func resourceProfileFromSettings(dir string) (apiv1alpha2.SandboxResourceProfile
 	return resourceProfileFromEnvironment()
 }
 
-func resourceAdmissionFromSettings(dir string, profile apiv1alpha2.SandboxResourceProfile) (*fastletsettings.ResourceAdmissionSettings, error) {
+func resourceAdmissionFromSettings(dir string, profile apiv1alpha2.SandboxResourceProfile) (fastletsettings.ResourceAdmissionSettings, bool, error) {
 	data, ok, err := readSetting(dir, fastletsettings.ResourceAdmissionKey)
 	if err != nil {
-		return nil, err
+		return fastletsettings.ResourceAdmissionSettings{}, false, err
 	}
 	if !ok {
 		if profile.ResourceMode() == apiv1alpha2.SandboxResourceModeResourceAware {
-			return nil, fmt.Errorf("%s is required for a ResourceAware Pool", fastletsettings.ResourceAdmissionKey)
+			return fastletsettings.ResourceAdmissionSettings{}, false, fmt.Errorf("%s is required for a ResourceAware Pool", fastletsettings.ResourceAdmissionKey)
 		}
-		return nil, nil
+		return fastletsettings.ResourceAdmissionSettings{}, false, nil
 	}
 	var settings fastletsettings.ResourceAdmissionSettings
 	if err := json.Unmarshal(data, &settings); err != nil {
-		return nil, err
+		return fastletsettings.ResourceAdmissionSettings{}, false, err
 	}
 	if err := settings.Validate(profile); err != nil {
-		return nil, err
+		return fastletsettings.ResourceAdmissionSettings{}, false, err
 	}
-	return &settings, nil
+	return settings, true, nil
 }
 
 func warmImagesFromEnvironment() ([]string, error) {

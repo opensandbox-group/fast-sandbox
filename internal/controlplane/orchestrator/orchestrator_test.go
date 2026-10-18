@@ -135,6 +135,25 @@ func TestCandidatesPassesImmutablePoolResourceDemandToPlacement(t *testing.T) {
 	require.Equal(t, expectedMemory.Value(), registry.lastRequest.Demand.Memory.Value())
 }
 
+func TestResourceAwarePlacementCanBeDisabledWithoutChangingPoolProfile(t *testing.T) {
+	orchestrator, registry, _, sandbox := newHarness(t)
+	var pool apiv1alpha2.SandboxPool
+	require.NoError(t, orchestrator.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
+	pool.Spec.SandboxResources = apiv1alpha2.SandboxResourceProfile{
+		Requests: &apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("250m"), Memory: resource.MustParse("384Mi")},
+		Limits:   &apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("1"), Memory: resource.MustParse("1Gi")},
+		PIDs:     256,
+	}
+	require.NoError(t, orchestrator.Client.Update(context.Background(), &pool))
+	registry.candidates = []placement.FastletInfo{{ID: "fastlet-a"}}
+	orchestrator.DisableResourceAwarePlacement = true
+
+	_, parameters, err := orchestrator.Candidates(context.Background(), sandbox, "request-a")
+	require.NoError(t, err)
+	require.Equal(t, apiv1alpha2.SandboxResourceModeResourceAware, parameters.ResourceMode)
+	require.Equal(t, apiv1alpha2.SandboxResourceModeLegacySlot, registry.lastRequest.ResourceMode)
+}
+
 func TestReconcileBindingsPreservesOpaqueInputAndReturnsObservation(t *testing.T) {
 	orchestrator, registry, fastletClient, sandbox := newHarness(t)
 	var pool apiv1alpha2.SandboxPool
@@ -254,7 +273,7 @@ func TestAssignDeclarativeProjectsAnnotationAndEnsureReturnsObservation(t *testi
 		require.Equal(t, candidate.PodIP, ip)
 		require.Equal(t, "sandbox-uid-a", request.Identity.SandboxUID)
 		require.Equal(t, envelope.RuntimeInstanceID, request.Identity.RuntimeInstanceID)
-		require.Empty(t, request.Sandbox.CPU, "Fastlet injects its fixed resource profile")
+		require.Equal(t, parameters.ResourceProfileHash, request.Sandbox.ResourceProfileHash)
 		return &fastletapi.CreateSandboxResponse{Disposition: fastletapi.CreateDispositionCreated, Sandbox: readyFastletObservation("sandbox-uid-a", assigned.Generation)}, nil
 	}
 	observed, err := orchestrator.EnsureRuntime(context.Background(), assigned)
@@ -530,7 +549,7 @@ func newHarness(t *testing.T) (*Orchestrator, *fakeRegistry, *fakeFastletClient,
 			SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
 				resource.MustParse("1"), resource.MustParse("512Mi"), 256,
 			),
-			FastletTemplate: corev1.PodTemplateSpec{},
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "fastlet"}}}},
 		},
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&apiv1alpha2.Sandbox{}).WithObjects(pool).Build()

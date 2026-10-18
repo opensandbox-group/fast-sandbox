@@ -45,7 +45,7 @@ func (m *SandboxManager) deliveryForCreate(input *fastletapi.EnsureSandboxInput)
 	if input == nil {
 		return nil, false
 	}
-	if restore := input.Sandbox.Spec.Restore; restore != nil {
+	if restore := input.Sandbox.Desired.Restore; restore != nil {
 		delivery, ok := m.runtime.(CheckpointDelivery)
 		if !ok {
 			return nil, false
@@ -59,7 +59,7 @@ func (m *SandboxManager) deliveryForCreate(input *fastletapi.EnsureSandboxInput)
 		return nil, false
 	}
 	return func(ctx context.Context) (ImageDeliveryStatus, error) {
-		return delivery.DeliverImage(ctx, input.Sandbox.Spec.Image)
+		return delivery.DeliverImage(ctx, input.Sandbox.Desired.Image)
 	}, true
 }
 
@@ -70,8 +70,8 @@ func (m *SandboxManager) deliveryForCreate(input *fastletapi.EnsureSandboxInput)
 // holding the RPC open for the artifact transfer.
 func (m *SandboxManager) parkForImageDelivery(req *fastletapi.CreateSandboxRequest, input *fastletapi.EnsureSandboxInput, placeholder *SandboxMetadata, started time.Time) (*fastletapi.CreateSandboxResponse, error) {
 	sandboxUID := input.Sandbox.Identity.SandboxUID
-	message := fmt.Sprintf("sandbox image %q is being delivered to the node", input.Sandbox.Spec.Image)
-	if restore := input.Sandbox.Spec.Restore; restore != nil {
+	message := fmt.Sprintf("sandbox image %q is being delivered to the node", input.Sandbox.Desired.Image)
+	if restore := input.Sandbox.Desired.Restore; restore != nil {
 		message = fmt.Sprintf("sandbox checkpoint %s is being pulled from the artifact store", restore.ArtifactDigest)
 	}
 	m.mu.Lock()
@@ -94,7 +94,7 @@ func (m *SandboxManager) parkForImageDelivery(req *fastletapi.CreateSandboxReque
 
 	m.startImageBootWorker(placeholder, req, input, started)
 	m.recordDiagnostic(sandboxUID, "info", "runtime", sandboxStateImagePending, message)
-	klog.InfoS("sandbox parked for async image delivery", "sandboxID", sandboxUID, "image", input.Sandbox.Spec.Image)
+	klog.InfoS("sandbox parked for async image delivery", "sandboxID", sandboxUID, "image", input.Sandbox.Desired.Image)
 	return &fastletapi.CreateSandboxResponse{
 		Disposition: fastletapi.CreateDispositionCreated,
 		Sandbox:     &status,
@@ -188,7 +188,7 @@ func (m *SandboxManager) runImageBootWorker(ctx context.Context, metadata *Sandb
 		// below is identical to the synchronous create tail, so lifecycle
 		// hooks, data-plane reconciliation, and readiness observations stay
 		// the same regardless of the delivery path.
-		klog.InfoS("sandbox artifacts delivered; booting runtime", "sandboxID", uid, "image", input.Sandbox.Spec.Image)
+		klog.InfoS("sandbox artifacts delivered; booting runtime", "sandboxID", uid, "image", input.Sandbox.Desired.Image)
 		bootCtx, cancel := context.WithTimeout(ctx, imageBootTimeout)
 		result, ensureErr := m.runtime.EnsureSandbox(bootCtx, input)
 		cancel()
@@ -237,9 +237,9 @@ func (m *SandboxManager) markCreateFailed(metadata *SandboxMetadata, cause error
 	}
 	metadata.Phase = sandboxStateCreateFailed
 	m.runtimeMessages[uid] = cause.Error()
-	m.cacheProtection.ProtectHotUntil(metadata.Config.Spec.Image, m.clock.Now().Add(time.Hour))
+	m.cacheProtection.ProtectHotUntil(metadata.Config.Desired.Image, m.clock.Now().Add(time.Hour))
 	m.recordDiagnosticLocked(uid, "error", "runtime", sandboxStateCreateFailed, cause.Error())
-	klog.ErrorS(cause, "cold Sandbox create failed", "sandboxID", uid, "image", metadata.Config.Spec.Image)
+	klog.ErrorS(cause, "cold Sandbox create failed", "sandboxID", uid, "image", metadata.Config.Desired.Image)
 }
 
 func sleepImageBootPoll(ctx context.Context, delay time.Duration) bool {

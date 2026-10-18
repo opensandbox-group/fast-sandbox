@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 )
@@ -26,7 +27,41 @@ var (
 	ErrActionHandlersInvalid  = errors.New("spec.actionHandlers is invalid")
 	ErrActionHandlersRemoved  = errors.New("existing spec.actionHandlers names cannot be removed or renamed")
 	ErrActionBindingsInvalid  = errors.New("spec.actionBindings is invalid")
+	ErrRuntimeOwnerResources  = errors.New("ResourceAware runtime owner resources are derived")
 )
+
+// ValidateResourceContract enforces the mode-specific source of truth. Legacy
+// Pools retain explicit aggregate Fastlet resources; ResourceAware Pools must
+// derive the runtime-owner CPU and memory envelope from Sandbox resources.
+func (s *SandboxPoolSpec) ValidateResourceContract() error {
+	if s == nil {
+		return fmt.Errorf("%w: pool spec is required", ErrRuntimeOwnerResources)
+	}
+	if err := ValidateSandboxResourceProfile(s.SandboxResources); err != nil {
+		return err
+	}
+	if s.SandboxResources.ResourceMode() != SandboxResourceModeResourceAware {
+		return nil
+	}
+	if len(s.FastletTemplate.Spec.Containers) == 0 {
+		return fmt.Errorf("%w: fastletTemplate.spec.containers must contain the fastlet container", ErrRuntimeOwnerResources)
+	}
+	owner := s.FastletTemplate.Spec.Containers[0]
+	for _, resources := range []struct {
+		name   string
+		values corev1.ResourceList
+	}{
+		{name: "requests", values: owner.Resources.Requests},
+		{name: "limits", values: owner.Resources.Limits},
+	} {
+		for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			if _, configured := resources.values[name]; configured {
+				return fmt.Errorf("%w: container %q must not set resources.%s.%s", ErrRuntimeOwnerResources, owner.Name, resources.name, name)
+			}
+		}
+	}
+	return nil
+}
 
 var reservedActionHandlerPorts = map[int32]string{
 	5758: "Fastlet control",
@@ -264,6 +299,12 @@ func pathsOverlap(left, right string) bool {
 // ValidateSandboxPoolUpdate enforces the immutable scheduling and resource
 // boundary shared by admission and reconciliation.
 func ValidateSandboxPoolUpdate(oldSpec, newSpec *SandboxPoolSpec) error {
+	if err := oldSpec.ValidateResourceContract(); err != nil {
+		return fmt.Errorf("old pool resources: %w", err)
+	}
+	if err := newSpec.ValidateResourceContract(); err != nil {
+		return fmt.Errorf("new pool resources: %w", err)
+	}
 	if err := oldSpec.ValidateRuntime(); err != nil {
 		return fmt.Errorf("old pool runtime: %w", err)
 	}

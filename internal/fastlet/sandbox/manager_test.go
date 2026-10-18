@@ -139,7 +139,7 @@ func (m *MockRuntime) Close() error {
 }
 
 type sandboxCreateFixture struct {
-	fastletapi.SandboxSpec
+	fastletapi.SandboxDesiredSpec
 	SandboxID          string
 	ClaimNamespace     string
 	ClaimName          string
@@ -167,15 +167,15 @@ func ensureSandboxForTest(ctx context.Context, manager *SandboxManager, spec *sa
 			InstanceGeneration: 1, RuntimeInstanceID: "runtime-" + spec.SandboxID,
 			AssignmentAttempt: 1, FastletPodUID: manager.fastletPodUID,
 		},
-		Sandbox: spec.SandboxSpec,
+		Sandbox: spec.SandboxDesiredSpec,
 	})
 }
 
 func runtimeSpecForTest(sandboxID, claimName, image string) *sandboxCreateFixture {
 	return &sandboxCreateFixture{
-		SandboxSpec: fastletapi.SandboxSpec{Image: image},
-		SandboxID:   sandboxID,
-		ClaimName:   claimName,
+		SandboxDesiredSpec: fastletapi.SandboxDesiredSpec{Image: image},
+		SandboxID:          sandboxID,
+		ClaimName:          claimName,
 	}
 }
 
@@ -354,7 +354,7 @@ func TestNewSandboxManager_InvalidCapacity(t *testing.T) {
 	}
 }
 
-func TestSandboxManagerRejectsProfileOverrides(t *testing.T) {
+func TestSandboxManagerResolvesRuntimeLimitsWithoutMutatingDesiredRequest(t *testing.T) {
 	profile := apiv1alpha2.NewLegacySandboxResourceProfile(
 		resource.MustParse("500m"), resource.MustParse("256Mi"), 128,
 	)
@@ -363,28 +363,55 @@ func TestSandboxManagerRejectsProfileOverrides(t *testing.T) {
 	})
 	require.NoError(t, err)
 	valid := &sandboxCreateFixture{
-		SandboxSpec: fastletapi.SandboxSpec{
-			CPU: "500m", Memory: "256Mi", PIDs: 128,
+		SandboxDesiredSpec: fastletapi.SandboxDesiredSpec{
 			RuntimeProfileHash: "runtime-hash", ResourceProfileHash: profile.Hash(),
 		},
 		SandboxID: "sandbox-a",
 	}
-	require.NoError(t, manager.validateProfiles(&valid.SandboxSpec))
+	require.NoError(t, manager.validateProfiles(&valid.SandboxDesiredSpec))
+	limits, err := manager.resolvedRuntimeLimits()
+	require.NoError(t, err)
+	require.Equal(t, fastletapi.SandboxRuntimeLimits{CPU: "500m", Memory: "256Mi", PIDs: 128}, limits)
 
 	tests := map[string]func(*sandboxCreateFixture){
-		"runtime hash":    func(spec *sandboxCreateFixture) { spec.RuntimeProfileHash = "other" },
-		"resource hash":   func(spec *sandboxCreateFixture) { spec.ResourceProfileHash = "other" },
-		"cpu override":    func(spec *sandboxCreateFixture) { spec.CPU = "1" },
-		"memory override": func(spec *sandboxCreateFixture) { spec.Memory = "1Gi" },
-		"pids override":   func(spec *sandboxCreateFixture) { spec.PIDs = 256 },
+		"runtime hash":  func(spec *sandboxCreateFixture) { spec.RuntimeProfileHash = "other" },
+		"resource hash": func(spec *sandboxCreateFixture) { spec.ResourceProfileHash = "other" },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
 			candidate := *valid
 			mutate(&candidate)
-			require.ErrorIs(t, manager.validateProfiles(&candidate.SandboxSpec), ErrSandboxProfileMismatch)
+			require.ErrorIs(t, manager.validateProfiles(&candidate.SandboxDesiredSpec), ErrSandboxProfileMismatch)
 		})
 	}
+}
+
+func TestPrepareCreateInputSeparatesDesiredStateFromResolvedLimits(t *testing.T) {
+	profile := apiv1alpha2.NewLegacySandboxResourceProfile(
+		resource.MustParse("500m"), resource.MustParse("256Mi"), 128,
+	)
+	manager, err := NewSandboxManagerWithConfig(NewMockRuntime(), SandboxManagerConfig{
+		Capacity: 5, RuntimeProfileHash: "runtime-hash", ResourceProfile: &profile,
+	})
+	require.NoError(t, err)
+	request := &fastletapi.CreateSandboxRequest{
+		SpecGeneration: 1,
+		Identity: fastletapi.SandboxIdentity{
+			SandboxUID: "sandbox-a", Namespace: "default", Name: "sandbox-a", InstanceGeneration: 1,
+			RuntimeInstanceID: "runtime-a", AssignmentAttempt: 1,
+		},
+		Sandbox: fastletapi.SandboxDesiredSpec{
+			Image: "alpine:latest", RuntimeProfileHash: "runtime-hash", ResourceProfileHash: profile.Hash(),
+			Env: map[string]string{"OWNER": "caller"},
+		},
+	}
+
+	input, failure := manager.prepareCreateInput(request)
+	require.Nil(t, failure)
+	require.Equal(t, fastletapi.SandboxRuntimeLimits{CPU: "500m", Memory: "256Mi", PIDs: 128}, input.Sandbox.Limits)
+	require.Equal(t, "caller", request.Sandbox.Env["OWNER"])
+	input.Sandbox.Desired.Env["OWNER"] = "runtime"
+	require.Equal(t, "caller", request.Sandbox.Env["OWNER"], "runtime configuration must not alias the HTTP request")
 }
 
 func TestSandboxManager_CreateSandbox_Success(t *testing.T) {

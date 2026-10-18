@@ -63,9 +63,9 @@ type FastletInfo struct {
 	Draining            bool
 
 	Admission fastletapi.AdmissionStatus
-	// ResourceCapacity is the runtime-owner Pod request observed from the
-	// Kubernetes watch. ResourceReceivedAt is local receive time for the
-	// versioned Fastlet resource-admission snapshot.
+	// ResourceCapacity is the Controller-resolved Sandbox commitment capacity
+	// projected on the watched Pod. ResourceReceivedAt is local receive time
+	// for the versioned Fastlet resource-admission snapshot.
 	ResourceCapacity   ResourceDemand
 	ResourceReceivedAt time.Time
 	resourceFence      resourceRevision

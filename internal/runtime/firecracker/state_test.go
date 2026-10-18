@@ -25,7 +25,7 @@ func TestStateRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 
 	state := &SandboxState{
-		Config:     fastletapi.RuntimeSandboxConfig{Spec: fastletapi.SandboxSpec{Image: "example.com/app:v1"}, Identity: fastletapi.SandboxIdentity{SandboxUID: "sandbox-1"}},
+		Config:     fastletapi.RuntimeSandboxConfig{Desired: fastletapi.SandboxDesiredSpec{Image: "example.com/app:v1"}, Identity: fastletapi.SandboxIdentity{SandboxUID: "sandbox-1"}},
 		Phase:      PhaseRunning,
 		PID:        4242,
 		APIAddress: filepath.Join(directory, "api.sock"),
@@ -36,7 +36,7 @@ func TestStateRoundTrip(t *testing.T) {
 	loaded, err := loadState(directory)
 	require.NoError(t, err)
 	require.Equal(t, state.Config.Identity.SandboxUID, loaded.Config.Identity.SandboxUID)
-	require.Equal(t, state.Config.Spec.Image, loaded.Config.Spec.Image)
+	require.Equal(t, state.Config.Desired.Image, loaded.Config.Desired.Image)
 	require.Equal(t, PhaseRunning, loaded.Phase)
 	require.Equal(t, 4242, loaded.PID)
 	require.Equal(t, state.APIAddress, loaded.APIAddress)

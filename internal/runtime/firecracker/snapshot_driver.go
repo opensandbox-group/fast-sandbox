@@ -381,10 +381,10 @@ func (d *Driver) dumpFootprintBytes(plan dumpPlan) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if state.Config.Spec.Memory == "" {
+	if state.Config.Limits.Memory == "" {
 		return 0, fmt.Errorf("sandbox spec carries no memory size")
 	}
-	mib, err := parseMemMiB(state.Config.Spec.Memory)
+	mib, err := parseMemMiB(state.Config.Limits.Memory)
 	if err != nil {
 		return 0, err
 	}
@@ -538,7 +538,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 
 	// Resolve the spill area BEFORE pausing: an unspillable dump falls back
 	// up front, never mid-window.
-	spillDir := d.spillDirFor(plan.snapshotID, state.Config.Spec.Memory)
+	spillDir := d.spillDirFor(plan.snapshotID, state.Config.Limits.Memory)
 	plan.spilled = spillDir != ""
 	klog.InfoS("firecracker sandbox dump starting",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID,
@@ -881,7 +881,7 @@ const maxPolicyBundleBytes = 1 << 20
 // fail-closed and observably — mirroring the corrupt vault file posture at
 // registration. The Handler reads the bundle file itself; the driver only
 // verifies it and hands over the path.
-func (d *Driver) importRestoreVault(ctx context.Context, spec fastletapi.SandboxSpec, restoreRef, vmstatePath, sandboxUID string) {
+func (d *Driver) importRestoreVault(ctx context.Context, spec fastletapi.SandboxDesiredSpec, restoreRef, vmstatePath, sandboxUID string) {
 	if spec.Restore == nil {
 		return
 	}
@@ -1196,6 +1196,10 @@ func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, ki
 	if err != nil {
 		return 0, err
 	}
+	// The lineage manifest of the dump: the golden image manifest of a fresh
+	// boot, or the cached checkpoint manifest when the Sandbox was itself
+	// resumed from a checkpoint (the checkpoint carries every lineage field
+	// forward, and the original image may not exist on this node at all).
 	sourceRef, err := restoreReference(state.Config.Spec)
 	if err != nil {
 		return 0, err

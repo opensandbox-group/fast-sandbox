@@ -122,17 +122,23 @@ profile. Legacy Pools declare only limits. Resource-aware Pools declare both
 requests and limits: Fastlet charges requests to its local commitment ledger,
 and passes limits to the selected RuntimeDriver for enforcement.
 
-By default, the Pool Controller sizes the request and limit of the
-resource-owning Fastlet from the Sandbox request and keeps them equal:
+For a ResourceAware Pool, the Controller derives one pure Sandbox commitment
+capacity and one runtime-owner envelope:
 
 ```text
-per-Sandbox request * maxSandboxesPerPod + runtime overhead
+commitmentCapacity = per-Sandbox request * maxSandboxesPerPod
+
+runtimeEnvelope = fixed runtime overhead
+                + max(commitmentCapacity, one per-Sandbox limit)
+
+runtimeOwner.requests = runtimeOwner.limits = runtimeEnvelope
 ```
 
-This default does not overcommit the Fastlet itself. An operator enables a
-specific density by setting explicit resource-owner requests and limits in
-`fastletTemplate`, while keeping `maxSandboxesPerPod` as an independent actor
-bound. CPU and memory commitments are checked separately before every Create.
+The first Fastlet container cannot override CPU or memory in ResourceAware
+mode. Operators select density through the independent per-Sandbox CPU and
+memory request-to-limit gaps, while `maxSandboxesPerPod` remains an actor
+bound. LegacySlot Pools retain explicit aggregate first-container resources.
+CPU and memory commitments are checked separately before every Create.
 Per-Sandbox limits isolate noisy neighbors, and the Kubernetes Pod cgroup caps
 their combined execution.
 
@@ -155,9 +161,9 @@ the deterministic Sandbox cgroup can be removed.
 All long-running containers in the Fastlet Pod must have CPU and memory
 limits, otherwise Kubernetes cannot guarantee a bounded Pod parent cgroup.
 Fast Sandbox supplies bounded defaults for platform-owned control/proxy
-containers and rejects an unbounded user-provided sidecar. A configured
-aggregate limit may be lower than the sum of Sandbox limits, but not lower
-than the runtime's fixed overhead.
+containers and rejects an unbounded user-provided sidecar. The derived
+aggregate envelope may be lower than the sum of Sandbox limits, but it always
+covers fixed overhead and at least one Sandbox limit.
 
 A runtime that cannot enforce the requested profile must reject the Pool capability instead of silently weakening isolation.
 

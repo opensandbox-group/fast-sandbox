@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/api/resource"
+
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 )
 
@@ -29,17 +31,56 @@ const (
 	ResourceProfileKey = "resource-profile.json"
 	// ResourceAdmissionKey is the optional ResourceAware commitment-capacity contract.
 	ResourceAdmissionKey = "resource-admission.json"
+	// CommitmentCapacityAnnotation projects the Controller-resolved Sandbox
+	// commitment capacity onto a Fastlet Pod for FastPath and Pool scaling.
+	CommitmentCapacityAnnotation = "fast-sandbox.io/commitment-capacity"
 )
 
-// ResourceAdmissionSettings delivers the final runtime-owner Pod request and
-// limit to Fastlet. Kubernetes requests cannot be discovered reliably from the
-// cgroup hierarchy, so the controller projects the post-defaulting values.
+// ResourceAdmissionSettings delivers the pure Sandbox commitment capacity and
+// the derived runtime-owner envelope to Fastlet. The Controller projects both
+// values so every consumer uses the same resolved resource contract.
 type ResourceAdmissionSettings struct {
 	Version             string                              `json:"version"`
 	Mode                apiv1alpha2.SandboxResourceMode     `json:"mode"`
+	StaticAdmission     bool                                `json:"staticAdmission"`
+	MemoryAdmission     bool                                `json:"memoryAdmission"`
 	Capacity            apiv1alpha2.SandboxComputeResources `json:"capacity"`
 	RuntimeLimit        apiv1alpha2.SandboxComputeResources `json:"runtimeLimit"`
 	ResourceProfileHash string                              `json:"resourceProfileHash"`
+}
+
+type commitmentCapacityAnnotation struct {
+	CPU    string `json:"cpu"`
+	Memory string `json:"memory"`
+}
+
+func EncodeCommitmentCapacity(resources apiv1alpha2.SandboxComputeResources) (string, error) {
+	if resources.CPU.Sign() <= 0 || resources.Memory.Sign() <= 0 {
+		return "", fmt.Errorf("commitment capacity must be greater than zero")
+	}
+	encoded, err := json.Marshal(commitmentCapacityAnnotation{
+		CPU: resources.CPU.String(), Memory: resources.Memory.String(),
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode commitment capacity: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func DecodeCommitmentCapacity(value string) (apiv1alpha2.SandboxComputeResources, error) {
+	var annotation commitmentCapacityAnnotation
+	if err := json.Unmarshal([]byte(value), &annotation); err != nil {
+		return apiv1alpha2.SandboxComputeResources{}, fmt.Errorf("decode commitment capacity: %w", err)
+	}
+	cpu, err := resource.ParseQuantity(annotation.CPU)
+	if err != nil || cpu.Sign() <= 0 {
+		return apiv1alpha2.SandboxComputeResources{}, fmt.Errorf("invalid commitment capacity cpu %q", annotation.CPU)
+	}
+	memory, err := resource.ParseQuantity(annotation.Memory)
+	if err != nil || memory.Sign() <= 0 {
+		return apiv1alpha2.SandboxComputeResources{}, fmt.Errorf("invalid commitment capacity memory %q", annotation.Memory)
+	}
+	return apiv1alpha2.SandboxComputeResources{CPU: cpu, Memory: memory}, nil
 }
 
 // Validate verifies that projected admission settings match the immutable

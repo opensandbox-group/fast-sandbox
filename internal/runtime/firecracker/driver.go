@@ -423,7 +423,8 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	}
 	config := &input.Sandbox
 	identity := config.Identity
-	spec := config.Spec
+	spec := config.Desired
+	limits := config.Limits
 	if identity.SandboxUID == "" || identity.FastletPodUID == "" ||
 		identity.InstanceGeneration <= 0 || identity.RuntimeInstanceID == "" || identity.AssignmentAttempt <= 0 {
 		return nil, fmt.Errorf("%w: complete Firecracker Sandbox identity is required", ErrInvalidConfig)
@@ -589,7 +590,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// validated here, not applied via the API (any machine-config call
 	// before snapshot/load is rejected).
 	if err == nil && !isOCI {
-		err = validateRestoreMachineConfig(spec, d.config, stateRoot, restoreRef)
+		err = validateRestoreMachineConfig(limits, d.config, stateRoot, restoreRef)
 	}
 	// Compatibility admission before any staging: a snapshot whose CPU
 	// provenance or Firecracker version mismatches this node must fail with
@@ -1291,7 +1292,7 @@ func waitVMRunning(ctx context.Context, client *Client, timeoutSeconds int32) (i
 
 // resolveMachineConfig maps the Sandbox resource profile to Firecracker
 // machine configuration, falling back to runtime defaults.
-func resolveMachineConfig(spec fastletapi.SandboxSpec, config runtimecatalog.FirecrackerConfig) (MachineConfigRequest, error) {
+func resolveMachineConfig(spec fastletapi.SandboxRuntimeLimits, config runtimecatalog.FirecrackerConfig) (MachineConfigRequest, error) {
 	request := MachineConfigRequest{VCPUs: int(config.DefaultVCPUs), MemSizeMiB: defaultMemoryMiB(config.DefaultMemory)}
 	if spec.CPU != "" {
 		quantity, err := resource.ParseQuantity(spec.CPU)

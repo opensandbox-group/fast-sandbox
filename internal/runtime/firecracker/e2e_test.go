@@ -884,16 +884,17 @@ func newE2EEnvironment(t *testing.T, capacity int, infraEnabled bool) *e2eEnviro
 func (env *e2eEnvironment) spec(index int) *fastletapi.RuntimeSandboxConfig {
 	sandboxID := fmt.Sprintf("e2e-sandbox-%d", index)
 	spec := &fastletapi.RuntimeSandboxConfig{
-		Spec: fastletapi.SandboxSpec{
-			Image: env.imageRef, CPU: "1", Memory: "512Mi",
+		Desired: fastletapi.SandboxDesiredSpec{
+			Image:              env.imageRef,
 			RuntimeProfileHash: "e2e-profile", ResourceProfileHash: "e2e-resource",
 		},
+		Limits: fastletapi.SandboxRuntimeLimits{CPU: "1", Memory: "512Mi"},
 		Identity: fastletapi.SandboxIdentity{SandboxUID: sandboxID, Name: sandboxID, Namespace: "e2e",
 			InstanceGeneration: 1, RuntimeInstanceID: fmt.Sprintf("e2e-ri-%d", index), AssignmentAttempt: 1,
 			FastletPodUID: env.podUID},
 	}
 	if env.infraEnabled {
-		spec.Spec.InfraRevision = env.infraMgr.Revision()
+		spec.Desired.InfraRevision = env.infraMgr.Revision()
 	}
 	return spec
 }

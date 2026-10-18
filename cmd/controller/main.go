@@ -64,6 +64,12 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	var sandboxProxyBaseURL string
 	var runtimeEnvironmentNamespace string
 	var runtimeEnvironmentConfigMap string
+	var resourceAwareStaticAdmission bool
+	var resourceAwareMemoryAdmission bool
+	var resourceAwarePlacement bool
+	var resourceAwarePoolScaling bool
+	var resourceAwareStartupGrace time.Duration
+	var resourceAwareScaleDownStabilization time.Duration
 
 	flag.StringVar(&roleValue, "role", "all", "Control-plane role: fastpath, controller, or all.")
 	flag.StringVar(&metricsAddress, "metrics-bind-address", ":9091", "Metrics listen address.")
@@ -83,6 +89,12 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	flag.IntVar(&sandboxReconcileWorkers, "sandbox-reconcile-workers", 4, "Concurrent Sandbox reconcilers (per-key serialization is guaranteed by the workqueue).")
 	flag.StringVar(&runtimeEnvironmentNamespace, "runtime-environment-namespace", envOrDefault("FAST_SANDBOX_RUNTIME_ENVIRONMENT_NAMESPACE", runtimeenv.SystemNamespace), "Namespace containing the platform runtime environment ConfigMap.")
 	flag.StringVar(&runtimeEnvironmentConfigMap, "runtime-environment-configmap", envOrDefault("FAST_SANDBOX_RUNTIME_ENVIRONMENT_CONFIGMAP", runtimeenv.ConfigMapName), "Platform runtime environment ConfigMap name.")
+	flag.BoolVar(&resourceAwareStaticAdmission, "resource-aware-static-admission", true, "Enable Fastlet CPU and memory commitment admission for ResourceAware Pools.")
+	flag.BoolVar(&resourceAwareMemoryAdmission, "resource-aware-memory-admission", true, "Enable Fastlet dynamic memory-pressure admission for ResourceAware Pools.")
+	flag.BoolVar(&resourceAwarePlacement, "resource-aware-placement", true, "Enable FastPath ResourceAware eligibility and ranking.")
+	flag.BoolVar(&resourceAwarePoolScaling, "resource-aware-pool-scaling", true, "Enable ResourceAware effective-capacity Pool scaling.")
+	flag.DurationVar(&resourceAwareStartupGrace, "resource-aware-fastlet-startup-grace", 2*time.Minute, "Maximum time a Fastlet without a heartbeat contributes nominal in-flight capacity.")
+	flag.DurationVar(&resourceAwareScaleDownStabilization, "resource-aware-scale-down-stabilization", time.Minute, "Continuous excess-capacity window required before ResourceAware scale-down.")
 	klog.InitFlags(nil)
 	flag.Parse()
 	defer klog.Flush()
@@ -98,8 +110,16 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 		os.Exit(1)
 	}
 	defer shutdownTracing(traceShutdown)
-	if heartbeatInterval <= 0 || heartbeatTimeout <= 0 || heartbeatConcurrency <= 0 || fastletDrainTimeout <= 0 {
+	if heartbeatInterval <= 0 || heartbeatTimeout <= 0 || heartbeatConcurrency <= 0 || fastletDrainTimeout <= 0 || resourceAwareStartupGrace <= 0 || resourceAwareScaleDownStabilization <= 0 {
 		klog.ErrorS(nil, "Heartbeat and drain timing values must be positive")
+		os.Exit(1)
+	}
+	if resourceAwarePlacement && !resourceAwareStaticAdmission {
+		klog.ErrorS(nil, "resource-aware-placement requires resource-aware-static-admission")
+		os.Exit(1)
+	}
+	if resourceAwarePoolScaling && !resourceAwarePlacement {
+		klog.ErrorS(nil, "resource-aware-pool-scaling requires resource-aware-placement")
 		os.Exit(1)
 	}
 	if role.RunsControllers() && routeVerifyPublicKey == "" {
@@ -150,6 +170,7 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	fastletClient := fastletapi.NewFastletClient(fastletPort)
 	orchestrator := &orchestration.Orchestrator{
 		Client: durableClient, Registry: registry, FastletClient: fastletClient, Catalog: catalog,
+		DisableResourceAwarePlacement: !resourceAwarePlacement,
 	}
 
 	if role.RunsControllers() {
@@ -165,6 +186,11 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 			FastletDrainer: fastletClient, DrainTimeout: fastletDrainTimeout,
 			FastletProxyImage: fastletProxyImage, RouteVerifyPublicKey: routeVerifyPublicKey,
 			RuntimeEnvironmentNamespace: runtimeEnvironmentNamespace, RuntimeEnvironmentConfigMap: runtimeEnvironmentConfigMap,
+			FastletStartupGrace:                 resourceAwareStartupGrace,
+			ResourceScaleDownStabilization:      resourceAwareScaleDownStabilization,
+			DisableResourceAwareStaticAdmission: !resourceAwareStaticAdmission,
+			DisableResourceAwareMemoryAdmission: !resourceAwareMemoryAdmission,
+			DisableResourceAwarePoolScaling:     !resourceAwarePoolScaling,
 		}).SetupWithManager(manager); err != nil {
 			klog.ErrorS(err, "Register SandboxPool controller")
 			os.Exit(1)

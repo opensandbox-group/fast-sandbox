@@ -13,6 +13,7 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/controlplane/placement"
+	"fast-sandbox/internal/fastletsettings"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
 
@@ -168,9 +169,11 @@ func (l *Loop) onPodDelete(object any) {
 
 func fastletInfoFromPod(pod *corev1.Pod) placement.FastletInfo {
 	resourceCapacity := placement.ResourceDemand{}
-	if len(pod.Spec.Containers) > 0 {
-		resourceCapacity.CPU = pod.Spec.Containers[0].Resources.Requests.Cpu().DeepCopy()
-		resourceCapacity.Memory = pod.Spec.Containers[0].Resources.Requests.Memory().DeepCopy()
+	if encoded := pod.Annotations[fastletsettings.CommitmentCapacityAnnotation]; encoded != "" {
+		if decoded, err := fastletsettings.DecodeCommitmentCapacity(encoded); err == nil {
+			resourceCapacity.CPU = decoded.CPU
+			resourceCapacity.Memory = decoded.Memory
+		}
 	}
 	return placement.FastletInfo{
 		ID: placement.FastletID(pod.Name), Namespace: pod.Namespace,

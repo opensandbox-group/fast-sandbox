@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -39,7 +40,10 @@ func TestValidateSandboxPoolUpdate(t *testing.T) {
 
 func TestValidateActionHandlersAndRejectRemoval(t *testing.T) {
 	handler := ActionHandler{Name: "egress", TargetHTTPPort: 18080}
-	base := SandboxPoolSpec{Runtime: RuntimeContainer, ActionHandlers: []ActionHandler{handler}}
+	base := SandboxPoolSpec{
+		Runtime: RuntimeContainer, ActionHandlers: []ActionHandler{handler},
+		SandboxResources: NewLegacySandboxResourceProfile(resource.MustParse("1"), resource.MustParse("1Gi"), 128),
+	}
 	require.NoError(t, base.ValidateActionHandlers())
 
 	duplicate := base
@@ -192,4 +196,25 @@ func TestValidateSandboxResourceProfile(t *testing.T) {
 	requestsExceedLimits := aware
 	requestsExceedLimits.Requests = &SandboxComputeResources{CPU: resource.MustParse("1"), Memory: resource.MustParse("512Mi")}
 	require.ErrorIs(t, ValidateSandboxResourceProfile(requestsExceedLimits), ErrInvalidSandboxResourceProfile)
+}
+
+func TestValidateResourceContractBranchesByMode(t *testing.T) {
+	legacy := SandboxPoolSpec{
+		SandboxResources: NewLegacySandboxResourceProfile(resource.MustParse("1"), resource.MustParse("1Gi"), 128),
+		FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: "fastlet", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}},
+		}}}},
+	}
+	require.NoError(t, legacy.ValidateResourceContract(), "LegacySlot retains explicit aggregate resources")
+
+	resourceAware := legacy
+	resourceAware.SandboxResources = SandboxResourceProfile{
+		Requests: &SandboxComputeResources{CPU: resource.MustParse("250m"), Memory: resource.MustParse("4Gi")},
+		Limits:   &SandboxComputeResources{CPU: resource.MustParse("2"), Memory: resource.MustParse("5Gi")},
+		PIDs:     128,
+	}
+	require.ErrorIs(t, resourceAware.ValidateResourceContract(), ErrRuntimeOwnerResources)
+
+	resourceAware.FastletTemplate.Spec.Containers[0].Resources = corev1.ResourceRequirements{}
+	require.NoError(t, resourceAware.ValidateResourceContract())
 }

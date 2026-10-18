@@ -497,7 +497,7 @@ func TestStaleRegistryHintsCannotExceedFastletCapacity(t *testing.T) {
 		_, err = manager.CreateSandbox(context.Background(), &fastletapi.CreateSandboxRequest{
 			RequestID:      "request-" + sandboxUID,
 			Identity:       fastletapi.SandboxIdentity{SandboxUID: sandboxUID, Namespace: "default", Name: sandboxUID, InstanceGeneration: 1, RuntimeInstanceID: "runtime-" + sandboxUID, AssignmentAttempt: 1, FastletPodUID: "uid-fastlet-a"},
-			Sandbox:        fastletapi.SandboxSpec{Image: "alpine:latest"},
+			Sandbox:        fastletapi.SandboxDesiredSpec{Image: "alpine:latest"},
 			SpecGeneration: 1,
 		})
 		if err == nil {

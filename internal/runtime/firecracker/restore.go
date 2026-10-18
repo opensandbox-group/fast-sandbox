@@ -41,7 +41,7 @@ func cachedManifestPath(stateRoot, image string) string {
 // the image reference of a fresh boot. Both the node cache and the driver
 // restore paths key off this value, so a checkpoint restored on another host
 // reuses the standard image cache layout unchanged.
-func restoreReference(spec fastletapi.SandboxSpec) (string, error) {
+func restoreReference(spec fastletapi.SandboxDesiredSpec) (string, error) {
 	if spec.Restore == nil {
 		return spec.Image, nil
 	}
@@ -122,7 +122,7 @@ func requireStaticGuestNetwork(network *artifacts.VMGuestNetwork) error {
 // the snapshot memory is rejected with an explicit error. When the cached
 // manifest carries no machine tuple (hand-seeded local cache), the request
 // profile is validated as the fallback.
-func validateRestoreMachineConfig(spec fastletapi.SandboxSpec, config runtimecatalog.FirecrackerConfig, stateRoot, image string) error {
+func validateRestoreMachineConfig(spec fastletapi.SandboxRuntimeLimits, config runtimecatalog.FirecrackerConfig, stateRoot, image string) error {
 	machine, ok, err := readCachedManifestMachine(stateRoot, image)
 	if err != nil {
 		return err

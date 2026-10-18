@@ -13,6 +13,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"fast-sandbox/internal/controlplane/placement"
+	"fast-sandbox/internal/fastletsettings"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
 
@@ -59,8 +60,11 @@ func TestFastletInfoFromPodUsesWatchIdentityAndReadiness(t *testing.T) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "fastlet-a", Namespace: "default", UID: types.UID("pod-uid-a"),
-			Labels:      map[string]string{"app": "sandbox-fastlet", "fast-sandbox.io/pool": "pool-a", "fast-sandbox.io/runtime": "container"},
-			Annotations: map[string]string{"fast-sandbox.io/runtime-profile-hash": "runtime-hash", "fast-sandbox.io/resource-profile-hash": "resource-hash"},
+			Labels: map[string]string{"app": "sandbox-fastlet", "fast-sandbox.io/pool": "pool-a", "fast-sandbox.io/runtime": "container"},
+			Annotations: map[string]string{
+				"fast-sandbox.io/runtime-profile-hash": "runtime-hash", "fast-sandbox.io/resource-profile-hash": "resource-hash",
+				fastletsettings.CommitmentCapacityAnnotation: `{"cpu":"750m","memory":"3Gi"}`,
+			},
 		},
 		Spec: corev1.PodSpec{NodeName: "node-a", Containers: []corev1.Container{{
 			Name: "fastlet", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{

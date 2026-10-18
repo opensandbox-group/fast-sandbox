@@ -57,14 +57,15 @@ type Registry interface {
 }
 
 type Orchestrator struct {
-	Client          client.Client
-	Registry        Registry
-	FastletClient   FastletClient
-	Catalog         *runtimecatalog.Catalog
-	TopK            int
-	Now             func() time.Time
-	activeCreatesMu sync.Mutex
-	activeCreates   map[types.NamespacedName]int
+	Client                        client.Client
+	Registry                      Registry
+	FastletClient                 FastletClient
+	Catalog                       *runtimecatalog.Catalog
+	TopK                          int
+	Now                           func() time.Time
+	DisableResourceAwarePlacement bool
+	activeCreatesMu               sync.Mutex
+	activeCreates                 map[types.NamespacedName]int
 }
 
 // RuntimeParameters are used only by the declarative Controller to validate a
@@ -105,7 +106,7 @@ func (o *Orchestrator) ResolveRuntime(ctx context.Context, sandbox *apiv1alpha2.
 	if err != nil {
 		return RuntimeParameters{}, fmt.Errorf("resolve runtime profile: %w", err)
 	}
-	if err := apiv1alpha2.ValidateSandboxResourceProfile(pool.Spec.SandboxResources); err != nil {
+	if err := pool.Spec.ValidateResourceContract(); err != nil {
 		return RuntimeParameters{}, fmt.Errorf("resolve Sandbox resources: %w", err)
 	}
 	infraPlan, err := infracatalog.Compile(pool.Spec.InfraComponents, profile)
@@ -142,7 +143,7 @@ func (o *Orchestrator) Candidates(ctx context.Context, sandbox *apiv1alpha2.Sand
 		RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
 		ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
 		FastletRevision: parameters.FastletRevision,
-		ResourceMode:    parameters.ResourceMode, Demand: parameters.ResourceDemand,
+		ResourceMode:    o.placementResourceMode(parameters.ResourceMode), Demand: parameters.ResourceDemand,
 		Image: sandbox.Spec.Image, StableKey: stableKey,
 	})
 	if len(candidates) == 0 {
@@ -169,12 +170,19 @@ func (o *Orchestrator) FastPathCandidatesMatching(sandbox *apiv1alpha2.Sandbox, 
 		RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
 		ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
 		FastletRevision: parameters.FastletRevision, ExcludedFastlets: excluded,
-		ResourceMode: parameters.ResourceMode, Demand: parameters.ResourceDemand,
+		ResourceMode: o.placementResourceMode(parameters.ResourceMode), Demand: parameters.ResourceDemand,
 	})
 	if len(candidates) == 0 {
 		return nil, ErrNoCandidate
 	}
 	return candidates, nil
+}
+
+func (o *Orchestrator) placementResourceMode(mode apiv1alpha2.SandboxResourceMode) apiv1alpha2.SandboxResourceMode {
+	if o.DisableResourceAwarePlacement && mode == apiv1alpha2.SandboxResourceModeResourceAware {
+		return apiv1alpha2.SandboxResourceModeLegacySlot
+	}
+	return mode
 }
 
 func (o *Orchestrator) topK(request placement.CandidateRequest) []placement.FastletInfo {
@@ -393,7 +401,7 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 	if err != nil {
 		return nil, err
 	}
-	spec := fastletapi.SandboxSpec{
+	spec := fastletapi.SandboxDesiredSpec{
 		Image:              sandbox.Spec.Image,
 		RuntimeProfileHash: envelope.RuntimeProfileHash, ResourceProfileHash: envelope.ResourceProfileHash,
 		InfraRevision: envelope.InfraRevision,

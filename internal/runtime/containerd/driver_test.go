@@ -222,7 +222,7 @@ func TestUserProcessStartAfterTaskStartDoesNotTreatSupervisorAsUserProcess(t *te
 }
 
 func TestSandboxResourceSpecOptsEnforceCPUAndMemory(t *testing.T) {
-	opts, err := sandboxResourceSpecOpts(&fastletapi.SandboxSpec{CPU: "500m", Memory: "256Mi", PIDs: 128})
+	opts, err := sandboxResourceSpecOpts(&fastletapi.SandboxRuntimeLimits{CPU: "500m", Memory: "256Mi", PIDs: 128})
 	require.NoError(t, err)
 	spec := &specs.Spec{Linux: &specs.Linux{}}
 	for _, opt := range opts {
@@ -236,21 +236,21 @@ func TestSandboxResourceSpecOptsEnforceCPUAndMemory(t *testing.T) {
 }
 
 func TestSandboxResourceSpecOptsRejectInvalidValues(t *testing.T) {
-	_, err := sandboxResourceSpecOpts(&fastletapi.SandboxSpec{CPU: "not-cpu"})
+	_, err := sandboxResourceSpecOpts(&fastletapi.SandboxRuntimeLimits{CPU: "not-cpu"})
 	require.Error(t, err)
-	_, err = sandboxResourceSpecOpts(&fastletapi.SandboxSpec{Memory: "0"})
+	_, err = sandboxResourceSpecOpts(&fastletapi.SandboxRuntimeLimits{Memory: "0"})
 	require.Error(t, err)
 }
 
 func TestValidateExistingRuntimeProfile(t *testing.T) {
 	existing := &SandboxMetadata{Config: fastletapi.RuntimeSandboxConfig{
-		Spec: fastletapi.SandboxSpec{CPU: "500m", Memory: "256Mi", PIDs: 128,
-			RuntimeProfileHash: "runtime-hash", ResourceProfileHash: "resource-hash"},
+		Desired:  fastletapi.SandboxDesiredSpec{RuntimeProfileHash: "runtime-hash", ResourceProfileHash: "resource-hash"},
+		Limits:   fastletapi.SandboxRuntimeLimits{CPU: "500m", Memory: "256Mi", PIDs: 128},
 		Identity: fastletapi.SandboxIdentity{SandboxUID: "sandbox-a"},
 	}}
 	requested := existing.Config
 	require.NoError(t, validateExistingRuntimeProfile(existing, &requested))
-	requested.Spec.CPU = "1"
+	requested.Limits.CPU = "1"
 	require.ErrorIs(t, validateExistingRuntimeProfile(existing, &requested), ErrSandboxProfileMismatch)
 }
 
@@ -460,7 +460,7 @@ func TestContainerdRuntime_CreateSandbox_Validation(t *testing.T) {
 		{
 			name: "empty sandbox ID",
 			input: &fastletapi.EnsureSandboxInput{Sandbox: fastletapi.RuntimeSandboxConfig{
-				Spec: fastletapi.SandboxSpec{Image: "alpine:latest"}, Identity: fastletapi.SandboxIdentity{Name: "test-claim"},
+				Desired: fastletapi.SandboxDesiredSpec{Image: "alpine:latest"}, Identity: fastletapi.SandboxIdentity{Name: "test-claim"},
 			}},
 		},
 		{
@@ -472,7 +472,7 @@ func TestContainerdRuntime_CreateSandbox_Validation(t *testing.T) {
 		{
 			name: "valid config",
 			input: &fastletapi.EnsureSandboxInput{Sandbox: fastletapi.RuntimeSandboxConfig{
-				Spec: fastletapi.SandboxSpec{Image: "alpine:latest", Command: []string{"/bin/sh"},
+				Desired: fastletapi.SandboxDesiredSpec{Image: "alpine:latest", Command: []string{"/bin/sh"},
 					Args: []string{"-c", "echo hello"}, WorkingDir: "/tmp", Env: map[string]string{"PATH": "/usr/bin", "HOME": "/root"}},
 				Identity: fastletapi.SandboxIdentity{SandboxUID: "sb-123", Name: "test-claim"},
 			}},
@@ -524,10 +524,11 @@ func TestContainerdRuntime_prepareLabels(t *testing.T) {
 	}
 
 	config := &fastletapi.RuntimeSandboxConfig{
-		Spec: fastletapi.SandboxSpec{
-			Image: "alpine:latest", CPU: "500m", Memory: "256Mi", PIDs: 128,
+		Desired: fastletapi.SandboxDesiredSpec{
+			Image:              "alpine:latest",
 			RuntimeProfileHash: "runtime-hash", ResourceProfileHash: "resource-hash", InfraRevision: "infra-hash",
 		},
+		Limits: fastletapi.SandboxRuntimeLimits{CPU: "500m", Memory: "256Mi", PIDs: 128},
 		Identity: fastletapi.SandboxIdentity{SandboxUID: "sb-123", Namespace: "tenant-a", Name: "test-claim",
 			InstanceGeneration: 2, RuntimeInstanceID: "runtime-1", AssignmentAttempt: 3},
 	}

@@ -18,55 +18,51 @@ Runtime, resource, and Infra profiles are immutable because changing them would 
 
 ## Logical capacity and physical budget
 
-`maxSandboxesPerPod` is an admission count, while the Fastlet Pod's CPU and
-memory limits are its physical aggregate budget. They intentionally do not
-have to multiply to the same value.
+`maxSandboxesPerPod` is always a hard actor-count boundary. It limits runtime
+state, network namespaces, file descriptors, and control-plane bookkeeping in
+addition to CPU and memory.
 
-The safe default is:
+### LegacySlot
+
+A flat `sandboxResources.cpu` and `.memory` profile keeps the existing slot
+model. The first Fastlet container may declare an explicit aggregate request
+and limit, including a limit lower than the sum of per-Sandbox limits. Existing
+Pool manifests and aggregate overcommit behavior are unchanged.
+
+### ResourceAware
+
+A nested `sandboxResources.requests` and `.limits` profile selects the
+resource-aware model. The first Fastlet container must not declare CPU or
+memory resources, because they would create a second capacity authority. The
+Controller derives:
 
 ```text
-Fastlet runtime-owner request and limit
-  = runtime overhead + maxSandboxesPerPod * per-Sandbox resources
+commitmentCapacity = sandbox request * maxSandboxesPerPod
+
+runtimeEnvelope = fixed runtime overhead
+                + max(commitmentCapacity, one Sandbox limit)
+
+runtimeOwner.requests = runtimeOwner.limits = runtimeEnvelope
 ```
 
-An operator enables overcommit explicitly by setting a lower runtime-owner
-limit in `fastletTemplate`. If no request is supplied, the Controller uses the
-lower explicit limit as the request. If a request is supplied, it must not
-exceed the limit. The limit must still cover the runtime overhead.
+Commitment capacity excludes fixed overhead and is shared unchanged by Fastlet
+admission, FastPath placement, and Pool scaling. The runtime envelope reserves
+the fixed overhead once and ensures the parent cgroup can honor at least one
+Sandbox's legal limit. Sidecar resources remain independent.
 
-Each Sandbox keeps its own CPU, memory, and PID limits. For containerd-backed
-runtimes, its OCI cgroup is created below the Kubernetes-owned Fastlet Pod
-cgroup. The bounded Pod parent therefore limits the sum of runc processes,
-gVisor sandboxes, or Kata VMMs even when their individual limits add up to
-more than the Pod budget.
+Each RuntimeDriver receives only Fastlet-resolved Sandbox limits. Requests are
+ledger values; they are not currently translated to CPU weight, `memory.low`,
+or another per-Sandbox QoS setting.
 
-Example:
+CPU and memory are asymmetric. CPU contention normally produces throttling and
+latency, so live CPU use does not hard-block admission in the initial release.
+Memory pressure may cause reclaim, long stalls, or OOM termination, so memory
+also has a dynamic admission gate based on watermarks, PSI, OOM events, node
+pressure, and telemetry freshness. That gate only blocks new creates; it does
+not reclaim, pause, migrate, or evict existing Sandboxes.
 
-```yaml
-spec:
-  maxSandboxesPerPod: 10
-  sandboxResources:
-    cpu: "1"
-    memory: 1Gi
-    pids: 256
-  fastletTemplate:
-    spec:
-      containers:
-        - name: fastlet
-          image: fast-sandbox/fastlet:dev
-          resources:
-            requests:
-              cpu: "5"
-              memory: 5Gi
-            limits:
-              cpu: "5"
-              memory: 5Gi
-```
-
-This Pool admits ten Sandboxes, each with a one-CPU/1 GiB ceiling, while their
-aggregate runtime budget is five CPUs/5 GiB plus the bounded platform proxy
-budget. Admission still fails at ten instances; CPU contention and memory OOM
-behavior are enforced by the cgroup hierarchy rather than by the Registry.
+See [Resource-aware overcommit tuning](../guides/resource-aware-overcommit-tuning.md)
+for a complete sizing example and operational guidance.
 
 ## Registry inputs
 

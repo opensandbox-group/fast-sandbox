@@ -110,7 +110,7 @@ func TestV2AdmissionProtocolAndHeartbeat(t *testing.T) {
 		RequestID:      "request-a",
 		Identity:       identity,
 		SpecGeneration: 1,
-		Sandbox:        fastletapi.SandboxSpec{Image: "alpine:latest"},
+		Sandbox:        fastletapi.SandboxDesiredSpec{Image: "alpine:latest"},
 	}, &created)
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.Equal(t, fastletapi.CreateDispositionCreated, created.Disposition)
@@ -136,7 +136,7 @@ func TestV2AdmissionProtocolAndHeartbeat(t *testing.T) {
 	recorder = postJSON(t, handler, "/api/v2/fastlet/create", fastletapi.CreateSandboxRequest{
 		RequestID:      "request-b",
 		Identity:       fastletapi.SandboxIdentity{SandboxUID: "sandbox-b", Namespace: "default", Name: "sandbox-b", InstanceGeneration: 1, RuntimeInstanceID: "runtime-b", AssignmentAttempt: 1, FastletPodUID: "pod-uid-a"},
-		Sandbox:        fastletapi.SandboxSpec{Image: "alpine:latest"},
+		Sandbox:        fastletapi.SandboxDesiredSpec{Image: "alpine:latest"},
 		SpecGeneration: 1,
 	}, &rejected)
 	require.Equal(t, http.StatusTooManyRequests, recorder.Code)
@@ -175,7 +175,7 @@ func TestSetDrainingRejectsNewCreates(t *testing.T) {
 	recorder = postJSON(t, handler, "/api/v2/fastlet/create", fastletapi.CreateSandboxRequest{
 		RequestID:      "request-a",
 		Identity:       fastletapi.SandboxIdentity{SandboxUID: "sandbox-a", Namespace: "default", Name: "sandbox-a", InstanceGeneration: 1, RuntimeInstanceID: "runtime-a", AssignmentAttempt: 1, FastletPodUID: "pod-uid-a"},
-		Sandbox:        fastletapi.SandboxSpec{Image: "alpine:latest"},
+		Sandbox:        fastletapi.SandboxDesiredSpec{Image: "alpine:latest"},
 		SpecGeneration: 1,
 	}, &rejected)
 	require.Equal(t, http.StatusConflict, recorder.Code)
@@ -215,7 +215,7 @@ func TestInvokeHandlerRouteDispatchesToFallback(t *testing.T) {
 	var created fastletapi.CreateSandboxResponse
 	recorder := postJSON(t, handler, "/api/v2/fastlet/create", fastletapi.CreateSandboxRequest{
 		RequestID: "request-a", Identity: identity, SpecGeneration: 1,
-		Sandbox: fastletapi.SandboxSpec{Image: "alpine:latest"},
+		Sandbox: fastletapi.SandboxDesiredSpec{Image: "alpine:latest"},
 	}, &created)
 	require.Equal(t, http.StatusOK, recorder.Code)
 
