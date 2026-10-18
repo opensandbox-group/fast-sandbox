@@ -417,14 +417,16 @@ func TestResourceAwareDesiredPodsUsesEffectiveFreeCapacityAndInFlightOnce(t *tes
 	seedControllerRegistry(t, registry, resourceAwareControllerFastlet("fastlet-blocked", "uid-blocked", 1, fastletapi.AdmissionStateBlocked, now))
 	reconciler := &SandboxPoolReconciler{Registry: registry, Now: func() time.Time { return now }}
 
-	require.Equal(t, int32(3), reconciler.planResourceAwareScale(pool, pods, 2, planned).desiredPods,
+	observed := resourceFastletsForPoolChildren(registry, pool, pods)
+	require.Equal(t, int32(3), reconciler.planResourceAwareScale(pool, pods, 2, planned, observed, now).desiredPods,
 		"two pending Sandboxes plus buffer require one replacement Fastlet when a peer is blocked")
 
 	inFlight := fastletPod("fastlet-starting", "uid-starting", "")
 	inFlight.Status.Phase = corev1.PodPending
 	inFlight.CreationTimestamp = metav1.NewTime(now.Add(-time.Minute))
 	pods = append(pods, *inFlight)
-	require.Equal(t, int32(3), reconciler.planResourceAwareScale(pool, pods, 2, planned).desiredPods,
+	observed = resourceFastletsForPoolChildren(registry, pool, pods)
+	require.Equal(t, int32(3), reconciler.planResourceAwareScale(pool, pods, 2, planned, observed, now).desiredPods,
 		"the starting Pod contributes nominal capacity exactly once")
 }
 
@@ -443,7 +445,8 @@ func TestResourceAwareDesiredPodsUsesBufferMaxForEmptyScaleDown(t *testing.T) {
 	seedControllerRegistry(t, registry, resourceAwareControllerFastlet("fastlet-b", "uid-b", 0, fastletapi.AdmissionStateOpen, now))
 	reconciler := &SandboxPoolReconciler{Registry: registry, Now: func() time.Time { return now }}
 
-	require.Equal(t, int32(1), reconciler.planResourceAwareScale(pool, pods, 0, planned).desiredPods)
+	observed := resourceFastletsForPoolChildren(registry, pool, pods)
+	require.Equal(t, int32(1), reconciler.planResourceAwareScale(pool, pods, 0, planned, observed, now).desiredPods)
 }
 
 func TestResourceAwareScalePlanKeepsSelectedFastletIdentity(t *testing.T) {
@@ -461,7 +464,8 @@ func TestResourceAwareScalePlanKeepsSelectedFastletIdentity(t *testing.T) {
 	seedControllerRegistry(t, registry, resourceAwareControllerFastlet("fastlet-blocked", "uid-blocked", 0, fastletapi.AdmissionStateBlocked, now))
 	reconciler := &SandboxPoolReconciler{Registry: registry, Now: func() time.Time { return now }}
 
-	plan := reconciler.planResourceAwareScale(pool, pods, 0, planned)
+	observed := resourceFastletsForPoolChildren(registry, pool, pods)
+	plan := reconciler.planResourceAwareScale(pool, pods, 0, planned, observed, now)
 	require.Equal(t, int32(1), plan.desiredPods)
 	require.Equal(t, []string{"fastlet-blocked/uid-blocked"}, plan.drainCandidates,
 		"the Pod that contributed zero effective capacity must remain the drain target")
@@ -483,7 +487,9 @@ func TestResourceAwareScalePlanPreservesActiveDrainTarget(t *testing.T) {
 	seedControllerRegistry(t, registry, resourceAwareControllerFastlet("fastlet-open", "uid-open", 2, fastletapi.AdmissionStateOpen, now))
 	reconciler := &SandboxPoolReconciler{Registry: registry, Now: func() time.Time { return now }}
 
-	plan := reconciler.planResourceAwareScale(pool, []corev1.Pod{*draining, *open}, 0, planned)
+	pods := []corev1.Pod{*draining, *open}
+	observed := resourceFastletsForPoolChildren(registry, pool, pods)
+	plan := reconciler.planResourceAwareScale(pool, pods, 0, planned, observed, now)
 	require.Equal(t, int32(1), plan.desiredPods)
 	require.Equal(t, int32(1), plan.activeScaleDownDrains)
 
@@ -525,11 +531,13 @@ func TestResourceAwareDesiredPodsExpiresNominalCapacityWithoutHeartbeat(t *testi
 	reconciler := &SandboxPoolReconciler{Now: func() time.Time { return now }, FastletStartupGrace: 2 * time.Minute}
 
 	pod.CreationTimestamp = metav1.NewTime(now.Add(-time.Minute))
-	require.Equal(t, int32(1), reconciler.planResourceAwareScale(pool, []corev1.Pod{*pod}, 2, planned).desiredPods,
+	pods := []corev1.Pod{*pod}
+	require.Equal(t, int32(1), reconciler.planResourceAwareScale(pool, pods, 2, planned, nil, now).desiredPods,
 		"a newly created Pod contributes its nominal capacity once")
 
 	pod.CreationTimestamp = metav1.NewTime(now.Add(-3 * time.Minute))
-	require.Equal(t, int32(2), reconciler.planResourceAwareScale(pool, []corev1.Pod{*pod}, 2, planned).desiredPods,
+	pods[0] = *pod
+	require.Equal(t, int32(2), reconciler.planResourceAwareScale(pool, pods, 2, planned, nil, now).desiredPods,
 		"a Pod without a heartbeat stops hiding replacement demand after startup grace")
 }
 
@@ -567,21 +575,110 @@ func TestSandboxNeedsResourceCapacityKeepsRejectedAssignmentPending(t *testing.T
 			Runtime:   apiv1alpha2.RuntimeStatus{State: apiv1alpha2.RuntimePending},
 		},
 	}
-	require.True(t, sandboxNeedsResourceCapacity(pending),
+	require.True(t, sandboxNeedsResourceCapacity(pending, nil, time.Time{}),
 		"a rejected Sandbox still needs capacity even though its durable assignment is present")
 
 	creating := pending.DeepCopy()
 	creating.Status.Runtime.State = apiv1alpha2.RuntimeCreating
-	require.False(t, sandboxNeedsResourceCapacity(creating),
+	require.False(t, sandboxNeedsResourceCapacity(creating, nil, time.Time{}),
 		"creation already holds a Fastlet commitment reservation")
 
 	ready := pending.DeepCopy()
 	ready.Status.Runtime.State = apiv1alpha2.RuntimeReady
-	require.False(t, sandboxNeedsResourceCapacity(ready))
+	require.False(t, sandboxNeedsResourceCapacity(ready, nil, time.Time{}))
 
 	paused := pending.DeepCopy()
 	paused.Status.Runtime.State = apiv1alpha2.RuntimePaused
-	require.False(t, sandboxNeedsResourceCapacity(paused))
+	require.False(t, sandboxNeedsResourceCapacity(paused, nil, time.Time{}))
+}
+
+func TestSandboxNeedsResourceCapacityUsesExactResumeReservation(t *testing.T) {
+	now := time.Date(2026, 10, 18, 8, 0, 0, 0, time.UTC)
+	resume := &apiv1alpha2.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID("sandbox-a"), Generation: 7},
+		Status: apiv1alpha2.SandboxStatus{
+			Placement: apiv1alpha2.PlacementStatus{FastletName: "fastlet-a", FastletPodUID: types.UID("uid-a"), Attempt: 3},
+			Runtime:   apiv1alpha2.RuntimeStatus{State: apiv1alpha2.RuntimeResuming, Generation: 2},
+		},
+	}
+	fastlet := resourceAwareControllerFastlet("fastlet-a", "uid-a", 1, fastletapi.AdmissionStateOpen, now)
+	fastlet.ResourceReceivedAt = now
+	fastlet.SandboxStatuses = map[string]fastletapi.SandboxStatus{
+		"sandbox-a": {
+			SandboxID: "sandbox-a", InstanceGeneration: 2, AssignmentAttempt: 3, AcceptedGeneration: 7,
+		},
+	}
+	observed := map[string]placement.FastletInfo{"fastlet-a/uid-a": fastlet}
+
+	require.True(t, sandboxNeedsResourceCapacity(resume, nil, now),
+		"a resume without Fastlet reservation evidence still needs capacity")
+	require.False(t, sandboxNeedsResourceCapacity(resume, observed, now),
+		"an accepted resume is already represented in Admission.Used")
+
+	newSpecGeneration := resume.DeepCopy()
+	newSpecGeneration.Generation++
+	require.False(t, sandboxNeedsResourceCapacity(newSpecGeneration, observed, now),
+		"an unrelated Spec update does not release the existing Fastlet reservation")
+
+	oldGeneration := fastlet
+	oldGeneration.SandboxStatuses = map[string]fastletapi.SandboxStatus{
+		"sandbox-a": {
+			SandboxID: "sandbox-a", InstanceGeneration: 1, AssignmentAttempt: 3, AcceptedGeneration: 7,
+		},
+	}
+	require.True(t, sandboxNeedsResourceCapacity(resume, map[string]placement.FastletInfo{"fastlet-a/uid-a": oldGeneration}, now),
+		"an old runtime generation must not suppress pending demand")
+
+	oldAttempt := fastlet
+	oldAttempt.SandboxStatuses = map[string]fastletapi.SandboxStatus{
+		"sandbox-a": {
+			SandboxID: "sandbox-a", InstanceGeneration: 2, AssignmentAttempt: 2, AcceptedGeneration: 7,
+		},
+	}
+	require.True(t, sandboxNeedsResourceCapacity(resume, map[string]placement.FastletInfo{"fastlet-a/uid-a": oldAttempt}, now),
+		"an old assignment attempt must not suppress pending demand")
+
+	stale := fastlet
+	stale.LastHeartbeat = now.Add(-placement.DefaultObservationStaleAfter - time.Second)
+	require.True(t, sandboxNeedsResourceCapacity(resume, map[string]placement.FastletInfo{"fastlet-a/uid-a": stale}, now),
+		"a stale reservation must return to conservative pending demand")
+}
+
+func TestAcceptedResumeDoesNotCreateReplacementFastlet(t *testing.T) {
+	now := time.Date(2026, 10, 18, 8, 0, 0, 0, time.UTC)
+	pool := resourceAwareScalingPool()
+	pool.Spec.Capacity.BufferMin = 3
+	pod := fastletPod("fastlet-a", "uid-a", "10.0.0.1")
+	fastlet := resourceAwareControllerFastlet("fastlet-a", "uid-a", 1, fastletapi.AdmissionStateOpen, now)
+	fastlet.SandboxStatuses = map[string]fastletapi.SandboxStatus{
+		"sandbox-a": {
+			SandboxID: "sandbox-a", InstanceGeneration: 2, AssignmentAttempt: 3, AcceptedGeneration: 7,
+		},
+	}
+	registry := placement.NewInMemoryRegistry()
+	seedControllerRegistry(t, registry, fastlet)
+	reconciler := &SandboxPoolReconciler{Registry: registry, Now: func() time.Time { return now }}
+	observed := resourceFastletsForPoolChildren(registry, pool, []corev1.Pod{*pod})
+	sandbox := apiv1alpha2.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{UID: types.UID("sandbox-a"), Generation: 7},
+		Spec:       apiv1alpha2.SandboxSpec{PoolRef: "pool-a"},
+		Status: apiv1alpha2.SandboxStatus{
+			Placement: apiv1alpha2.PlacementStatus{FastletName: "fastlet-a", FastletPodUID: types.UID("uid-a"), Attempt: 3},
+			Runtime:   apiv1alpha2.RuntimeStatus{State: apiv1alpha2.RuntimeResuming, Generation: 2},
+		},
+	}
+	children := map[string]struct{}{"fastlet-a/uid-a": {}}
+
+	_, pending := poolDemandCounts([]apiv1alpha2.Sandbox{sandbox}, "pool-a", children, true, observed, now)
+	require.Zero(t, pending, "the accepted resume is already charged to the Fastlet ledger")
+	plan := reconciler.planResourceAwareScale(
+		pool, []corev1.Pod{*pod}, pending, resourceAwarePlannedPod(), observed, now,
+	)
+	require.Equal(t, int32(1), plan.desiredPods,
+		"the accepted resume must not create a replacement Fastlet")
+	require.Equal(t, int32(2), reconciler.planResourceAwareScale(
+		pool, []corev1.Pod{*pod}, 1, resourceAwarePlannedPod(), observed, now,
+	).desiredPods, "recounting the accepted resume would create an unnecessary Fastlet")
 }
 
 func TestPoolDemandCountsFallsBackToSlotDemandWhenResourceScalingIsDisabled(t *testing.T) {
@@ -592,7 +689,7 @@ func TestPoolDemandCountsFallsBackToSlotDemandWhenResourceScalingIsDisabled(t *t
 		},
 	}
 
-	active, pendingCount := poolDemandCounts([]apiv1alpha2.Sandbox{pending}, "pool-a", nil, false)
+	active, pendingCount := poolDemandCounts([]apiv1alpha2.Sandbox{pending}, "pool-a", nil, false, nil, time.Time{})
 	require.Zero(t, active)
 	require.Equal(t, int32(1), pendingCount,
 		"disabling ResourceAware scaling must retain the existing slot-based demand path")

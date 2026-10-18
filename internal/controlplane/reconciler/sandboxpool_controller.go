@@ -266,7 +266,11 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	for index := range childPods.Items {
 		childIdentities[podIdentity(&childPods.Items[index])] = struct{}{}
 	}
-	activeCount, pendingCount := poolDemandCounts(allSandboxes.Items, pool.Name, childIdentities, resourceAwareScaling)
+	now := r.now()
+	observedFastlets := resourceFastletsForPoolChildren(r.Registry, &pool, childPods.Items)
+	activeCount, pendingCount := poolDemandCounts(
+		allSandboxes.Items, pool.Name, childIdentities, resourceAwareScaling, observedFastlets, now,
+	)
 
 	maxPerPod := getFastletCapacity(&pool)
 	if maxPerPod <= 0 {
@@ -280,7 +284,9 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	desiredPods := int32(0)
 	resourceScalePlan := resourceAwareScalePlan{}
 	if resourceAwareScaling {
-		resourceScalePlan = r.planResourceAwareScale(&pool, childPods.Items, pendingCount, desiredPod)
+		resourceScalePlan = r.planResourceAwareScale(
+			&pool, childPods.Items, pendingCount, desiredPod, observedFastlets, now,
+		)
 		desiredPods = resourceScalePlan.desiredPods
 	} else {
 		totalNeededSlots := activeCount + pendingCount + pool.Spec.Capacity.BufferMin
@@ -444,6 +450,8 @@ func (r *SandboxPoolReconciler) planResourceAwareScale(
 	pods []corev1.Pod,
 	pendingSandboxes int32,
 	plannedPod *corev1.Pod,
+	observed map[string]placement.FastletInfo,
+	now time.Time,
 ) resourceAwareScalePlan {
 	current := int32(len(pods))
 	plan := resourceAwareScalePlan{desiredPods: current}
@@ -456,9 +464,6 @@ func (r *SandboxPoolReconciler) planResourceAwareScale(
 		return plan
 	}
 	demand := placement.ResourceDemand{CPU: requests.CPU, Memory: requests.Memory}
-	now := r.now()
-	observed := resourceFastletsForPoolChildren(r.Registry, pool, pods)
-
 	var availableFree int32
 	removable := make([]resourceAwareDrainCandidate, 0, len(pods))
 	for index := range pods {
@@ -859,7 +864,11 @@ func sandboxNeedsPlacement(sandbox *apiv1alpha2.Sandbox) bool {
 	return true
 }
 
-func sandboxNeedsResourceCapacity(sandbox *apiv1alpha2.Sandbox) bool {
+func sandboxNeedsResourceCapacity(
+	sandbox *apiv1alpha2.Sandbox,
+	observedFastlets map[string]placement.FastletInfo,
+	now time.Time,
+) bool {
 	if sandbox == nil || sandbox.DeletionTimestamp != nil {
 		return false
 	}
@@ -871,9 +880,41 @@ func sandboxNeedsResourceCapacity(sandbox *apiv1alpha2.Sandbox) bool {
 		apiv1alpha2.RuntimePausing,
 		apiv1alpha2.RuntimePaused:
 		return false
+	case apiv1alpha2.RuntimeResuming:
+		return !fastletReportsCurrentReservation(sandbox, observedFastlets, now)
 	default:
 		return true
 	}
+}
+
+// fastletReportsCurrentReservation distinguishes a resume that is still
+// waiting for admission from one whose commitment is already included in the
+// assigned Fastlet's Admission.Used ledger. Every identity fence must match so
+// a stale observation from an earlier runtime or assignment cannot suppress
+// real pending demand.
+func fastletReportsCurrentReservation(
+	sandbox *apiv1alpha2.Sandbox,
+	observedFastlets map[string]placement.FastletInfo,
+	now time.Time,
+) bool {
+	if sandbox == nil || sandbox.UID == "" || sandbox.Status.Placement.FastletName == "" ||
+		sandbox.Status.Placement.FastletPodUID == "" || sandbox.Status.Placement.Attempt <= 0 ||
+		sandbox.Status.Runtime.Generation <= 0 || sandbox.Generation <= 0 {
+		return false
+	}
+	identity := sandbox.Status.Placement.FastletName + "/" + string(sandbox.Status.Placement.FastletPodUID)
+	fastlet, exists := observedFastlets[identity]
+	if !exists || fastlet.PodName != sandbox.Status.Placement.FastletName ||
+		fastlet.PodUID != string(sandbox.Status.Placement.FastletPodUID) ||
+		fastlet.LastHeartbeat.IsZero() || fastlet.ResourceReceivedAt.IsZero() ||
+		now.Sub(fastlet.LastHeartbeat) > placement.DefaultObservationStaleAfter ||
+		now.Sub(fastlet.ResourceReceivedAt) > placement.DefaultObservationStaleAfter {
+		return false
+	}
+	status, exists := fastlet.SandboxStatuses[string(sandbox.UID)]
+	return exists &&
+		status.InstanceGeneration == sandbox.Status.Runtime.Generation &&
+		status.AssignmentAttempt == sandbox.Status.Placement.Attempt
 }
 
 func poolDemandCounts(
@@ -881,6 +922,8 @@ func poolDemandCounts(
 	poolName string,
 	childIdentities map[string]struct{},
 	resourceAwareScaling bool,
+	observedFastlets map[string]placement.FastletInfo,
+	now time.Time,
 ) (active int32, pending int32) {
 	for index := range sandboxes {
 		sandbox := &sandboxes[index]
@@ -893,10 +936,11 @@ func poolDemandCounts(
 				active++
 			}
 		}
-		if resourceAwareScaling && sandboxNeedsResourceCapacity(sandbox) {
-			// A Fastlet rejection happens after the durable assignment CAS.
-			// Keep that Pending Sandbox in the demand ledger until it is Ready,
-			// otherwise replacement capacity can be drained before retry.
+		if resourceAwareScaling && sandboxNeedsResourceCapacity(sandbox, observedFastlets, now) {
+			// A Fastlet rejection happens after the durable assignment CAS. Keep
+			// demand pending until the assigned Fastlet reports the exact current
+			// reservation; public lifecycle state alone cannot distinguish a
+			// waiting resume from an accepted restore.
 			pending++
 		} else if !resourceAwareScaling && sandboxNeedsPlacement(sandbox) {
 			pending++
