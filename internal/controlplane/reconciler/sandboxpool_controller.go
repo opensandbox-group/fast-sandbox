@@ -278,8 +278,10 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 	desiredPods := int32(0)
+	resourceScalePlan := resourceAwareScalePlan{}
 	if resourceAwareScaling {
-		desiredPods = r.resourceAwareDesiredPods(&pool, childPods.Items, pendingCount, desiredPod)
+		resourceScalePlan = r.planResourceAwareScale(&pool, childPods.Items, pendingCount, desiredPod)
+		desiredPods = resourceScalePlan.desiredPods
 	} else {
 		totalNeededSlots := activeCount + pendingCount + pool.Spec.Capacity.BufferMin
 		desiredPods = (totalNeededSlots + maxPerPod - 1) / maxPerPod
@@ -295,7 +297,11 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	currentCount := int32(len(childPods.Items))
 	var resourceScaleDownCandidateSince *metav1.Time
 	if resourceAwareScaling {
-		desiredPods, resourceScaleDownCandidateSince = r.stabilizeResourceAwareScaleDown(&pool, currentCount, desiredPods)
+		// Existing resource scale-down drains are already committed removals.
+		// Stabilize only additional shrink so a later reconcile does not erase
+		// the durable target before the draining Pod can be deleted.
+		stabilizationBaseline := currentCount - resourceScalePlan.activeScaleDownDrains
+		desiredPods, resourceScaleDownCandidateSince = r.stabilizeResourceAwareScaleDown(&pool, stabilizationBaseline, desiredPods)
 	}
 	desiredPodHash := desiredPod.Annotations[placement.AnnotationPodTemplateHash]
 
@@ -335,7 +341,9 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.updatePoolStatus(ctx, &pool, observation.apply); err != nil {
 		return ctrl.Result{}, err
 	}
-	if result, handled, err := r.reconcileDraining(ctx, &pool, childPods.Items, allSandboxes.Items, desiredPods, desiredPodHash); err != nil {
+	if result, handled, err := r.reconcileDraining(
+		ctx, &pool, childPods.Items, allSandboxes.Items, desiredPods, desiredPodHash, resourceScalePlan.drainCandidates,
+	); err != nil {
 		return ctrl.Result{}, err
 	} else if handled {
 		return result, nil
@@ -420,42 +428,51 @@ func (r *SandboxPoolReconciler) fastletUtilizationCounts(
 	return idle, busy
 }
 
-func (r *SandboxPoolReconciler) resourceAwareDesiredPods(
+type resourceAwareDrainCandidate struct {
+	identity string
+	free     int32
+}
+
+type resourceAwareScalePlan struct {
+	desiredPods           int32
+	drainCandidates       []string
+	activeScaleDownDrains int32
+}
+
+func (r *SandboxPoolReconciler) planResourceAwareScale(
 	pool *apiv1alpha2.SandboxPool,
 	pods []corev1.Pod,
 	pendingSandboxes int32,
 	plannedPod *corev1.Pod,
-) int32 {
+) resourceAwareScalePlan {
 	current := int32(len(pods))
+	plan := resourceAwareScalePlan{desiredPods: current}
 	nominal := nominalResourceCapacity(pool, plannedPod)
 	if nominal <= 0 {
 		nominal = 1
 	}
 	requests, ok := pool.Spec.SandboxResources.RequestResources()
 	if !ok {
-		return current
+		return plan
 	}
 	demand := placement.ResourceDemand{CPU: requests.CPU, Memory: requests.Memory}
 	now := r.now()
-	children := childPodIdentities(pods)
-	observed := make(map[string]placement.FastletInfo, len(pods))
-	if r.Registry != nil {
-		for _, info := range r.Registry.GetAllFastlets() {
-			if info.Namespace != pool.Namespace || info.PoolName != pool.Name {
-				continue
-			}
-			identity := info.PodName + "/" + info.PodUID
-			if _, exists := children[identity]; exists {
-				observed[identity] = info
-			}
-		}
-	}
+	observed := resourceFastletsForPoolChildren(r.Registry, pool, pods)
 
 	var availableFree int32
-	removableFree := make([]int32, 0, len(pods))
+	removable := make([]resourceAwareDrainCandidate, 0, len(pods))
 	for index := range pods {
 		pod := &pods[index]
 		identity := podIdentity(pod)
+		drainRequested := placement.PodDrainRequested(pod)
+		if drainRequested && pod.Annotations[placement.AnnotationDrainReason] == placement.DrainReasonScaleDown {
+			plan.activeScaleDownDrains++
+		}
+		// The Pod annotation is the durable drain intent. Do not wait for the
+		// next heartbeat to remove that Fastlet from available capacity.
+		if drainRequested {
+			continue
+		}
 		info, exists := observed[identity]
 		if !exists || info.LastHeartbeat.IsZero() {
 			if r.podWithinStartupGrace(pod, now) {
@@ -466,31 +483,62 @@ func (r *SandboxPoolReconciler) resourceAwareDesiredPods(
 		free := placement.EffectiveFreeCapacity(info, demand, now, placement.DefaultObservationStaleAfter)
 		availableFree += free
 		if info.Used() == 0 && !info.Draining && !info.DrainRequested {
-			removableFree = append(removableFree, free)
+			removable = append(removable, resourceAwareDrainCandidate{identity: identity, free: free})
 		}
 	}
 
 	desiredFree := pendingSandboxes + pool.Spec.Capacity.BufferMin
-	desired := current
+	plan.desiredPods = current - plan.activeScaleDownDrains
 	if availableFree < desiredFree {
 		deficit := desiredFree - availableFree
-		desired += (deficit + nominal - 1) / nominal
-		return desired
+		// Canceling an in-progress resource scale-down can recover at most one
+		// nominal Fastlet per drain. Only create Pods for any remaining deficit.
+		deficit -= min(deficit, plan.activeScaleDownDrains*nominal)
+		plan.desiredPods = current + (deficit+nominal-1)/nominal
+		return plan
 	}
 	if pendingSandboxes > 0 {
-		return desired
+		return plan
 	}
 
 	retainedFree := max(pool.Spec.Capacity.BufferMax, pool.Spec.Capacity.BufferMin)
-	sort.Slice(removableFree, func(i, j int) bool { return removableFree[i] < removableFree[j] })
-	for _, free := range removableFree {
-		if desired <= pool.Spec.Capacity.PoolMin || availableFree-free < retainedFree {
+	sort.Slice(removable, func(i, j int) bool {
+		if removable[i].free != removable[j].free {
+			return removable[i].free < removable[j].free
+		}
+		return removable[i].identity < removable[j].identity
+	})
+	for _, candidate := range removable {
+		if plan.desiredPods <= pool.Spec.Capacity.PoolMin || availableFree-candidate.free < retainedFree {
 			break
 		}
-		availableFree -= free
-		desired--
+		availableFree -= candidate.free
+		plan.desiredPods--
+		plan.drainCandidates = append(plan.drainCandidates, candidate.identity)
 	}
-	return desired
+	return plan
+}
+
+func resourceFastletsForPoolChildren(
+	registry placement.FastletRegistry,
+	pool *apiv1alpha2.SandboxPool,
+	pods []corev1.Pod,
+) map[string]placement.FastletInfo {
+	observed := make(map[string]placement.FastletInfo, len(pods))
+	if registry == nil {
+		return observed
+	}
+	children := childPodIdentities(pods)
+	for _, info := range registry.GetAllFastlets() {
+		if info.Namespace != pool.Namespace || info.PoolName != pool.Name {
+			continue
+		}
+		identity := info.PodName + "/" + info.PodUID
+		if _, exists := children[identity]; exists {
+			observed[identity] = info
+		}
+	}
+	return observed
 }
 
 func nominalResourceCapacity(pool *apiv1alpha2.SandboxPool, pod *corev1.Pod) int32 {
@@ -616,6 +664,7 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 	sandboxes []apiv1alpha2.Sandbox,
 	desiredPods int32,
 	desiredPodHash string,
+	preferredScaleDown []string,
 ) (ctrl.Result, bool, error) {
 	target := int(len(pods) - int(desiredPods))
 	if target < 0 {
@@ -646,11 +695,23 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 
 	active := activeAssignmentsByPod(sandboxes, pool.Name)
 	if len(draining) < target {
+		preferredRank := make(map[string]int, len(preferredScaleDown))
+		for rank, identity := range preferredScaleDown {
+			preferredRank[identity] = rank
+		}
 		sort.Slice(available, func(i, j int) bool {
 			leftCurrent := fastletPodTemplateCurrent(available[i], desiredPodHash)
 			rightCurrent := fastletPodTemplateCurrent(available[j], desiredPodHash)
 			if leftCurrent != rightCurrent {
 				return !leftCurrent
+			}
+			leftRank, leftPreferred := preferredRank[podIdentity(available[i])]
+			rightRank, rightPreferred := preferredRank[podIdentity(available[j])]
+			if leftPreferred != rightPreferred {
+				return leftPreferred
+			}
+			if leftPreferred && leftRank != rightRank {
+				return leftRank < rightRank
 			}
 			left := active[podIdentity(available[i])]
 			right := active[podIdentity(available[j])]
@@ -1859,25 +1920,6 @@ func applyFastletResources(container *corev1.Container, overhead corev1.Resource
 	}
 	addScaledQuantity(defaultAggregate, corev1.ResourceCPU, requests.CPU, int64(capacity))
 	addScaledQuantity(defaultAggregate, corev1.ResourceMemory, requests.Memory, int64(capacity))
-	minimumRequest := overhead.DeepCopy()
-	if minimumRequest == nil {
-		minimumRequest = corev1.ResourceList{}
-	}
-	addScaledQuantity(minimumRequest, corev1.ResourceCPU, requests.CPU, 1)
-	addScaledQuantity(minimumRequest, corev1.ResourceMemory, requests.Memory, 1)
-	minimumLimit := overhead.DeepCopy()
-	if minimumLimit == nil {
-		minimumLimit = corev1.ResourceList{}
-	}
-	addScaledQuantity(minimumLimit, corev1.ResourceCPU, limits.CPU, 1)
-	addScaledQuantity(minimumLimit, corev1.ResourceMemory, limits.Memory, 1)
-	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
-		aggregateQuantity := defaultAggregate[name]
-		minimumQuantity := minimumLimit[name]
-		if aggregateQuantity.Cmp(minimumQuantity) < 0 {
-			defaultAggregate[name] = minimumQuantity.DeepCopy()
-		}
-	}
 	if container.Resources.Requests == nil {
 		container.Resources.Requests = corev1.ResourceList{}
 	}
@@ -1900,16 +1942,12 @@ func applyFastletResources(container *corev1.Container, overhead corev1.Resource
 		}
 
 		if hasLimit {
-			minimum := minimumLimit[name]
-			if limit.Cmp(minimum) < 0 {
-				return fmt.Errorf("runtime owner container %q limit %s=%s is below one Sandbox limit plus runtime overhead %s", container.Name, name, limit.String(), minimum.String())
+			minimum := overhead[name]
+			if !minimum.IsZero() && limit.Cmp(minimum) < 0 {
+				return fmt.Errorf("runtime owner container %q limit %s=%s is below runtime overhead %s", container.Name, name, limit.String(), minimum.String())
 			}
 			if hasRequest && request.Cmp(limit) > 0 {
 				return fmt.Errorf("runtime owner container %q request %s=%s exceeds aggregate limit %s", container.Name, name, request.String(), limit.String())
-			}
-			minimumCommitment := minimumRequest[name]
-			if hasRequest && request.Cmp(minimumCommitment) < 0 {
-				return fmt.Errorf("runtime owner container %q request %s=%s cannot commit one Sandbox request plus runtime overhead %s", container.Name, name, request.String(), minimumCommitment.String())
 			}
 			if !hasRequest {
 				request = defaultQuantity.DeepCopy()
@@ -1927,10 +1965,6 @@ func applyFastletResources(container *corev1.Container, overhead corev1.Resource
 		limit = defaultQuantity.DeepCopy()
 		if hasRequest && request.Cmp(limit) > 0 {
 			limit = request.DeepCopy()
-		}
-		minimumCommitment := minimumRequest[name]
-		if hasRequest && request.Cmp(minimumCommitment) < 0 {
-			return fmt.Errorf("runtime owner container %q request %s=%s cannot commit one Sandbox request plus runtime overhead %s", container.Name, name, request.String(), minimumCommitment.String())
 		}
 		container.Resources.Limits[name] = limit
 		if !hasRequest {

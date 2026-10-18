@@ -84,6 +84,11 @@ func ValidateSandboxResourceProfile(p SandboxResourceProfile) error {
 	if requests.CPU.Sign() <= 0 || requests.Memory.Sign() <= 0 {
 		return fmt.Errorf("%w: cpu and memory requests must be greater than zero", ErrInvalidSandboxResourceProfile)
 	}
+	requestMilliCPU := requests.CPU.MilliValue()
+	wholeMilliCPU := resource.NewMilliQuantity(requestMilliCPU, resource.DecimalSI)
+	if requestMilliCPU < 1 || requests.CPU.Cmp(*wholeMilliCPU) != 0 {
+		return fmt.Errorf("%w: cpu request must use whole millicores and be at least 1m", ErrInvalidSandboxResourceProfile)
+	}
 	if requests.CPU.Cmp(limits.CPU) > 0 || requests.Memory.Cmp(limits.Memory) > 0 {
 		return fmt.Errorf("%w: requests must not exceed limits", ErrInvalidSandboxResourceProfile)
 	}

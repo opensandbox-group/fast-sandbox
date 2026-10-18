@@ -180,6 +180,15 @@ func TestValidateSandboxResourceProfile(t *testing.T) {
 	}
 	require.NoError(t, ValidateSandboxResourceProfile(aware))
 	require.Equal(t, SandboxResourceModeResourceAware, aware.ResourceMode())
+	for _, cpu := range []string{"100u", "1500u"} {
+		finerThanMilliCPU := aware
+		finerThanMilliCPU.Requests = &SandboxComputeResources{CPU: resource.MustParse(cpu), Memory: resource.MustParse("128Mi")}
+		err := ValidateSandboxResourceProfile(finerThanMilliCPU)
+		require.ErrorContains(t, err, "cpu request must use whole millicores", cpu)
+	}
+	minimumMilliCPU := aware
+	minimumMilliCPU.Requests = &SandboxComputeResources{CPU: resource.MustParse("1m"), Memory: resource.MustParse("128Mi")}
+	require.NoError(t, ValidateSandboxResourceProfile(minimumMilliCPU))
 
 	require.ErrorIs(t, ValidateSandboxResourceProfile(SandboxResourceProfile{}), ErrInvalidSandboxResourceProfile)
 	missingMemory := resource.MustParse("1Gi")

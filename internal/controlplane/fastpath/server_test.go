@@ -34,11 +34,13 @@ type fastpathRegistry struct {
 	candidates []placement.FastletInfo
 	fastlets   map[placement.FastletID]placement.FastletInfo
 	feedback   []placement.FastletID
+	requests   []placement.CandidateRequest
 }
 
 func (r *fastpathRegistry) TopK(request placement.CandidateRequest, k int) []placement.FastletInfo {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.requests = append(r.requests, request)
 	var selected []placement.FastletInfo
 	for _, candidate := range r.candidates {
 		if _, excluded := request.ExcludedFastlets[candidate.ID]; excluded {
@@ -56,6 +58,41 @@ func (r *fastpathRegistry) TopK(request placement.CandidateRequest, k int) []pla
 		}
 	}
 	return selected
+}
+
+func TestCreatePassesResourceDemandToInitialAndRefreshedPlacement(t *testing.T) {
+	server, k8sClient, registry, fastlet := newV2Server(t)
+	var pool apiv1alpha2.SandboxPool
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
+	pool.Spec.SandboxResources = apiv1alpha2.SandboxResourceProfile{
+		Requests: &apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("250m"), Memory: resource.MustParse("4Gi")},
+		Limits:   &apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("2"), Memory: resource.MustParse("5Gi")},
+		PIDs:     128,
+	}
+	require.NoError(t, k8sClient.Update(context.Background(), &pool))
+
+	registry.candidates = nil
+	fastlet.createFailures = make(map[string]error)
+	for i := 0; i < 4; i++ {
+		candidate := testCandidate(fmt.Sprintf("fastlet-%d", i), fmt.Sprintf("pod-%d", i), fmt.Sprintf("10.0.0.%d", i+1))
+		registry.candidates = append(registry.candidates, candidate)
+		registry.fastlets[candidate.ID] = candidate
+		if i < 3 {
+			fastlet.createFailures[candidate.PodIP] = capacityRejection()
+		}
+	}
+
+	_, err := server.CreateSandbox(context.Background(), createRequest("resource-aware-refresh"))
+	require.NoError(t, err)
+	registry.mu.Lock()
+	requests := append([]placement.CandidateRequest(nil), registry.requests...)
+	registry.mu.Unlock()
+	require.Len(t, requests, 2, "the fourth candidate is discovered through one registry refresh")
+	for _, request := range requests {
+		require.Equal(t, apiv1alpha2.SandboxResourceModeResourceAware, request.ResourceMode)
+		require.Equal(t, "250m", request.Demand.CPU.String())
+		require.Equal(t, "4Gi", request.Demand.Memory.String())
+	}
 }
 
 func TestDefiniteRejectionsRefreshCandidatesBeyondInitialTopK(t *testing.T) {

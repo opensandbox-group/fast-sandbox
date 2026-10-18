@@ -63,12 +63,14 @@ type plannedCreate struct {
 	sandbox    *apiv1alpha2.Sandbox
 	candidates []placement.FastletInfo
 	assignment assignment.AssignmentEnvelope
+	parameters orchestration.RuntimeParameters
 }
 
 type acceptedCreate struct {
 	sandbox    *apiv1alpha2.Sandbox
 	candidates []placement.FastletInfo
 	assignment assignment.AssignmentEnvelope
+	parameters orchestration.RuntimeParameters
 	created    bool
 }
 
@@ -117,11 +119,14 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	sandbox := newSandboxCRD(request, bindings, createSpecHash)
 	releaseCreate := orchestrator.BeginFastPathCreate(client.ObjectKeyFromObject(sandbox))
 	defer releaseCreate()
-	rankedFastlets, envelope, err := s.selectFastletsForPool(ctx, orchestrator, pool, sandbox, request.RequestId)
+	parameters := fastPathRuntimeParameters(pool)
+	rankedFastlets, envelope, err := s.selectFastletsForPool(ctx, orchestrator, sandbox, request.RequestId, parameters)
 	if err != nil {
 		return nil, err
 	}
-	accepted, err := s.acceptCreateIntent(ctx, plannedCreate{sandbox: sandbox, candidates: rankedFastlets, assignment: envelope})
+	accepted, err := s.acceptCreateIntent(ctx, plannedCreate{
+		sandbox: sandbox, candidates: rankedFastlets, assignment: envelope, parameters: parameters,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -183,9 +188,20 @@ func newSandboxCRD(request *fastpathv2.CreateSandboxRequest, bindings []apiv1alp
 	return sandboxFromCreateRequest(request, bindings, createSpecHash)
 }
 
-func (s *Server) selectFastletsForPool(ctx context.Context, orchestrator *orchestration.Orchestrator, pool *apiv1alpha2.SandboxPool, sandbox *apiv1alpha2.Sandbox, stableKey string) ([]placement.FastletInfo, assignment.AssignmentEnvelope, error) {
+func fastPathRuntimeParameters(pool *apiv1alpha2.SandboxPool) orchestration.RuntimeParameters {
+	parameters := orchestration.RuntimeParameters{
+		FastletRevision: pool.Status.FastletRevision,
+		ResourceMode:    pool.Spec.SandboxResources.ResourceMode(),
+	}
+	if requests, ok := pool.Spec.SandboxResources.RequestResources(); ok {
+		parameters.ResourceDemand = placement.ResourceDemand{CPU: requests.CPU, Memory: requests.Memory}
+	}
+	return parameters
+}
+
+func (s *Server) selectFastletsForPool(ctx context.Context, orchestrator *orchestration.Orchestrator, sandbox *apiv1alpha2.Sandbox, stableKey string, parameters orchestration.RuntimeParameters) ([]placement.FastletInfo, assignment.AssignmentEnvelope, error) {
 	_, finishCandidates := startCreateStage(ctx, "candidate_selection")
-	rankedFastlets, err := orchestrator.FastPathCandidatesMatching(sandbox, stableKey, orchestration.RuntimeParameters{FastletRevision: pool.Status.FastletRevision}, nil)
+	rankedFastlets, err := orchestrator.FastPathCandidatesMatching(sandbox, stableKey, parameters, nil)
 	finishCandidates(err)
 	if err != nil {
 		if errors.Is(err, orchestration.ErrNoCandidate) {
@@ -193,7 +209,7 @@ func (s *Server) selectFastletsForPool(ctx context.Context, orchestrator *orches
 		}
 		return nil, assignment.AssignmentEnvelope{}, err
 	}
-	rankedFastlets = compatibleCandidates(rankedFastlets, pool.Status.FastletRevision)
+	rankedFastlets = compatibleCandidates(rankedFastlets, parameters.FastletRevision)
 	if len(rankedFastlets) == 0 {
 		return nil, assignment.AssignmentEnvelope{}, status.Error(codes.ResourceExhausted, "no Fastlet has the current Pool compatibility revision")
 	}
@@ -216,7 +232,7 @@ func (s *Server) acceptCreateIntent(ctx context.Context, plan plannedCreate) (*a
 	createErr := s.K8sClient.Create(crdContext, plan.sandbox)
 	finishCRDCreate(createErr)
 	if createErr == nil {
-		return &acceptedCreate{sandbox: plan.sandbox, candidates: plan.candidates, assignment: plan.assignment, created: true}, nil
+		return &acceptedCreate{sandbox: plan.sandbox, candidates: plan.candidates, assignment: plan.assignment, parameters: plan.parameters, created: true}, nil
 	}
 	var existing apiv1alpha2.Sandbox
 	getContext, finishRead := startCreateStage(ctx, "idempotency_read")
@@ -253,7 +269,9 @@ func (s *Server) acceptCreateIntent(ctx context.Context, plan plannedCreate) (*a
 	if !ok {
 		return nil, status.Error(codes.Unavailable, orchestration.ErrAssignedFastletUnavailable.Error())
 	}
-	return &acceptedCreate{sandbox: existing.DeepCopy(), candidates: []placement.FastletInfo{selected}, assignment: *existingEnvelope}, nil
+	return &acceptedCreate{
+		sandbox: existing.DeepCopy(), candidates: []placement.FastletInfo{selected}, assignment: *existingEnvelope, parameters: plan.parameters,
+	}, nil
 }
 
 func (s *Server) provisionRuntime(ctx context.Context, accepted *acceptedCreate, completion fastletapi.CreateCompletion) (*fastletapi.SandboxStatus, error) {
@@ -328,6 +346,8 @@ func (s *Server) refreshCreateCandidates(ctx context.Context, accepted *accepted
 		RuntimeName: candidate.RuntimeName, RuntimeProfileHash: accepted.assignment.RuntimeProfileHash,
 		ResourceProfileHash: accepted.assignment.ResourceProfileHash, InfraRevision: accepted.assignment.InfraRevision,
 		FastletRevision: candidate.FastletRevision,
+		ResourceMode:    accepted.parameters.ResourceMode,
+		ResourceDemand:  accepted.parameters.ResourceDemand,
 	}
 	_, finishSelection := startCreateStage(ctx, "candidate_selection")
 	more, selectionErr := s.Orchestrator.FastPathCandidatesMatching(accepted.sandbox, accepted.sandbox.Name, parameters, tried)
