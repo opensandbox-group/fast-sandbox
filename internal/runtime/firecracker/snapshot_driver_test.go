@@ -526,9 +526,7 @@ func TestCreateCheckpointStagesAndPublishesVaultBundle(t *testing.T) {
 	require.Len(t, files, 4)
 	require.Contains(t, files, "vault.json")
 	require.Equal(t, files["vault.json"], agent.manifest["egressVault"], "the egressVault marker names the staged vault entry")
-	require.Contains(t, agent.sums, "vault.json")
-
-	// The node-local cache commit carries the vault file next to the
+	require.Contains(t, agent.sums, "vault.json") // The node-local cache commit carries the vault file next to the
 	// snapshot files, so a same-node restore imports it before the data
 	// plane becomes ready.
 	reference := artifacts.CheckpointReference(result.ArtifactDigest)
@@ -548,6 +546,36 @@ func TestCreateCheckpointWithoutVaultStagesNothing(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, agent.manifest["files"].(map[string]any), 3, "ErrVaultAbsent stages no vault file")
 	require.NotContains(t, agent.manifest, "egressVault")
+}
+
+// The egress Handler resolves the bundle path in its own mount namespace,
+// so with FAST_SANDBOX_EGRESS_BUNDLE_DIR configured the export is handed a
+// path under that shared directory and the verified copy joins the publish
+// staging afterwards; the per-snapshot handoff directory is cleaned up.
+func TestCreateCheckpointHandsVaultThroughSharedBundleDir(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+	sharedRoot := t.TempDir()
+	t.Setenv(egressBundleDirEnv, sharedRoot)
+	mover := &fakeVaultMover{exportData: []byte(`{"v":1,"revision":3,"vault":{"token":"t"}}`)}
+	fixture.driver.SetVaultMover(mover)
+
+	_, err := fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "ckpt-1", Kind: fastletapi.SnapshotKindCheckpoint,
+	})
+	require.NoError(t, err)
+
+	exports, _ := mover.snapshot()
+	require.Len(t, exports, 1)
+	require.Contains(t, exports[0], sharedRoot, "the mover writes at the shared handoff path")
+	entries, err := os.ReadDir(sharedRoot)
+	require.NoError(t, err)
+	require.Empty(t, entries, "the per-snapshot handoff directory is cleaned up")
+	// The publish flow is unchanged: the bundle rode the manifest from the
+	// driver's staging copy.
+	files := agent.manifest["files"].(map[string]any)
+	require.Contains(t, files, "vault.json")
+	require.Equal(t, files["vault.json"], agent.manifest["egressVault"])
 }
 
 func TestCreateCheckpointFailsWhenVaultExportFails(t *testing.T) {

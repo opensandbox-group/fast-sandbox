@@ -68,6 +68,15 @@ const snapshotManifestName = "manifest.json"
 // direct-to-staging dump.
 const snapshotSpillDirEnv = "FAST_SANDBOX_SNAPSHOT_SPILL_DIR"
 
+// egressBundleDirEnv names the directory that hands the vault bundle file to
+// the egress Handler: the envelope carries a PATH and the Handler resolves it
+// in its own mount namespace, so the directory must be a volume shared with
+// the egress container (a hostPath, or the same emptyDir mounted twice).
+// Empty keeps the legacy behavior — the bundle lives at the driver's
+// snapshot staging path, which requires the staging area itself to be
+// mounted into egress.
+const egressBundleDirEnv = "FAST_SANDBOX_EGRESS_BUNDLE_DIR"
+
 // Driver implements the optional snapshot extension.
 var _ runtimecontract.Snapshotter = (*Driver)(nil)
 
@@ -146,8 +155,17 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 	// so the egress-local file survives for the retry. Template snapshots
 	// NEVER export: the vault belongs to one sandbox instance, and a shared
 	// boot image would leak it to every sandbox booted from the template.
+	//
+	// The staging directory may not exist yet on this path: create it, and
+	// hand the bundle to the Handler through the shared egress bundle
+	// directory when one is configured — the envelope carries a file PATH
+	// and the Handler resolves it in its own mount namespace, where the
+	// driver's staging is not mounted.
 	if kind == fastletapi.SnapshotKindCheckpoint {
-		if err := d.stageCheckpointVault(ctx, input.SandboxID, plan.staging); err != nil {
+		if err := os.MkdirAll(plan.staging, 0o700); err != nil {
+			return nil, fmt.Errorf("prepare snapshot staging %s: %w", plan.staging, err)
+		}
+		if err := d.stageCheckpointVault(ctx, input.SandboxID, plan.snapshotID, plan.staging); err != nil {
 			_ = os.RemoveAll(plan.staging)
 			return nil, err
 		}
@@ -654,19 +672,63 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 // its incarnation at restore import.
 const vaultBundleName = "vault.json"
 
+// egressBundleRoot returns the configured directory hands the vault bundle
+// to the egress Handler through ("" keeps the legacy staging path). The
+// envelope carries a file PATH and the Handler resolves it in its own mount
+// namespace, so the directory must be a volume shared with the egress
+// container (hostPath or same-emptyDir double mount). Read per call so
+// tests can inject without racing the driver lock.
+func (d *Driver) egressBundleRoot() string {
+	return strings.TrimSpace(os.Getenv(egressBundleDirEnv))
+}
+
 // stageCheckpointVault exports the subject's egress vault into the checkpoint
-// staging directory (no-op without a mover). The Handler copies the file
-// itself: a successful export with no file at the target simply means the
-// subject held no vault; any transfer failure fails the checkpoint so the
-// egress-local file survives for the retry.
-func (d *Driver) stageCheckpointVault(ctx context.Context, sandboxUID, staging string) error {
+// bundle. The Handler copies the file itself: a successful export with no
+// file at the target simply means the subject held no vault; any transfer
+// failure fails the checkpoint so the egress-local file survives for the
+// retry. With a shared bundle root configured, the export lands there and
+// the verified copy joins the publish staging afterwards.
+func (d *Driver) stageCheckpointVault(ctx context.Context, sandboxUID, snapshotID, staging string) error {
+	target := filepath.Join(staging, vaultBundleName)
+	handoffDir := ""
+	if root := d.egressBundleRoot(); root != "" {
+		if err := validateSandboxID(snapshotID); err != nil {
+			return fmt.Errorf("resolve the egress bundle handoff for snapshot %s: %w", snapshotID, err)
+		}
+		handoffDir = filepath.Join(root, snapshotID)
+		if err := os.MkdirAll(handoffDir, 0o700); err != nil {
+			return fmt.Errorf("prepare the egress bundle handoff directory: %w", err)
+		}
+		defer os.RemoveAll(handoffDir)
+		target = filepath.Join(handoffDir, vaultBundleName)
+	}
+	if err := d.moveVault(ctx, sandboxUID, target); err != nil {
+		return err
+	}
+	if handoffDir != "" {
+		data, err := os.ReadFile(target)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil //nolint:nilerr // no vault to carry: nothing joins the staging
+			}
+			return fmt.Errorf("read back the exported vault bundle: %w", err)
+		}
+		if err := os.WriteFile(filepath.Join(staging, vaultBundleName), data, 0o600); err != nil {
+			return fmt.Errorf("stage the exported vault bundle: %w", err)
+		}
+	}
+	return nil
+}
+
+// moveVault invokes the vault mover's export at the given handoff path.
+func (d *Driver) moveVault(ctx context.Context, sandboxUID, bundlePath string) error {
 	d.mu.RLock()
 	mover := d.vaultMover
 	d.mu.RUnlock()
 	if mover == nil {
 		return nil //nolint:nilerr // no mover wired: vault transfer disabled
 	}
-	if err := mover.ExportVault(ctx, sandboxUID, filepath.Join(staging, vaultBundleName)); err != nil {
+	if err := mover.ExportVault(ctx, sandboxUID, bundlePath); err != nil {
 		return fmt.Errorf("export egress vault for the checkpoint bundle: %w", err)
 	}
 	return nil
@@ -745,6 +807,26 @@ func (d *Driver) importRestoreVault(ctx context.Context, spec fastletapi.Sandbox
 		klog.ErrorS(errVaultBundleMismatch, "bundled vault digest mismatches the manifest entry; the restored Sandbox vault degrades",
 			"sandboxID", sandboxUID, "checkpoint", restoreRef, "file", vaultPath)
 		return //nolint:nilerr // unverified credential bytes are never delivered
+	}
+	// Hand the verified bundle through the shared egress bundle directory
+	// when configured: the Handler reads the path in its own mount
+	// namespace, where the restored staging is not mounted. Every handoff
+	// failure is the standard import-failure posture: the restored
+	// Sandbox's vault degrades, observably, and the resume proceeds.
+	if root := d.egressBundleRoot(); root != "" {
+		shared := filepath.Join(root, "restore-"+sandboxUID+".json")
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			klog.ErrorS(err, "prepare the egress bundle handoff directory failed; the restored Sandbox vault degrades",
+				"sandboxID", sandboxUID, "checkpoint", restoreRef)
+			return //nolint:nilerr // degradation is the import-failure posture
+		}
+		if err := os.WriteFile(shared, vaultData, 0o600); err != nil {
+			klog.ErrorS(err, "stage the restored vault bundle for egress failed; the restored Sandbox vault degrades",
+				"sandboxID", sandboxUID, "checkpoint", restoreRef)
+			return //nolint:nilerr // degradation is the import-failure posture
+		}
+		defer os.Remove(shared)
+		vaultPath = shared
 	}
 	if importErr := mover.ImportVault(ctx, sandboxUID, vaultPath); importErr != nil {
 		klog.ErrorS(importErr, "egress vault import failed; the restored Sandbox vault degrades",
