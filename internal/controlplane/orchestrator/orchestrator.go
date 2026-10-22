@@ -56,6 +56,11 @@ type Registry interface {
 	RecordFeedback(placement.FastletID, placement.LocalFeedback)
 }
 
+type localReservationRegistry interface {
+	ReserveLocal(placement.FastletID, placement.ResourceDemand) bool
+	ReleaseLocal(placement.FastletID, placement.ResourceDemand)
+}
+
 type Orchestrator struct {
 	Client                        client.Client
 	Registry                      Registry
@@ -79,6 +84,7 @@ type RuntimeParameters struct {
 	FastletRevision     string
 	ResourceMode        apiv1alpha2.SandboxResourceMode
 	ResourceDemand      placement.ResourceDemand
+	ResolvedResources   *fastletapi.ResolvedSandboxResources
 }
 
 func (o *Orchestrator) ResolveRuntime(ctx context.Context, sandbox *apiv1alpha2.Sandbox) (RuntimeParameters, error) {
@@ -127,10 +133,46 @@ func (o *Orchestrator) ResolveRuntime(ctx context.Context, sandbox *apiv1alpha2.
 		FastletRevision:     pool.Status.FastletRevision,
 		ResourceMode:        pool.Spec.SandboxResources.ResourceMode(),
 	}
-	if requests, ok := pool.Spec.SandboxResources.RequestResources(); ok {
-		parameters.ResourceDemand = placement.ResourceDemand{CPU: requests.CPU, Memory: requests.Memory}
+	resolved, demand, err := ResolveSandboxResources(&pool, sandbox)
+	if err != nil {
+		return RuntimeParameters{}, fmt.Errorf("resolve Sandbox resources: %w", err)
+	}
+	parameters.ResolvedResources, parameters.ResourceDemand = resolved, demand
+	if err := validateResolvedResourceAnnotations(sandbox, parameters); err != nil {
+		return RuntimeParameters{}, err
 	}
 	return parameters, nil
+}
+
+// ResolveSandboxResources compiles the caller limit and Pool policy into the
+// one request/limit contract consumed by placement and Fastlet admission.
+func ResolveSandboxResources(pool *apiv1alpha2.SandboxPool, sandbox *apiv1alpha2.Sandbox) (*fastletapi.ResolvedSandboxResources, placement.ResourceDemand, error) {
+	if pool == nil || sandbox == nil {
+		return nil, placement.ResourceDemand{}, errors.New("Pool and Sandbox are required")
+	}
+	mode := pool.Spec.SandboxResources.ResourceMode()
+	limits, err := pool.Spec.SandboxResources.ResolveLimits(sandbox.Spec.Resources)
+	if err != nil {
+		return nil, placement.ResourceDemand{}, err
+	}
+	if mode != apiv1alpha2.SandboxResourceModeResourceAware {
+		return nil, placement.ResourceDemand{}, nil
+	}
+	requests, err := pool.Spec.SandboxResources.DeriveRequests(limits)
+	if err != nil {
+		return nil, placement.ResourceDemand{}, err
+	}
+	_, envelope, err := pool.Spec.SandboxResources.ResolveFastletCapacity(pool.Spec.MaxSandboxesPerPod)
+	if err != nil {
+		return nil, placement.ResourceDemand{}, err
+	}
+	if limits.CPU.Cmp(envelope.CPU) > 0 || limits.Memory.Cmp(envelope.Memory) > 0 {
+		return nil, placement.ResourceDemand{}, fmt.Errorf("Sandbox limits %s/%s exceed Fastlet runtime envelope %s/%s", limits.CPU.String(), limits.Memory.String(), envelope.CPU.String(), envelope.Memory.String())
+	}
+	return &fastletapi.ResolvedSandboxResources{
+		Requests: fastletapi.SandboxResourceVector{CPU: requests.CPU.String(), Memory: requests.Memory.String()},
+		Limits:   fastletapi.SandboxRuntimeLimits{CPU: limits.CPU.String(), Memory: limits.Memory.String(), PIDs: pool.Spec.SandboxResources.PIDs},
+	}, placement.ResourceDemand{CPU: requests.CPU, Memory: requests.Memory}, nil
 }
 
 func (o *Orchestrator) Candidates(ctx context.Context, sandbox *apiv1alpha2.Sandbox, stableKey string) ([]placement.FastletInfo, RuntimeParameters, error) {
@@ -258,7 +300,7 @@ func (o *Orchestrator) AssignDeclarativePreferring(ctx context.Context, sandbox 
 		return projected, false, err
 	}
 
-	candidates, _, err := o.Candidates(ctx, sandbox, stableKey)
+	candidates, parameters, err := o.Candidates(ctx, sandbox, stableKey)
 	if err != nil {
 		return nil, false, err
 	}
@@ -274,12 +316,39 @@ func (o *Orchestrator) AssignDeclarativePreferring(ctx context.Context, sandbox 
 	if err != nil {
 		return nil, false, err
 	}
-	_, won, err := assignment.InitializeAssignmentAnnotation(ctx, o.Client, client.ObjectKeyFromObject(sandbox), desired)
+	_, won, err := assignment.InitializeAssignmentAnnotationWithMetadata(
+		ctx, o.Client, client.ObjectKeyFromObject(sandbox), desired, resolvedResourceAnnotations(parameters),
+	)
 	if err != nil {
 		return nil, false, err
 	}
 	projected, err := assignment.ProjectAssignmentToStatus(ctx, o.Client, client.ObjectKeyFromObject(sandbox))
 	return projected, won, err
+}
+
+func resolvedResourceAnnotations(parameters RuntimeParameters) map[string]string {
+	if parameters.ResolvedResources == nil {
+		return nil
+	}
+	return map[string]string{
+		assignment.AnnotationResourcePolicyHash:    parameters.ResourceProfileHash,
+		assignment.AnnotationResolvedRequestCPU:    parameters.ResolvedResources.Requests.CPU,
+		assignment.AnnotationResolvedRequestMemory: parameters.ResolvedResources.Requests.Memory,
+		assignment.AnnotationResolvedLimitCPU:      parameters.ResolvedResources.Limits.CPU,
+		assignment.AnnotationResolvedLimitMemory:   parameters.ResolvedResources.Limits.Memory,
+	}
+}
+
+func validateResolvedResourceAnnotations(sandbox *apiv1alpha2.Sandbox, parameters RuntimeParameters) error {
+	if sandbox == nil || parameters.ResolvedResources == nil || len(sandbox.Annotations) == 0 {
+		return nil
+	}
+	for name, want := range resolvedResourceAnnotations(parameters) {
+		if got, recorded := sandbox.Annotations[name]; recorded && got != want {
+			return fmt.Errorf("Sandbox resource intent changed after assignment: annotation %s=%q, resolved value=%q", name, got, want)
+		}
+	}
+	return nil
 }
 
 // preferFastlet moves the candidate matching (PodName, PodUID) to the front
@@ -365,17 +434,25 @@ func (o *Orchestrator) CreateRuntime(ctx context.Context, sandbox *apiv1alpha2.S
 	if err != nil {
 		return nil, err
 	}
-	return o.createRuntimeOnTarget(ctx, sandbox, fastlet, envelope, identity, "")
+	parameters, err := o.ResolveRuntime(ctx, sandbox)
+	if err != nil {
+		return nil, err
+	}
+	return o.createRuntimeOnTarget(ctx, sandbox, fastlet, envelope, identity, "", parameters)
 }
 
 // CreateRuntimeOnCandidate is used immediately after FastPath wins an
 // annotation Create/CAS. The annotation is revalidated, while a concurrently
 // stale status projection is deliberately ignored.
 func (o *Orchestrator) CreateRuntimeOnCandidate(ctx context.Context, sandbox *apiv1alpha2.Sandbox, fastlet placement.FastletInfo, envelope assignment.AssignmentEnvelope) (*fastletapi.CreateSandboxResponse, error) {
-	return o.CreateRuntimeOnCandidateWithCompletion(ctx, sandbox, fastlet, envelope, "")
+	parameters, err := o.ResolveRuntime(ctx, sandbox)
+	if err != nil {
+		return nil, err
+	}
+	return o.CreateRuntimeOnCandidateWithCompletion(ctx, sandbox, fastlet, envelope, "", parameters)
 }
 
-func (o *Orchestrator) CreateRuntimeOnCandidateWithCompletion(ctx context.Context, sandbox *apiv1alpha2.Sandbox, fastlet placement.FastletInfo, envelope assignment.AssignmentEnvelope, completion fastletapi.CreateCompletion) (*fastletapi.CreateSandboxResponse, error) {
+func (o *Orchestrator) CreateRuntimeOnCandidateWithCompletion(ctx context.Context, sandbox *apiv1alpha2.Sandbox, fastlet placement.FastletInfo, envelope assignment.AssignmentEnvelope, completion fastletapi.CreateCompletion, parameters RuntimeParameters) (*fastletapi.CreateSandboxResponse, error) {
 	current, err := assignment.AssignmentFromAnnotation(sandbox)
 	if err != nil {
 		return nil, err
@@ -393,10 +470,17 @@ func (o *Orchestrator) CreateRuntimeOnCandidateWithCompletion(ctx context.Contex
 		InstanceGeneration: envelope.InstanceGeneration, RuntimeInstanceID: envelope.RuntimeInstanceID,
 		AssignmentAttempt: envelope.Attempt, RouteGeneration: envelope.RouteGeneration, FastletPodUID: envelope.FastletPodUID,
 	}
-	return o.createRuntimeOnTarget(ctx, sandbox, fastlet, envelope, identity, completion)
+	return o.createRuntimeOnTarget(ctx, sandbox, fastlet, envelope, identity, completion, parameters)
 }
 
-func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1alpha2.Sandbox, fastlet placement.FastletInfo, envelope assignment.AssignmentEnvelope, identity fastletapi.SandboxIdentity, completion fastletapi.CreateCompletion) (*fastletapi.CreateSandboxResponse, error) {
+func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1alpha2.Sandbox, fastlet placement.FastletInfo, envelope assignment.AssignmentEnvelope, identity fastletapi.SandboxIdentity, completion fastletapi.CreateCompletion, parameters RuntimeParameters) (*fastletapi.CreateSandboxResponse, error) {
+	if local, ok := o.Registry.(localReservationRegistry); ok && createNeedsLocalReservation(sandbox, fastlet, identity) {
+		if !local.ReserveLocal(fastlet.ID, parameters.ResourceDemand) {
+			failure := &fastletapi.FastletError{Code: fastletapi.ErrorCapacityRejected, Reason: fastletapi.AdmissionReasonSlotFull, Message: "FastPath local in-flight capacity is exhausted", Retryable: true}
+			return nil, &fastletapi.CreateCallError{Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects, Failure: failure}
+		}
+		defer local.ReleaseLocal(fastlet.ID, parameters.ResourceDemand)
+	}
 	bindings, err := compileActionBindings(sandbox.Spec.ActionBindings)
 	if err != nil {
 		return nil, err
@@ -420,7 +504,8 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 	request := &fastletapi.CreateSandboxRequest{
 		RequestID: sandbox.Annotations[assignment.AnnotationRequestID], Identity: identity,
 		SpecGeneration: sandbox.Generation, ActionBindings: bindings, Completion: completion,
-		Sandbox: spec,
+		Sandbox:   spec,
+		Resources: parameters.ResolvedResources,
 	}
 	response, createErr := o.FastletClient.CreateSandbox(ctx, fastlet.PodIP, request)
 	// A Created observation may be runtime-Creating: the Fastlet parks cold
@@ -431,6 +516,7 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 		(response.Disposition == fastletapi.CreateDispositionCreated || response.Disposition == fastletapi.CreateDispositionExisting) &&
 		response.Sandbox != nil &&
 		(response.Sandbox.Runtime.State == fastletapi.RuntimeStateReady || response.Sandbox.Runtime.State == fastletapi.RuntimeStateCreating) {
+		o.recordAdmissionSnapshot(fastlet.ID, response)
 		return response, nil
 	}
 	if createErr == nil {
@@ -443,6 +529,25 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 	}
 	o.recordFeedback(fastlet.ID, response, createErr)
 	return response, createErr
+}
+
+func (o *Orchestrator) recordAdmissionSnapshot(id placement.FastletID, response *fastletapi.CreateSandboxResponse) {
+	if response == nil {
+		return
+	}
+	admission := response.Admission
+	o.Registry.RecordFeedback(id, placement.LocalFeedback{Admission: &admission, Sandbox: response.Sandbox, ObservedAt: time.Now()})
+}
+
+func createNeedsLocalReservation(sandbox *apiv1alpha2.Sandbox, fastlet placement.FastletInfo, identity fastletapi.SandboxIdentity) bool {
+	if sandbox != nil {
+		switch sandbox.Status.Runtime.State {
+		case apiv1alpha2.RuntimeCreating, apiv1alpha2.RuntimeReady:
+			return false
+		}
+	}
+	status, found := fastlet.SandboxStatuses[identity.SandboxUID]
+	return !found || status.InstanceGeneration != identity.InstanceGeneration || status.AssignmentAttempt != identity.AssignmentAttempt
 }
 
 // EnsureRuntime performs the side-effecting create/ensure operation. A
@@ -518,7 +623,16 @@ func (o *Orchestrator) DeleteRuntime(ctx context.Context, sandbox *apiv1alpha2.S
 	if err != nil {
 		return err
 	}
-	_, err = o.FastletClient.DeleteSandbox(ctx, fastlet.PodIP, &fastletapi.DeleteSandboxRequest{Identity: identity})
+	response, err := o.FastletClient.DeleteSandbox(ctx, fastlet.PodIP, &fastletapi.DeleteSandboxRequest{Identity: identity})
+	if response != nil {
+		admission := response.Admission
+		feedback := placement.LocalFeedback{Admission: &admission, ObservedAt: time.Now()}
+		var failure *fastletapi.FastletError
+		if errors.As(err, &failure) {
+			feedback.Code, feedback.Reason = failure.Code, failure.Reason
+		}
+		o.Registry.RecordFeedback(fastlet.ID, feedback)
+	}
 	return err
 }
 
@@ -815,6 +929,7 @@ func (o *Orchestrator) recordFeedback(id placement.FastletID, response *fastleta
 	if response != nil {
 		admission := response.Admission
 		feedback.Admission = &admission
+		feedback.Sandbox = response.Sandbox
 	}
 	o.Registry.RecordFeedback(id, feedback)
 }

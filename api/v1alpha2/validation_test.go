@@ -154,16 +154,12 @@ func TestSandboxResourceProfileHashIsCanonical(t *testing.T) {
 	b.PIDs++
 	require.NotEqual(t, a.Hash(), b.Hash())
 
-	awareA := SandboxResourceProfile{
-		Requests: &SandboxComputeResources{CPU: resource.MustParse("1"), Memory: resource.MustParse("5Gi")},
-		Limits:   &SandboxComputeResources{CPU: resource.MustParse("2"), Memory: resource.MustParse("10Gi")},
-		PIDs:     256,
-	}
-	awareB := SandboxResourceProfile{
-		Requests: &SandboxComputeResources{CPU: resource.MustParse("1000m"), Memory: resource.MustParse("5120Mi")},
-		Limits:   &SandboxComputeResources{CPU: resource.MustParse("2000m"), Memory: resource.MustParse("10240Mi")},
-		PIDs:     256,
-	}
+	awareA := NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("2"), resource.MustParse("10Gi"), resource.MustParse("2"), resource.MustParse("2"), 256,
+	)
+	awareB := NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("2000m"), resource.MustParse("10240Mi"), resource.MustParse("2.0"), resource.MustParse("2000m"), 256,
+	)
 	require.Equal(t, awareA.Hash(), awareB.Hash())
 	require.NotEqual(t, a.Hash(), awareA.Hash())
 }
@@ -173,22 +169,15 @@ func TestValidateSandboxResourceProfile(t *testing.T) {
 	require.NoError(t, ValidateSandboxResourceProfile(legacy))
 	require.Equal(t, SandboxResourceModeLegacySlot, legacy.ResourceMode())
 
-	aware := SandboxResourceProfile{
-		Requests: &SandboxComputeResources{CPU: resource.MustParse("250m"), Memory: resource.MustParse("128Mi")},
-		Limits:   &SandboxComputeResources{CPU: resource.MustParse("500m"), Memory: resource.MustParse("256Mi")},
-		PIDs:     128,
-	}
+	aware := NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("500m"), resource.MustParse("256Mi"), resource.MustParse("2"), resource.MustParse("2"), 128,
+	)
 	require.NoError(t, ValidateSandboxResourceProfile(aware))
 	require.Equal(t, SandboxResourceModeResourceAware, aware.ResourceMode())
-	for _, cpu := range []string{"100u", "1500u"} {
-		finerThanMilliCPU := aware
-		finerThanMilliCPU.Requests = &SandboxComputeResources{CPU: resource.MustParse(cpu), Memory: resource.MustParse("128Mi")}
-		err := ValidateSandboxResourceProfile(finerThanMilliCPU)
-		require.ErrorContains(t, err, "cpu request must use whole millicores", cpu)
-	}
-	minimumMilliCPU := aware
-	minimumMilliCPU.Requests = &SandboxComputeResources{CPU: resource.MustParse("1m"), Memory: resource.MustParse("128Mi")}
-	require.NoError(t, ValidateSandboxResourceProfile(minimumMilliCPU))
+	requests, ok := aware.RequestResources()
+	require.True(t, ok)
+	require.Equal(t, "250m", requests.CPU.String())
+	require.Equal(t, "128Mi", requests.Memory.String())
 
 	require.ErrorIs(t, ValidateSandboxResourceProfile(SandboxResourceProfile{}), ErrInvalidSandboxResourceProfile)
 	missingMemory := resource.MustParse("1Gi")
@@ -198,13 +187,20 @@ func TestValidateSandboxResourceProfile(t *testing.T) {
 	)), ErrInvalidSandboxResourceProfile)
 
 	mixed := legacy
-	mixed.Requests = aware.Requests
-	mixed.Limits = aware.Limits
+	mixed.Mode = SandboxResourceModeResourceAware
 	require.ErrorIs(t, ValidateSandboxResourceProfile(mixed), ErrInvalidSandboxResourceProfile)
 
-	requestsExceedLimits := aware
-	requestsExceedLimits.Requests = &SandboxComputeResources{CPU: resource.MustParse("1"), Memory: resource.MustParse("512Mi")}
-	require.ErrorIs(t, ValidateSandboxResourceProfile(requestsExceedLimits), ErrInvalidSandboxResourceProfile)
+	invalidRatio := aware
+	invalidRatio.OvercommitRatio = &SandboxOvercommitRatio{CPU: resource.MustParse("0.5"), Memory: resource.MustParse("1")}
+	require.ErrorIs(t, ValidateSandboxResourceProfile(invalidRatio), ErrInvalidSandboxResourceProfile)
+
+	rounded := NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("1"), resource.MustParse("5Gi"), resource.MustParse("3"), resource.MustParse("1.25"), 128,
+	)
+	roundedRequests, ok := rounded.RequestResources()
+	require.True(t, ok)
+	require.Equal(t, "334m", roundedRequests.CPU.String())
+	require.Equal(t, "4Gi", roundedRequests.Memory.String())
 }
 
 func TestValidateResourceContractBranchesByMode(t *testing.T) {
@@ -217,11 +213,9 @@ func TestValidateResourceContractBranchesByMode(t *testing.T) {
 	require.NoError(t, legacy.ValidateResourceContract(), "LegacySlot retains explicit aggregate resources")
 
 	resourceAware := legacy
-	resourceAware.SandboxResources = SandboxResourceProfile{
-		Requests: &SandboxComputeResources{CPU: resource.MustParse("250m"), Memory: resource.MustParse("4Gi")},
-		Limits:   &SandboxComputeResources{CPU: resource.MustParse("2"), Memory: resource.MustParse("5Gi")},
-		PIDs:     128,
-	}
+	resourceAware.SandboxResources = NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("2"), resource.MustParse("5Gi"), resource.MustParse("8"), resource.MustParse("1.25"), 128,
+	)
 	require.ErrorIs(t, resourceAware.ValidateResourceContract(), ErrRuntimeOwnerResources)
 
 	resourceAware.FastletTemplate.Spec.Containers[0].Resources = corev1.ResourceRequirements{}

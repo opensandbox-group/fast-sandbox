@@ -14,6 +14,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -105,6 +106,10 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	if err != nil {
 		return nil, err
 	}
+	resources, err := apiSandboxResourceRequirements(request.Resources)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 	// Inject identity before any downstream logging: helper calls on this
 	// path log through the ctx logger and must carry request_id/namespace.
 	ctx = observability.WithIdentity(ctx, observability.Identity{RequestID: request.RequestId, Namespace: request.Namespace, SandboxName: request.RequestId})
@@ -116,10 +121,14 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	if err != nil {
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
-	sandbox := newSandboxCRD(request, bindings, createSpecHash)
+	sandbox := newSandboxCRD(request, bindings, resources, createSpecHash)
 	releaseCreate := orchestrator.BeginFastPathCreate(client.ObjectKeyFromObject(sandbox))
 	defer releaseCreate()
-	parameters := fastPathRuntimeParameters(pool)
+	parameters, err := fastPathRuntimeParameters(pool, sandbox)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "resolve Sandbox resources: %v", err)
+	}
+	projectResolvedResourceAnnotations(sandbox, parameters, pool.Spec.SandboxResources.Hash())
 	rankedFastlets, envelope, err := s.selectFastletsForPool(ctx, orchestrator, sandbox, request.RequestId, parameters)
 	if err != nil {
 		return nil, err
@@ -184,19 +193,58 @@ func buildActionBindings(request *fastpathv2.CreateSandboxRequest, pool *apiv1al
 	return bindings, nil
 }
 
-func newSandboxCRD(request *fastpathv2.CreateSandboxRequest, bindings []apiv1alpha2.ActionBinding, createSpecHash string) *apiv1alpha2.Sandbox {
-	return sandboxFromCreateRequest(request, bindings, createSpecHash)
+func newSandboxCRD(request *fastpathv2.CreateSandboxRequest, bindings []apiv1alpha2.ActionBinding, resources *apiv1alpha2.SandboxResourceRequirements, createSpecHash string) *apiv1alpha2.Sandbox {
+	return sandboxFromCreateRequest(request, bindings, resources, createSpecHash)
 }
 
-func fastPathRuntimeParameters(pool *apiv1alpha2.SandboxPool) orchestration.RuntimeParameters {
+func apiSandboxResourceRequirements(resources *fastpathv2.SandboxResourceRequirements) (*apiv1alpha2.SandboxResourceRequirements, error) {
+	if resources == nil {
+		// A nil value means the Sandbox intentionally inherits the Pool defaults.
+		//nolint:nilnil
+		return nil, nil
+	}
+	if resources.Limits == nil || resources.Limits.Cpu == "" || resources.Limits.Memory == "" {
+		return nil, errors.New("resources.limits.cpu and resources.limits.memory are required")
+	}
+	cpu, err := resource.ParseQuantity(resources.Limits.Cpu)
+	if err != nil {
+		return nil, fmt.Errorf("invalid resources.limits.cpu: %w", err)
+	}
+	memory, err := resource.ParseQuantity(resources.Limits.Memory)
+	if err != nil {
+		return nil, fmt.Errorf("invalid resources.limits.memory: %w", err)
+	}
+	if cpu.Sign() <= 0 || memory.Sign() <= 0 || cpu.MilliValue() < 10 {
+		return nil, errors.New("resources limits must be positive and CPU must be at least 10m")
+	}
+	return &apiv1alpha2.SandboxResourceRequirements{Limits: apiv1alpha2.SandboxComputeResources{CPU: cpu, Memory: memory}}, nil
+}
+
+func fastPathRuntimeParameters(pool *apiv1alpha2.SandboxPool, sandbox *apiv1alpha2.Sandbox) (orchestration.RuntimeParameters, error) {
 	parameters := orchestration.RuntimeParameters{
 		FastletRevision: pool.Status.FastletRevision,
 		ResourceMode:    pool.Spec.SandboxResources.ResourceMode(),
 	}
-	if requests, ok := pool.Spec.SandboxResources.RequestResources(); ok {
-		parameters.ResourceDemand = placement.ResourceDemand{CPU: requests.CPU, Memory: requests.Memory}
+	resolved, demand, err := orchestration.ResolveSandboxResources(pool, sandbox)
+	if err != nil {
+		return orchestration.RuntimeParameters{}, err
 	}
-	return parameters
+	parameters.ResolvedResources, parameters.ResourceDemand = resolved, demand
+	return parameters, nil
+}
+
+func projectResolvedResourceAnnotations(sandbox *apiv1alpha2.Sandbox, parameters orchestration.RuntimeParameters, policyHash string) {
+	if sandbox == nil || parameters.ResolvedResources == nil {
+		return
+	}
+	if sandbox.Annotations == nil {
+		sandbox.Annotations = make(map[string]string)
+	}
+	sandbox.Annotations[assignment.AnnotationResourcePolicyHash] = policyHash
+	sandbox.Annotations[assignment.AnnotationResolvedRequestCPU] = parameters.ResolvedResources.Requests.CPU
+	sandbox.Annotations[assignment.AnnotationResolvedRequestMemory] = parameters.ResolvedResources.Requests.Memory
+	sandbox.Annotations[assignment.AnnotationResolvedLimitCPU] = parameters.ResolvedResources.Limits.CPU
+	sandbox.Annotations[assignment.AnnotationResolvedLimitMemory] = parameters.ResolvedResources.Limits.Memory
 }
 
 func (s *Server) selectFastletsForPool(ctx context.Context, orchestrator *orchestration.Orchestrator, sandbox *apiv1alpha2.Sandbox, stableKey string, parameters orchestration.RuntimeParameters) ([]placement.FastletInfo, assignment.AssignmentEnvelope, error) {
@@ -292,7 +340,7 @@ func (s *Server) provisionRuntime(ctx context.Context, accepted *acceptedCreate,
 			}
 		}
 		fastletContext, finishFastletCreate := startCreateStage(ctx, "fastlet_create")
-		response, callErr := s.Orchestrator.CreateRuntimeOnCandidateWithCompletion(fastletContext, accepted.sandbox, candidate, accepted.assignment, completion)
+		response, callErr := s.Orchestrator.CreateRuntimeOnCandidateWithCompletion(fastletContext, accepted.sandbox, candidate, accepted.assignment, completion, accepted.parameters)
 		finishFastletCreate(callErr)
 		if callErr == nil && response != nil && response.Sandbox != nil {
 			return response.Sandbox, nil
@@ -739,6 +787,10 @@ func poolInfo(pool *apiv1alpha2.SandboxPool) *fastpathv2.PoolInfo {
 		resourceProfile.Requests = &fastpathv2.ComputeResourceProfile{
 			Cpu: requests.CPU.String(), Memory: requests.Memory.String(),
 		}
+		resourceProfile.OvercommitRatio = &fastpathv2.ComputeResourceProfile{
+			Cpu:    pool.Spec.SandboxResources.OvercommitRatio.CPU.String(),
+			Memory: pool.Spec.SandboxResources.OvercommitRatio.Memory.String(),
+		}
 	default:
 		resourceProfile.Mode = fastpathv2.SandboxResourceMode_SANDBOX_RESOURCE_MODE_UNSPECIFIED
 	}
@@ -857,6 +909,7 @@ func sandboxInfoFromFastlet(sandbox *apiv1alpha2.Sandbox, observed *fastletapi.S
 		Runtime:   &fastpathv2.RuntimeInfo{State: protoRuntimeState(observed.Runtime.State)},
 		DataPlane: &fastpathv2.DataPlaneInfo{State: protoDataPlaneState(observed.DataPlane.State)},
 		State:     protoSandboxState(sandbox.Spec.State),
+		Resources: protoSandboxResources(sandbox.Spec.Resources),
 	}
 	if sandbox.Status.Runtime.CheckpointActive() {
 		info.Checkpoint = protoCheckpoint(sandbox.Status.Runtime.Checkpoint)
@@ -1004,6 +1057,7 @@ func sandboxInfoFromCRD(sandbox *apiv1alpha2.Sandbox) *fastpathv2.SandboxInfo {
 		Runtime:           &fastpathv2.RuntimeInfo{State: protoCRDRuntimeState(sandbox.Status.Runtime.State)},
 		DataPlane:         &fastpathv2.DataPlaneInfo{State: protoCRDDataPlaneState(sandbox.Status.DataPlane.State)},
 		State:             protoSandboxState(sandbox.Spec.State),
+		Resources:         protoSandboxResources(sandbox.Spec.Resources),
 	}
 	if sandbox.Status.Runtime.CheckpointActive() {
 		info.Checkpoint = protoCheckpoint(sandbox.Status.Runtime.Checkpoint)
@@ -1038,6 +1092,15 @@ func sandboxInfoFromCRD(sandbox *apiv1alpha2.Sandbox) *fastpathv2.SandboxInfo {
 	}
 	info.Ready = apiMeta.IsStatusConditionTrue(sandbox.Status.Conditions, orchestration.ConditionReady)
 	return info
+}
+
+func protoSandboxResources(resources *apiv1alpha2.SandboxResourceRequirements) *fastpathv2.SandboxResourceRequirements {
+	if resources == nil {
+		return nil
+	}
+	return &fastpathv2.SandboxResourceRequirements{Limits: &fastpathv2.ComputeResourceProfile{
+		Cpu: resources.Limits.CPU.String(), Memory: resources.Limits.Memory.String(),
+	}}
 }
 
 func protoCRDDataPlaneState(state apiv1alpha2.DataPlaneState) fastpathv2.DataPlaneState {
@@ -1175,7 +1238,7 @@ func (s *Server) issueRouteCredential(ctx context.Context, sandbox *apiv1alpha2.
 	return credential, claims, nil
 }
 
-func sandboxFromCreateRequest(request *fastpathv2.CreateSandboxRequest, bindings []apiv1alpha2.ActionBinding, createSpecHash string) *apiv1alpha2.Sandbox {
+func sandboxFromCreateRequest(request *fastpathv2.CreateSandboxRequest, bindings []apiv1alpha2.ActionBinding, resources *apiv1alpha2.SandboxResourceRequirements, createSpecHash string) *apiv1alpha2.Sandbox {
 	environment := make([]corev1.EnvVar, 0, len(request.Envs))
 	for name, value := range request.Envs {
 		environment = append(environment, corev1.EnvVar{Name: name, Value: value})
@@ -1205,6 +1268,7 @@ func sandboxFromCreateRequest(request *fastpathv2.CreateSandboxRequest, bindings
 			Envs: environment, WorkingDir: request.WorkingDir, ExpireTime: expiresAt,
 			FailurePolicy: toFailurePolicy(request.FailurePolicy), RecoveryTimeoutSeconds: recoveryTimeout,
 			ActionBindings: bindings,
+			Resources:      resources,
 		},
 	}
 }

@@ -166,6 +166,7 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	}
 
 	registry := placement.NewInMemoryRegistry()
+	registry.SetServerSeed(os.Getenv("POD_UID"))
 	catalog := runtimecatalog.Builtin()
 	fastletClient := fastletapi.NewFastletClient(fastletPort)
 	orchestrator := &orchestration.Orchestrator{

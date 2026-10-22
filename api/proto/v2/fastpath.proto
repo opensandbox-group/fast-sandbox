@@ -147,6 +147,7 @@ message SandboxInfo {
   // checkpoint is the resume source of a paused Sandbox. It is set only in
   // runtime states PAUSING, PAUSED, and RESUMING.
   CheckpointInfo checkpoint = 9;
+  SandboxResourceRequirements resources = 10;
 }
 
 // CheckpointInfo is the published checkpoint of a paused Sandbox.
@@ -185,6 +186,9 @@ message CreateSandboxRequest {
   int32 recovery_timeout_seconds = 12;
   repeated ActionBinding action_bindings = 13;
   CreateCompletion completion = 14;
+  // resources carries caller-owned runtime limits. It is valid only for a
+  // ResourceAware Pool; omission selects the Pool defaults.
+  SandboxResourceRequirements resources = 15;
 }
 
 message CreateSandboxResponse {
@@ -337,11 +341,16 @@ message ComputeResourceProfile {
   string memory = 2;
 }
 
+message SandboxResourceRequirements {
+  ComputeResourceProfile limits = 1;
+}
+
 message SandboxResourceProfileInfo {
   SandboxResourceMode mode = 1;
   ComputeResourceProfile requests = 2;
   ComputeResourceProfile limits = 3;
   int64 pids = 4;
+  ComputeResourceProfile overcommit_ratio = 5;
 }
 
 message PoolInfo {

@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/features"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/controlplane/assignment"
 	"fast-sandbox/internal/fastletsettings"
 	"fast-sandbox/test/e2e/support/fixtures"
 	"fast-sandbox/test/e2e/support/suiteenv"
@@ -190,11 +191,27 @@ func TestResourceAwareOvercommitScaling(t *testing.T) {
 			}
 			assertResourceAwareFastletContract(ctx, t, k8sClient, namespace, pool.Name)
 
-			for index := 1; index <= 3; index++ {
-				sandbox := createSchedulingSandbox(namespace, fmt.Sprintf("sb-resource-%d", index), pool.Name)
-				if _, err := fixture.CreateSandbox(ctx, namespace, sandbox); err != nil {
-					t.Fatalf("create resource-aware sandbox %d: %v", index, err)
-				}
+			first := createResourceAwareSchedulingSandbox(namespace, "sb-resource-1", pool.Name, "250m", "512Mi")
+			if _, err := fixture.CreateSandbox(ctx, namespace, first); err != nil {
+				t.Fatalf("create first heterogeneous Sandbox: %v", err)
+			}
+			assignedFirst := waitForAssignedSandbox(ctx, t, fixture, namespace, first.Name)
+			assertResolvedRequestAnnotations(t, pool, assignedFirst)
+
+			second := createSchedulingSandbox(namespace, "sb-resource-2", pool.Name)
+			if _, err := fixture.CreateSandbox(ctx, namespace, second); err != nil {
+				t.Fatalf("create default-profile Sandbox: %v", err)
+			}
+			assignedSecond := waitForAssignedSandbox(ctx, t, fixture, namespace, second.Name)
+			assertResolvedRequestAnnotations(t, pool, assignedSecond)
+			if assignedFirst.Status.Placement.FastletName != assignedSecond.Status.Placement.FastletName {
+				t.Fatalf("first two Sandboxes should fit one resource ledger, got %s and %s",
+					assignedFirst.Status.Placement.FastletName, assignedSecond.Status.Placement.FastletName)
+			}
+
+			third := createResourceAwareSchedulingSandbox(namespace, "sb-resource-3", pool.Name, "250m", "96Mi")
+			if _, err := fixture.CreateSandbox(ctx, namespace, third); err != nil {
+				t.Fatalf("create capacity-crossing Sandbox: %v", err)
 			}
 
 			scaleCtx, cancelScale := context.WithTimeout(ctx, 120*time.Second)
@@ -203,17 +220,28 @@ func TestResourceAwareOvercommitScaling(t *testing.T) {
 				t.Fatalf("wait for resource commitment scale-out: %v", err)
 			}
 
-			assignments := make(map[string]int)
+			assignments := make(map[string]apiv1alpha2.SandboxComputeResources)
 			for index := 1; index <= 3; index++ {
 				assigned := waitForAssignedSandbox(ctx, t, fixture, namespace, fmt.Sprintf("sb-resource-%d", index))
-				assignments[assigned.Status.Placement.FastletName]++
+				assertResolvedRequestAnnotations(t, pool, assigned)
+				committed := assignments[assigned.Status.Placement.FastletName]
+				cpu := resource.MustParse(assigned.Annotations[assignment.AnnotationResolvedRequestCPU])
+				memory := resource.MustParse(assigned.Annotations[assignment.AnnotationResolvedRequestMemory])
+				committed.CPU.Add(cpu)
+				committed.Memory.Add(memory)
+				assignments[assigned.Status.Placement.FastletName] = committed
 			}
 			if len(assignments) != 2 {
 				t.Fatalf("resource-aware placement used %d Fastlets, want 2: %v", len(assignments), assignments)
 			}
-			for fastlet, count := range assignments {
-				if count > 2 {
-					t.Fatalf("Fastlet %s admitted %d Sandboxes above its resource commitment capacity 2", fastlet, count)
+			capacity, _, err := pool.Spec.SandboxResources.ResolveFastletCapacity(pool.Spec.MaxSandboxesPerPod)
+			if err != nil {
+				t.Fatalf("resolve expected Fastlet capacity: %v", err)
+			}
+			for fastlet, committed := range assignments {
+				if committed.CPU.Cmp(capacity.CPU) > 0 || committed.Memory.Cmp(capacity.Memory) > 0 {
+					t.Fatalf("Fastlet %s committed %s/%s above capacity %s/%s", fastlet,
+						committed.CPU.String(), committed.Memory.String(), capacity.CPU.String(), capacity.Memory.String())
 				}
 			}
 
@@ -309,12 +337,10 @@ func TestResourceAwareMemoryPressureScaling(t *testing.T) {
 }
 
 func createResourceAwareSchedulingPool(namespace, name string) *apiv1alpha2.SandboxPool {
-	pool := createSchedulingPool(namespace, name, 1, 2, 2)
-	pool.Spec.SandboxResources = apiv1alpha2.SandboxResourceProfile{
-		Requests: &apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("100m"), Memory: resource.MustParse("128Mi")},
-		Limits:   &apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("500m"), Memory: resource.MustParse("192Mi")},
-		PIDs:     64,
-	}
+	pool := createSchedulingPool(namespace, name, 1, 2, 4)
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("500m"), resource.MustParse("192Mi"), resource.MustParse("5"), resource.MustParse("1.5"), 64,
+	)
 	pool.Spec.FastletTemplate.Spec.Containers[0].Env = []corev1.EnvVar{
 		{Name: "FAST_SANDBOX_MEMORY_HIGH_WATERMARK", Value: "0.99"},
 		{Name: "FAST_SANDBOX_MEMORY_LOW_WATERMARK", Value: "0.95"},
@@ -339,8 +365,8 @@ func assertResourceAwareFastletContract(ctx context.Context, t *testing.T, k8sCl
 	}
 
 	fastlet := pods.Items[0].Spec.Containers[0]
-	wantCPU := resource.MustParse("600m")
-	wantMemory := resource.MustParse("384Mi")
+	wantCPU := resource.MustParse("500m")
+	wantMemory := resource.MustParse("512Mi")
 	for name, resources := range map[string]corev1.ResourceList{
 		"requests": fastlet.Resources.Requests,
 		"limits":   fastlet.Resources.Limits,
@@ -357,11 +383,61 @@ func assertResourceAwareFastletContract(ctx context.Context, t *testing.T, k8sCl
 	if err != nil {
 		t.Fatalf("decode Fastlet commitment capacity: %v", err)
 	}
-	wantCapacityCPU := resource.MustParse("200m")
-	wantCapacityMemory := resource.MustParse("256Mi")
+	wantCapacityCPU := resource.MustParse("400m")
+	wantCapacityMemory := resource.MustParse("512Mi")
 	if capacity.CPU.Cmp(wantCapacityCPU) != 0 || capacity.Memory.Cmp(wantCapacityMemory) != 0 {
 		t.Fatalf("Fastlet commitment capacity=(%s,%s), want (%s,%s)",
 			capacity.CPU.String(), capacity.Memory.String(), wantCapacityCPU.String(), wantCapacityMemory.String())
+	}
+}
+
+func createResourceAwareSchedulingSandbox(namespace, name, pool, cpuLimit, memoryLimit string) *apiv1alpha2.Sandbox {
+	sandbox := createSchedulingSandbox(namespace, name, pool)
+	sandbox.Spec.Resources = &apiv1alpha2.SandboxResourceRequirements{
+		Limits: apiv1alpha2.SandboxComputeResources{
+			CPU:    resource.MustParse(cpuLimit),
+			Memory: resource.MustParse(memoryLimit),
+		},
+	}
+	return sandbox
+}
+
+func assertResolvedRequestAnnotations(t *testing.T, pool *apiv1alpha2.SandboxPool, sandbox *apiv1alpha2.Sandbox) {
+	t.Helper()
+	limits, err := pool.Spec.SandboxResources.ResolveLimits(sandbox.Spec.Resources)
+	if err != nil {
+		t.Fatalf("resolve expected limits for Sandbox %s: %v", sandbox.Name, err)
+	}
+	want, err := pool.Spec.SandboxResources.DeriveRequests(limits)
+	if err != nil {
+		t.Fatalf("derive expected requests for Sandbox %s: %v", sandbox.Name, err)
+	}
+	gotCPU, err := resource.ParseQuantity(sandbox.Annotations[assignment.AnnotationResolvedRequestCPU])
+	if err != nil {
+		t.Fatalf("parse resolved CPU request annotation for Sandbox %s: %v", sandbox.Name, err)
+	}
+	gotMemory, err := resource.ParseQuantity(sandbox.Annotations[assignment.AnnotationResolvedRequestMemory])
+	if err != nil {
+		t.Fatalf("parse resolved memory request annotation for Sandbox %s: %v", sandbox.Name, err)
+	}
+	if gotCPU.Cmp(want.CPU) != 0 || gotMemory.Cmp(want.Memory) != 0 {
+		t.Fatalf("Sandbox %s resolved requests=%s/%s, want %s/%s", sandbox.Name,
+			gotCPU.String(), gotMemory.String(), want.CPU.String(), want.Memory.String())
+	}
+	if got := sandbox.Annotations[assignment.AnnotationResourcePolicyHash]; got != pool.Spec.SandboxResources.Hash() {
+		t.Fatalf("Sandbox %s resource policy hash=%q, want %q", sandbox.Name, got, pool.Spec.SandboxResources.Hash())
+	}
+	gotLimitCPU, err := resource.ParseQuantity(sandbox.Annotations[assignment.AnnotationResolvedLimitCPU])
+	if err != nil {
+		t.Fatalf("parse resolved CPU limit annotation for Sandbox %s: %v", sandbox.Name, err)
+	}
+	gotLimitMemory, err := resource.ParseQuantity(sandbox.Annotations[assignment.AnnotationResolvedLimitMemory])
+	if err != nil {
+		t.Fatalf("parse resolved memory limit annotation for Sandbox %s: %v", sandbox.Name, err)
+	}
+	if gotLimitCPU.Cmp(limits.CPU) != 0 || gotLimitMemory.Cmp(limits.Memory) != 0 {
+		t.Fatalf("Sandbox %s resolved limits=%s/%s, want %s/%s", sandbox.Name,
+			gotLimitCPU.String(), gotLimitMemory.String(), limits.CPU.String(), limits.Memory.String())
 	}
 }
 

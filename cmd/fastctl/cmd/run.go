@@ -17,17 +17,27 @@ import (
 )
 
 type SandboxConfig struct {
-	Image                  string                `yaml:"image"`
-	PoolRef                string                `yaml:"pool_ref"`
-	Command                []string              `yaml:"command,omitempty"`
-	Args                   []string              `yaml:"args,omitempty"`
-	Envs                   map[string]string     `yaml:"envs,omitempty"`
-	WorkingDir             string                `yaml:"working_dir,omitempty"`
-	ExpiresAt              int64                 `yaml:"expires_at,omitempty"`
-	Metadata               map[string]string     `yaml:"metadata,omitempty"`
-	FailurePolicy          string                `yaml:"failure_policy,omitempty"`
-	RecoveryTimeoutSeconds int32                 `yaml:"recovery_timeout_seconds,omitempty"`
-	ActionBindings         []ActionBindingConfig `yaml:"action_bindings,omitempty"`
+	Image                  string                  `yaml:"image"`
+	PoolRef                string                  `yaml:"pool_ref"`
+	Command                []string                `yaml:"command,omitempty"`
+	Args                   []string                `yaml:"args,omitempty"`
+	Envs                   map[string]string       `yaml:"envs,omitempty"`
+	WorkingDir             string                  `yaml:"working_dir,omitempty"`
+	ExpiresAt              int64                   `yaml:"expires_at,omitempty"`
+	Metadata               map[string]string       `yaml:"metadata,omitempty"`
+	FailurePolicy          string                  `yaml:"failure_policy,omitempty"`
+	RecoveryTimeoutSeconds int32                   `yaml:"recovery_timeout_seconds,omitempty"`
+	ActionBindings         []ActionBindingConfig   `yaml:"action_bindings,omitempty"`
+	Resources              *SandboxResourcesConfig `yaml:"resources,omitempty"`
+}
+
+type SandboxResourcesConfig struct {
+	Limits ComputeResourcesConfig `yaml:"limits"`
+}
+
+type ComputeResourcesConfig struct {
+	CPU    string `yaml:"cpu"`
+	Memory string `yaml:"memory"`
 }
 
 type ActionBindingConfig struct {
@@ -45,6 +55,8 @@ var (
 	runFailurePolicy   string
 	runRecoveryTimeout int32
 	runActionBindings  []string
+	runCPULimit        string
+	runMemoryLimit     string
 )
 
 var runCmd = &cobra.Command{
@@ -161,6 +173,21 @@ Priority: Flags > Config File > Interactive Input
 		for _, binding := range actionBindings {
 			apiBindings = append(apiBindings, &fastpathv2.ActionBinding{Handler: binding.Handler, Input: binding.Input})
 		}
+		resources := config.Resources
+		if cmd.Flags().Changed("cpu-limit") || cmd.Flags().Changed("memory-limit") {
+			if resources == nil {
+				resources = &SandboxResourcesConfig{}
+			}
+			if cmd.Flags().Changed("cpu-limit") {
+				resources.Limits.CPU = runCPULimit
+			}
+			if cmd.Flags().Changed("memory-limit") {
+				resources.Limits.Memory = runMemoryLimit
+			}
+		}
+		if resources != nil && (resources.Limits.CPU == "" || resources.Limits.Memory == "") {
+			exitWithErrorf("resources.limits.cpu and resources.limits.memory must be set together")
+		}
 		req := &fastpathv2.CreateSandboxRequest{
 			Image:                config.Image,
 			PoolRef:              config.PoolRef,
@@ -174,6 +201,11 @@ Priority: Flags > Config File > Interactive Input
 			FailurePolicy: failurePolicy, RecoveryTimeoutSeconds: recoveryTimeout,
 			ActionBindings: apiBindings,
 			Completion:     fastpathv2.CreateCompletion_CREATE_COMPLETION_READY,
+		}
+		if resources != nil {
+			req.Resources = &fastpathv2.SandboxResourceRequirements{Limits: &fastpathv2.ComputeResourceProfile{
+				Cpu: resources.Limits.CPU, Memory: resources.Limits.Memory,
+			}}
 		}
 		klog.V(4).InfoS("sending CreateSandbox request", "name", name, "image", config.Image, "pool", config.PoolRef, "namespace", req.Namespace)
 
@@ -253,6 +285,8 @@ func init() {
 	runCmd.Flags().StringVar(&runFailurePolicy, "failure-policy", "", "Failure policy (Manual|AutoRecreate)")
 	runCmd.Flags().Int32Var(&runRecoveryTimeout, "recovery-timeout", 0, "Recovery delay in seconds")
 	runCmd.Flags().StringArrayVar(&runActionBindings, "action", nil, "Ordered Action Binding as handler=opaque-input; repeat to add Bindings")
+	runCmd.Flags().StringVar(&runCPULimit, "cpu-limit", "", "Per-Sandbox CPU runtime limit for a ResourceAware Pool")
+	runCmd.Flags().StringVar(&runMemoryLimit, "memory-limit", "", "Per-Sandbox memory runtime limit for a ResourceAware Pool")
 }
 
 func parseActionBindings(values []string) ([]ActionBindingConfig, error) {

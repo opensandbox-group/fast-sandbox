@@ -271,6 +271,13 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	activeCount, pendingCount := poolDemandCounts(
 		allSandboxes.Items, pool.Name, childIdentities, resourceAwareScaling, observedFastlets, now,
 	)
+	pendingResources := placement.ResourceDemand{}
+	if resourceAwareScaling {
+		pendingResources, err = poolPendingResourceDemand(&pool, allSandboxes.Items, observedFastlets, now)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	maxPerPod := getFastletCapacity(&pool)
 	if maxPerPod <= 0 {
@@ -284,8 +291,8 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	desiredPods := int32(0)
 	resourceScalePlan := resourceAwareScalePlan{}
 	if resourceAwareScaling {
-		resourceScalePlan = r.planResourceAwareScale(
-			&pool, childPods.Items, pendingCount, desiredPod, observedFastlets, now,
+		resourceScalePlan = r.planResourceAwareScaleWithDemand(
+			&pool, childPods.Items, pendingCount, pendingResources, desiredPod, observedFastlets, now,
 		)
 		desiredPods = resourceScalePlan.desiredPods
 	} else {
@@ -301,13 +308,13 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	currentCount := int32(len(childPods.Items))
-	var resourceScaleDownCandidateSince *metav1.Time
+	var scaleDownCandidate *metav1.Condition
 	if resourceAwareScaling {
 		// Existing resource scale-down drains are already committed removals.
 		// Stabilize only additional shrink so a later reconcile does not erase
 		// the durable target before the draining Pod can be deleted.
 		stabilizationBaseline := currentCount - resourceScalePlan.activeScaleDownDrains
-		desiredPods, resourceScaleDownCandidateSince = r.stabilizeResourceAwareScaleDown(&pool, stabilizationBaseline, desiredPods)
+		desiredPods, scaleDownCandidate = r.stabilizeResourceAwareScaleDown(&pool, stabilizationBaseline, desiredPods)
 	}
 	desiredPodHash := desiredPod.Annotations[placement.AnnotationPodTemplateHash]
 
@@ -332,17 +339,23 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	preparedFastlets := r.preparedFastletCount(&pool, infraPlan.Revision)
 	warmImageStatuses := r.aggregateWarmImageStatus(&pool, childPods.Items)
 	idleFastlets, busyFastlets := r.fastletUtilizationCounts(&pool, childPods.Items)
+	fastletSummary, resourceSummary := summarizePoolFastlets(&pool, childPods.Items, desiredPods, readyPods, idleFastlets, busyFastlets, observedFastlets, now)
+	sandboxSummary := summarizePoolSandboxes(allSandboxes.Items, pool.Name)
 	observation := poolObservation{
-		currentPods:                     currentCount,
-		readyPods:                       readyPods,
-		idleFastlets:                    idleFastlets,
-		busyFastlets:                    busyFastlets,
-		runtimeRevision:                 runtimePlan.Revision,
-		infraRevision:                   infraPlan.Revision,
-		fastletRevision:                 desiredPodHash,
-		preparedFastlets:                preparedFastlets,
-		resourceScaleDownCandidateSince: resourceScaleDownCandidateSince,
-		warmImages:                      warmImageStatuses,
+		currentPods:        currentCount,
+		readyPods:          readyPods,
+		idleFastlets:       idleFastlets,
+		busyFastlets:       busyFastlets,
+		runtimeRevision:    runtimePlan.Revision,
+		infraRevision:      infraPlan.Revision,
+		fastletRevision:    desiredPodHash,
+		preparedFastlets:   preparedFastlets,
+		scaleDownCandidate: scaleDownCandidate,
+		warmImages:         warmImageStatuses,
+		fastlets:           fastletSummary,
+		resources:          resourceSummary,
+		sandboxes:          sandboxSummary,
+		observedAt:         now,
 	}
 	if err := r.updatePoolStatus(ctx, &pool, observation.apply); err != nil {
 		return ctrl.Result{}, err
@@ -445,10 +458,18 @@ type resourceAwareScalePlan struct {
 	activeScaleDownDrains int32
 }
 
-func (r *SandboxPoolReconciler) planResourceAwareScale(
+type resourceAwareCapacityView struct {
+	freeSlots             int32
+	freeResources         placement.ResourceDemand
+	removable             []resourceAwareDrainCandidate
+	activeScaleDownDrains int32
+}
+
+func (r *SandboxPoolReconciler) planResourceAwareScaleWithDemand(
 	pool *apiv1alpha2.SandboxPool,
 	pods []corev1.Pod,
 	pendingSandboxes int32,
+	pendingDemand placement.ResourceDemand,
 	plannedPod *corev1.Pod,
 	observed map[string]placement.FastletInfo,
 	now time.Time,
@@ -464,14 +485,81 @@ func (r *SandboxPoolReconciler) planResourceAwareScale(
 		return plan
 	}
 	demand := placement.ResourceDemand{CPU: requests.CPU, Memory: requests.Memory}
-	var availableFree int32
-	removable := make([]resourceAwareDrainCandidate, 0, len(pods))
+	view := r.observeResourceAwareCapacity(pool, pods, plannedPod, observed, now, demand, nominal)
+	plan.activeScaleDownDrains = view.activeScaleDownDrains
+	availableFree := view.freeSlots
+	availableResources := view.freeResources
+
+	desiredFree := pendingSandboxes + pool.Spec.Capacity.BufferMin
+	plan.desiredPods = current - plan.activeScaleDownDrains
+	bufferCPU := demand.CPU.DeepCopy()
+	bufferCPU.Mul(int64(pool.Spec.Capacity.BufferMin))
+	bufferMemory := demand.Memory.DeepCopy()
+	bufferMemory.Mul(int64(pool.Spec.Capacity.BufferMin))
+	requiredCPU := pendingDemand.CPU.DeepCopy()
+	requiredCPU.Add(bufferCPU)
+	requiredMemory := pendingDemand.Memory.DeepCopy()
+	requiredMemory.Add(bufferMemory)
+	if availableFree < desiredFree || availableResources.CPU.Cmp(requiredCPU) < 0 || availableResources.Memory.Cmp(requiredMemory) < 0 {
+		deficit := max(int32(0), desiredFree-availableFree)
+		missingCPU := requiredCPU.MilliValue() - availableResources.CPU.MilliValue()
+		missingMemory := requiredMemory.Value() - availableResources.Memory.Value()
+		capacity, err := fastletsettings.DecodeCommitmentCapacity(plannedPod.Annotations[fastletsettings.CommitmentCapacityAnnotation])
+		podsNeeded := (deficit + nominal - 1) / nominal
+		if err == nil {
+			podsNeeded = max(podsNeeded, int32(ceilPositive(missingCPU, capacity.CPU.MilliValue())))
+			podsNeeded = max(podsNeeded, int32(ceilPositive(missingMemory, capacity.Memory.Value())))
+		}
+		// Canceling an in-progress resource scale-down can recover at most one
+		// nominal Fastlet per drain. Only create Pods for any remaining deficit.
+		podsNeeded -= min(podsNeeded, plan.activeScaleDownDrains)
+		plan.desiredPods = current + podsNeeded
+		return plan
+	}
+	if pendingSandboxes > 0 {
+		return plan
+	}
+
+	retainedFree := max(pool.Spec.Capacity.BufferMax, pool.Spec.Capacity.BufferMin)
+	sort.Slice(view.removable, func(i, j int) bool {
+		if view.removable[i].free != view.removable[j].free {
+			return view.removable[i].free < view.removable[j].free
+		}
+		return view.removable[i].identity < view.removable[j].identity
+	})
+	for _, candidate := range view.removable {
+		if plan.desiredPods <= pool.Spec.Capacity.PoolMin || availableFree-candidate.free < retainedFree {
+			break
+		}
+		availableFree -= candidate.free
+		plan.desiredPods--
+		plan.drainCandidates = append(plan.drainCandidates, candidate.identity)
+	}
+	return plan
+}
+
+func (r *SandboxPoolReconciler) observeResourceAwareCapacity(
+	pool *apiv1alpha2.SandboxPool,
+	pods []corev1.Pod,
+	plannedPod *corev1.Pod,
+	observed map[string]placement.FastletInfo,
+	now time.Time,
+	demand placement.ResourceDemand,
+	nominal int32,
+) resourceAwareCapacityView {
+	view := resourceAwareCapacityView{
+		freeResources: placement.ResourceDemand{CPU: resource.MustParse("0"), Memory: resource.MustParse("0")},
+		removable:     make([]resourceAwareDrainCandidate, 0, len(pods)),
+	}
+	nominalResources, nominalResourcesKnown := fastletsettings.DecodeCommitmentCapacity(
+		plannedPod.Annotations[fastletsettings.CommitmentCapacityAnnotation],
+	)
 	for index := range pods {
 		pod := &pods[index]
 		identity := podIdentity(pod)
 		drainRequested := placement.PodDrainRequested(pod)
 		if drainRequested && pod.Annotations[placement.AnnotationDrainReason] == placement.DrainReasonScaleDown {
-			plan.activeScaleDownDrains++
+			view.activeScaleDownDrains++
 		}
 		// The Pod annotation is the durable drain intent. Do not wait for the
 		// next heartbeat to remove that Fastlet from available capacity.
@@ -481,47 +569,31 @@ func (r *SandboxPoolReconciler) planResourceAwareScale(
 		info, exists := observed[identity]
 		if !exists || info.LastHeartbeat.IsZero() {
 			if r.podWithinStartupGrace(pod, now) {
-				availableFree += nominal
+				view.freeSlots += nominal
+				if nominalResourcesKnown == nil {
+					view.freeResources.CPU.Add(nominalResources.CPU)
+					view.freeResources.Memory.Add(nominalResources.Memory)
+				}
 			}
 			continue
 		}
 		free := placement.EffectiveFreeCapacity(info, demand, now, placement.DefaultObservationStaleAfter)
-		availableFree += free
+		view.freeSlots += free
+		freeResources := placement.EffectiveFreeResources(info, now, placement.DefaultObservationStaleAfter)
+		view.freeResources.CPU.Add(freeResources.CPU)
+		view.freeResources.Memory.Add(freeResources.Memory)
 		if info.Used() == 0 && !info.Draining && !info.DrainRequested {
-			removable = append(removable, resourceAwareDrainCandidate{identity: identity, free: free})
+			view.removable = append(view.removable, resourceAwareDrainCandidate{identity: identity, free: free})
 		}
 	}
+	return view
+}
 
-	desiredFree := pendingSandboxes + pool.Spec.Capacity.BufferMin
-	plan.desiredPods = current - plan.activeScaleDownDrains
-	if availableFree < desiredFree {
-		deficit := desiredFree - availableFree
-		// Canceling an in-progress resource scale-down can recover at most one
-		// nominal Fastlet per drain. Only create Pods for any remaining deficit.
-		deficit -= min(deficit, plan.activeScaleDownDrains*nominal)
-		plan.desiredPods = current + (deficit+nominal-1)/nominal
-		return plan
+func ceilPositive(value, divisor int64) int64 {
+	if value <= 0 || divisor <= 0 {
+		return 0
 	}
-	if pendingSandboxes > 0 {
-		return plan
-	}
-
-	retainedFree := max(pool.Spec.Capacity.BufferMax, pool.Spec.Capacity.BufferMin)
-	sort.Slice(removable, func(i, j int) bool {
-		if removable[i].free != removable[j].free {
-			return removable[i].free < removable[j].free
-		}
-		return removable[i].identity < removable[j].identity
-	})
-	for _, candidate := range removable {
-		if plan.desiredPods <= pool.Spec.Capacity.PoolMin || availableFree-candidate.free < retainedFree {
-			break
-		}
-		availableFree -= candidate.free
-		plan.desiredPods--
-		plan.drainCandidates = append(plan.drainCandidates, candidate.identity)
-	}
-	return plan
+	return (value + divisor - 1) / divisor
 }
 
 func resourceFastletsForPoolChildren(
@@ -583,24 +655,34 @@ func (r *SandboxPoolReconciler) stabilizeResourceAwareScaleDown(
 	pool *apiv1alpha2.SandboxPool,
 	current int32,
 	desired int32,
-) (int32, *metav1.Time) {
-	if desired >= current {
-		return desired, nil
-	}
+) (int32, *metav1.Condition) {
 	now := r.now()
-	since := pool.Status.ResourceScaleDownCandidateSince
-	if since == nil {
-		started := metav1.NewTime(now)
-		return current, &started
+	if desired >= current {
+		return desired, &metav1.Condition{
+			Type: apiv1alpha2.PoolConditionScaleDownCandidate, Status: metav1.ConditionFalse,
+			Reason: apiv1alpha2.ReasonDemandReturned, Message: "Pool capacity is within the configured buffer",
+			ObservedGeneration: pool.Generation, LastTransitionTime: metav1.NewTime(now),
+		}
 	}
+	condition := metav1.Condition{
+		Type: apiv1alpha2.PoolConditionScaleDownCandidate, Status: metav1.ConditionTrue,
+		Reason: apiv1alpha2.ReasonExcessCapacity, Message: "Pool has excess capacity and is waiting for the scale-down stabilization window",
+		ObservedGeneration: pool.Generation, LastTransitionTime: metav1.NewTime(now),
+	}
+	existing := apiMeta.FindStatusCondition(pool.Status.Conditions, apiv1alpha2.PoolConditionScaleDownCandidate)
+	if existing == nil || existing.Status != metav1.ConditionTrue {
+		return current, &condition
+	}
+	condition.LastTransitionTime = existing.LastTransitionTime
 	window := r.ResourceScaleDownStabilization
 	if window <= 0 {
 		window = defaultResourceScaleDownStabilization
 	}
-	if now.Sub(since.Time) < window {
-		return current, since.DeepCopy()
+	if now.Sub(existing.LastTransitionTime.Time) < window {
+		return current, &condition
 	}
-	return desired, since.DeepCopy()
+	condition.Message = "Pool capacity has remained above the configured buffer for the stabilization window"
+	return desired, &condition
 }
 
 func childPodIdentities(pods []corev1.Pod) map[string]struct{} {
@@ -772,6 +854,13 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 		empty := active[podIdentity(pod)] == 0
 		timedOut := !drainStartedAt(pod).IsZero() && now.Sub(drainStartedAt(pod)) >= timeout
 		previouslyAcked := pod.Annotations[placement.AnnotationDrainAckedAt] != ""
+		if timedOut && !empty && pod.Annotations[placement.AnnotationDrainReason] == placement.DrainReasonScaleDown {
+			if err := r.cancelDrain(ctx, pod); err != nil {
+				return ctrl.Result{}, true, err
+			}
+			klog.FromContext(ctx).Info("cancelled loaded scale-down drain after timeout", "pod", pod.Name)
+			continue
+		}
 		if (empty && (acked || previouslyAcked)) || timedOut {
 			if err := r.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
 				return ctrl.Result{}, true, err
@@ -947,6 +1036,32 @@ func poolDemandCounts(
 		}
 	}
 	return active, pending
+}
+
+func poolPendingResourceDemand(
+	pool *apiv1alpha2.SandboxPool,
+	sandboxes []apiv1alpha2.Sandbox,
+	observedFastlets map[string]placement.FastletInfo,
+	now time.Time,
+) (placement.ResourceDemand, error) {
+	total := placement.ResourceDemand{CPU: resource.MustParse("0"), Memory: resource.MustParse("0")}
+	for index := range sandboxes {
+		sandbox := &sandboxes[index]
+		if sandbox.Spec.PoolRef != pool.Name || !sandboxNeedsResourceCapacity(sandbox, observedFastlets, now) {
+			continue
+		}
+		limits, err := pool.Spec.SandboxResources.ResolveLimits(sandbox.Spec.Resources)
+		if err != nil {
+			return placement.ResourceDemand{}, fmt.Errorf("resolve pending Sandbox %s resources: %w", sandbox.Name, err)
+		}
+		requests, err := pool.Spec.SandboxResources.DeriveRequests(limits)
+		if err != nil {
+			return placement.ResourceDemand{}, fmt.Errorf("derive pending Sandbox %s requests: %w", sandbox.Name, err)
+		}
+		total.CPU.Add(requests.CPU)
+		total.Memory.Add(requests.Memory)
+	}
+	return total, nil
 }
 
 func podIdentity(pod *corev1.Pod) string {
@@ -1528,7 +1643,7 @@ func buildFastletSettingsFromResolved(pool *apiv1alpha2.SandboxPool, resolved re
 		return bundle, nil
 	}
 	bundle.ResourceAdmission = &fastletsettings.ResourceAdmissionSettings{
-		Version: "v1", Mode: apiv1alpha2.SandboxResourceModeResourceAware,
+		Version: "v2", Mode: apiv1alpha2.SandboxResourceModeResourceAware,
 		StaticAdmission: resolved.StaticAdmission, MemoryAdmission: resolved.MemoryAdmission,
 		Capacity: apiv1alpha2.SandboxComputeResources{
 			CPU: resolved.CommitmentCapacity.CPU.DeepCopy(), Memory: resolved.CommitmentCapacity.Memory.DeepCopy(),
@@ -2174,20 +2289,26 @@ func (r *SandboxPoolReconciler) updatePoolCondition(ctx context.Context, pool *a
 // poolObservation carries the per-reconcile counter/revision projection into
 // SandboxPool.status.
 type poolObservation struct {
-	currentPods                     int32
-	readyPods                       int32
-	idleFastlets                    int32
-	busyFastlets                    int32
-	runtimeRevision                 string
-	infraRevision                   string
-	fastletRevision                 string
-	preparedFastlets                int32
-	resourceScaleDownCandidateSince *metav1.Time
-	warmImages                      []apiv1alpha2.WarmImageStatus
+	currentPods        int32
+	readyPods          int32
+	idleFastlets       int32
+	busyFastlets       int32
+	runtimeRevision    string
+	infraRevision      string
+	fastletRevision    string
+	preparedFastlets   int32
+	scaleDownCandidate *metav1.Condition
+	warmImages         []apiv1alpha2.WarmImageStatus
+	fastlets           *apiv1alpha2.SandboxPoolFastletSummary
+	resources          *apiv1alpha2.SandboxPoolResourceSummary
+	sandboxes          *apiv1alpha2.SandboxPoolSandboxSummary
+	observedAt         time.Time
 }
 
 func (o poolObservation) apply(pool *apiv1alpha2.SandboxPool) bool {
 	status := &pool.Status
+	summaryDue := status.SummaryObservedAt == nil || o.observedAt.Sub(status.SummaryObservedAt.Time) >= time.Minute
+	summaryMatches := !summaryDue || reflect.DeepEqual(status.Fastlets, o.fastlets) && reflect.DeepEqual(status.Resources, o.resources) && reflect.DeepEqual(status.Sandboxes, o.sandboxes)
 	// omitempty turns empty WarmImages into nil on API reads; treat both as equal
 	// to avoid repeated status writes and watch-triggered reconciles.
 	if status.CurrentPods == o.currentPods &&
@@ -2195,8 +2316,7 @@ func (o poolObservation) apply(pool *apiv1alpha2.SandboxPool) bool {
 		status.BusyFastlets == o.busyFastlets &&
 		status.RuntimeRevision == o.runtimeRevision && status.InfraRevision == o.infraRevision &&
 		status.FastletRevision == o.fastletRevision && status.PreparedFastlets == o.preparedFastlets &&
-		reflect.DeepEqual(status.ResourceScaleDownCandidateSince, o.resourceScaleDownCandidateSince) &&
-		slices.Equal(status.WarmImages, o.warmImages) {
+		slices.Equal(status.WarmImages, o.warmImages) && conditionMatches(status.Conditions, o.scaleDownCandidate) && summaryMatches {
 		return false
 	}
 	status.CurrentPods = o.currentPods
@@ -2207,9 +2327,115 @@ func (o poolObservation) apply(pool *apiv1alpha2.SandboxPool) bool {
 	status.InfraRevision = o.infraRevision
 	status.FastletRevision = o.fastletRevision
 	status.PreparedFastlets = o.preparedFastlets
-	status.ResourceScaleDownCandidateSince = o.resourceScaleDownCandidateSince
 	status.WarmImages = o.warmImages
+	if o.scaleDownCandidate != nil {
+		apiMeta.SetStatusCondition(&status.Conditions, *o.scaleDownCandidate)
+	}
+	if summaryDue {
+		status.Fastlets, status.Resources, status.Sandboxes = o.fastlets, o.resources, o.sandboxes
+		observedAt := metav1.NewTime(o.observedAt)
+		status.SummaryObservedAt = &observedAt
+	}
 	return true
+}
+
+func summarizePoolFastlets(
+	pool *apiv1alpha2.SandboxPool,
+	pods []corev1.Pod,
+	desired, ready, idle, busy int32,
+	observed map[string]placement.FastletInfo,
+	now time.Time,
+) (*apiv1alpha2.SandboxPoolFastletSummary, *apiv1alpha2.SandboxPoolResourceSummary) {
+	fastlets := &apiv1alpha2.SandboxPoolFastletSummary{Desired: desired, Current: int32(len(pods)), Ready: ready, Idle: idle, Busy: busy}
+	resources := &apiv1alpha2.SandboxPoolResourceSummary{
+		Capacity: zeroComputeResources(), Committed: zeroComputeResources(), Free: zeroComputeResources(),
+	}
+	if pool.Spec.SandboxResources.ResourceMode() != apiv1alpha2.SandboxResourceModeResourceAware {
+		return fastlets, nil
+	}
+	for index := range pods {
+		pod := &pods[index]
+		if placement.PodDrainRequested(pod) {
+			fastlets.Draining++
+		}
+		capacity, err := fastletsettings.DecodeCommitmentCapacity(pod.Annotations[fastletsettings.CommitmentCapacityAnnotation])
+		if err == nil {
+			addComputeResources(&resources.Capacity, capacity)
+		}
+		info, ok := observed[podIdentity(pod)]
+		if !ok || info.Admission.Resources == nil || info.Admission.Resources.Version != "v2" {
+			continue
+		}
+		addDemand(&resources.Committed, info.ResourceCommitted)
+		status := info.Admission.Resources
+		fresh := !info.LastHeartbeat.IsZero() && !info.ResourceReceivedAt.IsZero() &&
+			now.Sub(info.LastHeartbeat) <= placement.DefaultObservationStaleAfter && now.Sub(info.ResourceReceivedAt) <= placement.DefaultObservationStaleAfter
+		if !fresh || !info.PodReady || !info.RuntimeReady || !info.InfraReady || info.Draining || info.DrainRequested ||
+			(status.State != fastletapi.AdmissionStateOpen && status.State != fastletapi.AdmissionStateDegraded) {
+			continue
+		}
+		free := apiv1alpha2.SandboxComputeResources{CPU: info.ResourceCapacity.CPU.DeepCopy(), Memory: info.ResourceCapacity.Memory.DeepCopy()}
+		free.CPU.Sub(info.ResourceCommitted.CPU)
+		free.CPU.Sub(info.InFlightResources.CPU)
+		free.Memory.Sub(info.ResourceCommitted.Memory)
+		free.Memory.Sub(info.InFlightResources.Memory)
+		if free.CPU.Sign() >= 0 && free.Memory.Sign() >= 0 {
+			addComputeResources(&resources.Free, free)
+		}
+	}
+	return fastlets, resources
+}
+
+func summarizePoolSandboxes(sandboxes []apiv1alpha2.Sandbox, poolName string) *apiv1alpha2.SandboxPoolSandboxSummary {
+	summary := &apiv1alpha2.SandboxPoolSandboxSummary{}
+	for index := range sandboxes {
+		sandbox := &sandboxes[index]
+		if sandbox.Spec.PoolRef != poolName {
+			continue
+		}
+		summary.Total++
+		if sandbox.Status.Placement.FastletName != "" {
+			summary.Assigned++
+		}
+		if sandbox.DeletionTimestamp != nil || sandbox.Status.Runtime.State == apiv1alpha2.RuntimeStopping {
+			summary.Terminating++
+			continue
+		}
+		switch sandbox.Status.Runtime.State {
+		case apiv1alpha2.RuntimeReady:
+			summary.Running++
+		case apiv1alpha2.RuntimePaused, apiv1alpha2.RuntimePausing:
+			summary.Paused++
+		case apiv1alpha2.RuntimeFailed, apiv1alpha2.RuntimeUnavailable:
+			summary.Failed++
+		default:
+			summary.Pending++
+		}
+	}
+	return summary
+}
+
+func zeroComputeResources() apiv1alpha2.SandboxComputeResources {
+	return apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("0"), Memory: resource.MustParse("0")}
+}
+
+func addComputeResources(target *apiv1alpha2.SandboxComputeResources, value apiv1alpha2.SandboxComputeResources) {
+	target.CPU.Add(value.CPU)
+	target.Memory.Add(value.Memory)
+}
+
+func addDemand(target *apiv1alpha2.SandboxComputeResources, value placement.ResourceDemand) {
+	target.CPU.Add(value.CPU)
+	target.Memory.Add(value.Memory)
+}
+
+func conditionMatches(conditions []metav1.Condition, expected *metav1.Condition) bool {
+	if expected == nil {
+		return true
+	}
+	current := apiMeta.FindStatusCondition(conditions, expected.Type)
+	return current != nil && current.Status == expected.Status && current.Reason == expected.Reason &&
+		current.Message == expected.Message && current.ObservedGeneration == expected.ObservedGeneration
 }
 
 // updatePoolStatus persists a SandboxPool status mutation conflict-safely.

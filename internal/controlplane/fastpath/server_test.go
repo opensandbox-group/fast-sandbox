@@ -33,8 +33,13 @@ type fastpathRegistry struct {
 	mu         sync.Mutex
 	candidates []placement.FastletInfo
 	fastlets   map[placement.FastletID]placement.FastletInfo
-	feedback   []placement.FastletID
+	feedback   []recordedFeedback
 	requests   []placement.CandidateRequest
+}
+
+type recordedFeedback struct {
+	id       placement.FastletID
+	feedback placement.LocalFeedback
 }
 
 func (r *fastpathRegistry) TopK(request placement.CandidateRequest, k int) []placement.FastletInfo {
@@ -64,11 +69,9 @@ func TestCreatePassesResourceDemandToInitialAndRefreshedPlacement(t *testing.T) 
 	server, k8sClient, registry, fastlet := newV2Server(t)
 	var pool apiv1alpha2.SandboxPool
 	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
-	pool.Spec.SandboxResources = apiv1alpha2.SandboxResourceProfile{
-		Requests: &apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("250m"), Memory: resource.MustParse("4Gi")},
-		Limits:   &apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("2"), Memory: resource.MustParse("5Gi")},
-		PIDs:     128,
-	}
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("2"), resource.MustParse("5Gi"), resource.MustParse("8"), resource.MustParse("1.25"), 128,
+	)
 	require.NoError(t, k8sClient.Update(context.Background(), &pool))
 
 	registry.candidates = nil
@@ -126,9 +129,24 @@ func TestDefiniteRejectionsRefreshCandidatesBeyondInitialTopK(t *testing.T) {
 			require.Equal(t, int64(4), envelope.RouteGeneration)
 			require.Equal(t, int64(1), envelope.InstanceGeneration)
 			require.Equal(t, "fastlet-3", envelope.FastletName)
-			require.Len(t, registry.feedback, 3, "each rejection is fed back exactly once")
+			require.Len(t, registry.feedback, 3+boolToInt(!ambiguous), "each rejection and definite success are fed back exactly once")
+			for i := 0; i < 3; i++ {
+				require.Equal(t, placement.FastletID(fmt.Sprintf("fastlet-%d", i)), registry.feedback[i].id)
+				require.Equal(t, fastletapi.ErrorCapacityRejected, registry.feedback[i].feedback.Code)
+			}
+			if !ambiguous {
+				require.Equal(t, placement.FastletID("fastlet-3"), registry.feedback[3].id)
+				require.NotNil(t, registry.feedback[3].feedback.Sandbox)
+			}
 		})
 	}
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func capacityRejection() error {
@@ -195,10 +213,10 @@ func (r *fastpathRegistry) GetFastletByID(id placement.FastletID) (placement.Fas
 	return value, ok
 }
 
-func (r *fastpathRegistry) RecordFeedback(id placement.FastletID, _ placement.LocalFeedback) {
+func (r *fastpathRegistry) RecordFeedback(id placement.FastletID, feedback placement.LocalFeedback) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.feedback = append(r.feedback, id)
+	r.feedback = append(r.feedback, recordedFeedback{id: id, feedback: feedback})
 }
 
 type fastpathFastlet struct {
@@ -426,6 +444,151 @@ func TestCreateHappyPathUsesOneRemoteWriteAndOneFastletCall(t *testing.T) {
 	envelope, err := assignment.AssignmentFromAnnotation(&persisted)
 	require.NoError(t, err)
 	require.Equal(t, "fastlet-a", envelope.FastletName)
+}
+
+func TestCreateResourceAwareSandboxPersistsLimitsAndForwardsResolvedResources(t *testing.T) {
+	server, k8sClient, registry, fastlet := newV2Server(t)
+	var pool apiv1alpha2.SandboxPool
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("1"), resource.MustParse("4Gi"), resource.MustParse("4"), resource.MustParse("2"), 128,
+	)
+	require.NoError(t, k8sClient.Update(context.Background(), &pool))
+
+	request := createRequest("sized-sandbox")
+	request.Resources = &fastpathv2.SandboxResourceRequirements{Limits: &fastpathv2.ComputeResourceProfile{
+		Cpu: "2", Memory: "6Gi",
+	}}
+	response, err := server.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, "2", response.Sandbox.Resources.Limits.Cpu)
+	require.Equal(t, "6Gi", response.Sandbox.Resources.Limits.Memory)
+
+	fastlet.mu.Lock()
+	require.Len(t, fastlet.createRequests, 1)
+	forwarded := fastlet.createRequests[0].Resources
+	fastlet.mu.Unlock()
+	require.NotNil(t, forwarded)
+	require.Equal(t, "500m", forwarded.Requests.CPU)
+	require.Equal(t, "3Gi", forwarded.Requests.Memory)
+	require.Equal(t, "2", forwarded.Limits.CPU)
+	require.Equal(t, "6Gi", forwarded.Limits.Memory)
+	require.Equal(t, int64(128), forwarded.Limits.PIDs)
+
+	registry.mu.Lock()
+	require.Equal(t, int64(500), registry.requests[0].Demand.CPU.MilliValue())
+	expectedMemory := resource.MustParse("3Gi")
+	require.Equal(t, expectedMemory.Value(), registry.requests[0].Demand.Memory.Value())
+	registry.mu.Unlock()
+
+	var persisted apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "sized-sandbox"}, &persisted))
+	require.Equal(t, "2", persisted.Spec.Resources.Limits.CPU.String())
+	require.Equal(t, "6Gi", persisted.Spec.Resources.Limits.Memory.String())
+	require.Equal(t, pool.Spec.SandboxResources.Hash(), persisted.Annotations[assignment.AnnotationResourcePolicyHash])
+	require.Equal(t, "500m", persisted.Annotations[assignment.AnnotationResolvedRequestCPU])
+	require.Equal(t, "3Gi", persisted.Annotations[assignment.AnnotationResolvedRequestMemory])
+	require.Equal(t, "2", persisted.Annotations[assignment.AnnotationResolvedLimitCPU])
+	require.Equal(t, "6Gi", persisted.Annotations[assignment.AnnotationResolvedLimitMemory])
+}
+
+func TestCreateRejectsPerSandboxResourcesForLegacyPool(t *testing.T) {
+	server, k8sClient, _, fastlet := newV2Server(t)
+	request := createRequest("legacy-sized")
+	request.Resources = &fastpathv2.SandboxResourceRequirements{Limits: &fastpathv2.ComputeResourceProfile{
+		Cpu: "1", Memory: "1Gi",
+	}}
+
+	_, err := server.CreateSandbox(context.Background(), request)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	creates, _, _, _ := k8sClient.counts()
+	require.Zero(t, creates)
+	require.Empty(t, fastlet.createRequests)
+}
+
+func TestCreateRejectsLimitAboveDerivedFastletEnvelope(t *testing.T) {
+	server, k8sClient, _, fastlet := newV2Server(t)
+	var pool apiv1alpha2.SandboxPool
+	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
+	pool.Spec.MaxSandboxesPerPod = 4
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("1"), resource.MustParse("4Gi"), resource.MustParse("4"), resource.MustParse("2"), 128,
+	)
+	require.NoError(t, k8sClient.Update(context.Background(), &pool))
+	request := createRequest("oversized-sandbox")
+	request.Resources = &fastpathv2.SandboxResourceRequirements{Limits: &fastpathv2.ComputeResourceProfile{
+		Cpu: "2", Memory: "6Gi",
+	}}
+
+	_, err := server.CreateSandbox(context.Background(), request)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Contains(t, err.Error(), "exceed Fastlet runtime envelope")
+	creates, _, _, _ := k8sClient.counts()
+	require.Zero(t, creates)
+	require.Empty(t, fastlet.createRequests)
+}
+
+type fakeManifestPolicy struct {
+	bindings map[string][]apiv1alpha2.ActionBinding
+	err      error
+}
+
+func (f *fakeManifestPolicy) ActionBindings(_ context.Context, _ *apiv1alpha2.SandboxPool, image string) ([]apiv1alpha2.ActionBinding, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.bindings[image], nil
+}
+
+func TestCreateSandboxAppliesManifestRecordedBindings(t *testing.T) {
+	server, k8sClient, _, _ := newV2Server(t)
+	server.ManifestPolicy = &fakeManifestPolicy{bindings: map[string][]apiv1alpha2.ActionBinding{
+		"app-snap-v1": {
+			{Handler: "audit", Input: `{"a":1}`},
+			{Handler: "missing-in-pool", Input: `{}`},
+		},
+	}}
+
+	// No explicit bindings: the recorded policy applies (declared handlers
+	// only).
+	request := createRequest("restored-1")
+	request.Image = "app-snap-v1"
+	_, err := server.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
+	var restored apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "restored-1"}, &restored))
+	require.Equal(t, []apiv1alpha2.ActionBinding{{Handler: "audit", Input: `{"a":1}`}}, restored.Spec.ActionBindings)
+
+	// Explicit bindings win per handler.
+	request2 := createRequest("restored-2")
+	request2.Image = "app-snap-v1"
+	request2.ActionBindings = []*fastpathv2.ActionBinding{{Handler: "audit", Input: `{"explicit":true}`}}
+	_, err = server.CreateSandbox(context.Background(), request2)
+	require.NoError(t, err)
+	var overridden apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "restored-2"}, &overridden))
+	require.Equal(t, []apiv1alpha2.ActionBinding{{Handler: "audit", Input: `{"explicit":true}`}}, overridden.Spec.ActionBindings)
+
+	// An image without recorded policy is untouched.
+	request3 := createRequest("plain-1")
+	_, err = server.CreateSandbox(context.Background(), request3)
+	require.NoError(t, err)
+	var plain apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "plain-1"}, &plain))
+	require.Empty(t, plain.Spec.ActionBindings)
+}
+
+func TestCreateSandboxPolicyResolutionFailureProceeds(t *testing.T) {
+	server, k8sClient, _, _ := newV2Server(t)
+	server.ManifestPolicy = &fakeManifestPolicy{err: errors.New("store unreachable")}
+
+	request := createRequest("restored-1")
+	request.Image = "app-snap-v1"
+	_, err := server.CreateSandbox(context.Background(), request)
+	require.NoError(t, err, "policy resolution is best-effort; the create proceeds")
+	var restored apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "restored-1"}, &restored))
+	require.Empty(t, restored.Spec.ActionBindings)
 }
 
 func TestGetAndListCacheHitsAvoidDurableKubernetesReads(t *testing.T) {
@@ -755,15 +918,9 @@ func TestGetAndListPoolsExposeCapabilitiesWithoutRegistryProjection(t *testing.T
 
 func TestPoolInfoExposesResourceAwareRequestsAndLimits(t *testing.T) {
 	pool := discoveryPool("pool-aware", "default")
-	pool.Spec.SandboxResources = apiv1alpha2.SandboxResourceProfile{
-		Requests: &apiv1alpha2.SandboxComputeResources{
-			CPU: resource.MustParse("1"), Memory: resource.MustParse("5Gi"),
-		},
-		Limits: &apiv1alpha2.SandboxComputeResources{
-			CPU: resource.MustParse("2"), Memory: resource.MustParse("10Gi"),
-		},
-		PIDs: 256,
-	}
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("2"), resource.MustParse("10Gi"), resource.MustParse("2"), resource.MustParse("2"), 256,
+	)
 
 	info := poolInfo(pool)
 	require.Equal(t, "2", info.SandboxCpu)
@@ -773,6 +930,8 @@ func TestPoolInfoExposesResourceAwareRequestsAndLimits(t *testing.T) {
 	require.Equal(t, "5Gi", info.SandboxResourceProfile.Requests.Memory)
 	require.Equal(t, "2", info.SandboxResourceProfile.Limits.Cpu)
 	require.Equal(t, "10Gi", info.SandboxResourceProfile.Limits.Memory)
+	require.Equal(t, "2", info.SandboxResourceProfile.OvercommitRatio.Cpu)
+	require.Equal(t, "2", info.SandboxResourceProfile.OvercommitRatio.Memory)
 	require.Equal(t, int64(256), info.SandboxResourceProfile.Pids)
 }
 
@@ -849,7 +1008,7 @@ func TestSandboxFromCreateRequestUsesCanonicalFields(t *testing.T) {
 	request := createRequest("request-a")
 	bindings, err := apiActionBindings(request.ActionBindings)
 	require.NoError(t, err)
-	sandbox := sandboxFromCreateRequest(request, bindings, "create-hash")
+	sandbox := sandboxFromCreateRequest(request, bindings, nil, "create-hash")
 	require.Equal(t, request.RequestId, sandbox.Name)
 	require.Equal(t, request.Image, sandbox.Spec.Image)
 	require.Equal(t, request.PoolRef, sandbox.Spec.PoolRef)

@@ -325,17 +325,11 @@ func newResourceAwareAdmissionManager(
 	capacityMemory string,
 ) (*SandboxManager, apiv1alpha2.SandboxResourceProfile) {
 	t.Helper()
-	profile := apiv1alpha2.SandboxResourceProfile{
-		Requests: &apiv1alpha2.SandboxComputeResources{
-			CPU: resource.MustParse("1"), Memory: resource.MustParse("5Gi"),
-		},
-		Limits: &apiv1alpha2.SandboxComputeResources{
-			CPU: resource.MustParse("2"), Memory: resource.MustParse("10Gi"),
-		},
-		PIDs: 256,
-	}
+	profile := apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("2"), resource.MustParse("10Gi"), resource.MustParse("2"), resource.MustParse("2"), 256,
+	)
 	settings := &fastletsettings.ResourceAdmissionSettings{
-		Version: "v1", Mode: apiv1alpha2.SandboxResourceModeResourceAware,
+		Version: "v2", Mode: apiv1alpha2.SandboxResourceModeResourceAware,
 		StaticAdmission: true, MemoryAdmission: true,
 		Capacity: apiv1alpha2.SandboxComputeResources{
 			CPU: resource.MustParse(capacityCPU), Memory: resource.MustParse(capacityMemory),
@@ -369,6 +363,32 @@ func ensureRequest(uid string, generation, attempt int64) *fastletapi.CreateSand
 func resourceAwareRequest(uid string, profile apiv1alpha2.SandboxResourceProfile) *fastletapi.CreateSandboxRequest {
 	request := ensureRequest(uid, 1, 1)
 	request.Sandbox.ResourceProfileHash = profile.Hash()
+	requests, _ := profile.RequestResources()
+	limits, _ := profile.LimitResources()
+	return resourceAwareRequestWithResources(uid, profile, requests, limits)
+}
+
+func resourceAwareRequestWithLimits(uid string, profile apiv1alpha2.SandboxResourceProfile, cpu, memory string) *fastletapi.CreateSandboxRequest {
+	limits := apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse(cpu), Memory: resource.MustParse(memory)}
+	requests, err := profile.DeriveRequests(limits)
+	if err != nil {
+		panic(err)
+	}
+	return resourceAwareRequestWithResources(uid, profile, requests, limits)
+}
+
+func resourceAwareRequestWithResources(
+	uid string,
+	profile apiv1alpha2.SandboxResourceProfile,
+	requests apiv1alpha2.SandboxComputeResources,
+	limits apiv1alpha2.SandboxComputeResources,
+) *fastletapi.CreateSandboxRequest {
+	request := ensureRequest(uid, 1, 1)
+	request.Sandbox.ResourceProfileHash = profile.Hash()
+	request.Resources = &fastletapi.ResolvedSandboxResources{
+		Requests: fastletapi.SandboxResourceVector{CPU: requests.CPU.String(), Memory: requests.Memory.String()},
+		Limits:   fastletapi.SandboxRuntimeLimits{CPU: limits.CPU.String(), Memory: limits.Memory.String(), PIDs: profile.PIDs},
+	}
 	return request
 }
 
@@ -508,6 +528,44 @@ func TestResourceAwareAdmissionUsesTighterMemoryCommitment(t *testing.T) {
 	require.Equal(t, 5, rejected.Admission.Used)
 }
 
+func TestResourceAwareDeleteReturnsLatestAdmissionLedger(t *testing.T) {
+	manager, profile := newResourceAwareAdmissionManager(t, newAdmissionRuntime(), 2, "2", "10Gi")
+	request := resourceAwareRequest("sandbox-a", profile)
+	_, err := manager.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
+
+	response, err := manager.DeleteSandbox(&fastletapi.DeleteSandboxRequest{Identity: request.Identity})
+	require.NoError(t, err)
+	require.NotNil(t, response.Admission.Resources)
+	require.Equal(t, "v2", response.Admission.Resources.Version)
+	require.Equal(t, "2", response.Admission.Resources.Capacity.CPU)
+	require.Equal(t, "10Gi", response.Admission.Resources.Capacity.Memory)
+}
+
+func TestResourceAwareAdmissionAccountsHeterogeneousSandboxRequests(t *testing.T) {
+	manager, profile := newResourceAwareAdmissionManager(t, newAdmissionRuntime(), 10, "4", "10Gi")
+
+	first, err := manager.CreateSandbox(context.Background(), resourceAwareRequestWithLimits("sandbox-small", profile, "1", "2Gi"))
+	require.NoError(t, err)
+	require.Equal(t, "500m", first.Admission.Resources.Committed.CPU)
+	require.Equal(t, "1Gi", first.Admission.Resources.Committed.Memory)
+
+	second, err := manager.CreateSandbox(context.Background(), resourceAwareRequestWithLimits("sandbox-large", profile, "4", "10Gi"))
+	require.NoError(t, err)
+	require.Equal(t, "2500m", second.Admission.Resources.Committed.CPU)
+	require.Equal(t, "6Gi", second.Admission.Resources.Committed.Memory)
+
+	third, err := manager.CreateSandbox(context.Background(), resourceAwareRequestWithLimits("sandbox-too-large", profile, "4", "6Gi"))
+	requireFastletCode(t, err, fastletapi.ErrorCapacityRejected)
+	require.Equal(t, fastletapi.AdmissionReasonStaticCPUExhausted, third.Error.Reason)
+	require.Equal(t, "2500m", third.Admission.Resources.Committed.CPU)
+	require.Equal(t, "6Gi", third.Admission.Resources.Committed.Memory)
+
+	stored := manager.sandboxes["sandbox-large"]
+	require.Equal(t, "4", stored.Config.Limits.CPU)
+	require.Equal(t, "10Gi", stored.Config.Limits.Memory)
+}
+
 func TestResourceAwareAdmissionFeatureGatesAreIndependent(t *testing.T) {
 	manager, _ := newResourceAwareAdmissionManager(t, newAdmissionRuntime(), 10, "2", "10Gi")
 	manager.staticResourceAdmission = false
@@ -515,7 +573,7 @@ func TestResourceAwareAdmissionFeatureGatesAreIndependent(t *testing.T) {
 	manager.resourceState = fastletapi.AdmissionStateBlocked
 	manager.resourceReason = fastletapi.AdmissionReasonFastletMemoryHighWatermark
 
-	require.Nil(t, manager.resourceCapacityFailureLocked(2),
+	require.Nil(t, manager.resourceCapacityFailureLocked(&fastletapi.RuntimeSandboxConfig{Limits: fastletapi.SandboxRuntimeLimits{CPU: "2", Memory: "10Gi", PIDs: 256}}),
 		"shadow telemetry may remain active while static and memory admission decisions are disabled")
 }
 

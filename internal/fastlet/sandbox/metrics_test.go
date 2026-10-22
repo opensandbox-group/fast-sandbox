@@ -35,8 +35,10 @@ func TestAdmissionStatusMetricsReflectLatestSnapshot(t *testing.T) {
 	recordAdmissionStatus(fastletapi.AdmissionStatus{
 		Capacity: 8, Used: 7, Creating: 1, Running: 3, Deleting: 1,
 		Resources: &fastletapi.ResourceAdmissionStatus{
-			Version: "v1", Epoch: "epoch-a", Revision: 4,
-			State: fastletapi.AdmissionStateBlocked, Reason: fastletapi.AdmissionReasonFastletMemoryHighWatermark,
+			Version: "v2", Epoch: "epoch-a", Revision: 4,
+			Capacity:  fastletapi.SandboxResourceVector{CPU: "2", Memory: "8Gi"},
+			Committed: fastletapi.SandboxResourceVector{CPU: "1", Memory: "4Gi"},
+			State:     fastletapi.AdmissionStateBlocked, Reason: fastletapi.AdmissionReasonFastletMemoryHighWatermark,
 		},
 	})
 

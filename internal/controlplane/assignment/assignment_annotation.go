@@ -45,6 +45,19 @@ func InitializeAssignmentAnnotation(
 	key types.NamespacedName,
 	desired AssignmentEnvelope,
 ) (*apiv1alpha2.Sandbox, bool, error) {
+	return InitializeAssignmentAnnotationWithMetadata(ctx, k8sClient, key, desired, nil)
+}
+
+// InitializeAssignmentAnnotationWithMetadata atomically records the first
+// assignment and Controller-derived diagnostic annotations. FastPath includes
+// the same metadata in its initial Sandbox Create instead.
+func InitializeAssignmentAnnotationWithMetadata(
+	ctx context.Context,
+	k8sClient client.Client,
+	key types.NamespacedName,
+	desired AssignmentEnvelope,
+	annotations map[string]string,
+) (*apiv1alpha2.Sandbox, bool, error) {
 	value, err := EncodeAssignment(desired)
 	if err != nil {
 		return nil, false, err
@@ -63,10 +76,15 @@ func InitializeAssignmentAnnotation(
 	if existing != nil {
 		return current.DeepCopy(), false, nil
 	}
+	projectedAnnotations := make(map[string]string, len(annotations)+1)
+	for name, annotationValue := range annotations {
+		projectedAnnotations[name] = annotationValue
+	}
+	projectedAnnotations[AnnotationAssignment] = value
 	patchBody, err := json.Marshal(map[string]any{
 		"metadata": map[string]any{
 			"resourceVersion": current.ResourceVersion,
-			"annotations":     map[string]string{AnnotationAssignment: value},
+			"annotations":     projectedAnnotations,
 		},
 	})
 	if err != nil {

@@ -102,6 +102,8 @@ class SDKTest(unittest.TestCase):
             failure_policy="AutoRecreate",
             recovery_timeout_seconds=120,
             action_bindings=[("egress", '{"policy":{"defaultAction":"deny"}}')],
+            cpu_limit="2",
+            memory_limit="6Gi",
         )
         self.assertEqual("sandbox-a", sandbox.name)
         request = self.stub.create_request
@@ -117,6 +119,12 @@ class SDKTest(unittest.TestCase):
             request.action_bindings[0].input,
         )
         self.assertEqual(fastpath_pb2.CREATE_COMPLETION_READY, request.completion)
+        self.assertEqual("2", request.resources.limits.cpu)
+        self.assertEqual("6Gi", request.resources.limits.memory)
+
+    def test_create_resource_limits_must_be_set_together(self):
+        with self.assertRaisesRegex(ValueError, "must be set together"):
+            self.client.create("sandbox-a", "alpine", cpu_limit="1")
 
     def test_atomic_ordered_action_binding_replace(self):
         sandbox = self.client.get("sandbox-a")

@@ -29,6 +29,10 @@ spec:
   command: ["/bin/sleep"]
   args: ["3600"]
   poolRef: default-pool
+  resources:
+    limits:
+      cpu: "1"
+      memory: 2Gi
   expireTime: "2026-07-30T00:00:00Z"
   failurePolicy: Manual
   recoveryTimeoutSeconds: 60
@@ -51,6 +55,7 @@ spec:
 | `resetRevision` | No | Opaque monotonic reset trigger |
 | `state` | No | `Running` (default) or `Paused`; `Paused` checkpoints the runtime to the artifact store and releases Fastlet capacity, flipping back to `Running` resumes the recorded checkpoint |
 | `poolRef` | Yes | Same-namespace SandboxPool |
+| `resources.limits` | No | ResourceAware per-Sandbox CPU and memory runtime limits; both are required together, and omission uses Pool defaults |
 | `actionBindings` | No | Ordered atomic Handler/input list; order defines lifecycle invocation order |
 
 User metadata is stored as ordinary Kubernetes labels. Labels under
@@ -152,7 +157,7 @@ spec:
 | `capacity` | Yes | Pool size and idle-buffer bounds |
 | `maxSandboxesPerPod` | Yes | Fastlet-authoritative admission limit |
 | `runtime` | Yes | Immutable runtime name |
-| `sandboxResources` | Yes | Immutable legacy limits (`cpu`/`memory`) or resource-aware `requests`/`limits`, plus the per-Sandbox PID limit |
+| `sandboxResources` | Yes | Flat default CPU/memory limits and PID limit; `mode: ResourceAware` adds separate CPU/memory overcommit ratios |
 | `warmImages` | No | Asynchronous, GC-protected cache inputs |
 | `infraComponents` | No | Inline immutable artifact/process/health/endpoint definitions |
 | `actionHandlers` | No | Named Pod-loopback Binding receivers and their lifecycle Hook subscriptions |
@@ -161,38 +166,38 @@ spec:
 Runtime names are `container`, `gvisor`, `kata-qemu`, `kata-clh`, `kata-fc`,
 `kata-dragonball`, and `firecracker`.
 
-Existing Pools keep the flat `cpu` and `memory` representation. New
-resource-aware Pools use the mutually exclusive shape below; `requests`
-drive Fastlet commitment admission and Pool elasticity, while `limits` remain
-the per-Sandbox runtime ceilings:
+Existing mode-less Pools keep the flat `cpu` and `memory` representation as
+LegacySlot. ResourceAware Pools retain those fields as default limits and add
+request-derivation policy:
 
 ```yaml
 sandboxResources:
-  requests:
-    cpu: 100m
-    memory: 128Mi
-  limits:
-    cpu: 500m
-    memory: 512Mi
+  mode: ResourceAware
+  cpu: "2"
+  memory: 5Gi
   pids: 256
+  overcommitRatio:
+    cpu: "8"
+    memory: "1.25"
 ```
 
-The two representations cannot be mixed. A request must be positive and no
-greater than its matching limit.
+Requests are `ceil(limit / ratio)` and are not public caller input. A Sandbox
+may override the default CPU and memory limits through `spec.resources.limits`
+or FastPath Create. LegacySlot rejects per-Sandbox overrides.
 
 In `ResourceAware` mode, the first container must not set CPU or memory
-requests or limits. The Controller derives the per-Fastlet commitment capacity
-as `sandboxResources.requests * maxSandboxesPerPod`, then derives the
-runtime-owner request and limit as fixed runtime overhead plus the larger of
-that commitment capacity and one Sandbox limit. Sidecars retain their own
-independent Kubernetes resources. In `LegacySlot` mode, explicit first-container
-resources and the existing aggregate overcommit behavior remain supported.
+requests or limits. The Controller derives the default request from the Pool
+ratios, the per-Fastlet commitment capacity as
+`defaultRequest * maxSandboxesPerPod`, and the runtime-owner request/limit as
+the larger of that capacity and one default Sandbox limit. Sidecars retain
+their own independent Kubernetes resources. LegacySlot keeps explicit
+first-container resources and existing aggregate overcommit behavior.
 
 CPU and memory ratios are intentionally independent:
 
 ```text
-CPU ratio    = limits.cpu / requests.cpu
-Memory ratio = limits.memory / requests.memory
+request.cpu    = ceil(limit.cpu / overcommitRatio.cpu)
+request.memory = ceil(limit.memory / overcommitRatio.memory)
 ```
 
 CPU is compressible and the initial implementation uses live CPU signals for
@@ -201,12 +206,12 @@ or OOM workloads, so ResourceAware Fastlets additionally block new creates on
 memory watermarks, PSI, OOM events, node pressure, or stale telemetry. This
 gate does not reclaim, pause, migrate, or evict existing Sandboxes.
 
-Pool status exposes Fastlet capacity, runtime/Infra/Fastlet revisions, prepared
-Fastlet counts, and per-image warm-cache aggregation. In ResourceAware mode,
-`resourceScaleDownCandidateSince` persists the beginning of a continuous
-excess-capacity window and is cleared when demand returns. Handler and Registry
-rollout details are not duplicated as nested status. Conditions are
-`RuntimeReady`, `InfraReady`, and `RegistryReady`.
+Pool status retains legacy top-level counters and adds `fastlets`, `resources`,
+and `sandboxes` summaries. Resource `capacity`, `committed`, and `free` are
+request-based commitment values, not host usage. `summaryObservedAt` records
+the rate-limited summary observation. The `ScaleDownCandidate` Condition's
+`lastTransitionTime` is the scale-down stabilization clock. Other Conditions
+include `RuntimeReady`, `InfraReady`, and `RegistryReady`.
 
 See the [Infra Components reference](infra-components.md) for the complete
 artifact, process, health, endpoint, validation, and revision contract.
@@ -371,8 +376,10 @@ The protobuf contract is
 - `request_id`, namespace, image, Pool, command, args, environment, and working directory;
 - absolute `expires_at_unix_seconds`;
 - initial `metadata`;
-- failure policy and recovery timeout.
-- ordered `action_bindings` and a `CreateCompletion` boundary.
+- failure policy and recovery timeout;
+- ordered `action_bindings` and a `CreateCompletion` boundary;
+- optional ResourceAware `resources.limits` with CPU and memory supplied
+  together.
 
 The first CRD write contains the complete initial intent. A retry with the same
 normalized intent is idempotent; a changed intent under the same request ID is

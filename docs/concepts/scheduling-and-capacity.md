@@ -18,7 +18,7 @@ Runtime, resource, and Infra profiles are immutable because changing them would 
 
 ## Logical capacity and physical budget
 
-`maxSandboxesPerPod` is always a hard actor-count boundary. It limits runtime
+`maxSandboxesPerPod` is always a hard Sandbox-count boundary. It limits runtime
 state, network namespaces, file descriptors, and control-plane bookkeeping in
 addition to CPU and memory.
 
@@ -31,24 +31,30 @@ Pool manifests and aggregate overcommit behavior are unchanged.
 
 ### ResourceAware
 
-A nested `sandboxResources.requests` and `.limits` profile selects the
-resource-aware model. The first Fastlet container must not declare CPU or
+An explicit `sandboxResources.mode: ResourceAware` selects the resource-aware
+model. Flat CPU and memory are default per-Sandbox limits; separate Pool ratios
+derive requests:
+
+```text
+defaultRequest = ceil(defaultLimit / overcommitRatio)
+```
+
+Callers may provide different per-Sandbox limits. Their requests are derived
+with the same ratios. The first Fastlet container must not declare CPU or
 memory resources, because they would create a second capacity authority. The
 Controller derives:
 
 ```text
-commitmentCapacity = sandbox request * maxSandboxesPerPod
+commitmentCapacity = defaultRequest * maxSandboxesPerPod
 
-runtimeEnvelope = fixed runtime overhead
-                + max(commitmentCapacity, one Sandbox limit)
+runtimeEnvelope = max(commitmentCapacity, default Sandbox limit)
 
 runtimeOwner.requests = runtimeOwner.limits = runtimeEnvelope
 ```
 
-Commitment capacity excludes fixed overhead and is shared unchanged by Fastlet
-admission, FastPath placement, and Pool scaling. The runtime envelope reserves
-the fixed overhead once and ensures the parent cgroup can honor at least one
-Sandbox's legal limit. Sidecar resources remain independent.
+Commitment capacity is shared unchanged by Fastlet admission, FastPath
+placement, and Pool scaling. The runtime envelope ensures the parent cgroup can
+honor at least one default Sandbox limit. Sidecar resources remain independent.
 
 Each RuntimeDriver receives only Fastlet-resolved Sandbox limits. Requests are
 ledger values; they are not currently translated to CPU weight, `memory.low`,
@@ -69,21 +75,27 @@ for a complete sizing example and operational guidance.
 Every Fast-Path and Controller replica maintains its own Registry from:
 
 1. Kubernetes watches for Pod membership, Pool labels, assignments, Pod UID changes, and lifecycle intent;
-2. low-frequency jittered Fastlet heartbeats for runtime capability, admission inventory, phase counts, image-cache state, Infra revision, and Registry revision;
-3. immediate feedback from local placement attempts.
+2. jittered Fastlet heartbeats for runtime capability, aggregate commitment,
+   pressure, phase counts, image-cache state, Infra revision, and Registry
+   revision;
+3. full aggregate admission snapshots piggybacked on Create success,
+   definitive rejection, and Delete responses;
+4. short-lived process-local reservations while Create RPCs are in flight.
 
 Watches provide topology changes without full polling. Heartbeats refresh runtime-local facts and repair missed or stale observations.
 
-Registries are eventually convergent by design. They do not coordinate through a global lock.
+Registries are eventually convergent by design. They do not coordinate through
+a global lock; Fastlet atomic admission resolves cross-replica races.
 
 ## Top-K placement
 
 The Orchestrator:
 
 1. filters by namespace, Pool, readiness, runtime profile, Infra revision, Registry revision, and stale heartbeat;
-2. requires a positive locally observed available-slot count;
+2. requires fresh eligible slot and resource ledgers in ResourceAware mode;
 3. prioritizes image-cache affinity;
-4. ranks by load and a stable tie-breaker;
+4. ranks by a coarse dominant-load bucket, FastPath Pod UID seed, and a stable
+   Sandbox tie-breaker;
 5. returns a bounded Top-K candidate list.
 
 The candidate list is not a reservation. A newly accepted Fast-Path create
@@ -127,7 +139,8 @@ Fastlet serializes capacity and identity transitions in one admission boundary. 
 
 Capacity is released only after runtime, network, Infra, and route absence is proven.
 
-This prevents stale or inconsistent Registries across Fast-Path replicas from exceeding `maxSandboxesPerPod`.
+This prevents stale or inconsistent Registries across Fast-Path replicas from
+exceeding slots or CPU/memory commitment capacity.
 
 ## Retry semantics
 
@@ -159,7 +172,16 @@ Protected cache classes include:
 
 ## Pool scaling and drain
 
-The Pool Controller maintains minimum/maximum Fastlet counts and buffer capacity. Scale-down and template replacement select Fastlets for persisted drain rather than deleting an arbitrary Pod.
+The Pool Controller maintains minimum/maximum Fastlet counts and buffer
+capacity. ResourceAware scale-up uses the exact summed request vectors of
+pending Sandboxes plus `bufferMin`; accepted Creating and Resuming Sandboxes
+are not counted twice. Fastlets without a heartbeat contribute nominal
+capacity only during startup grace.
+
+Scale-down begins only after a continuous excess-capacity window represented
+by the `ScaleDownCandidate` Condition. It selects empty Fastlets for persisted
+drain rather than deleting an arbitrary Pod. If a scale-down candidate becomes
+loaded, its drain is canceled after timeout instead of forcing deletion.
 
 The scheduling Registry excludes draining Fastlets from new placement.
 

@@ -16,8 +16,9 @@ const (
 )
 
 // SandboxDesiredSpec is caller-owned desired state sent to a Fastlet. Runtime
-// identity and fencing are owned exclusively by SandboxIdentity; resource
-// limits are resolved locally from the immutable Fastlet resource profile.
+// identity and fencing are owned exclusively by SandboxIdentity. Resolved
+// resources travel separately and are validated against the immutable Fastlet
+// resource profile before RuntimeSandboxConfig is built.
 type SandboxDesiredSpec struct {
 	Image               string            `json:"image"`
 	RuntimeProfileHash  string            `json:"runtimeProfileHash,omitempty"`
@@ -57,6 +58,20 @@ type SandboxRuntimeLimits struct {
 	CPU    string `json:"cpu,omitempty"`
 	Memory string `json:"memory,omitempty"`
 	PIDs   int64  `json:"pids,omitempty"`
+}
+
+// SandboxResourceVector is a CPU and memory vector on the internal wire.
+type SandboxResourceVector struct {
+	CPU    string `json:"cpu"`
+	Memory string `json:"memory"`
+}
+
+// ResolvedSandboxResources is the Controller-resolved admission and runtime
+// contract. Fastlet validates Requests against Limits and its immutable Pool
+// policy before reserving either resource.
+type ResolvedSandboxResources struct {
+	Requests SandboxResourceVector `json:"requests"`
+	Limits   SandboxRuntimeLimits  `json:"limits"`
 }
 
 // RestoreSpec selects the checkpoint artifact set a runtime is restored
@@ -340,20 +355,23 @@ const (
 )
 
 type ResourceAdmissionStatus struct {
-	Version  string          `json:"version"`
-	Epoch    string          `json:"epoch"`
-	Revision uint64          `json:"revision"`
-	State    AdmissionState  `json:"state"`
-	Reason   AdmissionReason `json:"reason,omitempty"`
+	Version   string                `json:"version"`
+	Epoch     string                `json:"epoch"`
+	Revision  uint64                `json:"revision"`
+	Capacity  SandboxResourceVector `json:"capacity"`
+	Committed SandboxResourceVector `json:"committed"`
+	State     AdmissionState        `json:"state"`
+	Reason    AdmissionReason       `json:"reason,omitempty"`
 }
 
 type CreateSandboxRequest struct {
-	RequestID      string               `json:"requestId,omitempty"`
-	Identity       SandboxIdentity      `json:"identity"`
-	Sandbox        SandboxDesiredSpec   `json:"sandbox"`
-	SpecGeneration int64                `json:"specGeneration,omitempty"`
-	ActionBindings []ActionBindingInput `json:"actionBindings,omitempty"`
-	Completion     CreateCompletion     `json:"completion,omitempty"`
+	RequestID      string                    `json:"requestId,omitempty"`
+	Identity       SandboxIdentity           `json:"identity"`
+	Sandbox        SandboxDesiredSpec        `json:"sandbox"`
+	Resources      *ResolvedSandboxResources `json:"resources,omitempty"`
+	SpecGeneration int64                     `json:"specGeneration,omitempty"`
+	ActionBindings []ActionBindingInput      `json:"actionBindings,omitempty"`
+	Completion     CreateCompletion          `json:"completion,omitempty"`
 }
 
 type CreateCompletion string
@@ -427,7 +445,8 @@ type DeleteSandboxRequest struct {
 }
 
 type DeleteSandboxResponse struct {
-	Error *FastletError `json:"error,omitempty"`
+	Admission AdmissionStatus `json:"admission"`
+	Error     *FastletError   `json:"error,omitempty"`
 }
 
 type ActionBindingInput struct {

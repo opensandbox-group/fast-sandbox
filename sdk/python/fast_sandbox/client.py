@@ -48,26 +48,34 @@ class Client:
         recovery_timeout_seconds: int = 60,
         action_bindings: Optional[Iterable[tuple[str, str]]] = None,
         completion: str = "Ready",
+        cpu_limit: str = "",
+        memory_limit: str = "",
     ) -> Sandbox:
         selected_namespace = namespace or self.namespace
         selected_request_id = request_id or name
         if selected_request_id != name:
             raise ValueError("request_id must equal the sandbox name")
+        if bool(cpu_limit) != bool(memory_limit):
+            raise ValueError("cpu_limit and memory_limit must be set together")
+        request = fastpath_pb2.CreateSandboxRequest(
+            request_id=selected_request_id,
+            namespace=selected_namespace,
+            image=image,
+            pool_ref=pool,
+            command=list(command or []), args=list(args or []),
+            envs=dict(envs or {}), working_dir=working_dir,
+            expires_at_unix_seconds=expires_at_unix_seconds,
+            metadata=dict(metadata or {}),
+            failure_policy=_failure_policy(failure_policy),
+            recovery_timeout_seconds=recovery_timeout_seconds,
+            action_bindings=_action_bindings(action_bindings or []),
+            completion=_create_completion(completion),
+        )
+        if cpu_limit:
+            request.resources.limits.cpu = cpu_limit
+            request.resources.limits.memory = memory_limit
         response = self._stub.CreateSandbox(
-            fastpath_pb2.CreateSandboxRequest(
-                request_id=selected_request_id,
-                namespace=selected_namespace,
-                image=image,
-                pool_ref=pool,
-                command=list(command or []), args=list(args or []),
-                envs=dict(envs or {}), working_dir=working_dir,
-                expires_at_unix_seconds=expires_at_unix_seconds,
-                metadata=dict(metadata or {}),
-                failure_policy=_failure_policy(failure_policy),
-                recovery_timeout_seconds=recovery_timeout_seconds,
-                action_bindings=_action_bindings(action_bindings or []),
-                completion=_create_completion(completion),
-            ),
+            request,
             metadata=grpc_metadata(),
         )
         return Sandbox(

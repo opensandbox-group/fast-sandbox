@@ -1,24 +1,22 @@
 # Resource-Aware Overcommit Tuning
 
-Use this guide to choose CPU and memory requests and limits for a
-`ResourceAware` SandboxPool. The request-to-limit gap is the overcommit policy;
-there is no separate ratio field and no Fastlet Pod resource override.
+Use this guide to choose Pool overcommit ratios and per-Sandbox runtime limits.
+Callers provide limits only. Fast Sandbox derives requests from the Pool
+policy and charges those requests to the Fastlet commitment ledger.
 
 ## Configure one resource authority
-
-Configure only these capacity inputs:
 
 ```yaml
 spec:
   maxSandboxesPerPod: 10
   sandboxResources:
-    requests:
-      cpu: 250m
-      memory: 4Gi
-    limits:
-      cpu: "2"
-      memory: 5Gi
+    mode: ResourceAware
+    cpu: "2"       # default per-Sandbox limit
+    memory: 5Gi    # default per-Sandbox limit
     pids: 256
+    overcommitRatio:
+      cpu: "8"
+      memory: "1.25"
   fastletTemplate:
     spec:
       containers:
@@ -27,161 +25,125 @@ spec:
 ```
 
 Do not set CPU or memory requests or limits on the first Fastlet container in
-`ResourceAware` mode. The Controller rejects that configuration because it
-would create a second source of truth. Sidecars may keep their own independent
-Kubernetes resources.
+ResourceAware mode. The Controller owns those values. Sidecars may keep their
+own Kubernetes resources.
 
-Existing `LegacySlot` Pools are different. Their flat
-`sandboxResources.cpu` and `.memory` fields, slot admission, explicit first
-container resources, and aggregate overcommit behavior remain supported.
+Existing mode-less Pools remain LegacySlot. They retain flat
+`sandboxResources.cpu`, `.memory`, and `.pids`, explicit first-container
+resources, and slot-only admission.
 
-## Understand the two derived budgets
+## Understand limit, request, capacity, and envelope
 
-For each resource, the Controller derives pure Sandbox commitment capacity:
-
-```text
-commitmentCapacity = Sandbox request * maxSandboxesPerPod
-```
-
-It then derives the runtime-owner envelope:
+For each Sandbox:
 
 ```text
-runtimeEnvelope = fixedFastletOverhead
-                + max(commitmentCapacity, one Sandbox limit)
-
-runtimeOwner.requests = runtimeEnvelope
-runtimeOwner.limits   = runtimeEnvelope
+request.cpu    = ceil(limit.cpu / overcommitRatio.cpu)
+request.memory = ceil(limit.memory / overcommitRatio.memory)
 ```
 
-The fixed overhead is selected by the platform runtime profile and is added
-once per Fastlet Pod. It is not a user field and it is not per Sandbox. The
-`max` term ensures that the parent cgroup can honor one Sandbox at its legal
-limit, even when the total commitment is smaller.
+The Pool defaults determine Fastlet capacity:
 
-Fastlet admission, FastPath placement, and Pool scaling consume the same
-resolved commitment capacity. They do not inspect the first container's
-Kubernetes request to reconstruct a different budget.
+```text
+commitmentCapacity = defaultRequest * maxSandboxesPerPod
+runtimeEnvelope    = max(commitmentCapacity, defaultLimit)
+```
+
+The runtime-owner container receives equal Kubernetes requests and limits of
+`runtimeEnvelope`. No fixed or per-Sandbox overhead is added by this model.
+
+Fastlet admission, FastPath placement, and Pool scaling all consume the same
+commitment capacity. A custom per-Sandbox limit is rejected if it exceeds the
+already-created runtime envelope.
 
 ## Tune CPU and memory separately
 
-Calculate the ratios independently:
+The configured ratios are also the intended limit-to-request ratios:
 
 ```text
-CPU overcommit ratio
-  = sandboxResources.limits.cpu / sandboxResources.requests.cpu
-
-Memory overcommit ratio
-  = sandboxResources.limits.memory / sandboxResources.requests.memory
+CPU overcommit ratio    = limit.cpu / request.cpu
+Memory overcommit ratio = limit.memory / request.memory
 ```
 
-CPU is compressible. A larger CPU request-to-limit gap is often acceptable
-when Sandboxes are usually idle or burst briefly. The main failure mode is
-contention: throttling, latency, and reduced throughput. The initial policy
-uses CPU requests for static commitment admission but does not hard-block a
-new Sandbox solely because real-time CPU usage is high.
+CPU is compressible. A large CPU ratio can be reasonable when Sandboxes are
+mostly idle or burst briefly. Watch sustained CPU demand, throttling, latency,
+and throughput. The first implementation uses static CPU commitment and does
+not block admission solely because current CPU utilization is high.
 
-Memory is not safely compressible in the same way. A workload can grow from
-its normal working set toward its limit after admission. Reclaim may add severe
-latency, and exhaustion may terminate processes. Start with a conservative
-memory gap and expand it only from measured working-set and pressure data.
+Memory is not safely compressible in the same way. Growth above the normal
+working set can cause reclaim, severe latency, or OOM termination. Start with
+a conservative memory ratio and watch RSS, working set, memory PSI, OOM
+events, high-watermark residence, and application latency.
 
-ResourceAware Fastlets combine the static memory ledger with a dynamic gate.
-New creates are blocked by configured high watermarks, memory PSI, OOM events,
-node memory pressure, or stale telemetry. This protection does not reclaim,
-pause, wake, migrate, evict, or preempt an existing Sandbox.
+Fastlet combines the static memory ledger with a dynamic gate. Memory
+watermarks, PSI, new OOM events, node memory pressure, or stale telemetry can
+block new creates. The gate does not reclaim, pause, migrate, or evict an
+existing Sandbox.
 
 ## Worked example
 
-Given the Pool above:
-
 ```text
-CPU request:                  250m
-CPU limit:                       2
-Memory request:               4 GiB
-Memory limit:                 5 GiB
-maxSandboxesPerPod:              10
-example fixed overhead: 250m, 256 MiB
+default limit:         2 CPU, 5 GiB
+overcommit ratio:      8 CPU, 1.25 memory
+default request:       250m, 4 GiB
+maxSandboxesPerPod:    10
 ```
 
-The independent overcommit ratios are:
-
-```text
-CPU:    2 / 250m = 8:1
-Memory: 5Gi / 4Gi = 1.25:1
-```
-
-The derived capacities are:
+The Fastlet contract is:
 
 ```text
 commitmentCapacity.cpu    = 250m * 10 = 2500m
 commitmentCapacity.memory = 4Gi * 10  = 40Gi
 
-runtimeEnvelope.cpu
-  = 250m + max(2500m, 2) = 2750m
-
-runtimeEnvelope.memory
-  = 256Mi + max(40Gi, 5Gi) = 40Gi + 256Mi
+runtimeEnvelope.cpu    = max(2500m, 2 CPU) = 2500m
+runtimeEnvelope.memory = max(40Gi, 5Gi)    = 40Gi
 ```
 
-The runtime-owner container receives equal Kubernetes requests and limits of
-2750m CPU and 40 GiB plus 256 MiB memory. The Fastlet ledger still exposes
-only 2500m CPU and 40 GiB memory to Sandboxes; fixed overhead cannot be spent
-by Sandbox admission.
+A smaller Create request may specify:
 
-Ten idle or normally loaded Sandboxes may be admitted. Their CPU limits sum to
-20 CPUs and their memory limits sum to 50 GiB, but the parent envelope bounds
-correlated bursts. CPU contention degrades performance. Memory pressure can
-block the tenth create before the static ledger is full if existing Sandboxes
-are already bursting above their 4 GiB commitments.
+```yaml
+resources:
+  limits:
+    cpu: "1"
+    memory: 2500Mi
+```
+
+Fast Sandbox derives `125m / 2Gi`. A larger Sandbox with `2 CPU / 5Gi`
+charges `250m / 4Gi`. The Fastlet ledger sums these exact heterogeneous
+requests; it does not multiply Sandbox count by the default request.
 
 ## Capacity-planning workflow
 
-1. Measure sustained CPU demand, CPU throttling, request latency, and throughput
-   for representative Sandboxes.
-2. Measure memory working set, RSS, high-watermark residence time, memory PSI,
-   reclaim behavior, and OOM events.
-3. Choose requests that cover normal sustained demand rather than the idle
-   baseline.
-4. Choose limits that permit useful bursts without making a correlated burst
-   exceed acceptable parent-cgroup risk.
-5. Set `maxSandboxesPerPod` from both resource density and non-resource actor
-   costs such as network namespaces, file descriptors, and runtime state.
-6. Roll out gradually and compare static rejections, dynamic memory
-   rejections, CPU throttling, latency, OOM events, and Pool scale events.
+1. Measure sustained CPU demand, throttling, latency, and throughput.
+2. Measure memory working set, RSS, PSI, reclaim, and OOM behavior.
+3. Pick default limits that cover the common runtime shape.
+4. Pick separate ratios that turn those limits into conservative commitments.
+5. Set `maxSandboxesPerPod` for both resource density and non-resource costs
+   such as netns entries, file descriptors, and runtime state.
+6. Ensure the derived runtime envelope can accept the largest intended custom
+   Sandbox limit; otherwise reduce the ratio, raise the slot count, or use a
+   different Pool class.
+7. Roll out gradually and compare static rejections, dynamic memory
+   rejections, CPU throttling, latency, OOM events, and Pool scaling.
 
-Do not raise the configured ratios merely because memory was reclaimed or a
-sample reported free pages. Those observations are transient and do not change
-the immutable commitment policy.
+Do not raise ratios merely because one sample reported free pages or reclaim
+succeeded. Those observations are transient and do not change commitment.
 
 ## Elasticity behavior
 
-A Fastlet with `BLOCKED`, `UNKNOWN`, stale, or unsupported resource state
-contributes no effective free capacity. The Pool Controller may create a
-replacement Fastlet when the remaining capacity cannot cover pending demand
-and `bufferMin`.
+A `BLOCKED`, `UNKNOWN`, stale, or draining Fastlet contributes zero
+schedulable free capacity. The Pool Controller adds capacity when pending
+request vectors plus `bufferMin` exceed the aggregate free vectors.
 
-A new Fastlet without a heartbeat contributes nominal capacity only during the
-startup grace period. After the grace expires it contributes zero until a
-fresh heartbeat arrives, preventing a CrashLooping Pod from hiding a capacity
-deficit.
+An accepted Creating or Resuming Sandbox is already charged in the Fastlet
+ledger and is not counted as pending demand again. A new Fastlet without a
+heartbeat contributes nominal capacity only during startup grace.
 
-`RuntimeCreating` already owns a Fastlet reservation, so it is not counted as
-pending demand a second time. Scale-down requires continuous excess capacity
-for the configured stabilization window, and the candidate start time is
-persisted in SandboxPool status.
+Scale-down requires continuous excess capacity. The start time is the
+`ScaleDownCandidate=True` Condition's `lastTransitionTime`. Only empty
+Fastlets are selected; a candidate that becomes loaded has its scale-down
+drain canceled instead of being force-deleted.
 
-## Rollout controls
-
-The Controller exposes independent switches for static Fastlet admission,
-dynamic memory admission, FastPath placement, and Pool scaling. Placement
-requires static admission, and Pool scaling requires placement. Disable the
-newest decision layer first during rollback; disabling a switch never changes
-the meaning of an immutable resource profile.
-
-See the [configuration reference](../reference/configuration.md) for flag names
-and defaults, and the
-[architecture design](../design/resource-aware-overcommit-placement.md) for
-the complete protocol, failure, and recovery contract. Use the
-[capacity validation guide](resource-aware-capacity-validation.md) to exercise
-derived resources, demand-driven elasticity, pressure heartbeats, and
-stabilized scale-down on a development cluster.
+See the [architecture design](../design/resource-aware-overcommit-placement.md)
+for the full protocol and the
+[capacity validation guide](resource-aware-capacity-validation.md) for manual
+cluster verification.

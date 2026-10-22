@@ -36,7 +36,7 @@ kubectl create namespace resource-aware-manual
 
 ### 1. Create the Pool
 
-Apply a Pool with two Sandbox commitments per Fastlet. Do not set CPU or
+Apply a Pool with four Sandbox slots per Fastlet. Do not set CPU or
 memory resources on the first Fastlet container; the Controller owns those
 values in `ResourceAware` mode.
 
@@ -54,15 +54,15 @@ spec:
     poolMax: 2
     bufferMin: 0
     bufferMax: 0
-  maxSandboxesPerPod: 2
+  maxSandboxesPerPod: 4
   sandboxResources:
-    requests:
-      cpu: 100m
-      memory: 128Mi
-    limits:
-      cpu: 500m
-      memory: 192Mi
+    mode: ResourceAware
+    cpu: 500m
+    memory: 192Mi
     pids: 64
+    overcommitRatio:
+      cpu: "5"
+      memory: "1.5"
   fastletTemplate:
     spec:
       containers:
@@ -86,16 +86,16 @@ EOF
 The expected resource contract is:
 
 ```text
-commitmentCapacity.cpu    = 100m * 2 = 200m
-commitmentCapacity.memory = 128Mi * 2 = 256Mi
+commitmentCapacity.cpu    = 100m * 4 = 400m
+commitmentCapacity.memory = 128Mi * 4 = 512Mi
 
 runtimeEnvelope.cpu
-  = 100m container-runtime overhead + max(200m, 500m)
-  = 600m
+  = max(400m, 500m)
+  = 500m
 
 runtimeEnvelope.memory
-  = 128Mi container-runtime overhead + max(256Mi, 192Mi)
-  = 384Mi
+  = max(512Mi, 192Mi)
+  = 512Mi
 ```
 
 The watermark overrides above make this static-capacity scenario insensitive
@@ -132,10 +132,9 @@ kubectl get pod "$FASTLET_POD" -n resource-aware-manual \
   -o jsonpath='{.spec.containers[0].resources}{"\n"}{.metadata.annotations.fast-sandbox\.io/commitment-capacity}{"\n"}'
 ```
 
-The first container must have equal Kubernetes requests and limits of `600m`
-CPU and `384Mi` memory. The annotation must contain `200m` CPU and `256Mi`
-memory. The envelope includes fixed Fastlet overhead; the commitment
-annotation does not.
+The first container must have equal Kubernetes requests and limits of `500m`
+CPU and `512Mi` memory. The annotation must contain `400m` CPU and `512Mi`
+memory.
 
 Inspect the immutable Fastlet settings delivered by the Controller:
 
@@ -147,8 +146,8 @@ kubectl get configmap "$SETTINGS_CM" -n resource-aware-manual \
   -o jsonpath='{.data.resource-admission\.json}' | jq .
 ```
 
-The document should report `capacity` as `200m` and `256Mi`, and
-`runtimeLimit` as `600m` and `384Mi`.
+The document should report `capacity` as `400m` and `512Mi`, and
+`runtimeLimit` as `500m` and `512Mi`.
 
 ### 4. Fill the first Fastlet
 
@@ -165,6 +164,10 @@ spec:
   image: docker.io/library/alpine:latest
   command: ["/bin/sleep", "3600"]
   poolRef: resource-aware-pool
+  resources:
+    limits:
+      cpu: 250m
+      memory: 512Mi
 ---
 apiVersion: sandbox.fast.io/v1alpha2
 kind: Sandbox
@@ -183,12 +186,17 @@ kubectl wait -n resource-aware-manual \
   --timeout=120s
 ```
 
-Both Sandboxes should use the same Fastlet, and the Pool should still have one
-Fastlet Pod:
+The first Sandbox derives a `50m / approximately 341.34Mi` request, while the
+second uses the Pool default `100m / 128Mi`. Their combined commitment remains
+below `400m / 512Mi`, so both should use the same Fastlet and the Pool should
+still have one Fastlet Pod:
 
 ```bash
 kubectl get sandboxes -n resource-aware-manual \
   -o custom-columns='NAME:.metadata.name,STATE:.status.runtime.state,FASTLET:.status.placement.fastletName'
+
+kubectl get sandbox ra-sandbox-1 -n resource-aware-manual \
+  -o jsonpath='{.metadata.annotations.fast-sandbox\.io/resolved-request-cpu}{" "}{.metadata.annotations.fast-sandbox\.io/resolved-request-memory}{" "}{.metadata.annotations.fast-sandbox\.io/resolved-limit-cpu}{" "}{.metadata.annotations.fast-sandbox\.io/resolved-limit-memory}{"\n"}'
 
 kubectl get pods -n resource-aware-manual \
   -l fast-sandbox.io/pool=resource-aware-pool \
@@ -197,9 +205,11 @@ kubectl get pods -n resource-aware-manual \
 
 ### 5. Trigger scale-out
 
-Create a third Sandbox. The first Fastlet has exhausted both of its static
-commitments, so the Sandbox remains pending until the Pool creates a second
-Fastlet.
+Create a third Sandbox whose derived request is `50m / 64Mi`. Adding it would
+raise the first Fastlet's memory commitment above `512Mi`, even though only
+two of its four slots are occupied. The Sandbox therefore remains pending
+until the Pool creates a second Fastlet; this proves resource pressure, not
+the slot ceiling, triggered scale-out.
 
 ```bash
 kubectl apply -f - <<'EOF'
@@ -212,6 +222,10 @@ spec:
   image: docker.io/library/alpine:latest
   command: ["/bin/sleep", "3600"]
   poolRef: resource-aware-pool
+  resources:
+    limits:
+      cpu: 250m
+      memory: 96Mi
 EOF
 
 for attempt in $(seq 1 60); do
@@ -232,8 +246,9 @@ kubectl get sandboxes -n resource-aware-manual \
   -o custom-columns='NAME:.metadata.name,STATE:.status.runtime.state,FASTLET:.status.placement.fastletName'
 ```
 
-There must be two distinct Fastlet names, and no Fastlet may own more than two
-Sandboxes.
+There must be two distinct Fastlet names. The first Fastlet may still own only
+two Sandboxes despite having four slots, because its remaining memory
+commitment is smaller than the third Sandbox request.
 
 ### 6. Trigger stabilized scale-down
 
@@ -245,11 +260,12 @@ kubectl delete sandbox -n resource-aware-manual \
 ```
 
 The Pool intentionally keeps two Fastlets during the default one-minute
-stabilization window. Inspect the persisted candidate timestamp:
+stabilization window. Inspect the persisted candidate Condition and its
+transition time:
 
 ```bash
 kubectl get sandboxpool resource-aware-pool -n resource-aware-manual \
-  -o jsonpath='{.status.resourceScaleDownCandidateSince}{"\n"}'
+  -o jsonpath='{range .status.conditions[?(@.type=="ScaleDownCandidate")]}{.status}{" "}{.lastTransitionTime}{"\n"}{end}'
 ```
 
 Wait for the excess idle Fastlet to drain and disappear:
@@ -292,13 +308,13 @@ spec:
     bufferMax: 1
   maxSandboxesPerPod: 2
   sandboxResources:
-    requests:
-      cpu: 100m
-      memory: 128Mi
-    limits:
-      cpu: 500m
-      memory: 192Mi
+    mode: ResourceAware
+    cpu: 500m
+    memory: 192Mi
     pids: 64
+    overcommitRatio:
+      cpu: "5"
+      memory: "1.5"
   fastletTemplate:
     spec:
       containers:
@@ -428,9 +444,8 @@ kubectl describe sandboxpool -n resource-aware-manual resource-aware-pool
 ```
 
 Check the `RuntimeReady` condition. A `ResourceProfileInvalid` reason usually
-means requests or limits are incomplete, a limit is below its request, or the
-first Fastlet container specifies CPU or memory resources in `ResourceAware`
-mode.
+means limits or ratios are invalid, a ratio is below one, or the first Fastlet
+container specifies CPU or memory resources in ResourceAware mode.
 
 ### The Pool does not scale out
 
@@ -462,8 +477,8 @@ Scale-down requires all of the following:
 - continuous excess capacity for the stabilization window;
 - no drain failure on the selected Fastlet.
 
-Read `status.resourceScaleDownCandidateSince`, list Sandbox placements, and
-inspect Controller logs before changing the Pool.
+Read the `ScaleDownCandidate` Condition and its `lastTransitionTime`, list
+Sandbox placements, and inspect Controller logs before changing the Pool.
 
 ## Clean up
 

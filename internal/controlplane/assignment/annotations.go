@@ -11,4 +11,11 @@ const (
 	AnnotationRequestID = "sandbox.fast.io/request-id"
 	// AnnotationCreateSpecHash binds a request ID to its immutable create intent.
 	AnnotationCreateSpecHash = "sandbox.fast.io/create-spec-hash"
+	// AnnotationResourcePolicyHash identifies the Pool policy used to derive
+	// the diagnostic request projection.
+	AnnotationResourcePolicyHash    = "fast-sandbox.io/resource-policy-hash"
+	AnnotationResolvedRequestCPU    = "fast-sandbox.io/resolved-request-cpu"
+	AnnotationResolvedRequestMemory = "fast-sandbox.io/resolved-request-memory"
+	AnnotationResolvedLimitCPU      = "fast-sandbox.io/resolved-limit-cpu"
+	AnnotationResolvedLimitMemory   = "fast-sandbox.io/resolved-limit-memory"
 )

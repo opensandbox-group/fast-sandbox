@@ -59,6 +59,11 @@ type SandboxSpec struct {
 	Envs       []corev1.EnvVar `json:"envs,omitempty"`
 	WorkingDir string          `json:"workingDir,omitempty"`
 
+	// Resources contains caller-owned per-Sandbox runtime limits. It is valid
+	// only for ResourceAware Pools and is immutable after creation. When it is
+	// omitted, the Pool's sandboxResources CPU and memory limits are used.
+	Resources *SandboxResourceRequirements `json:"resources,omitempty"`
+
 	// ExpireTime specifies when this sandbox should expire and be garbage collected.
 	// If not set, the sandbox will not expire automatically.
 	ExpireTime *metav1.Time `json:"expireTime,omitempty"`
@@ -95,6 +100,12 @@ type SandboxSpec struct {
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=16
 	ActionBindings []ActionBinding `json:"actionBindings,omitempty"`
+}
+
+// SandboxResourceRequirements deliberately exposes only runtime limits.
+// Admission requests are derived from the owning Pool's immutable policy.
+type SandboxResourceRequirements struct {
+	Limits SandboxComputeResources `json:"limits"`
 }
 
 type ActionBinding struct {

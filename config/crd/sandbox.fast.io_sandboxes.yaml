@@ -262,6 +262,35 @@ spec:
                   When Spec.ResetRevision > Status.Runtime.AcceptedResetRevision, the sandbox will be rescheduled.
                 format: date-time
                 type: string
+              resources:
+                description: |-
+                  Resources contains caller-owned per-Sandbox runtime limits. It is valid
+                  only for ResourceAware Pools and is immutable after creation. When it is
+                  omitted, the Pool's sandboxResources CPU and memory limits are used.
+                properties:
+                  limits:
+                    description: SandboxComputeResources is one CPU and memory resource
+                      vector.
+                    properties:
+                      cpu:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      memory:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                    required:
+                    - cpu
+                    - memory
+                    type: object
+                required:
+                - limits
+                type: object
               state:
                 default: Running
                 description: |-
