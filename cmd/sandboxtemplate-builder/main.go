@@ -91,6 +91,10 @@ func run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	registryAuth, err := loadRegistryAuth(os.Getenv(registryConfigPathEnv))
+	if err != nil {
+		return err
+	}
 	kernel, err := resolveKernel(spec.Kernel)
 	if err != nil {
 		return err
@@ -99,7 +103,7 @@ func run(ctx context.Context) error {
 
 	// Stage 1: convert — OCI image → sparse ext4 rootfs with the runtime injected.
 	convertStarted := time.Now()
-	sourceDigest, err := pullOCILayout(ctx, spec, workdir)
+	sourceDigest, err := pullOCILayout(ctx, spec, workdir, registryAuth)
 	if err != nil {
 		return err
 	}
