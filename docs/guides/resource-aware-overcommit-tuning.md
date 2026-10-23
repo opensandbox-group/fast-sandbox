@@ -45,15 +45,19 @@ The Pool defaults determine Fastlet capacity:
 
 ```text
 commitmentCapacity = defaultRequest * maxSandboxesPerPod
-runtimeEnvelope    = max(commitmentCapacity, defaultLimit)
+sandboxRuntimeBudget = max(commitmentCapacity, defaultLimit)
+runtimeEnvelope      = sandboxRuntimeBudget + fixedFastletOverhead
 ```
 
 The runtime-owner container receives equal Kubernetes requests and limits of
-`runtimeEnvelope`. No fixed or per-Sandbox overhead is added by this model.
+`runtimeEnvelope`. `fixedFastletOverhead` is selected by the platform runtime
+profile and added once per Fastlet Pod. It covers the Fastlet/runtime owner,
+while each Sandbox or VM remains inside its caller-visible limit; there is no
+separate per-Sandbox overhead field.
 
 Fastlet admission, FastPath placement, and Pool scaling all consume the same
-commitment capacity. A custom per-Sandbox limit is rejected if it exceeds the
-already-created runtime envelope.
+commitment capacity. A custom per-Sandbox limit is rejected if it exceeds
+`sandboxRuntimeBudget`, so it cannot consume the fixed overhead reserve.
 
 ## Tune CPU and memory separately
 
@@ -94,8 +98,12 @@ The Fastlet contract is:
 commitmentCapacity.cpu    = 250m * 10 = 2500m
 commitmentCapacity.memory = 4Gi * 10  = 40Gi
 
-runtimeEnvelope.cpu    = max(2500m, 2 CPU) = 2500m
-runtimeEnvelope.memory = max(40Gi, 5Gi)    = 40Gi
+sandboxRuntimeBudget.cpu    = max(2500m, 2 CPU) = 2500m
+sandboxRuntimeBudget.memory = max(40Gi, 5Gi)    = 40Gi
+
+# With the container profile's 100m / 128Mi fixed overhead:
+runtimeEnvelope.cpu    = 2600m
+runtimeEnvelope.memory = 40Gi + 128Mi
 ```
 
 A smaller Create request may specify:
@@ -119,9 +127,9 @@ requests; it does not multiply Sandbox count by the default request.
 4. Pick separate ratios that turn those limits into conservative commitments.
 5. Set `maxSandboxesPerPod` for both resource density and non-resource costs
    such as netns entries, file descriptors, and runtime state.
-6. Ensure the derived runtime envelope can accept the largest intended custom
-   Sandbox limit; otherwise reduce the ratio, raise the slot count, or use a
-   different Pool class.
+6. Ensure the derived Sandbox runtime budget can accept the largest intended
+   custom Sandbox limit; otherwise reduce the ratio, raise the slot count, or
+   use a different Pool class.
 7. Roll out gradually and compare static rejections, dynamic memory
    rejections, CPU throttling, latency, OOM events, and Pool scaling.
 
@@ -132,7 +140,10 @@ succeeded. Those observations are transient and do not change commitment.
 
 A `BLOCKED`, `UNKNOWN`, stale, or draining Fastlet contributes zero
 schedulable free capacity. The Pool Controller adds capacity when pending
-request vectors plus `bufferMin` exceed the aggregate free vectors.
+request vectors plus `bufferMin` exceed the aggregate free vectors. It also
+packs each pending request against individual Fastlet free vectors and scales
+out when aggregate capacity is fragmented so no single Fastlet can admit a
+larger Sandbox.
 
 An accepted Creating or Resuming Sandbox is already charged in the Fastlet
 ledger and is not counted as pending demand again. A new Fastlet without a

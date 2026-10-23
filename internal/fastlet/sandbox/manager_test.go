@@ -680,6 +680,28 @@ func TestSandboxManager_GetSandboxStatuses_RuntimeStatus(t *testing.T) {
 	assert.Greater(t, callCount, 0, "GetSandboxStatus should be called on runtime")
 }
 
+func TestSandboxManager_GetSandboxStatuses_StoppedRuntimeFailsWithoutReleasingAdmission(t *testing.T) {
+	mockRuntime := NewMockRuntime()
+	manager := NewSandboxManager(mockRuntime)
+	ctx := context.Background()
+	spec := runtimeSpecForTest("test-sb-stopped", "test-claim", "alpine:latest")
+
+	_, err := ensureSandboxForTest(ctx, manager, spec)
+	require.NoError(t, err)
+	mockRuntime.mu.Lock()
+	mockRuntime.sandboxes[spec.SandboxID].Phase = "Stopped"
+	mockRuntime.mu.Unlock()
+
+	statuses := manager.GetSandboxStatuses(ctx)
+	require.Len(t, statuses, 1)
+	require.Equal(t, fastletapi.RuntimeStateFailed, statuses[0].Runtime.State)
+	require.Equal(t, fastletapi.DataPlaneStateFailed, statuses[0].DataPlane.State)
+	require.Equal(t, "Stopped", statuses[0].Runtime.Message)
+
+	admission, _, _ := manager.State()
+	require.Equal(t, 1, admission.Used, "a failed observation must not release the commitment before cleanup")
+}
+
 func TestSandboxManager_GetSandboxStatuses_MultiplePhases(t *testing.T) {
 	mockRuntime := NewMockRuntime()
 	manager := NewSandboxManager(mockRuntime)

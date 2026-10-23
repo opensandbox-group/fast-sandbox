@@ -5,6 +5,8 @@ package runtimeenv
 import (
 	"encoding/json"
 
+	corev1 "k8s.io/api/core/v1"
+
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 )
@@ -64,6 +66,10 @@ type RuntimeBinding struct {
 	OptionsType string                               `json:"optionsType,omitempty"`
 	NeedsTTY    *bool                                `json:"needsTTY,omitempty"`
 	HostPaths   []runtimecatalog.HostPathRequirement `json:"hostPaths,omitempty"`
+	// FastletOverhead is the fixed CPU and memory budget consumed once by the
+	// runtime-owner process. It is platform-owned and never enters the
+	// per-Sandbox commitment ledger.
+	FastletOverhead corev1.ResourceList `json:"fastletOverhead,omitempty"`
 	// Firecracker carries the installation values of the Firecracker
 	// runtime driver (binary/jailer/kernel paths and the state root). Only
 	// non-empty fields override the builtin profile defaults; the profile's

@@ -142,6 +142,9 @@ spec:
         image: fast-sandbox/firecracker-runtime:dev
         imagePullPolicy: IfNotPresent
         command: ["/usr/local/bin/install-oci-tools"]
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits: {cpu: 500m, memory: 256Mi}
         volumeMounts:
         - name: oci-tools
           mountPath: /opt/fast-sandbox/oci
@@ -149,6 +152,13 @@ spec:
       - name: firecracker-agent
         image: fast-sandbox/firecracker-runtime:dev
         imagePullPolicy: IfNotPresent
+        # Node services run outside every Fastlet cgroup. These conservative
+        # defaults protect their own scheduling/QoS and are not included in a
+        # Pool's Fastlet overhead or Sandbox commitment capacity. Production
+        # packaging should expose the same block as operator-owned values.
+        resources:
+          requests: {cpu: 250m, memory: 256Mi}
+          limits: {memory: 1Gi}
         # Only Downward API identities live in env; all tunables come from
         # the mounted agent config (nodeReadiness hot-reloads per pass).
         env:
@@ -212,6 +222,9 @@ spec:
       - name: overlaybd-ublkd
         image: fast-sandbox/firecracker-runtime:dev
         imagePullPolicy: IfNotPresent
+        resources:
+          requests: {cpu: 100m, memory: 128Mi}
+          limits: {memory: 1Gi}
         command: ["/bin/sh", "-ec"]
         args:
         - 'if [ "$FAST_SANDBOX_OCI_ENABLED" != true ]; then exec sleep infinity; fi; exec /usr/local/bin/overlaybd-node'
@@ -248,6 +261,9 @@ spec:
       - name: janitor
         image: fast-sandbox/janitor:dev
         imagePullPolicy: IfNotPresent
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits: {cpu: 250m, memory: 256Mi}
         command: ["/workspace/janitor"]
         args: ["--scan-interval=2m", "--orphan-timeout=30s", "--containerd-socket=", "--oci-state-root=/var/lib/fast-sandbox/firecracker"]
         ports:

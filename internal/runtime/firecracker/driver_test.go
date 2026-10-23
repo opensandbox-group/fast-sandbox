@@ -859,6 +859,12 @@ func TestValidateRestoreMachineConfigUsesManifest(t *testing.T) {
 	err = validateRestoreMachineConfig(fastletapi.SandboxRuntimeLimits{Memory: "256Mi"}, config, stateRoot, image)
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	require.Contains(t, err.Error(), "below the template snapshot memory")
+
+	// A request CPU limit that cannot contain the immutable snapshot vCPU
+	// count is rejected before the VMM starts.
+	err = validateRestoreMachineConfig(fastletapi.SandboxRuntimeLimits{CPU: "500m", Memory: "1Gi"}, config, stateRoot, image)
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.Contains(t, err.Error(), "below the template snapshot vCPU count")
 }
 
 func TestValidateRestoreMachineConfigFallsBackWithoutManifest(t *testing.T) {

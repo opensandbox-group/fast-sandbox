@@ -170,7 +170,7 @@ func TestResolveSandboxResourcesRejectsLegacyOverrides(t *testing.T) {
 	require.ErrorContains(t, err, "per-Sandbox resources require ResourceAware mode")
 }
 
-func TestResolveSandboxResourcesDerivesRequestAndRejectsLimitAboveEnvelope(t *testing.T) {
+func TestResolveSandboxResourcesDerivesRequestAndRejectsLimitAboveRuntimeBudget(t *testing.T) {
 	_, _, _, sandbox := newHarness(t)
 	pool := &apiv1alpha2.SandboxPool{Spec: apiv1alpha2.SandboxPoolSpec{
 		MaxSandboxesPerPod: 8,
@@ -192,7 +192,7 @@ func TestResolveSandboxResourcesDerivesRequestAndRejectsLimitAboveEnvelope(t *te
 
 	sandbox.Spec.Resources.Limits.CPU = resource.MustParse("3")
 	_, _, err = ResolveSandboxResources(pool, sandbox)
-	require.ErrorContains(t, err, "exceed Fastlet runtime envelope")
+	require.ErrorContains(t, err, "exceed Fastlet Sandbox runtime budget")
 }
 
 func TestResolveRuntimeRejectsResourceMutationAfterAssignment(t *testing.T) {

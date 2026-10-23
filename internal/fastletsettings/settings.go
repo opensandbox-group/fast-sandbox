@@ -36,17 +36,19 @@ const (
 	CommitmentCapacityAnnotation = "fast-sandbox.io/commitment-capacity"
 )
 
-// ResourceAdmissionSettings delivers the pure Sandbox commitment capacity and
-// the derived runtime-owner envelope to Fastlet. The Controller projects both
-// values so every consumer uses the same resolved resource contract.
+// ResourceAdmissionSettings delivers the pure Sandbox commitment capacity, the
+// largest runtime budget assignable to one Sandbox, and the parent Fastlet
+// envelope. The parent envelope includes fixed Fastlet overhead; the other two
+// vectors do not.
 type ResourceAdmissionSettings struct {
-	Version             string                              `json:"version"`
-	Mode                apiv1alpha2.SandboxResourceMode     `json:"mode"`
-	StaticAdmission     bool                                `json:"staticAdmission"`
-	MemoryAdmission     bool                                `json:"memoryAdmission"`
-	Capacity            apiv1alpha2.SandboxComputeResources `json:"capacity"`
-	RuntimeLimit        apiv1alpha2.SandboxComputeResources `json:"runtimeLimit"`
-	ResourceProfileHash string                              `json:"resourceProfileHash"`
+	Version              string                              `json:"version"`
+	Mode                 apiv1alpha2.SandboxResourceMode     `json:"mode"`
+	StaticAdmission      bool                                `json:"staticAdmission"`
+	MemoryAdmission      bool                                `json:"memoryAdmission"`
+	Capacity             apiv1alpha2.SandboxComputeResources `json:"capacity"`
+	SandboxRuntimeBudget apiv1alpha2.SandboxComputeResources `json:"sandboxRuntimeBudget"`
+	RuntimeEnvelope      apiv1alpha2.SandboxComputeResources `json:"runtimeEnvelope"`
+	ResourceProfileHash  string                              `json:"resourceProfileHash"`
 }
 
 type commitmentCapacityAnnotation struct {
@@ -99,17 +101,21 @@ func (s *ResourceAdmissionSettings) Validate(profile apiv1alpha2.SandboxResource
 	requests, _ := profile.RequestResources()
 	limits, _ := profile.LimitResources()
 	if s.Capacity.CPU.Sign() <= 0 || s.Capacity.Memory.Sign() <= 0 ||
-		s.RuntimeLimit.CPU.Sign() <= 0 || s.RuntimeLimit.Memory.Sign() <= 0 {
-		return fmt.Errorf("resource admission capacity and runtime limit must be greater than zero")
+		s.SandboxRuntimeBudget.CPU.Sign() <= 0 || s.SandboxRuntimeBudget.Memory.Sign() <= 0 ||
+		s.RuntimeEnvelope.CPU.Sign() <= 0 || s.RuntimeEnvelope.Memory.Sign() <= 0 {
+		return fmt.Errorf("resource admission capacity, Sandbox runtime budget, and runtime envelope must be greater than zero")
 	}
-	if s.Capacity.CPU.Cmp(s.RuntimeLimit.CPU) > 0 || s.Capacity.Memory.Cmp(s.RuntimeLimit.Memory) > 0 {
-		return fmt.Errorf("resource admission capacity must not exceed the runtime limit")
+	if s.Capacity.CPU.Cmp(s.SandboxRuntimeBudget.CPU) > 0 || s.Capacity.Memory.Cmp(s.SandboxRuntimeBudget.Memory) > 0 {
+		return fmt.Errorf("resource admission capacity must not exceed the Sandbox runtime budget")
+	}
+	if s.SandboxRuntimeBudget.CPU.Cmp(s.RuntimeEnvelope.CPU) > 0 || s.SandboxRuntimeBudget.Memory.Cmp(s.RuntimeEnvelope.Memory) > 0 {
+		return fmt.Errorf("Sandbox runtime budget must not exceed the Fastlet runtime envelope")
 	}
 	if s.Capacity.CPU.Cmp(requests.CPU) < 0 || s.Capacity.Memory.Cmp(requests.Memory) < 0 {
 		return fmt.Errorf("resource admission capacity cannot commit one Sandbox request")
 	}
-	if s.RuntimeLimit.CPU.Cmp(limits.CPU) < 0 || s.RuntimeLimit.Memory.Cmp(limits.Memory) < 0 {
-		return fmt.Errorf("resource admission runtime limit cannot contain one Sandbox limit")
+	if s.SandboxRuntimeBudget.CPU.Cmp(limits.CPU) < 0 || s.SandboxRuntimeBudget.Memory.Cmp(limits.Memory) < 0 {
+		return fmt.Errorf("resource admission Sandbox runtime budget cannot contain one Sandbox limit")
 	}
 	return nil
 }

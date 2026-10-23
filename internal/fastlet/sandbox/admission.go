@@ -881,8 +881,8 @@ func (m *SandboxManager) resolveCreateResources(resolved *fastletapi.ResolvedSan
 	if errCPU != nil || errMemory != nil || requestCPU.Cmp(requests.CPU) != 0 || requestMemory.Cmp(requests.Memory) != 0 {
 		return fastletapi.SandboxRuntimeLimits{}, fmt.Errorf("%w: resolved requests do not match the Pool overcommit policy", ErrSandboxProfileMismatch)
 	}
-	if m.resourceAdmission == nil || limits.CPU.Cmp(m.resourceAdmission.RuntimeLimit.CPU) > 0 || limits.Memory.Cmp(m.resourceAdmission.RuntimeLimit.Memory) > 0 {
-		return fastletapi.SandboxRuntimeLimits{}, fmt.Errorf("%w: Sandbox limits exceed the Fastlet runtime envelope", ErrSandboxProfileMismatch)
+	if m.resourceAdmission == nil || limits.CPU.Cmp(m.resourceAdmission.SandboxRuntimeBudget.CPU) > 0 || limits.Memory.Cmp(m.resourceAdmission.SandboxRuntimeBudget.Memory) > 0 {
+		return fastletapi.SandboxRuntimeLimits{}, fmt.Errorf("%w: Sandbox limits exceed the Fastlet Sandbox runtime budget", ErrSandboxProfileMismatch)
 	}
 	return resolved.Limits, nil
 }

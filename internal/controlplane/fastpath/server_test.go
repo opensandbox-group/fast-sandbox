@@ -508,7 +508,7 @@ func TestCreateRejectsPerSandboxResourcesForLegacyPool(t *testing.T) {
 	require.Empty(t, fastlet.createRequests)
 }
 
-func TestCreateRejectsLimitAboveDerivedFastletEnvelope(t *testing.T) {
+func TestCreateRejectsLimitAboveDerivedSandboxRuntimeBudget(t *testing.T) {
 	server, k8sClient, _, fastlet := newV2Server(t)
 	var pool apiv1alpha2.SandboxPool
 	require.NoError(t, k8sClient.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
@@ -524,7 +524,7 @@ func TestCreateRejectsLimitAboveDerivedFastletEnvelope(t *testing.T) {
 
 	_, err := server.CreateSandbox(context.Background(), request)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
-	require.Contains(t, err.Error(), "exceed Fastlet runtime envelope")
+	require.Contains(t, err.Error(), "exceed Fastlet Sandbox runtime budget")
 	creates, _, _, _ := k8sClient.counts()
 	require.Zero(t, creates)
 	require.Empty(t, fastlet.createRequests)

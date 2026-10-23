@@ -162,12 +162,12 @@ func ResolveSandboxResources(pool *apiv1alpha2.SandboxPool, sandbox *apiv1alpha2
 	if err != nil {
 		return nil, placement.ResourceDemand{}, err
 	}
-	_, envelope, err := pool.Spec.SandboxResources.ResolveFastletCapacity(pool.Spec.MaxSandboxesPerPod)
+	_, runtimeBudget, err := pool.Spec.SandboxResources.ResolveFastletCapacity(pool.Spec.MaxSandboxesPerPod)
 	if err != nil {
 		return nil, placement.ResourceDemand{}, err
 	}
-	if limits.CPU.Cmp(envelope.CPU) > 0 || limits.Memory.Cmp(envelope.Memory) > 0 {
-		return nil, placement.ResourceDemand{}, fmt.Errorf("Sandbox limits %s/%s exceed Fastlet runtime envelope %s/%s", limits.CPU.String(), limits.Memory.String(), envelope.CPU.String(), envelope.Memory.String())
+	if limits.CPU.Cmp(runtimeBudget.CPU) > 0 || limits.Memory.Cmp(runtimeBudget.Memory) > 0 {
+		return nil, placement.ResourceDemand{}, fmt.Errorf("Sandbox limits %s/%s exceed Fastlet Sandbox runtime budget %s/%s", limits.CPU.String(), limits.Memory.String(), runtimeBudget.CPU.String(), runtimeBudget.Memory.String())
 	}
 	return &fastletapi.ResolvedSandboxResources{
 		Requests: fastletapi.SandboxResourceVector{CPU: requests.CPU.String(), Memory: requests.Memory.String()},

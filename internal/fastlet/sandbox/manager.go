@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -145,8 +146,11 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		copied.Capacity = apiv1alpha2.SandboxComputeResources{
 			CPU: config.ResourceAdmission.Capacity.CPU.DeepCopy(), Memory: config.ResourceAdmission.Capacity.Memory.DeepCopy(),
 		}
-		copied.RuntimeLimit = apiv1alpha2.SandboxComputeResources{
-			CPU: config.ResourceAdmission.RuntimeLimit.CPU.DeepCopy(), Memory: config.ResourceAdmission.RuntimeLimit.Memory.DeepCopy(),
+		copied.SandboxRuntimeBudget = apiv1alpha2.SandboxComputeResources{
+			CPU: config.ResourceAdmission.SandboxRuntimeBudget.CPU.DeepCopy(), Memory: config.ResourceAdmission.SandboxRuntimeBudget.Memory.DeepCopy(),
+		}
+		copied.RuntimeEnvelope = apiv1alpha2.SandboxComputeResources{
+			CPU: config.ResourceAdmission.RuntimeEnvelope.CPU.DeepCopy(), Memory: config.ResourceAdmission.RuntimeEnvelope.Memory.DeepCopy(),
 		}
 		resourceAdmission = &copied
 		if resourceEpoch == "" {
@@ -492,6 +496,11 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 		}
 		if inspected, err := m.runtime.InspectSandbox(ctx, sandboxID); err == nil {
 			runtimeObservation.Message = inspected.Phase
+			if runtimeObservation.State == fastletapi.RuntimeStateReady && strings.EqualFold(strings.TrimSpace(inspected.Phase), "stopped") {
+				runtimeObservation.State = fastletapi.RuntimeStateFailed
+				dataPlaneObservation.State = fastletapi.DataPlaneStateFailed
+				dataPlaneObservation.Message = "runtime reported stopped"
+			}
 		}
 		result = append(result, fastletapi.SandboxStatus{
 			SandboxID:          sandboxID,

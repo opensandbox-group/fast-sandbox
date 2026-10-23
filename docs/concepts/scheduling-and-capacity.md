@@ -47,14 +47,17 @@ Controller derives:
 ```text
 commitmentCapacity = defaultRequest * maxSandboxesPerPod
 
-runtimeEnvelope = max(commitmentCapacity, default Sandbox limit)
+sandboxRuntimeBudget = max(commitmentCapacity, default Sandbox limit)
+runtimeEnvelope = sandboxRuntimeBudget + fixedFastletOverhead
 
 runtimeOwner.requests = runtimeOwner.limits = runtimeEnvelope
 ```
 
 Commitment capacity is shared unchanged by Fastlet admission, FastPath
-placement, and Pool scaling. The runtime envelope ensures the parent cgroup can
-honor at least one default Sandbox limit. Sidecar resources remain independent.
+placement, and Pool scaling. The Sandbox runtime budget ensures the parent can
+honor at least one default Sandbox limit; the runtime envelope adds one
+runtime-profile-specific Fastlet overhead reserve. Sidecar resources remain
+independent.
 
 Each RuntimeDriver receives only Fastlet-resolved Sandbox limits. Requests are
 ledger values; they are not currently translated to CPU weight, `memory.low`,
