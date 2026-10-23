@@ -89,13 +89,16 @@ The expected resource contract is:
 commitmentCapacity.cpu    = 100m * 4 = 400m
 commitmentCapacity.memory = 128Mi * 4 = 512Mi
 
-runtimeEnvelope.cpu
+sandboxRuntimeBudget.cpu
   = max(400m, 500m)
   = 500m
 
-runtimeEnvelope.memory
+sandboxRuntimeBudget.memory
   = max(512Mi, 192Mi)
   = 512Mi
+
+runtimeEnvelope.cpu    = 500m + 100m = 600m
+runtimeEnvelope.memory = 512Mi + 128Mi = 640Mi
 ```
 
 The watermark overrides above make this static-capacity scenario insensitive
@@ -132,9 +135,11 @@ kubectl get pod "$FASTLET_POD" -n resource-aware-manual \
   -o jsonpath='{.spec.containers[0].resources}{"\n"}{.metadata.annotations.fast-sandbox\.io/commitment-capacity}{"\n"}'
 ```
 
-The first container must have equal Kubernetes requests and limits of `500m`
-CPU and `512Mi` memory. The annotation must contain `400m` CPU and `512Mi`
-memory.
+The first container must have equal Kubernetes requests and limits of `600m`
+CPU and `640Mi` memory: a `500m / 512Mi` Sandbox runtime budget plus the
+container runtime profile's `100m / 128Mi` fixed Fastlet overhead. The
+annotation must contain only the allocatable commitment capacity: `400m` CPU
+and `512Mi` memory.
 
 Inspect the immutable Fastlet settings delivered by the Controller:
 
@@ -146,8 +151,9 @@ kubectl get configmap "$SETTINGS_CM" -n resource-aware-manual \
   -o jsonpath='{.data.resource-admission\.json}' | jq .
 ```
 
-The document should report `capacity` as `400m` and `512Mi`, and
-`runtimeLimit` as `500m` and `512Mi`.
+The document should report `capacity` as `400m / 512Mi`,
+`sandboxRuntimeBudget` as `500m / 512Mi`, and `runtimeEnvelope` as
+`600m / 640Mi`.
 
 ### 4. Fill the first Fastlet
 

@@ -121,7 +121,8 @@ func requireStaticGuestNetwork(network *artifacts.VMGuestNetwork) error {
 // rejects it). The request cpu/mem only validate: a request memory below
 // the snapshot memory is rejected with an explicit error. When the cached
 // manifest carries no machine tuple (hand-seeded local cache), the request
-// profile is validated as the fallback.
+// profile is validated as the fallback. An explicit CPU limit must also be
+// large enough for the immutable snapshot vCPU tuple.
 func validateRestoreMachineConfig(spec fastletapi.SandboxRuntimeLimits, config runtimecatalog.FirecrackerConfig, stateRoot, image string) error {
 	machine, ok, err := readCachedManifestMachine(stateRoot, image)
 	if err != nil {
@@ -137,6 +138,16 @@ func validateRestoreMachine(spec fastletapi.SandboxSpec, config runtimecatalog.F
 	}
 	if machine.VCPUCount < 1 || machine.MemoryMiB < 1 {
 		return fmt.Errorf("%w: invalid manifest machine", ErrInvalidConfig)
+	}
+	if spec.CPU != "" {
+		quantity, err := resource.ParseQuantity(spec.CPU)
+		if err != nil {
+			return fmt.Errorf("%w: invalid CPU %q", ErrInvalidConfig, spec.CPU)
+		}
+		requestedVCPUs := int(math.Ceil(float64(quantity.MilliValue()) / 1000.0))
+		if requestedVCPUs < machine.VCPUCount {
+			return fmt.Errorf("%w: requested CPU %s permits %d vCPU(s), below the template snapshot vCPU count %d", ErrInvalidConfig, spec.CPU, requestedVCPUs, machine.VCPUCount)
+		}
 	}
 	snapshotMiB := machine.MemoryMiB
 	if spec.Memory != "" {

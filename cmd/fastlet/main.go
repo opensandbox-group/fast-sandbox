@@ -277,7 +277,7 @@ func startResourceAdmissionObserver(
 	if err != nil {
 		return err
 	}
-	limit := settings.RuntimeLimit.Memory.Value()
+	limit := settings.RuntimeEnvelope.Memory.Value()
 	if limit <= 0 {
 		return errors.New("resource admission runtime memory limit must be positive")
 	}

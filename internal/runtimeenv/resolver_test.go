@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
@@ -133,6 +134,40 @@ environments:
 	require.NoError(t, err)
 	require.Equal(t, "blockfile", plan.Profile.Containerd.Snapshotter)
 	require.Equal(t, "blockfile", plan.Containerd.Snapshotter)
+}
+
+func TestRuntimeBindingOverridesFastletOverhead(t *testing.T) {
+	config, err := Parse([]byte(`
+version: v1alpha2
+environments:
+  default:
+    runtimes:
+      container:
+        fastletOverhead:
+          cpu: 350m
+          memory: 384Mi
+`))
+	require.NoError(t, err)
+
+	plan, err := Resolve(runtimecatalog.Builtin(), config, apiv1alpha2.RuntimeContainer)
+	require.NoError(t, err)
+	cpu := plan.Profile.Deployment.Overhead[corev1.ResourceCPU]
+	memory := plan.Profile.Deployment.Overhead[corev1.ResourceMemory]
+	require.Equal(t, "350m", cpu.String())
+	require.Equal(t, "384Mi", memory.String())
+}
+
+func TestParseRejectsIncompleteFastletOverhead(t *testing.T) {
+	_, err := Parse([]byte(`
+version: v1alpha2
+environments:
+  default:
+    runtimes:
+      container:
+        fastletOverhead:
+          cpu: 100m
+`))
+	require.ErrorContains(t, err, "requires non-negative cpu and memory")
 }
 
 func TestFirecrackerBindingOverridesPathsAndHostPaths(t *testing.T) {

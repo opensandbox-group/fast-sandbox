@@ -196,3 +196,14 @@ For every runtime and node image revision:
 ## Firecracker OCI tools and node cache
 
 The runtime-agent DaemonSet installs fsb-vm and OverlayBD tools on the node and runs one optional ublkd container per node. Fastlet executes the shared tools locally and connects directly to the daemon socket. See the [OverlayBD OCI guide](overlaybd-oci-sandboxes.md) for installation paths, activation, shared-cache sizing, credential restrictions, and drain-before-upgrade requirements. Standalone fsb-vm remains usable with its existing tool and socket flags; Kubernetes and runtime-agent are not required.
+
+The example DaemonSet gives each node-service container explicit Kubernetes
+resources. Treat those values as starting points and expose equivalent
+per-container overrides in production packaging: the agent defaults to
+`250m / 256Mi` requests with a `1Gi` memory limit, OverlayBD to
+`100m / 128Mi` requests with a `1Gi` memory limit, and janitor to
+`50m / 64Mi` requests with `250m / 256Mi` limits. These are node-service
+budgets outside every Fastlet Pod cgroup; they are not part of a Pool's
+`fastletOverhead` or Sandbox commitment capacity. Size them from observed
+artifact concurrency, OverlayBD device count, cache activity, and janitor scan
+cost rather than increasing Pool runtime envelopes.

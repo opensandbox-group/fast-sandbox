@@ -334,7 +334,10 @@ func newResourceAwareAdmissionManager(
 		Capacity: apiv1alpha2.SandboxComputeResources{
 			CPU: resource.MustParse(capacityCPU), Memory: resource.MustParse(capacityMemory),
 		},
-		RuntimeLimit: apiv1alpha2.SandboxComputeResources{
+		SandboxRuntimeBudget: apiv1alpha2.SandboxComputeResources{
+			CPU: resource.MustParse(capacityCPU), Memory: resource.MustParse(capacityMemory),
+		},
+		RuntimeEnvelope: apiv1alpha2.SandboxComputeResources{
 			CPU: resource.MustParse(capacityCPU), Memory: resource.MustParse(capacityMemory),
 		},
 		ResourceProfileHash: profile.Hash(),

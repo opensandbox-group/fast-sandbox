@@ -4,7 +4,7 @@
 >
 > Status: implemented behind independent controller feature switches
 >
-> Last updated: 2026-10-22
+> Last updated: 2026-10-23
 
 ## Summary
 
@@ -89,6 +89,7 @@ own Kubernetes resources and do not enter the Sandbox commitment formula.
 - React to live memory pressure without treating CPU and memory as identical.
 - Reduce the 20-second heartbeat lag on active Create paths.
 - Spread concurrent FastPath replicas without introducing node ownership.
+- Reserve one runtime-profile-specific Fastlet overhead budget per Pod.
 - Preserve all existing `LegacySlot` behavior.
 
 ## Non-goals
@@ -98,7 +99,8 @@ own Kubernetes resources and do not enter the Sandbox commitment formula.
 - Reclaiming, pausing, migrating, or evicting existing Sandboxes.
 - Using swap as allocatable commitment capacity.
 - Adding `maxSandboxLimits` or one shared `overcommitRatio`.
-- Adding fixed Fastlet overhead or per-Sandbox overhead to this model.
+- Adding a separate per-Sandbox overhead field; Sandbox limits already own
+  that runtime budget.
 - Building a central transactional reservation database.
 - Replacing Kubernetes scheduling or node autoscaling.
 
@@ -239,19 +241,23 @@ commitmentCapacity.memory
   = defaultRequest.memory * maxSandboxesPerPod
 ```
 
-`commitmentCapacity` contains only Sandbox budget. No fixed overhead is added.
+`commitmentCapacity` contains only Sandbox requests. Fixed Fastlet overhead is
+not allocatable and is never added to this ledger.
 
 ### Runtime-owner envelope
 
-The first Fastlet container owns the child cgroups or VMs. Its Kubernetes
-request and limit are derived as:
+The first Fastlet container owns the child cgroups or VMs. The Controller
+first derives the maximum budget available to all Sandbox runtimes, then adds
+one fixed overhead selected by the resolved runtime profile:
 
 ```text
-runtimeEnvelope.cpu
+sandboxRuntimeBudget.cpu
   = max(commitmentCapacity.cpu, defaultSandboxLimit.cpu)
 
-runtimeEnvelope.memory
+sandboxRuntimeBudget.memory
   = max(commitmentCapacity.memory, defaultSandboxLimit.memory)
+
+runtimeEnvelope = sandboxRuntimeBudget + fixedFastletOverhead
 
 runtimeOwner.requests = runtimeEnvelope
 runtimeOwner.limits   = runtimeEnvelope
@@ -259,10 +265,14 @@ runtimeOwner.limits   = runtimeEnvelope
 
 The `max` guarantees that the parent can contain at least one legal default
 Sandbox limit even when a high overcommit ratio makes total commitment lower.
+The fixed overhead is added exactly once per Fastlet Pod; it covers the
+Fastlet process and runtime-specific ownership cost, not the VM's guest
+memory. It is configured as `fastletOverhead.cpu/memory` on each runtime
+binding in the platform-owned runtime-environments ConfigMap.
 
-A caller-specific limit must not exceed this already-created envelope. Fast
-Sandbox rejects an oversized Create request; there is no second maximum-limit
-field.
+A caller-specific limit must not exceed `sandboxRuntimeBudget`; the reserved
+Fastlet overhead cannot be consumed by a Sandbox. Fast Sandbox rejects an
+oversized Create request; there is no second maximum-limit field.
 
 ### ResourceAware template validation
 
@@ -307,7 +317,7 @@ admission contract:
 ```
 
 Fastlet verifies the resource profile hash, limit validity, request derivation,
-PIDs, runtime envelope, static capacity, and dynamic admission state before
+PIDs, Sandbox runtime budget, static capacity, and dynamic admission state before
 creating runtime side effects.
 
 After admission, RuntimeDriver receives only `RuntimeSandboxConfig` with
@@ -465,6 +475,15 @@ In addition to static commitment, the Fastlet observer may block new creates
 from parent-cgroup watermarks, memory PSI, cgroup OOM events, Kubernetes node
 memory pressure, or stale telemetry.
 
+For direct Firecracker, the VMM processes are descendants of the Fastlet Pod
+cgroup, so parent-cgroup memory pressure includes guest-backed VMM memory.
+The node-level runtime-agent DaemonSet is a separate Kubernetes workload and
+is not charged to a Pool. Node pressure is a distinct safety signal: one fresh
+`NodeMemoryPressure` observation removes every Fastlet on that node from both
+placement and scaler capacity. A stopped direct-Firecracker VMM is reported as
+a failed runtime observation while its commitment remains reserved until the
+normal cleanup path proves absence.
+
 Dynamic memory admission only blocks new Sandbox creation. It does not pause,
 migrate, reclaim, or evict existing Sandboxes.
 
@@ -492,8 +511,12 @@ Creating and accepted Resuming Sandboxes are excluded because their requests
 already appear in `committed`.
 
 The Pool scales up when free Sandbox count, free CPU commitment, or free memory
-commitment falls below pending demand plus `bufferMin`. The number of added
-Pods is the maximum deficit across the three dimensions, bounded by `poolMax`.
+commitment falls below pending demand plus `bufferMin`. It also retains each
+pending request vector and performs deterministic best-fit packing against
+individual Fastlet free vectors. This adds capacity when aggregate free
+resources look sufficient but are fragmented across Fastlets and no one
+Fastlet can admit the request. The number of added Pods is the larger of the
+aggregate deficit and packing deficit, bounded by `poolMax`.
 
 A newly created Fastlet contributes nominal capacity only during a bounded
 startup grace period. A Pod that never reports a heartbeat stops masking
@@ -608,8 +631,10 @@ Derived Fastlet contract:
 
 ```text
 commitmentCapacity = 2.5 CPU, 40 GiB
-runtimeEnvelope    = max(capacity, default limit)
-                   = 2.5 CPU, 40 GiB
+sandboxRuntimeBudget = max(capacity, default limit)
+                     = 2.5 CPU, 40 GiB
+fixedFastletOverhead = 100m CPU, 128 MiB  # container runtime profile
+runtimeEnvelope      = 2.6 CPU, 40 GiB + 128 MiB
 ```
 
 A caller requests a smaller Sandbox:

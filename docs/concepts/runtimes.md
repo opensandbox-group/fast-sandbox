@@ -122,23 +122,26 @@ ResourceAware Pools use that flat profile as the default limit but may accept
 different per-Sandbox CPU and memory limits. Callers never provide requests;
 Fast Sandbox derives them from separate Pool CPU and memory overcommit ratios.
 
-For a ResourceAware Pool, the Controller derives one pure Sandbox commitment
-capacity and one runtime-owner envelope:
+For a ResourceAware Pool, the Controller derives a pure Sandbox commitment
+capacity, a child-runtime budget, and a runtime-owner envelope:
 
 ```text
 defaultRequest = ceil(defaultLimit / overcommitRatio)
 
 commitmentCapacity = defaultRequest * maxSandboxesPerPod
 
-runtimeEnvelope = max(commitmentCapacity, default per-Sandbox limit)
+sandboxRuntimeBudget = max(commitmentCapacity, default per-Sandbox limit)
+
+runtimeEnvelope = sandboxRuntimeBudget + fixedFastletOverhead
 
 runtimeOwner.requests = runtimeOwner.limits = runtimeEnvelope
 ```
 
 The first Fastlet container cannot override CPU or memory in ResourceAware
-mode. Operators select density through independent Pool CPU and memory ratios,
-while `maxSandboxesPerPod` remains a hard Sandbox-count bound. LegacySlot Pools
-retain explicit aggregate first-container resources.
+mode. The platform runtime binding selects the fixed overhead added once per
+Fastlet Pod. Operators select Sandbox density through independent Pool CPU and
+memory ratios, while `maxSandboxesPerPod` remains a hard Sandbox-count bound.
+LegacySlot Pools retain explicit aggregate first-container resources.
 CPU and memory commitments are checked separately before every Create.
 Per-Sandbox limits isolate noisy neighbors, and the Kubernetes Pod cgroup caps
 their combined execution.

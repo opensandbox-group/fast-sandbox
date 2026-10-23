@@ -12,16 +12,17 @@ import (
 // compiled from a SandboxPool. Consumers may project this value, but must not
 // derive another capacity from the Pod template or Kubernetes requests.
 type resolvedFastletResources struct {
-	Mode               apiv1alpha2.SandboxResourceMode
-	StaticAdmission    bool
-	MemoryAdmission    bool
-	CommitmentCapacity apiv1alpha2.SandboxComputeResources
-	RuntimeEnvelope    apiv1alpha2.SandboxComputeResources
+	Mode                 apiv1alpha2.SandboxResourceMode
+	StaticAdmission      bool
+	MemoryAdmission      bool
+	CommitmentCapacity   apiv1alpha2.SandboxComputeResources
+	SandboxRuntimeBudget apiv1alpha2.SandboxComputeResources
+	RuntimeEnvelope      apiv1alpha2.SandboxComputeResources
 }
 
 func compileFastletResources(
 	pool *apiv1alpha2.SandboxPool,
-	_ corev1.ResourceList,
+	fastletOverhead corev1.ResourceList,
 ) (resolvedFastletResources, error) {
 	if pool == nil {
 		return resolvedFastletResources{}, fmt.Errorf("SandboxPool is required")
@@ -43,11 +44,27 @@ func compileFastletResources(
 		return resolvedFastletResources{}, fmt.Errorf("maxSandboxesPerPod must be greater than zero")
 	}
 
-	capacity, envelope, err := pool.Spec.SandboxResources.ResolveFastletCapacity(pool.Spec.MaxSandboxesPerPod)
+	capacity, sandboxRuntimeBudget, err := pool.Spec.SandboxResources.ResolveFastletCapacity(pool.Spec.MaxSandboxesPerPod)
 	if err != nil {
 		return resolvedFastletResources{}, err
 	}
+	envelope := apiv1alpha2.SandboxComputeResources{
+		CPU: sandboxRuntimeBudget.CPU.DeepCopy(), Memory: sandboxRuntimeBudget.Memory.DeepCopy(),
+	}
+	if cpu, exists := fastletOverhead[corev1.ResourceCPU]; exists {
+		if cpu.Sign() < 0 {
+			return resolvedFastletResources{}, fmt.Errorf("Fastlet cpu overhead must not be negative")
+		}
+		envelope.CPU.Add(cpu)
+	}
+	if memory, exists := fastletOverhead[corev1.ResourceMemory]; exists {
+		if memory.Sign() < 0 {
+			return resolvedFastletResources{}, fmt.Errorf("Fastlet memory overhead must not be negative")
+		}
+		envelope.Memory.Add(memory)
+	}
 	resolved.CommitmentCapacity = capacity
+	resolved.SandboxRuntimeBudget = sandboxRuntimeBudget
 	resolved.RuntimeEnvelope = envelope
 	return resolved, nil
 }

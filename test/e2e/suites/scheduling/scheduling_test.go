@@ -301,6 +301,90 @@ func TestResourceAwareOvercommitScaling(t *testing.T) {
 	testSuite.Env().Test(t, feature)
 }
 
+func TestResourceAwareFragmentedCapacityScaling(t *testing.T) {
+	suiteenv.RequireBasic(t)
+
+	feature := features.New("resource-aware-fragmented-capacity-scaling").
+		WithLabel("suite", "scheduling").
+		WithLabel("tier", "smoke").
+		Assess("pool scales when aggregate free resources cannot fit one Sandbox", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+			k8sClient := testSuite.MustKubeClient(t)
+			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
+			namespace := testSuite.AllocateNamespace("resource-fragmented")
+			if err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
+				t.Fatalf("create namespace: %v", err)
+			}
+			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
+
+			pool := createSchedulingPool(namespace, "resource-fragmented-pool", 2, 3, 4)
+			pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+				resource.MustParse("200m"), resource.MustParse("128Mi"), resource.MustParse("2"), resource.MustParse("2"), 64,
+			)
+			pool.Spec.Capacity.BufferMin = 0
+			pool.Spec.Capacity.BufferMax = 0
+			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
+				t.Fatalf("create fragmented-capacity Pool: %v", err)
+			}
+			initialCtx, cancelInitial := context.WithTimeout(ctx, 90*time.Second)
+			defer cancelInitial()
+			if _, err := fixture.WaitForReadyFastletPods(initialCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 2); err != nil {
+				t.Fatalf("wait for two initial Fastlets: %v", err)
+			}
+
+			endpoint, portForward, err := e2eenv.StartControllerPortForward(ctx, testSuite.ControllerNamespace())
+			if err != nil {
+				t.Fatalf("start FastPath port-forward: %v", err)
+			}
+			defer func() {
+				if err := portForward.Cleanup(); err != nil {
+					t.Errorf("cleanup FastPath port-forward: %v", err)
+				}
+			}()
+			connection, err := grpc.DialContext(ctx, endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+			if err != nil {
+				t.Fatalf("dial FastPath: %v", err)
+			}
+			defer connection.Close()
+			fastPath := fastpathv2.NewFastPathServiceClient(connection)
+
+			placements := make(map[string]int)
+			for index := 1; index <= 6; index++ {
+				name := fmt.Sprintf("sb-fragmented-%d", index)
+				if _, err := fastPath.CreateSandbox(ctx, createResourceAwareFastPathRequest(namespace, name, pool.Name, "", "")); err != nil {
+					t.Fatalf("create default Sandbox %d: %v", index, err)
+				}
+				assigned := waitForAssignedSandbox(ctx, t, fixture, namespace, name)
+				placements[assigned.Status.Placement.FastletName]++
+			}
+			if len(placements) != 2 {
+				t.Fatalf("six default Sandboxes used %d Fastlets, want 2: %v", len(placements), placements)
+			}
+			for fastlet, count := range placements {
+				if count != 3 {
+					t.Fatalf("Fastlet %s has %d default Sandboxes, want 3 before fragmentation test", fastlet, count)
+				}
+			}
+
+			large := createResourceAwareFastPathRequest(namespace, "sb-fragmented-large", pool.Name, "400m", "256Mi")
+			if _, err := fastPath.CreateSandbox(ctx, large); status.Code(err) != codes.ResourceExhausted {
+				t.Fatalf("fragmented FastPath CreateSandbox code=%s err=%v, want ResourceExhausted", status.Code(err), err)
+			}
+			scaleCtx, cancelScale := context.WithTimeout(ctx, 120*time.Second)
+			defer cancelScale()
+			if _, err := fixture.WaitForReadyFastletPods(scaleCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 3); err != nil {
+				t.Fatalf("wait for fragmentation-driven scale-out: %v", err)
+			}
+			assignedLarge := waitForAssignedSandbox(ctx, t, fixture, namespace, large.RequestId)
+			if _, reused := placements[assignedLarge.Status.Placement.FastletName]; reused {
+				t.Fatalf("large Sandbox reused fragmented Fastlet %s instead of new capacity", assignedLarge.Status.Placement.FastletName)
+			}
+			return ctx
+		}).
+		Feature()
+
+	testSuite.Env().Test(t, feature)
+}
+
 func TestResourceAwareMemoryPressureScaling(t *testing.T) {
 	suiteenv.RequireBasic(t)
 
@@ -393,8 +477,8 @@ func assertResourceAwareFastletContract(ctx context.Context, t *testing.T, k8sCl
 	}
 
 	fastlet := pods.Items[0].Spec.Containers[0]
-	wantCPU := resource.MustParse("500m")
-	wantMemory := resource.MustParse("512Mi")
+	wantCPU := resource.MustParse("600m")
+	wantMemory := resource.MustParse("640Mi")
 	for name, resources := range map[string]corev1.ResourceList{
 		"requests": fastlet.Resources.Requests,
 		"limits":   fastlet.Resources.Limits,

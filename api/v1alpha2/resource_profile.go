@@ -124,8 +124,9 @@ func (p SandboxResourceProfile) DeriveRequests(limits SandboxComputeResources) (
 	}, nil
 }
 
-// ResolveFastletCapacity derives the one commitment budget and runtime-owner
-// envelope shared by Controller, FastPath, Fastlet, and Pool scaling.
+// ResolveFastletCapacity derives the Sandbox commitment capacity and the
+// aggregate Sandbox runtime budget. The Controller adds fixed Fastlet
+// overhead separately when it builds the parent runtime envelope.
 func (p SandboxResourceProfile) ResolveFastletCapacity(maxSandboxes int32) (SandboxComputeResources, SandboxComputeResources, error) {
 	if maxSandboxes <= 0 {
 		return SandboxComputeResources{}, SandboxComputeResources{}, fmt.Errorf("maxSandboxesPerPod must be greater than zero")
@@ -138,14 +139,14 @@ func (p SandboxResourceProfile) ResolveFastletCapacity(maxSandboxes int32) (Sand
 	capacity := SandboxComputeResources{CPU: requests.CPU.DeepCopy(), Memory: requests.Memory.DeepCopy()}
 	capacity.CPU.Mul(int64(maxSandboxes))
 	capacity.Memory.Mul(int64(maxSandboxes))
-	envelope := SandboxComputeResources{CPU: capacity.CPU.DeepCopy(), Memory: capacity.Memory.DeepCopy()}
-	if envelope.CPU.Cmp(limits.CPU) < 0 {
-		envelope.CPU = limits.CPU.DeepCopy()
+	runtimeBudget := SandboxComputeResources{CPU: capacity.CPU.DeepCopy(), Memory: capacity.Memory.DeepCopy()}
+	if runtimeBudget.CPU.Cmp(limits.CPU) < 0 {
+		runtimeBudget.CPU = limits.CPU.DeepCopy()
 	}
-	if envelope.Memory.Cmp(limits.Memory) < 0 {
-		envelope.Memory = limits.Memory.DeepCopy()
+	if runtimeBudget.Memory.Cmp(limits.Memory) < 0 {
+		runtimeBudget.Memory = limits.Memory.DeepCopy()
 	}
-	return capacity, envelope, nil
+	return capacity, runtimeBudget, nil
 }
 
 func divideRoundUp(value int64, ratio resource.Quantity) (int64, error) {
