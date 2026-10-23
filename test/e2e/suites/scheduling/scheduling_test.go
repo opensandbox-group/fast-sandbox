@@ -6,6 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -14,9 +18,11 @@ import (
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
 
+	fastpathv2 "fast-sandbox/api/proto/v2"
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/controlplane/assignment"
 	"fast-sandbox/internal/fastletsettings"
+	e2eenv "fast-sandbox/test/e2e/env"
 	"fast-sandbox/test/e2e/support/fixtures"
 	"fast-sandbox/test/e2e/support/suiteenv"
 )
@@ -190,28 +196,50 @@ func TestResourceAwareOvercommitScaling(t *testing.T) {
 				t.Fatalf("wait for initial resource-aware fastlet: %v", err)
 			}
 			assertResourceAwareFastletContract(ctx, t, k8sClient, namespace, pool.Name)
-
-			first := createResourceAwareSchedulingSandbox(namespace, "sb-resource-1", pool.Name, "250m", "512Mi")
-			if _, err := fixture.CreateSandbox(ctx, namespace, first); err != nil {
-				t.Fatalf("create first heterogeneous Sandbox: %v", err)
+			endpoint, portForward, err := e2eenv.StartControllerPortForward(ctx, testSuite.ControllerNamespace())
+			if err != nil {
+				t.Fatalf("start FastPath port-forward: %v", err)
 			}
-			assignedFirst := waitForAssignedSandbox(ctx, t, fixture, namespace, first.Name)
+			defer func() {
+				if err := portForward.Cleanup(); err != nil {
+					t.Errorf("cleanup FastPath port-forward: %v", err)
+				}
+			}()
+			connection, err := grpc.DialContext(ctx, endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+			if err != nil {
+				t.Fatalf("dial FastPath: %v", err)
+			}
+			defer connection.Close()
+			fastPath := fastpathv2.NewFastPathServiceClient(connection)
+
+			firstRequest := createResourceAwareFastPathRequest(namespace, "sb-resource-1", pool.Name, "250m", "512Mi")
+			if _, err := fastPath.CreateSandbox(ctx, firstRequest); err != nil {
+				t.Fatalf("create first heterogeneous Sandbox through FastPath: %v", err)
+			}
+			assignedFirst := waitForAssignedSandbox(ctx, t, fixture, namespace, firstRequest.RequestId)
 			assertResolvedRequestAnnotations(t, pool, assignedFirst)
 
-			second := createSchedulingSandbox(namespace, "sb-resource-2", pool.Name)
-			if _, err := fixture.CreateSandbox(ctx, namespace, second); err != nil {
-				t.Fatalf("create default-profile Sandbox: %v", err)
+			secondRequest := createResourceAwareFastPathRequest(namespace, "sb-resource-2", pool.Name, "", "")
+			if _, err := fastPath.CreateSandbox(ctx, secondRequest); err != nil {
+				t.Fatalf("create default-profile Sandbox through FastPath: %v", err)
 			}
-			assignedSecond := waitForAssignedSandbox(ctx, t, fixture, namespace, second.Name)
+			assignedSecond := waitForAssignedSandbox(ctx, t, fixture, namespace, secondRequest.RequestId)
 			assertResolvedRequestAnnotations(t, pool, assignedSecond)
 			if assignedFirst.Status.Placement.FastletName != assignedSecond.Status.Placement.FastletName {
 				t.Fatalf("first two Sandboxes should fit one resource ledger, got %s and %s",
 					assignedFirst.Status.Placement.FastletName, assignedSecond.Status.Placement.FastletName)
 			}
 
-			third := createResourceAwareSchedulingSandbox(namespace, "sb-resource-3", pool.Name, "250m", "96Mi")
-			if _, err := fixture.CreateSandbox(ctx, namespace, third); err != nil {
-				t.Fatalf("create capacity-crossing Sandbox: %v", err)
+			thirdRequest := createResourceAwareFastPathRequest(namespace, "sb-resource-3", pool.Name, "250m", "96Mi")
+			if _, err := fastPath.CreateSandbox(ctx, thirdRequest); status.Code(err) != codes.ResourceExhausted {
+				t.Fatalf("capacity-crossing FastPath CreateSandbox code=%s err=%v, want ResourceExhausted", status.Code(err), err)
+			}
+			var pending apiv1alpha2.Sandbox
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: thirdRequest.RequestId}, &pending); err != nil {
+				t.Fatalf("capacity rejection must retain the pending Sandbox intent: %v", err)
+			}
+			if pending.DeletionTimestamp != nil {
+				t.Fatalf("capacity-blocked Sandbox intent is deleting instead of pending")
 			}
 
 			scaleCtx, cancelScale := context.WithTimeout(ctx, 120*time.Second)
@@ -391,15 +419,20 @@ func assertResourceAwareFastletContract(ctx context.Context, t *testing.T, k8sCl
 	}
 }
 
-func createResourceAwareSchedulingSandbox(namespace, name, pool, cpuLimit, memoryLimit string) *apiv1alpha2.Sandbox {
-	sandbox := createSchedulingSandbox(namespace, name, pool)
-	sandbox.Spec.Resources = &apiv1alpha2.SandboxResourceRequirements{
-		Limits: apiv1alpha2.SandboxComputeResources{
-			CPU:    resource.MustParse(cpuLimit),
-			Memory: resource.MustParse(memoryLimit),
-		},
+func createResourceAwareFastPathRequest(namespace, name, pool, cpuLimit, memoryLimit string) *fastpathv2.CreateSandboxRequest {
+	request := &fastpathv2.CreateSandboxRequest{
+		RequestId: name,
+		Namespace: namespace,
+		Image:     "docker.io/library/alpine:latest",
+		PoolRef:   pool,
+		Command:   []string{"/bin/sleep", "3600"},
 	}
-	return sandbox
+	if cpuLimit != "" || memoryLimit != "" {
+		request.Resources = &fastpathv2.SandboxResourceRequirements{
+			Limits: &fastpathv2.ComputeResourceProfile{Cpu: cpuLimit, Memory: memoryLimit},
+		}
+	}
+	return request
 }
 
 func assertResolvedRequestAnnotations(t *testing.T, pool *apiv1alpha2.SandboxPool, sandbox *apiv1alpha2.Sandbox) {

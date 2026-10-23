@@ -154,7 +154,7 @@ func capacityRejection() error {
 		Failure: &fastletapi.FastletError{Code: fastletapi.ErrorCapacityRejected, Message: "full", Retryable: true}}
 }
 
-func TestCandidateRefreshIsBoundedAndRollsBackNewIntent(t *testing.T) {
+func TestCandidateRefreshIsBoundedAndKeepsPendingIntent(t *testing.T) {
 	server, k8sClient, registry, fastlet := newV2Server(t)
 	registry.candidates = nil
 	for i := 0; i < maxCreateCandidateAttempts+5; i++ {
@@ -167,8 +167,10 @@ func TestCandidateRefreshIsBoundedAndRollsBackNewIntent(t *testing.T) {
 	require.Len(t, fastlet.createIPs, maxCreateCandidateAttempts)
 	var persisted apiv1alpha2.Sandbox
 	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "bounded"}, &persisted))
-	require.NotNil(t, persisted.DeletionTimestamp)
-	require.Contains(t, persisted.Finalizers, assignment.CleanupFinalizer, "rollback must retain deletion protection until fenced cleanup converges")
+	require.Nil(t, persisted.DeletionTimestamp)
+	require.Contains(t, persisted.Finalizers, assignment.CleanupFinalizer)
+	require.Equal(t, apiv1alpha2.RuntimeState(""), persisted.Status.Runtime.State,
+		"the durable intent remains pending so the Pool scaler can count its resource demand")
 }
 
 func TestCandidateRefreshKeepsAssignmentProfiles(t *testing.T) {
@@ -680,7 +682,14 @@ func TestNoCandidateAndExplicitRejection(t *testing.T) {
 	_, err := server.CreateSandbox(context.Background(), createRequest("no-candidate"))
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 	creates, _, _, _ := k8sClient.counts()
-	require.Zero(t, creates)
+	require.Equal(t, 1, creates)
+	var pending apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "no-candidate"}, &pending))
+	require.Nil(t, pending.DeletionTimestamp)
+	require.Contains(t, pending.Finalizers, assignment.CleanupFinalizer)
+	envelope, err := assignment.AssignmentFromAnnotation(&pending)
+	require.NoError(t, err)
+	require.Nil(t, envelope, "an intent accepted without capacity remains unassigned for Controller placement")
 
 	registry.candidates = []placement.FastletInfo{testCandidate("fastlet-a", "pod-a", "10.0.0.1")}
 	fastlet.createFailure = &fastletapi.CreateCallError{Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects, Failure: &fastletapi.FastletError{Code: fastletapi.ErrorCapacityRejected, Message: "full", Retryable: true}}
@@ -688,8 +697,32 @@ func TestNoCandidateAndExplicitRejection(t *testing.T) {
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 	var persisted apiv1alpha2.Sandbox
 	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "rejected"}, &persisted))
-	require.NotNil(t, persisted.DeletionTimestamp)
-	require.Contains(t, persisted.Finalizers, assignment.CleanupFinalizer, "rejected intent remains protected until fenced cleanup converges")
+	require.Nil(t, persisted.DeletionTimestamp)
+	require.Contains(t, persisted.Finalizers, assignment.CleanupFinalizer)
+	require.Equal(t, apiv1alpha2.RuntimeState(""), persisted.Status.Runtime.State,
+		"a definite admission rejection remains visible as pending resource demand")
+}
+
+func TestIdempotentRetryAssignsPreviouslyUnassignedIntent(t *testing.T) {
+	server, k8sClient, registry, _ := newV2Server(t)
+	registry.candidates = nil
+	request := createRequest("pending-retry")
+	_, err := server.CreateSandbox(context.Background(), request)
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+
+	candidate := testCandidate("fastlet-b", "pod-b", "10.0.0.2")
+	registry.candidates = []placement.FastletInfo{candidate}
+	registry.fastlets[candidate.ID] = candidate
+	response, err := server.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, "pending-retry", response.Sandbox.GetIdentity().GetName())
+
+	var persisted apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: request.RequestId}, &persisted))
+	envelope, err := assignment.AssignmentFromAnnotation(&persisted)
+	require.NoError(t, err)
+	require.NotNil(t, envelope)
+	require.Equal(t, candidate.PodName, envelope.FastletName)
 }
 
 func TestExplicitRejectionCASesToSecondCandidate(t *testing.T) {

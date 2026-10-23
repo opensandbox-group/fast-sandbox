@@ -129,9 +129,18 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSa
 		return nil, status.Errorf(codes.InvalidArgument, "resolve Sandbox resources: %v", err)
 	}
 	projectResolvedResourceAnnotations(sandbox, parameters, pool.Spec.SandboxResources.Hash())
-	rankedFastlets, envelope, err := s.selectFastletsForPool(ctx, orchestrator, sandbox, request.RequestId, parameters)
-	if err != nil {
-		return nil, err
+	rankedFastlets, envelope, selectionErr := s.selectFastletsForPool(ctx, orchestrator, sandbox, request.RequestId, parameters)
+	if selectionErr != nil && status.Code(selectionErr) != codes.ResourceExhausted {
+		return nil, selectionErr
+	}
+	// Capacity exhaustion is an accepted, durable create intent rather than a
+	// rejected API operation. Persisting the unassigned Sandbox gives the Pool
+	// scaler exact pending demand; the Controller assigns it after scale-out.
+	// Idempotent retries can still resume an assignment already made by the
+	// Controller even when the current registry has no spare capacity.
+	if selectionErr != nil {
+		rankedFastlets = nil
+		envelope = assignment.AssignmentEnvelope{}
 	}
 	accepted, err := s.acceptCreateIntent(ctx, plannedCreate{
 		sandbox: sandbox, candidates: rankedFastlets, assignment: envelope, parameters: parameters,
@@ -146,6 +155,12 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	}
 	acceptedObserved = true
 	prepDur := time.Since(prepStarted)
+	if len(accepted.candidates) == 0 {
+		if selectionErr == nil {
+			return nil, status.Error(codes.Unavailable, "Sandbox intent is persisted but assignment is not ready")
+		}
+		return nil, selectionErr
+	}
 
 	runtimeStarted := time.Now()
 	observed, err := s.provisionRuntime(ctx, accepted, completion.fastlet)
@@ -310,8 +325,24 @@ func (s *Server) acceptCreateIntent(ctx context.Context, plan plannedCreate) (*a
 		}
 	}
 	existingEnvelope, err := assignment.AssignmentFromAnnotation(&existing)
-	if err != nil || existingEnvelope == nil {
-		return nil, status.Errorf(codes.Unavailable, "existing Sandbox assignment is not ready: %v", err)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read existing Sandbox assignment: %v", err)
+	}
+	if existingEnvelope == nil && len(plan.candidates) > 0 {
+		initialized, _, initializeErr := assignment.InitializeAssignmentAnnotation(
+			ctx, s.K8sClient, client.ObjectKeyFromObject(&existing), plan.assignment,
+		)
+		if initializeErr != nil {
+			return nil, grpcKubernetesError(initializeErr)
+		}
+		existing = *initialized
+		existingEnvelope, err = assignment.AssignmentFromAnnotation(&existing)
+		if err != nil {
+			return nil, status.Errorf(codes.Unavailable, "read initialized Sandbox assignment: %v", err)
+		}
+	}
+	if existingEnvelope == nil {
+		return &acceptedCreate{sandbox: existing.DeepCopy(), parameters: plan.parameters}, nil
 	}
 	selected, ok := s.Orchestrator.Registry.GetFastletByID(placement.FastletID(existingEnvelope.FastletName))
 	if !ok {
@@ -365,26 +396,9 @@ func (s *Server) provisionRuntime(ctx context.Context, accepted *acceptedCreate,
 				"fastlet", candidate.ID, "sandbox", accepted.sandbox.Name, "err", callErr)
 			continue
 		}
-		if err := s.rollbackRejectedCreate(ctx, accepted, callErr); err != nil {
-			return nil, err
-		}
-		return nil, status.Errorf(codes.ResourceExhausted, "all Fastlet candidates rejected admission: %v", callErr)
+		return nil, status.Errorf(codes.ResourceExhausted, "all Fastlet candidates rejected admission; Sandbox intent remains pending for Pool scale-out: %v", callErr)
 	}
 	return nil, status.Error(codes.ResourceExhausted, orchestration.ErrNoCandidate.Error())
-}
-
-// Only an intent accepted by this call can be rolled back after all attempts
-// have proven absence of runtime side effects. Existing intents stay durable.
-func (s *Server) rollbackRejectedCreate(ctx context.Context, accepted *acceptedCreate, rejection error) error {
-	if !accepted.created {
-		return nil
-	}
-	uid := accepted.sandbox.UID
-	err := s.K8sClient.Delete(ctx, accepted.sandbox, client.Preconditions{UID: &uid})
-	if err != nil && !apierrors.IsNotFound(err) {
-		return status.Errorf(codes.Unavailable, "all Fastlet candidates rejected and intent rollback failed: rejection=%v rollback=%v", rejection, err)
-	}
-	return nil
 }
 
 // refreshCreateCandidates keeps refresh selection registry-only and preserves
