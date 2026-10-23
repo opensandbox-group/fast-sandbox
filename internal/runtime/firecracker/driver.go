@@ -424,7 +424,6 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	config := &input.Sandbox
 	identity := config.Identity
 	spec := config.Desired
-	limits := config.Limits
 	if identity.SandboxUID == "" || identity.FastletPodUID == "" ||
 		identity.InstanceGeneration <= 0 || identity.RuntimeInstanceID == "" || identity.AssignmentAttempt <= 0 {
 		return nil, fmt.Errorf("%w: complete Firecracker Sandbox identity is required", ErrInvalidConfig)
@@ -590,7 +589,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// validated here, not applied via the API (any machine-config call
 	// before snapshot/load is rejected).
 	if err == nil && !isOCI {
-		err = validateRestoreMachineConfig(limits, d.config, stateRoot, restoreRef)
+		err = validateRestoreMachineConfig(config.Limits, d.config, stateRoot, restoreRef)
 	}
 	// Compatibility admission before any staging: a snapshot whose CPU
 	// provenance or Firecracker version mismatches this node must fail with
