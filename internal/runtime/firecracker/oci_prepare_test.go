@@ -330,3 +330,16 @@ func TestOCITokenOnlyCredentialsFailBeforeAttachment(t *testing.T) {
 	require.ErrorContains(t, err, "identitytoken-only credentials are not supported")
 	require.NoDirExists(t, filepath.Join(root, "oci/inputs"))
 }
+
+func TestPreparedOCIManifestFollowsSharedSnapfiles(t *testing.T) {
+	root := t.TempDir()
+	shared := filepath.Join(root, "sandboxes/.snapfiles/template/mnt")
+	home := filepath.Join(root, "sandboxes/sandbox-1")
+	require.NoError(t, os.MkdirAll(shared, 0750))
+	require.NoError(t, os.MkdirAll(home, 0750))
+	require.NoError(t, os.Symlink(shared, filepath.Join(home, "mnt")))
+	require.NoError(t, os.WriteFile(filepath.Join(shared, snapshotManifestName), []byte("shared manifest"), 0600))
+	raw, err := readPreparedOCIManifest(root, "sandbox-1")
+	require.NoError(t, err)
+	require.Equal(t, "shared manifest", string(raw))
+}

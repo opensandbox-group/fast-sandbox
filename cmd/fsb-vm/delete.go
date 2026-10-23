@@ -59,6 +59,9 @@ func runDelete(ctx context.Context, sandboxID string) error {
 	if err := removeSandboxDirs(layout); err != nil {
 		return err
 	}
+	if err := pruneSharedSnapfiles(ctx, ublkd, false); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: prune shared snapfiles: %v\n", err)
+	}
 	fmt.Printf("sandbox %s deleted\n", sandboxID)
 	return nil
 }
@@ -88,6 +91,16 @@ func releaseSandbox(ctx context.Context, ublkd deviceReleaser, layout sandboxLay
 			failures = append(failures, err)
 		}
 	}
+	alias, err := sharedSnapfilesAlias(layout.home)
+	if err != nil {
+		return err
+	}
+	if alias != "" {
+		if state.SharedSnapfiles != "" && state.SharedSnapfiles != alias {
+			return errors.New("shared snapfiles lease disagrees with its alias")
+		}
+		state.SharedSnapfiles = alias
+	}
 	state.Phase = phaseDeleting
 	persist()
 
@@ -101,7 +114,10 @@ func releaseSandbox(ctx context.Context, ublkd deviceReleaser, layout sandboxLay
 	if err := os.Remove(layout.rootfsLink); err != nil && !os.IsNotExist(err) {
 		failures = append(failures, fmt.Errorf("remove rootfs drive link: %w", err))
 	}
-	unmountErr := unmount(layout.mountPoint)
+	var unmountErr error
+	if state.SharedSnapfiles == "" {
+		unmountErr = unmount(layout.mountPoint)
+	}
 	if unmountErr != nil {
 		failures = append(failures, fmt.Errorf("umount snapfiles: %w", unmountErr))
 	}
@@ -119,7 +135,7 @@ func releaseSandbox(ctx context.Context, ublkd deviceReleaser, layout sandboxLay
 		state.Rootfs = nil
 	}
 	// The snapfiles device stays attached while its filesystem is mounted.
-	if unmountErr == nil {
+	if unmountErr == nil && state.SharedSnapfiles == "" {
 		snapfilesMatches, releaseErr := releaseOwnedDevices(ctx, ublkd, devices, layout.snapfilesConfig)
 		if releaseErr != nil {
 			failures = append(failures, fmt.Errorf("release snapfiles device: %w", releaseErr))
@@ -127,6 +143,12 @@ func releaseSandbox(ctx context.Context, ublkd deviceReleaser, layout sandboxLay
 			failures = append(failures, fmt.Errorf("ublkd add of %s may still be in flight; keeping its backing files", layout.snapfilesConfig))
 		} else {
 			state.Snapfiles = nil
+		}
+	}
+	// Only drop the shared lease after the VMM is stopped and private devices released.
+	if len(failures) == 0 {
+		if err := releaseSharedSnapfilesLease(layout.home, state); err != nil {
+			failures = append(failures, err)
 		}
 	}
 	persist()

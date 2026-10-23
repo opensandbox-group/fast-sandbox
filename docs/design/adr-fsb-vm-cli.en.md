@@ -118,12 +118,11 @@ involvement). It is a single-host data-plane tool.
 ### ADR-009 Command surface and lifecycle: create / list / delete
 
 - **Decision**: semantics follow aenv (start = bring a sandbox up from a template;
-  no start/resume distinction). The MVP has three commands:
+  no start/resume distinction). The lifecycle commands are:
   - `fsb-vm create -f template.json [--kernel ...] [--network=none]`
   - `fsb-vm list`: enumerate state and verify `(pid, starttime, boot_id)` identity
-  - `fsb-vm delete <sandbox_id>`: safely stop Firecracker → unmount snapfiles →
-    delete both ublk devices by absolute config-path ownership → remove directories
-    only after every resource is released
+  - `fsb-vm delete <sandbox_id>`: safely stop Firecracker → release the private rootfs device by absolute config-path ownership → remove the snapfiles alias and release its shared lease → remove Sandbox directories → prune idle snapfiles
+  - `fsb-vm cleanup-snapfiles`: release shared snapfiles entries with no Sandbox leases
 - **Concurrency and identifiers**: `sandbox_id` must be one safe directory name.
   Non-blocking per-ID flock serializes create/delete, and create atomically claims the
   state directory with `Mkdir`, eliminating check-then-create races.
@@ -135,7 +134,7 @@ involvement). It is a single-host data-plane tool.
 - **Process safety**: state records PID, `/proc/<pid>/stat` starttime, and boot_id;
   identity is rechecked before signals are sent through pidfd, preventing PID-reuse kills.
 - **Layout**: state directory `/var/lib/fsb-vm/sandboxes/<id>/` (upper,
-  config.v1.json, mount point, state.json); runtime directory
+  config.v1.json, snapfiles alias, state.json); shared read-only device config, mount and ownership record under `/var/lib/fsb-vm/sandboxes/.snapfiles/<key>/`; runtime directory
   `/run/fsb-vm/sandboxes/<id>/` (api socket, serial log, `rootfs.dev` link).
 
 ### ADR-010 Networking: NetworkProvider abstraction, MVP supports none
@@ -250,10 +249,8 @@ involvement). It is a single-host data-plane tool.
    atomically claim the directories; write `creating` state.
 2. ORAS-pull the rootfs and snapfiles manifests → ordered layer digest lists.
 3. Canonicalize dockerAuth for OverlayBD blob URL prefixes and merge cred.json.
-4. rootfs: persist config ownership before allocation → create hybrid upper →
-   ublkd `/v1/add` → update the device record.
-5. snapfiles: persist config ownership before allocation → `/v1/add` → mount ro →
-   read and validate manifest.json.
+4. snapfiles: acquire a durable lease on the cache entry for the resolved layers and credential scope; the first user persists config ownership → `/v1/add` → mounts read-only. Later users reuse that device and mount within the same state directory and mount namespace. Read and validate manifest.json for the rootfs size.
+5. rootfs: persist config ownership before allocation → create a private hybrid upper sized from manifest.json → ublkd `/v1/add` → update the device record.
 6. Resolve the kernel; create `rootfs.dev` in the runtime directory; launch
    Firecracker with that cwd; persist `(pid, starttime, boot_id)`.
 7. `PUT /snapshot/load` directly (relative `rootfs.dev` already resolves; memfile uses

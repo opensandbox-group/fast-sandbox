@@ -427,7 +427,7 @@ sudo "$FSB_VM" \
 `--network` currently supports only `none`. `create`:
 
 1. strictly validates and atomically claims `sandbox_id`, then writes `creating` state;
-2. pulls manifests, creates rootfs/snapfiles devices, and progressively records ownership;
+2. pulls manifests, acquires shared read-only snapfiles and a private writable rootfs device, and progressively records ownership;
 3. creates `rootfs.dev` in the runtime directory and loads the snapshot with that cwd;
 4. resumes the VM and changes `state.json` to `running`.
 
@@ -454,6 +454,8 @@ sudo "$FSB_VM" \
 
 Do not reuse a `sandbox_id` that still exists locally.
 
+Snapfiles devices and mounts are shared by default for identical resolved layers and credential scope within the same `--state-dir` and mount namespace. Writable rootfs devices and uppers remain private. Each Sandbox keeps a durable snapfiles lease until deletion.
+
 ## 8. Inspect VMs
 
 ```bash
@@ -467,8 +469,10 @@ Example output:
 
 ```text
 SANDBOX_ID       STATUS   PID    ROOTFS_DEV   SNAPFILES_DEV   API_SOCKET
-application-demo running  12345  /dev/ublkb0  /dev/ublkb1     $RUNTIME_DIR/application-demo/api.sock
+application-demo running  12345  /dev/ublkb0  -               $RUNTIME_DIR/application-demo/api.sock
 ```
+
+`SNAPFILES_DEV` is `-` for shared attachments because the Sandbox holds a lease rather than owning that device.
 
 Status requires the recorded Firecracker `(PID, starttime, boot_id)` identity to still match; the PID number alone is insufficient. A directory whose `state.json` cannot be read is shown as `corrupt`. When using custom directories, pass the same `--state-dir` and `--runtime-dir` to `list`, `create`, and `delete`.
 
@@ -484,11 +488,13 @@ sudo "$FSB_VM" \
 Cleanup proceeds in this order:
 
 1. send SIGTERM to Firecracker, escalating to SIGKILL when needed;
-2. unmount snapfiles;
-3. delete the rootfs and snapfiles ublk devices;
-4. remove sandbox state and runtime directories.
+2. delete the private rootfs ublk device;
+3. remove the Sandbox’s snapfiles alias and release its shared lease;
+4. remove sandbox state and runtime directories, then prune idle snapfiles entries.
 
-If Firecracker cannot be stopped, delete does not release devices that the VMM may still hold; other safe steps are attempted where possible. Directories are removed only after every resource is released. Any failure retains `deleting` state and the writable upper so the same delete can be retried. Device ownership is verified by the absolute config path currently reported by ublkd, never by a reusable dev_id alone. Signals use pidfd after starttime and boot_id validation.
+If Firecracker cannot be stopped, delete does not release devices that the VMM may still hold; other safe steps are attempted where possible. Directories are removed only after private resources and the shared lease are released. Any failure retains `deleting` state and the writable upper so the same delete can be retried. Device ownership is verified by the absolute config path currently reported by ublkd, never by a reusable dev_id alone. Signals use pidfd after starttime and boot_id validation.
+
+Up to 16 idle snapfiles entries remain warm. An entry becomes eligible for eviction after 10 idle minutes; entries with Sandbox leases are never evicted. Expiry is checked during subsequent deletes and failed-create rollbacks, without a background timer. To release unused entries immediately, run `sudo "$FSB_VM" --state-dir "$STATE_DIR" cleanup-snapfiles`.
 
 Verify cleanup with:
 

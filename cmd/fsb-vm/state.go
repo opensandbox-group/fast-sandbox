@@ -73,6 +73,8 @@ type sandboxState struct {
 	// means an add was issued whose reply was never recorded.
 	Rootfs    *deviceRecord `json:"rootfs_device,omitempty"`
 	Snapfiles *deviceRecord `json:"snapfiles_device,omitempty"`
+	// SharedSnapfiles is a durable lease; shared devices are never Sandbox-owned.
+	SharedSnapfiles string `json:"shared_snapfiles,omitempty"`
 
 	MountPoint  string         `json:"mount_point"`
 	APISocket   string         `json:"api_socket"`

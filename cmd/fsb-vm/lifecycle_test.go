@@ -21,6 +21,32 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestPrintSandboxSharedAndPrivateSnapfiles(t *testing.T) {
+	for _, shared := range []bool{false, true} {
+		t.Run(strconv.FormatBool(shared), func(t *testing.T) {
+			state := &sandboxState{SandboxID: "sandbox", Firecracker: &processRecord{PID: 123}, Rootfs: &deviceRecord{DevID: 1, DevPath: "/dev/ublkb1"}, Snapfiles: &deviceRecord{DevID: 2, DevPath: "/dev/ublkb2"}}
+			want := "snapfiles device: /dev/ublkb2 (dev_id 2)"
+			if shared {
+				state.Snapfiles = nil
+				state.SharedSnapfiles = strings.Repeat("a", 64)
+				state.MountPoint = "/shared/mnt"
+				want = "snapfiles shared: /shared/mnt"
+			}
+			reader, writer, err := os.Pipe()
+			require.NoError(t, err)
+			previous := os.Stdout
+			os.Stdout = writer
+			t.Cleanup(func() { os.Stdout = previous; _ = reader.Close(); _ = writer.Close() })
+			require.NotPanics(t, func() { printSandbox(state) })
+			require.NoError(t, writer.Close())
+			os.Stdout = previous
+			output, err := io.ReadAll(reader)
+			require.NoError(t, err)
+			require.Contains(t, string(output), want)
+		})
+	}
+}
+
 // fakeProcTree points procRoot at a temporary tree for the test.
 func fakeProcTree(t *testing.T, bootID string) string {
 	t.Helper()
@@ -757,7 +783,7 @@ func TestManifestRequiresRelativeRootfsDrive(t *testing.T) {
 
 func TestCreateHasNoSpecOverrides(t *testing.T) {
 	flags := newCreateCommand().Flags()
-	for _, removed := range []string{"vcpu", "memory-mb", "rootfs-drive-id"} {
+	for _, removed := range []string{"vcpu", "memory-mb", "rootfs-drive-id", "share-snapfiles"} {
 		if flags.Lookup(removed) != nil {
 			t.Errorf("create must not expose --%s", removed)
 		}

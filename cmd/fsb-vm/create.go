@@ -153,6 +153,9 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 		if err := removeSandboxDirs(layout); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: %v\n", err)
 		}
+		if err := pruneSharedSnapfiles(context.Background(), ublkd, false); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: prune shared snapfiles: %v\n", err)
+		}
 	}()
 	persist := func() error { return writeState(layout.home, state) }
 
@@ -182,17 +185,10 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	// which lives on it — supplies the disk size that sets the rootfs hybrid
 	// upper's virtual size. Attaching snapfiles read-only carries no such
 	// dependency, so it is the safe first step.
-	snapfilesConfig, err := writeSnapfilesConfig(layout.home, snapfilesImage)
-	if err != nil {
+	if err := acquireSharedSnapfiles(ctx, ublkd, layout.home, state, snapfilesImage, dockerAuth); err != nil {
 		return err
 	}
-	snapfilesDevPath, err := addSandboxDevice(ctx, ublkd, snapfilesConfig, &state.Snapfiles, persist)
-	if err != nil {
-		return err
-	}
-	if err := mountReadOnly(snapfilesDevPath, layout.mountPoint); err != nil {
-		return err
-	}
+	layout.mountPoint = state.MountPoint
 
 	metadata, err := loadManifest(filepath.Join(layout.mountPoint, inDiskManifest))
 	if err != nil {
@@ -360,7 +356,11 @@ func printSandbox(state *sandboxState) {
 	fmt.Printf("  firecracker pid : %d\n", state.Firecracker.PID)
 	fmt.Printf("  api socket      : %s\n", state.APISocket)
 	fmt.Printf("  rootfs device   : %s (dev_id %d)\n", state.Rootfs.DevPath, state.Rootfs.DevID)
-	fmt.Printf("  snapfiles device: %s (dev_id %d)\n", state.Snapfiles.DevPath, state.Snapfiles.DevID)
+	if state.SharedSnapfiles != "" {
+		fmt.Printf("  snapfiles shared: %s\n", state.MountPoint)
+	} else {
+		fmt.Printf("  snapfiles device: %s (dev_id %d)\n", state.Snapfiles.DevPath, state.Snapfiles.DevID)
+	}
 	fmt.Printf("  vcpu / memory   : %d / %d MiB\n", state.VCPU, state.MemoryMB)
 	fmt.Printf("  network         : %s\n", state.Network)
 }

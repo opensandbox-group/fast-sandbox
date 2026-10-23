@@ -51,3 +51,69 @@ func TestOCICleanupKeepsOtherPodsAndRetainsFailedPack(t *testing.T) {
 		require.ErrorContains(t, backend.Cleanup(context.Background(), resource), "ownership")
 	}
 }
+
+func TestOCISharedSnapfilesOrphanIdentity(t *testing.T) {
+	root := t.TempDir()
+	for _, pod := range []string{"old-pod", "replacement-pod"} {
+		home := filepath.Join(root, "oci/pods", pod, "sandboxes/.snapfiles", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+		require.NoError(t, os.MkdirAll(home, 0700))
+		require.NoError(t, os.WriteFile(filepath.Join(home, "state.json"), []byte(`{"device":null}`), 0600))
+		locks := filepath.Join(filepath.Dir(home), ".locks")
+		require.NoError(t, os.MkdirAll(locks, 0700))
+		require.NoError(t, os.WriteFile(filepath.Join(locks, "cache.lock"), nil, 0600))
+		require.NoError(t, os.MkdirAll(filepath.Join(root, "oci/pods", pod, "runtime"), 0700))
+	}
+	backend := NewOCIBackend(root)
+	resources, err := backend.Scan(context.Background())
+	require.NoError(t, err)
+	require.Len(t, resources, 2)
+	var commands [][]string
+	backend.run = func(_ context.Context, args ...string) error {
+		commands = append(commands, args)
+		return os.RemoveAll(filepath.Join(root, "oci/pods/old-pod/sandboxes/.snapfiles", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+	}
+	for _, r := range resources {
+		if r.FastletPodUID == "old-pod" {
+			require.Equal(t, "snapfiles/old-pod", r.ResourceID)
+			require.NoError(t, backend.Cleanup(context.Background(), r))
+		}
+	}
+	require.Len(t, commands, 1)
+	require.Contains(t, commands[0], "cleanup-snapfiles")
+	require.Contains(t, commands[0], filepath.Join(root, "oci/pods/old-pod/sandboxes"))
+	require.NoDirExists(t, filepath.Join(root, "oci/pods/old-pod"))
+	require.DirExists(t, filepath.Join(root, "oci/pods/replacement-pod/sandboxes/.snapfiles/.locks"))
+}
+
+func TestOCISharedSnapfilesCleanupRetriesLockOnlyDirectory(t *testing.T) {
+	root := t.TempDir()
+	cache := filepath.Join(root, "oci/pods/old-pod/sandboxes/.snapfiles")
+	require.NoError(t, os.MkdirAll(filepath.Join(cache, ".locks"), 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(cache, ".locks/cache.lock"), nil, 0600))
+	backend := NewOCIBackend(root)
+	resources, err := backend.Scan(context.Background())
+	require.NoError(t, err)
+	require.Len(t, resources, 1, "lock-only caches must remain discoverable after an interrupted cleanup")
+	backend.run = func(context.Context, ...string) error { return errors.New("device busy") }
+	require.ErrorContains(t, backend.Cleanup(context.Background(), resources[0]), "device busy")
+	require.DirExists(t, cache)
+	backend.run = func(context.Context, ...string) error { return nil }
+	require.NoError(t, backend.Cleanup(context.Background(), resources[0]))
+	require.NoDirExists(t, filepath.Join(root, "oci/pods/old-pod"))
+	require.NoError(t, backend.Cleanup(context.Background(), resources[0]), "cleanup must be idempotent")
+}
+
+func TestOCISharedSnapfilesCleanupPreservesRetainedEntries(t *testing.T) {
+	root := t.TempDir()
+	cache := filepath.Join(root, "oci/pods/old-pod/sandboxes/.snapfiles")
+	require.NoError(t, os.MkdirAll(filepath.Join(cache, ".locks"), 0700))
+	require.NoError(t, os.MkdirAll(filepath.Join(cache, "incomplete-cache"), 0700))
+	backend := NewOCIBackend(root)
+	resources, err := backend.Scan(context.Background())
+	require.NoError(t, err)
+	require.Len(t, resources, 1)
+	backend.run = func(context.Context, ...string) error { return nil }
+	require.ErrorContains(t, backend.Cleanup(context.Background(), resources[0]), "retained")
+	require.DirExists(t, filepath.Join(cache, "incomplete-cache"))
+	require.DirExists(t, filepath.Join(cache, ".locks"))
+}

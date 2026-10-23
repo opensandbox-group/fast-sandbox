@@ -50,6 +50,19 @@ func (b *OCIBackend) Scan(_ context.Context) ([]ResourceIdentity, error) {
 		pod := filepath.Base(filepath.Dir(filepath.Dir(home)))
 		result = append(result, ResourceIdentity{Backend: BackendOCI, ResourceID: "sandbox/" + pod + "/" + filepath.Base(home), FastletPodUID: pod, CreatedAt: info.ModTime()})
 	}
+	caches, err := filepath.Glob(filepath.Join(b.stateRoot, "oci/pods/*/sandboxes/.snapfiles"))
+	if err != nil {
+		return nil, err
+	}
+	for _, path := range caches {
+		root := filepath.Dir(filepath.Dir(path))
+		pod := filepath.Base(root)
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, ResourceIdentity{Backend: BackendOCI, ResourceID: "snapfiles/" + pod, FastletPodUID: pod, CreatedAt: info.ModTime()})
+	}
 	owners, err := filepath.Glob(filepath.Join(b.stateRoot, "snapshots/*/*/.pack-owner.json"))
 	if err != nil {
 		return nil, err
@@ -104,6 +117,28 @@ func (b *OCIBackend) Cleanup(ctx context.Context, expected ResourceIdentity) err
 		// Remove empty Pod directories without touching retained/unknown operations.
 		_ = os.Remove(filepath.Join(root, "sandboxes"))
 		_ = os.Remove(filepath.Join(root, "runtime"))
+	case len(parts) == 2 && parts[0] == "snapfiles":
+		root := filepath.Join(b.stateRoot, "oci/pods", parts[1])
+		if err := b.run(ctx, "--ublkd-socket", socket, "--state-dir", filepath.Join(root, "sandboxes"), "cleanup-snapfiles"); err != nil {
+			return err
+		}
+		cache := filepath.Join(root, "sandboxes/.snapfiles")
+		entries, err := os.ReadDir(cache)
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.Name() != ".locks" {
+				return fmt.Errorf("shared snapfiles cleanup retained %s", filepath.Join(cache, entry.Name()))
+			}
+		}
+		// Janitor has confirmed this Pod is gone; no live CLI can hold these locks.
+		if err := os.RemoveAll(cache); err != nil {
+			return err
+		}
+		_ = os.Remove(filepath.Join(root, "sandboxes"))
+		_ = os.Remove(filepath.Join(root, "runtime"))
+		_ = os.Remove(root)
 	case len(parts) == 3 && parts[0] == "pack":
 		staging := filepath.Join(b.stateRoot, "snapshots", parts[1], parts[2])
 		if err := b.run(ctx, "--ublkd-socket", socket, "--build-work-dir", filepath.Join(staging, "pack-work"), "cleanup-pack", "--bundle-dir", staging); err != nil {
