@@ -9,6 +9,7 @@ import (
 	"time"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 	fastletcache "fast-sandbox/internal/fastlet/cache"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
@@ -262,7 +263,6 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 	if request.Now.IsZero() {
 		request.Now = r.clock()
 	}
-	request.Image = fastletcache.NormalizeReference(request.Image)
 	staleAfter := time.Duration(r.staleAfter.Load())
 	r.mu.RLock()
 	slots := make([]*fastletSlot, 0, len(r.fastlets))
@@ -360,6 +360,12 @@ func hardFilter(info FastletInfo, request CandidateRequest, staleAfter time.Dura
 func imageHit(info FastletInfo, image string) bool {
 	if image == "" || !info.CacheComplete {
 		return false
+	}
+	if info.RuntimeName == apiv1alpha2.RuntimeFirecracker {
+		// Firecracker reports cache directory keys derived from the exact reference.
+		image = artifacts.ImageIndexKey(image)
+	} else {
+		image = fastletcache.NormalizeReference(image)
 	}
 	index := sort.SearchStrings(info.Images, image)
 	return index < len(info.Images) && info.Images[index] == image

@@ -2,6 +2,7 @@ package placement
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"sync"
 	"testing"
@@ -92,6 +93,43 @@ func TestTopKPrefersImageThenLoadAndDoesNotAllocate(t *testing.T) {
 	stored, ok := registry.GetFastletByID("cache-hit")
 	require.True(t, ok)
 	require.Equal(t, 4, stored.Used(), "selection must not consume Registry capacity")
+}
+
+func TestTopKMatchesFirecrackerCacheKeys(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		image           string
+		cachedReference string
+		wantHit         bool
+	}{
+		{"image reference", "example.com/app:v1", "example.com/app:v1", true},
+		{"raw reference", "docker.io/library/alpine:Latest", "docker.io/library/alpine:Latest", true},
+		{"template ID", "Template-AbC123", "Template-AbC123", true},
+		{"different tag", "example.com/app:v2", "example.com/app:v1", false},
+		{"normalized alias is distinct", "docker.io/library/alpine:latest", "alpine:latest", false},
+		{"checkpoint is distinct", "example.com/app:v1", "checkpoint:sha256:checkpoint-digest", false},
+		{"no image requested", "", "", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := NewInMemoryRegistry()
+			cacheKey := fmt.Sprintf("%x", sha256.Sum256([]byte(test.cachedReference)))
+			cached := readyFastlet("cached", 4, 5, cacheKey)
+			uncached := readyFastlet("uncached", 0, 5)
+			cached.RuntimeName, uncached.RuntimeName = apiv1alpha2.RuntimeFirecracker, apiv1alpha2.RuntimeFirecracker
+			seedFastlet(t, registry, cached)
+			seedFastlet(t, registry, uncached)
+			request := candidate(test.image, "request-a")
+			request.RuntimeName = apiv1alpha2.RuntimeFirecracker
+
+			selected := registry.TopK(request, 1)
+			require.Len(t, selected, 1)
+			want := uncached.ID
+			if test.wantHit {
+				want = cached.ID
+			}
+			require.Equal(t, want, selected[0].ID)
+		})
+	}
 }
 
 func TestTopKDoesNotMutateAdmission(t *testing.T) {
