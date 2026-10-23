@@ -27,7 +27,7 @@ func TestOCIResumeRejectsAnotherSandboxAndTemplateUse(t *testing.T) {
 	config := &fastletapi.RuntimeSandboxConfig{}
 	config.Identity.Namespace = "test"
 	config.Identity.SandboxUID = "owner"
-	config.Spec.Restore = &fastletapi.RestoreSpec{ManifestRef: ref, ArtifactDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	config.Desired.Restore = &fastletapi.RestoreSpec{ManifestRef: ref, ArtifactDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	raw, err := json.Marshal(map[string]any{"platform": map[string]any{"checkpoint": map[string]string{"sandboxUID": "owner", "namespace": "test"}}})
 	require.NoError(t, err)
 	var metadata ociRestoreMetadata
@@ -36,13 +36,13 @@ func TestOCIResumeRejectsAnotherSandboxAndTemplateUse(t *testing.T) {
 	config.Identity.SandboxUID = "other"
 	require.ErrorIs(t, validateOCIResumeOwner(metadata, config), ErrInvalidConfig)
 	config.Identity.SandboxUID = "owner"
-	config.Spec.Restore = nil
+	config.Desired.Restore = nil
 	require.ErrorIs(t, validateOCIResumeOwner(metadata, config), ErrInvalidConfig)
 }
 func TestOCICheckpointRestoreReferenceBoundToDigest(t *testing.T) {
 	sum := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	ref := "oci://r.example/ns/r@sha256:" + sum
-	spec := fastletapi.SandboxSpec{Restore: &fastletapi.RestoreSpec{ManifestRef: ref, ArtifactDigest: sum}}
+	spec := fastletapi.SandboxDesiredSpec{Restore: &fastletapi.RestoreSpec{ManifestRef: ref, ArtifactDigest: sum}}
 	got, err := restoreReference(spec)
 	require.NoError(t, err)
 	require.Equal(t, ref, got)
@@ -60,24 +60,24 @@ func TestPrepareOCISnapshotKeepsNativeFlowIndependentOfRegistry(t *testing.T) {
 	state.Config.Identity.SandboxUID = "sandbox-1"
 	state.Config.Identity.Namespace = "test"
 	state.Phase = PhaseRunning
-	state.Config.Spec.Image = "native:golden"
+	state.Config.Desired.Image = "native:golden"
 	require.NoError(t, saveState(dir, state))
 	plan := dumpPlan{sandboxDir: dir, snapshotID: "checkpoint-id"}
 	enabled, err := prepareOCISnapshot(plan)
 	require.NoError(t, err)
 	require.False(t, enabled)
 	t.Setenv("FAST_SANDBOX_OCI_ENABLED", "true")
-	state.Config.Spec.Image = "oci://registry.example/templates/alpine:build"
+	state.Config.Desired.Image = "oci://registry.example/templates/alpine:build"
 	require.NoError(t, saveState(dir, state))
 	t.Setenv(ociSnapshotRepositoryEnv, "")
-	destination, err := checkpointDestinationForSource(state.Config.Spec.Image, plan.snapshotID)
+	destination, err := checkpointDestinationForSource(state.Config.Desired.Image, plan.snapshotID)
 	require.NoError(t, err)
 	require.Equal(t, "registry.example/templates/alpine:checkpoint-id", destination)
 	enabled, err = prepareOCISnapshot(plan)
 	require.NoError(t, err)
 	require.True(t, enabled, "default OCI pause must not require an extra environment variable")
 	t.Setenv(ociSnapshotRepositoryEnv, "registry.example/snapshots/checkpoints")
-	destination, err = checkpointDestinationForSource(state.Config.Spec.Image, plan.snapshotID)
+	destination, err = checkpointDestinationForSource(state.Config.Desired.Image, plan.snapshotID)
 	require.NoError(t, err)
 	require.Equal(t, "registry.example/snapshots/checkpoints:checkpoint-id", destination)
 	enabled, err = prepareOCISnapshot(plan)
@@ -91,7 +91,7 @@ func TestPrepareOCISnapshotKeepsNativeFlowIndependentOfRegistry(t *testing.T) {
 func TestDisabledOCIRejectsLiveSnapshotBeforeDump(t *testing.T) {
 	t.Setenv("FAST_SANDBOX_OCI_ENABLED", "false")
 	fixture := newSnapshotDriverFixture(t)
-	fixture.sandboxSpec.Spec.Image = "oci://r.example/ns/template:base"
+	fixture.sandboxSpec.Desired.Image = "oci://r.example/ns/template:base"
 	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
 	_, err := fixture.driver.CreateSnapshot(t.Context(), &runtimecontract.SnapshotInput{
 		SandboxID: sandboxID, SnapshotID: "live-snapshot", Kind: fastletapi.SnapshotKindTemplate,

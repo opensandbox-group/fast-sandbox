@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/api/resource"
+
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 )
 
@@ -27,15 +29,105 @@ const (
 	ActionHandlersKey = "action-handlers.json"
 	// ResourceProfileKey is the ConfigMap key holding the JSON sandbox resource profile.
 	ResourceProfileKey = "resource-profile.json"
+	// ResourceAdmissionKey is the optional ResourceAware commitment-capacity contract.
+	ResourceAdmissionKey = "resource-admission.json"
+	// CommitmentCapacityAnnotation projects the Controller-resolved Sandbox
+	// commitment capacity onto a Fastlet Pod for FastPath and Pool scaling.
+	CommitmentCapacityAnnotation = "fast-sandbox.io/commitment-capacity"
 )
+
+// ResourceAdmissionSettings delivers the pure Sandbox commitment capacity, the
+// largest runtime budget assignable to one Sandbox, and the parent Fastlet
+// envelope. The parent envelope includes fixed Fastlet overhead; the other two
+// vectors do not.
+type ResourceAdmissionSettings struct {
+	Version              string                              `json:"version"`
+	Mode                 apiv1alpha2.SandboxResourceMode     `json:"mode"`
+	StaticAdmission      bool                                `json:"staticAdmission"`
+	MemoryAdmission      bool                                `json:"memoryAdmission"`
+	Capacity             apiv1alpha2.SandboxComputeResources `json:"capacity"`
+	SandboxRuntimeBudget apiv1alpha2.SandboxComputeResources `json:"sandboxRuntimeBudget"`
+	RuntimeEnvelope      apiv1alpha2.SandboxComputeResources `json:"runtimeEnvelope"`
+	ResourceProfileHash  string                              `json:"resourceProfileHash"`
+}
+
+type commitmentCapacityAnnotation struct {
+	CPU    string `json:"cpu"`
+	Memory string `json:"memory"`
+}
+
+func EncodeCommitmentCapacity(resources apiv1alpha2.SandboxComputeResources) (string, error) {
+	if resources.CPU.Sign() <= 0 || resources.Memory.Sign() <= 0 {
+		return "", fmt.Errorf("commitment capacity must be greater than zero")
+	}
+	encoded, err := json.Marshal(commitmentCapacityAnnotation{
+		CPU: resources.CPU.String(), Memory: resources.Memory.String(),
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode commitment capacity: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func DecodeCommitmentCapacity(value string) (apiv1alpha2.SandboxComputeResources, error) {
+	var annotation commitmentCapacityAnnotation
+	if err := json.Unmarshal([]byte(value), &annotation); err != nil {
+		return apiv1alpha2.SandboxComputeResources{}, fmt.Errorf("decode commitment capacity: %w", err)
+	}
+	cpu, err := resource.ParseQuantity(annotation.CPU)
+	if err != nil || cpu.Sign() <= 0 {
+		return apiv1alpha2.SandboxComputeResources{}, fmt.Errorf("invalid commitment capacity cpu %q", annotation.CPU)
+	}
+	memory, err := resource.ParseQuantity(annotation.Memory)
+	if err != nil || memory.Sign() <= 0 {
+		return apiv1alpha2.SandboxComputeResources{}, fmt.Errorf("invalid commitment capacity memory %q", annotation.Memory)
+	}
+	return apiv1alpha2.SandboxComputeResources{CPU: cpu, Memory: memory}, nil
+}
+
+// Validate verifies that projected admission settings match the immutable
+// Pool profile and can admit at least one Sandbox without exceeding the parent
+// runtime limit.
+func (s *ResourceAdmissionSettings) Validate(profile apiv1alpha2.SandboxResourceProfile) error {
+	if s == nil {
+		return fmt.Errorf("resource admission settings are required")
+	}
+	if s.Version != "v2" || s.Mode != apiv1alpha2.SandboxResourceModeResourceAware {
+		return fmt.Errorf("unsupported resource admission settings version %q mode %q", s.Version, s.Mode)
+	}
+	if profile.ResourceMode() != apiv1alpha2.SandboxResourceModeResourceAware || s.ResourceProfileHash != profile.Hash() {
+		return fmt.Errorf("resource admission settings do not match the Sandbox resource profile")
+	}
+	requests, _ := profile.RequestResources()
+	limits, _ := profile.LimitResources()
+	if s.Capacity.CPU.Sign() <= 0 || s.Capacity.Memory.Sign() <= 0 ||
+		s.SandboxRuntimeBudget.CPU.Sign() <= 0 || s.SandboxRuntimeBudget.Memory.Sign() <= 0 ||
+		s.RuntimeEnvelope.CPU.Sign() <= 0 || s.RuntimeEnvelope.Memory.Sign() <= 0 {
+		return fmt.Errorf("resource admission capacity, Sandbox runtime budget, and runtime envelope must be greater than zero")
+	}
+	if s.Capacity.CPU.Cmp(s.SandboxRuntimeBudget.CPU) > 0 || s.Capacity.Memory.Cmp(s.SandboxRuntimeBudget.Memory) > 0 {
+		return fmt.Errorf("resource admission capacity must not exceed the Sandbox runtime budget")
+	}
+	if s.SandboxRuntimeBudget.CPU.Cmp(s.RuntimeEnvelope.CPU) > 0 || s.SandboxRuntimeBudget.Memory.Cmp(s.RuntimeEnvelope.Memory) > 0 {
+		return fmt.Errorf("Sandbox runtime budget must not exceed the Fastlet runtime envelope")
+	}
+	if s.Capacity.CPU.Cmp(requests.CPU) < 0 || s.Capacity.Memory.Cmp(requests.Memory) < 0 {
+		return fmt.Errorf("resource admission capacity cannot commit one Sandbox request")
+	}
+	if s.SandboxRuntimeBudget.CPU.Cmp(limits.CPU) < 0 || s.SandboxRuntimeBudget.Memory.Cmp(limits.Memory) < 0 {
+		return fmt.Errorf("resource admission Sandbox runtime budget cannot contain one Sandbox limit")
+	}
+	return nil
+}
 
 // Bundle is the pool-declared declarative configuration projected into the
 // settings ConfigMap. It is the Fastlet-facing projection of SandboxPool
 // fields that describe desired sandbox behavior rather than pod identity.
 type Bundle struct {
-	WarmImages      []string                           `json:"warmImages"`
-	ActionHandlers  []apiv1alpha2.ActionHandler        `json:"actionHandlers,omitempty"`
-	ResourceProfile apiv1alpha2.SandboxResourceProfile `json:"resourceProfile"`
+	WarmImages        []string                           `json:"warmImages"`
+	ActionHandlers    []apiv1alpha2.ActionHandler        `json:"actionHandlers,omitempty"`
+	ResourceProfile   apiv1alpha2.SandboxResourceProfile `json:"resourceProfile"`
+	ResourceAdmission *ResourceAdmissionSettings         `json:"resourceAdmission,omitempty"`
 }
 
 // Files renders the bundle into ConfigMap data keys, one JSON document per
@@ -61,11 +153,19 @@ func (b Bundle) Files() (map[string]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("encode resource profile: %w", err)
 	}
-	return map[string]string{
+	files := map[string]string{
 		WarmImagesKey:      string(warmImagesJSON),
 		ActionHandlersKey:  string(actionHandlersJSON),
 		ResourceProfileKey: string(resourceProfile),
-	}, nil
+	}
+	if b.ResourceAdmission != nil {
+		resourceAdmission, err := json.Marshal(b.ResourceAdmission)
+		if err != nil {
+			return nil, fmt.Errorf("encode resource admission settings: %w", err)
+		}
+		files[ResourceAdmissionKey] = string(resourceAdmission)
+	}
+	return files, nil
 }
 
 // Revision returns the content-addressed revision ("sha256:...") of the
@@ -77,7 +177,11 @@ func (b Bundle) Revision() (string, error) {
 		return "", err
 	}
 	digest := sha256.New()
-	for _, key := range []string{ActionHandlersKey, ResourceProfileKey, WarmImagesKey} {
+	keys := []string{ActionHandlersKey, ResourceProfileKey, WarmImagesKey}
+	if _, found := files[ResourceAdmissionKey]; found {
+		keys = append(keys, ResourceAdmissionKey)
+	}
+	for _, key := range keys {
 		digest.Write([]byte(key))
 		digest.Write([]byte{0})
 		digest.Write([]byte(files[key]))

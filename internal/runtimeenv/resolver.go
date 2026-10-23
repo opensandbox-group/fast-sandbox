@@ -96,6 +96,9 @@ func applyEnvironment(profile *runtimecatalog.RuntimeProfile, environment NodeRu
 			profile.Deployment.NodeSelector[key] = value
 		}
 	}
+	if len(binding.FastletOverhead) > 0 {
+		profile.Deployment.Overhead = binding.FastletOverhead.DeepCopy()
+	}
 	paths := append([]runtimecatalog.HostPathRequirement(nil), profile.Deployment.HostPaths...)
 	paths = append(paths, environment.HostPaths...)
 	if profile.Firecracker != nil {

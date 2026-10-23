@@ -91,7 +91,7 @@ func TestHostProcessServiceIsProbedOnPodLoopbackNotSandboxAddress(t *testing.T) 
 	require.NoError(t, err)
 	require.NoError(t, manager.Prepare(context.Background()))
 	spec := &fastletapi.RuntimeSandboxConfig{
-		Spec:     fastletapi.SandboxSpec{InfraRevision: manager.Revision()},
+		Desired:  fastletapi.SandboxDesiredSpec{InfraRevision: manager.Revision()},
 		Identity: fastletapi.SandboxIdentity{SandboxUID: "uid-a", InstanceGeneration: 1, AssignmentAttempt: 1},
 	}
 	_, err = manager.PrepareInstance(context.Background(), spec)
@@ -112,7 +112,7 @@ func TestComponentReadinessFailureIsReportedAndFailsDataPlaneReady(t *testing.T)
 	manager, _ := testManager(t, apiv1alpha2.RuntimeContainer)
 	require.NoError(t, manager.Prepare(context.Background()))
 	spec := &fastletapi.RuntimeSandboxConfig{
-		Spec:     fastletapi.SandboxSpec{InfraRevision: manager.Revision()},
+		Desired:  fastletapi.SandboxDesiredSpec{InfraRevision: manager.Revision()},
 		Identity: fastletapi.SandboxIdentity{SandboxUID: "uid-a", InstanceGeneration: 1, AssignmentAttempt: 1},
 	}
 	_, err := manager.PrepareInstance(context.Background(), spec)

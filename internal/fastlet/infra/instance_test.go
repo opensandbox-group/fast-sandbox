@@ -20,7 +20,7 @@ func TestPrepareAndRecoverInstanceUsesFencedPrivateConfigWithoutComponentToken(t
 	manager, _ := testManager(t, apiv1alpha2.RuntimeContainer)
 	require.NoError(t, manager.Prepare(context.Background()))
 	spec := &fastletapi.RuntimeSandboxConfig{
-		Spec:     fastletapi.SandboxSpec{InfraRevision: manager.Revision()},
+		Desired:  fastletapi.SandboxDesiredSpec{InfraRevision: manager.Revision()},
 		Identity: fastletapi.SandboxIdentity{SandboxUID: "uid-a", InstanceGeneration: 2, AssignmentAttempt: 3},
 	}
 	instance, err := manager.PrepareInstance(context.Background(), spec)
@@ -56,7 +56,7 @@ func TestPrepareInstanceExcludesHostProcessComponentFromSupervisorConfig(t *test
 	manager, _ := testHostProcessManager(t)
 	require.NoError(t, manager.Prepare(context.Background()))
 	spec := &fastletapi.RuntimeSandboxConfig{
-		Spec:     fastletapi.SandboxSpec{InfraRevision: manager.Revision()},
+		Desired:  fastletapi.SandboxDesiredSpec{InfraRevision: manager.Revision()},
 		Identity: fastletapi.SandboxIdentity{SandboxUID: "uid-a", InstanceGeneration: 1, AssignmentAttempt: 1},
 	}
 	instance, err := manager.PrepareInstance(context.Background(), spec)
@@ -136,7 +136,7 @@ func TestPrepareInstanceMixedGuestAndHostProcessComponents(t *testing.T) {
 	require.NoError(t, manager.Prepare(context.Background()))
 
 	spec := &fastletapi.RuntimeSandboxConfig{
-		Spec:     fastletapi.SandboxSpec{InfraRevision: manager.Revision()},
+		Desired:  fastletapi.SandboxDesiredSpec{InfraRevision: manager.Revision()},
 		Identity: fastletapi.SandboxIdentity{SandboxUID: "uid-a", InstanceGeneration: 1, AssignmentAttempt: 1},
 	}
 	instance, err := manager.PrepareInstance(context.Background(), spec)
@@ -159,7 +159,7 @@ func TestPrepareInstanceRejectsWrongImmutableRevision(t *testing.T) {
 	manager, _ := testManager(t, apiv1alpha2.RuntimeContainer)
 	require.NoError(t, manager.Prepare(context.Background()))
 	_, err := manager.PrepareInstance(context.Background(), &fastletapi.RuntimeSandboxConfig{
-		Spec:     fastletapi.SandboxSpec{InfraRevision: "sha256:stale"},
+		Desired:  fastletapi.SandboxDesiredSpec{InfraRevision: "sha256:stale"},
 		Identity: fastletapi.SandboxIdentity{SandboxUID: "uid-a", InstanceGeneration: 1, AssignmentAttempt: 1},
 	})
 	require.ErrorContains(t, err, "revision")

@@ -8,12 +8,26 @@ import (
 	"sync/atomic"
 	"time"
 
+	"k8s.io/apimachinery/pkg/api/resource"
+
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	fastletcache "fast-sandbox/internal/fastlet/cache"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
 
 type FastletID string
+
+const DefaultObservationStaleAfter = 45 * time.Second
+
+type ResourceDemand struct {
+	CPU    resource.Quantity
+	Memory resource.Quantity
+}
+
+type resourceRevision struct {
+	Epoch    string
+	Revision uint64
+}
 
 var (
 	ErrFastletNotFound  = errors.New("Fastlet is not present in the Pod watch store")
@@ -49,6 +63,15 @@ type FastletInfo struct {
 	Draining            bool
 
 	Admission fastletapi.AdmissionStatus
+	// ResourceCapacity is the Controller-resolved Sandbox commitment capacity
+	// projected on the watched Pod. ResourceReceivedAt is local receive time
+	// for the versioned Fastlet resource-admission snapshot.
+	ResourceCapacity   ResourceDemand
+	ResourceCommitted  ResourceDemand
+	InFlightResources  ResourceDemand
+	InFlightSlots      int
+	ResourceReceivedAt time.Time
+	resourceFence      resourceRevision
 
 	Images          []string
 	CacheEpoch      string
@@ -70,6 +93,10 @@ func (i FastletInfo) Capacity() int {
 	return i.Admission.Capacity
 }
 
+func (i FastletInfo) SchedulingUsed() int {
+	return i.Admission.Used + i.InFlightSlots
+}
+
 // FastletRegistry is the scheduling view consumed by the Pool controller.
 type FastletRegistry interface {
 	GetAllFastlets() []FastletInfo
@@ -84,6 +111,8 @@ type CandidateRequest struct {
 	ResourceProfileHash string
 	InfraRevision       string
 	FastletRevision     string
+	ResourceMode        apiv1alpha2.SandboxResourceMode
+	Demand              ResourceDemand
 	Image               string
 	StableKey           string
 	Now                 time.Time
@@ -93,6 +122,9 @@ type CandidateRequest struct {
 
 type LocalFeedback struct {
 	Code       fastletapi.FastletErrorCode
+	Reason     fastletapi.AdmissionReason
+	Admission  *fastletapi.AdmissionStatus
+	Sandbox    *fastletapi.SandboxStatus
 	ObservedAt time.Time
 	RetryAfter time.Duration
 }
@@ -103,12 +135,16 @@ type fastletSlot struct {
 }
 
 type rankedFastlet struct {
-	slot        *fastletSlot
-	id          FastletID
-	capacity    int
-	imageHit    bool
-	used        int
-	stableOrder uint64
+	slot         *fastletSlot
+	id           FastletID
+	capacity     int
+	imageHit     bool
+	used         int
+	stateRank    int
+	dominantLoad float64
+	loadBucket   int
+	serverOrder  uint64
+	stableOrder  uint64
 }
 
 type InMemoryRegistry struct {
@@ -116,15 +152,66 @@ type InMemoryRegistry struct {
 	fastlets   map[FastletID]*fastletSlot
 	staleAfter atomic.Int64
 	clock      func() time.Time
+	serverSeed string
 }
 
 func NewInMemoryRegistry() *InMemoryRegistry {
 	registry := &InMemoryRegistry{fastlets: make(map[FastletID]*fastletSlot), clock: time.Now}
-	registry.staleAfter.Store(int64(45 * time.Second))
+	registry.staleAfter.Store(int64(DefaultObservationStaleAfter))
 	return registry
 }
 
 func (r *InMemoryRegistry) SetStaleAfter(duration time.Duration) { r.staleAfter.Store(int64(duration)) }
+
+// SetServerSeed gives one FastPath replica a stable, soft node preference.
+// It changes ranking within a coarse load bucket and never creates ownership.
+func (r *InMemoryRegistry) SetServerSeed(seed string) { r.serverSeed = seed }
+
+// ReserveLocal records one request that this FastPath has selected but whose
+// Fastlet response has not arrived yet. It prevents concurrent local creates
+// from all consuming the same eventually-consistent free capacity.
+func (r *InMemoryRegistry) ReserveLocal(id FastletID, demand ResourceDemand) bool {
+	r.mu.RLock()
+	slot := r.fastlets[id]
+	r.mu.RUnlock()
+	if slot == nil {
+		return false
+	}
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	if slot.info.SchedulingUsed() >= slot.info.Capacity() {
+		return false
+	}
+	if demand.CPU.Sign() > 0 && demand.Memory.Sign() > 0 {
+		cpu := slot.info.ResourceCommitted.CPU.MilliValue() + slot.info.InFlightResources.CPU.MilliValue() + demand.CPU.MilliValue()
+		memory := slot.info.ResourceCommitted.Memory.Value() + slot.info.InFlightResources.Memory.Value() + demand.Memory.Value()
+		if cpu > slot.info.ResourceCapacity.CPU.MilliValue() || memory > slot.info.ResourceCapacity.Memory.Value() {
+			return false
+		}
+		slot.info.InFlightResources.CPU.Add(demand.CPU)
+		slot.info.InFlightResources.Memory.Add(demand.Memory)
+	}
+	slot.info.InFlightSlots++
+	return true
+}
+
+func (r *InMemoryRegistry) ReleaseLocal(id FastletID, demand ResourceDemand) {
+	r.mu.RLock()
+	slot := r.fastlets[id]
+	r.mu.RUnlock()
+	if slot == nil {
+		return
+	}
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	if slot.info.InFlightSlots > 0 {
+		slot.info.InFlightSlots--
+	}
+	if demand.CPU.Sign() > 0 && demand.Memory.Sign() > 0 {
+		slot.info.InFlightResources.CPU.Sub(demand.CPU)
+		slot.info.InFlightResources.Memory.Sub(demand.Memory)
+	}
+}
 
 // UpsertPod is fed only by the Kubernetes Pod informer. Replacing a Pod UID
 // clears all heartbeat state so a reused endpoint can never inherit readiness,
@@ -157,6 +244,11 @@ func preserveHeartbeat(target *FastletInfo, previous FastletInfo) {
 	target.InfraReady = previous.InfraReady
 	target.Draining = target.DrainRequested || previous.Draining
 	target.Admission = previous.Admission
+	target.ResourceReceivedAt = previous.ResourceReceivedAt
+	target.ResourceCommitted = cloneDemand(previous.ResourceCommitted)
+	target.InFlightResources = cloneDemand(previous.InFlightResources)
+	target.InFlightSlots = previous.InFlightSlots
+	target.resourceFence = previous.resourceFence
 	target.Images = append([]string(nil), previous.Images...)
 	target.PreparedArtifacts = append([]string(nil), previous.PreparedArtifacts...)
 	target.RegistryRevision = previous.RegistryRevision
@@ -202,7 +294,8 @@ func (r *InMemoryRegistry) ApplyHeartbeat(id FastletID, expectedPodUID string, h
 	slot.info.PreparedArtifacts = append([]string(nil), heartbeat.PreparedArtifacts...)
 	slot.info.RegistryRevision = heartbeat.RegistryRevision
 	slot.info.WarmImages = cloneWarmImageStates(heartbeat.WarmImages)
-	slot.info.Admission = heartbeat.Admission
+	applyHeartbeatAdmission(&slot.info, heartbeat.Admission, observedAt)
+	applyAdmissionResources(&slot.info)
 	if slot.info.RuntimeProfileHash == "" {
 		slot.info.RuntimeProfileHash = heartbeat.RuntimeProfileHash
 	}
@@ -233,8 +326,32 @@ func (r *InMemoryRegistry) ApplyHeartbeat(id FastletID, expectedPodUID string, h
 	slot.info.CacheRevision = heartbeat.Cache.Revision
 	slot.info.HeartbeatSequence = heartbeat.Sequence
 	slot.info.LastHeartbeat = observedAt
-	slot.info.RejectedUntil = time.Time{}
+	if resourceRejectionCleared(slot.info) {
+		slot.info.RejectedUntil = time.Time{}
+	}
 	return nil
+}
+
+func applyHeartbeatAdmission(info *FastletInfo, incoming fastletapi.AdmissionStatus, observedAt time.Time) {
+	resourceStatus := incoming.Resources
+	if resourceStatus == nil {
+		if info.Admission.Resources == nil {
+			info.Admission = cloneAdmission(incoming)
+		}
+		return
+	}
+	current := info.Admission.Resources
+	accept := current == nil || resourceStatus.Epoch != current.Epoch || resourceStatus.Revision >= current.Revision
+	if resourceStatus.Epoch == info.resourceFence.Epoch && resourceStatus.Revision <= info.resourceFence.Revision {
+		accept = current != nil && resourceStatus.Epoch == current.Epoch && resourceStatus.Revision == current.Revision &&
+			current.State == resourceStatus.State && current.Reason == resourceStatus.Reason
+	}
+	if accept {
+		info.Admission = cloneAdmission(incoming)
+	}
+	if accepted := info.Admission.Resources; accepted != nil && accepted.Epoch == resourceStatus.Epoch && accepted.Revision == resourceStatus.Revision {
+		info.ResourceReceivedAt = observedAt
+	}
 }
 
 func (r *InMemoryRegistry) RecordFeedback(id FastletID, feedback LocalFeedback) {
@@ -250,12 +367,54 @@ func (r *InMemoryRegistry) RecordFeedback(id FastletID, feedback LocalFeedback) 
 	if feedback.RetryAfter <= 0 {
 		feedback.RetryAfter = 5 * time.Second
 	}
+	if feedback.Admission != nil && feedback.Admission.Resources != nil || feedback.Sandbox != nil {
+		slot.mu.Lock()
+		if feedback.Admission != nil && feedback.Admission.Resources != nil {
+			applyFeedbackAdmission(&slot.info, *feedback.Admission, feedback.ObservedAt, feedback.Code == fastletapi.ErrorCapacityRejected)
+			applyAdmissionResources(&slot.info)
+		}
+		if feedback.Sandbox != nil && feedback.Sandbox.SandboxID != "" {
+			if slot.info.SandboxStatuses == nil {
+				slot.info.SandboxStatuses = make(map[string]fastletapi.SandboxStatus)
+			}
+			status := cloneSandboxStatus(*feedback.Sandbox)
+			slot.info.SandboxStatuses[status.SandboxID] = status
+		}
+		slot.mu.Unlock()
+	}
 	switch feedback.Code {
 	case fastletapi.ErrorCapacityRejected, fastletapi.ErrorDraining, fastletapi.ErrorRuntimeUnavailable, fastletapi.ErrorNetworkUnavailable, fastletapi.ErrorInfraUnavailable:
 		slot.mu.Lock()
 		slot.info.RejectedUntil = feedback.ObservedAt.Add(feedback.RetryAfter)
 		slot.mu.Unlock()
 	}
+}
+
+func applyFeedbackAdmission(info *FastletInfo, incoming fastletapi.AdmissionStatus, observedAt time.Time, fence bool) {
+	resourceStatus := incoming.Resources
+	if resourceStatus == nil {
+		return
+	}
+	current := info.Admission.Resources
+	if current != nil && (resourceStatus.Epoch != current.Epoch || resourceStatus.Revision < current.Revision) {
+		return
+	}
+	info.Admission = cloneAdmission(incoming)
+	info.ResourceReceivedAt = observedAt
+	if fence || resourceStatus.State == fastletapi.AdmissionStateBlocked || resourceStatus.State == fastletapi.AdmissionStateUnknown {
+		info.resourceFence = resourceRevision{Epoch: resourceStatus.Epoch, Revision: resourceStatus.Revision}
+	}
+}
+
+func resourceRejectionCleared(info FastletInfo) bool {
+	status := info.Admission.Resources
+	if status == nil {
+		return true
+	}
+	if status.State != fastletapi.AdmissionStateOpen && status.State != fastletapi.AdmissionStateDegraded {
+		return false
+	}
+	return info.resourceFence.Epoch == "" || status.Epoch != info.resourceFence.Epoch || status.Revision > info.resourceFence.Revision
 }
 
 func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
@@ -272,33 +431,49 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 	r.mu.RUnlock()
 
 	heartbeats := heartbeatAgeSummary{}
+	blockedNodes := resourceBlockedNodes(slots, request.Now, staleAfter)
 	ranked := make([]rankedFastlet, 0, len(slots))
 	for _, slot := range slots {
 		slot.mu.RLock()
 		info := slot.info
 		heartbeats.observe(info.LastHeartbeat, request.Now, staleAfter)
-		if !hardFilter(info, request, staleAfter) {
+		if !hardFilter(info, request, staleAfter, blockedNodes) {
 			slot.mu.RUnlock()
 			continue
 		}
+		load := dominantResourceLoad(info, request)
+		serverOrder := uint64(0)
+		if r.serverSeed != "" {
+			serverOrder = stableOrder(r.serverSeed, info.ID)
+		}
 		ranked = append(ranked, rankedFastlet{
-			slot:        slot,
-			id:          info.ID,
-			capacity:    info.Capacity(),
-			imageHit:    imageHit(info, request.Image),
-			used:        info.Used(),
-			stableOrder: stableOrder(request.StableKey, info.ID),
+			slot:         slot,
+			id:           info.ID,
+			capacity:     info.Capacity(),
+			imageHit:     imageHit(info, request.Image),
+			used:         info.Used(),
+			stateRank:    admissionStateRank(info),
+			dominantLoad: load,
+			loadBucket:   int(load * 10),
+			serverOrder:  serverOrder,
+			stableOrder:  stableOrder(request.StableKey, info.ID),
 		})
 		slot.mu.RUnlock()
 	}
 	recordHeartbeatAgeSummary(heartbeats)
 	sort.Slice(ranked, func(i, j int) bool {
 		left, right := ranked[i], ranked[j]
+		if left.stateRank != right.stateRank {
+			return left.stateRank < right.stateRank
+		}
 		if left.imageHit != right.imageHit {
 			return left.imageHit
 		}
-		if left.used*right.capacity != right.used*left.capacity {
-			return left.used*right.capacity < right.used*left.capacity
+		if left.loadBucket != right.loadBucket {
+			return left.loadBucket < right.loadBucket
+		}
+		if left.serverOrder != right.serverOrder {
+			return left.serverOrder < right.serverOrder
 		}
 		if left.stableOrder != right.stableOrder {
 			return left.stableOrder < right.stableOrder
@@ -323,7 +498,7 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 	return selected
 }
 
-func hardFilter(info FastletInfo, request CandidateRequest, staleAfter time.Duration) bool {
+func hardFilter(info FastletInfo, request CandidateRequest, staleAfter time.Duration, blockedNodes map[string]struct{}) bool {
 	if _, excluded := request.ExcludedFastlets[info.ID]; excluded {
 		return false
 	}
@@ -336,7 +511,7 @@ func hardFilter(info FastletInfo, request CandidateRequest, staleAfter time.Dura
 	if request.Now.Sub(info.LastHeartbeat) > staleAfter || request.Now.Before(info.RejectedUntil) {
 		return false
 	}
-	if info.Capacity() <= 0 || info.Used() >= info.Capacity() {
+	if info.Capacity() <= 0 || info.SchedulingUsed() >= info.Capacity() {
 		return false
 	}
 	if request.RuntimeName != "" && info.RuntimeName != request.RuntimeName {
@@ -354,7 +529,113 @@ func hardFilter(info FastletInfo, request CandidateRequest, staleAfter time.Dura
 	if request.FastletRevision != "" && info.FastletRevision != request.FastletRevision {
 		return false
 	}
+	if request.ResourceMode == apiv1alpha2.SandboxResourceModeResourceAware {
+		if _, blocked := blockedNodes[info.NodeName]; blocked {
+			return false
+		}
+		if !resourceEligible(info, request, staleAfter) {
+			return false
+		}
+	}
 	return true
+}
+
+func resourceBlockedNodes(slots []*fastletSlot, now time.Time, staleAfter time.Duration) map[string]struct{} {
+	blocked := make(map[string]struct{})
+	for _, slot := range slots {
+		slot.mu.RLock()
+		info := slot.info
+		if HasFreshNodeMemoryPressure(info, now, staleAfter) {
+			blocked[info.NodeName] = struct{}{}
+		}
+		slot.mu.RUnlock()
+	}
+	return blocked
+}
+
+// HasFreshNodeMemoryPressure reports whether one observation blocks every
+// Fastlet on the same node. Pool scaling uses the same predicate as placement
+// so aggregate capacity never includes a sibling Fastlet that Top-K rejects.
+func HasFreshNodeMemoryPressure(info FastletInfo, now time.Time, staleAfter time.Duration) bool {
+	status := info.Admission.Resources
+	return info.NodeName != "" && status != nil && status.Version == "v2" &&
+		status.State == fastletapi.AdmissionStateBlocked && status.Reason == fastletapi.AdmissionReasonNodeMemoryPressure &&
+		!info.ResourceReceivedAt.IsZero() && now.Sub(info.ResourceReceivedAt) <= staleAfter &&
+		!info.LastHeartbeat.IsZero() && now.Sub(info.LastHeartbeat) <= staleAfter
+}
+
+func resourceEligible(info FastletInfo, request CandidateRequest, staleAfter time.Duration) bool {
+	status := info.Admission.Resources
+	if status == nil || status.Version != "v2" || info.ResourceReceivedAt.IsZero() || request.Now.Sub(info.ResourceReceivedAt) > staleAfter {
+		return false
+	}
+	if status.State != fastletapi.AdmissionStateOpen && status.State != fastletapi.AdmissionStateDegraded {
+		return false
+	}
+	if request.Demand.CPU.Sign() <= 0 || request.Demand.Memory.Sign() <= 0 ||
+		info.ResourceCapacity.CPU.Sign() <= 0 || info.ResourceCapacity.Memory.Sign() <= 0 {
+		return false
+	}
+	return info.ResourceCommitted.CPU.MilliValue()+info.InFlightResources.CPU.MilliValue()+request.Demand.CPU.MilliValue() <= info.ResourceCapacity.CPU.MilliValue() &&
+		info.ResourceCommitted.Memory.Value()+info.InFlightResources.Memory.Value()+request.Demand.Memory.Value() <= info.ResourceCapacity.Memory.Value()
+}
+
+// EffectiveFreeCapacity returns the immediately schedulable Sandbox count for
+// a resource-aware Fastlet. It combines the slot ledger, static commitment,
+// dynamic pressure state, and local receive-time freshness.
+func EffectiveFreeCapacity(info FastletInfo, demand ResourceDemand, now time.Time, staleAfter time.Duration) int32 {
+	request := CandidateRequest{Now: now, ResourceMode: apiv1alpha2.SandboxResourceModeResourceAware, Demand: demand}
+	if !info.PodReady || !info.RuntimeReady || !info.InfraReady || info.Draining || info.DrainRequested || info.LastHeartbeat.IsZero() ||
+		now.Sub(info.LastHeartbeat) > staleAfter || now.Before(info.RejectedUntil) || !resourceEligible(info, request, staleAfter) {
+		return 0
+	}
+	slotFree := int64(info.Capacity() - info.SchedulingUsed())
+	cpuFree := (info.ResourceCapacity.CPU.MilliValue() - info.ResourceCommitted.CPU.MilliValue() - info.InFlightResources.CPU.MilliValue()) / demand.CPU.MilliValue()
+	memoryFree := (info.ResourceCapacity.Memory.Value() - info.ResourceCommitted.Memory.Value() - info.InFlightResources.Memory.Value()) / demand.Memory.Value()
+	free := min(slotFree, cpuFree, memoryFree)
+	if free <= 0 {
+		return 0
+	}
+	return int32(free)
+}
+
+// EffectiveFreeResources returns the schedulable commitment vector after
+// dynamic admission, freshness, drain, observed commitments, and local
+// in-flight reservations are applied.
+func EffectiveFreeResources(info FastletInfo, now time.Time, staleAfter time.Duration) ResourceDemand {
+	status := info.Admission.Resources
+	if !info.PodReady || !info.RuntimeReady || !info.InfraReady || info.Draining || info.DrainRequested || info.LastHeartbeat.IsZero() ||
+		now.Sub(info.LastHeartbeat) > staleAfter || now.Before(info.RejectedUntil) || status == nil || status.Version != "v2" ||
+		info.ResourceReceivedAt.IsZero() || now.Sub(info.ResourceReceivedAt) > staleAfter ||
+		(status.State != fastletapi.AdmissionStateOpen && status.State != fastletapi.AdmissionStateDegraded) {
+		return ResourceDemand{}
+	}
+	free := ResourceDemand{CPU: info.ResourceCapacity.CPU.DeepCopy(), Memory: info.ResourceCapacity.Memory.DeepCopy()}
+	free.CPU.Sub(info.ResourceCommitted.CPU)
+	free.CPU.Sub(info.InFlightResources.CPU)
+	free.Memory.Sub(info.ResourceCommitted.Memory)
+	free.Memory.Sub(info.InFlightResources.Memory)
+	if free.CPU.Sign() < 0 || free.Memory.Sign() < 0 {
+		return ResourceDemand{}
+	}
+	return free
+}
+
+func admissionStateRank(info FastletInfo) int {
+	if info.Admission.Resources != nil && info.Admission.Resources.State == fastletapi.AdmissionStateDegraded {
+		return 1
+	}
+	return 0
+}
+
+func dominantResourceLoad(info FastletInfo, request CandidateRequest) float64 {
+	slotLoad := float64(info.SchedulingUsed()) / float64(info.Capacity())
+	if request.ResourceMode != apiv1alpha2.SandboxResourceModeResourceAware {
+		return slotLoad
+	}
+	cpuLoad := float64(info.ResourceCommitted.CPU.MilliValue()+info.InFlightResources.CPU.MilliValue()) / float64(info.ResourceCapacity.CPU.MilliValue())
+	memoryLoad := float64(info.ResourceCommitted.Memory.Value()+info.InFlightResources.Memory.Value()) / float64(info.ResourceCapacity.Memory.Value())
+	return max(slotLoad, cpuLoad, memoryLoad)
 }
 
 func imageHit(info FastletInfo, image string) bool {
@@ -418,11 +699,60 @@ func (r *InMemoryRegistry) RemoveIfPodUID(id FastletID, podUID string) {
 }
 
 func cloneInfo(info FastletInfo) FastletInfo {
+	info.Admission = cloneAdmission(info.Admission)
+	info.ResourceCapacity = ResourceDemand{CPU: info.ResourceCapacity.CPU.DeepCopy(), Memory: info.ResourceCapacity.Memory.DeepCopy()}
+	info.ResourceCommitted = cloneDemand(info.ResourceCommitted)
+	info.InFlightResources = cloneDemand(info.InFlightResources)
 	info.Images = append([]string(nil), info.Images...)
 	info.PreparedArtifacts = append([]string(nil), info.PreparedArtifacts...)
 	info.WarmImages = cloneWarmImageStates(info.WarmImages)
 	info.SandboxStatuses = cloneStatuses(info.SandboxStatuses)
 	return info
+}
+
+func cloneDemand(demand ResourceDemand) ResourceDemand {
+	return ResourceDemand{CPU: demand.CPU.DeepCopy(), Memory: demand.Memory.DeepCopy()}
+}
+
+func applyAdmissionResources(info *FastletInfo) {
+	if info == nil || info.Admission.Resources == nil {
+		return
+	}
+	status := info.Admission.Resources
+	capacity, capacityOK := parseResourceVector(status.Capacity)
+	committed, committedOK := parseResourceVector(status.Committed)
+	if !capacityOK || !committedOK {
+		info.ResourceReceivedAt = time.Time{}
+		return
+	}
+	// The Pod annotation is the Controller projection; the Fastlet snapshot
+	// must agree before its ledger can become scheduling input.
+	if info.ResourceCapacity.CPU.Sign() > 0 && (capacity.CPU.Cmp(info.ResourceCapacity.CPU) != 0 || capacity.Memory.Cmp(info.ResourceCapacity.Memory) != 0) {
+		info.ResourceReceivedAt = time.Time{}
+		return
+	}
+	info.ResourceCapacity = capacity
+	info.ResourceCommitted = committed
+}
+
+func parseResourceVector(vector fastletapi.SandboxResourceVector) (ResourceDemand, bool) {
+	cpu, err := resource.ParseQuantity(vector.CPU)
+	if err != nil || cpu.Sign() < 0 {
+		return ResourceDemand{}, false
+	}
+	memory, err := resource.ParseQuantity(vector.Memory)
+	if err != nil || memory.Sign() < 0 {
+		return ResourceDemand{}, false
+	}
+	return ResourceDemand{CPU: cpu, Memory: memory}, true
+}
+
+func cloneAdmission(admission fastletapi.AdmissionStatus) fastletapi.AdmissionStatus {
+	if admission.Resources != nil {
+		resources := *admission.Resources
+		admission.Resources = &resources
+	}
+	return admission
 }
 
 func cloneWarmImageStates(values []fastletapi.WarmImageState) []fastletapi.WarmImageState {
@@ -435,9 +765,13 @@ func cloneStatuses(statuses map[string]fastletapi.SandboxStatus) map[string]fast
 	}
 	result := make(map[string]fastletapi.SandboxStatus, len(statuses))
 	for key, status := range statuses {
-		status.InfraComponents = append([]fastletapi.InfraComponentDiagnostic(nil), status.InfraComponents...)
-		status.ActionBindings = append([]fastletapi.ActionBindingStatus(nil), status.ActionBindings...)
-		result[key] = status
+		result[key] = cloneSandboxStatus(status)
 	}
 	return result
+}
+
+func cloneSandboxStatus(status fastletapi.SandboxStatus) fastletapi.SandboxStatus {
+	status.InfraComponents = append([]fastletapi.InfraComponentDiagnostic(nil), status.InfraComponents...)
+	status.ActionBindings = append([]fastletapi.ActionBindingStatus(nil), status.ActionBindings...)
+	return status
 }

@@ -38,6 +38,8 @@ Fast Sandbox documentation is organized by reader intent:
 - [Runtime node installation](guides/runtime-node-installation.md)
 - [Runtime environments](guides/runtime-environments.md)
 - [Sandbox Actions](guides/sandbox-actions.md)
+- [Resource-aware overcommit tuning](guides/resource-aware-overcommit-tuning.md)
+- [Resource-aware capacity validation](guides/resource-aware-capacity-validation.md)
 - [Observability](guides/observability.md)
 - [Performance](guides/performance.md)
 - [Testing](guides/testing.md)
@@ -53,6 +55,15 @@ Fast Sandbox documentation is organized by reader intent:
 - [fastctl](reference/fastctl.md)
 - [Configuration](reference/configuration.md)
 - [Runtime support](reference/runtime-support.md)
+
+## Design proposals and decisions
+
+These documents record proposed or accepted architecture decisions. A proposed
+design does not replace the current concept or reference contract until its
+implementation is complete.
+
+- [Resource-aware overcommit placement](design/resource-aware-overcommit-placement.md)
+  — implemented from [Issue #115](https://github.com/opensandbox-group/fast-sandbox/issues/115)
 
 ## Documentation policy
 

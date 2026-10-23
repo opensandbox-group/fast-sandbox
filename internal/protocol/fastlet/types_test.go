@@ -15,7 +15,7 @@ func TestCreateRequestSerializesIdentityDesiredSpecAndRequestMetadataOnce(t *tes
 			InstanceGeneration: 2, RuntimeInstanceID: "runtime-a", AssignmentAttempt: 3,
 			RouteGeneration: 4, FastletPodUID: "pod-a",
 		},
-		Sandbox:        SandboxSpec{Image: "alpine:latest", CPU: "500m", Memory: "256Mi"},
+		Sandbox:        SandboxDesiredSpec{Image: "alpine:latest"},
 		ActionBindings: []ActionBindingInput{{Handler: "egress", Input: "allow: example.com"}},
 	}
 	encoded, err := json.Marshal(request)
@@ -33,6 +33,9 @@ func TestCreateRequestSerializesIdentityDesiredSpecAndRequestMetadataOnce(t *tes
 
 	desired := object["sandbox"].(map[string]any)
 	require.Equal(t, "alpine:latest", desired["image"])
+	require.NotContains(t, desired, "cpu")
+	require.NotContains(t, desired, "memory")
+	require.NotContains(t, desired, "pids")
 	for _, key := range []string{"sandboxUid", "sandboxId", "namespace", "name", "requestId", "instanceGeneration", "runtimeInstanceId", "assignmentAttempt", "routeGeneration", "fastletPodUid"} {
 		require.NotContains(t, desired, key)
 	}
@@ -46,7 +49,8 @@ func TestEnsureSandboxInputKeepsInvocationConfigAndAllocationSeparate(t *testing
 		RequestID: "invocation-a",
 		Sandbox: RuntimeSandboxConfig{
 			Identity: SandboxIdentity{SandboxUID: "uid-a", Namespace: "tenant-a", Name: "sandbox-a"},
-			Spec:     SandboxSpec{Image: "alpine:latest"},
+			Desired:  SandboxDesiredSpec{Image: "alpine:latest"},
+			Limits:   SandboxRuntimeLimits{CPU: "500m", Memory: "256Mi", PIDs: 128},
 		},
 	}
 	encoded, err := json.Marshal(input)
@@ -56,7 +60,8 @@ func TestEnsureSandboxInputKeepsInvocationConfigAndAllocationSeparate(t *testing
 	require.Equal(t, "invocation-a", object["requestId"])
 	sandbox := object["sandbox"].(map[string]any)
 	require.Equal(t, "uid-a", sandbox["identity"].(map[string]any)["sandboxUid"])
-	require.Equal(t, "alpine:latest", sandbox["spec"].(map[string]any)["image"])
+	require.Equal(t, "alpine:latest", sandbox["desired"].(map[string]any)["image"])
+	require.Equal(t, "500m", sandbox["limits"].(map[string]any)["cpu"])
 	for _, key := range []string{"sandboxId", "claimNamespace", "claimName", "requestId", "network", "networkIp", "networkSlotId"} {
 		require.NotContains(t, sandbox, key)
 	}
@@ -66,6 +71,31 @@ func TestEnsureSandboxInputKeepsInvocationConfigAndAllocationSeparate(t *testing
 	require.NoError(t, err)
 	require.NotContains(t, string(allocationJSON), "invocation-a")
 	require.Contains(t, string(allocationJSON), `"slotId":"slot-a"`)
+}
+
+func TestRuntimeSandboxConfigReadsLegacyDurableSpec(t *testing.T) {
+	legacy := []byte(`{
+		"identity":{"sandboxUid":"uid-a"},
+		"spec":{"image":"alpine:latest","resourceProfileHash":"profile-a","cpu":"500m","memory":"256Mi","pids":128}
+	}`)
+	var config RuntimeSandboxConfig
+	require.NoError(t, json.Unmarshal(legacy, &config))
+	require.Equal(t, "uid-a", config.Identity.SandboxUID)
+	require.Equal(t, "alpine:latest", config.Desired.Image)
+	require.Equal(t, "profile-a", config.Desired.ResourceProfileHash)
+	require.Equal(t, SandboxRuntimeLimits{CPU: "500m", Memory: "256Mi", PIDs: 128}, config.Limits)
+
+	encoded, err := json.Marshal(config)
+	require.NoError(t, err)
+	require.Contains(t, string(encoded), `"desired"`)
+	require.Contains(t, string(encoded), `"limits"`)
+	require.NotContains(t, string(encoded), `"spec"`)
+}
+
+func TestRuntimeSandboxConfigRejectsMixedCurrentAndLegacyShapes(t *testing.T) {
+	var config RuntimeSandboxConfig
+	err := json.Unmarshal([]byte(`{"desired":{"image":"current"},"spec":{"image":"legacy"}}`), &config)
+	require.ErrorContains(t, err, "cannot contain both desired and legacy spec")
 }
 
 func TestHeartbeatUsesAdmissionAndCacheAsSingleAuthorities(t *testing.T) {

@@ -83,7 +83,7 @@ func (m *Manager) PrepareInstance(ctx context.Context, config *fastletapi.Runtim
 	if err != nil {
 		return PreparedInstance{}, err
 	}
-	if plan.Revision != config.Spec.InfraRevision {
+	if plan.Revision != config.Desired.InfraRevision {
 		return PreparedInstance{}, errors.New("Sandbox Infra revision does not match prepared plan")
 	}
 	if len(plan.Components) == 0 {

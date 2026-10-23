@@ -6,14 +6,23 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
 
+	fastpathv2 "fast-sandbox/api/proto/v2"
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/controlplane/assignment"
+	"fast-sandbox/internal/fastletsettings"
+	e2eenv "fast-sandbox/test/e2e/env"
 	"fast-sandbox/test/e2e/support/fixtures"
 	"fast-sandbox/test/e2e/support/suiteenv"
 )
@@ -62,17 +71,15 @@ func TestResourceSlotCapacity(t *testing.T) {
 				t.Fatalf("create sandbox 3: %v", err)
 			}
 
-			// CRD-first persists a durable assignment before Fastlet admission.
-			// Capacity rejection therefore leaves the third declarative intent
-			// assigned but Pending; it must never become a third runtime while
-			// the first two slots remain occupied.
+			// Depending on heartbeat timing, placement either filters the full
+			// Fastlet immediately or Fastlet rejects a durable assignment. Both
+			// paths must leave the third Sandbox Pending without a third runtime.
 			pendingCtx, cancelPending := context.WithTimeout(ctx, 30*time.Second)
 			defer cancelPending()
 			if _, err := fixture.WaitForSandbox(pendingCtx, types.NamespacedName{Name: "sb-slot-3", Namespace: namespace}, func(sb *apiv1alpha2.Sandbox) bool {
-				return sb.Status.Placement.FastletName != "" &&
-					sb.Annotations["sandbox.fast.io/assignment"] != ""
+				return sb.Status.Runtime.State == apiv1alpha2.RuntimePending
 			}); err != nil {
-				t.Fatalf("wait for capacity-rejected Sandbox to retain its durable assignment: %v", err)
+				t.Fatalf("wait for capacity-blocked Sandbox to remain Pending: %v", err)
 			}
 			ensureCtx, cancelEnsure := context.WithTimeout(ctx, 30*time.Second)
 			defer cancelEnsure()
@@ -93,9 +100,6 @@ func ensureSandboxRemainsCapacityBlocked(ctx context.Context, k8sClient client.C
 		var sandbox apiv1alpha2.Sandbox
 		if err := k8sClient.Get(ctx, name, &sandbox); err != nil {
 			return err
-		}
-		if sandbox.Status.Placement.FastletName == "" || sandbox.Annotations["sandbox.fast.io/assignment"] == "" {
-			return fmt.Errorf("durable assignment disappeared")
 		}
 		if sandbox.Status.Runtime.State == apiv1alpha2.RuntimeReady {
 			return fmt.Errorf("runtime became Ready despite exhausted capacity")
@@ -164,6 +168,413 @@ func TestAutoScaling(t *testing.T) {
 		Feature()
 
 	testSuite.Env().Test(t, feature)
+}
+
+func TestResourceAwareOvercommitScaling(t *testing.T) {
+	suiteenv.RequireBasic(t)
+
+	feature := features.New("resource-aware-overcommit-scaling").
+		WithLabel("suite", "scheduling").
+		WithLabel("tier", "smoke").
+		Assess("derived resource commitment scales out and stabilizes scale-down", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+			k8sClient := testSuite.MustKubeClient(t)
+			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
+
+			namespace := testSuite.AllocateNamespace("resource-aware")
+			if err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
+				t.Fatalf("create namespace: %v", err)
+			}
+			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
+
+			pool := createResourceAwareSchedulingPool(namespace, "resource-aware-pool")
+			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
+				t.Fatalf("create resource-aware sandbox pool: %v", err)
+			}
+			initialCtx, cancelInitial := context.WithTimeout(ctx, 90*time.Second)
+			defer cancelInitial()
+			if _, err := fixture.WaitForReadyFastletPods(initialCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for initial resource-aware fastlet: %v", err)
+			}
+			assertResourceAwareFastletContract(ctx, t, k8sClient, namespace, pool.Name)
+			endpoint, portForward, err := e2eenv.StartControllerPortForward(ctx, testSuite.ControllerNamespace())
+			if err != nil {
+				t.Fatalf("start FastPath port-forward: %v", err)
+			}
+			defer func() {
+				if err := portForward.Cleanup(); err != nil {
+					t.Errorf("cleanup FastPath port-forward: %v", err)
+				}
+			}()
+			connection, err := grpc.DialContext(ctx, endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+			if err != nil {
+				t.Fatalf("dial FastPath: %v", err)
+			}
+			defer connection.Close()
+			fastPath := fastpathv2.NewFastPathServiceClient(connection)
+
+			firstRequest := createResourceAwareFastPathRequest(namespace, "sb-resource-1", pool.Name, "250m", "512Mi")
+			if _, err := fastPath.CreateSandbox(ctx, firstRequest); err != nil {
+				t.Fatalf("create first heterogeneous Sandbox through FastPath: %v", err)
+			}
+			assignedFirst := waitForAssignedSandbox(ctx, t, fixture, namespace, firstRequest.RequestId)
+			assertResolvedRequestAnnotations(t, pool, assignedFirst)
+
+			secondRequest := createResourceAwareFastPathRequest(namespace, "sb-resource-2", pool.Name, "", "")
+			if _, err := fastPath.CreateSandbox(ctx, secondRequest); err != nil {
+				t.Fatalf("create default-profile Sandbox through FastPath: %v", err)
+			}
+			assignedSecond := waitForAssignedSandbox(ctx, t, fixture, namespace, secondRequest.RequestId)
+			assertResolvedRequestAnnotations(t, pool, assignedSecond)
+			if assignedFirst.Status.Placement.FastletName != assignedSecond.Status.Placement.FastletName {
+				t.Fatalf("first two Sandboxes should fit one resource ledger, got %s and %s",
+					assignedFirst.Status.Placement.FastletName, assignedSecond.Status.Placement.FastletName)
+			}
+
+			thirdRequest := createResourceAwareFastPathRequest(namespace, "sb-resource-3", pool.Name, "250m", "96Mi")
+			if _, err := fastPath.CreateSandbox(ctx, thirdRequest); status.Code(err) != codes.ResourceExhausted {
+				t.Fatalf("capacity-crossing FastPath CreateSandbox code=%s err=%v, want ResourceExhausted", status.Code(err), err)
+			}
+			var pending apiv1alpha2.Sandbox
+			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: thirdRequest.RequestId}, &pending); err != nil {
+				t.Fatalf("capacity rejection must retain the pending Sandbox intent: %v", err)
+			}
+			if pending.DeletionTimestamp != nil {
+				t.Fatalf("capacity-blocked Sandbox intent is deleting instead of pending")
+			}
+
+			scaleCtx, cancelScale := context.WithTimeout(ctx, 120*time.Second)
+			defer cancelScale()
+			if _, err := fixture.WaitForReadyFastletPods(scaleCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 2); err != nil {
+				t.Fatalf("wait for resource commitment scale-out: %v", err)
+			}
+
+			assignments := make(map[string]apiv1alpha2.SandboxComputeResources)
+			for index := 1; index <= 3; index++ {
+				assigned := waitForAssignedSandbox(ctx, t, fixture, namespace, fmt.Sprintf("sb-resource-%d", index))
+				assertResolvedRequestAnnotations(t, pool, assigned)
+				committed := assignments[assigned.Status.Placement.FastletName]
+				cpu := resource.MustParse(assigned.Annotations[assignment.AnnotationResolvedRequestCPU])
+				memory := resource.MustParse(assigned.Annotations[assignment.AnnotationResolvedRequestMemory])
+				committed.CPU.Add(cpu)
+				committed.Memory.Add(memory)
+				assignments[assigned.Status.Placement.FastletName] = committed
+			}
+			if len(assignments) != 2 {
+				t.Fatalf("resource-aware placement used %d Fastlets, want 2: %v", len(assignments), assignments)
+			}
+			capacity, _, err := pool.Spec.SandboxResources.ResolveFastletCapacity(pool.Spec.MaxSandboxesPerPod)
+			if err != nil {
+				t.Fatalf("resolve expected Fastlet capacity: %v", err)
+			}
+			for fastlet, committed := range assignments {
+				if committed.CPU.Cmp(capacity.CPU) > 0 || committed.Memory.Cmp(capacity.Memory) > 0 {
+					t.Fatalf("Fastlet %s committed %s/%s above capacity %s/%s", fastlet,
+						committed.CPU.String(), committed.Memory.String(), capacity.CPU.String(), capacity.Memory.String())
+				}
+			}
+
+			for index := 1; index <= 3; index++ {
+				sandbox := &apiv1alpha2.Sandbox{ObjectMeta: metav1.ObjectMeta{
+					Namespace: namespace,
+					Name:      fmt.Sprintf("sb-resource-%d", index),
+				}}
+				if err := k8sClient.Delete(ctx, sandbox); err != nil {
+					t.Fatalf("delete resource-aware sandbox %d: %v", index, err)
+				}
+				deleteCtx, cancelDelete := context.WithTimeout(ctx, 60*time.Second)
+				if err := fixture.WaitForSandboxDeleted(deleteCtx, types.NamespacedName{Name: sandbox.Name, Namespace: namespace}); err != nil {
+					cancelDelete()
+					t.Fatalf("wait for resource-aware sandbox %d deletion: %v", index, err)
+				}
+				cancelDelete()
+			}
+
+			downCtx, cancelDown := context.WithTimeout(ctx, 150*time.Second)
+			defer cancelDown()
+			if err := waitForFastletPodCount(downCtx, k8sClient, namespace, pool.Name, 1); err != nil {
+				t.Fatalf("wait for stabilized resource-aware scale-down: %v", err)
+			}
+			return ctx
+		}).
+		Feature()
+
+	testSuite.Env().Test(t, feature)
+}
+
+func TestResourceAwareFragmentedCapacityScaling(t *testing.T) {
+	suiteenv.RequireBasic(t)
+
+	feature := features.New("resource-aware-fragmented-capacity-scaling").
+		WithLabel("suite", "scheduling").
+		WithLabel("tier", "smoke").
+		Assess("pool scales when aggregate free resources cannot fit one Sandbox", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+			k8sClient := testSuite.MustKubeClient(t)
+			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
+			namespace := testSuite.AllocateNamespace("resource-fragmented")
+			if err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
+				t.Fatalf("create namespace: %v", err)
+			}
+			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
+
+			pool := createSchedulingPool(namespace, "resource-fragmented-pool", 2, 3, 4)
+			pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+				resource.MustParse("200m"), resource.MustParse("128Mi"), resource.MustParse("2"), resource.MustParse("2"), 64,
+			)
+			pool.Spec.Capacity.BufferMin = 0
+			pool.Spec.Capacity.BufferMax = 0
+			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
+				t.Fatalf("create fragmented-capacity Pool: %v", err)
+			}
+			initialCtx, cancelInitial := context.WithTimeout(ctx, 90*time.Second)
+			defer cancelInitial()
+			if _, err := fixture.WaitForReadyFastletPods(initialCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 2); err != nil {
+				t.Fatalf("wait for two initial Fastlets: %v", err)
+			}
+
+			endpoint, portForward, err := e2eenv.StartControllerPortForward(ctx, testSuite.ControllerNamespace())
+			if err != nil {
+				t.Fatalf("start FastPath port-forward: %v", err)
+			}
+			defer func() {
+				if err := portForward.Cleanup(); err != nil {
+					t.Errorf("cleanup FastPath port-forward: %v", err)
+				}
+			}()
+			connection, err := grpc.DialContext(ctx, endpoint, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+			if err != nil {
+				t.Fatalf("dial FastPath: %v", err)
+			}
+			defer connection.Close()
+			fastPath := fastpathv2.NewFastPathServiceClient(connection)
+
+			placements := make(map[string]int)
+			for index := 1; index <= 6; index++ {
+				name := fmt.Sprintf("sb-fragmented-%d", index)
+				if _, err := fastPath.CreateSandbox(ctx, createResourceAwareFastPathRequest(namespace, name, pool.Name, "", "")); err != nil {
+					t.Fatalf("create default Sandbox %d: %v", index, err)
+				}
+				assigned := waitForAssignedSandbox(ctx, t, fixture, namespace, name)
+				placements[assigned.Status.Placement.FastletName]++
+			}
+			if len(placements) != 2 {
+				t.Fatalf("six default Sandboxes used %d Fastlets, want 2: %v", len(placements), placements)
+			}
+			for fastlet, count := range placements {
+				if count != 3 {
+					t.Fatalf("Fastlet %s has %d default Sandboxes, want 3 before fragmentation test", fastlet, count)
+				}
+			}
+
+			large := createResourceAwareFastPathRequest(namespace, "sb-fragmented-large", pool.Name, "400m", "256Mi")
+			if _, err := fastPath.CreateSandbox(ctx, large); status.Code(err) != codes.ResourceExhausted {
+				t.Fatalf("fragmented FastPath CreateSandbox code=%s err=%v, want ResourceExhausted", status.Code(err), err)
+			}
+			scaleCtx, cancelScale := context.WithTimeout(ctx, 120*time.Second)
+			defer cancelScale()
+			if _, err := fixture.WaitForReadyFastletPods(scaleCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 3); err != nil {
+				t.Fatalf("wait for fragmentation-driven scale-out: %v", err)
+			}
+			assignedLarge := waitForAssignedSandbox(ctx, t, fixture, namespace, large.RequestId)
+			if _, reused := placements[assignedLarge.Status.Placement.FastletName]; reused {
+				t.Fatalf("large Sandbox reused fragmented Fastlet %s instead of new capacity", assignedLarge.Status.Placement.FastletName)
+			}
+			return ctx
+		}).
+		Feature()
+
+	testSuite.Env().Test(t, feature)
+}
+
+func TestResourceAwareMemoryPressureScaling(t *testing.T) {
+	suiteenv.RequireBasic(t)
+
+	feature := features.New("resource-aware-memory-pressure-scaling").
+		WithLabel("suite", "scheduling").
+		WithLabel("tier", "smoke").
+		Assess("blocked heartbeat removes effective capacity and rejects new placement", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+			k8sClient := testSuite.MustKubeClient(t)
+			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
+
+			namespace := testSuite.AllocateNamespace("resource-pressure")
+			if err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
+				t.Fatalf("create namespace: %v", err)
+			}
+			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
+
+			pool := createResourceAwareSchedulingPool(namespace, "resource-pressure-pool")
+			pool.Spec.Capacity.BufferMin = 1
+			pool.Spec.Capacity.BufferMax = 1
+			pool.Spec.FastletTemplate.Spec.Containers[0].Env = []corev1.EnvVar{
+				{Name: "FAST_SANDBOX_MEMORY_OBSERVER_INTERVAL", Value: "250ms"},
+				{Name: "FAST_SANDBOX_MEMORY_HIGH_WATERMARK", Value: "0.01"},
+				{Name: "FAST_SANDBOX_MEMORY_LOW_WATERMARK", Value: "0.005"},
+				{Name: "FAST_SANDBOX_MEMORY_HIGH_SAMPLES", Value: "1"},
+				{Name: "FAST_SANDBOX_MEMORY_RECOVERY_SAMPLES", Value: "1"},
+				{Name: "FAST_SANDBOX_MEMORY_PSI_AVG10_THRESHOLD", Value: "0"},
+				{Name: "FAST_SANDBOX_NODE_MEMORY_LOW_WATERMARK", Value: "0"},
+				{Name: "FAST_SANDBOX_NODE_MEMORY_RECOVERY_WATERMARK", Value: "0"},
+			}
+			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
+				t.Fatalf("create pressured resource-aware pool: %v", err)
+			}
+
+			scaleCtx, cancelScale := context.WithTimeout(ctx, 120*time.Second)
+			defer cancelScale()
+			if _, err := fixture.WaitForReadyFastletPods(scaleCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 2); err != nil {
+				t.Fatalf("wait for pressure-driven replacement capacity: %v", err)
+			}
+
+			// Allow the second Fastlet's blocked admission state to cross the
+			// heartbeat boundary before testing placement.
+			select {
+			case <-ctx.Done():
+				t.Fatalf("wait for blocked Fastlet heartbeats: %v", ctx.Err())
+			case <-time.After(8 * time.Second):
+			}
+
+			sandbox := createSchedulingSandbox(namespace, "sb-pressure-blocked", pool.Name)
+			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox); err != nil {
+				t.Fatalf("create Sandbox under memory pressure: %v", err)
+			}
+			if err := fixture.EnsureSandboxRemainsUnassigned(ctx,
+				types.NamespacedName{Name: sandbox.Name, Namespace: namespace}, 10*time.Second,
+			); err != nil {
+				t.Fatalf("Sandbox should remain unassigned while all Fastlets are memory-blocked: %v", err)
+			}
+			return ctx
+		}).
+		Feature()
+
+	testSuite.Env().Test(t, feature)
+}
+
+func createResourceAwareSchedulingPool(namespace, name string) *apiv1alpha2.SandboxPool {
+	pool := createSchedulingPool(namespace, name, 1, 2, 4)
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("500m"), resource.MustParse("192Mi"), resource.MustParse("5"), resource.MustParse("1.5"), 64,
+	)
+	pool.Spec.FastletTemplate.Spec.Containers[0].Env = []corev1.EnvVar{
+		{Name: "FAST_SANDBOX_MEMORY_HIGH_WATERMARK", Value: "0.99"},
+		{Name: "FAST_SANDBOX_MEMORY_LOW_WATERMARK", Value: "0.95"},
+		{Name: "FAST_SANDBOX_MEMORY_PSI_AVG10_THRESHOLD", Value: "0"},
+		{Name: "FAST_SANDBOX_NODE_MEMORY_LOW_WATERMARK", Value: "0"},
+		{Name: "FAST_SANDBOX_NODE_MEMORY_RECOVERY_WATERMARK", Value: "0"},
+	}
+	return pool
+}
+
+func assertResourceAwareFastletContract(ctx context.Context, t *testing.T, k8sClient client.Client, namespace, pool string) {
+	t.Helper()
+	pods := &corev1.PodList{}
+	if err := k8sClient.List(ctx, pods,
+		client.InNamespace(namespace),
+		client.MatchingLabels{"fast-sandbox.io/pool": pool},
+	); err != nil {
+		t.Fatalf("list resource-aware Fastlets: %v", err)
+	}
+	if len(pods.Items) != 1 {
+		t.Fatalf("initial resource-aware Fastlet count=%d, want 1", len(pods.Items))
+	}
+
+	fastlet := pods.Items[0].Spec.Containers[0]
+	wantCPU := resource.MustParse("600m")
+	wantMemory := resource.MustParse("640Mi")
+	for name, resources := range map[string]corev1.ResourceList{
+		"requests": fastlet.Resources.Requests,
+		"limits":   fastlet.Resources.Limits,
+	} {
+		if got := resources[corev1.ResourceCPU]; got.Cmp(wantCPU) != 0 {
+			t.Fatalf("Fastlet %s CPU=%s, want %s", name, got.String(), wantCPU.String())
+		}
+		if got := resources[corev1.ResourceMemory]; got.Cmp(wantMemory) != 0 {
+			t.Fatalf("Fastlet %s memory=%s, want %s", name, got.String(), wantMemory.String())
+		}
+	}
+
+	capacity, err := fastletsettings.DecodeCommitmentCapacity(pods.Items[0].Annotations[fastletsettings.CommitmentCapacityAnnotation])
+	if err != nil {
+		t.Fatalf("decode Fastlet commitment capacity: %v", err)
+	}
+	wantCapacityCPU := resource.MustParse("400m")
+	wantCapacityMemory := resource.MustParse("512Mi")
+	if capacity.CPU.Cmp(wantCapacityCPU) != 0 || capacity.Memory.Cmp(wantCapacityMemory) != 0 {
+		t.Fatalf("Fastlet commitment capacity=(%s,%s), want (%s,%s)",
+			capacity.CPU.String(), capacity.Memory.String(), wantCapacityCPU.String(), wantCapacityMemory.String())
+	}
+}
+
+func createResourceAwareFastPathRequest(namespace, name, pool, cpuLimit, memoryLimit string) *fastpathv2.CreateSandboxRequest {
+	request := &fastpathv2.CreateSandboxRequest{
+		RequestId: name,
+		Namespace: namespace,
+		Image:     "docker.io/library/alpine:latest",
+		PoolRef:   pool,
+		Command:   []string{"/bin/sleep", "3600"},
+	}
+	if cpuLimit != "" || memoryLimit != "" {
+		request.Resources = &fastpathv2.SandboxResourceRequirements{
+			Limits: &fastpathv2.ComputeResourceProfile{Cpu: cpuLimit, Memory: memoryLimit},
+		}
+	}
+	return request
+}
+
+func assertResolvedRequestAnnotations(t *testing.T, pool *apiv1alpha2.SandboxPool, sandbox *apiv1alpha2.Sandbox) {
+	t.Helper()
+	limits, err := pool.Spec.SandboxResources.ResolveLimits(sandbox.Spec.Resources)
+	if err != nil {
+		t.Fatalf("resolve expected limits for Sandbox %s: %v", sandbox.Name, err)
+	}
+	want, err := pool.Spec.SandboxResources.DeriveRequests(limits)
+	if err != nil {
+		t.Fatalf("derive expected requests for Sandbox %s: %v", sandbox.Name, err)
+	}
+	gotCPU, err := resource.ParseQuantity(sandbox.Annotations[assignment.AnnotationResolvedRequestCPU])
+	if err != nil {
+		t.Fatalf("parse resolved CPU request annotation for Sandbox %s: %v", sandbox.Name, err)
+	}
+	gotMemory, err := resource.ParseQuantity(sandbox.Annotations[assignment.AnnotationResolvedRequestMemory])
+	if err != nil {
+		t.Fatalf("parse resolved memory request annotation for Sandbox %s: %v", sandbox.Name, err)
+	}
+	if gotCPU.Cmp(want.CPU) != 0 || gotMemory.Cmp(want.Memory) != 0 {
+		t.Fatalf("Sandbox %s resolved requests=%s/%s, want %s/%s", sandbox.Name,
+			gotCPU.String(), gotMemory.String(), want.CPU.String(), want.Memory.String())
+	}
+	if got := sandbox.Annotations[assignment.AnnotationResourcePolicyHash]; got != pool.Spec.SandboxResources.Hash() {
+		t.Fatalf("Sandbox %s resource policy hash=%q, want %q", sandbox.Name, got, pool.Spec.SandboxResources.Hash())
+	}
+	gotLimitCPU, err := resource.ParseQuantity(sandbox.Annotations[assignment.AnnotationResolvedLimitCPU])
+	if err != nil {
+		t.Fatalf("parse resolved CPU limit annotation for Sandbox %s: %v", sandbox.Name, err)
+	}
+	gotLimitMemory, err := resource.ParseQuantity(sandbox.Annotations[assignment.AnnotationResolvedLimitMemory])
+	if err != nil {
+		t.Fatalf("parse resolved memory limit annotation for Sandbox %s: %v", sandbox.Name, err)
+	}
+	if gotLimitCPU.Cmp(limits.CPU) != 0 || gotLimitMemory.Cmp(limits.Memory) != 0 {
+		t.Fatalf("Sandbox %s resolved limits=%s/%s, want %s/%s", sandbox.Name,
+			gotLimitCPU.String(), gotLimitMemory.String(), limits.CPU.String(), limits.Memory.String())
+	}
+}
+
+func waitForFastletPodCount(ctx context.Context, k8sClient client.Client, namespace, pool string, want int) error {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		pods := &corev1.PodList{}
+		if err := k8sClient.List(ctx, pods,
+			client.InNamespace(namespace),
+			client.MatchingLabels{"fast-sandbox.io/pool": pool},
+		); err == nil && len(pods.Items) == want {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func createSchedulingPool(namespace, name string, min, max, maxPerPod int32) *apiv1alpha2.SandboxPool {

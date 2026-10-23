@@ -111,9 +111,9 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletError(fastletapi.ErrorRuntimeUnavailable,
 			fmt.Sprintf("target Sandbox runtime is %q, not running", metadata.Phase), true))
 	}
-	image := metadata.Config.Spec.Image
-	if metadata.Config.Spec.Restore != nil {
-		image = metadata.Config.Spec.Restore.ManifestRef
+	image := metadata.Config.Desired.Image
+	if metadata.Config.Desired.Restore != nil {
+		image = metadata.Config.Desired.Restore.ManifestRef
 	}
 	if req.Snapshot.Kind != fastletapi.SnapshotKindCheckpoint && req.Snapshot.TemplateName == "" && !strings.HasPrefix(image, ocitemplate.Prefix) {
 		m.mu.Unlock()

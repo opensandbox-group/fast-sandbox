@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/yaml"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
@@ -86,6 +87,9 @@ func (c Config) Validate() error { //nolint:gocognit // pre-existing sequential 
 			if err := validateHostPaths(binding.HostPaths); err != nil {
 				return fmt.Errorf("environment %s runtime %s: %w", name, runtimeName, err)
 			}
+			if err := validateFastletOverhead(binding.FastletOverhead); err != nil {
+				return fmt.Errorf("environment %s runtime %s: %w", name, runtimeName, err)
+			}
 			if binding.Firecracker != nil {
 				for _, value := range []struct{ field, path string }{
 					{"firecracker.binaryPath", binding.Firecracker.BinaryPath},
@@ -100,6 +104,23 @@ func (c Config) Validate() error { //nolint:gocognit // pre-existing sequential 
 				}
 			}
 		}
+	}
+	return nil
+}
+
+func validateFastletOverhead(overhead corev1.ResourceList) error {
+	if len(overhead) == 0 {
+		return nil
+	}
+	for name := range overhead {
+		if name != corev1.ResourceCPU && name != corev1.ResourceMemory {
+			return fmt.Errorf("fastletOverhead supports only cpu and memory, found %q", name)
+		}
+	}
+	cpu, cpuFound := overhead[corev1.ResourceCPU]
+	memory, memoryFound := overhead[corev1.ResourceMemory]
+	if !cpuFound || !memoryFound || cpu.Sign() < 0 || memory.Sign() < 0 {
+		return errors.New("fastletOverhead requires non-negative cpu and memory")
 	}
 	return nil
 }

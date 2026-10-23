@@ -381,10 +381,10 @@ func (d *Driver) dumpFootprintBytes(plan dumpPlan) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if state.Config.Spec.Memory == "" {
+	if state.Config.Limits.Memory == "" {
 		return 0, fmt.Errorf("sandbox spec carries no memory size")
 	}
-	mib, err := parseMemMiB(state.Config.Spec.Memory)
+	mib, err := parseMemMiB(state.Config.Limits.Memory)
 	if err != nil {
 		return 0, err
 	}
@@ -392,7 +392,7 @@ func (d *Driver) dumpFootprintBytes(plan dumpPlan) (int64, error) {
 	if plan.jailed {
 		rootfs = filepath.Join(plan.jailRoot(), rootfsImageName)
 	}
-	if source, e := restoreReference(state.Config.Spec); e == nil && strings.HasPrefix(source, "oci://") {
+	if source, e := restoreReference(state.Config.Desired); e == nil && strings.HasPrefix(source, "oci://") {
 		rootfs = filepath.Join(filepath.Dir(rootfs), "rootfs.dev")
 	}
 	info, err := d.stat(rootfs)
@@ -400,7 +400,7 @@ func (d *Driver) dumpFootprintBytes(plan dumpPlan) (int64, error) {
 		return 0, err
 	}
 	rootBytes := info.Size()
-	if source, e := restoreReference(state.Config.Spec); e == nil && strings.HasPrefix(source, "oci://") {
+	if source, e := restoreReference(state.Config.Desired); e == nil && strings.HasPrefix(source, "oci://") {
 		// Frozen upper extents, snapfiles and compressed output are staged;
 		// remote parent data is never materialized in local scratch space.
 		home := filepath.Join(d.ociRoot(), "sandboxes", plan.sandboxID, "upper")
@@ -538,7 +538,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 
 	// Resolve the spill area BEFORE pausing: an unspillable dump falls back
 	// up front, never mid-window.
-	spillDir := d.spillDirFor(plan.snapshotID, state.Config.Spec.Memory)
+	spillDir := d.spillDirFor(plan.snapshotID, state.Config.Limits.Memory)
 	plan.spilled = spillDir != ""
 	klog.InfoS("firecracker sandbox dump starting",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID,
@@ -586,7 +586,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		}
 	}
 
-	sourceRef, err := restoreReference(state.Config.Spec)
+	sourceRef, err := restoreReference(state.Config.Desired)
 	if err != nil {
 		return err
 	}
@@ -811,7 +811,7 @@ func (d *Driver) stageTemplateState(ctx context.Context, sandboxUID, staging str
 // state. Provenance is manifest-enforced exactly like the restore import
 // (sha256 + size, stat-first bounded); every rejected posture degrades the
 // clone to the CRD seed and never fails the create.
-func (d *Driver) importTemplateCarry(ctx context.Context, spec fastletapi.SandboxSpec, restoreRef, bundleDir, sandboxUID string) {
+func (d *Driver) importTemplateCarry(ctx context.Context, spec fastletapi.SandboxDesiredSpec, restoreRef, bundleDir, sandboxUID string) {
 	if spec.Restore != nil {
 		return //nolint:nilerr // restores take the restore-import path
 	}
@@ -881,7 +881,7 @@ const maxPolicyBundleBytes = 1 << 20
 // fail-closed and observably — mirroring the corrupt vault file posture at
 // registration. The Handler reads the bundle file itself; the driver only
 // verifies it and hands over the path.
-func (d *Driver) importRestoreVault(ctx context.Context, spec fastletapi.SandboxSpec, restoreRef, vmstatePath, sandboxUID string) {
+func (d *Driver) importRestoreVault(ctx context.Context, spec fastletapi.SandboxDesiredSpec, restoreRef, vmstatePath, sandboxUID string) {
 	if spec.Restore == nil {
 		return
 	}
@@ -925,7 +925,7 @@ func (d *Driver) importRestoreVault(ctx context.Context, spec fastletapi.Sandbox
 // enforced provenance (sha256 + size, stat-first bounded): anything
 // unverified is never delivered, and the restored subject keeps the
 // bootstrap binding policy — the pre-transfer semantics, observably.
-func (d *Driver) importRestorePolicy(ctx context.Context, spec fastletapi.SandboxSpec, restoreRef, vmstatePath, sandboxUID string) {
+func (d *Driver) importRestorePolicy(ctx context.Context, spec fastletapi.SandboxDesiredSpec, restoreRef, vmstatePath, sandboxUID string) {
 	if spec.Restore == nil {
 		return
 	}
@@ -1196,7 +1196,11 @@ func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, ki
 	if err != nil {
 		return 0, err
 	}
-	sourceRef, err := restoreReference(state.Config.Spec)
+	// The lineage manifest of the dump: the golden image manifest of a fresh
+	// boot, or the cached checkpoint manifest when the Sandbox was itself
+	// resumed from a checkpoint (the checkpoint carries every lineage field
+	// forward, and the original image may not exist on this node at all).
+	sourceRef, err := restoreReference(state.Config.Desired)
 	if err != nil {
 		return 0, err
 	}
@@ -1236,7 +1240,7 @@ func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, ki
 	if err != nil {
 		return 0, err
 	}
-	image, err := json.Marshal(state.Config.Spec.Image)
+	image, err := json.Marshal(state.Config.Desired.Image)
 	if err != nil {
 		return 0, err
 	}

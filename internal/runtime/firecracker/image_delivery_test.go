@@ -92,9 +92,9 @@ func (f *driverFixture) installMaterializingAgent(agent *materializingAgent) {
 
 func TestDeliverImageReportsDeliveredWhenCached(t *testing.T) {
 	fixture := newDriverFixture(t)
-	fixture.prepareCachedImage(t, fixture.sandboxSpec.Spec.Image)
+	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
 
-	status, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Spec.Image)
+	status, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Desired.Image)
 	require.NoError(t, err)
 	require.Equal(t, runtimecontract.ImageDelivered, status)
 }
@@ -102,7 +102,7 @@ func TestDeliverImageReportsDeliveredWhenCached(t *testing.T) {
 func TestDeliverImageLocalModeMissingIsImpossible(t *testing.T) {
 	fixture := newDriverFixture(t)
 
-	status, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Spec.Image)
+	status, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Desired.Image)
 	require.ErrorIs(t, err, ErrImageNotReady)
 	require.Equal(t, runtimecontract.ImageDeliveryStatus(""), status)
 
@@ -117,19 +117,19 @@ func TestDeliverImageKicksBackgroundAttemptUntilCommitted(t *testing.T) {
 	fixture.installMaterializingAgent(agent)
 
 	started := time.Now()
-	status, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Spec.Image)
+	status, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Desired.Image)
 	require.NoError(t, err)
 	require.Equal(t, runtimecontract.ImageDelivering, status)
 
 	require.Eventually(t, func() bool {
-		_, resolveErr := resolveRootfsImage(fixture.stateRoot, fixture.sandboxSpec.Spec.Image)
+		_, resolveErr := resolveRootfsImage(fixture.stateRoot, fixture.sandboxSpec.Desired.Image)
 		return resolveErr == nil
 	}, 5*time.Second, 20*time.Millisecond, "background delivery must commit the image")
 
 	require.GreaterOrEqual(t, agent.deliveredPins(), 1)
 	require.Less(t, time.Since(started), 5*time.Second, "DeliverImage must never block on the transfer")
 
-	status, err = fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Spec.Image)
+	status, err = fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Desired.Image)
 	require.NoError(t, err)
 	require.Equal(t, runtimecontract.ImageDelivered, status)
 }
@@ -143,13 +143,13 @@ func TestDeliverImageReportsReplayWithoutLocalCommitAsFailure(t *testing.T) {
 	agent := &materializingAgent{fakeAgentClient: &fakeAgentClient{}, cacheRoot: fixture.stateRoot, noCommit: true}
 	fixture.installMaterializingAgent(agent)
 
-	status, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Spec.Image)
+	status, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Desired.Image)
 	require.NoError(t, err)
 	require.Equal(t, runtimecontract.ImageDelivering, status)
 
 	var reported error
 	require.Eventually(t, func() bool {
-		_, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Spec.Image)
+		_, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Desired.Image)
 		if err != nil {
 			reported = err
 			return true
@@ -169,7 +169,7 @@ func TestDeliverImageIsSingleFlight(t *testing.T) {
 	var statuses = make(chan runtimecontract.ImageDeliveryStatus, 2)
 	for range 2 {
 		go func() {
-			status, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Spec.Image)
+			status, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Desired.Image)
 			require.NoError(t, err)
 			statuses <- status
 		}()
@@ -184,7 +184,7 @@ func TestDeliverImageIsSingleFlight(t *testing.T) {
 			status)
 	}
 	require.Eventually(t, func() bool {
-		_, resolveErr := resolveRootfsImage(fixture.stateRoot, fixture.sandboxSpec.Spec.Image)
+		_, resolveErr := resolveRootfsImage(fixture.stateRoot, fixture.sandboxSpec.Desired.Image)
 		return resolveErr == nil
 	}, 5*time.Second, 20*time.Millisecond)
 	require.Equal(t, 1, agent.deliveredPins(), "concurrent deliveries must coalesce into one attempt")
@@ -192,7 +192,7 @@ func TestDeliverImageIsSingleFlight(t *testing.T) {
 
 func TestDeliverImageRechecksCacheAfterInitialMiss(t *testing.T) {
 	fixture := newDriverFixture(t)
-	image := fixture.sandboxSpec.Spec.Image
+	image := fixture.sandboxSpec.Desired.Image
 	agent := &materializingAgent{fakeAgentClient: &fakeAgentClient{}, cacheRoot: fixture.stateRoot}
 	fixture.installMaterializingAgent(agent)
 	fixture.driver.newAgentClient = func(string) (AgentClient, error) {
@@ -228,14 +228,14 @@ func TestDeliverImageReportsFailureOnceThenRecoversAfterWindow(t *testing.T) {
 	boom := errors.New("remote image index 404")
 
 	agent.setPinErr(boom)
-	status, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Spec.Image)
+	status, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Desired.Image)
 	require.NoError(t, err)
 	require.Equal(t, runtimecontract.ImageDelivering, status)
 
 	// The finished attempt failure is reported at most once per window.
 	var reported error
 	require.Eventually(t, func() bool {
-		_, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Spec.Image)
+		_, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Desired.Image)
 		if err != nil {
 			reported = err
 			return true
@@ -245,18 +245,18 @@ func TestDeliverImageReportsFailureOnceThenRecoversAfterWindow(t *testing.T) {
 	require.ErrorIs(t, reported, boom)
 
 	// Within the window the failure stays sticky (no doomed new attempt).
-	_, err = fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Spec.Image)
+	_, err = fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Desired.Image)
 	require.ErrorIs(t, err, boom)
 
 	// After the window a fresh attempt runs; once the remote recovers the
 	// image is delivered.
 	time.Sleep(400 * time.Millisecond)
 	agent.setPinErr(nil)
-	status, err = fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Spec.Image)
+	status, err = fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Desired.Image)
 	require.NoError(t, err)
 	require.Equal(t, runtimecontract.ImageDelivering, status)
 	require.Eventually(t, func() bool {
-		_, resolveErr := resolveRootfsImage(fixture.stateRoot, fixture.sandboxSpec.Spec.Image)
+		_, resolveErr := resolveRootfsImage(fixture.stateRoot, fixture.sandboxSpec.Desired.Image)
 		return resolveErr == nil
 	}, 5*time.Second, 20*time.Millisecond)
 }
@@ -270,7 +270,7 @@ func TestDeliverImageReportsFailureOnceThenRecoversAfterWindow(t *testing.T) {
 // snapshot check then release-destroyed a network slot per attempt.
 func TestDeliverImagePartialCacheIsNotDelivered(t *testing.T) {
 	fixture := newDriverFixture(t)
-	image := fixture.sandboxSpec.Spec.Image
+	image := fixture.sandboxSpec.Desired.Image
 	dir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(image))
 	require.NoError(t, os.MkdirAll(dir, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, rootfsImageName), []byte("rootfs-image-data"), 0o640))
@@ -316,17 +316,17 @@ func TestDeliverCheckpointRejectsIncompleteAddress(t *testing.T) {
 }
 
 func TestRestoreReferenceUsesCheckpointDigest(t *testing.T) {
-	reference, err := restoreReference(fastletapi.SandboxSpec{
+	reference, err := restoreReference(fastletapi.SandboxDesiredSpec{
 		Image:   "app:v1",
 		Restore: &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/m.json", ArtifactDigest: "digest-cp"},
 	})
 	require.NoError(t, err)
 	require.Equal(t, artifacts.CheckpointReference("digest-cp"), reference)
 
-	reference, err = restoreReference(fastletapi.SandboxSpec{Image: "app:v1"})
+	reference, err = restoreReference(fastletapi.SandboxDesiredSpec{Image: "app:v1"})
 	require.NoError(t, err)
 	require.Equal(t, "app:v1", reference)
 
-	_, err = restoreReference(fastletapi.SandboxSpec{Image: "app:v1", Restore: &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/m.json"}})
+	_, err = restoreReference(fastletapi.SandboxDesiredSpec{Image: "app:v1", Restore: &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/m.json"}})
 	require.ErrorContains(t, err, "restore requires manifestRef and artifactDigest")
 }

@@ -115,23 +115,42 @@ makes upgrades and rollback explicit.
 
 Kata supports Infra delivery through OCI bind mounts, image/template baking, preinstalled artifacts, or runtime-specific guest copy.
 
-## Fixed Pool resources and aggregate overcommit
+## Pool policy and per-Sandbox limits
 
-Every Sandbox in one Pool uses the same immutable CPU, memory, and PID limits. Fastlet passes those values to the selected RuntimeDriver and is the enforcement boundary.
+Legacy Pools apply one fixed CPU, memory, and PID profile to every Sandbox.
+ResourceAware Pools use that flat profile as the default limit but may accept
+different per-Sandbox CPU and memory limits. Callers never provide requests;
+Fast Sandbox derives them from separate Pool CPU and memory overcommit ratios.
 
-By default, the Pool Controller sizes both the request and limit of the
-resource-owning Fastlet from:
+For a ResourceAware Pool, the Controller derives a pure Sandbox commitment
+capacity, a child-runtime budget, and a runtime-owner envelope:
 
 ```text
-per-Sandbox resources * maxSandboxesPerPod + runtime overhead
+defaultRequest = ceil(defaultLimit / overcommitRatio)
+
+commitmentCapacity = defaultRequest * maxSandboxesPerPod
+
+sandboxRuntimeBudget = max(commitmentCapacity, default per-Sandbox limit)
+
+runtimeEnvelope = sandboxRuntimeBudget + fixedFastletOverhead
+
+runtimeOwner.requests = runtimeOwner.limits = runtimeEnvelope
 ```
 
-This default does not overcommit. An operator can opt into aggregate CPU or
-memory overcommit by setting a lower limit on the resource-owning container in
-`fastletTemplate`. For example, ten Sandboxes can each retain a `1` CPU limit
-while the Fastlet runtime owner has a `5` CPU aggregate limit. Per-Sandbox
-limits still isolate noisy neighbors, while the Kubernetes Pod cgroup caps
+The first Fastlet container cannot override CPU or memory in ResourceAware
+mode. The platform runtime binding selects the fixed overhead added once per
+Fastlet Pod. Operators select Sandbox density through independent Pool CPU and
+memory ratios, while `maxSandboxesPerPod` remains a hard Sandbox-count bound.
+LegacySlot Pools retain explicit aggregate first-container resources.
+CPU and memory commitments are checked separately before every Create.
+Per-Sandbox limits isolate noisy neighbors, and the Kubernetes Pod cgroup caps
 their combined execution.
+
+Fastlet also observes its runtime-owner memory cgroup. Sustained high usage,
+memory PSI, a new OOM event, or node memory pressure blocks new admissions;
+low-watermark recovery reopens admission. CPU remains a hard static
+commitment dimension, but live CPU pressure is not a hard gate in the first
+resource-aware version.
 
 Containerd-backed runtimes do not remain in containerd's top-level cgroup.
 Fastlet discovers its Kubernetes Pod cgroup from the Pod UID and the mounted
@@ -144,11 +163,12 @@ Deletion is not considered complete until the runtime process has left and
 the deterministic Sandbox cgroup can be removed.
 
 All long-running containers in the Fastlet Pod must have CPU and memory
-limits, otherwise Kubernetes cannot guarantee a bounded Pod parent cgroup.
-Fast Sandbox supplies bounded defaults for platform-owned control/proxy
-containers and rejects an unbounded user-provided sidecar. A configured
-aggregate limit may be lower than the sum of Sandbox limits, but not lower
-than the runtime's fixed overhead.
+limits, otherwise Kubernetes cannot guarantee bounded Pod execution. Fast
+Sandbox supplies bounded defaults for platform-owned control/proxy containers
+and rejects an unbounded user-provided sidecar. The derived runtime-owner
+envelope may be lower than the sum of Sandbox limits, but it always covers at
+least one default Sandbox limit. A caller limit above that envelope is
+rejected.
 
 A runtime that cannot enforce the requested profile must reject the Pool capability instead of silently weakening isolation.
 

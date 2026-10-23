@@ -140,11 +140,12 @@ func (c *agentHTTPClient) LeaseDevices(ctx context.Context, requestID string, co
 		return Lease{}, fmt.Errorf("%w: sandbox spec is required", runtimecontract.ErrInvalidConfig)
 	}
 	identity := config.Identity
-	spec := config.Spec
+	spec := config.Desired
+	limits := config.Limits
 	var response agentprotocol.LeaseDevicesResponse
 	if err := c.doJSON(ctx, agentprotocol.RouteLeaseDevices, agentprotocol.LeaseDevicesRequest{
 		Identity: c.identity(requestID), SandboxID: identity.SandboxUID, Image: spec.Image,
-		MemSizeMiB: defaultMemoryMiB(spec.Memory), RootfsWritable: false,
+		MemSizeMiB: defaultMemoryMiB(limits.Memory), RootfsWritable: false,
 	}, &response); err != nil {
 		return Lease{}, err
 	}

@@ -16,14 +16,20 @@ data:
         kubelet:
           root: /var/lib/kubelet
         runtimes:
-          container: {}
-          gvisor: {}
-          kata-qemu: {}
-          kata-clh: {}
+          container:
+            fastletOverhead: {cpu: 100m, memory: 128Mi}
+          gvisor:
+            fastletOverhead: {cpu: 200m, memory: 256Mi}
+          kata-qemu:
+            fastletOverhead: {cpu: 250m, memory: 256Mi}
+          kata-clh:
+            fastletOverhead: {cpu: 250m, memory: 256Mi}
           kata-fc:
+            fastletOverhead: {cpu: 250m, memory: 256Mi}
             snapshotter: blockfile
             configPath: /opt/kata/share/defaults/kata-containers/configuration-fc-fast-sandbox.toml
           kata-dragonball:
+            fastletOverhead: {cpu: 250m, memory: 256Mi}
             configPath: /opt/kata/share/defaults/kata-containers/runtime-rs/configuration-dragonball-fast-sandbox.toml
           # Firecracker on-demand loading: the node-level runtime-agent pulls
           # the golden snapshot set from the artifact store into StateRoot,
@@ -32,6 +38,7 @@ data:
           # the agent's readiness loop. No kernelPath: restore never boots a
           # kernel; direct-boot operators pin one here.
           firecracker:
+            fastletOverhead: {cpu: 250m, memory: 256Mi}
             firecracker:
               binaryPath: /opt/fast-sandbox/firecracker/firecracker
               jailerPath: /opt/fast-sandbox/firecracker/jailer

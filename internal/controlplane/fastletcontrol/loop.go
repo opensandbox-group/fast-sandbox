@@ -13,6 +13,7 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/controlplane/placement"
+	"fast-sandbox/internal/fastletsettings"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
 
@@ -167,6 +168,13 @@ func (l *Loop) onPodDelete(object any) {
 }
 
 func fastletInfoFromPod(pod *corev1.Pod) placement.FastletInfo {
+	resourceCapacity := placement.ResourceDemand{}
+	if encoded := pod.Annotations[fastletsettings.CommitmentCapacityAnnotation]; encoded != "" {
+		if decoded, err := fastletsettings.DecodeCommitmentCapacity(encoded); err == nil {
+			resourceCapacity.CPU = decoded.CPU
+			resourceCapacity.Memory = decoded.Memory
+		}
+	}
 	return placement.FastletInfo{
 		ID: placement.FastletID(pod.Name), Namespace: pod.Namespace,
 		PodName: pod.Name, PodUID: string(pod.UID), PodIP: pod.Status.PodIP,
@@ -176,6 +184,7 @@ func fastletInfoFromPod(pod *corev1.Pod) placement.FastletInfo {
 		ResourceProfileHash: pod.Annotations["fast-sandbox.io/resource-profile-hash"],
 		InfraRevision:       pod.Annotations["fast-sandbox.io/infra-revision"],
 		FastletRevision:     pod.Annotations[placement.AnnotationPodTemplateHash],
+		ResourceCapacity:    resourceCapacity,
 		DrainRequested:      placement.PodDrainRequested(pod),
 		Draining:            placement.PodDrainRequested(pod),
 		PodReady:            pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" && podConditionTrue(pod.Status.Conditions, corev1.PodReady),

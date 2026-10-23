@@ -32,3 +32,19 @@ func TestSameRuntimeIdentityIncludesEveryFence(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateProfileIncludesResolvedRuntimeLimits(t *testing.T) {
+	config := fastletapi.RuntimeSandboxConfig{
+		Identity: fastletapi.SandboxIdentity{SandboxUID: "sandbox-a"},
+		Desired: fastletapi.SandboxDesiredSpec{
+			RuntimeProfileHash: "runtime-a", ResourceProfileHash: "resources-a", InfraRevision: "infra-a",
+		},
+		Limits: fastletapi.SandboxRuntimeLimits{CPU: "2", Memory: "5Gi", PIDs: 256},
+	}
+	existing := &Metadata{Config: config}
+	require.NoError(t, ValidateProfile(existing, &config))
+
+	changed := config
+	changed.Limits.Memory = "6Gi"
+	require.ErrorIs(t, ValidateProfile(existing, &changed), ErrSandboxProfileMismatch)
+}

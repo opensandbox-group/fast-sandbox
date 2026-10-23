@@ -27,13 +27,37 @@ const (
 	RuntimeFirecracker RuntimeName = "firecracker"
 )
 
-// SandboxResourceProfile defines the fixed resource limit for every Sandbox in
-// a Pool. Fastlet is the component that enforces these values at runtime.
-type SandboxResourceProfile struct {
+// SandboxComputeResources is one CPU and memory resource vector.
+type SandboxComputeResources struct {
 	CPU    resource.Quantity `json:"cpu"`
 	Memory resource.Quantity `json:"memory"`
+}
+
+// SandboxResourceProfile defines the default per-Sandbox runtime limit and,
+// in ResourceAware mode, the policy used to derive admission commitments.
+// Omitting Mode preserves the historical LegacySlot interpretation.
+type SandboxResourceProfile struct {
+	// +kubebuilder:validation:Enum=LegacySlot;ResourceAware
+	Mode SandboxResourceMode `json:"mode,omitempty"`
+
+	// CPU and Memory are runtime limits. ResourceAware Sandboxes may override
+	// them per request; otherwise they are the defaults.
+	CPU    *resource.Quantity `json:"cpu,omitempty"`
+	Memory *resource.Quantity `json:"memory,omitempty"`
+
+	// OvercommitRatio derives commitment requests from runtime limits. It is
+	// required only in ResourceAware mode and remains separate for CPU and
+	// memory because the resources have different pressure policies.
+	OvercommitRatio *SandboxOvercommitRatio `json:"overcommitRatio,omitempty"`
+
 	// +kubebuilder:validation:Minimum=1
 	PIDs int64 `json:"pids"`
+}
+
+// SandboxOvercommitRatio controls per-resource request derivation.
+type SandboxOvercommitRatio struct {
+	CPU    resource.Quantity `json:"cpu"`
+	Memory resource.Quantity `json:"memory"`
 }
 
 // InfraRestartPolicy controls process restart after exit.
@@ -250,13 +274,44 @@ type SandboxPoolStatus struct {
 	IdleFastlets int32 `json:"idleFastlets,omitempty"`
 	BusyFastlets int32 `json:"busyFastlets,omitempty"`
 
-	RuntimeRevision  string `json:"runtimeRevision,omitempty"`
-	InfraRevision    string `json:"infraRevision,omitempty"`
-	FastletRevision  string `json:"fastletRevision,omitempty"`
-	PreparedFastlets int32  `json:"preparedFastlets,omitempty"`
+	Fastlets          *SandboxPoolFastletSummary  `json:"fastlets,omitempty"`
+	Resources         *SandboxPoolResourceSummary `json:"resources,omitempty"`
+	Sandboxes         *SandboxPoolSandboxSummary  `json:"sandboxes,omitempty"`
+	SummaryObservedAt *metav1.Time                `json:"summaryObservedAt,omitempty"`
 
-	WarmImages []WarmImageStatus  `json:"warmImages,omitempty"`
-	Conditions []metav1.Condition `json:"conditions,omitempty"`
+	RuntimeRevision  string             `json:"runtimeRevision,omitempty"`
+	InfraRevision    string             `json:"infraRevision,omitempty"`
+	FastletRevision  string             `json:"fastletRevision,omitempty"`
+	PreparedFastlets int32              `json:"preparedFastlets,omitempty"`
+	WarmImages       []WarmImageStatus  `json:"warmImages,omitempty"`
+	Conditions       []metav1.Condition `json:"conditions,omitempty"`
+}
+
+type SandboxPoolFastletSummary struct {
+	Desired  int32 `json:"desired,omitempty"`
+	Current  int32 `json:"current,omitempty"`
+	Ready    int32 `json:"ready,omitempty"`
+	Idle     int32 `json:"idle,omitempty"`
+	Busy     int32 `json:"busy,omitempty"`
+	Draining int32 `json:"draining,omitempty"`
+}
+
+// SandboxPoolResourceSummary reports request-based commitment accounting.
+// Free is schedulable commitment, not host OS idle CPU or memory.
+type SandboxPoolResourceSummary struct {
+	Capacity  SandboxComputeResources `json:"capacity"`
+	Committed SandboxComputeResources `json:"committed"`
+	Free      SandboxComputeResources `json:"free"`
+}
+
+type SandboxPoolSandboxSummary struct {
+	Total       int32 `json:"total,omitempty"`
+	Assigned    int32 `json:"assigned,omitempty"`
+	Pending     int32 `json:"pending,omitempty"`
+	Running     int32 `json:"running,omitempty"`
+	Paused      int32 `json:"paused,omitempty"`
+	Terminating int32 `json:"terminating,omitempty"`
+	Failed      int32 `json:"failed,omitempty"`
 }
 
 // WarmImageStatus aggregates cache state for one configured warm image.
@@ -272,9 +327,10 @@ type WarmImageStatus struct {
 
 // Pool condition types
 const (
-	PoolConditionRuntimeReady  = "RuntimeReady"
-	PoolConditionInfraReady    = "InfraReady"
-	PoolConditionRegistryReady = "RegistryReady"
+	PoolConditionRuntimeReady       = "RuntimeReady"
+	PoolConditionInfraReady         = "InfraReady"
+	PoolConditionRegistryReady      = "RegistryReady"
+	PoolConditionScaleDownCandidate = "ScaleDownCandidate"
 )
 
 // Pool condition reasons
@@ -289,6 +345,8 @@ const (
 	ReasonInfraComponentsAvailable = "InfraComponentsAvailable"
 	ReasonRegistryInvalid          = "RegistryInvalid"
 	ReasonRegistryAvailable        = "RegistryAvailable"
+	ReasonExcessCapacity           = "ExcessCapacity"
+	ReasonDemandReturned           = "DemandReturned"
 )
 
 // +kubebuilder:object:root=true

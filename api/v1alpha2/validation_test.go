@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
@@ -19,11 +20,9 @@ func TestValidateRuntime(t *testing.T) {
 func TestValidateSandboxPoolUpdate(t *testing.T) {
 	base := SandboxPoolSpec{
 		Runtime: RuntimeContainer,
-		SandboxResources: SandboxResourceProfile{
-			CPU:    resource.MustParse("1"),
-			Memory: resource.MustParse("1Gi"),
-			PIDs:   256,
-		},
+		SandboxResources: NewLegacySandboxResourceProfile(
+			resource.MustParse("1"), resource.MustParse("1Gi"), 256,
+		),
 	}
 
 	same := *base.DeepCopy()
@@ -34,13 +33,17 @@ func TestValidateSandboxPoolUpdate(t *testing.T) {
 	require.ErrorIs(t, ValidateSandboxPoolUpdate(&base, &runtimeChanged), ErrRuntimeImmutable)
 
 	resourcesChanged := *base.DeepCopy()
-	resourcesChanged.SandboxResources.Memory = resource.MustParse("2Gi")
+	changedMemory := resource.MustParse("2Gi")
+	resourcesChanged.SandboxResources.Memory = &changedMemory
 	require.ErrorIs(t, ValidateSandboxPoolUpdate(&base, &resourcesChanged), ErrResourcesImmutable)
 }
 
 func TestValidateActionHandlersAndRejectRemoval(t *testing.T) {
 	handler := ActionHandler{Name: "egress", TargetHTTPPort: 18080}
-	base := SandboxPoolSpec{Runtime: RuntimeContainer, ActionHandlers: []ActionHandler{handler}}
+	base := SandboxPoolSpec{
+		Runtime: RuntimeContainer, ActionHandlers: []ActionHandler{handler},
+		SandboxResources: NewLegacySandboxResourceProfile(resource.MustParse("1"), resource.MustParse("1Gi"), 128),
+	}
 	require.NoError(t, base.ValidateActionHandlers())
 
 	duplicate := base
@@ -145,21 +148,76 @@ func TestValidateHostProcessInfraComponent(t *testing.T) {
 }
 
 func TestSandboxResourceProfileHashIsCanonical(t *testing.T) {
-	a := SandboxResourceProfile{CPU: resource.MustParse("1"), Memory: resource.MustParse("1024Mi"), PIDs: 256}
-	b := SandboxResourceProfile{CPU: resource.MustParse("1000m"), Memory: resource.MustParse("1Gi"), PIDs: 256}
+	a := NewLegacySandboxResourceProfile(resource.MustParse("1"), resource.MustParse("1024Mi"), 256)
+	b := NewLegacySandboxResourceProfile(resource.MustParse("1000m"), resource.MustParse("1Gi"), 256)
 	require.Equal(t, a.Hash(), b.Hash())
 	b.PIDs++
 	require.NotEqual(t, a.Hash(), b.Hash())
+
+	awareA := NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("2"), resource.MustParse("10Gi"), resource.MustParse("2"), resource.MustParse("2"), 256,
+	)
+	awareB := NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("2000m"), resource.MustParse("10240Mi"), resource.MustParse("2.0"), resource.MustParse("2000m"), 256,
+	)
+	require.Equal(t, awareA.Hash(), awareB.Hash())
+	require.NotEqual(t, a.Hash(), awareA.Hash())
 }
 
 func TestValidateSandboxResourceProfile(t *testing.T) {
-	valid := SandboxResourceProfile{CPU: resource.MustParse("500m"), Memory: resource.MustParse("256Mi"), PIDs: 128}
-	require.NoError(t, ValidateSandboxResourceProfile(valid))
+	legacy := NewLegacySandboxResourceProfile(resource.MustParse("500m"), resource.MustParse("256Mi"), 128)
+	require.NoError(t, ValidateSandboxResourceProfile(legacy))
+	require.Equal(t, SandboxResourceModeLegacySlot, legacy.ResourceMode())
+
+	aware := NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("500m"), resource.MustParse("256Mi"), resource.MustParse("2"), resource.MustParse("2"), 128,
+	)
+	require.NoError(t, ValidateSandboxResourceProfile(aware))
+	require.Equal(t, SandboxResourceModeResourceAware, aware.ResourceMode())
+	requests, ok := aware.RequestResources()
+	require.True(t, ok)
+	require.Equal(t, "250m", requests.CPU.String())
+	require.Equal(t, "128Mi", requests.Memory.String())
+
 	require.ErrorIs(t, ValidateSandboxResourceProfile(SandboxResourceProfile{}), ErrInvalidSandboxResourceProfile)
-	require.ErrorIs(t, ValidateSandboxResourceProfile(SandboxResourceProfile{
-		CPU: resource.MustParse("1"),
-	}), ErrInvalidSandboxResourceProfile)
-	require.ErrorIs(t, ValidateSandboxResourceProfile(SandboxResourceProfile{
-		CPU: resource.MustParse("1m"), Memory: resource.MustParse("256Mi"), PIDs: 128,
-	}), ErrInvalidSandboxResourceProfile)
+	missingMemory := resource.MustParse("1Gi")
+	require.ErrorIs(t, ValidateSandboxResourceProfile(SandboxResourceProfile{Memory: &missingMemory, PIDs: 128}), ErrInvalidSandboxResourceProfile)
+	require.ErrorIs(t, ValidateSandboxResourceProfile(NewLegacySandboxResourceProfile(
+		resource.MustParse("1m"), resource.MustParse("256Mi"), 128,
+	)), ErrInvalidSandboxResourceProfile)
+
+	mixed := legacy
+	mixed.Mode = SandboxResourceModeResourceAware
+	require.ErrorIs(t, ValidateSandboxResourceProfile(mixed), ErrInvalidSandboxResourceProfile)
+
+	invalidRatio := aware
+	invalidRatio.OvercommitRatio = &SandboxOvercommitRatio{CPU: resource.MustParse("0.5"), Memory: resource.MustParse("1")}
+	require.ErrorIs(t, ValidateSandboxResourceProfile(invalidRatio), ErrInvalidSandboxResourceProfile)
+
+	rounded := NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("1"), resource.MustParse("5Gi"), resource.MustParse("3"), resource.MustParse("1.25"), 128,
+	)
+	roundedRequests, ok := rounded.RequestResources()
+	require.True(t, ok)
+	require.Equal(t, "334m", roundedRequests.CPU.String())
+	require.Equal(t, "4Gi", roundedRequests.Memory.String())
+}
+
+func TestValidateResourceContractBranchesByMode(t *testing.T) {
+	legacy := SandboxPoolSpec{
+		SandboxResources: NewLegacySandboxResourceProfile(resource.MustParse("1"), resource.MustParse("1Gi"), 128),
+		FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name: "fastlet", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}},
+		}}}},
+	}
+	require.NoError(t, legacy.ValidateResourceContract(), "LegacySlot retains explicit aggregate resources")
+
+	resourceAware := legacy
+	resourceAware.SandboxResources = NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("2"), resource.MustParse("5Gi"), resource.MustParse("8"), resource.MustParse("1.25"), 128,
+	)
+	require.ErrorIs(t, resourceAware.ValidateResourceContract(), ErrRuntimeOwnerResources)
+
+	resourceAware.FastletTemplate.Spec.Containers[0].Resources = corev1.ResourceRequirements{}
+	require.NoError(t, resourceAware.ValidateResourceContract())
 }

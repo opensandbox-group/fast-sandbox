@@ -1,6 +1,7 @@
 package fastlet
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -14,13 +15,12 @@ const (
 	UserProcessStartUnknown               UserProcessStartSource = "unknown"
 )
 
-// SandboxSpec is the desired runtime configuration sent to a Fastlet. Runtime
-// identity and fencing are owned exclusively by SandboxIdentity.
-type SandboxSpec struct {
+// SandboxDesiredSpec is caller-owned desired state sent to a Fastlet. Runtime
+// identity and fencing are owned exclusively by SandboxIdentity. Resolved
+// resources travel separately and are validated against the immutable Fastlet
+// resource profile before RuntimeSandboxConfig is built.
+type SandboxDesiredSpec struct {
 	Image               string            `json:"image"`
-	CPU                 string            `json:"cpu,omitempty"`
-	Memory              string            `json:"memory,omitempty"`
-	PIDs                int64             `json:"pids,omitempty"`
 	RuntimeProfileHash  string            `json:"runtimeProfileHash,omitempty"`
 	ResourceProfileHash string            `json:"resourceProfileHash,omitempty"`
 	InfraRevision       string            `json:"infraRevision,omitempty"`
@@ -33,6 +33,45 @@ type SandboxSpec struct {
 	// scratch: the driver delivers and validates the set, loads vmstate and
 	// memory, and resumes the guest. Only a Sandbox resume produces it.
 	Restore *RestoreSpec `json:"restore,omitempty"`
+}
+
+func (s SandboxDesiredSpec) DeepCopy() SandboxDesiredSpec {
+	copied := s
+	copied.Command = append([]string(nil), s.Command...)
+	copied.Args = append([]string(nil), s.Args...)
+	if s.Env != nil {
+		copied.Env = make(map[string]string, len(s.Env))
+		for key, value := range s.Env {
+			copied.Env[key] = value
+		}
+	}
+	if s.Restore != nil {
+		restore := *s.Restore
+		copied.Restore = &restore
+	}
+	return copied
+}
+
+// SandboxRuntimeLimits is the Fastlet-resolved resource boundary consumed by
+// RuntimeDriver implementations. It is never accepted from an HTTP caller.
+type SandboxRuntimeLimits struct {
+	CPU    string `json:"cpu,omitempty"`
+	Memory string `json:"memory,omitempty"`
+	PIDs   int64  `json:"pids,omitempty"`
+}
+
+// SandboxResourceVector is a CPU and memory vector on the internal wire.
+type SandboxResourceVector struct {
+	CPU    string `json:"cpu"`
+	Memory string `json:"memory"`
+}
+
+// ResolvedSandboxResources is the Controller-resolved admission and runtime
+// contract. Fastlet validates Requests against Limits and its immutable Pool
+// policy before reserving either resource.
+type ResolvedSandboxResources struct {
+	Requests SandboxResourceVector `json:"requests"`
+	Limits   SandboxRuntimeLimits  `json:"limits"`
 }
 
 // RestoreSpec selects the checkpoint artifact set a runtime is restored
@@ -51,8 +90,47 @@ type RestoreSpec struct {
 // configuration. The two authorities remain explicitly nested so runtime
 // implementations cannot silently merge or overwrite duplicate fields.
 type RuntimeSandboxConfig struct {
-	Identity SandboxIdentity `json:"identity"`
-	Spec     SandboxSpec     `json:"spec"`
+	Identity SandboxIdentity      `json:"identity"`
+	Desired  SandboxDesiredSpec   `json:"desired"`
+	Limits   SandboxRuntimeLimits `json:"limits"`
+}
+
+// UnmarshalJSON keeps durable runtime state written before desired state and
+// resolved limits were separated readable during an in-place Fastlet upgrade.
+// HTTP Create requests do not use RuntimeSandboxConfig and therefore do not
+// inherit this compatibility path.
+func (c *RuntimeSandboxConfig) UnmarshalJSON(data []byte) error {
+	type legacyRuntimeSandboxSpec struct {
+		SandboxDesiredSpec
+		CPU    string `json:"cpu,omitempty"`
+		Memory string `json:"memory,omitempty"`
+		PIDs   int64  `json:"pids,omitempty"`
+	}
+	var wire struct {
+		Identity SandboxIdentity           `json:"identity"`
+		Desired  *SandboxDesiredSpec       `json:"desired"`
+		Limits   *SandboxRuntimeLimits     `json:"limits"`
+		Spec     *legacyRuntimeSandboxSpec `json:"spec"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if wire.Desired != nil && wire.Spec != nil {
+		return errors.New("runtime Sandbox config cannot contain both desired and legacy spec")
+	}
+	*c = RuntimeSandboxConfig{Identity: wire.Identity}
+	if wire.Spec != nil {
+		c.Desired = wire.Spec.SandboxDesiredSpec
+		c.Limits = SandboxRuntimeLimits{CPU: wire.Spec.CPU, Memory: wire.Spec.Memory, PIDs: wire.Spec.PIDs}
+		return nil
+	}
+	if wire.Desired != nil {
+		c.Desired = *wire.Desired
+	}
+	if wire.Limits != nil {
+		c.Limits = *wire.Limits
+	}
+	return nil
 }
 
 // EnsureSandboxInput represents one idempotent Ensure call. RequestID
@@ -209,6 +287,7 @@ const (
 
 type FastletError struct {
 	Code      FastletErrorCode `json:"code"`
+	Reason    AdmissionReason  `json:"reason,omitempty"`
 	Message   string           `json:"message"`
 	Retryable bool             `json:"retryable"`
 	Cause     error            `json:"-"`
@@ -240,20 +319,59 @@ type SandboxIdentity struct {
 }
 
 type AdmissionStatus struct {
-	Capacity int `json:"capacity"`
-	Creating int `json:"creating"`
-	Running  int `json:"running"`
-	Deleting int `json:"deleting"`
-	Used     int `json:"used"`
+	Capacity  int                      `json:"capacity"`
+	Creating  int                      `json:"creating"`
+	Running   int                      `json:"running"`
+	Deleting  int                      `json:"deleting"`
+	Used      int                      `json:"used"`
+	Resources *ResourceAdmissionStatus `json:"resources,omitempty"`
+}
+
+type AdmissionState string
+
+const (
+	AdmissionStateOpen     AdmissionState = "OPEN"
+	AdmissionStateDegraded AdmissionState = "DEGRADED"
+	AdmissionStateBlocked  AdmissionState = "BLOCKED"
+	AdmissionStateUnknown  AdmissionState = "UNKNOWN"
+)
+
+type AdmissionReason string
+
+const (
+	AdmissionReasonSlotFull                   AdmissionReason = "SLOT_FULL"
+	AdmissionReasonStaticCPUExhausted         AdmissionReason = "STATIC_CPU_EXHAUSTED"
+	AdmissionReasonStaticMemoryExhausted      AdmissionReason = "STATIC_MEMORY_EXHAUSTED"
+	AdmissionReasonFastletMemoryHighWatermark AdmissionReason = "FASTLET_MEMORY_HIGH_WATERMARK"
+	AdmissionReasonFastletMemoryPSI           AdmissionReason = "FASTLET_MEMORY_PSI"
+	AdmissionReasonFastletOOMEvent            AdmissionReason = "FASTLET_OOM_EVENT"
+	AdmissionReasonNodeMemoryPressure         AdmissionReason = "NODE_MEMORY_PRESSURE"
+	AdmissionReasonCPUSaturation              AdmissionReason = "CPU_SATURATION"
+	AdmissionReasonCPUThrottling              AdmissionReason = "CPU_THROTTLING"
+	AdmissionReasonTelemetryStale             AdmissionReason = "TELEMETRY_STALE"
+	AdmissionReasonTelemetryMissing           AdmissionReason = "TELEMETRY_MISSING"
+	AdmissionReasonRecoveryIncomplete         AdmissionReason = "RECOVERY_INCOMPLETE"
+	AdmissionReasonUnsupportedProtocol        AdmissionReason = "UNSUPPORTED_PROTOCOL"
+)
+
+type ResourceAdmissionStatus struct {
+	Version   string                `json:"version"`
+	Epoch     string                `json:"epoch"`
+	Revision  uint64                `json:"revision"`
+	Capacity  SandboxResourceVector `json:"capacity"`
+	Committed SandboxResourceVector `json:"committed"`
+	State     AdmissionState        `json:"state"`
+	Reason    AdmissionReason       `json:"reason,omitempty"`
 }
 
 type CreateSandboxRequest struct {
-	RequestID      string               `json:"requestId,omitempty"`
-	Identity       SandboxIdentity      `json:"identity"`
-	Sandbox        SandboxSpec          `json:"sandbox"`
-	SpecGeneration int64                `json:"specGeneration,omitempty"`
-	ActionBindings []ActionBindingInput `json:"actionBindings,omitempty"`
-	Completion     CreateCompletion     `json:"completion,omitempty"`
+	RequestID      string                    `json:"requestId,omitempty"`
+	Identity       SandboxIdentity           `json:"identity"`
+	Sandbox        SandboxDesiredSpec        `json:"sandbox"`
+	Resources      *ResolvedSandboxResources `json:"resources,omitempty"`
+	SpecGeneration int64                     `json:"specGeneration,omitempty"`
+	ActionBindings []ActionBindingInput      `json:"actionBindings,omitempty"`
+	Completion     CreateCompletion          `json:"completion,omitempty"`
 }
 
 type CreateCompletion string
@@ -327,7 +445,8 @@ type DeleteSandboxRequest struct {
 }
 
 type DeleteSandboxResponse struct {
-	Error *FastletError `json:"error,omitempty"`
+	Admission AdmissionStatus `json:"admission"`
+	Error     *FastletError   `json:"error,omitempty"`
 }
 
 type ActionBindingInput struct {

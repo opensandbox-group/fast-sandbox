@@ -137,7 +137,7 @@ func newSnapshotFixture(t *testing.T) (*driverFixture, *snapshotAgentFake) {
 func newSnapshotDriverFixture(t *testing.T) *driverFixture {
 	t.Helper()
 	fixture := newDriverFixture(t)
-	fixture.prepareCachedImage(t, fixture.sandboxSpec.Spec.Image)
+	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
 	fixture.server.running = true
 	return fixture
 }
@@ -164,7 +164,7 @@ func TestCreateSnapshotDumpsPublishesAndResumes(t *testing.T) {
 	// The published manifest copies the source facts verbatim and describes
 	// this dump.
 	require.Equal(t, "app-v2", agent.key)
-	require.Equal(t, fixture.sandboxSpec.Spec.Image,
+	require.Equal(t, fixture.sandboxSpec.Desired.Image,
 		agent.manifest["lineage"].(map[string]any)["image"])
 	machine := agent.manifest["machine"].(map[string]any)
 	require.Equal(t, float64(2), machine["vcpuCount"])
@@ -214,7 +214,7 @@ func TestCreateSnapshotRequiresRunningSandbox(t *testing.T) {
 
 func TestCreateSnapshotRequiresAgentForPublication(t *testing.T) {
 	fixture := newSnapshotDriverFixture(t)
-	fixture.prepareCachedImage(t, fixture.sandboxSpec.Spec.Image)
+	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
 	fixture.server.running = true
 	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
 
@@ -229,7 +229,7 @@ func TestCreateSnapshotRequiresSourceManifestFacts(t *testing.T) {
 	fixture := newSnapshotDriverFixture(t)
 	fixture.server.running = true
 	// A hand-seeded cache without machine/guestNetwork facts.
-	dir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(fixture.sandboxSpec.Spec.Image))
+	dir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(fixture.sandboxSpec.Desired.Image))
 	require.NoError(t, os.MkdirAll(dir, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, rootfsImageName), []byte("rootfs"), 0o640))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(`{"schemaVersion":1}`), 0o640))
@@ -247,7 +247,7 @@ func TestCreateSnapshotRejectsInsufficientStagingBeforePause(t *testing.T) {
 	fixture.driver.snapshotCapacityWait = 0 // no GC self-heal wait
 	// An absurd memory size makes the footprint exceed any tmpdir's free
 	// space without touching the disk.
-	fixture.sandboxSpec.Spec.Memory = "99999Gi"
+	fixture.sandboxSpec.Limits.Memory = "99999Gi"
 	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
 
 	_, err := fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
@@ -310,7 +310,7 @@ func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
 	state, err := loadState(dir)
 	require.NoError(t, err)
 	restore := &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/publish/abcdef/manifest.json", ArtifactDigest: "lineage-digest"}
-	state.Config.Spec.Restore = restore
+	state.Config.Desired.Restore = restore
 	require.NoError(t, saveState(dir, state))
 
 	cacheDir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(artifacts.CheckpointReference(restore.ArtifactDigest)))
@@ -339,7 +339,7 @@ func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
 	require.NoError(t, json.Unmarshal(payload, &document))
 	require.Equal(t, "10.0.0.2", document["guestNetwork"].(map[string]any)["ip"],
 		"the checkpoint lineage facts ride forward into the new checkpoint")
-	require.Equal(t, fixture.sandboxSpec.Spec.Image,
+	require.Equal(t, fixture.sandboxSpec.Desired.Image,
 		document["lineage"].(map[string]any)["image"])
 }
 
@@ -353,7 +353,7 @@ func TestAssembleSnapshotManifestDropsInheritedEgressVaultMarker(t *testing.T) {
 	state, err := loadState(dir)
 	require.NoError(t, err)
 	restore := &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/publish/abcdef/manifest.json", ArtifactDigest: "lineage-digest"}
-	state.Config.Spec.Restore = restore
+	state.Config.Desired.Restore = restore
 	require.NoError(t, saveState(dir, state))
 
 	cacheDir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(artifacts.CheckpointReference(restore.ArtifactDigest)))
@@ -695,7 +695,7 @@ func TestImportRestoreVaultDeliversBundleBeforeDataPlane(t *testing.T) {
 	// file: the import hands the exact bundle path to the mover.
 	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, vaultBundleName), vaultContent, 0o600))
 	writeCheckpointManifest(t, cacheDir, vaultContent, true)
-	spec := fixture.sandboxSpec.Spec
+	spec := fixture.sandboxSpec.Desired
 	spec.Restore = restore
 	fixture.driver.importRestoreVault(context.Background(), spec, "checkpoint:sha256:digest", vmstatePath, sandboxID)
 	exports, imports := mover.snapshot()
@@ -756,7 +756,7 @@ func TestImportRestorePolicyDeliversBundleBeforeDataPlane(t *testing.T) {
 	mover := &fakeStateMover{}
 	fixture.driver.SetStateMover(mover)
 
-	fixture.sandboxSpec.Spec.Restore = &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/publish/abcdef/manifest.json", ArtifactDigest: "digest"}
+	fixture.sandboxSpec.Desired.Restore = &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/publish/abcdef/manifest.json", ArtifactDigest: "digest"}
 	cacheDir := t.TempDir()
 	vmstatePath := filepath.Join(cacheDir, vmstateSnapshotName)
 	require.NoError(t, os.WriteFile(vmstatePath, []byte("vmstate"), 0o600))
@@ -764,7 +764,7 @@ func TestImportRestorePolicyDeliversBundleBeforeDataPlane(t *testing.T) {
 
 	importPolicy := func() []string {
 		fixture.driver.importRestorePolicy(context.Background(),
-			fixture.sandboxSpec.Spec, "checkpoint:sha256:digest", vmstatePath, sandboxID)
+			fixture.sandboxSpec.Desired, "checkpoint:sha256:digest", vmstatePath, sandboxID)
 		_, imports := mover.snapshot()
 		return imports
 	}
@@ -823,7 +823,7 @@ func TestImportRestorePolicyDeliversBundleBeforeDataPlane(t *testing.T) {
 	mover.mu.Lock()
 	mover.imports = nil
 	mover.mu.Unlock()
-	spec := fixture.sandboxSpec.Spec
+	spec := fixture.sandboxSpec.Desired
 	spec.Restore = nil
 	fixture.driver.importRestorePolicy(context.Background(), spec, "app-v1", vmstatePath, sandboxID)
 	_, imports := mover.snapshot()
@@ -875,7 +875,7 @@ func TestImportTemplateCarry(t *testing.T) {
 
 	vaultContent := []byte(`{"v":1,"vault":true}`)
 	policyContent := []byte(`{"v":1,"policy":{"defaultAction":"allow"}}`)
-	cacheDir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(fixture.sandboxSpec.Spec.Image))
+	cacheDir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(fixture.sandboxSpec.Desired.Image))
 	require.NoError(t, os.MkdirAll(cacheDir, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, vaultBundleName), vaultContent, 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, policyBundleName), policyContent, 0o600))
@@ -888,7 +888,7 @@ func TestImportTemplateCarry(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, snapshotManifestName), payload, 0o644))
 
-	spec := fixture.sandboxSpec.Spec // fresh boot from the fixture image
+	spec := fixture.sandboxSpec.Desired // fresh boot from the fixture image
 	fixture.driver.importTemplateCarry(context.Background(), spec, spec.Image, cacheDir, sandboxID)
 	_, imports := mover.snapshotTemplate()
 	require.Len(t, imports, 2, "vault and policy both land for the clone's first registration")
@@ -908,13 +908,13 @@ func TestImportTemplateCarryAbsent(t *testing.T) {
 	mover := &fakeStateMover{} // no template-carry capability
 	fixture.driver.SetStateMover(mover)
 
-	cacheDir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(fixture.sandboxSpec.Spec.Image))
+	cacheDir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(fixture.sandboxSpec.Desired.Image))
 	require.NoError(t, os.MkdirAll(cacheDir, 0o750))
 	payload, err := json.Marshal(map[string]any{"schemaVersion": 1, "files": map[string]any{}})
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(cacheDir, snapshotManifestName), payload, 0o644))
 
-	spec := fixture.sandboxSpec.Spec
+	spec := fixture.sandboxSpec.Desired
 	fixture.driver.importTemplateCarry(context.Background(), spec, spec.Image, cacheDir, sandboxID)
 	_, imports := mover.snapshot()
 	require.Empty(t, imports, "a mover without the template-carry capability is never invoked")

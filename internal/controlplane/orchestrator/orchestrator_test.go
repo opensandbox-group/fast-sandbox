@@ -21,12 +21,15 @@ import (
 )
 
 type fakeRegistry struct {
-	candidates []placement.FastletInfo
-	fastlets   map[placement.FastletID]placement.FastletInfo
-	feedback   []placement.FastletID
+	candidates  []placement.FastletInfo
+	fastlets    map[placement.FastletID]placement.FastletInfo
+	feedback    []placement.FastletID
+	feedbacks   []placement.LocalFeedback
+	lastRequest placement.CandidateRequest
 }
 
-func (r *fakeRegistry) TopK(placement.CandidateRequest, int) []placement.FastletInfo {
+func (r *fakeRegistry) TopK(request placement.CandidateRequest, _ int) []placement.FastletInfo {
+	r.lastRequest = request
 	return append([]placement.FastletInfo(nil), r.candidates...)
 }
 
@@ -35,8 +38,9 @@ func (r *fakeRegistry) GetFastletByID(id placement.FastletID) (placement.Fastlet
 	return value, ok
 }
 
-func (r *fakeRegistry) RecordFeedback(id placement.FastletID, _ placement.LocalFeedback) {
+func (r *fakeRegistry) RecordFeedback(id placement.FastletID, feedback placement.LocalFeedback) {
 	r.feedback = append(r.feedback, id)
+	r.feedbacks = append(r.feedbacks, feedback)
 }
 
 func (*fakeRegistry) ApplyHeartbeat(placement.FastletID, string, *fastletapi.HeartbeatResponse, time.Time) error {
@@ -48,6 +52,7 @@ type fakeFastletClient struct {
 
 	create       func(string, *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error)
 	inspect      func(string, *fastletapi.InspectSandboxRequest) (*fastletapi.InspectSandboxResponse, error)
+	delete       func(string, *fastletapi.DeleteSandboxRequest) (*fastletapi.DeleteSandboxResponse, error)
 	inspectCalls int
 	deleted      bool
 	actions      *fastletapi.ReconcileBindingsRequest
@@ -81,8 +86,11 @@ func (f *fakeFastletClient) InspectSandbox(_ context.Context, ip string, request
 	return f.inspect(ip, request)
 }
 
-func (f *fakeFastletClient) DeleteSandbox(context.Context, string, *fastletapi.DeleteSandboxRequest) (*fastletapi.DeleteSandboxResponse, error) {
+func (f *fakeFastletClient) DeleteSandbox(_ context.Context, ip string, request *fastletapi.DeleteSandboxRequest) (*fastletapi.DeleteSandboxResponse, error) {
 	f.deleted = true
+	if f.delete != nil {
+		return f.delete(ip, request)
+	}
 	return &fastletapi.DeleteSandboxResponse{}, nil
 }
 
@@ -109,6 +117,104 @@ func TestFastPathCandidatesIsRegistryOnly(t *testing.T) {
 	candidates, err := orchestrator.FastPathCandidates(sandbox, "request-a")
 	require.NoError(t, err)
 	require.Equal(t, candidate.ID, candidates[0].ID)
+}
+
+func TestCandidatesPassesImmutablePoolResourceDemandToPlacement(t *testing.T) {
+	orchestrator, registry, _, sandbox := newHarness(t)
+	var pool apiv1alpha2.SandboxPool
+	require.NoError(t, orchestrator.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("1"), resource.MustParse("768Mi"), resource.MustParse("4"), resource.MustParse("2"), 256,
+	)
+	require.NoError(t, orchestrator.Client.Update(context.Background(), &pool))
+	registry.candidates = []placement.FastletInfo{{ID: "fastlet-a"}}
+
+	_, parameters, err := orchestrator.Candidates(context.Background(), sandbox, "request-a")
+	require.NoError(t, err)
+	require.Equal(t, apiv1alpha2.SandboxResourceModeResourceAware, parameters.ResourceMode)
+	require.Equal(t, int64(250), registry.lastRequest.Demand.CPU.MilliValue())
+	expectedMemory := resource.MustParse("384Mi")
+	require.Equal(t, expectedMemory.Value(), registry.lastRequest.Demand.Memory.Value())
+}
+
+func TestResourceAwarePlacementCanBeDisabledWithoutChangingPoolProfile(t *testing.T) {
+	orchestrator, registry, _, sandbox := newHarness(t)
+	var pool apiv1alpha2.SandboxPool
+	require.NoError(t, orchestrator.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("1"), resource.MustParse("768Mi"), resource.MustParse("4"), resource.MustParse("2"), 256,
+	)
+	require.NoError(t, orchestrator.Client.Update(context.Background(), &pool))
+	registry.candidates = []placement.FastletInfo{{ID: "fastlet-a"}}
+	orchestrator.DisableResourceAwarePlacement = true
+
+	_, parameters, err := orchestrator.Candidates(context.Background(), sandbox, "request-a")
+	require.NoError(t, err)
+	require.Equal(t, apiv1alpha2.SandboxResourceModeResourceAware, parameters.ResourceMode)
+	require.Equal(t, apiv1alpha2.SandboxResourceModeLegacySlot, registry.lastRequest.ResourceMode)
+}
+
+func TestResolveSandboxResourcesRejectsLegacyOverrides(t *testing.T) {
+	_, _, _, sandbox := newHarness(t)
+	pool := &apiv1alpha2.SandboxPool{Spec: apiv1alpha2.SandboxPoolSpec{
+		MaxSandboxesPerPod: 8,
+		SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+			resource.MustParse("1"), resource.MustParse("1Gi"), 256,
+		),
+	}}
+	sandbox.Spec.Resources = &apiv1alpha2.SandboxResourceRequirements{Limits: apiv1alpha2.SandboxComputeResources{
+		CPU: resource.MustParse("2"), Memory: resource.MustParse("2Gi"),
+	}}
+
+	_, _, err := ResolveSandboxResources(pool, sandbox)
+	require.ErrorContains(t, err, "per-Sandbox resources require ResourceAware mode")
+}
+
+func TestResolveSandboxResourcesDerivesRequestAndRejectsLimitAboveRuntimeBudget(t *testing.T) {
+	_, _, _, sandbox := newHarness(t)
+	pool := &apiv1alpha2.SandboxPool{Spec: apiv1alpha2.SandboxPoolSpec{
+		MaxSandboxesPerPod: 8,
+		SandboxResources: apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+			resource.MustParse("1"), resource.MustParse("4Gi"), resource.MustParse("4"), resource.MustParse("2"), 256,
+		),
+	}}
+	sandbox.Spec.Resources = &apiv1alpha2.SandboxResourceRequirements{Limits: apiv1alpha2.SandboxComputeResources{
+		CPU: resource.MustParse("2"), Memory: resource.MustParse("6Gi"),
+	}}
+
+	resolved, demand, err := ResolveSandboxResources(pool, sandbox)
+	require.NoError(t, err)
+	require.Equal(t, "500m", resolved.Requests.CPU)
+	require.Equal(t, "3Gi", resolved.Requests.Memory)
+	require.Equal(t, "2", resolved.Limits.CPU)
+	require.Equal(t, "6Gi", resolved.Limits.Memory)
+	require.Equal(t, int64(500), demand.CPU.MilliValue())
+
+	sandbox.Spec.Resources.Limits.CPU = resource.MustParse("3")
+	_, _, err = ResolveSandboxResources(pool, sandbox)
+	require.ErrorContains(t, err, "exceed Fastlet Sandbox runtime budget")
+}
+
+func TestResolveRuntimeRejectsResourceMutationAfterAssignment(t *testing.T) {
+	orchestrator, _, _, sandbox := newHarness(t)
+	var pool apiv1alpha2.SandboxPool
+	require.NoError(t, orchestrator.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("1"), resource.MustParse("4Gi"), resource.MustParse("4"), resource.MustParse("2"), 256,
+	)
+	require.NoError(t, orchestrator.Client.Update(context.Background(), &pool))
+	sandbox.Spec.Resources = &apiv1alpha2.SandboxResourceRequirements{Limits: apiv1alpha2.SandboxComputeResources{
+		CPU: resource.MustParse("2"), Memory: resource.MustParse("6Gi"),
+	}}
+
+	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+	sandbox.Annotations = resolvedResourceAnnotations(parameters)
+	// 1999m still derives the same rounded 500m request. The resolved-limit
+	// fence must therefore detect a change that request annotations alone miss.
+	sandbox.Spec.Resources.Limits.CPU = resource.MustParse("1999m")
+	_, err = orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.ErrorContains(t, err, assignment.AnnotationResolvedLimitCPU)
 }
 
 func TestReconcileBindingsPreservesOpaqueInputAndReturnsObservation(t *testing.T) {
@@ -230,7 +336,7 @@ func TestAssignDeclarativeProjectsAnnotationAndEnsureReturnsObservation(t *testi
 		require.Equal(t, candidate.PodIP, ip)
 		require.Equal(t, "sandbox-uid-a", request.Identity.SandboxUID)
 		require.Equal(t, envelope.RuntimeInstanceID, request.Identity.RuntimeInstanceID)
-		require.Empty(t, request.Sandbox.CPU, "Fastlet injects its fixed resource profile")
+		require.Equal(t, parameters.ResourceProfileHash, request.Sandbox.ResourceProfileHash)
 		return &fastletapi.CreateSandboxResponse{Disposition: fastletapi.CreateDispositionCreated, Sandbox: readyFastletObservation("sandbox-uid-a", assigned.Generation)}, nil
 	}
 	observed, err := orchestrator.EnsureRuntime(context.Background(), assigned)
@@ -241,6 +347,35 @@ func TestAssignDeclarativeProjectsAnnotationAndEnsureReturnsObservation(t *testi
 	var persisted apiv1alpha2.Sandbox
 	require.NoError(t, orchestrator.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "sandbox-a"}, &persisted))
 	require.Empty(t, persisted.Status.Runtime.State)
+}
+
+func TestAssignDeclarativeProjectsResolvedResourceAnnotations(t *testing.T) {
+	orchestrator, registry, _, sandbox := newHarness(t)
+	var pool apiv1alpha2.SandboxPool
+	require.NoError(t, orchestrator.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("1"), resource.MustParse("4Gi"), resource.MustParse("4"), resource.MustParse("2"), 256,
+	)
+	require.NoError(t, orchestrator.Client.Update(context.Background(), &pool))
+	sandbox.Spec.Resources = &apiv1alpha2.SandboxResourceRequirements{Limits: apiv1alpha2.SandboxComputeResources{
+		CPU: resource.MustParse("2"), Memory: resource.MustParse("6Gi"),
+	}}
+	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+	candidate := candidateFor(parameters)
+	registry.candidates = []placement.FastletInfo{candidate}
+	registry.fastlets[candidate.ID] = candidate
+	sandbox.UID = types.UID("sandbox-uid-a")
+	require.NoError(t, orchestrator.Client.Create(context.Background(), sandbox))
+
+	assigned, won, err := orchestrator.AssignDeclarative(context.Background(), sandbox, "sandbox-uid-a")
+	require.NoError(t, err)
+	require.True(t, won)
+	require.Equal(t, pool.Spec.SandboxResources.Hash(), assigned.Annotations[assignment.AnnotationResourcePolicyHash])
+	require.Equal(t, "500m", assigned.Annotations[assignment.AnnotationResolvedRequestCPU])
+	require.Equal(t, "3Gi", assigned.Annotations[assignment.AnnotationResolvedRequestMemory])
+	require.Equal(t, "2", assigned.Annotations[assignment.AnnotationResolvedLimitCPU])
+	require.Equal(t, "6Gi", assigned.Annotations[assignment.AnnotationResolvedLimitMemory])
 }
 
 func TestObserveRuntimeReturnsStructuredRuntimeAndDataPlaneIndependently(t *testing.T) {
@@ -325,6 +460,130 @@ func TestEnsureRuntimeAcceptsParkedColdCreate(t *testing.T) {
 	observed, err := orchestrator.EnsureRuntime(context.Background(), sandbox)
 	require.NoError(t, err, "a parked cold create is an accepted create, not a failure")
 	require.Equal(t, fastletapi.RuntimeStateCreating, observed.Runtime.State)
+}
+
+func TestCreateRejectionImmediatelyForwardsAdmissionSnapshot(t *testing.T) {
+	orchestrator, registry, fastletClient, sandbox := newHarness(t)
+	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+	candidate := candidateFor(parameters)
+	registry.fastlets[candidate.ID] = candidate
+	sandbox.UID = types.UID("sandbox-uid-a")
+	envelope, err := AssignmentForCandidate(candidate, 1, 1, 1, "runtime-a")
+	require.NoError(t, err)
+	require.NoError(t, assignment.SetAssignmentAnnotation(sandbox, envelope))
+	resources := &fastletapi.ResourceAdmissionStatus{
+		Version: "v2", Epoch: "resource-epoch-a", Revision: 9,
+		Capacity:  fastletapi.SandboxResourceVector{CPU: "2", Memory: "8Gi"},
+		Committed: fastletapi.SandboxResourceVector{CPU: "1", Memory: "4Gi"},
+		State:     fastletapi.AdmissionStateBlocked, Reason: fastletapi.AdmissionReasonFastletMemoryHighWatermark,
+	}
+	response := &fastletapi.CreateSandboxResponse{
+		Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects,
+		Admission:   fastletapi.AdmissionStatus{Capacity: 8, Used: 5, Running: 5, Resources: resources},
+	}
+	failure := &fastletapi.FastletError{
+		Code: fastletapi.ErrorCapacityRejected, Reason: fastletapi.AdmissionReasonFastletMemoryHighWatermark,
+		Message: "memory pressure blocks admission", Retryable: true,
+	}
+	fastletClient.create = func(string, *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error) {
+		return response, &fastletapi.CreateCallError{Disposition: response.Disposition, Failure: failure}
+	}
+
+	returned, err := orchestrator.CreateRuntime(context.Background(), sandbox)
+	require.Error(t, err)
+	require.Same(t, response, returned)
+	require.Len(t, registry.feedbacks, 1)
+	require.Equal(t, failure.Reason, registry.feedbacks[0].Reason)
+	require.NotNil(t, registry.feedbacks[0].Admission)
+	require.Equal(t, uint64(9), registry.feedbacks[0].Admission.Resources.Revision)
+}
+
+func TestCreateSuccessImmediatelyForwardsAdmissionSnapshot(t *testing.T) {
+	orchestrator, registry, fastletClient, sandbox := newHarness(t)
+	var pool apiv1alpha2.SandboxPool
+	require.NoError(t, orchestrator.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("2"), resource.MustParse("8Gi"), resource.MustParse("4"), resource.MustParse("2"), 256,
+	)
+	require.NoError(t, orchestrator.Client.Update(context.Background(), &pool))
+	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+	candidate := candidateFor(parameters)
+	registry.fastlets[candidate.ID] = candidate
+	sandbox.UID = types.UID("sandbox-uid-a")
+	envelope, err := AssignmentForCandidate(candidate, 1, 1, 1, "runtime-a")
+	require.NoError(t, err)
+	require.NoError(t, assignment.SetAssignmentAnnotation(sandbox, envelope))
+	resources := &fastletapi.ResourceAdmissionStatus{
+		Version: "v2", Epoch: "resource-epoch-a", Revision: 3,
+		Capacity:  fastletapi.SandboxResourceVector{CPU: "4", Memory: "16Gi"},
+		Committed: fastletapi.SandboxResourceVector{CPU: "500m", Memory: "4Gi"},
+		State:     fastletapi.AdmissionStateOpen,
+	}
+	fastletClient.create = func(string, *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error) {
+		return &fastletapi.CreateSandboxResponse{
+			Disposition: fastletapi.CreateDispositionCreated,
+			Sandbox:     readyFastletObservation(string(sandbox.UID), sandbox.Generation),
+			Admission:   fastletapi.AdmissionStatus{Capacity: 8, Used: 1, Running: 1, Resources: resources},
+		}, nil
+	}
+
+	_, err = orchestrator.CreateRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+	require.Len(t, registry.feedbacks, 1)
+	require.NotNil(t, registry.feedbacks[0].Admission)
+	require.Equal(t, uint64(3), registry.feedbacks[0].Admission.Resources.Revision)
+	require.Equal(t, "500m", registry.feedbacks[0].Admission.Resources.Committed.CPU)
+}
+
+func TestDeleteImmediatelyForwardsAdmissionSnapshot(t *testing.T) {
+	orchestrator, registry, fastletClient, sandbox := newHarness(t)
+	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+	candidate := candidateFor(parameters)
+	registry.fastlets[candidate.ID] = candidate
+	sandbox.UID = types.UID("sandbox-uid-a")
+	envelope, err := AssignmentForCandidate(candidate, 1, 1, 1, "runtime-a")
+	require.NoError(t, err)
+	require.NoError(t, assignment.SetAssignmentAnnotation(sandbox, envelope))
+	resources := &fastletapi.ResourceAdmissionStatus{
+		Version: "v2", Epoch: "resource-epoch-a", Revision: 4,
+		Capacity:  fastletapi.SandboxResourceVector{CPU: "2", Memory: "8Gi"},
+		Committed: fastletapi.SandboxResourceVector{CPU: "0", Memory: "0"},
+		State:     fastletapi.AdmissionStateOpen,
+	}
+	fastletClient.delete = func(string, *fastletapi.DeleteSandboxRequest) (*fastletapi.DeleteSandboxResponse, error) {
+		return &fastletapi.DeleteSandboxResponse{
+			Admission: fastletapi.AdmissionStatus{Capacity: 8, Resources: resources},
+		}, nil
+	}
+
+	require.NoError(t, orchestrator.DeleteRuntime(context.Background(), sandbox))
+	require.Len(t, registry.feedbacks, 1)
+	require.NotNil(t, registry.feedbacks[0].Admission)
+	require.Equal(t, uint64(4), registry.feedbacks[0].Admission.Resources.Revision)
+	require.Equal(t, "0", registry.feedbacks[0].Admission.Resources.Committed.CPU)
+}
+
+func TestCreateNeedsLocalReservationOnlyBeforeCurrentIdentityIsReported(t *testing.T) {
+	sandbox := &apiv1alpha2.Sandbox{Status: apiv1alpha2.SandboxStatus{Runtime: apiv1alpha2.RuntimeStatus{State: apiv1alpha2.RuntimePending}}}
+	identity := fastletapi.SandboxIdentity{SandboxUID: "sandbox-a", InstanceGeneration: 2, AssignmentAttempt: 3}
+	fastlet := placement.FastletInfo{SandboxStatuses: map[string]fastletapi.SandboxStatus{}}
+	require.True(t, createNeedsLocalReservation(sandbox, fastlet, identity))
+
+	fastlet.SandboxStatuses[identity.SandboxUID] = fastletapi.SandboxStatus{
+		SandboxID: identity.SandboxUID, InstanceGeneration: identity.InstanceGeneration, AssignmentAttempt: identity.AssignmentAttempt,
+	}
+	require.False(t, createNeedsLocalReservation(sandbox, fastlet, identity))
+
+	fastlet.SandboxStatuses[identity.SandboxUID] = fastletapi.SandboxStatus{
+		SandboxID: identity.SandboxUID, InstanceGeneration: identity.InstanceGeneration, AssignmentAttempt: identity.AssignmentAttempt - 1,
+	}
+	require.True(t, createNeedsLocalReservation(sandbox, fastlet, identity))
+
+	sandbox.Status.Runtime.State = apiv1alpha2.RuntimeCreating
+	require.False(t, createNeedsLocalReservation(sandbox, placement.FastletInfo{}, identity))
 }
 
 func readyFastletObservation(sandboxID string, generation int64) *fastletapi.SandboxStatus {
@@ -468,10 +727,10 @@ func newHarness(t *testing.T) (*Orchestrator, *fakeRegistry, *fakeFastletClient,
 		Spec: apiv1alpha2.SandboxPoolSpec{
 			Runtime: apiv1alpha2.RuntimeContainer, Capacity: apiv1alpha2.PoolCapacity{PoolMin: 1, PoolMax: 1},
 			MaxSandboxesPerPod: 8,
-			SandboxResources: apiv1alpha2.SandboxResourceProfile{
-				CPU: resource.MustParse("1"), Memory: resource.MustParse("512Mi"), PIDs: 256,
-			},
-			FastletTemplate: corev1.PodTemplateSpec{},
+			SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+				resource.MustParse("1"), resource.MustParse("512Mi"), 256,
+			),
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "fastlet"}}}},
 		},
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&apiv1alpha2.Sandbox{}).WithObjects(pool).Build()

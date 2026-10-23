@@ -240,9 +240,9 @@ func createValidationPool(namespace, name string) *apiv1alpha2.SandboxPool {
 			},
 			MaxSandboxesPerPod: 20,
 			Runtime:            apiv1alpha2.RuntimeContainer,
-			SandboxResources: apiv1alpha2.SandboxResourceProfile{
-				CPU: resource.MustParse("100m"), Memory: resource.MustParse("64Mi"), PIDs: 64,
-			},
+			SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+				resource.MustParse("100m"), resource.MustParse("64Mi"), 64,
+			),
 			FastletTemplate: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{

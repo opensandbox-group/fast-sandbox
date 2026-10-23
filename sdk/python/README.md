@@ -31,6 +31,8 @@ with Client(
         command=["sleep", "3600"],
         expires_at_unix_seconds=1785373200,
         metadata={"owner": "team-a"},
+        cpu_limit="2",       # optional ResourceAware per-Sandbox limit
+        memory_limit="6Gi",  # must be set with cpu_limit
     )
 
     # Wait directly on the assigned Fastlet and resolve one named component.

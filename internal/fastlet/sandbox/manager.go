@@ -6,17 +6,18 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	fastletaction "fast-sandbox/internal/fastlet/action"
 	fastletcache "fast-sandbox/internal/fastlet/cache"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
+	"fast-sandbox/internal/fastletsettings"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	"fast-sandbox/internal/registryconfig"
 	"fast-sandbox/pkg/util/idgen"
@@ -27,6 +28,8 @@ type SandboxManagerConfig struct {
 	RuntimeName        apiv1alpha2.RuntimeName
 	RuntimeProfileHash string
 	ResourceProfile    *apiv1alpha2.SandboxResourceProfile
+	ResourceAdmission  *fastletsettings.ResourceAdmissionSettings
+	ResourceEpoch      string
 	FastletPodUID      string
 	Clock              Clock
 	RecoverOnStart     bool
@@ -40,35 +43,46 @@ type SandboxManagerConfig struct {
 }
 
 type SandboxManager struct {
-	mu                  sync.RWMutex
-	runtime             RuntimeDriver
-	runtimeName         string
-	capacity            int
-	runtimeProfileHash  string
-	resourceProfile     *apiv1alpha2.SandboxResourceProfile
-	resourceProfileHash string
-	infraRevision       string
-	infraManager        *fastletinfra.Manager
-	actionManager       *fastletaction.Manager
-	infraReady          bool
-	infraMessage        string
-	fastletPodUID       string
-	clock               Clock
-	recovering          bool
-	runtimeReady        bool
-	routeReady          bool
-	draining            bool
-	drainReason         string
-	tombstones          map[string]fastletapi.SandboxIdentity
-	diagnostics         map[string][]fastletapi.SandboxDiagnosticEvent
-	diagnosticOrder     []string
-	cacheTracker        *fastletcache.Tracker
-	cacheProtection     *fastletcache.ProtectionIndex
-	warmImages          []string
-	warmImageStates     map[string]fastletapi.WarmImageState
-	registryProvider    registryconfig.Provider
-	routePublisher      RoutePublisher
-	dataPlaneWorkers    map[string]dataPlaneWorker
+	mu                          sync.RWMutex
+	runtime                     RuntimeDriver
+	runtimeName                 string
+	capacity                    int
+	runtimeProfileHash          string
+	resourceProfile             *apiv1alpha2.SandboxResourceProfile
+	resourceProfileHash         string
+	resourceAdmission           *fastletsettings.ResourceAdmissionSettings
+	staticResourceAdmission     bool
+	resourceEpoch               string
+	resourceRevision            uint64
+	resourceLastUsed            int
+	resourceLastCommittedCPU    string
+	resourceLastCommittedMemory string
+	resourceLastState           fastletapi.AdmissionState
+	resourceLastReason          fastletapi.AdmissionReason
+	resourceState               fastletapi.AdmissionState
+	resourceReason              fastletapi.AdmissionReason
+	infraRevision               string
+	infraManager                *fastletinfra.Manager
+	actionManager               *fastletaction.Manager
+	infraReady                  bool
+	infraMessage                string
+	fastletPodUID               string
+	clock                       Clock
+	recovering                  bool
+	runtimeReady                bool
+	routeReady                  bool
+	draining                    bool
+	drainReason                 string
+	tombstones                  map[string]fastletapi.SandboxIdentity
+	diagnostics                 map[string][]fastletapi.SandboxDiagnosticEvent
+	diagnosticOrder             []string
+	cacheTracker                *fastletcache.Tracker
+	cacheProtection             *fastletcache.ProtectionIndex
+	warmImages                  []string
+	warmImageStates             map[string]fastletapi.WarmImageState
+	registryProvider            registryconfig.Provider
+	routePublisher              RoutePublisher
+	dataPlaneWorkers            map[string]dataPlaneWorker
 	// imageBootWorkers drives cold Sandboxes from the image-pending phase to
 	// a committed runtime: once the async artifact delivery reports
 	// Delivered, the worker boots the runtime (EnsureSandbox) and commits it
@@ -119,6 +133,36 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		profile = &copied
 		resourceHash = copied.Hash()
 	}
+	var resourceAdmission *fastletsettings.ResourceAdmissionSettings
+	resourceEpoch := config.ResourceEpoch
+	if config.ResourceAdmission != nil {
+		if profile == nil {
+			return nil, fmt.Errorf("%w: resource admission settings require a Sandbox resource profile", ErrInvalidConfig)
+		}
+		if err := config.ResourceAdmission.Validate(*profile); err != nil {
+			return nil, err
+		}
+		copied := *config.ResourceAdmission
+		copied.Capacity = apiv1alpha2.SandboxComputeResources{
+			CPU: config.ResourceAdmission.Capacity.CPU.DeepCopy(), Memory: config.ResourceAdmission.Capacity.Memory.DeepCopy(),
+		}
+		copied.SandboxRuntimeBudget = apiv1alpha2.SandboxComputeResources{
+			CPU: config.ResourceAdmission.SandboxRuntimeBudget.CPU.DeepCopy(), Memory: config.ResourceAdmission.SandboxRuntimeBudget.Memory.DeepCopy(),
+		}
+		copied.RuntimeEnvelope = apiv1alpha2.SandboxComputeResources{
+			CPU: config.ResourceAdmission.RuntimeEnvelope.CPU.DeepCopy(), Memory: config.ResourceAdmission.RuntimeEnvelope.Memory.DeepCopy(),
+		}
+		resourceAdmission = &copied
+		if resourceEpoch == "" {
+			var err error
+			resourceEpoch, err = idgen.GenerateRequestID()
+			if err != nil {
+				return nil, fmt.Errorf("generate resource admission epoch: %w", err)
+			}
+		}
+	} else if profile != nil && profile.ResourceMode() == apiv1alpha2.SandboxResourceModeResourceAware {
+		return nil, fmt.Errorf("%w: ResourceAware profile requires resource admission settings", ErrInvalidConfig)
+	}
 	var cacheSource fastletcache.ImageSource
 	if source, ok := runtime.(RuntimeArtifactCache); ok {
 		cacheSource = source
@@ -138,8 +182,11 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		runtime: runtime, runtimeName: string(config.RuntimeName), capacity: config.Capacity,
 		runtimeProfileHash: config.RuntimeProfileHash,
 		resourceProfile:    profile, resourceProfileHash: resourceHash,
-		infraRevision: config.InfraRevision,
-		infraManager:  config.InfraManager, infraReady: config.InfraManager == nil,
+		resourceAdmission: resourceAdmission, resourceEpoch: resourceEpoch, resourceLastUsed: -1,
+		staticResourceAdmission: resourceAdmission != nil && resourceAdmission.StaticAdmission,
+		resourceState:           fastletapi.AdmissionStateOpen,
+		infraRevision:           config.InfraRevision,
+		infraManager:            config.InfraManager, infraReady: config.InfraManager == nil,
 		actionManager: config.ActionManager,
 		fastletPodUID: config.FastletPodUID,
 		clock:         config.Clock,
@@ -305,6 +352,25 @@ func (m *SandboxManager) ResourceProfileHash() string {
 	return m.resourceProfileHash
 }
 
+// SetResourceAdmissionState applies the latest local pressure decision. The
+// next admission snapshot advances its revision when the state or reason
+// changes, allowing Create feedback to fence older heartbeats.
+func (m *SandboxManager) SetResourceAdmissionState(state fastletapi.AdmissionState, reason fastletapi.AdmissionReason) error {
+	switch state {
+	case fastletapi.AdmissionStateOpen, fastletapi.AdmissionStateDegraded, fastletapi.AdmissionStateBlocked, fastletapi.AdmissionStateUnknown:
+	default:
+		return fmt.Errorf("%w: unsupported resource admission state %q", ErrInvalidConfig, state)
+	}
+	if state == fastletapi.AdmissionStateOpen {
+		reason = ""
+	}
+	m.mu.Lock()
+	m.resourceState = state
+	m.resourceReason = reason
+	m.mu.Unlock()
+	return nil
+}
+
 func (m *SandboxManager) RuntimeProfileHash() string {
 	return m.runtimeProfileHash
 }
@@ -319,7 +385,7 @@ func capacityFromEnvironment() int {
 	return capVal
 }
 
-func (m *SandboxManager) validateProfiles(spec *fastletapi.SandboxSpec) error {
+func (m *SandboxManager) validateProfiles(spec *fastletapi.SandboxDesiredSpec) error {
 	if m.runtimeProfileHash != "" && spec.RuntimeProfileHash != m.runtimeProfileHash {
 		return fmt.Errorf("%w: runtime profile hash %q does not match Fastlet profile %q", ErrSandboxProfileMismatch, spec.RuntimeProfileHash, m.runtimeProfileHash)
 	}
@@ -329,30 +395,23 @@ func (m *SandboxManager) validateProfiles(spec *fastletapi.SandboxSpec) error {
 	if spec.ResourceProfileHash != m.resourceProfileHash {
 		return fmt.Errorf("%w: resource profile hash %q does not match Fastlet profile %q", ErrSandboxProfileMismatch, spec.ResourceProfileHash, m.resourceProfileHash)
 	}
-	if spec.CPU != "" {
-		cpu, err := resource.ParseQuantity(spec.CPU)
-		if err != nil || cpu.Cmp(m.resourceProfile.CPU) != 0 {
-			return fmt.Errorf("%w: cpu %q does not match %s", ErrSandboxProfileMismatch, spec.CPU, m.resourceProfile.CPU.String())
-		}
-	}
-	if spec.Memory != "" {
-		memory, err := resource.ParseQuantity(spec.Memory)
-		if err != nil || memory.Cmp(m.resourceProfile.Memory) != 0 {
-			return fmt.Errorf("%w: memory %q does not match %s", ErrSandboxProfileMismatch, spec.Memory, m.resourceProfile.Memory.String())
-		}
-	}
-	if spec.PIDs != 0 && spec.PIDs != m.resourceProfile.PIDs {
-		return fmt.Errorf("%w: pids %d does not match %d", ErrSandboxProfileMismatch, spec.PIDs, m.resourceProfile.PIDs)
-	}
-	// The Fastlet profile is authoritative. The control plane sends only the
-	// profile identity; runtime-enforced values are injected atomically here.
-	spec.CPU = m.resourceProfile.CPU.String()
-	spec.Memory = m.resourceProfile.Memory.String()
-	spec.PIDs = m.resourceProfile.PIDs
 	return m.validateInfraRevision(spec)
 }
 
-func (m *SandboxManager) validateInfraRevision(spec *fastletapi.SandboxSpec) error {
+func (m *SandboxManager) resolvedRuntimeLimits() (fastletapi.SandboxRuntimeLimits, error) {
+	if m.resourceProfile == nil {
+		return fastletapi.SandboxRuntimeLimits{}, nil
+	}
+	limits, ok := m.resourceProfile.LimitResources()
+	if !ok {
+		return fastletapi.SandboxRuntimeLimits{}, fmt.Errorf("%w: Fastlet resource profile has no runtime limits", ErrSandboxProfileMismatch)
+	}
+	return fastletapi.SandboxRuntimeLimits{
+		CPU: limits.CPU.String(), Memory: limits.Memory.String(), PIDs: m.resourceProfile.PIDs,
+	}, nil
+}
+
+func (m *SandboxManager) validateInfraRevision(spec *fastletapi.SandboxDesiredSpec) error {
 	if m.infraRevision != "" && spec.InfraRevision != m.infraRevision {
 		return fmt.Errorf("%w: Infra revision %q does not match Fastlet revision %q", ErrSandboxProfileMismatch, spec.InfraRevision, m.infraRevision)
 	}
@@ -395,8 +454,8 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 		})
 		delete(m.sandboxes, sandboxID)
 		delete(m.runtimeMessages, sandboxID)
-		m.cacheProtection.Unprotect(expected.Config.Spec.Image, fastletcache.ProtectActive)
-		m.cacheProtection.ProtectHotUntil(expected.Config.Spec.Image, m.clock.Now().Add(time.Hour))
+		m.cacheProtection.Unprotect(expected.Config.Desired.Image, fastletcache.ProtectActive)
+		m.cacheProtection.ProtectHotUntil(expected.Config.Desired.Image, m.clock.Now().Add(time.Hour))
 		m.recordDiagnosticLocked(sandboxID, "info", "fastlet", "deleted", "proxy route and runtime resources were deleted")
 		klog.InfoS("sandbox deletion completed", "sandboxID", sandboxID)
 	}
@@ -437,6 +496,11 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 		}
 		if inspected, err := m.runtime.InspectSandbox(ctx, sandboxID); err == nil {
 			runtimeObservation.Message = inspected.Phase
+			if runtimeObservation.State == fastletapi.RuntimeStateReady && strings.EqualFold(strings.TrimSpace(inspected.Phase), "stopped") {
+				runtimeObservation.State = fastletapi.RuntimeStateFailed
+				dataPlaneObservation.State = fastletapi.DataPlaneStateFailed
+				dataPlaneObservation.Message = "runtime reported stopped"
+			}
 		}
 		result = append(result, fastletapi.SandboxStatus{
 			SandboxID:          sandboxID,

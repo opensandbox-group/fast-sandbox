@@ -128,7 +128,7 @@ func (r *Driver) Initialize(ctx context.Context, socketPath string) error {
 func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSandboxInput, allocation fastletapi.RuntimeAllocation) (_ *SandboxMetadata, resultErr error) {
 	config := &input.Sandbox
 	identity := config.Identity
-	spec := config.Spec
+	spec := config.Desired
 	network := allocation.Network
 	totalStart := time.Now()
 	ctx, finishTotal := startContainerdCreateStage(ctx, string(r.runtimeName), "total")
@@ -415,7 +415,7 @@ func (r *Driver) pullImage(ctx context.Context, imageName string) (containerd.Im
 }
 
 func (r *Driver) prepareSpecOpts(ctx context.Context, config *fastletapi.RuntimeSandboxConfig, allocation fastletapi.RuntimeAllocation, image containerd.Image) ([]oci.SpecOpts, *infra.PreparedInstance, error) {
-	spec := &config.Spec
+	spec := &config.Desired
 	network := allocation.Network
 	originalArgs := append(spec.Command, spec.Args...)
 
@@ -439,7 +439,7 @@ func (r *Driver) prepareSpecOpts(ctx context.Context, config *fastletapi.Runtime
 	if len(originalArgs) > 0 {
 		specOpts = append(specOpts, oci.WithProcessArgs(originalArgs...))
 	}
-	resourceOpts, err := sandboxResourceSpecOpts(spec)
+	resourceOpts, err := sandboxResourceSpecOpts(&config.Limits)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -521,7 +521,7 @@ func withSandboxInit() oci.SpecOpts {
 	}
 }
 
-func sandboxResourceSpecOpts(config *fastletapi.SandboxSpec) ([]oci.SpecOpts, error) {
+func sandboxResourceSpecOpts(config *fastletapi.SandboxRuntimeLimits) ([]oci.SpecOpts, error) {
 	var opts []oci.SpecOpts
 	if config.CPU != "" {
 		cpu, err := resource.ParseQuantity(config.CPU)
@@ -574,7 +574,8 @@ func (r *Driver) getRuntimeOptions() *runtimeoptions.Options {
 
 func (r *Driver) prepareLabels(config *fastletapi.RuntimeSandboxConfig, allocation fastletapi.RuntimeAllocation) map[string]string {
 	identity := config.Identity
-	spec := config.Spec
+	spec := config.Desired
+	limits := config.Limits
 	network := allocation.Network
 	routeGeneration := identity.RouteGeneration
 	if routeGeneration <= 0 {
@@ -591,9 +592,9 @@ func (r *Driver) prepareLabels(config *fastletapi.RuntimeSandboxConfig, allocati
 		"fast-sandbox.io/runtime-profile-hash":  spec.RuntimeProfileHash,
 		"fast-sandbox.io/resource-profile-hash": spec.ResourceProfileHash,
 		"fast-sandbox.io/infra-revision":        spec.InfraRevision,
-		"fast-sandbox.io/resource-cpu":          spec.CPU,
-		"fast-sandbox.io/resource-memory":       spec.Memory,
-		"fast-sandbox.io/resource-pids":         strconv.FormatInt(spec.PIDs, 10),
+		"fast-sandbox.io/resource-cpu":          limits.CPU,
+		"fast-sandbox.io/resource-memory":       limits.Memory,
+		"fast-sandbox.io/resource-pids":         strconv.FormatInt(limits.PIDs, 10),
 		"fast-sandbox.io/instance-generation":   strconv.FormatInt(identity.InstanceGeneration, 10),
 		"fast-sandbox.io/runtime-instance-id":   identity.RuntimeInstanceID,
 		"fast-sandbox.io/assignment-attempt":    strconv.FormatInt(identity.AssignmentAttempt, 10),
@@ -727,13 +728,14 @@ func (r *Driver) InspectSandbox(ctx context.Context, sandboxID string) (*Sandbox
 	}
 	metadata := &SandboxMetadata{
 		Config: fastletapi.RuntimeSandboxConfig{
-			Spec: fastletapi.SandboxSpec{
+			Desired: fastletapi.SandboxDesiredSpec{
 				Image:               info.Image,
-				CPU:                 info.Labels["fast-sandbox.io/resource-cpu"],
-				Memory:              info.Labels["fast-sandbox.io/resource-memory"],
 				RuntimeProfileHash:  info.Labels["fast-sandbox.io/runtime-profile-hash"],
 				ResourceProfileHash: info.Labels["fast-sandbox.io/resource-profile-hash"],
 				InfraRevision:       info.Labels["fast-sandbox.io/infra-revision"],
+			},
+			Limits: fastletapi.SandboxRuntimeLimits{
+				CPU: info.Labels["fast-sandbox.io/resource-cpu"], Memory: info.Labels["fast-sandbox.io/resource-memory"],
 			},
 			Identity: fastletapi.SandboxIdentity{
 				SandboxUID: sandboxID, Namespace: info.Labels["fast-sandbox.io/sandbox-namespace"],
@@ -751,7 +753,7 @@ func (r *Driver) InspectSandbox(ctx context.Context, sandboxID string) (*Sandbox
 		CreatedAt:   info.CreatedAt.Unix(),
 		Phase:       "stopped",
 	}
-	metadata.Config.Spec.PIDs, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/resource-pids"], 10, 64)
+	metadata.Config.Limits.PIDs, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/resource-pids"], 10, 64)
 	metadata.Config.Identity.InstanceGeneration, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/instance-generation"], 10, 64)
 	metadata.Config.Identity.AssignmentAttempt, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/assignment-attempt"], 10, 64)
 	metadata.Config.Identity.RouteGeneration, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/route-generation"], 10, 64)
