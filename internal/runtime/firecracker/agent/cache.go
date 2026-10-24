@@ -13,6 +13,7 @@ package agent
 // resolveRootfsImage and GC work on the pulled artifacts unchanged.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -157,7 +158,7 @@ func stageFile(ctx context.Context, c *Client, dir, storeKey string, file native
 		}
 	}()
 	digest := sha256.New()
-	written, err := io.Copy(tmp, io.TeeReader(body, digest))
+	written, err := copySparse(tmp, io.TeeReader(body, digest))
 	if err != nil {
 		return fmt.Errorf("download %s: %w", file.publish, err)
 	}
@@ -182,6 +183,39 @@ func stageFile(ctx context.Context, c *Client, dir, storeKey string, file native
 	}
 	keep = true
 	return nil
+}
+
+// copySparse copies into a new, empty file, seeking over all-zero chunks.
+// Buffering keeps hole detection independent of network read boundaries.
+// The caller hashes the entire input, including zeros skipped on disk.
+func copySparse(output *os.File, input io.Reader) (int64, error) {
+	var buffer, zeros [32 << 10]byte
+	var written int64
+	buffered := 0
+	for {
+		n, readErr := input.Read(buffer[buffered:])
+		buffered += n
+		if buffered > 0 && (buffered == len(buffer) || readErr != nil) {
+			var err error
+			if bytes.Equal(buffer[:buffered], zeros[:buffered]) {
+				_, err = output.Seek(int64(buffered), io.SeekCurrent)
+			} else {
+				_, err = output.Write(buffer[:buffered])
+			}
+			if err != nil {
+				return written, err
+			}
+			written += int64(buffered)
+			buffered = 0
+		}
+		if errors.Is(readErr, io.EOF) {
+			// Seeking alone does not extend a file that ends in a hole.
+			return written, output.Truncate(written)
+		}
+		if readErr != nil {
+			return written, readErr
+		}
+	}
 }
 
 // commitManifest writes the downloaded manifest as the pull commit point:
