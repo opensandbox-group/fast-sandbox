@@ -281,7 +281,10 @@ or memory requests or limits. The Controller owns those four values.
 
 Other Pod template fields remain user-owned, including image, environment,
 scheduling constraints, security context, volumes, and sidecars. Sidecar
-resources remain ordinary Kubernetes resources.
+resources remain ordinary Kubernetes resources. For aggregate Pod-cgroup
+observation, `resource-admission.json.podMemoryBudget` is derived as
+`runtimeEnvelope.memory + sum(long-running sidecar memory limits)`. It is an
+observer threshold only and is not admission capacity.
 
 ## Internal Create contract
 
@@ -510,13 +513,17 @@ The scaler sums the exact derived request of each pending Sandbox. Accepted
 Creating and accepted Resuming Sandboxes are excluded because their requests
 already appear in `committed`.
 
-The Pool scales up when free Sandbox count, free CPU commitment, or free memory
-commitment falls below pending demand plus `bufferMin`. It also retains each
-pending request vector and performs deterministic best-fit packing against
-individual Fastlet free vectors. This adds capacity when aggregate free
-resources look sufficient but are fragmented across Fastlets and no one
-Fastlet can admit the request. The number of added Pods is the larger of the
-aggregate deficit and packing deficit, bounded by `poolMax`.
+The scaler retains every pending request vector and performs deterministic
+best-fit packing against individual Fastlet free vectors, including physical
+slot count. This exact fit is authoritative for scale-out: it adds capacity
+when aggregate resources are fragmented, but does not add a Fastlet merely
+because a smaller-than-default request makes the default-sized free count look
+low. The resulting Pod count remains bounded by `poolMax`.
+
+A no-capacity FastPath Create fails before CRD creation, so that failed call is
+not converted into scaler demand. Buffer capacity provides proactive headroom;
+the client retries after capacity appears. Pending demand comes only from
+already durable operations whose outcome or lifecycle is still in progress.
 
 A newly created Fastlet contributes nominal capacity only during a bounded
 startup grace period. A Pod that never reports a heartbeat stops masking

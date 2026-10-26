@@ -94,7 +94,10 @@ For ResourceAware Pools, `resource-admission.json` is the single resolved
 contract shared by Fastlet admission and the runtime boundary. Its `capacity`
 is the pure Sandbox commitment capacity; `sandboxRuntimeBudget` is the maximum
 aggregate child-runtime budget and cannot be consumed by fixed Fastlet cost;
-`runtimeEnvelope` adds the runtime profile's one-per-Pod `fastletOverhead`.
+`runtimeEnvelope` adds the runtime profile's one-per-Pod `fastletOverhead`;
+`podMemoryBudget` adds all long-running sidecar memory limits for runtimes
+whose pressure observer reads the aggregate Pod cgroup. This observer-only
+budget never changes Sandbox commitment capacity.
 FastPath and the Pool scaler consume the same capacity through a
 platform-owned Pod annotation instead of re-deriving it from the first
 container's Kubernetes request.

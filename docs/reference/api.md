@@ -433,7 +433,10 @@ trusted direct-ingress contract.
 - only an explicit side-effect-free Fastlet rejection permits trying another
   Top-K candidate;
 - ambiguous transport failure preserves and retries the durable assignment;
-- failures after CRD persistence leave durable intent for Reconciler takeover;
+- ambiguous failures after CRD persistence leave the same assignment durable
+  for idempotent retry and Reconciler takeover;
+- no-capacity failures create no CRD, while conclusive side-effect-free
+  rejection of every candidate deletes an intent newly created by that call;
 - Delete is accepted before asynchronous finalizer cleanup completes;
 - stale Pod UID, instance generation, assignment attempt, route generation, or
   route credential is rejected.

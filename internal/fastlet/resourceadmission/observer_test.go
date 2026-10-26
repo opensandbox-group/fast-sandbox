@@ -74,6 +74,23 @@ func TestObserverAppliesHighLowWatermarkHysteresis(t *testing.T) {
 	require.Empty(t, reason)
 }
 
+func TestObserverDoesNotChargeSidecarUsageAgainstRuntimeOwnerEnvelope(t *testing.T) {
+	// The aggregate Pod observer receives the Pod memory budget (3 GiB), not
+	// the 1 GiB runtime-owner envelope. A 1.5 GiB sidecar-inclusive sample is
+	// therefore healthy instead of a false high-watermark block.
+	reader := &sequenceReader{samples: []Sample{
+		{MemoryCurrentBytes: 1536, MemoryLimitBytes: 3072, NodeAvailableRatio: 0.5},
+		{MemoryCurrentBytes: 1536, MemoryLimitBytes: 3072, NodeAvailableRatio: 0.5},
+	}}
+	observer, err := NewObserver(reader, &recordingSetter{}, testConfig())
+	require.NoError(t, err)
+
+	observer.ObserveOnce()
+	state, reason := observer.ObserveOnce()
+	require.Equal(t, fastletapi.AdmissionStateOpen, state)
+	require.Empty(t, reason)
+}
+
 func TestObserverBlocksOOMPSIAndNodePressure(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -152,6 +152,7 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		copied.RuntimeEnvelope = apiv1alpha2.SandboxComputeResources{
 			CPU: config.ResourceAdmission.RuntimeEnvelope.CPU.DeepCopy(), Memory: config.ResourceAdmission.RuntimeEnvelope.Memory.DeepCopy(),
 		}
+		copied.PodMemoryBudget = config.ResourceAdmission.PodMemoryBudget.DeepCopy()
 		resourceAdmission = &copied
 		if resourceEpoch == "" {
 			var err error

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,6 +36,7 @@ type fastpathRegistry struct {
 	fastlets   map[placement.FastletID]placement.FastletInfo
 	feedback   []recordedFeedback
 	requests   []placement.CandidateRequest
+	reserve    func(placement.FastletID, placement.ResourceDemand) bool
 }
 
 type recordedFeedback struct {
@@ -154,7 +156,7 @@ func capacityRejection() error {
 		Failure: &fastletapi.FastletError{Code: fastletapi.ErrorCapacityRejected, Message: "full", Retryable: true}}
 }
 
-func TestCandidateRefreshIsBoundedAndKeepsPendingIntent(t *testing.T) {
+func TestCandidateRefreshIsBoundedAndRollsBackRejectedIntent(t *testing.T) {
 	server, k8sClient, registry, fastlet := newV2Server(t)
 	registry.candidates = nil
 	for i := 0; i < maxCreateCandidateAttempts+5; i++ {
@@ -167,10 +169,9 @@ func TestCandidateRefreshIsBoundedAndKeepsPendingIntent(t *testing.T) {
 	require.Len(t, fastlet.createIPs, maxCreateCandidateAttempts)
 	var persisted apiv1alpha2.Sandbox
 	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "bounded"}, &persisted))
-	require.Nil(t, persisted.DeletionTimestamp)
+	require.NotNil(t, persisted.DeletionTimestamp)
 	require.Contains(t, persisted.Finalizers, assignment.CleanupFinalizer)
-	require.Equal(t, apiv1alpha2.RuntimeState(""), persisted.Status.Runtime.State,
-		"the durable intent remains pending so the Pool scaler can count its resource demand")
+	require.Equal(t, apiv1alpha2.RuntimeState(""), persisted.Status.Runtime.State)
 }
 
 func TestCandidateRefreshKeepsAssignmentProfiles(t *testing.T) {
@@ -220,6 +221,17 @@ func (r *fastpathRegistry) RecordFeedback(id placement.FastletID, feedback place
 	defer r.mu.Unlock()
 	r.feedback = append(r.feedback, recordedFeedback{id: id, feedback: feedback})
 }
+
+func (r *fastpathRegistry) ReserveLocal(id placement.FastletID, demand placement.ResourceDemand) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.reserve != nil {
+		return r.reserve(id, demand)
+	}
+	return true
+}
+
+func (r *fastpathRegistry) ReleaseLocal(placement.FastletID, placement.ResourceDemand) {}
 
 type fastpathFastlet struct {
 	mu             sync.Mutex
@@ -682,14 +694,9 @@ func TestNoCandidateAndExplicitRejection(t *testing.T) {
 	_, err := server.CreateSandbox(context.Background(), createRequest("no-candidate"))
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 	creates, _, _, _ := k8sClient.counts()
-	require.Equal(t, 1, creates)
+	require.Equal(t, 0, creates)
 	var pending apiv1alpha2.Sandbox
-	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "no-candidate"}, &pending))
-	require.Nil(t, pending.DeletionTimestamp)
-	require.Contains(t, pending.Finalizers, assignment.CleanupFinalizer)
-	envelope, err := assignment.AssignmentFromAnnotation(&pending)
-	require.NoError(t, err)
-	require.Nil(t, envelope, "an intent accepted without capacity remains unassigned for Controller placement")
+	require.True(t, apierrors.IsNotFound(k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "no-candidate"}, &pending)))
 
 	registry.candidates = []placement.FastletInfo{testCandidate("fastlet-a", "pod-a", "10.0.0.1")}
 	fastlet.createFailure = &fastletapi.CreateCallError{Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects, Failure: &fastletapi.FastletError{Code: fastletapi.ErrorCapacityRejected, Message: "full", Retryable: true}}
@@ -697,18 +704,18 @@ func TestNoCandidateAndExplicitRejection(t *testing.T) {
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 	var persisted apiv1alpha2.Sandbox
 	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "rejected"}, &persisted))
-	require.Nil(t, persisted.DeletionTimestamp)
+	require.NotNil(t, persisted.DeletionTimestamp)
 	require.Contains(t, persisted.Finalizers, assignment.CleanupFinalizer)
-	require.Equal(t, apiv1alpha2.RuntimeState(""), persisted.Status.Runtime.State,
-		"a definite admission rejection remains visible as pending resource demand")
+	require.Equal(t, apiv1alpha2.RuntimeState(""), persisted.Status.Runtime.State)
 }
 
-func TestIdempotentRetryAssignsPreviouslyUnassignedIntent(t *testing.T) {
+func TestIdempotentRetryAssignsPreexistingUnassignedIntent(t *testing.T) {
 	server, k8sClient, registry, _ := newV2Server(t)
-	registry.candidates = nil
 	request := createRequest("pending-retry")
-	_, err := server.CreateSandbox(context.Background(), request)
-	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	createSpecHash, err := CreateSpecHash(request)
+	require.NoError(t, err)
+	persistedIntent := newSandboxCRD(request, nil, nil, createSpecHash)
+	require.NoError(t, k8sClient.Create(context.Background(), persistedIntent))
 
 	candidate := testCandidate("fastlet-b", "pod-b", "10.0.0.2")
 	registry.candidates = []placement.FastletInfo{candidate}
@@ -781,10 +788,77 @@ func TestExistingIntentExplicitRejectionIsNeverDeleted(t *testing.T) {
 		Failure:     &fastletapi.FastletError{Code: fastletapi.ErrorCapacityRejected, Message: "still full", Retryable: true},
 	}
 	_, err = server.CreateSandbox(context.Background(), createRequest("existing-intent"))
-	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	require.Equal(t, codes.Unavailable, status.Code(err))
 
 	var persisted apiv1alpha2.Sandbox
 	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "existing-intent"}, &persisted))
+}
+
+func TestLocalReservationConflictRetainsAssignmentForIdempotentRetry(t *testing.T) {
+	server, k8sClient, registry, fastlet := newV2Server(t)
+	second := testCandidate("fastlet-b", "pod-b", "10.0.0.2")
+	registry.candidates = append(registry.candidates, second)
+	registry.fastlets[second.ID] = second
+	registry.reserve = func(placement.FastletID, placement.ResourceDemand) bool { return false }
+
+	request := createRequest("local-conflict")
+	_, err := server.CreateSandbox(context.Background(), request)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Empty(t, fastlet.createIPs)
+
+	var persisted apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: request.RequestId}, &persisted))
+	envelope, err := assignment.AssignmentFromAnnotation(&persisted)
+	require.NoError(t, err)
+	require.Equal(t, "fastlet-a", envelope.FastletName)
+	require.Equal(t, int64(1), envelope.Attempt)
+
+	registry.reserve = nil
+	_, err = server.CreateSandbox(context.Background(), request)
+	require.NoError(t, err)
+	require.Equal(t, []string{"10.0.0.1"}, fastlet.createIPs)
+}
+
+func TestConcurrentIdempotentCreatesNeverMoveAssignmentOnLocalConflict(t *testing.T) {
+	server, k8sClient, registry, fastlet := newV2Server(t)
+	secondCandidate := testCandidate("fastlet-b", "pod-b", "10.0.0.2")
+	registry.candidates = append(registry.candidates, secondCandidate)
+	registry.fastlets[secondCandidate.ID] = secondCandidate
+	var reservations atomic.Int32
+	registry.reserve = func(placement.FastletID, placement.ResourceDemand) bool {
+		return reservations.Add(1) == 1
+	}
+	firstReachedFastlet := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	fastlet.beforeCreate = func(*fastletapi.CreateSandboxRequest) {
+		close(firstReachedFastlet)
+		<-releaseFirst
+	}
+
+	request := createRequest("concurrent-idempotent")
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := server.CreateSandbox(context.Background(), request)
+		firstResult <- err
+	}()
+	select {
+	case <-firstReachedFastlet:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Create did not reach the assigned Fastlet")
+	}
+
+	_, secondErr := server.CreateSandbox(context.Background(), createRequest("concurrent-idempotent"))
+	require.Equal(t, codes.Unavailable, status.Code(secondErr))
+	close(releaseFirst)
+	require.NoError(t, <-firstResult)
+
+	var persisted apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: request.RequestId}, &persisted))
+	envelope, err := assignment.AssignmentFromAnnotation(&persisted)
+	require.NoError(t, err)
+	require.Equal(t, "fastlet-a", envelope.FastletName)
+	require.Equal(t, int64(1), envelope.Attempt)
+	require.Equal(t, []string{"10.0.0.1"}, fastlet.createIPs)
 }
 
 func TestAmbiguousFailureNeverReassigns(t *testing.T) {

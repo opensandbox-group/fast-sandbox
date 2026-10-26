@@ -340,6 +340,7 @@ func newResourceAwareAdmissionManager(
 		RuntimeEnvelope: apiv1alpha2.SandboxComputeResources{
 			CPU: resource.MustParse(capacityCPU), Memory: resource.MustParse(capacityMemory),
 		},
+		PodMemoryBudget:     resource.MustParse(capacityMemory),
 		ResourceProfileHash: profile.Hash(),
 	}
 	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{

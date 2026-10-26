@@ -146,11 +146,15 @@ CPU and memory commitments are checked separately before every Create.
 Per-Sandbox limits isolate noisy neighbors, and the Kubernetes Pod cgroup caps
 their combined execution.
 
-Fastlet also observes its runtime-owner memory cgroup. Sustained high usage,
-memory PSI, a new OOM event, or node memory pressure blocks new admissions;
-low-watermark recovery reopens admission. CPU remains a hard static
-commitment dimension, but live CPU pressure is not a hard gate in the first
-resource-aware version.
+Fastlet observes the cgroup that actually owns runtime memory. Ordinary
+in-container runtimes use the runtime-owner container envelope. Containerd
+runtimes observe the aggregate Pod cgroup because their shim/VMM processes
+can live outside the Fastlet container cgroup; that observer budget equals the
+runtime envelope plus all long-running sidecar memory limits. Sidecars do not
+increase Sandbox commitment capacity. Sustained high usage, memory PSI, a new
+OOM event, or node memory pressure blocks new admissions; low-watermark
+recovery reopens admission. CPU remains a hard static commitment dimension,
+but live CPU pressure is not a hard gate in the first resource-aware version.
 
 Containerd-backed runtimes do not remain in containerd's top-level cgroup.
 Fastlet discovers its Kubernetes Pod cgroup from the Pod UID and the mounted

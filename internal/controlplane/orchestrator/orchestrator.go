@@ -31,6 +31,7 @@ var (
 	ErrInvalidActionDesiredState  = errors.New("Sandbox Action desired state is invalid")
 	ErrAssignedFastletUnavailable = errors.New("assigned Fastlet is unavailable or was replaced")
 	ErrUnknownFastletOutcome      = errors.New("Fastlet operation outcome is unknown")
+	ErrLocalReservationConflict   = errors.New("FastPath local in-flight reservation conflicts with the durable assignment")
 )
 
 const (
@@ -438,7 +439,7 @@ func (o *Orchestrator) CreateRuntime(ctx context.Context, sandbox *apiv1alpha2.S
 	if err != nil {
 		return nil, err
 	}
-	return o.createRuntimeOnTarget(ctx, sandbox, fastlet, envelope, identity, "", parameters)
+	return o.createRuntimeOnTarget(ctx, sandbox, fastlet, envelope, identity, "", parameters, true)
 }
 
 // CreateRuntimeOnCandidate is used immediately after FastPath wins an
@@ -470,14 +471,23 @@ func (o *Orchestrator) CreateRuntimeOnCandidateWithCompletion(ctx context.Contex
 		InstanceGeneration: envelope.InstanceGeneration, RuntimeInstanceID: envelope.RuntimeInstanceID,
 		AssignmentAttempt: envelope.Attempt, RouteGeneration: envelope.RouteGeneration, FastletPodUID: envelope.FastletPodUID,
 	}
-	return o.createRuntimeOnTarget(ctx, sandbox, fastlet, envelope, identity, completion, parameters)
+	return o.createRuntimeOnTarget(ctx, sandbox, fastlet, envelope, identity, completion, parameters, false)
 }
 
-func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1alpha2.Sandbox, fastlet placement.FastletInfo, envelope assignment.AssignmentEnvelope, identity fastletapi.SandboxIdentity, completion fastletapi.CreateCompletion, parameters RuntimeParameters) (*fastletapi.CreateSandboxResponse, error) {
+func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1alpha2.Sandbox, fastlet placement.FastletInfo, envelope assignment.AssignmentEnvelope, identity fastletapi.SandboxIdentity, completion fastletapi.CreateCompletion, parameters RuntimeParameters, declarative bool) (*fastletapi.CreateSandboxResponse, error) {
 	if local, ok := o.Registry.(localReservationRegistry); ok && createNeedsLocalReservation(sandbox, fastlet, identity) {
 		if !local.ReserveLocal(fastlet.ID, parameters.ResourceDemand) {
-			failure := &fastletapi.FastletError{Code: fastletapi.ErrorCapacityRejected, Reason: fastletapi.AdmissionReasonSlotFull, Message: "FastPath local in-flight capacity is exhausted", Retryable: true}
-			return nil, &fastletapi.CreateCallError{Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects, Failure: failure}
+			if declarative {
+				// A Sandbox reconciler owns one serialized durable operation. No
+				// Fastlet RPC has started, so it may safely select another target.
+				failure := &fastletapi.FastletError{Code: fastletapi.ErrorCapacityRejected, Reason: fastletapi.AdmissionReasonSlotFull, Message: "Controller local capacity view rejects the assigned Fastlet", Retryable: true}
+				return nil, &fastletapi.CreateCallError{Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects, Failure: failure}
+			}
+			// This is a conflict in one FastPath replica's eventually-consistent
+			// cache, not a rejection reported by the assigned Fastlet. Treating it
+			// as a candidate rejection would allow a concurrent idempotent Create
+			// to move the durable assignment while another call is already using it.
+			return nil, fmt.Errorf("%w: fastlet=%s", ErrLocalReservationConflict, fastlet.ID)
 		}
 		defer local.ReleaseLocal(fastlet.ID, parameters.ResourceDemand)
 	}

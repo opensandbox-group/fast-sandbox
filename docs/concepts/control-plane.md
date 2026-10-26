@@ -54,10 +54,13 @@ sequenceDiagram
   else rejected before side effects
     F->>K: CAS assignment to another candidate
     F->>L: atomic Create(new attempt)
-  else ambiguous or cleanup required
+  else ambiguous outcome
     F-->>C: retryable error
     RC->>K: observe durable intent
     RC->>L: resume the same identity
+  else every candidate rejects before side effects
+    F->>K: delete the newly created intent
+    F-->>C: ResourceExhausted
   end
 ```
 
@@ -69,7 +72,10 @@ sequenceDiagram
 - A different workload, expiry, metadata, failure, or Pool intent under the
   same request ID is rejected.
 - A failure that occurs before candidate selection creates no CRD.
-- A failure after the CRD Create leaves durable intent for retry and reconciliation.
+- An ambiguous failure after CRD creation leaves the same assignment durable
+  for retry and reconciliation.
+- If every Fastlet explicitly rejects before side effects, Fast-Path deletes
+  the intent created by that API call before returning `ResourceExhausted`.
 
 The initial CRD write includes absolute expiry and user metadata. Fast-Path
 Create does not require a follow-up lifecycle update to complete initial

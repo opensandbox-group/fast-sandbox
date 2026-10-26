@@ -277,9 +277,9 @@ func startResourceAdmissionObserver(
 	if err != nil {
 		return err
 	}
-	limit := settings.RuntimeEnvelope.Memory.Value()
-	if limit <= 0 {
-		return errors.New("resource admission runtime memory limit must be positive")
+	limit, err := resourceAdmissionObserverMemoryLimit(settings, aggregatePodCgroup)
+	if err != nil {
+		return err
 	}
 	var reader fastletresourceadmission.Reader
 	if aggregatePodCgroup {
@@ -304,6 +304,20 @@ func startResourceAdmissionObserver(
 	}
 	go observer.Run(ctx)
 	return nil
+}
+
+func resourceAdmissionObserverMemoryLimit(settings *fastletsettings.ResourceAdmissionSettings, aggregatePodCgroup bool) (int64, error) {
+	if settings == nil {
+		return 0, errors.New("resource admission settings are required")
+	}
+	limit := settings.RuntimeEnvelope.Memory.Value()
+	if aggregatePodCgroup {
+		limit = settings.PodMemoryBudget.Value()
+	}
+	if limit <= 0 {
+		return 0, errors.New("resource admission observer memory limit must be positive")
+	}
+	return limit, nil
 }
 
 func memoryObserverConfigFromEnvironment() (fastletresourceadmission.Config, error) {

@@ -494,46 +494,47 @@ func (r *SandboxPoolReconciler) planResourceAwareScaleWithDemand(
 	view := r.observeResourceAwareCapacity(pool, pods, plannedPod, observed, now, demand, nominal)
 	plan.activeScaleDownDrains = view.activeScaleDownDrains
 	availableFree := view.freeSlots
-	availableResources := view.freeResources
-
-	pendingDemand := sumResourceDemands(pendingDemands)
-	desiredFree := pendingSandboxes + pool.Spec.Capacity.BufferMin
 	plan.desiredPods = current - plan.activeScaleDownDrains
-	bufferCPU := demand.CPU.DeepCopy()
-	bufferCPU.Mul(int64(pool.Spec.Capacity.BufferMin))
-	bufferMemory := demand.Memory.DeepCopy()
-	bufferMemory.Mul(int64(pool.Spec.Capacity.BufferMin))
-	requiredCPU := pendingDemand.CPU.DeepCopy()
-	requiredCPU.Add(bufferCPU)
-	requiredMemory := pendingDemand.Memory.DeepCopy()
-	requiredMemory.Add(bufferMemory)
 	capacity, capacityErr := fastletsettings.DecodeCommitmentCapacity(plannedPod.Annotations[fastletsettings.CommitmentCapacityAnnotation])
-	fragmentationPods, packable := additionalFastletsForDemands(
-		pendingDemands, pool.Spec.Capacity.BufferMin, demand, view.freeBins,
-		resourceAwareFreeBin{slots: nominal, resources: placement.ResourceDemand{CPU: capacity.CPU, Memory: capacity.Memory}},
-	)
-	if capacityErr != nil {
-		packable = false
-		fragmentationPods = 0
-	}
-	if availableFree < desiredFree || availableResources.CPU.Cmp(requiredCPU) < 0 ||
-		availableResources.Memory.Cmp(requiredMemory) < 0 || fragmentationPods > 0 {
-		deficit := max(int32(0), desiredFree-availableFree)
-		missingCPU := requiredCPU.MilliValue() - availableResources.CPU.MilliValue()
-		missingMemory := requiredMemory.Value() - availableResources.Memory.Value()
-		podsNeeded := (deficit + nominal - 1) / nominal
-		if capacityErr == nil {
-			podsNeeded = max(podsNeeded, int32(ceilPositive(missingCPU, capacity.CPU.MilliValue())))
-			podsNeeded = max(podsNeeded, int32(ceilPositive(missingMemory, capacity.Memory.Value())))
+	if capacityErr == nil {
+		podsNeeded, packable := additionalFastletsForDemands(
+			pendingDemands, pool.Spec.Capacity.BufferMin, demand, view.freeBins,
+			resourceAwareFreeBin{slots: nominal, resources: placement.ResourceDemand{CPU: capacity.CPU, Memory: capacity.Memory}},
+		)
+		if !packable {
+			// A demand that cannot fit an empty Fastlet cannot be repaired by
+			// adding more identical Pods. Request validation owns that error.
+			return plan
 		}
-		if packable {
-			podsNeeded = max(podsNeeded, fragmentationPods)
+		if podsNeeded > 0 {
+			// Canceling an in-progress resource scale-down can recover at most
+			// one nominal Fastlet per drain. Create only the remaining Pods.
+			podsNeeded -= min(podsNeeded, plan.activeScaleDownDrains)
+			plan.desiredPods = current + podsNeeded
+			return plan
 		}
-		// Canceling an in-progress resource scale-down can recover at most one
-		// nominal Fastlet per drain. Only create Pods for any remaining deficit.
-		podsNeeded -= min(podsNeeded, plan.activeScaleDownDrains)
-		plan.desiredPods = current + podsNeeded
-		return plan
+	} else {
+		// Old Pods without a valid capacity annotation use the conservative
+		// aggregate fallback until rollout replaces them. Heterogeneous pools
+		// with a valid annotation always use the exact per-Fastlet fit above.
+		availableResources := view.freeResources
+		pendingDemand := sumResourceDemands(pendingDemands)
+		desiredFree := pendingSandboxes + pool.Spec.Capacity.BufferMin
+		bufferCPU := demand.CPU.DeepCopy()
+		bufferCPU.Mul(int64(pool.Spec.Capacity.BufferMin))
+		bufferMemory := demand.Memory.DeepCopy()
+		bufferMemory.Mul(int64(pool.Spec.Capacity.BufferMin))
+		requiredCPU := pendingDemand.CPU.DeepCopy()
+		requiredCPU.Add(bufferCPU)
+		requiredMemory := pendingDemand.Memory.DeepCopy()
+		requiredMemory.Add(bufferMemory)
+		if availableFree < desiredFree || availableResources.CPU.Cmp(requiredCPU) < 0 || availableResources.Memory.Cmp(requiredMemory) < 0 {
+			deficit := max(int32(0), desiredFree-availableFree)
+			podsNeeded := (deficit + nominal - 1) / nominal
+			podsNeeded -= min(podsNeeded, plan.activeScaleDownDrains)
+			plan.desiredPods = current + podsNeeded
+			return plan
+		}
 	}
 	if pendingSandboxes > 0 {
 		return plan
@@ -738,13 +739,6 @@ func dominantDemandShare(demand, capacity placement.ResourceDemand) float64 {
 		float64(demand.CPU.MilliValue())/float64(capacity.CPU.MilliValue()),
 		float64(demand.Memory.Value())/float64(capacity.Memory.Value()),
 	)
-}
-
-func ceilPositive(value, divisor int64) int64 {
-	if value <= 0 || divisor <= 0 {
-		return 0
-	}
-	return (value + divisor - 1) / divisor
 }
 
 func resourceFastletsForPoolChildren(
@@ -1792,6 +1786,16 @@ func buildFastletSettingsFromResolved(pool *apiv1alpha2.SandboxPool, resolved re
 	if resolved.Mode != apiv1alpha2.SandboxResourceModeResourceAware {
 		return bundle, nil
 	}
+	podMemoryBudget := resolved.RuntimeEnvelope.Memory.DeepCopy()
+	for index := 1; index < len(pool.Spec.FastletTemplate.Spec.Containers); index++ {
+		if limit, found := pool.Spec.FastletTemplate.Spec.Containers[index].Resources.Limits[corev1.ResourceMemory]; found && limit.Sign() > 0 {
+			podMemoryBudget.Add(limit)
+		}
+	}
+	// The platform-owned proxy is always injected and runs in the same Pod
+	// cgroup. Its default memory limit must therefore be part of that scope's
+	// observer budget, while remaining outside Sandbox commitment capacity.
+	podMemoryBudget.Add(defaultPlatformResourceLimit(corev1.ResourceMemory))
 	bundle.ResourceAdmission = &fastletsettings.ResourceAdmissionSettings{
 		Version: "v2", Mode: apiv1alpha2.SandboxResourceModeResourceAware,
 		StaticAdmission: resolved.StaticAdmission, MemoryAdmission: resolved.MemoryAdmission,
@@ -1804,6 +1808,7 @@ func buildFastletSettingsFromResolved(pool *apiv1alpha2.SandboxPool, resolved re
 		RuntimeEnvelope: apiv1alpha2.SandboxComputeResources{
 			CPU: resolved.RuntimeEnvelope.CPU.DeepCopy(), Memory: resolved.RuntimeEnvelope.Memory.DeepCopy(),
 		},
+		PodMemoryBudget:     podMemoryBudget,
 		ResourceProfileHash: pool.Spec.SandboxResources.Hash(),
 	}
 	return bundle, nil
@@ -2315,34 +2320,37 @@ func applyDefaultPlatformResources(container *corev1.Container) {
 	if container.Resources.Limits == nil {
 		container.Resources.Limits = corev1.ResourceList{}
 	}
-	defaults := map[corev1.ResourceName]struct {
-		request resource.Quantity
-		limit   resource.Quantity
-	}{
-		corev1.ResourceCPU: {
-			request: resource.MustParse("50m"),
-			limit:   resource.MustParse("250m"),
-		},
-		corev1.ResourceMemory: {
-			request: resource.MustParse("64Mi"),
-			limit:   resource.MustParse("256Mi"),
-		},
-	}
-	for name, defaultValue := range defaults {
+	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+		defaultRequest := defaultPlatformResourceRequest(name)
+		defaultLimit := defaultPlatformResourceLimit(name)
 		request, hasRequest := container.Resources.Requests[name]
 		if !hasRequest || request.IsZero() {
-			request = defaultValue.request.DeepCopy()
+			request = defaultRequest
 			container.Resources.Requests[name] = request
 		}
 		limit, hasLimit := container.Resources.Limits[name]
 		if !hasLimit || limit.IsZero() {
-			limit = defaultValue.limit.DeepCopy()
+			limit = defaultLimit
 			if request.Cmp(limit) > 0 {
 				limit = request.DeepCopy()
 			}
 			container.Resources.Limits[name] = limit
 		}
 	}
+}
+
+func defaultPlatformResourceRequest(name corev1.ResourceName) resource.Quantity {
+	if name == corev1.ResourceCPU {
+		return resource.MustParse("50m")
+	}
+	return resource.MustParse("64Mi")
+}
+
+func defaultPlatformResourceLimit(name corev1.ResourceName) resource.Quantity {
+	if name == corev1.ResourceCPU {
+		return resource.MustParse("250m")
+	}
+	return resource.MustParse("256Mi")
 }
 
 func validateContainerHasLimits(container *corev1.Container) error {

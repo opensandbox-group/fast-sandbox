@@ -234,12 +234,21 @@ func TestResourceAwareOvercommitScaling(t *testing.T) {
 			if _, err := fastPath.CreateSandbox(ctx, thirdRequest); status.Code(err) != codes.ResourceExhausted {
 				t.Fatalf("capacity-crossing FastPath CreateSandbox code=%s err=%v, want ResourceExhausted", status.Code(err), err)
 			}
-			var pending apiv1alpha2.Sandbox
-			if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: namespace, Name: thirdRequest.RequestId}, &pending); err != nil {
-				t.Fatalf("capacity rejection must retain the pending Sandbox intent: %v", err)
+			rejectedCtx, cancelRejected := context.WithTimeout(ctx, 60*time.Second)
+			if err := fixture.WaitForSandboxDeleted(rejectedCtx, types.NamespacedName{Name: thirdRequest.RequestId, Namespace: namespace}); err != nil {
+				cancelRejected()
+				t.Fatalf("failed FastPath Create must not leave a runnable intent: %v", err)
 			}
-			if pending.DeletionTimestamp != nil {
-				t.Fatalf("capacity-blocked Sandbox intent is deleting instead of pending")
+			cancelRejected()
+
+			// A separately accepted declarative intent is real scaler demand. It
+			// must not be confused with the failed FastPath request above.
+			thirdSandbox := createSchedulingSandbox(namespace, thirdRequest.RequestId, pool.Name)
+			thirdSandbox.Spec.Resources = &apiv1alpha2.SandboxResourceRequirements{Limits: apiv1alpha2.SandboxComputeResources{
+				CPU: resource.MustParse("250m"), Memory: resource.MustParse("96Mi"),
+			}}
+			if _, err := fixture.CreateSandbox(ctx, namespace, thirdSandbox); err != nil {
+				t.Fatalf("create accepted third Sandbox intent: %v", err)
 			}
 
 			scaleCtx, cancelScale := context.WithTimeout(ctx, 120*time.Second)
@@ -368,6 +377,19 @@ func TestResourceAwareFragmentedCapacityScaling(t *testing.T) {
 			large := createResourceAwareFastPathRequest(namespace, "sb-fragmented-large", pool.Name, "400m", "256Mi")
 			if _, err := fastPath.CreateSandbox(ctx, large); status.Code(err) != codes.ResourceExhausted {
 				t.Fatalf("fragmented FastPath CreateSandbox code=%s err=%v, want ResourceExhausted", status.Code(err), err)
+			}
+			rejectedCtx, cancelRejected := context.WithTimeout(ctx, 60*time.Second)
+			if err := fixture.WaitForSandboxDeleted(rejectedCtx, types.NamespacedName{Name: large.RequestId, Namespace: namespace}); err != nil {
+				cancelRejected()
+				t.Fatalf("fragmented FastPath rejection must not leave a runnable intent: %v", err)
+			}
+			cancelRejected()
+			largeSandbox := createSchedulingSandbox(namespace, large.RequestId, pool.Name)
+			largeSandbox.Spec.Resources = &apiv1alpha2.SandboxResourceRequirements{Limits: apiv1alpha2.SandboxComputeResources{
+				CPU: resource.MustParse("400m"), Memory: resource.MustParse("256Mi"),
+			}}
+			if _, err := fixture.CreateSandbox(ctx, namespace, largeSandbox); err != nil {
+				t.Fatalf("create accepted fragmented Sandbox intent: %v", err)
 			}
 			scaleCtx, cancelScale := context.WithTimeout(ctx, 120*time.Second)
 			defer cancelScale()

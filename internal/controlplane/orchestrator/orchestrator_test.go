@@ -26,6 +26,7 @@ type fakeRegistry struct {
 	feedback    []placement.FastletID
 	feedbacks   []placement.LocalFeedback
 	lastRequest placement.CandidateRequest
+	reserve     func(placement.FastletID, placement.ResourceDemand) bool
 }
 
 func (r *fakeRegistry) TopK(request placement.CandidateRequest, _ int) []placement.FastletInfo {
@@ -46,6 +47,15 @@ func (r *fakeRegistry) RecordFeedback(id placement.FastletID, feedback placement
 func (*fakeRegistry) ApplyHeartbeat(placement.FastletID, string, *fastletapi.HeartbeatResponse, time.Time) error {
 	return nil
 }
+
+func (r *fakeRegistry) ReserveLocal(id placement.FastletID, demand placement.ResourceDemand) bool {
+	if r.reserve != nil {
+		return r.reserve(id, demand)
+	}
+	return true
+}
+
+func (*fakeRegistry) ReleaseLocal(placement.FastletID, placement.ResourceDemand) {}
 
 type fakeFastletClient struct {
 	heartbeat func(string, *fastletapi.HeartbeatRequest) (*fastletapi.HeartbeatResponse, error)
@@ -584,6 +594,29 @@ func TestCreateNeedsLocalReservationOnlyBeforeCurrentIdentityIsReported(t *testi
 
 	sandbox.Status.Runtime.State = apiv1alpha2.RuntimeCreating
 	require.False(t, createNeedsLocalReservation(sandbox, placement.FastletInfo{}, identity))
+}
+
+func TestDeclarativeLocalReservationConflictAllowsSafeReassignment(t *testing.T) {
+	orchestrator, registry, fastletClient, sandbox := newHarness(t)
+	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+	candidate := candidateFor(parameters)
+	registry.fastlets[candidate.ID] = candidate
+	registry.reserve = func(placement.FastletID, placement.ResourceDemand) bool { return false }
+	sandbox.UID = types.UID("sandbox-uid-a")
+	envelope, err := AssignmentForCandidate(candidate, 1, 1, 1, "runtime-a")
+	require.NoError(t, err)
+	require.NoError(t, assignment.SetAssignmentAnnotation(sandbox, envelope))
+	fastletCalled := false
+	fastletClient.create = func(string, *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error) {
+		fastletCalled = true
+		return nil, nil
+	}
+
+	_, err = orchestrator.CreateRuntime(context.Background(), sandbox)
+	require.Error(t, err)
+	require.True(t, IsCandidateRejection(err))
+	require.False(t, fastletCalled, "the conflict is proven before any Fastlet side effect")
 }
 
 func readyFastletObservation(sandboxID string, generation int64) *fastletapi.SandboxStatus {

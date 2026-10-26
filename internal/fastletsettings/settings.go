@@ -48,7 +48,11 @@ type ResourceAdmissionSettings struct {
 	Capacity             apiv1alpha2.SandboxComputeResources `json:"capacity"`
 	SandboxRuntimeBudget apiv1alpha2.SandboxComputeResources `json:"sandboxRuntimeBudget"`
 	RuntimeEnvelope      apiv1alpha2.SandboxComputeResources `json:"runtimeEnvelope"`
-	ResourceProfileHash  string                              `json:"resourceProfileHash"`
+	// PodMemoryBudget matches the aggregate Pod cgroup observed by runtimes
+	// whose VMM or shim processes live outside the Fastlet container cgroup.
+	// It includes RuntimeEnvelope.Memory plus every long-running sidecar limit.
+	PodMemoryBudget     resource.Quantity `json:"podMemoryBudget"`
+	ResourceProfileHash string            `json:"resourceProfileHash"`
 }
 
 type commitmentCapacityAnnotation struct {
@@ -102,14 +106,17 @@ func (s *ResourceAdmissionSettings) Validate(profile apiv1alpha2.SandboxResource
 	limits, _ := profile.LimitResources()
 	if s.Capacity.CPU.Sign() <= 0 || s.Capacity.Memory.Sign() <= 0 ||
 		s.SandboxRuntimeBudget.CPU.Sign() <= 0 || s.SandboxRuntimeBudget.Memory.Sign() <= 0 ||
-		s.RuntimeEnvelope.CPU.Sign() <= 0 || s.RuntimeEnvelope.Memory.Sign() <= 0 {
-		return fmt.Errorf("resource admission capacity, Sandbox runtime budget, and runtime envelope must be greater than zero")
+		s.RuntimeEnvelope.CPU.Sign() <= 0 || s.RuntimeEnvelope.Memory.Sign() <= 0 || s.PodMemoryBudget.Sign() <= 0 {
+		return fmt.Errorf("resource admission capacity, Sandbox runtime budget, runtime envelope, and Pod memory budget must be greater than zero")
 	}
 	if s.Capacity.CPU.Cmp(s.SandboxRuntimeBudget.CPU) > 0 || s.Capacity.Memory.Cmp(s.SandboxRuntimeBudget.Memory) > 0 {
 		return fmt.Errorf("resource admission capacity must not exceed the Sandbox runtime budget")
 	}
 	if s.SandboxRuntimeBudget.CPU.Cmp(s.RuntimeEnvelope.CPU) > 0 || s.SandboxRuntimeBudget.Memory.Cmp(s.RuntimeEnvelope.Memory) > 0 {
 		return fmt.Errorf("Sandbox runtime budget must not exceed the Fastlet runtime envelope")
+	}
+	if s.PodMemoryBudget.Cmp(s.RuntimeEnvelope.Memory) < 0 {
+		return fmt.Errorf("Pod memory budget must not be lower than the Fastlet runtime envelope memory")
 	}
 	if s.Capacity.CPU.Cmp(requests.CPU) < 0 || s.Capacity.Memory.Cmp(requests.Memory) < 0 {
 		return fmt.Errorf("resource admission capacity cannot commit one Sandbox request")
