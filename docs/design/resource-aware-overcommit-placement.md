@@ -509,11 +509,16 @@ free capacity.
 
 ### Pending demand and scale-up
 
-The scaler sums the exact derived request of each pending Sandbox. Accepted
-Creating and accepted Resuming Sandboxes are excluded because their requests
-already appear in `committed`.
+The shared resource resolver classifies every pending Sandbox before scaling.
+Only admissible Sandboxes contribute an exact derived request. A caller limit
+that cannot fit the Pool's per-Fastlet runtime budget is excluded from shared
+capacity planning and reported on that Sandbox as `ResourceResolved=False`;
+one invalid desired state never blocks valid pending work or `bufferMin`.
+Accepted Creating and accepted Resuming Sandboxes are also excluded because
+their requests already appear in `committed`.
 
-The scaler retains every pending request vector and performs deterministic
+The scaler receives this single collection of admissible request vectors; it
+does not maintain an independent pending count. It performs deterministic
 best-fit packing against individual Fastlet free vectors, including physical
 slot count. This exact fit is authoritative for scale-out: it adds capacity
 when aggregate resources are fragmented, but does not add a Fastlet merely

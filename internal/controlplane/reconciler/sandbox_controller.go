@@ -124,7 +124,17 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *o
 	}
 	assigned, newlyAssigned, err := orchestrator.AssignDeclarativePreferring(ctx, sandbox, string(sandbox.UID), preferredFastlet, preferredPodUID)
 	if err != nil {
+		var resolutionErr *orchestration.SandboxResourceResolutionError
+		if errors.As(err, &resolutionErr) {
+			if statusErr := r.markResourceUnresolved(ctx, sandbox, resolutionErr.Reason, resolutionErr.Error()); statusErr != nil {
+				return ctrl.Result{}, statusErr
+			}
+			return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
+		}
 		if errors.Is(err, orchestration.ErrNoCandidate) {
+			if statusErr := r.markResourceResolved(ctx, sandbox); statusErr != nil {
+				return ctrl.Result{}, statusErr
+			}
 			if statusErr := r.markPending(ctx, sandbox, "NoCandidate", "No Ready Fastlet currently accepts this Pool/profile"); statusErr != nil {
 				klog.FromContext(ctx).Error(statusErr, "Failed to mark Sandbox Pending after NoCandidate", "sandbox", sandbox.Name)
 			}
@@ -137,6 +147,9 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *o
 			return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 		}
 		return ctrl.Result{}, err
+	}
+	if statusErr := r.markResourceResolved(ctx, assigned); statusErr != nil {
+		return ctrl.Result{}, statusErr
 	}
 
 	// Keep the status projection above available to the active Fast-Path CAS,
@@ -275,6 +288,27 @@ func (r *SandboxReconciler) markPending(ctx context.Context, sandbox *apiv1alpha
 		}
 		setControllerStates(status, apiv1alpha2.RuntimePending, apiv1alpha2.DataPlanePending, message)
 		setSandboxReadyCondition(status, sandbox.Generation, reason, message)
+	})
+}
+
+func (r *SandboxReconciler) markResourceUnresolved(ctx context.Context, sandbox *apiv1alpha2.Sandbox, reason, message string) error {
+	return r.patchStatus(ctx, sandbox, func(status *apiv1alpha2.SandboxStatus) {
+		setControllerStates(status, apiv1alpha2.RuntimePending, apiv1alpha2.DataPlanePending, message)
+		setSandboxReadyCondition(status, sandbox.Generation, reason, message)
+		apiMeta.SetStatusCondition(&status.Conditions, metav1.Condition{
+			Type: apiv1alpha2.SandboxConditionResourceResolved, Status: metav1.ConditionFalse,
+			Reason: reason, Message: message, ObservedGeneration: sandbox.Generation, LastTransitionTime: metav1.Now(),
+		})
+	})
+}
+
+func (r *SandboxReconciler) markResourceResolved(ctx context.Context, sandbox *apiv1alpha2.Sandbox) error {
+	return r.patchStatus(ctx, sandbox, func(status *apiv1alpha2.SandboxStatus) {
+		apiMeta.SetStatusCondition(&status.Conditions, metav1.Condition{
+			Type: apiv1alpha2.SandboxConditionResourceResolved, Status: metav1.ConditionTrue,
+			Reason: "Resolved", Message: "Sandbox resources are admissible under the Pool policy",
+			ObservedGeneration: sandbox.Generation, LastTransitionTime: metav1.Now(),
+		})
 	})
 }
 

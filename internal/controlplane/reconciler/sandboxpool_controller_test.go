@@ -48,7 +48,7 @@ func (r *SandboxPoolReconciler) planResourceAwareScale(
 			CPU: requests.CPU.DeepCopy(), Memory: requests.Memory.DeepCopy(),
 		})
 	}
-	return r.planResourceAwareScaleWithDemand(pool, pods, pendingSandboxes, pendingDemands, plannedPod, observed, now)
+	return r.planResourceAwareScaleWithDemand(pool, pods, pendingDemands, plannedPod, observed, now)
 }
 
 func TestRegistryConfigCompilesSameNamespaceSecretsAndPreservesLastValidRevision(t *testing.T) {
@@ -740,15 +740,16 @@ func TestResourceAwareScaleUsesHeterogeneousPendingCommitments(t *testing.T) {
 			Status: apiv1alpha2.SandboxStatus{Runtime: apiv1alpha2.RuntimeStatus{State: apiv1alpha2.RuntimePending}},
 		}
 	}
-	pending, err := poolPendingResourceDemands(pool, sandboxes, observed, now)
+	resolution, err := resolvePoolPendingResources(pool, sandboxes, observed, now)
 	require.NoError(t, err)
+	pending := resolution.admissible
 	totalPending := sumResourceDemands(pending)
 	require.Equal(t, int64(6000), totalPending.CPU.MilliValue())
 	expectedMemory := resource.MustParse("6Gi")
 	require.Equal(t, expectedMemory.Value(), totalPending.Memory.Value())
 
 	plan := reconciler.planResourceAwareScaleWithDemand(
-		pool, []corev1.Pod{*pod}, int32(len(sandboxes)), pending, planned, observed, now,
+		pool, []corev1.Pod{*pod}, pending, planned, observed, now,
 	)
 	require.Equal(t, int32(2), plan.desiredPods,
 		"three Sandboxes fit the four-slot count but their six-CPU commitment needs two Fastlets")
@@ -789,13 +790,14 @@ func TestResourceAwareScaleAddsFastletWhenAggregateCapacityIsFragmented(t *testi
 		},
 		Status: apiv1alpha2.SandboxStatus{Runtime: apiv1alpha2.RuntimeStatus{State: apiv1alpha2.RuntimePending}},
 	}
-	pending, err := poolPendingResourceDemands(pool, []apiv1alpha2.Sandbox{sandbox}, observed, now)
+	resolution, err := resolvePoolPendingResources(pool, []apiv1alpha2.Sandbox{sandbox}, observed, now)
 	require.NoError(t, err)
+	pending := resolution.admissible
 	require.Len(t, pending, 1)
 	require.Equal(t, int64(2000), pending[0].CPU.MilliValue())
 
 	plan := (&SandboxPoolReconciler{}).planResourceAwareScaleWithDemand(
-		pool, pods, 1, pending, planned, observed, now,
+		pool, pods, pending, planned, observed, now,
 	)
 	require.Equal(t, int32(3), plan.desiredPods,
 		"aggregate free CPU is sufficient, but neither existing Fastlet can fit the two-CPU request")
@@ -839,16 +841,70 @@ func TestResourceAwareScaleDoesNotAddFastletWhenSmallOverridesFit(t *testing.T) 
 			Status: apiv1alpha2.SandboxStatus{Runtime: apiv1alpha2.RuntimeStatus{State: apiv1alpha2.RuntimePending}},
 		}
 	}
-	pending, err := poolPendingResourceDemands(pool, sandboxes, observed, now)
+	resolution, err := resolvePoolPendingResources(pool, sandboxes, observed, now)
 	require.NoError(t, err)
+	pending := resolution.admissible
 	require.Len(t, pending, 2)
 	require.Equal(t, int64(500), pending[0].CPU.MilliValue())
 
 	plan := (&SandboxPoolReconciler{}).planResourceAwareScaleWithDemand(
-		pool, pods, int32(len(sandboxes)), pending, planned, observed, now,
+		pool, pods, pending, planned, observed, now,
 	)
 	require.Equal(t, int32(2), plan.desiredPods,
 		"each small request fits one physical slot even though neither remainder fits a default Sandbox")
+}
+
+func TestUnadmittableDemandDoesNotSuppressValidScaleOutOrBuffer(t *testing.T) {
+	now := time.Date(2026, 10, 26, 8, 0, 0, 0, time.UTC)
+	pool := resourceAwareScalingPool()
+	pool.Spec.MaxSandboxesPerPod = 4
+	pool.Spec.Capacity.BufferMin = 1
+	pool.Spec.Capacity.BufferMax = 1
+	planned := resourceAwarePlannedPod()
+	pod := fastletPod("fastlet-full", "uid-full", "10.0.0.1")
+	full := resourceAwareControllerFastlet("fastlet-full", "uid-full", 4, fastletapi.AdmissionStateOpen, now)
+	full.Admission.Capacity = 4
+	full.ResourceCommitted = placement.ResourceDemand{CPU: resource.MustParse("4"), Memory: resource.MustParse("8Gi")}
+	full.ResourceReceivedAt = now
+	observed := map[string]placement.FastletInfo{"fastlet-full/uid-full": full}
+
+	valid := apiv1alpha2.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "valid", Namespace: pool.Namespace},
+		Spec: apiv1alpha2.SandboxSpec{
+			PoolRef: pool.Name,
+			Resources: &apiv1alpha2.SandboxResourceRequirements{Limits: apiv1alpha2.SandboxComputeResources{
+				CPU: resource.MustParse("2"), Memory: resource.MustParse("4Gi"),
+			}},
+		},
+		Status: apiv1alpha2.SandboxStatus{Runtime: apiv1alpha2.RuntimeStatus{State: apiv1alpha2.RuntimePending}},
+	}
+	oversized := valid.DeepCopy()
+	oversized.Name = "oversized"
+	oversized.Spec.Resources.Limits = apiv1alpha2.SandboxComputeResources{
+		CPU: resource.MustParse("10"), Memory: resource.MustParse("20Gi"),
+	}
+
+	resolution, err := resolvePoolPendingResources(pool, []apiv1alpha2.Sandbox{valid, *oversized}, observed, now)
+	require.NoError(t, err)
+	require.Len(t, resolution.admissible, 1)
+	require.Len(t, resolution.unadmittable, 1)
+	require.Equal(t, "oversized", resolution.unadmittable[0].key.Name)
+	require.Equal(t, orchestration.ReasonLimitExceedsFastletBudget, resolution.unadmittable[0].reason)
+
+	plan := (&SandboxPoolReconciler{}).planResourceAwareScaleWithDemand(
+		pool, []corev1.Pod{*pod}, resolution.admissible, planned, observed, now,
+	)
+	require.Equal(t, int32(2), plan.desiredPods,
+		"the valid pending Sandbox and buffer must still create one fresh Fastlet")
+
+	resolution, err = resolvePoolPendingResources(pool, []apiv1alpha2.Sandbox{*oversized}, observed, now)
+	require.NoError(t, err)
+	require.Empty(t, resolution.admissible)
+	plan = (&SandboxPoolReconciler{}).planResourceAwareScaleWithDemand(
+		pool, []corev1.Pod{*pod}, resolution.admissible, planned, observed, now,
+	)
+	require.Equal(t, int32(2), plan.desiredPods,
+		"an unadmittable Sandbox must not suppress the independent Pool buffer")
 }
 
 func TestResourceAwareScaleExcludesEveryFastletOnPressuredNode(t *testing.T) {

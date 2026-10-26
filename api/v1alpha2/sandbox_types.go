@@ -27,6 +27,11 @@ const (
 
 const SandboxConditionReady = "Ready"
 
+// SandboxConditionResourceResolved reports whether the caller-owned runtime
+// limits can be compiled into one admissible request/limit pair under the
+// referenced Pool's immutable resource policy.
+const SandboxConditionResourceResolved = "ResourceResolved"
+
 // SandboxConditionSuspended reflects whether the Sandbox runtime is
 // checkpointed and released. It is True only while the pause is durably
 // complete (status.runtime.state == Paused); Pausing and Resuming are

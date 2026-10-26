@@ -21,6 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/klog/v2"
@@ -32,6 +33,7 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	infracatalog "fast-sandbox/internal/catalog/infra"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 	"fast-sandbox/internal/controlplane/placement"
 	"fast-sandbox/internal/fastlet/podcgroup"
 	"fast-sandbox/internal/fastletsettings"
@@ -273,9 +275,16 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	)
 	var pendingDemands []placement.ResourceDemand
 	if resourceAwareScaling {
-		pendingDemands, err = poolPendingResourceDemands(&pool, allSandboxes.Items, observedFastlets, now)
+		resolution, resolveErr := resolvePoolPendingResources(&pool, allSandboxes.Items, observedFastlets, now)
+		err = resolveErr
 		if err != nil {
 			return ctrl.Result{}, err
+		}
+		pendingDemands = resolution.admissible
+		pendingCount = int32(len(pendingDemands))
+		for _, rejected := range resolution.unadmittable {
+			logger.V(2).Info("excluding unadmittable Sandbox from Pool demand",
+				"sandbox", rejected.key.String(), "reason", rejected.reason, "message", rejected.message)
 		}
 	}
 
@@ -292,7 +301,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	resourceScalePlan := resourceAwareScalePlan{}
 	if resourceAwareScaling {
 		resourceScalePlan = r.planResourceAwareScaleWithDemand(
-			&pool, childPods.Items, pendingCount, pendingDemands, desiredPod, observedFastlets, now,
+			&pool, childPods.Items, pendingDemands, desiredPod, observedFastlets, now,
 		)
 		desiredPods = resourceScalePlan.desiredPods
 	} else {
@@ -471,15 +480,26 @@ type resourceAwareFreeBin struct {
 	resources placement.ResourceDemand
 }
 
+type unadmittableSandboxResource struct {
+	key     types.NamespacedName
+	reason  string
+	message string
+}
+
+type poolPendingResourceResolution struct {
+	admissible   []placement.ResourceDemand
+	unadmittable []unadmittableSandboxResource
+}
+
 func (r *SandboxPoolReconciler) planResourceAwareScaleWithDemand(
 	pool *apiv1alpha2.SandboxPool,
 	pods []corev1.Pod,
-	pendingSandboxes int32,
 	pendingDemands []placement.ResourceDemand,
 	plannedPod *corev1.Pod,
 	observed map[string]placement.FastletInfo,
 	now time.Time,
 ) resourceAwareScalePlan {
+	pendingSandboxes := int32(len(pendingDemands))
 	current := int32(len(pods))
 	plan := resourceAwareScalePlan{desiredPods: current}
 	nominal := nominalResourceCapacity(pool, plannedPod)
@@ -1183,29 +1203,33 @@ func poolDemandCounts(
 	return active, pending
 }
 
-func poolPendingResourceDemands(
+func resolvePoolPendingResources(
 	pool *apiv1alpha2.SandboxPool,
 	sandboxes []apiv1alpha2.Sandbox,
 	observedFastlets map[string]placement.FastletInfo,
 	now time.Time,
-) ([]placement.ResourceDemand, error) {
-	demands := make([]placement.ResourceDemand, 0)
+) (poolPendingResourceResolution, error) {
+	result := poolPendingResourceResolution{admissible: make([]placement.ResourceDemand, 0)}
 	for index := range sandboxes {
 		sandbox := &sandboxes[index]
 		if sandbox.Spec.PoolRef != pool.Name || !sandboxNeedsResourceCapacity(sandbox, observedFastlets, now) {
 			continue
 		}
-		limits, err := pool.Spec.SandboxResources.ResolveLimits(sandbox.Spec.Resources)
+		_, demand, err := orchestration.ResolveSandboxResources(pool, sandbox)
 		if err != nil {
-			return nil, fmt.Errorf("resolve pending Sandbox %s resources: %w", sandbox.Name, err)
+			var resolutionErr *orchestration.SandboxResourceResolutionError
+			if errors.As(err, &resolutionErr) {
+				result.unadmittable = append(result.unadmittable, unadmittableSandboxResource{
+					key:    types.NamespacedName{Namespace: sandbox.Namespace, Name: sandbox.Name},
+					reason: resolutionErr.Reason, message: resolutionErr.Error(),
+				})
+				continue
+			}
+			return poolPendingResourceResolution{}, fmt.Errorf("resolve pending Sandbox %s resources: %w", sandbox.Name, err)
 		}
-		requests, err := pool.Spec.SandboxResources.DeriveRequests(limits)
-		if err != nil {
-			return nil, fmt.Errorf("derive pending Sandbox %s requests: %w", sandbox.Name, err)
-		}
-		demands = append(demands, placement.ResourceDemand{CPU: requests.CPU, Memory: requests.Memory})
+		result.admissible = append(result.admissible, demand)
 	}
-	return demands, nil
+	return result, nil
 }
 
 func podIdentity(pod *corev1.Pod) string {

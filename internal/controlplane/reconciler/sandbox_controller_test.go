@@ -189,6 +189,43 @@ func TestDeclarativeCreateWithoutCapacityStaysPending(t *testing.T) {
 	require.Equal(t, apiv1alpha2.RuntimePending, current.Status.Runtime.State)
 }
 
+func TestDeclarativeCreateReportsUnadmittableResourcesAndRecovers(t *testing.T) {
+	reconciler, _, _, sandbox := newControllerHarness(t)
+	var pool apiv1alpha2.SandboxPool
+	require.NoError(t, reconciler.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
+	pool.Spec.MaxSandboxesPerPod = 4
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("2"), resource.MustParse("4Gi"), resource.MustParse("2"), resource.MustParse("2"), 256,
+	)
+	pool.Spec.FastletTemplate.Spec.Containers = []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}}
+	require.NoError(t, reconciler.Update(context.Background(), &pool))
+
+	current := getControllerSandbox(t, reconciler, sandbox.Name)
+	current.Spec.Resources = &apiv1alpha2.SandboxResourceRequirements{Limits: apiv1alpha2.SandboxComputeResources{
+		CPU: resource.MustParse("10"), Memory: resource.MustParse("20Gi"),
+	}}
+	require.NoError(t, reconciler.Update(context.Background(), current))
+	reconcileTwice(t, reconciler, sandbox.Name)
+
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	require.Empty(t, current.Status.Placement.FastletName)
+	require.Equal(t, apiv1alpha2.RuntimePending, current.Status.Runtime.State)
+	require.True(t, current.Status.HasCondition(
+		apiv1alpha2.SandboxConditionResourceResolved, metav1.ConditionFalse, orchestration.ReasonLimitExceedsFastletBudget,
+	))
+
+	current.Spec.Resources.Limits = apiv1alpha2.SandboxComputeResources{
+		CPU: resource.MustParse("2"), Memory: resource.MustParse("4Gi"),
+	}
+	require.NoError(t, reconciler.Update(context.Background(), current))
+	_, err := reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+	require.NoError(t, err)
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	require.True(t, current.Status.HasCondition(
+		apiv1alpha2.SandboxConditionResourceResolved, metav1.ConditionTrue, "Resolved",
+	))
+}
+
 func TestDeclarativeCreateUsesSharedV2Orchestrator(t *testing.T) {
 	reconciler, _, fastlet, sandbox := newControllerHarness(t)
 	reconcileTwice(t, reconciler, sandbox.Name)
@@ -198,6 +235,7 @@ func TestDeclarativeCreateUsesSharedV2Orchestrator(t *testing.T) {
 	require.Equal(t, int64(1), current.Status.Placement.Attempt)
 	require.Equal(t, apiv1alpha2.RuntimeReady, current.Status.Runtime.State)
 	require.Equal(t, apiv1alpha2.DataPlaneReady, current.Status.DataPlane.State)
+	require.True(t, current.Status.HasCondition(apiv1alpha2.SandboxConditionResourceResolved, metav1.ConditionTrue, "Resolved"))
 	fastlet.mu.Lock()
 	require.Equal(t, 1, fastlet.ensureCall)
 	fastlet.mu.Unlock()

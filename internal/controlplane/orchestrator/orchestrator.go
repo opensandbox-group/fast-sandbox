@@ -38,7 +38,32 @@ const (
 	ConditionReady       = apiv1alpha2.SandboxConditionReady
 	ReasonFastletPodLost = "FastletPodLost"
 	ReasonExpired        = "Expired"
+
+	ReasonInvalidSandboxResources   = "InvalidSandboxResources"
+	ReasonLimitExceedsFastletBudget = "LimitExceedsFastletBudget"
 )
+
+// SandboxResourceResolutionError is a caller-owned resource intent that
+// cannot be admitted under an otherwise valid Pool policy. Callers may isolate
+// this Sandbox without treating the Pool or controller as unhealthy.
+type SandboxResourceResolutionError struct {
+	Reason string
+	Err    error
+}
+
+func (e *SandboxResourceResolutionError) Error() string {
+	if e == nil || e.Err == nil {
+		return "Sandbox resources are not admissible"
+	}
+	return e.Err.Error()
+}
+
+func (e *SandboxResourceResolutionError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
 
 type FastletClient interface {
 	Heartbeat(context.Context, string, *fastletapi.HeartbeatRequest) (*fastletapi.HeartbeatResponse, error)
@@ -151,24 +176,30 @@ func ResolveSandboxResources(pool *apiv1alpha2.SandboxPool, sandbox *apiv1alpha2
 	if pool == nil || sandbox == nil {
 		return nil, placement.ResourceDemand{}, errors.New("Pool and Sandbox are required")
 	}
+	if err := apiv1alpha2.ValidateSandboxResourceProfile(pool.Spec.SandboxResources); err != nil {
+		return nil, placement.ResourceDemand{}, err
+	}
 	mode := pool.Spec.SandboxResources.ResourceMode()
 	limits, err := pool.Spec.SandboxResources.ResolveLimits(sandbox.Spec.Resources)
 	if err != nil {
-		return nil, placement.ResourceDemand{}, err
+		return nil, placement.ResourceDemand{}, &SandboxResourceResolutionError{Reason: ReasonInvalidSandboxResources, Err: err}
 	}
 	if mode != apiv1alpha2.SandboxResourceModeResourceAware {
 		return nil, placement.ResourceDemand{}, nil
 	}
 	requests, err := pool.Spec.SandboxResources.DeriveRequests(limits)
 	if err != nil {
-		return nil, placement.ResourceDemand{}, err
+		return nil, placement.ResourceDemand{}, &SandboxResourceResolutionError{Reason: ReasonInvalidSandboxResources, Err: err}
 	}
 	_, runtimeBudget, err := pool.Spec.SandboxResources.ResolveFastletCapacity(pool.Spec.MaxSandboxesPerPod)
 	if err != nil {
 		return nil, placement.ResourceDemand{}, err
 	}
 	if limits.CPU.Cmp(runtimeBudget.CPU) > 0 || limits.Memory.Cmp(runtimeBudget.Memory) > 0 {
-		return nil, placement.ResourceDemand{}, fmt.Errorf("Sandbox limits %s/%s exceed Fastlet Sandbox runtime budget %s/%s", limits.CPU.String(), limits.Memory.String(), runtimeBudget.CPU.String(), runtimeBudget.Memory.String())
+		return nil, placement.ResourceDemand{}, &SandboxResourceResolutionError{
+			Reason: ReasonLimitExceedsFastletBudget,
+			Err:    fmt.Errorf("Sandbox limits %s/%s exceed Fastlet Sandbox runtime budget %s/%s", limits.CPU.String(), limits.Memory.String(), runtimeBudget.CPU.String(), runtimeBudget.Memory.String()),
+		}
 	}
 	return &fastletapi.ResolvedSandboxResources{
 		Requests: fastletapi.SandboxResourceVector{CPU: requests.CPU.String(), Memory: requests.Memory.String()},

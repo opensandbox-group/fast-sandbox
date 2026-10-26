@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -399,6 +400,89 @@ func TestResourceAwareFragmentedCapacityScaling(t *testing.T) {
 			assignedLarge := waitForAssignedSandbox(ctx, t, fixture, namespace, large.RequestId)
 			if _, reused := placements[assignedLarge.Status.Placement.FastletName]; reused {
 				t.Fatalf("large Sandbox reused fragmented Fastlet %s instead of new capacity", assignedLarge.Status.Placement.FastletName)
+			}
+			return ctx
+		}).
+		Feature()
+
+	testSuite.Env().Test(t, feature)
+}
+
+func TestResourceAwareUnadmittableDemandIsolation(t *testing.T) {
+	suiteenv.RequireBasic(t)
+
+	feature := features.New("resource-aware-unadmittable-demand-isolation").
+		WithLabel("suite", "scheduling").
+		WithLabel("tier", "smoke").
+		Assess("invalid Sandbox resources do not block valid Pool demand", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+			k8sClient := testSuite.MustKubeClient(t)
+			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
+			namespace := testSuite.AllocateNamespace("resource-invalid")
+			if err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
+				t.Fatalf("create namespace: %v", err)
+			}
+			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
+
+			pool := createResourceAwareSchedulingPool(namespace, "resource-invalid-pool")
+			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
+				t.Fatalf("create resource-aware Pool: %v", err)
+			}
+			initialCtx, cancelInitial := context.WithTimeout(ctx, 90*time.Second)
+			defer cancelInitial()
+			if _, err := fixture.WaitForReadyFastletPods(initialCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 1); err != nil {
+				t.Fatalf("wait for initial Fastlet: %v", err)
+			}
+
+			// Fill the only Fastlet so the later valid Sandbox requires scale-out.
+			for index := 1; index <= int(pool.Spec.MaxSandboxesPerPod); index++ {
+				name := fmt.Sprintf("sb-invalid-fill-%d", index)
+				sandbox := createSchedulingSandbox(namespace, name, pool.Name)
+				if _, err := fixture.CreateSandbox(ctx, namespace, sandbox); err != nil {
+					t.Fatalf("create capacity-filling Sandbox %d: %v", index, err)
+				}
+				waitForAssignedSandbox(ctx, t, fixture, namespace, name)
+			}
+
+			invalid := createSchedulingSandbox(namespace, "sb-unadmittable", pool.Name)
+			invalid.Spec.Resources = &apiv1alpha2.SandboxResourceRequirements{Limits: apiv1alpha2.SandboxComputeResources{
+				CPU: resource.MustParse("5"), Memory: resource.MustParse("5Gi"),
+			}}
+			if _, err := fixture.CreateSandbox(ctx, namespace, invalid); err != nil {
+				t.Fatalf("create unadmittable Sandbox intent: %v", err)
+			}
+			invalidCtx, cancelInvalid := context.WithTimeout(ctx, 60*time.Second)
+			defer cancelInvalid()
+			if _, err := fixture.WaitForSandbox(invalidCtx, types.NamespacedName{Name: invalid.Name, Namespace: namespace}, func(sb *apiv1alpha2.Sandbox) bool {
+				condition := apiMeta.FindStatusCondition(sb.Status.Conditions, apiv1alpha2.SandboxConditionResourceResolved)
+				return condition != nil && condition.Status == metav1.ConditionFalse &&
+					condition.Reason == "LimitExceedsFastletBudget" &&
+					sb.Status.Placement.FastletName == "" && sb.Status.Runtime.State == apiv1alpha2.RuntimePending
+			}); err != nil {
+				t.Fatalf("wait for unadmittable resource status: %v", err)
+			}
+
+			valid := createSchedulingSandbox(namespace, "sb-admittable", pool.Name)
+			if _, err := fixture.CreateSandbox(ctx, namespace, valid); err != nil {
+				t.Fatalf("create valid pending Sandbox: %v", err)
+			}
+			scaleCtx, cancelScale := context.WithTimeout(ctx, 120*time.Second)
+			defer cancelScale()
+			if _, err := fixture.WaitForReadyFastletPods(scaleCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 2); err != nil {
+				t.Fatalf("wait for valid demand to scale Pool despite invalid demand: %v", err)
+			}
+			assigned := waitForAssignedSandbox(ctx, t, fixture, namespace, valid.Name)
+			if assigned.Status.Placement.FastletName == "" {
+				t.Fatal("valid Sandbox did not receive the new Fastlet capacity")
+			}
+
+			var currentInvalid apiv1alpha2.Sandbox
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: invalid.Name, Namespace: namespace}, &currentInvalid); err != nil {
+				t.Fatalf("get unadmittable Sandbox after scale-out: %v", err)
+			}
+			condition := apiMeta.FindStatusCondition(currentInvalid.Status.Conditions, apiv1alpha2.SandboxConditionResourceResolved)
+			if condition == nil || condition.Status != metav1.ConditionFalse || currentInvalid.Status.Placement.FastletName != "" {
+				t.Fatalf("unadmittable Sandbox changed after valid scale-out: placement=%q condition=%+v",
+					currentInvalid.Status.Placement.FastletName, condition)
 			}
 			return ctx
 		}).

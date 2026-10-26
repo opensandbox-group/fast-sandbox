@@ -71,7 +71,7 @@ User metadata is stored as ordinary Kubernetes labels. Labels under
 | `dataPlane` | Route state, route-generation fence, transition time, and message |
 | `infraComponents` | Per-component name, `Starting`/`Ready`/`Failed`, transition time, and message |
 | `actionBindings` | Per-Binding Handler, `Pending`/`Applying`/`Ready`/`Failed`, transition time, and message |
-| `conditions` | Aggregate standard `Ready` plus `Suspended` (True only while durably paused) |
+| `conditions` | Aggregate `Ready`, `Suspended` (True only while durably paused), and `ResourceResolved`; an unadmittable per-Sandbox limit sets `ResourceResolved=False` without poisoning shared Pool scaling |
 
 Runtime and DataPlane use separate state enums. Input digests, invocation IDs,
 runtime IDs, and per-Handler fences remain internal and never appear in CRD

@@ -178,6 +178,9 @@ func TestResolveSandboxResourcesRejectsLegacyOverrides(t *testing.T) {
 
 	_, _, err := ResolveSandboxResources(pool, sandbox)
 	require.ErrorContains(t, err, "per-Sandbox resources require ResourceAware mode")
+	var resolutionErr *SandboxResourceResolutionError
+	require.ErrorAs(t, err, &resolutionErr)
+	require.Equal(t, ReasonInvalidSandboxResources, resolutionErr.Reason)
 }
 
 func TestResolveSandboxResourcesDerivesRequestAndRejectsLimitAboveRuntimeBudget(t *testing.T) {
@@ -203,6 +206,9 @@ func TestResolveSandboxResourcesDerivesRequestAndRejectsLimitAboveRuntimeBudget(
 	sandbox.Spec.Resources.Limits.CPU = resource.MustParse("3")
 	_, _, err = ResolveSandboxResources(pool, sandbox)
 	require.ErrorContains(t, err, "exceed Fastlet Sandbox runtime budget")
+	var resolutionErr *SandboxResourceResolutionError
+	require.ErrorAs(t, err, &resolutionErr)
+	require.Equal(t, ReasonLimitExceedsFastletBudget, resolutionErr.Reason)
 }
 
 func TestResolveRuntimeRejectsResourceMutationAfterAssignment(t *testing.T) {

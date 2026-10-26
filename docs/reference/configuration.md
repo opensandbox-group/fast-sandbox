@@ -102,6 +102,12 @@ FastPath and the Pool scaler consume the same capacity through a
 platform-owned Pod annotation instead of re-deriving it from the first
 container's Kubernetes request.
 
+Per-Sandbox limits are compiled through the same resolver for FastPath,
+declarative reconciliation, and Pool scaling. A direct CRD whose limits exceed
+one Fastlet's `sandboxRuntimeBudget` remains visible with
+`ResourceResolved=False`, but is excluded from admissible pending demand so it
+cannot suppress scale-out for valid Sandboxes or the configured buffer.
+
 Each runtime binding in `fast-sandbox-runtime-environments` may configure
 `fastletOverhead.cpu` and `.memory`. The Controller adds it exactly once when
 deriving the first Fastlet container's equal Kubernetes requests and limits.
