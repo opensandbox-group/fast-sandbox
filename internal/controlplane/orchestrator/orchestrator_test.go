@@ -225,7 +225,7 @@ func TestResolveRuntimeRejectsResourceMutationAfterAssignment(t *testing.T) {
 
 	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
 	require.NoError(t, err)
-	sandbox.Annotations = resolvedResourceAnnotations(parameters)
+	sandbox.Annotations = assignment.ResolvedResourceAnnotations(parameters.ResourceProfileHash, parameters.ResolvedResources)
 	// 1999m still derives the same rounded 500m request. The resolved-limit
 	// fence must therefore detect a change that request annotations alone miss.
 	sandbox.Spec.Resources.Limits.CPU = resource.MustParse("1999m")

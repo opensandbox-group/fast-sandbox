@@ -203,7 +203,7 @@ request.memory = ceil(limit.memory / overcommitRatio.memory)
 CPU is compressible and the initial implementation uses live CPU signals for
 observability rather than hard admission. Memory pressure can reclaim, stall,
 or OOM workloads, so ResourceAware Fastlets additionally block new creates on
-memory watermarks, PSI, OOM events, node pressure, or stale telemetry. This
+memory watermarks, PSI, OOM events, host pressure, or stale telemetry. This
 gate does not reclaim, pause, migrate, or evict existing Sandboxes.
 
 Pool status retains legacy top-level counters and adds `fastlets`, `resources`,
@@ -211,7 +211,9 @@ and `sandboxes` summaries. Resource `capacity`, `committed`, and `free` are
 request-based commitment values, not host usage. `summaryObservedAt` records
 the rate-limited summary observation. The `ScaleDownCandidate` Condition's
 `lastTransitionTime` is the scale-down stabilization clock. Other Conditions
-include `RuntimeReady`, `InfraReady`, and `RegistryReady`.
+include `RuntimeReady`, `InfraReady`, and `RegistryReady`. When `poolMax`
+prevents required scale-out, `CapacityAvailable=False` reports reason
+`PoolMaxReached`; it returns True after demand fits within the replica limit.
 
 See the [Infra Components reference](infra-components.md) for the complete
 artifact, process, health, endpoint, validation, and revision contract.

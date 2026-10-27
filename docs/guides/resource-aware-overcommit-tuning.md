@@ -79,7 +79,7 @@ a conservative memory ratio and watch RSS, working set, memory PSI, OOM
 events, high-watermark residence, and application latency.
 
 Fastlet combines the static memory ledger with a dynamic gate. Memory
-watermarks, PSI, new OOM events, node memory pressure, or stale telemetry can
+watermarks, PSI, new OOM events, host memory pressure, or stale telemetry can
 block new creates. The gate does not reclaim, pause, migrate, or evict an
 existing Sandbox.
 

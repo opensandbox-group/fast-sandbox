@@ -148,16 +148,13 @@ type fastletSlot struct {
 }
 
 type rankedFastlet struct {
-	slot         *fastletSlot
-	id           FastletID
-	capacity     int
-	imageHit     bool
-	used         int
-	stateRank    int
-	dominantLoad float64
-	loadBucket   int
-	serverOrder  uint64
-	stableOrder  uint64
+	slot        *fastletSlot
+	id          FastletID
+	imageHit    bool
+	stateRank   int
+	loadBucket  int
+	serverOrder uint64
+	stableOrder uint64
 }
 
 type InMemoryRegistry struct {
@@ -492,16 +489,13 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 			serverOrder = stableOrder(r.serverSeed, info.ID)
 		}
 		ranked = append(ranked, rankedFastlet{
-			slot:         slot,
-			id:           info.ID,
-			capacity:     info.Capacity(),
-			imageHit:     imageHit(info, request.Image),
-			used:         info.Used(),
-			stateRank:    admissionStateRank(info),
-			dominantLoad: load,
-			loadBucket:   int(load * 10),
-			serverOrder:  serverOrder,
-			stableOrder:  stableOrder(request.StableKey, info.ID),
+			slot:        slot,
+			id:          info.ID,
+			imageHit:    imageHit(info, request.Image),
+			stateRank:   admissionStateRank(info),
+			loadBucket:  int(load * 10),
+			serverOrder: serverOrder,
+			stableOrder: stableOrder(request.StableKey, info.ID),
 		})
 		slot.mu.RUnlock()
 	}
@@ -673,13 +667,6 @@ func EffectiveFreeCapacity(info FastletInfo, demand ResourceDemand, now time.Tim
 		return 0
 	}
 	return int32(free)
-}
-
-// EffectiveFreeResources returns the schedulable commitment vector after
-// dynamic admission, freshness, drain, observed commitments, and local
-// in-flight reservations are applied.
-func EffectiveFreeResources(info FastletInfo, now time.Time, staleAfter time.Duration) ResourceDemand {
-	return ResourceSchedulability(info, now, staleAfter).FreeResources
 }
 
 func admissionStateRank(info FastletInfo) int {

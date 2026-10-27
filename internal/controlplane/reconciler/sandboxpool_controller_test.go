@@ -37,7 +37,7 @@ func (r *SandboxPoolReconciler) planResourceAwareScale(
 	pool *apiv1alpha2.SandboxPool,
 	pods []corev1.Pod,
 	pendingSandboxes int32,
-	plannedPod *corev1.Pod,
+	commitmentCapacity apiv1alpha2.SandboxComputeResources,
 	observed map[string]placement.FastletInfo,
 	now time.Time,
 ) resourceAwareScalePlan {
@@ -48,7 +48,7 @@ func (r *SandboxPoolReconciler) planResourceAwareScale(
 			CPU: requests.CPU.DeepCopy(), Memory: requests.Memory.DeepCopy(),
 		})
 	}
-	return r.planResourceAwareScaleWithDemand(pool, pods, nil, pendingDemands, plannedPod, observed, nil, now)
+	return r.planResourceAwareScaleWithDemand(pool, pods, nil, pendingDemands, commitmentCapacity, observed, nil, now)
 }
 
 func TestRegistryConfigCompilesSameNamespaceSecretsAndPreservesLastValidRevision(t *testing.T) {
@@ -426,7 +426,7 @@ func TestRuntimeCapabilityConditionWaitsForHeartbeat(t *testing.T) {
 func TestResourceAwareDesiredPodsUsesEffectiveFreeCapacityAndInFlightOnce(t *testing.T) {
 	now := time.Date(2026, 10, 16, 8, 0, 0, 0, time.UTC)
 	pool := resourceAwareScalingPool()
-	planned := resourceAwarePlannedPod()
+	planned := resourceAwareCommitmentCapacity(pool)
 	pods := []corev1.Pod{
 		*fastletPod("fastlet-open", "uid-open", "10.0.0.1"),
 		*fastletPod("fastlet-blocked", "uid-blocked", "10.0.0.2"),
@@ -454,7 +454,7 @@ func TestResourceAwareDesiredPodsUsesBufferMaxForEmptyScaleDown(t *testing.T) {
 	pool := resourceAwareScalingPool()
 	pool.Spec.Capacity.BufferMin = 2
 	pool.Spec.Capacity.BufferMax = 4
-	planned := resourceAwarePlannedPod()
+	planned := resourceAwareCommitmentCapacity(pool)
 	pods := []corev1.Pod{
 		*fastletPod("fastlet-a", "uid-a", "10.0.0.1"),
 		*fastletPod("fastlet-b", "uid-b", "10.0.0.2"),
@@ -473,7 +473,7 @@ func TestResourceAwareScalePlanKeepsSelectedFastletIdentity(t *testing.T) {
 	pool := resourceAwareScalingPool()
 	pool.Spec.Capacity.BufferMin = 0
 	pool.Spec.Capacity.BufferMax = 0
-	planned := resourceAwarePlannedPod()
+	planned := resourceAwareCommitmentCapacity(pool)
 	pods := []corev1.Pod{
 		*fastletPod("fastlet-healthy", "uid-healthy", "10.0.0.1"),
 		*fastletPod("fastlet-blocked", "uid-blocked", "10.0.0.2"),
@@ -493,7 +493,7 @@ func TestResourceAwareScalePlanKeepsSelectedFastletIdentity(t *testing.T) {
 func TestResourceAwareScalePlanPreservesActiveDrainTarget(t *testing.T) {
 	now := time.Date(2026, 10, 16, 8, 0, 0, 0, time.UTC)
 	pool := resourceAwareScalingPool()
-	planned := resourceAwarePlannedPod()
+	planned := resourceAwareCommitmentCapacity(pool)
 	draining := fastletPod("fastlet-draining", "uid-draining", "10.0.0.1")
 	draining.Annotations = map[string]string{
 		placement.AnnotationDraining:    "true",
@@ -545,7 +545,7 @@ func TestReconcileDrainingUsesResourceScalePlanIdentity(t *testing.T) {
 func TestResourceAwareDesiredPodsExpiresNominalCapacityWithoutHeartbeat(t *testing.T) {
 	now := time.Date(2026, 10, 16, 8, 0, 0, 0, time.UTC)
 	pool := resourceAwareScalingPool()
-	planned := resourceAwarePlannedPod()
+	planned := resourceAwareCommitmentCapacity(pool)
 	pod := fastletPod("fastlet-starting", "uid-starting", "")
 	pod.Status.Phase = corev1.PodPending
 	reconciler := &SandboxPoolReconciler{Now: func() time.Time { return now }, FastletStartupGrace: 2 * time.Minute}
@@ -696,12 +696,12 @@ func TestAcceptedResumeDoesNotCreateReplacementFastlet(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, resolution.admissible, "the accepted resume is already charged to the Fastlet ledger")
 	plan := reconciler.planResourceAwareScale(
-		pool, []corev1.Pod{*pod}, int32(len(resolution.admissible)), resourceAwarePlannedPod(), observed, now,
+		pool, []corev1.Pod{*pod}, int32(len(resolution.admissible)), resourceAwareCommitmentCapacity(pool), observed, now,
 	)
 	require.Equal(t, int32(1), plan.desiredPods,
 		"the accepted resume must not create a replacement Fastlet")
 	require.Equal(t, int32(2), reconciler.planResourceAwareScale(
-		pool, []corev1.Pod{*pod}, 1, resourceAwarePlannedPod(), observed, now,
+		pool, []corev1.Pod{*pod}, 1, resourceAwareCommitmentCapacity(pool), observed, now,
 	).desiredPods, "recounting the accepted resume would create an unnecessary Fastlet")
 }
 
@@ -725,7 +725,7 @@ func TestResourceAwareScaleUsesHeterogeneousPendingCommitments(t *testing.T) {
 	pool.Spec.MaxSandboxesPerPod = 4
 	pool.Spec.Capacity.BufferMin = 0
 	pool.Spec.Capacity.BufferMax = 0
-	planned := resourceAwarePlannedPod()
+	planned := resourceAwareCommitmentCapacity(pool)
 	pod := fastletPod("fastlet-a", "uid-a", "10.0.0.1")
 	registry := placement.NewInMemoryRegistry()
 	seedControllerRegistry(t, registry, resourceAwareControllerFastlet("fastlet-a", "uid-a", 0, fastletapi.AdmissionStateOpen, now))
@@ -748,7 +748,11 @@ func TestResourceAwareScaleUsesHeterogeneousPendingCommitments(t *testing.T) {
 	resolution, err := resolvePoolPendingResources(pool, sandboxes, observed, now)
 	require.NoError(t, err)
 	pending := resolution.admissible
-	totalPending := sumResourceDemands(pending)
+	totalPending := placement.ResourceDemand{CPU: resource.MustParse("0"), Memory: resource.MustParse("0")}
+	for _, demand := range pending {
+		totalPending.CPU.Add(demand.CPU)
+		totalPending.Memory.Add(demand.Memory)
+	}
 	require.Equal(t, int64(6000), totalPending.CPU.MilliValue())
 	expectedMemory := resource.MustParse("6Gi")
 	require.Equal(t, expectedMemory.Value(), totalPending.Memory.Value())
@@ -766,7 +770,7 @@ func TestResourceAwareScaleAddsFastletWhenAggregateCapacityIsFragmented(t *testi
 	pool.Spec.MaxSandboxesPerPod = 4
 	pool.Spec.Capacity.BufferMin = 0
 	pool.Spec.Capacity.BufferMax = 0
-	planned := resourceAwarePlannedPod()
+	planned := resourceAwareCommitmentCapacity(pool)
 	pods := []corev1.Pod{
 		*fastletPod("fastlet-a", "uid-a", "10.0.0.1"),
 		*fastletPod("fastlet-b", "uid-b", "10.0.0.2"),
@@ -814,7 +818,7 @@ func TestResourceAwareScaleDoesNotAddFastletWhenSmallOverridesFit(t *testing.T) 
 	pool.Spec.MaxSandboxesPerPod = 4
 	pool.Spec.Capacity.BufferMin = 0
 	pool.Spec.Capacity.BufferMax = 0
-	planned := resourceAwarePlannedPod()
+	planned := resourceAwareCommitmentCapacity(pool)
 	pods := []corev1.Pod{
 		*fastletPod("fastlet-a", "uid-a", "10.0.0.1"),
 		*fastletPod("fastlet-b", "uid-b", "10.0.0.2"),
@@ -865,7 +869,7 @@ func TestUnadmittableDemandDoesNotSuppressValidScaleOutOrBuffer(t *testing.T) {
 	pool.Spec.MaxSandboxesPerPod = 4
 	pool.Spec.Capacity.BufferMin = 1
 	pool.Spec.Capacity.BufferMax = 1
-	planned := resourceAwarePlannedPod()
+	planned := resourceAwareCommitmentCapacity(pool)
 	pod := fastletPod("fastlet-full", "uid-full", "10.0.0.1")
 	full := resourceAwareControllerFastlet("fastlet-full", "uid-full", 4, fastletapi.AdmissionStateOpen, now)
 	full.Admission.Capacity = 4
@@ -915,7 +919,7 @@ func TestUnadmittableDemandDoesNotSuppressValidScaleOutOrBuffer(t *testing.T) {
 func TestResourceAwareScaleExcludesEveryFastletOnPressuredNode(t *testing.T) {
 	now := time.Date(2026, 10, 23, 8, 0, 0, 0, time.UTC)
 	pool := resourceAwareScalingPool()
-	planned := resourceAwarePlannedPod()
+	planned := resourceAwareCommitmentCapacity(pool)
 	pods := []corev1.Pod{
 		*fastletPod("fastlet-pressured", "uid-pressured", "10.0.0.1"),
 		*fastletPod("fastlet-sibling", "uid-sibling", "10.0.0.2"),
@@ -940,7 +944,7 @@ func TestResourceAwareScaleExcludesEveryFastletOnPressuredNode(t *testing.T) {
 func TestResourceAwareScaleExcludesStartingFastletOnPressuredNode(t *testing.T) {
 	now := time.Date(2026, 10, 23, 8, 0, 0, 0, time.UTC)
 	pool := resourceAwareScalingPool()
-	planned := resourceAwarePlannedPod()
+	planned := resourceAwareCommitmentCapacity(pool)
 	pressuredPod := fastletPod("fastlet-pressured", "uid-pressured", "10.0.0.1")
 	pressuredPod.Spec.NodeName = "node-a"
 	startingPod := fastletPod("fastlet-starting", "uid-starting", "")
@@ -965,7 +969,7 @@ func TestResourceAwareScaleExcludesStartingFastletOnPressuredNode(t *testing.T) 
 func TestResourceAwareScaleAppliesPressureObservedByAnotherPool(t *testing.T) {
 	now := time.Date(2026, 10, 23, 8, 0, 0, 0, time.UTC)
 	pool := resourceAwareScalingPool()
-	planned := resourceAwarePlannedPod()
+	planned := resourceAwareCommitmentCapacity(pool)
 	pod := fastletPod("fastlet-current-pool", "uid-current", "10.0.0.2")
 	pod.Spec.NodeName = "node-a"
 	open := resourceAwareControllerFastlet("fastlet-current-pool", "uid-current", 0, fastletapi.AdmissionStateOpen, now)
@@ -986,9 +990,8 @@ func TestResourceAwareScaleKeepsPlannedUpgradeRemovalTarget(t *testing.T) {
 	pool.Spec.MaxSandboxesPerPod = 4
 	pool.Spec.Capacity.BufferMin = 1
 	pool.Spec.Capacity.BufferMax = 1
-	planned := resourceAwarePlannedPod()
+	planned := resourceAwareCommitmentCapacity(pool)
 	const desiredHash = "desired-template"
-	planned.Annotations[placement.AnnotationPodTemplateHash] = desiredHash
 
 	oldPod := fastletPod("fastlet-old", "uid-old", "10.0.0.1")
 	oldPod.Annotations = map[string]string{
@@ -1035,7 +1038,7 @@ func TestResourceAwareScaleDownExcludesFastletAwaitingAdmission(t *testing.T) {
 	sandbox.Status.Runtime.State = apiv1alpha2.RuntimePending
 
 	plan := (&SandboxPoolReconciler{}).planResourceAwareScaleWithDemand(
-		pool, pods, []apiv1alpha2.Sandbox{sandbox}, nil, resourceAwarePlannedPod(), observed, nil, now,
+		pool, pods, []apiv1alpha2.Sandbox{sandbox}, nil, resourceAwareCommitmentCapacity(pool), observed, nil, now,
 	)
 	require.Equal(t, int32(1), plan.desiredPods)
 	require.Equal(t, []string{"fastlet-b/uid-b"}, plan.drainCandidates,
@@ -1154,14 +1157,12 @@ func resourceAwareScalingPool() *apiv1alpha2.SandboxPool {
 	}
 }
 
-func resourceAwarePlannedPod() *corev1.Pod {
-	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
-		fastletsettings.CommitmentCapacityAnnotation: `{"cpu":"4","memory":"8Gi"}`,
-	}}, Spec: corev1.PodSpec{Containers: []corev1.Container{{
-		Name: "fastlet", Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
-			corev1.ResourceCPU: resource.MustParse("4"), corev1.ResourceMemory: resource.MustParse("8Gi"),
-		}},
-	}}}}
+func resourceAwareCommitmentCapacity(pool *apiv1alpha2.SandboxPool) apiv1alpha2.SandboxComputeResources {
+	capacity, _, err := pool.Spec.SandboxResources.ResolveFastletCapacity(pool.Spec.MaxSandboxesPerPod)
+	if err != nil {
+		panic(err)
+	}
+	return capacity
 }
 
 func resourceAwareControllerFastlet(name, uid string, used int, state fastletapi.AdmissionState, now time.Time) placement.FastletInfo {

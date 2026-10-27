@@ -283,8 +283,10 @@ Other Pod template fields remain user-owned, including image, environment,
 scheduling constraints, security context, volumes, and sidecars. Sidecar
 resources remain ordinary Kubernetes resources. For aggregate Pod-cgroup
 observation, `resource-admission.json.podMemoryBudget` is derived as
-`runtimeEnvelope.memory + sum(long-running sidecar memory limits)`. It is an
-observer threshold only and is not admission capacity.
+`runtimeEnvelope.memory + sum(regular sidecar and restartable init-sidecar
+memory limits)`. One-shot init containers are excluded because
+they do not overlap steady Sandbox execution. This is an observer threshold
+only and is not admission capacity.
 
 ## Internal Create contract
 
@@ -480,10 +482,14 @@ memory pressure, or stale telemetry.
 
 For direct Firecracker, the VMM processes are descendants of the Fastlet Pod
 cgroup, so parent-cgroup memory pressure includes guest-backed VMM memory.
+The runtime converts resolved limits to Firecracker's whole-vCPU and MiB
+machine configuration; it does not claim Linux-cgroup precision for arbitrary
+fractional per-Sandbox overrides.
 The node-level runtime-agent DaemonSet is a separate Kubernetes workload and
-is not charged to a Pool. Node pressure is a distinct safety signal: one fresh
-`NodeMemoryPressure` observation removes every Fastlet on that node from both
-placement and scaler capacity. A stopped direct-Firecracker VMM is reported as
+is not charged to a Pool. Host pressure is a distinct safety signal: one fresh
+`HostMemoryPressure` observation removes every Fastlet on that host from both
+placement and scaler capacity. The previous `NodeMemoryPressure` reason remains
+accepted during rolling upgrades. A stopped direct-Firecracker VMM is reported as
 a failed runtime observation while its commitment remains reserved until the
 normal cleanup path proves absence.
 
@@ -524,11 +530,19 @@ slot count. This exact fit is authoritative for scale-out: it adds capacity
 when aggregate resources are fragmented, but does not add a Fastlet merely
 because a smaller-than-default request makes the default-sized free count look
 low. The resulting Pod count remains bounded by `poolMax`.
+If `poolMax` prevents required scale-out, the Pool reports
+`CapacityAvailable=False` with reason `PoolMaxReached`; an invalid individual
+Sandbox remains a separate `ResourceResolved=False` diagnosis.
 
-A no-capacity FastPath Create fails before CRD creation, so that failed call is
-not converted into scaler demand. Buffer capacity provides proactive headroom;
-the client retries after capacity appears. Pending demand comes only from
-already durable operations whose outcome or lifecycle is still in progress.
+A no-capacity FastPath Create never leaves a new durable CRD, so that failed
+call is not converted into scaler demand. Candidate filtering can reject it
+before CRD creation; a definitive Fastlet or FastPath-local admission rejection
+discovered after persistence is rolled back before `ResourceExhausted` is
+returned. Ambiguous outcomes and pre-existing idempotent intents are retained
+and return `Unavailable` for Controller recovery. Buffer capacity provides
+proactive headroom; the client retries after capacity appears. Pending demand
+comes only from already durable operations whose outcome or lifecycle is still
+in progress.
 
 A newly created Fastlet contributes nominal capacity only during a bounded
 startup grace period. A Pod that never reports a heartbeat stops masking

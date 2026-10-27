@@ -95,12 +95,14 @@ contract shared by Fastlet admission and the runtime boundary. Its `capacity`
 is the pure Sandbox commitment capacity; `sandboxRuntimeBudget` is the maximum
 aggregate child-runtime budget and cannot be consumed by fixed Fastlet cost;
 `runtimeEnvelope` adds the runtime profile's one-per-Pod `fastletOverhead`;
-`podMemoryBudget` adds all long-running sidecar memory limits for runtimes
-whose pressure observer reads the aggregate Pod cgroup. This observer-only
-budget never changes Sandbox commitment capacity.
-FastPath and the Pool scaler consume the same capacity through a
-platform-owned Pod annotation instead of re-deriving it from the first
-container's Kubernetes request.
+`podMemoryBudget` adds all long-running regular sidecar and restartable
+init-sidecar memory limits for runtimes whose pressure observer reads the
+aggregate Pod cgroup. One-shot init containers are excluded. This
+observer-only budget never changes Sandbox commitment capacity.
+The Controller passes the compiled capacity directly to the Pool scaler and
+projects that same value through a platform-owned Pod annotation for Registry
+bootstrap, FastPath placement, and status. No consumer re-derives capacity
+from the first container's Kubernetes request.
 
 Per-Sandbox limits are compiled through the same resolver for FastPath,
 declarative reconciliation, and Pool scaling. A direct CRD whose limits exceed

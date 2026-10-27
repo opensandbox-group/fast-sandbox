@@ -32,7 +32,9 @@ const (
 	// ResourceAdmissionKey is the optional ResourceAware commitment-capacity contract.
 	ResourceAdmissionKey = "resource-admission.json"
 	// CommitmentCapacityAnnotation projects the Controller-resolved Sandbox
-	// commitment capacity onto a Fastlet Pod for FastPath and Pool scaling.
+	// commitment capacity onto a Fastlet Pod for Registry bootstrap, FastPath
+	// placement, and Pool status. The Pool scaler consumes the same compiled
+	// capacity directly instead of deriving it from this projection.
 	CommitmentCapacityAnnotation = "fast-sandbox.io/commitment-capacity"
 )
 
@@ -50,7 +52,8 @@ type ResourceAdmissionSettings struct {
 	RuntimeEnvelope      apiv1alpha2.SandboxComputeResources `json:"runtimeEnvelope"`
 	// PodMemoryBudget matches the aggregate Pod cgroup observed by runtimes
 	// whose VMM or shim processes live outside the Fastlet container cgroup.
-	// It includes RuntimeEnvelope.Memory plus every long-running sidecar limit.
+	// It includes RuntimeEnvelope.Memory plus every regular sidecar and
+	// restartable init-sidecar memory limit.
 	PodMemoryBudget     resource.Quantity `json:"podMemoryBudget"`
 	ResourceProfileHash string            `json:"resourceProfileHash"`
 }

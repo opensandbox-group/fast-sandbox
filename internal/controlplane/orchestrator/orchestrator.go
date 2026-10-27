@@ -349,7 +349,8 @@ func (o *Orchestrator) AssignDeclarativePreferring(ctx context.Context, sandbox 
 		return nil, false, err
 	}
 	_, won, err := assignment.InitializeAssignmentAnnotationWithMetadata(
-		ctx, o.Client, client.ObjectKeyFromObject(sandbox), desired, resolvedResourceAnnotations(parameters),
+		ctx, o.Client, client.ObjectKeyFromObject(sandbox), desired,
+		assignment.ResolvedResourceAnnotations(parameters.ResourceProfileHash, parameters.ResolvedResources),
 	)
 	if err != nil {
 		return nil, false, err
@@ -358,24 +359,11 @@ func (o *Orchestrator) AssignDeclarativePreferring(ctx context.Context, sandbox 
 	return projected, won, err
 }
 
-func resolvedResourceAnnotations(parameters RuntimeParameters) map[string]string {
-	if parameters.ResolvedResources == nil {
-		return nil
-	}
-	return map[string]string{
-		assignment.AnnotationResourcePolicyHash:    parameters.ResourceProfileHash,
-		assignment.AnnotationResolvedRequestCPU:    parameters.ResolvedResources.Requests.CPU,
-		assignment.AnnotationResolvedRequestMemory: parameters.ResolvedResources.Requests.Memory,
-		assignment.AnnotationResolvedLimitCPU:      parameters.ResolvedResources.Limits.CPU,
-		assignment.AnnotationResolvedLimitMemory:   parameters.ResolvedResources.Limits.Memory,
-	}
-}
-
 func validateResolvedResourceAnnotations(sandbox *apiv1alpha2.Sandbox, parameters RuntimeParameters) error {
 	if sandbox == nil || parameters.ResolvedResources == nil || len(sandbox.Annotations) == 0 {
 		return nil
 	}
-	for name, want := range resolvedResourceAnnotations(parameters) {
+	for name, want := range assignment.ResolvedResourceAnnotations(parameters.ResourceProfileHash, parameters.ResolvedResources) {
 		if got, recorded := sandbox.Annotations[name]; recorded && got != want {
 			return fmt.Errorf("Sandbox resource intent changed after assignment: annotation %s=%q, resolved value=%q", name, got, want)
 		}

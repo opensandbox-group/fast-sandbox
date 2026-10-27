@@ -307,7 +307,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	resourceScalePlan := resourceAwareScalePlan{}
 	if resourceAwareScaling {
 		resourceScalePlan = r.planResourceAwareScaleWithDemand(
-			&pool, childPods.Items, allSandboxes.Items, pendingDemands, desiredPod, observedFastlets, blockedNodes, now,
+			&pool, childPods.Items, allSandboxes.Items, pendingDemands, resolvedResources.CommitmentCapacity, observedFastlets, blockedNodes, now,
 		)
 		desiredPods = resourceScalePlan.desiredPods
 	} else {
@@ -485,7 +485,6 @@ type resourceAwareScalePlan struct {
 
 type resourceAwareCapacityView struct {
 	freeSlots             int32
-	freeResources         placement.ResourceDemand
 	freeBins              []resourceAwareFreeBin
 	removable             []resourceAwareDrainCandidate
 	activeDrains          int32
@@ -513,7 +512,7 @@ func (r *SandboxPoolReconciler) planResourceAwareScaleWithDemand(
 	pods []corev1.Pod,
 	sandboxes []apiv1alpha2.Sandbox,
 	pendingDemands []placement.ResourceDemand,
-	plannedPod *corev1.Pod,
+	commitmentCapacity apiv1alpha2.SandboxComputeResources,
 	observed map[string]placement.FastletInfo,
 	blockedNodes map[string]struct{},
 	now time.Time,
@@ -528,7 +527,7 @@ func (r *SandboxPoolReconciler) planResourceAwareScaleWithDemand(
 	pendingSandboxes := int32(len(pendingDemands))
 	current := int32(len(pods))
 	plan := resourceAwareScalePlan{desiredPods: current}
-	nominal := nominalResourceCapacity(pool, plannedPod)
+	nominal := getFastletCapacity(pool)
 	if nominal <= 0 {
 		nominal = 1
 	}
@@ -537,51 +536,28 @@ func (r *SandboxPoolReconciler) planResourceAwareScaleWithDemand(
 		return plan
 	}
 	demand := placement.ResourceDemand{CPU: requests.CPU, Memory: requests.Memory}
-	view := r.observeResourceAwareCapacity(pool, pods, sandboxes, plannedPod, observed, blockedNodes, now, demand, nominal)
+	view := r.observeResourceAwareCapacity(pool, pods, sandboxes, commitmentCapacity, observed, blockedNodes, now, demand, nominal)
 	plan.activeDrains = view.activeDrains
 	plan.activeScaleDownDrains = view.activeScaleDownDrains
 	availableFree := view.freeSlots
 	plan.desiredPods = current - plan.activeDrains
-	capacity, capacityErr := fastletsettings.DecodeCommitmentCapacity(plannedPod.Annotations[fastletsettings.CommitmentCapacityAnnotation])
-	if capacityErr == nil {
-		podsNeeded, packable := additionalFastletsForDemands(
-			pendingDemands, pool.Spec.Capacity.BufferMin, demand, view.freeBins,
-			resourceAwareFreeBin{slots: nominal, resources: placement.ResourceDemand{CPU: capacity.CPU, Memory: capacity.Memory}},
-		)
-		if !packable {
-			// A demand that cannot fit an empty Fastlet cannot be repaired by
-			// adding more identical Pods. Request validation owns that error.
-			return plan
-		}
-		if podsNeeded > 0 {
-			// Canceling an in-progress resource scale-down can recover at most
-			// one nominal Fastlet per drain. Create only the remaining Pods.
-			podsNeeded -= min(podsNeeded, plan.activeScaleDownDrains)
-			plan.desiredPods = current + podsNeeded
-			return plan
-		}
-	} else {
-		// Old Pods without a valid capacity annotation use the conservative
-		// aggregate fallback until rollout replaces them. Heterogeneous pools
-		// with a valid annotation always use the exact per-Fastlet fit above.
-		availableResources := view.freeResources
-		pendingDemand := sumResourceDemands(pendingDemands)
-		desiredFree := pendingSandboxes + pool.Spec.Capacity.BufferMin
-		bufferCPU := demand.CPU.DeepCopy()
-		bufferCPU.Mul(int64(pool.Spec.Capacity.BufferMin))
-		bufferMemory := demand.Memory.DeepCopy()
-		bufferMemory.Mul(int64(pool.Spec.Capacity.BufferMin))
-		requiredCPU := pendingDemand.CPU.DeepCopy()
-		requiredCPU.Add(bufferCPU)
-		requiredMemory := pendingDemand.Memory.DeepCopy()
-		requiredMemory.Add(bufferMemory)
-		if availableFree < desiredFree || availableResources.CPU.Cmp(requiredCPU) < 0 || availableResources.Memory.Cmp(requiredMemory) < 0 {
-			deficit := max(int32(0), desiredFree-availableFree)
-			podsNeeded := (deficit + nominal - 1) / nominal
-			podsNeeded -= min(podsNeeded, plan.activeScaleDownDrains)
-			plan.desiredPods = current + podsNeeded
-			return plan
-		}
+	podsNeeded, packable := additionalFastletsForDemands(
+		pendingDemands, pool.Spec.Capacity.BufferMin, demand, view.freeBins,
+		resourceAwareFreeBin{slots: nominal, resources: placement.ResourceDemand{
+			CPU: commitmentCapacity.CPU.DeepCopy(), Memory: commitmentCapacity.Memory.DeepCopy(),
+		}},
+	)
+	if !packable {
+		// A demand that cannot fit an empty Fastlet cannot be repaired by
+		// adding more identical Pods. Request validation owns that error.
+		return plan
+	}
+	if podsNeeded > 0 {
+		// Canceling an in-progress resource scale-down can recover at most
+		// one nominal Fastlet per drain. Create only the remaining Pods.
+		podsNeeded -= min(podsNeeded, plan.activeScaleDownDrains)
+		plan.desiredPods = current + podsNeeded
+		return plan
 	}
 	if pendingSandboxes > 0 {
 		return plan
@@ -609,7 +585,7 @@ func (r *SandboxPoolReconciler) observeResourceAwareCapacity(
 	pool *apiv1alpha2.SandboxPool,
 	pods []corev1.Pod,
 	sandboxes []apiv1alpha2.Sandbox,
-	plannedPod *corev1.Pod,
+	commitmentCapacity apiv1alpha2.SandboxComputeResources,
 	observed map[string]placement.FastletInfo,
 	blockedNodes map[string]struct{},
 	now time.Time,
@@ -617,13 +593,9 @@ func (r *SandboxPoolReconciler) observeResourceAwareCapacity(
 	nominal int32,
 ) resourceAwareCapacityView {
 	view := resourceAwareCapacityView{
-		freeResources: placement.ResourceDemand{CPU: resource.MustParse("0"), Memory: resource.MustParse("0")},
-		freeBins:      make([]resourceAwareFreeBin, 0, len(pods)),
-		removable:     make([]resourceAwareDrainCandidate, 0, len(pods)),
+		freeBins:  make([]resourceAwareFreeBin, 0, len(pods)),
+		removable: make([]resourceAwareDrainCandidate, 0, len(pods)),
 	}
-	nominalResources, nominalResourcesKnown := fastletsettings.DecodeCommitmentCapacity(
-		plannedPod.Annotations[fastletsettings.CommitmentCapacityAnnotation],
-	)
 	awaitingAdmission := awaitingAdmissionByFastlet(sandboxes, observed, now)
 	for index := range pods {
 		pod := &pods[index]
@@ -651,28 +623,23 @@ func (r *SandboxPoolReconciler) observeResourceAwareCapacity(
 		if !exists || info.LastHeartbeat.IsZero() {
 			if r.podWithinStartupGrace(pod, now) {
 				view.freeSlots += nominal
-				if nominalResourcesKnown == nil {
-					view.freeResources.CPU.Add(nominalResources.CPU)
-					view.freeResources.Memory.Add(nominalResources.Memory)
-					view.freeBins = append(view.freeBins, resourceAwareFreeBin{
-						slots: nominal,
-						resources: placement.ResourceDemand{
-							CPU: nominalResources.CPU.DeepCopy(), Memory: nominalResources.Memory.DeepCopy(),
-						},
-					})
-				}
+				view.freeBins = append(view.freeBins, resourceAwareFreeBin{
+					slots: nominal,
+					resources: placement.ResourceDemand{
+						CPU: commitmentCapacity.CPU.DeepCopy(), Memory: commitmentCapacity.Memory.DeepCopy(),
+					},
+				})
 			}
 			continue
 		}
 		if _, blocked := blockedNodes[info.NodeName]; blocked {
 			continue
 		}
+		schedulability := placement.ResourceSchedulability(info, now, placement.DefaultObservationStaleAfter)
 		free := placement.EffectiveFreeCapacity(info, demand, now, placement.DefaultObservationStaleAfter)
 		view.freeSlots += free
-		freeResources := placement.EffectiveFreeResources(info, now, placement.DefaultObservationStaleAfter)
-		view.freeResources.CPU.Add(freeResources.CPU)
-		view.freeResources.Memory.Add(freeResources.Memory)
-		slotFree := int32(max(0, info.Capacity()-info.SchedulingUsed()))
+		freeResources := schedulability.FreeResources
+		slotFree := schedulability.FreeSlots
 		if slotFree > 0 && freeResources.CPU.Sign() > 0 && freeResources.Memory.Sign() > 0 {
 			view.freeBins = append(view.freeBins, resourceAwareFreeBin{
 				slots: slotFree,
@@ -687,15 +654,6 @@ func (r *SandboxPoolReconciler) observeResourceAwareCapacity(
 		}
 	}
 	return view
-}
-
-func sumResourceDemands(demands []placement.ResourceDemand) placement.ResourceDemand {
-	total := placement.ResourceDemand{CPU: resource.MustParse("0"), Memory: resource.MustParse("0")}
-	for _, demand := range demands {
-		total.CPU.Add(demand.CPU)
-		total.Memory.Add(demand.Memory)
-	}
-	return total
 }
 
 // additionalFastletsForDemands performs a deterministic best-fit-decreasing
@@ -809,27 +767,6 @@ func resourceFastletsForPoolChildren(
 		}
 	}
 	return observed
-}
-
-func nominalResourceCapacity(pool *apiv1alpha2.SandboxPool, pod *corev1.Pod) int32 {
-	if pool == nil || pod == nil {
-		return 0
-	}
-	requests, ok := pool.Spec.SandboxResources.RequestResources()
-	if !ok || requests.CPU.Sign() <= 0 || requests.Memory.Sign() <= 0 {
-		return 0
-	}
-	resolved, err := fastletsettings.DecodeCommitmentCapacity(pod.Annotations[fastletsettings.CommitmentCapacityAnnotation])
-	if err != nil {
-		return 0
-	}
-	cpu := resolved.CPU.MilliValue() / requests.CPU.MilliValue()
-	memory := resolved.Memory.Value() / requests.Memory.Value()
-	capacity := min(int64(getFastletCapacity(pool)), cpu, memory)
-	if capacity <= 0 {
-		return 0
-	}
-	return int32(capacity)
 }
 
 func (r *SandboxPoolReconciler) podWithinStartupGrace(pod *corev1.Pod, now time.Time) bool {

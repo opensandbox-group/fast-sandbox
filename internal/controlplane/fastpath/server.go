@@ -128,7 +128,7 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "resolve Sandbox resources: %v", err)
 	}
-	projectResolvedResourceAnnotations(sandbox, parameters, pool.Spec.SandboxResources.Hash())
+	assignment.ProjectResolvedResourceAnnotations(sandbox, pool.Spec.SandboxResources.Hash(), parameters.ResolvedResources)
 	rankedFastlets, envelope, selectionErr := s.selectFastletsForPool(ctx, orchestrator, sandbox, request.RequestId, parameters)
 	if selectionErr != nil && status.Code(selectionErr) != codes.ResourceExhausted {
 		return nil, selectionErr
@@ -261,20 +261,6 @@ func fastPathRuntimeParameters(pool *apiv1alpha2.SandboxPool, sandbox *apiv1alph
 	}
 	parameters.ResolvedResources, parameters.ResourceDemand = resolved, demand
 	return parameters, nil
-}
-
-func projectResolvedResourceAnnotations(sandbox *apiv1alpha2.Sandbox, parameters orchestration.RuntimeParameters, policyHash string) {
-	if sandbox == nil || parameters.ResolvedResources == nil {
-		return
-	}
-	if sandbox.Annotations == nil {
-		sandbox.Annotations = make(map[string]string)
-	}
-	sandbox.Annotations[assignment.AnnotationResourcePolicyHash] = policyHash
-	sandbox.Annotations[assignment.AnnotationResolvedRequestCPU] = parameters.ResolvedResources.Requests.CPU
-	sandbox.Annotations[assignment.AnnotationResolvedRequestMemory] = parameters.ResolvedResources.Requests.Memory
-	sandbox.Annotations[assignment.AnnotationResolvedLimitCPU] = parameters.ResolvedResources.Limits.CPU
-	sandbox.Annotations[assignment.AnnotationResolvedLimitMemory] = parameters.ResolvedResources.Limits.Memory
 }
 
 func (s *Server) selectFastletsForPool(ctx context.Context, orchestrator *orchestration.Orchestrator, sandbox *apiv1alpha2.Sandbox, stableKey string, parameters orchestration.RuntimeParameters) ([]placement.FastletInfo, assignment.AssignmentEnvelope, error) {
