@@ -19,11 +19,11 @@ func TestDisabledOCIRejectsCreateResumeAndWarmPull(t *testing.T) {
 	for _, cached := range []bool{false, true} {
 		for _, resume := range []bool{false, true} {
 			fixture := newDriverFixture(t)
-			fixture.sandboxSpec.Spec.Image = image
+			fixture.sandboxSpec.Desired.Image = image
 			restore := &fastletapi.RestoreSpec{ManifestRef: image, ArtifactDigest: digest}
 			if resume {
-				fixture.sandboxSpec.Spec.Image = "native:template"
-				fixture.sandboxSpec.Spec.Restore = restore
+				fixture.sandboxSpec.Desired.Image = "native:template"
+				fixture.sandboxSpec.Desired.Restore = restore
 			}
 			if cached {
 				file := cachedManifestPath(fixture.stateRoot, image)
@@ -62,11 +62,11 @@ func TestOCISupportDefaultsAndNativeIndependence(t *testing.T) {
 				require.NoError(t, err)
 			}
 			fixture := newDriverFixture(t)
-			fixture.prepareCachedImage(t, fixture.sandboxSpec.Spec.Image)
-			status, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Spec.Image)
+			fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
+			status, err := fixture.driver.DeliverImage(context.Background(), fixture.sandboxSpec.Desired.Image)
 			require.NoError(t, err)
 			require.Equal(t, runtimecontract.ImageDelivered, status)
-			require.NoError(t, fixture.driver.PullImage(context.Background(), fixture.sandboxSpec.Spec.Image))
+			require.NoError(t, fixture.driver.PullImage(context.Background(), fixture.sandboxSpec.Desired.Image))
 			require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
 			_, err = fixture.driver.EnsureSandbox(context.Background(), ensureInput(&fixture.sandboxSpec))
 			require.NoError(t, err)
@@ -103,7 +103,7 @@ func TestEnsureSandboxRejectsInvalidCLIMetadataBeforeAcquiringSlot(t *testing.T)
 		t.Run(payload, func(t *testing.T) {
 			fixture := newDriverFixture(t)
 			require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
-			fixture.sandboxSpec.Spec.Image = "oci://r.example/ns/t@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+			fixture.sandboxSpec.Desired.Image = "oci://r.example/ns/t@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 			installPreparedOCI(t, fixture, payload)
 			_, err := fixture.driver.EnsureSandbox(context.Background(), ensureInput(&fixture.sandboxSpec))
 			require.Error(t, err)

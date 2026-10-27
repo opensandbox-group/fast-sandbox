@@ -131,7 +131,7 @@ func validateRestoreMachineConfig(spec fastletapi.SandboxRuntimeLimits, config r
 	return validateRestoreMachine(spec, config, machine, ok)
 }
 
-func validateRestoreMachine(spec fastletapi.SandboxSpec, config runtimecatalog.FirecrackerConfig, machine manifestMachine, ok bool) error {
+func validateRestoreMachine(spec fastletapi.SandboxRuntimeLimits, config runtimecatalog.FirecrackerConfig, machine manifestMachine, ok bool) error {
 	if !ok {
 		_, err := resolveMachineConfig(spec, config)
 		return err

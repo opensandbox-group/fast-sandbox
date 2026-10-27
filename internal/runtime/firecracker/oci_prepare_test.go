@@ -107,10 +107,10 @@ func TestOCICreateAndResumeUseCLIResultWithoutAgentMetadata(t *testing.T) {
 			fixture := newDriverFixture(t)
 			require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
 			image := "oci://r.example/templates/base@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-			fixture.sandboxSpec.Spec.Image = image
+			fixture.sandboxSpec.Desired.Image = image
 			metadata := preparedMetadata(t)
 			if resume {
-				fixture.sandboxSpec.Spec.Restore = &fastletapi.RestoreSpec{ManifestRef: image, ArtifactDigest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+				fixture.sandboxSpec.Desired.Restore = &fastletapi.RestoreSpec{ManifestRef: image, ArtifactDigest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
 				metadata["platform"] = map[string]any{"checkpoint": map[string]string{"sandboxUID": "sandbox-1", "namespace": "tenant-a"}}
 			}
 			raw, err := json.Marshal(metadata)
@@ -157,7 +157,7 @@ func TestOCIPreparePreservesAdmissionAndReleasesDevices(t *testing.T) {
 		t.Run(invalid, func(t *testing.T) {
 			fixture := newDriverFixture(t)
 			require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
-			fixture.sandboxSpec.Spec.Image = "oci://r.example/templates/base:build"
+			fixture.sandboxSpec.Desired.Image = "oci://r.example/templates/base:build"
 			metadata := preparedMetadata(t)
 			switch invalid {
 			case "owner":
@@ -279,7 +279,7 @@ esac
 func TestOCIRecordsOwnershipBeforePrepareAndRecoversInterruptedAttachment(t *testing.T) {
 	t.Setenv("FAST_SANDBOX_OCI_ENABLED", "true")
 	fixture := newDriverFixture(t)
-	fixture.sandboxSpec.Spec.Image = "oci://r.example/templates/base:build"
+	fixture.sandboxSpec.Desired.Image = "oci://r.example/templates/base:build"
 	installOCIRegistryConfig(t, registryconfig.Credential{Host: "r.example", Username: "reader", Password: "secret"})
 	bin := t.TempDir()
 	t.Setenv("TEST_OCI_ROOT", fixture.stateRoot)

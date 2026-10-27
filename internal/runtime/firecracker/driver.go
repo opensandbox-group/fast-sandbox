@@ -874,7 +874,7 @@ func (d *Driver) DeleteSandbox(ctx context.Context, sandboxID string) (resultErr
 			klog.V(2).InfoS("infra instance cleanup on delete leaked resources", "sandboxID", sandboxID, "err", removeErr)
 		}
 	}
-	reference, err := restoreReference(state.Config.Spec)
+	reference, err := restoreReference(state.Config.Desired)
 	if err != nil {
 		return err
 	}

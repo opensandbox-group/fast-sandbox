@@ -27,7 +27,7 @@ func TestOCISnapshotManifestCarriesOpaquePolicy(t *testing.T) {
 			sandboxDir := filepath.Join(fixture.stateRoot, sandboxStateDir, id)
 			state, err := loadState(sandboxDir)
 			require.NoError(t, err)
-			state.Config.Spec.Image = "oci://r.example/templates/base@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+			state.Config.Desired.Image = "oci://r.example/templates/base@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 			require.NoError(t, saveState(sandboxDir, state))
 			home := filepath.Join(fixture.stateRoot, "oci/sandboxes", id)
 			require.NoError(t, os.MkdirAll(filepath.Join(home, "mnt"), 0750))
@@ -92,11 +92,11 @@ func TestOCIRestoreImportsStateFromSnapfilesBeforeReady(t *testing.T) {
 				fixture := newDriverFixture(t)
 				require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
 				image := "oci://r.example/templates/base@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-				fixture.sandboxSpec.Spec.Image = image
+				fixture.sandboxSpec.Desired.Image = image
 				metadata := preparedMetadata(t)
 				metadata["platform"] = map[string]any{}
 				if resume {
-					fixture.sandboxSpec.Spec.Restore = &fastletapi.RestoreSpec{ManifestRef: image, ArtifactDigest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+					fixture.sandboxSpec.Desired.Restore = &fastletapi.RestoreSpec{ManifestRef: image, ArtifactDigest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
 					metadata["platform"].(map[string]any)["checkpoint"] = map[string]string{"sandboxUID": "sandbox-1", "namespace": "tenant-a"}
 				}
 				policy := []byte(`{"v":1,"incarnation":"old","revision":7,"policy":{"defaultAction":"deny"}}`)

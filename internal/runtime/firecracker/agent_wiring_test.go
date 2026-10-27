@@ -247,7 +247,7 @@ func TestEnsureSandboxCachedImageNeverPins(t *testing.T) {
 
 func TestDeleteOCIResumeDoesNotUnpinAgentImages(t *testing.T) {
 	fixture := newDriverFixture(t)
-	fixture.prepareCachedImage(t, fixture.sandboxSpec.Spec.Image)
+	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
 	agent := &fakeAgentClient{}
 	fixture.installAgent(agent)
 	_, err := fixture.driver.EnsureSandbox(context.Background(), ensureInput(&fixture.sandboxSpec))
@@ -257,7 +257,7 @@ func TestDeleteOCIResumeDoesNotUnpinAgentImages(t *testing.T) {
 	require.NoError(t, err)
 	digest := strings.Repeat("a", 64)
 	checkpoint := "oci://registry.example/checkpoints@sha256:" + digest
-	state.Config.Spec.Restore = &fastletapi.RestoreSpec{ManifestRef: checkpoint, ArtifactDigest: digest}
+	state.Config.Desired.Restore = &fastletapi.RestoreSpec{ManifestRef: checkpoint, ArtifactDigest: digest}
 	require.NoError(t, saveState(directory, state))
 	require.NoError(t, fixture.driver.DeleteSandbox(context.Background(), fixture.sandboxSpec.Identity.SandboxUID))
 	_, unpins, _ := agent.snapshot()

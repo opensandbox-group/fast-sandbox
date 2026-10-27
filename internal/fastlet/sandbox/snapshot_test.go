@@ -357,7 +357,7 @@ func TestCreateOCITemplateSnapshotUsesIndependentUUIDsWithoutNameFence(t *testin
 	runtime.blockBeforePublishing = true
 	defer close(runtime.block)
 	manager := newSnapshotManager(t, runtime)
-	manager.sandboxes["uid-a"].Config.Spec.Image = "oci://r.example/ns/template:base"
+	manager.sandboxes["uid-a"].Config.Desired.Image = "oci://r.example/ns/template:base"
 	var ids []string
 	for _, taskID := range []string{"first", "second"} {
 		request := snapshotRequest(taskID)

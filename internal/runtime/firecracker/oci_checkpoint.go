@@ -109,7 +109,7 @@ func (d *Driver) publishOCISnapshot(ctx context.Context, plan dumpPlan, sizeByte
 	if err != nil {
 		return nil, err
 	}
-	sourceRef, err := restoreReference(state.Config.Spec)
+	sourceRef, err := restoreReference(state.Config.Desired)
 	if err != nil {
 		return nil, err
 	}
@@ -160,13 +160,13 @@ func validateOCIResumeOwner(document ociRestoreMetadata, config *fastletapi.Runt
 	if document.Platform != nil {
 		owner = document.Platform.Checkpoint
 	}
-	if config.Spec.Restore != nil && owner == nil {
+	if config.Desired.Restore != nil && owner == nil {
 		return fmt.Errorf("%w: OCI resume reference is not a checkpoint", ErrInvalidConfig)
 	}
 	if owner == nil {
 		return nil
 	}
-	if config.Spec.Restore == nil || owner.SandboxUID != config.Identity.SandboxUID || owner.Namespace != config.Identity.Namespace {
+	if config.Desired.Restore == nil || owner.SandboxUID != config.Identity.SandboxUID || owner.Namespace != config.Identity.Namespace {
 		return fmt.Errorf("%w: OCI checkpoint belongs to a different sandbox", ErrInvalidConfig)
 	}
 	return nil
@@ -177,7 +177,7 @@ func prepareOCISnapshot(plan dumpPlan) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	source, err := restoreReference(state.Config.Spec)
+	source, err := restoreReference(state.Config.Desired)
 	if err != nil {
 		return false, err
 	}

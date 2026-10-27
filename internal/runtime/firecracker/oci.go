@@ -189,7 +189,7 @@ func (d *Driver) prepareOCIRestore(ctx context.Context, directory, reference str
 		return attachment, err
 	}
 	hasMachine := metadata.Machine.VCPUCount > 0 && metadata.Machine.MemoryMiB > 0
-	if err := validateRestoreMachine(config.Spec, d.config, metadata.Machine, hasMachine); err != nil {
+	if err := validateRestoreMachine(config.Limits, d.config, metadata.Machine, hasMachine); err != nil {
 		return attachment, err
 	}
 	if err := checkRestoreCompatibility(metadata.Compatibility, artifacts.HostCPUIdentity(), d.firecrackerVersion(), reference); err != nil {

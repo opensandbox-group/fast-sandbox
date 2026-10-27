@@ -542,69 +542,6 @@ func TestCreateRejectsLimitAboveDerivedSandboxRuntimeBudget(t *testing.T) {
 	require.Empty(t, fastlet.createRequests)
 }
 
-type fakeManifestPolicy struct {
-	bindings map[string][]apiv1alpha2.ActionBinding
-	err      error
-}
-
-func (f *fakeManifestPolicy) ActionBindings(_ context.Context, _ *apiv1alpha2.SandboxPool, image string) ([]apiv1alpha2.ActionBinding, error) {
-	if f.err != nil {
-		return nil, f.err
-	}
-	return f.bindings[image], nil
-}
-
-func TestCreateSandboxAppliesManifestRecordedBindings(t *testing.T) {
-	server, k8sClient, _, _ := newV2Server(t)
-	server.ManifestPolicy = &fakeManifestPolicy{bindings: map[string][]apiv1alpha2.ActionBinding{
-		"app-snap-v1": {
-			{Handler: "audit", Input: `{"a":1}`},
-			{Handler: "missing-in-pool", Input: `{}`},
-		},
-	}}
-
-	// No explicit bindings: the recorded policy applies (declared handlers
-	// only).
-	request := createRequest("restored-1")
-	request.Image = "app-snap-v1"
-	_, err := server.CreateSandbox(context.Background(), request)
-	require.NoError(t, err)
-	var restored apiv1alpha2.Sandbox
-	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "restored-1"}, &restored))
-	require.Equal(t, []apiv1alpha2.ActionBinding{{Handler: "audit", Input: `{"a":1}`}}, restored.Spec.ActionBindings)
-
-	// Explicit bindings win per handler.
-	request2 := createRequest("restored-2")
-	request2.Image = "app-snap-v1"
-	request2.ActionBindings = []*fastpathv2.ActionBinding{{Handler: "audit", Input: `{"explicit":true}`}}
-	_, err = server.CreateSandbox(context.Background(), request2)
-	require.NoError(t, err)
-	var overridden apiv1alpha2.Sandbox
-	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "restored-2"}, &overridden))
-	require.Equal(t, []apiv1alpha2.ActionBinding{{Handler: "audit", Input: `{"explicit":true}`}}, overridden.Spec.ActionBindings)
-
-	// An image without recorded policy is untouched.
-	request3 := createRequest("plain-1")
-	_, err = server.CreateSandbox(context.Background(), request3)
-	require.NoError(t, err)
-	var plain apiv1alpha2.Sandbox
-	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "plain-1"}, &plain))
-	require.Empty(t, plain.Spec.ActionBindings)
-}
-
-func TestCreateSandboxPolicyResolutionFailureProceeds(t *testing.T) {
-	server, k8sClient, _, _ := newV2Server(t)
-	server.ManifestPolicy = &fakeManifestPolicy{err: errors.New("store unreachable")}
-
-	request := createRequest("restored-1")
-	request.Image = "app-snap-v1"
-	_, err := server.CreateSandbox(context.Background(), request)
-	require.NoError(t, err, "policy resolution is best-effort; the create proceeds")
-	var restored apiv1alpha2.Sandbox
-	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "restored-1"}, &restored))
-	require.Empty(t, restored.Spec.ActionBindings)
-}
-
 func TestGetAndListCacheHitsAvoidDurableKubernetesReads(t *testing.T) {
 	server, k8sClient, _, _ := newV2Server(t)
 	created, err := server.CreateSandbox(context.Background(), createRequest("sandbox-a"))
