@@ -301,7 +301,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	resourceScalePlan := resourceAwareScalePlan{}
 	if resourceAwareScaling {
 		resourceScalePlan = r.planResourceAwareScaleWithDemand(
-			&pool, childPods.Items, pendingDemands, desiredPod, observedFastlets, now,
+			&pool, childPods.Items, allSandboxes.Items, pendingDemands, desiredPod, observedFastlets, now,
 		)
 		desiredPods = resourceScalePlan.desiredPods
 	} else {
@@ -319,10 +319,10 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	currentCount := int32(len(childPods.Items))
 	var scaleDownCandidate *metav1.Condition
 	if resourceAwareScaling {
-		// Existing resource scale-down drains are already committed removals.
-		// Stabilize only additional shrink so a later reconcile does not erase
-		// the durable target before the draining Pod can be deleted.
-		stabilizationBaseline := currentCount - resourceScalePlan.activeScaleDownDrains
+		// Every persisted drain is already a committed removal, including a
+		// planned upgrade. Stabilize only additional shrink so a later reconcile
+		// does not erase the durable target before the draining Pod is deleted.
+		stabilizationBaseline := currentCount - resourceScalePlan.activeDrains
 		desiredPods, scaleDownCandidate = r.stabilizeResourceAwareScaleDown(&pool, stabilizationBaseline, desiredPods)
 	}
 	desiredPodHash := desiredPod.Annotations[placement.AnnotationPodTemplateHash]
@@ -370,7 +370,8 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 	if result, handled, err := r.reconcileDraining(
-		ctx, &pool, childPods.Items, allSandboxes.Items, desiredPods, desiredPodHash, resourceScalePlan.drainCandidates,
+		ctx, &pool, childPods.Items, allSandboxes.Items, desiredPods, desiredPodHash,
+		resourceAwareScaling, resourceScalePlan.drainCandidates, observedFastlets,
 	); err != nil {
 		return ctrl.Result{}, err
 	} else if handled {
@@ -464,6 +465,7 @@ type resourceAwareDrainCandidate struct {
 type resourceAwareScalePlan struct {
 	desiredPods           int32
 	drainCandidates       []string
+	activeDrains          int32
 	activeScaleDownDrains int32
 }
 
@@ -472,6 +474,7 @@ type resourceAwareCapacityView struct {
 	freeResources         placement.ResourceDemand
 	freeBins              []resourceAwareFreeBin
 	removable             []resourceAwareDrainCandidate
+	activeDrains          int32
 	activeScaleDownDrains int32
 }
 
@@ -494,6 +497,7 @@ type poolPendingResourceResolution struct {
 func (r *SandboxPoolReconciler) planResourceAwareScaleWithDemand(
 	pool *apiv1alpha2.SandboxPool,
 	pods []corev1.Pod,
+	sandboxes []apiv1alpha2.Sandbox,
 	pendingDemands []placement.ResourceDemand,
 	plannedPod *corev1.Pod,
 	observed map[string]placement.FastletInfo,
@@ -511,10 +515,11 @@ func (r *SandboxPoolReconciler) planResourceAwareScaleWithDemand(
 		return plan
 	}
 	demand := placement.ResourceDemand{CPU: requests.CPU, Memory: requests.Memory}
-	view := r.observeResourceAwareCapacity(pool, pods, plannedPod, observed, now, demand, nominal)
+	view := r.observeResourceAwareCapacity(pool, pods, sandboxes, plannedPod, observed, now, demand, nominal)
+	plan.activeDrains = view.activeDrains
 	plan.activeScaleDownDrains = view.activeScaleDownDrains
 	availableFree := view.freeSlots
-	plan.desiredPods = current - plan.activeScaleDownDrains
+	plan.desiredPods = current - plan.activeDrains
 	capacity, capacityErr := fastletsettings.DecodeCommitmentCapacity(plannedPod.Annotations[fastletsettings.CommitmentCapacityAnnotation])
 	if capacityErr == nil {
 		podsNeeded, packable := additionalFastletsForDemands(
@@ -581,6 +586,7 @@ func (r *SandboxPoolReconciler) planResourceAwareScaleWithDemand(
 func (r *SandboxPoolReconciler) observeResourceAwareCapacity(
 	pool *apiv1alpha2.SandboxPool,
 	pods []corev1.Pod,
+	sandboxes []apiv1alpha2.Sandbox,
 	plannedPod *corev1.Pod,
 	observed map[string]placement.FastletInfo,
 	now time.Time,
@@ -596,6 +602,7 @@ func (r *SandboxPoolReconciler) observeResourceAwareCapacity(
 		plannedPod.Annotations[fastletsettings.CommitmentCapacityAnnotation],
 	)
 	blockedNodes := make(map[string]struct{})
+	awaitingAdmission := awaitingAdmissionByFastlet(sandboxes, observed, now)
 	for _, info := range observed {
 		if placement.HasFreshNodeMemoryPressure(info, now, placement.DefaultObservationStaleAfter) {
 			blockedNodes[info.NodeName] = struct{}{}
@@ -605,8 +612,11 @@ func (r *SandboxPoolReconciler) observeResourceAwareCapacity(
 		pod := &pods[index]
 		identity := podIdentity(pod)
 		drainRequested := placement.PodDrainRequested(pod)
-		if drainRequested && pod.Annotations[placement.AnnotationDrainReason] == placement.DrainReasonScaleDown {
-			view.activeScaleDownDrains++
+		if drainRequested {
+			view.activeDrains++
+			if pod.Annotations[placement.AnnotationDrainReason] == placement.DrainReasonScaleDown {
+				view.activeScaleDownDrains++
+			}
 		}
 		// The Pod annotation is the durable drain intent. Do not wait for the
 		// next heartbeat to remove that Fastlet from available capacity.
@@ -654,7 +664,8 @@ func (r *SandboxPoolReconciler) observeResourceAwareCapacity(
 				},
 			})
 		}
-		if info.Used() == 0 && !info.Draining && !info.DrainRequested {
+		if fastletResourceObservationFresh(info, now) && info.SchedulingUsed() == 0 && awaitingAdmission[identity] == 0 &&
+			!info.Draining && !info.DrainRequested {
 			view.removable = append(view.removable, resourceAwareDrainCandidate{identity: identity, free: free})
 		}
 	}
@@ -916,7 +927,9 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 	sandboxes []apiv1alpha2.Sandbox,
 	desiredPods int32,
 	desiredPodHash string,
+	resourceAware bool,
 	preferredScaleDown []string,
+	observedFastlets map[string]placement.FastletInfo,
 ) (ctrl.Result, bool, error) {
 	target := int(len(pods) - int(desiredPods))
 	if target < 0 {
@@ -947,47 +960,23 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 
 	active := activeAssignmentsByPod(sandboxes, pool.Name)
 	if len(draining) < target {
-		preferredRank := make(map[string]int, len(preferredScaleDown))
-		for rank, identity := range preferredScaleDown {
-			preferredRank[identity] = rank
-		}
-		sort.Slice(available, func(i, j int) bool {
-			leftCurrent := fastletPodTemplateCurrent(available[i], desiredPodHash)
-			rightCurrent := fastletPodTemplateCurrent(available[j], desiredPodHash)
-			if leftCurrent != rightCurrent {
-				return !leftCurrent
-			}
-			leftRank, leftPreferred := preferredRank[podIdentity(available[i])]
-			rightRank, rightPreferred := preferredRank[podIdentity(available[j])]
-			if leftPreferred != rightPreferred {
-				return leftPreferred
-			}
-			if leftPreferred && leftRank != rightRank {
-				return leftRank < rightRank
-			}
-			left := active[podIdentity(available[i])]
-			right := active[podIdentity(available[j])]
-			if left != right {
-				return left < right
-			}
-			return available[i].Name < available[j].Name
-		})
-		count := target - len(draining)
-		if count > len(available) {
-			count = len(available)
-		}
+		count := min(target-len(draining), len(available))
 		currentTemplateReady := currentTemplatePodsReady(pods, desiredPodHash, r.Registry)
-		for _, pod := range available[:count] {
-			reason := placement.DrainReasonScaleDown
-			if !fastletPodTemplateCurrent(pod, desiredPodHash) && currentTemplateReady {
-				reason = placement.DrainReasonPlannedUpgrade
+		if hasCurrentTemplatePod(pods, desiredPodHash) && !currentTemplateReady {
+			for _, pod := range available {
+				if !fastletPodTemplateCurrent(pod, desiredPodHash) {
+					return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
+				}
 			}
-			if !fastletPodTemplateCurrent(pod, desiredPodHash) && hasCurrentTemplatePod(pods, desiredPodHash) && !currentTemplateReady {
-				return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
-			}
-			if err := r.startDrain(ctx, pod, reason); err != nil {
+		}
+		selections := selectDrainTargets(available, count, preferredScaleDown, desiredPodHash, currentTemplateReady, resourceAware, active)
+		for _, selection := range selections {
+			if err := r.startDrain(ctx, selection.pod, selection.reason); err != nil {
 				return ctrl.Result{RequeueAfter: drainRequeue}, true, err
 			}
+		}
+		if len(selections) < count {
+			return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
 		}
 		return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
 	}
@@ -997,6 +986,7 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 	}
 
 	now := r.now()
+	awaitingAdmission := awaitingAdmissionByFastlet(sandboxes, observedFastlets, now)
 	timeout := r.DrainTimeout
 	if timeout <= 0 {
 		timeout = defaultDrainTimeout
@@ -1017,6 +1007,12 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 			}
 		}
 		empty := active[podIdentity(pod)] == 0
+		if resourceAware {
+			identity := podIdentity(pod)
+			info, exists := observedFastlets[identity]
+			empty = exists && fastletResourceObservationFresh(info, now) && info.SchedulingUsed() == 0 &&
+				awaitingAdmission[identity] == 0
+		}
 		timedOut := !drainStartedAt(pod).IsZero() && now.Sub(drainStartedAt(pod)) >= timeout
 		previouslyAcked := pod.Annotations[placement.AnnotationDrainAckedAt] != ""
 		if timedOut && !empty && pod.Annotations[placement.AnnotationDrainReason] == placement.DrainReasonScaleDown {
@@ -1034,6 +1030,83 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 		}
 	}
 	return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
+}
+
+type drainTarget struct {
+	pod    *corev1.Pod
+	reason string
+}
+
+func selectDrainTargets(
+	available []*corev1.Pod,
+	count int,
+	preferredScaleDown []string,
+	desiredPodHash string,
+	currentTemplateReady bool,
+	resourceAware bool,
+	active map[string]int,
+) []drainTarget {
+	if count <= 0 {
+		return nil
+	}
+	selected := make(map[string]struct{}, count)
+	result := make([]drainTarget, 0, count)
+	appendTarget := func(pod *corev1.Pod, reason string) {
+		identity := podIdentity(pod)
+		if len(result) >= count {
+			return
+		}
+		if _, exists := selected[identity]; exists {
+			return
+		}
+		selected[identity] = struct{}{}
+		result = append(result, drainTarget{pod: pod, reason: reason})
+	}
+
+	if currentTemplateReady {
+		upgrade := make([]*corev1.Pod, 0, len(available))
+		for _, pod := range available {
+			if !fastletPodTemplateCurrent(pod, desiredPodHash) {
+				upgrade = append(upgrade, pod)
+			}
+		}
+		sort.Slice(upgrade, func(i, j int) bool {
+			left, right := active[podIdentity(upgrade[i])], active[podIdentity(upgrade[j])]
+			if left != right {
+				return left < right
+			}
+			return upgrade[i].Name < upgrade[j].Name
+		})
+		for _, pod := range upgrade {
+			appendTarget(pod, placement.DrainReasonPlannedUpgrade)
+		}
+	}
+
+	availableByIdentity := make(map[string]*corev1.Pod, len(available))
+	for _, pod := range available {
+		availableByIdentity[podIdentity(pod)] = pod
+	}
+	if resourceAware {
+		for _, identity := range preferredScaleDown {
+			if pod := availableByIdentity[identity]; pod != nil {
+				appendTarget(pod, placement.DrainReasonScaleDown)
+			}
+		}
+		return result
+	}
+
+	remaining := append([]*corev1.Pod(nil), available...)
+	sort.Slice(remaining, func(i, j int) bool {
+		left, right := active[podIdentity(remaining[i])], active[podIdentity(remaining[j])]
+		if left != right {
+			return left < right
+		}
+		return remaining[i].Name < remaining[j].Name
+	})
+	for _, pod := range remaining {
+		appendTarget(pod, placement.DrainReasonScaleDown)
+	}
+	return result
 }
 
 func (r *SandboxPoolReconciler) startDrain(ctx context.Context, pod *corev1.Pod, reason string) error {
@@ -1102,6 +1175,31 @@ func activeAssignmentsByPod(sandboxes []apiv1alpha2.Sandbox, poolName string) ma
 		result[placement.FastletName+"/"+string(placement.FastletPodUID)]++
 	}
 	return result
+}
+
+func awaitingAdmissionByFastlet(
+	sandboxes []apiv1alpha2.Sandbox,
+	observedFastlets map[string]placement.FastletInfo,
+	now time.Time,
+) map[string]int {
+	result := make(map[string]int)
+	for index := range sandboxes {
+		sandbox := &sandboxes[index]
+		if sandbox.DeletionTimestamp != nil || sandbox.Status.Placement.FastletName == "" || sandbox.Status.Placement.FastletPodUID == "" {
+			continue
+		}
+		identity := sandbox.Status.Placement.FastletName + "/" + string(sandbox.Status.Placement.FastletPodUID)
+		if !fastletReportsCurrentReservation(sandbox, observedFastlets, now) {
+			result[identity]++
+		}
+	}
+	return result
+}
+
+func fastletResourceObservationFresh(info placement.FastletInfo, now time.Time) bool {
+	return !info.LastHeartbeat.IsZero() && !info.ResourceReceivedAt.IsZero() &&
+		now.Sub(info.LastHeartbeat) <= placement.DefaultObservationStaleAfter &&
+		now.Sub(info.ResourceReceivedAt) <= placement.DefaultObservationStaleAfter
 }
 
 func sandboxNeedsPlacement(sandbox *apiv1alpha2.Sandbox) bool {
