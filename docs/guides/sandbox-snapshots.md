@@ -194,6 +194,30 @@ credentials) see the sections below.
   verbatim from the source image (they describe the vmstate lineage that
   restore validates). Only the template-name index is written — never a
   default `sha256(image)` key, which would pollute the golden image.
+- **Transfer mode** (`transfer.format` in the runtime-agent config, the
+  Helm value `runtime.transfer.format`): one install-time switch.
+  - `legacy` (default): the whole-file layout above and the original cache
+    behaviour (every create/resume re-hashes the cached set).
+  - `chunked`: each artifact is split into 4 MiB chunks; all-zero chunks
+    are skipped and the rest are stored once under content-addressed keys
+    (`<store>/chunks/sha256/<aa>/<sha256>`), so a 3.5 GiB snapshot that is
+    ~93% zeros uploads ~240 MiB, and a repeat pause only its changed
+    chunks. The set namespace then holds `chunks.json` (the chunk list)
+    instead of the artifacts, bound into the manifest by a `chunks` field:
+    index digest → manifest → `chunks.json` → per-chunk sha256 forms an
+    unbroken verification chain. The mode also turns on parallel chunk
+    transfers, a verified-cache marker (`user.fsb.verified` xattr) that
+    replaces the per-lease re-hash, sparse fsynced cache writes, parallel
+    manifest hashing in the fastlet (#61), and the same-node cache of
+    template snapshots (#57).
+  - Pulls read both layouts in either mode, so switching back to `legacy`
+    keeps every chunked snapshot restorable. An agent image that predates
+    the setting cannot read chunked sets: roll the new image to every node
+    before switching any node to `chunked`.
+  - Store requirements are unchanged: path-style SigV4 `GET`/`PUT`/`HEAD`
+    (Ceph RGW, MinIO, AWS S3, R2, ...). Chunk `PUT`s are signed with the
+    payload digest, so the store rejects a corrupted body. Chunk objects
+    are shared between sets and are not garbage-collected yet.
 - **Follow-ups**: [#56](https://github.com/opensandbox-group/fast-sandbox/issues/56)
   diff snapshots (pause window proportional to dirty pages),
   [#57](https://github.com/opensandbox-group/fast-sandbox/issues/57)

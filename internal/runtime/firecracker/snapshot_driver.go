@@ -10,9 +10,12 @@ package firecracker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -114,6 +117,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 		spillRoot:   d.snapshotSpillRoot(),
 	}
 	d.mu.RUnlock()
+	plan.chunked = d.agentTransferChunked()
 	plan.sandboxDir = filepath.Join(plan.stateRoot, sandboxStateDir, plan.sandboxID)
 	ociSnapshot, err := prepareOCISnapshot(plan)
 	if err != nil {
@@ -173,14 +177,15 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 		return nil, err
 	}
 
-	sizeBytes, err := assembleSnapshotManifest(plan.stateRoot, d.ociRoot(), plan.staging, plan.sandboxDir, kind)
+	assembleStarted := time.Now()
+	sizeBytes, err := d.assemblePlanManifest(&plan, kind)
 	if err != nil {
 		_ = os.RemoveAll(plan.staging)
 		return nil, err
 	}
 	klog.InfoS("firecracker checkpoint manifest assembled",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind,
-		"sizeBytes", sizeBytes, "staging", plan.staging)
+		"sizeBytes", sizeBytes, "staging", plan.staging, "assemble", time.Since(assembleStarted).String())
 
 	if ociSnapshot {
 		return d.publishOCISnapshot(ctx, plan, sizeBytes, kind, input.OnPublishing)
@@ -212,25 +217,47 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 		ArtifactDigest: outcome.ArtifactDigest,
 		SizeBytes:      sizeBytes,
 	}
-	// A checkpoint keeps the published set in the node-local image cache: a
-	// resume that still lands on this node restores locally (~ms) instead of
-	// pulling the full set back from the store (~16s per 3.5GiB). The commit
-	// is best-effort — the store copy is authoritative, and any miss (cache
-	// evicted by the image GC, or a resume on another node) falls back to the
-	// normal pull path. Template snapshots keep discarding staging; their
-	// same-node prewarm is issue #57.
-	if kind == fastletapi.SnapshotKindCheckpoint {
-		if cacheErr := d.commitCheckpointCache(result, plan.staging); cacheErr != nil {
-			klog.ErrorS(cacheErr, "checkpoint local cache commit failed; a resume will pull from the store",
-				"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "manifestRef", outcome.ManifestRef)
-		}
-	} else {
-		_ = os.RemoveAll(plan.staging)
-	}
+	d.retainPublishedSet(&plan, kind, input.TemplateName, result, outcome)
 	klog.InfoS("firecracker snapshot published",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "templateName", input.TemplateName,
 		"manifestRef", outcome.ManifestRef, "sizeBytes", sizeBytes, "publish", time.Since(publishStarted).String())
 	return result, nil
+}
+
+// assemblePlanManifest writes the snapshot manifest of the staged set: the
+// original sequential assembly, or in chunked transfer mode the parallel one
+// reusing the digests the spill copy computed.
+func (d *Driver) assemblePlanManifest(plan *dumpPlan, kind fastletapi.SnapshotKind) (int64, error) {
+	if plan.chunked {
+		return assembleSnapshotManifestWith(plan.stateRoot, d.ociRoot(), plan.staging, plan.sandboxDir, kind, plan.knownSums, true)
+	}
+	return assembleSnapshotManifest(plan.stateRoot, d.ociRoot(), plan.staging, plan.sandboxDir, kind)
+}
+
+// retainPublishedSet decides what happens to the staging directory of a
+// published set. A checkpoint keeps the set in the node-local image cache: a
+// resume that still lands on this node restores locally (~ms) instead of
+// pulling the full set back from the store (~16s per 3.5GiB). The commit is
+// best-effort — the store copy is authoritative, and any miss (cache evicted
+// by the image GC, or a resume on another node) falls back to the normal
+// pull path. Template snapshots discard staging, unless the agent runs the
+// chunked transfer mode: then the set is cached under its template name, the
+// reference a later create resolves (issue #57).
+func (d *Driver) retainPublishedSet(plan *dumpPlan, kind fastletapi.SnapshotKind, templateName string, result *runtimecontract.SnapshotResult, outcome PublishOutcome) {
+	switch {
+	case kind == fastletapi.SnapshotKindCheckpoint:
+		if cacheErr := d.commitCheckpointCache(result, plan.staging); cacheErr != nil {
+			klog.ErrorS(cacheErr, "checkpoint local cache commit failed; a resume will pull from the store",
+				"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "manifestRef", outcome.ManifestRef)
+		}
+	case outcome.TransferFormat == agentTransferFormatChunked:
+		if cacheErr := d.commitSnapshotCache(templateName, plan.staging); cacheErr != nil {
+			klog.ErrorS(cacheErr, "template snapshot local cache commit failed; a create will pull from the store",
+				"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "templateName", templateName)
+		}
+	default:
+		_ = os.RemoveAll(plan.staging)
+	}
 }
 
 // commitCheckpointCache moves a published checkpoint artifact set from its
@@ -245,7 +272,19 @@ func (d *Driver) commitCheckpointCache(result *runtimecontract.SnapshotResult, s
 	if result == nil || result.ArtifactDigest == "" {
 		return fmt.Errorf("%w: checkpoint result carries no artifact digest", ErrInvalidConfig)
 	}
-	reference := artifacts.CheckpointReference(result.ArtifactDigest)
+	return d.commitSnapshotCache(artifacts.CheckpointReference(result.ArtifactDigest), staging)
+}
+
+// commitSnapshotCache moves a published artifact set from its staging
+// directory into the node-local image cache under reference (the checkpoint
+// reference, or the template name of a template snapshot); see
+// commitCheckpointCache. An existing complete entry is kept, matching the
+// pull path, which never refreshes a committed cache entry.
+func (d *Driver) commitSnapshotCache(reference, staging string) error {
+	if reference == "" {
+		_ = os.RemoveAll(staging)
+		return fmt.Errorf("%w: snapshot cache reference is empty", ErrInvalidConfig)
+	}
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	d.mu.RUnlock()
@@ -454,6 +493,13 @@ type dumpPlan struct {
 	pauseAPI    time.Duration
 	dumpAPI     time.Duration
 	resumeAPI   time.Duration
+	// chunked mirrors the runtime-agent's chunked transfer mode: the spill
+	// copy hashes as it goes and the manifest assembly hashes in parallel.
+	chunked bool
+	// knownSums carries staged-file digests computed while the dump was
+	// relocated (path -> sha256), so the manifest assembly skips re-reading
+	// those files.
+	knownSums map[string]string
 }
 
 // jailRoot returns the jail root of the plan's Sandbox (jailer mode only).
@@ -703,7 +749,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		jailedDumpVMStateName: vmstateSnapshotName,
 		jailedDumpMemoryName:  memorySnapshotName,
 	} {
-		if err := copyFile(filepath.Join(spillDir, dumped), filepath.Join(plan.staging, staged)); err != nil {
+		if err := relocateSpilledFile(plan, filepath.Join(spillDir, dumped), filepath.Join(plan.staging, staged)); err != nil {
 			_ = os.RemoveAll(spillDir)
 			return fmt.Errorf("move spilled %s into the staging directory: %w", dumped, err)
 		}
@@ -1150,7 +1196,11 @@ type snapshotManifestEntries struct {
 	Names                 []string
 }
 
-func collectSnapshotManifestEntries(staging string, isOCI bool) (snapshotManifestEntries, error) {
+// collectSnapshotManifestEntries describes the staged files of a snapshot
+// set. With parallel (chunked transfer mode) known digests (path -> sha256) are
+// reused and the remaining files are hashed concurrently before the entries
+// are built; otherwise each file is hashed in turn as it is described.
+func collectSnapshotManifestEntries(staging string, isOCI bool, known map[string]string, parallel bool) (snapshotManifestEntries, error) {
 	bundleFiles, err := stagedBundleFiles(staging)
 	if err != nil {
 		return snapshotManifestEntries{}, err
@@ -1162,6 +1212,11 @@ func collectSnapshotManifestEntries(staging string, isOCI bool) (snapshotManifes
 	files, stateFiles := map[string]artifacts.ManifestFile{}, map[string]artifacts.ManifestFile{}
 	var sizeBytes, rootfsSize int64
 	cache := map[string]string{}
+	if parallel {
+		if cache, err = hashStagedFiles(staging, bundleFiles, known); err != nil {
+			return snapshotManifestEntries{}, err
+		}
+	}
 	for _, name := range bundleFiles {
 		file, err := artifacts.FileEntry(filepath.Join(staging, name), cache)
 		if err != nil {
@@ -1192,6 +1247,13 @@ func collectSnapshotManifestEntries(staging string, isOCI bool) (snapshotManifes
 }
 
 func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, kind fastletapi.SnapshotKind) (int64, error) {
+	return assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir, kind, nil, false)
+}
+
+// assembleSnapshotManifestWith is assembleSnapshotManifest with the
+// chunked-mode hashing (see collectSnapshotManifestEntries): the set's
+// wall time is its largest file, not the sum of all of them.
+func assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir string, kind fastletapi.SnapshotKind, known map[string]string, parallel bool) (int64, error) {
 	state, err := loadState(sandboxDir)
 	if err != nil {
 		return 0, err
@@ -1214,7 +1276,7 @@ func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, ki
 		return 0, err
 	}
 	isOCI := strings.HasPrefix(sourceRef, ocitemplate.Prefix)
-	entries, err := collectSnapshotManifestEntries(staging, isOCI)
+	entries, err := collectSnapshotManifestEntries(staging, isOCI, known, parallel)
 	if err != nil {
 		return 0, err
 	}
@@ -1294,6 +1356,129 @@ func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, ki
 		return 0, err
 	}
 	return entries.SizeBytes, nil
+}
+
+// agentTransferFormatChunked is the runtime-agent's chunked transfer mode
+// (agent.TransferFormatChunked; the driver does not import the agent).
+const agentTransferFormatChunked = "chunked"
+
+// agentTransferChunked reports whether the runtime-agent last reported the
+// chunked transfer mode. An agent client that cannot report it, or an agent
+// that predates the setting, means legacy.
+func (d *Driver) agentTransferChunked() bool {
+	client, err := d.agentClientOrNil()
+	if err != nil || client == nil {
+		return false
+	}
+	reporter, ok := client.(transferFormatReporter)
+	return ok && reporter.TransferFormat() == agentTransferFormatChunked
+}
+
+// relocateSpilledFile copies one spilled dump file into the staging
+// directory. In chunked mode the copy hashes as it goes (the bytes are read
+// from tmpfs anyway) and leaves all-zero blocks as holes, so the manifest
+// assembly neither re-reads guest memory nor the publish re-scans zeros.
+func relocateSpilledFile(plan *dumpPlan, source, target string) error {
+	if !plan.chunked {
+		return copyFile(source, target)
+	}
+	sum, err := copyFileSparseHashed(source, target)
+	if err != nil {
+		return err
+	}
+	if plan.knownSums == nil {
+		plan.knownSums = map[string]string{}
+	}
+	plan.knownSums[target] = sum
+	return nil
+}
+
+// hashStagedFiles returns the checksum cache of the named staged files
+// (path -> sha256): known digests are taken as-is, the rest are hashed
+// concurrently.
+func hashStagedFiles(staging string, names []string, known map[string]string) (map[string]string, error) {
+	cache := map[string]string{}
+	var (
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		firstErr error
+	)
+	for _, name := range names {
+		path := filepath.Join(staging, name)
+		if sum, ok := known[path]; ok {
+			cache[path] = sum
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sum, err := artifacts.SHA256File(path)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("checksum %s: %w", name, err)
+				}
+				return
+			}
+			cache[path] = sum
+		}()
+	}
+	wg.Wait()
+	return cache, firstErr
+}
+
+// copyFileSparseHashed copies source to target and returns the sha256 of the
+// content. All-zero 64 KiB blocks are seeked over instead of written, so the
+// target is sparse while its logical content (and digest) is unchanged.
+func copyFileSparseHashed(source, target string) (string, error) {
+	input, err := os.Open(source)
+	if err != nil {
+		return "", err
+	}
+	defer input.Close()
+	output, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.New()
+	buffer := make([]byte, 4<<20)
+	var size int64
+	for {
+		n, readErr := io.ReadFull(input, buffer)
+		block := buffer[:n]
+		_, _ = digest.Write(block)
+		for len(block) > 0 {
+			step := min(len(block), 64<<10)
+			if artifacts.IsZero(block[:step]) {
+				_, err = output.Seek(int64(step), io.SeekCurrent)
+			} else {
+				_, err = output.Write(block[:step])
+			}
+			if err != nil {
+				_ = output.Close()
+				return "", err
+			}
+			block = block[step:]
+		}
+		size += int64(n)
+		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+			break
+		}
+		if readErr != nil {
+			_ = output.Close()
+			return "", readErr
+		}
+	}
+	// A trailing hole has no write behind it: set the logical size.
+	if err := output.Truncate(size); err != nil {
+		_ = output.Close()
+		return "", err
+	}
+	if err := output.Close(); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
 func readSourceManifest(stateRoot, ociRoot, image, sandboxID string) ([]byte, error) {

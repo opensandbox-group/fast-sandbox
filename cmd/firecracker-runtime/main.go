@@ -91,7 +91,16 @@ func run() error {
 	// dart child (p2p.dart.addr) or an external gateway (p2p.gateway.addr)
 	// is active. Artifact bytes always fall back to direct S3 when the
 	// gateway is unreachable.
-	var pullOptions []agentpull.Option
+	transfer := config.Transfer.transfer()
+	pullOptions := []agentpull.Option{agentpull.WithTransfer(transfer)}
+	transferFormat := agentpull.TransferFormatLegacy
+	if transfer.Chunked() {
+		transferFormat = agentpull.TransferFormatChunked
+	}
+	serviceOptions = append(serviceOptions, agentserver.WithTransferFormat(transferFormat))
+	klog.InfoS("artifact transfer configured", "format", transferFormat,
+		"compression", config.Transfer.Compression, "concurrency", config.Transfer.Concurrency,
+		"chunkSizeMiB", config.Transfer.ChunkSizeMiB)
 	var dartManager *agentdart.Manager
 	var p2pProbe func() bool
 	var gatewayProbers []*gatewayProber

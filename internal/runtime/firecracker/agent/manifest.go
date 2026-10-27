@@ -6,6 +6,7 @@ package agent
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 
 	"fast-sandbox/internal/artifacts"
@@ -23,6 +24,19 @@ func parseManifest(payload []byte) (manifest, error) {
 		return manifest{}, fmt.Errorf("manifest has no native files; OCI artifacts must be prepared through fsb-vm")
 	}
 	return manifest(document), nil
+}
+
+// chunkBinding returns the optional chunk index binding of a manifest
+// document (nil for a whole-file set). It is a manifest extension outside
+// the shared VMManifest model, so it is decoded from the raw bytes.
+func chunkBinding(payload []byte) (*artifacts.ChunkIndexRef, error) {
+	var document struct {
+		Chunks *artifacts.ChunkIndexRef `json:"chunks,omitempty"`
+	}
+	if err := json.Unmarshal(payload, &document); err != nil {
+		return nil, fmt.Errorf("decode manifest chunk binding: %w", err)
+	}
+	return document.Chunks, nil
 }
 
 // nativeFile pairs a published artifact with its local cache name and the

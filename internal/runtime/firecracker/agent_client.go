@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"fast-sandbox/internal/observability"
@@ -69,6 +70,16 @@ type AgentClient interface {
 type PublishOutcome struct {
 	ManifestRef    string
 	ArtifactDigest string
+	// TransferFormat is the agent's transfer mode ("" from an agent that
+	// predates the setting, meaning legacy).
+	TransferFormat string
+}
+
+// transferFormatReporter is implemented by agent clients that remember the
+// transfer mode the agent last reported (Health or PublishImage). Clients
+// without it — and agents that predate the setting — mean legacy.
+type transferFormatReporter interface {
+	TransferFormat() string
 }
 
 // agentHTTPClient implements AgentClient over the UDS socket.
@@ -76,6 +87,15 @@ type agentHTTPClient struct {
 	client    *http.Client
 	namespace string
 	podUID    string
+	// transferFormat is the transfer mode the agent last reported.
+	transferFormat atomic.Value
+}
+
+// TransferFormat returns the transfer mode the agent last reported ("" until
+// the first Health or PublishImage response, or from an older agent).
+func (c *agentHTTPClient) TransferFormat() string {
+	format, _ := c.transferFormat.Load().(string)
+	return format
 }
 
 // NewAgentClient builds the UDS HTTP client of the runtime-agent. The
@@ -132,7 +152,8 @@ func (c *agentHTTPClient) PublishImage(ctx context.Context, requestID, kind, key
 	}, &response); err != nil {
 		return PublishOutcome{}, err
 	}
-	return PublishOutcome{ManifestRef: response.ManifestRef, ArtifactDigest: response.ArtifactDigest}, nil
+	c.transferFormat.Store(response.TransferFormat)
+	return PublishOutcome{ManifestRef: response.ManifestRef, ArtifactDigest: response.ArtifactDigest, TransferFormat: response.TransferFormat}, nil
 }
 
 func (c *agentHTTPClient) LeaseDevices(ctx context.Context, requestID string, config *fastletapi.RuntimeSandboxConfig) (Lease, error) {
@@ -183,6 +204,7 @@ func (c *agentHTTPClient) Health(ctx context.Context) error {
 	if err := c.doJSON(ctx, agentprotocol.RouteHealth, c.identity(""), &response); err != nil {
 		return err
 	}
+	c.transferFormat.Store(response.TransferFormat)
 	if !response.OK {
 		return fmt.Errorf("runtime-agent reports unhealthy: leases=%d images=%d", response.LeaseCount, response.ImageCount)
 	}
