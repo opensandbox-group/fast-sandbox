@@ -48,7 +48,7 @@ func (r *SandboxPoolReconciler) planResourceAwareScale(
 			CPU: requests.CPU.DeepCopy(), Memory: requests.Memory.DeepCopy(),
 		})
 	}
-	return r.planResourceAwareScaleWithDemand(pool, pods, nil, pendingDemands, plannedPod, observed, now)
+	return r.planResourceAwareScaleWithDemand(pool, pods, nil, pendingDemands, plannedPod, observed, nil, now)
 }
 
 func TestRegistryConfigCompilesSameNamespaceSecretsAndPreservesLastValidRevision(t *testing.T) {
@@ -754,7 +754,7 @@ func TestResourceAwareScaleUsesHeterogeneousPendingCommitments(t *testing.T) {
 	require.Equal(t, expectedMemory.Value(), totalPending.Memory.Value())
 
 	plan := reconciler.planResourceAwareScaleWithDemand(
-		pool, []corev1.Pod{*pod}, sandboxes, pending, planned, observed, now,
+		pool, []corev1.Pod{*pod}, sandboxes, pending, planned, observed, nil, now,
 	)
 	require.Equal(t, int32(2), plan.desiredPods,
 		"three Sandboxes fit the four-slot count but their six-CPU commitment needs two Fastlets")
@@ -802,7 +802,7 @@ func TestResourceAwareScaleAddsFastletWhenAggregateCapacityIsFragmented(t *testi
 	require.Equal(t, int64(2000), pending[0].CPU.MilliValue())
 
 	plan := (&SandboxPoolReconciler{}).planResourceAwareScaleWithDemand(
-		pool, pods, []apiv1alpha2.Sandbox{sandbox}, pending, planned, observed, now,
+		pool, pods, []apiv1alpha2.Sandbox{sandbox}, pending, planned, observed, nil, now,
 	)
 	require.Equal(t, int32(3), plan.desiredPods,
 		"aggregate free CPU is sufficient, but neither existing Fastlet can fit the two-CPU request")
@@ -853,7 +853,7 @@ func TestResourceAwareScaleDoesNotAddFastletWhenSmallOverridesFit(t *testing.T) 
 	require.Equal(t, int64(500), pending[0].CPU.MilliValue())
 
 	plan := (&SandboxPoolReconciler{}).planResourceAwareScaleWithDemand(
-		pool, pods, sandboxes, pending, planned, observed, now,
+		pool, pods, sandboxes, pending, planned, observed, nil, now,
 	)
 	require.Equal(t, int32(2), plan.desiredPods,
 		"each small request fits one physical slot even though neither remainder fits a default Sandbox")
@@ -897,7 +897,7 @@ func TestUnadmittableDemandDoesNotSuppressValidScaleOutOrBuffer(t *testing.T) {
 	require.Equal(t, orchestration.ReasonLimitExceedsFastletBudget, resolution.unadmittable[0].reason)
 
 	plan := (&SandboxPoolReconciler{}).planResourceAwareScaleWithDemand(
-		pool, []corev1.Pod{*pod}, []apiv1alpha2.Sandbox{valid, *oversized}, resolution.admissible, planned, observed, now,
+		pool, []corev1.Pod{*pod}, []apiv1alpha2.Sandbox{valid, *oversized}, resolution.admissible, planned, observed, nil, now,
 	)
 	require.Equal(t, int32(2), plan.desiredPods,
 		"the valid pending Sandbox and buffer must still create one fresh Fastlet")
@@ -906,7 +906,7 @@ func TestUnadmittableDemandDoesNotSuppressValidScaleOutOrBuffer(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, resolution.admissible)
 	plan = (&SandboxPoolReconciler{}).planResourceAwareScaleWithDemand(
-		pool, []corev1.Pod{*pod}, []apiv1alpha2.Sandbox{*oversized}, resolution.admissible, planned, observed, now,
+		pool, []corev1.Pod{*pod}, []apiv1alpha2.Sandbox{*oversized}, resolution.admissible, planned, observed, nil, now,
 	)
 	require.Equal(t, int32(2), plan.desiredPods,
 		"an unadmittable Sandbox must not suppress the independent Pool buffer")
@@ -962,6 +962,24 @@ func TestResourceAwareScaleExcludesStartingFastletOnPressuredNode(t *testing.T) 
 		"a starting sibling on the pressured node must not contribute nominal startup-grace capacity")
 }
 
+func TestResourceAwareScaleAppliesPressureObservedByAnotherPool(t *testing.T) {
+	now := time.Date(2026, 10, 23, 8, 0, 0, 0, time.UTC)
+	pool := resourceAwareScalingPool()
+	planned := resourceAwarePlannedPod()
+	pod := fastletPod("fastlet-current-pool", "uid-current", "10.0.0.2")
+	pod.Spec.NodeName = "node-a"
+	open := resourceAwareControllerFastlet("fastlet-current-pool", "uid-current", 0, fastletapi.AdmissionStateOpen, now)
+	open.NodeName = "node-a"
+	open.ResourceReceivedAt = now
+	observed := map[string]placement.FastletInfo{"fastlet-current-pool/uid-current": open}
+
+	plan := (&SandboxPoolReconciler{}).planResourceAwareScaleWithDemand(
+		pool, []corev1.Pod{*pod}, nil, nil, planned, observed, map[string]struct{}{"node-a": {}}, now,
+	)
+	require.Equal(t, int32(2), plan.desiredPods,
+		"fresh node pressure reported by a different Pool must remove this Pool's sibling capacity")
+}
+
 func TestResourceAwareScaleKeepsPlannedUpgradeRemovalTarget(t *testing.T) {
 	now := time.Date(2026, 10, 27, 8, 0, 0, 0, time.UTC)
 	pool := resourceAwareScalingPool()
@@ -988,7 +1006,7 @@ func TestResourceAwareScaleKeepsPlannedUpgradeRemovalTarget(t *testing.T) {
 
 	plan := (&SandboxPoolReconciler{}).planResourceAwareScaleWithDemand(
 		pool, []corev1.Pod{*oldPod, *newPod}, nil, nil, planned,
-		map[string]placement.FastletInfo{"fastlet-new/uid-new": newInfo}, now,
+		map[string]placement.FastletInfo{"fastlet-new/uid-new": newInfo}, nil, now,
 	)
 	require.Equal(t, int32(1), plan.activeDrains)
 	require.Equal(t, int32(1), plan.desiredPods,
@@ -1017,7 +1035,7 @@ func TestResourceAwareScaleDownExcludesFastletAwaitingAdmission(t *testing.T) {
 	sandbox.Status.Runtime.State = apiv1alpha2.RuntimePending
 
 	plan := (&SandboxPoolReconciler{}).planResourceAwareScaleWithDemand(
-		pool, pods, []apiv1alpha2.Sandbox{sandbox}, nil, resourceAwarePlannedPod(), observed, now,
+		pool, pods, []apiv1alpha2.Sandbox{sandbox}, nil, resourceAwarePlannedPod(), observed, nil, now,
 	)
 	require.Equal(t, int32(1), plan.desiredPods)
 	require.Equal(t, []string{"fastlet-b/uid-b"}, plan.drainCandidates,
@@ -1056,7 +1074,7 @@ func TestPoolSummarySeparatesFastletsResourcesAndSandboxes(t *testing.T) {
 	seedControllerRegistry(t, registry, resourceAwareControllerFastlet("fastlet-blocked", "uid-blocked", 2, fastletapi.AdmissionStateBlocked, now))
 	observed := resourceFastletsForPoolChildren(registry, pool, pods)
 
-	fastlets, resources := summarizePoolFastlets(pool, pods, 2, 2, 0, 2, observed, now)
+	fastlets, resources := summarizePoolFastlets(pool, pods, 2, 2, 0, 2, observed, nil, now)
 	require.Equal(t, &apiv1alpha2.SandboxPoolFastletSummary{Desired: 2, Current: 2, Ready: 2, Busy: 2}, fastlets)
 	require.Equal(t, "8", resources.Capacity.CPU.String())
 	require.Equal(t, "16Gi", resources.Capacity.Memory.String())
@@ -1064,6 +1082,13 @@ func TestPoolSummarySeparatesFastletsResourcesAndSandboxes(t *testing.T) {
 	require.Equal(t, "6Gi", resources.Committed.Memory.String())
 	require.Equal(t, "3", resources.Free.CPU.String())
 	require.Equal(t, "6Gi", resources.Free.Memory.String())
+
+	open := observed["fastlet-open/uid-open"]
+	open.RejectedUntil = now.Add(time.Minute)
+	observed["fastlet-open/uid-open"] = open
+	_, resources = summarizePoolFastlets(pool, pods, 2, 2, 0, 2, observed, nil, now)
+	require.Zero(t, resources.Free.CPU.Sign(), "Pool summary must use the same rejection cooldown as placement")
+	require.Zero(t, resources.Free.Memory.Sign(), "Pool summary must use the same rejection cooldown as placement")
 
 	terminatingAt := metav1.NewTime(now)
 	sandboxes := []apiv1alpha2.Sandbox{

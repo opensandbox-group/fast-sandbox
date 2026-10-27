@@ -198,6 +198,23 @@ func TestTopKResourceAwareRequiresFreshEligibleStateAndRanksOpenFirst(t *testing
 	require.Equal(t, FastletID("degraded-cache-hit"), selected[1].ID)
 }
 
+func TestResourceSchedulabilityAppliesRejectionCooldownToEveryConsumer(t *testing.T) {
+	info := resourceAwareFastlet("cooldown", 1, fastletapi.AdmissionStateOpen, 2)
+	info.ResourceReceivedAt = registryNow
+	info.ResourceCommitted = ResourceDemand{CPU: resource.MustParse("1"), Memory: resource.MustParse("2Gi")}
+	info.RejectedUntil = registryNow.Add(5 * time.Second)
+
+	view := ResourceSchedulability(info, registryNow, DefaultObservationStaleAfter)
+	require.False(t, view.Schedulable)
+	require.Zero(t, view.FreeSlots)
+	require.Zero(t, view.FreeResources.CPU.Sign())
+	require.Zero(t, view.FreeResources.Memory.Sign())
+	require.Zero(t, EffectiveFreeCapacity(
+		info, ResourceDemand{CPU: resource.MustParse("1"), Memory: resource.MustParse("2Gi")},
+		registryNow, DefaultObservationStaleAfter,
+	))
+}
+
 func TestTopKPropagatesFreshNodeMemoryPressureAcrossFastlets(t *testing.T) {
 	registry := NewInMemoryRegistry()
 	pressured := resourceAwareFastlet("pressured", 0, fastletapi.AdmissionStateBlocked, 2)

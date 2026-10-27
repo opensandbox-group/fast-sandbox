@@ -83,6 +83,12 @@ func TestFastletInfoFromPodUsesWatchIdentityAndReadiness(t *testing.T) {
 	require.Equal(t, "resource-hash", info.ResourceProfileHash)
 	require.Equal(t, int64(750), info.ResourceCapacity.CPU.MilliValue())
 	require.Equal(t, int64(3*1024*1024*1024), info.ResourceCapacity.Memory.Value())
+
+	terminating := pod.DeepCopy()
+	deletedAt := metav1.NewTime(time.Now())
+	terminating.DeletionTimestamp = &deletedAt
+	require.False(t, fastletInfoFromPod(terminating).PodReady,
+		"a terminating Pod must stop contributing schedulable capacity before its delete event")
 }
 
 func TestDrainAnnotationImmediatelyExcludesPodAndHeartbeatCannotClearIt(t *testing.T) {

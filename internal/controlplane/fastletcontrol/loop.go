@@ -187,7 +187,7 @@ func fastletInfoFromPod(pod *corev1.Pod) placement.FastletInfo {
 		ResourceCapacity:    resourceCapacity,
 		DrainRequested:      placement.PodDrainRequested(pod),
 		Draining:            placement.PodDrainRequested(pod),
-		PodReady:            pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" && podConditionTrue(pod.Status.Conditions, corev1.PodReady),
+		PodReady:            pod.DeletionTimestamp == nil && pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "" && podConditionTrue(pod.Status.Conditions, corev1.PodReady),
 		PodObservedAt:       time.Now(),
 	}
 }

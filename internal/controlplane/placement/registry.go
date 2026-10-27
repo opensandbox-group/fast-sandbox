@@ -586,14 +586,23 @@ func hardFilter(info FastletInfo, request CandidateRequest, staleAfter time.Dura
 }
 
 func resourceBlockedNodes(slots []*fastletSlot, now time.Time, staleAfter time.Duration) map[string]struct{} {
-	blocked := make(map[string]struct{})
+	infos := make([]FastletInfo, 0, len(slots))
 	for _, slot := range slots {
 		slot.mu.RLock()
-		info := slot.info
+		infos = append(infos, slot.info)
+		slot.mu.RUnlock()
+	}
+	return FreshNodeMemoryPressureNodes(infos, now, staleAfter)
+}
+
+// FreshNodeMemoryPressureNodes returns the node-wide pressure fence reported by
+// any fresh Fastlet observation, independent of Pool ownership.
+func FreshNodeMemoryPressureNodes(infos []FastletInfo, now time.Time, staleAfter time.Duration) map[string]struct{} {
+	blocked := make(map[string]struct{})
+	for _, info := range infos {
 		if HasFreshNodeMemoryPressure(info, now, staleAfter) {
 			blocked[info.NodeName] = struct{}{}
 		}
-		slot.mu.RUnlock()
 	}
 	return blocked
 }
@@ -610,34 +619,55 @@ func HasFreshNodeMemoryPressure(info FastletInfo, now time.Time, staleAfter time
 }
 
 func resourceEligible(info FastletInfo, request CandidateRequest, staleAfter time.Duration) bool {
+	view := ResourceSchedulability(info, request.Now, staleAfter)
+	return view.Fits(request.Demand)
+}
+
+type SchedulabilityView struct {
+	Schedulable   bool
+	FreeSlots     int32
+	FreeResources ResourceDemand
+}
+
+func (v SchedulabilityView) Fits(demand ResourceDemand) bool {
+	return v.Schedulable && demand.CPU.Sign() > 0 && demand.Memory.Sign() > 0 &&
+		demand.CPU.Cmp(v.FreeResources.CPU) <= 0 && demand.Memory.Cmp(v.FreeResources.Memory) <= 0
+}
+
+// ResourceSchedulability is the shared Fastlet capacity view used by placement,
+// Pool scaling, and the operator summary. Profile and node-pressure filters are
+// deliberately applied by their callers.
+func ResourceSchedulability(info FastletInfo, now time.Time, staleAfter time.Duration) SchedulabilityView {
 	status := info.Admission.Resources
-	if status == nil || status.Version != "v2" || info.ResourceReceivedAt.IsZero() || request.Now.Sub(info.ResourceReceivedAt) > staleAfter {
-		return false
+	if !info.PodReady || !info.RuntimeReady || !info.InfraReady || info.Draining || info.DrainRequested || info.LastHeartbeat.IsZero() ||
+		now.Sub(info.LastHeartbeat) > staleAfter || now.Before(info.RejectedUntil) || status == nil || status.Version != "v2" ||
+		info.ResourceReceivedAt.IsZero() || now.Sub(info.ResourceReceivedAt) > staleAfter ||
+		(status.State != fastletapi.AdmissionStateOpen && status.State != fastletapi.AdmissionStateDegraded) {
+		return SchedulabilityView{}
 	}
-	if status.State != fastletapi.AdmissionStateOpen && status.State != fastletapi.AdmissionStateDegraded {
-		return false
+	free := ResourceDemand{CPU: info.ResourceCapacity.CPU.DeepCopy(), Memory: info.ResourceCapacity.Memory.DeepCopy()}
+	free.CPU.Sub(info.ResourceCommitted.CPU)
+	free.CPU.Sub(info.InFlightResources.CPU)
+	free.Memory.Sub(info.ResourceCommitted.Memory)
+	free.Memory.Sub(info.InFlightResources.Memory)
+	freeSlots := int32(max(0, info.Capacity()-info.SchedulingUsed()))
+	if freeSlots <= 0 || free.CPU.Sign() <= 0 || free.Memory.Sign() <= 0 {
+		return SchedulabilityView{}
 	}
-	if request.Demand.CPU.Sign() <= 0 || request.Demand.Memory.Sign() <= 0 ||
-		info.ResourceCapacity.CPU.Sign() <= 0 || info.ResourceCapacity.Memory.Sign() <= 0 {
-		return false
-	}
-	return info.ResourceCommitted.CPU.MilliValue()+info.InFlightResources.CPU.MilliValue()+request.Demand.CPU.MilliValue() <= info.ResourceCapacity.CPU.MilliValue() &&
-		info.ResourceCommitted.Memory.Value()+info.InFlightResources.Memory.Value()+request.Demand.Memory.Value() <= info.ResourceCapacity.Memory.Value()
+	return SchedulabilityView{Schedulable: true, FreeSlots: freeSlots, FreeResources: free}
 }
 
 // EffectiveFreeCapacity returns the immediately schedulable Sandbox count for
 // a resource-aware Fastlet. It combines the slot ledger, static commitment,
 // dynamic pressure state, and local receive-time freshness.
 func EffectiveFreeCapacity(info FastletInfo, demand ResourceDemand, now time.Time, staleAfter time.Duration) int32 {
-	request := CandidateRequest{Now: now, ResourceMode: apiv1alpha2.SandboxResourceModeResourceAware, Demand: demand}
-	if !info.PodReady || !info.RuntimeReady || !info.InfraReady || info.Draining || info.DrainRequested || info.LastHeartbeat.IsZero() ||
-		now.Sub(info.LastHeartbeat) > staleAfter || now.Before(info.RejectedUntil) || !resourceEligible(info, request, staleAfter) {
+	view := ResourceSchedulability(info, now, staleAfter)
+	if !view.Fits(demand) {
 		return 0
 	}
-	slotFree := int64(info.Capacity() - info.SchedulingUsed())
-	cpuFree := (info.ResourceCapacity.CPU.MilliValue() - info.ResourceCommitted.CPU.MilliValue() - info.InFlightResources.CPU.MilliValue()) / demand.CPU.MilliValue()
-	memoryFree := (info.ResourceCapacity.Memory.Value() - info.ResourceCommitted.Memory.Value() - info.InFlightResources.Memory.Value()) / demand.Memory.Value()
-	free := min(slotFree, cpuFree, memoryFree)
+	cpuFree := view.FreeResources.CPU.MilliValue() / demand.CPU.MilliValue()
+	memoryFree := view.FreeResources.Memory.Value() / demand.Memory.Value()
+	free := min(int64(view.FreeSlots), cpuFree, memoryFree)
 	if free <= 0 {
 		return 0
 	}
@@ -648,22 +678,7 @@ func EffectiveFreeCapacity(info FastletInfo, demand ResourceDemand, now time.Tim
 // dynamic admission, freshness, drain, observed commitments, and local
 // in-flight reservations are applied.
 func EffectiveFreeResources(info FastletInfo, now time.Time, staleAfter time.Duration) ResourceDemand {
-	status := info.Admission.Resources
-	if !info.PodReady || !info.RuntimeReady || !info.InfraReady || info.Draining || info.DrainRequested || info.LastHeartbeat.IsZero() ||
-		now.Sub(info.LastHeartbeat) > staleAfter || now.Before(info.RejectedUntil) || status == nil || status.Version != "v2" ||
-		info.ResourceReceivedAt.IsZero() || now.Sub(info.ResourceReceivedAt) > staleAfter ||
-		(status.State != fastletapi.AdmissionStateOpen && status.State != fastletapi.AdmissionStateDegraded) {
-		return ResourceDemand{}
-	}
-	free := ResourceDemand{CPU: info.ResourceCapacity.CPU.DeepCopy(), Memory: info.ResourceCapacity.Memory.DeepCopy()}
-	free.CPU.Sub(info.ResourceCommitted.CPU)
-	free.CPU.Sub(info.InFlightResources.CPU)
-	free.Memory.Sub(info.ResourceCommitted.Memory)
-	free.Memory.Sub(info.InFlightResources.Memory)
-	if free.CPU.Sign() < 0 || free.Memory.Sign() < 0 {
-		return ResourceDemand{}
-	}
-	return free
+	return ResourceSchedulability(info, now, staleAfter).FreeResources
 }
 
 func admissionStateRank(info FastletInfo) int {

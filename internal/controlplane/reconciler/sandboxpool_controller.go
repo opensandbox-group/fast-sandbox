@@ -270,6 +270,12 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	now := r.now()
 	observedFastlets := resourceFastletsForPoolChildren(r.Registry, &pool, childPods.Items)
+	blockedNodes := make(map[string]struct{})
+	if r.Registry != nil {
+		blockedNodes = placement.FreshNodeMemoryPressureNodes(
+			r.Registry.GetAllFastlets(), now, placement.DefaultObservationStaleAfter,
+		)
+	}
 	var activeCount, pendingCount int32
 	var pendingDemands []placement.ResourceDemand
 	if resourceAwareScaling {
@@ -301,7 +307,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	resourceScalePlan := resourceAwareScalePlan{}
 	if resourceAwareScaling {
 		resourceScalePlan = r.planResourceAwareScaleWithDemand(
-			&pool, childPods.Items, allSandboxes.Items, pendingDemands, desiredPod, observedFastlets, now,
+			&pool, childPods.Items, allSandboxes.Items, pendingDemands, desiredPod, observedFastlets, blockedNodes, now,
 		)
 		desiredPods = resourceScalePlan.desiredPods
 	} else {
@@ -348,7 +354,9 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	preparedFastlets := r.preparedFastletCount(&pool, infraPlan.Revision)
 	warmImageStatuses := r.aggregateWarmImageStatus(&pool, childPods.Items)
 	idleFastlets, busyFastlets := r.fastletUtilizationCounts(&pool, childPods.Items)
-	fastletSummary, resourceSummary := summarizePoolFastlets(&pool, childPods.Items, desiredPods, readyPods, idleFastlets, busyFastlets, observedFastlets, now)
+	fastletSummary, resourceSummary := summarizePoolFastlets(
+		&pool, childPods.Items, desiredPods, readyPods, idleFastlets, busyFastlets, observedFastlets, blockedNodes, now,
+	)
 	sandboxSummary := summarizePoolSandboxes(allSandboxes.Items, pool.Name)
 	observation := poolObservation{
 		currentPods:        currentCount,
@@ -501,8 +509,16 @@ func (r *SandboxPoolReconciler) planResourceAwareScaleWithDemand(
 	pendingDemands []placement.ResourceDemand,
 	plannedPod *corev1.Pod,
 	observed map[string]placement.FastletInfo,
+	blockedNodes map[string]struct{},
 	now time.Time,
 ) resourceAwareScalePlan {
+	if blockedNodes == nil {
+		infos := make([]placement.FastletInfo, 0, len(observed))
+		for _, info := range observed {
+			infos = append(infos, info)
+		}
+		blockedNodes = placement.FreshNodeMemoryPressureNodes(infos, now, placement.DefaultObservationStaleAfter)
+	}
 	pendingSandboxes := int32(len(pendingDemands))
 	current := int32(len(pods))
 	plan := resourceAwareScalePlan{desiredPods: current}
@@ -515,7 +531,7 @@ func (r *SandboxPoolReconciler) planResourceAwareScaleWithDemand(
 		return plan
 	}
 	demand := placement.ResourceDemand{CPU: requests.CPU, Memory: requests.Memory}
-	view := r.observeResourceAwareCapacity(pool, pods, sandboxes, plannedPod, observed, now, demand, nominal)
+	view := r.observeResourceAwareCapacity(pool, pods, sandboxes, plannedPod, observed, blockedNodes, now, demand, nominal)
 	plan.activeDrains = view.activeDrains
 	plan.activeScaleDownDrains = view.activeScaleDownDrains
 	availableFree := view.freeSlots
@@ -589,6 +605,7 @@ func (r *SandboxPoolReconciler) observeResourceAwareCapacity(
 	sandboxes []apiv1alpha2.Sandbox,
 	plannedPod *corev1.Pod,
 	observed map[string]placement.FastletInfo,
+	blockedNodes map[string]struct{},
 	now time.Time,
 	demand placement.ResourceDemand,
 	nominal int32,
@@ -601,13 +618,7 @@ func (r *SandboxPoolReconciler) observeResourceAwareCapacity(
 	nominalResources, nominalResourcesKnown := fastletsettings.DecodeCommitmentCapacity(
 		plannedPod.Annotations[fastletsettings.CommitmentCapacityAnnotation],
 	)
-	blockedNodes := make(map[string]struct{})
 	awaitingAdmission := awaitingAdmissionByFastlet(sandboxes, observed, now)
-	for _, info := range observed {
-		if placement.HasFreshNodeMemoryPressure(info, now, placement.DefaultObservationStaleAfter) {
-			blockedNodes[info.NodeName] = struct{}{}
-		}
-	}
 	for index := range pods {
 		pod := &pods[index]
 		identity := podIdentity(pod)
@@ -2619,6 +2630,7 @@ func summarizePoolFastlets(
 	pods []corev1.Pod,
 	desired, ready, idle, busy int32,
 	observed map[string]placement.FastletInfo,
+	blockedNodes map[string]struct{},
 	now time.Time,
 ) (*apiv1alpha2.SandboxPoolFastletSummary, *apiv1alpha2.SandboxPoolResourceSummary) {
 	fastlets := &apiv1alpha2.SandboxPoolFastletSummary{Desired: desired, Current: int32(len(pods)), Ready: ready, Idle: idle, Busy: busy}
@@ -2642,21 +2654,11 @@ func summarizePoolFastlets(
 			continue
 		}
 		addDemand(&resources.Committed, info.ResourceCommitted)
-		status := info.Admission.Resources
-		fresh := !info.LastHeartbeat.IsZero() && !info.ResourceReceivedAt.IsZero() &&
-			now.Sub(info.LastHeartbeat) <= placement.DefaultObservationStaleAfter && now.Sub(info.ResourceReceivedAt) <= placement.DefaultObservationStaleAfter
-		if !fresh || !info.PodReady || !info.RuntimeReady || !info.InfraReady || info.Draining || info.DrainRequested ||
-			(status.State != fastletapi.AdmissionStateOpen && status.State != fastletapi.AdmissionStateDegraded) {
+		if _, blocked := blockedNodes[info.NodeName]; blocked {
 			continue
 		}
-		free := apiv1alpha2.SandboxComputeResources{CPU: info.ResourceCapacity.CPU.DeepCopy(), Memory: info.ResourceCapacity.Memory.DeepCopy()}
-		free.CPU.Sub(info.ResourceCommitted.CPU)
-		free.CPU.Sub(info.InFlightResources.CPU)
-		free.Memory.Sub(info.ResourceCommitted.Memory)
-		free.Memory.Sub(info.InFlightResources.Memory)
-		if free.CPU.Sign() >= 0 && free.Memory.Sign() >= 0 {
-			addComputeResources(&resources.Free, free)
-		}
+		view := placement.ResourceSchedulability(info, now, placement.DefaultObservationStaleAfter)
+		addDemand(&resources.Free, view.FreeResources)
 	}
 	return fastlets, resources
 }
