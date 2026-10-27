@@ -557,7 +557,7 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 		(response.Disposition == fastletapi.CreateDispositionCreated || response.Disposition == fastletapi.CreateDispositionExisting) &&
 		response.Sandbox != nil &&
 		(response.Sandbox.Runtime.State == fastletapi.RuntimeStateReady || response.Sandbox.Runtime.State == fastletapi.RuntimeStateCreating) {
-		o.recordAdmissionSnapshot(fastlet.ID, response)
+		o.recordAdmissionSnapshot(fastlet, response)
 		return response, nil
 	}
 	if createErr == nil {
@@ -568,16 +568,18 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 			createErr = fmt.Errorf("%w: %w", ErrUnknownFastletOutcome, createErr)
 		}
 	}
-	o.recordFeedback(fastlet.ID, response, createErr)
+	o.recordFeedback(fastlet, response, createErr)
 	return response, createErr
 }
 
-func (o *Orchestrator) recordAdmissionSnapshot(id placement.FastletID, response *fastletapi.CreateSandboxResponse) {
+func (o *Orchestrator) recordAdmissionSnapshot(fastlet placement.FastletInfo, response *fastletapi.CreateSandboxResponse) {
 	if response == nil {
 		return
 	}
 	admission := response.Admission
-	o.Registry.RecordFeedback(id, placement.LocalFeedback{Admission: &admission, Sandbox: response.Sandbox, ObservedAt: time.Now()})
+	feedback := localFeedbackForFastlet(fastlet)
+	feedback.Admission, feedback.Sandbox, feedback.ObservedAt = &admission, response.Sandbox, o.now()
+	o.Registry.RecordFeedback(fastlet.ID, feedback)
 }
 
 func createNeedsLocalReservation(sandbox *apiv1alpha2.Sandbox, fastlet placement.FastletInfo, identity fastletapi.SandboxIdentity) bool {
@@ -667,7 +669,8 @@ func (o *Orchestrator) DeleteRuntime(ctx context.Context, sandbox *apiv1alpha2.S
 	response, err := o.FastletClient.DeleteSandbox(ctx, fastlet.PodIP, &fastletapi.DeleteSandboxRequest{Identity: identity})
 	if response != nil {
 		admission := response.Admission
-		feedback := placement.LocalFeedback{Admission: &admission, ObservedAt: time.Now()}
+		feedback := localFeedbackForFastlet(fastlet)
+		feedback.Admission, feedback.ObservedAt = &admission, o.now()
 		var failure *fastletapi.FastletError
 		if errors.As(err, &failure) {
 			feedback.Code, feedback.Reason = failure.Code, failure.Reason
@@ -919,7 +922,7 @@ func (o *Orchestrator) assignedTarget(sandbox *apiv1alpha2.Sandbox) (placement.F
 	if envelope == nil {
 		return placement.FastletInfo{}, assignment.AssignmentEnvelope{}, fastletapi.SandboxIdentity{}, ErrAssignedFastletUnavailable
 	}
-	fastlet, ok := o.Registry.GetFastletByID(placement.FastletID(envelope.FastletName))
+	fastlet, ok := o.Registry.GetFastletByID(placement.NewFastletID(sandbox.Namespace, envelope.FastletName))
 	if !ok || fastlet.PodUID != envelope.FastletPodUID || fastlet.PodIP == "" ||
 		fastlet.RuntimeProfileHash != envelope.RuntimeProfileHash || fastlet.ResourceProfileHash != envelope.ResourceProfileHash ||
 		fastlet.InfraRevision != envelope.InfraRevision {
@@ -954,25 +957,38 @@ func IsCandidateRejection(err error) bool {
 	}
 }
 
-func (o *Orchestrator) recordFeedback(id placement.FastletID, response *fastletapi.CreateSandboxResponse, err error) {
+func (o *Orchestrator) recordFeedback(fastlet placement.FastletInfo, response *fastletapi.CreateSandboxResponse, err error) {
 	var failure *fastletapi.FastletError
 	if !errors.As(err, &failure) {
 		return
 	}
 	// The feedback blacklists the fastlet for a short window (scheduling-
 	// visible via RejectedUntil); leave one line explaining why.
-	klog.V(2).InfoS("recording fastlet rejection feedback; candidate penalized", "fastlet", id, "code", failure.Code)
-	now := time.Now()
-	if o.Now != nil {
-		now = o.Now()
-	}
-	feedback := placement.LocalFeedback{Code: failure.Code, Reason: failure.Reason, ObservedAt: now}
+	klog.V(2).InfoS("recording fastlet rejection feedback; candidate penalized", "fastlet", fastlet.ID, "code", failure.Code)
+	feedback := localFeedbackForFastlet(fastlet)
+	feedback.Code, feedback.Reason, feedback.ObservedAt = failure.Code, failure.Reason, o.now()
 	if response != nil {
 		admission := response.Admission
 		feedback.Admission = &admission
 		feedback.Sandbox = response.Sandbox
 	}
-	o.Registry.RecordFeedback(id, feedback)
+	o.Registry.RecordFeedback(fastlet.ID, feedback)
+}
+
+func localFeedbackForFastlet(fastlet placement.FastletInfo) placement.LocalFeedback {
+	feedback := placement.LocalFeedback{PodUID: fastlet.PodUID}
+	if resources := fastlet.Admission.Resources; resources != nil {
+		feedback.BaseResourceEpoch = resources.Epoch
+		feedback.BaseResourceRevision = resources.Revision
+	}
+	return feedback
+}
+
+func (o *Orchestrator) now() time.Time {
+	if o.Now != nil {
+		return o.Now()
+	}
+	return time.Now()
 }
 
 func setReadyCondition(status *apiv1alpha2.SandboxStatus, generation int64, ready bool, reason, message string) {

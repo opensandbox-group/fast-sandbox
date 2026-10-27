@@ -373,7 +373,7 @@ func (s *Server) loadExistingCreateIntent(ctx context.Context, plan plannedCreat
 	if existingEnvelope == nil {
 		return &acceptedCreate{sandbox: existing.DeepCopy(), parameters: plan.parameters}, true, nil
 	}
-	selected, ok := s.Orchestrator.Registry.GetFastletByID(placement.FastletID(existingEnvelope.FastletName))
+	selected, ok := s.Orchestrator.Registry.GetFastletByID(placement.NewFastletID(existing.Namespace, existingEnvelope.FastletName))
 	if !ok {
 		return nil, true, status.Error(codes.Unavailable, orchestration.ErrAssignedFastletUnavailable.Error())
 	}
@@ -925,7 +925,7 @@ func (s *Server) GetSandboxDiagnostics(ctx context.Context, request *fastpathv2.
 		response.FastletError = appendDiagnosticError(response.FastletError, "Fastlet diagnostics client is not configured")
 		return response, nil
 	}
-	fastlet, found := s.Orchestrator.Registry.GetFastletByID(placement.FastletID(envelope.FastletName))
+	fastlet, found := s.Orchestrator.Registry.GetFastletByID(placement.NewFastletID(sandbox.Namespace, envelope.FastletName))
 	if !found || fastlet.PodUID != envelope.FastletPodUID {
 		response.FastletError = appendDiagnosticError(response.FastletError, "assigned Fastlet is unavailable or replaced")
 		return response, nil
@@ -957,7 +957,7 @@ func (s *Server) inspectAssignedSandbox(ctx context.Context, sandbox *apiv1alpha
 	if s.Orchestrator == nil || s.Orchestrator.Registry == nil || s.Orchestrator.FastletClient == nil {
 		return nil, nil, placement.FastletInfo{}, status.Error(codes.FailedPrecondition, "Fastlet inspect client is not configured")
 	}
-	fastlet, found := s.Orchestrator.Registry.GetFastletByID(placement.FastletID(envelope.FastletName))
+	fastlet, found := s.Orchestrator.Registry.GetFastletByID(placement.NewFastletID(sandbox.Namespace, envelope.FastletName))
 	if !found || fastlet.PodUID != envelope.FastletPodUID || fastlet.PodIP == "" {
 		return nil, nil, placement.FastletInfo{}, status.Error(codes.Unavailable, "assigned Fastlet is unavailable")
 	}

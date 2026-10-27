@@ -133,7 +133,7 @@ func (l *Loop) onPodUpdate(previous, current any) {
 	newPod, newOK := current.(*corev1.Pod)
 	if oldOK && oldPod.Labels["app"] == fastletAppLabelValue &&
 		(!newOK || newPod.Labels["app"] != fastletAppLabelValue || newPod.Name != oldPod.Name || newPod.UID != oldPod.UID) {
-		l.Registry.RemoveIfPodUID(placement.FastletID(oldPod.Name), string(oldPod.UID))
+		l.Registry.RemoveIfPodUID(placement.NewFastletID(oldPod.Namespace, oldPod.Name), string(oldPod.UID))
 	}
 	if newOK {
 		l.onPodAdd(newPod)
@@ -163,7 +163,7 @@ func (l *Loop) onPodDelete(object any) {
 		}
 	}
 	if ok && pod.Labels["app"] == fastletAppLabelValue {
-		l.Registry.RemoveIfPodUID(placement.FastletID(pod.Name), string(pod.UID))
+		l.Registry.RemoveIfPodUID(placement.NewFastletID(pod.Namespace, pod.Name), string(pod.UID))
 	}
 }
 
@@ -176,7 +176,7 @@ func fastletInfoFromPod(pod *corev1.Pod) placement.FastletInfo {
 		}
 	}
 	return placement.FastletInfo{
-		ID: placement.FastletID(pod.Name), Namespace: pod.Namespace,
+		ID: placement.NewFastletID(pod.Namespace, pod.Name), Namespace: pod.Namespace,
 		PodName: pod.Name, PodUID: string(pod.UID), PodIP: pod.Status.PodIP,
 		NodeName: pod.Spec.NodeName, PoolName: pod.Labels["fast-sandbox.io/pool"],
 		RuntimeName:         apiv1alpha2.RuntimeName(pod.Labels["fast-sandbox.io/runtime"]),

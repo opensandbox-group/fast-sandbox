@@ -17,6 +17,16 @@ import (
 
 type FastletID string
 
+func NewFastletID(namespace, name string) FastletID {
+	// Keep the historical default-namespace ID stable for in-process callers;
+	// every other namespace is explicitly qualified so watched Pods cannot
+	// overwrite each other in the cluster-wide Registry.
+	if namespace == "" || namespace == "default" {
+		return FastletID(name)
+	}
+	return FastletID(namespace + "/" + name)
+}
+
 const DefaultObservationStaleAfter = 45 * time.Second
 
 type ResourceDemand struct {
@@ -121,12 +131,15 @@ type CandidateRequest struct {
 }
 
 type LocalFeedback struct {
-	Code       fastletapi.FastletErrorCode
-	Reason     fastletapi.AdmissionReason
-	Admission  *fastletapi.AdmissionStatus
-	Sandbox    *fastletapi.SandboxStatus
-	ObservedAt time.Time
-	RetryAfter time.Duration
+	PodUID               string
+	BaseResourceEpoch    string
+	BaseResourceRevision uint64
+	Code                 fastletapi.FastletErrorCode
+	Reason               fastletapi.AdmissionReason
+	Admission            *fastletapi.AdmissionStatus
+	Sandbox              *fastletapi.SandboxStatus
+	ObservedAt           time.Time
+	RetryAfter           time.Duration
 }
 
 type fastletSlot struct {
@@ -367,43 +380,75 @@ func (r *InMemoryRegistry) RecordFeedback(id FastletID, feedback LocalFeedback) 
 	if feedback.RetryAfter <= 0 {
 		feedback.RetryAfter = 5 * time.Second
 	}
-	if feedback.Admission != nil && feedback.Admission.Resources != nil || feedback.Sandbox != nil {
-		slot.mu.Lock()
-		if feedback.Admission != nil && feedback.Admission.Resources != nil {
-			applyFeedbackAdmission(&slot.info, *feedback.Admission, feedback.ObservedAt, feedback.Code == fastletapi.ErrorCapacityRejected)
+	slot.mu.Lock()
+	defer slot.mu.Unlock()
+	if feedback.PodUID != "" && slot.info.PodUID != feedback.PodUID {
+		return
+	}
+	admissionAccepted := feedback.Admission == nil || feedback.Admission.Resources == nil
+	if feedback.Admission != nil && feedback.Admission.Resources != nil {
+		admissionAccepted = applyFeedbackAdmission(&slot.info, *feedback.Admission, feedback)
+		if admissionAccepted {
 			applyAdmissionResources(&slot.info)
 		}
-		if feedback.Sandbox != nil && feedback.Sandbox.SandboxID != "" {
-			if slot.info.SandboxStatuses == nil {
-				slot.info.SandboxStatuses = make(map[string]fastletapi.SandboxStatus)
-			}
-			status := cloneSandboxStatus(*feedback.Sandbox)
+	}
+	if admissionAccepted && feedback.Sandbox != nil && feedback.Sandbox.SandboxID != "" {
+		if slot.info.SandboxStatuses == nil {
+			slot.info.SandboxStatuses = make(map[string]fastletapi.SandboxStatus)
+		}
+		status := cloneSandboxStatus(*feedback.Sandbox)
+		current, exists := slot.info.SandboxStatuses[status.SandboxID]
+		if !exists || sandboxObservationAtOrAfter(status, current) {
 			slot.info.SandboxStatuses[status.SandboxID] = status
 		}
-		slot.mu.Unlock()
+	}
+	if !admissionAccepted {
+		return
 	}
 	switch feedback.Code {
 	case fastletapi.ErrorCapacityRejected, fastletapi.ErrorDraining, fastletapi.ErrorRuntimeUnavailable, fastletapi.ErrorNetworkUnavailable, fastletapi.ErrorInfraUnavailable:
-		slot.mu.Lock()
 		slot.info.RejectedUntil = feedback.ObservedAt.Add(feedback.RetryAfter)
-		slot.mu.Unlock()
+	default:
+		if resourceRejectionCleared(slot.info) {
+			slot.info.RejectedUntil = time.Time{}
+		}
 	}
 }
 
-func applyFeedbackAdmission(info *FastletInfo, incoming fastletapi.AdmissionStatus, observedAt time.Time, fence bool) {
+func applyFeedbackAdmission(info *FastletInfo, incoming fastletapi.AdmissionStatus, feedback LocalFeedback) bool {
 	resourceStatus := incoming.Resources
 	if resourceStatus == nil {
-		return
+		return false
 	}
 	current := info.Admission.Resources
-	if current != nil && (resourceStatus.Epoch != current.Epoch || resourceStatus.Revision < current.Revision) {
-		return
+	if current != nil {
+		if resourceStatus.Epoch == current.Epoch {
+			if resourceStatus.Revision < current.Revision {
+				return false
+			}
+		} else if feedback.BaseResourceEpoch != current.Epoch || feedback.BaseResourceRevision != current.Revision {
+			return false
+		}
 	}
 	info.Admission = cloneAdmission(incoming)
-	info.ResourceReceivedAt = observedAt
-	if fence || resourceStatus.State == fastletapi.AdmissionStateBlocked || resourceStatus.State == fastletapi.AdmissionStateUnknown {
+	info.ResourceReceivedAt = feedback.ObservedAt
+	if feedback.Code == fastletapi.ErrorCapacityRejected || resourceStatus.State == fastletapi.AdmissionStateBlocked || resourceStatus.State == fastletapi.AdmissionStateUnknown {
 		info.resourceFence = resourceRevision{Epoch: resourceStatus.Epoch, Revision: resourceStatus.Revision}
 	}
+	return true
+}
+
+func sandboxObservationAtOrAfter(incoming, current fastletapi.SandboxStatus) bool {
+	if incoming.InstanceGeneration != current.InstanceGeneration {
+		return incoming.InstanceGeneration > current.InstanceGeneration
+	}
+	if incoming.AssignmentAttempt != current.AssignmentAttempt {
+		return incoming.AssignmentAttempt > current.AssignmentAttempt
+	}
+	if incoming.AcceptedGeneration != current.AcceptedGeneration {
+		return incoming.AcceptedGeneration > current.AcceptedGeneration
+	}
+	return incoming.AppliedGeneration >= current.AppliedGeneration
 }
 
 func resourceRejectionCleared(info FastletInfo) bool {

@@ -92,7 +92,7 @@ func (o *Orchestrator) snapshotIdentityOnAssigned(sandbox *apiv1alpha2.Sandbox, 
 	if envelope == nil {
 		return fastletapi.SnapshotIdentity{}, placement.FastletInfo{}, fmt.Errorf("%w: target Sandbox has no durable assignment", ErrAssignedFastletUnavailable)
 	}
-	fastlet, ok := o.Registry.GetFastletByID(placement.FastletID(envelope.FastletName))
+	fastlet, ok := o.Registry.GetFastletByID(placement.NewFastletID(sandbox.Namespace, envelope.FastletName))
 	if !ok || fastlet.PodUID != envelope.FastletPodUID || fastlet.PodIP == "" {
 		return fastletapi.SnapshotIdentity{}, placement.FastletInfo{}, fmt.Errorf("%w: assigned Fastlet is unavailable", ErrAssignedFastletUnavailable)
 	}
@@ -141,7 +141,7 @@ func (o *Orchestrator) CreateSnapshot(ctx context.Context, snapshot *apiv1alpha2
 // across a mid-flight Sandbox reassignment.
 func (o *Orchestrator) observeTarget(snapshot *apiv1alpha2.SandboxSnapshot, sandbox *apiv1alpha2.Sandbox) (fastletapi.SnapshotIdentity, placement.FastletInfo, error) {
 	if triggered := snapshot.Status.Triggered; triggered != nil && triggered.FastletName != "" {
-		fastlet, ok := o.Registry.GetFastletByID(placement.FastletID(triggered.FastletName))
+		fastlet, ok := o.Registry.GetFastletByID(placement.NewFastletID(snapshot.Namespace, triggered.FastletName))
 		if !ok || fastlet.PodUID != triggered.FastletPodUID || fastlet.PodIP == "" {
 			return fastletapi.SnapshotIdentity{}, placement.FastletInfo{},
 				fmt.Errorf("%w: pinned fastlet %s is unavailable", ErrAssignedFastletUnavailable, triggered.FastletName)

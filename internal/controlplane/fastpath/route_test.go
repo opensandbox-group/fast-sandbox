@@ -51,8 +51,10 @@ func TestResolveEndpointIssuesInstanceFencedCredential(t *testing.T) {
 	require.NoError(t, assignment.SetAssignmentAnnotation(sandbox, envelope))
 	pool := &apiv1alpha2.SandboxPool{ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "tenant-a"}}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sandbox, pool).Build()
+	candidate := testCandidate("fastlet-a", "pod-a", "10.0.0.1")
+	candidate.ID = placement.NewFastletID("tenant-a", candidate.PodName)
 	registry := &fastpathRegistry{fastlets: map[placement.FastletID]placement.FastletInfo{
-		"fastlet-a": testCandidate("fastlet-a", "pod-a", "10.0.0.1"),
+		candidate.ID: candidate,
 	}}
 	fastlet := &fastpathFastlet{inspectStatus: testObservedStatus("uid-a", "running", sandbox.Generation, nil)}
 	server := &Server{K8sClient: k8sClient, RouteCache: k8sClient, CredentialIssuer: issuer,

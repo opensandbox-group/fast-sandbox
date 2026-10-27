@@ -111,7 +111,7 @@ func (s *Server) relayTarget(sandbox *apiv1alpha2.Sandbox) (placement.FastletInf
 	if s.Orchestrator == nil || s.Orchestrator.Registry == nil || s.Orchestrator.FastletClient == nil {
 		return placement.FastletInfo{}, nil, status.Error(codes.FailedPrecondition, "Fastlet relay client is not configured")
 	}
-	fastlet, found := s.Orchestrator.Registry.GetFastletByID(placement.FastletID(envelope.FastletName))
+	fastlet, found := s.Orchestrator.Registry.GetFastletByID(placement.NewFastletID(sandbox.Namespace, envelope.FastletName))
 	if !found || fastlet.PodUID != envelope.FastletPodUID || fastlet.PodIP == "" {
 		return placement.FastletInfo{}, nil, status.Error(codes.Unavailable, "assigned Fastlet is unavailable")
 	}
