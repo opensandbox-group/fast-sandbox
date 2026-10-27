@@ -151,7 +151,6 @@ type rankedFastlet struct {
 	slot        *fastletSlot
 	id          FastletID
 	imageHit    bool
-	stateRank   int
 	loadBucket  int
 	serverOrder uint64
 	stableOrder uint64
@@ -453,7 +452,7 @@ func resourceRejectionCleared(info FastletInfo) bool {
 	if status == nil {
 		return true
 	}
-	if status.State != fastletapi.AdmissionStateOpen && status.State != fastletapi.AdmissionStateDegraded {
+	if status.State != fastletapi.AdmissionStateOpen {
 		return false
 	}
 	return info.resourceFence.Epoch == "" || status.Epoch != info.resourceFence.Epoch || status.Revision > info.resourceFence.Revision
@@ -492,7 +491,6 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 			slot:        slot,
 			id:          info.ID,
 			imageHit:    imageHit(info, request.Image),
-			stateRank:   admissionStateRank(info),
 			loadBucket:  int(load * 10),
 			serverOrder: serverOrder,
 			stableOrder: stableOrder(request.StableKey, info.ID),
@@ -502,9 +500,6 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 	recordHeartbeatAgeSummary(heartbeats)
 	sort.Slice(ranked, func(i, j int) bool {
 		left, right := ranked[i], ranked[j]
-		if left.stateRank != right.stateRank {
-			return left.stateRank < right.stateRank
-		}
 		if left.imageHit != right.imageHit {
 			return left.imageHit
 		}
@@ -637,7 +632,7 @@ func ResourceSchedulability(info FastletInfo, now time.Time, staleAfter time.Dur
 	if !info.PodReady || !info.RuntimeReady || !info.InfraReady || info.Draining || info.DrainRequested || info.LastHeartbeat.IsZero() ||
 		now.Sub(info.LastHeartbeat) > staleAfter || now.Before(info.RejectedUntil) || status == nil || status.Version != "v2" ||
 		info.ResourceReceivedAt.IsZero() || now.Sub(info.ResourceReceivedAt) > staleAfter ||
-		(status.State != fastletapi.AdmissionStateOpen && status.State != fastletapi.AdmissionStateDegraded) {
+		status.State != fastletapi.AdmissionStateOpen {
 		return SchedulabilityView{}
 	}
 	free := ResourceDemand{CPU: info.ResourceCapacity.CPU.DeepCopy(), Memory: info.ResourceCapacity.Memory.DeepCopy()}
@@ -667,13 +662,6 @@ func EffectiveFreeCapacity(info FastletInfo, demand ResourceDemand, now time.Tim
 		return 0
 	}
 	return int32(free)
-}
-
-func admissionStateRank(info FastletInfo) int {
-	if info.Admission.Resources != nil && info.Admission.Resources.State == fastletapi.AdmissionStateDegraded {
-		return 1
-	}
-	return 0
 }
 
 func dominantResourceLoad(info FastletInfo, request CandidateRequest) float64 {

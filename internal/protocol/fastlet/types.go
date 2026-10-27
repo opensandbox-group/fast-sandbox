@@ -330,10 +330,9 @@ type AdmissionStatus struct {
 type AdmissionState string
 
 const (
-	AdmissionStateOpen     AdmissionState = "OPEN"
-	AdmissionStateDegraded AdmissionState = "DEGRADED"
-	AdmissionStateBlocked  AdmissionState = "BLOCKED"
-	AdmissionStateUnknown  AdmissionState = "UNKNOWN"
+	AdmissionStateOpen    AdmissionState = "OPEN"
+	AdmissionStateBlocked AdmissionState = "BLOCKED"
+	AdmissionStateUnknown AdmissionState = "UNKNOWN"
 )
 
 type AdmissionReason string
@@ -349,8 +348,6 @@ const (
 	// AdmissionReasonNodeMemoryPressure is accepted from older Fastlets during
 	// rolling upgrades. New observations use AdmissionReasonHostMemoryPressure.
 	AdmissionReasonNodeMemoryPressure  AdmissionReason = "NODE_MEMORY_PRESSURE"
-	AdmissionReasonCPUSaturation       AdmissionReason = "CPU_SATURATION"
-	AdmissionReasonCPUThrottling       AdmissionReason = "CPU_THROTTLING"
 	AdmissionReasonTelemetryStale      AdmissionReason = "TELEMETRY_STALE"
 	AdmissionReasonTelemetryMissing    AdmissionReason = "TELEMETRY_MISSING"
 	AdmissionReasonRecoveryIncomplete  AdmissionReason = "RECOVERY_INCOMPLETE"

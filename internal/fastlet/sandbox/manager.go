@@ -358,7 +358,7 @@ func (m *SandboxManager) ResourceProfileHash() string {
 // changes, allowing Create feedback to fence older heartbeats.
 func (m *SandboxManager) SetResourceAdmissionState(state fastletapi.AdmissionState, reason fastletapi.AdmissionReason) error {
 	switch state {
-	case fastletapi.AdmissionStateOpen, fastletapi.AdmissionStateDegraded, fastletapi.AdmissionStateBlocked, fastletapi.AdmissionStateUnknown:
+	case fastletapi.AdmissionStateOpen, fastletapi.AdmissionStateBlocked, fastletapi.AdmissionStateUnknown:
 	default:
 		return fmt.Errorf("%w: unsupported resource admission state %q", ErrInvalidConfig, state)
 	}

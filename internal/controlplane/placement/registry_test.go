@@ -180,22 +180,21 @@ func TestTopKResourceAwareFiltersCommitmentBeforeCacheRanking(t *testing.T) {
 	require.Equal(t, FastletID("eligible-cache-miss"), selected[0].ID)
 }
 
-func TestTopKResourceAwareRequiresFreshEligibleStateAndRanksOpenFirst(t *testing.T) {
+func TestTopKResourceAwareRequiresFreshOpenState(t *testing.T) {
 	registry := NewInMemoryRegistry()
 	open := resourceAwareFastlet("open-cache-miss", 1, fastletapi.AdmissionStateOpen, 1)
-	degraded := resourceAwareFastlet("degraded-cache-hit", 0, fastletapi.AdmissionStateDegraded, 1, "alpine:latest")
+	deprecated := resourceAwareFastlet("deprecated-degraded-cache-hit", 0, fastletapi.AdmissionState("DEGRADED"), 1, "alpine:latest")
 	blocked := resourceAwareFastlet("blocked", 0, fastletapi.AdmissionStateBlocked, 1)
 	unknown := resourceAwareFastlet("unknown", 0, fastletapi.AdmissionStateUnknown, 1)
 	stale := resourceAwareFastlet("stale", 0, fastletapi.AdmissionStateOpen, 1)
 	stale.LastHeartbeat = registryNow.Add(-time.Minute)
-	for _, info := range []FastletInfo{open, degraded, blocked, unknown, stale} {
+	for _, info := range []FastletInfo{open, deprecated, blocked, unknown, stale} {
 		seedFastlet(t, registry, info)
 	}
 
 	selected := registry.TopK(resourceAwareCandidate("alpine:latest"), 10)
-	require.Len(t, selected, 2)
+	require.Len(t, selected, 1)
 	require.Equal(t, FastletID("open-cache-miss"), selected[0].ID)
-	require.Equal(t, FastletID("degraded-cache-hit"), selected[1].ID)
 }
 
 func TestResourceSchedulabilityAppliesRejectionCooldownToEveryConsumer(t *testing.T) {

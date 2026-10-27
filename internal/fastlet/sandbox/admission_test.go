@@ -605,6 +605,11 @@ func TestResourceAdmissionRevisionOrdersPressureFeedback(t *testing.T) {
 	require.Equal(t, rejected.Admission.Resources.Revision, repeated.Resources.Revision)
 }
 
+func TestResourceAdmissionRejectsUnsupportedState(t *testing.T) {
+	manager, _ := newResourceAwareAdmissionManager(t, newAdmissionRuntime(), 10, "10", "50Gi")
+	require.ErrorContains(t, manager.SetResourceAdmissionState(fastletapi.AdmissionState("DEGRADED"), ""), "unsupported resource admission state")
+}
+
 func TestDuplicateEnsureCreatesRuntimeOnce(t *testing.T) {
 	runtime := newAdmissionRuntime()
 	runtime.ensureEntered = make(chan struct{}, 1)

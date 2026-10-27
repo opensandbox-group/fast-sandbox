@@ -363,7 +363,7 @@ Under one Fastlet lock, Create checks:
 activeSandboxes + 1 <= maxSandboxesPerPod
 committed.cpu + candidate.request.cpu <= capacity.cpu
 committed.memory + candidate.request.memory <= capacity.memory
-dynamicAdmissionState in {OPEN, DEGRADED}
+dynamicAdmissionState == OPEN
 ```
 
 Only then is a placeholder reservation inserted. Runtime creation happens
@@ -442,11 +442,10 @@ pressure also blocks other Fastlets observed on the same node.
 
 Eligible candidates are ordered by:
 
-1. admission state (`OPEN` before `DEGRADED`);
-2. image cache hit;
-3. coarse dominant-load bucket;
-4. FastPath replica preference;
-5. Sandbox-stable tie-breaker.
+1. image cache hit;
+2. coarse dominant-load bucket;
+3. FastPath replica preference;
+4. Sandbox-stable tie-breaker.
 
 The FastPath Deployment injects its Pod UID as `POD_UID`. The registry uses
 `hash(POD_UID, fastletID)` inside a 10-percent dominant-load bucket. Different
