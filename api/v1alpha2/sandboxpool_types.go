@@ -330,6 +330,7 @@ const (
 	PoolConditionRuntimeReady       = "RuntimeReady"
 	PoolConditionInfraReady         = "InfraReady"
 	PoolConditionRegistryReady      = "RegistryReady"
+	PoolConditionCapacityAvailable  = "CapacityAvailable"
 	PoolConditionScaleDownCandidate = "ScaleDownCandidate"
 )
 
@@ -345,6 +346,8 @@ const (
 	ReasonInfraComponentsAvailable = "InfraComponentsAvailable"
 	ReasonRegistryInvalid          = "RegistryInvalid"
 	ReasonRegistryAvailable        = "RegistryAvailable"
+	ReasonCapacityAvailable        = "CapacityAvailable"
+	ReasonPoolMaxReached           = "PoolMaxReached"
 	ReasonExcessCapacity           = "ExcessCapacity"
 	ReasonDemandReturned           = "DemandReturned"
 )

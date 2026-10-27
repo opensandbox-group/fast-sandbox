@@ -1056,6 +1056,22 @@ func TestResourceAwareDrainDoesNotFallbackPastExactCandidates(t *testing.T) {
 	require.Equal(t, placement.DrainReasonScaleDown, selections[0].reason)
 }
 
+func TestPoolCapacityConditionReportsPoolMaxLimit(t *testing.T) {
+	pool := resourceAwareScalingPool()
+	pool.Spec.Capacity.PoolMax = 2
+
+	condition := poolCapacityCondition(pool, 3, true)
+	require.Equal(t, apiv1alpha2.PoolConditionCapacityAvailable, condition.Type)
+	require.Equal(t, metav1.ConditionFalse, condition.Status)
+	require.Equal(t, apiv1alpha2.ReasonPoolMaxReached, condition.Reason)
+	require.Contains(t, condition.Message, "requires 3 Fastlet Pods")
+	require.Contains(t, condition.Message, "poolMax limits the Pool to 2")
+
+	condition = poolCapacityCondition(pool, 2, false)
+	require.Equal(t, metav1.ConditionTrue, condition.Status)
+	require.Equal(t, apiv1alpha2.ReasonCapacityAvailable, condition.Reason)
+}
+
 func TestPoolSummarySeparatesFastletsResourcesAndSandboxes(t *testing.T) {
 	now := time.Date(2026, 10, 22, 8, 0, 0, 0, time.UTC)
 	pool := resourceAwareScalingPool()

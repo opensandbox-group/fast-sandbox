@@ -408,7 +408,12 @@ func (s *Server) provisionRuntime(ctx context.Context, accepted *acceptedCreate,
 		if callErr == nil {
 			return nil, status.Error(codes.Unavailable, "Fastlet Create returned no Sandbox observation; Sandbox intent is persisted for Controller recovery")
 		}
-		if !orchestration.IsCandidateRejection(callErr) {
+		// A local reservation conflict happens before the Fastlet RPC. It is a
+		// definitive rejection only while this call owns the newly created
+		// intent, so candidate retry or rollback cannot disrupt an idempotent
+		// replay that is already using the durable assignment.
+		ownedLocalRejection := accepted.created && errors.Is(callErr, orchestration.ErrLocalReservationConflict)
+		if !orchestration.IsCandidateRejection(callErr) && !ownedLocalRejection {
 			return nil, status.Errorf(codes.Unavailable, "Sandbox intent is persisted and Controller will retry: %v", callErr)
 		}
 		hasBudget := len(tried) < maxCreateCandidateAttempts

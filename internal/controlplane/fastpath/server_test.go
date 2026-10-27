@@ -794,7 +794,7 @@ func TestExistingIntentExplicitRejectionIsNeverDeleted(t *testing.T) {
 	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "existing-intent"}, &persisted))
 }
 
-func TestLocalReservationConflictRetainsAssignmentForIdempotentRetry(t *testing.T) {
+func TestNewIntentLocalReservationConflictRollsBackBeforeReturningFailure(t *testing.T) {
 	server, k8sClient, registry, fastlet := newV2Server(t)
 	second := testCandidate("fastlet-b", "pod-b", "10.0.0.2")
 	registry.candidates = append(registry.candidates, second)
@@ -803,20 +803,14 @@ func TestLocalReservationConflictRetainsAssignmentForIdempotentRetry(t *testing.
 
 	request := createRequest("local-conflict")
 	_, err := server.CreateSandbox(context.Background(), request)
-	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 	require.Empty(t, fastlet.createIPs)
 
 	var persisted apiv1alpha2.Sandbox
 	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: request.RequestId}, &persisted))
-	envelope, err := assignment.AssignmentFromAnnotation(&persisted)
-	require.NoError(t, err)
-	require.Equal(t, "fastlet-a", envelope.FastletName)
-	require.Equal(t, int64(1), envelope.Attempt)
-
-	registry.reserve = nil
-	_, err = server.CreateSandbox(context.Background(), request)
-	require.NoError(t, err)
-	require.Equal(t, []string{"10.0.0.1"}, fastlet.createIPs)
+	require.NotNil(t, persisted.DeletionTimestamp)
+	require.Contains(t, persisted.Finalizers, assignment.CleanupFinalizer)
+	require.Equal(t, apiv1alpha2.RuntimeState(""), persisted.Status.Runtime.State)
 }
 
 func TestConcurrentIdempotentCreatesNeverMoveAssignmentOnLocalConflict(t *testing.T) {
@@ -849,10 +843,13 @@ func TestConcurrentIdempotentCreatesNeverMoveAssignmentOnLocalConflict(t *testin
 
 	_, secondErr := server.CreateSandbox(context.Background(), createRequest("concurrent-idempotent"))
 	require.Equal(t, codes.Unavailable, status.Code(secondErr))
+	var persisted apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: request.RequestId}, &persisted),
+		"an idempotent replay must not roll back the first call's intent")
+	require.Nil(t, persisted.DeletionTimestamp)
 	close(releaseFirst)
 	require.NoError(t, <-firstResult)
 
-	var persisted apiv1alpha2.Sandbox
 	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: request.RequestId}, &persisted))
 	envelope, err := assignment.AssignmentFromAnnotation(&persisted)
 	require.NoError(t, err)

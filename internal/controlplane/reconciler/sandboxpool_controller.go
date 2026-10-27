@@ -315,14 +315,20 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		desiredPods = (totalNeededSlots + maxPerPod - 1) / maxPerPod
 	}
 
+	currentCount := int32(len(childPods.Items))
 	if desiredPods < pool.Spec.Capacity.PoolMin {
 		desiredPods = pool.Spec.Capacity.PoolMin
 	}
+	requestedDesiredPods := desiredPods
+	capacityLimited := pool.Spec.Capacity.PoolMax > 0 && requestedDesiredPods > pool.Spec.Capacity.PoolMax &&
+		(!resourceAwareScaling || requestedDesiredPods > currentCount)
 	if pool.Spec.Capacity.PoolMax > 0 && desiredPods > pool.Spec.Capacity.PoolMax {
 		desiredPods = pool.Spec.Capacity.PoolMax
 	}
+	if err := r.updatePoolCondition(ctx, &pool, poolCapacityCondition(&pool, requestedDesiredPods, capacityLimited)); err != nil {
+		return ctrl.Result{}, err
+	}
 
-	currentCount := int32(len(childPods.Items))
 	var scaleDownCandidate *metav1.Condition
 	if resourceAwareScaling {
 		// Every persisted drain is already a committed removal, including a
@@ -870,6 +876,24 @@ func (r *SandboxPoolReconciler) stabilizeResourceAwareScaleDown(
 	}
 	condition.Message = "Pool capacity has remained above the configured buffer for the stabilization window"
 	return desired, &condition
+}
+
+func poolCapacityCondition(pool *apiv1alpha2.SandboxPool, requestedDesiredPods int32, capacityLimited bool) metav1.Condition {
+	condition := metav1.Condition{
+		Type:    apiv1alpha2.PoolConditionCapacityAvailable,
+		Status:  metav1.ConditionTrue,
+		Reason:  apiv1alpha2.ReasonCapacityAvailable,
+		Message: "Pool replica limits can satisfy the current capacity target",
+	}
+	if capacityLimited && pool != nil {
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = apiv1alpha2.ReasonPoolMaxReached
+		condition.Message = fmt.Sprintf(
+			"Current demand requires %d Fastlet Pods, but poolMax limits the Pool to %d",
+			requestedDesiredPods, pool.Spec.Capacity.PoolMax,
+		)
+	}
+	return condition
 }
 
 func childPodIdentities(pods []corev1.Pod) map[string]struct{} {
