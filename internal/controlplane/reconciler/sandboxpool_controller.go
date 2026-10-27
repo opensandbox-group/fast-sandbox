@@ -270,9 +270,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	now := r.now()
 	observedFastlets := resourceFastletsForPoolChildren(r.Registry, &pool, childPods.Items)
-	activeCount, pendingCount := poolDemandCounts(
-		allSandboxes.Items, pool.Name, childIdentities, resourceAwareScaling, observedFastlets, now,
-	)
+	var activeCount, pendingCount int32
 	var pendingDemands []placement.ResourceDemand
 	if resourceAwareScaling {
 		resolution, resolveErr := resolvePoolPendingResources(&pool, allSandboxes.Items, observedFastlets, now)
@@ -286,6 +284,8 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			logger.V(2).Info("excluding unadmittable Sandbox from Pool demand",
 				"sandbox", rejected.key.String(), "reason", rejected.reason, "message", rejected.message)
 		}
+	} else {
+		activeCount, pendingCount = poolSlotDemandCounts(allSandboxes.Items, pool.Name, childIdentities)
 	}
 
 	maxPerPod := getFastletCapacity(&pool)
@@ -1129,6 +1129,7 @@ func sandboxNeedsResourceCapacity(
 	switch sandbox.Status.Runtime.State {
 	case apiv1alpha2.RuntimeReady,
 		apiv1alpha2.RuntimeCreating,
+		apiv1alpha2.RuntimeFailed,
 		apiv1alpha2.RuntimeStopping,
 		apiv1alpha2.RuntimeStopped,
 		apiv1alpha2.RuntimePausing,
@@ -1171,13 +1172,10 @@ func fastletReportsCurrentReservation(
 		status.AssignmentAttempt == sandbox.Status.Placement.Attempt
 }
 
-func poolDemandCounts(
+func poolSlotDemandCounts(
 	sandboxes []apiv1alpha2.Sandbox,
 	poolName string,
 	childIdentities map[string]struct{},
-	resourceAwareScaling bool,
-	observedFastlets map[string]placement.FastletInfo,
-	now time.Time,
 ) (active int32, pending int32) {
 	for index := range sandboxes {
 		sandbox := &sandboxes[index]
@@ -1190,13 +1188,7 @@ func poolDemandCounts(
 				active++
 			}
 		}
-		if resourceAwareScaling && sandboxNeedsResourceCapacity(sandbox, observedFastlets, now) {
-			// A Fastlet rejection happens after the durable assignment CAS. Keep
-			// demand pending until the assigned Fastlet reports the exact current
-			// reservation; public lifecycle state alone cannot distinguish a
-			// waiting resume from an accepted restore.
-			pending++
-		} else if !resourceAwareScaling && sandboxNeedsPlacement(sandbox) {
+		if sandboxNeedsPlacement(sandbox) {
 			pending++
 		}
 	}

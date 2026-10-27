@@ -609,6 +609,11 @@ func TestSandboxNeedsResourceCapacityKeepsRejectedAssignmentPending(t *testing.T
 	paused := pending.DeepCopy()
 	paused.Status.Runtime.State = apiv1alpha2.RuntimePaused
 	require.False(t, sandboxNeedsResourceCapacity(paused, nil, time.Time{}))
+
+	failed := pending.DeepCopy()
+	failed.Status.Runtime.State = apiv1alpha2.RuntimeFailed
+	require.False(t, sandboxNeedsResourceCapacity(failed, nil, time.Time{}),
+		"terminal failure needs an explicit recovery operation, not additional Pool capacity")
 }
 
 func TestSandboxNeedsResourceCapacityUsesExactResumeReservation(t *testing.T) {
@@ -686,12 +691,11 @@ func TestAcceptedResumeDoesNotCreateReplacementFastlet(t *testing.T) {
 			Runtime:   apiv1alpha2.RuntimeStatus{State: apiv1alpha2.RuntimeResuming, Generation: 2},
 		},
 	}
-	children := map[string]struct{}{"fastlet-a/uid-a": {}}
-
-	_, pending := poolDemandCounts([]apiv1alpha2.Sandbox{sandbox}, "pool-a", children, true, observed, now)
-	require.Zero(t, pending, "the accepted resume is already charged to the Fastlet ledger")
+	resolution, err := resolvePoolPendingResources(pool, []apiv1alpha2.Sandbox{sandbox}, observed, now)
+	require.NoError(t, err)
+	require.Empty(t, resolution.admissible, "the accepted resume is already charged to the Fastlet ledger")
 	plan := reconciler.planResourceAwareScale(
-		pool, []corev1.Pod{*pod}, pending, resourceAwarePlannedPod(), observed, now,
+		pool, []corev1.Pod{*pod}, int32(len(resolution.admissible)), resourceAwarePlannedPod(), observed, now,
 	)
 	require.Equal(t, int32(1), plan.desiredPods,
 		"the accepted resume must not create a replacement Fastlet")
@@ -700,7 +704,7 @@ func TestAcceptedResumeDoesNotCreateReplacementFastlet(t *testing.T) {
 	).desiredPods, "recounting the accepted resume would create an unnecessary Fastlet")
 }
 
-func TestPoolDemandCountsFallsBackToSlotDemandWhenResourceScalingIsDisabled(t *testing.T) {
+func TestPoolSlotDemandCountsRetainsLegacySlotDemand(t *testing.T) {
 	pending := apiv1alpha2.Sandbox{
 		Spec: apiv1alpha2.SandboxSpec{PoolRef: "pool-a"},
 		Status: apiv1alpha2.SandboxStatus{
@@ -708,7 +712,7 @@ func TestPoolDemandCountsFallsBackToSlotDemandWhenResourceScalingIsDisabled(t *t
 		},
 	}
 
-	active, pendingCount := poolDemandCounts([]apiv1alpha2.Sandbox{pending}, "pool-a", nil, false, nil, time.Time{})
+	active, pendingCount := poolSlotDemandCounts([]apiv1alpha2.Sandbox{pending}, "pool-a", nil)
 	require.Zero(t, active)
 	require.Equal(t, int32(1), pendingCount,
 		"disabling ResourceAware scaling must retain the existing slot-based demand path")
