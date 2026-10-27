@@ -87,13 +87,13 @@ func (r *CgroupReader) Read() (Sample, error) {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return Sample{}, err
 	}
-	nodeAvailable, err := readNodeAvailableRatio(r.meminfoPath)
+	nodeAvailable, nodeMemoryObserved, err := readNodeAvailableRatio(r.meminfoPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return Sample{}, err
 	}
 	return Sample{
 		MemoryCurrentBytes: current, MemoryLimitBytes: limit, OOMKills: events["oom_kill"],
-		MemoryPSIAvg10: psi, NodeAvailableRatio: nodeAvailable,
+		MemoryPSIAvg10: psi, HostAvailableRatio: nodeAvailable, HostMemoryObserved: nodeMemoryObserved,
 	}, nil
 }
 
@@ -152,10 +152,10 @@ func readPSIAvg10(path string) (float64, error) {
 	return 0, scanner.Err()
 }
 
-func readNodeAvailableRatio(path string) (float64, error) {
+func readNodeAvailableRatio(path string) (float64, bool, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	defer file.Close()
 	values := make(map[string]uint64)
@@ -167,17 +167,17 @@ func readNodeAvailableRatio(path string) (float64, error) {
 		}
 		value, parseErr := strconv.ParseUint(fields[1], 10, 64)
 		if parseErr != nil {
-			return 0, parseErr
+			return 0, false, parseErr
 		}
 		values[fields[0]] = value
 	}
 	if err := scanner.Err(); err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	total := values["MemTotal:"]
-	available := values["MemAvailable:"]
-	if total == 0 || available == 0 {
-		return 0, nil
+	total, totalFound := values["MemTotal:"]
+	available, availableFound := values["MemAvailable:"]
+	if !totalFound || total == 0 || !availableFound {
+		return 0, false, nil
 	}
-	return float64(available) / float64(total), nil
+	return float64(available) / float64(total), true, nil
 }

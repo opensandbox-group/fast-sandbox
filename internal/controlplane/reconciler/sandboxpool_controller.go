@@ -272,7 +272,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	observedFastlets := resourceFastletsForPoolChildren(r.Registry, &pool, childPods.Items)
 	blockedNodes := make(map[string]struct{})
 	if r.Registry != nil {
-		blockedNodes = placement.FreshNodeMemoryPressureNodes(
+		blockedNodes = placement.FreshHostMemoryPressureNodes(
 			r.Registry.GetAllFastlets(), now, placement.DefaultObservationStaleAfter,
 		)
 	}
@@ -517,7 +517,7 @@ func (r *SandboxPoolReconciler) planResourceAwareScaleWithDemand(
 		for _, info := range observed {
 			infos = append(infos, info)
 		}
-		blockedNodes = placement.FreshNodeMemoryPressureNodes(infos, now, placement.DefaultObservationStaleAfter)
+		blockedNodes = placement.FreshHostMemoryPressureNodes(infos, now, placement.DefaultObservationStaleAfter)
 	}
 	pendingSandboxes := int32(len(pendingDemands))
 	current := int32(len(pods))
@@ -1914,6 +1914,15 @@ func buildFastletSettingsFromResolved(pool *apiv1alpha2.SandboxPool, resolved re
 	podMemoryBudget := resolved.RuntimeEnvelope.Memory.DeepCopy()
 	for index := 1; index < len(pool.Spec.FastletTemplate.Spec.Containers); index++ {
 		if limit, found := pool.Spec.FastletTemplate.Spec.Containers[index].Resources.Limits[corev1.ResourceMemory]; found && limit.Sign() > 0 {
+			podMemoryBudget.Add(limit)
+		}
+	}
+	for index := range pool.Spec.FastletTemplate.Spec.InitContainers {
+		container := &pool.Spec.FastletTemplate.Spec.InitContainers[index]
+		if container.RestartPolicy == nil || *container.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+			continue
+		}
+		if limit, found := container.Resources.Limits[corev1.ResourceMemory]; found && limit.Sign() > 0 {
 			podMemoryBudget.Add(limit)
 		}
 	}

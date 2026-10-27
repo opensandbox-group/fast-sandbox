@@ -30,7 +30,23 @@ func TestCgroupReaderReadsV2MemoryAndNodeSignals(t *testing.T) {
 	require.Equal(t, uint64(1024*1024*1024), sample.MemoryLimitBytes)
 	require.Equal(t, uint64(1), sample.OOMKills)
 	require.Equal(t, 1.25, sample.MemoryPSIAvg10)
-	require.Equal(t, 0.25, sample.NodeAvailableRatio)
+	require.Equal(t, 0.25, sample.HostAvailableRatio)
+	require.True(t, sample.HostMemoryObserved)
+}
+
+func TestReadNodeAvailableRatioDistinguishesZeroFromMissing(t *testing.T) {
+	meminfo := filepath.Join(t.TempDir(), "meminfo")
+	writeTestFile(t, meminfo, "MemTotal:       1000000 kB\nMemAvailable:          0 kB\n")
+	ratio, observed, err := readNodeAvailableRatio(meminfo)
+	require.NoError(t, err)
+	require.True(t, observed)
+	require.Zero(t, ratio)
+
+	writeTestFile(t, meminfo, "MemTotal:       1000000 kB\n")
+	ratio, observed, err = readNodeAvailableRatio(meminfo)
+	require.NoError(t, err)
+	require.False(t, observed)
+	require.Zero(t, ratio)
 }
 
 func writeTestFile(t *testing.T, path, content string) {

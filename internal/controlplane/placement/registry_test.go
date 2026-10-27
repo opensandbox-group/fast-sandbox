@@ -218,7 +218,14 @@ func TestResourceSchedulabilityAppliesRejectionCooldownToEveryConsumer(t *testin
 func TestTopKPropagatesFreshNodeMemoryPressureAcrossFastlets(t *testing.T) {
 	registry := NewInMemoryRegistry()
 	pressured := resourceAwareFastlet("pressured", 0, fastletapi.AdmissionStateBlocked, 2)
-	pressured.Admission.Resources.Reason = fastletapi.AdmissionReasonNodeMemoryPressure
+	pressured.Admission.Resources.Reason = fastletapi.AdmissionReasonHostMemoryPressure
+	pressured.ResourceReceivedAt = registryNow
+	require.True(t, HasFreshHostMemoryPressure(pressured, registryNow, DefaultObservationStaleAfter))
+	legacy := pressured
+	legacy.Admission = cloneAdmission(pressured.Admission)
+	legacy.Admission.Resources.Reason = fastletapi.AdmissionReasonNodeMemoryPressure
+	require.True(t, HasFreshHostMemoryPressure(legacy, registryNow, DefaultObservationStaleAfter),
+		"rolling upgrades must preserve the previous wire reason")
 	sameNodeOpen := resourceAwareFastlet("same-node-open", 0, fastletapi.AdmissionStateOpen, 2)
 	otherNodeOpen := resourceAwareFastlet("other-node-open", 0, fastletapi.AdmissionStateOpen, 2)
 	otherNodeOpen.NodeName = "node-b"

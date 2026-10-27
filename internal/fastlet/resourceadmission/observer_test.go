@@ -49,12 +49,12 @@ func testConfig() Config {
 
 func TestObserverAppliesHighLowWatermarkHysteresis(t *testing.T) {
 	reader := &sequenceReader{samples: []Sample{
-		{MemoryCurrentBytes: 50, MemoryLimitBytes: 100, NodeAvailableRatio: 0.5},
-		{MemoryCurrentBytes: 91, MemoryLimitBytes: 100, NodeAvailableRatio: 0.5},
-		{MemoryCurrentBytes: 92, MemoryLimitBytes: 100, NodeAvailableRatio: 0.5},
-		{MemoryCurrentBytes: 85, MemoryLimitBytes: 100, NodeAvailableRatio: 0.5},
-		{MemoryCurrentBytes: 79, MemoryLimitBytes: 100, NodeAvailableRatio: 0.5},
-		{MemoryCurrentBytes: 78, MemoryLimitBytes: 100, NodeAvailableRatio: 0.5},
+		{MemoryCurrentBytes: 50, MemoryLimitBytes: 100, HostAvailableRatio: 0.5, HostMemoryObserved: true},
+		{MemoryCurrentBytes: 91, MemoryLimitBytes: 100, HostAvailableRatio: 0.5, HostMemoryObserved: true},
+		{MemoryCurrentBytes: 92, MemoryLimitBytes: 100, HostAvailableRatio: 0.5, HostMemoryObserved: true},
+		{MemoryCurrentBytes: 85, MemoryLimitBytes: 100, HostAvailableRatio: 0.5, HostMemoryObserved: true},
+		{MemoryCurrentBytes: 79, MemoryLimitBytes: 100, HostAvailableRatio: 0.5, HostMemoryObserved: true},
+		{MemoryCurrentBytes: 78, MemoryLimitBytes: 100, HostAvailableRatio: 0.5, HostMemoryObserved: true},
 	}}
 	setter := &recordingSetter{}
 	observer, err := NewObserver(reader, setter, testConfig())
@@ -79,8 +79,8 @@ func TestObserverDoesNotChargeSidecarUsageAgainstRuntimeOwnerEnvelope(t *testing
 	// the 1 GiB runtime-owner envelope. A 1.5 GiB sidecar-inclusive sample is
 	// therefore healthy instead of a false high-watermark block.
 	reader := &sequenceReader{samples: []Sample{
-		{MemoryCurrentBytes: 1536, MemoryLimitBytes: 3072, NodeAvailableRatio: 0.5},
-		{MemoryCurrentBytes: 1536, MemoryLimitBytes: 3072, NodeAvailableRatio: 0.5},
+		{MemoryCurrentBytes: 1536, MemoryLimitBytes: 3072, HostAvailableRatio: 0.5, HostMemoryObserved: true},
+		{MemoryCurrentBytes: 1536, MemoryLimitBytes: 3072, HostAvailableRatio: 0.5, HostMemoryObserved: true},
 	}}
 	observer, err := NewObserver(reader, &recordingSetter{}, testConfig())
 	require.NoError(t, err)
@@ -98,11 +98,12 @@ func TestObserverBlocksOOMPSIAndNodePressure(t *testing.T) {
 		reason  fastletapi.AdmissionReason
 	}{
 		{name: "oom increase", samples: []Sample{
-			{MemoryCurrentBytes: 50, MemoryLimitBytes: 100, OOMKills: 1, NodeAvailableRatio: 0.5},
-			{MemoryCurrentBytes: 50, MemoryLimitBytes: 100, OOMKills: 2, NodeAvailableRatio: 0.5},
+			{MemoryCurrentBytes: 50, MemoryLimitBytes: 100, OOMKills: 1, HostAvailableRatio: 0.5, HostMemoryObserved: true},
+			{MemoryCurrentBytes: 50, MemoryLimitBytes: 100, OOMKills: 2, HostAvailableRatio: 0.5, HostMemoryObserved: true},
 		}, reason: fastletapi.AdmissionReasonFastletOOMEvent},
-		{name: "memory PSI", samples: []Sample{{MemoryCurrentBytes: 50, MemoryLimitBytes: 100, MemoryPSIAvg10: 11, NodeAvailableRatio: 0.5}}, reason: fastletapi.AdmissionReasonFastletMemoryPSI},
-		{name: "node memory", samples: []Sample{{MemoryCurrentBytes: 50, MemoryLimitBytes: 100, NodeAvailableRatio: 0.04}}, reason: fastletapi.AdmissionReasonNodeMemoryPressure},
+		{name: "memory PSI", samples: []Sample{{MemoryCurrentBytes: 50, MemoryLimitBytes: 100, MemoryPSIAvg10: 11, HostAvailableRatio: 0.5, HostMemoryObserved: true}}, reason: fastletapi.AdmissionReasonFastletMemoryPSI},
+		{name: "host memory", samples: []Sample{{MemoryCurrentBytes: 50, MemoryLimitBytes: 100, HostAvailableRatio: 0.04, HostMemoryObserved: true}}, reason: fastletapi.AdmissionReasonHostMemoryPressure},
+		{name: "host memory exhausted", samples: []Sample{{MemoryCurrentBytes: 50, MemoryLimitBytes: 100, HostAvailableRatio: 0, HostMemoryObserved: true}}, reason: fastletapi.AdmissionReasonHostMemoryPressure},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -121,7 +122,7 @@ func TestObserverBlocksOOMPSIAndNodePressure(t *testing.T) {
 
 func TestObserverFailsClosedWhenTelemetryDisappears(t *testing.T) {
 	reader := &sequenceReader{
-		samples: []Sample{{MemoryCurrentBytes: 50, MemoryLimitBytes: 100, NodeAvailableRatio: 0.5}, {}},
+		samples: []Sample{{MemoryCurrentBytes: 50, MemoryLimitBytes: 100, HostAvailableRatio: 0.5, HostMemoryObserved: true}, {}},
 		errs:    []error{nil, errors.New("cgroup removed")},
 	}
 	observer, err := NewObserver(reader, &recordingSetter{}, testConfig())
@@ -130,4 +131,23 @@ func TestObserverFailsClosedWhenTelemetryDisappears(t *testing.T) {
 	state, reason := observer.ObserveOnce()
 	require.Equal(t, fastletapi.AdmissionStateUnknown, state)
 	require.Equal(t, fastletapi.AdmissionReasonTelemetryMissing, reason)
+}
+
+func TestObserverFailsClosedWhenHostMemoryTelemetryIsMissing(t *testing.T) {
+	observer, err := NewObserver(&sequenceReader{samples: []Sample{{MemoryCurrentBytes: 50, MemoryLimitBytes: 100}}}, &recordingSetter{}, testConfig())
+	require.NoError(t, err)
+	state, reason := observer.ObserveOnce()
+	require.Equal(t, fastletapi.AdmissionStateUnknown, state)
+	require.Equal(t, fastletapi.AdmissionReasonTelemetryMissing, reason)
+}
+
+func TestObserverAllowsMissingHostTelemetryWhenHostPolicyIsDisabled(t *testing.T) {
+	config := testConfig()
+	config.NodeLowWatermark = 0
+	config.NodeRecoveryWatermark = 0
+	observer, err := NewObserver(&sequenceReader{samples: []Sample{{MemoryCurrentBytes: 50, MemoryLimitBytes: 100}}}, &recordingSetter{}, config)
+	require.NoError(t, err)
+	state, reason := observer.ObserveOnce()
+	require.Equal(t, fastletapi.AdmissionStateOpen, state)
+	require.Empty(t, reason)
 }

@@ -13,7 +13,8 @@ type Sample struct {
 	MemoryLimitBytes   uint64
 	OOMKills           uint64
 	MemoryPSIAvg10     float64
-	NodeAvailableRatio float64
+	HostAvailableRatio float64
+	HostMemoryObserved bool
 }
 
 type Reader interface {
@@ -101,7 +102,9 @@ func (o *Observer) ObserveOnce() (fastletapi.AdmissionState, fastletapi.Admissio
 
 func (o *Observer) observe() {
 	sample, err := o.reader.Read()
-	if err != nil || sample.MemoryLimitBytes == 0 {
+	hostObservationRequired := o.config.NodeLowWatermark > 0 || o.config.NodeRecoveryWatermark > 0
+	if err != nil || sample.MemoryLimitBytes == 0 ||
+		(hostObservationRequired && !sample.HostMemoryObserved) {
 		o.transition(fastletapi.AdmissionStateUnknown, fastletapi.AdmissionReasonTelemetryMissing)
 		o.highSamples = 0
 		o.recoverySamples = 0
@@ -120,10 +123,10 @@ func (o *Observer) observe() {
 		o.recoverySamples = 0
 		o.transition(fastletapi.AdmissionStateBlocked, fastletapi.AdmissionReasonFastletOOMEvent)
 		return
-	case o.config.NodeLowWatermark > 0 && sample.NodeAvailableRatio > 0 && sample.NodeAvailableRatio <= o.config.NodeLowWatermark:
+	case o.config.NodeLowWatermark > 0 && sample.HostAvailableRatio <= o.config.NodeLowWatermark:
 		o.highSamples = 0
 		o.recoverySamples = 0
-		o.transition(fastletapi.AdmissionStateBlocked, fastletapi.AdmissionReasonNodeMemoryPressure)
+		o.transition(fastletapi.AdmissionStateBlocked, fastletapi.AdmissionReasonHostMemoryPressure)
 		return
 	case o.config.PSIAvg10Threshold > 0 && sample.MemoryPSIAvg10 >= o.config.PSIAvg10Threshold:
 		o.highSamples = 0
@@ -141,7 +144,7 @@ func (o *Observer) observe() {
 
 	o.highSamples = 0
 	if usageRatio <= o.config.LowWatermark &&
-		(o.config.NodeRecoveryWatermark == 0 || sample.NodeAvailableRatio == 0 || sample.NodeAvailableRatio >= o.config.NodeRecoveryWatermark) {
+		(o.config.NodeRecoveryWatermark == 0 || sample.HostAvailableRatio >= o.config.NodeRecoveryWatermark) {
 		o.recoverySamples++
 		if firstValidSample || o.recoverySamples >= o.config.RecoverySamples {
 			o.transition(fastletapi.AdmissionStateOpen, "")

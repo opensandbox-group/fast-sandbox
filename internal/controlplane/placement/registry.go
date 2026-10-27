@@ -592,28 +592,29 @@ func resourceBlockedNodes(slots []*fastletSlot, now time.Time, staleAfter time.D
 		infos = append(infos, slot.info)
 		slot.mu.RUnlock()
 	}
-	return FreshNodeMemoryPressureNodes(infos, now, staleAfter)
+	return FreshHostMemoryPressureNodes(infos, now, staleAfter)
 }
 
-// FreshNodeMemoryPressureNodes returns the node-wide pressure fence reported by
+// FreshHostMemoryPressureNodes returns the host-wide pressure fence reported by
 // any fresh Fastlet observation, independent of Pool ownership.
-func FreshNodeMemoryPressureNodes(infos []FastletInfo, now time.Time, staleAfter time.Duration) map[string]struct{} {
+func FreshHostMemoryPressureNodes(infos []FastletInfo, now time.Time, staleAfter time.Duration) map[string]struct{} {
 	blocked := make(map[string]struct{})
 	for _, info := range infos {
-		if HasFreshNodeMemoryPressure(info, now, staleAfter) {
+		if HasFreshHostMemoryPressure(info, now, staleAfter) {
 			blocked[info.NodeName] = struct{}{}
 		}
 	}
 	return blocked
 }
 
-// HasFreshNodeMemoryPressure reports whether one observation blocks every
-// Fastlet on the same node. Pool scaling uses the same predicate as placement
+// HasFreshHostMemoryPressure reports whether one observation blocks every
+// Fastlet on the same host. Pool scaling uses the same predicate as placement
 // so aggregate capacity never includes a sibling Fastlet that Top-K rejects.
-func HasFreshNodeMemoryPressure(info FastletInfo, now time.Time, staleAfter time.Duration) bool {
+func HasFreshHostMemoryPressure(info FastletInfo, now time.Time, staleAfter time.Duration) bool {
 	status := info.Admission.Resources
 	return info.NodeName != "" && status != nil && status.Version == "v2" &&
-		status.State == fastletapi.AdmissionStateBlocked && status.Reason == fastletapi.AdmissionReasonNodeMemoryPressure &&
+		status.State == fastletapi.AdmissionStateBlocked &&
+		(status.Reason == fastletapi.AdmissionReasonHostMemoryPressure || status.Reason == fastletapi.AdmissionReasonNodeMemoryPressure) &&
 		!info.ResourceReceivedAt.IsZero() && now.Sub(info.ResourceReceivedAt) <= staleAfter &&
 		!info.LastHeartbeat.IsZero() && now.Sub(info.LastHeartbeat) <= staleAfter
 }

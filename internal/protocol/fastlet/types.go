@@ -345,13 +345,16 @@ const (
 	AdmissionReasonFastletMemoryHighWatermark AdmissionReason = "FASTLET_MEMORY_HIGH_WATERMARK"
 	AdmissionReasonFastletMemoryPSI           AdmissionReason = "FASTLET_MEMORY_PSI"
 	AdmissionReasonFastletOOMEvent            AdmissionReason = "FASTLET_OOM_EVENT"
-	AdmissionReasonNodeMemoryPressure         AdmissionReason = "NODE_MEMORY_PRESSURE"
-	AdmissionReasonCPUSaturation              AdmissionReason = "CPU_SATURATION"
-	AdmissionReasonCPUThrottling              AdmissionReason = "CPU_THROTTLING"
-	AdmissionReasonTelemetryStale             AdmissionReason = "TELEMETRY_STALE"
-	AdmissionReasonTelemetryMissing           AdmissionReason = "TELEMETRY_MISSING"
-	AdmissionReasonRecoveryIncomplete         AdmissionReason = "RECOVERY_INCOMPLETE"
-	AdmissionReasonUnsupportedProtocol        AdmissionReason = "UNSUPPORTED_PROTOCOL"
+	AdmissionReasonHostMemoryPressure         AdmissionReason = "HOST_MEMORY_PRESSURE"
+	// AdmissionReasonNodeMemoryPressure is accepted from older Fastlets during
+	// rolling upgrades. New observations use AdmissionReasonHostMemoryPressure.
+	AdmissionReasonNodeMemoryPressure  AdmissionReason = "NODE_MEMORY_PRESSURE"
+	AdmissionReasonCPUSaturation       AdmissionReason = "CPU_SATURATION"
+	AdmissionReasonCPUThrottling       AdmissionReason = "CPU_THROTTLING"
+	AdmissionReasonTelemetryStale      AdmissionReason = "TELEMETRY_STALE"
+	AdmissionReasonTelemetryMissing    AdmissionReason = "TELEMETRY_MISSING"
+	AdmissionReasonRecoveryIncomplete  AdmissionReason = "RECOVERY_INCOMPLETE"
+	AdmissionReasonUnsupportedProtocol AdmissionReason = "UNSUPPORTED_PROTOCOL"
 )
 
 type ResourceAdmissionStatus struct {

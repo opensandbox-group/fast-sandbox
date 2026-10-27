@@ -2040,6 +2040,7 @@ func TestBuildFastletSettingsProjectsResourceAwareCapacity(t *testing.T) {
 func TestBuildFastletSettingsIncludesSidecarsInPodMemoryBudget(t *testing.T) {
 	profile, err := runtimecatalog.Builtin().Resolve(apiv1alpha2.RuntimeContainer)
 	require.NoError(t, err)
+	always := corev1.ContainerRestartPolicyAlways
 	pool := &apiv1alpha2.SandboxPool{Spec: apiv1alpha2.SandboxPoolSpec{
 		Runtime:            apiv1alpha2.RuntimeContainer,
 		MaxSandboxesPerPod: 2,
@@ -2051,13 +2052,20 @@ func TestBuildFastletSettingsIncludesSidecarsInPodMemoryBudget(t *testing.T) {
 			{Name: "metrics", Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
 				corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("2Gi"),
 			}}},
+		}, InitContainers: []corev1.Container{
+			{Name: "steady-sidecar", RestartPolicy: &always, Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("512Mi"),
+			}}},
+			{Name: "one-shot-init", Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+				corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("1Gi"),
+			}}},
 		}}},
 	}}
 
 	settings, err := buildFastletSettings(pool, profile)
 	require.NoError(t, err)
-	require.Equal(t, "2560Mi", settings.ResourceAdmission.PodMemoryBudget.String(),
-		"the aggregate Pod observer includes the runtime owner, user sidecars, and the platform proxy")
+	require.Equal(t, "3Gi", settings.ResourceAdmission.PodMemoryBudget.String(),
+		"the aggregate Pod observer includes the runtime owner, long-running sidecars, and platform proxy but not one-shot init containers")
 	require.Equal(t, "256Mi", settings.ResourceAdmission.RuntimeEnvelope.Memory.String(),
 		"sidecars never increase Sandbox commitment or the runtime-owner envelope")
 }
