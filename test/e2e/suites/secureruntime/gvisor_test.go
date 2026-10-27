@@ -27,6 +27,7 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	e2eenv "fast-sandbox/test/e2e/env"
 	"fast-sandbox/test/e2e/support/fixtures"
+	"fast-sandbox/test/e2e/support/netprobe"
 	"fast-sandbox/test/e2e/support/suiteenv"
 )
 
@@ -291,7 +292,9 @@ func waitForSecureRuntimeHTTP(ctx context.Context, t *testing.T, namespace, pod,
 	var last string
 	var lastErr error
 	for {
-		output, err := secureRuntimeKubectl(waitCtx, "exec", "-n", namespace, pod, "-c", "fastlet", "--", "wget", "-q", "-O", "-", fmt.Sprintf("http://%s:%d/", ip, port))
+		args := []string{"exec", "-n", namespace, pod, "-c", "fastlet", "--"}
+		args = append(args, netprobe.HTTPGetCommand(ip, port)...)
+		output, err := secureRuntimeKubectl(waitCtx, args...)
 		last = string(output)
 		lastErr = err
 		if err == nil && strings.Contains(last, want) {

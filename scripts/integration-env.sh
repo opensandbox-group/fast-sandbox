@@ -13,6 +13,7 @@
 #   ./scripts/integration-env.sh up            # full environment + chain
 #   ./scripts/integration-env.sh status        # component/template/pool health
 #   ./scripts/integration-env.sh verify        # sandbox create + execd /ping
+#   ./scripts/integration-env.sh verify-resource-aware # native Firecracker resource ledger
 #   ./scripts/integration-env.sh verify-snapshot # live sandbox snapshot E2E
 #     (requires the egress image in local docker:
 #      docker pull opensandbox/egress:latest)
@@ -174,7 +175,13 @@ inherit_go_env() {
 			log "inherited $name=$value from $SUDO_USER"
 		done
 	fi
-	value="$("$go_bin" env GOPROXY 2>/dev/null || true)"
+	# Prefer an explicit process-level override. Besides matching normal Go
+	# precedence, this keeps sudo-driven runs reliable when the invoking user's
+	# persisted go env is empty or cannot be read.
+	value="${GOPROXY:-}"
+	if [[ -z "$value" ]]; then
+		value="$("$go_bin" env GOPROXY 2>/dev/null || true)"
+	fi
 	if [[ -n "$value" ]]; then
 		# `make images` reads DOCKER_BUILD_FLAGS as well; a caller-supplied
 		# --build-arg comes later on the command line and still wins.
@@ -1896,6 +1903,122 @@ verify() {
 
 	stage_summary
 	highlight "== verify complete: 2 + $CONCURRENCY sandboxes delivered via fastctl (central proxy); teardown clean =="
+}
+
+# --- ResourceAware native Firecracker ---------------------------------------
+# This is intentionally separate from the legacy firecracker-pool used by the
+# delivery/concurrency battery. It proves that a real direct-Firecracker VM is
+# admitted through the ResourceAware ledger without changing the compatibility
+# contract of the standard sample Pool.
+RESOURCE_AWARE_POOL="firecracker-resource-aware-pool"
+RESOURCE_AWARE_SANDBOX="sandbox-firecracker-resource-aware"
+
+resource_aware_fastlet_ready() {
+	[[ "$(kubectl -n "$NS" get pods -l "fast-sandbox.io/pool=$RESOURCE_AWARE_POOL" -o json 2>/dev/null | jq '[.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length')" -eq 1 ]]
+}
+
+resource_aware_runtime_contract_ready() {
+	kubectl -n "$NS" get pods -l "fast-sandbox.io/pool=$RESOURCE_AWARE_POOL" -o json 2>/dev/null | jq -e '
+		.items | length == 1 and
+		.items[0].metadata.annotations["fast-sandbox.io/commitment-capacity"] != null and
+		.items[0].spec.containers[0].resources.requests.cpu == .items[0].spec.containers[0].resources.limits.cpu and
+		.items[0].spec.containers[0].resources.requests.memory == .items[0].spec.containers[0].resources.limits.memory
+	' >/dev/null
+}
+
+resource_aware_heartbeat_matches() { # pod request-cpu request-memory
+	local pod="$1" request_cpu="$2" request_memory="$3" port pid attempt payload
+	allocate_next_local_port
+	port="$FASTLET_ALLOCATED_PORT"
+	kubectl -n "$NS" port-forward "pod/$pod" "$port:5758" >/dev/null 2>&1 &
+	pid=$!
+	for attempt in $(seq 1 50); do
+		if kill -0 "$pid" 2>/dev/null && tcp_listening "$port"; then
+			break
+		fi
+		sleep 0.1
+	done
+	if ! kill -0 "$pid" 2>/dev/null || ! tcp_listening "$port"; then
+		kill "$pid" >/dev/null 2>&1 || true
+		wait "$pid" 2>/dev/null || true
+		return 1
+	fi
+	payload="$(curl -fsS -m 3 "http://127.0.0.1:$port/api/v2/fastlet/heartbeat" 2>/dev/null || true)"
+	kill "$pid" >/dev/null 2>&1 || true
+	wait "$pid" 2>/dev/null || true
+	printf '%s' "$payload" | jq -e --arg cpu "$request_cpu" --arg memory "$request_memory" '
+		.admission.used == 1 and
+		.admission.resources.version == "v2" and
+		.admission.resources.state == "OPEN" and
+		.admission.resources.committed.cpu == $cpu and
+		.admission.resources.committed.memory == $memory
+	' >/dev/null
+}
+
+resource_aware_cleanup() {
+	kubectl -n "$NS" delete sandbox "$RESOURCE_AWARE_SANDBOX" \
+		--ignore-not-found --wait=false >/dev/null 2>&1 || true
+	kubectl -n "$NS" delete sandboxpool "$RESOURCE_AWARE_POOL" \
+		--ignore-not-found --wait=false >/dev/null 2>&1 || true
+	resolve_daemon_down
+	port_forward_down
+}
+
+verify_resource_aware() {
+	local pool_json pod request_cpu request_memory
+	[[ -n "$(kubectl_get "sandboxtemplate/$SBX_TEMPLATE" '{.status.manifestRef}' 2>/dev/null)" ]] \
+		|| die "no built golden image (run 'integration-env.sh up' first)"
+	pool_json="$(kubectl -n "$NS" get sandboxpool "$SBX_POOL" -o json | jq --arg name "$RESOURCE_AWARE_POOL" '
+		del(
+			.metadata.uid,
+			.metadata.resourceVersion,
+			.metadata.generation,
+			.metadata.creationTimestamp,
+			.metadata.managedFields,
+			.status
+		) |
+		del(.metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"]) |
+		.metadata.name = $name |
+		.spec.capacity = {poolMin: 1, poolMax: 1, bufferMin: 0, bufferMax: 0} |
+		.spec.maxSandboxesPerPod = 2 |
+		.spec.sandboxResources = {
+			mode: "ResourceAware",
+			cpu: "1",
+			memory: "512Mi",
+			pids: 128,
+			overcommitRatio: {cpu: "4", memory: "1.25"}
+		}
+	')"
+	trap 'resource_aware_cleanup' EXIT
+	printf '%s' "$pool_json" | kubectl apply -f - >/dev/null
+	wait_for "ResourceAware Firecracker Fastlet ready" 120 resource_aware_fastlet_ready
+	wait_for "derived runtime-owner envelope installed" 30 resource_aware_runtime_contract_ready
+
+	port_forward_up
+	resolve_daemon_up
+	local SBX_POOL="$RESOURCE_AWARE_POOL"
+	fastctl_run_sandbox "$RESOURCE_AWARE_SANDBOX"
+	wait_until "ResourceAware Firecracker execd /ping" 120000 probe_execd "$RESOURCE_AWARE_SANDBOX"
+
+	request_cpu="$(kubectl_get "sandbox/$RESOURCE_AWARE_SANDBOX" '{.metadata.annotations.fast-sandbox\.io/resolved-request-cpu}')"
+	request_memory="$(kubectl_get "sandbox/$RESOURCE_AWARE_SANDBOX" '{.metadata.annotations.fast-sandbox\.io/resolved-request-memory}')"
+	[[ "$request_cpu" == "250m" && -n "$request_memory" ]] \
+		|| fail "unexpected resolved commitment request: cpu=$request_cpu memory=$request_memory"
+	[[ "$(kubectl_get "sandbox/$RESOURCE_AWARE_SANDBOX" '{.metadata.annotations.fast-sandbox\.io/resolved-limit-cpu}')" == "1" ]] \
+		|| fail "resolved Firecracker CPU limit does not match the Pool default"
+	[[ "$(kubectl_get "sandbox/$RESOURCE_AWARE_SANDBOX" '{.metadata.annotations.fast-sandbox\.io/resolved-limit-memory}')" == "512Mi" ]] \
+		|| fail "resolved Firecracker memory limit does not match the Pool default"
+	pod="$(kubectl_get "sandbox/$RESOURCE_AWARE_SANDBOX" '{.status.placement.fastletName}')"
+	wait_for "Fastlet heartbeat reports the admitted Firecracker commitment" 30 \
+		resource_aware_heartbeat_matches "$pod" "$request_cpu" "$request_memory"
+	pass "native Firecracker VM created through ResourceAware admission and reported its commitment ledger"
+
+	fastctl delete "$RESOURCE_AWARE_SANDBOX" >/dev/null 2>&1 || true
+	wait_for "ResourceAware Firecracker Sandbox deleted" 90 sandbox_gone "$RESOURCE_AWARE_SANDBOX"
+	kubectl -n "$NS" delete sandboxpool "$RESOURCE_AWARE_POOL" --wait=true --timeout=120s >/dev/null
+	trap - EXIT
+	resolve_daemon_down
+	port_forward_down
 }
 
 # --- max-concurrency soak (part of verify) ------------------------------------
@@ -5187,15 +5310,16 @@ pause_on_error() {
 verify_all() {
 	[[ -n "$(kubectl_get "sandboxtemplate/$SBX_TEMPLATE" '{.status.manifestRef}' 2>/dev/null)" ]] \
 		|| die "no built golden image (run 'integration-env.sh up' first)"
-	run_stage "verify-all 1/7: base delivery" verify
-	run_stage "verify-all 2/7: P2P evidence" verify_p2p
-	run_stage "verify-all 3/7: execd HTTP API battery" verify_execd_api
-	run_stage "verify-all 4/7: live snapshot + restore" verify_snapshot
-	run_stage "verify-all 5/7: cross-host pause/resume" verify_pause
-	run_stage "verify-all 6/7: egress policy matrix" verify_egress
-	run_stage "verify-all 7/7: relayed-policy lifecycle" verify_policy
+	run_stage "verify-all 1/8: base delivery" verify
+	run_stage "verify-all 2/8: ResourceAware native Firecracker" verify_resource_aware
+	run_stage "verify-all 3/8: P2P evidence" verify_p2p
+	run_stage "verify-all 4/8: execd HTTP API battery" verify_execd_api
+	run_stage "verify-all 5/8: live snapshot + restore" verify_snapshot
+	run_stage "verify-all 6/8: cross-host pause/resume" verify_pause
+	run_stage "verify-all 7/8: egress policy matrix" verify_egress
+	run_stage "verify-all 8/8: relayed-policy lifecycle" verify_policy
 	stage_summary
-	highlight "== verify-all complete: base + p2p + execd-api + snapshot + pause + egress + policy green =="
+	highlight "== verify-all complete: base + ResourceAware Firecracker + p2p + execd-api + snapshot + pause + egress + policy green =="
 }
 
 # --- status --------------------------------------------------------------------------------------
@@ -5309,13 +5433,17 @@ env_summary() {
 
 usage() {
 	cat <<'EOF'
-usage: integration-env.sh [--cleanup|--auto-clean] {up|down|status|verify|verify-all}
+usage: integration-env.sh [--cleanup|--auto-clean] {up|down|status|verify|verify-resource-aware|verify-all}
 
   up       build the whole environment (tasks 1-9) and report status
   down     teardown: kind cluster + MinIO container + credentials + sysctl
   status   component / template / pool / sandbox health
   verify   create 2 sandboxes, probe execd /ping, then a max-concurrency
            batch (CONCURRENCY=5 at pool capacity), delete all, assert cleanup
+  verify-resource-aware
+           create a temporary ResourceAware direct-Firecracker Pool, verify
+           the derived runtime-owner envelope, launch a real VM, probe execd,
+           and match its resolved request to the Fastlet heartbeat ledger
   verify-snapshot
            live sandbox snapshot E2E on the egress pool: a deny-policy
            source sandbox (allow control proves the plane serves) ->
@@ -5390,7 +5518,7 @@ for arg in "$@"; do
 	case "$arg" in
 		--cleanup) ACTION="down" ;;
 		--auto-clean) AUTO_CLEAN=1 ;;
-		up|down|status|verify|verify-all|verify-snapshot|verify-pause|verify-p2p|verify-execd-api|verify-egress|verify-policy) ACTION="$arg" ;;
+		up|down|status|verify|verify-resource-aware|verify-all|verify-snapshot|verify-pause|verify-p2p|verify-execd-api|verify-egress|verify-policy) ACTION="$arg" ;;
 		*) usage ;;
 	esac
 done
@@ -5451,6 +5579,11 @@ case "$ACTION" in
 	verify)
 		trap 'on_error verify' ERR
 		verify
+		trap - ERR
+		;;
+	verify-resource-aware)
+		trap 'on_error verify-resource-aware' ERR
+		verify_resource_aware
 		trap - ERR
 		;;
 	verify-snapshot)

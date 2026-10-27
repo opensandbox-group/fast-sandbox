@@ -1,5 +1,7 @@
 # Build-only OCI artifacts shared by Builder and the node runtime image.
 # Native binaries target the Ubuntu 22.04 ABI; no compiler enters the output.
+ARG GOPROXY=https://proxy.golang.org,direct
+
 FROM ubuntu:22.04 AS overlaybd-build
 
 ARG OVERLAYBD_REV
@@ -8,17 +10,23 @@ RUN sh /build-tools/build-overlaybd.sh /out
 
 FROM golang:1.26.3 AS convertor-build
 ARG CONVERTOR_REV=a00e366f9bfc970ec4aaa00887541c4c1d9f9dab
+ARG GOPROXY
+ENV GOPROXY=${GOPROXY}
 RUN git init /src/convertor \
     && cd /src/convertor \
     && git remote add origin https://github.com/containerd/accelerated-container-image.git \
-    && git fetch --depth 1 origin "$CONVERTOR_REV" \
+    && for attempt in 1 2 3; do \
+         git -c http.version=HTTP/1.1 fetch --depth 1 origin "$CONVERTOR_REV" && break; \
+         [ "$attempt" -eq 3 ] && exit 1; \
+         sleep $((attempt * 2)); \
+       done \
     && git checkout --detach FETCH_HEAD \
     && CGO_ENABLED=0 go build -o /out/convertor ./cmd/convertor
 
 FROM --platform=$BUILDPLATFORM golang:1.25 AS fsb-build
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
-ARG GOPROXY=https://proxy.golang.org,direct
+ARG GOPROXY
 ENV GOPROXY=${GOPROXY}
 WORKDIR /src
 COPY go.mod go.sum ./

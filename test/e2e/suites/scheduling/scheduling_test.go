@@ -2,7 +2,9 @@ package scheduling
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/controlplane/assignment"
 	"fast-sandbox/internal/fastletsettings"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	e2eenv "fast-sandbox/test/e2e/env"
 	"fast-sandbox/test/e2e/support/fixtures"
 	"fast-sandbox/test/e2e/support/suiteenv"
@@ -241,6 +244,9 @@ func TestResourceAwareOvercommitScaling(t *testing.T) {
 				t.Fatalf("failed FastPath Create must not leave a runnable intent: %v", err)
 			}
 			cancelRejected()
+			if err := ensureFastletPodCount(ctx, k8sClient, namespace, pool.Name, 1, 5*time.Second); err != nil {
+				t.Fatalf("failed FastPath Create must not become Pool scaler demand: %v", err)
+			}
 
 			// A separately accepted declarative intent is real scaler demand. It
 			// must not be confused with the failed FastPath request above.
@@ -460,6 +466,9 @@ func TestResourceAwareUnadmittableDemandIsolation(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("wait for unadmittable resource status: %v", err)
 			}
+			if err := ensurePoolDoesNotReportMaxReached(ctx, k8sClient, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 5*time.Second); err != nil {
+				t.Fatalf("unadmittable Sandbox must not consume shared Pool capacity: %v", err)
+			}
 
 			valid := createSchedulingSandbox(namespace, "sb-admittable", pool.Name)
 			if _, err := fixture.CreateSandbox(ctx, namespace, valid); err != nil {
@@ -529,13 +538,25 @@ func TestResourceAwareMemoryPressureScaling(t *testing.T) {
 			if _, err := fixture.WaitForReadyFastletPods(scaleCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, 2); err != nil {
 				t.Fatalf("wait for pressure-driven replacement capacity: %v", err)
 			}
-
-			// Allow the second Fastlet's blocked admission state to cross the
-			// heartbeat boundary before testing placement.
-			select {
-			case <-ctx.Done():
-				t.Fatalf("wait for blocked Fastlet heartbeats: %v", ctx.Err())
-			case <-time.After(8 * time.Second):
+			var pods corev1.PodList
+			if err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{"fast-sandbox.io/pool": pool.Name}); err != nil {
+				t.Fatalf("list pressured Fastlets: %v", err)
+			}
+			if len(pods.Items) != 2 {
+				t.Fatalf("pressured Fastlet count=%d, want 2", len(pods.Items))
+			}
+			for index := range pods.Items {
+				waitForFastletAdmission(ctx, t, pods.Items[index], fastletapi.AdmissionStateBlocked, fastletapi.AdmissionReasonFastletMemoryHighWatermark)
+			}
+			conditionCtx, cancelCondition := context.WithTimeout(ctx, 90*time.Second)
+			defer cancelCondition()
+			conditionPool, err := fixture.WaitForPoolCondition(conditionCtx, types.NamespacedName{Name: pool.Name, Namespace: namespace}, apiv1alpha2.PoolConditionCapacityAvailable, metav1.ConditionFalse)
+			if err != nil {
+				t.Fatalf("wait for PoolMaxReached under memory pressure: %v", err)
+			}
+			condition := apiMeta.FindStatusCondition(conditionPool.Status.Conditions, apiv1alpha2.PoolConditionCapacityAvailable)
+			if condition == nil || condition.Reason != apiv1alpha2.ReasonPoolMaxReached {
+				t.Fatalf("CapacityAvailable condition=%+v, want PoolMaxReached", condition)
 			}
 
 			sandbox := createSchedulingSandbox(namespace, "sb-pressure-blocked", pool.Name)
@@ -550,6 +571,123 @@ func TestResourceAwareMemoryPressureScaling(t *testing.T) {
 			return ctx
 		}).
 		Feature()
+
+	testSuite.Env().Test(t, feature)
+}
+
+func TestResourceAwareBufferUsesSandboxSlots(t *testing.T) {
+	suiteenv.RequireBasic(t)
+
+	feature := features.New("resource-aware-buffer-sandbox-slots").
+		WithLabel("suite", "scheduling").
+		WithLabel("tier", "smoke").
+		Assess("buffer thresholds retain default Sandbox commitments, not Fastlet Pods", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+			k8sClient := testSuite.MustKubeClient(t)
+			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
+			namespace := testSuite.AllocateNamespace("resource-buffer")
+			if err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
+				t.Fatalf("create namespace: %v", err)
+			}
+			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
+
+			pool := createResourceAwareSchedulingPool(namespace, "resource-buffer-pool")
+			pool.Spec.Capacity.BufferMin = 2
+			pool.Spec.Capacity.BufferMax = 2
+			if _, err := fixture.CreateSandboxPool(ctx, namespace, pool); err != nil {
+				t.Fatalf("create resource-aware Pool: %v", err)
+			}
+			initialCtx, cancelInitial := context.WithTimeout(ctx, 90*time.Second)
+			defer cancelInitial()
+			if _, err := fixture.WaitForReadyFastletPods(initialCtx, client.ObjectKeyFromObject(pool), 1); err != nil {
+				t.Fatalf("wait for initial Fastlet: %v", err)
+			}
+			if err := ensureFastletPodCount(ctx, k8sClient, namespace, pool.Name, 1, 5*time.Second); err != nil {
+				t.Fatalf("two free buffer slots must not mean two spare Fastlets: %v", err)
+			}
+
+			for index := 1; index <= 3; index++ {
+				name := fmt.Sprintf("sb-buffer-%d", index)
+				if _, err := fixture.CreateSandbox(ctx, namespace, createSchedulingSandbox(namespace, name, pool.Name)); err != nil {
+					t.Fatalf("create Sandbox %d: %v", index, err)
+				}
+				waitForAssignedSandbox(ctx, t, fixture, namespace, name)
+			}
+			scaleCtx, cancelScale := context.WithTimeout(ctx, 120*time.Second)
+			defer cancelScale()
+			if _, err := fixture.WaitForReadyFastletPods(scaleCtx, client.ObjectKeyFromObject(pool), 2); err != nil {
+				t.Fatalf("wait for buffer-slot scale-out: %v", err)
+			}
+			return ctx
+		}).Feature()
+
+	testSuite.Env().Test(t, feature)
+}
+
+func TestResourceAwareHostPressurePropagatesAcrossPools(t *testing.T) {
+	suiteenv.RequireBasic(t)
+
+	feature := features.New("resource-aware-host-pressure-cross-pool").
+		WithLabel("suite", "scheduling").
+		WithLabel("tier", "validation").
+		Assess("host pressure reported by one Fastlet blocks same-node capacity in another Pool", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+			k8sClient := testSuite.MustKubeClient(t)
+			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
+			namespace := testSuite.AllocateNamespace("resource-host-pressure")
+			if err := k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}); err != nil {
+				t.Fatalf("create namespace: %v", err)
+			}
+			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
+			nodeName := firstSchedulableNode(ctx, t, k8sClient)
+
+			source := createResourceAwareSchedulingPool(namespace, "host-pressure-source")
+			source.Spec.Capacity = apiv1alpha2.PoolCapacity{PoolMin: 1, PoolMax: 1}
+			source.Spec.FastletTemplate.Spec.NodeSelector = map[string]string{"kubernetes.io/hostname": nodeName}
+			source.Spec.FastletTemplate.Spec.Containers[0].Env = resourceObserverEnv("1", "0.99", "1", "1")
+			if _, err := fixture.CreateSandboxPool(ctx, namespace, source); err != nil {
+				t.Fatalf("create host-pressure source Pool: %v", err)
+			}
+			target := createResourceAwareSchedulingPool(namespace, "host-pressure-target")
+			target.Spec.Capacity = apiv1alpha2.PoolCapacity{PoolMin: 1, PoolMax: 2}
+			target.Spec.FastletTemplate.Spec.NodeSelector = map[string]string{"kubernetes.io/hostname": nodeName}
+			target.Spec.FastletTemplate.Spec.Containers[0].Env = resourceObserverEnv("1", "0.99", "0", "0")
+			if _, err := fixture.CreateSandboxPool(ctx, namespace, target); err != nil {
+				t.Fatalf("create host-pressure target Pool: %v", err)
+			}
+			readyCtx, cancelReady := context.WithTimeout(ctx, 90*time.Second)
+			defer cancelReady()
+			if _, err := fixture.WaitForReadyFastletPods(readyCtx, client.ObjectKeyFromObject(source), 1); err != nil {
+				t.Fatalf("wait for source Fastlet: %v", err)
+			}
+			if _, err := fixture.WaitForReadyFastletPods(readyCtx, client.ObjectKeyFromObject(target), 1); err != nil {
+				t.Fatalf("wait for target Fastlet: %v", err)
+			}
+			sourcePod := onlyPoolPod(ctx, t, k8sClient, namespace, source.Name)
+			targetPod := onlyPoolPod(ctx, t, k8sClient, namespace, target.Name)
+			waitForFastletAdmission(ctx, t, sourcePod, fastletapi.AdmissionStateBlocked, fastletapi.AdmissionReasonHostMemoryPressure)
+			waitForFastletAdmission(ctx, t, targetPod, fastletapi.AdmissionStateOpen, "")
+
+			sandbox := createSchedulingSandbox(namespace, "sb-host-pressure", target.Name)
+			if _, err := fixture.CreateSandbox(ctx, namespace, sandbox); err != nil {
+				t.Fatalf("create target Sandbox: %v", err)
+			}
+			scaleCtx, cancelScale := context.WithTimeout(ctx, 150*time.Second)
+			defer cancelScale()
+			if _, err := fixture.WaitForReadyFastletPods(scaleCtx, client.ObjectKeyFromObject(target), 2); err != nil {
+				t.Fatalf("wait for target Pool scale-out under host pressure: %v", err)
+			}
+			if err := fixture.EnsureSandboxRemainsUnassigned(ctx, client.ObjectKeyFromObject(sandbox), 10*time.Second); err != nil {
+				t.Fatalf("Sandbox should remain unassigned while its node is pressure-blocked: %v", err)
+			}
+			conditionPool, err := fixture.WaitForPoolCondition(scaleCtx, client.ObjectKeyFromObject(target), apiv1alpha2.PoolConditionCapacityAvailable, metav1.ConditionFalse)
+			if err != nil {
+				t.Fatalf("wait for target PoolMaxReached: %v", err)
+			}
+			condition := apiMeta.FindStatusCondition(conditionPool.Status.Conditions, apiv1alpha2.PoolConditionCapacityAvailable)
+			if condition == nil || condition.Reason != apiv1alpha2.ReasonPoolMaxReached {
+				t.Fatalf("target CapacityAvailable condition=%+v, want PoolMaxReached", condition)
+			}
+			return ctx
+		}).Feature()
 
 	testSuite.Env().Test(t, feature)
 }
@@ -681,6 +819,165 @@ func waitForFastletPodCount(ctx context.Context, k8sClient client.Client, namesp
 		case <-ticker.C:
 		}
 	}
+}
+
+func ensureFastletPodCount(ctx context.Context, k8sClient client.Client, namespace, pool string, want int, duration time.Duration) error {
+	checkCtx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := checkCtx.Err(); err != nil {
+			if err == context.DeadlineExceeded {
+				return nil
+			}
+			return err
+		}
+		pods := &corev1.PodList{}
+		if err := k8sClient.List(checkCtx, pods,
+			client.InNamespace(namespace),
+			client.MatchingLabels{"fast-sandbox.io/pool": pool},
+		); err != nil {
+			if checkCtx.Err() == context.DeadlineExceeded {
+				return nil
+			}
+			return err
+		}
+		if len(pods.Items) != want {
+			return fmt.Errorf("Fastlet Pod count=%d, want %d throughout %s", len(pods.Items), want, duration)
+		}
+		select {
+		case <-checkCtx.Done():
+			if checkCtx.Err() == context.DeadlineExceeded {
+				return nil
+			}
+			return checkCtx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func ensurePoolDoesNotReportMaxReached(ctx context.Context, k8sClient client.Client, name types.NamespacedName, duration time.Duration) error {
+	checkCtx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := checkCtx.Err(); err != nil {
+			if err == context.DeadlineExceeded {
+				return nil
+			}
+			return err
+		}
+		var pool apiv1alpha2.SandboxPool
+		if err := k8sClient.Get(checkCtx, name, &pool); err != nil {
+			if checkCtx.Err() == context.DeadlineExceeded {
+				return nil
+			}
+			return err
+		}
+		condition := apiMeta.FindStatusCondition(pool.Status.Conditions, apiv1alpha2.PoolConditionCapacityAvailable)
+		if condition != nil && condition.Status == metav1.ConditionFalse && condition.Reason == apiv1alpha2.ReasonPoolMaxReached {
+			return fmt.Errorf("Pool reported PoolMaxReached for an unadmittable Sandbox: %s", condition.Message)
+		}
+		select {
+		case <-checkCtx.Done():
+			if checkCtx.Err() == context.DeadlineExceeded {
+				return nil
+			}
+			return checkCtx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForFastletAdmission(ctx context.Context, t *testing.T, pod corev1.Pod, state fastletapi.AdmissionState, reason fastletapi.AdmissionReason) *fastletapi.ResourceAdmissionStatus {
+	t.Helper()
+	endpoint, forward, err := e2eenv.StartPodPortForward(ctx, pod.Namespace, pod.Name, 5758)
+	if err != nil {
+		t.Fatalf("start heartbeat port-forward for %s/%s: %v", pod.Namespace, pod.Name, err)
+	}
+	defer func() {
+		if err := forward.Cleanup(); err != nil {
+			t.Errorf("cleanup heartbeat port-forward for %s/%s: %v", pod.Namespace, pod.Name, err)
+		}
+	}()
+
+	waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	client := &http.Client{Timeout: 2 * time.Second}
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	var last *fastletapi.ResourceAdmissionStatus
+	for {
+		request, requestErr := http.NewRequestWithContext(waitCtx, http.MethodGet, endpoint+"/api/v2/fastlet/heartbeat", nil)
+		if requestErr != nil {
+			t.Fatalf("build heartbeat request for %s/%s: %v", pod.Namespace, pod.Name, requestErr)
+		}
+		response, requestErr := client.Do(request)
+		if requestErr == nil {
+			var heartbeat fastletapi.HeartbeatResponse
+			decodeErr := json.NewDecoder(response.Body).Decode(&heartbeat)
+			_ = response.Body.Close()
+			if decodeErr == nil {
+				last = heartbeat.Admission.Resources
+				if last != nil && last.State == state && (reason == "" || last.Reason == reason) {
+					return last
+				}
+			}
+		}
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf("wait for Fastlet %s/%s admission state=%s reason=%s (last=%+v): %v", pod.Namespace, pod.Name, state, reason, last, waitCtx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func resourceObserverEnv(localHigh, localLow, hostLow, hostRecovery string) []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{Name: "FAST_SANDBOX_MEMORY_OBSERVER_INTERVAL", Value: "250ms"},
+		{Name: "FAST_SANDBOX_MEMORY_HIGH_WATERMARK", Value: localHigh},
+		{Name: "FAST_SANDBOX_MEMORY_LOW_WATERMARK", Value: localLow},
+		{Name: "FAST_SANDBOX_MEMORY_HIGH_SAMPLES", Value: "1"},
+		{Name: "FAST_SANDBOX_MEMORY_RECOVERY_SAMPLES", Value: "1"},
+		{Name: "FAST_SANDBOX_MEMORY_PSI_AVG10_THRESHOLD", Value: "0"},
+		{Name: "FAST_SANDBOX_NODE_MEMORY_LOW_WATERMARK", Value: hostLow},
+		{Name: "FAST_SANDBOX_NODE_MEMORY_RECOVERY_WATERMARK", Value: hostRecovery},
+	}
+}
+
+func firstSchedulableNode(ctx context.Context, t *testing.T, k8sClient client.Client) string {
+	t.Helper()
+	var nodes corev1.NodeList
+	if err := k8sClient.List(ctx, &nodes); err != nil {
+		t.Fatalf("list Nodes: %v", err)
+	}
+	for index := range nodes.Items {
+		node := &nodes.Items[index]
+		if node.Spec.Unschedulable {
+			continue
+		}
+		for _, condition := range node.Status.Conditions {
+			if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+				return node.Name
+			}
+		}
+	}
+	t.Fatal("no schedulable Ready Node found")
+	return ""
+}
+
+func onlyPoolPod(ctx context.Context, t *testing.T, k8sClient client.Client, namespace, pool string) corev1.Pod {
+	t.Helper()
+	var pods corev1.PodList
+	if err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{"fast-sandbox.io/pool": pool}); err != nil {
+		t.Fatalf("list Fastlets for Pool %s/%s: %v", namespace, pool, err)
+	}
+	if len(pods.Items) != 1 {
+		t.Fatalf("Fastlet count for Pool %s/%s=%d, want 1", namespace, pool, len(pods.Items))
+	}
+	return pods.Items[0]
 }
 
 func createSchedulingPool(namespace, name string, min, max, maxPerPod int32) *apiv1alpha2.SandboxPool {

@@ -2,6 +2,7 @@ package drain
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -9,6 +10,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -102,6 +104,102 @@ func TestPoolScaleDownUsesDurableDrain(t *testing.T) {
 			if third.Status.Placement.FastletPodUID == drainingPod.UID {
 				t.Fatalf("new Sandbox was assigned to draining Pod %s/%s", drainingPod.Name, drainingPod.UID)
 			}
+			return ctx
+		}).Feature()
+	testSuite.Env().Test(t, feature)
+}
+
+func TestResourceAwareScaleDownUsesDurableDrain(t *testing.T) {
+	suiteenv.RequireBasic(t)
+	feature := features.New("resource-aware-durable-pool-drain").
+		WithLabel("suite", "drain").
+		WithLabel("tier", "validation").
+		Assess("only an empty ResourceAware Fastlet is durably fenced before scale-down", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+			k8sClient := testSuite.MustKubeClient(t)
+			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
+			namespace := testSuite.AllocateNamespace("resource-drain")
+			requireNoError(t, k8sClient.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}), "create namespace")
+			defer suiteenv.DeleteNamespace(ctx, t, k8sClient, namespace)
+
+			pool := resourceAwareDrainPool(namespace)
+			_, err := fixture.CreateSandboxPool(ctx, namespace, pool)
+			requireNoError(t, err, "create ResourceAware Pool")
+			waitCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+			defer cancel()
+			_, err = fixture.WaitForReadyFastletPods(waitCtx, client.ObjectKeyFromObject(pool), 2)
+			requireNoError(t, err, "wait for two ResourceAware Fastlets")
+
+			first := drainSandbox(namespace, "resource-sandbox-a", pool.Name, "docker.io/library/alpine:latest")
+			requireNoError(t, k8sClient.Create(ctx, first), "create first ResourceAware Sandbox")
+			first = waitAssigned(ctx, t, fixture, first)
+			second := drainSandbox(namespace, "resource-sandbox-b", pool.Name, "docker.io/library/alpine:latest")
+			requireNoError(t, k8sClient.Create(ctx, second), "create second ResourceAware Sandbox")
+			second = waitAssigned(ctx, t, fixture, second)
+			if first.Status.Placement.FastletPodUID == second.Status.Placement.FastletPodUID {
+				t.Fatalf("ResourceAware Sandboxes were not spread across Fastlets: first=%+v second=%+v", first.Status.Placement, second.Status.Placement)
+			}
+
+			const holdFinalizer = "e2e.fast-sandbox.io/hold-draining-pod"
+			var pods corev1.PodList
+			requireNoError(t, k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{"fast-sandbox.io/pool": pool.Name}), "list ResourceAware Fastlets")
+			for index := range pods.Items {
+				pod := &pods.Items[index]
+				requireNoError(t, addPodFinalizer(ctx, k8sClient, client.ObjectKeyFromObject(pod), holdFinalizer), "hold ResourceAware Fastlet deletion")
+			}
+			requireNoError(t, retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				var current apiv1alpha2.SandboxPool
+				if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), &current); err != nil {
+					return err
+				}
+				current.Spec.Capacity.PoolMin = 1
+				return k8sClient.Update(ctx, &current)
+			}), "reduce ResourceAware Pool minimum")
+			if err := ensureNoDrainingPod(ctx, k8sClient, namespace, pool.Name, 5*time.Second); err != nil {
+				t.Fatalf("occupied ResourceAware Fastlets must not be selected for scale-down: %v", err)
+			}
+
+			// Once one Sandbox is deleted, exactly that empty Fastlet becomes a
+			// valid scale-down candidate after the stabilization window.
+			requireNoError(t, k8sClient.Delete(ctx, first), "delete first ResourceAware Sandbox")
+			deleteCtx, cancelDelete := context.WithTimeout(ctx, 60*time.Second)
+			requireNoError(t, fixture.WaitForSandboxDeleted(deleteCtx, client.ObjectKeyFromObject(first)), "wait for first ResourceAware Sandbox deletion")
+			cancelDelete()
+
+			drainingPod := waitForDrainingPod(ctx, t, k8sClient, namespace, pool.Name, 100*time.Second)
+			if drainingPod.UID != first.Status.Placement.FastletPodUID {
+				t.Fatalf("draining Pod UID=%s, want newly empty Fastlet UID=%s", drainingPod.UID, first.Status.Placement.FastletPodUID)
+			}
+			if drainingPod.Annotations[placement.AnnotationDrainReason] != placement.DrainReasonScaleDown ||
+				drainingPod.Annotations[placement.AnnotationDrainStartedAt] == "" || drainingPod.Annotations[placement.AnnotationDrainAckedAt] == "" {
+				t.Fatalf("ResourceAware drain metadata is incomplete: %#v", drainingPod.Annotations)
+			}
+
+			restartControllerLeader(ctx, t, k8sClient)
+			var persisted corev1.Pod
+			requireNoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(&drainingPod), &persisted), "get ResourceAware draining Pod after leader change")
+			if persisted.UID != drainingPod.UID || !placement.PodDrainRequested(&persisted) {
+				t.Fatalf("leader change lost ResourceAware drain state: before=%s/%s after=%s/%s", drainingPod.Name, drainingPod.UID, persisted.Name, persisted.UID)
+			}
+
+			third := drainSandbox(namespace, "resource-sandbox-c", pool.Name, "docker.io/library/alpine:latest")
+			requireNoError(t, k8sClient.Create(ctx, third), "create post-drain ResourceAware Sandbox")
+			third = waitAssigned(ctx, t, fixture, third)
+			if third.Status.Placement.FastletPodUID == drainingPod.UID {
+				t.Fatalf("new ResourceAware Sandbox was assigned to draining Pod %s/%s", drainingPod.Name, drainingPod.UID)
+			}
+
+			requireNoError(t, removePodFinalizer(ctx, k8sClient, client.ObjectKeyFromObject(&drainingPod), holdFinalizer), "release draining Fastlet deletion")
+			deadline := time.Now().Add(60 * time.Second)
+			for time.Now().Before(deadline) {
+				var current corev1.Pod
+				err := k8sClient.Get(ctx, client.ObjectKeyFromObject(&drainingPod), &current)
+				if apierrors.IsNotFound(err) {
+					return ctx
+				}
+				requireNoError(t, err, "wait for ResourceAware draining Fastlet deletion")
+				time.Sleep(250 * time.Millisecond)
+			}
+			t.Fatal("ResourceAware draining Fastlet was not deleted after its hold finalizer was removed")
 			return ctx
 		}).Feature()
 	testSuite.Env().Test(t, feature)
@@ -219,6 +317,23 @@ func drainPool(namespace string) *apiv1alpha2.SandboxPool {
 	}
 }
 
+func resourceAwareDrainPool(namespace string) *apiv1alpha2.SandboxPool {
+	pool := drainPool(namespace)
+	pool.Name = "resource-drain-pool"
+	pool.Spec.MaxSandboxesPerPod = 2
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+		resource.MustParse("500m"), resource.MustParse("192Mi"), resource.MustParse("5"), resource.MustParse("1.5"), 64,
+	)
+	pool.Spec.FastletTemplate.Spec.Containers[0].Env = []corev1.EnvVar{
+		{Name: "FAST_SANDBOX_MEMORY_HIGH_WATERMARK", Value: "0.99"},
+		{Name: "FAST_SANDBOX_MEMORY_LOW_WATERMARK", Value: "0.95"},
+		{Name: "FAST_SANDBOX_MEMORY_PSI_AVG10_THRESHOLD", Value: "0"},
+		{Name: "FAST_SANDBOX_NODE_MEMORY_LOW_WATERMARK", Value: "0"},
+		{Name: "FAST_SANDBOX_NODE_MEMORY_RECOVERY_WATERMARK", Value: "0"},
+	}
+	return pool
+}
+
 func drainSandbox(namespace, name, pool, image string) *apiv1alpha2.Sandbox {
 	return &apiv1alpha2.Sandbox{
 		TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha2.GroupVersion.String(), Kind: "Sandbox"},
@@ -254,6 +369,97 @@ func requireNoError(t *testing.T, err error, action string) {
 	t.Helper()
 	if err != nil {
 		t.Fatalf("%s: %v", action, err)
+	}
+}
+
+func addPodFinalizer(ctx context.Context, k8sClient client.Client, key client.ObjectKey, finalizer string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var pod corev1.Pod
+		if err := k8sClient.Get(ctx, key, &pod); err != nil {
+			return err
+		}
+		for _, existing := range pod.Finalizers {
+			if existing == finalizer {
+				return nil
+			}
+		}
+		pod.Finalizers = append(pod.Finalizers, finalizer)
+		return k8sClient.Update(ctx, &pod)
+	})
+}
+
+func removePodFinalizer(ctx context.Context, k8sClient client.Client, key client.ObjectKey, finalizer string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var pod corev1.Pod
+		if err := k8sClient.Get(ctx, key, &pod); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		filtered := pod.Finalizers[:0]
+		for _, existing := range pod.Finalizers {
+			if existing != finalizer {
+				filtered = append(filtered, existing)
+			}
+		}
+		pod.Finalizers = filtered
+		return k8sClient.Update(ctx, &pod)
+	})
+}
+
+func ensureNoDrainingPod(ctx context.Context, k8sClient client.Client, namespace, pool string, duration time.Duration) error {
+	checkCtx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := checkCtx.Err(); err != nil {
+			if err == context.DeadlineExceeded {
+				return nil
+			}
+			return err
+		}
+		var pods corev1.PodList
+		if err := k8sClient.List(checkCtx, &pods, client.InNamespace(namespace), client.MatchingLabels{"fast-sandbox.io/pool": pool}); err != nil {
+			if checkCtx.Err() == context.DeadlineExceeded {
+				return nil
+			}
+			return err
+		}
+		for index := range pods.Items {
+			if placement.PodDrainRequested(&pods.Items[index]) {
+				return fmt.Errorf("occupied Pod %s was marked draining", pods.Items[index].Name)
+			}
+		}
+		select {
+		case <-checkCtx.Done():
+			if checkCtx.Err() == context.DeadlineExceeded {
+				return nil
+			}
+			return checkCtx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitForDrainingPod(ctx context.Context, t *testing.T, k8sClient client.Client, namespace, pool string, timeout time.Duration) corev1.Pod {
+	t.Helper()
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var pods corev1.PodList
+		if err := k8sClient.List(waitCtx, &pods, client.InNamespace(namespace), client.MatchingLabels{"fast-sandbox.io/pool": pool}); err == nil {
+			for index := range pods.Items {
+				if placement.PodDrainRequested(&pods.Items[index]) && pods.Items[index].Annotations[placement.AnnotationDrainAckedAt] != "" {
+					return pods.Items[index]
+				}
+			}
+		}
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf("wait for durable ResourceAware drain: %v", waitCtx.Err())
+		case <-ticker.C:
+		}
 	}
 }
 

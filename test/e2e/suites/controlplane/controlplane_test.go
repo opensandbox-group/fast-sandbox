@@ -260,7 +260,7 @@ func TestMultiActiveControlPlane(t *testing.T) {
 		for index, response := range successfulResponses {
 			assertUniqueCreateIdentity(t, seenUIDs, seenNames, fmt.Sprintf("response-%d", index), response)
 		}
-		waitUntil(ctx, t, "capacity-bounded ready runtimes and durable CRD-first intents", func() (bool, error) {
+		waitUntil(ctx, t, "capacity-bounded ready runtimes and durable successful intents", func() (bool, error) {
 			var list apiv1alpha2.SandboxList
 			if err := k8sClient.List(ctx, &list, client.InNamespace(namespace)); err != nil {
 				return false, err
@@ -284,8 +284,90 @@ func TestMultiActiveControlPlane(t *testing.T) {
 			if readyCount > successes {
 				return false, fmt.Errorf("ready runtimes=%d exceeds successful admissions=%d", readyCount, successes)
 			}
-			return readyCount == successes && intentCount >= successes && intentCount <= requests, nil
+			if intentCount != successes {
+				return false, fmt.Errorf("durable intents=%d, want exactly successful admissions=%d", intentCount, successes)
+			}
+			return readyCount == successes, nil
 		})
+	})
+
+	t.Run("concurrent retries with one request ID converge to one durable Sandbox", func(t *testing.T) {
+		idempotentPool := controlPlanePool(namespace, "idempotent-pool", 1)
+		if err := k8sClient.Create(ctx, idempotentPool); err != nil {
+			t.Fatalf("create idempotent Pool: %v", err)
+		}
+		waitForReadyFastlets(ctx, t, k8sClient, namespace, idempotentPool.Name, 1)
+
+		requestID := namespace + "-same-request"
+		var group sync.WaitGroup
+		var lock sync.Mutex
+		responses := make([]*fastpathv2.CreateSandboxResponse, 0, len(replicas))
+		errorsByReplica := make(map[string]error)
+		for index := range replicas {
+			replica := replicas[index]
+			group.Add(1)
+			go func() {
+				defer group.Done()
+				requestCtx, requestCancel := context.WithTimeout(ctx, 30*time.Second)
+				defer requestCancel()
+				response, createErr := replica.client.CreateSandbox(requestCtx, createRequest(namespace, idempotentPool.Name, requestID))
+				lock.Lock()
+				defer lock.Unlock()
+				if createErr != nil {
+					errorsByReplica[replica.name] = createErr
+					return
+				}
+				responses = append(responses, response)
+			}()
+		}
+		group.Wait()
+		if len(responses) == 0 {
+			t.Fatalf("all same-request creates failed: %v", errorsByReplica)
+		}
+		for replica, createErr := range errorsByReplica {
+			if status.Code(createErr) != codes.Unavailable {
+				t.Fatalf("same-request error from %s code=%s, want Unavailable: %v", replica, status.Code(createErr), createErr)
+			}
+		}
+		wantUID := responses[0].GetSandbox().GetIdentity().GetUid()
+		if wantUID == "" {
+			t.Fatal("same-request success returned an empty UID")
+		}
+		for index, response := range responses[1:] {
+			if got := response.GetSandbox().GetIdentity().GetUid(); got != wantUID {
+				t.Fatalf("same-request response %d UID=%q, want %q", index+1, got, wantUID)
+			}
+		}
+
+		ready := waitForSandbox(ctx, t, k8sClient, types.NamespacedName{Namespace: namespace, Name: requestID}, func(item *apiv1alpha2.Sandbox) bool {
+			return item.Status.Runtime.State == apiv1alpha2.RuntimeReady
+		})
+		if string(ready.UID) != wantUID {
+			t.Fatalf("durable Sandbox UID=%q, want RPC UID=%q", ready.UID, wantUID)
+		}
+		retryCtx, retryCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer retryCancel()
+		retryResponse, err := replicas[0].client.CreateSandbox(retryCtx, createRequest(namespace, idempotentPool.Name, requestID))
+		if err != nil {
+			t.Fatalf("retry completed same request: %v", err)
+		}
+		if got := retryResponse.GetSandbox().GetIdentity().GetUid(); got != wantUID {
+			t.Fatalf("retry UID=%q, want %q", got, wantUID)
+		}
+
+		var list apiv1alpha2.SandboxList
+		if err := k8sClient.List(ctx, &list, client.InNamespace(namespace)); err != nil {
+			t.Fatalf("list same-request Sandboxes: %v", err)
+		}
+		count := 0
+		for index := range list.Items {
+			if list.Items[index].Spec.PoolRef == idempotentPool.Name {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("same-request durable Sandbox count=%d, want 1", count)
+		}
 	})
 }
 

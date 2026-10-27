@@ -353,9 +353,7 @@ func assertSandboxProxyServiceSurvivesReplicaLoss(ctx context.Context, t *testin
 func restartFastletProxy(ctx context.Context, t *testing.T, k8sClient client.Client, namespace, podName string) {
 	t.Helper()
 	previous := containerRestartCount(ctx, t, k8sClient, namespace, podName, "fastlet-proxy")
-	if output, err := kubectl(ctx, "exec", "-n", namespace, podName, "-c", "fastlet-proxy", "--", "kill", "1"); err != nil {
-		t.Fatalf("restart Fastlet Proxy: %v: %s", err, output)
-	}
+	injectionOutput, injectionErr := kubectl(ctx, "exec", "-n", namespace, podName, "-c", "fastlet-proxy", "--", "kill", "1")
 	waitCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	for {
@@ -369,7 +367,7 @@ func restartFastletProxy(ctx context.Context, t *testing.T, k8sClient client.Cli
 		}
 		select {
 		case <-waitCtx.Done():
-			t.Fatalf("wait for Fastlet Proxy restart: %v", waitCtx.Err())
+			t.Fatalf("wait for Fastlet Proxy restart: %v; kill result: err=%v output=%q", waitCtx.Err(), injectionErr, string(injectionOutput))
 		case <-time.After(250 * time.Millisecond):
 		}
 	}

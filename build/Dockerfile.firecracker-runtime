@@ -31,7 +31,11 @@ ENV GOPROXY=${GOPROXY}
 RUN git init /src/dart \
     && cd /src/dart \
     && git remote add origin https://github.com/data-accelerator/dart \
-    && git fetch --depth 1 origin "$DART_REV" \
+    && for attempt in 1 2 3; do \
+         git -c http.version=HTTP/1.1 fetch --depth 1 origin "$DART_REV" && break; \
+         [ "$attempt" -eq 3 ] && exit 1; \
+         sleep $((attempt * 2)); \
+       done \
     && git checkout --detach FETCH_HEAD \
     && CGO_ENABLED=0 go build -o /out/dart ./cmd/dart
 
@@ -43,7 +47,7 @@ FROM alpine:3.19 AS fc-assets
 ARG FC_VERSION
 RUN apk add --no-cache curl \
     && mkdir /bundle /stage \
-    && curl -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-x86_64.tgz" -o /stage/fc.tgz \
+    && curl --retry 3 --retry-all-errors --connect-timeout 20 --max-time 120 -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-x86_64.tgz" -o /stage/fc.tgz \
     && tar -xzf /stage/fc.tgz -C /stage \
     && find /stage -type f -name "firecracker-${FC_VERSION}-x86_64" -exec mv {} /bundle/firecracker \; \
     && find /stage -type f -name "jailer-${FC_VERSION}-x86_64" -exec mv {} /bundle/jailer \; \
