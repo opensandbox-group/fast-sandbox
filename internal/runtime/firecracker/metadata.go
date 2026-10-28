@@ -54,21 +54,19 @@ func writeVMMetadataFile(directory string, metadata VMMetadata) error {
 	return file.Close()
 }
 
-// publishVMMetadata writes the record in the background; consumers treat a
-// missing record as "not ready yet". A permanent failure is logged — that
-// VM's console cannot be collected, but provisioning is unaffected.
+// publishVMMetadata writes the record on the create path. It never fails
+// provisioning: a write error (e.g. disk full) is logged — that VM's console
+// cannot be collected, but the VM itself is unaffected.
 func (d *Driver) publishVMMetadata(directory string, identity fastletapi.SandboxIdentity) {
-	go func() {
-		metadata := VMMetadata{
-			Version:          vmMetadataVersion,
-			UID:              identity.SandboxUID,
-			Namespace:        identity.Namespace,
-			Name:             identity.Name,
-			PlacementAttempt: identity.AssignmentAttempt,
-		}
-		if err := writeVMMetadataFile(directory, metadata); err != nil {
-			klog.ErrorS(err, "failed to write the VM discovery metadata; node-local agents cannot collect this VM's console output",
-				"sandboxID", identity.SandboxUID, "path", filepath.Join(directory, vmMetadataName))
-		}
-	}()
+	metadata := VMMetadata{
+		Version:          vmMetadataVersion,
+		UID:              identity.SandboxUID,
+		Namespace:        identity.Namespace,
+		Name:             identity.Name,
+		PlacementAttempt: identity.AssignmentAttempt,
+	}
+	if err := writeVMMetadataFile(directory, metadata); err != nil {
+		klog.ErrorS(err, "failed to write the VM discovery metadata; node-local agents cannot collect this VM's console output",
+			"sandboxID", identity.SandboxUID, "path", filepath.Join(directory, vmMetadataName))
+	}
 }

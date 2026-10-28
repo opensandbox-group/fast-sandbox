@@ -50,9 +50,4 @@ The file name is always `fast-sandbox.json`, inside the VM directory. In both mo
 
 ## Writer semantics (reference)
 
-The driver composes the JSON in memory and emits it with a single `write()`;
-no fsync. The write is asynchronous and never blocks or fails provisioning.
-The file is written once and never modified afterwards. Teardown removes the
-whole jail/sandbox directory — metadata and log together — so a consumer never
-observes a deleted log with the metadata still present. A permanent write
-failure (e.g. disk full) is logged; that VM's console is not collectable.
+The driver composes the JSON in memory and emits it with a single `write()`; no fsync. The write happens at the end of a successful create and never fails provisioning (a write error is logged; that VM's console is not collectable). The file is written once and never modified afterwards. Teardown removes the whole jail/sandbox directory — metadata and log together — so a consumer never observes a deleted log with the metadata still present.

@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -26,18 +25,13 @@ func (f *driverFixture) prepareBareCachedImage(t *testing.T, image string) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, memorySnapshotName), []byte("memory-snapshot-data"), 0o640))
 }
 
-// awaitVMMetadataForTest polls until the record parses, matching the
-// consumer contract of retrying on a short JSON prefix.
-func awaitVMMetadataForTest(t *testing.T, path string) VMMetadata {
+// readVMMetadataForTest reads and decodes the record after provisioning.
+func readVMMetadataForTest(t *testing.T, path string) VMMetadata {
 	t.Helper()
+	payload, err := os.ReadFile(path)
+	require.NoError(t, err, "the discovery record must exist after provisioning returns")
 	var decoded VMMetadata
-	require.Eventually(t, func() bool {
-		payload, err := os.ReadFile(path)
-		if err != nil {
-			return false
-		}
-		return json.Unmarshal(payload, &decoded) == nil
-	}, 5*time.Second, 10*time.Millisecond, "the asynchronous discovery record must appear after provisioning")
+	require.NoError(t, json.Unmarshal(payload, &decoded))
 	return decoded
 }
 
@@ -108,7 +102,7 @@ func TestEnsureSandboxWritesVMMetadataInJail(t *testing.T) {
 	require.Equal(t, VMMetadata{
 		Version: vmMetadataVersion, UID: longSandboxUID,
 		Namespace: "team-a", Name: "sbx-7d9f2c", PlacementAttempt: 1,
-	}, awaitVMMetadataForTest(t, path))
+	}, readVMMetadataForTest(t, path))
 
 	require.NoError(t, fixture.driver.DeleteSandbox(context.Background(), longSandboxUID))
 	_, statErr := os.Stat(path)
@@ -129,5 +123,5 @@ func TestEnsureSandboxWritesVMMetadataInStateDir(t *testing.T) {
 	require.Equal(t, VMMetadata{
 		Version: vmMetadataVersion, UID: "sandbox-1", Namespace: "tenant-a",
 		Name: "sandbox-1", PlacementAttempt: 1,
-	}, awaitVMMetadataForTest(t, path))
+	}, readVMMetadataForTest(t, path))
 }
