@@ -51,6 +51,7 @@ Fast Sandbox documentation is organized by reader intent:
 ## Reference
 
 - [API](reference/api.md)
+- [VM discovery metadata](reference/vm-metadata.md)
 - [Infra Components](reference/infra-components.md)
 - [fastctl](reference/fastctl.md)
 - [Configuration](reference/configuration.md)

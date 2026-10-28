@@ -52,7 +52,7 @@ machine/drive/network call before it is rejected). The driver:
 3. `PATCH /vm {"state":"Resumed"}` (InstanceStart is rejected after load),
    then polls until `Running`.
 
-After a successful restore the driver also writes the write-once VM discovery record `fast-sandbox.json` next to the process log — the jail root in jailer mode, `<StateRoot>/sandboxes/<sandbox-uid>/` in direct mode — carrying the full (untruncated) Sandbox UID, namespace, name, and placement attempt, so node-local agents can discover local VMs with a directory scan instead of watching Sandbox CRs cluster-wide; the asynchronous write never blocks provisioning, and teardown removes the record together with the surrounding directory.
+After a successful restore the driver also writes the write-once VM discovery record `fast-sandbox.json` next to the process log — the jail root in jailer mode, `<StateRoot>/sandboxes/<sandbox-uid>/` in direct mode — carrying the full (untruncated) Sandbox UID, namespace, name, and placement attempt, so node-local agents can discover local VMs with a directory scan instead of watching Sandbox CRs cluster-wide; the asynchronous write never blocks provisioning, and teardown removes the record together with the surrounding directory. The reader contract and schema are specified in [VM discovery metadata](../reference/vm-metadata.md).
 
 ## Network topology (per-clone netns)
 

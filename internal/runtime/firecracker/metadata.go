@@ -14,7 +14,7 @@ import (
 // vmMetadataName is the write-once discovery record next to the process log
 // (the jail root in jailer mode, the state directory in direct mode). It
 // carries the full Sandbox UID, which the jail directory name truncates to
-// 32 characters.
+// 32 characters. The reader contract: docs/reference/vm-metadata.md.
 const vmMetadataName = "fast-sandbox.json"
 
 const vmMetadataVersion = 1
