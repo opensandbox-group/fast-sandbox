@@ -2,14 +2,13 @@ package firecracker
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
-
-	"fast-sandbox/api/vmmetadata"
 )
 
 // longSandboxUID is a full 36-character Sandbox CR UID; the jail directory
@@ -29,33 +28,35 @@ func (f *driverFixture) prepareBareCachedImage(t *testing.T, image string) {
 
 // awaitVMMetadataForTest polls until the record parses, matching the
 // consumer contract of retrying on a short JSON prefix.
-func awaitVMMetadataForTest(t *testing.T, path string) vmmetadata.Metadata {
+func awaitVMMetadataForTest(t *testing.T, path string) VMMetadata {
 	t.Helper()
-	var decoded vmmetadata.Metadata
+	var decoded VMMetadata
 	require.Eventually(t, func() bool {
 		payload, err := os.ReadFile(path)
 		if err != nil {
 			return false
 		}
-		decoded, err = vmmetadata.Parse(payload)
-		return err == nil
+		return json.Unmarshal(payload, &decoded) == nil
 	}, 5*time.Second, 10*time.Millisecond, "the asynchronous discovery record must appear after provisioning")
 	return decoded
 }
 
 func TestWriteVMMetadataFileSchema(t *testing.T) {
 	directory := t.TempDir()
-	require.NoError(t, writeVMMetadataFile(directory, vmmetadata.Metadata{
-		Version: vmmetadata.CurrentVersion, UID: longSandboxUID,
+	require.NoError(t, writeVMMetadataFile(directory, VMMetadata{
+		Version: vmMetadataVersion, UID: longSandboxUID,
 		Namespace: "team-a", Name: "sbx-7d9f2c", PlacementAttempt: 2,
 	}))
-	path := filepath.Join(directory, vmmetadata.FileName)
-	record, err := vmmetadata.Read(directory)
+	path := filepath.Join(directory, vmMetadataName)
+	payload, err := os.ReadFile(path)
 	require.NoError(t, err)
-	require.Equal(t, vmmetadata.Metadata{
-		Version: 1, UID: longSandboxUID,
-		Namespace: "team-a", Name: "sbx-7d9f2c", PlacementAttempt: 2,
-	}, record)
+	var fields map[string]any
+	require.NoError(t, json.Unmarshal(payload, &fields))
+	require.Equal(t, float64(1), fields["version"])
+	require.Equal(t, longSandboxUID, fields["uid"])
+	require.Equal(t, "team-a", fields["namespace"])
+	require.Equal(t, "sbx-7d9f2c", fields["name"])
+	require.Equal(t, float64(2), fields["placementAttempt"])
 	info, err := os.Stat(path)
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(0640), info.Mode().Perm())
@@ -63,28 +64,30 @@ func TestWriteVMMetadataFileSchema(t *testing.T) {
 
 func TestWriteVMMetadataFileOmitsZeroPlacementAttempt(t *testing.T) {
 	directory := t.TempDir()
-	require.NoError(t, writeVMMetadataFile(directory, vmmetadata.Metadata{
-		Version: vmmetadata.CurrentVersion, UID: longSandboxUID, Namespace: "team-a", Name: "sbx-7d9f2c",
+	require.NoError(t, writeVMMetadataFile(directory, VMMetadata{
+		Version: vmMetadataVersion, UID: longSandboxUID, Namespace: "team-a", Name: "sbx-7d9f2c",
 	}))
-	payload, err := os.ReadFile(filepath.Join(directory, vmmetadata.FileName))
+	payload, err := os.ReadFile(filepath.Join(directory, vmMetadataName))
 	require.NoError(t, err)
 	require.NotContains(t, string(payload), "placementAttempt")
 }
 
 func TestWriteVMMetadataFileIsWriteOnce(t *testing.T) {
 	directory := t.TempDir()
-	first := vmmetadata.Metadata{Version: vmmetadata.CurrentVersion, UID: longSandboxUID, Namespace: "team-a", Name: "sbx-7d9f2c", PlacementAttempt: 1}
+	first := VMMetadata{Version: vmMetadataVersion, UID: longSandboxUID, Namespace: "team-a", Name: "sbx-7d9f2c", PlacementAttempt: 1}
 	require.NoError(t, writeVMMetadataFile(directory, first))
-	stale := vmmetadata.Metadata{Version: vmmetadata.CurrentVersion, UID: "aaaaaaaa-3b2d-4c5e-8f70-a1b2c3d4e5f6", Namespace: "team-b", Name: "sbx-other", PlacementAttempt: 9}
+	stale := VMMetadata{Version: vmMetadataVersion, UID: "aaaaaaaa-3b2d-4c5e-8f70-a1b2c3d4e5f6", Namespace: "team-b", Name: "sbx-other", PlacementAttempt: 9}
 	require.NoError(t, writeVMMetadataFile(directory, stale))
-	record, err := vmmetadata.Read(directory)
+	payload, err := os.ReadFile(filepath.Join(directory, vmMetadataName))
 	require.NoError(t, err)
-	require.Equal(t, first, record)
+	var decoded VMMetadata
+	require.NoError(t, json.Unmarshal(payload, &decoded))
+	require.Equal(t, first, decoded)
 }
 
 func TestWriteVMMetadataFileRejectsInvalid(t *testing.T) {
-	require.ErrorIs(t, writeVMMetadataFile("", vmmetadata.Metadata{UID: longSandboxUID}), ErrInvalidConfig)
-	require.ErrorIs(t, writeVMMetadataFile(t.TempDir(), vmmetadata.Metadata{}), ErrInvalidConfig)
+	require.ErrorIs(t, writeVMMetadataFile("", VMMetadata{UID: longSandboxUID}), ErrInvalidConfig)
+	require.ErrorIs(t, writeVMMetadataFile(t.TempDir(), VMMetadata{}), ErrInvalidConfig)
 }
 
 func TestEnsureSandboxWritesVMMetadataInJail(t *testing.T) {
@@ -101,9 +104,9 @@ func TestEnsureSandboxWritesVMMetadataInJail(t *testing.T) {
 
 	truncatedID := truncatedSandboxID(longSandboxUID)
 	require.Len(t, truncatedID, 32)
-	path := filepath.Join(jailerRoot(filepath.Join(fixture.stateRoot, jailerChrootBaseDir), "firecracker", truncatedID), vmmetadata.FileName)
-	require.Equal(t, vmmetadata.Metadata{
-		Version: vmmetadata.CurrentVersion, UID: longSandboxUID,
+	path := filepath.Join(jailerRoot(filepath.Join(fixture.stateRoot, jailerChrootBaseDir), "firecracker", truncatedID), vmMetadataName)
+	require.Equal(t, VMMetadata{
+		Version: vmMetadataVersion, UID: longSandboxUID,
 		Namespace: "team-a", Name: "sbx-7d9f2c", PlacementAttempt: 1,
 	}, awaitVMMetadataForTest(t, path))
 
@@ -122,9 +125,9 @@ func TestEnsureSandboxWritesVMMetadataInStateDir(t *testing.T) {
 
 	directory, err := sandboxDir(fixture.stateRoot, fixture.sandboxSpec.Identity.SandboxUID)
 	require.NoError(t, err)
-	path := filepath.Join(directory, vmmetadata.FileName)
-	require.Equal(t, vmmetadata.Metadata{
-		Version: vmmetadata.CurrentVersion, UID: "sandbox-1", Namespace: "tenant-a",
+	path := filepath.Join(directory, vmMetadataName)
+	require.Equal(t, VMMetadata{
+		Version: vmMetadataVersion, UID: "sandbox-1", Namespace: "tenant-a",
 		Name: "sandbox-1", PlacementAttempt: 1,
 	}, awaitVMMetadataForTest(t, path))
 }
