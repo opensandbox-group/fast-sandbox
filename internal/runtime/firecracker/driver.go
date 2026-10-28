@@ -417,7 +417,7 @@ func (d *Driver) ProbeCapabilities(ctx context.Context) CapabilityReport {
 // snapshot set (an instance checkpoint when the request carries a resume
 // reference). The call is idempotent and emits an OTel span tree correlated
 // by the Sandbox identity.
-func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSandboxInput) (_ *SandboxMetadata, resultErr error) { //nolint:gocognit,gocyclo,maintidx // pre-existing create/resume state machine; refactor tracked separately
+func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSandboxInput) (_ *SandboxMetadata, resultErr error) { //nolint:gocognit,gocyclo,maintidx,funlen // pre-existing create/resume state machine; refactor tracked separately
 	if input == nil {
 		return nil, fmt.Errorf("%w: Firecracker Sandbox input is required", ErrInvalidConfig)
 	}
@@ -801,6 +801,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		"configure", configureDur.String(),
 		"boot", bootDur.String(), "vmStatePolls", polls,
 	)
+	d.publishVMMetadata(logDir, identity)
 	createdComplete = true
 	return existingMetadata(state), nil
 }
