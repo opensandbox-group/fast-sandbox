@@ -191,6 +191,11 @@ func packRootfs(ctx context.Context, bundle, work string, layout artifactLayout,
 	if err != nil {
 		return nil, err
 	}
+	// A no-write checkpoint commits a byte-identical layer; keep the
+	// inherited stack so the rootfs layer chain stays unchanged.
+	if len(rootLayers) > 0 && rootLayers[len(rootLayers)-1].Digest == root.Digest {
+		return rootLayers, nil
+	}
 	rootLayers = append(rootLayers, root)
 
 	return rootLayers, nil

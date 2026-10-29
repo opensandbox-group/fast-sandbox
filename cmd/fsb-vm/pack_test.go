@@ -34,6 +34,49 @@ func TestPackRejectsTruncatedCheckpointBeforeKernelResources(t *testing.T) {
 	require.Contains(t, err.Error(), "does not match machine metadata")
 }
 
+func TestPackRootfsReusesInheritedStackOnUnchangedLayer(t *testing.T) {
+	const unchangedPayload = "committed layer payload"
+	for _, mode := range []string{"unchanged", "dirty"} {
+		t.Run(mode, func(t *testing.T) {
+			previous := global
+			t.Cleanup(func() { global = previous })
+			dir := t.TempDir()
+			fixture := filepath.Join(dir, "committed.zfile")
+			payload := unchangedPayload
+			if mode == "dirty" {
+				payload = "committed layer payload with new writes"
+			}
+			require.NoError(t, os.WriteFile(fixture, []byte(payload), 0600))
+			global.overlaybdCommit = filepath.Join(dir, "overlaybd-commit")
+			require.NoError(t, os.WriteFile(global.overlaybdCommit, []byte("#!/bin/sh\nexec cp "+fixture+" \"$5\"\n"), 0755))
+
+			bundle := t.TempDir()
+			for _, name := range []string{ocitemplate.UpperDataName, ocitemplate.UpperIndexName} {
+				require.NoError(t, os.WriteFile(filepath.Join(bundle, name), []byte(unchangedPayload), 0600))
+			}
+			upper := &ocitemplate.RootfsUpper{
+				Repository:       "registry.example/sandbox",
+				VirtualSizeBytes: 1 << 30,
+				Lowers: []ocispec.Descriptor{
+					{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("template"), Size: 10},
+					{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString(unchangedPayload), Size: int64(len(unchangedPayload))},
+				},
+			}
+			layout, _, err := createStagedArtifactLayout(t.TempDir(), "pack-rootfs")
+			require.NoError(t, err)
+			layers, err := packRootfs(context.Background(), bundle, t.TempDir(), layout, upper)
+			require.NoError(t, err)
+			if mode == "unchanged" {
+				require.Equal(t, upper.Lowers, layers)
+			} else {
+				require.Len(t, layers, len(upper.Lowers)+1)
+				require.Equal(t, upper.Lowers, layers[:len(upper.Lowers)])
+				require.Equal(t, digest.FromString(payload), layers[len(upper.Lowers)].Digest)
+			}
+		})
+	}
+}
+
 func TestPackedPairPreservesRootfsParentLayers(t *testing.T) {
 	layout, _, err := createStagedArtifactLayout(t.TempDir(), "incremental")
 	require.NoError(t, err)
