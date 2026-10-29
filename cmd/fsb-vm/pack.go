@@ -1,33 +1,57 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 
+	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/spf13/cobra"
+	"oras.land/oras-go/v2/registry/remote/auth"
 
 	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/ocitemplate"
 )
 
+// Default checkpoint rootfs layer-chain policy: once the chain reaches
+// maxRootfsLayers the newest squashLayers layers are merged into one, keeping
+// the template base layers at the bottom shared across sandboxes.
+const (
+	defaultMaxRootfsLayers = 24
+	defaultSquashLayers    = 16
+)
+
 // pack exports an already captured checkpoint. It never boots a new VM.
 func newPackCommand() *cobra.Command {
 	var bundle, output string
-	cmd := &cobra.Command{Use: "pack", Short: "Package captured rootfs, memory and VM state as an OverlayBD pair", RunE: func(cmd *cobra.Command, _ []string) error { return packCheckpoint(cmd.Context(), bundle, output) }}
+	var maxLayers, squashLayers int
+	cmd := &cobra.Command{Use: "pack", Short: "Package captured rootfs, memory and VM state as an OverlayBD pair", RunE: func(cmd *cobra.Command, _ []string) error {
+		if squashLayers < 2 {
+			return fmt.Errorf("--squash-layers must be at least 2, got %d", squashLayers)
+		}
+		if maxLayers <= squashLayers {
+			return fmt.Errorf("--max-rootfs-layers (%d) must exceed --squash-layers (%d)", maxLayers, squashLayers)
+		}
+		return packCheckpoint(cmd.Context(), bundle, output, maxLayers, squashLayers)
+	}}
 	cmd.Flags().StringVar(&bundle, "bundle-dir", "", "captured checkpoint directory")
 	cmd.Flags().StringVar(&output, "output", "", "local logical output name:tag")
+	cmd.Flags().IntVar(&maxLayers, "max-rootfs-layers", defaultMaxRootfsLayers, "squash the inherited rootfs layer chain once it reaches this many layers")
+	cmd.Flags().IntVar(&squashLayers, "squash-layers", defaultSquashLayers, "number of newest rootfs layers merged per squash")
 	_ = cmd.MarkFlagRequired("bundle-dir")
 	_ = cmd.MarkFlagRequired("output")
 	return cmd
 }
 
-func packCheckpoint(ctx context.Context, bundle, outputName string) (resultErr error) {
+func packCheckpoint(ctx context.Context, bundle, outputName string, maxLayers, squashLayers int) (resultErr error) {
 	releaseBundle, err := lockPackBundle(bundle)
 	if err != nil {
 		return err
@@ -72,7 +96,7 @@ func packCheckpoint(ctx context.Context, bundle, outputName string) (resultErr e
 	if err != nil {
 		return err
 	}
-	rootLayers, err := packRootfs(ctx, bundle, work, layout, upper)
+	rootLayers, err := packRootfs(ctx, bundle, work, layout, upper, maxLayers, squashLayers)
 	if err != nil {
 		return err
 	}
@@ -158,7 +182,7 @@ func validatePackBundle(bundle string) ([]byte, *ocitemplate.RootfsUpper, error)
 	return metadata, upper, nil
 }
 
-func packRootfs(ctx context.Context, bundle, work string, layout artifactLayout, upper *ocitemplate.RootfsUpper) ([]ocispec.Descriptor, error) {
+func packRootfs(ctx context.Context, bundle, work string, layout artifactLayout, upper *ocitemplate.RootfsUpper, maxLayers, squashLayers int) ([]ocispec.Descriptor, error) {
 	compressed := filepath.Join(work, "rootfs.zfile")
 	var rootLayers []ocispec.Descriptor
 	if upper != nil {
@@ -192,6 +216,121 @@ func packRootfs(ctx context.Context, bundle, work string, layout artifactLayout,
 		return nil, err
 	}
 	rootLayers = append(rootLayers, root)
+	return squashRootfsTail(ctx, layout, rootLayers, upper, maxLayers, squashLayers)
+}
 
-	return rootLayers, nil
+// squashRootfsTail bounds the inherited layer chain: once it reaches
+// maxLayers, the newest squashLayers layers are merged into a single layer
+// with overlaybd-merge, so repeated pause/snapshot cycles no longer grow the
+// chain without bound. The bottom layers keep the template base shared
+// across sandboxes via registry blob mounts. Inherited tail blobs are
+// fetched from upper.Repository when absent locally; any failure is an
+// optimization miss that publishes the un-squashed chain without failing
+// the checkpoint.
+func squashRootfsTail(ctx context.Context, layout artifactLayout, rootLayers []ocispec.Descriptor, upper *ocitemplate.RootfsUpper, maxLayers, squashLayers int) ([]ocispec.Descriptor, error) {
+	if upper == nil || len(rootLayers) < maxLayers {
+		return rootLayers, nil
+	}
+	tailCount := squashLayers
+	if tailCount > len(rootLayers)-1 {
+		tailCount = len(rootLayers) - 1
+	}
+	bottom := rootLayers[:len(rootLayers)-tailCount]
+	tail := rootLayers[len(rootLayers)-tailCount:]
+	for _, layer := range tail {
+		if err := ensureLocalBlob(ctx, layout, upper.Repository, layer); err != nil {
+			return rootLayers, squashMiss(err)
+		}
+	}
+	merged := filepath.Join(layout.blobDir(), fmt.Sprintf(".squash-%s.tmp", digest.FromString(filepath.Base(layout.root)).Encoded()))
+	arguments := []string{"-n", strconv.Itoa(tailCount), "-z"}
+	for _, layer := range tail {
+		arguments = append(arguments, layout.blobPath(layer.Digest))
+	}
+	arguments = append(arguments, merged)
+	command := exec.CommandContext(ctx, global.overlaybdMerge, arguments...)
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	command.Stdout = io.Discard
+	defer os.Remove(merged)
+	if err := command.Run(); err != nil {
+		return rootLayers, squashMiss(fmt.Errorf("overlaybd-merge: %w: %s", err, stderr.String()))
+	}
+	desc, err := installCommittedLayer(layout, merged, true)
+	if err != nil {
+		return rootLayers, squashMiss(err)
+	}
+	fmt.Fprintf(os.Stderr, "squashed %d rootfs layers into %s\n", tailCount, desc.Digest)
+	return append(bottom, desc), nil
+}
+
+// squashMiss reports why a squash attempt did not change the published
+// chain: the checkpoint stays valid, only the optimization is missed.
+func squashMiss(err error) error {
+	fmt.Fprintf(os.Stderr, "layer squash skipped: %v\n", err)
+	return nil
+}
+
+// ensureLocalBlob materializes one inherited layer blob in the layout blob
+// store, fetching it from the parent repository when absent (the common
+// case: pack staging never downloads parent layers on its own).
+func ensureLocalBlob(ctx context.Context, layout artifactLayout, repository string, desc ocispec.Descriptor) error {
+	path := layout.blobPath(desc.Digest)
+	if info, err := os.Stat(path); err == nil && info.Size() == desc.Size {
+		return nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	credentials, err := packCredentials()
+	if err != nil {
+		return err
+	}
+	repo, _, err := ocitemplate.Repository(repository+"@"+desc.Digest.String(), credentials, ocitemplate.WithPlainHTTP(global.plainHTTP))
+	if err != nil {
+		return err
+	}
+	stream, err := repo.Blobs().Fetch(ctx, desc)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+	if err := os.MkdirAll(layout.blobDir(), 0o750); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(layout.blobDir(), ".fetch-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	verifier := desc.Digest.Verifier()
+	size, err := io.Copy(io.MultiWriter(temp, verifier), stream)
+	if err == nil {
+		err = temp.Close()
+	}
+	if err == nil && (size != desc.Size || !verifier.Verified()) {
+		err = fmt.Errorf("blob %s: digest or size mismatch", desc.Digest)
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(tempName, path)
+}
+
+// packCredentials resolves pull credentials from the node's overlaybd
+// credential file, the same source the runtime uses for on-demand block
+// reads of the inherited layers.
+func packCredentials() (ocitemplate.CredentialFunc, error) {
+	config, err := readCredentials(global.credFile)
+	if err != nil {
+		return nil, err
+	}
+	return func(_ context.Context, reference string) (auth.Credential, error) {
+		ref, err := parseRegistryReference(reference)
+		if err != nil {
+			return auth.EmptyCredential, err
+		}
+		credential, _, err := credentialFor(config, ref)
+		return credential, err
+	}, nil
 }
