@@ -342,12 +342,13 @@ func minimalImageConfig() []byte {
 
 // assembleManifest builds an OCI image manifest JSON around the given layers
 // and returns the serialized bytes plus the manifest's own descriptor.
-func assembleManifest(configDesc ocispec.Descriptor, layers []ocispec.Descriptor) ([]byte, ocispec.Descriptor, error) {
+func assembleManifest(configDesc ocispec.Descriptor, layers []ocispec.Descriptor, annotations map[string]string) ([]byte, ocispec.Descriptor, error) {
 	manifest := ocispec.Manifest{
-		Versioned: specs.Versioned{SchemaVersion: 2},
-		MediaType: ocispec.MediaTypeImageManifest,
-		Config:    configDesc,
-		Layers:    layers,
+		Versioned:   specs.Versioned{SchemaVersion: 2},
+		MediaType:   ocispec.MediaTypeImageManifest,
+		Config:      configDesc,
+		Layers:      layers,
+		Annotations: annotations,
 	}
 	payload, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {

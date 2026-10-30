@@ -4,6 +4,9 @@
 //	go run ./test/e2e/support/registryseed \
 //	  -from alpine:3.19 -to 127.0.0.1:5000/templates:base \
 //	  -compiled-out /tmp/registry.json
+//
+// Docker-style source short names (alpine, alpine:3.19, team/app) are
+// normalized onto docker.io; the -to destination stays strict.
 package main
 
 import (
@@ -11,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"oras.land/oras-go/v2"
 	"oras.land/oras-go/v2/registry"
@@ -30,6 +34,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: registryseed -from <ref> -to <ref> [-compiled-out <path>]")
 		os.Exit(2)
 	}
+	from = normalizeSourceImage(from)
 	ctx := context.Background()
 	source, err := newRepository(from, false)
 	if err != nil {
@@ -50,7 +55,9 @@ func main() {
 		return
 	}
 	compiled, err := registryconfig.NewCompiled([]registryconfig.Credential{{
-		Host: destRef.Registry, RepositoryPrefix: destRef.Repository,
+		// Host-wide anonymous access: the E2E also publishes checkpoints to
+		// sibling repositories (snapshots), which must resolve the same entry.
+		Host: destRef.Registry,
 	}})
 	if err != nil {
 		fatal(err)
@@ -74,6 +81,23 @@ func newRepository(reference string, plainHTTP bool) (*remote.Repository, error)
 	repo.PlainHTTP = plainHTTP
 	repo.Client = &auth.Client{Cache: auth.NewCache()}
 	return repo, nil
+}
+
+// normalizeSourceImage maps Docker-style short names onto docker.io so
+// oras-go's strict ParseReference accepts them: a first path component that
+// is not a registry host (no dot, no port, not localhost) implies the
+// docker.io domain, and a bare single-component name implies the library
+// namespace.
+func normalizeSourceImage(reference string) string {
+	domain, remainder := "docker.io", reference
+	if index := strings.Index(reference, "/"); index >= 0 {
+		if first := reference[:index]; first == "localhost" || strings.ContainsAny(first, ".:") {
+			return reference
+		}
+	} else {
+		remainder = "library/" + reference
+	}
+	return domain + "/" + remainder
 }
 
 func parseOrFatal(reference string) registry.Reference {

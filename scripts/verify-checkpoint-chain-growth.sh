@@ -14,7 +14,7 @@ command -v docker >/dev/null || { echo "docker is required" >&2; exit 1; }
 
 echo "== simulating $CYCLES pause cycles (max-layers=$MAX_LAYERS squash-layers=$SQUASH) =="
 exec docker run --rm \
-  -v "$REPO":/src -v "${HOME}/go/pkg/mod":/go/pkg/mod \
+  -v "$REPO":/src -v "${HOME:-/root}/go/pkg/mod":/go/pkg/mod \
   -w /src \
   -e GOCACHE=/tmp/gocache -e GOFLAGS=-buildvcs=false \
   -e FSB_CHAIN_CYCLES="$CYCLES" \

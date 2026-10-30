@@ -58,6 +58,14 @@ func captureOCIUpper(ociRoot, sandboxID, staging string) error {
 	for _, lower := range config.Lowers {
 		upper.Lowers = append(upper.Lowers, oci.Descriptor{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.Digest(lower.Digest), Size: lower.Size})
 	}
+	// The template base boundary was recorded at attach time from the
+	// published rootfs manifest; carrying it into the upper keeps the squash
+	// policy from ever merging shared template base layers.
+	state, err := readSandboxBaseLayers(home)
+	if err != nil {
+		return err
+	}
+	upper.BaseLayers = state
 	if err = upper.Validate(); err != nil {
 		return err
 	}
@@ -76,6 +84,23 @@ func captureOCIUpper(ociRoot, sandboxID, staging string) error {
 		return err
 	}
 	return os.WriteFile(filepath.Join(staging, ocitemplate.RootfsUpperName), raw, 0600)
+}
+
+// readSandboxBaseLayers reads the template base boundary fsb-vm persisted in
+// the sandbox state at attach time. Legacy states without the field mean
+// unknown (0).
+func readSandboxBaseLayers(home string) (int, error) {
+	raw, err := os.ReadFile(filepath.Join(home, "state.json"))
+	if err != nil {
+		return 0, err
+	}
+	var state struct {
+		RootfsBaseLayers int `json:"rootfs_base_layers,omitempty"`
+	}
+	if err = json.Unmarshal(raw, &state); err != nil {
+		return 0, fmt.Errorf("parse sandbox state %s: %w", filepath.Join(home, "state.json"), err)
+	}
+	return state.RootfsBaseLayers, nil
 }
 
 // Hybrid uppers have a large sparse address space. Copying only allocated

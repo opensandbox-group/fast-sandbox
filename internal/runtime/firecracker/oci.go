@@ -29,12 +29,17 @@ func validateOCISupport(image string) error {
 	}
 	switch os.Getenv("FAST_SANDBOX_OCI_ENABLED") {
 	case ociEnabled:
-		return nil
 	case "", "false":
 		return fmt.Errorf("%w: OCI templates and checkpoints require FAST_SANDBOX_OCI_ENABLED=true", ErrInvalidConfig)
 	default:
 		return fmt.Errorf("%w: FAST_SANDBOX_OCI_ENABLED must be true or false", ErrInvalidConfig)
 	}
+	switch strings.TrimSpace(os.Getenv("FAST_SANDBOX_OCI_PLAIN_HTTP")) {
+	case "", "false", "0", "true", "1":
+	default:
+		return fmt.Errorf("%w: FAST_SANDBOX_OCI_PLAIN_HTTP must be true or false", ErrInvalidConfig)
+	}
+	return nil
 }
 
 func validateOCIReference(image string) error {

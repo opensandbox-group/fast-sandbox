@@ -112,7 +112,11 @@ func packCheckpoint(ctx context.Context, bundle, outputName string, maxLayers, s
 	if err != nil {
 		return err
 	}
-	if _, err = writeTemplatePair(layout, output, rootLayers, snap, "checkpoint", nil); err != nil {
+	baseLayers := 0
+	if upper != nil {
+		baseLayers = upper.BaseLayers
+	}
+	if _, err = writeTemplatePair(layout, output, rootLayers, snap, "checkpoint", nil, baseLayers); err != nil {
 		return err
 	}
 	if err = publishArtifactLayout(layout, final); err != nil {
@@ -218,23 +222,64 @@ func packRootfs(ctx context.Context, bundle, work string, layout artifactLayout,
 	return squashRootfsTail(ctx, layout, rootLayers, upper, maxLayers, squashLayers)
 }
 
-// squashRootfsTail merges the newest squashLayers layers into one once the
+// squashRootfsTail merges the newest inherited layers into one whenever the
 // chain reaches maxLayers, keeping the template base layers at the bottom.
-// Missing tail blobs are fetched from upper.Repository; any failure skips
-// the squash and publishes the un-squashed chain.
+// Squashing repeats until the published chain is below the bound; any
+// failure skips the squash and publishes the un-squashed chain.
 func squashRootfsTail(ctx context.Context, layout artifactLayout, rootLayers []ocispec.Descriptor, upper *ocitemplate.RootfsUpper, maxLayers, squashLayers int) ([]ocispec.Descriptor, error) {
-	if upper == nil || len(rootLayers) < maxLayers {
+	if upper == nil {
 		return rootLayers, nil
 	}
+	// Credentials are resolved lazily so all-local chains never touch the
+	// credential file, and at most once per squash.
+	var credentials ocitemplate.CredentialFunc
+	resolveCredentials := func() (ocitemplate.CredentialFunc, error) {
+		if credentials == nil {
+			resolved, err := packCredentials()
+			if err != nil {
+				return nil, err
+			}
+			credentials = resolved
+		}
+		return credentials, nil
+	}
+	for len(rootLayers) >= maxLayers {
+		next, err := squashOnce(ctx, layout, rootLayers, upper, resolveCredentials, squashLayers)
+		if err != nil {
+			return rootLayers, squashMiss(err)
+		}
+		if len(next) == len(rootLayers) {
+			// The surviving margin cannot absorb another merge; publish as-is.
+			return rootLayers, nil
+		}
+		rootLayers = next
+	}
+	return rootLayers, nil
+}
+
+// squashOnce merges the newest non-base layers into one. It returns the input
+// unchanged when no merge is possible.
+func squashOnce(ctx context.Context, layout artifactLayout, rootLayers []ocispec.Descriptor, upper *ocitemplate.RootfsUpper, resolveCredentials func() (ocitemplate.CredentialFunc, error), squashLayers int) ([]ocispec.Descriptor, error) {
 	tailCount := squashLayers
 	if tailCount > len(rootLayers)-1 {
 		tailCount = len(rootLayers) - 1
 	}
+	// Never merge into the immutable template base stack: baseLayers is the
+	// boundary recorded at capture time (0 = unknown, legacy chains keep the
+	// positional rule).
+	if base := upper.BaseLayers; base > 0 {
+		if room := len(rootLayers) - base; tailCount > room {
+			tailCount = room
+		}
+	}
+	if tailCount < 2 {
+		return rootLayers, nil
+	}
 	bottom := rootLayers[:len(rootLayers)-tailCount]
 	tail := rootLayers[len(rootLayers)-tailCount:]
 	for _, layer := range tail {
-		if err := ensureLocalBlob(ctx, layout, upper.Repository, layer); err != nil {
-			return rootLayers, squashMiss(err)
+		if err := ensureLocalBlob(ctx, layout, upper.Repository, resolveCredentials, layer); err != nil {
+			return nil, err
 		}
 	}
 	merged := filepath.Join(layout.blobDir(), fmt.Sprintf(".squash-%s.tmp", digest.FromString(filepath.Base(layout.root)).Encoded()))
@@ -249,14 +294,33 @@ func squashRootfsTail(ctx context.Context, layout artifactLayout, rootLayers []o
 	command.Stdout = io.Discard
 	defer os.Remove(merged)
 	if err := command.Run(); err != nil {
-		return rootLayers, squashMiss(fmt.Errorf("overlaybd-merge: %w: %s", err, stderr.String()))
+		return nil, fmt.Errorf("overlaybd-merge: %w: %s", err, stderr.String())
 	}
 	desc, err := installCommittedLayer(layout, merged, true)
 	if err != nil {
-		return rootLayers, squashMiss(err)
+		return nil, err
 	}
 	fmt.Fprintf(os.Stderr, "squashed %d rootfs layers into %s\n", tailCount, desc.Digest)
+	removeSquashedBlobs(layout, tail, bottom, desc)
 	return append(bottom, desc), nil
+}
+
+// removeSquashedBlobs drops the tail blobs the merge absorbed so a standalone
+// pack does not accumulate unreferenced inherited layers in the artifact
+// store. Digests still referenced by the surviving chain are kept.
+func removeSquashedBlobs(layout artifactLayout, tail, bottom []ocispec.Descriptor, merged ocispec.Descriptor) {
+	keep := map[digest.Digest]bool{merged.Digest: true}
+	for _, layer := range bottom {
+		keep[layer.Digest] = true
+	}
+	for _, layer := range tail {
+		if keep[layer.Digest] {
+			continue
+		}
+		if err := os.Remove(layout.blobPath(layer.Digest)); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "warning: remove squashed layer blob %s: %v\n", layer.Digest, err)
+		}
+	}
 }
 
 // squashMiss turns a failed squash into an optimization miss.
@@ -266,15 +330,16 @@ func squashMiss(err error) error {
 }
 
 // ensureLocalBlob fetches one inherited layer blob from the parent
-// repository when it is not already in the layout blob store.
-func ensureLocalBlob(ctx context.Context, layout artifactLayout, repository string, desc ocispec.Descriptor) error {
+// repository when it is not already in the layout blob store. Credentials are
+// resolved through resolveCredentials only when a fetch is actually needed.
+func ensureLocalBlob(ctx context.Context, layout artifactLayout, repository string, resolveCredentials func() (ocitemplate.CredentialFunc, error), desc ocispec.Descriptor) error {
 	path := layout.blobPath(desc.Digest)
 	if info, err := os.Stat(path); err == nil && info.Size() == desc.Size {
 		return nil
 	} else if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	credentials, err := packCredentials()
+	credentials, err := resolveCredentials()
 	if err != nil {
 		return err
 	}
@@ -298,14 +363,15 @@ func ensureLocalBlob(ctx context.Context, layout artifactLayout, repository stri
 	defer os.Remove(tempName)
 	verifier := desc.Digest.Verifier()
 	size, err := io.Copy(io.MultiWriter(temp, verifier), stream)
-	if err == nil {
-		err = temp.Close()
-	}
-	if err == nil && (size != desc.Size || !verifier.Verified()) {
-		err = fmt.Errorf("blob %s: digest or size mismatch", desc.Digest)
-	}
 	if err != nil {
+		_ = temp.Close()
 		return err
+	}
+	if err = temp.Close(); err != nil {
+		return err
+	}
+	if size != desc.Size || !verifier.Verified() {
+		return fmt.Errorf("blob %s: digest or size mismatch", desc.Digest)
 	}
 	return os.Rename(tempName, path)
 }

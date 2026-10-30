@@ -36,25 +36,39 @@ func TestPackRejectsTruncatedCheckpointBeforeKernelResources(t *testing.T) {
 }
 
 func TestPackedPairPreservesRootfsParentLayers(t *testing.T) {
-	layout, _, err := createStagedArtifactLayout(t.TempDir(), "incremental")
-	require.NoError(t, err)
-	parent := ocispec.Descriptor{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("parent"), Size: 100}
-	delta := ocispec.Descriptor{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("delta"), Size: 20}
-	snap := ocispec.Descriptor{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("memory"), Size: 50}
-	names, err := parseOutput("snapshot:test")
-	require.NoError(t, err)
-	_, err = writeTemplatePair(layout, names, []ocispec.Descriptor{parent, delta}, snap, "checkpoint", nil)
-	require.NoError(t, err)
-	var index layoutIndex
-	raw, err := os.ReadFile(filepath.Join(layout.root, "manifest/index.json"))
-	require.NoError(t, err)
-	require.NoError(t, json.Unmarshal(raw, &index))
-	require.Len(t, index.Images, 2)
-	raw, err = os.ReadFile(layout.manifestPath(index.Images[0].ManifestFile))
-	require.NoError(t, err)
-	var manifest ocispec.Manifest
-	require.NoError(t, json.Unmarshal(raw, &manifest))
-	require.Equal(t, []ocispec.Descriptor{parent, delta}, manifest.Layers)
+	for _, baseLayers := range []int{0, 5} {
+		t.Run(fmt.Sprintf("base=%d", baseLayers), func(t *testing.T) {
+			layout, _, err := createStagedArtifactLayout(t.TempDir(), "incremental")
+			require.NoError(t, err)
+			parent := ocispec.Descriptor{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("parent"), Size: 100}
+			delta := ocispec.Descriptor{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("delta"), Size: 20}
+			snap := ocispec.Descriptor{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("memory"), Size: 50}
+			names, err := parseOutput("snapshot:test")
+			require.NoError(t, err)
+			_, err = writeTemplatePair(layout, names, []ocispec.Descriptor{parent, delta}, snap, "checkpoint", nil, baseLayers)
+			require.NoError(t, err)
+			var index layoutIndex
+			raw, err := os.ReadFile(filepath.Join(layout.root, "manifest/index.json"))
+			require.NoError(t, err)
+			require.NoError(t, json.Unmarshal(raw, &index))
+			require.Len(t, index.Images, 2)
+			raw, err = os.ReadFile(layout.manifestPath(index.Images[0].ManifestFile))
+			require.NoError(t, err)
+			var manifest ocispec.Manifest
+			require.NoError(t, json.Unmarshal(raw, &manifest))
+			require.Equal(t, []ocispec.Descriptor{parent, delta}, manifest.Layers)
+			if baseLayers > 0 {
+				require.Equal(t, strconv.Itoa(baseLayers), manifest.Annotations[ocitemplate.AnnotationRootfsBaseLayers])
+			} else {
+				require.NotContains(t, manifest.Annotations, ocitemplate.AnnotationRootfsBaseLayers)
+			}
+			raw, err = os.ReadFile(layout.manifestPath(index.Images[1].ManifestFile))
+			require.NoError(t, err)
+			var snapfilesManifest ocispec.Manifest
+			require.NoError(t, json.Unmarshal(raw, &snapfilesManifest))
+			require.NotContains(t, snapfilesManifest.Annotations, ocitemplate.AnnotationRootfsBaseLayers, "only the rootfs manifest carries the base boundary")
+		})
+	}
 }
 
 func TestRecoverPackReleasesOnlyOwnedDeviceBeforeRemovingFiles(t *testing.T) {
@@ -492,4 +506,96 @@ func TestPackRootfsSquashFallsBackOnMergeFailure(t *testing.T) {
 	layers, err := packRootfs(context.Background(), bundle, t.TempDir(), layout, squashTestUpper(chain), 3, 2)
 	require.NoError(t, err)
 	require.Len(t, layers, len(chain)+1, "un-squashed chain is published when merge fails")
+}
+
+// TestPackRootfsSquashPreservesBaseLayers clamps the merge tail above the
+// inherited template base boundary and drops the blobs the merge absorbed.
+func TestPackRootfsSquashPreservesBaseLayers(t *testing.T) {
+	previous := global
+	t.Cleanup(func() { global = previous })
+	dir := t.TempDir()
+	squashTestStubs(t, dir)
+	global.overlaybdCommit = filepath.Join(dir, "overlaybd-commit")
+	global.overlaybdMerge = filepath.Join(dir, "overlaybd-merge")
+
+	base := []ocispec.Descriptor{
+		{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("base0"), Size: 4},
+		{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("base1"), Size: 4},
+		{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("base2"), Size: 4},
+	}
+	checkpointLayers := []ocispec.Descriptor{
+		{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("delta0"), Size: 4},
+		{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("delta1"), Size: 4},
+	}
+	chain := append(append([]ocispec.Descriptor{}, base...), checkpointLayers...)
+	layout, _, err := createStagedArtifactLayout(t.TempDir(), "bounded-base")
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(layout.blobDir(), 0o750))
+	for _, layer := range chain {
+		// Blob contents are irrelevant to the merge stub, but sizes must
+		// match the descriptors or ensureLocalBlob would try to fetch.
+		require.NoError(t, os.WriteFile(layout.blobPath(layer.Digest), []byte("data"), 0o640))
+	}
+	upper := squashTestUpper(chain)
+	upper.BaseLayers = len(base)
+	bundle := t.TempDir()
+	for _, name := range []string{ocitemplate.UpperDataName, ocitemplate.UpperIndexName} {
+		require.NoError(t, os.WriteFile(filepath.Join(bundle, name), []byte("payload"), 0600))
+	}
+	// 5 inherited layers + the new root reach the bound of 6; the positional
+	// tail of 4 would reach into the base, the clamp keeps it to 3.
+	layers, err := packRootfs(context.Background(), bundle, t.TempDir(), layout, upper, 6, 4)
+	require.NoError(t, err)
+	require.Len(t, layers, len(base)+1)
+	require.Equal(t, base, layers[:len(base)], "template base layers must survive untouched")
+	for _, layer := range base {
+		require.FileExists(t, layout.blobPath(layer.Digest), "base blobs stay in the store")
+	}
+	for _, layer := range checkpointLayers {
+		require.NoFileExists(t, layout.blobPath(layer.Digest), "absorbed checkpoint blobs are cleaned up")
+	}
+}
+
+// TestPackRootfsSquashRecoversOvershootChain collapses a chain that already
+// exceeds the bound (after prior squash misses) back under it in one pack.
+func TestPackRootfsSquashRecoversOvershootChain(t *testing.T) {
+	maxLayers, squashCount := 24, 16
+	previous := global
+	t.Cleanup(func() { global = previous })
+	dir := t.TempDir()
+	squashTestStubs(t, dir)
+	global.overlaybdCommit = filepath.Join(dir, "overlaybd-commit")
+	global.overlaybdMerge = filepath.Join(dir, "overlaybd-merge")
+
+	chain := make([]ocispec.Descriptor, 0, 40)
+	for index := 0; index < 40; index++ {
+		chain = append(chain, ocispec.Descriptor{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString(fmt.Sprintf("overshoot-%d", index)), Size: 4})
+	}
+	layout, _, err := createStagedArtifactLayout(t.TempDir(), "overshoot")
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(layout.blobDir(), 0o750))
+	for _, layer := range chain {
+		require.NoError(t, os.WriteFile(layout.blobPath(layer.Digest), []byte("data"), 0o640))
+	}
+	bundle := t.TempDir()
+	for _, name := range []string{ocitemplate.UpperDataName, ocitemplate.UpperIndexName} {
+		require.NoError(t, os.WriteFile(filepath.Join(bundle, name), []byte("payload"), 0600))
+	}
+	layers, err := packRootfs(context.Background(), bundle, t.TempDir(), layout, squashTestUpper(chain), maxLayers, squashCount)
+	require.NoError(t, err)
+	// 40 inherited + the new root: 41 -> 26 -> 11, below the bound in one pack.
+	require.Less(t, len(layers), maxLayers)
+	require.Equal(t, 11, len(layers))
+	require.Equal(t, chain[:10], layers[:10], "repeated squashes keep the surviving bottom layers")
+	// Only the surviving chain's blobs remain in the store.
+	kept := map[digest.Digest]bool{}
+	for _, layer := range layers {
+		kept[layer.Digest] = true
+	}
+	entries, err := os.ReadDir(layout.blobDir())
+	require.NoError(t, err)
+	require.Len(t, entries, len(layers), "absorbed blobs are cleaned up")
+	for _, entry := range entries {
+		require.Regexp(t, `^[0-9a-f]{64}$`, entry.Name())
+	}
 }

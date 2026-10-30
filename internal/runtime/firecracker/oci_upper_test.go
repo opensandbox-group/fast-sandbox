@@ -36,12 +36,17 @@ func TestCaptureOCIUpperPreservesSparsePrivateChangesAndParent(t *testing.T) {
 	require.NoError(t, err)
 	path := filepath.Join(home, "rootfs.config.v1.json")
 	require.NoError(t, os.WriteFile(path, raw, 0600))
+	state := map[string]any{"format_version": 2, "sandbox_id": "test", "rootfs_base_layers": 1}
+	raw, err = json.Marshal(state)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(home, "state.json"), raw, 0600))
 	require.NoError(t, captureOCIUpper(filepath.Join(root, "oci"), "test", staging))
 	upper, err := ocitemplate.ReadRootfsUpper(staging)
 	require.NoError(t, err)
 	require.Equal(t, "r.example/templates/base", upper.Repository)
 	require.Equal(t, int64(1<<30), upper.VirtualSizeBytes)
 	require.Len(t, upper.Lowers, 1)
+	require.Equal(t, 1, upper.BaseLayers)
 	// A failed upload can leave the original VM running without changing its
 	// frozen capture: later guest writes cannot leak into that checkpoint.
 	require.NoError(t, os.WriteFile(index, []byte("later mapping"), 0600))

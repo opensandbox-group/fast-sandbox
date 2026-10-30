@@ -9,10 +9,11 @@
 # is cleaned up on exit.
 #
 # Overrides: FC_CHAIN_CYCLES (100), CHAIN_SOURCE_IMAGE (alpine:3.19),
-# REGISTRY_IMAGE (registry:2), REGISTRY_PORT (5000), WORK, and the
-# Firecracker assets FC_BINARY/FC_JAILER/FC_KERNEL/FC_ROOTFS. Tools come
-# from OCI_TOOLS_DIR or OCI_TOOLS_IMAGE; without either, overlaybd is built
-# from source (~10-20 min, first run only).
+# REGISTRY_IMAGE (registry:2), REGISTRY_PORT (5000), WORK, the
+# Firecracker assets FC_BINARY/FC_JAILER/FC_KERNEL/FC_ROOTFS, and CONVERTOR
+# (overlaybd userspace convertor; probed at the usual install paths when
+# unset). Tools come from OCI_TOOLS_DIR or OCI_TOOLS_IMAGE; without either,
+# overlaybd is built from source (~10-20 min, first run only).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -54,6 +55,9 @@ cleanup() {
     ip -o link show master fsb0 2>/dev/null | awk -F: '{print $2}' | tr -d ' ' | xargs -r -n1 ip link del 2>/dev/null || true
 }
 trap cleanup EXIT
+# Route signals through the EXIT trap so Ctrl-C and CI timeouts still clean up.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # --- 1. build fsb-vm and put it on PATH --------------------------------------
 log "building fsb-vm"
@@ -72,9 +76,9 @@ elif [[ -n "${OCI_TOOLS_IMAGE:-}" ]]; then
     mkdir -p "$WORK/oci-tools"
     docker cp "$cid":/. "$WORK/oci-tools/" >/dev/null
     docker rm "$cid" >/dev/null
-    package_dir="$(dirname "$(find "$WORK/oci-tools" -name SHA256SUMS | head -1)")"
-    [[ -n "$package_dir" ]] || fail "no packaged tools (SHA256SUMS) in $OCI_TOOLS_IMAGE"
-    "$REPO_ROOT/build/oci/install-tools.sh" "$package_dir" "$OCIToolsDir"
+    sha_sums="$(find "$WORK/oci-tools" -name SHA256SUMS -print -quit)"
+    [[ -n "$sha_sums" ]] || fail "no packaged tools (SHA256SUMS) in $OCI_TOOLS_IMAGE"
+    "$REPO_ROOT/build/oci/install-tools.sh" "$(dirname "$sha_sums")" "$OCIToolsDir"
 else
     log "building overlaybd tools from source (first run takes ~10-20 minutes; set OCI_TOOLS_DIR to skip)"
     mkdir -p "$WORK/overlaybd-src" "$WORK/oci-tools"
@@ -123,16 +127,14 @@ done
 curl -fsS "http://${REGISTRY}/v2/" >/dev/null || fail "local registry never became ready"
 
 log "seeding $CHAIN_SOURCE_IMAGE into the local registry"
-go run ./test/e2e/support/registryseed \
+(cd "$REPO_ROOT" && go run ./test/e2e/support/registryseed \
     -from "$CHAIN_SOURCE_IMAGE" \
     -to "${REGISTRY}/${TEMPLATE_REPO}:base" \
-    -compiled-out "$RUN_DIR/registry.json"
+    -compiled-out "$RUN_DIR/registry.json")
 export FAST_SANDBOX_REGISTRY_CONFIG_PATH="$RUN_DIR/registry.json"
 export FAST_SANDBOX_OCI_PLAIN_HTTP=1
 export FAST_SANDBOX_OCI_SNAPSHOT_REPOSITORY="${REGISTRY}/${SNAPSHOT_REPO}"
 
-# fsb-vm credential file: an anonymous entry for the loopback registry, both
-# for the template repository and the snapshot repository.
 # fsb-vm credential file: an anonymous entry for the loopback registry, both
 # for the template repository and the snapshot repository (base64 ":").
 printf '{"auths":{"%s/templates":{"auth":"Og=="},"%s/snapshots":{"auth":"Og=="}}}\n' \
@@ -140,11 +142,31 @@ printf '{"auths":{"%s/templates":{"auth":"Og=="},"%s/snapshots":{"auth":"Og=="}}
 pass "registry ready and credentials staged"
 
 # --- 5. build the OCI template pair (real cold boot + full snapshot) ---------
+convertor="${CONVERTOR:-}"
+if [[ -z "$convertor" ]]; then
+    for candidate in "$OCIToolsDir/current/bin/convertor" /opt/overlaybd/snapshotter/convertor /usr/local/bin/convertor; do
+        if [[ -x "$candidate" ]]; then
+            convertor="$candidate"
+            break
+        fi
+    done
+fi
+[[ -n "$convertor" && -x "$convertor" ]] || fail "overlaybd convertor binary not found (set CONVERTOR); a plain OCI source needs it to build the template"
+tools_bin="$OCIToolsDir/current/bin"
 if curl -fsS "http://${REGISTRY}/v2/${TEMPLATE_REPO}/manifests/tpl_snapfiles" >/dev/null 2>&1; then
     log "template pair already present, skipping build"
 else
+    rm -rf "$WORK/artifacts/${TEMPLATE_REPO}_tpl"
     log "building the OCI template pair from $CHAIN_SOURCE_IMAGE (one cold boot)"
     fsb-vm build --plain-http \
+        --firecracker "$FC_BINARY" \
+        --ublkd-socket "$OCISocketDir/ublkd.sock" \
+        --cred-file "$OCISocketDir/cred.json" \
+        --overlaybd-create "$tools_bin/overlaybd-create" \
+        --overlaybd-commit "$tools_bin/overlaybd-commit" \
+        --overlaybd-merge "$tools_bin/overlaybd-merge" \
+        --overlaybd-resize "$tools_bin/overlaybd-resize" \
+        --overlaybd-convertor "$convertor" \
         --source "oci://${REGISTRY}/${TEMPLATE_REPO}:base" \
         --output "templates:tpl" \
         --kernel "$FC_KERNEL" \
@@ -162,6 +184,7 @@ pass "template pair published at $TEMPLATE_REF"
 
 # --- 6. the pause/publish/restore chain ---------------------------------------
 log "running $CYCLES pause/publish/restore cycles (chain bound asserted every cycle)"
+# A failing go test must not abort the script before the summary diagnostics.
 (cd "$REPO_ROOT" && env \
     FC_BINARY="${FC_BINARY}" FC_JAILER="${FC_JAILER:-}" FC_KERNEL="$FC_KERNEL" \
     FC_ROOTFS="${FC_ROOTFS:-}" FC_STATE_ROOT="$WORK/state" \
@@ -170,7 +193,7 @@ log "running $CYCLES pause/publish/restore cycles (chain bound asserted every cy
     PATH="$BIN_DIR:$PATH" \
     go test -tags firecracker -count=1 -v -timeout 24h \
     -run '^TestFirecrackerOCICheckpointChainE2E$' \
-    ./internal/runtime/firecracker/) 2>&1 | tee "$RUN_DIR/chain-test.log"
+    ./internal/runtime/firecracker/) 2>&1 | tee "$RUN_DIR/chain-test.log" || true
 
 echo
 echo "== per-cycle chain length and stage timings =="
