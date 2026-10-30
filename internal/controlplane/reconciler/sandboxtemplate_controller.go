@@ -30,6 +30,7 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifactstore"
 	"fast-sandbox/internal/ocitemplate"
+	"fast-sandbox/internal/registryconfig"
 )
 
 const (
@@ -87,6 +88,19 @@ const (
 const (
 	sandboxTemplatePublishSecretDir = "/etc/fast-sandbox/publish-credentials"
 	publishCredentialsDirEnv        = "SANDBOX_TEMPLATE_PUBLISH_SECRET_DIR"
+)
+
+// Registry config mount for the build Pod. The builder pulls the source and
+// execd images itself through go-containerregistry, which authenticates
+// anonymously unless credentials are supplied; a private registry then answers
+// 401. The controller compiles the namespace's fast-sandbox-registry config
+// into a per-template Secret and mounts it here, and the builder resolves pull
+// credentials from it (registryConfigDirEnv matches the fastlet wiring so the
+// builder reuses the same env/path).
+const (
+	sandboxTemplateRegistryConfigDir = "/etc/fast-sandbox/registry"
+	registryConfigDirEnv             = "FAST_SANDBOX_REGISTRY_CONFIG_PATH"
+	templateRegistryConfigVolumeName = "registry-config"
 )
 
 // SandboxTemplateReconciler reconciles SandboxTemplate resources by driving
@@ -639,6 +653,10 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 			}},
 		})
 	}
+	env, volumeMounts, volumes, registryCompiled, registrySecretName, err := r.applyRegistryAuthMount(ctx, template, env, volumeMounts, volumes)
+	if err != nil {
+		return err
+	}
 	if endpoint != "" {
 		env = append(env, corev1.EnvVar{Name: "AWS_ENDPOINT_URL", Value: endpoint})
 	}
@@ -731,10 +749,108 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 	if err := ctrl.SetControllerReference(template, pod, r.Scheme); err != nil {
 		return err
 	}
+	// Persist the compiled registry Secret before creating the Pod so the mount
+	// resolves. It is owner-ref'd to the template, so it is garbage-collected
+	// with the template alongside the build Pod.
+	if len(registryCompiled.Credentials) > 0 {
+		if err := r.persistTemplateRegistrySecret(ctx, template, registrySecretName, registryCompiled); err != nil {
+			return err
+		}
+	}
 	if err := r.Create(ctx, pod); err != nil && !apierrors.IsAlreadyExists(err) {
 		return err
 	}
 	return nil
+}
+
+// applyRegistryAuthMount compiles the namespace's registry configuration
+// (same source the fastlet uses) and, when it yields any credentials, appends
+// the env/volume/volumeMount triple so the builder can authenticate private
+// image pulls. An empty set leaves the build on anonymous pulls (public
+// images still build), so no Secret/mount is added. Split out of
+// createBuildPod to keep that function's branching within the lint budget.
+func (r *SandboxTemplateReconciler) applyRegistryAuthMount(
+	ctx context.Context,
+	template *apiv1alpha2.SandboxTemplate,
+	env []corev1.EnvVar,
+	volumeMounts []corev1.VolumeMount,
+	volumes []corev1.Volume,
+) ([]corev1.EnvVar, []corev1.VolumeMount, []corev1.Volume, registryconfig.Compiled, string, error) {
+	registryCompiled, err := compileRegistryConfig(ctx, r.Client, template.Namespace)
+	if err != nil {
+		return nil, nil, nil, registryconfig.Compiled{}, "", err
+	}
+	// Stable per-template name (not buildPodName, which carries the
+	// generation): a rotated registry Secret must not accumulate one copy per
+	// rebuild.
+	registrySecretName := templateRegistrySecretName(template)
+	if len(registryCompiled.Credentials) == 0 {
+		return env, volumeMounts, volumes, registryCompiled, registrySecretName, nil
+	}
+	env = append(env, corev1.EnvVar{Name: registryConfigDirEnv, Value: registryconfig.MountPath})
+	volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		Name: templateRegistryConfigVolumeName, MountPath: sandboxTemplateRegistryConfigDir, ReadOnly: true,
+	})
+	volumes = append(volumes, corev1.Volume{
+		Name: templateRegistryConfigVolumeName,
+		VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+			SecretName: registrySecretName,
+		}},
+	})
+	return env, volumeMounts, volumes, registryCompiled, registrySecretName, nil
+}
+
+// persistTemplateRegistrySecret writes the compiled registry.json into a
+// per-template Opaque Secret the build Pod mounts, modeled on the pool
+// reconciler's persistRegistrySecret: it creates the Secret or, when it already
+// exists with different content, rewrites it. The Secret is owner-ref'd to the
+// template so it is garbage-collected with the template.
+func (r *SandboxTemplateReconciler) persistTemplateRegistrySecret(
+	ctx context.Context,
+	template *apiv1alpha2.SandboxTemplate,
+	name string,
+	compiled registryconfig.Compiled,
+) error {
+	content, err := compiled.Marshal()
+	if err != nil {
+		return err
+	}
+	key := client.ObjectKey{Namespace: template.Namespace, Name: name}
+	var secret corev1.Secret
+	err = r.Get(ctx, key, &secret)
+	if apierrors.IsNotFound(err) {
+		secret = corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      key.Name,
+				Namespace: key.Namespace,
+				Labels: map[string]string{
+					sandboxTemplateBuildLabel:     templateLabelValue(template.Name),
+					sandboxTemplateNamespaceLabel: template.Namespace,
+				},
+			},
+			Type: corev1.SecretTypeOpaque,
+			Data: map[string][]byte{registryconfig.SecretKey: content},
+		}
+		if err := ctrl.SetControllerReference(template, &secret, r.Scheme); err != nil {
+			return err
+		}
+		if err := r.Create(ctx, &secret); err != nil && !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if secret.Type == corev1.SecretTypeOpaque && string(secret.Data[registryconfig.SecretKey]) == string(content) {
+		return nil
+	}
+	secret.Type = corev1.SecretTypeOpaque
+	if secret.Data == nil {
+		secret.Data = make(map[string][]byte)
+	}
+	secret.Data[registryconfig.SecretKey] = content
+	return r.Update(ctx, &secret)
 }
 
 // ensureBuilderRBAC converges the builder ServiceAccount, Role and
@@ -953,6 +1069,16 @@ func templateLabelValue(name string) string {
 	}
 	sum := sha256.Sum256([]byte(name))
 	return fmt.Sprintf("%s-%x", name[:40], sum[:8])
+}
+
+// templateRegistrySecretName derives the per-template registry Secret name.
+// Unlike buildPodName, this intentionally omits the generation: the Secret
+// holds the current compiled registry config and is rewritten in place
+// (persistTemplateRegistrySecret) across rebuilds, so it must not accumulate
+// a new name — and a new orphaned Secret with rotated credentials — on every
+// generation bump.
+func templateRegistrySecretName(template *apiv1alpha2.SandboxTemplate) string {
+	return templateLabelValue(template.Name) + "-registry"
 }
 
 // suffixIfNotEmpty returns ": <suffix>" when suffix is non-empty, or "".

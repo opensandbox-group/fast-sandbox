@@ -169,7 +169,15 @@ func prepareOCISource(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 		return "", "", err
 	}
 	if spec.Execd != "" {
-		if err := extractExecd(ctx, spec.Execd, filepath.Join(workdir, "execd-root")); err != nil {
+		execdRef, err := name.ParseReference(spec.Execd)
+		if err != nil {
+			return "", "", fmt.Errorf("parse execd image %q: %w", spec.Execd, err)
+		}
+		execdAuth, err := authn.DefaultKeychain.Resolve(execdRef.Context())
+		if err != nil {
+			return "", "", fmt.Errorf("resolve execd credentials %q: %w", spec.Execd, err)
+		}
+		if err := extractExecd(ctx, spec.Execd, filepath.Join(workdir, "execd-root"), execdAuth); err != nil {
 			return "", "", err
 		}
 	}
