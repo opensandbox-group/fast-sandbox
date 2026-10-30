@@ -105,6 +105,14 @@ type Driver struct {
 	// fcVersion caches the last successfully resolved local Firecracker
 	// binary version (restore admission); unresolved lookups are retried.
 	fcVersion string
+	// metadataPublication tracks in-flight VM discovery payload writes
+	// (metadata.go): the payload goroutine never blocks EnsureSandbox, and
+	// tests wait on it to observe the record after provisioning returns.
+	metadataPublication sync.WaitGroup
+	// writeVMMetadataPayload emits the discovery record payload; stubbed in
+	// tests to hold publication mid-flight and prove EnsureSandbox does not
+	// wait for it.
+	writeVMMetadataPayload func(file *os.File, payload []byte) error
 }
 
 // defaultImageGCInterval bounds the image cache by usage without coupling GC
@@ -122,9 +130,10 @@ func New(profile runtimecatalog.RuntimeProfile) (*Driver, error) {
 		newClient: NewClient, stat: os.Stat, killProcess: killPID, probeProcess: pidAlive,
 		alignJailKVM: defaultAlignJailKVM,
 		waitSocket:   waitForAPISocket, processes: make(map[string]Process),
-		checkStorage:         checkStateRootStorage,
-		imageGCInterval:      defaultImageGCInterval,
-		imageCacheLimitBytes: defaultImageCacheLimitBytes,
+		checkStorage:           checkStateRootStorage,
+		writeVMMetadataPayload: writeVMMetadataPayload,
+		imageGCInterval:        defaultImageGCInterval,
+		imageCacheLimitBytes:   defaultImageCacheLimitBytes,
 	}, nil
 }
 

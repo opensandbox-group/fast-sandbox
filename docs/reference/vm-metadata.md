@@ -40,14 +40,37 @@ The file name is always `fast-sandbox.json`, inside the VM directory. In both mo
 2. Read `fast-sandbox.json` and parse the JSON.
 3. A missing or unparseable file means **not ready yet**: skip the directory
    and retry on the next periodic scan. This is never fatal and never
-   blacklists the VM — a short JSON prefix is possible by design (single
-   `write()` without temp-file rename) and heals on the next write tick.
-4. A directory disappearing is the **stream end** signal; keep a grace window
+   blacklists the VM. Publication is asynchronous: the record's file is
+   created before provisioning returns and the payload is written shortly
+   after, so an empty or short JSON prefix is possible by design (single
+   `write()` without temp-file rename) and recovers on a later scan once the
+   payload lands.
+4. A parse failure that persists across scans is a **permanently unusable
+   record**: the payload write failed or was interrupted (for example by a
+   process restart or a full disk), and there is no write tick or automatic
+   repair. This is accepted — that VM's console cannot be collected until
+   teardown; the VM itself is unaffected. Consumers may give up collecting
+   such a directory after a bounded number of retries.
+5. A directory disappearing is the **stream end** signal; keep a grace window
    so a sandbox that moves back to the node resumes its stream instead of
    finalizing.
-5. `placementAttempt` lets you tell a stale jail from the new one when both
+6. `placementAttempt` lets you tell a stale jail from the new one when both
    exist for the same truncated UID prefix.
 
 ## Writer semantics (reference)
 
-The driver composes the JSON in memory and emits it with a single `write()`; no fsync. The write happens at the end of a successful create and never fails provisioning (a write error is logged; that VM's console is not collectable). The file is written once and never modified afterwards. Teardown removes the whole jail/sandbox directory — metadata and log together — so a consumer never observes a deleted log with the metadata still present.
+The driver composes the JSON in memory, creates the record file on the create
+path (`O_EXCL`, write-once: an existing record is never rewritten), and
+writes the payload with a single `write()` from a background goroutine — no
+fsync, no temp-file rename. The payload write never blocks or fails
+provisioning; a create or write error (e.g. disk full) is logged, and that
+VM's console is not collectable. A failed or interrupted write can leave an
+empty or short record that never heals (see the consumer contract above).
+
+Teardown removes the whole jail/sandbox directory with a recursive
+`RemoveAll`. This is **not atomic**: individual entries are unlinked one by
+one, so a consumer racing teardown can successfully read the metadata and
+still get `ENOENT` when it opens the log, or observe the metadata file
+disappear between its scan and its read. Consumers must tolerate any entry
+vanishing between scan, metadata read, and log open, and treat it as the
+stream end — the writer makes no atomic-visibility promise.
