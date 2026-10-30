@@ -106,6 +106,11 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 		m.mu.Unlock()
 		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, failure)
 	}
+	if m.requiresStrictActionHandling(metadata.Config.ActionsAPIVersion) {
+		m.mu.Unlock()
+		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletError(fastletapi.ErrorSnapshotUnsupported,
+			"Actions v2 management does not support snapshots in this release", false))
+	}
 	if metadata.Phase != sandboxStateRunning {
 		m.mu.Unlock()
 		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletError(fastletapi.ErrorRuntimeUnavailable,

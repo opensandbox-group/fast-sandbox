@@ -46,13 +46,13 @@ func (m *SandboxManager) InvokeHandler(ctx context.Context, req *fastletapi.Invo
 		return &fastletapi.InvokeHandlerResponse{Error: failure}, failure
 	}
 	actionManager := m.actionManager
-	sandboxUID := req.Identity.SandboxUID
+	attachment := actionAttachment(metadata)
 	m.mu.Unlock()
 	if actionManager == nil {
 		failure := fastletError(fastletapi.ErrorActionUnavailable, "Fastlet has no Sandbox Action configuration", false)
 		return &fastletapi.InvokeHandlerResponse{Error: failure}, failure
 	}
-	status, body, relayErr := actionManager.RelayHandler(ctx, sandboxUID, req.Handler, req.Method, req.Path, req.Payload)
+	status, body, relayErr := actionManager.RelayHandler(ctx, attachment, req.Handler, req.Method, req.Path, req.Payload)
 	if errors.Is(relayErr, fastletaction.ErrUnknownHandler) {
 		failure := fastletError(fastletapi.ErrorNotFound, fmt.Sprintf("Action Handler %q is not declared", req.Handler), false)
 		return &fastletapi.InvokeHandlerResponse{Error: failure}, failure

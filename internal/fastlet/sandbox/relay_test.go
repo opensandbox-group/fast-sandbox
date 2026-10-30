@@ -2,6 +2,8 @@ package sandbox
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -78,6 +80,47 @@ func TestInvokeHandlerUnreachableHandlerSurfacesError(t *testing.T) {
 	require.NotNil(t, response.Error)
 	require.Equal(t, fastletapi.ErrorActionUnavailable, response.Error.Code)
 	require.Error(t, relayErr)
+}
+
+func TestInvokeHandlerCarriesValidatedFullOwnerToActionsV2Relay(t *testing.T) {
+	var seenURI string
+	var seenOwner actionapi.Owner
+	handlerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenURI = r.URL.RequestURI()
+		decoded, err := base64.RawURLEncoding.DecodeString(r.Header.Get(actionapi.HeaderOwner))
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(decoded, &seenOwner))
+		require.Equal(t, "uid-a", r.Header.Get(actionapi.HeaderSandboxUID))
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(handlerServer.Close)
+	port := int32(handlerServer.Listener.Addr().(*net.TCPAddr).Port)
+	strictHandler := apiv1alpha2.ActionHandler{Name: "egress", TargetHTTPPort: port}
+	actionManager, err := fastletaction.NewManagerWithAPIVersion([]apiv1alpha2.ActionHandler{strictHandler}, actionapi.APIVersionV2, nil)
+	require.NoError(t, err)
+	manager, err := NewSandboxManagerWithConfig(newAdmissionRuntime(), SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-a", ActionManager: actionManager,
+	})
+	require.NoError(t, err)
+	identity := relayIdentity("uid-a")
+	metadata := &SandboxMetadata{Config: fastletapi.RuntimeSandboxConfig{
+		Identity: identity, ActionsAPIVersion: actionapi.APIVersionV2,
+	}, Phase: sandboxStateRunning, AppliedGeneration: 1}
+	manager.sandboxes["uid-a"] = metadata
+	attachment := actionAttachment(metadata)
+	require.NoError(t, actionManager.RegisterDesired(attachment, 1, nil))
+
+	response, err := manager.InvokeHandler(context.Background(), &fastletapi.InvokeHandlerRequest{
+		Identity: identity, Handler: "egress", Method: http.MethodPut, Path: "/vault/uid-a", Payload: []byte(`{"revision":1}`),
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(http.StatusOK), response.Status)
+	require.Equal(t, "/_fastlet/v2/relay/vault/uid-a", seenURI)
+	require.Equal(t, actionapi.Owner{
+		SandboxUID: identity.SandboxUID, FastletPodUID: identity.FastletPodUID,
+		RuntimeInstanceID: identity.RuntimeInstanceID, InstanceGeneration: identity.InstanceGeneration,
+		AssignmentAttempt: identity.AssignmentAttempt, RouteGeneration: identity.RouteGeneration, AttachmentID: actionAttachmentID(metadata),
+	}, seenOwner)
 }
 
 func TestInvokeHandlerFencesAndValidation(t *testing.T) {

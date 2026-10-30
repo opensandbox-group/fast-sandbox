@@ -250,7 +250,7 @@ func loadFastletStartupSettings() (fastletStartupSettings, error) {
 	if err != nil {
 		return fastletStartupSettings{}, fmt.Errorf("parse action handlers: %w", err)
 	}
-	actionManager, err := fastletaction.NewManager(actionHandlers, nil)
+	actionManager, err := fastletaction.NewManagerWithAPIVersion(actionHandlers, runtimePlan.EffectiveActionsAPIVersion(), nil)
 	if err != nil {
 		return fastletStartupSettings{}, fmt.Errorf("configure action handlers: %w", err)
 	}

@@ -33,6 +33,7 @@ func TestCreateRequestSerializesIdentityDesiredSpecAndRequestMetadataOnce(t *tes
 
 	desired := object["sandbox"].(map[string]any)
 	require.Equal(t, "alpine:latest", desired["image"])
+	require.NotContains(t, desired, "actionsApiVersion", "caller-owned Create input cannot select the Actions protocol")
 	require.NotContains(t, desired, "cpu")
 	require.NotContains(t, desired, "memory")
 	require.NotContains(t, desired, "pids")
@@ -42,6 +43,23 @@ func TestCreateRequestSerializesIdentityDesiredSpecAndRequestMetadataOnce(t *tes
 
 	binding := object["actionBindings"].([]any)[0].(map[string]any)
 	require.Equal(t, map[string]any{"handler": "egress", "input": "allow: example.com"}, binding)
+}
+
+func TestRuntimeSandboxConfigPersistsActionsModeOutsideCallerDesiredSpec(t *testing.T) {
+	config := RuntimeSandboxConfig{
+		Identity: SandboxIdentity{SandboxUID: "uid-a"}, ActionsAPIVersion: "sandbox.fast.io/actions/v2",
+		Desired: SandboxDesiredSpec{Image: "alpine:latest"},
+	}
+	encoded, err := json.Marshal(config)
+	require.NoError(t, err)
+	var object map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &object))
+	require.Equal(t, "sandbox.fast.io/actions/v2", object["actionsApiVersion"])
+	require.NotContains(t, object["desired"].(map[string]any), "actionsApiVersion")
+
+	var decoded RuntimeSandboxConfig
+	require.NoError(t, json.Unmarshal(encoded, &decoded))
+	require.Equal(t, config, decoded)
 }
 
 func TestEnsureSandboxInputKeepsInvocationConfigAndAllocationSeparate(t *testing.T) {

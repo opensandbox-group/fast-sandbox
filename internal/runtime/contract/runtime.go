@@ -144,8 +144,14 @@ type Snapshotter interface {
 	DeleteSnapshot(ctx context.Context, snapshotID string) error
 }
 
+// ResourceRecoveryOwnerRetirer gates destructive recovery of one dead runtime.
+// Implementations call it after confirming the runtime is dead and before
+// releasing any sandbox-owned resources. A failure must leave those resources
+// intact so recovery can be retried.
+type ResourceRecoveryOwnerRetirer func(ctx context.Context, metadata *Metadata) error
+
 type ResourceRecoverer interface {
-	RecoverRuntimeResources(ctx context.Context, managed []*Metadata) error
+	RecoverRuntimeResources(ctx context.Context, managed []*Metadata, retireOwner ResourceRecoveryOwnerRetirer) error
 }
 
 type ResourceAdmission interface {

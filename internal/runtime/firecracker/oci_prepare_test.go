@@ -308,7 +308,7 @@ touch "$TEST_OCI_ROOT/recovered"
 	home := filepath.Join(fixture.stateRoot, "oci/sandboxes/sandbox-1")
 	require.NoError(t, os.MkdirAll(home, 0750))
 	require.NoError(t, os.WriteFile(filepath.Join(home, "state.json"), []byte(`{"rootfs_device":{"dev_id":42}}`), 0600))
-	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil))
+	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil, nil))
 	require.NoDirExists(t, home)
 	require.NoDirExists(t, filepath.Join(fixture.stateRoot, sandboxStateDir, "sandbox-1"))
 	require.FileExists(t, filepath.Join(fixture.stateRoot, "recovered"))

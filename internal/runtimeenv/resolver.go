@@ -15,6 +15,7 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	actionapi "fast-sandbox/internal/protocol/action"
 )
 
 var ErrEnvironmentNotFound = errors.New("runtime environment not found")
@@ -34,8 +35,18 @@ func Resolve(catalog *runtimecatalog.Catalog, config Config, runtimeName apiv1al
 	if err := applyEnvironment(&profile, environment, binding); err != nil {
 		return ResolvedRuntimePlan{}, fmt.Errorf("resolve runtime %s in environment %s: %w", profile.Name, environmentName, err)
 	}
+	actionsAPIVersion := config.ActionsAPIVersion
+	if actionsAPIVersion == "" {
+		actionsAPIVersion = actionapi.APIVersion
+	}
+	if actionsAPIVersion != actionapi.APIVersion && actionsAPIVersion != actionapi.APIVersionV2 {
+		return ResolvedRuntimePlan{}, fmt.Errorf("unsupported Actions apiVersion %q", actionsAPIVersion)
+	}
+	if actionsAPIVersion == actionapi.APIVersionV2 && profile.Name != apiv1alpha2.RuntimeFirecracker {
+		return ResolvedRuntimePlan{}, fmt.Errorf("Actions apiVersion %q is supported only by runtime %s", actionsAPIVersion, apiv1alpha2.RuntimeFirecracker)
+	}
 	plan := ResolvedRuntimePlan{
-		Version: PlanVersion, Environment: environmentName, Profile: profile,
+		Version: PlanVersion, Environment: environmentName, ActionsAPIVersion: actionsAPIVersion, Profile: profile,
 		Containerd: resolvedContainerdEnvironment(environment.Containerd, profile), Kubelet: environment.Kubelet,
 	}
 	if err := stampRevision(&plan); err != nil {
@@ -59,6 +70,9 @@ func DecodePlan(reader io.Reader) (ResolvedRuntimePlan, error) {
 	expectedProfileHash := plan.Profile.ProfileHash
 	if expected == "" || plan.Version != PlanVersion {
 		return ResolvedRuntimePlan{}, errors.New("runtime plan version and revision are required")
+	}
+	if plan.ActionsAPIVersion != "" && plan.ActionsAPIVersion != actionapi.APIVersion && plan.ActionsAPIVersion != actionapi.APIVersionV2 {
+		return ResolvedRuntimePlan{}, fmt.Errorf("unsupported Actions apiVersion in runtime plan %q", plan.ActionsAPIVersion)
 	}
 	if err := stampRevision(&plan); err != nil {
 		return ResolvedRuntimePlan{}, err

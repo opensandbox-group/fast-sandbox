@@ -48,6 +48,8 @@ node preparation and independent smoke-test sequence.
 `version` is mandatory for operator-supplied configuration. This prevents an
 old manifest from being silently interpreted with new field semantics.
 
+The optional top-level `actionsApiVersion` selects the platform-owned Fastlet-to-Handler management protocol for the runtime domain. Omission preserves the legacy v1 protocol. The experimental `sandbox.fast.io/actions/v2` value is supported only for direct Firecracker pools in this release; it is included in each immutable runtime plan and persisted by Fastlet with newly created runtime metadata. It is not a Pool or Sandbox field, and it does not enable credential-bound TLS interception. Before selecting v2, all active and standby Fastlet and egress components in the management domain must support v2, matching egress processes must use `OPENSANDBOX_EGRESS_ACTIONS_API_VERSION=sandbox.fast.io/actions/v2`, and the Pod-local management listener must be isolated as described in the [Sandbox Actions guide](sandbox-actions.md).
+
 An operator can bind a runtime to another node environment without adding
 branches to Controller, Fastlet, the containerd driver, Infra delivery or
 NodeJanitor:

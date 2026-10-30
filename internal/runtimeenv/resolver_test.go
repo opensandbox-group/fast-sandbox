@@ -9,11 +9,13 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	actionapi "fast-sandbox/internal/protocol/action"
 )
 
 func TestResolveDefaultProducesCompleteImmutablePlan(t *testing.T) {
 	plan, err := ResolveDefault(runtimecatalog.Builtin(), apiv1alpha2.RuntimeContainer)
 	require.NoError(t, err)
+	require.Equal(t, actionapi.APIVersion, plan.EffectiveActionsAPIVersion())
 	require.Equal(t, DefaultEnvironment, plan.Environment)
 	require.Equal(t, "k8s.io", plan.Profile.ContainerdNamespace())
 	require.Equal(t, "overlayfs", plan.Profile.Containerd.Snapshotter)
@@ -29,6 +31,56 @@ func TestResolveDefaultProducesCompleteImmutablePlan(t *testing.T) {
 	decoded, err := DecodePlan(bytes.NewReader(payload))
 	require.NoError(t, err)
 	require.Equal(t, plan, decoded)
+}
+
+func TestLegacyRuntimePlanWithoutActionsVersionRemainsV1(t *testing.T) {
+	plan, err := ResolveDefault(runtimecatalog.Builtin(), apiv1alpha2.RuntimeContainer)
+	require.NoError(t, err)
+	plan.ActionsAPIVersion = ""
+	require.NoError(t, stampRevision(&plan))
+	payload, err := plan.Marshal()
+	require.NoError(t, err)
+	decoded, err := DecodePlan(bytes.NewReader(payload))
+	require.NoError(t, err)
+	require.Empty(t, decoded.ActionsAPIVersion)
+	require.Equal(t, actionapi.APIVersion, decoded.EffectiveActionsAPIVersion())
+}
+
+func TestActionsAPIVersionComesFromTrustedRuntimeEnvironmentConfig(t *testing.T) {
+	config, err := Parse([]byte(`
+version: v1alpha2
+actionsApiVersion: sandbox.fast.io/actions/v2
+environments:
+  default:
+    runtimes:
+      firecracker: {}
+`))
+	require.NoError(t, err)
+
+	plan, err := Resolve(runtimecatalog.Builtin(), config, apiv1alpha2.RuntimeFirecracker)
+	require.NoError(t, err)
+	require.Equal(t, actionapi.APIVersionV2, plan.EffectiveActionsAPIVersion())
+
+	payload, err := plan.Marshal()
+	require.NoError(t, err)
+	decoded, err := DecodePlan(bytes.NewReader(payload))
+	require.NoError(t, err)
+	require.Equal(t, plan, decoded)
+
+	_, err = Resolve(runtimecatalog.Builtin(), config, apiv1alpha2.RuntimeContainer)
+	require.ErrorContains(t, err, "supported only by runtime firecracker")
+}
+
+func TestActionsAPIVersionRejectsUnknownTrustedConfigValue(t *testing.T) {
+	_, err := Parse([]byte(`
+version: v1alpha2
+actionsApiVersion: sandbox.fast.io/actions/v3
+environments:
+  default:
+    runtimes:
+      container: {}
+`))
+	require.ErrorContains(t, err, "unsupported Actions apiVersion")
 }
 
 func TestResolveKataFirecrackerUsesRuntimeSnapshotterOverride(t *testing.T) {

@@ -44,6 +44,10 @@ func (m *SandboxManager) ReconcileBindings(ctx context.Context, req *fastletapi.
 	attachment := actionAttachment(metadata)
 	m.mu.Unlock()
 	if actionManager == nil {
+		if effectiveSandboxActionAPIVersion(metadata.Config.ActionsAPIVersion) != actionapi.APIVersion {
+			failure := fastletError(fastletapi.ErrorActionUnavailable, "Fastlet has no Action Handler for the Sandbox apiVersion", false)
+			return &fastletapi.ReconcileBindingsResponse{Error: failure}, failure
+		}
 		if len(req.ActionBindings) == 0 {
 			m.mu.Lock()
 			if m.sandboxes[metadata.Config.Identity.SandboxUID] != metadata {
@@ -105,11 +109,30 @@ func actionAttachment(metadata *SandboxMetadata) fastletaction.Attachment {
 	identity := metadata.Config.Identity
 	network := metadata.Allocation.Network
 	return fastletaction.Attachment{
-		ID: actionAttachmentID(metadata), InstanceGeneration: identity.InstanceGeneration,
+		ID: actionAttachmentID(metadata), APIVersion: effectiveSandboxActionAPIVersion(metadata.Config.ActionsAPIVersion),
+		FastletPodUID: identity.FastletPodUID, InstanceGeneration: identity.InstanceGeneration,
 		AssignmentAttempt: identity.AssignmentAttempt, RuntimeInstanceID: identity.RuntimeInstanceID, RouteGeneration: identity.RouteGeneration,
 		SandboxUID: identity.SandboxUID, SandboxName: identity.Name, Namespace: identity.Namespace,
 		IP: network.IP, Gateway: network.Gateway, PrivateCIDR: network.PrivateCIDR, HostVeth: network.HostVeth,
 	}
+}
+
+func effectiveSandboxActionAPIVersion(version string) string {
+	if version == "" {
+		return actionapi.APIVersion
+	}
+	return version
+}
+
+func isLegacyActionAPIVersion(version string) bool {
+	return version == "" || version == actionapi.APIVersion
+}
+
+func (m *SandboxManager) requiresStrictActionHandling(version string) bool {
+	if !isLegacyActionAPIVersion(version) {
+		return true
+	}
+	return m.actionManager != nil && m.actionManager.APIVersion() != actionapi.APIVersion
 }
 
 func (m *SandboxManager) registerDesiredActions(metadata *SandboxMetadata, generation int64, bindings []fastletapi.ActionBindingInput) error {

@@ -160,7 +160,7 @@ spec:
 | `sandboxResources` | Yes | Flat default CPU/memory limits and PID limit; `mode: ResourceAware` adds separate CPU/memory overcommit ratios |
 | `warmImages` | No | Asynchronous, GC-protected cache inputs |
 | `infraComponents` | No | Inline immutable artifact/process/health/endpoint definitions |
-| `actionHandlers` | No | Named Pod-loopback Binding receivers and their lifecycle Hook subscriptions |
+| `actionHandlers` | No | Named Pod-loopback Binding receivers and lifecycle Hook subscriptions; protocol mode is platform-owned runtime configuration, not part of the public Pool API |
 | `fastletTemplate` | Yes | Kubernetes Pod template for image, environment, scheduling, security, and sidecars; ResourceAware runtime-owner CPU and memory are Controller-derived |
 
 Runtime names are `container`, `gvisor`, `kata-qemu`, `kata-clh`, `kata-fc`,

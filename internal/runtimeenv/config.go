@@ -13,6 +13,7 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	actionapi "fast-sandbox/internal/protocol/action"
 )
 
 var containerdNamespacePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
@@ -39,6 +40,9 @@ func Parse(raw []byte) (Config, error) {
 func (c Config) Validate() error { //nolint:gocognit // pre-existing sequential field validation; refactor tracked separately
 	if c.Version != ConfigVersion {
 		return fmt.Errorf("unsupported runtime environment config version %q; expected %q", c.Version, ConfigVersion)
+	}
+	if c.ActionsAPIVersion != "" && c.ActionsAPIVersion != actionapi.APIVersion && c.ActionsAPIVersion != actionapi.APIVersionV2 {
+		return fmt.Errorf("unsupported Actions apiVersion %q", c.ActionsAPIVersion)
 	}
 	if len(c.Environments) == 0 {
 		return errors.New("at least one runtime environment is required")
@@ -166,6 +170,9 @@ func (c Config) ContainerdEndpoints() []ContainerdEndpoint {
 func mergeConfig(base *Config, override Config) {
 	if override.Version != "" {
 		base.Version = override.Version
+	}
+	if override.ActionsAPIVersion != "" {
+		base.ActionsAPIVersion = override.ActionsAPIVersion
 	}
 	if base.Environments == nil {
 		base.Environments = make(map[string]NodeRuntimeEnvironment)

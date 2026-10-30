@@ -1,12 +1,22 @@
 package v1alpha2
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 )
+
+func TestActionProtocolSelectionIsNotPartOfPublicPoolSchema(t *testing.T) {
+	payload, err := json.Marshal(ActionHandler{Name: "egress", TargetHTTPPort: 18080})
+	require.NoError(t, err)
+	require.NotContains(t, string(payload), "apiVersion")
+	poolPayload, err := json.Marshal(SandboxPoolSpec{ActionHandlers: []ActionHandler{{Name: "egress", TargetHTTPPort: 18080}}})
+	require.NoError(t, err)
+	require.NotContains(t, string(poolPayload), "actionsApiVersion")
+}
 
 func TestValidateRuntime(t *testing.T) {
 	require.NoError(t, (&SandboxPoolSpec{Runtime: RuntimeKataFc}).ValidateRuntime())

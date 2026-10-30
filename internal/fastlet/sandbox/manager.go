@@ -83,6 +83,10 @@ type SandboxManager struct {
 	registryProvider            registryconfig.Provider
 	routePublisher              RoutePublisher
 	dataPlaneWorkers            map[string]dataPlaneWorker
+	// deleteWorkers prevents multiple lifecycle callbacks from tearing down
+	// one Sandbox concurrently after its Action owner has retired.
+	deleteWorkers        map[string]*SandboxMetadata
+	deleteRetryRequested map[string]*SandboxMetadata
 	// imageBootWorkers drives cold Sandboxes from the image-pending phase to
 	// a committed runtime: once the async artifact delivery reports
 	// Delivered, the worker boots the runtime (EnsureSandbox) and commits it
@@ -96,6 +100,10 @@ type SandboxManager struct {
 	heartbeatSequence atomic.Uint64
 	// sandboxes  sandboxID -> metadata
 	sandboxes map[string]*SandboxMetadata
+	// createDeletePending remembers that a strict DELETE was accepted while
+	// Create was still committing the runtime. The runtime is only torn down
+	// after that Create path has produced the concrete metadata owner.
+	createDeletePending map[string]bool
 	// snapshots tracks in-memory snapshot tasks keyed by the SandboxSnapshot
 	// UID (snapshot.go). Tasks are ephemeral and never survive a restart.
 	snapshots map[string]*snapshotTask
@@ -197,15 +205,18 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		diagnostics:     make(map[string][]fastletapi.SandboxDiagnosticEvent),
 		cacheTracker:    fastletcache.NewTracker(cacheSource, config.CacheEpoch, fastletcache.DefaultMaxInventory),
 		cacheProtection: protection, warmImages: append([]string(nil), config.WarmImages...),
-		warmImageStates:  warmImageStates,
-		registryProvider: config.RegistryProvider,
-		readinessChanged: make(chan struct{}),
-		routePublisher:   config.RoutePublisher,
-		dataPlaneWorkers: make(map[string]dataPlaneWorker),
-		imageBootWorkers: make(map[string]imageBootWorker),
-		runtimeMessages:  make(map[string]string),
-		sandboxes:        make(map[string]*SandboxMetadata),
-		snapshots:        make(map[string]*snapshotTask),
+		warmImageStates:      warmImageStates,
+		registryProvider:     config.RegistryProvider,
+		readinessChanged:     make(chan struct{}),
+		routePublisher:       config.RoutePublisher,
+		dataPlaneWorkers:     make(map[string]dataPlaneWorker),
+		deleteWorkers:        make(map[string]*SandboxMetadata),
+		deleteRetryRequested: make(map[string]*SandboxMetadata),
+		imageBootWorkers:     make(map[string]imageBootWorker),
+		runtimeMessages:      make(map[string]string),
+		sandboxes:            make(map[string]*SandboxMetadata),
+		createDeletePending:  make(map[string]bool),
+		snapshots:            make(map[string]*snapshotTask),
 	}
 	if manager.actionManager != nil {
 		manager.actionManager.SetChangeNotifier(manager.actionStateChanged)
@@ -421,8 +432,53 @@ func (m *SandboxManager) validateInfraRevision(spec *fastletapi.SandboxDesiredSp
 
 func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata) {
 	const gracefulTimeout = 10 * time.Second
+	m.mu.Lock()
+	if m.sandboxes[sandboxID] != expected {
+		m.mu.Unlock()
+		return
+	}
+	if m.deleteWorkers[sandboxID] == expected {
+		m.deleteRetryRequested[sandboxID] = expected
+		m.mu.Unlock()
+		return
+	}
+	m.deleteWorkers[sandboxID] = expected
+	delete(m.deleteRetryRequested, sandboxID)
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		if m.deleteWorkers[sandboxID] == expected {
+			delete(m.deleteWorkers, sandboxID)
+		}
+		retry := m.deleteRetryRequested[sandboxID] == expected && m.sandboxes[sandboxID] == expected
+		if m.deleteRetryRequested[sandboxID] == expected {
+			delete(m.deleteRetryRequested, sandboxID)
+		}
+		m.mu.Unlock()
+		if retry {
+			go m.asyncDelete(sandboxID, expected)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), gracefulTimeout+5*time.Second)
 	defer cancel()
+	if m.requiresStrictActionHandling(expected.Config.ActionsAPIVersion) {
+		var err error
+		if m.actionManager == nil {
+			err = errors.New("strict Action Handler is unavailable; runtime cleanup is blocked")
+		} else {
+			err = m.actionManager.ConfirmOwnerRetired(ctx, actionAttachment(expected))
+		}
+		if err != nil {
+			m.mu.Lock()
+			if m.sandboxes[sandboxID] == expected {
+				expected.Phase = sandboxStateDeleteFailed
+				m.recordDiagnosticLocked(sandboxID, "error", "action", sandboxStateDeleteFailed, err.Error())
+			}
+			m.mu.Unlock()
+			klog.ErrorS(err, "strict Action owner is not confirmed retired; runtime cleanup blocked", "sandboxID", sandboxID)
+			return
+		}
+	}
 	if err := m.removeRoute(ctx, expected); err != nil {
 		m.mu.Lock()
 		if m.sandboxes[sandboxID] == expected {
@@ -455,6 +511,7 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 		})
 		delete(m.sandboxes, sandboxID)
 		delete(m.runtimeMessages, sandboxID)
+		delete(m.createDeletePending, sandboxID)
 		m.cacheProtection.Unprotect(expected.Config.Desired.Image, fastletcache.ProtectActive)
 		m.cacheProtection.ProtectHotUntil(expected.Config.Desired.Image, m.clock.Now().Add(time.Hour))
 		m.recordDiagnosticLocked(sandboxID, "info", "fastlet", "deleted", "proxy route and runtime resources were deleted")

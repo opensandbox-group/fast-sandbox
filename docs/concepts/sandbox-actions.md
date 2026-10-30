@@ -178,6 +178,12 @@ sequence order.
 has no `binding` or `hook` payload and is distinct from `SetBinding(null)`.
 Missing Handler state is success.
 
+### 3.6 Strict Actions v2 transport
+
+The experimental transport is selected by the platform administrator through the existing `fast-sandbox-runtime-environments` ConfigMap's top-level `actionsApiVersion` setting. It is not selected by a Pool, Sandbox, or Create request. The controller carries the value in the content-addressed runtime plan; Fastlet stamps it into durable runtime metadata and requires the same version during recovery. An omitted setting preserves v1. With v2 configured, only the direct Firecracker runtime is supported, v2 uses separate `/_fastlet/v2` management and relay paths with the complete owner tuple (Sandbox UID, Fastlet Pod UID, runtime instance, generation, assignment attempt, route generation, and attachment ID), and no v1 fallback is attempted. Every egress Handler must independently be configured with `OPENSANDBOX_EGRESS_ACTIONS_API_VERSION=sandbox.fast.io/actions/v2`.
+
+This is an experimental management transport for legacy Vault and Policy CRUD. It does not enable credential-bound TLS interception or Vault v2 writes. Explicit snapshot, pause/resume, and restore operations are rejected before their runtime effects. Only verified clean-base images are supported: ordinary images with template carry are not universally rejected before VM startup; carry admission hardening is deferred. Management owner fields are fencing data, not caller authentication. The listener is Pod-netns loopback and may be reachable by other containers in that Pod; do not enable v2 until deployment-specific management-port isolation has been verified. This release adds no authentication or network policy for that endpoint.
+
 ## 4. Ordering and concurrency
 
 For one Sandbox and Handler, Fastlet serializes `SetBinding`, Hook, and
@@ -263,3 +269,5 @@ resurrected by a delayed Create retry.
 - Input is persisted in the Sandbox CRD and is not a secret transport. Secret
   material needs a separate reference/credential design.
 - Inputs and diagnostics must not be logged by the platform by default.
+
+Strict v2 requests carry `mode: legacy`. An absent egress owner requires REMOVE to persist a retirement fence before runtime teardown; absence alone is not proof of retirement. Dead Firecracker recovery retires the same persisted owner before releasing resources, and preserves state on cleanup failure so recovery can retry. Same-UID rebind and live binding removal are unsupported in this slice.

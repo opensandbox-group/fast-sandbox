@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -38,14 +39,18 @@ const (
 	maxRelayResponseSize = 128 << 10
 )
 
+// ErrOwnerRetired means this identity cannot be admitted again. Retrying the
+// same owner cannot make progress; a new runtime generation is required.
+var ErrOwnerRetired = errors.New("Sandbox owner is retired")
+
 type Caller interface {
-	Status(context.Context, int32) (actionapi.HandlerStatus, error)
+	Status(context.Context, int32, string) (actionapi.HandlerStatus, error)
 	Invoke(context.Context, int32, actionapi.Request) error
 	// Relay delivers one opaque payload to a Handler's loopback port on
 	// behalf of a fence-validated Sandbox and returns the Handler's HTTP
 	// status and body verbatim: any response status is a result, and only
 	// transport failures are errors.
-	Relay(ctx context.Context, port int32, sandboxUID, method, path string, body []byte) (int, []byte, error)
+	Relay(ctx context.Context, port int32, apiVersion string, owner actionapi.Owner, method, path string, body []byte) (int, []byte, error)
 }
 
 type HTTPCaller struct{ client *http.Client }
@@ -59,8 +64,12 @@ func NewHTTPCaller() *HTTPCaller {
 	}}
 }
 
-func (c *HTTPCaller) Status(ctx context.Context, port int32) (actionapi.HandlerStatus, error) {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint(port, statusPath), nil)
+func (c *HTTPCaller) Status(ctx context.Context, port int32, apiVersion string) (actionapi.HandlerStatus, error) {
+	path, err := statusEndpoint(apiVersion)
+	if err != nil {
+		return actionapi.HandlerStatus{}, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint(port, path), nil)
 	if err != nil {
 		return actionapi.HandlerStatus{}, err
 	}
@@ -80,7 +89,7 @@ func (c *HTTPCaller) Status(ctx context.Context, port int32) (actionapi.HandlerS
 	if err := json.Unmarshal(body, &result); err != nil {
 		return result, fmt.Errorf("decode Action Handler status: %w", err)
 	}
-	if result.APIVersion != actionapi.APIVersion || result.InstanceID == "" || !result.Ready {
+	if result.APIVersion != apiVersion || result.InstanceID == "" || !result.Ready || apiVersion == actionapi.APIVersionV2 && !result.OwnerStatus {
 		return result, fmt.Errorf("action Handler is not ready: %s", result.Message)
 	}
 	return result, nil
@@ -91,7 +100,11 @@ func (c *HTTPCaller) Invoke(ctx context.Context, port int32, invocation actionap
 	if err != nil {
 		return err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint(port, requestPath), bytes.NewReader(body))
+	path, err := actionEndpoint(invocation.APIVersion)
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint(port, path), bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -123,7 +136,17 @@ func (c *HTTPCaller) Invoke(ctx context.Context, port int32, invocation actionap
 // actionapi.HeaderSandboxUID header so the Handler can scope per-subject
 // state by the fence-validated identity instead of caller-controlled path
 // segments.
-func (c *HTTPCaller) Relay(ctx context.Context, port int32, sandboxUID, method, path string, body []byte) (int, []byte, error) {
+func (c *HTTPCaller) Relay(ctx context.Context, port int32, apiVersion string, owner actionapi.Owner, method, path string, body []byte) (int, []byte, error) {
+	if apiVersion == actionapi.APIVersionV2 {
+		if !owner.Valid() {
+			return 0, nil, errors.New("Actions v2 relay requires a complete Sandbox owner")
+		}
+		path = v2RelayPath(path)
+	} else if apiVersion != actionapi.APIVersion {
+		return 0, nil, fmt.Errorf("unsupported Action apiVersion %q", apiVersion)
+	} else if owner.SandboxUID == "" {
+		return 0, nil, errors.New("Action relay requires a Sandbox UID")
+	}
 	if method == "" {
 		method = http.MethodPost
 	}
@@ -131,8 +154,13 @@ func (c *HTTPCaller) Relay(ctx context.Context, port int32, sandboxUID, method, 
 	if err != nil {
 		return 0, nil, err
 	}
-	if sandboxUID != "" {
-		request.Header.Set(actionapi.HeaderSandboxUID, sandboxUID)
+	request.Header.Set(actionapi.HeaderSandboxUID, owner.SandboxUID)
+	if apiVersion == actionapi.APIVersionV2 {
+		encoded, err := json.Marshal(owner)
+		if err != nil {
+			return 0, nil, err
+		}
+		request.Header.Set(actionapi.HeaderOwner, base64.RawURLEncoding.EncodeToString(encoded))
 	}
 	if len(body) > 0 {
 		request.Header.Set("Content-Type", "application/json")
@@ -164,6 +192,35 @@ func readBoundedLimit(reader io.Reader, limit int64) ([]byte, error) {
 	return body, nil
 }
 
+func statusEndpoint(apiVersion string) (string, error) {
+	switch apiVersion {
+	case actionapi.APIVersion:
+		return statusPath, nil
+	case actionapi.APIVersionV2:
+		return "/_fastlet/v2/actions/status", nil
+	default:
+		return "", fmt.Errorf("unsupported Action apiVersion %q", apiVersion)
+	}
+}
+
+func actionEndpoint(apiVersion string) (string, error) {
+	switch apiVersion {
+	case actionapi.APIVersion:
+		return requestPath, nil
+	case actionapi.APIVersionV2:
+		return "/_fastlet/v2/actions", nil
+	default:
+		return "", fmt.Errorf("unsupported Action apiVersion %q", apiVersion)
+	}
+}
+
+func v2RelayPath(path string) string {
+	if strings.HasPrefix(path, "/_fastlet/v2/") {
+		return path
+	}
+	return "/_fastlet/v2/relay" + path
+}
+
 func endpoint(port int32, path string) string {
 	return fmt.Sprintf("http://127.0.0.1:%d%s", port, path)
 }
@@ -176,7 +233,9 @@ type DesiredInput struct {
 
 type Attachment struct {
 	ID                 string
+	APIVersion         string
 	SandboxUID         string
+	FastletPodUID      string
 	SandboxName        string
 	Namespace          string
 	InstanceGeneration int64
@@ -242,15 +301,16 @@ type handlerObservation struct {
 }
 
 type Manager struct {
-	mu       sync.RWMutex
-	handlers []apiv1alpha2.ActionHandler
-	byName   map[string]apiv1alpha2.ActionHandler
-	caller   Caller
-	states   map[string]*sandboxState
-	terminal map[string]Attachment
-	observed map[string]handlerObservation
-	ready    bool
-	message  string
+	mu         sync.RWMutex
+	handlers   []apiv1alpha2.ActionHandler
+	apiVersion string
+	byName     map[string]apiv1alpha2.ActionHandler
+	caller     Caller
+	states     map[string]*sandboxState
+	terminal   map[string]Attachment
+	observed   map[string]handlerObservation
+	ready      bool
+	message    string
 	// vaultHandler is the Pool-declared Action Handler serving the egress
 	// vault surface; empty disables the driver-invoked vault transfer.
 	vaultHandler string
@@ -262,9 +322,22 @@ type Manager struct {
 }
 
 func NewManager(handlers []apiv1alpha2.ActionHandler, caller Caller) (*Manager, error) {
+	return NewManagerWithAPIVersion(handlers, actionapi.APIVersion, caller)
+}
+
+// NewManagerWithAPIVersion configures the loopback protocol from the
+// controller-owned runtime plan. The Pool's public ActionHandler list only
+// declares ports and names; it cannot select or override the protocol.
+func NewManagerWithAPIVersion(handlers []apiv1alpha2.ActionHandler, apiVersion string, caller Caller) (*Manager, error) {
 	spec := apiv1alpha2.SandboxPoolSpec{ActionHandlers: handlers}
 	if err := spec.ValidateActionHandlers(); err != nil {
 		return nil, err
+	}
+	if apiVersion == "" {
+		return nil, errors.New("Actions apiVersion is required by the runtime plan")
+	}
+	if apiVersion != actionapi.APIVersion && apiVersion != actionapi.APIVersionV2 {
+		return nil, fmt.Errorf("unsupported Actions apiVersion %q", apiVersion)
 	}
 	if caller == nil {
 		caller = NewHTTPCaller()
@@ -274,11 +347,18 @@ func NewManager(handlers []apiv1alpha2.ActionHandler, caller Caller) (*Manager, 
 		byName[handler.Name] = handler
 	}
 	return &Manager{
-		handlers: append([]apiv1alpha2.ActionHandler(nil), handlers...),
-		byName:   byName, caller: caller, states: make(map[string]*sandboxState),
+		handlers:   append([]apiv1alpha2.ActionHandler(nil), handlers...),
+		apiVersion: apiVersion, byName: byName, caller: caller, states: make(map[string]*sandboxState),
 		terminal: make(map[string]Attachment),
 		observed: make(map[string]handlerObservation), ready: len(handlers) == 0,
 	}, nil
+}
+
+func (m *Manager) APIVersion() string {
+	if m == nil || m.apiVersion == "" {
+		return actionapi.APIVersion
+	}
+	return m.apiVersion
 }
 
 func (m *Manager) SetChangeNotifier(notify func(string)) {
@@ -298,15 +378,35 @@ var ErrUnknownHandler = errors.New("Action Handler is not declared by the Fastle
 // trusted actionapi.HeaderSandboxUID header on the loopback request. The
 // relay does not touch per-Sandbox Binding state, so a slow Handler never
 // delays Binding reconciliation.
-func (m *Manager) RelayHandler(ctx context.Context, sandboxUID, name, method, path string, payload []byte) (int, []byte, error) {
+func (m *Manager) RelayHandler(ctx context.Context, attachment Attachment, name, method, path string, payload []byte) (int, []byte, error) {
 	m.mu.RLock()
 	handler, found := m.byName[name]
 	caller := m.caller
+	apiVersion := m.apiVersion
 	m.mu.RUnlock()
 	if !found {
 		return 0, nil, ErrUnknownHandler
 	}
-	return caller.Relay(ctx, handler.TargetHTTPPort, sandboxUID, method, path, payload)
+	if err := m.ValidateAPIVersion(attachment.APIVersion); err != nil {
+		return 0, nil, err
+	}
+	if apiVersion == actionapi.APIVersion {
+		return caller.Relay(ctx, handler.TargetHTTPPort, apiVersion, actionapi.Owner{SandboxUID: attachment.SandboxUID}, method, path, payload)
+	}
+	if apiVersion != actionapi.APIVersionV2 {
+		return 0, nil, fmt.Errorf("unsupported Actions apiVersion %q", apiVersion)
+	}
+	state := m.getState(attachment.SandboxUID)
+	if state == nil {
+		return 0, nil, errors.New("Sandbox Action owner is not registered")
+	}
+	state.mu.RLock()
+	current := state.attachment
+	state.mu.RUnlock()
+	if !sameOwner(current, attachment) {
+		return 0, nil, errors.New("handler relay targets a stale Sandbox owner")
+	}
+	return caller.Relay(ctx, handler.TargetHTTPPort, m.apiVersion, ownerFromAttachment(attachment), method, path, payload)
 }
 
 func (m *Manager) notifyChanged(sandboxUID string) {
@@ -347,6 +447,18 @@ func (m *Manager) Ready() bool {
 
 func (m *Manager) Required() bool { return len(m.handlers) > 0 }
 
+func (m *Manager) ValidateAPIVersion(version string) error {
+	version = effectiveAPIVersion(version)
+	want := m.apiVersion
+	if want == "" {
+		want = actionapi.APIVersion
+	}
+	if version != want {
+		return fmt.Errorf("Sandbox Action apiVersion %q does not match Fastlet Handler apiVersion %q", version, want)
+	}
+	return nil
+}
+
 func (m *Manager) probe(ctx context.Context) {
 	m.probeMu.Lock()
 	defer m.probeMu.Unlock()
@@ -358,8 +470,18 @@ func (m *Manager) probe(ctx context.Context) {
 	results := make([]result, 0, len(m.handlers))
 	for _, handler := range m.handlers {
 		probeCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
-		status, err := m.caller.Status(probeCtx, handler.TargetHTTPPort)
+		status, err := m.caller.Status(probeCtx, handler.TargetHTTPPort, m.apiVersion)
 		cancel()
+		if err == nil {
+			switch {
+			case status.APIVersion != m.apiVersion:
+				err = fmt.Errorf("Action Handler apiVersion %q does not match configured %q", status.APIVersion, m.apiVersion)
+			case !status.Ready:
+				err = errors.New("Action Handler is not ready")
+			case m.apiVersion == actionapi.APIVersionV2 && !status.OwnerStatus:
+				err = errors.New("Action Handler does not support owner-aware Actions v2")
+			}
+		}
 		results = append(results, result{handler: handler, status: status, err: err})
 	}
 
@@ -415,6 +537,9 @@ func (m *Manager) Reconcile(ctx context.Context, attachment Attachment, specGene
 	if specGeneration <= 0 || attachment.SandboxUID == "" || attachment.ID == "" || attachment.RuntimeInstanceID == "" {
 		return nil, 0, errors.New("positive specGeneration, Sandbox UID, attachment ID, and runtime instance ID are required")
 	}
+	if err := m.ValidateAPIVersion(attachment.APIVersion); err != nil {
+		return nil, 0, err
+	}
 	canonical, signature, err := m.validateDesired(desired)
 	if err != nil {
 		return nil, 0, err
@@ -442,6 +567,9 @@ func (m *Manager) Reconcile(ctx context.Context, attachment Attachment, specGene
 func (m *Manager) RegisterDesired(attachment Attachment, specGeneration int64, desired []DesiredInput) error {
 	if specGeneration <= 0 || attachment.SandboxUID == "" || attachment.ID == "" || attachment.RuntimeInstanceID == "" {
 		return errors.New("positive specGeneration, Sandbox UID, attachment ID, and runtime instance ID are required")
+	}
+	if err := m.ValidateAPIVersion(attachment.APIVersion); err != nil {
+		return err
 	}
 	canonical, signature, err := m.validateDesired(desired)
 	if err != nil {
@@ -504,6 +632,9 @@ func (m *Manager) RecordHook(sandboxUID string, attachment Attachment, hook acti
 	}
 	if sandboxUID == "" || attachment.SandboxUID != sandboxUID || attachment.ID == "" {
 		return errors.New("Sandbox UID and attachment ID are required for lifecycle Hook")
+	}
+	if err := m.ValidateAPIVersion(attachment.APIVersion); err != nil {
+		return err
 	}
 	if hook != actionapi.LifecycleHookRuntimeReady && hook != actionapi.LifecycleHookDataPlaneReady {
 		return fmt.Errorf("unsupported lifecycle Hook %q", hook)
@@ -812,12 +943,108 @@ func (m *Manager) Delete(ctx context.Context, sandboxUID string) error {
 	if state == nil {
 		return nil
 	}
+	state.mu.RLock()
+	attachment := state.attachment
+	state.mu.RUnlock()
+	return m.deleteState(ctx, state, attachment)
+}
+
+// DeleteOwned is the strict Actions v2 path. It preserves the local owner and
+// blocks runtime/slot teardown until each Handler either acknowledges exact
+// owner removal or a read-back proves that exact owner is already retired.
+func (m *Manager) DeleteOwned(ctx context.Context, attachment Attachment) error {
+	if err := m.ValidateAPIVersion(attachment.APIVersion); err != nil {
+		return err
+	}
+	if m.APIVersion() == actionapi.APIVersion {
+		return m.Delete(ctx, attachment.SandboxUID)
+	}
+	if m.APIVersion() != actionapi.APIVersionV2 {
+		return fmt.Errorf("unsupported Actions apiVersion %q", m.APIVersion())
+	}
+	if !ownerFromAttachment(attachment).Valid() {
+		return errors.New("Actions v2 Delete requires a complete Sandbox owner")
+	}
+	state := m.getState(attachment.SandboxUID)
+	if state == nil {
+		return m.deleteRemoteOwner(ctx, attachment, 0)
+	}
+	state.mu.RLock()
+	current := state.attachment
+	state.mu.RUnlock()
+	if !sameOwner(current, attachment) {
+		return errors.New("Delete targets a stale Sandbox owner")
+	}
+	return m.deleteState(ctx, state, attachment)
+}
+
+// ConfirmOwnerRetired performs a read-only confirmation that every configured
+// Handler has retired the exact Actions v2 owner. Runtime teardown uses this
+// after asynchronous lifecycle paths, where a previous REMOVE may have failed
+// or its result may be unknown.
+func (m *Manager) ConfirmOwnerRetired(ctx context.Context, attachment Attachment) error {
+	if err := m.ValidateAPIVersion(attachment.APIVersion); err != nil {
+		return err
+	}
+	if m.APIVersion() != actionapi.APIVersionV2 || !ownerFromAttachment(attachment).Valid() {
+		return errors.New("Actions v2 retirement confirmation requires a complete owner")
+	}
+	owner := ownerFromAttachment(attachment)
+	for _, handler := range m.handlers {
+		observed, err := m.observeOwner(ctx, handler.TargetHTTPPort, owner)
+		if err != nil {
+			return fmt.Errorf("confirm Action Handler %s owner retirement: %w", handler.Name, err)
+		}
+		if observed.State != actionapi.OwnerStateRetired {
+			return fmt.Errorf("Action Handler %s still owns the Sandbox", handler.Name)
+		}
+	}
+	return nil
+}
+
+// CheckCreateOwner consumes the durable retirement fence before runtime boot.
+// A current observation is not a claim that retirement is not in progress.
+func (m *Manager) CheckCreateOwner(ctx context.Context, attachment Attachment) error {
+	if err := m.ValidateAPIVersion(attachment.APIVersion); err != nil {
+		return err
+	}
+	if m.APIVersion() != actionapi.APIVersionV2 || !ownerFromAttachment(attachment).Valid() {
+		return errors.New("Actions v2 create fence requires a complete Sandbox owner")
+	}
+	probeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var probes sync.WaitGroup
+	errs := make([]error, len(m.handlers))
+	for index, handler := range m.handlers {
+		probes.Go(func() {
+			observed, err := m.observeOwner(probeCtx, handler.TargetHTTPPort, ownerFromAttachment(attachment))
+			if err != nil {
+				errs[index] = fmt.Errorf("check Action Handler %s owner retirement fence: %w", handler.Name, err)
+			} else if observed.State == actionapi.OwnerStateRetired {
+				errs[index] = ErrOwnerRetired
+			}
+			if errs[index] != nil {
+				cancel()
+			}
+		})
+	}
+	probes.Wait()
+	return errors.Join(errs...)
+}
+
+func (m *Manager) deleteState(ctx context.Context, state *sandboxState, expected Attachment) error {
+	sandboxUID := expected.SandboxUID
 	if !state.lockOperations(ctx) {
 		return ctx.Err()
 	}
 	defer state.unlockOperations()
 	state.mu.Lock()
-	if state.terminating {
+	attachment, generation := state.attachment, state.desiredGeneration
+	if !sameOwner(attachment, expected) {
+		state.mu.Unlock()
+		return errors.New("Delete owner changed while waiting for Action operations")
+	}
+	if state.terminating && effectiveAPIVersion(expected.APIVersion) != actionapi.APIVersionV2 {
 		state.mu.Unlock()
 		return nil
 	}
@@ -836,8 +1063,16 @@ func (m *Manager) Delete(ctx context.Context, sandboxUID string) error {
 			}
 		}
 	}
-	attachment, generation := state.attachment, state.desiredGeneration
 	state.mu.Unlock()
+	if effectiveAPIVersion(attachment.APIVersion) == actionapi.APIVersionV2 {
+		// Retirement and its confirmation cover every declared Handler, including
+		// unbound Handlers and SETs whose ACK was lost before local recording.
+		if err := m.deleteRemoteOwner(ctx, attachment, generation); err != nil {
+			return err
+		}
+		m.finishDelete(sandboxUID, state, attachment)
+		return nil
+	}
 	// REMOVE_BINDING is sequenced best-effort: this Delete forgets the state
 	// and the terminal fence prevents any re-send, so a lost call leaves a
 	// stale subject (policy + credential vault) registered on the Handler
@@ -864,17 +1099,85 @@ func (m *Manager) Delete(ctx context.Context, sandboxUID string) error {
 			break
 		}
 	}
+	m.finishDelete(sandboxUID, state, attachment)
+	return result
+}
+
+func (m *Manager) deleteRemoteOwner(ctx context.Context, attachment Attachment, generation int64) error {
+	for index := len(m.handlers) - 1; index >= 0; index-- {
+		if err := m.deleteRemoteHandler(ctx, m.handlers[index].Name, attachment, generation); err != nil {
+			return err
+		}
+	}
+	m.mu.Lock()
+	current, found := m.terminal[attachment.SandboxUID]
+	if !found || attachmentAfter(attachment, current) {
+		m.terminal[attachment.SandboxUID] = attachment
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *Manager) deleteRemoteHandler(ctx context.Context, name string, attachment Attachment, generation int64) error {
+	handler := m.byName[name]
+	owner := ownerFromAttachment(attachment)
+	observed, err := m.observeOwner(ctx, handler.TargetHTTPPort, owner)
+	if err != nil {
+		return fmt.Errorf("read back Action Handler %s owner before REMOVE: %w", name, err)
+	}
+	if observed.State == actionapi.OwnerStateRetired {
+		return nil
+	}
+	if (observed.State != actionapi.OwnerStateCurrent && observed.State != actionapi.OwnerStateAbsent) || !observed.Owner.Matches(owner) {
+		return fmt.Errorf("Action Handler %s reports an unknown or mismatched owner", name)
+	}
+	instanceID, _ := m.handlerInstance(name)
+	request := buildRequest(actionapi.OperationRemoveBinding, stableInvocationID(actionapi.OperationRemoveBinding, name, instanceID, generation, attachment, "", "terminal"), generation, attachment)
+	if err := m.caller.Invoke(ctx, handler.TargetHTTPPort, request); err == nil {
+		return nil
+	} else {
+		// A transport error or non-2xx may be an ACK loss. Read back before
+		// any later explicit retry; never replay REMOVE blindly.
+		observed, readErr := m.observeOwner(ctx, handler.TargetHTTPPort, owner)
+		if readErr == nil && observed.State == actionapi.OwnerStateRetired && observed.Owner.Matches(owner) {
+			return nil
+		}
+		if readErr != nil {
+			return errors.Join(fmt.Errorf("REMOVE_BINDING for %s has unknown outcome: %w", name, err), readErr)
+		}
+		return fmt.Errorf("REMOVE_BINDING for %s remains pending after owner read-back: %w", name, err)
+	}
+}
+
+func (m *Manager) observeOwner(ctx context.Context, port int32, owner actionapi.Owner) (actionapi.OwnerObservation, error) {
+	status, body, err := m.caller.Relay(ctx, port, actionapi.APIVersionV2, owner, http.MethodGet, "/_fastlet/v2/owners/"+owner.SandboxUID, nil)
+	if err != nil {
+		return actionapi.OwnerObservation{}, err
+	}
+	if status != http.StatusOK {
+		return actionapi.OwnerObservation{}, fmt.Errorf("owner read-back returned HTTP %d: %s", status, truncate(strings.TrimSpace(string(body)), 512))
+	}
+	var observation actionapi.OwnerObservation
+	if err := json.Unmarshal(body, &observation); err != nil {
+		return observation, fmt.Errorf("decode owner read-back: %w", err)
+	}
+	if observation.State != actionapi.OwnerStateCurrent && observation.State != actionapi.OwnerStateRetired && observation.State != actionapi.OwnerStateAbsent || !observation.Owner.Matches(owner) {
+		return observation, errors.New("owner read-back did not confirm the requested owner")
+	}
+	return observation, nil
+}
+
+func (m *Manager) finishDelete(sandboxUID string, state *sandboxState, attachment Attachment) {
 	m.mu.Lock()
 	if m.states[sandboxUID] == state {
 		delete(m.states, sandboxUID)
-		current, found := m.terminal[sandboxUID]
-		if !found || attachmentAfter(attachment, current) {
-			m.terminal[sandboxUID] = attachment
-		}
+	}
+	current, found := m.terminal[sandboxUID]
+	if !found || attachmentAfter(attachment, current) {
+		m.terminal[sandboxUID] = attachment
 	}
 	m.mu.Unlock()
 	m.notifyChanged(sandboxUID)
-	return result
 }
 
 func (m *Manager) Statuses(sandboxUID string) ([]fastletapi.ActionBindingStatus, int64) {
@@ -984,7 +1287,7 @@ func (m *Manager) getOrCreateState(attachment Attachment) (*sandboxState, error)
 	defer m.mu.Unlock()
 	if terminalAttachment, found := m.terminal[attachment.SandboxUID]; found {
 		if !attachmentAfter(attachment, terminalAttachment) {
-			return nil, errors.New("Action Binding state is terminal for this runtime attachment")
+			return nil, fmt.Errorf("Action Binding state is terminal for this runtime attachment: %w", ErrOwnerRetired)
 		}
 	}
 	state := m.states[attachment.SandboxUID]
@@ -1006,6 +1309,27 @@ func attachmentAfter(candidate, current Attachment) bool {
 		return candidate.RouteGeneration > current.RouteGeneration
 	}
 	return false
+}
+
+func effectiveAPIVersion(version string) string {
+	if version == "" {
+		return actionapi.APIVersion
+	}
+	return version
+}
+
+func ownerFromAttachment(attachment Attachment) actionapi.Owner {
+	return actionapi.Owner{
+		SandboxUID: attachment.SandboxUID, FastletPodUID: attachment.FastletPodUID,
+		RuntimeInstanceID: attachment.RuntimeInstanceID, InstanceGeneration: attachment.InstanceGeneration,
+		AssignmentAttempt: attachment.AssignmentAttempt, RouteGeneration: attachment.RouteGeneration,
+		AttachmentID: attachment.ID,
+	}
+}
+
+func sameOwner(left, right Attachment) bool {
+	return effectiveAPIVersion(left.APIVersion) == effectiveAPIVersion(right.APIVersion) &&
+		ownerFromAttachment(left).Matches(ownerFromAttachment(right))
 }
 
 func (m *Manager) getState(uid string) *sandboxState {
@@ -1070,8 +1394,9 @@ func setBindingStatus(binding *bindingState, state apiv1alpha2.ActionState, mess
 }
 
 func buildRequest(operation actionapi.Operation, invocationID string, generation int64, attachment Attachment) actionapi.Request {
-	return actionapi.Request{
-		APIVersion: actionapi.APIVersion, Operation: operation, InvocationID: invocationID,
+	apiVersion := effectiveAPIVersion(attachment.APIVersion)
+	request := actionapi.Request{
+		APIVersion: apiVersion, Operation: operation, InvocationID: invocationID,
 		Sandbox: actionapi.SandboxIdentity{UID: attachment.SandboxUID, Name: attachment.SandboxName, Namespace: attachment.Namespace},
 		Revision: actionapi.Revision{
 			SpecGeneration: generation, RuntimeInstanceID: attachment.RuntimeInstanceID,
@@ -1081,6 +1406,12 @@ func buildRequest(operation actionapi.Operation, invocationID string, generation
 			IP: attachment.IP, Gateway: attachment.Gateway, PrivateCIDR: attachment.PrivateCIDR, HostVeth: attachment.HostVeth,
 		}},
 	}
+	if apiVersion == actionapi.APIVersionV2 {
+		owner := ownerFromAttachment(attachment)
+		request.Owner = &owner
+		request.Mode = "legacy"
+	}
+	return request
 }
 
 func stableInvocationID(operation actionapi.Operation, handler, handlerInstance string, generation int64, attachment Attachment, digest, extra string) string {

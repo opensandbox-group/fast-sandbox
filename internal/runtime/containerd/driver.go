@@ -766,7 +766,7 @@ func (r *Driver) InspectSandbox(ctx context.Context, sandboxID string) (*Sandbox
 	return metadata, nil
 }
 
-func (r *Driver) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata) error {
+func (r *Driver) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata, _ runtimecontract.ResourceRecoveryOwnerRetirer) error {
 	if r.networkManager == nil {
 		return nil
 	}

@@ -9,6 +9,7 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	actionapi "fast-sandbox/internal/protocol/action"
 )
 
 const (
@@ -25,8 +26,9 @@ const (
 )
 
 type Config struct {
-	Version      string                            `json:"version"`
-	Environments map[string]NodeRuntimeEnvironment `json:"environments"`
+	Version           string                            `json:"version"`
+	ActionsAPIVersion string                            `json:"actionsApiVersion,omitempty"`
+	Environments      map[string]NodeRuntimeEnvironment `json:"environments"`
 }
 
 // NodeRuntimeEnvironment describes where a platform administrator installed
@@ -103,12 +105,22 @@ type ResolvedContainerdEnvironment struct {
 // controller, Fastlet and lifecycle placement. Revision is also used as the
 // runtime profile identity advertised by Fastlet heartbeats.
 type ResolvedRuntimePlan struct {
-	Version     string                        `json:"version"`
-	Environment string                        `json:"environment"`
-	Revision    string                        `json:"revision"`
-	Profile     runtimecatalog.RuntimeProfile `json:"profile"`
-	Containerd  ResolvedContainerdEnvironment `json:"containerd"`
-	Kubelet     KubeletEnvironment            `json:"kubelet"`
+	Version           string                        `json:"version"`
+	Environment       string                        `json:"environment"`
+	Revision          string                        `json:"revision"`
+	ActionsAPIVersion string                        `json:"actionsApiVersion,omitempty"`
+	Profile           runtimecatalog.RuntimeProfile `json:"profile"`
+	Containerd        ResolvedContainerdEnvironment `json:"containerd"`
+	Kubelet           KubeletEnvironment            `json:"kubelet"`
+}
+
+// EffectiveActionsAPIVersion preserves pre-field runtime plans as legacy v1.
+// New controller plans write an explicit version into their content digest.
+func (p ResolvedRuntimePlan) EffectiveActionsAPIVersion() string {
+	if p.ActionsAPIVersion == "" {
+		return actionapi.APIVersion
+	}
+	return p.ActionsAPIVersion
 }
 
 func (p ResolvedRuntimePlan) Marshal() ([]byte, error) {

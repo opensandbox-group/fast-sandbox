@@ -2,6 +2,7 @@
 package action
 
 const APIVersion = "sandbox.fast.io/actions/v1"
+const APIVersionV2 = "sandbox.fast.io/actions/v2"
 
 // HeaderSandboxUID is the trusted sandbox identity header the Fastlet
 // injects on relayed handler requests. The relayed method/path/body are
@@ -9,6 +10,13 @@ const APIVersion = "sandbox.fast.io/actions/v1"
 // platform-endorsed value (fence-validated by the Fastlet) instead of any
 // caller-controlled path segment.
 const HeaderSandboxUID = "X-Sandbox-Uid"
+const HeaderOwner = "X-Fast-Sandbox-Owner"
+
+const (
+	OwnerStateCurrent = "current"
+	OwnerStateRetired = "retired"
+	OwnerStateAbsent  = "absent"
+)
 
 type Operation string
 
@@ -56,6 +64,30 @@ type Revision struct {
 	RouteGeneration   int64  `json:"routeGeneration,omitempty"`
 }
 
+// Owner is the full platform-validated runtime fence carried on Actions v2.
+// It fences delayed relay and lifecycle calls but is not caller authentication.
+type Owner struct {
+	SandboxUID         string `json:"sandboxUid"`
+	FastletPodUID      string `json:"fastletPodUid"`
+	RuntimeInstanceID  string `json:"runtimeInstanceId"`
+	InstanceGeneration int64  `json:"instanceGeneration"`
+	AssignmentAttempt  int64  `json:"assignmentAttempt"`
+	RouteGeneration    int64  `json:"routeGeneration"`
+	AttachmentID       string `json:"attachmentId"`
+}
+
+func (o Owner) Valid() bool {
+	return o.SandboxUID != "" && o.FastletPodUID != "" && o.RuntimeInstanceID != "" &&
+		o.InstanceGeneration > 0 && o.AssignmentAttempt > 0 && o.RouteGeneration > 0 && o.AttachmentID != ""
+}
+
+func (o Owner) Matches(other Owner) bool { return o == other }
+
+type OwnerObservation struct {
+	State string `json:"state"`
+	Owner Owner  `json:"owner"`
+}
+
 type NetworkAttachment struct {
 	IP          string `json:"ip,omitempty"`
 	Gateway     string `json:"gateway,omitempty"`
@@ -99,11 +131,13 @@ type SnapshotTransfer struct {
 }
 
 type Request struct {
+	Mode         string                `json:"mode,omitempty"`
 	APIVersion   string                `json:"apiVersion"`
 	Operation    Operation             `json:"operation"`
 	InvocationID string                `json:"invocationId"`
 	Sandbox      SandboxIdentity       `json:"sandbox"`
 	Revision     Revision              `json:"revision"`
+	Owner        *Owner                `json:"owner,omitempty"`
 	Attachment   Attachment            `json:"attachment"`
 	Binding      *BindingPayload       `json:"binding,omitempty"`
 	Hook         *LifecycleHookPayload `json:"hook,omitempty"`
@@ -111,10 +145,11 @@ type Request struct {
 }
 
 type HandlerStatus struct {
-	APIVersion string `json:"apiVersion"`
-	Ready      bool   `json:"ready"`
-	InstanceID string `json:"instanceId"`
-	Message    string `json:"message,omitempty"`
+	APIVersion  string `json:"apiVersion"`
+	Ready       bool   `json:"ready"`
+	InstanceID  string `json:"instanceId"`
+	Message     string `json:"message,omitempty"`
+	OwnerStatus bool   `json:"ownerStatus,omitempty"`
 	// VaultTransfer reports that the Handler can carry a subject's vault
 	// file across pause/resume (VAULT_EXPORT / VAULT_IMPORT): it serves the
 	// vault operations and persists vault files. Absent (older Handler

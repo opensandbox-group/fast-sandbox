@@ -3,6 +3,8 @@ package action
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -26,8 +28,10 @@ func (f *fakeCaller) snapshotRelay() []recordedRelay {
 func TestRelayHandlerResolvesDeclaredPortAndPassesThrough(t *testing.T) {
 	caller := &fakeCaller{instanceID: "handler-1", relayStatus: http.StatusConflict, relayBody: []byte(`{"error":"exists"}`)}
 	manager := readyManager(t, []apiv1alpha2.ActionHandler{handler("egress", 18080)}, caller)
+	attachment := attachment("uid-a")
+	require.NoError(t, manager.RegisterDesired(attachment, 1, nil))
 
-	status, body, err := manager.RelayHandler(context.Background(), "uid-a", "egress", http.MethodPut, "/vault/uid-a", []byte(`{"revision":1}`))
+	status, body, err := manager.RelayHandler(context.Background(), attachment, "egress", http.MethodPut, "/vault/uid-a", []byte(`{"revision":1}`))
 	require.NoError(t, err)
 	require.Equal(t, http.StatusConflict, status, "the handler's status is the result, not an error")
 	require.Equal(t, []byte(`{"error":"exists"}`), body)
@@ -44,7 +48,9 @@ func TestRelayHandlerResolvesDeclaredPortAndPassesThrough(t *testing.T) {
 func TestRelayHandlerRejectsUnknownHandler(t *testing.T) {
 	caller := &fakeCaller{instanceID: "handler-1"}
 	manager := readyManager(t, []apiv1alpha2.ActionHandler{handler("egress", 18080)}, caller)
-	_, _, err := manager.RelayHandler(context.Background(), "uid-a", "vault", http.MethodPost, "/vault/uid-a", nil)
+	attachment := attachment("uid-a")
+	require.NoError(t, manager.RegisterDesired(attachment, 1, nil))
+	_, _, err := manager.RelayHandler(context.Background(), attachment, "vault", http.MethodPost, "/vault/uid-a", nil)
 	require.ErrorIs(t, err, ErrUnknownHandler)
 	require.Empty(t, caller.snapshotRelay())
 }
@@ -58,7 +64,7 @@ func TestHTTPCallerRelayDefaultsMethodToPost(t *testing.T) {
 	}))
 	t.Cleanup(handlerServer.Close)
 	status, _, err := NewHTTPCaller().Relay(context.Background(),
-		int32(handlerServer.Listener.Addr().(*net.TCPAddr).Port), "uid-a", "", "/vault/uid-a", []byte(`{}`))
+		int32(handlerServer.Listener.Addr().(*net.TCPAddr).Port), actionapi.APIVersion, actionapi.Owner{SandboxUID: "uid-a"}, "", "/vault/uid-a", []byte(`{}`))
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, status)
 	require.Equal(t, http.MethodPost, seenMethod)
@@ -79,7 +85,7 @@ func TestHTTPCallerRelayIsVerbatimOverRealHTTP(t *testing.T) {
 	t.Cleanup(handlerServer.Close)
 	port := int32(handlerServer.Listener.Addr().(*net.TCPAddr).Port)
 
-	status, body, err := NewHTTPCaller().Relay(context.Background(), port, "uid-a", http.MethodPut, "/vault/uid-a?x=1", []byte(`{"revision":1}`))
+	status, body, err := NewHTTPCaller().Relay(context.Background(), port, actionapi.APIVersion, actionapi.Owner{SandboxUID: "uid-a"}, http.MethodPut, "/vault/uid-a?x=1", []byte(`{"revision":1}`))
 	require.NoError(t, err)
 	require.Equal(t, http.StatusConflict, status)
 	require.Equal(t, []byte(`{"error":"exists"}`), body)
@@ -96,7 +102,7 @@ func TestHTTPCallerRelaySurfacesTransportFailures(t *testing.T) {
 	port := int32(listener.Addr().(*net.TCPAddr).Port)
 	require.NoError(t, listener.Close())
 
-	_, _, err = NewHTTPCaller().Relay(context.Background(), port, "", http.MethodGet, "/vault/s-a", nil)
+	_, _, err = NewHTTPCaller().Relay(context.Background(), port, "", actionapi.Owner{SandboxUID: "s-a"}, http.MethodGet, "/vault/s-a", nil)
 	require.Error(t, err, "an unreachable Handler is a relay failure, not a handler outcome")
 }
 
@@ -107,7 +113,7 @@ func TestHTTPCallerRelayBoundsResponsesAndRedirects(t *testing.T) {
 	}))
 	t.Cleanup(redirect.Close)
 	status, body, err := NewHTTPCaller().Relay(context.Background(),
-		int32(redirect.Listener.Addr().(*net.TCPAddr).Port), "uid-a", http.MethodGet, "/vault/s-a", nil)
+		int32(redirect.Listener.Addr().(*net.TCPAddr).Port), actionapi.APIVersion, actionapi.Owner{SandboxUID: "uid-a"}, http.MethodGet, "/vault/s-a", nil)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusFound, status, "redirects are surfaced verbatim, never followed")
 	require.Empty(t, body)
@@ -117,7 +123,7 @@ func TestHTTPCallerRelayBoundsResponsesAndRedirects(t *testing.T) {
 	}))
 	t.Cleanup(oversized.Close)
 	_, _, err = NewHTTPCaller().Relay(context.Background(),
-		int32(oversized.Listener.Addr().(*net.TCPAddr).Port), "uid-a", http.MethodGet, "/vault/s-a", nil)
+		int32(oversized.Listener.Addr().(*net.TCPAddr).Port), actionapi.APIVersion, actionapi.Owner{SandboxUID: "uid-a"}, http.MethodGet, "/vault/s-a", nil)
 	require.Error(t, err)
 	require.ErrorContains(t, err, fmt.Sprintf("exceeds %d bytes", int64(maxRelayResponseSize)))
 }
@@ -135,7 +141,7 @@ func TestHTTPCallerRelaySurfacesContextCancellation(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _, relayErr = NewHTTPCaller().Relay(ctx, int32(held.Listener.Addr().(*net.TCPAddr).Port), "uid-a", http.MethodGet, "/vault/s-a", nil)
+		_, _, relayErr = NewHTTPCaller().Relay(ctx, int32(held.Listener.Addr().(*net.TCPAddr).Port), actionapi.APIVersion, actionapi.Owner{SandboxUID: "uid-a"}, http.MethodGet, "/vault/s-a", nil)
 	}()
 	cancel()
 	select {
@@ -168,7 +174,7 @@ func TestHTTPCallerRelayReturnsResponsesOverManagementBound(t *testing.T) {
 	}()
 	require.NoError(t, err)
 
-	status, body, relayErr := NewHTTPCaller().Relay(context.Background(), port, "uid-a", http.MethodGet, "/policy/uid-a", nil)
+	status, body, relayErr := NewHTTPCaller().Relay(context.Background(), port, actionapi.APIVersion, actionapi.Owner{SandboxUID: "uid-a"}, http.MethodGet, "/policy/uid-a", nil)
 	require.NoError(t, relayErr)
 	require.Equal(t, http.StatusOK, status)
 	require.Equal(t, document, body, "the relay returns handler-owned documents verbatim")
@@ -178,6 +184,52 @@ func TestHTTPCallerRelayReturnsResponsesOverManagementBound(t *testing.T) {
 	caller := &HTTPCaller{client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(bytes.NewReader(document))}, nil
 	})}}
-	_, statusErr := caller.Status(context.Background(), port)
+	_, statusErr := caller.Status(context.Background(), port, actionapi.APIVersion)
 	require.ErrorContains(t, statusErr, "exceeds")
+}
+
+func TestHTTPCallerActionsV2UsesDedicatedRoutesAndFullOwner(t *testing.T) {
+	owner := actionapi.Owner{SandboxUID: "uid-a", FastletPodUID: "pod-a", RuntimeInstanceID: "runtime-a", InstanceGeneration: 2,
+		AssignmentAttempt: 3, RouteGeneration: 4, AttachmentID: "attachment-a"}
+	var actionVersion, actionOwner, relayPath string
+	handlerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_fastlet/v2/actions/status":
+			_ = json.NewEncoder(w).Encode(actionapi.HandlerStatus{APIVersion: actionapi.APIVersionV2, Ready: true, InstanceID: "egress-1", OwnerStatus: true})
+		case "/_fastlet/v2/actions":
+			var request actionapi.Request
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+			actionVersion, actionOwner = request.APIVersion, request.Owner.SandboxUID
+			w.WriteHeader(http.StatusOK)
+		case "/_fastlet/v2/relay/vault/uid-a":
+			relayPath = r.URL.Path
+			var got actionapi.Owner
+			decoded, err := base64.RawURLEncoding.DecodeString(r.Header.Get(actionapi.HeaderOwner))
+			require.NoError(t, err)
+			require.NoError(t, json.Unmarshal(decoded, &got))
+			require.Equal(t, owner, got)
+			require.Equal(t, owner.SandboxUID, r.Header.Get(actionapi.HeaderSandboxUID))
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer handlerServer.Close()
+	port := int32(handlerServer.Listener.Addr().(*net.TCPAddr).Port)
+	caller := NewHTTPCaller()
+	_, err := caller.Status(context.Background(), port, actionapi.APIVersionV2)
+	require.NoError(t, err)
+	_, err = caller.Status(context.Background(), port, actionapi.APIVersion)
+	require.Error(t, err, "a v2-only receiver must not be retried through v1")
+
+	request := actionapi.Request{APIVersion: actionapi.APIVersionV2, Operation: actionapi.OperationSetBinding,
+		Sandbox: actionapi.SandboxIdentity{UID: owner.SandboxUID}, Owner: &owner,
+		Revision: actionapi.Revision{SpecGeneration: 1, RuntimeInstanceID: owner.RuntimeInstanceID, AttachmentID: owner.AttachmentID, RouteGeneration: owner.RouteGeneration}}
+	require.NoError(t, caller.Invoke(context.Background(), port, request))
+	status, _, err := caller.Relay(context.Background(), port, actionapi.APIVersionV2, owner, http.MethodGet, "/vault/uid-a", nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, status)
+	require.Equal(t, actionapi.APIVersionV2, actionVersion)
+	require.Equal(t, owner.SandboxUID, actionOwner)
+	require.Equal(t, "/_fastlet/v2/relay/vault/uid-a", relayPath)
 }

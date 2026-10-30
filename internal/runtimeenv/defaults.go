@@ -2,10 +2,11 @@ package runtimeenv
 
 import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	actionapi "fast-sandbox/internal/protocol/action"
 )
 
 func DefaultConfig() Config {
-	return Config{Version: ConfigVersion, Environments: map[string]NodeRuntimeEnvironment{
+	return Config{Version: ConfigVersion, ActionsAPIVersion: actionapi.APIVersion, Environments: map[string]NodeRuntimeEnvironment{
 		DefaultEnvironment: {
 			Containerd: ContainerdEnvironment{
 				Socket: "/run/containerd/containerd.sock", Namespace: "k8s.io",

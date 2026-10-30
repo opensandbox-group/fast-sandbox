@@ -90,9 +90,10 @@ type RestoreSpec struct {
 // configuration. The two authorities remain explicitly nested so runtime
 // implementations cannot silently merge or overwrite duplicate fields.
 type RuntimeSandboxConfig struct {
-	Identity SandboxIdentity      `json:"identity"`
-	Desired  SandboxDesiredSpec   `json:"desired"`
-	Limits   SandboxRuntimeLimits `json:"limits"`
+	Identity          SandboxIdentity      `json:"identity"`
+	ActionsAPIVersion string               `json:"actionsApiVersion,omitempty"`
+	Desired           SandboxDesiredSpec   `json:"desired"`
+	Limits            SandboxRuntimeLimits `json:"limits"`
 }
 
 // UnmarshalJSON keeps durable runtime state written before desired state and
@@ -107,10 +108,11 @@ func (c *RuntimeSandboxConfig) UnmarshalJSON(data []byte) error {
 		PIDs   int64  `json:"pids,omitempty"`
 	}
 	var wire struct {
-		Identity SandboxIdentity           `json:"identity"`
-		Desired  *SandboxDesiredSpec       `json:"desired"`
-		Limits   *SandboxRuntimeLimits     `json:"limits"`
-		Spec     *legacyRuntimeSandboxSpec `json:"spec"`
+		Identity          SandboxIdentity           `json:"identity"`
+		ActionsAPIVersion string                    `json:"actionsApiVersion,omitempty"`
+		Desired           *SandboxDesiredSpec       `json:"desired"`
+		Limits            *SandboxRuntimeLimits     `json:"limits"`
+		Spec              *legacyRuntimeSandboxSpec `json:"spec"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
@@ -118,7 +120,7 @@ func (c *RuntimeSandboxConfig) UnmarshalJSON(data []byte) error {
 	if wire.Desired != nil && wire.Spec != nil {
 		return errors.New("runtime Sandbox config cannot contain both desired and legacy spec")
 	}
-	*c = RuntimeSandboxConfig{Identity: wire.Identity}
+	*c = RuntimeSandboxConfig{Identity: wire.Identity, ActionsAPIVersion: wire.ActionsAPIVersion}
 	if wire.Spec != nil {
 		c.Desired = wire.Spec.SandboxDesiredSpec
 		c.Limits = SandboxRuntimeLimits{CPU: wire.Spec.CPU, Memory: wire.Spec.Memory, PIDs: wire.Spec.PIDs}

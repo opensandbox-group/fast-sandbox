@@ -21,6 +21,7 @@ import (
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	infracontract "fast-sandbox/internal/infra/contract"
+	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
 
@@ -744,10 +745,56 @@ func TestRecoverRuntimeResourcesCleansDeadVM(t *testing.T) {
 		Config: fixture.sandboxSpec, Phase: PhaseRunning, PID: 777, APIAddress: filepath.Join(directory, "dead.sock"),
 	}))
 
-	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil))
+	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil, nil))
 	_, err = os.Stat(directory)
 	require.True(t, os.IsNotExist(err))
 	require.Contains(t, fixture.killCalls, 777)
+	require.Equal(t, 0, fixture.manager.Snapshot().Bound)
+}
+
+func TestRecoverRuntimeResourcesRetiresStrictOwnerBeforeCleanup(t *testing.T) {
+	fixture := newDriverFixture(t)
+	fixture.sandboxSpec.ActionsAPIVersion = actionapi.APIVersionV2
+	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
+	require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
+	_, err := fixture.driver.EnsureSandbox(context.Background(), ensureInput(&fixture.sandboxSpec))
+	require.NoError(t, err)
+	managed, err := fixture.driver.ListManagedSandboxes(context.Background())
+	require.NoError(t, err)
+	require.Len(t, managed, 1)
+	identity := managed[0].Config.Identity
+	directory, err := sandboxDir(fixture.stateRoot, identity.SandboxUID)
+	require.NoError(t, err)
+	fixture.driver.probeProcess = func(int) error { return os.ErrNotExist }
+
+	// A standalone strict recovery without the Fastlet's retirement gate must
+	// fail before release, process cleanup, or durable-state deletion.
+	require.ErrorContains(t, fixture.driver.RecoverRuntimeResources(context.Background(), managed, nil), "requires owner retirement")
+	require.DirExists(t, directory)
+	require.Equal(t, 1, fixture.manager.Snapshot().Bound)
+	require.Empty(t, fixture.killCalls)
+
+	unknown := errors.New("owner read-back unavailable")
+	var retirementCalls int
+	retireOwner := func(_ context.Context, metadata *SandboxMetadata) error {
+		retirementCalls++
+		require.Equal(t, identity, metadata.Config.Identity, "the gate receives the complete persisted owner")
+		require.Equal(t, actionapi.APIVersionV2, metadata.Config.ActionsAPIVersion)
+		return unknown
+	}
+	require.ErrorIs(t, fixture.driver.RecoverRuntimeResources(context.Background(), managed, retireOwner), unknown)
+	require.Equal(t, 1, retirementCalls)
+	require.DirExists(t, directory)
+	require.Equal(t, 1, fixture.manager.Snapshot().Bound)
+	require.Empty(t, fixture.killCalls)
+
+	retireOwner = func(_ context.Context, metadata *SandboxMetadata) error {
+		require.Equal(t, identity, metadata.Config.Identity)
+		require.Equal(t, actionapi.APIVersionV2, metadata.Config.ActionsAPIVersion)
+		return nil
+	}
+	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), managed, retireOwner))
+	require.NoDirExists(t, directory)
 	require.Equal(t, 0, fixture.manager.Snapshot().Bound)
 }
 
@@ -759,12 +806,40 @@ func TestRecoverRuntimeResourcesKeepsAliveVM(t *testing.T) {
 	_, err := fixture.driver.EnsureSandbox(context.Background(), ensureInput(&fixture.sandboxSpec))
 	require.NoError(t, err)
 
-	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil))
+	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil, nil))
 	managed, err := fixture.driver.ListManagedSandboxes(context.Background())
 	require.NoError(t, err)
 	require.Len(t, managed, 1)
 	require.Equal(t, "172.30.0.2", managed[0].Allocation.Network.IP)
 	require.NotEmpty(t, managed[0].Allocation.Network.SlotID)
+}
+
+func TestStrictRecoveryRetriesFailedSlotRelease(t *testing.T) {
+	fixture := newDriverFixture(t)
+	fixture.sandboxSpec.ActionsAPIVersion = actionapi.APIVersionV2
+	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
+	require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
+	flaky := &flakyDestroyDriver{failuresRemaining: 1}
+	manager := newNetworkManagerWithDriverForTest(t, flaky)
+	fixture.driver.SetNetworkManager(manager)
+	_, err := fixture.driver.EnsureSandbox(context.Background(), ensureInput(&fixture.sandboxSpec))
+	require.NoError(t, err)
+	retire := func(context.Context, *SandboxMetadata) error { return nil }
+	// A healthy strict VM must not be retired during recovery.
+	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil,
+		func(context.Context, *SandboxMetadata) error { t.Error("retired a healthy VM"); return nil }))
+	fixture.driver.probeProcess = func(int) error { return os.ErrNotExist }
+	directory, err := sandboxDir(fixture.stateRoot, fixture.sandboxSpec.Identity.SandboxUID)
+	require.NoError(t, err)
+	require.ErrorContains(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil, retire), "release retired Sandbox network slot")
+	require.DirExists(t, directory)
+	require.Equal(t, 1, manager.Snapshot().Destroying)
+	require.Empty(t, fixture.killCalls)
+	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil, retire))
+	require.NoDirExists(t, directory)
+	require.Equal(t, 2, flaky.destroyCalls)
+	manager.Quiesce()
+	require.Zero(t, manager.Snapshot().Destroying)
 }
 
 func TestGetAccessDescriptor(t *testing.T) {
@@ -1153,7 +1228,7 @@ func TestRecoverRuntimeResourcesRemovesJailRoot(t *testing.T) {
 	jailDir := filepath.Dir(jailerRoot(filepath.Join(fixture.stateRoot, jailerChrootBaseDir), "firecracker", "sandbox-1"))
 	require.NoError(t, os.MkdirAll(filepath.Join(jailDir, "root"), 0o750))
 
-	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil))
+	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil, nil))
 	_, err = os.Stat(jailDir)
 	require.True(t, os.IsNotExist(err))
 }
@@ -1201,6 +1276,6 @@ func TestRecoveryDoesNotInspectAnotherFastletPodVM(t *testing.T) {
 	managed, err := fixture.driver.ListManagedSandboxes(context.Background())
 	require.NoError(t, err)
 	require.Empty(t, managed)
-	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil))
+	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil, nil))
 	require.FileExists(t, filepath.Join(directory, sandboxMetaName))
 }

@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
 
@@ -91,6 +92,20 @@ func TestCreateSnapshotRejectsRuntimeWithoutSnapshotter(t *testing.T) {
 	var failure *fastletapi.FastletError
 	require.ErrorAs(t, err, &failure)
 	require.Equal(t, fastletapi.ErrorSnapshotUnsupported, failure.Code)
+}
+
+func TestCreateSnapshotRejectsActionsV2BeforeSnapshotter(t *testing.T) {
+	runtime := newSnapshotRuntime()
+	manager := newSnapshotManager(t, runtime)
+	manager.sandboxes["uid-a"].Config.ActionsAPIVersion = actionapi.APIVersionV2
+
+	_, err := manager.CreateSnapshot(context.Background(), snapshotRequest("snap-v2"))
+	require.Error(t, err)
+	var failure *fastletapi.FastletError
+	require.ErrorAs(t, err, &failure)
+	require.Equal(t, fastletapi.ErrorSnapshotUnsupported, failure.Code)
+	require.Zero(t, runtime.createCalls, "strict snapshot admission must fail before runtime snapshot effects")
+	require.Empty(t, manager.snapshots)
 }
 
 func TestCreateSnapshotAdmitsRunsAndObserves(t *testing.T) {

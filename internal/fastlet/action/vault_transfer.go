@@ -171,11 +171,14 @@ func (m *Manager) invokeTemplateTransfer(ctx context.Context, operation actionap
 	if name == "" || !declared {
 		return nil
 	}
+	if m.apiVersion == actionapi.APIVersionV2 {
+		return fmt.Errorf("%s is not supported by the strict Actions v2 management slice", operation)
+	}
 	invocation, err := m.stateInvocation(ctx, operation, name, sandboxUID, bundlePath)
 	if err != nil {
 		return err
 	}
-	status, err := m.caller.Status(ctx, handler.TargetHTTPPort)
+	status, err := m.caller.Status(ctx, handler.TargetHTTPPort, m.apiVersion)
 	if err != nil {
 		return fmt.Errorf("%s template state transfer capability probe for Sandbox %s: %w", operation, sandboxUID, err)
 	}
@@ -239,6 +242,9 @@ func (m *Manager) invokeStateTransfer(ctx context.Context, operation actionapi.O
 		// The Pool cannot hold egress state at all: nothing to transfer.
 		return nil
 	}
+	if m.apiVersion == actionapi.APIVersionV2 {
+		return fmt.Errorf("%s is not supported by the strict Actions v2 management slice", operation)
+	}
 	invocation, err := m.stateInvocation(ctx, operation, name, sandboxUID, bundlePath)
 	if err != nil {
 		return err
@@ -251,7 +257,7 @@ func (m *Manager) invokeStateTransfer(ctx context.Context, operation actionapi.O
 	// input as the only policy). An unreachable Handler is NOT a capability
 	// answer: the probe failure fails the checkpoint so the egress-local
 	// files survive for the retry.
-	status, err := m.caller.Status(ctx, handler.TargetHTTPPort)
+	status, err := m.caller.Status(ctx, handler.TargetHTTPPort, m.apiVersion)
 	if err != nil {
 		return fmt.Errorf("%s state transfer capability probe for Sandbox %s: %w", operation, sandboxUID, err)
 	}

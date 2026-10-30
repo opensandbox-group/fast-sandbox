@@ -81,6 +81,7 @@ func (m *SandboxManager) parkForImageDelivery(req *fastletapi.CreateSandboxReque
 		return createFailure(fastletError(fastletapi.ErrorConflict, "Sandbox changed before image delivery parked", true), admission)
 	}
 	if placeholder.Phase == sandboxStateTerminating {
+		delete(m.createDeletePending, sandboxUID)
 		admission := m.admissionStatusLocked()
 		go m.asyncDelete(sandboxUID, placeholder)
 		m.mu.Unlock()
@@ -142,6 +143,9 @@ func (m *SandboxManager) runImageBootWorker(ctx context.Context, metadata *Sandb
 			delete(m.imageBootWorkers, uid)
 		}
 		terminating := m.sandboxes[uid] == metadata && metadata.Phase == sandboxStateTerminating
+		if terminating {
+			delete(m.createDeletePending, uid)
+		}
 		m.mu.Unlock()
 		if terminating {
 			go m.asyncDelete(uid, metadata)
