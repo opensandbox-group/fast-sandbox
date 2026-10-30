@@ -1,33 +1,18 @@
 #!/usr/bin/env bash
 # firecracker-oci-chain-e2e.sh — real pause/checkpoint chain E2E over an OCI
-# overlaybd template: a local registry:2 container, a real template build, a
-# real overlaybd-ublkd, and N (default 100) pause/publish/restore cycles
-# driven through the actual Firecracker driver. Every cycle resolves the
-# published rootfs manifest and asserts the inherited layer chain stays
-# bounded by the fsb-vm pack squash policy — the "layer explosion" guard.
+# overlaybd template: local registry:2, real template build, real
+# overlaybd-ublkd, and N (default 100) pause/publish/restore cycles through
+# the Firecracker driver, asserting the rootfs chain stays bounded.
 #
 # Requirements: Linux x86_64, root, /dev/kvm, /dev/net/tun, docker, go, jq,
-# curl. Same reference host as firecracker-e2e.sh / firecracker-chain-e2e.sh.
+# curl. Everything it creates (registry container, ublkd, netns/tap, state)
+# is cleaned up on exit.
 #
-# Host impact: a registry:2 container on 127.0.0.1:5000 (removed on exit),
-# an overlaybd-ublkd process on /run/fast-sandbox/overlaybd (stopped on
-# exit), fsb-vm state under $WORK, and the usual per-run netns/tap devices
-# (purged on exit).
-#
-# Overrides (environment):
-#   FC_CHAIN_CYCLES      pause/publish/restore cycles (default 100)
-#   OCI_TOOLS_DIR        pre-packaged oci-tools directory (bin/libexec/lib,
-#                        as produced by package-tools.sh). When absent the
-#                        script builds overlaybd from source in a container
-#                        (about 10-20 minutes on the first run).
-#   OCI_TOOLS_IMAGE      alternative: docker image carrying the packaged
-#                        tools (fast-sandbox/oci-tools:dev layout)
-#   FC_BINARY/FC_JAILER/FC_KERNEL/FC_ROOTFS  Firecracker assets, as in the
-#                        other E2E scripts
-#   CHAIN_SOURCE_IMAGE   template source image (default alpine:3.19)
-#   REGISTRY_IMAGE       registry:2 image tag (default registry:2)
-#   REGISTRY_PORT        local registry port (default 5000)
-#   WORK                 workspace (default $PWD/.firecracker-oci-chain-e2e)
+# Overrides: FC_CHAIN_CYCLES (100), CHAIN_SOURCE_IMAGE (alpine:3.19),
+# REGISTRY_IMAGE (registry:2), REGISTRY_PORT (5000), WORK, and the
+# Firecracker assets FC_BINARY/FC_JAILER/FC_KERNEL/FC_ROOTFS. Tools come
+# from OCI_TOOLS_DIR or OCI_TOOLS_IMAGE; without either, overlaybd is built
+# from source (~10-20 min, first run only).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

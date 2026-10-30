@@ -1,18 +1,8 @@
 #!/usr/bin/env bash
-# verify-checkpoint-chain-growth.sh — prove that repeated pause/snapshot
-# cycles no longer grow the rootfs layer chain without bound.
+# verify-checkpoint-chain-growth.sh — run the packRootfs chain simulation in
+# a container and print the per-cycle chain length.
 #
-# Runs the packRootfs chain simulation (TestPackRootfsSquashBoundsChainGrowth)
-# in a Linux container: every cycle plays one pause — a dirty layer is
-# committed on top of the previous cycle's published stack — and the squash
-# policy collapses the configured tail once the chain reaches the cap. The
-# per-cycle chain length is printed so the bounded oscillation is visible.
-#
-# Usage:
-#   scripts/verify-checkpoint-chain-growth.sh [cycles] [max-layers] [squash-layers]
-#
-# Environment:
-#   GO_IMAGE   container image used to run the test (default golang:1.25)
+# Usage: scripts/verify-checkpoint-chain-growth.sh [cycles] [max-layers] [squash-layers]
 set -eu
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 GO_IMAGE="${GO_IMAGE:-golang:1.25}"

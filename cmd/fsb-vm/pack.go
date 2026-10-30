@@ -21,9 +21,8 @@ import (
 	"fast-sandbox/internal/ocitemplate"
 )
 
-// Default checkpoint rootfs layer-chain policy: once the chain reaches
-// maxRootfsLayers the newest squashLayers layers are merged into one, keeping
-// the template base layers at the bottom shared across sandboxes.
+// Checkpoint rootfs chain policy: at maxRootfsLayers, merge the newest
+// squashLayers layers into one; template base layers stay at the bottom.
 const (
 	defaultMaxRootfsLayers = 24
 	defaultSquashLayers    = 16
@@ -219,14 +218,10 @@ func packRootfs(ctx context.Context, bundle, work string, layout artifactLayout,
 	return squashRootfsTail(ctx, layout, rootLayers, upper, maxLayers, squashLayers)
 }
 
-// squashRootfsTail bounds the inherited layer chain: once it reaches
-// maxLayers, the newest squashLayers layers are merged into a single layer
-// with overlaybd-merge, so repeated pause/snapshot cycles no longer grow the
-// chain without bound. The bottom layers keep the template base shared
-// across sandboxes via registry blob mounts. Inherited tail blobs are
-// fetched from upper.Repository when absent locally; any failure is an
-// optimization miss that publishes the un-squashed chain without failing
-// the checkpoint.
+// squashRootfsTail merges the newest squashLayers layers into one once the
+// chain reaches maxLayers, keeping the template base layers at the bottom.
+// Missing tail blobs are fetched from upper.Repository; any failure skips
+// the squash and publishes the un-squashed chain.
 func squashRootfsTail(ctx context.Context, layout artifactLayout, rootLayers []ocispec.Descriptor, upper *ocitemplate.RootfsUpper, maxLayers, squashLayers int) ([]ocispec.Descriptor, error) {
 	if upper == nil || len(rootLayers) < maxLayers {
 		return rootLayers, nil
@@ -264,16 +259,14 @@ func squashRootfsTail(ctx context.Context, layout artifactLayout, rootLayers []o
 	return append(bottom, desc), nil
 }
 
-// squashMiss reports why a squash attempt did not change the published
-// chain: the checkpoint stays valid, only the optimization is missed.
+// squashMiss turns a failed squash into an optimization miss.
 func squashMiss(err error) error {
 	fmt.Fprintf(os.Stderr, "layer squash skipped: %v\n", err)
 	return nil
 }
 
-// ensureLocalBlob materializes one inherited layer blob in the layout blob
-// store, fetching it from the parent repository when absent (the common
-// case: pack staging never downloads parent layers on its own).
+// ensureLocalBlob fetches one inherited layer blob from the parent
+// repository when it is not already in the layout blob store.
 func ensureLocalBlob(ctx context.Context, layout artifactLayout, repository string, desc ocispec.Descriptor) error {
 	path := layout.blobPath(desc.Digest)
 	if info, err := os.Stat(path); err == nil && info.Size() == desc.Size {
@@ -318,8 +311,7 @@ func ensureLocalBlob(ctx context.Context, layout artifactLayout, repository stri
 }
 
 // packCredentials resolves pull credentials from the node's overlaybd
-// credential file, the same source the runtime uses for on-demand block
-// reads of the inherited layers.
+// credential file, like the runtime's own on-demand block reads.
 func packCredentials() (ocitemplate.CredentialFunc, error) {
 	config, err := readCredentials(global.credFile)
 	if err != nil {

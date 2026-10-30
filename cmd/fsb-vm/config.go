@@ -119,7 +119,7 @@ func init() {
 	flags.StringVar(&global.firecrackerBin, "firecracker", defaultFirecrackerBin, "firecracker binary path")
 	flags.StringVar(&global.overlaybdCreate, "overlaybd-create", defaultOverlaybdCreate, "overlaybd-create binary path")
 	flags.StringVar(&global.overlaybdCommit, "overlaybd-commit", defaultOverlaybdCommit, "overlaybd-commit binary path")
-	flags.StringVar(&global.overlaybdMerge, "overlaybd-merge", defaultOverlaybdMerge, "overlaybd-merge binary path (checkpoint layer squash)")
+	flags.StringVar(&global.overlaybdMerge, "overlaybd-merge", defaultOverlaybdMerge, "overlaybd-merge binary path")
 	flags.StringVar(&global.overlaybdResize, "overlaybd-resize", defaultOverlaybdResize, "overlaybd-resize binary path")
 	flags.StringVar(&global.convertor, "overlaybd-convertor", defaultConvertor, "overlaybd userspace convertor binary path")
 	flags.StringVar(&global.buildWorkDir, "build-work-dir", defaultBuildWorkDir, "temporary build directory root (build command)")

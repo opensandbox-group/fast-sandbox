@@ -1,13 +1,9 @@
-// registryseed seeds the E2E's local plain-HTTP registry and emits the
-// compiled registry credential file the runtime expects.
+// registryseed copies a source image into the local plain-HTTP registry via
+// ORAS and optionally emits the compiled registry credential file:
 //
 //	go run ./test/e2e/support/registryseed \
 //	  -from alpine:3.19 -to 127.0.0.1:5000/templates:base \
 //	  -compiled-out /tmp/registry.json
-//
-// The copy is a full graph copy (manifest, config, layers) via ORAS: the
-// source uses the docker credential hierarchy (anonymous for public images),
-// the destination always speaks plain HTTP.
 package main
 
 import (

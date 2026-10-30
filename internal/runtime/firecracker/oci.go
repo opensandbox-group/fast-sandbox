@@ -58,9 +58,8 @@ func ociRootForPod(stateRoot, podUID string) string {
 	return root
 }
 
-// ociPlainHTTP reports whether the deployment's registries speak plain HTTP
-// (air-gapped or loopback setups). fsb-vm inherits it for ORAS pulls and the
-// repoBlobUrl scheme overlaybd range-reads; OCI publication honors it too.
+// ociPlainHTTP reports whether the registries speak plain HTTP; it flows
+// into fsb-vm (ORAS pulls and repoBlobUrl) and OCI publication.
 func ociPlainHTTP() bool {
 	value := strings.TrimSpace(os.Getenv("FAST_SANDBOX_OCI_PLAIN_HTTP"))
 	return value == "1" || strings.EqualFold(value, "true")

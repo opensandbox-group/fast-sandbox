@@ -383,9 +383,8 @@ func TestPackRecoveryFencesLateAddBeforeReleasingFiles(t *testing.T) {
 	}
 }
 
-// squashTestStubs installs overlaybd-commit/overlaybd-merge stubs: the commit
-// stub always produces fresh dirty content (every cycle writes), the merge
-// stub concatenates its input layers into the last argument.
+// squashTestStubs installs commit/merge stubs: every commit is dirty, the
+// merge concatenates its input layers into the last argument.
 func squashTestStubs(t *testing.T, dir string) {
 	t.Helper()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "overlaybd-commit"), []byte("#!/bin/sh\nhead -c 128 /dev/urandom > \"$5\"\n"), 0755))
@@ -400,8 +399,7 @@ func squashTestUpper(layers []ocispec.Descriptor) *ocitemplate.RootfsUpper {
 	}
 }
 
-// chainEnv overrides the chain simulation parameters from the environment so
-// scripts/verify-checkpoint-chain-growth.sh can explore the policy space.
+// chainEnv reads FSB_CHAIN_* overrides for the verify script.
 func chainEnv(maxLayers, squashCount, cycles int) (int, int, int) {
 	for _, entry := range []struct {
 		name string
@@ -417,12 +415,9 @@ func chainEnv(maxLayers, squashCount, cycles int) (int, int, int) {
 	return maxLayers, squashCount, cycles
 }
 
-// TestPackRootfsSquashBoundsChainGrowth simulates repeated pause cycles
-// through the real packRootfs path: every cycle appends one dirty layer on
-// top of the previous cycle's published stack, exactly like resume does.
-// Layer blobs are carried over between cycles the way the node checkpoint
-// cache keeps them locally. The chain must never exceed maxRootfsLayers and
-// each squash must collapse the configured tail.
+// TestPackRootfsSquashBoundsChainGrowth simulates pause cycles through the
+// real packRootfs path: one dirty layer per cycle, blobs carried across
+// cycles. The chain must never exceed maxRootfsLayers.
 func TestPackRootfsSquashBoundsChainGrowth(t *testing.T) {
 	maxLayers, squashCount, cycles := chainEnv(8, 4, 30)
 	previous := global
@@ -470,8 +465,8 @@ func TestPackRootfsSquashBoundsChainGrowth(t *testing.T) {
 	require.Greater(t, squashes, 0, "the cap must trigger squashes")
 }
 
-// TestPackRootfsSquashFallsBackOnMergeFailure keeps the checkpoint valid when
-// the merge tool is unavailable: the un-squashed chain is published instead.
+// TestPackRootfsSquashFallsBackOnMergeFailure publishes the un-squashed
+// chain when the merge tool is unavailable.
 func TestPackRootfsSquashFallsBackOnMergeFailure(t *testing.T) {
 	previous := global
 	t.Cleanup(func() { global = previous })

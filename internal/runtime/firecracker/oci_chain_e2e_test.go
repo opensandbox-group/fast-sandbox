@@ -2,28 +2,16 @@
 
 package firecracker
 
-// oci_chain_e2e_test.go — real pause/checkpoint chain E2E for OCI-rooted
-// sandboxes: create from an OCI template pair, then repeatedly dump, publish
-// an instance-private checkpoint (fsb-vm pack + registry push) and restore a
-// fresh VM from the published manifestRef. Every cycle resolves the
-// published rootfs manifest and asserts the inherited layer chain stays
-// bounded by the fsb-vm pack squash policy (max-rootfs-layers, default 24).
+// Real pause/checkpoint chain E2E for OCI-rooted sandboxes: repeatedly dump,
+// publish a checkpoint (fsb-vm pack + push) and restore from the published
+// manifestRef, asserting every published rootfs manifest stays within the
+// pack squash bound. Run scripts/firecracker-oci-chain-e2e.sh to wire up the
+// host (Linux, root, KVM, TUN, registry, overlaybd-ublkd).
 //
-// Requirements mirror the other Firecracker E2Es (Linux, root, KVM, TUN)
-// plus a reachable OCI registry holding the template pair and a running
-// overlaybd-ublkd on the fast-sandbox socket dir; scripts/
-// firecracker-oci-chain-e2e.sh wires all of that up.
-//
-// Environment:
-//   FC_OCI_TEMPLATE_REF    oci://<registry>/<repo>:<tag> of the template pair (required)
-//   FC_CHAIN_CYCLES        pause/publish/restore cycles (default 100)
-//   FC_CHAIN_MAX_LAYERS    expected chain bound; must match the fsb-vm pack
-//                          --max-rootfs-layers default (24)
-//   FAST_SANDBOX_OCI_SNAPSHOT_REPOSITORY  checkpoint repository; defaults to
-//                          the template repository
-//   FAST_SANDBOX_OCI_PLAIN_HTTP / FAST_SANDBOX_REGISTRY_CONFIG_PATH
-//                          registry transport and credential plumbing, as in
-//                          production
+// Environment: FC_OCI_TEMPLATE_REF (required), FC_CHAIN_CYCLES (default
+// 100), FC_CHAIN_MAX_LAYERS (default 24, must match the fsb-vm pack
+// default), FAST_SANDBOX_OCI_SNAPSHOT_REPOSITORY, FAST_SANDBOX_OCI_PLAIN_HTTP,
+// FAST_SANDBOX_REGISTRY_CONFIG_PATH.
 
 import (
 	"context"
@@ -156,10 +144,8 @@ func TestFirecrackerOCICheckpointChainE2E(t *testing.T) {
 		require.Positive(t, metadata.PID, "cycle %d: VM must be running", cycle)
 
 		snapshotID := fmt.Sprintf("chain-%06d", cycle)
-		// CreateSnapshot spans the whole publish path: the business pause
-		// window (pause + dump + upper capture + resume) and the offline
-		// pack + registry push. The driver's klog line separates the pause
-		// window into pauseAPI/dumpAPI/resumeAPI.
+		// CreateSnapshot covers the pause window plus offline pack + push;
+		// the driver's klog line breaks the pause window down further.
 		checkpointStart := time.Now()
 		result, err := driver.CreateSnapshot(cycleCtx, &runtimecontract.SnapshotInput{
 			SandboxID:  spec.Identity.SandboxUID,
@@ -207,10 +193,8 @@ func ociChainSpec(podUID string) *fastletapi.RuntimeSandboxConfig {
 	}
 }
 
-// fetchPublishedRootfsLayers resolves the cycle's published rootfs manifest
-// (tag <snapshotID>_rootfs per the pair convention) and returns its layer
-// count. The repository mirrors checkpointDestinationForSource: the explicit
-// snapshot repository, else the template's repository.
+// fetchPublishedRootfsLayers returns the layer count of the cycle's
+// published rootfs manifest (tag <snapshotID>_rootfs).
 func fetchPublishedRootfsLayers(t *testing.T, templateRef, snapshotID string) int {
 	t.Helper()
 	repository := envOr("FAST_SANDBOX_OCI_SNAPSHOT_REPOSITORY", "")
