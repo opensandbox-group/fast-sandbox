@@ -188,8 +188,8 @@ log "running $CYCLES pause/publish/restore cycles (chain bound asserted every cy
     ./internal/runtime/firecracker/) 2>&1 | tee "$RUN_DIR/chain-test.log"
 
 echo
-echo "== per-cycle chain length =="
-grep -oE 'CHAIN cycle=[0-9]+ layers=[0-9]+' "$RUN_DIR/chain-test.log" || true
+echo "== per-cycle chain length and stage timings =="
+grep -E 'CHAIN (cycle|summary)' "$RUN_DIR/chain-test.log" || true
 if grep -q '^ok' "$RUN_DIR/chain-test.log"; then
     pass "chain stayed bounded across $CYCLES cycles"
 else

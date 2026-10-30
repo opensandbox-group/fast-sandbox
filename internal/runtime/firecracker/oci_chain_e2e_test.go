@@ -139,6 +139,8 @@ func TestFirecrackerOCICheckpointChainE2E(t *testing.T) {
 
 	manifestRef, artifactDigest := templateRef, ""
 	maxObserved := 0
+	var totalRestore, totalCheckpoint, totalDelete time.Duration
+	chainStart := time.Now()
 	for cycle := 1; cycle <= cycles; cycle++ {
 		spec := ociChainSpec(podUID)
 		if cycle == 1 {
@@ -147,28 +149,47 @@ func TestFirecrackerOCICheckpointChainE2E(t *testing.T) {
 			spec.Desired.Restore = &fastletapi.RestoreSpec{ManifestRef: manifestRef, ArtifactDigest: artifactDigest}
 		}
 		cycleCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		restoreStart := time.Now()
 		metadata, err := driver.EnsureSandbox(cycleCtx, ensureInput(spec))
+		restoreDur := time.Since(restoreStart)
 		require.NoErrorf(t, err, "cycle %d: restore", cycle)
 		require.Positive(t, metadata.PID, "cycle %d: VM must be running", cycle)
 
 		snapshotID := fmt.Sprintf("chain-%06d", cycle)
+		// CreateSnapshot spans the whole publish path: the business pause
+		// window (pause + dump + upper capture + resume) and the offline
+		// pack + registry push. The driver's klog line separates the pause
+		// window into pauseAPI/dumpAPI/resumeAPI.
+		checkpointStart := time.Now()
 		result, err := driver.CreateSnapshot(cycleCtx, &runtimecontract.SnapshotInput{
 			SandboxID:  spec.Identity.SandboxUID,
 			SnapshotID: snapshotID,
 			Kind:       fastletapi.SnapshotKindCheckpoint,
 		})
+		checkpointDur := time.Since(checkpointStart)
 		require.NoErrorf(t, err, "cycle %d: checkpoint", cycle)
 
 		layers := fetchPublishedRootfsLayers(t, templateRef, snapshotID)
-		t.Logf("CHAIN cycle=%d layers=%d manifestRef=%s", cycle, layers, result.ManifestRef)
-		require.LessOrEqualf(t, layers, bound, "cycle %d exceeds the layer bound", cycle)
-		maxObserved = max(maxObserved, layers)
-
+		deleteStart := time.Now()
 		require.NoError(t, driver.DeleteSandbox(context.Background(), spec.Identity.SandboxUID))
 		waitForCleanSlot(t, manager, 1)
+		deleteDur := time.Since(deleteStart)
+		totalRestore, totalCheckpoint, totalDelete = totalRestore+restoreDur, totalCheckpoint+checkpointDur, totalDelete+deleteDur
+		t.Logf("CHAIN cycle=%d layers=%d restore=%s checkpoint=%s delete=%s manifestRef=%s",
+			cycle, layers, restoreDur.Round(time.Millisecond), checkpointDur.Round(time.Millisecond),
+			deleteDur.Round(time.Millisecond), result.ManifestRef)
+		require.LessOrEqualf(t, layers, bound, "cycle %d exceeds the layer bound", cycle)
+		maxObserved = max(maxObserved, layers)
 		cancel()
 		manifestRef, artifactDigest = result.ManifestRef, result.ArtifactDigest
 	}
+	wall := time.Since(chainStart)
+	t.Logf("CHAIN summary cycles=%d maxLayers=%d wall=%s avgCycle=%s avgRestore=%s avgCheckpoint=%s avgDelete=%s",
+		cycles, maxObserved, wall.Round(time.Second),
+		(wall / time.Duration(cycles)).Round(time.Millisecond),
+		(totalRestore / time.Duration(cycles)).Round(time.Millisecond),
+		(totalCheckpoint / time.Duration(cycles)).Round(time.Millisecond),
+		(totalDelete / time.Duration(cycles)).Round(time.Millisecond))
 	require.Equal(t, bound, maxObserved, "every cycle writes, so the cap must be reached exactly")
 }
 
