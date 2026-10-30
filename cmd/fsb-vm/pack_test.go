@@ -398,11 +398,21 @@ func TestPackRecoveryFencesLateAddBeforeReleasingFiles(t *testing.T) {
 }
 
 // squashTestStubs installs commit/merge stubs: every commit is dirty, the
-// merge concatenates its input layers into the last argument.
+// merge validates the packaged tool's argument shape and concatenates the
+// layer files named by the merge config into the output.
 func squashTestStubs(t *testing.T, dir string) {
 	t.Helper()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "overlaybd-commit"), []byte("#!/bin/sh\nhead -c 128 /dev/urandom > \"$5\"\n"), 0755))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "overlaybd-merge"), []byte("#!/bin/sh\nshift 2\nfor a in \"$@\"; do last=$a; done\nshift $(($# - 1))\ncat \"$@\" > \"$last\"\n"), 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "overlaybd-merge"), []byte(`#!/bin/sh
+if [ "$#" -ne 2 ] || [ ! -f "$1" ]; then
+  echo "usage: overlaybd-merge <config> <out>" >&2
+  exit 2
+fi
+: > "$2"
+for layer in $(grep -o '"file":"[^"]*"' "$1" | sed 's/^"file":"//;s/"$//'); do
+  cat "$layer" >> "$2" || exit 1
+done
+`), 0755))
 }
 
 func squashTestUpper(layers []ocispec.Descriptor) *ocitemplate.RootfsUpper {
@@ -440,6 +450,7 @@ func TestPackRootfsSquashBoundsChainGrowth(t *testing.T) {
 	squashTestStubs(t, dir)
 	global.overlaybdCommit = filepath.Join(dir, "overlaybd-commit")
 	global.overlaybdMerge = filepath.Join(dir, "overlaybd-merge")
+	global.overlaybdServiceConfig = filepath.Join(t.TempDir(), "overlaybd.json")
 
 	ctx := context.Background()
 	blobs := map[digest.Digest][]byte{}
@@ -469,6 +480,7 @@ func TestPackRootfsSquashBoundsChainGrowth(t *testing.T) {
 			if _, ok := blobs[layer.Digest]; !ok {
 				data, err := os.ReadFile(layout.blobPath(layer.Digest))
 				require.NoError(t, err)
+				require.NotEmpty(t, data, "cycle %d: merged layer %s must retain data", cycle, layer.Digest)
 				blobs[layer.Digest] = data
 			}
 		}
@@ -488,6 +500,7 @@ func TestPackRootfsSquashFallsBackOnMergeFailure(t *testing.T) {
 	squashTestStubs(t, dir)
 	global.overlaybdCommit = filepath.Join(dir, "overlaybd-commit")
 	global.overlaybdMerge = filepath.Join(dir, "missing-merge")
+	global.overlaybdServiceConfig = filepath.Join(t.TempDir(), "overlaybd.json")
 
 	chain := []ocispec.Descriptor{
 		{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("l1"), Size: 4},
@@ -517,6 +530,7 @@ func TestPackRootfsSquashPreservesBaseLayers(t *testing.T) {
 	squashTestStubs(t, dir)
 	global.overlaybdCommit = filepath.Join(dir, "overlaybd-commit")
 	global.overlaybdMerge = filepath.Join(dir, "overlaybd-merge")
+	global.overlaybdServiceConfig = filepath.Join(t.TempDir(), "overlaybd.json")
 
 	base := []ocispec.Descriptor{
 		{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("base0"), Size: 4},
@@ -554,6 +568,13 @@ func TestPackRootfsSquashPreservesBaseLayers(t *testing.T) {
 	for _, layer := range checkpointLayers {
 		require.NoFileExists(t, layout.blobPath(layer.Digest), "absorbed checkpoint blobs are cleaned up")
 	}
+	// The merged layer must be derived from the input layers: the stub
+	// concatenates the files named by the merge config, bottom-first, so the
+	// output is both checkpoint deltas followed by the committed root layer.
+	merged, err := os.ReadFile(layout.blobPath(layers[len(layers)-1].Digest))
+	require.NoError(t, err)
+	require.Len(t, merged, 2*len("data")+128, "the merge must consume every tail layer")
+	require.Equal(t, "datadata", string(merged[:2*len("data")]), "tail layers merge bottom-first")
 }
 
 // TestPackRootfsSquashRecoversOvershootChain collapses a chain that already
@@ -566,6 +587,7 @@ func TestPackRootfsSquashRecoversOvershootChain(t *testing.T) {
 	squashTestStubs(t, dir)
 	global.overlaybdCommit = filepath.Join(dir, "overlaybd-commit")
 	global.overlaybdMerge = filepath.Join(dir, "overlaybd-merge")
+	global.overlaybdServiceConfig = filepath.Join(t.TempDir(), "overlaybd.json")
 
 	chain := make([]ocispec.Descriptor, 0, 40)
 	for index := 0; index < 40; index++ {

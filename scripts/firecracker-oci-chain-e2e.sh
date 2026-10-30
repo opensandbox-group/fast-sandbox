@@ -131,6 +131,7 @@ log "seeding $CHAIN_SOURCE_IMAGE into the local registry"
     -from "$CHAIN_SOURCE_IMAGE" \
     -to "${REGISTRY}/${TEMPLATE_REPO}:base" \
     -compiled-out "$RUN_DIR/registry.json")
+export FAST_SANDBOX_OCI_ENABLED=true
 export FAST_SANDBOX_REGISTRY_CONFIG_PATH="$RUN_DIR/registry.json"
 export FAST_SANDBOX_OCI_PLAIN_HTTP=1
 export FAST_SANDBOX_OCI_SNAPSHOT_REPOSITORY="${REGISTRY}/${SNAPSHOT_REPO}"

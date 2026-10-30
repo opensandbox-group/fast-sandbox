@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -283,11 +282,18 @@ func squashOnce(ctx context.Context, layout artifactLayout, rootLayers []ocispec
 		}
 	}
 	merged := filepath.Join(layout.blobDir(), fmt.Sprintf(".squash-%s.tmp", digest.FromString(filepath.Base(layout.root)).Encoded()))
-	arguments := []string{"-n", strconv.Itoa(tailCount), "-z"}
-	for _, layer := range tail {
-		arguments = append(arguments, layout.blobPath(layer.Digest))
+	// The packaged overlaybd-merge takes an image config path plus an output
+	// path: the config names the tail blobs as a private read-only stack and
+	// the tool flattens it into one zfile layer (--compress is its default).
+	mergeConfig, err := writeSquashMergeConfig(layout, tail)
+	if err != nil {
+		return nil, err
 	}
-	arguments = append(arguments, merged)
+	defer os.Remove(mergeConfig)
+	if err = ensureMergeServiceConfig(); err != nil {
+		return nil, err
+	}
+	arguments := []string{mergeConfig, merged}
 	command := exec.CommandContext(ctx, global.overlaybdMerge, arguments...)
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
@@ -303,6 +309,69 @@ func squashOnce(ctx context.Context, layout artifactLayout, rootLayers []ocispec
 	fmt.Fprintf(os.Stderr, "squashed %d rootfs layers into %s\n", tailCount, desc.Digest)
 	removeSquashedBlobs(layout, tail, bottom, desc)
 	return append(bottom, desc), nil
+}
+
+// overlaybdMergeConfig is the image config consumed by the packaged
+// overlaybd-merge: a read-only stack of local layer files, bottom-first.
+type overlaybdMergeConfig struct {
+	Lowers []overlaybdMergeLayer `json:"lowers"`
+}
+
+type overlaybdMergeLayer struct {
+	File string `json:"file"`
+}
+
+// writeSquashMergeConfig materializes the merge input config beside the
+// output, referencing the tail blobs as local files so the merge itself
+// never touches the network or the registry.
+func writeSquashMergeConfig(layout artifactLayout, tail []ocispec.Descriptor) (string, error) {
+	config := overlaybdMergeConfig{Lowers: make([]overlaybdMergeLayer, 0, len(tail))}
+	for _, layer := range tail {
+		config.Lowers = append(config.Lowers, overlaybdMergeLayer{File: layout.blobPath(layer.Digest)})
+	}
+	raw, err := json.Marshal(config)
+	if err != nil {
+		return "", err
+	}
+	return writeSquashTempConfig(layout, raw)
+}
+
+// ensureMergeServiceConfig creates the overlaybd service config when the
+// host has none yet: the pinned overlaybd-merge validates the default path
+// at argument parsing even when a custom service config is passed, so pack
+// materializes a minimal local-only config there. Existing files are never
+// modified.
+func ensureMergeServiceConfig() error {
+	if err := os.MkdirAll(filepath.Dir(global.overlaybdServiceConfig), 0o755); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(global.overlaybdServiceConfig, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer file.Close()
+	_, err = file.WriteString(`{"enableAudit":false,"logPath":""}`)
+	return err
+}
+
+func writeSquashTempConfig(layout artifactLayout, raw []byte) (string, error) {
+	if err := os.MkdirAll(layout.blobDir(), 0o750); err != nil {
+		return "", err
+	}
+	config, err := os.CreateTemp(layout.blobDir(), ".squash-*.json")
+	if err != nil {
+		return "", err
+	}
+	name := config.Name()
+	if _, err = config.Write(raw); err != nil {
+		_ = config.Close()
+		_ = os.Remove(name)
+		return "", err
+	}
+	return name, config.Close()
 }
 
 // removeSquashedBlobs drops the tail blobs the merge absorbed so a standalone

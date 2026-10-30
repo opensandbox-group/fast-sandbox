@@ -48,6 +48,9 @@ func TestFirecrackerOCICheckpointChainE2E(t *testing.T) {
 	if templateRef == "" {
 		t.Skip("requires FC_OCI_TEMPLATE_REF (oci:// template pair published by the E2E script)")
 	}
+	// The script exports this too; set it here so the test cannot silently
+	// exercise a disabled OCI path.
+	t.Setenv("FAST_SANDBOX_OCI_ENABLED", "true")
 	cycles := 100
 	if value := os.Getenv("FC_CHAIN_CYCLES"); value != "" {
 		parsed, err := strconv.Atoi(value)
@@ -56,7 +59,8 @@ func TestFirecrackerOCICheckpointChainE2E(t *testing.T) {
 		cycles = parsed
 	}
 	// Must match the fsb-vm pack --max-rootfs-layers default; every cycle
-	// appends a layer, so the cap must be reached and never exceeded.
+	// appends a layer, so the candidate chain reaches the cap and the pack
+	// squash must keep every published manifest at or below it.
 	bound := 24
 	if value := os.Getenv("FC_CHAIN_MAX_LAYERS"); value != "" {
 		parsed, err := strconv.Atoi(value)
@@ -126,7 +130,7 @@ func TestFirecrackerOCICheckpointChainE2E(t *testing.T) {
 	})
 
 	manifestRef, artifactDigest := templateRef, ""
-	maxObserved := 0
+	maxObserved, squashes, prevLayers := 0, 0, 0
 	var totalRestore, totalCheckpoint, totalDelete time.Duration
 	chainStart := time.Now()
 	for cycle := 1; cycle <= cycles; cycle++ {
@@ -165,6 +169,12 @@ func TestFirecrackerOCICheckpointChainE2E(t *testing.T) {
 			cycle, layers, restoreDur.Round(time.Millisecond), checkpointDur.Round(time.Millisecond),
 			deleteDur.Round(time.Millisecond), result.ManifestRef)
 		require.LessOrEqualf(t, layers, bound, "cycle %d exceeds the layer bound", cycle)
+		// Every cycle writes one layer, so a published count below the
+		// previous cycle's proves the pack squash merged the chain.
+		if prevLayers > 0 && layers < prevLayers {
+			squashes++
+		}
+		prevLayers = layers
 		maxObserved = max(maxObserved, layers)
 		cancel()
 		manifestRef, artifactDigest = result.ManifestRef, result.ArtifactDigest
@@ -176,7 +186,10 @@ func TestFirecrackerOCICheckpointChainE2E(t *testing.T) {
 		(totalRestore / time.Duration(cycles)).Round(time.Millisecond),
 		(totalCheckpoint / time.Duration(cycles)).Round(time.Millisecond),
 		(totalDelete / time.Duration(cycles)).Round(time.Millisecond))
-	require.Equal(t, bound, maxObserved, "every cycle writes, so the cap must be reached exactly")
+	// A working squash collapses the candidate chain at the cap before
+	// publication, so the observed maximum stays below the bound; require a
+	// squash to have happened instead of an exact published maximum.
+	require.Greaterf(t, squashes, 0, "the cap must trigger a squash within %d cycles", cycles)
 }
 
 const ociChainSandboxID = "oci-chain-sandbox"
