@@ -106,6 +106,14 @@ type Driver struct {
 	// fcVersion caches the last successfully resolved local Firecracker
 	// binary version (restore admission); unresolved lookups are retried.
 	fcVersion string
+	// metadataPublication tracks in-flight VM discovery payload writes
+	// (metadata.go): the payload goroutine never blocks EnsureSandbox, and
+	// tests wait on it to observe the record after provisioning returns.
+	metadataPublication sync.WaitGroup
+	// writeVMMetadataPayload emits the discovery record payload; stubbed in
+	// tests to hold publication mid-flight and prove EnsureSandbox does not
+	// wait for it.
+	writeVMMetadataPayload func(file *os.File, payload []byte) error
 }
 
 // defaultImageGCInterval bounds the image cache by usage without coupling GC
@@ -123,9 +131,10 @@ func New(profile runtimecatalog.RuntimeProfile) (*Driver, error) {
 		newClient: NewClient, stat: os.Stat, killProcess: killPID, probeProcess: pidAlive,
 		alignJailKVM: defaultAlignJailKVM,
 		waitSocket:   waitForAPISocket, processes: make(map[string]Process),
-		checkStorage:         checkStateRootStorage,
-		imageGCInterval:      defaultImageGCInterval,
-		imageCacheLimitBytes: defaultImageCacheLimitBytes,
+		checkStorage:           checkStateRootStorage,
+		writeVMMetadataPayload: writeVMMetadataPayload,
+		imageGCInterval:        defaultImageGCInterval,
+		imageCacheLimitBytes:   defaultImageCacheLimitBytes,
 	}, nil
 }
 
@@ -418,7 +427,7 @@ func (d *Driver) ProbeCapabilities(ctx context.Context) CapabilityReport {
 // snapshot set (an instance checkpoint when the request carries a resume
 // reference). The call is idempotent and emits an OTel span tree correlated
 // by the Sandbox identity.
-func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSandboxInput) (_ *SandboxMetadata, resultErr error) { //nolint:gocognit,gocyclo,maintidx // pre-existing create/resume state machine; refactor tracked separately
+func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSandboxInput) (_ *SandboxMetadata, resultErr error) { //nolint:gocognit,gocyclo,maintidx,funlen // pre-existing create/resume state machine; refactor tracked separately
 	if input == nil {
 		return nil, fmt.Errorf("%w: Firecracker Sandbox input is required", ErrInvalidConfig)
 	}
@@ -802,6 +811,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		"configure", configureDur.String(),
 		"boot", bootDur.String(), "vmStatePolls", polls,
 	)
+	d.publishVMMetadata(logDir, identity)
 	createdComplete = true
 	return existingMetadata(state), nil
 }
