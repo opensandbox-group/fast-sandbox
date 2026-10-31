@@ -142,7 +142,11 @@ func (d *Driver) publishOCISnapshot(ctx context.Context, plan dumpPlan, sizeByte
 	if onPublishing != nil {
 		onPublishing()
 	}
-	ref, _, err := ocitemplate.Push(ctx, filepath.Join(plan.staging, "artifacts", "snapshot_"+plan.snapshotID), destination, raw, credentials)
+	pushOptions := []ocitemplate.RepositoryOption{}
+	if ociPlainHTTP() {
+		pushOptions = append(pushOptions, ocitemplate.WithPlainHTTP(true))
+	}
+	ref, _, err := ocitemplate.Push(ctx, filepath.Join(plan.staging, "artifacts", "snapshot_"+plan.snapshotID), destination, raw, credentials, pushOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("publish OCI snapshot: %w", err)
 	}

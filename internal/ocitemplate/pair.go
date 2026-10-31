@@ -21,6 +21,11 @@ const (
 	AnnotationSandboxUID   = "io.fast-sandbox.sandbox.uid"
 	AnnotationNamespace    = "io.fast-sandbox.sandbox.namespace"
 	AnnotationCheckpointID = "io.fast-sandbox.checkpoint.id"
+	// AnnotationRootfsBaseLayers records how many bottom layers of a rootfs
+	// manifest belong to the immutable template base. It travels with the
+	// published pair so checkpoint lineages keep the boundary that keeps
+	// base blobs shared across sandboxes.
+	AnnotationRootfsBaseLayers = "io.fast-sandbox.rootfs.base-layers"
 )
 
 // validatePairID validates both derived tag names, including the registry tag length

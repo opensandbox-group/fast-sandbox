@@ -29,7 +29,7 @@ func TestPushPackedPairWithCheckpointAnnotations(t *testing.T) {
 	require.NoError(t, err)
 	names, err := parseOutput("snapshot:checkpoint-1")
 	require.NoError(t, err)
-	_, err = writeTemplatePair(layout, names, []oci.Descriptor{parent, delta}, snap, "checkpoint", nil)
+	_, err = writeTemplatePair(layout, names, []oci.Descriptor{parent, delta}, snap, "checkpoint", nil, 0)
 	require.NoError(t, err)
 	server := httptest.NewTLSServer(registrytest.New())
 	defer server.Close()
@@ -79,7 +79,7 @@ func TestPushPlainHTTP(t *testing.T) {
 			require.NoError(t, err)
 			names, err := parseOutput("snapshot:http-test")
 			require.NoError(t, err)
-			_, err = writeTemplatePair(layout, names, []oci.Descriptor{layer}, layer, "checkpoint", nil)
+			_, err = writeTemplatePair(layout, names, []oci.Descriptor{layer}, layer, "checkpoint", nil, 0)
 			require.NoError(t, err)
 			handler := registrytest.New()
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

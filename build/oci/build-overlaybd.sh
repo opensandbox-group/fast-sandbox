@@ -24,10 +24,10 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
   -DCMAKE_CXX_FLAGS="-w" \
   -DBUILD_STREAM_CONVERTOR=OFF -DBUILD_UBLK_FRONTEND=ON -DORIGIN_EXT2FS=OFF
 cmake --build build --target overlaybd-import-raw overlaybd-ublkd \
-  overlaybd-create overlaybd-apply overlaybd-commit overlaybd-resize \
+  overlaybd-create overlaybd-apply overlaybd-commit overlaybd-merge overlaybd-resize \
   --parallel "${JOBS:-8}"
 mkdir -p "$out/bin" "$out/lib"
-for tool in overlaybd-import-raw overlaybd-ublkd overlaybd-create overlaybd-apply overlaybd-commit overlaybd-resize; do
+for tool in overlaybd-import-raw overlaybd-ublkd overlaybd-create overlaybd-apply overlaybd-commit overlaybd-merge overlaybd-resize; do
   install -m 0755 "build/output/$tool" "$out/bin/$tool"
 done
 # OverlayBD's patched ext2fs library must take precedence over the system copy.

@@ -29,12 +29,17 @@ func validateOCISupport(image string) error {
 	}
 	switch os.Getenv("FAST_SANDBOX_OCI_ENABLED") {
 	case ociEnabled:
-		return nil
 	case "", "false":
 		return fmt.Errorf("%w: OCI templates and checkpoints require FAST_SANDBOX_OCI_ENABLED=true", ErrInvalidConfig)
 	default:
 		return fmt.Errorf("%w: FAST_SANDBOX_OCI_ENABLED must be true or false", ErrInvalidConfig)
 	}
+	switch strings.TrimSpace(os.Getenv("FAST_SANDBOX_OCI_PLAIN_HTTP")) {
+	case "", "false", "0", "true", "1":
+	default:
+		return fmt.Errorf("%w: FAST_SANDBOX_OCI_PLAIN_HTTP must be true or false", ErrInvalidConfig)
+	}
+	return nil
 }
 
 func validateOCIReference(image string) error {
@@ -58,12 +63,19 @@ func ociRootForPod(stateRoot, podUID string) string {
 	return root
 }
 
+// ociPlainHTTP reports whether the registries speak plain HTTP; it flows
+// into fsb-vm (ORAS pulls and repoBlobUrl) and OCI publication.
+func ociPlainHTTP() bool {
+	value := strings.TrimSpace(os.Getenv("FAST_SANDBOX_OCI_PLAIN_HTTP"))
+	return value == "1" || strings.EqualFold(value, "true")
+}
+
 func (d *Driver) fsbArgs() []string {
 	tools := filepath.Join(runtimecatalog.OCIToolsDir, "current", "bin")
 	if resolved, err := filepath.EvalSymlinks(tools); err == nil {
 		tools = resolved
 	}
-	return []string{
+	args := []string{
 		"--state-dir", filepath.Join(d.ociRoot(), "sandboxes"),
 		"--manifest-cache-dir", filepath.Join(d.config.StateRoot, "oci/manifest-cache"),
 		"--runtime-dir", filepath.Join(d.ociRoot(), "runtime"),
@@ -75,8 +87,13 @@ func (d *Driver) fsbArgs() []string {
 		"--reject-credential-conflicts",
 		"--overlaybd-create", filepath.Join(tools, "overlaybd-create"),
 		"--overlaybd-commit", filepath.Join(tools, "overlaybd-commit"),
+		"--overlaybd-merge", filepath.Join(tools, "overlaybd-merge"),
 		"--overlaybd-resize", filepath.Join(tools, "overlaybd-resize"),
 	}
+	if ociPlainHTTP() {
+		args = append(args, "--plain-http")
+	}
+	return args
 }
 func (d *Driver) attachOCI(ctx context.Context, id, image string) (rootfs, vmstate, memory string, resultErr error) {
 	if err := validateOCIReference(image); err != nil {

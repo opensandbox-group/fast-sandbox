@@ -19,7 +19,11 @@ const (
 	defaultFirecrackerBin  = "firecracker"
 	defaultOverlaybdCreate = "/opt/overlaybd/bin/overlaybd-create"
 	defaultOverlaybdCommit = "/opt/overlaybd/bin/overlaybd-commit"
+	defaultOverlaybdMerge  = "/opt/overlaybd/bin/overlaybd-merge"
 	defaultOverlaybdResize = "/opt/overlaybd/bin/overlaybd-resize"
+	// overlaybd-merge validates this service config path at argument parsing
+	// even when a custom one is passed, so it must exist on the pack host.
+	defaultOverlaybdServiceConfig = "/etc/overlaybd/overlaybd.json"
 	defaultConvertor       = "/opt/overlaybd/snapshotter/convertor"
 	defaultBuildWorkDir    = "/var/lib/fsb-vm/builds"
 	defaultBuildOutputDir  = "/var/lib/fsb-vm/artifacts"
@@ -37,7 +41,9 @@ type config struct {
 	firecrackerBin            string
 	overlaybdCreate           string
 	overlaybdCommit           string
+	overlaybdMerge            string
 	overlaybdResize           string
+	overlaybdServiceConfig    string
 	convertor                 string
 	buildWorkDir              string
 	buildOutputDir            string
@@ -117,7 +123,9 @@ func init() {
 	flags.StringVar(&global.firecrackerBin, "firecracker", defaultFirecrackerBin, "firecracker binary path")
 	flags.StringVar(&global.overlaybdCreate, "overlaybd-create", defaultOverlaybdCreate, "overlaybd-create binary path")
 	flags.StringVar(&global.overlaybdCommit, "overlaybd-commit", defaultOverlaybdCommit, "overlaybd-commit binary path")
+	flags.StringVar(&global.overlaybdMerge, "overlaybd-merge", defaultOverlaybdMerge, "overlaybd-merge binary path")
 	flags.StringVar(&global.overlaybdResize, "overlaybd-resize", defaultOverlaybdResize, "overlaybd-resize binary path")
+	flags.StringVar(&global.overlaybdServiceConfig, "overlaybd-service-config", defaultOverlaybdServiceConfig, "overlaybd service config path created for overlaybd-merge when missing")
 	flags.StringVar(&global.convertor, "overlaybd-convertor", defaultConvertor, "overlaybd userspace convertor binary path")
 	flags.StringVar(&global.buildWorkDir, "build-work-dir", defaultBuildWorkDir, "temporary build directory root (build command)")
 	flags.StringVar(&global.buildOutputDir, "build-output-dir", defaultBuildOutputDir, "artifact output directory root (build command)")
