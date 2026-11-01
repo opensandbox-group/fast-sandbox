@@ -11,7 +11,8 @@ See the [contributing guide](CONTRIBUTING.md) for scope, creation instructions, 
 
 ## Proposal index
 
-There are no proposals yet. The first proposal will be `FSEP-0001`. Add an entry in the same PR as a new proposal; when its content or status changes, update both this index and the proposal's `last-updated` field.
+The first proposal is `FSEP-0001`. Add an entry in the same PR as a new proposal; when its content or status changes, update both this index and the proposal's `last-updated` field.
 
 | FSEP | Title | Status | Last updated |
 |:----:|-------|--------|:------------:|
+| [0001](0001-bounded-runtime-cgroups.md) | Bounded Runtime Cgroup Hierarchy with Explicit Per-Sandbox Host Overhead | draft | 2026-11-01 |
