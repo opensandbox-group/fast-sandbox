@@ -175,6 +175,9 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	if err != nil {
 		return err
 	}
+	// The base boundary rides with the rootfs manifest; record it before the
+	// next persist so checkpoint capture finds it in state.json.
+	state.RootfsBaseLayers = rootfsImage.BaseLayers
 	snapfilesImage, err := resolveImage(ctx, state.SnapfilesRef, dockerAuth)
 	if err != nil {
 		return err

@@ -7,7 +7,7 @@ out=${3:?}
 mkdir -p "$out/bin" "$out/libexec" "$out/lib"
 cp "$fsb_vm" "$out/bin/fsb-vm"
 cp -L "$source_dir/lib/"* "$out/lib/"
-for tool in overlaybd-ublkd overlaybd-create overlaybd-commit overlaybd-resize overlaybd-import-raw; do
+for tool in overlaybd-ublkd overlaybd-create overlaybd-commit overlaybd-merge overlaybd-resize overlaybd-import-raw; do
   cp "$source_dir/bin/$tool" "$out/libexec/$tool"
   cat > "$out/bin/$tool" <<'WRAPPER'
 #!/bin/sh

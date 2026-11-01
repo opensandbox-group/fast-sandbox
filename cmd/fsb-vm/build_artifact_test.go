@@ -196,7 +196,7 @@ func TestAssembleManifest(t *testing.T) {
 		{MediaType: overlaybdZfileLayerMediaType, Digest: sha256Digest([]byte("l2")), Size: 2},
 	}
 
-	payload, desc, err := assembleManifest(configDesc, layers)
+	payload, desc, err := assembleManifest(configDesc, layers, nil)
 	if err != nil {
 		t.Fatalf("assembleManifest: %v", err)
 	}
@@ -275,7 +275,7 @@ func installValidPair(t *testing.T, layout artifactLayout) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	manifest, _, err := assembleManifest(configDesc, []ocispec.Descriptor{layerDesc})
+	manifest, _, err := assembleManifest(configDesc, []ocispec.Descriptor{layerDesc}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +351,7 @@ func TestTemplatePairValidatesLocalLayersBeforeIndex(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			raw, desc, err := assembleManifest(config, []ocispec.Descriptor{layer})
+			raw, desc, err := assembleManifest(config, []ocispec.Descriptor{layer}, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -359,7 +359,7 @@ func TestTemplatePairValidatesLocalLayersBeforeIndex(t *testing.T) {
 			if err := os.WriteFile(source.ManifestPath, raw, 0600); err != nil {
 				t.Fatal(err)
 			}
-			_, err = writeTemplatePair(layout, names, []ocispec.Descriptor{layer}, layer, "source:test", &source)
+			_, err = writeTemplatePair(layout, names, []ocispec.Descriptor{layer}, layer, "source:test", &source, 0)
 			if missing {
 				if err == nil {
 					t.Fatal("missing local layer must fail")

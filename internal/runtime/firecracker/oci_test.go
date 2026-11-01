@@ -75,6 +75,27 @@ func TestOCISupportDefaultsAndNativeIndependence(t *testing.T) {
 	}
 }
 
+func TestOCIPlainHTTPValidation(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_OCI_ENABLED", "true")
+	for _, plainHTTP := range []string{"", "true", "1", "false", "0"} {
+		t.Run(plainHTTP, func(t *testing.T) {
+			t.Setenv("FAST_SANDBOX_OCI_PLAIN_HTTP", plainHTTP)
+			require.NoError(t, validateOCISupport("oci://r.example/ns/template:build"))
+		})
+	}
+	for _, plainHTTP := range []string{"yes", "ture", "2"} {
+		t.Run(plainHTTP, func(t *testing.T) {
+			t.Setenv("FAST_SANDBOX_OCI_PLAIN_HTTP", plainHTTP)
+			err := validateOCISupport("oci://r.example/ns/template:build")
+			require.ErrorIs(t, err, ErrInvalidConfig)
+			require.ErrorContains(t, err, "FAST_SANDBOX_OCI_PLAIN_HTTP must be true or false")
+		})
+	}
+	// Native images never consult the OCI environment.
+	t.Setenv("FAST_SANDBOX_OCI_PLAIN_HTTP", "invalid")
+	require.NoError(t, validateOCISupport("native:template"))
+}
+
 func TestOCIDeliveryNeedsNeitherAgentNorOuterCache(t *testing.T) {
 	t.Setenv("FAST_SANDBOX_OCI_ENABLED", "true")
 	root := t.TempDir()

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -604,9 +605,10 @@ func runBuild(ctx context.Context, options *buildOptions) (err error) {
 		return err
 	}
 
-	// Steps 8-9: write the manifests and layout index, then publish.
+	// Steps 8-9: write the manifests and layout index, then publish. Every
+	// template rootfs layer is immutable base for later checkpoint lineages.
 	rootfsLayers := append(append([]ocispec.Descriptor{}, fetched.Layers...), rootfsDesc)
-	pair, err := writeTemplatePair(layout, output, rootfsLayers, snapDesc, options.source, &fetched)
+	pair, err := writeTemplatePair(layout, output, rootfsLayers, snapDesc, options.source, &fetched, len(rootfsLayers))
 	if err != nil {
 		return err
 	}
@@ -756,8 +758,10 @@ type manifestDigests struct {
 
 // writeTemplatePair writes the shared config, rootfs/snapfiles manifests and index.
 // Builds validate all local blobs before indexing. Checkpoints may inherit remote
-// layers, so their index has no local source manifest to validate.
-func writeTemplatePair(layout artifactLayout, output outputNames, root []ocispec.Descriptor, snap ocispec.Descriptor, source string, fetched *fetchedImage) (manifestDigests, error) {
+// layers, so their index has no local source manifest to validate. baseLayers is
+// the count of bottom rootfs layers belonging to the immutable template base; it
+// is stamped on the rootfs manifest so checkpoint lineages keep the boundary.
+func writeTemplatePair(layout artifactLayout, output outputNames, root []ocispec.Descriptor, snap ocispec.Descriptor, source string, fetched *fetchedImage, baseLayers int) (manifestDigests, error) {
 	config, err := layout.installBytes(minimalImageConfig(), ocispec.MediaTypeImageConfig)
 	if err != nil {
 		return manifestDigests{}, err
@@ -769,7 +773,11 @@ func writeTemplatePair(layout artifactLayout, output outputNames, root []ocispec
 		name   string
 		layers []ocispec.Descriptor
 	}{{output.rootfsName(), root}, {output.snapfilesName(), []ocispec.Descriptor{snap}}} {
-		payload, desc, err := assembleManifest(config, entry.layers)
+		var annotations map[string]string
+		if entry.name == output.rootfsName() && baseLayers > 0 {
+			annotations = map[string]string{ocitemplate.AnnotationRootfsBaseLayers: strconv.Itoa(baseLayers)}
+		}
+		payload, desc, err := assembleManifest(config, entry.layers, annotations)
 		if err != nil {
 			return manifestDigests{}, err
 		}

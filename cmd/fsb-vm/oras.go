@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/opencontainers/go-digest"
@@ -288,7 +289,18 @@ func resolveImage(ctx context.Context, imageRef string, config dockerConfig) (re
 			fmt.Fprintf(os.Stderr, "warning: cache image manifest: %v\n", err)
 		}
 	}
-	return resolvedImage{Lowers: lowers, RepoBlobURL: repoBlobURL(ref, global.plainHTTP)}, nil
+	return resolvedImage{Lowers: lowers, RepoBlobURL: repoBlobURL(ref, global.plainHTTP), BaseLayers: manifestBaseLayers(manifest.Annotations)}, nil
+}
+
+// manifestBaseLayers reads the template base boundary published with the
+// rootfs manifest. Unknown or malformed values mean unknown (0).
+func manifestBaseLayers(annotations map[string]string) int {
+	if value, ok := annotations[ocitemplate.AnnotationRootfsBaseLayers]; ok {
+		if count, err := strconv.Atoi(value); err == nil && count >= 0 {
+			return count
+		}
+	}
+	return 0
 }
 
 // ---- overlaybd layer classification (build-flow source validation) ----

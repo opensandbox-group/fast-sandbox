@@ -25,6 +25,11 @@ type RootfsUpper struct {
 	Repository       string           `json:"repository"`
 	VirtualSizeBytes int64            `json:"virtualSizeBytes"`
 	Lowers           []oci.Descriptor `json:"lowers"`
+	// BaseLayers is the number of bottom Lowers that belong to the immutable
+	// template base and must stay shared across sandboxes. Zero means the
+	// boundary is unknown (legacy captures); the squash policy then falls
+	// back to the positional tail rule.
+	BaseLayers int `json:"baseLayers,omitempty"`
 }
 
 func (u RootfsUpper) Validate() error {
@@ -34,6 +39,9 @@ func (u RootfsUpper) Validate() error {
 	}
 	if u.VirtualSizeBytes <= 0 || len(u.Lowers) == 0 {
 		return fmt.Errorf("invalid rootfs upper size or empty parent stack")
+	}
+	if u.BaseLayers < 0 || u.BaseLayers > len(u.Lowers) {
+		return fmt.Errorf("invalid rootfs base layer count %d for %d parent layers", u.BaseLayers, len(u.Lowers))
 	}
 	for _, d := range u.Lowers {
 		if d.Digest.Algorithm() != digest.SHA256 || d.Digest.Validate() != nil || d.Size <= 0 || d.MediaType != OverlayBDLayerMediaType {

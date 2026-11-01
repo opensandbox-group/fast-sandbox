@@ -15,10 +15,12 @@ type lowerLayer struct {
 
 // resolvedImage is the outcome of pulling an overlaybd image manifest: the
 // ordered (bottom-up) lower layers and the repoBlobUrl overlaybd fetches
-// blocks from at runtime.
+// blocks from at runtime. BaseLayers is the immutable template base boundary
+// carried by the published manifest (0 when absent, e.g. legacy images).
 type resolvedImage struct {
 	Lowers      []lowerLayer
 	RepoBlobURL string
+	BaseLayers  int
 }
 
 // dockerConfig models the docker config json carried in template.json's

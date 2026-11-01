@@ -68,6 +68,9 @@ type sandboxState struct {
 	RootfsRef        string          `json:"rootfs_ref"`
 	SnapfilesRef     string          `json:"snapfiles_ref"`
 	TemplateMetadata json.RawMessage `json:"template_metadata,omitempty"`
+	// RootfsBaseLayers mirrors the immutable template base boundary of the
+	// rootfs manifest so checkpoint capture can carry it into RootfsUpper.
+	RootfsBaseLayers int `json:"rootfs_base_layers,omitempty"`
 
 	// A nil device record means "not owned"; a record with an empty DevPath
 	// means an add was issued whose reply was never recorded.
