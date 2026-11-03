@@ -102,7 +102,7 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	flag.BoolVar(&resourceAwarePoolScaling, "resource-aware-pool-scaling", true, "Enable ResourceAware effective-capacity Pool scaling.")
 	flag.DurationVar(&resourceAwareStartupGrace, "resource-aware-fastlet-startup-grace", 2*time.Minute, "Maximum time a Fastlet without a heartbeat contributes nominal in-flight capacity.")
 	flag.DurationVar(&resourceAwareScaleDownStabilization, "resource-aware-scale-down-stabilization", time.Minute, "Continuous excess-capacity window required before ResourceAware scale-down.")
-	flag.StringVar(&cacheNamespaces, "cache-namespaces", "", "Comma-separated namespaces the informer cache watches; empty watches the whole cluster. Must cover every namespace holding SandboxPool/Sandbox objects and the runtime environment ConfigMap.")
+	flag.StringVar(&cacheNamespaces, "namespaces", "", "Comma-separated namespaces the informer cache watches; empty watches the whole cluster. Must cover every namespace holding SandboxPool/Sandbox objects and the runtime environment ConfigMap.")
 	flag.Float64Var(&kubeClientQPS, "kube-client-qps", 0, "API-server client rate limit in queries per second; 0 keeps the client-go default.")
 	flag.IntVar(&kubeClientBurst, "kube-client-burst", 0, "API-server client burst budget for the rate limiter; 0 keeps the client-go default.")
 	klog.InitFlags(nil)
@@ -309,7 +309,7 @@ func envOrDefault(name, fallback string) string {
 	return fallback
 }
 
-// parseCacheNamespaces splits the comma-separated --cache-namespaces value
+// parseCacheNamespaces splits the comma-separated --namespaces value
 // into a set. Empty or whitespace-only entries are dropped; an empty result
 // means cluster-wide watching.
 func parseCacheNamespaces(value string) map[string]struct{} {
@@ -346,7 +346,7 @@ func validateControllerCacheScoping(namespaces map[string]struct{}, runtimeEnvir
 		runtimeNamespace = runtimeenv.SystemNamespace
 	}
 	if _, ok := namespaces[runtimeNamespace]; !ok {
-		return fmt.Errorf("cache-namespaces must include the runtime environment namespace %q", runtimeNamespace)
+		return fmt.Errorf("--namespaces must include the runtime environment namespace %q", runtimeNamespace)
 	}
 	return nil
 }

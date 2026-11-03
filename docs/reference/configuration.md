@@ -26,7 +26,7 @@ and platform-owned runtime implementation details.
 | `--resource-aware-pool-scaling` | `true` | Enable ResourceAware effective-capacity Pool scaling |
 | `--resource-aware-fastlet-startup-grace` | `2m` | Time a new Fastlet without a heartbeat contributes nominal capacity |
 | `--resource-aware-scale-down-stabilization` | `1m` | Continuous excess-capacity period required before scale-down |
-| `--cache-namespaces` | *(empty = whole cluster)* | Comma-separated namespaces the informer cache watches |
+| `--namespaces` | *(empty = whole cluster)* | Comma-separated namespaces the informer cache watches |
 | `--kube-client-qps` | *(client-go default)* | API-server client rate limit in queries per second |
 | `--kube-client-burst` | *(client-go default)* | API-server client burst budget for the rate limiter |
 
@@ -41,8 +41,8 @@ and Secrets cluster-wide, and the initial cache sync has to LIST all of them.
 On large shared clusters that sync can exceed the controller memory budget
 and OOM-kill the Pod during startup.
 
-`--cache-namespaces` scopes the informer cache to the listed namespaces, for
-example `--cache-namespaces=tenant-a,tenant-b`. The set must cover every
+`--namespaces` scopes the informer cache to the listed namespaces, for
+example `--namespaces=tenant-a,tenant-b`. The set must cover every
 namespace that holds SandboxPool, Sandbox, or SandboxTemplate objects, plus
 the runtime environment namespace (`--runtime-environment-namespace`); the
 controller refuses to start otherwise. Empty keeps cluster-wide semantics
