@@ -271,7 +271,7 @@ func TestClaimSandboxIsAtomic(t *testing.T) {
 	}
 }
 
-// fakeReleaser records Del calls against a fixed device listing.
+// fakeReleaser records Release calls against a fixed device listing.
 type fakeReleaser struct {
 	devices []ublkdDevice
 	listErr error
@@ -283,7 +283,7 @@ func (f *fakeReleaser) List(context.Context) ([]ublkdDevice, error) {
 	return f.devices, f.listErr
 }
 
-func (f *fakeReleaser) Del(_ context.Context, devID int) error {
+func (f *fakeReleaser) Release(_ context.Context, devID int) error {
 	if err := f.delErr[devID]; err != nil {
 		return err
 	}

@@ -3,7 +3,7 @@
 set -eu
 out=${1:?usage: build-overlaybd.sh OUTPUT_DIR}
 tools_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-revision=${OVERLAYBD_REV:-5119193d540010e09c0af98add1ef2b0f4a51bc0}
+revision=${OVERLAYBD_REV:-fbb2a84bf53eea0d4b1c346dce831a80c1cca291}
 
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -13,9 +13,16 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   pkg-config uuid-dev zlib1g-dev
 rm -rf /var/lib/apt/lists/*
 
-git clone https://github.com/containerd/overlaybd.git /src/overlaybd
+git init /src/overlaybd
 cd /src/overlaybd
-git checkout --detach "$revision"
+git remote add origin https://github.com/containerd/overlaybd.git
+# Retry the fetch: the GitHub connection can stall.
+for attempt in 1 2 3; do
+  git -c http.version=HTTP/1.1 fetch --depth 1 origin "$revision" && break
+  [ "$attempt" -eq 3 ] && exit 1
+  sleep $((attempt * 2))
+done
+git checkout --detach FETCH_HEAD
 install -m 0644 "$tools_dir/overlaybd-import-raw.cpp" src/tools/overlaybd-import-raw.cpp
 sed -i '/add_executable(overlaybd-create/i add_executable(overlaybd-import-raw overlaybd-import-raw.cpp)\ntarget_include_directories(overlaybd-import-raw PUBLIC ${PHOTON_INCLUDE_DIR})\ntarget_link_libraries(overlaybd-import-raw photon_static overlaybd_lib)\n' src/tools/CMakeLists.txt
 # Third-party source is built container-only; suppress its default-warning

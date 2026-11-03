@@ -235,6 +235,16 @@ spec:
           value: /var/lib/fast-sandbox/firecracker
         - name: OVERLAYBD_CACHE_SIZE_GB
           value: "16"
+        # Warm pool: LOW=0 disables it. SIZE_GB must equal the template
+        # rootfsSize in whole GiB (2Gi -> 2; default 30Gi -> 30): larger or
+        # smaller values miss on every acquire. Keep LOW+HIGH within ublks_max
+        # (64) alongside Sandbox rootfs devices.
+        - name: OVERLAYBD_POOL_LOW
+          value: "4"
+        - name: OVERLAYBD_POOL_HIGH
+          value: "8"
+        - name: OVERLAYBD_POOL_SIZE_GB
+          value: "30"
         securityContext:
           privileged: true
         readinessProbe:

@@ -42,6 +42,8 @@ type deviceRecord struct {
 	Config  string `json:"config"`
 	DevID   int    `json:"dev_id"`
 	DevPath string `json:"dev_path,omitempty"`
+	// Acquired records that the device came from /v1/acquire rather than /v1/add.
+	Acquired bool `json:"acquired,omitempty"`
 
 	// addOutcomeUnknown is deliberately process-local. If create loses the Add
 	// response, its immediate rollback must retain the backing files when List

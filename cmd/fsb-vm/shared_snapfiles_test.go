@@ -54,7 +54,7 @@ func sharedSnapfilesFixture(t *testing.T, addHooks ...func(http.ResponseWriter, 
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "dev_id": d.DevID, "dev": d.Dev})
 		case "/v1/list":
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "devices": devices})
-		case "/v1/del":
+		case "/v1/del", "/v1/release":
 			var body struct {
 				ID int `json:"dev_id"`
 			}
@@ -354,7 +354,7 @@ func TestSharedSnapfilesRecoveryReleasesAddCompletedDuringFence(t *testing.T) {
 			lateDevice = true
 			w.WriteHeader(http.StatusInternalServerError)
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "device failed to start (see daemon log)"})
-		case "/v1/del":
+		case "/v1/del", "/v1/release":
 			var body struct {
 				ID int `json:"dev_id"`
 			}
