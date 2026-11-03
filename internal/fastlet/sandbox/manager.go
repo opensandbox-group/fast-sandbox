@@ -558,6 +558,13 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 				runtimeObservation.State = fastletapi.RuntimeStateFailed
 				dataPlaneObservation.State = fastletapi.DataPlaneStateFailed
 				dataPlaneObservation.Message = "runtime reported stopped"
+				if checker, ok := m.runtime.(interface{ SandboxRuntimeExited(string) bool }); ok && checker.SandboxRuntimeExited(sandboxID) {
+					// Delete is generation-fenced and releases commitment only after
+					// route, runtime, and network cleanup have succeeded.
+					if _, err := m.DeleteSandboxContext(ctx, &fastletapi.DeleteSandboxRequest{Identity: identity}); err != nil {
+						klog.FromContext(ctx).Error(err, "clean up exited Sandbox", "sandbox", sandboxID)
+					}
+				}
 			}
 		}
 		result = append(result, fastletapi.SandboxStatus{

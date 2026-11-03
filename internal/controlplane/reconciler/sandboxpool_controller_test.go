@@ -1529,6 +1529,32 @@ func TestLoadedScaleDownFastletCancelsAtDrainTimeout(t *testing.T) {
 	require.False(t, placement.PodDrainRequested(remaining), "ordinary scale-down must not force-delete a loaded Fastlet")
 }
 
+func TestBoundedFirecrackerUpgradeNeverForcesLoadedFastlet(t *testing.T) {
+	now := time.Now()
+	r, k8s, _, pool := newDrainHarness(t, nil)
+	r.Now = func() time.Time { return now }
+	pool.Spec.Runtime = apiv1alpha2.RuntimeFirecracker
+	pool.Spec.SandboxResources = resourceAwareScalingPool().Spec.SandboxResources
+	pod := getFastletPod(t, k8s, "fastlet-a")
+	pod.Annotations = map[string]string{
+		placement.AnnotationDraining: "true", placement.AnnotationDrainReason: placement.DrainReasonPlannedUpgrade,
+		placement.AnnotationDrainStartedAt: now.Add(-24 * time.Hour).Format(time.RFC3339Nano),
+	}
+	ctx := context.Background()
+	require.NoError(t, k8s.Update(ctx, pod))
+	for _, used := range []int{1, 0} {
+		pod = getFastletPod(t, k8s, pod.Name)
+		info := resourceAwareControllerFastlet(pod.Name, string(pod.UID), used, fastletapi.AdmissionStateOpen, now)
+		info.ResourceReceivedAt = now
+		_, _, err := r.reconcileDraining(ctx, pool, []corev1.Pod{*pod}, nil, 0, "", false, nil, map[string]placement.FastletInfo{podIdentity(pod): info})
+		require.NoError(t, err)
+	}
+	var gone corev1.Pod
+	err := k8s.Get(ctx, client.ObjectKeyFromObject(pod), &gone)
+	require.Error(t, err)
+	require.NoError(t, client.IgnoreNotFound(err))
+}
+
 func TestPlannedUpgradeWaitsForReadySurgeThenDrainsOldTemplate(t *testing.T) {
 	reconciler, k8sClient, _, pool := newDrainHarness(t, []apiv1alpha2.Sandbox{
 		assignedSandbox("sandbox-a", "fastlet-a", "pod-a"),
@@ -1691,6 +1717,43 @@ func TestConstructPodSharesNodeOCIToolsAndSocket(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConstructResourceAwareFirecrackerPodMountsWritableHostCgroup(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	reconciler := &SandboxPoolReconciler{Scheme: scheme, Catalog: runtimecatalog.Builtin()}
+	pool := &apiv1alpha2.SandboxPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "firecracker-pool", Namespace: "default", UID: types.UID("pool-uid")},
+		Spec: apiv1alpha2.SandboxPoolSpec{
+			Runtime: apiv1alpha2.RuntimeFirecracker, MaxSandboxesPerPod: 2,
+			SandboxResources: apiv1alpha2.NewResourceAwareSandboxResourceProfile(
+				resource.MustParse("512m"), resource.MustParse("512Mi"),
+				resource.MustParse("2"), resource.MustParse("2"), 128,
+			),
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}},
+			}},
+		},
+	}
+	plan, err := runtimeenv.ResolveDefault(reconciler.Catalog, pool.Spec.Runtime)
+	require.NoError(t, err)
+	pod, err := reconciler.constructPodWithRuntimePlan(pool, plan)
+	require.NoError(t, err)
+	require.True(t, hasHostPath(pod, podcgroup.HostPath))
+	mount := volumeMountForNamedContainer(t, pod, "fastlet", podcgroup.VolumeName)
+	require.NotNil(t, mount)
+	require.Equal(t, podcgroup.HostRoot, mount.MountPath)
+	require.False(t, mount.ReadOnly)
+
+	legacy := pool.DeepCopy()
+	legacy.Spec.SandboxResources = apiv1alpha2.NewLegacySandboxResourceProfile(
+		resource.MustParse("512m"), resource.MustParse("512Mi"), 128,
+	)
+	legacyPod, err := reconciler.constructPodWithRuntimePlan(legacy, plan)
+	require.NoError(t, err)
+	require.False(t, hasHostPath(legacyPod, podcgroup.HostPath),
+		"LegacySlot Firecracker must preserve its existing process placement")
 }
 
 func TestConstructPodAddsKVMWithoutRuntimeClass(t *testing.T) {

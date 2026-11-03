@@ -94,6 +94,7 @@ type RuntimeSandboxConfig struct {
 	ActionsAPIVersion string               `json:"actionsApiVersion,omitempty"`
 	Desired           SandboxDesiredSpec   `json:"desired"`
 	Limits            SandboxRuntimeLimits `json:"limits"`
+	CPURequest        string               `json:"cpuRequest,omitempty"` // Validated commitment used for host CPU weight.
 }
 
 // UnmarshalJSON keeps durable runtime state written before desired state and
@@ -112,6 +113,7 @@ func (c *RuntimeSandboxConfig) UnmarshalJSON(data []byte) error {
 		ActionsAPIVersion string                    `json:"actionsApiVersion,omitempty"`
 		Desired           *SandboxDesiredSpec       `json:"desired"`
 		Limits            *SandboxRuntimeLimits     `json:"limits"`
+		CPURequest        string                    `json:"cpuRequest,omitempty"`
 		Spec              *legacyRuntimeSandboxSpec `json:"spec"`
 	}
 	if err := json.Unmarshal(data, &wire); err != nil {
@@ -120,7 +122,7 @@ func (c *RuntimeSandboxConfig) UnmarshalJSON(data []byte) error {
 	if wire.Desired != nil && wire.Spec != nil {
 		return errors.New("runtime Sandbox config cannot contain both desired and legacy spec")
 	}
-	*c = RuntimeSandboxConfig{Identity: wire.Identity, ActionsAPIVersion: wire.ActionsAPIVersion}
+	*c = RuntimeSandboxConfig{Identity: wire.Identity, ActionsAPIVersion: wire.ActionsAPIVersion, CPURequest: wire.CPURequest}
 	if wire.Spec != nil {
 		c.Desired = wire.Spec.SandboxDesiredSpec
 		c.Limits = SandboxRuntimeLimits{CPU: wire.Spec.CPU, Memory: wire.Spec.Memory, PIDs: wire.Spec.PIDs}

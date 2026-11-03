@@ -274,6 +274,40 @@ A caller-specific limit must not exceed `sandboxRuntimeBudget`; the reserved
 Fastlet overhead cannot be consumed by a Sandbox. Fast Sandbox rejects an
 oversized Create request; there is no second maximum-limit field.
 
+### Direct Firecracker runtime cgroup enforcement
+
+For ResourceAware direct Firecracker Pools, the compiled values are enforced
+with a cgroup v2 hierarchy before the Fastlet reports Ready:
+
+```text
+Kubernetes Pod cgroup
+├── Kubernetes Fastlet container cgroup
+│   └── fastlet process
+├── proxy/sidecar container cgroups
+└── fast-sandbox                         sandboxRuntimeBudget
+    ├── fsb-<sandbox-a>                  cpu.weight, cpu.max, pids.max
+    │   └── Firecracker VMM-A
+    └── fsb-<sandbox-b>                  cpu.weight, cpu.max, pids.max
+        └── Firecracker VMM-B
+```
+
+`fast-sandbox.cpu.max` and `fast-sandbox.memory.max` equal the compiled
+`sandboxRuntimeBudget`. Each leaf receives a CPU weight from its resolved request, a CPU quota from its limit, and a PID limit. Each leaf has `memory.max=max`. Its resident guest pages and host bookkeeping count toward the shared memory ceiling. Before reporting Ready, Fastlet verifies zero effective host swap for that pool and exercises the same `clone3(CLONE_INTO_CGROUP)` launch path used for VMMs.
+
+The Sandbox subtree is a sibling of the Kubernetes container cgroups, rather
+than a child of the Fastlet container cgroup. This preserves the cgroup v2
+no-internal-process rule without moving Kubernetes-owned container processes
+or breaking later `exec` operations. The Kubernetes Pod cgroup still supplies
+the outer `runtimeEnvelope + sidecars` bound. A Sandbox-budget OOM can select
+a VMM below `fast-sandbox`, but the Fastlet process is outside that victim
+subtree and retains the fixed overhead reserve.
+
+The public memory limit retains its guest RAM semantics, subject to the restore template's machine configuration. Any VMM in this Pod can be selected when the shared pool runs out of memory. Pod-level and node-wide OOM have wider victim sets. Operators roll out this contract by Pool and Fastlet version. Planned replacements wait for an acknowledged drain and fresh evidence that the old Fastlet is empty. Restart recovery reconciles dead VM records and reservations. Keeping a VM running across container replacement is a separate capability.
+
+Containerd-backed runtimes keep their existing deterministic per-Sandbox OCI
+cgroups and aggregate Pod-cgroup observation. This change does not alter their
+handler-specific cgroup placement contract.
+
 ### ResourceAware template validation
 
 In ResourceAware mode, the first `fastletTemplate` container must not set CPU
@@ -479,11 +513,13 @@ In addition to static commitment, the Fastlet observer may block new creates
 from parent-cgroup watermarks, memory PSI, cgroup OOM events, Kubernetes node
 memory pressure, or stale telemetry.
 
-For direct Firecracker, the VMM processes are descendants of the Fastlet Pod
-cgroup, so parent-cgroup memory pressure includes guest-backed VMM memory.
-The runtime converts resolved limits to Firecracker's whole-vCPU and MiB
-machine configuration; it does not claim Linux-cgroup precision for arbitrary
-fractional per-Sandbox overrides.
+For direct Firecracker, every VMM is launched into a deterministic leaf below
+the bounded `fast-sandbox` subtree. The memory observer reads that shared
+subtree, so pressure includes guest-backed VMM memory but excludes the Fastlet
+process. The runtime converts resolved limits to Firecracker's whole-vCPU and
+MiB machine configuration and also applies host CPU and PID limits;
+fractional CPU is precise at the host cgroup even though the guest vCPU count
+is rounded up.
 The node-level runtime-agent DaemonSet is a separate Kubernetes workload and
 is not charged to a Pool. Host pressure is a distinct safety signal: one fresh
 `HostMemoryPressure` observation removes every Fastlet on that host from both

@@ -72,6 +72,13 @@ type WorkingDirRunner interface {
 	StartInDir(ctx context.Context, workingDir, name string, args []string, logPath string) (Process, error)
 }
 
+// CgroupRunner starts a process directly in a cgroup v2 leaf. Implementations
+// must make placement part of process creation; launching first and moving a
+// PID later leaves a window where a VMM can consume the Fastlet cgroup.
+type CgroupRunner interface {
+	StartInCgroup(ctx context.Context, cgroupPath, workingDir, name string, args []string, logPath string) (Process, error)
+}
+
 // ExecProcessRunner starts Firecracker with exec.Command. The VM deliberately
 // outlives the caller context: only Kill terminates it. The process stdout
 // and stderr are appended to logPath so a failed boot is diagnosable.
@@ -79,25 +86,42 @@ type ExecProcessRunner struct{}
 
 // Start launches the process without binding its lifetime to ctx.
 func (ExecProcessRunner) Start(_ context.Context, name string, args []string, logPath string) (Process, error) {
-	return ExecProcessRunner{}.StartInDir(context.Background(), "", name, args, logPath)
+	return ExecProcessRunner{}.start("", "", name, args, logPath)
 }
 
 // StartInDir launches the process with the given working directory.
 func (ExecProcessRunner) StartInDir(_ context.Context, workingDir, name string, args []string, logPath string) (Process, error) {
+	return ExecProcessRunner{}.start("", workingDir, name, args, logPath)
+}
+
+// StartInCgroup launches the process atomically into cgroupPath.
+func (ExecProcessRunner) StartInCgroup(_ context.Context, cgroupPath, workingDir, name string, args []string, logPath string) (Process, error) {
+	return ExecProcessRunner{}.start(cgroupPath, workingDir, name, args, logPath)
+}
+
+func (ExecProcessRunner) start(cgroupPath, workingDir, name string, args []string, logPath string) (Process, error) {
 	command := exec.Command(name, args...)
 	if workingDir != "" {
 		command.Dir = workingDir
 	}
+	var logFile *os.File
 	if logPath != "" {
-		logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
+		var err error
+		logFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
 		if err != nil {
 			return nil, err
 		}
 		command.Stdout = logFile
 		command.Stderr = logFile
 	}
-	if err := command.Start(); err != nil {
+	if err := startCommandInCgroup(command, cgroupPath); err != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 		return nil, err
+	}
+	if logFile != nil {
+		_ = logFile.Close()
 	}
 	return &execProcess{command: command}, nil
 }
@@ -152,6 +176,9 @@ type launchConfig struct {
 	WorkingDir string
 	// LogPath receives the firecracker stdout/stderr (empty discards output).
 	LogPath string
+	// CgroupPath is the writable host path of this Sandbox's cgroup v2 leaf.
+	// Empty preserves the legacy process placement.
+	CgroupPath string
 }
 
 // buildArgv produces the Firecracker command line. In jailer mode the jailer
@@ -196,6 +223,13 @@ func launch(ctx context.Context, runner ProcessRunner, config launchConfig) (Pro
 		if strings.TrimSpace(config.BinaryPath) == "" || strings.TrimSpace(config.ChrootBase) == "" || strings.TrimSpace(config.NetNSPath) == "" {
 			return nil, fmt.Errorf("%w: jailer mode requires the firecracker binary, chroot base, and slot netns", ErrInvalidConfig)
 		}
+		if config.CgroupPath != "" {
+			cgroupRunner, ok := runner.(CgroupRunner)
+			if !ok {
+				return nil, fmt.Errorf("%w: process runner cannot launch into a cgroup", ErrInvalidConfig)
+			}
+			return cgroupRunner.StartInCgroup(ctx, config.CgroupPath, "", config.JailerPath, config.buildArgv(), config.LogPath)
+		}
 		return runner.Start(ctx, config.JailerPath, config.buildArgv(), config.LogPath)
 	}
 	if strings.TrimSpace(config.BinaryPath) == "" {
@@ -203,6 +237,13 @@ func launch(ctx context.Context, runner ProcessRunner, config launchConfig) (Pro
 	}
 	if !filepath.IsAbs(config.APIAddress) {
 		return nil, fmt.Errorf("%w: firecracker API address must be an absolute path", ErrInvalidConfig)
+	}
+	if config.CgroupPath != "" {
+		cgroupRunner, ok := runner.(CgroupRunner)
+		if !ok {
+			return nil, fmt.Errorf("%w: process runner cannot launch into a cgroup", ErrInvalidConfig)
+		}
+		return cgroupRunner.StartInCgroup(ctx, config.CgroupPath, config.WorkingDir, config.BinaryPath, config.buildArgv(), config.LogPath)
 	}
 	if runnerInDir, ok := runner.(WorkingDirRunner); ok && config.WorkingDir != "" {
 		return runnerInDir.StartInDir(ctx, config.WorkingDir, config.BinaryPath, config.buildArgv(), config.LogPath)

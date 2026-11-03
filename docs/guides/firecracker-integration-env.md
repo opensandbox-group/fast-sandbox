@@ -32,6 +32,8 @@ One-liners:
 ```bash
 ./scripts/integration-env.sh up        # two-node env + P2P/dart (tasks 1-8)
 ./scripts/integration-env.sh verify    # 2 + 5 sandboxes; verify 4 = P2P evidence
+./scripts/integration-env.sh verify-resource-aware # ResourceAware ledger + VM
+./scripts/integration-env.sh verify-cgroup-oom     # VM memcg OOM; Fastlet survives
 ./scripts/integration-env.sh verify-snapshot  # live snapshot E2E (see below)
 ./scripts/integration-env.sh verify-policy    # relayed-policy lifecycle E2E (see below)
 ./scripts/integration-env.sh verify-all       # every verify flow in one session
@@ -39,11 +41,18 @@ One-liners:
 ./scripts/integration-env.sh down      # host left clean
 ```
 
-`verify-all` runs the full battery in one go, ordered base delivery → P2P →
-execd API → snapshot → pause → egress → policy, fail-fast with the usual log
-dumps and one final stage-timings table. It assumes `up` has already built the
-golden image; the snapshot step rebuilds images and rolls the control plane,
-and the egress step recreates and finally removes its pool.
+`verify-all` runs the full battery in one go, ordered base delivery →
+ResourceAware ledger → ResourceAware cgroup OOM → P2P → execd API → snapshot
+→ pause → egress → policy, fail-fast with the usual log dumps and one final
+stage-timings table. It assumes `up` has already built the golden image; the
+snapshot step rebuilds images and rolls the control plane, and the egress step
+recreates and finally removes its pool.
+
+`verify-cgroup-oom` uses two disposable ResourceAware Pools. Each holds two native Firecracker VMs under one Fastlet Pod. The verifier reads the Pod and shared VM limits from the kernel, checks VMM leaf membership and exported host metrics, and exercises aggregate CPU throttling. The first case temporarily lowers the shared memory cap to inject an OOM. The second keeps the cap at 512 MiB and uploads distinct files to guest tmpfs until resident guest memory triggers a shared-pool OOM.
+
+Both cases require a local OOM event at the pool, a kernel OOM kill, fewer live VMMs, and release of the dead VM's admission reservation before an explicit Delete. The same Fastlet Pod and container must stay Ready, answer a heartbeat, and create and delete a reachable replacement Sandbox. The verifier checks that deleting the Pool removes its resource subtree from the node. Set `CGROUP_CREATE_SAMPLES` to collect repeated sequential warm creates after recovery.
+
+The injected case also freezes that test Fastlet, marks the Sandbox for deletion, kills its VMM, checks for its persisted record, and restarts the Fastlet container. The new instance must return an empty ledger and remove the old leaf, jail, and runtime record.
 
 `KIND_SINGLE=1` falls back to one node (cache-only, no peer traffic);
 `WARM_IMAGES=1` restores the preheat for fast delivery baselines.

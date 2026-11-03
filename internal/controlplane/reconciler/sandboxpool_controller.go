@@ -980,7 +980,10 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 			}
 		}
 		empty := active[podIdentity(pod)] == 0
-		if resourceAware {
+		protectedUpgrade := pool.Spec.Runtime == apiv1alpha2.RuntimeFirecracker &&
+			pool.Spec.SandboxResources.ResourceMode() == apiv1alpha2.SandboxResourceModeResourceAware &&
+			pod.Annotations[placement.AnnotationDrainReason] == placement.DrainReasonPlannedUpgrade
+		if resourceAware || protectedUpgrade {
 			identity := podIdentity(pod)
 			info, exists := observedFastlets[identity]
 			empty = exists && fastletResourceObservationFresh(info, now) && info.SchedulingUsed() == 0 &&
@@ -993,6 +996,12 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-exis
 				return ctrl.Result{}, true, err
 			}
 			klog.FromContext(ctx).Info("cancelled loaded scale-down drain after timeout", "pod", pod.Name)
+			continue
+		}
+		if protectedUpgrade && !(empty && (acked || previouslyAcked)) {
+			if timedOut {
+				klog.FromContext(ctx).Info("planned Fastlet replacement blocked until drain is acknowledged and empty", "pod", pod.Name)
+			}
 			continue
 		}
 		if (empty && (acked || previouslyAcked)) || timedOut {
@@ -1415,6 +1424,9 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 	}
 
 	runtimeResourceOwner := podSpec.Containers[0].Name
+	needsHostCgroup := profile.Driver == runtimecatalog.DriverKindContainerd ||
+		(profile.Driver == runtimecatalog.DriverKindFirecracker &&
+			resolvedResources.Mode == apiv1alpha2.SandboxResourceModeResourceAware)
 	if len(podSpec.Containers) > 0 {
 		c := &podSpec.Containers[0]
 		if c.SecurityContext == nil {
@@ -1485,7 +1497,7 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			corev1.VolumeMount{Name: fastletsettings.VolumeName, MountPath: fastletsettings.MountPath, ReadOnly: true},
 			corev1.VolumeMount{Name: proxyControlVolumeName, MountPath: proxyRunDir},
 		)
-		if profile.Driver == runtimecatalog.DriverKindContainerd {
+		if needsHostCgroup {
 			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{
 				Name: podcgroup.VolumeName, MountPath: podcgroup.HostRoot,
 			})
@@ -1575,7 +1587,7 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 		},
 		corev1.Volume{Name: proxyControlVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 	)
-	if profile.Driver == runtimecatalog.DriverKindContainerd {
+	if needsHostCgroup {
 		podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
 			Name: podcgroup.VolumeName,
 			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{
@@ -1906,6 +1918,9 @@ func buildFastletSettingsFromResolved(pool *apiv1alpha2.SandboxPool, resolved re
 		},
 		PodMemoryBudget:     podMemoryBudget,
 		ResourceProfileHash: pool.Spec.SandboxResources.Hash(),
+	}
+	if pool.Spec.Runtime == apiv1alpha2.RuntimeFirecracker {
+		bundle.ResourceAdmission.Version = fastletsettings.BoundedFirecrackerVersion
 	}
 	return bundle, nil
 }

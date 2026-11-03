@@ -14,6 +14,7 @@ import (
 	fastletaction "fast-sandbox/internal/fastlet/action"
 	fastletcache "fast-sandbox/internal/fastlet/cache"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
+	"fast-sandbox/internal/fastletsettings"
 	"fast-sandbox/internal/observability"
 	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
@@ -175,6 +176,9 @@ func (m *SandboxManager) prepareCreateInput(req *fastletapi.CreateSandboxRequest
 			Identity: identity, ActionsAPIVersion: actionsAPIVersion,
 			Desired: req.Sandbox.DeepCopy(), Limits: limits,
 		},
+	}
+	if req.Resources != nil && m.resourceAdmission != nil && m.resourceAdmission.Version == fastletsettings.BoundedFirecrackerVersion {
+		input.Sandbox.CPURequest = req.Resources.Requests.CPU
 	}
 	return input, nil
 }

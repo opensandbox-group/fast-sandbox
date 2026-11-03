@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
 
@@ -86,6 +87,11 @@ func main() {
 	defer rt.Close()
 
 	rt.SetNamespace(namespace)
+	runtimeCgroups, err := configureRuntimeCgroups(rt, resourceAdmission, podUID)
+	if err != nil {
+		klog.ErrorS(err, "Failed to configure bounded Sandbox runtime cgroups")
+		os.Exit(1)
+	}
 	if runtimeProfile.ResidualProcess != runtimecatalog.ResidualProcessNone {
 		configurable, ok := rt.(nodeCleanupConfigurable)
 		if !ok {
@@ -191,7 +197,8 @@ func main() {
 	}
 	defer sandboxManager.Close()
 	if resourceAdmission != nil && resourceAdmission.MemoryAdmission {
-		if err := startResourceAdmissionObserver(ctx, sandboxManager, resourceAdmission, podUID, runtimeProfile.Driver == runtimecatalog.DriverKindContainerd); err != nil {
+		if err := startResourceAdmissionObserver(ctx, sandboxManager, resourceAdmission, podUID,
+			runtimeProfile.Driver == runtimecatalog.DriverKindContainerd, runtimeCgroups); err != nil {
 			klog.ErrorS(err, "Resource admission telemetry is unavailable; admission remains UNKNOWN")
 		}
 	}
@@ -241,6 +248,10 @@ func loadFastletStartupSettings() (fastletStartupSettings, error) {
 	var resourceAdmission *fastletsettings.ResourceAdmissionSettings
 	if resourceAdmissionFound {
 		resourceAdmission = &resourceAdmissionValue
+		bounded := runtimePlan.Profile.Driver == runtimecatalog.DriverKindFirecracker
+		if bounded != (resourceAdmission.Version == fastletsettings.BoundedFirecrackerVersion) {
+			return fastletStartupSettings{}, errors.New("runtime and bounded Firecracker settings revision do not match")
+		}
 	}
 	warmImages, err := warmImagesFromSettings(settingsDir)
 	if err != nil {
@@ -266,6 +277,7 @@ func startResourceAdmissionObserver(
 	settings *fastletsettings.ResourceAdmissionSettings,
 	podUID string,
 	aggregatePodCgroup bool,
+	runtimeCgroups *podcgroup.RuntimeManager,
 ) error {
 	if manager == nil || settings == nil {
 		return errors.New("resource admission manager and settings are required")
@@ -277,12 +289,15 @@ func startResourceAdmissionObserver(
 	if err != nil {
 		return err
 	}
-	limit, err := resourceAdmissionObserverMemoryLimit(settings, aggregatePodCgroup)
+	observeRuntimeSubtree := runtimeCgroups != nil && !aggregatePodCgroup
+	limit, err := resourceAdmissionObserverMemoryLimit(settings, aggregatePodCgroup, observeRuntimeSubtree)
 	if err != nil {
 		return err
 	}
 	var reader fastletresourceadmission.Reader
-	if aggregatePodCgroup {
+	if observeRuntimeSubtree {
+		reader, err = fastletresourceadmission.NewCgroupPathReader(runtimeCgroups.AggregateFilesystemPath(), "/proc/meminfo", uint64(limit))
+	} else if aggregatePodCgroup {
 		layout, discoverErr := podcgroup.Discover(podcgroup.HostRoot, podUID)
 		if discoverErr != nil {
 			return discoverErr
@@ -306,12 +321,14 @@ func startResourceAdmissionObserver(
 	return nil
 }
 
-func resourceAdmissionObserverMemoryLimit(settings *fastletsettings.ResourceAdmissionSettings, aggregatePodCgroup bool) (int64, error) {
+func resourceAdmissionObserverMemoryLimit(settings *fastletsettings.ResourceAdmissionSettings, aggregatePodCgroup, runtimeSubtree bool) (int64, error) {
 	if settings == nil {
 		return 0, errors.New("resource admission settings are required")
 	}
 	limit := settings.RuntimeEnvelope.Memory.Value()
-	if aggregatePodCgroup {
+	if runtimeSubtree {
+		limit = settings.SandboxRuntimeBudget.Memory.Value()
+	} else if aggregatePodCgroup {
 		limit = settings.PodMemoryBudget.Value()
 	}
 	if limit <= 0 {
@@ -389,6 +406,45 @@ func newNetworkManager(capacity int, podUID string, networkMode runtimecatalog.N
 
 type networkConfigurable interface {
 	SetNetworkManager(*fastletnetwork.Manager)
+}
+
+type runtimeCgroupConfigurable interface {
+	SetRuntimeCgroupManager(*podcgroup.RuntimeManager) error
+}
+
+func configureRuntimeCgroups(
+	rt runtimecontract.Driver,
+	settings *fastletsettings.ResourceAdmissionSettings,
+	podUID string,
+) (*podcgroup.RuntimeManager, error) {
+	if settings == nil || settings.Version != fastletsettings.BoundedFirecrackerVersion {
+		return nil, nil
+	}
+	configurable, ok := rt.(runtimeCgroupConfigurable)
+	if !ok {
+		return nil, errors.New("runtime cannot enforce the bounded Firecracker cgroup contract")
+	}
+	manager, err := podcgroup.NewRuntimeManager(podcgroup.HostRoot, podUID, podcgroup.RuntimeBudget{
+		CPU:    settings.SandboxRuntimeBudget.CPU.DeepCopy(),
+		Memory: settings.SandboxRuntimeBudget.Memory.DeepCopy(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := manager.Prepare(); err != nil {
+		return nil, err
+	}
+	if err := configurable.SetRuntimeCgroupManager(manager); err != nil {
+		return nil, err
+	}
+	if err := manager.RegisterMetrics(prometheus.DefaultRegisterer); err != nil {
+		return nil, err
+	}
+	klog.InfoS("bounded Sandbox runtime cgroup prepared",
+		"path", manager.AggregatePath(),
+		"cpu", settings.SandboxRuntimeBudget.CPU.String(),
+		"memory", settings.SandboxRuntimeBudget.Memory.String())
+	return manager, nil
 }
 
 // tuneNeighborGCThresholds raises the neighbour cache GC thresholds so a

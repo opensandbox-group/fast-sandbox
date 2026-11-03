@@ -52,8 +52,13 @@ runtimeEnvelope      = sandboxRuntimeBudget + fixedFastletOverhead
 The runtime-owner container receives equal Kubernetes requests and limits of
 `runtimeEnvelope`. `fixedFastletOverhead` is selected by the platform runtime
 profile and added once per Fastlet Pod. It covers the Fastlet/runtime owner,
-while each Sandbox or VM remains inside its caller-visible limit; there is no
-separate per-Sandbox overhead field.
+while each runtime enforces its supported Sandbox limits. VM overhead consumes the shared Sandbox budget.
+
+ResourceAware direct Firecracker enforces the split at runtime. The Fastlet
+stays in its Kubernetes container cgroup, while every VMM runs below a shared
+`fast-sandbox` sibling cgroup capped at `sandboxRuntimeBudget`. Each VM has a host accounting leaf with `memory.max=max`. A Sandbox-budget OOM can therefore
+terminate a VMM without placing the Fastlet process in the same OOM victim
+subtree. This guarantee does not cover node-wide global OOM.
 
 Fastlet admission, FastPath placement, and Pool scaling all consume the same
 commitment capacity. A custom per-Sandbox limit is rejected if it exceeds
@@ -96,9 +101,9 @@ Choose whether to enable memory overcommit from measured working sets and simult
 | Long-lived JVM heaps, application caches, databases, or resident models | Do not assume an idle process releases memory. Keep the ratio at 1 unless measured headroom supports overcommit. FPR cannot reclaim live or application-retained memory. |
 | Unknown workloads or workloads requiring guaranteed simultaneous growth to their limits | Use a memory ratio of 1 and provision sufficient runtime and node capacity, including overhead. CPU overcommit can still be tuned independently. |
 
-An overcommitted Pool does not reserve the sum of VM memory limits. For example, a Pool with `maxSandboxesPerPod: 4`, default 4 GiB VM limits, and a memory ratio of 4 derives 1 GiB requests and a 4 GiB Sandbox runtime budget, plus fixed Fastlet overhead. Two already admitted VMs can exceed that budget by simultaneously needing 3 GiB each. FPR cannot return those live pages, so cgroup OOM can terminate VMs or the runtime owner and affect other VMs in the same Fastlet.
+An overcommitted Pool does not reserve the sum of VM memory limits. For example, a Pool with `maxSandboxesPerPod: 4`, default 4 GiB VM limits, and a memory ratio of 4 derives 1 GiB requests and a 4 GiB Sandbox runtime budget, plus fixed Fastlet overhead. Two already admitted VMs can exceed that budget by simultaneously needing 3 GiB each. FPR cannot return those live pages, so the bounded direct-Firecracker Sandbox subtree may reclaim memory or terminate one of its VMMs. The Fastlet remains outside that Sandbox-budget OOM victim subtree, but the affected Sandbox still fails and another VMM may be selected when aggregate pressure continues.
 
-The dynamic admission gate blocks new creates under pressure; it does not reserve headroom for future growth of existing VMs or guarantee that they avoid OOM. Leave headroom for simultaneous bursts, guest/runtime overhead, and host file cache, including snapshot cache. Validate pool-wide peak demand, cgroup usage, PSI, OOM events, and latency under realistic concurrency before increasing the ratio. If those bounds cannot be established, leave memory overcommit disabled with `sandboxResources.overcommitRatio.memory: "1"`.
+The dynamic admission gate blocks new creates under pressure. Existing VMs can continue to grow. Budget for their resident guest pages, VMM overhead, and host file cache, including snapshot cache. Inspect the pool's cgroup usage, individual VM usage, PSI, OOM events, and latency at realistic concurrency before increasing the ratio. Operators can disable memory overcommit with `sandboxResources.overcommitRatio.memory: "1"`.
 
 ## Worked example
 
