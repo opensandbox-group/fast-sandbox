@@ -135,6 +135,7 @@ type statefulFakeServer struct {
 	snapshotLoads []SnapshotLoadRequest
 	snapshotDumps []SnapshotCreateRequest
 	failSnapshot  bool
+	failVersion   bool
 	running       bool
 	socket        string
 }
@@ -161,9 +162,14 @@ func (s *statefulFakeServer) handle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	failSnapshot := s.failSnapshot
+	failVersion := s.failVersion
 	s.mu.Unlock()
 	switch r.URL.Path {
 	case "/version":
+		if failVersion {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"version":"1.15.1"}`))
 	case "/actions":
@@ -737,7 +743,7 @@ func TestListManagedSandboxesFiltersNamespace(t *testing.T) {
 	require.Empty(t, managed)
 }
 
-func TestRecoverRuntimeResourcesCleansDeadVM(t *testing.T) {
+func TestRecoverRuntimeResourcesRetainsDeadRunningVMAsTerminalFailure(t *testing.T) {
 	fixture := newDriverFixture(t)
 	fixture.driver.probeProcess = func(int) error { return os.ErrNotExist }
 	require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
@@ -749,10 +755,64 @@ func TestRecoverRuntimeResourcesCleansDeadVM(t *testing.T) {
 	}))
 
 	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil, nil))
-	_, err = os.Stat(directory)
-	require.True(t, os.IsNotExist(err))
+	state, err := loadState(directory)
+	require.NoError(t, err)
+	require.Equal(t, PhaseFailed, state.Phase)
+	require.Equal(t, "runtime exited unexpectedly", state.FailureMessage)
+	require.Zero(t, state.PID)
 	require.Contains(t, fixture.killCalls, 777)
 	require.Equal(t, 0, fixture.manager.Snapshot().Bound)
+}
+
+func TestTerminalFailureRecordSurvivesCleanupUntilDeleteAcknowledges(t *testing.T) {
+	fixture := newDriverFixture(t)
+	owner := fixture.driver.networkOwner(&fixture.sandboxSpec)
+	_, err := fixture.manager.Acquire(t.Context(), owner)
+	require.NoError(t, err)
+	directory, err := ensureSandboxDir(fixture.stateRoot, fixture.sandboxSpec.Identity.SandboxUID)
+	require.NoError(t, err)
+	require.NoError(t, saveState(directory, &SandboxState{
+		Config: fixture.sandboxSpec, Phase: PhaseRunning, PID: 777, APIAddress: filepath.Join(directory, "dead.sock"),
+	}))
+
+	require.NoError(t, fixture.driver.RecordTerminalFailure(t.Context(), fixture.sandboxSpec.Identity, "runtime exited"))
+	state, err := loadState(directory)
+	require.NoError(t, err)
+	require.Equal(t, PhaseFailed, state.Phase)
+	require.Equal(t, fixture.sandboxSpec.Identity, state.Config.Identity)
+	require.Equal(t, "runtime exited", state.FailureMessage)
+
+	require.NoError(t, fixture.driver.CleanupTerminalFailure(t.Context(), fixture.sandboxSpec.Identity))
+	state, err = loadState(directory)
+	require.NoError(t, err)
+	require.Equal(t, PhaseFailed, state.Phase)
+	require.Zero(t, state.PID)
+	require.Equal(t, 0, fixture.manager.Snapshot().Bound)
+	managed, err := fixture.driver.ListManagedSandboxes(t.Context())
+	require.NoError(t, err)
+	require.Len(t, managed, 1)
+	require.Equal(t, "runtime-failed", managed[0].Phase)
+
+	require.NoError(t, fixture.driver.DeleteSandbox(t.Context(), fixture.sandboxSpec.Identity.SandboxUID))
+	require.NoDirExists(t, directory)
+}
+
+func TestRecordTerminalFailureCannotFenceReplacementIdentity(t *testing.T) {
+	fixture := newDriverFixture(t)
+	directory, err := ensureSandboxDir(fixture.stateRoot, fixture.sandboxSpec.Identity.SandboxUID)
+	require.NoError(t, err)
+	replacement := fixture.sandboxSpec
+	replacement.Identity.InstanceGeneration++
+	replacement.Identity.AssignmentAttempt++
+	replacement.Identity.RuntimeInstanceID = "runtime-g8"
+	require.NoError(t, saveState(directory, &SandboxState{Config: replacement, Phase: PhaseRunning, PID: 888}))
+
+	err = fixture.driver.RecordTerminalFailure(t.Context(), fixture.sandboxSpec.Identity, "stale G7 exit")
+	require.ErrorContains(t, err, "no longer matches")
+	state, loadErr := loadState(directory)
+	require.NoError(t, loadErr)
+	require.Equal(t, PhaseRunning, state.Phase)
+	require.Equal(t, "runtime-g8", state.Config.Identity.RuntimeInstanceID)
 }
 
 func TestRecoverInterruptedStartBeforeSocketProbe(t *testing.T) {
@@ -918,7 +978,9 @@ func TestRecoverRuntimeResourcesRetiresStrictOwnerBeforeCleanup(t *testing.T) {
 		return nil
 	}
 	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), managed, retireOwner))
-	require.NoDirExists(t, directory)
+	state, err := loadState(directory)
+	require.NoError(t, err)
+	require.Equal(t, PhaseFailed, state.Phase)
 	require.Equal(t, 0, fixture.manager.Snapshot().Bound)
 }
 
@@ -955,7 +1017,9 @@ func TestRecoveryRetriesDeadVMLeafRemoval(t *testing.T) {
 	require.NoError(t, os.Remove(events))
 	require.NoError(t, fixture.driver.RecoverRuntimeResources(t.Context(), nil, nil))
 	require.NoDirExists(t, leaf)
-	require.NoDirExists(t, directory)
+	state, err := loadState(directory)
+	require.NoError(t, err)
+	require.Equal(t, PhaseFailed, state.Phase)
 }
 
 func TestRecoverRuntimeResourcesKeepsAliveVM(t *testing.T) {
@@ -972,6 +1036,52 @@ func TestRecoverRuntimeResourcesKeepsAliveVM(t *testing.T) {
 	require.Len(t, managed, 1)
 	require.Equal(t, "172.30.0.2", managed[0].Allocation.Network.IP)
 	require.NotEmpty(t, managed[0].Allocation.Network.SlotID)
+}
+
+func TestRecoveryRetriesLiveVMWithUnavailableAPI(t *testing.T) {
+	fixture := newDriverFixture(t)
+	fixture.sandboxSpec.CPURequest = "1"
+	fixture.sandboxSpec.Limits.PIDs = 64
+	_, err := fixture.manager.Acquire(t.Context(), fixture.driver.networkOwner(&fixture.sandboxSpec))
+	require.NoError(t, err)
+	directory, err := ensureSandboxDir(fixture.stateRoot, fixture.sandboxSpec.Identity.SandboxUID)
+	require.NoError(t, err)
+	require.NoError(t, saveState(directory, &SandboxState{
+		Config: fixture.sandboxSpec, Phase: PhaseRunning, PID: 777, APIAddress: fixture.server.socket,
+	}))
+	runtimeCgroups, leaf := interruptedStartCgroup(t, fixture.sandboxSpec.Identity)
+	for _, path := range []string{filepath.Dir(leaf), filepath.Dir(filepath.Dir(leaf))} {
+		require.NoError(t, os.WriteFile(filepath.Join(path, "cgroup.controllers"), []byte("cpu memory pids"), 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(path, "cgroup.subtree_control"), nil, 0o600))
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(leaf), "memory.swap.max"), nil, 0o600))
+	require.NoError(t, runtimeCgroups.Prepare())
+	require.NoError(t, os.WriteFile(filepath.Join(leaf, "cgroup.procs"), []byte("777\n"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(leaf, "cgroup.events"), []byte("populated 1\n"), 0o600))
+	fixture.driver.runtimeCgroups = runtimeCgroups
+	fixture.server.mu.Lock()
+	fixture.server.failVersion = true
+	fixture.server.mu.Unlock()
+
+	for range 2 {
+		require.ErrorContains(t, fixture.driver.RecoverRuntimeResources(t.Context(), nil, nil), "still contains processes")
+		state, loadErr := loadState(directory)
+		require.NoError(t, loadErr)
+		require.Equal(t, PhaseRunning, state.Phase, "temporary API errors must not become a durable terminal failure")
+		require.Empty(t, state.FailureMessage)
+		require.Equal(t, 777, state.PID)
+		require.Equal(t, 1, fixture.manager.Snapshot().Bound)
+		require.Empty(t, fixture.killCalls)
+	}
+	fixture.server.mu.Lock()
+	fixture.server.failVersion = false
+	fixture.server.mu.Unlock()
+	require.NoError(t, fixture.driver.RecoverRuntimeResources(t.Context(), nil, nil))
+	state, err := loadState(directory)
+	require.NoError(t, err)
+	require.Equal(t, PhaseRunning, state.Phase)
+	require.Equal(t, 1, fixture.manager.Snapshot().Bound)
+	require.Empty(t, fixture.killCalls)
 }
 
 func TestStrictRecoveryRetriesFailedSlotRelease(t *testing.T) {
@@ -996,7 +1106,9 @@ func TestStrictRecoveryRetriesFailedSlotRelease(t *testing.T) {
 	require.Equal(t, 1, manager.Snapshot().Destroying)
 	require.Empty(t, fixture.killCalls)
 	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), nil, retire))
-	require.NoDirExists(t, directory)
+	state, err := loadState(directory)
+	require.NoError(t, err)
+	require.Equal(t, PhaseFailed, state.Phase)
 	require.Equal(t, 2, flaky.destroyCalls)
 	manager.Quiesce()
 	require.Zero(t, manager.Snapshot().Destroying)

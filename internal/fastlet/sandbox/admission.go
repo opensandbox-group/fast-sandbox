@@ -224,11 +224,11 @@ func (m *SandboxManager) reserveSandboxForCreate(req *fastletapi.CreateSandboxRe
 	if m.draining {
 		return reject(fastletError(fastletapi.ErrorDraining, m.drainReason, true), fastletapi.CreateDispositionRejectedBeforeSideEffects)
 	}
-	// A terminal create-failed Sandbox is projected but occupies no slot or
-	// resource commitment: it must not block new creates.
+	// Terminal records are projected but occupy no slot or resource commitment:
+	// they must not block unrelated creates while awaiting Controller ACK.
 	active := 0
 	for _, managed := range m.sandboxes {
-		if managed.Phase != sandboxStateCreateFailed {
+		if managed.Phase != sandboxStateCreateFailed && managed.Phase != sandboxStateRuntimeFailed {
 			active++
 		}
 	}
@@ -684,6 +684,7 @@ func absentDeleteOwner(identity fastletapi.SandboxIdentity, apiVersion string) *
 func (m *SandboxManager) dispatchDeleteAfterRetirement(sandboxUID string, metadata *SandboxMetadata, strictActions, wasCreating bool) {
 	if metadata != nil && !wasCreating {
 		m.mu.Lock()
+		terminalCleanupInFlight := m.terminalFailureWorkers[sandboxUID] == metadata
 		if m.sandboxes[sandboxUID] == metadata {
 			delete(m.createDeletePending, sandboxUID)
 			if strictActions {
@@ -691,7 +692,9 @@ func (m *SandboxManager) dispatchDeleteAfterRetirement(sandboxUID string, metada
 			}
 		}
 		m.mu.Unlock()
-		go m.asyncDelete(sandboxUID, metadata)
+		if !terminalCleanupInFlight {
+			go m.asyncDelete(sandboxUID, metadata)
+		}
 	} else if metadata != nil && strictActions && wasCreating {
 		// A canceled image worker can finish its one cleanup attempt while
 		// REMOVE_BINDING is still in flight. If it observed the owner as current,
@@ -747,6 +750,7 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit 
 		}
 	}
 	recovered := make(map[string]*SandboxMetadata, len(managed))
+	recoveredMessages := make(map[string]string)
 	for _, metadata := range managed {
 		if metadata == nil || metadata.Config.Identity.SandboxUID == "" {
 			continue
@@ -770,22 +774,35 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit 
 		if metadata.Phase == "" {
 			metadata.Phase = sandboxStateUnknown
 		}
-		if m.infraManager != nil {
+		terminalFailure := metadata.Phase == sandboxStateRuntimeFailed
+		if m.infraManager != nil && !terminalFailure {
 			if metadata.Config.Desired.InfraRevision != m.infraRevision {
 				return fmt.Errorf("recovered Sandbox %s Infra revision does not match Fastlet", identity.SandboxUID)
 			}
 			metadata.Phase = sandboxStateInfraPending
-		} else if m.actionManager != nil && m.actionManager.Required() {
+		} else if m.actionManager != nil && m.actionManager.Required() && !terminalFailure {
 			metadata.Phase = sandboxStateActionPending
+		}
+		if metadata.RuntimeMessage != "" {
+			recoveredMessages[identity.SandboxUID] = metadata.RuntimeMessage
 		}
 		recovered[identity.SandboxUID] = metadata
 	}
-	if len(recovered) > m.capacity {
-		return fmt.Errorf("recovered %d Sandboxes exceeds Fastlet capacity %d", len(recovered), m.capacity)
+	activeRecovered := 0
+	for _, metadata := range recovered {
+		if metadata.Phase != sandboxStateRuntimeFailed {
+			activeRecovered++
+		}
+	}
+	if activeRecovered > m.capacity {
+		return fmt.Errorf("recovered %d active Sandboxes exceeds Fastlet capacity %d", activeRecovered, m.capacity)
 	}
 	publications := make([]RoutePublication, 0, len(recovered))
 	pendingInfra := false
 	for _, metadata := range recovered {
+		if metadata.Phase == sandboxStateRuntimeFailed {
+			continue
+		}
 		if m.infraManager != nil {
 			pendingInfra = true
 			continue
@@ -805,16 +822,24 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit 
 	}
 	activeImages := make([]string, 0, len(recovered))
 	for _, metadata := range recovered {
-		activeImages = append(activeImages, metadata.Config.Desired.Image)
+		if metadata.Phase != sandboxStateRuntimeFailed {
+			activeImages = append(activeImages, metadata.Config.Desired.Image)
+		}
 	}
 	m.cacheProtection.Replace(fastletcache.ProtectActive, activeImages)
 	m.mu.Lock()
 	m.sandboxes = recovered
+	for sandboxUID, message := range recoveredMessages {
+		m.runtimeMessages[sandboxUID] = message
+	}
 	m.recovering = false
 	m.runtimeReady = true
 	m.routeReady = m.routePublisher == nil || !pendingInfra
 	m.mu.Unlock()
 	for _, metadata := range recovered {
+		if metadata.Phase == sandboxStateRuntimeFailed {
+			continue
+		}
 		m.recordActionHook(metadata, actionapi.LifecycleHookRuntimeReady, 1)
 		if m.infraManager == nil {
 			m.recordActionHook(metadata, actionapi.LifecycleHookDataPlaneReady, 2)
@@ -894,6 +919,8 @@ func (m *SandboxManager) createExistingLocked(existing *SandboxMetadata, request
 	}
 	switch existing.Phase {
 	case sandboxStateInfraPending, sandboxStateInitializingInfra, sandboxStateInfraUnavailable, sandboxStateRoutePending, sandboxStatePublishingRoute, sandboxStateRouteUnavailable, sandboxStateActionPending, sandboxStateActionUnavailable:
+		return &fastletapi.CreateSandboxResponse{Disposition: fastletapi.CreateDispositionExisting, Sandbox: &status, Admission: m.admissionStatusLocked()}, nil
+	case sandboxStateRuntimeFailureCleanup, sandboxStateRuntimeFailed:
 		return &fastletapi.CreateSandboxResponse{Disposition: fastletapi.CreateDispositionExisting, Sandbox: &status, Admission: m.admissionStatusLocked()}, nil
 	}
 	if existing.Phase != sandboxStateRunning {
@@ -990,9 +1017,9 @@ func (m *SandboxManager) admissionStatusLocked() fastletapi.AdmissionStatus {
 		switch metadata.Phase {
 		case sandboxStateCreating, sandboxStateImagePending, sandboxStateInfraPending, sandboxStateInitializingInfra, sandboxStateInfraUnavailable, sandboxStateRoutePending, sandboxStatePublishingRoute, sandboxStateRouteUnavailable, sandboxStateActionPending, sandboxStateActionUnavailable:
 			status.Creating++
-		case sandboxStateTerminating, sandboxStateDeleting, sandboxStateDeleteFailed, sandboxStateCreateCleanup, sandboxStateCreateCleanupFailed:
+		case sandboxStateTerminating, sandboxStateDeleting, sandboxStateDeleteFailed, sandboxStateCreateCleanup, sandboxStateCreateCleanupFailed, sandboxStateRuntimeFailureCleanup:
 			status.Deleting++
-		case sandboxStateCreateFailed:
+		case sandboxStateCreateFailed, sandboxStateRuntimeFailed:
 			// Terminal create failure: projected for the Controller but it
 			// occupies no admission capacity.
 		default:
@@ -1110,7 +1137,7 @@ func (m *SandboxManager) resolveCreateResources(resolved *fastletapi.ResolvedSan
 func (m *SandboxManager) resourceCommittedLocked() (apiv1alpha2.SandboxComputeResources, bool) {
 	committed := apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("0"), Memory: resource.MustParse("0")}
 	for _, metadata := range m.sandboxes {
-		if metadata.Phase == sandboxStateCreateFailed {
+		if metadata.Phase == sandboxStateCreateFailed || metadata.Phase == sandboxStateRuntimeFailed {
 			continue
 		}
 		requests, err := m.requestsForRuntimeConfig(&metadata.Config)
@@ -1171,7 +1198,7 @@ func observationsForPhase(phase string, routeReady bool) (fastletapi.RuntimeObse
 	switch phase {
 	case sandboxStateCreating, sandboxStateImagePending:
 		runtime.State, dataPlane.State = fastletapi.RuntimeStateCreating, fastletapi.DataPlaneStatePending
-	case sandboxStateCreateFailed:
+	case sandboxStateCreateFailed, sandboxStateRuntimeFailureCleanup, sandboxStateRuntimeFailed:
 		runtime.State, dataPlane.State = fastletapi.RuntimeStateFailed, fastletapi.DataPlaneStateFailed
 	case sandboxStateInfraPending, sandboxStateInitializingInfra, sandboxStateRoutePending, sandboxStatePublishingRoute:
 		runtime.State, dataPlane.State = fastletapi.RuntimeStateReady, fastletapi.DataPlaneStatePublishing

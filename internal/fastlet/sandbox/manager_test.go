@@ -31,6 +31,43 @@ type MockRuntime struct {
 	getStatusCalls map[string]int
 }
 
+type terminalFailureMockRuntime struct {
+	*MockRuntime
+	recordCalls  int
+	cleanupCalls int
+}
+
+func (m *terminalFailureMockRuntime) SandboxRuntimeExited(string) bool { return true }
+
+func (m *terminalFailureMockRuntime) RecordTerminalFailure(_ context.Context, identity fastletapi.SandboxIdentity, message string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recordCalls++
+	sandboxID := identity.SandboxUID
+	metadata := m.sandboxes[sandboxID]
+	if metadata == nil {
+		return ErrSandboxNotFound
+	}
+	if metadata.Config.Identity != identity {
+		return errors.New("terminal identity mismatch")
+	}
+	metadata.Phase = sandboxStateRuntimeFailed
+	metadata.RuntimeMessage = message
+	return nil
+}
+
+func (m *terminalFailureMockRuntime) CleanupTerminalFailure(_ context.Context, identity fastletapi.SandboxIdentity) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sandboxID := identity.SandboxUID
+	metadata := m.sandboxes[sandboxID]
+	if metadata == nil || metadata.Config.Identity != identity || metadata.Phase != sandboxStateRuntimeFailed {
+		return errors.New("terminal identity was not recorded before cleanup")
+	}
+	m.cleanupCalls++
+	return nil
+}
+
 // NewMockRuntime creates a new mock runtime for testing.
 func NewMockRuntime() *MockRuntime {
 	return &MockRuntime{
@@ -700,6 +737,54 @@ func TestSandboxManager_GetSandboxStatuses_StoppedRuntimeFailsWithoutReleasingAd
 
 	admission, _, _ := manager.State()
 	require.Equal(t, 1, admission.Used, "a failed observation must not release the commitment before cleanup")
+}
+
+func TestSandboxManager_ExitedRuntimeRemainsFailedAcrossRestartUntilDelete(t *testing.T) {
+	runtime := &terminalFailureMockRuntime{MockRuntime: NewMockRuntime()}
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{Capacity: 1, FastletPodUID: "pod-a"})
+	require.NoError(t, err)
+	spec := runtimeSpecForTest("test-sb-terminal", "test-claim", "alpine:latest")
+	request := &fastletapi.CreateSandboxRequest{
+		RequestID: "create-terminal", SpecGeneration: 1,
+		Identity: fastletapi.SandboxIdentity{
+			SandboxUID: spec.SandboxID, Namespace: "default", Name: spec.ClaimName, FastletPodUID: "pod-a",
+			InstanceGeneration: 7, RuntimeInstanceID: "runtime-g7", AssignmentAttempt: 3, RouteGeneration: 1,
+		},
+		Sandbox: spec.SandboxDesiredSpec,
+	}
+	_, err = manager.CreateSandbox(t.Context(), request)
+	require.NoError(t, err)
+	runtime.mu.Lock()
+	exited := *runtime.sandboxes[spec.SandboxID]
+	exited.Phase = "Stopped"
+	runtime.sandboxes[spec.SandboxID] = &exited
+	runtime.mu.Unlock()
+
+	statuses := manager.GetSandboxStatuses(t.Context())
+	require.Len(t, statuses, 1)
+	require.Equal(t, fastletapi.RuntimeStateFailed, statuses[0].Runtime.State)
+	require.Eventually(t, func() bool {
+		admission, _, _ := manager.State()
+		runtime.mu.Lock()
+		defer runtime.mu.Unlock()
+		return runtime.recordCalls > 0 && runtime.cleanupCalls > 0 && admission.Used == 0
+	}, time.Second, 10*time.Millisecond)
+
+	restarted, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{Capacity: 1, FastletPodUID: "pod-a", RecoverOnStart: true})
+	require.NoError(t, err)
+	require.NoError(t, restarted.Recover(t.Context()))
+	inspected, err := restarted.InspectSandbox(&fastletapi.InspectSandboxRequest{Identity: request.Identity})
+	require.NoError(t, err)
+	require.Equal(t, fastletapi.RuntimeStateFailed, inspected.Sandbox.Runtime.State)
+	require.Equal(t, request.Identity.RuntimeInstanceID, inspected.Sandbox.RuntimeInstanceID)
+
+	replayed, err := restarted.CreateSandbox(t.Context(), request)
+	require.NoError(t, err)
+	require.Equal(t, fastletapi.CreateDispositionExisting, replayed.Disposition)
+	require.Equal(t, fastletapi.RuntimeStateFailed, replayed.Sandbox.Runtime.State)
+	_, err = restarted.DeleteSandbox(&fastletapi.DeleteSandboxRequest{Identity: request.Identity})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return !runtime.HasSandbox(spec.SandboxID) }, time.Second, 10*time.Millisecond)
 }
 
 func TestSandboxManager_GetSandboxStatuses_MultiplePhases(t *testing.T) {

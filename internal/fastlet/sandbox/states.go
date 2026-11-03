@@ -12,6 +12,12 @@ const (
 	sandboxStateCreateCleanup       = "create-cleanup"
 	sandboxStateCreateCleanupFailed = "create-cleanup-failed"
 	sandboxStateDeleteFailed        = "delete-failed"
+	// sandboxStateRuntimeFailureCleanup retains admission while an unexpected
+	// exit is durably recorded but its physical resources are still reclaiming.
+	sandboxStateRuntimeFailureCleanup = "runtime-failure-cleanup"
+	// sandboxStateRuntimeFailed retains only the terminal identity; runtime
+	// resources no longer consume admission capacity.
+	sandboxStateRuntimeFailed = "runtime-failed"
 )
 
 const (

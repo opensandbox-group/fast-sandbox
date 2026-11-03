@@ -84,6 +84,12 @@ The Fastlet Pod is the instance lifetime boundary.
 
 AutoRecreate does not preserve process memory, local filesystem state, or network identity. It creates a new instance from the CRD spec.
 
+## Runtime exit while Fastlet remains online
+
+When a previously Ready runtime reports `Stopped` and its dedicated cgroup is confirmed empty, Fastlet durably records the complete instance identity as `Failed` before reclaiming physical resources. Heartbeat, Inspect, and an idempotent Ensure for that identity continue to return the same terminal record across a Fastlet restart. The Controller revalidates that the CR assignment still names the observed identity, persists `Failed`, and only then acknowledges deletion of the Fastlet record; the persisted CR state prevents a later `NotFound` from recreating the failed identity.
+
+`failurePolicy` remains scoped to Fastlet Pod loss. An online single-runtime exit stays `Failed` until an explicit reset advances the instance identity; it does not implicitly apply `AutoRecreate`.
+
 ## Pool drain
 
 Pool scale-down and template replacement use a persisted drain sequence. A draining Fastlet stops receiving new admission, existing Sandboxes are handled according to lifecycle policy, and normal drain completion requires a matching attempt to return an atomic, recovery-complete empty admission snapshot. Non-protected planned replacements retain their timeout policy after a successful drain RPC. During a rolling upgrade from an older Fastlet, deletion always requires a fresh Heartbeat RPC started after the drain acknowledgement to identify the same Pod and carry the same empty, recovery-complete evidence; cached heartbeats and timeout alone cannot authorize legacy deletion.

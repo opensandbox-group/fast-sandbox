@@ -177,7 +177,8 @@ func (m *SandboxManager) actionStateChanged(sandboxUID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	metadata := m.sandboxes[sandboxUID]
-	if metadata == nil || metadata.Phase == sandboxStateTerminating || metadata.Phase == sandboxStateDeleting || metadata.Phase == sandboxStateDeleteFailed {
+	if metadata == nil || metadata.Phase == sandboxStateTerminating || metadata.Phase == sandboxStateDeleting || metadata.Phase == sandboxStateDeleteFailed ||
+		metadata.Phase == sandboxStateRuntimeFailureCleanup || metadata.Phase == sandboxStateRuntimeFailed {
 		return
 	}
 	metadata.ActionBindingStatuses = append(metadata.ActionBindingStatuses[:0], statuses...)

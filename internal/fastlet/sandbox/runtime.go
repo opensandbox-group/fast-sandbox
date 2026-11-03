@@ -10,6 +10,7 @@ type RuntimeDriver = runtimecontract.Driver
 type RuntimeArtifactCache = runtimecontract.ArtifactCache
 type RuntimeResourceRecoverer = runtimecontract.ResourceRecoverer
 type RuntimeResourceAdmission = runtimecontract.ResourceAdmission
+type RuntimeTerminalFailureHandler = runtimecontract.TerminalFailureHandler
 type AccessDescriptorProvider = runtimecontract.AccessDescriptorProvider
 type CapabilityReport = runtimecontract.CapabilityReport
 type RoutePublication = dataplane.RoutePublication
