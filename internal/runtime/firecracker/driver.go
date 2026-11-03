@@ -1073,10 +1073,11 @@ func (d *Driver) recoverDeadSandbox(ctx context.Context, state *SandboxState, di
 	if err := d.releaseOCI(ctx, sandboxUID); err != nil {
 		return err
 	}
-	if removeErr := removeSandboxDir(directory); removeErr != nil {
-		klog.ErrorS(removeErr, "Firecracker recovery failed to remove the sandbox state directory", "stateDirectory", directory)
+	// Recovery discovers work from these state directories. Keep the record until the leaf is gone.
+	if err := removeRuntimeCgroup(runtimeCgroups, sandboxUID); err != nil {
+		return err
 	}
-	return removeRuntimeCgroup(runtimeCgroups, sandboxUID)
+	return removeSandboxDir(directory)
 }
 
 // resumePausedVM resumes a live but paused microVM (snapshot-dump crash

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifacts"
@@ -20,6 +21,7 @@ import (
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
+	"fast-sandbox/internal/fastlet/podcgroup"
 	infracontract "fast-sandbox/internal/infra/contract"
 	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
@@ -797,6 +799,42 @@ func TestRecoverRuntimeResourcesRetiresStrictOwnerBeforeCleanup(t *testing.T) {
 	require.NoError(t, fixture.driver.RecoverRuntimeResources(context.Background(), managed, retireOwner))
 	require.NoDirExists(t, directory)
 	require.Equal(t, 0, fixture.manager.Snapshot().Bound)
+}
+
+func TestRecoveryRetriesDeadVMLeafRemoval(t *testing.T) {
+	fixture := newDriverFixture(t)
+	fixture.driver.probeProcess = func(int) error { return os.ErrNotExist }
+	identity := fixture.sandboxSpec.Identity
+	directory, err := ensureSandboxDir(fixture.stateRoot, identity.SandboxUID)
+	require.NoError(t, err)
+	require.NoError(t, saveState(directory, &SandboxState{
+		Config: fixture.sandboxSpec, Phase: PhaseRunning, PID: 777, APIAddress: filepath.Join(directory, "dead.sock"),
+	}))
+
+	root := t.TempDir()
+	layout := podcgroup.Layout{PodPath: "/kubepods/pod" + identity.FastletPodUID}
+	path, err := layout.SandboxPath(identity.SandboxUID)
+	require.NoError(t, err)
+	leaf := filepath.Join(root, path)
+	require.NoError(t, os.MkdirAll(leaf, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "cgroup.controllers"), []byte("cpu memory pids"), 0o600))
+	manager, err := podcgroup.NewRuntimeManager(root, identity.FastletPodUID, podcgroup.RuntimeBudget{
+		CPU: resource.MustParse("1"), Memory: resource.MustParse("512Mi"),
+	})
+	require.NoError(t, err)
+	fixture.driver.runtimeCgroups = manager
+
+	// On a regular filesystem this file both reports an empty cgroup and prevents rmdir.
+	events := filepath.Join(leaf, "cgroup.events")
+	require.NoError(t, os.WriteFile(events, []byte("populated 0\n"), 0o600))
+	require.ErrorContains(t, fixture.driver.RecoverRuntimeResources(t.Context(), nil, nil), "remove Sandbox runtime cgroup")
+	_, err = loadState(directory)
+	require.NoError(t, err)
+
+	require.NoError(t, os.Remove(events))
+	require.NoError(t, fixture.driver.RecoverRuntimeResources(t.Context(), nil, nil))
+	require.NoDirExists(t, leaf)
+	require.NoDirExists(t, directory)
 }
 
 func TestRecoverRuntimeResourcesKeepsAliveVM(t *testing.T) {
