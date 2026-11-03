@@ -24,9 +24,9 @@ const (
 	// overlaybd-merge validates this service config path at argument parsing
 	// even when a custom one is passed, so it must exist on the pack host.
 	defaultOverlaybdServiceConfig = "/etc/overlaybd/overlaybd.json"
-	defaultConvertor       = "/opt/overlaybd/snapshotter/convertor"
-	defaultBuildWorkDir    = "/var/lib/fsb-vm/builds"
-	defaultBuildOutputDir  = "/var/lib/fsb-vm/artifacts"
+	defaultConvertor              = "/opt/overlaybd/snapshotter/convertor"
+	defaultBuildWorkDir           = "/var/lib/fsb-vm/builds"
+	defaultBuildOutputDir         = "/var/lib/fsb-vm/artifacts"
 )
 
 // config holds the resolved global options shared by every subcommand. It is
