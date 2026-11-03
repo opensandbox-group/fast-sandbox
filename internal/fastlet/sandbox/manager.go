@@ -72,6 +72,7 @@ type SandboxManager struct {
 	runtimeReady                bool
 	routeReady                  bool
 	draining                    bool
+	drainID                     string
 	drainReason                 string
 	tombstones                  map[string]fastletapi.SandboxIdentity
 	diagnostics                 map[string][]fastletapi.SandboxDiagnosticEvent

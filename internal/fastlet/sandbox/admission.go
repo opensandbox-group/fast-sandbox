@@ -828,11 +828,35 @@ func (m *SandboxManager) runtimeResourceAvailable() bool {
 	return !ok || admission.RuntimeResourceAvailable()
 }
 
-func (m *SandboxManager) SetDraining(draining bool, reason string) {
+func (m *SandboxManager) SetDraining(req *fastletapi.SetDrainingRequest) (*fastletapi.SetDrainingResponse, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.draining = draining
-	m.drainReason = reason
+	if req == nil {
+		return nil, fastletError(fastletapi.ErrorConflict, "drain request is required", false)
+	}
+	if req.FastletPodUID != "" && m.fastletPodUID != "" && req.FastletPodUID != m.fastletPodUID {
+		return nil, fastletError(fastletapi.ErrorStaleAssignment, "drain request targets a different Fastlet Pod UID", false)
+	}
+	if m.draining && m.drainID != "" && req.DrainID != "" && m.drainID != req.DrainID {
+		return nil, fastletError(fastletapi.ErrorConflict, "another drain attempt is already active", true)
+	}
+	if !req.Draining && m.draining && m.drainID != "" && req.DrainID != m.drainID {
+		return nil, fastletError(fastletapi.ErrorConflict, "drain cancellation does not match the active attempt", true)
+	}
+	m.draining = req.Draining
+	m.drainReason = req.Reason
+	if req.Draining {
+		if req.DrainID != "" {
+			m.drainID = req.DrainID
+		}
+	} else {
+		m.drainID = ""
+	}
+	admission := m.admissionStatusLocked()
+	return &fastletapi.SetDrainingResponse{
+		Draining: req.Draining, DrainID: req.DrainID, FastletPodUID: m.fastletPodUID,
+		Admission: &admission, Recovering: m.recovering, RuntimeReady: m.runtimeReady,
+	}, nil
 }
 
 func (m *SandboxManager) Ready() bool {

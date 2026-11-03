@@ -299,13 +299,21 @@ func TestRegistryWriteSecretRefRequiresName(t *testing.T) {
 type recordingDrainer struct {
 	mu       sync.Mutex
 	requests []fastletapi.SetDrainingRequest
+	respond  func(*fastletapi.SetDrainingRequest) *fastletapi.SetDrainingResponse
 }
 
 func (d *recordingDrainer) SetDraining(_ context.Context, _ string, request *fastletapi.SetDrainingRequest) (*fastletapi.SetDrainingResponse, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.requests = append(d.requests, *request)
-	return &fastletapi.SetDrainingResponse{Draining: request.Draining}, nil
+	if d.respond != nil {
+		return d.respond(request), nil
+	}
+	admission := fastletapi.AdmissionStatus{}
+	return &fastletapi.SetDrainingResponse{
+		Draining: request.Draining, DrainID: request.DrainID, FastletPodUID: request.FastletPodUID,
+		Admission: &admission, RuntimeReady: true,
+	}, nil
 }
 
 func TestResolveRuntimeProfileUsesCanonicalRuntime(t *testing.T) {
@@ -1531,7 +1539,7 @@ func TestLoadedScaleDownFastletCancelsAtDrainTimeout(t *testing.T) {
 
 func TestBoundedFirecrackerUpgradeNeverForcesLoadedFastlet(t *testing.T) {
 	now := time.Now()
-	r, k8s, _, pool := newDrainHarness(t, nil)
+	r, k8s, drainer, pool := newDrainHarness(t, nil)
 	r.Now = func() time.Time { return now }
 	pool.Spec.Runtime = apiv1alpha2.RuntimeFirecracker
 	pool.Spec.SandboxResources = resourceAwareScalingPool().Spec.SandboxResources
@@ -1543,8 +1551,21 @@ func TestBoundedFirecrackerUpgradeNeverForcesLoadedFastlet(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, k8s.Update(ctx, pod))
 	for _, used := range []int{1, 0} {
+		used := used
+		drainer.respond = func(request *fastletapi.SetDrainingRequest) *fastletapi.SetDrainingResponse {
+			admission := fastletapi.AdmissionStatus{Used: used, Running: used, Resources: &fastletapi.ResourceAdmissionStatus{
+				Version: "v2", Epoch: "epoch-a", Revision: uint64(used + 1),
+				Committed: fastletapi.SandboxResourceVector{CPU: fmt.Sprintf("%d", used), Memory: fmt.Sprintf("%dGi", used)},
+			}}
+			return &fastletapi.SetDrainingResponse{
+				Draining: request.Draining, DrainID: request.DrainID, FastletPodUID: request.FastletPodUID,
+				Admission: &admission, RuntimeReady: true,
+			}
+		}
 		pod = getFastletPod(t, k8s, pod.Name)
-		info := resourceAwareControllerFastlet(pod.Name, string(pod.UID), used, fastletapi.AdmissionStateOpen, now)
+		// Keep the Registry snapshot empty in both iterations. Only the atomic
+		// drain response changes, reproducing the pre-ACK TOCTOU window.
+		info := resourceAwareControllerFastlet(pod.Name, string(pod.UID), 0, fastletapi.AdmissionStateOpen, now)
 		info.ResourceReceivedAt = now
 		_, _, err := r.reconcileDraining(ctx, pool, []corev1.Pod{*pod}, nil, 0, "", false, nil, map[string]placement.FastletInfo{podIdentity(pod): info})
 		require.NoError(t, err)
@@ -1553,6 +1574,37 @@ func TestBoundedFirecrackerUpgradeNeverForcesLoadedFastlet(t *testing.T) {
 	err := k8s.Get(ctx, client.ObjectKeyFromObject(pod), &gone)
 	require.Error(t, err)
 	require.NoError(t, client.IgnoreNotFound(err))
+}
+
+func TestDrainSnapshotValidationFailsClosed(t *testing.T) {
+	emptyResources := &fastletapi.ResourceAdmissionStatus{
+		Version: "v2", Epoch: "epoch-a", Revision: 1,
+		Committed: fastletapi.SandboxResourceVector{CPU: "0", Memory: "0"},
+	}
+	emptyAdmission := &fastletapi.AdmissionStatus{Resources: emptyResources}
+	valid := &fastletapi.SetDrainingResponse{
+		Draining: true, DrainID: "drain-a", FastletPodUID: "pod-a", Admission: emptyAdmission, RuntimeReady: true,
+	}
+	require.True(t, drainResponseEmpty(valid, true))
+
+	missing := *valid
+	missing.Admission = nil
+	require.False(t, drainResponseEmpty(&missing, true))
+	recovering := *valid
+	recovering.Recovering = true
+	require.False(t, drainResponseEmpty(&recovering, true))
+	loaded := *valid
+	loadedAdmission := *emptyAdmission
+	loadedAdmission.Used, loadedAdmission.Creating = 1, 1
+	loaded.Admission = &loadedAdmission
+	require.False(t, drainResponseEmpty(&loaded, true))
+	invalidLedger := *valid
+	invalidAdmission := *emptyAdmission
+	invalidResources := *emptyResources
+	invalidResources.Reason = fastletapi.AdmissionReasonUnsupportedProtocol
+	invalidAdmission.Resources = &invalidResources
+	invalidLedger.Admission = &invalidAdmission
+	require.False(t, drainResponseEmpty(&invalidLedger, true))
 }
 
 func TestPlannedUpgradeWaitsForReadySurgeThenDrainsOldTemplate(t *testing.T) {

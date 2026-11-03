@@ -168,9 +168,15 @@ func TestSetDrainingRejectsNewCreates(t *testing.T) {
 	manager := newServerManager(t, newServerRuntime(), false)
 	handler := NewFastletServer(":0", manager).Handler()
 	var draining fastletapi.SetDrainingResponse
-	recorder := postJSON(t, handler, "/api/v2/fastlet/draining", fastletapi.SetDrainingRequest{Draining: true, Reason: "upgrade"}, &draining)
+	recorder := postJSON(t, handler, "/api/v2/fastlet/draining", fastletapi.SetDrainingRequest{
+		Draining: true, Reason: "upgrade", DrainID: "drain-a", FastletPodUID: "pod-uid-a",
+	}, &draining)
 	require.Equal(t, http.StatusOK, recorder.Code)
 	require.True(t, draining.Draining)
+	require.Equal(t, "drain-a", draining.DrainID)
+	require.Equal(t, "pod-uid-a", draining.FastletPodUID)
+	require.True(t, draining.RuntimeReady)
+	require.NotNil(t, draining.Admission)
 	var rejected fastletapi.CreateSandboxResponse
 	recorder = postJSON(t, handler, "/api/v2/fastlet/create", fastletapi.CreateSandboxRequest{
 		RequestID:      "request-a",

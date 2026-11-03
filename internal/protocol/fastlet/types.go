@@ -503,12 +503,19 @@ type InvokeHandlerResponse struct {
 }
 
 type SetDrainingRequest struct {
-	Draining bool   `json:"draining"`
-	Reason   string `json:"reason,omitempty"`
+	Draining      bool   `json:"draining"`
+	Reason        string `json:"reason,omitempty"`
+	DrainID       string `json:"drainId,omitempty"`
+	FastletPodUID string `json:"fastletPodUid,omitempty"`
 }
 
 type SetDrainingResponse struct {
-	Draining bool `json:"draining"`
+	Draining      bool             `json:"draining"`
+	DrainID       string           `json:"drainId,omitempty"`
+	FastletPodUID string           `json:"fastletPodUid,omitempty"`
+	Admission     *AdmissionStatus `json:"admission,omitempty"`
+	Recovering    bool             `json:"recovering"`
+	RuntimeReady  bool             `json:"runtimeReady"`
 }
 
 type RuntimeDiagnostics struct {

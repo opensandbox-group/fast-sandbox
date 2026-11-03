@@ -86,7 +86,7 @@ AutoRecreate does not preserve process memory, local filesystem state, or networ
 
 ## Pool drain
 
-Pool scale-down and template replacement use a persisted drain sequence. A draining Fastlet stops receiving new admission, existing Sandboxes are handled according to lifecycle policy, and the Pod is removed only after the drain contract is satisfied.
+Pool scale-down and template replacement use a persisted drain sequence. A draining Fastlet stops receiving new admission, existing Sandboxes are handled according to lifecycle policy, and normal drain completion requires a matching attempt to return an atomic, recovery-complete empty admission snapshot. Non-protected planned replacements retain their timeout policy after a successful drain RPC. During a rolling upgrade from an older Fastlet, deletion always requires a fresh Heartbeat RPC started after the drain acknowledgement to identify the same Pod and carry the same empty, recovery-complete evidence; cached heartbeats and timeout alone cannot authorize legacy deletion.
 
 Planned replacement can use a ready surge so the new Fastlet proves runtime and Infra capability before the old one drains.
 
