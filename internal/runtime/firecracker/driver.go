@@ -918,7 +918,7 @@ func (d *Driver) DeleteSandbox(ctx context.Context, sandboxID string) error {
 func (d *Driver) RecordTerminalFailure(ctx context.Context, identity fastletapi.SandboxIdentity, message string) (resultErr error) {
 	sandboxID := identity.SandboxUID
 	ctx = observability.WithIdentity(ctx, observability.Identity{SandboxUID: sandboxID})
-	ctx, span := observability.Start(ctx, "fastlet.firecracker.record-terminal-failure")
+	_, span := observability.Start(ctx, "fastlet.firecracker.record-terminal-failure")
 	defer func() { observability.End(span, resultErr) }()
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
@@ -1053,7 +1053,7 @@ func (d *Driver) ListManagedSandboxes(_ context.Context) ([]*SandboxMetadata, er
 // RecoverRuntimeResources cleans up VMs that died with a Fastlet restart:
 // Firecracker processes are pod-local, so stale records are removed and
 // their slots released; surviving VMs are returned.
-func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer) error {
+func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer) error { //nolint:gocognit // ordered recovery classifies each durable runtime before cleanup or adoption
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	manager := d.networkManager

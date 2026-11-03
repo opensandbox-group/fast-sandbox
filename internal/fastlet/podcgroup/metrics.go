@@ -57,7 +57,7 @@ func (c *runtimeMetrics) Describe(out chan<- *prometheus.Desc) {
 	}
 }
 
-func (c *runtimeMetrics) Collect(out chan<- prometheus.Metric) {
+func (c *runtimeMetrics) Collect(out chan<- prometheus.Metric) { //nolint:gocognit // metric files and keyed fields form one bounded collector loop
 	m := c.manager
 	m.mu.Lock()
 	paths := map[string]string{"": m.AggregateFilesystemPath()}

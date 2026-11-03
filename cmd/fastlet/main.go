@@ -418,7 +418,7 @@ func configureRuntimeCgroups(
 	podUID string,
 ) (*podcgroup.RuntimeManager, error) {
 	if settings == nil || settings.Version != fastletsettings.BoundedFirecrackerVersion {
-		return nil, nil
+		return nil, nil //nolint:nilnil // no runtime cgroup manager is expected for other admission modes
 	}
 	configurable, ok := rt.(runtimeCgroupConfigurable)
 	if !ok {

@@ -898,7 +898,7 @@ func (r *SandboxPoolReconciler) runtimeCapabilityCondition(pool *apiv1alpha2.San
 	return condition, ready
 }
 
-func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit // pre-existing drain state machine; refactor tracked separately
+func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit,gocyclo // persisted drain state machine; refactor tracked separately
 	ctx context.Context,
 	pool *apiv1alpha2.SandboxPool,
 	pods []corev1.Pod,

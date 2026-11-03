@@ -711,7 +711,7 @@ func (m *SandboxManager) dispatchDeleteAfterRetirement(sandboxUID string, metada
 	}
 }
 
-func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit // pre-existing recovery sequence; refactor tracked separately
+func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit,gocyclo // ordered startup recovery sequence; refactor tracked separately
 	m.mu.Lock()
 	m.recovering = true
 	m.runtimeReady = false
