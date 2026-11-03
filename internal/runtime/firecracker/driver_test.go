@@ -755,6 +755,127 @@ func TestRecoverRuntimeResourcesCleansDeadVM(t *testing.T) {
 	require.Equal(t, 0, fixture.manager.Snapshot().Bound)
 }
 
+func TestRecoverInterruptedStartBeforeSocketProbe(t *testing.T) {
+	for _, socketAvailable := range []bool{true, false} {
+		t.Run(map[bool]string{true: "socket-available", false: "socket-unavailable"}[socketAvailable], func(t *testing.T) {
+			fixture := newDriverFixture(t)
+			fixture.driver.SetFastletPodUID(fixture.sandboxSpec.Identity.FastletPodUID)
+			owner := fixture.driver.networkOwner(&fixture.sandboxSpec)
+			_, err := fixture.manager.Acquire(t.Context(), owner)
+			require.NoError(t, err)
+			directory, err := ensureSandboxDir(fixture.stateRoot, fixture.sandboxSpec.Identity.SandboxUID)
+			require.NoError(t, err)
+			apiAddress := filepath.Join(directory, "dead.sock")
+			if socketAvailable {
+				apiAddress = fixture.server.socket
+			}
+			require.NoError(t, saveState(directory, &SandboxState{
+				Config: fixture.sandboxSpec, Phase: PhaseStarting, APIAddress: apiAddress,
+			}))
+
+			runtimeCgroups, leaf := interruptedStartCgroup(t, fixture.sandboxSpec.Identity)
+			require.NoError(t, os.WriteFile(filepath.Join(leaf, "cgroup.procs"), []byte("4321\n"), 0o600))
+			require.NoError(t, os.WriteFile(filepath.Join(leaf, "cgroup.events"), []byte("populated 1\n"), 0o600))
+			fixture.driver.runtimeCgroups = runtimeCgroups
+			clientCalls := 0
+			fixture.driver.newClient = func(address string) *Client {
+				clientCalls++
+				return NewClient(address)
+			}
+			fixture.driver.killProcess = func(pid int) error {
+				if pid == 0 {
+					return nil
+				}
+				require.Equal(t, 1, fixture.manager.Snapshot().Bound, "the network slot must remain bound until the VMM is absent")
+				fixture.killCalls = append(fixture.killCalls, pid)
+				require.NoError(t, os.Remove(filepath.Join(leaf, "cgroup.procs")))
+				require.NoError(t, os.Remove(filepath.Join(leaf, "cgroup.events")))
+				return nil
+			}
+
+			require.NoError(t, fixture.driver.RecoverRuntimeResources(t.Context(), nil, nil))
+			require.Zero(t, clientCalls, "PID-less Starting recovery must run before probing the API socket")
+			require.Equal(t, []int{4321}, fixture.killCalls)
+			require.Equal(t, 0, fixture.manager.Snapshot().Bound)
+			require.NoDirExists(t, directory)
+			require.NoDirExists(t, leaf)
+			require.NoError(t, fixture.driver.RecoverRuntimeResources(t.Context(), nil, nil), "recovery must be idempotent")
+		})
+	}
+}
+
+func TestRecoverInterruptedStartPreservesUnknownCgroupOwnership(t *testing.T) {
+	fixture := newDriverFixture(t)
+	fixture.driver.SetFastletPodUID(fixture.sandboxSpec.Identity.FastletPodUID)
+	_, err := fixture.manager.Acquire(t.Context(), fixture.driver.networkOwner(&fixture.sandboxSpec))
+	require.NoError(t, err)
+	directory, err := ensureSandboxDir(fixture.stateRoot, fixture.sandboxSpec.Identity.SandboxUID)
+	require.NoError(t, err)
+	require.NoError(t, saveState(directory, &SandboxState{
+		Config: fixture.sandboxSpec, Phase: PhaseStarting, APIAddress: fixture.server.socket,
+	}))
+	runtimeCgroups, leaf := interruptedStartCgroup(t, fixture.sandboxSpec.Identity)
+	require.NoError(t, os.WriteFile(filepath.Join(leaf, "cgroup.events"), []byte("populated 1\n"), 0o600))
+	fixture.driver.runtimeCgroups = runtimeCgroups
+	clientCalls := 0
+	fixture.driver.newClient = func(address string) *Client {
+		clientCalls++
+		return NewClient(address)
+	}
+
+	err = fixture.driver.RecoverRuntimeResources(t.Context(), nil, nil)
+	require.ErrorContains(t, err, "read Sandbox cgroup processes")
+	require.Zero(t, clientCalls)
+	require.Empty(t, fixture.killCalls)
+	require.Equal(t, 1, fixture.manager.Snapshot().Bound)
+	require.DirExists(t, directory)
+}
+
+func TestRecoverInterruptedStartCleansMissingCgroup(t *testing.T) {
+	fixture := newDriverFixture(t)
+	fixture.driver.SetFastletPodUID(fixture.sandboxSpec.Identity.FastletPodUID)
+	_, err := fixture.manager.Acquire(t.Context(), fixture.driver.networkOwner(&fixture.sandboxSpec))
+	require.NoError(t, err)
+	directory, err := ensureSandboxDir(fixture.stateRoot, fixture.sandboxSpec.Identity.SandboxUID)
+	require.NoError(t, err)
+	require.NoError(t, saveState(directory, &SandboxState{
+		Config: fixture.sandboxSpec, Phase: PhaseStarting, APIAddress: fixture.server.socket,
+	}))
+	runtimeCgroups, leaf := interruptedStartCgroup(t, fixture.sandboxSpec.Identity)
+	require.NoError(t, os.Remove(leaf))
+	fixture.driver.runtimeCgroups = runtimeCgroups
+	clientCalls := 0
+	fixture.driver.newClient = func(address string) *Client {
+		clientCalls++
+		return NewClient(address)
+	}
+
+	require.NoError(t, fixture.driver.RecoverRuntimeResources(t.Context(), nil, nil))
+	require.Zero(t, clientCalls)
+	require.Empty(t, fixture.killCalls)
+	require.Equal(t, 0, fixture.manager.Snapshot().Bound)
+	require.NoDirExists(t, directory)
+}
+
+func interruptedStartCgroup(t *testing.T, identity fastletapi.SandboxIdentity) (*podcgroup.RuntimeManager, string) {
+	t.Helper()
+	root := t.TempDir()
+	podRelative := filepath.Join("kubepods", "burstable", "pod"+identity.FastletPodUID)
+	podPath := filepath.Join(root, podRelative)
+	require.NoError(t, os.MkdirAll(podPath, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "cgroup.controllers"), []byte("cpu memory pids"), 0o600))
+	manager, err := podcgroup.NewRuntimeManager(root, identity.FastletPodUID, podcgroup.RuntimeBudget{
+		CPU: resource.MustParse("1"), Memory: resource.MustParse("512Mi"),
+	})
+	require.NoError(t, err)
+	layout := podcgroup.Layout{PodPath: "/" + filepath.ToSlash(podRelative)}
+	cgroupPath, err := layout.SandboxPath(identity.SandboxUID)
+	require.NoError(t, err)
+	leaf := filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(cgroupPath, "/")))
+	require.NoError(t, os.MkdirAll(leaf, 0o750))
+	return manager, leaf
+}
+
 func TestRecoverRuntimeResourcesRetiresStrictOwnerBeforeCleanup(t *testing.T) {
 	fixture := newDriverFixture(t)
 	fixture.sandboxSpec.ActionsAPIVersion = actionapi.APIVersionV2

@@ -234,6 +234,40 @@ func (m *RuntimeManager) ConfirmAbsent(sandboxID string) error {
 	return nil
 }
 
+// SandboxProcesses returns the processes in the deterministic Sandbox leaf.
+// A missing leaf is distinguished from an unreadable leaf so recovery never
+// treats an unknown ownership observation as proof of absence.
+func (m *RuntimeManager) SandboxProcesses(sandboxID string) ([]int, bool, error) {
+	if m == nil {
+		return nil, false, errors.New("runtime cgroup manager is required")
+	}
+	cgroupPath, err := m.layout.SandboxPath(sandboxID)
+	if err != nil {
+		return nil, false, err
+	}
+	path := cgroupFilesystemPath(m.root, cgroupPath)
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	raw, err := os.ReadFile(filepath.Join(path, "cgroup.procs"))
+	if err != nil {
+		return nil, true, fmt.Errorf("read Sandbox cgroup processes %q: %w", path, err)
+	}
+	fields := strings.Fields(string(raw))
+	pids := make([]int, 0, len(fields))
+	for _, field := range fields {
+		pid, err := strconv.Atoi(field)
+		if err != nil || pid <= 0 {
+			return nil, true, fmt.Errorf("parse Sandbox cgroup PID %q in %q", field, path)
+		}
+		pids = append(pids, pid)
+	}
+	return pids, true, nil
+}
+
 // RemoveSandbox removes an empty leaf after its runtime process exits.
 func (m *RuntimeManager) RemoveSandbox(sandboxID string) error {
 	if m == nil || sandboxID == "" {

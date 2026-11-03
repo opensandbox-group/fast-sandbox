@@ -1017,6 +1017,12 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 		if podUID != "" && state.Config.Identity.FastletPodUID != podUID {
 			continue
 		}
+		if handled, err := d.recoverInterruptedStart(ctx, state, directory, manager, runtimeCgroups, retireOwner); handled {
+			if err != nil {
+				return err
+			}
+			continue
+		}
 		alive, probeErr := d.probeVM(ctx, state)
 		if probeErr != nil || !alive {
 			if err := d.recoverDeadSandbox(ctx, state, directory, manager, runtimeCgroups, retireOwner); err != nil {
@@ -1033,6 +1039,60 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 		d.resumePausedVM(ctx, state)
 	}
 	return nil
+}
+
+const interruptedStartExitTimeout = 2 * time.Second
+
+// recoverInterruptedStart closes the launch-to-PID-persistence crash window.
+// The state and deterministic cgroup together identify a VMM started by this
+// Fastlet Pod; recovery must resolve that leaf before an API socket can make a
+// PID-less Starting record look adoptable.
+func (d *Driver) recoverInterruptedStart(ctx context.Context, state *SandboxState, directory string, manager *fastletnetwork.Manager, runtimeCgroups *podcgroup.RuntimeManager, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer) (bool, error) {
+	if state == nil || state.Phase != PhaseStarting || state.PID != 0 || runtimeCgroups == nil {
+		return false, nil
+	}
+	sandboxUID := state.Config.Identity.SandboxUID
+	d.mu.RLock()
+	podUID := d.podUID
+	d.mu.RUnlock()
+	if podUID == "" || state.Config.Identity.FastletPodUID != podUID {
+		return true, fmt.Errorf("cannot attribute interrupted Firecracker start for sandbox %s to the current Fastlet Pod", sandboxUID)
+	}
+	pids, exists, err := runtimeCgroups.SandboxProcesses(sandboxUID)
+	if err != nil {
+		return true, fmt.Errorf("inspect interrupted Firecracker start cgroup for sandbox %s: %w", sandboxUID, err)
+	}
+	if exists {
+		d.mu.RLock()
+		killProcess := d.killProcess
+		d.mu.RUnlock()
+		for _, pid := range pids {
+			if killProcess == nil {
+				return true, fmt.Errorf("terminate interrupted Firecracker start for sandbox %s: process killer is unavailable", sandboxUID)
+			}
+			if err := killProcess(pid); err != nil {
+				return true, fmt.Errorf("terminate interrupted Firecracker PID %d for sandbox %s: %w", pid, sandboxUID, err)
+			}
+		}
+	}
+	deadline := time.Now().Add(interruptedStartExitTimeout)
+	for {
+		if err := runtimeCgroups.ConfirmAbsent(sandboxUID); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			return true, fmt.Errorf("confirm interrupted Firecracker start exited for sandbox %s: %w", sandboxUID, err)
+		}
+		select {
+		case <-ctx.Done():
+			return true, ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if err := d.recoverDeadSandbox(ctx, state, directory, manager, runtimeCgroups, retireOwner); err != nil {
+		return true, err
+	}
+	klog.InfoS("recovered interrupted Firecracker start", "sandboxID", sandboxUID, "terminatedPIDs", pids)
+	return true, nil
 }
 
 // recoverDeadSandbox preserves retirement-before-release ordering for a dead
@@ -1502,7 +1562,7 @@ func (d *Driver) killAndForget(sandboxID string, pid int) {
 		}
 		return
 	}
-	if d.killProcess != nil {
+	if pid > 0 && d.killProcess != nil {
 		_ = d.killProcess(pid)
 	}
 }

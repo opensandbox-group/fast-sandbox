@@ -157,6 +157,8 @@ The leaf accounts for resident guest pages and VMM overhead with `memory.max=max
 The Fastlet process remains in its
 Kubernetes container cgroup, outside the Sandbox OOM victim subtree.
 
+If Fastlet restarts after launching a VMM but before persisting its PID, recovery resolves the `Starting` record from the deterministic leaf before probing the API socket. A missing or empty leaf follows ordinary cleanup; a populated leaf owned by the current Fastlet Pod is terminated and confirmed empty before its network slot is released, while an unreadable ownership observation retains the record and resources for retry.
+
 The sibling layout is deliberate. Making the Fastlet container cgroup an
 internal cgroup v2 node would require moving Kubernetes-owned processes and
 could break later container `exec` operations. The Pod cgroup remains the
