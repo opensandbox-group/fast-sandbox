@@ -26,10 +26,34 @@ and platform-owned runtime implementation details.
 | `--resource-aware-pool-scaling` | `true` | Enable ResourceAware effective-capacity Pool scaling |
 | `--resource-aware-fastlet-startup-grace` | `2m` | Time a new Fastlet without a heartbeat contributes nominal capacity |
 | `--resource-aware-scale-down-stabilization` | `1m` | Continuous excess-capacity period required before scale-down |
+| `--cache-namespaces` | *(empty = whole cluster)* | Comma-separated namespaces the informer cache watches |
+| `--kube-client-qps` | *(client-go default)* | API-server client rate limit in queries per second |
+| `--kube-client-burst` | *(client-go default)* | API-server client burst budget for the rate limiter |
 
 Resource-aware placement requires static admission. Resource-aware Pool
 scaling requires placement. These constraints prevent a downstream component
 from acting on capacity that an upstream authority does not enforce.
+
+### Cache scoping and client rate limiting
+
+By default every controller and FastPath replica watches Pods, ConfigMaps,
+and Secrets cluster-wide, and the initial cache sync has to LIST all of them.
+On large shared clusters that sync can exceed the controller memory budget
+and OOM-kill the Pod during startup.
+
+`--cache-namespaces` scopes the informer cache to the listed namespaces, for
+example `--cache-namespaces=tenant-a,tenant-b`. The set must cover every
+namespace that holds SandboxPool, Sandbox, or SandboxTemplate objects, plus
+the runtime environment namespace (`--runtime-environment-namespace`); the
+controller refuses to start otherwise. Empty keeps cluster-wide semantics
+for multi-tenant deployments. Label selectors are not enough for this: the
+ConfigMaps and Secrets the Pool controller reads have no distinguishing
+label.
+
+`--kube-client-qps` and `--kube-client-burst` tune the shared API-server
+client's rate limiter (they must be set together, and `0` keeps the client-go
+default). Raising them speeds up the initial cache-sync LISTs on large
+clusters; watches are exempt from the limiter.
 
 Image and route-key flags can also be supplied by environment:
 
