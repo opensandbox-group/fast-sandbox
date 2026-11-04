@@ -2034,6 +2034,9 @@ resource_aware_oom_fastlet_ready() {
 }
 
 resource_aware_oom_cleanup() {
+	if [[ -n "${pod:-}" && -n "${aggregate:-}" ]]; then
+		resource_aware_stop_runtime_cpu_load "$pod" "$aggregate" >/dev/null 2>&1 || true
+	fi
 	kubectl -n "$NS" delete sandbox "$RESOURCE_AWARE_OOM_SANDBOX_A" "$RESOURCE_AWARE_OOM_SANDBOX_B" "$recovery_name" \
 		--ignore-not-found --wait=false >/dev/null 2>&1 || true
 	kubectl -n "$NS" delete sandboxpool "$RESOURCE_AWARE_OOM_POOL" \
@@ -2057,7 +2060,9 @@ resource_aware_runtime_leaf_count() { # fastlet-pod aggregate-path
 }
 
 resource_aware_runtime_leaf_count_matches() { # fastlet-pod aggregate-path expected
-	[[ "$(resource_aware_runtime_leaf_count "$1" "$2")" -eq "$3" ]]
+	local count
+	count="$(resource_aware_runtime_leaf_count "$1" "$2")" || return 1
+	[[ "$count" =~ ^[0-9]+$ && "$count" -eq "$3" ]]
 }
 
 resource_aware_runtime_jail_absent() { # fastlet-pod sandbox-uid
@@ -2240,7 +2245,7 @@ verify_resource_aware_cgroup_oom() (
 
 verify_one_resource_aware_oom() (
 	local mode="$1" id="$BASHPID" pool_json pod pod_uid restart_count aggregate cpu_before cpu_after oom_before oom_after live_after
-	local sandbox_uid_a sandbox_uid_b node elapsed_ns start_ns sample local_oom_before local_oom_after uid leaf_ns create_ns
+	local sandbox_uid_a sandbox_uid_b node elapsed_ns start_ns sample local_oom_before local_oom_after uid leaf_ns create_ns fastlet_cgroup
 	local RESOURCE_AWARE_OOM_POOL="fc-oom-$mode-$id" RESOURCE_AWARE_OOM_SANDBOX_A="fc-oom-a-$id" RESOURCE_AWARE_OOM_SANDBOX_B="fc-oom-b-$id"
 	local recovery_name="fc-recovery-$id"
 	[[ -n "$(kubectl_get "sandboxtemplate/$SBX_TEMPLATE" '{.status.manifestRef}' 2>/dev/null)" ]] \
@@ -2286,19 +2291,23 @@ verify_one_resource_aware_oom() (
 	sandbox_uid_b="$(kubectl_get "sandbox/$RESOURCE_AWARE_OOM_SANDBOX_B" '{.metadata.uid}')"
 	pod_uid="$(kubectl_get "pod/$pod" '{.metadata.uid}')"
 	restart_count="$(kubectl -n "$NS" get pod "$pod" -o json | jq -r '.status.containerStatuses[] | select(.name == "fastlet") | .restartCount')"
-	aggregate="$(resource_aware_runtime_cgroup "$pod")"
+	aggregate="$(resource_aware_runtime_cgroup "$pod")" \
+		|| fail "could not observe the bounded fast-sandbox cgroup for Fastlet $pod"
 	[[ -n "$aggregate" ]] || fail "bounded fast-sandbox cgroup was not found below the Fastlet Pod"
 	[[ "$(kubectl -n "$NS" exec "$pod" -c fastlet -- cat "$aggregate/cpu.max")" == "100000 100000" ]] \
 		|| fail "aggregate Sandbox CPU budget is not 1 CPU"
 	[[ "$(kubectl -n "$NS" exec "$pod" -c fastlet -- cat "$aggregate/memory.max")" == "536870912" ]] \
 		|| fail "aggregate Sandbox memory budget is not 512Mi"
-	[[ "$(resource_aware_runtime_leaf_count "$pod" "$aggregate")" -eq 2 ]] \
+	resource_aware_runtime_leaf_count_matches "$pod" "$aggregate" 2 \
 		|| fail "expected two per-Sandbox cgroup leaves"
 	[[ "$(resource_aware_runtime_live_vm_count "$pod" "$aggregate")" -eq 2 ]] \
 		|| fail "each Firecracker VMM must start inside its assigned cgroup leaf"
 	resource_aware_runtime_leaf_limits_match "$pod" "$aggregate" \
 		|| fail "per-Sandbox cgroup leaves do not carry the resolved CPU/memory/PID limits"
-	if kubectl -n "$NS" exec "$pod" -c fastlet -- grep -q fast-sandbox /proc/1/cgroup 2>/dev/null; then
+	fastlet_cgroup="$(kubectl -n "$NS" exec "$pod" -c fastlet -- cat /proc/1/cgroup)" \
+		|| fail "could not read the Fastlet process cgroup for $pod"
+	[[ -n "$fastlet_cgroup" ]] || fail "Fastlet process cgroup is empty for $pod"
+	if [[ "$fastlet_cgroup" == *fast-sandbox* ]]; then
 		fail "Fastlet process unexpectedly belongs to the Sandbox runtime subtree"
 	fi
 
@@ -2376,7 +2385,8 @@ verify_one_resource_aware_oom() (
 		elapsed_ns=$(( $(date +%s%N) - start_ns ))
 		[[ "$(kubectl_get "sandbox/$recovery_name" '{.status.placement.fastletName}')" == "$pod" ]] || fail "replacement was placed on a different Fastlet"
 		uid="$(kubectl_get "sandbox/$recovery_name" '{.metadata.uid}')"
-		leaf_ns="$(kubectl -n "$NS" exec "$pod" -c fastlet -- cat "/var/lib/fast-sandbox/firecracker/sandboxes/$uid/meta.json" | jq -e '.stageDurations.cgroup | select(. > 0)')"
+		leaf_ns="$(kubectl -n "$NS" exec "$pod" -c fastlet -- cat "/var/lib/fast-sandbox/firecracker/sandboxes/$uid/meta.json" | jq -e '.stageDurations.cgroup | select(type == "number" and . > 0)')" \
+			|| fail "replacement Sandbox $recovery_name ($uid) metadata lacks a positive numeric cgroup stage duration"
 		fastctl delete "$recovery_name" >/dev/null
 		wait_for "replacement Sandbox deleted" 90 sandbox_gone "$recovery_name"
 		wait_for "replacement cgroup released" 30 resource_aware_runtime_leaf_count_matches "$pod" "$aggregate" 0
