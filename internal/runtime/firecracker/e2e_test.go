@@ -5,10 +5,7 @@ package firecracker
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -27,6 +24,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
@@ -428,10 +426,10 @@ func runE2EOnce(t *testing.T, useInfra bool) {
 
 // e2ePrepVersion marks the golden snapshot set format. It must be bumped
 // whenever the preparation recipe changes (NIC baking, drive path, boot
-// args, machine tuple): a cached set from an older recipe is incompatible
+// args, machine tuple, manifest schema): a cached set from an older recipe is incompatible
 // with the current restore driver (e.g. it lacks the baked NIC that
 // network_overrides expects), so the reuse check must reject it.
-const e2ePrepVersion = 4
+const e2ePrepVersion = 5
 
 // bootVM starts the microVM and waits until the machine state is Running.
 // It serves the golden-snapshot prep path only (cold boot: InstanceStart);
@@ -521,6 +519,7 @@ func prepareE2EGoldenSnapshot(t *testing.T, binary, kernel, rootfs, stateRoot, i
 	for _, args := range [][]string{
 		{"tuntap", "add", "dev", prepTap, "mode", "tap"},
 		{"link", "set", "dev", prepTap, "address", guestnetwork.GatewayMAC},
+		{"link", "set", "dev", prepTap, "mtu", strconv.Itoa(fastletnetwork.DefaultMTU)},
 		{"addr", "add", "172.30.0.1/24", "dev", prepTap},
 		{"link", "set", "dev", prepTap, "up"},
 		// Suppress host ARP requests: the guest must learn the gateway from
@@ -553,20 +552,22 @@ func prepareE2EGoldenSnapshot(t *testing.T, binary, kernel, rootfs, stateRoot, i
 	// The preparation machine must match the manifest machine tuple that
 	// restore validates (vmstate pins mem_size_mib): 1 vCPU / 512 MiB, the
 	// same as the e2e Sandbox spec.
-	require.NoError(t, client.ConfigureMachine(context.Background(), MachineConfigRequest{VCPUs: 1, MemSizeMiB: 512}))
+	machine := MachineConfigRequest{VCPUs: 1, MemSizeMiB: 512}
+	require.NoError(t, client.ConfigureMachine(context.Background(), machine))
 	// The static guest network is baked into the snapshot via the boot
 	// args: the restored guest resumes with eth0 = 172.30.0.3 (the first
 	// slot's guest address), which is the v1.16 clone networking model.
 	require.NoError(t, client.ConfigureBootSource(context.Background(), BootSourceRequest{
 		KernelImagePath: kernel, BootArgs: e2ePrepBootArgs(bootArgs),
 	}))
-	require.NoError(t, client.AttachDrive(context.Background(), DriveRequest{
+	drive := DriveRequest{
 		// Relative path baked in the vmstate; instances resolve it via
 		// their process cwd. Booted read-write exactly like a restored
 		// instance so the snapshot's filesystem state matches the golden
 		// rootfs the instances reflink-copy from.
-		DriveID: "root", PathOnHost: "rootfs.img", IsRootDevice: true, IsReadOnly: false,
-	}))
+		DriveID: "root", PathOnHost: rootfsImageName, IsRootDevice: true, IsReadOnly: false,
+	}
+	require.NoError(t, client.AttachDrive(context.Background(), drive))
 	require.NoError(t, client.AttachNetworkInterface(context.Background(), NetworkInterfaceRequest{
 		// The NIC (iface id + MAC + state) is baked in the vmstate; each
 		// restored instance overrides only the host tap name.
@@ -590,30 +591,31 @@ func prepareE2EGoldenSnapshot(t *testing.T, binary, kernel, rootfs, stateRoot, i
 	}))
 	require.NoError(t, process.Kill())
 
-	// The manifest records the machine tuple restore validates and the
-	// artifact digests of the golden set (commit point: manifest last).
-	rootfsDigest, err := fileSHA256(rootfsImg)
+	// Use the same manifest producer as the builder. Prep does not apply a
+	// CPU template, so capture the actual host CPU identity with tier "none".
+	files := map[string]artifacts.ManifestFile{}
+	for _, file := range []struct{ name, path string }{
+		{"rootfs.ext4", rootfsImg}, {vmstateSnapshotName, vmstate}, {memorySnapshotName, memory},
+	} {
+		entry, err := artifacts.FileEntry(file.path, nil)
+		require.NoError(t, err)
+		files[file.name] = entry
+	}
+	document := artifacts.NewVMManifest(artifacts.VMMachine{
+		VCPUCount: machine.VCPUs, MemoryMiB: int64(machine.MemSizeMiB),
+		RootfsSizeMiB: (files["rootfs.ext4"].SizeBytes + (1 << 20) - 1) >> 20,
+		RootfsDriveID: drive.DriveID, RootfsDrivePath: drive.PathOnHost,
+	}, strings.TrimPrefix(filepath.Base(kernel), "vmlinux-"), binary, artifacts.CPUTemplateNone)
+	// Every restored instance owns the baked address; its per-instance slot
+	// IP is translated to this address by the netns DNAT.
+	document.GuestNetwork = &artifacts.VMGuestNetwork{
+		Iface: "eth0", MAC: e2ePrepMAC, IP: e2ePrepGuestIP,
+		Gateway: "172.30.0.1", Netmask: "255.255.255.0", MTU: fastletnetwork.DefaultMTU,
+	}
+	document.Files = files
+	manifest, err := artifacts.MarshalVMManifest(document)
 	require.NoError(t, err)
-	vmstateDigest, err := fileSHA256(vmstate)
-	require.NoError(t, err)
-	memoryDigest, err := fileSHA256(memory)
-	require.NoError(t, err)
-	manifest, err := json.Marshal(map[string]any{
-		"machine": map[string]any{"vcpu": "1", "memory": "512Mi"},
-		// The baked guest network (clone model): every restored instance
-		// owns the same static address; per-instance identity is the slot
-		// IP, translated to this address by the netns DNAT.
-		"guestNetwork": map[string]any{
-			"iface": "eth0", "mac": e2ePrepMAC, "ip": e2ePrepGuestIP,
-			"gateway": "172.30.0.1", "netmask": "255.255.255.0",
-		},
-		"files": map[string]any{
-			"rootfs.ext4":  map[string]any{"sha256": rootfsDigest, "sizeBytes": fileSize(t, rootfsImg)},
-			"vmstate.snap": map[string]any{"sha256": vmstateDigest, "sizeBytes": fileSize(t, vmstate)},
-			"memory.snap":  map[string]any{"sha256": memoryDigest, "sizeBytes": fileSize(t, memory)},
-		},
-	})
-	require.NoError(t, err)
+	// The complete, validated manifest remains the artifact-set commit point.
 	require.NoError(t, os.WriteFile(manifestPath, manifest, 0o640))
 	t.Logf("prepared golden snapshot set %s (rootfs=%s)", dir, filepath.Base(rootfs))
 }
@@ -671,26 +673,6 @@ func waitVMState(ctx context.Context, client *Client, want string, timeout time.
 		case <-time.After(bootPollInterval):
 		}
 	}
-}
-
-func fileSHA256(path string) (string, error) {
-	input, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer input.Close()
-	digest := sha256.New()
-	if _, err := io.Copy(digest, input); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(digest.Sum(nil)), nil
-}
-
-func fileSize(t *testing.T, path string) int64 {
-	t.Helper()
-	info, err := os.Stat(path)
-	require.NoError(t, err)
-	return info.Size()
 }
 
 // e2eEnvironment bundles the host checks, StateRoot, slot manager, driver,
@@ -888,7 +870,8 @@ func (env *e2eEnvironment) spec(index int) *fastletapi.RuntimeSandboxConfig {
 			Image:              env.imageRef,
 			RuntimeProfileHash: "e2e-profile", ResourceProfileHash: "e2e-resource",
 		},
-		Limits: fastletapi.SandboxRuntimeLimits{CPU: "1", Memory: "512Mi"},
+		Limits:     fastletapi.SandboxRuntimeLimits{CPU: "1", Memory: "512Mi"},
+		CPURequest: "1",
 		Identity: fastletapi.SandboxIdentity{SandboxUID: sandboxID, Name: sandboxID, Namespace: "e2e",
 			InstanceGeneration: 1, RuntimeInstanceID: fmt.Sprintf("e2e-ri-%d", index), AssignmentAttempt: 1,
 			FastletPodUID: env.podUID},
@@ -1102,11 +1085,19 @@ func (env *e2eEnvironment) assertSlotDataPlane(sandboxID string) {
 	t.Helper()
 	slot, ok := env.manager.Lookup(sandboxID)
 	require.True(t, ok)
-	check := []string{"netns", "exec", slot.NetNSName, "iptables", "-t", "nat", "-C",
-		"PREROUTING", "-d", slot.IP + "/32", "-j", "DNAT", "--to-destination", guestIPLabel(slot)}
-	if _, err := exec.Command("ip", check...).CombinedOutput(); err != nil {
-		t.Logf("slot data plane missing; dumping guest network diagnostics:\n%s", dumpNetworkDiagnostics(t, slot, env.stateRoot, env.jailer))
-		require.NoErrorf(t, err, "slot %s data plane: DNAT %s -> %s missing", slot.ID, slot.IP, guestIPLabel(slot))
+	chain := "PREROUTING"
+	var rules [][]string
+	if slot.GuestNATBatch {
+		chain = "FSB_GUEST_DNAT"
+		rules = append(rules, []string{"PREROUTING", "-j", chain})
+	}
+	rules = append(rules, []string{chain, "-d", slot.IP + "/32", "-j", "DNAT", "--to-destination", guestIPLabel(slot)})
+	for _, rule := range rules {
+		check := append([]string{"netns", "exec", slot.NetNSName, "iptables", "-t", "nat", "-C"}, rule...)
+		if _, err := exec.Command("ip", check...).CombinedOutput(); err != nil {
+			t.Logf("slot data plane missing; dumping guest network diagnostics:\n%s", dumpNetworkDiagnostics(t, slot, env.stateRoot, env.jailer))
+			require.NoErrorf(t, err, "slot %s data plane: rule %v missing", slot.ID, rule)
+		}
 	}
 }
 
