@@ -83,33 +83,36 @@ func (f *FixtureClient) WaitForSandbox(ctx context.Context, name types.Namespace
 }
 
 func (f *FixtureClient) EnsureSandboxRemainsUnassigned(ctx context.Context, name types.NamespacedName, duration time.Duration) error {
-	checkCtx, cancel := context.WithTimeout(ctx, duration)
-	defer cancel()
+	until := time.Now().Add(duration)
+	observation := time.NewTimer(duration)
+	defer observation.Stop()
 
 	ticker := time.NewTicker(f.pollInterval)
 	defer ticker.Stop()
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// The observation window must not become the API request deadline:
+		// client-go can reject a rate-limit wait before that deadline expires.
+		// Finish with a successful read started after the observation window.
+		finalSample := !time.Now().Before(until)
 		sandbox := &apiv1alpha2.Sandbox{}
-		if err := f.client.Get(checkCtx, name, sandbox); err != nil {
-			if checkCtx.Err() == context.DeadlineExceeded {
-				return nil
-			}
-			if checkCtx.Err() != nil {
-				return checkCtx.Err()
-			}
+		if err := f.client.Get(ctx, name, sandbox); err != nil {
 			return err
 		}
 		if sandbox.Status.Placement.FastletName != "" {
 			return fmt.Errorf("sandbox %s/%s was assigned unexpectedly", name.Namespace, name.Name)
 		}
+		if finalSample {
+			return ctx.Err()
+		}
 
 		select {
-		case <-checkCtx.Done():
-			if checkCtx.Err() == context.DeadlineExceeded {
-				return nil
-			}
-			return checkCtx.Err()
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-observation.C:
 		case <-ticker.C:
 		}
 	}
