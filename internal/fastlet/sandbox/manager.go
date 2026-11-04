@@ -696,7 +696,9 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 			runtimeObservation.Message = message
 		}
 		if inspected, err := m.runtime.InspectSandbox(ctx, sandboxID); err == nil {
-			runtimeObservation.Message = inspected.Phase
+			if runtimeObservation.State != fastletapi.RuntimeStateFailed || messages[sandboxID] == "" {
+				runtimeObservation.Message = inspected.Phase
+			}
 			if runtimeObservation.State == fastletapi.RuntimeStateReady && strings.EqualFold(strings.TrimSpace(inspected.Phase), "stopped") {
 				runtimeObservation.State = fastletapi.RuntimeStateFailed
 				dataPlaneObservation.State = fastletapi.DataPlaneStateFailed

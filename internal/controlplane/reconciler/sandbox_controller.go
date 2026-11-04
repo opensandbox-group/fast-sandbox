@@ -98,13 +98,9 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, request ctrl.Request)
 // status branch is terminal until an explicit reset, so a later NotFound can
 // never send Ensure for the failed identity again.
 func (r *SandboxReconciler) reconcileTerminalRuntimeFailure(ctx context.Context, orchestrator *orchestration.Orchestrator, sandbox *apiv1alpha2.Sandbox) (ctrl.Result, error) {
-	if err := orchestrator.DeleteRuntime(ctx, sandbox); err != nil {
-		if errors.Is(err, orchestration.ErrAssignedFastletUnavailable) {
-			return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
-		}
-		return ctrl.Result{RequeueAfter: DeletionPollInterval}, err
-	}
-	gone, err := orchestrator.RuntimeGone(ctx, sandbox)
+	// Keep the identity whose Failed decision was recorded. Projecting a newer
+	// assignment here could acknowledge a replacement that has not failed.
+	gone, err := r.ensureAssignedRuntimeDeleted(ctx, orchestrator, sandbox)
 	if err != nil {
 		if errors.Is(err, orchestration.ErrAssignedFastletUnavailable) {
 			return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
@@ -117,6 +113,9 @@ func (r *SandboxReconciler) reconcileTerminalRuntimeFailure(ctx context.Context,
 	return ctrl.Result{}, nil
 }
 
+// terminalRuntimeFailureRecorded identifies a durable stop decision for this
+// exact assignment. It removes future demand, but does not prove that Fastlet
+// has finished releasing the instance's physical resources.
 func terminalRuntimeFailureRecorded(sandbox *apiv1alpha2.Sandbox) bool {
 	if sandbox == nil || sandbox.Status.Runtime.State != apiv1alpha2.RuntimeFailed {
 		return false
@@ -288,7 +287,7 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *o
 		}
 	}
 	if newlyAssigned {
-		klog.FromContext(ctx).Info("sandbox assigned and runtime ensured", "sandbox", sandbox.Name, "fastlet", assigned.Status.Placement.FastletName)
+		klog.FromContext(ctx).Info("sandbox assigned and runtime observed", "sandbox", sandbox.Name, "fastlet", assigned.Status.Placement.FastletName, "runtimeState", observed.Runtime.State)
 	}
 	if observationReady(assigned, observed) {
 		return ctrl.Result{RequeueAfter: ReadyRequeueInterval}, nil
@@ -591,6 +590,13 @@ func (r *SandboxReconciler) ensureRuntimeDeleted(ctx context.Context, orchestrat
 		return false, assignment.ErrAssignmentAnnotationChanged
 	}
 	*sandbox = *projected
+	return r.ensureAssignedRuntimeDeleted(ctx, orchestrator, sandbox)
+}
+
+// ensureAssignedRuntimeDeleted cleans up one already-resolved assignment. A
+// missing or replaced owning Pod completes acknowledgement without changing
+// the durable Sandbox decision; temporary registry loss does not.
+func (r *SandboxReconciler) ensureAssignedRuntimeDeleted(ctx context.Context, orchestrator *orchestration.Orchestrator, sandbox *apiv1alpha2.Sandbox) (bool, error) {
 	// Always send Delete before Inspect, even if a Create has not arrived yet.
 	// Fastlet records a tombstone that fences a delayed Create for this identity.
 	if err := orchestrator.DeleteRuntime(ctx, sandbox); err != nil {

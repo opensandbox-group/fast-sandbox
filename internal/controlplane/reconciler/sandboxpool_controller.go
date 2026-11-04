@@ -1251,7 +1251,7 @@ func activeAssignmentsByPod(sandboxes []apiv1alpha2.Sandbox, poolName string) ma
 	result := make(map[string]int)
 	for index := range sandboxes {
 		sandbox := &sandboxes[index]
-		if sandbox.Spec.PoolRef != poolName || sandbox.Status.Placement.FastletName == "" {
+		if sandbox.Spec.PoolRef != poolName || sandbox.Status.Placement.FastletName == "" || terminalRuntimeFailureRecorded(sandbox) {
 			continue
 		}
 		placement := sandbox.Status.Placement
@@ -1268,7 +1268,7 @@ func awaitingAdmissionByFastlet(
 	result := make(map[string]int)
 	for index := range sandboxes {
 		sandbox := &sandboxes[index]
-		if sandbox.DeletionTimestamp != nil || sandbox.Status.Placement.FastletName == "" || sandbox.Status.Placement.FastletPodUID == "" {
+		if sandbox.DeletionTimestamp != nil || sandbox.Status.Placement.FastletName == "" || sandbox.Status.Placement.FastletPodUID == "" || terminalRuntimeFailureRecorded(sandbox) {
 			continue
 		}
 		identity := sandbox.Status.Placement.FastletName + "/" + string(sandbox.Status.Placement.FastletPodUID)
@@ -1354,7 +1354,7 @@ func poolSlotDemandCounts(
 ) (active int32, pending int32) {
 	for index := range sandboxes {
 		sandbox := &sandboxes[index]
-		if sandbox.Spec.PoolRef != poolName || sandbox.DeletionTimestamp != nil {
+		if sandbox.Spec.PoolRef != poolName || sandbox.DeletionTimestamp != nil || terminalRuntimeFailureRecorded(sandbox) {
 			continue
 		}
 		if sandbox.Status.Placement.FastletName != "" {

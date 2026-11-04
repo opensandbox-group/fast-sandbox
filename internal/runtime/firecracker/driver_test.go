@@ -1064,7 +1064,12 @@ func TestRecoveryRetriesLiveVMWithUnavailableAPI(t *testing.T) {
 	fixture.server.mu.Unlock()
 
 	for range 2 {
-		require.ErrorContains(t, fixture.driver.RecoverRuntimeResources(t.Context(), nil, nil), "still contains processes")
+		err := fixture.driver.RecoverRuntimeResources(t.Context(), nil, nil)
+		require.ErrorContains(t, err, "still contains processes")
+		require.ErrorContains(t, err, "sandbox "+fixture.sandboxSpec.Identity.SandboxUID)
+		require.ErrorContains(t, err, "PID 777")
+		require.ErrorContains(t, err, "Fastlet Pod "+fixture.sandboxSpec.Identity.FastletPodUID)
+		require.ErrorContains(t, err, "phase Running")
 		state, loadErr := loadState(directory)
 		require.NoError(t, loadErr)
 		require.Equal(t, PhaseRunning, state.Phase, "temporary API errors must not become a durable terminal failure")
@@ -1076,6 +1081,17 @@ func TestRecoveryRetriesLiveVMWithUnavailableAPI(t *testing.T) {
 	fixture.server.mu.Lock()
 	fixture.server.failVersion = false
 	fixture.server.mu.Unlock()
+	// A healthy API is still insufficient when the expected PID is not in
+	// this Sandbox's cgroup; report the blocked identity without killing it.
+	require.NoError(t, os.WriteFile(filepath.Join(leaf, "cgroup.procs"), []byte("888\n"), 0o600))
+	err = fixture.driver.RecoverRuntimeResources(t.Context(), nil, nil)
+	require.ErrorContains(t, err, "adopt Firecracker sandbox "+fixture.sandboxSpec.Identity.SandboxUID)
+	require.ErrorContains(t, err, "expected Firecracker PID 777")
+	require.ErrorContains(t, err, "Fastlet Pod "+fixture.sandboxSpec.Identity.FastletPodUID)
+	require.ErrorContains(t, err, "phase Running")
+	require.Equal(t, 1, fixture.manager.Snapshot().Bound)
+	require.Empty(t, fixture.killCalls)
+	require.NoError(t, os.WriteFile(filepath.Join(leaf, "cgroup.procs"), []byte("777\n"), 0o600))
 	require.NoError(t, fixture.driver.RecoverRuntimeResources(t.Context(), nil, nil))
 	state, err := loadState(directory)
 	require.NoError(t, err)

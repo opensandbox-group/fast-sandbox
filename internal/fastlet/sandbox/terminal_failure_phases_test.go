@@ -67,6 +67,7 @@ func requireTerminalPhaseViews(t *testing.T, manager *SandboxManager, request *f
 		require.Equal(t, request.Identity.AssignmentAttempt, status.AssignmentAttempt)
 		require.Equal(t, request.Identity.RouteGeneration, status.RouteGeneration)
 		require.Equal(t, fastletapi.RuntimeStateFailed, status.Runtime.State)
+		require.Equal(t, inspected.Sandbox.Runtime.Message, status.Runtime.Message)
 		require.Equal(t, fastletapi.DataPlaneStateFailed, status.DataPlane.State)
 	}
 }

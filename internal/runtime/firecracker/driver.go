@@ -978,7 +978,19 @@ func (d *Driver) deleteSandbox(ctx context.Context, sandboxID string, retainTerm
 	if expectedIdentity != nil && !runtimecontract.SameRuntimeIdentity(state.Config.Identity, *expectedIdentity) {
 		return fmt.Errorf("terminal cleanup identity for sandbox %s no longer matches the durable runtime", sandboxID)
 	}
-	d.killAndForget(sandboxID, state.PID)
+	pid := state.PID
+	if state.Phase == PhaseFailed && runtimeCgroups != nil {
+		if err := runtimeCgroups.ConfirmAbsent(sandboxID); err != nil {
+			return fmt.Errorf("confirm terminal Firecracker sandbox %s exited (PID %d, Fastlet Pod %s, phase %s): %w",
+				sandboxID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
+		}
+		// Terminal cleanup can retry after the tracked process was forgotten
+		// but before PID=0 was persisted. An empty cgroup proves this runtime
+		// exited; its historical numeric PID may now identify another process.
+		// Apply this fence to Controller Delete as well as retained cleanup.
+		pid = 0
+	}
+	d.killAndForget(sandboxID, pid)
 	if manager != nil && state.Config.Identity.SandboxUID != "" {
 		// Release is reached unconditionally: a slot stuck in Destroying by an
 		// earlier failed release must be retried here, and Release matches
@@ -1096,7 +1108,8 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 			continue
 		}
 		if err := recoverRuntimeCgroup(runtimeCgroups, &state.Config, state.PID); err != nil {
-			return err
+			return fmt.Errorf("adopt Firecracker sandbox %s during recovery (PID %d, Fastlet Pod %s, phase %s): %w",
+				state.Config.Identity.SandboxUID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
 		}
 		// A Fastlet crash during a snapshot dump leaves the VM paused (the
 		// Snapshotter contract only covers in-process failure paths). The
@@ -1145,7 +1158,8 @@ func (d *Driver) recoverInterruptedStart(ctx context.Context, state *SandboxStat
 		if err := runtimeCgroups.ConfirmAbsent(sandboxUID); err == nil {
 			break
 		} else if time.Now().After(deadline) {
-			return true, fmt.Errorf("confirm interrupted Firecracker start exited for sandbox %s: %w", sandboxUID, err)
+			return true, fmt.Errorf("confirm interrupted Firecracker start exited for sandbox %s (PID %d, Fastlet Pod %s, phase %s): %w",
+				sandboxUID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
 		}
 		select {
 		case <-ctx.Done():
@@ -1168,7 +1182,8 @@ func (d *Driver) recoverDeadSandbox(ctx context.Context, state *SandboxState, di
 	pid := state.PID
 	if runtimeCgroups != nil {
 		if err := runtimeCgroups.ConfirmAbsent(sandboxUID); err != nil {
-			return err
+			return fmt.Errorf("confirm Firecracker sandbox %s exited during recovery (PID %d, Fastlet Pod %s, phase %s): %w",
+				sandboxUID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
 		}
 		pid = 0
 	}
@@ -1298,12 +1313,19 @@ func (d *Driver) probeVM(ctx context.Context, state *SandboxState) (bool, error)
 	d.mu.RUnlock()
 	if state.PID > 0 {
 		if err := probeProcess(state.PID); err != nil {
+			klog.V(2).InfoS("Firecracker process probe failed",
+				"sandboxID", state.Config.Identity.SandboxUID, "PID", state.PID,
+				"fastletPodUID", state.Config.Identity.FastletPodUID, "phase", state.Phase, "err", err)
 			return false, nil
 		}
 	}
 	client := d.newClient(state.APIAddress)
 	defer client.Close()
 	if _, err := client.Version(ctx); err != nil {
+		klog.V(2).InfoS("Firecracker API probe failed",
+			"sandboxID", state.Config.Identity.SandboxUID, "PID", state.PID,
+			"fastletPodUID", state.Config.Identity.FastletPodUID, "phase", state.Phase,
+			"apiAddress", state.APIAddress, "err", err)
 		return false, nil
 	}
 	return true, nil

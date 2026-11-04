@@ -90,6 +90,12 @@ When a created runtime reports `Stopped` and its dedicated cgroup is confirmed e
 
 `failurePolicy` remains scoped to Fastlet Pod loss. An online single-runtime exit stays `Failed` until an explicit reset advances the instance identity; it does not implicitly apply `AutoRecreate`.
 
+The terminal CR keeps its placement and assignment identity after acknowledgement so a later `NotFound` cannot recreate the failed generation. That terminal decision no longer counts as pending admission or active placement demand, but it does not prove physical cleanup has finished: drain completion still requires the Fastlet's recovery-complete, empty admission and resource snapshot. If the original Pod is gone, the Controller stops waiting for its acknowledgement and keeps the terminal decision; NodeJanitor remains responsible for orphaned host resources.
+
+## Recovery with uncertain runtime state
+
+For ResourceAware direct Firecracker, a live process outside its expected cgroup or an unavailable VMM API with a populated cgroup blocks recovery of that Fastlet. Recovery retains the instance record, network slot, and resource ownership and retries; API failure alone does not authorize terminating a guest that may still be running. Recovery errors identify the Sandbox, recorded PID, Pod UID, and phase, and verbose API probe logs retain the underlying error. Operators should inspect those ownership and API observations before choosing an explicit recovery action. This version does not automatically terminate a live VMM after a timeout or admit around an unresolved instance; per-instance recovery isolation requires a separate design.
+
 ## Pool drain
 
 Pool scale-down and template replacement use a persisted drain sequence. A draining Fastlet stops receiving new admission, existing Sandboxes are handled according to lifecycle policy, and normal drain completion requires a matching attempt to return an atomic, recovery-complete empty admission snapshot. Non-protected planned replacements retain their timeout policy after a successful drain RPC. During a rolling upgrade from an older Fastlet, deletion always requires a fresh Heartbeat RPC started after the drain acknowledgement to identify the same Pod and carry the same empty, recovery-complete evidence; cached heartbeats and timeout alone cannot authorize legacy deletion.

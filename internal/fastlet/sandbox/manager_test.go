@@ -777,6 +777,12 @@ func TestSandboxManager_ExitedRuntimeRemainsFailedAcrossRestartUntilDelete(t *te
 	require.NoError(t, err)
 	require.Equal(t, fastletapi.RuntimeStateFailed, inspected.Sandbox.Runtime.State)
 	require.Equal(t, request.Identity.RuntimeInstanceID, inspected.Sandbox.RuntimeInstanceID)
+	require.Equal(t, "runtime reported stopped and its dedicated cgroup is empty", inspected.Sandbox.Runtime.Message)
+	for range 3 {
+		heartbeat := restarted.GetSandboxStatuses(t.Context())
+		require.Len(t, heartbeat, 1)
+		require.Equal(t, inspected.Sandbox.Runtime.Message, heartbeat[0].Runtime.Message)
+	}
 
 	replayed, err := restarted.CreateSandbox(t.Context(), request)
 	require.NoError(t, err)
