@@ -43,7 +43,10 @@ type SandboxManagerConfig struct {
 }
 
 type SandboxManager struct {
-	mu                          sync.RWMutex
+	mu sync.RWMutex
+	// routeMu orders route writes and removal before runtime/network cleanup.
+	// Acquire it before mu; never wait for routeMu while holding mu.
+	routeMu                     sync.Mutex
 	runtime                     RuntimeDriver
 	runtimeName                 string
 	capacity                    int
@@ -524,6 +527,17 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 	}
 }
 
+// runtimeWorkAllowedLocked fences late lifecycle callbacks while a terminal
+// record is being written, and after the runtime enters cleanup or deletion.
+// Callers hold m.mu; physical cleanup still waits for durable failure recording.
+func (m *SandboxManager) runtimeWorkAllowedLocked(metadata *SandboxMetadata) bool {
+	if metadata == nil {
+		return false
+	}
+	id := metadata.Config.Identity.SandboxUID
+	return m.sandboxes[id] == metadata && runtimeCreatedPhase(metadata.Phase) && m.terminalFailureWorkers[id] != metadata
+}
+
 func (m *SandboxManager) preserveExitedRuntime(ctx context.Context, sandboxID string, identity fastletapi.SandboxIdentity, message string) {
 	handler, ok := m.runtime.(RuntimeTerminalFailureHandler)
 	if !ok {
@@ -531,13 +545,14 @@ func (m *SandboxManager) preserveExitedRuntime(ctx context.Context, sandboxID st
 	}
 	m.mu.Lock()
 	metadata := m.sandboxes[sandboxID]
-	if metadata == nil || metadata.Phase != sandboxStateRunning || metadata.Config.Identity != identity || m.terminalFailureWorkers[sandboxID] == metadata {
+	if !m.runtimeWorkAllowedLocked(metadata) || metadata.Config.Identity != identity {
 		m.mu.Unlock()
 		return
 	}
 	// Reserve the worker before durable I/O so Delete cannot remove this
 	// identity and allow a replacement while its failure record is written.
 	m.terminalFailureWorkers[sandboxID] = metadata
+	m.cancelDataPlaneReconcileLocked(metadata)
 	m.mu.Unlock()
 	if err := handler.RecordTerminalFailure(ctx, identity, message); err != nil {
 		klog.FromContext(ctx).Error(err, "persist exited Sandbox identity", "sandbox", sandboxID)
@@ -545,7 +560,7 @@ func (m *SandboxManager) preserveExitedRuntime(ctx context.Context, sandboxID st
 		return
 	}
 	m.mu.Lock()
-	if m.sandboxes[sandboxID] != metadata || metadata.Phase != sandboxStateRunning {
+	if m.sandboxes[sandboxID] != metadata || !runtimeCreatedPhase(metadata.Phase) {
 		m.mu.Unlock()
 		m.finishTerminalFailureWorker(sandboxID, metadata)
 		return

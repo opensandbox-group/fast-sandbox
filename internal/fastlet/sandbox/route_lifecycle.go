@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"k8s.io/klog/v2"
 
@@ -16,18 +17,25 @@ func (m *SandboxManager) ReconcileProxyRoutes(ctx context.Context) error {
 	if m.routePublisher == nil {
 		return nil
 	}
+	m.routeMu.Lock()
+	defer m.routeMu.Unlock()
 	m.mu.RLock()
 	metadata := make([]SandboxMetadata, 0, len(m.sandboxes))
+	owners := make([]*SandboxMetadata, 0, len(m.sandboxes))
 	pendingInfra := false
 	for _, sandbox := range m.sandboxes {
-		switch sandbox.Phase {
-		case sandboxStateTerminating, sandboxStateDeleting, sandboxStateDeleteFailed, sandboxStateCreateCleanup, sandboxStateCreateCleanupFailed, sandboxStateInfraPending, sandboxStateInitializingInfra, sandboxStateInfraUnavailable:
-			if sandbox.Phase == sandboxStateInfraPending || sandbox.Phase == sandboxStateInitializingInfra || sandbox.Phase == sandboxStateInfraUnavailable {
-				pendingInfra = true
-			}
+		if !m.runtimeWorkAllowedLocked(sandbox) {
 			continue
 		}
-		metadata = append(metadata, *sandbox)
+		switch sandbox.Phase {
+		case sandboxStateInfraPending, sandboxStateInitializingInfra, sandboxStateInfraUnavailable:
+			pendingInfra = true
+			continue
+		}
+		snapshot := *sandbox
+		snapshot.InfraServices = slices.Clone(sandbox.InfraServices)
+		metadata = append(metadata, snapshot)
+		owners = append(owners, sandbox)
 	}
 	m.mu.RUnlock()
 	if pendingInfra {
@@ -35,21 +43,29 @@ func (m *SandboxManager) ReconcileProxyRoutes(ctx context.Context) error {
 		return fmt.Errorf("reconcile proxy routes: %w", ErrInfraUnavailable)
 	}
 	publications := make([]RoutePublication, 0, len(metadata))
+	publishedOwners := make([]*SandboxMetadata, 0, len(metadata))
 	for index := range metadata {
+		m.mu.RLock()
+		allowed := m.runtimeWorkAllowedLocked(owners[index])
+		m.mu.RUnlock()
+		if !allowed {
+			continue
+		}
 		publication, err := m.routePublication(&metadata[index])
 		if err != nil {
 			m.MarkProxyRouteUnavailable()
 			return err
 		}
 		publications = append(publications, publication)
+		publishedOwners = append(publishedOwners, owners[index])
 	}
 	if err := m.routePublisher.ReconcileRoutes(ctx, publications); err != nil {
 		m.MarkProxyRouteUnavailable()
 		return err
 	}
 	m.mu.Lock()
-	for _, sandbox := range m.sandboxes {
-		if sandbox.Phase == sandboxStateRoutePending || sandbox.Phase == sandboxStateRouteUnavailable {
+	for _, sandbox := range publishedOwners {
+		if m.runtimeWorkAllowedLocked(sandbox) && (sandbox.Phase == sandboxStateRoutePending || sandbox.Phase == sandboxStateRouteUnavailable) {
 			sandbox.Phase = sandboxStateRunning
 		}
 	}
@@ -111,7 +127,17 @@ func (m *SandboxManager) publishRoute(ctx context.Context, metadata *SandboxMeta
 	if m.routePublisher == nil {
 		return nil
 	}
-	publication, err := m.routePublication(metadata)
+	m.routeMu.Lock()
+	defer m.routeMu.Unlock()
+	m.mu.RLock()
+	if !m.runtimeWorkAllowedLocked(metadata) {
+		m.mu.RUnlock()
+		return fmt.Errorf("Sandbox is no longer accepting route publication")
+	}
+	snapshot := *metadata
+	snapshot.InfraServices = slices.Clone(metadata.InfraServices)
+	m.mu.RUnlock()
+	publication, err := m.routePublication(&snapshot)
 	if err != nil {
 		m.MarkProxyRouteUnavailable()
 		return err
@@ -127,6 +153,8 @@ func (m *SandboxManager) removeRoute(ctx context.Context, metadata *SandboxMetad
 	if m.routePublisher == nil {
 		return nil
 	}
+	m.routeMu.Lock()
+	defer m.routeMu.Unlock()
 	// Removing a route only needs its fenced identity. Runtime deletion may
 	// already have removed the AccessDescriptor when a previous cleanup attempt
 	// failed later (for example while releasing a network slot). Re-resolving

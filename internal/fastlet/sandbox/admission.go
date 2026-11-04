@@ -816,7 +816,10 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit,
 		}
 	}
 	if m.routePublisher != nil && !pendingInfra {
-		if err := m.routePublisher.ReconcileRoutes(ctx, publications); err != nil {
+		m.routeMu.Lock()
+		err := m.routePublisher.ReconcileRoutes(ctx, publications)
+		m.routeMu.Unlock()
+		if err != nil {
 			return fmt.Errorf("reconcile Fastlet Proxy routes: %w", err)
 		}
 	}

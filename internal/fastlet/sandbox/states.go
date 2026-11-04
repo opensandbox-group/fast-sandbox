@@ -44,3 +44,16 @@ const (
 	// sandboxStateUnknown covers recovered Sandboxes recorded without a phase.
 	sandboxStateUnknown = "unknown"
 )
+
+// runtimeCreatedPhase is independent of Infra, route, and Action readiness.
+// A confirmed runtime exit can take ownership of any of these phases.
+func runtimeCreatedPhase(phase string) bool {
+	switch phase {
+	case sandboxStateInfraPending, sandboxStateInitializingInfra, sandboxStateInfraUnavailable,
+		sandboxStateRoutePending, sandboxStatePublishingRoute, sandboxStateRouteUnavailable,
+		sandboxStateActionPending, sandboxStateActionUnavailable, sandboxStateRunning:
+		return true
+	default:
+		return false
+	}
+}
