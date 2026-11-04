@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -186,6 +187,44 @@ func TestSetDrainingRejectsNewCreates(t *testing.T) {
 	}, &rejected)
 	require.Equal(t, http.StatusConflict, recorder.Code)
 	require.Equal(t, fastletapi.ErrorDraining, rejected.Error.Code)
+}
+
+func TestSetDrainingPreservesIdentityErrorsOverHTTP(t *testing.T) {
+	manager := newServerManager(t, newServerRuntime(), false)
+	server := httptest.NewServer(NewFastletServer(":0", manager).Handler())
+	t.Cleanup(server.Close)
+	address := server.Listener.Addr().(*net.TCPAddr)
+	client := fastletapi.NewFastletClient(address.Port)
+	current := &fastletapi.SetDrainingRequest{Draining: true, DrainID: "drain-a", FastletPodUID: "pod-uid-a"}
+	_, err := client.SetDraining(t.Context(), address.IP.String(), current)
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name      string
+		request   fastletapi.SetDrainingRequest
+		code      fastletapi.FastletErrorCode
+		message   string
+		retryable bool
+	}{
+		{"wrong Pod", fastletapi.SetDrainingRequest{Draining: true, DrainID: "drain-a", FastletPodUID: "pod-uid-b"}, fastletapi.ErrorStaleAssignment, "different Fastlet Pod UID", false},
+		{"different attempt", fastletapi.SetDrainingRequest{Draining: true, DrainID: "drain-b", FastletPodUID: "pod-uid-a"}, fastletapi.ErrorConflict, "another drain attempt", true},
+		{"unfenced cancellation", fastletapi.SetDrainingRequest{FastletPodUID: "pod-uid-a"}, fastletapi.ErrorConflict, "cancellation does not match", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response, err := client.SetDraining(t.Context(), address.IP.String(), &tc.request)
+			var failure *fastletapi.FastletError
+			require.ErrorAs(t, err, &failure)
+			require.Equal(t, tc.code, failure.Code)
+			require.Contains(t, failure.Message, tc.message)
+			require.Equal(t, tc.retryable, failure.Retryable)
+			require.NotNil(t, response)
+			require.Equal(t, failure, response.Error)
+		})
+	}
+	response, err := client.SetDraining(t.Context(), address.IP.String(), current)
+	require.NoError(t, err)
+	require.Equal(t, "drain-a", response.DrainID)
+	require.True(t, response.Draining, "rejected requests must not cancel the current drain")
+	require.NotNil(t, response.Admission)
 }
 
 func TestHeartbeatUsesCacheCursor(t *testing.T) {

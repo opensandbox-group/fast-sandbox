@@ -516,6 +516,7 @@ type SetDrainingResponse struct {
 	Admission     *AdmissionStatus `json:"admission,omitempty"`
 	Recovering    bool             `json:"recovering"`
 	RuntimeReady  bool             `json:"runtimeReady"`
+	Error         *FastletError    `json:"error,omitempty"`
 }
 
 type RuntimeDiagnostics struct {

@@ -250,7 +250,7 @@ func loadFastletStartupSettings() (fastletStartupSettings, error) {
 		resourceAdmission = &resourceAdmissionValue
 		bounded := runtimePlan.Profile.Driver == runtimecatalog.DriverKindFirecracker
 		if bounded != (resourceAdmission.Version == fastletsettings.BoundedFirecrackerVersion) {
-			return fastletStartupSettings{}, errors.New("runtime and bounded Firecracker settings revision do not match")
+			return fastletStartupSettings{}, fmt.Errorf("runtime driver %q and resource admission settings version %q do not match: bounded Firecracker requires %q", runtimePlan.Profile.Driver, resourceAdmission.Version, fastletsettings.BoundedFirecrackerVersion)
 		}
 	}
 	warmImages, err := warmImagesFromSettings(settingsDir)

@@ -860,16 +860,20 @@ func (m *SandboxManager) SetDraining(req *fastletapi.SetDrainingRequest) (*fastl
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if req == nil {
-		return nil, fastletError(fastletapi.ErrorConflict, "drain request is required", false)
+		failure := fastletError(fastletapi.ErrorConflict, "drain request is required", false)
+		return &fastletapi.SetDrainingResponse{Error: failure}, failure
 	}
 	if req.FastletPodUID != "" && m.fastletPodUID != "" && req.FastletPodUID != m.fastletPodUID {
-		return nil, fastletError(fastletapi.ErrorStaleAssignment, "drain request targets a different Fastlet Pod UID", false)
+		failure := fastletError(fastletapi.ErrorStaleAssignment, "drain request targets a different Fastlet Pod UID", false)
+		return &fastletapi.SetDrainingResponse{Error: failure}, failure
 	}
 	if m.draining && m.drainID != "" && req.DrainID != "" && m.drainID != req.DrainID {
-		return nil, fastletError(fastletapi.ErrorConflict, "another drain attempt is already active", true)
+		failure := fastletError(fastletapi.ErrorConflict, "another drain attempt is already active", true)
+		return &fastletapi.SetDrainingResponse{Error: failure}, failure
 	}
 	if !req.Draining && m.draining && m.drainID != "" && req.DrainID != m.drainID {
-		return nil, fastletError(fastletapi.ErrorConflict, "drain cancellation does not match the active attempt", true)
+		failure := fastletError(fastletapi.ErrorConflict, "drain cancellation does not match the active attempt", true)
+		return &fastletapi.SetDrainingResponse{Error: failure}, failure
 	}
 	m.draining = req.Draining
 	m.drainReason = req.Reason

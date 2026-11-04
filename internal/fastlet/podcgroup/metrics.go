@@ -84,10 +84,17 @@ func (c *runtimeMetrics) Collect(out chan<- prometheus.Metric) { //nolint:gocogn
 						break
 					}
 					if strings.HasSuffix(g.key, "=") && strings.HasPrefix(line, g.key) {
-						raw = strings.TrimPrefix(fields[1], "avg10=")
+						values := strings.Fields(strings.TrimPrefix(line, g.key))
+						if len(values) > 0 {
+							raw = values[0]
+						}
 						break
 					}
 				}
+			}
+			// cgroup v2 represents an unlimited memory ceiling as "max".
+			if g.file == "memory.max" && raw == "max" {
+				raw = "+Inf"
 			}
 			if n, err := strconv.ParseFloat(raw, 64); err == nil {
 				out <- prometheus.MustNewConstMetric(c.descs[i], g.kind, n*g.scale, id)
