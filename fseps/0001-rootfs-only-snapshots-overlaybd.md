@@ -1,7 +1,7 @@
 ---
 title: "Rootfs-Only Snapshots on the OverlayBD Path"
 authors:
-  - "高然"
+  - "@Pangjiping"
 creation-date: 2026-11-05
 last-updated: 2026-11-05
 status: draft
