@@ -208,7 +208,7 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	if err != nil {
 		return err
 	}
-	rootfsDevPath, err := addSandboxDevice(ctx, ublkd, rootfsConfig, &state.Rootfs, persist)
+	rootfsDevPath, err := acquireSandboxDevice(ctx, ublkd, rootfsConfig, &state.Rootfs, persist)
 	if err != nil {
 		return err
 	}
@@ -278,15 +278,28 @@ func claimSandbox(layout sandboxLayout, sandboxID string) error {
 	return nil
 }
 
-// addSandboxDevice attaches config through ublkd, recording the device in
-// *record before the add (so a crash mid-add leaves a trace) and completing
-// the record once ublkd replies. It returns the /dev/ublkbN path.
+// addSandboxDevice attaches config through ublkd add, used for the shared
+// read-only snapfiles that the pool does not serve.
 func addSandboxDevice(ctx context.Context, ublkd *ublkdClient, config string, record **deviceRecord, persist func() error) (string, error) {
 	*record = &deviceRecord{Config: config, DevID: -1}
+	return attachSandboxDevice(ctx, ublkd.Add, record, persist)
+}
+
+// acquireSandboxDevice attaches config through ublkd acquire, an exclusive
+// lease the warm pool can serve. Teardown must use Release.
+func acquireSandboxDevice(ctx context.Context, ublkd *ublkdClient, config string, record **deviceRecord, persist func() error) (string, error) {
+	*record = &deviceRecord{Config: config, DevID: -1, Acquired: true}
+	return attachSandboxDevice(ctx, ublkd.Acquire, record, persist)
+}
+
+// attachSandboxDevice persists the pre-recorded device before calling attach so
+// a crash mid-call leaves a trace, then completes the record once ublkd replies.
+func attachSandboxDevice(ctx context.Context, attach func(context.Context, string) (int, string, error),
+	record **deviceRecord, persist func() error) (string, error) {
 	if err := persist(); err != nil {
 		return "", err
 	}
-	devID, devPath, err := ublkd.Add(ctx, config)
+	devID, devPath, err := attach(ctx, (*record).Config)
 	if err != nil {
 		(*record).addOutcomeUnknown = errors.Is(err, errAddOutcomeUnknown)
 		return "", err

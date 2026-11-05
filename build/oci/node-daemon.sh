@@ -22,4 +22,20 @@ cat > "$socket_dir/service.json" <<EOF_JSON
   "registryFsVersion": "v2", "serviceConfig": {"enable": false}
 }
 EOF_JSON
-exec "$tools/overlaybd-ublkd" --socket-path "$socket_dir/ublkd.sock" --service-config "$socket_dir/service.json" --cache-dir "$cache"
+# Warm pool: LOW=0 disables it; otherwise SIZE_GB is required. All three values
+# must be non-negative integers.
+pool_low=${OVERLAYBD_POOL_LOW:-0}
+pool_high=${OVERLAYBD_POOL_HIGH:-$pool_low}
+pool_size=${OVERLAYBD_POOL_SIZE_GB:-0}
+if ! { [ "$pool_low" -ge 0 ] && [ "$pool_high" -ge 0 ] && [ "$pool_size" -ge 0 ]; } 2>/dev/null; then
+  echo 'pool values must be non-negative integers' >&2
+  exit 1
+elif [ "$pool_low" != 0 ] && [ "$pool_size" = 0 ]; then
+  echo 'OVERLAYBD_POOL_SIZE_GB must be set when pool-low > 0' >&2
+  exit 1
+fi
+exec "$tools/overlaybd-ublkd" --socket-path "$socket_dir/ublkd.sock" \
+     --service-config "$socket_dir/service.json" --cache-dir "$cache" \
+     --pool-low "$pool_low" \
+     --pool-high "$pool_high" \
+     --pool-size-gb "$pool_size"

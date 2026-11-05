@@ -362,7 +362,7 @@ func TestPackRecoveryFencesLateAddBeforeReleasingFiles(t *testing.T) {
 						return fenceReply(200, `{"ok":true,"devices":[{"dev_id":42,"config":`+strconv.Quote(config)+`}]}`), nil
 					}
 					return fenceReply(200, `{"ok":true,"devices":[]}`), nil
-				case "/v1/del":
+				case "/v1/del", "/v1/release":
 					var input map[string]int
 					require.NoError(t, json.NewDecoder(req.Body).Decode(&input))
 					require.Equal(t, 42, input["dev_id"])

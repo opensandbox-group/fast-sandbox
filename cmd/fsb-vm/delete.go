@@ -69,7 +69,7 @@ func runDelete(ctx context.Context, sandboxID string) error {
 // deviceReleaser is the part of the ublkd client teardown needs.
 type deviceReleaser interface {
 	List(ctx context.Context) ([]ublkdDevice, error)
-	Del(ctx context.Context, devID int) error
+	Release(ctx context.Context, devID int) error
 }
 
 // releaseSandbox frees every resource of a sandbox, shared by delete and by
@@ -188,9 +188,9 @@ func releaseOwnedDevicesByConfig(ctx context.Context, ublkd deviceReleaser, conf
 }
 
 // releaseOwnedDevices detaches every device ublkd lists under config and
-// returns how many matching devices were visible. A recorded dev_id is never
-// deleted blindly: once released, the id can be reused by another sandbox's
-// device.
+// returns the match count. Release (not Del) parks a pooled device back in the
+// idle pool. Devices match by config path, since a recorded dev_id may already
+// belong to another sandbox.
 func releaseOwnedDevices(ctx context.Context, ublkd deviceReleaser, devices []ublkdDevice, config string) (int, error) {
 	matches := 0
 	var failures []error
@@ -199,7 +199,7 @@ func releaseOwnedDevices(ctx context.Context, ublkd deviceReleaser, devices []ub
 			continue
 		}
 		matches++
-		if err := ublkd.Del(ctx, device.DevID); err != nil {
+		if err := ublkd.Release(ctx, device.DevID); err != nil {
 			failures = append(failures, err)
 		}
 	}

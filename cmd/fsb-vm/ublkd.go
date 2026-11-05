@@ -77,6 +77,17 @@ type ublkdAddResponse struct {
 	Error string `json:"error"`
 }
 
+// ublkdAcquireResponse is the /v1/acquire reply: an add reply plus the lease
+// mode and reference count.
+type ublkdAcquireResponse struct {
+	OK       bool   `json:"ok"`
+	DevID    int    `json:"dev_id"`
+	Dev      string `json:"dev"`
+	Mode     string `json:"mode"`
+	RefCount int    `json:"refcount"`
+	Error    string `json:"error"`
+}
+
 type ublkdListResponse struct {
 	OK      bool          `json:"ok"`
 	Devices []ublkdDevice `json:"devices"`
@@ -116,6 +127,24 @@ func (c *ublkdClient) Add(ctx context.Context, configPath string) (int, string, 
 	return response.DevID, response.Dev, nil
 }
 
+// Acquire takes an exclusive lease; the warm pool serves it from a pre-created
+// device, so callers must return it with Release rather than Del.
+func (c *ublkdClient) Acquire(ctx context.Context, configPath string) (int, string, error) {
+	request := map[string]string{ublkdConfigKey: configPath, "mode": "exclusive"}
+	var response ublkdAcquireResponse
+	if err := c.do(ctx, http.MethodPost, "/v1/acquire", request, &response); err != nil {
+		var requestErr *ublkdRequestError
+		if errors.As(err, &requestErr) && !requestErr.definitelyNotSent() {
+			return 0, "", fmt.Errorf("%w: %w", errAddOutcomeUnknown, err)
+		}
+		return 0, "", err
+	}
+	if !response.OK {
+		return 0, "", fmt.Errorf("ublkd acquire %s: %s", configPath, response.Error)
+	}
+	return response.DevID, response.Dev, nil
+}
+
 // Del detaches a device by dev_id. It is idempotent from the caller's
 // perspective: an already-gone device is reported by the daemon.
 func (c *ublkdClient) Del(ctx context.Context, devID int) error {
@@ -126,6 +155,20 @@ func (c *ublkdClient) Del(ctx context.Context, devID int) error {
 	}
 	if !response.OK {
 		return fmt.Errorf("ublkd del %d: %s", devID, response.Error)
+	}
+	return nil
+}
+
+// Release drops one lease. A pooled device is parked back in the idle pool;
+// any other exclusive device is torn down once its last lease returns, which
+// makes Release safe for devices created by Add too.
+func (c *ublkdClient) Release(ctx context.Context, devID int) error {
+	var response ublkdOKResponse
+	if err := c.do(ctx, http.MethodPost, "/v1/release", map[string]int{"dev_id": devID}, &response); err != nil {
+		return err
+	}
+	if !response.OK {
+		return fmt.Errorf("ublkd release %d: %s", devID, response.Error)
 	}
 	return nil
 }
