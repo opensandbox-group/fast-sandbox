@@ -84,10 +84,50 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, request ctrl.Request)
 	if expirationPending(&sandbox, now) {
 		return r.reconcileExpiration(ctx, orchestrator, &sandbox)
 	}
+	if terminalRuntimeFailureRecorded(&sandbox) {
+		return r.reconcileTerminalRuntimeFailure(ctx, orchestrator, &sandbox)
+	}
 	if sandbox.Spec.State == apiv1alpha2.SandboxStatePaused {
 		return r.reconcilePause(ctx, orchestrator, &sandbox)
 	}
 	return r.reconcileEnsure(ctx, orchestrator, &sandbox)
+}
+
+// reconcileTerminalRuntimeFailure acknowledges a Fastlet-retained terminal
+// identity only after the same assignment is durably Failed in CR status. The
+// status branch is terminal until an explicit reset, so a later NotFound can
+// never send Ensure for the failed identity again.
+func (r *SandboxReconciler) reconcileTerminalRuntimeFailure(ctx context.Context, orchestrator *orchestration.Orchestrator, sandbox *apiv1alpha2.Sandbox) (ctrl.Result, error) {
+	// Keep the identity whose Failed decision was recorded. Projecting a newer
+	// assignment here could acknowledge a replacement that has not failed.
+	gone, err := r.ensureAssignedRuntimeDeleted(ctx, orchestrator, sandbox)
+	if err != nil {
+		if errors.Is(err, orchestration.ErrAssignedFastletUnavailable) {
+			return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
+		}
+		return ctrl.Result{RequeueAfter: DeletionPollInterval}, err
+	}
+	if !gone {
+		return ctrl.Result{RequeueAfter: DeletionPollInterval}, nil
+	}
+	return ctrl.Result{}, nil
+}
+
+// terminalRuntimeFailureRecorded identifies a durable stop decision for this
+// exact assignment. It removes future demand, but does not prove that Fastlet
+// has finished releasing the instance's physical resources.
+func terminalRuntimeFailureRecorded(sandbox *apiv1alpha2.Sandbox) bool {
+	if sandbox == nil || sandbox.Status.Runtime.State != apiv1alpha2.RuntimeFailed {
+		return false
+	}
+	envelope, err := assignment.AssignmentFromAnnotation(sandbox)
+	if err != nil || envelope == nil {
+		return false
+	}
+	placement := sandbox.Status.Placement
+	return sandbox.Status.Runtime.Generation == envelope.InstanceGeneration &&
+		placement.FastletName == envelope.FastletName && string(placement.FastletPodUID) == envelope.FastletPodUID &&
+		placement.Attempt == envelope.Attempt
 }
 
 func sandboxObservabilityIdentity(sandbox *apiv1alpha2.Sandbox) observability.Identity {
@@ -102,7 +142,7 @@ func sandboxObservabilityIdentity(sandbox *apiv1alpha2.Sandbox) observability.Id
 	return identity
 }
 
-func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *orchestration.Orchestrator, sandbox *apiv1alpha2.Sandbox) (ctrl.Result, error) { //nolint:gocognit // pre-existing reconcile state machine; refactor tracked separately
+func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *orchestration.Orchestrator, sandbox *apiv1alpha2.Sandbox) (ctrl.Result, error) { //nolint:gocognit,gocyclo // pre-existing reconcile state machine; refactor tracked separately
 	// During an active create, status may still name a rejected candidate.
 	// Project the durable assignment before interpreting that Pod's loss.
 	if sandbox.Status.Placement.FastletName != "" && !orchestrator.FastPathCreateActive(client.ObjectKeyFromObject(sandbox)) {
@@ -227,22 +267,78 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *o
 			return ctrl.Result{RequeueAfter: ObservationPollInterval}, err
 		}
 	}
-	if err := r.patchStatus(ctx, assigned, func(status *apiv1alpha2.SandboxStatus) {
-		orchestration.ProjectObservedStatus(status, assigned, observed)
-		// A resume in flight is a pause-FSM state: while the restore has not
-		// reached Ready the Sandbox reads Resuming, and a completed resume
-		// clears the one-shot checkpoint.
-		projectResumeFromCheckpoint(status, assigned, observed)
-	}); err != nil {
-		return ctrl.Result{}, err
+	if observed.Runtime.State == fastletapi.RuntimeStateFailed {
+		persisted, err := r.persistTerminalRuntimeFailure(ctx, assigned, observed)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !persisted {
+			return ctrl.Result{Requeue: true}, nil
+		}
+	} else {
+		if err := r.patchStatus(ctx, assigned, func(status *apiv1alpha2.SandboxStatus) {
+			orchestration.ProjectObservedStatus(status, assigned, observed)
+			// A resume in flight is a pause-FSM state: while the restore has not
+			// reached Ready the Sandbox reads Resuming, and a completed resume
+			// clears the one-shot checkpoint.
+			projectResumeFromCheckpoint(status, assigned, observed)
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	if newlyAssigned {
-		klog.FromContext(ctx).Info("sandbox assigned and runtime ensured", "sandbox", sandbox.Name, "fastlet", assigned.Status.Placement.FastletName)
+		klog.FromContext(ctx).Info("sandbox assigned and runtime observed", "sandbox", sandbox.Name, "fastlet", assigned.Status.Placement.FastletName, "runtimeState", observed.Runtime.State)
 	}
 	if observationReady(assigned, observed) {
 		return ctrl.Result{RequeueAfter: ReadyRequeueInterval}, nil
 	}
 	return ctrl.Result{RequeueAfter: ObservationPollInterval}, nil
+}
+
+// persistTerminalRuntimeFailure revalidates the durable assignment on every
+// status-update retry. A Failed observation from G7 must never be attached to
+// a concurrently persisted G8 assignment.
+func (r *SandboxReconciler) persistTerminalRuntimeFailure(ctx context.Context, sandbox *apiv1alpha2.Sandbox, observed *fastletapi.SandboxStatus) (bool, error) {
+	persisted := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var current apiv1alpha2.Sandbox
+		if err := r.Get(ctx, client.ObjectKeyFromObject(sandbox), &current); err != nil {
+			return err
+		}
+		if current.UID != sandbox.UID {
+			return assignment.ErrAssignmentAnnotationChanged
+		}
+		envelope, err := assignment.AssignmentFromAnnotation(&current)
+		if err != nil {
+			return err
+		}
+		if !observedMatchesAssignment(&current, envelope, observed) {
+			return nil
+		}
+		before := current.DeepCopy().Status
+		orchestration.ProjectObservedStatus(&current.Status, &current, observed)
+		projectResumeFromCheckpoint(&current.Status, &current, observed)
+		current.Status.ObservedGeneration = current.Generation
+		if reflect.DeepEqual(before, current.Status) {
+			persisted = true
+			return nil
+		}
+		if err := r.Status().Update(ctx, &current); err != nil {
+			return err
+		}
+		persisted = true
+		return nil
+	})
+	return persisted, err
+}
+
+func observedMatchesAssignment(sandbox *apiv1alpha2.Sandbox, envelope *assignment.AssignmentEnvelope, observed *fastletapi.SandboxStatus) bool {
+	return sandbox != nil && envelope != nil && observed != nil &&
+		observed.SandboxID == string(sandbox.UID) &&
+		observed.InstanceGeneration == envelope.InstanceGeneration &&
+		observed.RuntimeInstanceID == envelope.RuntimeInstanceID &&
+		observed.AssignmentAttempt == envelope.Attempt &&
+		observed.RouteGeneration == envelope.RouteGeneration
 }
 
 func (r *SandboxReconciler) assignedPodLost(ctx context.Context, sandbox *apiv1alpha2.Sandbox) (bool, error) {
@@ -494,6 +590,13 @@ func (r *SandboxReconciler) ensureRuntimeDeleted(ctx context.Context, orchestrat
 		return false, assignment.ErrAssignmentAnnotationChanged
 	}
 	*sandbox = *projected
+	return r.ensureAssignedRuntimeDeleted(ctx, orchestrator, sandbox)
+}
+
+// ensureAssignedRuntimeDeleted cleans up one already-resolved assignment. A
+// missing or replaced owning Pod completes acknowledgement without changing
+// the durable Sandbox decision; temporary registry loss does not.
+func (r *SandboxReconciler) ensureAssignedRuntimeDeleted(ctx context.Context, orchestrator *orchestration.Orchestrator, sandbox *apiv1alpha2.Sandbox) (bool, error) {
 	// Always send Delete before Inspect, even if a Create has not arrived yet.
 	// Fastlet records a tombstone that fences a delayed Create for this identity.
 	if err := orchestrator.DeleteRuntime(ctx, sandbox); err != nil {

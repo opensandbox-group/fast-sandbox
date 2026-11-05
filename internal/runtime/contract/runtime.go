@@ -21,6 +21,7 @@ type Metadata struct {
 	ContainerID            string
 	PID                    int
 	Phase                  string
+	RuntimeMessage         string
 	CreatedAt              int64
 	UserProcessStartedAt   time.Time
 	UserProcessStartSource fastletapi.UserProcessStartSource
@@ -152,6 +153,16 @@ type ResourceRecoveryOwnerRetirer func(ctx context.Context, metadata *Metadata) 
 
 type ResourceRecoverer interface {
 	RecoverRuntimeResources(ctx context.Context, managed []*Metadata, retireOwner ResourceRecoveryOwnerRetirer) error
+}
+
+// TerminalFailureHandler durably fences an unexpectedly exited runtime before
+// reclaiming its physical resources. RecordTerminalFailure must commit the
+// complete runtime identity before returning success. CleanupTerminalFailure
+// is idempotent and must retain that record until the ordinary DeleteSandbox
+// path acknowledges the Controller's durable terminal decision.
+type TerminalFailureHandler interface {
+	RecordTerminalFailure(ctx context.Context, identity fastletapi.SandboxIdentity, message string) error
+	CleanupTerminalFailure(ctx context.Context, identity fastletapi.SandboxIdentity) error
 }
 
 type ResourceAdmission interface {

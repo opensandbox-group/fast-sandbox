@@ -34,6 +34,9 @@ const (
 	PhaseStarting VMPhase = "Starting"
 	PhaseRunning  VMPhase = "Running"
 	PhaseStopped  VMPhase = "Stopped"
+	// PhaseFailed is a durable terminal observation. Physical resources may
+	// already be reclaimed, but the identity remains until Controller ACK.
+	PhaseFailed VMPhase = "runtime-failed"
 )
 
 // SandboxState is the durable per-Sandbox driver record. It keeps stable
@@ -46,6 +49,7 @@ type SandboxState struct {
 	PID              int                                 `json:"pid,omitempty"`
 	APIAddress       string                              `json:"apiAddress,omitempty"`
 	CreatedAt        int64                               `json:"createdAt"`
+	FailureMessage   string                              `json:"failureMessage,omitempty"`
 	InfraServices    []infracontract.ServiceEndpoint     `json:"infraServices,omitempty"`
 	InfraDiagnostics []infracontract.ComponentDiagnostic `json:"infraDiagnostics,omitempty"`
 	// StageDurations records the per-stage create timing of the Sandbox

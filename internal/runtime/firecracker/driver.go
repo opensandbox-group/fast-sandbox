@@ -21,6 +21,7 @@ import (
 	dataplane "fast-sandbox/internal/dataplane/contract"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
+	"fast-sandbox/internal/fastlet/podcgroup"
 	infracontract "fast-sandbox/internal/infra/contract"
 	"fast-sandbox/internal/nodecleanup"
 	"fast-sandbox/internal/observability"
@@ -57,6 +58,7 @@ type Driver struct {
 	waitSocket     func(ctx context.Context, socketPath string, timeout time.Duration) error
 	checkStorage   func(context.Context, string) error
 	networkManager *fastletnetwork.Manager
+	runtimeCgroups *podcgroup.RuntimeManager
 	infraMgr       *fastletinfra.Manager
 	// stateMover carries the egress-owned state files (credential vault,
 	// recorded network policy) across pause/resume; nil disables the
@@ -284,6 +286,40 @@ func (d *Driver) SetNetworkManager(manager *fastletnetwork.Manager) {
 	d.mu.Unlock()
 }
 
+// SetRuntimeCgroupManager wires the ResourceAware host cgroup hierarchy.
+// LegacySlot leaves it nil and preserves the historical process placement.
+func (d *Driver) SetRuntimeCgroupManager(manager *podcgroup.RuntimeManager) error {
+	if manager == nil {
+		return errors.New("runtime cgroup manager is required")
+	}
+	// Probe the actual clone path with the container's seccomp and cgroup
+	// delegation before the first heartbeat can advertise capacity.
+	path, err := os.MkdirTemp(manager.AggregateFilesystemPath(), ".launch-probe-")
+	if err != nil {
+		return err
+	}
+	p, err := (ExecProcessRunner{}).StartInCgroup(context.Background(), path, "", "/bin/true", nil, "")
+	if err == nil {
+		err = p.Wait()
+	}
+	if err = errors.Join(err, os.Remove(path)); err != nil {
+		return fmt.Errorf("atomic runtime placement probe: %w", err)
+	}
+	d.mu.Lock()
+	d.runtimeCgroups = manager
+	d.mu.Unlock()
+	return nil
+}
+
+// SandboxRuntimeExited verifies an empty kernel cgroup before the Fastlet
+// releases a stopped VM. A failed API-socket probe alone is insufficient.
+func (d *Driver) SandboxRuntimeExited(id string) bool {
+	d.mu.RLock()
+	m := d.runtimeCgroups
+	d.mu.RUnlock()
+	return m != nil && m.Empty(id)
+}
+
 // SetStateMover wires the driver-invoked egress state transfers: checkpoints
 // stage the subject's vault and policy files into the bundle before the
 // runtime release purges them, and restores import them before the data
@@ -469,6 +505,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	manager := d.networkManager
+	runtimeCgroups := d.runtimeCgroups
 	d.mu.RUnlock()
 	if manager == nil {
 		return nil, fmt.Errorf("%w: firecracker requires the Fastlet network manager", ErrNetworkUnavailable)
@@ -499,6 +536,9 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		if alive, probeErr := d.probeVM(ctx, existing); probeErr == nil && alive {
 			if runtimecontract.SameRuntimeIdentity(existing.Config.Identity, identity) {
 				if err := validateExistingRuntimeProfile(existingMetadata(existing), config); err != nil {
+					return nil, err
+				}
+				if err := recoverRuntimeCgroup(runtimeCgroups, config, existing.PID); err != nil {
 					return nil, err
 				}
 				return existingMetadata(existing), nil
@@ -700,6 +740,25 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	if jailRoot != "" {
 		logDir = jailRoot
 	}
+	cgroupPath := ""
+	var cgroupSetup time.Duration
+	if runtimeCgroups != nil {
+		started := time.Now()
+		cgroupPath, err = ensureRuntimeCgroup(runtimeCgroups, config)
+		cgroupSetup = time.Since(started)
+		if err != nil {
+			releaseSlot()
+			return nil, err
+		}
+		defer func() {
+			if createdComplete {
+				return
+			}
+			if removeErr := runtimeCgroups.RemoveSandbox(identity.SandboxUID); removeErr != nil {
+				klog.V(2).InfoS("remove cgroup after failed Firecracker create", "sandboxID", identity.SandboxUID, "err", removeErr)
+			}
+		}()
+	}
 
 	launchCtx, launchSpan := observability.Start(ctx, "fastlet.firecracker.launch")
 	launchStarted := time.Now()
@@ -709,6 +768,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		APIAddress: apiAddress,
 		WorkingDir: directory,
 		LogPath:    filepath.Join(logDir, processLogName),
+		CgroupPath: cgroupPath,
 	}, slot)
 	if err == nil {
 		state.PID = process.PID()
@@ -796,6 +856,9 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		"acquire": acquireDur, "rootfs": rootfsDur, "infra": infraDur,
 		"launch": launchDur, "configure": configureDur, "boot": bootDur,
 	}
+	if runtimeCgroups != nil {
+		state.StageDurations["cgroup"] = cgroupSetup
+	}
 	if err := saveState(directory, state); err != nil {
 		d.killAndForget(identity.SandboxUID, process.PID())
 		releaseSlot()
@@ -845,13 +908,54 @@ func (d *Driver) InspectSandbox(ctx context.Context, sandboxID string) (_ *Sandb
 
 // DeleteSandbox stops the microVM, releases its network slot, and removes the
 // Sandbox state. The call is idempotent.
-func (d *Driver) DeleteSandbox(ctx context.Context, sandboxID string) (resultErr error) {
+func (d *Driver) DeleteSandbox(ctx context.Context, sandboxID string) error {
+	return d.deleteSandbox(ctx, sandboxID, false, nil)
+}
+
+// RecordTerminalFailure commits the complete failed identity before any
+// physical resource is reclaimed. A Fastlet crash after this point can resume
+// cleanup without making the old identity look absent.
+func (d *Driver) RecordTerminalFailure(ctx context.Context, identity fastletapi.SandboxIdentity, message string) (resultErr error) {
+	sandboxID := identity.SandboxUID
+	ctx = observability.WithIdentity(ctx, observability.Identity{SandboxUID: sandboxID})
+	_, span := observability.Start(ctx, "fastlet.firecracker.record-terminal-failure")
+	defer func() { observability.End(span, resultErr) }()
+	d.mu.RLock()
+	stateRoot := d.config.StateRoot
+	d.mu.RUnlock()
+	directory, err := sandboxDir(stateRoot, sandboxID)
+	if err != nil {
+		return err
+	}
+	state, err := loadState(directory)
+	if err != nil {
+		return err
+	}
+	if !runtimecontract.SameRuntimeIdentity(state.Config.Identity, identity) {
+		return fmt.Errorf("terminal failure identity for sandbox %s no longer matches the durable runtime", sandboxID)
+	}
+	if state.Phase != PhaseRunning && state.Phase != PhaseStopped && state.Phase != PhaseFailed {
+		return fmt.Errorf("cannot record terminal failure for sandbox %s in phase %s", sandboxID, state.Phase)
+	}
+	state.Phase = PhaseFailed
+	state.FailureMessage = message
+	return saveState(directory, state)
+}
+
+// CleanupTerminalFailure reclaims physical resources while retaining the
+// durable failed identity for Controller acknowledgement.
+func (d *Driver) CleanupTerminalFailure(ctx context.Context, identity fastletapi.SandboxIdentity) error {
+	return d.deleteSandbox(ctx, identity.SandboxUID, true, &identity)
+}
+
+func (d *Driver) deleteSandbox(ctx context.Context, sandboxID string, retainTerminalRecord bool, expectedIdentity *fastletapi.SandboxIdentity) (resultErr error) {
 	ctx = observability.WithIdentity(ctx, observability.Identity{SandboxUID: sandboxID})
 	ctx, span := observability.Start(ctx, "fastlet.firecracker.delete")
 	defer func() { observability.End(span, resultErr) }()
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	manager := d.networkManager
+	runtimeCgroups := d.runtimeCgroups
 	d.mu.RUnlock()
 	directory, err := sandboxDir(stateRoot, sandboxID)
 	if err != nil {
@@ -860,12 +964,33 @@ func (d *Driver) DeleteSandbox(ctx context.Context, sandboxID string) (resultErr
 	state, err := loadState(directory)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			if retainTerminalRecord {
+				return ErrSandboxNotFound
+			}
 			d.removeJailRoot(sandboxID)
-			return d.releaseOCI(ctx, sandboxID)
+			return errors.Join(d.releaseOCI(ctx, sandboxID), removeRuntimeCgroup(runtimeCgroups, sandboxID))
 		}
 		return err
 	}
-	d.killAndForget(sandboxID, state.PID)
+	if retainTerminalRecord && state.Phase != PhaseFailed {
+		return fmt.Errorf("cannot clean terminal failure for sandbox %s in phase %s", sandboxID, state.Phase)
+	}
+	if expectedIdentity != nil && !runtimecontract.SameRuntimeIdentity(state.Config.Identity, *expectedIdentity) {
+		return fmt.Errorf("terminal cleanup identity for sandbox %s no longer matches the durable runtime", sandboxID)
+	}
+	pid := state.PID
+	if state.Phase == PhaseFailed && runtimeCgroups != nil {
+		if err := runtimeCgroups.ConfirmAbsent(sandboxID); err != nil {
+			return fmt.Errorf("confirm terminal Firecracker sandbox %s exited (PID %d, Fastlet Pod %s, phase %s): %w",
+				sandboxID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
+		}
+		// Terminal cleanup can retry after the tracked process was forgotten
+		// but before PID=0 was persisted. An empty cgroup proves this runtime
+		// exited; its historical numeric PID may now identify another process.
+		// Apply this fence to Controller Delete as well as retained cleanup.
+		pid = 0
+	}
+	d.killAndForget(sandboxID, pid)
 	if manager != nil && state.Config.Identity.SandboxUID != "" {
 		// Release is reached unconditionally: a slot stuck in Destroying by an
 		// earlier failed release must be retried here, and Release matches
@@ -892,8 +1017,20 @@ func (d *Driver) DeleteSandbox(ctx context.Context, sandboxID string) (resultErr
 	d.releaseAgentSandbox(ctx, sandboxID, reference)
 	d.removeJailRoot(sandboxID)
 	d.ensureResidualProcessAbsent(ctx, sandboxID)
+	if err := removeRuntimeCgroup(runtimeCgroups, sandboxID); err != nil {
+		return err
+	}
 	if err := d.releaseOCI(ctx, sandboxID); err != nil {
 		return err
+	}
+	if retainTerminalRecord {
+		state.PID = 0
+		state.APIAddress = ""
+		if err := saveState(directory, state); err != nil {
+			return fmt.Errorf("persist reclaimed terminal sandbox %s: %w", sandboxID, err)
+		}
+		klog.InfoS("firecracker sandbox resources reclaimed; terminal identity retained", "sandboxID", sandboxID)
+		return nil
 	}
 	if removeErr := removeSandboxDir(directory); removeErr != nil {
 		klog.ErrorS(removeErr, "Failed to remove sandbox state directory", "sandboxID", sandboxID)
@@ -928,10 +1065,11 @@ func (d *Driver) ListManagedSandboxes(_ context.Context) ([]*SandboxMetadata, er
 // RecoverRuntimeResources cleans up VMs that died with a Fastlet restart:
 // Firecracker processes are pod-local, so stale records are removed and
 // their slots released; surviving VMs are returned.
-func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer) error {
+func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer) error { //nolint:gocognit // ordered recovery classifies each durable runtime before cleanup or adoption
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	manager := d.networkManager
+	runtimeCgroups := d.runtimeCgroups
 	podUID := d.podUID
 	d.mu.RUnlock()
 	directories, err := listSandboxDirs(stateRoot)
@@ -949,12 +1087,29 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 		if podUID != "" && state.Config.Identity.FastletPodUID != podUID {
 			continue
 		}
-		alive, probeErr := d.probeVM(ctx, state)
-		if probeErr != nil || !alive {
-			if err := d.recoverDeadSandbox(ctx, state, directory, manager, retireOwner); err != nil {
+		if handled, err := d.recoverInterruptedStart(ctx, state, directory, manager, runtimeCgroups, retireOwner); handled {
+			if err != nil {
 				return err
 			}
 			continue
+		}
+		if state.Phase == PhaseFailed {
+			if err := d.recoverDeadSandbox(ctx, state, directory, manager, runtimeCgroups, retireOwner, true); err != nil {
+				return err
+			}
+			continue
+		}
+		alive, probeErr := d.probeVM(ctx, state)
+		if probeErr != nil || !alive {
+			retainTerminalRecord := state.Phase == PhaseRunning
+			if err := d.recoverDeadSandbox(ctx, state, directory, manager, runtimeCgroups, retireOwner, retainTerminalRecord); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := recoverRuntimeCgroup(runtimeCgroups, &state.Config, state.PID); err != nil {
+			return fmt.Errorf("adopt Firecracker sandbox %s during recovery (PID %d, Fastlet Pod %s, phase %s): %w",
+				state.Config.Identity.SandboxUID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
 		}
 		// A Fastlet crash during a snapshot dump leaves the VM paused (the
 		// Snapshotter contract only covers in-process failure paths). The
@@ -964,17 +1119,91 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 	return nil
 }
 
+const interruptedStartExitTimeout = 2 * time.Second
+
+// recoverInterruptedStart closes the launch-to-PID-persistence crash window.
+// The state and deterministic cgroup together identify a VMM started by this
+// Fastlet Pod; recovery must resolve that leaf before an API socket can make a
+// PID-less Starting record look adoptable.
+func (d *Driver) recoverInterruptedStart(ctx context.Context, state *SandboxState, directory string, manager *fastletnetwork.Manager, runtimeCgroups *podcgroup.RuntimeManager, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer) (bool, error) {
+	if state == nil || state.Phase != PhaseStarting || state.PID != 0 || runtimeCgroups == nil {
+		return false, nil
+	}
+	sandboxUID := state.Config.Identity.SandboxUID
+	d.mu.RLock()
+	podUID := d.podUID
+	d.mu.RUnlock()
+	if podUID == "" || state.Config.Identity.FastletPodUID != podUID {
+		return true, fmt.Errorf("cannot attribute interrupted Firecracker start for sandbox %s to the current Fastlet Pod", sandboxUID)
+	}
+	pids, exists, err := runtimeCgroups.SandboxProcesses(sandboxUID)
+	if err != nil {
+		return true, fmt.Errorf("inspect interrupted Firecracker start cgroup for sandbox %s: %w", sandboxUID, err)
+	}
+	if exists {
+		d.mu.RLock()
+		killProcess := d.killProcess
+		d.mu.RUnlock()
+		for _, pid := range pids {
+			if killProcess == nil {
+				return true, fmt.Errorf("terminate interrupted Firecracker start for sandbox %s: process killer is unavailable", sandboxUID)
+			}
+			if err := killProcess(pid); err != nil {
+				return true, fmt.Errorf("terminate interrupted Firecracker PID %d for sandbox %s: %w", pid, sandboxUID, err)
+			}
+		}
+	}
+	deadline := time.Now().Add(interruptedStartExitTimeout)
+	for {
+		if err := runtimeCgroups.ConfirmAbsent(sandboxUID); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			return true, fmt.Errorf("confirm interrupted Firecracker start exited for sandbox %s (PID %d, Fastlet Pod %s, phase %s): %w",
+				sandboxUID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
+		}
+		select {
+		case <-ctx.Done():
+			return true, ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if err := d.recoverDeadSandbox(ctx, state, directory, manager, runtimeCgroups, retireOwner, false); err != nil {
+		return true, err
+	}
+	klog.InfoS("recovered interrupted Firecracker start", "sandboxID", sandboxUID, "terminatedPIDs", pids)
+	return true, nil
+}
+
 // recoverDeadSandbox preserves retirement-before-release ordering for a dead
 // runtime. Retirement failure prevents slot release; strict slot-release
 // failure preserves the remaining cleanup state for a later retry.
-func (d *Driver) recoverDeadSandbox(ctx context.Context, state *SandboxState, directory string, manager *fastletnetwork.Manager, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer) error {
+func (d *Driver) recoverDeadSandbox(ctx context.Context, state *SandboxState, directory string, manager *fastletnetwork.Manager, runtimeCgroups *podcgroup.RuntimeManager, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer, retainTerminalRecord bool) error {
+	sandboxUID := state.Config.Identity.SandboxUID
+	pid := state.PID
+	if runtimeCgroups != nil {
+		if err := runtimeCgroups.ConfirmAbsent(sandboxUID); err != nil {
+			return fmt.Errorf("confirm Firecracker sandbox %s exited during recovery (PID %d, Fastlet Pod %s, phase %s): %w",
+				sandboxUID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
+		}
+		pid = 0
+	}
+	// An unavailable API alone does not prove that a sibling VMM exited.
+	// Persist a terminal identity only after its cgroup is confirmed absent,
+	// so a later recovery can still adopt a live VM after a transient failure.
+	if retainTerminalRecord && state.Phase != PhaseFailed {
+		state.Phase = PhaseFailed
+		state.FailureMessage = "runtime exited unexpectedly"
+		if err := saveState(directory, state); err != nil {
+			return fmt.Errorf("persist terminal Firecracker failure for sandbox %s: %w", sandboxUID, err)
+		}
+	}
 	metadata := existingMetadata(state)
 	if retireOwner != nil {
 		if err := retireOwner(ctx, metadata); err != nil {
-			return fmt.Errorf("retire Action owner before recovering dead Firecracker sandbox %s: %w", state.Config.Identity.SandboxUID, err)
+			return fmt.Errorf("retire Action owner before recovering dead Firecracker sandbox %s: %w", sandboxUID, err)
 		}
 	} else if version := state.Config.ActionsAPIVersion; version != "" && version != actionapi.APIVersion {
-		return fmt.Errorf("Actions apiVersion %q requires owner retirement before recovering dead Firecracker sandbox %s", version, state.Config.Identity.SandboxUID)
+		return fmt.Errorf("Actions apiVersion %q requires owner retirement before recovering dead Firecracker sandbox %s", version, sandboxUID)
 	}
 	if manager != nil && state.Config.ActionsAPIVersion == actionapi.APIVersionV2 {
 		// Release also retries a Destroying slot; Lookup only sees Bound.
@@ -982,7 +1211,6 @@ func (d *Driver) recoverDeadSandbox(ctx context.Context, state *SandboxState, di
 			return fmt.Errorf("release retired Sandbox network slot: %w", err)
 		}
 	} else if manager != nil {
-		sandboxUID := state.Config.Identity.SandboxUID
 		if slot, exists := manager.Lookup(sandboxUID); exists {
 			_ = slot
 			if releaseErr := manager.Release(ctx, d.networkOwner(&state.Config)); releaseErr != nil {
@@ -990,15 +1218,21 @@ func (d *Driver) recoverDeadSandbox(ctx context.Context, state *SandboxState, di
 			}
 		}
 	}
-	d.killAndForget(state.Config.Identity.SandboxUID, state.PID)
-	d.removeJailRoot(state.Config.Identity.SandboxUID)
-	if err := d.releaseOCI(ctx, state.Config.Identity.SandboxUID); err != nil {
+	d.killAndForget(sandboxUID, pid)
+	d.removeJailRoot(sandboxUID)
+	if err := d.releaseOCI(ctx, sandboxUID); err != nil {
 		return err
 	}
-	if removeErr := removeSandboxDir(directory); removeErr != nil {
-		klog.ErrorS(removeErr, "Firecracker recovery failed to remove the sandbox state directory", "stateDirectory", directory)
+	// Recovery discovers work from these state directories. Keep the record until the leaf is gone.
+	if err := removeRuntimeCgroup(runtimeCgroups, sandboxUID); err != nil {
+		return err
 	}
-	return nil
+	if retainTerminalRecord {
+		state.PID = 0
+		state.APIAddress = ""
+		return saveState(directory, state)
+	}
+	return removeSandboxDir(directory)
 }
 
 // resumePausedVM resumes a live but paused microVM (snapshot-dump crash
@@ -1079,12 +1313,19 @@ func (d *Driver) probeVM(ctx context.Context, state *SandboxState) (bool, error)
 	d.mu.RUnlock()
 	if state.PID > 0 {
 		if err := probeProcess(state.PID); err != nil {
+			klog.V(2).InfoS("Firecracker process probe failed",
+				"sandboxID", state.Config.Identity.SandboxUID, "PID", state.PID,
+				"fastletPodUID", state.Config.Identity.FastletPodUID, "phase", state.Phase, "err", err)
 			return false, nil
 		}
 	}
 	client := d.newClient(state.APIAddress)
 	defer client.Close()
 	if _, err := client.Version(ctx); err != nil {
+		klog.V(2).InfoS("Firecracker API probe failed",
+			"sandboxID", state.Config.Identity.SandboxUID, "PID", state.PID,
+			"fastletPodUID", state.Config.Identity.FastletPodUID, "phase", state.Phase,
+			"apiAddress", state.APIAddress, "err", err)
 		return false, nil
 	}
 	return true, nil
@@ -1246,6 +1487,10 @@ func (d *Driver) removeJailRoot(sandboxID string) {
 	// otherwise descend into the SHARED spill root and delete other
 	// sandboxes' dumps.
 	_ = unmountPath(filepath.Join(root, jailerSpillDirName))
+	// alignJailKVM installs a bind mount after the jailer has prepared dev/kvm.
+	// A memcg OOM can kill the VMM before the jailer tears that mount down, so
+	// detach it explicitly before RemoveAll or the otherwise-dead jail leaks.
+	_ = unmountPath(jailedKVMDevicePath(root))
 	for _, target := range []string{"rootfs.dev", filepath.Join(jailerChrootSnapshotsDir, vmstateSnapshotName), filepath.Join(jailerChrootSnapshotsDir, memorySnapshotName)} {
 		_ = unmountPath(filepath.Join(root, target))
 	}
@@ -1385,6 +1630,7 @@ func existingMetadata(state *SandboxState) *SandboxMetadata {
 	metadata.ContainerID = state.Config.Identity.SandboxUID
 	metadata.PID = state.PID
 	metadata.Phase = string(state.Phase)
+	metadata.RuntimeMessage = state.FailureMessage
 	metadata.CreatedAt = state.CreatedAt
 	metadata.UserProcessStartSource = fastletapi.UserProcessStartRuntimeDirect
 	metadata.InfraServices = append(metadata.InfraServices, state.InfraServices...)
@@ -1419,7 +1665,7 @@ func (d *Driver) killAndForget(sandboxID string, pid int) {
 		}
 		return
 	}
-	if d.killProcess != nil {
+	if pid > 0 && d.killProcess != nil {
 		_ = d.killProcess(pid)
 	}
 }
@@ -1429,6 +1675,7 @@ func (d *Driver) killAndForget(sandboxID string, pid int) {
 func (d *Driver) cleanupStale(ctx context.Context, directory string, state *SandboxState) error {
 	d.mu.RLock()
 	manager := d.networkManager
+	runtimeCgroups := d.runtimeCgroups
 	d.mu.RUnlock()
 	sandboxUID := state.Config.Identity.SandboxUID
 	d.killAndForget(sandboxUID, state.PID)
@@ -1443,10 +1690,62 @@ func (d *Driver) cleanupStale(ctx context.Context, directory string, state *Sand
 		}
 	}
 	d.removeJailRoot(sandboxUID)
+	if err := removeRuntimeCgroup(runtimeCgroups, sandboxUID); err != nil {
+		return err
+	}
 	if err := d.releaseOCI(ctx, sandboxUID); err != nil {
 		return err
 	}
 	return removeSandboxDir(directory)
+}
+
+func ensureRuntimeCgroup(manager *podcgroup.RuntimeManager, config *fastletapi.RuntimeSandboxConfig) (string, error) {
+	if manager == nil || config == nil {
+		return "", fmt.Errorf("%w: runtime cgroup manager and Sandbox config are required", ErrInvalidConfig)
+	}
+	cpu, err := resource.ParseQuantity(config.Limits.CPU)
+	if err != nil {
+		return "", fmt.Errorf("%w: invalid Sandbox CPU limit %q", ErrInvalidConfig, config.Limits.CPU)
+	}
+	request, err := resource.ParseQuantity(config.CPURequest)
+	if err != nil {
+		return "", fmt.Errorf("%w: invalid Sandbox CPU request %q", ErrInvalidConfig, config.CPURequest)
+	}
+	path, err := manager.EnsureSandbox(config.Identity.SandboxUID, podcgroup.SandboxLimits{
+		CPU: cpu, CPURequest: request, PIDs: config.Limits.PIDs,
+	})
+	if err != nil {
+		return "", fmt.Errorf("prepare Firecracker Sandbox cgroup: %w", err)
+	}
+	return path, nil
+}
+
+func recoverRuntimeCgroup(manager *podcgroup.RuntimeManager, config *fastletapi.RuntimeSandboxConfig, pid int) error {
+	if manager == nil {
+		return nil
+	}
+	path, err := ensureRuntimeCgroup(manager, config)
+	if err != nil {
+		return err
+	}
+	pids, err := os.ReadFile(filepath.Join(path, "cgroup.procs"))
+	if err != nil {
+		return err
+	}
+	if pid <= 0 || !strings.Contains("\n"+string(pids)+"\n", fmt.Sprintf("\n%d\n", pid)) {
+		return fmt.Errorf("expected Firecracker PID %d in Sandbox cgroup %q", pid, path)
+	}
+	return nil
+}
+
+func removeRuntimeCgroup(manager *podcgroup.RuntimeManager, sandboxID string) error {
+	if manager == nil {
+		return nil
+	}
+	if err := manager.RemoveSandbox(sandboxID); err != nil {
+		return fmt.Errorf("remove Firecracker Sandbox cgroup: %w", err)
+	}
+	return nil
 }
 
 func killPID(pid int) error {

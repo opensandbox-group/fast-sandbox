@@ -126,6 +126,8 @@ See [Performance](performance.md) for the complete latency boundary and benchmar
 
 ## Diagnostics
 
+ResourceAware direct Firecracker exports `fast_sandbox_runtime_cgroup_memory_limit_bytes` for the shared pool and each live Sandbox leaf. An empty `sandbox_uid` selects the bounded pool; a leaf with `memory.max=max` reports `+Inf`, rather than omitting the series. A missing series therefore does not represent an unlimited memory ceiling.
+
 ```bash
 bin/fastctl --endpoint localhost:9090 \
   diagnostics sandbox <sandbox-name>

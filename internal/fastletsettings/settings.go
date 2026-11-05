@@ -58,6 +58,10 @@ type ResourceAdmissionSettings struct {
 	ResourceProfileHash string            `json:"resourceProfileHash"`
 }
 
+// BoundedFirecrackerVersion fences older Fastlets, which accept only v2
+// settings. The admission heartbeat protocol itself remains v2.
+const BoundedFirecrackerVersion = "v3"
+
 type commitmentCapacityAnnotation struct {
 	CPU    string `json:"cpu"`
 	Memory string `json:"memory"`
@@ -99,7 +103,7 @@ func (s *ResourceAdmissionSettings) Validate(profile apiv1alpha2.SandboxResource
 	if s == nil {
 		return fmt.Errorf("resource admission settings are required")
 	}
-	if s.Version != "v2" || s.Mode != apiv1alpha2.SandboxResourceModeResourceAware {
+	if (s.Version != "v2" && s.Version != BoundedFirecrackerVersion) || s.Mode != apiv1alpha2.SandboxResourceModeResourceAware {
 		return fmt.Errorf("unsupported resource admission settings version %q mode %q", s.Version, s.Mode)
 	}
 	if profile.ResourceMode() != apiv1alpha2.SandboxResourceModeResourceAware || s.ResourceProfileHash != profile.Hash() {

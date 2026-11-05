@@ -73,6 +73,7 @@ func (f *controllerFastlet) CreateSandbox(_ context.Context, _ string, request *
 	}
 	f.runtimes[request.Identity.SandboxUID] = phase
 	status := controllerObservation(request.Identity.SandboxUID, phase)
+	setControllerObservationIdentity(status, request.Identity)
 	status.AcceptedGeneration = request.SpecGeneration
 	status.AppliedGeneration = request.SpecGeneration
 	return &fastletapi.CreateSandboxResponse{Disposition: fastletapi.CreateDispositionCreated, Sandbox: status}, nil
@@ -89,7 +90,9 @@ func (f *controllerFastlet) InspectSandbox(_ context.Context, _ string, request 
 		failure := &fastletapi.FastletError{Code: fastletapi.ErrorNotFound, Message: "not found"}
 		return &fastletapi.InspectSandboxResponse{Error: failure}, failure
 	}
-	return &fastletapi.InspectSandboxResponse{Sandbox: controllerObservation(request.Identity.SandboxUID, phase)}, nil
+	status := controllerObservation(request.Identity.SandboxUID, phase)
+	setControllerObservationIdentity(status, request.Identity)
+	return &fastletapi.InspectSandboxResponse{Sandbox: status}, nil
 }
 
 func (f *controllerFastlet) DeleteSandbox(_ context.Context, _ string, request *fastletapi.DeleteSandboxRequest) (*fastletapi.DeleteSandboxResponse, error) {
@@ -173,11 +176,23 @@ func controllerObservation(sandboxID, phase string) *fastletapi.SandboxStatus {
 	case "infra-unavailable", "route-unavailable":
 		status.Runtime.State = fastletapi.RuntimeStateReady
 		status.DataPlane.State = fastletapi.DataPlaneStateUnavailable
+	case "failed":
+		status.Runtime.State = fastletapi.RuntimeStateFailed
+		status.Runtime.Message = "runtime exited unexpectedly"
+		status.DataPlane.State = fastletapi.DataPlaneStateFailed
 	default:
 		status.Runtime.State = fastletapi.RuntimeStateCreating
 		status.DataPlane.State = fastletapi.DataPlaneStatePending
 	}
 	return status
+}
+
+func setControllerObservationIdentity(status *fastletapi.SandboxStatus, identity fastletapi.SandboxIdentity) {
+	status.SandboxID = identity.SandboxUID
+	status.InstanceGeneration = identity.InstanceGeneration
+	status.RuntimeInstanceID = identity.RuntimeInstanceID
+	status.AssignmentAttempt = identity.AssignmentAttempt
+	status.RouteGeneration = identity.RouteGeneration
 }
 
 func TestDeclarativeCreateWithoutCapacityStaysPending(t *testing.T) {
@@ -286,6 +301,79 @@ func TestUnknownOutcomePreservesDurableAssignment(t *testing.T) {
 	current := getControllerSandbox(t, reconciler, sandbox.Name)
 	require.NotEmpty(t, current.Status.Placement.FastletName)
 	require.Equal(t, "fastlet-a", current.Status.Placement.FastletName)
+}
+
+func TestTerminalRuntimeFailureIsDurableBeforeFastletRecordIsAcknowledged(t *testing.T) {
+	reconciler, _, fastlet, sandbox := newControllerHarness(t)
+	placementStatus := apiv1alpha2.PlacementStatus{FastletName: "fastlet-a", FastletPodUID: "pod-a", Attempt: 1}
+	current := getControllerSandbox(t, reconciler, sandbox.Name)
+	current.Finalizers = []string{FinalizerName}
+	require.NoError(t, reconciler.Update(t.Context(), current))
+	current = seedReadyControllerAssignment(t, reconciler, getControllerSandbox(t, reconciler, sandbox.Name), placementStatus)
+	fastlet.runtimes[string(current.UID)] = "failed"
+
+	// Model a Controller crash after reading Failed but before writing status:
+	// the retained Fastlet record is still returned to the replacement process.
+	observed, err := reconciler.Orchestrator.ObserveRuntime(t.Context(), current)
+	require.NoError(t, err)
+	require.Equal(t, fastletapi.RuntimeStateFailed, observed.Runtime.State)
+	require.Equal(t, apiv1alpha2.RuntimeReady, getControllerSandbox(t, reconciler, sandbox.Name).Status.Runtime.State)
+
+	restarted := &SandboxReconciler{Client: reconciler.Client, Scheme: reconciler.Scheme, Orchestrator: reconciler.Orchestrator}
+	_, err = restarted.Reconcile(t.Context(), requestFor(sandbox.Name))
+	require.NoError(t, err)
+	current = getControllerSandbox(t, restarted, sandbox.Name)
+	require.Equal(t, apiv1alpha2.RuntimeFailed, current.Status.Runtime.State)
+	fastlet.mu.Lock()
+	require.Equal(t, 0, fastlet.ensureCall)
+	require.Equal(t, 0, fastlet.deleteCall, "Fastlet record must survive until Failed status is durable")
+	fastlet.mu.Unlock()
+
+	// Model another crash after the CR write but before acknowledgement. The
+	// next process deletes only the retained record and never Ensures G7 again.
+	restarted = &SandboxReconciler{Client: reconciler.Client, Scheme: reconciler.Scheme, Orchestrator: reconciler.Orchestrator}
+	_, err = restarted.Reconcile(t.Context(), requestFor(sandbox.Name))
+	require.NoError(t, err)
+	fastlet.mu.Lock()
+	require.Equal(t, 0, fastlet.ensureCall)
+	require.Equal(t, 1, fastlet.deleteCall)
+	_, retained := fastlet.runtimes[string(current.UID)]
+	fastlet.mu.Unlock()
+	require.False(t, retained)
+
+	_, err = restarted.Reconcile(t.Context(), requestFor(sandbox.Name))
+	require.NoError(t, err)
+	fastlet.mu.Lock()
+	require.Equal(t, 0, fastlet.ensureCall, "NotFound after acknowledgement must not recreate the failed identity")
+	fastlet.mu.Unlock()
+}
+
+func TestTerminalRuntimeFailureDoesNotCrossAssignmentFence(t *testing.T) {
+	reconciler, _, _, sandbox := newControllerHarness(t)
+	placementStatus := apiv1alpha2.PlacementStatus{FastletName: "fastlet-a", FastletPodUID: "pod-a", Attempt: 1}
+	current := seedReadyControllerAssignment(t, reconciler, getControllerSandbox(t, reconciler, sandbox.Name), placementStatus)
+	old, err := assignment.AssignmentFromAnnotation(current)
+	require.NoError(t, err)
+	require.NotNil(t, old)
+	observed := controllerObservation(string(current.UID), "failed")
+	setControllerObservationIdentity(observed, fastletapi.SandboxIdentity{
+		SandboxUID: string(current.UID), InstanceGeneration: old.InstanceGeneration,
+		RuntimeInstanceID: old.RuntimeInstanceID, AssignmentAttempt: old.Attempt, RouteGeneration: old.RouteGeneration,
+	})
+
+	next := *old
+	next.InstanceGeneration++
+	next.Attempt++
+	next.RouteGeneration++
+	next.RuntimeInstanceID = "runtime-g8"
+	require.NoError(t, assignment.SetAssignmentAnnotation(current, next))
+	require.NoError(t, reconciler.Update(t.Context(), current))
+
+	persisted, err := reconciler.persistTerminalRuntimeFailure(t.Context(), current, observed)
+	require.NoError(t, err)
+	require.False(t, persisted)
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	require.Equal(t, apiv1alpha2.RuntimeReady, current.Status.Runtime.State)
 }
 
 func TestPodLostPolicyManualAndAutoRecreate(t *testing.T) {

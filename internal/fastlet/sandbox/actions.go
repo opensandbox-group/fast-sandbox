@@ -35,7 +35,7 @@ func (m *SandboxManager) ReconcileBindings(ctx context.Context, req *fastletapi.
 		m.mu.Unlock()
 		return &fastletapi.ReconcileBindingsResponse{Error: failure}, failure
 	}
-	if metadata.Phase == sandboxStateCreating || metadata.Phase == sandboxStateTerminating || metadata.Phase == sandboxStateDeleting {
+	if !m.runtimeWorkAllowedLocked(metadata) {
 		m.mu.Unlock()
 		failure := fastletError(fastletapi.ErrorInProgress, "runtime is not ready for Sandbox Actions", true)
 		return &fastletapi.ReconcileBindingsResponse{Error: failure}, failure
@@ -50,7 +50,7 @@ func (m *SandboxManager) ReconcileBindings(ctx context.Context, req *fastletapi.
 		}
 		if len(req.ActionBindings) == 0 {
 			m.mu.Lock()
-			if m.sandboxes[metadata.Config.Identity.SandboxUID] != metadata {
+			if !m.runtimeWorkAllowedLocked(metadata) {
 				m.mu.Unlock()
 				failure := fastletError(fastletapi.ErrorStaleGeneration, "Sandbox changed while Actions were reconciling", true)
 				return &fastletapi.ReconcileBindingsResponse{Error: failure}, failure
@@ -72,7 +72,7 @@ func (m *SandboxManager) ReconcileBindings(ctx context.Context, req *fastletapi.
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.sandboxes[metadata.Config.Identity.SandboxUID] != metadata {
+	if !m.runtimeWorkAllowedLocked(metadata) {
 		failure := fastletError(fastletapi.ErrorStaleGeneration, "Sandbox changed while Actions were reconciling", true)
 		return &fastletapi.ReconcileBindingsResponse{Error: failure}, failure
 	}
@@ -136,6 +136,16 @@ func (m *SandboxManager) requiresStrictActionHandling(version string) bool {
 }
 
 func (m *SandboxManager) registerDesiredActions(metadata *SandboxMetadata, generation int64, bindings []fastletapi.ActionBindingInput) error {
+	m.mu.RLock()
+	uid := metadata.Config.Identity.SandboxUID
+	// Admission registers desired Bindings before creating the runtime.
+	creating := metadata.Phase == sandboxStateCreating || metadata.Phase == sandboxStateImagePending
+	allowed := m.sandboxes[uid] == metadata && m.terminalFailureWorkers[uid] != metadata &&
+		(creating || runtimeCreatedPhase(metadata.Phase))
+	m.mu.RUnlock()
+	if !allowed {
+		return errors.New("Sandbox is no longer accepting Action work")
+	}
 	if m.actionManager == nil {
 		if len(bindings) != 0 {
 			return errors.New("Fastlet has no Action Handler configuration")
@@ -147,6 +157,12 @@ func (m *SandboxManager) registerDesiredActions(metadata *SandboxMetadata, gener
 
 func (m *SandboxManager) recordActionHook(metadata *SandboxMetadata, hook actionapi.LifecycleHook, sequence int64) {
 	if m.actionManager == nil {
+		return
+	}
+	m.mu.RLock()
+	allowed := m.runtimeWorkAllowedLocked(metadata)
+	m.mu.RUnlock()
+	if !allowed {
 		return
 	}
 	sandboxUID := metadata.Config.Identity.SandboxUID
@@ -177,7 +193,8 @@ func (m *SandboxManager) actionStateChanged(sandboxUID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	metadata := m.sandboxes[sandboxUID]
-	if metadata == nil || metadata.Phase == sandboxStateTerminating || metadata.Phase == sandboxStateDeleting || metadata.Phase == sandboxStateDeleteFailed {
+	if metadata == nil || m.terminalFailureWorkers[sandboxUID] == metadata || metadata.Phase == sandboxStateTerminating || metadata.Phase == sandboxStateDeleting || metadata.Phase == sandboxStateDeleteFailed ||
+		metadata.Phase == sandboxStateRuntimeFailureCleanup || metadata.Phase == sandboxStateRuntimeFailed {
 		return
 	}
 	metadata.ActionBindingStatuses = append(metadata.ActionBindingStatuses[:0], statuses...)

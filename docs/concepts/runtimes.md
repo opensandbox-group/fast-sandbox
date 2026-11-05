@@ -143,23 +143,39 @@ Fastlet Pod. Operators select Sandbox density through independent Pool CPU and
 memory ratios, while `maxSandboxesPerPod` remains a hard Sandbox-count bound.
 LegacySlot Pools retain explicit aggregate first-container resources.
 CPU and memory commitments are checked separately before every Create.
-Per-Sandbox limits isolate noisy neighbors, and the Kubernetes Pod cgroup caps
-their combined execution.
+Per-Sandbox limits isolate noisy neighbors. The Kubernetes Pod cgroup supplies
+the outer runtime envelope, while runtimes that have a dedicated aggregate
+subtree can enforce the Sandbox-only runtime budget below it.
 
 Direct Firecracker converts the resolved CPU and memory limits to its
-whole-vCPU and MiB machine configuration. It enforces the VM shape, but does
-not promise Linux-cgroup precision for arbitrary fractional CPU overrides.
+whole-vCPU and MiB machine configuration. In ResourceAware mode, Fastlet also
+creates a cgroup v2 sibling subtree named `fast-sandbox` below the Kubernetes
+Pod cgroup. The subtree is capped at `sandboxRuntimeBudget`, and each VMM is
+created atomically in a deterministic per-Sandbox leaf. Its CPU request sets
+the scheduling weight, its CPU limit sets the quota, and its PID limit caps host tasks.
+The leaf accounts for resident guest pages and VMM overhead with `memory.max=max`.
+The Fastlet process remains in its
+Kubernetes container cgroup, outside the Sandbox OOM victim subtree.
 
-Fastlet observes the cgroup that actually owns runtime memory. Ordinary
-in-container runtimes use the runtime-owner container envelope. Containerd
-runtimes observe the aggregate Pod cgroup because their shim/VMM processes
-can live outside the Fastlet container cgroup; that observer budget equals the
-runtime envelope plus regular sidecars and restartable init-sidecars. One-shot
-init containers are excluded, and sidecars do not increase Sandbox commitment
-capacity. Sustained high usage, memory PSI, a new OOM event, or host memory
-pressure blocks new admissions; low-watermark
-recovery reopens admission. CPU remains a hard static commitment dimension,
-but live CPU pressure is not a hard gate in the first resource-aware version.
+If Fastlet restarts after launching a VMM but before persisting its PID, recovery resolves the `Starting` record from the deterministic leaf before probing the API socket. A missing or empty leaf follows ordinary cleanup; a populated leaf owned by the current Fastlet Pod is terminated and confirmed empty before its network slot is released, while an unreadable ownership observation retains the record and resources for retry.
+
+The sibling layout is deliberate. Making the Fastlet container cgroup an
+internal cgroup v2 node would require moving Kubernetes-owned processes and
+could break later container `exec` operations. The Pod cgroup remains the
+outer `runtimeEnvelope + sidecars` bound, while the `fast-sandbox` ceiling
+prevents VMMs from consuming the fixed Fastlet overhead reserve.
+
+Fastlet observes the cgroup that actually owns runtime memory. Direct
+Firecracker observes the bounded `fast-sandbox` subtree against
+`sandboxRuntimeBudget`. Containerd runtimes observe the aggregate Pod cgroup
+because their shim/VMM processes can live outside the Fastlet container
+cgroup; that observer budget equals the runtime envelope plus regular sidecars
+and restartable init-sidecars. One-shot init containers are excluded, and
+sidecars do not increase Sandbox commitment capacity. Sustained high usage,
+memory PSI, a new OOM event, or host memory pressure blocks new admissions;
+low-watermark recovery reopens admission. CPU remains a hard static commitment
+dimension, but live CPU pressure is not a hard gate in the first
+resource-aware version.
 
 Containerd-backed runtimes do not remain in containerd's top-level cgroup.
 Fastlet discovers its Kubernetes Pod cgroup from the Pod UID and the mounted

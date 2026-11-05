@@ -1517,7 +1517,14 @@ func TestDrainingRejectsNewEnsureButKeepsExistingSandboxIdempotent(t *testing.T)
 	require.NoError(t, err)
 	require.Equal(t, fastletapi.CreateDispositionCreated, created.Disposition)
 
-	manager.SetDraining(true, "pool scale-down")
+	drain, err := manager.SetDraining(&fastletapi.SetDrainingRequest{
+		Draining: true, Reason: "pool scale-down", DrainID: "drain-a", FastletPodUID: "pod-uid-a",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "drain-a", drain.DrainID)
+	require.Equal(t, "pod-uid-a", drain.FastletPodUID)
+	require.NotNil(t, drain.Admission)
+	require.Equal(t, 1, drain.Admission.Used)
 	reconciled, err := manager.CreateSandbox(context.Background(), existing)
 	require.NoError(t, err)
 	require.Equal(t, fastletapi.CreateDispositionExisting, reconciled.Disposition)
@@ -1526,6 +1533,43 @@ func TestDrainingRejectsNewEnsureButKeepsExistingSandboxIdempotent(t *testing.T)
 
 	_, err = manager.CreateSandbox(context.Background(), ensureRequest("sandbox-b", 1, 1))
 	requireFastletCode(t, err, fastletapi.ErrorDraining)
+}
+
+func TestSetDrainingReturnsAtomicSnapshotAndFencesAttempt(t *testing.T) {
+	manager, err := NewSandboxManagerWithConfig(newAdmissionRuntime(), SandboxManagerConfig{
+		Capacity: 1, FastletPodUID: "pod-uid-a",
+	})
+	require.NoError(t, err)
+	_, err = manager.CreateSandbox(context.Background(), ensureRequest("sandbox-a", 1, 1))
+	require.NoError(t, err)
+
+	response, err := manager.SetDraining(&fastletapi.SetDrainingRequest{
+		Draining: true, DrainID: "drain-a", FastletPodUID: "pod-uid-a",
+	})
+	require.NoError(t, err)
+	require.True(t, response.RuntimeReady)
+	require.False(t, response.Recovering)
+	require.Equal(t, 1, response.Admission.Used)
+	require.Equal(t, 1, response.Admission.Running)
+
+	_, err = manager.SetDraining(&fastletapi.SetDrainingRequest{
+		Draining: false, DrainID: "drain-b", FastletPodUID: "pod-uid-a",
+	})
+	requireFastletCode(t, err, fastletapi.ErrorConflict)
+	require.False(t, manager.Ready(), "a stale cancellation must not clear the active drain")
+
+	_, err = manager.SetDraining(&fastletapi.SetDrainingRequest{
+		Draining: false, DrainID: "drain-a", FastletPodUID: "pod-uid-b",
+	})
+	requireFastletCode(t, err, fastletapi.ErrorStaleAssignment)
+	require.False(t, manager.Ready(), "a request for another Pod UID must have no effect")
+
+	response, err = manager.SetDraining(&fastletapi.SetDrainingRequest{
+		Draining: false, DrainID: "drain-a", FastletPodUID: "pod-uid-a",
+	})
+	require.NoError(t, err)
+	require.False(t, response.Draining)
+	require.True(t, manager.Ready())
 }
 
 func TestRouteRemovalPrecedesAndGatesRuntimeDeletion(t *testing.T) {

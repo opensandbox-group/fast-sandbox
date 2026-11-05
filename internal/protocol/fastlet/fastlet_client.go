@@ -254,6 +254,8 @@ func responseFastletError(response any) *FastletError {
 		return typed.Error
 	case *DeleteSnapshotResponse:
 		return typed.Error
+	case *SetDrainingResponse:
+		return typed.Error
 	default:
 		return nil
 	}

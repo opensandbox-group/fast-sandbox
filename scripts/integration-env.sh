@@ -14,6 +14,7 @@
 #   ./scripts/integration-env.sh status        # component/template/pool health
 #   ./scripts/integration-env.sh verify        # sandbox create + execd /ping
 #   ./scripts/integration-env.sh verify-resource-aware # native Firecracker resource ledger
+#   ./scripts/integration-env.sh verify-cgroup-oom # VM memcg OOM; Fastlet survives
 #   ./scripts/integration-env.sh verify-snapshot # live sandbox snapshot E2E
 #     (requires the egress image in local docker:
 #      docker pull opensandbox/egress:latest)
@@ -1912,6 +1913,9 @@ verify() {
 # contract of the standard sample Pool.
 RESOURCE_AWARE_POOL="firecracker-resource-aware-pool"
 RESOURCE_AWARE_SANDBOX="sandbox-firecracker-resource-aware"
+RESOURCE_AWARE_OOM_POOL="firecracker-resource-aware-oom-pool"
+RESOURCE_AWARE_OOM_SANDBOX_A="sandbox-firecracker-oom-a"
+RESOURCE_AWARE_OOM_SANDBOX_B="sandbox-firecracker-oom-b"
 
 resource_aware_fastlet_ready() {
 	[[ "$(kubectl -n "$NS" get pods -l "fast-sandbox.io/pool=$RESOURCE_AWARE_POOL" -o json 2>/dev/null | jq '[.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length')" -eq 1 ]]
@@ -1919,7 +1923,7 @@ resource_aware_fastlet_ready() {
 
 resource_aware_runtime_contract_ready() {
 	kubectl -n "$NS" get pods -l "fast-sandbox.io/pool=$RESOURCE_AWARE_POOL" -o json 2>/dev/null | jq -e '
-		.items | length == 1 and
+		(.items | length) == 1 and
 		.items[0].metadata.annotations["fast-sandbox.io/commitment-capacity"] != null and
 		.items[0].spec.containers[0].resources.requests.cpu == .items[0].spec.containers[0].resources.limits.cpu and
 		.items[0].spec.containers[0].resources.requests.memory == .items[0].spec.containers[0].resources.limits.memory
@@ -2020,6 +2024,385 @@ verify_resource_aware() {
 	resolve_daemon_down
 	port_forward_down
 }
+
+# --- ResourceAware native Firecracker cgroup/OOM isolation ------------------
+# Exercise the same pool contract with deterministic injection and real guest
+# tmpfs growth. The guest path never changes a cgroup limit.
+
+resource_aware_oom_fastlet_ready() {
+	[[ "$(kubectl -n "$NS" get pods -l "fast-sandbox.io/pool=$RESOURCE_AWARE_OOM_POOL" -o json 2>/dev/null | jq '[.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length')" -eq 1 ]]
+}
+
+resource_aware_oom_cleanup() {
+	if [[ -n "${pod:-}" && -n "${aggregate:-}" ]]; then
+		resource_aware_stop_runtime_cpu_load "$pod" "$aggregate" >/dev/null 2>&1 || true
+	fi
+	kubectl -n "$NS" delete sandbox "$RESOURCE_AWARE_OOM_SANDBOX_A" "$RESOURCE_AWARE_OOM_SANDBOX_B" "$recovery_name" \
+		--ignore-not-found --wait=false >/dev/null 2>&1 || true
+	kubectl -n "$NS" delete sandboxpool "$RESOURCE_AWARE_OOM_POOL" \
+		--ignore-not-found --wait=false >/dev/null 2>&1 || true
+	resolve_daemon_down
+	port_forward_down
+}
+
+resource_aware_runtime_cgroup() { # fastlet-pod
+	local pod="$1" uid uid_systemd
+	uid="$(kubectl_get "pod/$pod" '{.metadata.uid}')"
+	uid_systemd="${uid//-/_}"
+	kubectl -n "$NS" exec "$pod" -c fastlet -- \
+		find /host/sys/fs/cgroup -type d -name fast-sandbox 2>/dev/null \
+		| grep -E "($uid|$uid_systemd)" | head -1
+}
+
+resource_aware_runtime_leaf_count() { # fastlet-pod aggregate-path
+	kubectl -n "$NS" exec "$1" -c fastlet -- \
+		find "$2" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' '
+}
+
+resource_aware_runtime_leaf_count_matches() { # fastlet-pod aggregate-path expected
+	local count
+	count="$(resource_aware_runtime_leaf_count "$1" "$2")" || return 1
+	[[ "$count" =~ ^[0-9]+$ && "$count" -eq "$3" ]]
+}
+
+resource_aware_runtime_jail_absent() { # fastlet-pod sandbox-uid
+	local jail_id="${2:0:32}"
+	kubectl -n "$NS" exec "$1" -c fastlet -- \
+		test ! -d "/var/lib/fast-sandbox/firecracker/jails/firecracker/$jail_id"
+}
+
+resource_aware_runtime_live_vm_count() { # fastlet-pod aggregate-path
+	kubectl -n "$NS" exec "$1" -c fastlet -- sh -ceu '
+		count=0
+		for group in "$1"/fsb-*; do
+			[ -d "$group" ] || continue
+			for pid in $(cat "$group/cgroup.procs" 2>/dev/null); do
+				[ "$(cat "/proc/$pid/comm" 2>/dev/null)" = firecracker ] && count=$((count + 1))
+			done
+		done
+		echo "$count"
+	' sh "$2"
+}
+
+resource_aware_runtime_leaf_limits_match() { # fastlet-pod aggregate-path
+	kubectl -n "$NS" exec "$1" -c fastlet -- sh -ceu '
+		count=0
+		for group in "$1"/fsb-*; do
+			[ -d "$group" ] || continue
+			[ "$(cat "$group/cpu.max")" = "100000 100000" ]
+			[ "$(cat "$group/memory.max")" = max ]
+			[ "$(cat "$group/cpu.weight")" = 10 ]
+			[ "$(cat "$group/pids.max")" = "128" ]
+			count=$((count + 1))
+		done
+		[ "$count" -eq 2 ]
+	' sh "$2"
+}
+
+resource_aware_runtime_oom_kills() { # fastlet-pod aggregate-path
+	kubectl -n "$NS" exec "$1" -c fastlet -- \
+		awk '$1 == "oom_kill" { print $2 }' "$2/memory.events" 2>/dev/null
+}
+
+resource_aware_runtime_cpu_throttles() { # fastlet-pod aggregate-path
+	kubectl -n "$NS" exec "$1" -c fastlet -- \
+		awk '$1 == "nr_throttled" { print $2 }' "$2/cpu.stat" 2>/dev/null
+}
+
+resource_aware_runtime_oom_observed() { # fastlet-pod aggregate-path previous-count
+	local current
+	current="$(resource_aware_runtime_oom_kills "$1" "$2")"
+	[[ "${current:-0}" -gt "$3" ]]
+}
+
+resource_aware_runtime_cpu_throttled() { # fastlet-pod aggregate-path previous-count
+	local current
+	current="$(resource_aware_runtime_cpu_throttles "$1" "$2")"
+	[[ "${current:-0}" -gt "$3" ]]
+}
+
+resource_aware_fastlet_heartbeat_responds() { # fastlet-pod
+	local port pid payload
+	allocate_next_local_port
+	port="$FASTLET_ALLOCATED_PORT"
+	kubectl -n "$NS" port-forward "pod/$1" "$port:5758" >"$WORK/oom-heartbeat-forward.log" 2>&1 &
+	pid=$!
+	PF_PIDS+=("$pid")
+	for _ in $(seq 1 20); do
+		payload="$(curl -fsS -m 2 "http://127.0.0.1:$port/api/v2/fastlet/heartbeat" 2>/dev/null || true)"
+		if printf '%s' "$payload" | jq -e '.admission.resources.version == "v2"' >/dev/null 2>&1; then
+			kill "$pid" >/dev/null 2>&1 || true
+			wait "$pid" >/dev/null 2>&1 || true
+			return 0
+		fi
+		sleep 0.5
+	done
+	kill "$pid" >/dev/null 2>&1 || true
+	wait "$pid" >/dev/null 2>&1 || true
+	return 1
+}
+
+resource_aware_start_runtime_cpu_load() { # fastlet-pod aggregate-path
+	kubectl -n "$NS" exec "$1" -c fastlet -- sh -ceu '
+		count=0
+		for group in "$1"/fsb-*; do
+			[ -d "$group" ] || continue
+			sh -c "while :; do :; done" </dev/null >/dev/null 2>&1 &
+			pid=$!
+			echo "$pid" >"$group/cgroup.procs"
+			count=$((count + 1))
+		done
+		[ "$count" -eq 2 ]
+	' sh "$2"
+}
+
+resource_aware_stop_runtime_cpu_load() { # fastlet-pod aggregate-path
+	kubectl -n "$NS" exec "$1" -c fastlet -- sh -ceu '
+		for group in "$1"/fsb-*; do
+			[ -d "$group" ] || continue
+			for pid in $(cat "$group/cgroup.procs" 2>/dev/null); do
+				[ "$(cat "/proc/$pid/comm" 2>/dev/null)" = firecracker ] || kill "$pid" 2>/dev/null || true
+			done
+		done
+	' sh "$2"
+}
+
+# Execd writes the multipart payload into /tmp in the guest. Holding files on
+# tmpfs faults and retains guest-backed pages without depending on shell exec.
+resource_aware_guest_pressure() (
+	local pod="$1" aggregate="$2" before="$3" payload name batch
+	payload="$(mktemp "$WORK/guest-tmpfs.XXXXXXXX")"
+	trap 'rm -f -- "$payload"' EXIT
+	dd if=/dev/urandom of="$payload" bs=1M count=8 status=none
+	for batch in $(seq 1 32); do
+		for name in "$RESOURCE_AWARE_OOM_SANDBOX_A" "$RESOURCE_AWARE_OOM_SANDBOX_B"; do
+			if resource_aware_runtime_oom_observed "$pod" "$aggregate" "$before"; then
+				return 0
+			fi
+			execd_route_resolve "$name" || fail "lost guest route during pressure"
+			if ! curl --fail-with-body -sS -m 30 -H "X-Fast-Sandbox-Route-Credential: $EXECD_API_CRED" \
+				-F 'metadata=@-;filename=metadata;type=application/json' -F "file=@$payload;filename=pages" \
+				"$(execd_base_url)/files/upload" <<<"{\"path\":\"/tmp/oom-pages-$batch\",\"mode\":600}"; then
+				wait_for "guest upload interrupted by shared-pool OOM" 10 resource_aware_runtime_oom_observed "$pod" "$aggregate" "$before"
+				return 0
+			fi
+		done
+		log "guest tmpfs writes: $((batch * 8)) MiB per VM, pool memory.current=$(kubectl -n "$NS" exec "$pod" -c fastlet -- cat "$aggregate/memory.current")"
+	done
+)
+
+resource_aware_dead_reservation_released() {
+	kubectl get --raw "/api/v1/namespaces/$NS/pods/$1:5758/proxy/api/v2/fastlet/heartbeat" |
+		jq -e '.admission | (.resources.version == "v2") and
+			((.used == 0 and .resources.committed.memory == "0") or
+			 (.used == 1 and .resources.committed.memory == "256Mi"))' >/dev/null
+}
+
+# Freeze the Fastlet before killing its sole test VMM so only startup
+# recovery can remove the persisted runtime record and its reservation.
+resource_aware_verify_restart() (
+	local pod="$1" node="$2" pool_path="$3" name="$4" cid sandbox_uid new_cid init_pid
+	fastctl_run_sandbox "$name"
+	wait_until "restart fixture guest Ready" 120000 probe_execd "$name"
+	sandbox_uid="$(kubectl_get "sandbox/$name" '{.metadata.uid}')"
+	cid="$(kubectl_get "pod/$pod" '{.status.containerStatuses[?(@.name=="fastlet")].containerID}')"
+	[[ "$cid" == containerd://* ]] || fail "expected a containerd Fastlet"
+	init_pid="$(docker exec "$node" crictl inspect --output go-template --template '{{.info.pid}}' "${cid#containerd://}")"
+	[[ "$init_pid" =~ ^[0-9]+$ && "$init_pid" -gt 1 ]] || fail "invalid Fastlet init PID"
+	docker exec "$node" kill -STOP "$init_pid"
+	trap 'docker exec "$node" kill -CONT "$init_pid" 2>/dev/null || true' EXIT
+	# Remove durable Create intent while the old Fastlet cannot process
+	# Delete. Otherwise the controller may legitimately recreate the VM.
+	kubectl -n "$NS" delete sandbox "$name" --wait=false >/dev/null
+	docker exec "$node" sh -ceu '
+		set -- "$1"/fsb-*/cgroup.kill
+		[ "$#" -eq 1 ] && [ -w "$1" ]
+		echo 1 >"$1"
+	' sh "$pool_path"
+	docker exec "$node" test -f "/var/lib/fast-sandbox/firecracker/sandboxes/$sandbox_uid/meta.json"
+	docker exec "$node" kill -KILL "$init_pid"
+	trap - EXIT
+	for _ in $(seq 1 90); do
+		new_cid="$(kubectl_get "pod/$pod" '{.status.containerStatuses[?(@.name=="fastlet")].containerID}')"
+		[[ -n "$new_cid" && "$new_cid" != "$cid" ]] && break
+		sleep 1
+	done
+	[[ -n "$new_cid" && "$new_cid" != "$cid" ]] || fail "Fastlet container was not replaced"
+	kubectl -n "$NS" wait --for=condition=Ready "pod/$pod" --timeout=90s
+	resource_aware_fastlet_heartbeat_responds "$pod" || fail "restarted Fastlet has no heartbeat"
+	kubectl get --raw "/api/v1/namespaces/$NS/pods/$pod:5758/proxy/api/v2/fastlet/heartbeat" |
+		jq -e '.admission | .used == 0 and .resources.committed.memory == "0"' >/dev/null || fail "restart recovered a dead reservation"
+	resource_aware_runtime_jail_absent "$pod" "$sandbox_uid" || fail "restart retained the dead VM jail"
+	kubectl -n "$NS" exec "$pod" -c fastlet -- test ! -e "/var/lib/fast-sandbox/firecracker/sandboxes/$sandbox_uid/meta.json" || fail "dead runtime record still exists"
+	wait_for "restart released the dead VM leaf" 30 resource_aware_runtime_leaf_count_matches "$pod" "/host$pool_path" 0
+	wait_for "restart fixture deleted" 90 sandbox_gone "$name"
+)
+
+verify_resource_aware_cgroup_oom() (
+	local mode
+	for mode in injected guest; do verify_one_resource_aware_oom "$mode"; done
+)
+
+verify_one_resource_aware_oom() (
+	local mode="$1" id="$BASHPID" pool_json pod pod_uid restart_count aggregate cpu_before cpu_after oom_before oom_after live_after
+	local sandbox_uid_a sandbox_uid_b node elapsed_ns start_ns sample local_oom_before local_oom_after uid leaf_ns create_ns fastlet_cgroup
+	local RESOURCE_AWARE_OOM_POOL="fc-oom-$mode-$id" RESOURCE_AWARE_OOM_SANDBOX_A="fc-oom-a-$id" RESOURCE_AWARE_OOM_SANDBOX_B="fc-oom-b-$id"
+	local recovery_name="fc-recovery-$id"
+	[[ -n "$(kubectl_get "sandboxtemplate/$SBX_TEMPLATE" '{.status.manifestRef}' 2>/dev/null)" ]] \
+		|| die "no built golden image (run 'integration-env.sh up' first)"
+	pool_json="$(kubectl -n "$NS" get sandboxpool "$SBX_POOL" -o json | jq --arg name "$RESOURCE_AWARE_OOM_POOL" --arg fastlet "$IMG_FASTLET" '
+		del(
+			.metadata.uid,
+			.metadata.resourceVersion,
+			.metadata.generation,
+			.metadata.creationTimestamp,
+			.metadata.managedFields,
+			.status
+		) |
+		del(.metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"]) |
+		.metadata.name = $name |
+		.spec.fastletTemplate.spec.containers[0].image = $fastlet |
+		.spec.capacity = {poolMin: 1, poolMax: 1, bufferMin: 0, bufferMax: 0} |
+		.spec.maxSandboxesPerPod = 2 |
+		.spec.sandboxResources = {
+			mode: "ResourceAware",
+			cpu: "1",
+			memory: "512Mi",
+			pids: 128,
+			overcommitRatio: {cpu: "4", memory: "2"}
+		}
+	')"
+	printf '%s' "$pool_json" | kubectl create -f - >/dev/null
+	trap 'resource_aware_oom_cleanup' EXIT
+	wait_for "OOM-test ResourceAware Fastlet ready" 120 resource_aware_oom_fastlet_ready
+
+	port_forward_up
+	resolve_daemon_up
+	local SBX_POOL="$RESOURCE_AWARE_OOM_POOL"
+	fastctl_run_sandbox "$RESOURCE_AWARE_OOM_SANDBOX_A"
+	fastctl_run_sandbox "$RESOURCE_AWARE_OOM_SANDBOX_B"
+	wait_until "OOM-test Sandbox A execd ready" 120000 probe_execd "$RESOURCE_AWARE_OOM_SANDBOX_A"
+	wait_until "OOM-test Sandbox B execd ready" 120000 probe_execd "$RESOURCE_AWARE_OOM_SANDBOX_B"
+
+	pod="$(kubectl_get "sandbox/$RESOURCE_AWARE_OOM_SANDBOX_A" '{.status.placement.fastletName}')"
+	[[ "$pod" == "$(kubectl_get "sandbox/$RESOURCE_AWARE_OOM_SANDBOX_B" '{.status.placement.fastletName}')" ]] \
+		|| fail "OOM-test Sandboxes were not placed on the same Fastlet"
+	sandbox_uid_a="$(kubectl_get "sandbox/$RESOURCE_AWARE_OOM_SANDBOX_A" '{.metadata.uid}')"
+	sandbox_uid_b="$(kubectl_get "sandbox/$RESOURCE_AWARE_OOM_SANDBOX_B" '{.metadata.uid}')"
+	pod_uid="$(kubectl_get "pod/$pod" '{.metadata.uid}')"
+	restart_count="$(kubectl -n "$NS" get pod "$pod" -o json | jq -r '.status.containerStatuses[] | select(.name == "fastlet") | .restartCount')"
+	aggregate="$(resource_aware_runtime_cgroup "$pod")" \
+		|| fail "could not observe the bounded fast-sandbox cgroup for Fastlet $pod"
+	[[ -n "$aggregate" ]] || fail "bounded fast-sandbox cgroup was not found below the Fastlet Pod"
+	[[ "$(kubectl -n "$NS" exec "$pod" -c fastlet -- cat "$aggregate/cpu.max")" == "100000 100000" ]] \
+		|| fail "aggregate Sandbox CPU budget is not 1 CPU"
+	[[ "$(kubectl -n "$NS" exec "$pod" -c fastlet -- cat "$aggregate/memory.max")" == "536870912" ]] \
+		|| fail "aggregate Sandbox memory budget is not 512Mi"
+	resource_aware_runtime_leaf_count_matches "$pod" "$aggregate" 2 \
+		|| fail "expected two per-Sandbox cgroup leaves"
+	[[ "$(resource_aware_runtime_live_vm_count "$pod" "$aggregate")" -eq 2 ]] \
+		|| fail "each Firecracker VMM must start inside its assigned cgroup leaf"
+	resource_aware_runtime_leaf_limits_match "$pod" "$aggregate" \
+		|| fail "per-Sandbox cgroup leaves do not carry the resolved CPU/memory/PID limits"
+	fastlet_cgroup="$(kubectl -n "$NS" exec "$pod" -c fastlet -- cat /proc/1/cgroup)" \
+		|| fail "could not read the Fastlet process cgroup for $pod"
+	[[ -n "$fastlet_cgroup" ]] || fail "Fastlet process cgroup is empty for $pod"
+	if [[ "$fastlet_cgroup" == *fast-sandbox* ]]; then
+		fail "Fastlet process unexpectedly belongs to the Sandbox runtime subtree"
+	fi
+
+	cpu_before="$(resource_aware_runtime_cpu_throttles "$pod" "$aggregate")"
+	resource_aware_start_runtime_cpu_load "$pod" "$aggregate"
+	wait_for "shared Sandbox cgroup records aggregate CPU throttling" 30 \
+		resource_aware_runtime_cpu_throttled "$pod" "$aggregate" "${cpu_before:-0}"
+	cpu_after="$(resource_aware_runtime_cpu_throttles "$pod" "$aggregate")"
+	resource_aware_stop_runtime_cpu_load "$pod" "$aggregate"
+
+	node="$(kubectl_get "pod/$pod" '{.spec.nodeName}')"
+	local pod_cg mountpath
+	pod_cg="$(dirname "$aggregate")"
+	[[ "${pod_cg##*/}" == *"$pod_uid"* || "${pod_cg##*/}" == *"${pod_uid//-/_}"* ]] || fail "shared VM pool is not a direct child of the Pod cgroup"
+	mountpath="/sys/fs/cgroup${aggregate#/host/sys/fs/cgroup}"
+	kubectl -n "$NS" exec "$pod" -c fastlet -- sh -ceu '
+		pool_limit=$(cat "$1/memory.max")
+		pod_limit=$(cat "$2/memory.max")
+		[ "$pod_limit" != max ] && [ "$pod_limit" -gt "$pool_limit" ]
+		if [ -e "$1/memory.swap.max" ]; then [ "$(cat "$1/memory.swap.max")" = 0 ]; else [ "$(wc -l < /proc/swaps)" -eq 1 ]; fi
+		echo "Verified outer Pod memory.max=$pod_limit, shared pool memory.max=$pool_limit, Pod cpu.max=$(cat "$2/cpu.max")"
+	' sh "$aggregate" "$pod_cg"
+	kubectl get --raw "/api/v1/namespaces/$NS/pods/$pod:5758/proxy/metrics" |
+		grep -F "fast_sandbox_runtime_cgroup_memory_bytes{sandbox_uid=\"$sandbox_uid_a\"}" >/dev/null || fail "Sandbox A host memory metric is missing"
+	oom_before="$(resource_aware_runtime_oom_kills "$pod" "$aggregate")"
+	local_oom_before="$(kubectl -n "$NS" exec "$pod" -c fastlet -- awk '$1=="oom"{print $2}' "$aggregate/memory.events.local")"
+	if [[ "$mode" == guest ]]; then
+		resource_aware_guest_pressure "$pod" "$aggregate" "$oom_before"
+	else
+		kubectl -n "$NS" exec "$pod" -c fastlet -- sh -ceu 'echo 1 >"$1/memory.max"' sh "$aggregate"
+	fi
+	wait_for "$mode pressure causes pool memcg OOM" 60 resource_aware_runtime_oom_observed "$pod" "$aggregate" "$oom_before"
+	if [[ "$mode" == injected ]]; then
+		kubectl -n "$NS" exec "$pod" -c fastlet -- sh -ceu 'echo 536870912 >"$1/memory.max"' sh "$aggregate"
+	fi
+	local_oom_after="$(kubectl -n "$NS" exec "$pod" -c fastlet -- awk '$1=="oom"{print $2}' "$aggregate/memory.events.local")"
+	[[ "$local_oom_after" -gt "$local_oom_before" ]] || fail "OOM was not triggered at the shared pool"
+	[[ "$(kubectl -n "$NS" exec "$pod" -c fastlet -- cat "$aggregate/memory.max")" == "536870912" ]] || fail "wrong final pool limit"
+	oom_after="$(resource_aware_runtime_oom_kills "$pod" "$aggregate")"
+	live_after="$(resource_aware_runtime_live_vm_count "$pod" "$aggregate")"
+	[[ "$live_after" -lt 2 ]] || fail "memcg OOM did not kill a Firecracker VMM"
+
+	[[ "$(kubectl_get "pod/$pod" '{.metadata.uid}')" == "$pod_uid" ]] \
+		|| fail "Fastlet Pod was replaced after Sandbox memcg OOM"
+	[[ "$(kubectl -n "$NS" get pod "$pod" -o json | jq -r '.status.containerStatuses[] | select(.name == "fastlet") | .restartCount')" == "$restart_count" ]] \
+		|| fail "Fastlet container restarted after Sandbox memcg OOM"
+	kubectl -n "$NS" wait --for=condition=Ready "pod/$pod" --timeout=20s >/dev/null
+	resource_aware_fastlet_heartbeat_responds "$pod" \
+		|| fail "Fastlet heartbeat stopped responding after Sandbox memcg OOM"
+
+	pass "aggregate CPU throttling enforced (nr_throttled $cpu_before -> $cpu_after)"
+	wait_for "dead VMM commitment released before explicit Delete" 90 resource_aware_dead_reservation_released "$pod"
+	pass "Sandbox memcg OOM killed VMM(s) but Fastlet stayed Ready (oom_kill $oom_before -> $oom_after, live VMMs=$live_after)"
+	fastctl delete "$RESOURCE_AWARE_OOM_SANDBOX_A" >/dev/null 2>&1 || true
+	fastctl delete "$RESOURCE_AWARE_OOM_SANDBOX_B" >/dev/null 2>&1 || true
+	wait_for "OOM-test Sandbox A deleted" 90 sandbox_gone "$RESOURCE_AWARE_OOM_SANDBOX_A"
+	wait_for "OOM-test Sandbox B deleted" 90 sandbox_gone "$RESOURCE_AWARE_OOM_SANDBOX_B"
+	wait_for "per-Sandbox runtime cgroups removed" 30 \
+		resource_aware_runtime_leaf_count_matches "$pod" "$aggregate" 0
+	wait_for "OOM-test Sandbox A jail removed" 30 \
+		resource_aware_runtime_jail_absent "$pod" "$sandbox_uid_a"
+	wait_for "OOM-test Sandbox B jail removed" 30 \
+		resource_aware_runtime_jail_absent "$pod" "$sandbox_uid_b"
+	# First Create includes normal pressure recovery and placement backoff.
+	# Measure subsequent creates against a warm, open Fastlet.
+	for sample in $(seq 0 "${CGROUP_CREATE_SAMPLES:-1}"); do
+		start_ns="$(date +%s%N)"
+		if (( sample == 0 )); then
+			fastctl_run_sandbox "$recovery_name"
+		else
+			fastctl run "$recovery_name" --image "$SBX_IMAGE" --pool "$SBX_POOL" >/dev/null
+		fi
+		create_ns=$(( $(date +%s%N) - start_ns ))
+		wait_until "replacement guest Ready" 120000 probe_execd "$recovery_name"
+		elapsed_ns=$(( $(date +%s%N) - start_ns ))
+		[[ "$(kubectl_get "sandbox/$recovery_name" '{.status.placement.fastletName}')" == "$pod" ]] || fail "replacement was placed on a different Fastlet"
+		uid="$(kubectl_get "sandbox/$recovery_name" '{.metadata.uid}')"
+		leaf_ns="$(kubectl -n "$NS" exec "$pod" -c fastlet -- cat "/var/lib/fast-sandbox/firecracker/sandboxes/$uid/meta.json" | jq -e '.stageDurations.cgroup | select(type == "number" and . > 0)')" \
+			|| fail "replacement Sandbox $recovery_name ($uid) metadata lacks a positive numeric cgroup stage duration"
+		fastctl delete "$recovery_name" >/dev/null
+		wait_for "replacement Sandbox deleted" 90 sandbox_gone "$recovery_name"
+		wait_for "replacement cgroup released" 30 resource_aware_runtime_leaf_count_matches "$pod" "$aggregate" 0
+		pass "$mode Create/Delete sample=$sample concurrency=1 leaf_ns=$leaf_ns create_ns=$create_ns guest_ready_ns=$elapsed_ns"
+	done
+	[[ "$(kubectl_get "pod/$pod" '{.metadata.uid}')" == "$pod_uid" && "$(kubectl -n "$NS" get pod "$pod" -o json | jq -r '.status.containerStatuses[] | select(.name == "fastlet") | .restartCount')" == "$restart_count" ]] || fail "Fastlet changed during recovery Create/Delete"
+	if [[ "$mode" == injected ]]; then
+		resource_aware_verify_restart "$pod" "$node" "$mountpath" "$recovery_name"
+	fi
+	kubectl -n "$NS" delete sandboxpool "$RESOURCE_AWARE_OOM_POOL" --wait=true --timeout=120s >/dev/null
+	wait_for "Pod-owned cgroup removed from node" 150 docker exec "$node" test ! -d "$mountpath"
+	trap - EXIT
+	resolve_daemon_down
+	port_forward_down
+	highlight "== verify-cgroup-oom complete: VM OOM isolated below live Fastlet =="
+)
 
 # --- max-concurrency soak (part of verify) ------------------------------------
 # CONCURRENCY (default 5) is the per-fastlet slot capacity
@@ -5310,16 +5693,17 @@ pause_on_error() {
 verify_all() {
 	[[ -n "$(kubectl_get "sandboxtemplate/$SBX_TEMPLATE" '{.status.manifestRef}' 2>/dev/null)" ]] \
 		|| die "no built golden image (run 'integration-env.sh up' first)"
-	run_stage "verify-all 1/8: base delivery" verify
-	run_stage "verify-all 2/8: ResourceAware native Firecracker" verify_resource_aware
-	run_stage "verify-all 3/8: P2P evidence" verify_p2p
-	run_stage "verify-all 4/8: execd HTTP API battery" verify_execd_api
-	run_stage "verify-all 5/8: live snapshot + restore" verify_snapshot
-	run_stage "verify-all 6/8: cross-host pause/resume" verify_pause
-	run_stage "verify-all 7/8: egress policy matrix" verify_egress
-	run_stage "verify-all 8/8: relayed-policy lifecycle" verify_policy
+	run_stage "verify-all 1/9: base delivery" verify
+	run_stage "verify-all 2/9: ResourceAware native Firecracker" verify_resource_aware
+	run_stage "verify-all 3/9: ResourceAware cgroup OOM isolation" verify_resource_aware_cgroup_oom
+	run_stage "verify-all 4/9: P2P evidence" verify_p2p
+	run_stage "verify-all 5/9: execd HTTP API battery" verify_execd_api
+	run_stage "verify-all 6/9: live snapshot + restore" verify_snapshot
+	run_stage "verify-all 7/9: cross-host pause/resume" verify_pause
+	run_stage "verify-all 8/9: egress policy matrix" verify_egress
+	run_stage "verify-all 9/9: relayed-policy lifecycle" verify_policy
 	stage_summary
-	highlight "== verify-all complete: base + ResourceAware Firecracker + p2p + execd-api + snapshot + pause + egress + policy green =="
+	highlight "== verify-all complete: base + ResourceAware Firecracker/cgroup OOM + p2p + execd-api + snapshot + pause + egress + policy green =="
 }
 
 # --- status --------------------------------------------------------------------------------------
@@ -5433,7 +5817,7 @@ env_summary() {
 
 usage() {
 	cat <<'EOF'
-usage: integration-env.sh [--cleanup|--auto-clean] {up|down|status|verify|verify-resource-aware|verify-all}
+usage: integration-env.sh [--cleanup|--auto-clean] {up|down|status|verify|verify-resource-aware|verify-cgroup-oom|verify-all}
 
   up       build the whole environment (tasks 1-9) and report status
   down     teardown: kind cluster + MinIO container + credentials + sysctl
@@ -5444,6 +5828,10 @@ usage: integration-env.sh [--cleanup|--auto-clean] {up|down|status|verify|verify
            create a temporary ResourceAware direct-Firecracker Pool, verify
            the derived runtime-owner envelope, launch a real VM, probe execd,
            and match its resolved request to the Fastlet heartbeat ledger
+  verify-cgroup-oom
+           exercise injected and real guest-driven VM pool OOM, check that the
+           same Fastlet creates and deletes a replacement, then verify restart
+           ledger recovery and removal of the Pod-owned cgroup tree
   verify-snapshot
            live sandbox snapshot E2E on the egress pool: a deny-policy
            source sandbox (allow control proves the plane serves) ->
@@ -5518,7 +5906,7 @@ for arg in "$@"; do
 	case "$arg" in
 		--cleanup) ACTION="down" ;;
 		--auto-clean) AUTO_CLEAN=1 ;;
-		up|down|status|verify|verify-resource-aware|verify-all|verify-snapshot|verify-pause|verify-p2p|verify-execd-api|verify-egress|verify-policy) ACTION="$arg" ;;
+		up|down|status|verify|verify-resource-aware|verify-cgroup-oom|verify-all|verify-snapshot|verify-pause|verify-p2p|verify-execd-api|verify-egress|verify-policy) ACTION="$arg" ;;
 		*) usage ;;
 	esac
 done
@@ -5584,6 +5972,11 @@ case "$ACTION" in
 	verify-resource-aware)
 		trap 'on_error verify-resource-aware' ERR
 		verify_resource_aware
+		trap - ERR
+		;;
+	verify-cgroup-oom)
+		trap 'on_error verify-cgroup-oom' ERR
+		verify_resource_aware_cgroup_oom
 		trap - ERR
 		;;
 	verify-snapshot)

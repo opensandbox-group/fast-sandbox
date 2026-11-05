@@ -43,7 +43,10 @@ type SandboxManagerConfig struct {
 }
 
 type SandboxManager struct {
-	mu                          sync.RWMutex
+	mu sync.RWMutex
+	// routeMu orders route writes and removal before runtime/network cleanup.
+	// Acquire it before mu; never wait for routeMu while holding mu.
+	routeMu                     sync.Mutex
 	runtime                     RuntimeDriver
 	runtimeName                 string
 	capacity                    int
@@ -72,6 +75,7 @@ type SandboxManager struct {
 	runtimeReady                bool
 	routeReady                  bool
 	draining                    bool
+	drainID                     string
 	drainReason                 string
 	tombstones                  map[string]fastletapi.SandboxIdentity
 	diagnostics                 map[string][]fastletapi.SandboxDiagnosticEvent
@@ -87,6 +91,9 @@ type SandboxManager struct {
 	// one Sandbox concurrently after its Action owner has retired.
 	deleteWorkers        map[string]*SandboxMetadata
 	deleteRetryRequested map[string]*SandboxMetadata
+	// terminalFailureWorkers reclaim an unexpectedly exited runtime without
+	// deleting the durable identity that the Controller still has to observe.
+	terminalFailureWorkers map[string]*SandboxMetadata
 	// imageBootWorkers drives cold Sandboxes from the image-pending phase to
 	// a committed runtime: once the async artifact delivery reports
 	// Delivered, the worker boots the runtime (EnsureSandbox) and commits it
@@ -205,18 +212,19 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		diagnostics:     make(map[string][]fastletapi.SandboxDiagnosticEvent),
 		cacheTracker:    fastletcache.NewTracker(cacheSource, config.CacheEpoch, fastletcache.DefaultMaxInventory),
 		cacheProtection: protection, warmImages: append([]string(nil), config.WarmImages...),
-		warmImageStates:      warmImageStates,
-		registryProvider:     config.RegistryProvider,
-		readinessChanged:     make(chan struct{}),
-		routePublisher:       config.RoutePublisher,
-		dataPlaneWorkers:     make(map[string]dataPlaneWorker),
-		deleteWorkers:        make(map[string]*SandboxMetadata),
-		deleteRetryRequested: make(map[string]*SandboxMetadata),
-		imageBootWorkers:     make(map[string]imageBootWorker),
-		runtimeMessages:      make(map[string]string),
-		sandboxes:            make(map[string]*SandboxMetadata),
-		createDeletePending:  make(map[string]bool),
-		snapshots:            make(map[string]*snapshotTask),
+		warmImageStates:        warmImageStates,
+		registryProvider:       config.RegistryProvider,
+		readinessChanged:       make(chan struct{}),
+		routePublisher:         config.RoutePublisher,
+		dataPlaneWorkers:       make(map[string]dataPlaneWorker),
+		deleteWorkers:          make(map[string]*SandboxMetadata),
+		deleteRetryRequested:   make(map[string]*SandboxMetadata),
+		terminalFailureWorkers: make(map[string]*SandboxMetadata),
+		imageBootWorkers:       make(map[string]imageBootWorker),
+		runtimeMessages:        make(map[string]string),
+		sandboxes:              make(map[string]*SandboxMetadata),
+		createDeletePending:    make(map[string]bool),
+		snapshots:              make(map[string]*snapshotTask),
 	}
 	if manager.actionManager != nil {
 		manager.actionManager.SetChangeNotifier(manager.actionStateChanged)
@@ -519,6 +527,133 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 	}
 }
 
+// runtimeWorkAllowedLocked fences late lifecycle callbacks while a terminal
+// record is being written, and after the runtime enters cleanup or deletion.
+// Callers hold m.mu; physical cleanup still waits for durable failure recording.
+func (m *SandboxManager) runtimeWorkAllowedLocked(metadata *SandboxMetadata) bool {
+	if metadata == nil {
+		return false
+	}
+	id := metadata.Config.Identity.SandboxUID
+	return m.sandboxes[id] == metadata && runtimeCreatedPhase(metadata.Phase) && m.terminalFailureWorkers[id] != metadata
+}
+
+func (m *SandboxManager) preserveExitedRuntime(ctx context.Context, sandboxID string, identity fastletapi.SandboxIdentity, message string) {
+	handler, ok := m.runtime.(RuntimeTerminalFailureHandler)
+	if !ok {
+		return
+	}
+	m.mu.Lock()
+	metadata := m.sandboxes[sandboxID]
+	if !m.runtimeWorkAllowedLocked(metadata) || metadata.Config.Identity != identity {
+		m.mu.Unlock()
+		return
+	}
+	// Reserve the worker before durable I/O so Delete cannot remove this
+	// identity and allow a replacement while its failure record is written.
+	m.terminalFailureWorkers[sandboxID] = metadata
+	m.cancelDataPlaneReconcileLocked(metadata)
+	m.mu.Unlock()
+	if err := handler.RecordTerminalFailure(ctx, identity, message); err != nil {
+		klog.FromContext(ctx).Error(err, "persist exited Sandbox identity", "sandbox", sandboxID)
+		m.finishTerminalFailureWorker(sandboxID, metadata)
+		return
+	}
+	m.mu.Lock()
+	if m.sandboxes[sandboxID] != metadata || !runtimeCreatedPhase(metadata.Phase) {
+		m.mu.Unlock()
+		m.finishTerminalFailureWorker(sandboxID, metadata)
+		return
+	}
+	metadata.Phase = sandboxStateRuntimeFailureCleanup
+	m.runtimeMessages[sandboxID] = message
+	m.recordDiagnosticLocked(sandboxID, "error", "runtime", sandboxStateRuntimeFailureCleanup, message)
+	m.signalReadinessChangedLocked()
+	m.mu.Unlock()
+	go m.cleanupTerminalFailure(sandboxID, metadata)
+}
+
+func (m *SandboxManager) startTerminalFailureCleanup(sandboxID string, expected *SandboxMetadata) {
+	m.mu.Lock()
+	if m.sandboxes[sandboxID] != expected || expected.Phase != sandboxStateRuntimeFailureCleanup || m.terminalFailureWorkers[sandboxID] == expected {
+		m.mu.Unlock()
+		return
+	}
+	m.terminalFailureWorkers[sandboxID] = expected
+	m.mu.Unlock()
+	go m.cleanupTerminalFailure(sandboxID, expected)
+}
+
+func (m *SandboxManager) finishTerminalFailureWorker(sandboxID string, expected *SandboxMetadata) {
+	m.mu.Lock()
+	if m.terminalFailureWorkers[sandboxID] == expected {
+		delete(m.terminalFailureWorkers, sandboxID)
+	}
+	deleteAccepted := m.sandboxes[sandboxID] == expected &&
+		(expected.Phase == sandboxStateTerminating || expected.Phase == sandboxStateDeleting)
+	m.mu.Unlock()
+	if deleteAccepted {
+		go m.asyncDelete(sandboxID, expected)
+	}
+}
+
+func (m *SandboxManager) cleanupTerminalFailure(sandboxID string, expected *SandboxMetadata) {
+	defer m.finishTerminalFailureWorker(sandboxID, expected)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if m.requiresStrictActionHandling(expected.Config.ActionsAPIVersion) {
+		if m.actionManager == nil {
+			m.recordTerminalCleanupError(sandboxID, expected, "strict Action Handler is unavailable")
+			return
+		}
+		if err := m.actionManager.DeleteOwned(ctx, actionAttachment(expected)); err != nil {
+			m.recordTerminalCleanupError(sandboxID, expected, err.Error())
+			return
+		}
+		if err := m.actionManager.ConfirmOwnerRetired(ctx, actionAttachment(expected)); err != nil {
+			m.recordTerminalCleanupError(sandboxID, expected, err.Error())
+			return
+		}
+	} else if m.actionManager != nil {
+		if err := m.actionManager.Delete(ctx, sandboxID); err != nil {
+			klog.ErrorS(err, "best-effort Action cleanup for exited Sandbox failed", "sandboxID", sandboxID)
+		}
+	}
+	if err := m.removeRoute(ctx, expected); err != nil {
+		m.recordTerminalCleanupError(sandboxID, expected, err.Error())
+		return
+	}
+	handler, ok := m.runtime.(RuntimeTerminalFailureHandler)
+	if !ok {
+		m.recordTerminalCleanupError(sandboxID, expected, "runtime cannot retain terminal failure records")
+		return
+	}
+	if err := handler.CleanupTerminalFailure(ctx, expected.Config.Identity); err != nil {
+		m.recordTerminalCleanupError(sandboxID, expected, err.Error())
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sandboxes[sandboxID] != expected || expected.Phase != sandboxStateRuntimeFailureCleanup {
+		return
+	}
+	expected.Phase = sandboxStateRuntimeFailed
+	m.cacheProtection.Unprotect(expected.Config.Desired.Image, fastletcache.ProtectActive)
+	m.cacheProtection.ProtectHotUntil(expected.Config.Desired.Image, m.clock.Now().Add(time.Hour))
+	m.recordDiagnosticLocked(sandboxID, "info", "runtime", sandboxStateRuntimeFailed, "runtime resources were reclaimed; terminal identity retained for Controller acknowledgement")
+	m.signalReadinessChangedLocked()
+}
+
+func (m *SandboxManager) recordTerminalCleanupError(sandboxID string, expected *SandboxMetadata, message string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sandboxes[sandboxID] != expected || expected.Phase != sandboxStateRuntimeFailureCleanup {
+		return
+	}
+	m.recordDiagnosticLocked(sandboxID, "error", "runtime", sandboxStateRuntimeFailureCleanup, message)
+	klog.ErrorS(errors.New(message), "terminal Sandbox cleanup remains pending", "sandboxID", sandboxID)
+}
+
 func (m *SandboxManager) ListImages(ctx context.Context) ([]string, error) {
 	cache, ok := m.runtime.(RuntimeArtifactCache)
 	if !ok {
@@ -546,6 +681,14 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 
 	result := make([]fastletapi.SandboxStatus, 0, len(snapshots))
 	for sandboxID, meta := range snapshots {
+		if meta.Phase == sandboxStateRuntimeFailureCleanup {
+			m.mu.RLock()
+			current := m.sandboxes[sandboxID]
+			m.mu.RUnlock()
+			if current != nil {
+				m.startTerminalFailureCleanup(sandboxID, current)
+			}
+		}
 		identity := meta.Config.Identity
 		dataPlaneReady := proxyReady && routeReadyForPhase(meta.Phase)
 		runtimeObservation, dataPlaneObservation := observationsForPhase(meta.Phase, dataPlaneReady)
@@ -553,11 +696,16 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 			runtimeObservation.Message = message
 		}
 		if inspected, err := m.runtime.InspectSandbox(ctx, sandboxID); err == nil {
-			runtimeObservation.Message = inspected.Phase
+			if runtimeObservation.State != fastletapi.RuntimeStateFailed || messages[sandboxID] == "" {
+				runtimeObservation.Message = inspected.Phase
+			}
 			if runtimeObservation.State == fastletapi.RuntimeStateReady && strings.EqualFold(strings.TrimSpace(inspected.Phase), "stopped") {
 				runtimeObservation.State = fastletapi.RuntimeStateFailed
 				dataPlaneObservation.State = fastletapi.DataPlaneStateFailed
 				dataPlaneObservation.Message = "runtime reported stopped"
+				if checker, ok := m.runtime.(interface{ SandboxRuntimeExited(string) bool }); ok && checker.SandboxRuntimeExited(sandboxID) {
+					m.preserveExitedRuntime(ctx, sandboxID, identity, "runtime reported stopped and its dedicated cgroup is empty")
+				}
 			}
 		}
 		result = append(result, fastletapi.SandboxStatus{
