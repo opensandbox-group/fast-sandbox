@@ -321,7 +321,7 @@ func mergeGuestEnvs(spec apiv1alpha2.SandboxTemplateSpec, workdir string) (map[s
 const startupFailedMarker = "SANDBOX_STARTUP_FAILED"
 
 // guestBusyboxPath is where the builder's static busybox lands in the guest
-// rootfs, backing the init's loopback setup on images without ip/ifconfig.
+// rootfs, backing loopback setup and TCP readiness checks.
 // The filename must stay "busybox": applets dispatch on argv[0].
 const guestBusyboxPath = "/usr/local/lib/sandbox-busybox/busybox"
 
@@ -388,20 +388,27 @@ elif [ -n "${ENTRYPOINT:-}" ]; then
   setsid /bin/sh -c "$ENTRYPOINT" &
 fi
 ` + readinessBlock + `
-if ! command -v nc >/dev/null 2>&1; then
-  echo "SANDBOX_STARTUP_FAILED nc_missing"
-  exit 1
-fi
-ready_tcp() { host=${1#tcp://}; host=${host%%:*}; port=${1##*:}; nc -w 1 "$host" "$port" </dev/null >/dev/null 2>&1; }
+select_nc() {
+  if ` + guestBusyboxPath + ` nc --help >/dev/null 2>&1; then
+    guest_nc() { ` + guestBusyboxPath + ` nc "$@"; }
+  elif command -v nc >/dev/null 2>&1; then
+    guest_nc() { nc "$@"; }
+  else
+    echo "SANDBOX_STARTUP_FAILED nc_missing"
+    exit 1
+  fi
+}
+ready_tcp() { host=${1#tcp://}; host=${host%%:*}; port=${1##*:}; guest_nc -w 1 "$host" "$port" </dev/null >/dev/null 2>&1; }
 ready_cmd() { /bin/sh -c "${1#cmd://}" >/dev/null 2>&1; }
-ready_execd_ping() { nc -w 1 127.0.0.1 44772 </dev/null >/dev/null 2>&1; }
+ready_execd_ping() { guest_nc -w 1 127.0.0.1 44772 </dev/null >/dev/null 2>&1; }
 if [ -n "${READINESS_PROBE:-}" ]; then
   case "$READINESS_PROBE" in
-    tcp://*) until ready_tcp "$READINESS_PROBE"; do sleep 1; done ;;
+    tcp://*) select_nc; until ready_tcp "$READINESS_PROBE"; do sleep 1; done ;;
     cmd://*) until ready_cmd "$READINESS_PROBE"; do sleep 1; done ;;
     *) echo "SANDBOX_STARTUP_FAILED invalid_probe"; exit 1 ;;
   esac
 elif [ -x /opt/opensandbox/execd ]; then
+  select_nc
   until ready_execd_ping; do sleep 1; done
 else
   sleep "${WARMUP_SECONDS:-60}"
