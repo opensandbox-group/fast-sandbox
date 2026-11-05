@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
@@ -219,5 +222,92 @@ func TestInjectBusyboxFrom(t *testing.T) {
 	}
 	if injectBusyboxFrom([]string{filepath.Join(workdir, "missing")}, rootfs) {
 		t.Fatalf("injectBusyboxFrom reported injection without a readable candidate")
+	}
+}
+
+// Execute the rendered readiness shell with an isolated PATH so host tools
+// cannot hide a missing guest dependency. No VM or privileged mounts needed.
+func TestGuestInitTCPReadinessTools(t *testing.T) {
+	tests := []struct {
+		name, probe, wantTool                string
+		busybox, imageNC, execd, wantFailure bool
+	}{
+		{name: "tcp uses injected busybox", probe: "tcp://127.0.0.1:8080", busybox: true, wantTool: "busybox"},
+		{name: "injected busybox takes precedence", probe: "tcp://127.0.0.1:8080", busybox: true, imageNC: true, wantTool: "busybox"},
+		{name: "execd uses injected busybox", busybox: true, execd: true, wantTool: "busybox"},
+		{name: "tcp falls back to image nc", probe: "tcp://127.0.0.1:8080", imageNC: true, wantTool: "image"},
+		{name: "tcp fails without either tool", probe: "tcp://127.0.0.1:8080", wantFailure: true},
+		{name: "execd fails without either tool", execd: true, wantFailure: true},
+		{name: "command probe needs no nc", probe: "cmd://true", execd: true},
+		{name: "warmup needs no nc"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeExecutable := func(name, body string) string {
+				t.Helper()
+				path := filepath.Join(dir, name)
+				if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				return path
+			}
+			// Model an injected BusyBox that lacks the nc applet by default.
+			busybox := writeExecutable("busybox", "exit 1\n")
+			if test.busybox {
+				writeExecutable("busybox", `
+[ "$1" = nc ] || exit 1
+shift
+[ "$1" = --help ] && exit 0
+printf 'busybox %s\n' "$*" >> "$CALLS"
+`)
+			}
+			if test.imageNC {
+				writeExecutable("nc", `printf 'image %s\n' "$*" >> "$CALLS"`)
+			}
+			writeExecutable("sleep", "exit 0\n")
+			execd := filepath.Join(dir, "execd")
+			if test.execd {
+				writeExecutable("execd", "exit 0\n")
+			}
+			script := renderGuestInit(apiv1alpha2.SandboxTemplateSpec{})
+			start := strings.Index(script, "select_nc() {")
+			end := strings.Index(script, "echo SANDBOX_READY") + len("echo SANDBOX_READY")
+			if start < 0 || end < start {
+				t.Fatal("rendered readiness block missing")
+			}
+			script = strings.ReplaceAll(script[start:end], guestBusyboxPath, shellQuote(busybox))
+			script = strings.ReplaceAll(script, "/opt/opensandbox/execd", execd)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "/bin/sh", "-eu", "-c", script)
+			calls := filepath.Join(dir, "calls")
+			cmd.Env = []string{"PATH=" + dir, "CALLS=" + calls, "READINESS_PROBE=" + test.probe, "WARMUP_SECONDS=0"}
+			output, err := cmd.CombinedOutput()
+			if test.wantFailure {
+				if err == nil || !strings.Contains(string(output), "SANDBOX_STARTUP_FAILED nc_missing") || strings.Contains(string(output), "SANDBOX_READY") {
+					t.Fatalf("expected nc_missing failure, got %v: %s", err, output)
+				}
+				return
+			}
+			if err != nil || !strings.Contains(string(output), "SANDBOX_READY") {
+				t.Fatalf("readiness failed: %v: %s", err, output)
+			}
+			payload, err := os.ReadFile(calls)
+			if test.wantTool == "" {
+				if !os.IsNotExist(err) {
+					t.Fatalf("unexpected TCP check: %q, %v", payload, err)
+				}
+				return
+			}
+			port := "8080"
+			if test.execd {
+				port = "44772"
+			}
+			want := test.wantTool + " -w 1 127.0.0.1 " + port + "\n"
+			if err != nil || string(payload) != want {
+				t.Fatalf("TCP calls = %q, %v; want %q", payload, err, want)
+			}
+		})
 	}
 }
