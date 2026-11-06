@@ -138,6 +138,8 @@ the checkpoint lineage. Pause failures leave the runtime running (the dump
 resumes the VM on every failure path) and retry with a new attempt epoch
 (`status.runtime.pauseAttempt`).
 
+Fast-Path clients may request pause immediately after create returns Ready, even if the Controller has not projected that observation into the Sandbox status yet. The Controller continues creation/observation until the runtime is ready to checkpoint. `Paused` is published only after runtime deletion and durable assignment cleanup complete, so clients can resume immediately when they observe it. Once a checkpoint is persisted, release completes even if a concurrent resume request changes the desired state to Running; the subsequent reconciliation restores that checkpoint with a fresh assignment. If pause is requested again during an unfinished restore, the Controller preserves the original checkpoint lineage, finishes restoring, and then checkpoints the restored runtime. Assignment cleanup also resumes after an interrupted status write. No client-side settle delay is required.
+
 ## Non-goals
 
 The lifecycle contract does not provide:
