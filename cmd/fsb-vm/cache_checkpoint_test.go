@@ -8,9 +8,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"fast-sandbox/internal/ocitemplate"
 	"github.com/opencontainers/go-digest"
 	"github.com/stretchr/testify/require"
+
+	"fast-sandbox/internal/ocitemplate"
 )
 
 func TestCheckpointPublicationCacheReusedOfflineAndEvicted(t *testing.T) {

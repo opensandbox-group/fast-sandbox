@@ -1,3 +1,5 @@
+//go:build ignore
+
 // Integration test for the pinned Photon cache: local import, offline hit,
 // automatic capacity eviction, and source fallback. No KVM or ublk is needed.
 #include <dirent.h>

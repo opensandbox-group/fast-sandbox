@@ -3,7 +3,6 @@ package firecracker
 import (
 	"context"
 	"encoding/json"
-	"fast-sandbox/internal/ocitemplate"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"oras.land/oras-go/v2/registry/remote/auth"
 
+	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	"fast-sandbox/internal/registryconfig"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
