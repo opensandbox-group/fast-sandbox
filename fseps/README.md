@@ -15,4 +15,6 @@ Add an entry in the same PR as a new proposal; when its content or status change
 
 | FSEP | Title | Status | Last updated |
 |:----:|-------|--------|:------------:|
-| [FSEP-0001](0001-rootfs-only-snapshots-overlaybd.md) | Rootfs-Only Snapshots on the OverlayBD Path | draft | 2026-11-05 |
+| [FSEP-0001](0001-rootfs-only-snapshots-overlaybd.md) | Rootfs-Only Snapshots on the OverlayBD Path | draft | 2026-11-06 |
+
+FSEP-0001 updated on 2026-11-06: proposes guest-filesystem-consistent, memory-dump-free capture with VM Pause retained; E2B-style optional memory output is documented as an alternative. The draft now specifies an FSB-owned guest helper, capability gates, terminal-token cleanup semantics, and a backend-barrier PoC delivery gate. Status remains draft.
