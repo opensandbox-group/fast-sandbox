@@ -23,6 +23,9 @@ for attempt in 1 2 3; do
   sleep $((attempt * 2))
 done
 git checkout --detach FETCH_HEAD
+install -m 0644 "$tools_dir/cache-import.h" src/ublk/cache-import.h
+sed -i '/#define UBLKD_DEFAULT_SOCK/i #include "cache-import.h"' src/ublk/ublkd_main.cpp
+sed -i '/if (target == "\/v1\/add"/i\        if (target == "/v1/cache/import" \&\& req.verb() == photon::net::http::Verb::POST) {\n            handle_cache_import(service_, body, code, msg);\n        } else' src/ublk/ublkd_main.cpp
 install -m 0644 "$tools_dir/overlaybd-import-raw.cpp" src/tools/overlaybd-import-raw.cpp
 sed -i '/add_executable(overlaybd-create/i add_executable(overlaybd-import-raw overlaybd-import-raw.cpp)\ntarget_include_directories(overlaybd-import-raw PUBLIC ${PHOTON_INCLUDE_DIR})\ntarget_link_libraries(overlaybd-import-raw photon_static overlaybd_lib)\n' src/tools/CMakeLists.txt
 # Third-party source is built container-only; suppress its default-warning

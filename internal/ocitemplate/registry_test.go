@@ -111,6 +111,16 @@ func TestPublishResolveMetadataOnly(t *testing.T) {
 		_, err = resolveTestPair(t, context.Background(), logical, nil)
 		require.NoError(t, err, "resolve paired tags without a third image")
 	}
+	cached, err := PushForCache(context.Background(), dir, dest, []byte(`{"machine":{"vcpu":"1","memory":"512Mi"}}`), nil)
+	require.NoError(t, err)
+	require.Equal(t, ref, cached.Reference)
+	resolved, err := resolveTestPair(t, context.Background(), ref, nil)
+	require.NoError(t, err)
+	require.JSONEq(t, string(resolved), string(cached.Metadata))
+	require.NotEmpty(t, cached.Manifests)
+	for reference, raw := range cached.Manifests {
+		require.True(t, strings.HasSuffix(reference, "@"+digest.FromBytes(raw).String()))
+	}
 	// The same immutable publication can be retried, but not overwritten.
 	repeated, _, err := Push(context.Background(), dir, dest, []byte(`{"machine":{"vcpu":"1","memory":"512Mi"}}`), nil)
 	require.NoError(t, err)

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"k8s.io/klog/v2"
 	"oras.land/oras-go/v2/registry"
@@ -146,9 +147,15 @@ func (d *Driver) publishOCISnapshot(ctx context.Context, plan dumpPlan, sizeByte
 	if ociPlainHTTP() {
 		pushOptions = append(pushOptions, ocitemplate.WithPlainHTTP(true))
 	}
-	ref, _, err := ocitemplate.Push(ctx, filepath.Join(plan.staging, "artifacts", "snapshot_"+plan.snapshotID), destination, raw, credentials, pushOptions...)
+	published, err := ocitemplate.PushForCache(ctx, filepath.Join(plan.staging, "artifacts", "snapshot_"+plan.snapshotID), destination, raw, credentials, pushOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("publish OCI snapshot: %w", err)
+	}
+	ref := published.Reference
+	// Cache population is best effort, but finishes before Paused is reported.
+	// Publication remains authoritative if the daemon is old, full or unavailable.
+	if err := d.cacheOCICheckpoint(ctx, plan.staging, plan.snapshotID, published); err != nil {
+		klog.ErrorS(err, "OCI checkpoint cache population skipped", "snapshotID", plan.snapshotID)
 	}
 	parsed, err := registry.ParseReference(strings.TrimPrefix(ref, ocitemplate.Prefix))
 	if err != nil {
@@ -206,4 +213,43 @@ func (d *Driver) cleanupSnapshotStaging(ctx context.Context, staging string) err
 		return err
 	}
 	return os.RemoveAll(staging)
+}
+
+func (d *Driver) cacheOCICheckpoint(ctx context.Context, staging, snapshotID string, published *ocitemplate.PublishedCheckpoint) error {
+	credential, err := checkpointCredential(strings.TrimPrefix(published.Reference, ocitemplate.Prefix))
+	if err != nil {
+		return err
+	}
+	if _, err := ocitemplate.BasicCredential(credential.Username, credential.Password, credential.IdentityToken); err != nil {
+		return err
+	}
+	ref, err := registry.ParseReference(strings.TrimPrefix(published.Reference, ocitemplate.Prefix))
+	if err != nil {
+		return err
+	}
+	auth, err := json.Marshal(map[string]any{"auths": map[string]any{ref.Registry + "/" + ref.Repository: map[string]string{"username": credential.Username, "password": credential.Password}}})
+	if err != nil {
+		return err
+	}
+	raw, err := json.Marshal(published)
+	if err != nil {
+		return err
+	}
+	metadataFile, authFile := filepath.Join(staging, "cache-published.json"), filepath.Join(staging, "cache-auth.json")
+	if err := os.WriteFile(metadataFile, raw, 0600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(authFile, auth, 0600); err != nil {
+		return err
+	}
+	defer os.Remove(authFile)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	args := append(d.fsbArgs(), "cache-checkpoint", "--published", metadataFile, "--docker-auth-file", authFile,
+		"--artifacts", filepath.Join(staging, "artifacts", "snapshot_"+snapshotID))
+	if output, err := exec.CommandContext(ctx, "fsb-vm", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("populate OCI checkpoint cache: %w: %s", err, output)
+	}
+	klog.InfoS("OCI checkpoint cache populated", "reference", published.Reference)
+	return nil
 }

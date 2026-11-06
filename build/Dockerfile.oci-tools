@@ -5,8 +5,17 @@ ARG GOPROXY=https://proxy.golang.org,direct
 FROM ubuntu:22.04 AS overlaybd-build
 
 ARG OVERLAYBD_REV
-COPY build/oci/build-overlaybd.sh build/sandboxtemplate-builder/overlaybd-import-raw.cpp /build-tools/
+COPY build/oci/build-overlaybd.sh build/oci/cache-import.h build/sandboxtemplate-builder/overlaybd-import-raw.cpp /build-tools/
 RUN sh /build-tools/build-overlaybd.sh /out
+
+# Optional integration test target; the normal tool bundle does not include it.
+FROM overlaybd-build AS cache-import-test
+COPY build/oci/cache-import-test.cpp /src/overlaybd/src/ublk/cache-import-test.cpp
+RUN printf '\nadd_executable(cache-import-test cache-import-test.cpp)\ntarget_compile_options(cache-import-test PRIVATE -UNDEBUG)\ntarget_link_libraries(cache-import-test ublk_frontend_lib photon_static overlaybd_image_lib libublksrv_static ${CURL_LIBRARIES} ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY} ${AIO_LIBRARIES})\n' >> /src/overlaybd/src/ublk/CMakeLists.txt \
+    && cmake -S /src/overlaybd -B /src/overlaybd/build -DFETCHCONTENT_UPDATES_DISCONNECTED=ON \
+    && cmake --build /src/overlaybd/build --target cache-import-test --parallel 8
+ENV LD_LIBRARY_PATH=/out/lib
+ENTRYPOINT ["/src/overlaybd/build/output/cache-import-test"]
 
 FROM golang:1.26.3 AS convertor-build
 ARG CONVERTOR_REV=a00e366f9bfc970ec4aaa00887541c4c1d9f9dab
