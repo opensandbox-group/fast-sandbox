@@ -116,6 +116,10 @@ SDKs regenerate stubs only; `pkg/sandboxclient` and the Python SDK add optional 
 
 The primary implementation bypasses `PUT /snapshot/create`; it does not write temporary vmstate or memory files. Guest filesystem freeze, VM Pause, and upper capture are separate operations: freeze synchronizes the guest filesystem and prevents new filesystem modifications; Pause stops vCPUs; the storage barrier makes the upper data/index pair stable for capture. None is a synonym for another.
 
+**Existing Full capture baseline.** `snapshot_driver.go` currently runs Pause → snapshot/create → `captureOCIUpper` → Resume. The upper helper explicitly requires completed drive drain/flush and paused vCPUs; it does not acquire a separate OverlayBD barrier lock. Here, “barrier” means the proven stable capture boundary, not a requirement to introduce a new service or Acquire/Release API. Bypassing snapshot/create must replace its relevant device preparation and completion guarantees. An independent backend exclusion mechanism is needed only if the actual storage behavior requires it.
+
+Guest freeze adds the filesystem consistency required when RAM is discarded. Full retains Guest-memory state; rootfs-only needs a filesystem state that can boot independently. This is separate from draining host-side I/O. Existing Full sequencing is the reuse baseline, not proof that every asynchronous write or error case is covered.
+
 **Consistency scope.** v1 captures the supported guest root filesystem on the OCI root drive. A successful freeze must complete filesystem transactions and synchronize filesystem data and metadata through the supported block stack. This does not flush application user-space buffers, commit application transactions, include tmpfs or external volumes, or promise multi-volume atomicity. Bypass writers to the raw root device must be excluded by the supported guest contract. Unsupported guests or storage configurations are rejected, not downgraded to sync-only or crash-consistent capture.
 
 ```mermaid
@@ -123,15 +127,15 @@ sequenceDiagram
     participant F as Fastlet
     participant G as Guest control agent
     participant V as Firecracker
-    participant O as OverlayBD backend
+    participant O as Storage quiesce integration
     F->>F: Validate capabilities and reserve capture space
     F->>G: Freeze root filesystem with operation token
     G-->>F: Confirm freeze completed
     F->>V: Pause VM
-    F->>O: Establish barrier, drain prior I/O and flush
+    F->>O: Drain and flush through validated replacement path
     O-->>F: Stable upper boundary confirmed
     F->>F: Copy upper data and index under protection
-    F->>O: Release barrier
+    F->>O: Release any acquired backend protection
     F->>V: Resume VM
     F->>G: Thaw root filesystem
     G-->>F: Confirm filesystem writable again
@@ -142,12 +146,12 @@ sequenceDiagram
 2. **Guest freeze.** An authenticated, privileged guest control channel performs the filesystem freeze operation, such as `FIFREEZE` on the ext4 root mount, while vCPUs are still running. Plain `sync` is insufficient: writes can occur between sync completion and Pause. Freeze/thaw must be serialized, idempotent for an operation token, and usable without writing to the frozen filesystem. The agent must enforce a bounded freeze lease/watchdog and report whether protection expired. A lost acknowledgement is an ambiguous freeze, not proof that no freeze occurred.
 3. **Pause.** Pause vCPUs only after freeze confirmation. Prevent overlapping lifecycle/capture operations. If the freeze lease expires before Pause, abort capture. Lease expiry while paused must also invalidate capture unless the protected interval is conclusively established; recovery resumes the VM before requesting guest thaw.
 4. **Backend barrier, drain, and flush.** Establish an explicit boundary that allows earlier writes to complete while preventing later mutations from racing capture. Account for Firecracker file-engine work, kernel block-device writeback, ublk requests, and OverlayBD data/index state. Verify the virtio cache/flush configuration and propagate failures across the supported stack. A barrier that blocks the writes needed to drain can deadlock. Empty ublkd queues or unchanged upper file sizes/timestamps are not a completion proof.
-5. **Cut.** With the boundary held, reuse the copying machinery in `captureOCIUpper`: reflink, sparse extent copy, or sparse scan, producing independent `rootfs.upper.data/index` and `rootfs-upper.json`. The helper's existing snapshot-create precondition must be replaced with the new barrier contract. Two reflinks are not a multi-file transaction: protection remains held until both files and their capture metadata are complete. v1 does not seal or restack the live upper. A partial capture is never published.
-6. **Recover the source.** Release the backend barrier, Resume vCPUs, and confirm guest thaw, in that order. Only then hand independent capture files to asynchronous commit, pack, squash, and push. Upload failure must not refreeze the source.
+5. **Cut.** With the boundary held, reuse the copying machinery in `captureOCIUpper`: reflink, sparse extent copy, or sparse scan, producing independent `rootfs.upper.data/index` and `rootfs-upper.json`. The helper's existing snapshot-create precondition must be satisfied by the validated replacement path; the copy implementation remains reusable. Two reflinks are not a multi-file transaction: protection remains held until both files and their capture metadata are complete. v1 does not seal or restack the live upper. A partial capture is never published.
+6. **Recover the source.** Release any explicitly acquired backend protection, Resume vCPUs, and confirm guest thaw, in that order. Only then hand independent capture files to asynchronous commit, pack, squash, and push. Upload failure must not refreeze the source.
 
-**Implementation gate.** The current FSB clients do not expose a standalone VMM disk-drain or ublkd quiesce API. The above is a required protocol, not a claim that these calls already exist. Before enabling RootfsOnly, the implementation must specify and test the concrete guest channel and backend operations, including the proof that no delayed VMM write can arrive after the acknowledged boundary. In particular, guest freeze completion must be validated against actual cache/flush semantics; backend idle polling is not a substitute. If the deployed stack cannot provide this boundary without a VMM change, keep the mode disabled and revisit the alternative below instead of weakening consistency.
+**Implementation gate.** The current FSB clients do not expose a standalone VMM disk-drain or ublkd quiesce API. The above is a required protocol, not a claim that these calls already exist. Do not rely on RAM-dump duration to allow incidental backend work to finish. Before enabling RootfsOnly, the implementation must specify and test the concrete guest channel and backend operations, including the proof that no delayed VMM write can arrive after the acknowledged boundary. In particular, guest freeze completion must be validated against actual cache/flush semantics; backend idle polling is not a substitute. If the deployed stack cannot provide this boundary without a VMM change, keep the mode disabled and revisit the alternative below instead of weakening consistency.
 
-**Failure recovery.** Persist capture phase, source generation, operation token, and cleanup obligations before issuing freeze/Pause/barrier actions. Cleanup runs on success, errors, timeouts, and cancellation, with its own bounded context rather than an already-cancelled request context. Fastlet restart reconciles unfinished operations. Resolve ambiguous Pause outcomes under the lifecycle fence; resolve freeze/barrier outcomes using the terminal-token and late-completion rules below, not status polling or idempotency alone; release backend protection before Resume and thaw only after the guest can execute. A watchdog alone cannot thaw a paused VM. If Resume or thaw cannot be confirmed, mark the source unhealthy/lost and fail the operation; VMM death cannot be repaired by Resume. Do not report success merely because captured files exist.
+**Failure recovery.** Persist capture phase, source generation, operation token, and cleanup obligations before issuing freeze/Pause/barrier actions. Cleanup runs on success, errors, timeouts, and cancellation, with its own bounded context rather than an already-cancelled request context. Fastlet restart reconciles unfinished operations. Resolve ambiguous Pause outcomes under the lifecycle fence; resolve freeze/barrier outcomes using the terminal-token and late-completion rules below, not status polling or idempotency alone; release backend protection before Resume and thaw only after the guest can execute. A timed-out request does not cancel an in-flight VMM or storage operation. Discard an ambiguous capture and establish completion or failure before ordering Resume, thaw, or a successor operation. If completion cannot be established within the recovery budget, quarantine the source for reconciliation. A watchdog alone cannot thaw a paused VM. If Resume or thaw cannot be confirmed, mark the source unhealthy/lost and fail the operation; VMM death cannot be repaired by Resume. Do not report success merely because captured files exist.
 
 **Resources and packaging.** Reserve space for the upper copy, pack/squash intermediates, and metadata with concurrent admission accounting; rootfs-only has no RAM-sized spill or staging allocation. Derive the reservation from actual copy/packing behavior rather than assuming a fixed `2*upper` formula. Full snapshots retain their existing spill behavior. `fsb-vm pack --rootfs-only` stops requiring vmstate/memory files and writes metadata-only snapfiles; lower inheritance, zfile commit, and pair publishing are reused.
 
@@ -163,7 +167,7 @@ sequenceDiagram
 | FSB template builder | Package a versioned helper into the guest image, start it from guest-init before user workloads, configure vsock in template VM creation, and record the capability only after an end-to-end probe |
 | FSB Firecracker runtime | Configure the vsock device and private host socket for cold boot and compatible full-template restore, implement the client, bind requests to the current VM incarnation, and reconcile interrupted capture |
 | FSB Fastlet | Persist capture intent and cleanup obligations, fence ownership changes, enforce deadlines, and reject unsupported source templates before side effects |
-| FSB storage integration | Deliver and validate the backend barrier described below; guest protocol delivery alone does not enable capture |
+| FSB storage integration | Deliver and validate the replacement drain/completion/flush path and stable capture boundary; introduce backend exclusion only if required by the deployed stack |
 
 The host socket is per VM, accessible only to the runtime service and trusted host administrators, and is never routed through the sandbox proxy. The helper accepts control requests only from the host vsock peer; host socket permissions and peer validation form the channel authentication boundary, while operation IDs provide fencing, not authentication. Do not bake reusable bearer credentials into templates. Runtime setup must test the deployed Firecracker vsock transport and kernel support, including full-template restore and reconnect after Pause. A privileged malicious guest can defeat its own filesystem consistency; this contract assumes the managed helper and excludes raw-device bypass writers.
 
@@ -173,51 +177,60 @@ The additive manifest declaration is `guestControl: { protocol: "fsb-freeze-v1",
 
 ### Operation protocol: cancellation fences late completion
 
-Every request carries the VM incarnation, capture generation, unique operation ID, and expected agent epoch. Generations are monotonic within an incarnation and fenced by the current Fastlet owner. Acquire requests include a bounded lease duration, started when the service first accepts the token; retries never extend that lease. Fastlet separately tracks its own host deadline. Replays must match the original parameters. The guest helper and backend barrier service both implement the following semantics; the backend's concrete API remains a PoC deliverable.
+Every request carries the VM incarnation, capture generation, unique operation ID, and expected agent epoch. Generations are monotonic within an incarnation and fenced by the current Fastlet owner. Freeze requests include a bounded lease duration, started when the service first accepts the token; retries never extend that lease. Fastlet separately tracks its own host deadline. Replays must match the original parameters. The guest helper implements the following semantics. These rules also apply to any asynchronous backend acquisition introduced by the bypass implementation. They do not require creating a separate backend barrier service.
 
 | Operation | Required response / semantics |
 |---|---|
 | `Capabilities` | Protocol, agent epoch, supported root mount, lease limits; verifies the live endpoint rather than only template metadata |
-| `Freeze` / backend `Acquire` | Register `pending` before invoking the side effect; report `held` only after successful completion and a recheck that the token is neither terminal nor expired |
+| `Freeze` | Register `pending` before invoking the side effect; report `held` only after successful completion and a recheck that the token is neither terminal nor expired |
 | `Status` | Return `pending`, `held`, `released`, or `expired`, plus `cleanupPending`, failure reason, and agent epoch; `unknown` is explicitly ambiguous, never equivalent to released |
-| `Thaw` / backend `Release` | Also cancels an in-flight or not-yet-seen acquire for that token. Record irreversible `released` intent before cleanup. Replays are idempotent; successful completion requires `cleanupPending=false` |
+| `Thaw` | Also cancels an in-flight or not-yet-seen freeze for that token. Record irreversible `released` intent before cleanup. Replays are idempotent; successful completion requires `cleanupPending=false` |
 | Lease expiry | Record irreversible `expired` intent, invalidate capture, and perform the same cleanup as release. Expiry never permits reacquisition with the same token |
 
-A token in `released` or `expired` can never transition back to `pending` or `held`. A release received before an acquire creates a tombstone, so a delayed acquire cannot take effect. A blocking kernel/backend call that already started may still succeed after cancellation: its completion handler must check terminal intent, immediately perform compensating thaw/release, and never acknowledge `held`. Terminal intent is not proof of completed cleanup; keep `cleanupPending=true` until all in-flight work and compensation have finished. If this cannot be confirmed within the recovery budget, fail capture and quarantine the source rather than claiming it is writable.
+A token in `released` or `expired` can never transition back to `pending` or `held`. A thaw received before a freeze creates a tombstone, so a delayed freeze cannot take effect. A blocking kernel call that already started may still succeed after cancellation: its completion handler must check terminal intent, immediately perform compensating thaw, and never acknowledge `held`. Terminal intent is not proof of completed cleanup; keep `cleanupPending=true` until all in-flight work and compensation have finished. If this cannot be confirmed within the recovery budget, fail capture and quarantine the source rather than claiming it is writable.
 
 ```mermaid
 sequenceDiagram
     participant F as Fastlet
-    participant A as Guest helper or barrier service
-    participant K as Kernel or storage backend
-    F->>A: Freeze or Acquire with token T
+    participant A as Guest helper
+    participant K as Guest kernel
+    F->>A: Freeze with token T
     A->>K: Start blocking operation
     Note over F,A: Response deadline expires
-    F->>A: Thaw or Release T
+    F->>A: Thaw T
     A->>A: Record released intent, cleanup pending
     K-->>A: Late operation success
-    A->>K: Compensating thaw or release
+    A->>K: Compensating thaw
     K-->>A: Cleanup complete
     A-->>F: released, cleanupPending false
     Note over F,A: Only now may a newer capture start
 ```
 
-Keep the source-wide lifecycle fence until the old operation and its compensation complete. Otherwise a late thaw for token T could unfreeze a newer token even though token T was correctly canceled: Linux filesystem thaw does not understand FSB operation IDs. Backend release must likewise be scoped to the correct ownership generation and cannot unlock a successor's barrier. Retain terminal records or a generation high-water mark for the VM incarnation; never garbage-collect them in a way that admits stale requests. A helper/backend restart changes its epoch and invalidates old requests and captures. Reconcile any possibly held protection and old workers before admitting a new operation; if that cannot be established, quarantine the source. A full-template restore starts a new VM incarnation and must perform this handshake before advertising capture support.
+Keep the source-wide lifecycle fence until the old operation and its compensation complete. Otherwise a late thaw for token T could unfreeze a newer token even though token T was correctly canceled: Linux filesystem thaw does not understand FSB operation IDs. Retain terminal records or a generation high-water mark for the VM incarnation; never garbage-collect them in a way that admits stale requests. A helper restart changes its epoch and invalidates old requests and captures. Reconcile any possibly held protection and old workers before admitting a new operation; if that cannot be established, quarantine the source. A full-template restore starts a new VM incarnation and must perform this handshake before advertising capture support.
 
-Fastlet persists the terminal decision before sending cleanup, preventing a restarted coordinator from replaying acquire after cancellation. After confirmed source recovery, it may publish only a capture whose entire cut completed under valid protection; any ambiguous or expired protection during the cut invalidates the artifact. Guest watchdog time cannot bound host wall-clock time while vCPUs are paused: the host independently enforces the capture/recovery deadline and performs release, Resume, then guest cleanup. Neither watchdog nor cancellation is a guarantee that a stuck kernel call can be interrupted.
+Fastlet persists the terminal decision before sending cleanup, preventing a restarted coordinator from replaying freeze after cancellation. After confirmed source recovery, it may publish only a capture whose entire cut completed under valid protection; any ambiguous or expired protection during the cut invalidates the artifact. Guest watchdog time cannot bound host wall-clock time while vCPUs are paused: the host independently enforces the capture/recovery deadline and resolves outstanding VMM work, releases any acquired backend protection, performs Resume, then guest cleanup. Neither watchdog nor cancellation is a guarantee that a stuck kernel call can be interrupted.
 
-### Backend barrier: proof required before enablement
+### Replacement drain/flush path: implementation obligations
 
-Fastlet's Firecracker runtime adapter coordinates the barrier; the storage integration owns its backend implementation and acknowledgement. Before coding the production path, a Linux/KVM/ublk PoC must deliver the following evidence and a concrete API mapping. No existing `ublkd` lease or unchanged file timestamp is accepted as this API.
+Fastlet's Firecracker runtime adapter coordinates the capture; the runtime/storage integration owns the replacement completion boundary and its acknowledgement. The concrete API mapping and Linux/KVM/ublk PoC remain prerequisites for enabling the mode. The primary design still bypasses snapshot/create and produces neither RAM nor temporary vmstate. Selecting a custom snapshot API would be a separate design decision.
 
-| Proof obligation | PoC output required |
+**What a bypass implementation must actually supply.** The current FSB client has no standalone VMM disk-drain API. Calling host `sync`, fsyncing upper files, or polling ublkd cannot observe all VMM-owned in-flight work. A dedicated VMM quiesce operation could reuse existing internals rather than reimplementing them, but it would still require a reviewed API and VMM release. The minimum obligations are:
+
+| Layer / responsibility | Required implementation or proof |
 |---|---|
-| Upstream writes | Identify how submitted VMM file-engine work, host writeback, and ublk requests complete before the acknowledgement, and why no delayed upstream writer can mutate the protected upper afterward |
-| Backend stability | Identify the operation that drains prior work, flushes the required data/index state, excludes later mutation, and holds protection across both copies without blocking its own drain |
-| Failure propagation | Show guest virtio cache/flush configuration and error propagation for the supported stack; distinguish a coherent cut from power-loss durability |
-| Recovery | Demonstrate token cancellation, late acquisition compensation, restart reconciliation, and bounded failure reporting without releasing a successor's protection |
+| VMM execution boundary | Require paused vCPUs, serialize with the VMM event loop and lifecycle changes, and prevent new device submissions from invalidating the acknowledged cut |
+| File-engine drain | For async I/O, wait for submitted operations (`submit_and_wait_all` in the inspected source); cover the deployed sync engine as well. Do not equate file-engine drain with consuming every pending guest virtqueue descriptor |
+| Completion processing | Preserve async completion handling, request status/used-ring updates and required notifications so the source can Resume correctly; no completion may still mutate the captured backend afterward |
+| Flush and errors | Flush the backing block FD through the supported host/ublk/OverlayBD path; verify how upper data/index become stable and how submission, completion, and flush errors reach the caller |
+| Rootfs-only consistency | Keep Guest freeze before Pause; VMM drain does not flush Guest dirty pages or application buffers. Define the supported cache/flush configuration and exclude raw-device bypass writers |
+| Capture lifetime | Copy both upper files under the proven stable interval. Add a backend exclusion mechanism only if backend behavior actually requires one; if added, define acquisition, release, and late-operation fencing |
+| Recovery and validation | Resolve lost replies and outstanding work before Resume, thaw or a successor operation; stress delayed writes and source recovery. No idle polling or arbitrary sleep substitutes for completion |
 
-Pause is retained in v1. Freeze without Pause is not this proposal's alternate implementation: it requires a separate proof for continuing guest activity and bypass writes. If the PoC cannot satisfy the barrier contract while bypassing snapshot/create, keep RootfsOnly disabled and review the E2B-style VMM alternative below.
+A bypass path does not need to serialize CPU/device state or RAM merely to export the rootfs, but it must retain whatever device bookkeeping is required for safe continuation and subsequent Full snapshots. This is why it is more than reproducing a `drain(); flush()` pair outside the VMM.
+
+**Validation boundary.** The replacement path requires Linux/KVM/ublk experiments on the deployed stack: buffered guest writes, delayed I/O, errors, and writes between data/index copies must not yield a successful inconsistent artifact. Full's current sequencing is the reuse baseline, not a substitute for these tests. A coherent cut and power-loss durability are distinct claims. Pause remains required in v1; no-Pause capture and live restacking are separate designs.
+
+**Error propagation.** The inspected upstream Firecracker block-device wrapper logs drain/flush failures instead of returning them from `prepare_save`; the inspected E2B branch uses `expect` and can terminate the VMM. Neither policy should be inherited without review. The replacement path must surface submission, completion, and flush failures to the capture caller, avoid publication, and preserve source recovery when safe. A source that cannot safely recover must be reported unhealthy/lost.
 
 ### Alternative for discussion: E2B-style optional memory output
 
@@ -309,18 +322,19 @@ Unit (run anywhere, `make test SCOPE=unit`):
 - Mode plumbing through all four contract layers, including `SnapshotSpecHash` covering the new field (request_id replay with a changed mode must be rejected).
 - Validation matrix: `rootfsOnly` accepted for OCI template-kind; rejected for the S3 path, for `SnapshotKindCheckpoint`, unsupported guest/storage capabilities, and by the dispatch gate for a real old fastlet.
 - `validatePackBundle` rootfs-only branch (no vmstate/memfile requirement); `assembleSnapshotManifest` writes `snapshotMode` and `kernel.cmdline`; `dumpFootprintBytes` OCI branch without the memory term.
-- Guest/backend protocol state machines: release before acquire, duplicate messages, conflicting replay parameters, cancellation during blocking acquisition, expiry, lost acknowledgements, epoch changes, and stale generations. A terminal token never becomes held; no successor is admitted while compensation is pending.
+- Guest protocol state machines: thaw before freeze, duplicate messages, conflicting replay parameters, cancellation during blocking acquisition, expiry, lost acknowledgements, epoch changes, and stale generations. A terminal token never becomes held; no successor is admitted while compensation is pending.
 - Admission branch: `readPreparedOCIMetadata` dispatches on `platform.snapshotMode`; compatibility exemption applies only to `rootfsOnly`.
 
 E2E and integration (Linux, root, KVM, ublkd, XFS StateRoot; skipped platforms reported):
 
 - **Lifecycle:** create a sandbox from an OCI template → write a file and start a background process → `CreateSandboxSnapshot(mode=ROOTFS_ONLY)` → source resumes and its rootfs is writable again (measure freeze-to-thaw and ping gap) → create a new sandbox from the snapshot → the file is readable, the old process is gone, execd answers `/ping`, entrypoint re-ran (boot-marker file with a boot count), sandbox reaches `DataPlaneReady` via the re-probe path.
 - **Repeat boots:** boot the same rootfs-only artifact twice (chain: snapshot the booted sandbox again) — guest-init and bootstrap re-runs stay healthy; layer chain stays ≤ 24 with squash firing and `BaseLayers` preserved (`oci_chain_e2e_test.go` pattern extended).
-- **Consistency:** exercise buffered writes, fsync and rename under load; verify freeze blocks later filesystem mutations, captured file contents and checksums match the protected boundary, and the assembled image passes filesystem checks. Inject delayed VMM/ublk writes and a write between data/index copies to validate the barrier. Inject flush errors; none may produce a successful snapshot. Application transaction consistency is not inferred from e2fsck.
+- **Consistency:** exercise buffered writes, fsync and rename under load; verify freeze blocks later filesystem mutations, captured file contents and checksums match the protected boundary, and the assembled image passes filesystem checks. Inject delayed VMM/ublk writes and a write between data/index copies to validate the stable capture interval without relying on RAM-dump latency. Inject flush errors; none may produce a successful snapshot. Application transaction consistency is not inferred from e2fsck.
+- **Capture regression:** verify rootfs-only followed by Full on the same source, error propagation from the replacement I/O path, and rejection of unsupported runtime capabilities before freeze. Preserve existing Full requests and their memory output.
 - **Control-channel delivery:** build a capable template, verify the manifest and live handshake, test cold boot and full-template restore/reconnect, then freeze rootfs while status and cleanup remain responsive. Reject old, metadata-only, incompatible-kernel/device, and helper-crashed templates without capture side effects.
-- **Late completion:** delay actual guest freeze and backend acquisition beyond cancellation, let each complete late, and verify compensating cleanup before admitting a successor. Inject helper/backend/Fastlet restarts and cleanup failures; verify stale requests cannot re-freeze or release newer protection, ambiguous sources remain quarantined, and no invalid artifact is published.
+- **Late completion:** delay actual Guest freeze and any introduced backend acquisition beyond cancellation, and verify compensating cleanup before admitting a successor. Separately time out drain/flush while underlying work continues and verify that no upper copy or unordered Resume occurs. Inject helper/Fastlet and relevant backend restarts and cleanup failures; verify stale requests cannot re-freeze or release newer protection, ambiguous sources remain quarantined, and no invalid artifact is published.
 - **Portability:** boot a rootfs-only artifact in both Intel-to-AMD and AMD-to-Intel directions with compatible application ISA and guest kernel; a full snapshot from the same source still restores only on the compatible node.
-- **Failure recovery:** inject failures and cancellation at freeze, Pause, barrier, either upper copy, Resume and thaw; test lost acknowledgements, expired leases, fastlet restart and VMM death. Verify release/Resume/thaw or an explicit unhealthy/lost result, with no partial publication. Kill mid-publish and retry using existing immutable-tag semantics. Missing kernel must fail before VM boot and clean up acquired resources.
+- **Failure recovery:** inject failures and cancellation at freeze, Pause, barrier, either upper copy, Resume and thaw; test lost acknowledgements, expired leases, fastlet restart and VMM death. Verify release of any acquired protection, Resume, and thaw or an explicit unhealthy/lost result, with no partial publication. Kill mid-publish and retry using existing immutable-tag semantics. Missing kernel must fail before VM boot and clean up acquired resources.
 
 Performance (state environment and cache state; reuse `scripts/integration-env.sh` instrumentation `vm_pause_window_ms`, `ping_max_gap_ms`, `checkpoint_dump_window_ms`): guest freeze-to-thaw and vCPU pause windows for rootfs-only vs full at 512MiB and 2GiB memory sizes, varying upper size and reflink availability; boot-to-first-request vs restore-to-first-request; artifact and staging sizes (no memory term); registry push bytes (one new layer vs layer + snapfiles).
 
@@ -328,11 +342,11 @@ Acceptance criteria: confirmed guest filesystem consistency and backend capture 
 
 ## Rollout and rollback
 
-Rollout is per-request opt-in and capability-gated; the pieces land inert-first. This draft is not implementation-ready until the concrete backend barrier passes its PoC. Delivery is split as follows:
+Rollout is per-request opt-in and capability-gated; the pieces land inert-first. This draft is not implementation-ready until the replacement drain/completion/flush path and stable capture boundary pass their PoC. Delivery is split as follows:
 
 | Stage | Deliverable | Exit gate |
 |---|---|---|
-| 1. Protocol and storage feasibility | Guest protocol state machine and concrete cross-layer barrier PoC | Both late-completion races and delayed writes are covered, or return to design review |
+| 1. Protocol and storage feasibility | Guest protocol state machine and replacement drain/completion/flush PoC | Both late-completion races and delayed writes are covered, or return to design review |
 | 2. Guest delivery | FSB helper, builder injection, private vsock wiring, manifest capability, and runtime handshake | New templates pass freeze/thaw and full-restore reconnect tests; old templates fail closed for RootfsOnly |
 | 3. Runtime and contracts | Recovery journal, generation fencing, mode plumbing and generated outputs, kernel asset delivery, cold-boot path, and protected upper capture | Integration, failure injection, and real version-skew tests pass with capture still disabled by default |
 | 4. Opt-in enablement | Workload latency budgets and documentation updates | Maintainer acceptance and successful consistency, portability, and recovery validation |
@@ -341,7 +355,7 @@ Update `sandbox-snapshots.md`, `overlaybd-oci-sandboxes.md`, `artifact-manifest-
 
 Signals to monitor: snapshot success/failure rates by mode, boot failure and readiness-timeout rates for rootfs-only images, pause-window and boot-latency histograms, layer counts and squash frequency on chains, node kernel-asset label coverage.
 
-Rollback triggers: boot failures or readiness timeouts above budget, any consistency finding on frozen images, or version-skew confusion. Rollback first disables new `mode=ROOTFS_ONLY` requests and new creates from rootfs-only templates, then finishes or reconciles in-flight captures using the owning protocol version. Do not remove helpers, barrier services, or recovery state while protection may still be held; no component downgrade is required because full snapshots are the untouched default. Limits: rootfs-only artifacts already in the registry cannot be booted by rolled-back drivers (degenerate pair), and their disk data is only reachable by booting a new-mode driver from them or by re-snapshotting a sandbox that is still running from one. Kernel bundles left on nodes are harmless.
+Rollback triggers: boot failures or readiness timeouts above budget, any consistency finding on frozen images, or version-skew confusion. Rollback first disables new `mode=ROOTFS_ONLY` requests and new creates from rootfs-only templates, then finishes or reconciles in-flight captures using the owning protocol version. Do not remove helpers, any introduced quiesce services, or recovery state while protection may still be held; no component downgrade is required because full snapshots are the untouched default. Limits: rootfs-only artifacts already in the registry cannot be booted by rolled-back drivers (degenerate pair), and their disk data is only reachable by booting a new-mode driver from them or by re-snapshotting a sandbox that is still running from one. Kernel bundles left on nodes are harmless.
 
 ## Related links (optional)
 
@@ -356,3 +370,10 @@ Rollback triggers: boot failures or readiness timeouts above budget, any consist
 - [Snapshot request without memory path](https://github.com/e2b-dev/runtime/blob/e85b9f5f6de6c92b002f376b4f91b1652d3c942e/packages/orchestrator/pkg/sandbox/fc/client.go).
 - [Optional-memory snapshot implementation](https://github.com/e2b-dev/firecracker/blob/621718e6fd6ec4f319c76ae8f61c85df7342f903/src/vmm/src/persist/mod.rs).
 - [Guest freeze motivation: E2B PR 3019](https://github.com/e2b-dev/runtime/pull/3019).
+
+### Pinned upstream Firecracker references
+
+- Inspected revision: `2038188f145fb81b8d098147a10e9d9f392fd22f` (v1.16.1), static source inspection only; validate the actual deployed FSB build separately.
+- [Snapshot ordering and output](https://github.com/firecracker-microvm/firecracker/blob/2038188f145fb81b8d098147a10e9d9f392fd22f/src/vmm/src/persist.rs).
+- [Block preparation, logged drain errors, and completion handling](https://github.com/firecracker-microvm/firecracker/blob/2038188f145fb81b8d098147a10e9d9f392fd22f/src/vmm/src/devices/virtio/block/virtio/device.rs).
+- [Async drain and backing-file sync](https://github.com/firecracker-microvm/firecracker/blob/2038188f145fb81b8d098147a10e9d9f392fd22f/src/vmm/src/devices/virtio/block/virtio/io/async_io.rs).
