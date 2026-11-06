@@ -194,20 +194,26 @@ func (r *SandboxReconciler) persistPauseCheckpoint(ctx context.Context, orchestr
 // releasePausedRuntime deletes the runtime and releases the durable
 // assignment, then marks the Sandbox Paused.
 func (r *SandboxReconciler) releasePausedRuntime(ctx context.Context, orchestrator *orchestration.Orchestrator, sandbox *apiv1alpha2.Sandbox, checkpointID string) (ctrl.Result, error) {
-	if sandbox.Status.Placement.FastletName != "" {
+	envelope, err := assignment.AssignmentFromAnnotation(sandbox)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if envelope != nil {
 		done, err := r.ensureRuntimeDeleted(ctx, orchestrator, sandbox)
 		if err != nil || !done {
 			return ctrl.Result{RequeueAfter: DeletionPollInterval}, err
 		}
-	}
-	// The checkpoint address is persisted: node-local task records are
-	// best-effort cleanup while the assignment still resolves the Fastlet.
-	if err := orchestrator.DeleteCheckpoint(ctx, sandbox, checkpointID); err != nil {
-		var failure *fastletapi.FastletError
-		if !errors.As(err, &failure) || failure.Code != fastletapi.ErrorNotFound {
-			klog.FromContext(ctx).Error(err, "Checkpoint task cleanup deferred", "sandbox", sandbox.Name)
+		// The checkpoint address is persisted: node-local task records are
+		// best-effort cleanup while the assignment still resolves the Fastlet.
+		if err := orchestrator.DeleteCheckpoint(ctx, sandbox, checkpointID); err != nil {
+			var failure *fastletapi.FastletError
+			if !errors.As(err, &failure) || failure.Code != fastletapi.ErrorNotFound {
+				klog.FromContext(ctx).Error(err, "Checkpoint task cleanup deferred", "sandbox", sandbox.Name)
+			}
 		}
 	}
+	// A missing annotation means deletion already completed. ClearAssignment
+	// can still need to repair a stale placement after a failed status write.
 	cleared, err := orchestrator.ClearAssignment(ctx, sandbox, false)
 	if err != nil {
 		return ctrl.Result{}, err

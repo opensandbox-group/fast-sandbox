@@ -86,13 +86,19 @@ func (o *Orchestrator) DeleteCheckpoint(ctx context.Context, sandbox *apiv1alpha
 // keeps the restore lineage — including transient projections (Pending,
 // Unavailable, Failed) and the window between a completed restore and its
 // status projection, so a resume can never silently degrade into a fresh
-// boot. The pause FSM (desired state Paused) owns the checkpoint instead.
+// boot. A pause requested during a pending restore must finish that restore
+// before taking a new checkpoint; the pause FSM owns it in other states.
 func ResumeCheckpoint(sandbox *apiv1alpha2.Sandbox) *apiv1alpha2.CheckpointStatus {
 	if sandbox == nil || sandbox.Status.Runtime.Checkpoint == nil {
 		return nil
 	}
 	if sandbox.Spec.State == apiv1alpha2.SandboxStatePaused {
-		return nil
+		switch sandbox.Status.Runtime.State {
+		case "", apiv1alpha2.RuntimePending, apiv1alpha2.RuntimeCreating, apiv1alpha2.RuntimeUnavailable, apiv1alpha2.RuntimeResuming:
+			// Re-pausing cannot turn an unfinished restore into a fresh boot.
+		default:
+			return nil
+		}
 	}
 	return sandbox.Status.Runtime.Checkpoint
 }
