@@ -211,7 +211,7 @@ func TestObjectStoreSourceStillStagesLocalTar(t *testing.T) {
 	archive := filepath.Join(dir, "source.tar")
 	require.NoError(t, tarball.WriteToFile(archive, tag, image))
 	t.Setenv("SANDBOX_TEMPLATE_IMAGE_TAR", archive)
-	sum, err := pullOCILayout(context.Background(), apiv1alpha2.SandboxTemplateSpec{Image: tag.String()}, dir)
+	sum, err := pullOCILayout(context.Background(), apiv1alpha2.SandboxTemplateSpec{Image: tag.String()}, dir, &registryAuth{})
 	require.NoError(t, err)
 	want, err := image.Digest()
 	require.NoError(t, err)

@@ -23,6 +23,7 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifactstore"
+	"fast-sandbox/internal/registryconfig"
 )
 
 func newSandboxTemplate(namespace, name string) *apiv1alpha2.SandboxTemplate {
@@ -1241,4 +1242,73 @@ func TestOCIInvalidPublishFailsBeforeCreatingPod(t *testing.T) {
 			require.Empty(t, pods.Items)
 		})
 	}
+}
+
+// TestSandboxTemplateReconcileMountsRegistryCredentials covers the registry
+// auth wiring end to end: a namespace with a configured private registry
+// mounts the compiled registry config into the build Pod, and a namespace
+// with none mounts nothing (anonymous pulls, public images still build).
+func TestSandboxTemplateReconcileMountsRegistryCredentials(t *testing.T) {
+	namespace, name := "tenant-a", "golden-private"
+	template := newSandboxTemplate(namespace, name)
+	body := "registries:\n  - host: jd-registry.example.com\n    secretRef:\n      name: pull-creds\n"
+	reconciler := newSandboxTemplateReconciler(t, template,
+		registryConfigMap(namespace, body),
+		dockerconfigSecret(namespace, "pull-creds", "jd-registry.example.com", "u", "p"),
+	)
+	reconcileOnce(t, reconciler, client.ObjectKey{Namespace: namespace, Name: name})
+	pods := listBuilderPods(t, reconciler, namespace)
+	require.Len(t, pods, 1)
+	pod := &pods[0]
+
+	var volume *corev1.Volume
+	for index := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[index].Name == templateRegistryConfigVolumeName {
+			volume = &pod.Spec.Volumes[index]
+			break
+		}
+	}
+	require.NotNil(t, volume, "expected a %s volume, got %+v", templateRegistryConfigVolumeName, pod.Spec.Volumes)
+	require.NotNil(t, volume.Secret)
+	wantSecretName := templateRegistrySecretName(template)
+	require.Equal(t, wantSecretName, volume.Secret.SecretName)
+
+	var secret corev1.Secret
+	require.NoError(t, reconciler.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: wantSecretName}, &secret))
+	require.NotEmpty(t, secret.Data[registryconfig.SecretKey])
+}
+
+// TestSandboxTemplateReconcileWithoutRegistryConfigMountsNothing guards the
+// anonymous-pull default: a namespace with no fast-sandbox-registry
+// ConfigMap must not get a registry-config volume or env var on the build
+// Pod, so public-image builds are unaffected.
+func TestSandboxTemplateReconcileWithoutRegistryConfigMountsNothing(t *testing.T) {
+	namespace, name := "tenant-a", "golden-public"
+	template := newSandboxTemplate(namespace, name)
+	reconciler := newSandboxTemplateReconciler(t, template)
+	reconcileOnce(t, reconciler, client.ObjectKey{Namespace: namespace, Name: name})
+	pods := listBuilderPods(t, reconciler, namespace)
+	require.Len(t, pods, 1)
+	pod := &pods[0]
+
+	for _, volume := range pod.Spec.Volumes {
+		require.NotEqual(t, templateRegistryConfigVolumeName, volume.Name)
+	}
+	for _, env := range pod.Spec.Containers[0].Env {
+		require.NotEqual(t, registryConfigDirEnv, env.Name)
+	}
+}
+
+// TestSandboxTemplateRegistrySecretNameStableAcrossRebuilds guards the fix
+// for the registry Secret accumulating one copy per generation: unlike
+// buildPodName, the registry Secret name must not carry the generation, so a
+// rebuild rewrites the same Secret in place instead of orphaning the
+// previous one with rotated credentials still inside it.
+func TestSandboxTemplateRegistrySecretNameStableAcrossRebuilds(t *testing.T) {
+	template := newSandboxTemplate("tenant-a", "golden-rebuild")
+	first := templateRegistrySecretName(template)
+	template.Generation++
+	second := templateRegistrySecretName(template)
+	require.Equal(t, first, second, "the registry secret name must not depend on template generation")
+	require.NotEqual(t, buildPodName(template), first, "the registry secret and the build pod must not collide on name")
 }
