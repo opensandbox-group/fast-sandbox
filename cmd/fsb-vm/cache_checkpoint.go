@@ -100,6 +100,10 @@ func cacheCheckpoint(ctx context.Context, result *ocitemplate.PublishedCheckpoin
 		scheme = "http://"
 	}
 	base := scheme + ref.Registry + "/v2/" + ref.Repository + "/blobs/"
+	return importCheckpointLayers(ctx, layers, artifacts, base, client)
+}
+
+func importCheckpointLayers(ctx context.Context, layers []oci.Descriptor, artifacts, base string, client *ublkdClient) error {
 	seen := map[digest.Digest]bool{}
 	for _, layer := range layers {
 		if layer.Digest.Validate() != nil || layer.Digest.Algorithm() != digest.SHA256 || layer.Size <= 0 {
