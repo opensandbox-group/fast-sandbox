@@ -3,6 +3,9 @@ package firecracker
 import (
 	"context"
 	"encoding/json"
+	"fast-sandbox/internal/ocitemplate"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -131,4 +134,30 @@ func TestOCITokenOnlyCredentialsFailBeforePacking(t *testing.T) {
 	installOCIRegistryConfig(t, registryconfig.Credential{Host: "r.example", IdentityToken: "private-token"})
 	_, err := checkpointCredentials("r.example/checkpoints/sandbox:pause")
 	require.ErrorContains(t, err, "identitytoken-only credentials are not supported")
+}
+
+func TestCheckpointCacheUsesRestoreReadCredentialAndCleansSecret(t *testing.T) {
+	installOCIRegistryConfig(t, registryconfig.Credential{Host: "r.example", RepositoryPrefix: "checkpoints", Username: "reader", Password: "read-secret", WriteUsername: "writer", WritePassword: "write-secret"})
+	dir := t.TempDir()
+	script := `#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--docker-auth-file" ]; then cp "$2" "$CACHE_TEST_AUTH_OUTPUT"; fi
+    shift
+done
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "fsb-vm"), []byte(script), 0700))
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	output := filepath.Join(dir, "observed-auth.json")
+	t.Setenv("CACHE_TEST_AUTH_OUTPUT", output)
+	staging := filepath.Join(dir, "staging")
+	require.NoError(t, os.Mkdir(staging, 0700))
+	d := &Driver{}
+	d.config.StateRoot = dir
+	published := &ocitemplate.PublishedCheckpoint{Reference: "oci://r.example/checkpoints/sandbox@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	require.NoError(t, d.cacheOCICheckpoint(context.Background(), staging, "checkpoint-id", published))
+	raw, err := os.ReadFile(output)
+	require.NoError(t, err)
+	require.JSONEq(t, `{"auths":{"r.example/checkpoints/sandbox":{"username":"reader","password":"read-secret"}}}`, string(raw))
+	_, err = os.Stat(filepath.Join(staging, "cache-auth.json"))
+	require.ErrorIs(t, err, os.ErrNotExist)
 }

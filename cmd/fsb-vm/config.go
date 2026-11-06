@@ -138,5 +138,6 @@ func init() {
 	rootCmd.AddCommand(newBuildCommand())
 	rootCmd.AddCommand(newPushCommand())
 	rootCmd.AddCommand(newPackCommand())
+	rootCmd.AddCommand(newCacheCheckpointCommand())
 	rootCmd.AddCommand(newPackCleanupCommand())
 }
