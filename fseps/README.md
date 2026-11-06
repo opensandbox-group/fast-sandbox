@@ -17,4 +17,4 @@ Add an entry in the same PR as a new proposal; when its content or status change
 |:----:|-------|--------|:------------:|
 | [FSEP-0001](0001-rootfs-only-snapshots-overlaybd.md) | Rootfs-Only Snapshots on the OverlayBD Path | draft | 2026-11-06 |
 
-FSEP-0001 updated on 2026-11-06: recommends optional-RAM snapshot/create with Guest freeze and VM Pause, reusing Full's upper-capture ordering without requiring a new backend barrier service. The draft covers Guest helper delivery, late-operation recovery, VMM error handling and release ownership, plus the implementation obligations of bypassing snapshot/create. Status remains draft.
+FSEP-0001 updated on 2026-11-06: proposes guest-filesystem-consistent, memory-dump-free capture with VM Pause retained; E2B-style optional memory output is documented as an alternative. The draft now specifies an FSB-owned guest helper, capability gates, terminal-token cleanup semantics, and a backend-barrier PoC delivery gate. Status remains draft.
