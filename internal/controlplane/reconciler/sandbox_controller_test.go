@@ -2,6 +2,7 @@ package reconciler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -495,7 +496,7 @@ func TestDeletionFinalizerWaitsForV2RuntimeDeletion(t *testing.T) {
 func TestResetDeletesOldRuntimeThenAdvancesGeneration(t *testing.T) {
 	reconciler, _, fastlet, sandbox := newControllerHarness(t)
 	placementStatus := apiv1alpha2.PlacementStatus{FastletName: "fastlet-a", FastletPodUID: "pod-a", Attempt: 1}
-	resetAt := metav1.NewTime(time.Now().Add(time.Minute))
+	resetAt := metav1.NewTime(time.Date(2026, 11, 4, 12, 57, 50, 536117123, time.UTC))
 	current := getControllerSandbox(t, reconciler, sandbox.Name)
 	current.Spec.ResetRevision = &resetAt
 	current.Finalizers = []string{FinalizerName}
@@ -511,7 +512,40 @@ func TestResetDeletesOldRuntimeThenAdvancesGeneration(t *testing.T) {
 	require.Empty(t, current.Status.Placement.FastletName)
 	require.Equal(t, int64(2), current.Status.Runtime.Generation)
 	require.NotNil(t, current.Status.Runtime.AcceptedResetRevision)
-	require.Equal(t, resetAt.Unix(), current.Status.Runtime.AcceptedResetRevision.Unix())
+	require.True(t, resetAt.Time.Equal(current.Status.Runtime.AcceptedResetRevision.Time))
+	for range 3 {
+		_, err = reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+		require.NoError(t, err)
+	}
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	require.Equal(t, apiv1alpha2.RuntimeReady, current.Status.Runtime.State)
+	require.Equal(t, int64(2), current.Status.Runtime.Generation)
+	require.False(t, resetPending(current))
+	require.Equal(t, 1, fastlet.deleteCall)
+	require.Equal(t, 1, fastlet.ensureCall)
+}
+
+func TestFractionalResetAcknowledgementConvergesAfterJSONRoundTrip(t *testing.T) {
+	for _, token := range []string{"2026-11-04T12:57:50.536117Z", "2026-11-04T12:57:50.536117123Z"} {
+		t.Run(token, func(t *testing.T) {
+			reconciler, _, _, sandbox := newControllerHarness(t)
+			// Raw CRD patches retain fractional seconds independently of the
+			// typed status update. Keep that desired spec across the round trip.
+			require.NoError(t, json.Unmarshal([]byte(`{"resetRevision":"`+token+`"}`), &sandbox.Spec))
+			require.True(t, resetPending(sandbox))
+			_, err := reconciler.reconcileReset(context.Background(), reconciler.Orchestrator, sandbox)
+			require.NoError(t, err)
+			accepted := getControllerSandbox(t, reconciler, sandbox.Name)
+			wireStatus, err := json.Marshal(accepted.Status)
+			require.NoError(t, err)
+			require.NoError(t, json.Unmarshal(wireStatus, &sandbox.Status))
+			require.False(t, resetPending(sandbox), "acknowledged raw API reset must stop being pending")
+
+			// A distinct revision in the same second still requests another reset.
+			sandbox.Spec.ResetRevision = &metav1.Time{Time: sandbox.Spec.ResetRevision.Add(time.Nanosecond)}
+			require.True(t, resetPending(sandbox))
+		})
+	}
 }
 
 func TestExpiredSandboxRecoversWhenExpireTimeIsExtended(t *testing.T) {
