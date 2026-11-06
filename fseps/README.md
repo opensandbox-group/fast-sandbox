@@ -15,6 +15,4 @@ Add an entry in the same PR as a new proposal; when its content or status change
 
 | FSEP | Title | Status | Last updated |
 |:----:|-------|--------|:------------:|
-| [FSEP-0001](0001-rootfs-only-snapshots-overlaybd.md) | Rootfs-Only Snapshots on the OverlayBD Path | draft | 2026-11-06 |
-
-FSEP-0001 updated on 2026-11-06: proposes guest-filesystem-consistent, memory-dump-free capture with VM Pause retained and snapshot/create bypassed. The draft specifies Guest helper delivery and late-operation recovery, explains the existing Full capture boundary, and details replacement drain/completion/flush responsibilities without mandating a separate backend barrier service. E2B-style optional memory output remains an alternative for discussion, not the selected implementation. It also records a reproduced v1.16.1 vsock Resume lifecycle hazard and requires device-continuation validation when bypassing snapshot creation. Status remains draft.
+| [FSEP-0001](0001-rootfs-only-snapshots-overlaybd.md) | Rootfs-Only Snapshots on the OverlayBD Path | draft | 2026-11-05 |
