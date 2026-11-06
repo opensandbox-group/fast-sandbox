@@ -87,6 +87,11 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, request ctrl.Request)
 	if terminalRuntimeFailureRecorded(&sandbox) {
 		return r.reconcileTerminalRuntimeFailure(ctx, orchestrator, &sandbox)
 	}
+	// A persisted checkpoint commits the release. A concurrent Resume must
+	// not ensure the old identity while deletion/assignment cleanup is pending.
+	if sandbox.Status.Runtime.State == apiv1alpha2.RuntimePausing && sandbox.Status.Runtime.Checkpoint != nil {
+		return r.releasePausedRuntime(ctx, orchestrator, &sandbox, sandbox.Status.Runtime.Checkpoint.CheckpointID)
+	}
 	if sandbox.Spec.State == apiv1alpha2.SandboxStatePaused {
 		return r.reconcilePause(ctx, orchestrator, &sandbox)
 	}

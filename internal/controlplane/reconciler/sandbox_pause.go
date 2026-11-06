@@ -78,9 +78,14 @@ func (r *SandboxReconciler) reconcilePause(ctx context.Context, orchestrator *or
 		return r.observePause(ctx, orchestrator, sandbox)
 	case apiv1alpha2.RuntimeReady:
 		return r.triggerPause(ctx, orchestrator, sandbox)
-	case apiv1alpha2.RuntimePending, apiv1alpha2.RuntimeCreating, apiv1alpha2.RuntimeUnavailable, apiv1alpha2.RuntimeResuming:
-		return ctrl.Result{RequeueAfter: ObservationPollInterval},
-			r.markPauseWaiting(ctx, sandbox, "PauseWaitingRuntime", "Sandbox runtime is "+string(sandbox.Status.Runtime.State)+"; pause starts once it is Ready")
+	case "", apiv1alpha2.RuntimePending, apiv1alpha2.RuntimeCreating, apiv1alpha2.RuntimeUnavailable, apiv1alpha2.RuntimeResuming:
+		// Fast-Path can return Ready before the Controller projects it. Merely
+		// waiting here would starve the ensure/observation that advances status.
+		result, err := r.reconcileEnsure(ctx, orchestrator, sandbox)
+		if err == nil && result.RequeueAfter == ReadyRequeueInterval {
+			return ctrl.Result{Requeue: true}, nil
+		}
+		return result, err
 	default:
 		// Failed/Stopped/Stopping: there is no live runtime to checkpoint.
 		return ctrl.Result{RequeueAfter: DefaultRequeueInterval},
@@ -195,14 +200,6 @@ func (r *SandboxReconciler) releasePausedRuntime(ctx context.Context, orchestrat
 			return ctrl.Result{RequeueAfter: DeletionPollInterval}, err
 		}
 	}
-	if err := r.patchStatus(ctx, sandbox, func(status *apiv1alpha2.SandboxStatus) {
-		message := "Sandbox is paused; set spec.state=Running to resume from the checkpoint"
-		setControllerStates(status, apiv1alpha2.RuntimePaused, apiv1alpha2.DataPlaneUnavailable, message)
-		setSandboxReadyCondition(status, sandbox.Generation, "Suspended", message)
-		setSandboxSuspendedCondition(status, sandbox.Generation, true, "CheckpointPublished", message)
-	}); err != nil {
-		return ctrl.Result{}, err
-	}
 	// The checkpoint address is persisted: node-local task records are
 	// best-effort cleanup while the assignment still resolves the Fastlet.
 	if err := orchestrator.DeleteCheckpoint(ctx, sandbox, checkpointID); err != nil {
@@ -211,7 +208,18 @@ func (r *SandboxReconciler) releasePausedRuntime(ctx context.Context, orchestrat
 			klog.FromContext(ctx).Error(err, "Checkpoint task cleanup deferred", "sandbox", sandbox.Name)
 		}
 	}
-	if _, err := orchestrator.ClearAssignment(ctx, sandbox, false); err != nil {
+	cleared, err := orchestrator.ClearAssignment(ctx, sandbox, false)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	// PAUSED is the externally observable release barrier. Never expose it
+	// while resume could still select the deleted runtime's assignment.
+	if err := r.patchStatus(ctx, cleared, func(status *apiv1alpha2.SandboxStatus) {
+		message := "Sandbox is paused; set spec.state=Running to resume from the checkpoint"
+		setControllerStates(status, apiv1alpha2.RuntimePaused, apiv1alpha2.DataPlaneUnavailable, message)
+		setSandboxReadyCondition(status, sandbox.Generation, "Suspended", message)
+		setSandboxSuspendedCondition(status, sandbox.Generation, true, "CheckpointPublished", message)
+	}); err != nil {
 		return ctrl.Result{}, err
 	}
 	klog.FromContext(ctx).Info("sandbox paused; runtime released and assignment cleared", "sandbox", sandbox.Name, "checkpointID", checkpointID)
