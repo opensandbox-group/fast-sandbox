@@ -7,6 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -33,7 +36,7 @@ func (c Client) Call(ctx context.Context, r Request) (response Response, callErr
 			callErr = errors.Join(callErr, ctx.Err())
 		}
 	}()
-	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", c.SocketPath)
+	conn, err := dialControlSocket(ctx, c.SocketPath)
 	if err != nil {
 		return Response{}, err
 	}
@@ -157,4 +160,19 @@ func (c Client) waitOperation(ctx context.Context, request Request, response Res
 			return response, err
 		}
 	}
+}
+
+// Keep the directory descriptor alive until connect completes. The short alias
+// preserves /proc/<pid>/root and cwd resolution without exceeding sun_path.
+func dialControlSocket(ctx context.Context, path string) (net.Conn, error) {
+	if runtime.GOOS != "linux" || len(path) < 108 {
+		return (&net.Dialer{}).DialContext(ctx, "unix", path)
+	}
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	defer directory.Close()
+	alias := fmt.Sprintf("/proc/self/fd/%d/%s", directory.Fd(), filepath.Base(path))
+	return (&net.Dialer{}).DialContext(ctx, "unix", alias)
 }

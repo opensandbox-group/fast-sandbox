@@ -58,21 +58,45 @@ func newCaptureJournal(directory string, r captureRecord) (*captureJournal, erro
 	if r.Incarnation == "" || !filepath.IsAbs(r.Device) || !filepath.IsAbs(r.Staging) || r.Request.Protocol != guestcontrol.Protocol || r.Request.Epoch == "" || r.Request.Generation == 0 || r.Request.OperationID == "" {
 		return nil, errors.New("incomplete capture journal identity")
 	}
-	// Create an exclusive directory to avoid overwriting an unreconciled predecessor record.
-	if err := os.Mkdir(directory, 0700); err != nil {
+
+	// The caller holds the lifecycle lock. Never replace an existing journal,
+	// including a corrupt or incomplete record from an older implementation.
+	if _, err := os.Lstat(directory); !os.IsNotExist(err) {
+		if err == nil {
+			err = os.ErrExist
+		}
 		return nil, fmt.Errorf("reserve capture journal: %w", err)
 	}
-	if err := syncCaptureDirectory(filepath.Dir(directory)); err != nil {
+	temporary, err := os.MkdirTemp(filepath.Dir(directory), ".capture-init-")
+	if err != nil {
 		return nil, err
 	}
+	return publishInitialCaptureJournal(directory, temporary, r)
+}
+
+// Prepare the entire initial record privately before making the fence visible.
+// A crash before rename can leave only an inert temporary directory, never an
+// empty rootfs-capture fence. No Guest/VM effects may start before this returns.
+func publishInitialCaptureJournal(directory, temporary string, r captureRecord) (journal *captureJournal, resultErr error) {
+	defer func() { resultErr = errors.Join(resultErr, os.RemoveAll(temporary)) }()
 	r.Version = 1
 	r.Phase = capturePrepared
-	j := &captureJournal{directory: directory, record: r}
+	j := &captureJournal{directory: temporary, record: r}
 	if err := j.persist(); err != nil {
 		return nil, err
 	}
+	if err := os.Rename(temporary, directory); err != nil {
+		return nil, err
+	}
+	j.directory = directory
+	if err := syncCaptureDirectory(filepath.Dir(directory)); err != nil {
+		// No side effects have started. Roll back our complete but unacknowledged
+		// reservation; if cleanup fails, preserve the error and recoverable record.
+		return nil, errors.Join(err, os.RemoveAll(directory), syncCaptureDirectory(filepath.Dir(directory)))
+	}
 	return j, nil
 }
+
 func loadCaptureJournal(directory string) (*captureJournal, error) {
 	raw, err := os.ReadFile(filepath.Join(directory, "capture.json"))
 	if err != nil {

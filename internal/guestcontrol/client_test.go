@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -212,5 +214,48 @@ func TestFreezeWaitRejectsAsynchronousFailure(t *testing.T) {
 	if err == nil || response.Failure == "" {
 		b, _ := json.Marshal(response)
 		t.Fatalf("response %s, err %v", b, err)
+	}
+}
+
+func TestClientDialsLongProcSocketPath(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("requires Linux procfs")
+	}
+	for _, name := range []string{"guest-control.sock", "restored.sock"} {
+		t.Run(name, func(t *testing.T) {
+			directory := filepath.Join(t.TempDir(), strings.Repeat("d", 110))
+			if err := os.MkdirAll(directory, 0700); err != nil {
+				t.Fatal(err)
+			}
+			fd, err := os.Open(directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer fd.Close()
+			alias := fmt.Sprintf("/proc/self/fd/%d/%s", fd.Fd(), name)
+			listener, err := net.Listen("unix", alias)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			// Connect through the same proc-root prefix used for direct and jailed VMMs.
+			path := fmt.Sprintf("/proc/%d/root%s/%s", os.Getpid(), directory, name)
+			conn, err := dialControlSocket(t.Context(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conn.Close()
+			missing := filepath.Join(directory, "missing", name)
+			if conn, err := dialControlSocket(t.Context(), missing); err == nil {
+				conn.Close()
+				t.Fatal("accepted missing parent")
+			}
+			canceled, cancel := context.WithCancel(t.Context())
+			cancel()
+			if conn, err := dialControlSocket(canceled, path); err == nil {
+				conn.Close()
+				t.Fatal("ignored canceled context")
+			}
+		})
 	}
 }
