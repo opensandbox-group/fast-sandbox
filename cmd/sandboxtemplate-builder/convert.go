@@ -132,6 +132,10 @@ func guestInitPath(spec apiv1alpha2.SandboxTemplateSpec) string {
 // env, and /etc/hosts into the mounted rootfs, returning the baked MITM CA
 // lineage (nil when none).
 func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint string) ([]mitmCALineage, error) {
+	control, err := injectGuestControl(spec, mountPoint)
+	if err != nil {
+		return nil, err
+	}
 	opt := filepath.Join(mountPoint, "opt", "opensandbox")
 	if err := os.MkdirAll(opt, 0o755); err != nil {
 		return nil, err
@@ -169,7 +173,7 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 	if err := os.MkdirAll(filepath.Dir(guestInit), 0o755); err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(guestInit, []byte(renderGuestInit(spec)), 0o755); err != nil { //nolint:gosec // executable guest init inside the built rootfs image
+	if err := os.WriteFile(guestInit, []byte(renderGuestInitWithControl(spec, control)), 0o755); err != nil { //nolint:gosec // executable guest init inside the built rootfs image
 		return nil, err
 	}
 
@@ -335,7 +339,12 @@ var hostBusyboxCandidates = []string{"/bin/busybox", "/usr/bin/busybox"}
 // healthcheck), the one-shot SANDBOX_READY marker, and a heartbeat loop so
 // the host can verify the guest is alive after a snapshot restore (the init
 // does not re-run after resume).
-func renderGuestInit(spec apiv1alpha2.SandboxTemplateSpec) string {
+
+func renderGuestInitWithControl(spec apiv1alpha2.SandboxTemplateSpec, control bool) string {
+	controlStart := ""
+	if control {
+		controlStart = "setsid /usr/local/sbin/fsb-guest-control --mount / --port 1234 </dev/null >/dev/console 2>&1 &\n"
+	}
 	var readiness []string
 	if spec.Readiness.Probe != "" {
 		readiness = append(readiness, "READINESS_PROBE="+shellQuote(spec.Readiness.Probe))
@@ -377,7 +386,7 @@ mountpoint -q /tmp || mount -t tmpfs tmpfs /tmp
 ` + loGate + `
 exec </dev/console >/dev/console 2>&1
 hostname sandbox
-` + renderFreePageReporting() + `
+` + renderFreePageReporting() + controlStart + `
 [ -f /etc/sandbox-init.env ] && . /etc/sandbox-init.env
 if [ -x /opt/opensandbox/bootstrap.sh ]; then
   # The entrypoint becomes the bootstrap's user command: bootstrap.sh TERMs

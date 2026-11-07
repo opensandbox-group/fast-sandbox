@@ -87,6 +87,17 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 	if input == nil || input.SandboxID == "" || input.SnapshotID == "" {
 		return nil, fmt.Errorf("%w: sandboxId and snapshotId are required", ErrInvalidConfig)
 	}
+	mode := fastletapi.NormalizeSnapshotMode(input.Mode)
+	if mode != fastletapi.SnapshotModeFull && mode != fastletapi.SnapshotModeRootfsOnly {
+		return nil, fmt.Errorf("%w: unknown snapshot mode", ErrInvalidConfig)
+	}
+	if mode == fastletapi.SnapshotModeRootfsOnly {
+		return d.createRootfsSnapshot(ctx, input)
+	}
+	return d.createFullSnapshot(ctx, input)
+}
+
+func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.SnapshotInput) (*runtimecontract.SnapshotResult, error) {
 	kind := input.Kind
 	if kind == "" {
 		kind = fastletapi.SnapshotKindTemplate
@@ -105,6 +116,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 	}
 	d.mu.RLock()
 	plan := dumpPlan{
+		identity:    input.Identity,
 		stateRoot:   d.config.StateRoot,
 		binaryName:  filepath.Base(d.config.BinaryPath),
 		sandboxID:   input.SandboxID,
@@ -393,7 +405,7 @@ func (d *Driver) dumpFootprintBytes(plan dumpPlan) (int64, error) {
 		rootfs = filepath.Join(plan.jailRoot(), rootfsImageName)
 	}
 	if source, e := restoreReference(state.Config.Desired); e == nil && strings.HasPrefix(source, "oci://") {
-		rootfs = filepath.Join(filepath.Dir(rootfs), "rootfs.dev")
+		rootfs = filepath.Join(filepath.Dir(rootfs), rootfsDeviceName)
 	}
 	info, err := d.stat(rootfs)
 	if err != nil {
@@ -404,17 +416,9 @@ func (d *Driver) dumpFootprintBytes(plan dumpPlan) (int64, error) {
 		// Frozen upper extents, snapfiles and compressed output are staged;
 		// remote parent data is never materialized in local scratch space.
 		home := filepath.Join(d.ociRoot(), "sandboxes", plan.sandboxID, "upper")
-		var upperBytes int64
-		for _, name := range []string{"writable_data", "writable_index"} {
-			info, e := os.Stat(filepath.Join(home, name))
-			if e != nil {
-				return 0, e
-			}
-			if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-				upperBytes += stat.Blocks * 512
-			} else {
-				upperBytes += info.Size()
-			}
+		upperBytes, err := allocatedUpperBytes(home)
+		if err != nil {
+			return 0, err
 		}
 		return 3*(upperBytes+(int64(mib)<<20)) + (512 << 20), nil
 	}
@@ -437,6 +441,7 @@ func stagingFree(stateRoot string) int64 {
 // covers pause→resume (the business-visible interruption), spillMove the
 // post-resume relocation into the publish staging.
 type dumpPlan struct {
+	identity    *fastletapi.SandboxIdentity
 	stateRoot   string
 	binaryName  string
 	sandboxID   string
@@ -516,6 +521,11 @@ func (d *Driver) spillDirFor(snapshotID, memoryQuantity string) string {
 // StateRoot filesystem. The Sandbox keeps running on every failure path,
 // with a failed resume joined after (and never masking) the dump error.
 func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error { //nolint:gocognit,maintidx // pre-existing pause/dump/resume window; refactor tracked separately
+	releaseLifecycle, err := lockSandboxMutation(ctx, plan.stateRoot, plan.sandboxID)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	snapshotMu.Lock()
 	defer snapshotMu.Unlock()
 
@@ -525,6 +535,9 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 			return fmt.Errorf("%w: %s", runtimecontract.ErrSandboxNotFound, plan.sandboxID)
 		}
 		return err
+	}
+	if plan.identity != nil && !runtimecontract.SameRuntimeIdentity(*plan.identity, state.Config.Identity) {
+		return errors.New("snapshot source runtime identity changed")
 	}
 	if state.Phase != PhaseRunning {
 		return fmt.Errorf("%w: sandbox runtime is %q, must be Running", ErrInvalidConfig, state.Phase)
@@ -592,7 +605,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 	}
 	ociRoot := strings.HasPrefix(sourceRef, "oci://")
 	if ociRoot {
-		rootfs = filepath.Join(filepath.Dir(rootfs), "rootfs.dev")
+		rootfs = filepath.Join(filepath.Dir(rootfs), rootfsDeviceName)
 	}
 	cleanupSpill := func() {
 		if !plan.spilled {
@@ -1196,21 +1209,8 @@ func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, ki
 	if err != nil {
 		return 0, err
 	}
-	// The lineage manifest of the dump: the golden image manifest of a fresh
-	// boot, or the cached checkpoint manifest when the Sandbox was itself
-	// resumed from a checkpoint (the checkpoint carries every lineage field
-	// forward, and the original image may not exist on this node at all).
-	sourceRef, err := restoreReference(state.Config.Desired)
+	document, sourceRef, err := snapshotSourceDocument(stateRoot, ociRoot, state)
 	if err != nil {
-		return 0, err
-	}
-	raw, err := readSourceManifest(stateRoot, ociRoot, sourceRef, state.Config.Identity.SandboxUID)
-	if err != nil {
-		return 0, err
-	}
-
-	var document map[string]json.RawMessage
-	if err = json.Unmarshal(raw, &document); err != nil {
 		return 0, err
 	}
 	isOCI := strings.HasPrefix(sourceRef, ocitemplate.Prefix)
@@ -1253,6 +1253,7 @@ func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, ki
 	if err != nil {
 		return 0, err
 	}
+	delete(platform, "snapshotMode")
 	delete(platform, "checkpoint")
 	if kind == fastletapi.SnapshotKindCheckpoint {
 		platform["checkpoint"], err = json.Marshal(artifacts.CheckpointOwner{SandboxUID: state.Config.Identity.SandboxUID, Namespace: state.Config.Identity.Namespace})
@@ -1323,4 +1324,45 @@ func snapshotStagingPath(stateRoot, podUID, snapshotID string, oci bool) string 
 		return filepath.Join(stateRoot, snapshotStagingDir, podUID, snapshotID)
 	}
 	return filepath.Join(stateRoot, snapshotStagingDir, snapshotID)
+}
+
+// Sparse upper logical sizes include holes; budget capacity against the allocated blocks that will actually be copied.
+func allocatedUpperBytes(home string) (int64, error) {
+	var total int64
+	for _, name := range []string{"writable_data", "writable_index"} {
+		info, err := os.Stat(filepath.Join(home, name))
+		if err != nil {
+			return 0, err
+		}
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			total += stat.Blocks * 512
+		} else {
+			total += info.Size()
+		}
+	}
+	return total, nil
+}
+
+func snapshotSourceDocument(stateRoot, ociRoot string, state *SandboxState) (map[string]json.RawMessage, string, error) {
+	// Capture follows source lineage: new instances read the template, while checkpoint-restored instances read the cached checkpoint; the original image may no longer be on this node.
+	sourceRef, err := restoreReference(state.Config.Desired)
+	if err != nil {
+		return nil, "", err
+	}
+	raw, err := readSourceManifest(stateRoot, ociRoot, sourceRef, state.Config.Identity.SandboxUID)
+	if err != nil {
+		return nil, "", err
+	}
+
+	var document map[string]json.RawMessage
+	if err = json.Unmarshal(raw, &document); err != nil {
+		return nil, "", err
+	}
+	if state.BootCompatibility != nil {
+		document["compatibility"], err = json.Marshal(state.BootCompatibility)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	return document, sourceRef, nil
 }

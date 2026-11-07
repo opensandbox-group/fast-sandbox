@@ -15,9 +15,11 @@ import (
 	"time"
 
 	"github.com/opencontainers/go-digest"
+	oci "github.com/opencontainers/image-spec/specs-go/v1"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 
+	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/ocitemplate"
 )
 
@@ -620,4 +622,56 @@ func TestPackRootfsSquashRecoversOvershootChain(t *testing.T) {
 	for _, entry := range entries {
 		require.Regexp(t, `^[0-9a-f]{64}$`, entry.Name())
 	}
+}
+
+func packCheckpoint(ctx context.Context, bundle, outputName string, maxLayers, squashLayers int) error {
+	return packCapturedBundle(ctx, bundle, outputName, maxLayers, squashLayers, false)
+}
+
+func validatePackBundle(bundle string) ([]byte, *ocitemplate.RootfsUpper, error) {
+	return validatePackBundleMode(bundle, false)
+}
+
+func TestRootfsOnlyPackBoundary(t *testing.T) {
+	for _, scenario := range []string{"valid", "wrong-mode", "memory.snap", "vmstate.snap", "vault.json", "policy.json", "missing-upper", "checkpoint", "missing-cmdline", "unknown-mode"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			m := testVMManifest()
+			m.Platform = &artifacts.VMPlatform{SnapshotMode: "rootfsOnly"}
+			m.Kernel.Cmdline = "console=ttyS0 root=/dev/vda rw init=/init"
+			if scenario == "checkpoint" {
+				m.Platform.Checkpoint = &artifacts.CheckpointOwner{SandboxUID: "uid", Namespace: "ns"}
+			}
+			if scenario == "missing-cmdline" {
+				m.Kernel.Cmdline = ""
+			}
+			if scenario == "unknown-mode" {
+				m.Platform.SnapshotMode = "typo"
+			}
+			raw, err := json.Marshal(m)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), raw, 0600))
+			u := ocitemplate.RootfsUpper{Repository: "example.com/test/rootfs", VirtualSizeBytes: 1 << 20, Lowers: []oci.Descriptor{{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("parent"), Size: 100}}}
+			raw, err = json.Marshal(u)
+			require.NoError(t, err)
+			if scenario != "missing-upper" {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, ocitemplate.RootfsUpperName), raw, 0600))
+			}
+			for _, name := range []string{ocitemplate.UpperDataName, ocitemplate.UpperIndexName} {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("upper"), 0600))
+			}
+			if scenario == "memory.snap" || scenario == "vmstate.snap" || scenario == "vault.json" || scenario == "policy.json" {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, scenario), nil, 0600))
+			}
+			_, _, err = validatePackBundleMode(dir, scenario != "wrong-mode")
+			if scenario == "valid" || scenario == "vault.json" || scenario == "policy.json" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+	size, err := snapfilesSizeGiB(&buildOptions{rootfsOnly: true}, "/absent/vmstate", "/absent/memory")
+	require.NoError(t, err)
+	require.Equal(t, 1, size)
 }

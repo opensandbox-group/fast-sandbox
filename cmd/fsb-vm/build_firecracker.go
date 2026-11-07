@@ -188,6 +188,11 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 			return "", "", err
 		}
 	}
+	if options.guestControlPort != 0 {
+		if err := client.do(ctx, "PUT", "/vsock", map[string]any{"guest_cid": 3, "uds_path": "guest-control.sock"}, nil); err != nil {
+			return "", "", err
+		}
+	}
 	if err := client.startInstance(ctx); err != nil {
 		return "", "", fmt.Errorf("start instance: %w", err)
 	}
@@ -196,6 +201,12 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 		return "", "", err
 	}
 
+	if options.guestControlPort != 0 {
+		if err := probeRootfsHelper(ctx, filepath.Join(runtimeDir, "guest-control.sock"), options.guestControlPort); err != nil {
+			return "", "", err
+		}
+		options.guestControlVerified = true
+	}
 	snapDir := filepath.Join(workDir, "snapshot")
 	if err := os.MkdirAll(snapDir, 0o750); err != nil {
 		return "", "", fmt.Errorf("create snapshot dir: %w", err)

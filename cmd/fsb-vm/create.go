@@ -13,6 +13,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/firecrackerconfig"
 )
 
 // createOptions holds the create-command flags (ADR-007/009/010). The machine
@@ -220,7 +221,8 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	// Step 6: resolve the kernel path (ADR-004). Firecracker snapshot restore
 	// carries the guest kernel in the memory state, but the ADR requires the
 	// host-local vmlinux to be present and version-matched.
-	if _, err := resolveKernel(global.kernelDir, metadata.Kernel.Version, options.kernel); err != nil {
+	kernel, err := resolveKernel(global.kernelDir, metadata.Kernel.Version, options.kernel)
+	if err != nil {
 		return err
 	}
 
@@ -237,7 +239,7 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	if err := persist(); err != nil {
 		return err
 	}
-	if err := resumeVM(ctx, layout, metadata, provider); err != nil {
+	if err := startTemplateVM(ctx, layout, metadata, provider, kernel); err != nil {
 		return err
 	}
 
@@ -351,19 +353,7 @@ func resumeVM(ctx context.Context, layout sandboxLayout, metadata artifacts.VMMa
 // resolveKernel maps manifest.kernel.version to a host-local vmlinux path
 // (ADR-004). An explicit override wins; a missing file is a hard error.
 func resolveKernel(kernelDir, kernelVersion, override string) (string, error) {
-	path := override
-	if path == "" {
-		name := "vmlinux-" + kernelVersion
-		// The standard Builder records its unversioned default filename.
-		if kernelVersion == "vmlinux.bin" {
-			name = kernelVersion
-		}
-		path = filepath.Join(kernelDir, name)
-	}
-	if _, err := os.Stat(path); err != nil {
-		return "", fmt.Errorf("kernel %s not found (kernel.version %q): %w", path, kernelVersion, err)
-	}
-	return path, nil
+	return firecrackerconfig.ResolveKernel(kernelDir, kernelVersion, override)
 }
 
 // printSandbox reports the created sandbox on stdout.
@@ -379,4 +369,51 @@ func printSandbox(state *sandboxState) {
 	}
 	fmt.Printf("  vcpu / memory   : %d / %d MiB\n", state.VCPU, state.MemoryMB)
 	fmt.Printf("  network         : %s\n", state.Network)
+}
+
+// startTemplateVM selects cold boot or Full restore from the declared mode; missing RAM never triggers an implicit fallback.
+func startTemplateVM(ctx context.Context, layout sandboxLayout, metadata artifacts.VMManifest, provider networkProvider, kernel string) error {
+	if !metadata.IsRootfsOnly() {
+		return resumeVM(ctx, layout, metadata, provider)
+	}
+	client := newFirecrackerClient(layout.apiSocket)
+	defer client.close()
+	ready, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := client.waitReady(ready); err != nil {
+		return err
+	}
+	return configureRootfsBoot(ctx, client, layout, metadata, provider, kernel)
+}
+func configureRootfsBoot(ctx context.Context, client *firecrackerClient, layout sandboxLayout, metadata artifacts.VMManifest, provider networkProvider, kernel string) error {
+	if err := metadata.Validate(); err != nil {
+		return err
+	}
+	if !metadata.IsRootfsOnly() || kernel == "" {
+		return errors.New("explicit rootfsOnly metadata and resolved kernel required")
+	}
+	host, cleanup, err := provider.Acquire(ctx, metadata)
+	if err != nil {
+		return err
+	}
+	success := false
+	defer func() {
+		if !success && cleanup != nil {
+			_ = cleanup()
+		}
+	}()
+	ops, err := firecrackerconfig.RootfsBoot(metadata, kernel, rootfsDriveLink, host, filepath.Join(layout.runtime, "guest-control.sock"))
+	if err != nil {
+		return err
+	}
+	for _, op := range ops {
+		if err := client.do(ctx, "PUT", op.Path, op.Body, nil); err != nil {
+			return err
+		}
+	}
+	if err := client.startInstance(ctx); err != nil {
+		return err
+	}
+	success = true
+	return nil
 }

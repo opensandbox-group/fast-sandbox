@@ -171,7 +171,7 @@ func (s *statefulFakeServer) handle(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"version":"1.15.1"}`))
+		_, _ = w.Write([]byte(`{"firecracker_version":"1.15.1"}`))
 	case "/actions":
 		var action actionRequest
 		_ = json.NewDecoder(r.Body).Decode(&action)
@@ -466,7 +466,7 @@ func TestEnsureSandboxBootsVM(t *testing.T) {
 	require.NotEmpty(t, metadata.Allocation.Network.SlotID)
 
 	require.Len(t, fixture.launcher.started, 1)
-	require.Equal(t, "/usr/local/bin/firecracker", fixture.launcher.started[0][0])
+	require.Equal(t, "nsenter", fixture.launcher.started[0][0])
 	require.Contains(t, fixture.launcher.started[0], "--api-sock")
 	// Direct mode has no jail and no jailed KVM device to align.
 	require.Empty(t, fixture.alignCalls)
@@ -476,6 +476,9 @@ func TestEnsureSandboxBootsVM(t *testing.T) {
 	slot, exists := fixture.manager.Lookup("sandbox-1")
 	require.True(t, exists)
 	require.Equal(t, "172.30.0.3", slot.GuestIP)
+	// Direct mode must also enter the allocated network namespace before executing the actual VMM.
+	require.GreaterOrEqual(t, len(fixture.launcher.started[0]), 4)
+	require.Equal(t, []string{"nsenter", "--net=" + slot.NetNSPath, "--", "/usr/local/bin/firecracker"}, fixture.launcher.started[0][:4])
 
 	calls := fixture.server.recordedCalls()
 	// v1.16 restore: LoadSnapshot is the first (and only pre-boot) API call;

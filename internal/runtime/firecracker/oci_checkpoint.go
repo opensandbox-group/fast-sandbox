@@ -95,9 +95,41 @@ func checkpointCredentials(destination string) (ocitemplate.CredentialFunc, erro
 	}, nil
 }
 
-// publishOCISnapshot runs inside the existing asynchronous snapshot worker.
-// Success means the snapfiles manifest publication point is visible in ACR.
+// Fix publication inputs while holding the source instance lock; packing and upload must not reread meta.json, which may be deleted or replaced.
+type ociPublication struct{ destination string }
+
+func prepareOCIPublication(plan dumpPlan) (ociPublication, error) {
+	state, err := loadState(plan.sandboxDir)
+	if err != nil {
+		return ociPublication{}, err
+	}
+	sourceRef, err := restoreReference(state.Config.Desired)
+	if err != nil {
+		return ociPublication{}, err
+	}
+	destination, err := checkpointDestinationForSource(sourceRef, plan.snapshotID)
+	if err != nil {
+		return ociPublication{}, err
+	}
+	owner, err := json.Marshal(state.Config.Identity)
+	if err != nil {
+		return ociPublication{}, err
+	}
+	if err := os.WriteFile(filepath.Join(plan.staging, ".pack-owner.json"), owner, 0600); err != nil {
+		return ociPublication{}, err
+	}
+	return ociPublication{destination: destination}, nil
+}
+
 func (d *Driver) publishOCISnapshot(ctx context.Context, plan dumpPlan, sizeBytes int64, kind fastletapi.SnapshotKind, onPublishing func()) (*runtimecontract.SnapshotResult, error) {
+	publication, err := prepareOCIPublication(plan)
+	if err != nil {
+		return nil, err
+	}
+	return d.publishPreparedOCISnapshot(ctx, plan, sizeBytes, publication, onPublishing)
+}
+
+func (d *Driver) publishPreparedOCISnapshot(ctx context.Context, plan dumpPlan, sizeBytes int64, publication ociPublication, onPublishing func()) (*runtimecontract.SnapshotResult, error) {
 	defer func() {
 		if _, err := os.Stat(filepath.Join(plan.staging, ".pack-resources-active")); err == nil {
 			klog.ErrorS(fmt.Errorf("pack resources may still be active"), "checkpoint backing files retained for recovery", "staging", plan.staging)
@@ -105,37 +137,23 @@ func (d *Driver) publishOCISnapshot(ctx context.Context, plan dumpPlan, sizeByte
 		}
 		_ = os.RemoveAll(plan.staging)
 	}()
-	state, err := loadState(plan.sandboxDir)
+	credentials, err := checkpointCredentials(publication.destination)
 	if err != nil {
 		return nil, err
 	}
-	sourceRef, err := restoreReference(state.Config.Desired)
-	if err != nil {
-		return nil, err
-	}
-	destination, err := checkpointDestinationForSource(sourceRef, plan.snapshotID)
-	if err != nil {
-		return nil, err
-	}
-	credentials, err := checkpointCredentials(destination)
-	if err != nil {
-		return nil, err
-	}
-
 	manifestPath := filepath.Join(plan.staging, snapshotManifestName)
 	raw, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return nil, err
 	}
-	// Local recovery ownership is not part of the published artifact manifest.
-	owner, err := json.Marshal(state.Config.Identity)
+	args := append(d.fsbArgs(), "--build-work-dir", filepath.Join(plan.staging, "pack-work"), "--build-output-dir", filepath.Join(plan.staging, "artifacts"), "pack", "--bundle-dir", plan.staging, "--output", "snapshot:"+plan.snapshotID)
+	document, err := artifacts.DecodeVMManifest(raw)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(filepath.Join(plan.staging, ".pack-owner.json"), owner, 0600); err != nil {
-		return nil, err
+	if document.IsRootfsOnly() {
+		args = append(args, "--rootfs-only")
 	}
-	args := append(d.fsbArgs(), "--build-work-dir", filepath.Join(plan.staging, "pack-work"), "--build-output-dir", filepath.Join(plan.staging, "artifacts"), "pack", "--bundle-dir", plan.staging, "--output", "snapshot:"+plan.snapshotID)
 	if output, err := exec.CommandContext(ctx, "fsb-vm", args...).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("package OCI snapshot: %w: %s", err, output)
 	}
@@ -146,7 +164,7 @@ func (d *Driver) publishOCISnapshot(ctx context.Context, plan dumpPlan, sizeByte
 	if ociPlainHTTP() {
 		pushOptions = append(pushOptions, ocitemplate.WithPlainHTTP(true))
 	}
-	ref, _, err := ocitemplate.Push(ctx, filepath.Join(plan.staging, "artifacts", "snapshot_"+plan.snapshotID), destination, raw, credentials, pushOptions...)
+	ref, _, err := ocitemplate.Push(ctx, filepath.Join(plan.staging, "artifacts", "snapshot_"+plan.snapshotID), publication.destination, raw, credentials, pushOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("publish OCI snapshot: %w", err)
 	}

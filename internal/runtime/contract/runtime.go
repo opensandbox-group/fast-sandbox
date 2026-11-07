@@ -102,6 +102,9 @@ type SnapshotResult struct {
 
 // SnapshotInput carries one snapshot request to the runtime driver.
 type SnapshotInput struct {
+	Mode fastletapi.SnapshotMode
+	// Identity binds the asynchronous task to the runtime incarnation verified at admission.
+	Identity *fastletapi.SandboxIdentity
 	// SandboxID identifies the running Sandbox to snapshot.
 	SandboxID string
 	// SnapshotID is the node-local identity of the snapshot; it scopes the

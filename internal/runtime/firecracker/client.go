@@ -79,12 +79,18 @@ type NetworkInterfaceRequest struct {
 	GuestMAC    string `json:"guest_mac,omitempty"`
 }
 
+// VSockRequest configures PUT /vsock for a cold-boot VM. Keep the host socket private to the runtime; Guest CIDs 0, 1, and 2 are reserved.
+type VSockRequest struct {
+	GuestCID uint32 `json:"guest_cid"`
+	UDSPath  string `json:"uds_path"`
+}
+
 type actionRequest struct {
 	ActionType string `json:"action_type"`
 }
 
 type versionResponse struct {
-	Version string `json:"version"`
+	Version string `json:"firecracker_version"`
 }
 
 type instanceInfoResponse struct {
@@ -124,6 +130,9 @@ func (c *Client) Version(ctx context.Context) (string, error) {
 	if err := c.do(ctx, http.MethodGet, "/version", nil, &response); err != nil {
 		return "", err
 	}
+	if response.Version == "" {
+		return "", fmt.Errorf("Firecracker /version response missing firecracker_version")
+	}
 	return response.Version, nil
 }
 
@@ -147,6 +156,15 @@ func (c *Client) AttachNetworkInterface(ctx context.Context, request NetworkInte
 	return c.do(ctx, http.MethodPut, "/network-interfaces/"+pathEscape(request.IfaceID), request, nil)
 }
 
+// ConfigureVSock configures the Guest control channel before InstanceStart.
+// Do not use it as an additional configuration step before LoadSnapshot.
+func (c *Client) ConfigureVSock(ctx context.Context, request VSockRequest) error {
+	if request.GuestCID < 3 || request.GuestCID == ^uint32(0) || request.UDSPath == "" {
+		return fmt.Errorf("vsock requires a non-reserved guest CID and private socket path")
+	}
+	return c.do(ctx, http.MethodPut, "/vsock", request, nil)
+}
+
 // Start boots the microVM (InstanceStart action).
 func (c *Client) Start(ctx context.Context) error {
 	return c.do(ctx, http.MethodPut, "/actions", actionRequest{ActionType: "InstanceStart"}, nil)
@@ -155,7 +173,7 @@ func (c *Client) Start(ctx context.Context) error {
 // Pause pauses the microVM (PATCH /vm). It is part of the snapshot
 // preparation surface (golden snapshot self-bootstrap).
 func (c *Client) Pause(ctx context.Context) error {
-	return c.do(ctx, http.MethodPatch, "/vm", map[string]string{"state": "Paused"}, nil)
+	return c.do(ctx, http.MethodPatch, "/vm", map[string]string{"state": vmPaused}, nil)
 }
 
 // Resume resumes a paused microVM (PATCH /vm). After snapshot/load with

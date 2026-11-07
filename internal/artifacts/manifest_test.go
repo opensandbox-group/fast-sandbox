@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestCompatibilityCPUTemplate: the node-side tier resolution behind the
@@ -303,5 +305,23 @@ func TestVMManifestContract(t *testing.T) {
 				t.Fatal("invalid contract accepted")
 			}
 		})
+	}
+}
+
+func TestRootfsManifestRetainsArchitectureButNotCPUState(t *testing.T) {
+	m := VMManifest{SchemaVersion: 1, Runtime: "firecracker", Machine: VMMachine{VCPUCount: 1, MemoryMiB: 256, RootfsSizeMiB: 1024, RootfsDrivePath: VMRootfsDrivePath}, Kernel: VMKernel{Version: "6.1.177", Cmdline: "root=/dev/vda rw init=/init"}, Compatibility: SnapshotCompatibility{CPUArch: "aarch64", FirecrackerVersion: "1.16.1"}, Platform: &VMPlatform{SnapshotMode: "rootfsOnly"}}
+	require.NoError(t, m.Validate())
+	full := m
+	full.Platform = nil
+	require.Error(t, full.Validate(), "Full must still require CPU provenance")
+	for _, mutate := range []func(*VMManifest){
+		func(v *VMManifest) { v.Compatibility.CPUArch = "riscv64" },
+		func(v *VMManifest) { v.Kernel.Cmdline = "" },
+		func(v *VMManifest) { v.Files = map[string]ManifestFile{"memory.snap": {}} },
+		func(v *VMManifest) { v.GuestControl = &VMGuestControl{Protocol: "typo"} },
+	} {
+		copy := m
+		mutate(&copy)
+		require.Error(t, copy.Validate())
 	}
 }

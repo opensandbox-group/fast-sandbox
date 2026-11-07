@@ -33,7 +33,7 @@ func TestClientVersion(t *testing.T) {
 	socketPath := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/version", r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"version":"1.15.1"}`))
+		_, _ = w.Write([]byte(`{"firecracker_version":"1.15.1"}`))
 	})
 	client := NewClient(socketPath)
 	t.Cleanup(client.Close)
@@ -41,6 +41,21 @@ func TestClientVersion(t *testing.T) {
 	version, err := client.Version(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, "1.15.1", version)
+}
+
+func TestClientVersionRejectsMissingVersion(t *testing.T) {
+	for _, body := range []string{`{}`, `{"firecracker_version":""}`, `{"version":"1.15.1"}`} {
+		t.Run(body, func(t *testing.T) {
+			socketPath := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(body))
+			})
+			client := NewClient(socketPath)
+			t.Cleanup(client.Close)
+			version, err := client.Version(context.Background())
+			require.ErrorContains(t, err, "missing firecracker_version")
+			require.Empty(t, version)
+		})
+	}
 }
 
 func TestClientLifecycleCalls(t *testing.T) {
@@ -177,4 +192,25 @@ func TestClientNotReady(t *testing.T) {
 func TestPathEscape(t *testing.T) {
 	require.Equal(t, "root", pathEscape("root"))
 	require.Equal(t, "a%2Fb", pathEscape("a/b"))
+}
+
+func TestClientConfigureVSock(t *testing.T) {
+	var received VSockRequest
+	calls := 0
+	socketPath := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		require.Equal(t, http.MethodPut, r.Method)
+		require.Equal(t, "/vsock", r.URL.Path)
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&received))
+		w.WriteHeader(http.StatusNoContent)
+	})
+	client := NewClient(socketPath)
+	t.Cleanup(client.Close)
+	for _, cid := range []uint32{0, 1, 2, ^uint32(0)} {
+		require.Error(t, client.ConfigureVSock(context.Background(), VSockRequest{GuestCID: cid, UDSPath: "control.sock"}))
+	}
+	require.Error(t, client.ConfigureVSock(context.Background(), VSockRequest{GuestCID: 3}))
+	require.NoError(t, client.ConfigureVSock(context.Background(), VSockRequest{GuestCID: 3, UDSPath: "control.sock"}))
+	require.Equal(t, 1, calls)
+	require.Equal(t, VSockRequest{GuestCID: 3, UDSPath: "control.sock"}, received)
 }

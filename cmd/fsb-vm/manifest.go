@@ -40,6 +40,9 @@ func validateManifest(m artifacts.VMManifest, binary string, force bool) error {
 		}
 		fmt.Fprintln(os.Stderr, "warning:", err)
 	}
+	if m.IsRootfsOnly() {
+		return nil
+	}
 	return artifacts.MatchRestoreCompatibility(m.Compatibility, artifacts.HostCPUIdentity(), want)
 }
 
@@ -70,6 +73,16 @@ func buildSnapfilesManifest(options *buildOptions, createdAt time.Time) ([]byte,
 		return nil, err
 	}
 	manifest := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: options.vcpu, MemoryMiB: int64(options.memoryMB), RootfsSizeMiB: int64(size), RootfsDriveID: options.rootfsDriveID, RootfsDrivePath: rootfsDriveLink}, version, global.firecrackerBin, artifacts.CPUTemplateNone)
+	if options.guestControlPort != 0 {
+		if !options.guestControlVerified {
+			return nil, fmt.Errorf("guest control capability requires successful freeze/thaw probe")
+		}
+		manifest.GuestControl = &artifacts.VMGuestControl{Protocol: "fsb-freeze-v1", Transport: "vsock", Port: options.guestControlPort, HelperVersion: "1"}
+	}
+	manifest.Kernel.Cmdline = options.bootArgs
+	if strings.TrimSpace(manifest.Kernel.Cmdline) == "" {
+		manifest.Kernel.Cmdline = defaultBootArgs + " init=" + options.initPath
+	}
 	manifest.Lineage = &artifacts.VMLineage{Image: options.source, CreatedAt: createdAt.UTC().Format(time.RFC3339)}
 	if ref, err := parseRegistryReference(options.source); err == nil && strings.HasPrefix(ref.Reference, "sha256:") {
 		manifest.Lineage.ImageDigest = ref.Reference
@@ -91,8 +104,12 @@ func buildSnapfilesManifest(options *buildOptions, createdAt time.Time) ([]byte,
 			return nil, err
 		}
 	}
-	if _, err := artifacts.DecodeVMManifest(raw); err != nil {
+	document, err := artifacts.DecodeVMManifest(raw)
+	if err != nil {
 		return nil, err
+	}
+	if document.IsRootfsOnly() {
+		return nil, fmt.Errorf("build produces Full snapshots; use pack --rootfs-only for captured rootfsOnly bundles")
 	}
 	return raw, nil
 }

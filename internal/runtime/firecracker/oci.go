@@ -202,6 +202,7 @@ func (d *Driver) prepareOCIRestore(ctx context.Context, directory, reference str
 		return attachment, err
 	}
 	metadata := attachment.metadata
+
 	if err := validateOCIResumeOwner(metadata, config); err != nil {
 		return attachment, err
 	}
@@ -209,8 +210,14 @@ func (d *Driver) prepareOCIRestore(ctx context.Context, directory, reference str
 	if err := validateRestoreMachine(config.Limits, d.config, metadata.Machine, hasMachine); err != nil {
 		return attachment, err
 	}
-	if err := checkRestoreCompatibility(metadata.Compatibility, artifacts.HostCPUIdentity(), d.firecrackerVersion(), reference); err != nil {
-		return attachment, err
+	if metadata.IsRootfsOnly() {
+		if err := checkRootfsBootCompatibility(metadata, d.firecrackerVersion()); err != nil {
+			return attachment, err
+		}
+	} else {
+		if err := checkRestoreCompatibility(metadata.Compatibility, artifacts.HostCPUIdentity(), d.firecrackerVersion(), reference); err != nil {
+			return attachment, err
+		}
 	}
 	return attachment, nil
 }
@@ -278,7 +285,7 @@ func (d *Driver) releaseOCI(ctx context.Context, id string) error {
 }
 func (d *Driver) prepareOCIInstance(id, directory, rootfs, vmstate, memory string) (string, string, string, error) {
 	if d.config.JailerPath == "" {
-		if err := os.Symlink(rootfs, filepath.Join(directory, "rootfs.dev")); err != nil {
+		if err := os.Symlink(rootfs, filepath.Join(directory, rootfsDeviceName)); err != nil {
 			return "", "", "", err
 		}
 		return rootfs, "", filepath.Join(directory, "api.sock"), nil
@@ -287,7 +294,7 @@ func (d *Driver) prepareOCIInstance(id, directory, rootfs, vmstate, memory strin
 	if err := os.MkdirAll(filepath.Join(root, jailerChrootSnapshotsDir), 0750); err != nil {
 		return "", "", "", err
 	}
-	for _, entry := range []struct{ source, target string }{{rootfs, "rootfs.dev"}, {vmstate, filepath.Join(jailerChrootSnapshotsDir, vmstateSnapshotName)}, {memory, filepath.Join(jailerChrootSnapshotsDir, memorySnapshotName)}} {
+	for _, entry := range []struct{ source, target string }{{rootfs, rootfsDeviceName}, {vmstate, filepath.Join(jailerChrootSnapshotsDir, vmstateSnapshotName)}, {memory, filepath.Join(jailerChrootSnapshotsDir, memorySnapshotName)}} {
 		target := filepath.Join(root, entry.target)
 		file, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, 0640)
 		if err != nil {
@@ -299,5 +306,5 @@ func (d *Driver) prepareOCIInstance(id, directory, rootfs, vmstate, memory strin
 		}
 	}
 	d.prepareSnapshotSpill(root)
-	return filepath.Join(root, "rootfs.dev"), root, filepath.Join(root, "api.sock"), nil
+	return filepath.Join(root, rootfsDeviceName), root, filepath.Join(root, "api.sock"), nil
 }
