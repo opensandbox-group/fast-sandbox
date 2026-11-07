@@ -30,6 +30,7 @@ var snapshotWorkerTimeout = 30 * time.Minute
 // ever taken toward this Fastlet since start, which is accepted as a small,
 // inspectable leak.
 type snapshotTask struct {
+	mode         fastletapi.SnapshotMode
 	identity     fastletapi.SnapshotIdentity
 	kind         fastletapi.SnapshotKind
 	templateName string
@@ -87,7 +88,7 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 			"Fastlet is draining", true))
 	}
 	if existing, found := m.snapshots[req.Identity.SnapshotUID]; found {
-		sameClaim := sameSnapshotSandboxClaim(existing.identity.Sandbox, req.Identity.Sandbox)
+		sameClaim := sameSnapshotRequest(existing, req)
 		status := existing.status()
 		m.mu.Unlock()
 		if sameClaim {
@@ -120,6 +121,10 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 	if metadata.Config.Desired.Restore != nil {
 		image = metadata.Config.Desired.Restore.ManifestRef
 	}
+	if req.Snapshot.Mode == fastletapi.SnapshotModeRootfsOnly && !strings.HasPrefix(image, ocitemplate.Prefix) {
+		m.mu.Unlock()
+		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletError(fastletapi.ErrorSnapshotUnsupported, "RootfsOnly requires OCI rootfs", false))
+	}
 	if req.Snapshot.Kind != fastletapi.SnapshotKindCheckpoint && req.Snapshot.TemplateName == "" && !strings.HasPrefix(image, ocitemplate.Prefix) {
 		m.mu.Unlock()
 		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletError(fastletapi.ErrorConflict,
@@ -139,18 +144,9 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 			return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, failure)
 		}
 	}
-	// Template-name fence — holds to terminal: concurrent publishers of one
-	// index key would race last-writer-wins on the store. Checkpoints carry
-	// no index key and are exempt.
-	if req.Snapshot.Kind != fastletapi.SnapshotKindCheckpoint && req.Snapshot.TemplateName != "" {
-		for _, task := range m.snapshots {
-			if !fastletapi.SnapshotPhaseTerminal(task.phase) && task.templateName == req.Snapshot.TemplateName {
-				failure := fastletError(fastletapi.ErrorSnapshotInProgress,
-					"template name is held by a snapshot that has not terminated; retry after it terminates or use another name", false)
-				m.mu.Unlock()
-				return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, failure)
-			}
-		}
+	if failure := m.snapshotTemplateConflictLocked(req); failure != nil {
+		m.mu.Unlock()
+		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, failure)
 	}
 	snapshotID, err := idgen.GenerateRequestID()
 	if err != nil {
@@ -159,7 +155,7 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 			"generate snapshot id: "+err.Error(), true, err))
 	}
 	task := &snapshotTask{
-		identity: req.Identity, kind: req.Snapshot.Kind, templateName: req.Snapshot.TemplateName,
+		mode: fastletapi.NormalizeSnapshotMode(req.Snapshot.Mode), identity: req.Identity, kind: req.Snapshot.Kind, templateName: req.Snapshot.TemplateName,
 		snapshotID: snapshotID, phase: fastletapi.SnapshotPhasePending,
 	}
 	m.snapshots[req.Identity.SnapshotUID] = task
@@ -176,6 +172,13 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 func (m *SandboxManager) validateSnapshotRequest(req *fastletapi.CreateSnapshotRequest) *fastletapi.FastletError {
 	if req == nil || req.Identity.SnapshotUID == "" || req.Identity.Namespace == "" || req.Identity.Name == "" {
 		return fastletError(fastletapi.ErrorConflict, "snapshotUid, namespace, and name are required", false)
+	}
+	mode := fastletapi.NormalizeSnapshotMode(req.Snapshot.Mode)
+	if mode != fastletapi.SnapshotModeFull && mode != fastletapi.SnapshotModeRootfsOnly {
+		return fastletError(fastletapi.ErrorConflict, "unknown snapshot mode", false)
+	}
+	if mode == fastletapi.SnapshotModeRootfsOnly && req.Snapshot.Kind == fastletapi.SnapshotKindCheckpoint {
+		return fastletError(fastletapi.ErrorConflict, "RootfsOnly supports templates only", false)
 	}
 	switch req.Snapshot.Kind {
 	case "", fastletapi.SnapshotKindTemplate:
@@ -220,15 +223,16 @@ func (m *SandboxManager) runSnapshotWorker(snapshotter RuntimeSnapshotter, task 
 
 	m.mu.RLock()
 	metadata, found := m.sandboxes[sandboxUID]
-	runnable := found && metadata.Phase == sandboxStateRunning
+	runnable := found && metadata.Phase == sandboxStateRunning && sameSnapshotSandboxClaim(metadata.Config.Identity, task.identity.Sandbox)
 	m.mu.RUnlock()
 	if !runnable {
 		m.finishSnapshotTask(task, fastletapi.SnapshotPhaseFailed, "target Sandbox is no longer running on this Fastlet")
 		return
 	}
 
-	m.setSnapshotPhase(task, fastletapi.SnapshotPhaseCreating, "dumping vmstate/memory and cloning the rootfs")
+	m.setSnapshotPhase(task, fastletapi.SnapshotPhaseCreating, "capturing sandbox artifacts")
 	result, err := snapshotter.CreateSnapshot(ctx, &RuntimeSnapshotInput{
+		Mode: task.mode, Identity: &task.identity.Sandbox,
 		SandboxID:    sandboxUID,
 		SnapshotID:   task.snapshotID,
 		Kind:         task.kind,
@@ -388,4 +392,22 @@ func (m *SandboxManager) DeleteSnapshot(ctx context.Context, req *fastletapi.Del
 		}
 	}
 	return &fastletapi.DeleteSnapshotResponse{}, nil
+}
+
+func sameSnapshotRequest(existing *snapshotTask, req *fastletapi.CreateSnapshotRequest) bool {
+	return sameSnapshotSandboxClaim(existing.identity.Sandbox, req.Identity.Sandbox) && fastletapi.NormalizeSnapshotMode(existing.mode) == fastletapi.NormalizeSnapshotMode(req.Snapshot.Mode) && existing.kind == req.Snapshot.Kind && existing.templateName == req.Snapshot.TemplateName
+}
+
+func (m *SandboxManager) snapshotTemplateConflictLocked(req *fastletapi.CreateSnapshotRequest) *fastletapi.FastletError {
+	// Protect the template name until the task reaches a terminal state so concurrent publications cannot overwrite the same index; checkpoints have no index key and are exempt.
+	if req.Snapshot.Kind != fastletapi.SnapshotKindCheckpoint && req.Snapshot.TemplateName != "" {
+		for _, task := range m.snapshots {
+			if !fastletapi.SnapshotPhaseTerminal(task.phase) && task.templateName == req.Snapshot.TemplateName {
+				failure := fastletError(fastletapi.ErrorSnapshotInProgress,
+					"template name is held by a snapshot that has not terminated; retry after it terminates or use another name", false)
+				return failure
+			}
+		}
+	}
+	return nil
 }

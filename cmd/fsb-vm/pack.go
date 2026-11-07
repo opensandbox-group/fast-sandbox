@@ -23,6 +23,7 @@ import (
 // Checkpoint rootfs chain policy: at maxRootfsLayers, merge the newest
 // squashLayers layers into one; template base layers stay at the bottom.
 const (
+	packMemorySnapshotName = "memory.snap"
 	defaultMaxRootfsLayers = 24
 	defaultSquashLayers    = 16
 )
@@ -31,6 +32,7 @@ const (
 func newPackCommand() *cobra.Command {
 	var bundle, output string
 	var maxLayers, squashLayers int
+	var rootfsOnly bool
 	cmd := &cobra.Command{Use: "pack", Short: "Package captured rootfs, memory and VM state as an OverlayBD pair", RunE: func(cmd *cobra.Command, _ []string) error {
 		if squashLayers < 2 {
 			return fmt.Errorf("--squash-layers must be at least 2, got %d", squashLayers)
@@ -38,8 +40,9 @@ func newPackCommand() *cobra.Command {
 		if maxLayers <= squashLayers {
 			return fmt.Errorf("--max-rootfs-layers (%d) must exceed --squash-layers (%d)", maxLayers, squashLayers)
 		}
-		return packCheckpoint(cmd.Context(), bundle, output, maxLayers, squashLayers)
+		return packCapturedBundle(cmd.Context(), bundle, output, maxLayers, squashLayers, rootfsOnly)
 	}}
+	cmd.Flags().BoolVar(&rootfsOnly, "rootfs-only", false, "package an explicit rootfsOnly template without RAM or VM state")
 	cmd.Flags().StringVar(&bundle, "bundle-dir", "", "captured checkpoint directory")
 	cmd.Flags().StringVar(&output, "output", "", "local logical output name:tag")
 	cmd.Flags().IntVar(&maxLayers, "max-rootfs-layers", defaultMaxRootfsLayers, "squash the inherited rootfs layer chain once it reaches this many layers")
@@ -49,7 +52,7 @@ func newPackCommand() *cobra.Command {
 	return cmd
 }
 
-func packCheckpoint(ctx context.Context, bundle, outputName string, maxLayers, squashLayers int) (resultErr error) {
+func packCapturedBundle(ctx context.Context, bundle, outputName string, maxLayers, squashLayers int, rootfsOnly bool) (resultErr error) {
 	releaseBundle, err := lockPackBundle(bundle)
 	if err != nil {
 		return err
@@ -62,7 +65,7 @@ func packCheckpoint(ctx context.Context, bundle, outputName string, maxLayers, s
 	if err != nil {
 		return err
 	}
-	metadata, upper, err := validatePackBundle(bundle)
+	metadata, upper, err := validatePackBundleMode(bundle, rootfsOnly)
 	if err != nil {
 		return err
 	}
@@ -99,12 +102,12 @@ func packCheckpoint(ctx context.Context, bundle, outputName string, maxLayers, s
 		return err
 	}
 	ublkd := newUblkdClient(global.ublkdSocket)
-	options := &buildOptions{snapshotManifest: metadata, snapshotExtras: extras, snapfilesProgress: func(phase string) error { return writePackResources(activeMarker, work, phase) }}
+	options := &buildOptions{rootfsOnly: rootfsOnly, snapshotManifest: metadata, snapshotExtras: extras, snapfilesProgress: func(phase string) error { return writePackResources(activeMarker, work, phase) }}
 	// Preserve backing files if this process is killed or resource rollback fails.
 	if err = writePackResources(activeMarker, work, packPhasePrepared); err != nil {
 		return err
 	}
-	if err = captureSnapfiles(ctx, ublkd, options, work, filepath.Join(bundle, "vmstate.snap"), filepath.Join(bundle, "memory.snap"), undo); err != nil {
+	if err = captureSnapfiles(ctx, ublkd, options, work, filepath.Join(bundle, "vmstate.snap"), filepath.Join(bundle, packMemorySnapshotName), undo); err != nil {
 		return err
 	}
 	snap, err := sealUpper(ctx, layout, work, "snapfiles", true)
@@ -140,7 +143,7 @@ func packSnapshotExtras(bundle string) (map[string]string, error) {
 	return extras, nil
 }
 
-func validatePackBundle(bundle string) ([]byte, *ocitemplate.RootfsUpper, error) {
+func validatePackBundleMode(bundle string, rootfsOnly bool) ([]byte, *ocitemplate.RootfsUpper, error) {
 	metadata, err := os.ReadFile(filepath.Join(bundle, inDiskManifest))
 	if err != nil {
 		return nil, nil, err
@@ -149,14 +152,29 @@ func validatePackBundle(bundle string) ([]byte, *ocitemplate.RootfsUpper, error)
 	if err != nil {
 		return nil, nil, err
 	}
+	if manifest.IsRootfsOnly() != rootfsOnly {
+		return nil, nil, errors.New("snapshot mode does not match --rootfs-only")
+	}
 	machine := manifest.Machine
 
 	upper, upperErr := ocitemplate.ReadRootfsUpper(bundle)
 	if upperErr != nil && !errors.Is(upperErr, os.ErrNotExist) {
 		return nil, nil, upperErr
 	}
-	required := []string{"vmstate.snap", "memory.snap", "manifest.json"}
-	sizes := map[string]int64{"memory.snap": int64(machine.MemoryMiB) << 20}
+	required := []string{"vmstate.snap", packMemorySnapshotName, "manifest.json"}
+	sizes := map[string]int64{packMemorySnapshotName: int64(machine.MemoryMiB) << 20}
+	if rootfsOnly {
+		if upper == nil {
+			return nil, nil, errors.New("rootfsOnly requires an OverlayBD upper")
+		}
+		for _, name := range []string{"vmstate.snap", packMemorySnapshotName} {
+			if _, err := os.Lstat(filepath.Join(bundle, name)); !errors.Is(err, os.ErrNotExist) {
+				return nil, nil, fmt.Errorf("rootfsOnly forbids %s or cannot verify its absence", name)
+			}
+		}
+		required = []string{"manifest.json"}
+		sizes = map[string]int64{}
+	}
 	if upper != nil {
 		if upper.VirtualSizeBytes != int64(machine.RootfsSizeMiB)<<20 {
 			return nil, nil, fmt.Errorf("rootfs upper size does not match machine metadata")

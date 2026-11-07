@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/klog/v2"
 
+	"fast-sandbox/internal/artifacts"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	dataplane "fast-sandbox/internal/dataplane/contract"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
@@ -527,6 +528,11 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		return nil, err
 	}
 
+	releaseLifecycle, err := lockSandboxMutation(ctx, stateRoot, identity.SandboxUID)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseLifecycle()
 	directory, err := ensureSandboxDir(stateRoot, identity.SandboxUID)
 	if err != nil {
 		return nil, err
@@ -565,6 +571,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	var ociRootfs, vmstatePath, memoryPath string
 	var ociMetadata ociRestoreMetadata
 	var ociPrepareDur time.Duration
+	var rootfsKernel string
 	ociAttached := false
 	createdComplete := false
 	defer func() {
@@ -650,7 +657,14 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	var instanceRootfs, jailRoot, apiAddress string
 	if err == nil {
 		if isOCI {
-			instanceRootfs, jailRoot, apiAddress, err = d.prepareOCIInstance(identity.SandboxUID, directory, ociRootfs, vmstatePath, memoryPath)
+			if ociMetadata.IsRootfsOnly() {
+				rootfsKernel, err = d.rootfsKernel(ociMetadata)
+				if err == nil {
+					instanceRootfs, jailRoot, apiAddress, err = d.prepareRootfsBootInstance(identity.SandboxUID, directory, ociRootfs, rootfsKernel)
+				}
+			} else {
+				instanceRootfs, jailRoot, apiAddress, err = d.prepareOCIInstance(identity.SandboxUID, directory, ociRootfs, vmstatePath, memoryPath)
+			}
 		} else {
 			instanceRootfs, jailRoot, apiAddress, err = d.prepareInstance(
 				stateRoot, identity.SandboxUID, restoreRef, directory, vmstatePath, memoryPath,
@@ -728,6 +742,10 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		Phase:      PhaseStarting,
 		APIAddress: apiAddress, CreatedAt: time.Now().Unix(),
 		InfraServices: infraServices, InfraDiagnostics: infraDiagnostics,
+	}
+	if ociMetadata.IsRootfsOnly() {
+		provenance := artifacts.NewVMManifest(ociMetadata.Machine, ociMetadata.Kernel.Version, d.config.BinaryPath, artifacts.CPUTemplateNone).Compatibility
+		state.BootCompatibility = &provenance
 	}
 	if err := saveState(directory, state); err != nil {
 		releaseSlot()
@@ -816,7 +834,11 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	defer client.Close()
 	configureStarted := time.Now()
 	configureCtx, configureSpan := observability.Start(ctx, "fastlet.firecracker.configure")
-	err = configureRestoreVM(configureCtx, client, slot, vmstatePath, memoryPath, jailRoot != "")
+	if ociMetadata.IsRootfsOnly() {
+		err = configureRootfsVM(configureCtx, client, slot, ociMetadata, rootfsKernel, filepath.Join(filepath.Dir(apiAddress), "guest-control.sock"), jailRoot != "")
+	} else {
+		err = configureRestoreVM(configureCtx, client, slot, vmstatePath, memoryPath, jailRoot != "")
+	}
 	observability.End(configureSpan, err)
 	if err != nil {
 		d.killAndForget(identity.SandboxUID, process.PID())
@@ -827,7 +849,15 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 
 	bootStarted := time.Now()
 	bootCtx, bootSpan := observability.Start(ctx, "fastlet.firecracker.resume")
-	polls, err := resumeVM(bootCtx, client, d.config.BootTimeoutSeconds)
+	var polls int
+	if ociMetadata.IsRootfsOnly() {
+		err = client.Start(bootCtx)
+		if err == nil {
+			polls, err = waitVMRunning(bootCtx, client, d.config.BootTimeoutSeconds)
+		}
+	} else {
+		polls, err = resumeVM(bootCtx, client, d.config.BootTimeoutSeconds)
+	}
 	observability.End(bootSpan, err)
 	if err != nil {
 		d.killAndForget(identity.SandboxUID, process.PID())
@@ -923,6 +953,11 @@ func (d *Driver) RecordTerminalFailure(ctx context.Context, identity fastletapi.
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	d.mu.RUnlock()
+	releaseLifecycle, err := lockSandboxMutation(ctx, stateRoot, sandboxID)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	directory, err := sandboxDir(stateRoot, sandboxID)
 	if err != nil {
 		return err
@@ -957,6 +992,11 @@ func (d *Driver) deleteSandbox(ctx context.Context, sandboxID string, retainTerm
 	manager := d.networkManager
 	runtimeCgroups := d.runtimeCgroups
 	d.mu.RUnlock()
+	releaseLifecycle, err := lockSandboxMutation(ctx, stateRoot, sandboxID)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	directory, err := sandboxDir(stateRoot, sandboxID)
 	if err != nil {
 		return err
@@ -1077,44 +1117,65 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 		return err
 	}
 	for _, directory := range directories {
-		state, err := loadState(directory)
-		if err != nil {
-			// Corrupt state: recovery cannot classify the sandbox. Never
-			// silent — the sandbox may leak a VM or a network slot.
-			klog.ErrorS(err, "Firecracker recovery skipped a sandbox with unreadable state", "stateDirectory", directory)
-			continue
-		}
-		if podUID != "" && state.Config.Identity.FastletPodUID != podUID {
-			continue
-		}
-		if handled, err := d.recoverInterruptedStart(ctx, state, directory, manager, runtimeCgroups, retireOwner); handled {
+		if err := func() error {
+			releaseLifecycle, err := lockSandboxLifecycle(ctx, stateRoot, filepath.Base(directory))
 			if err != nil {
 				return err
 			}
-			continue
-		}
-		if state.Phase == PhaseFailed {
-			if err := d.recoverDeadSandbox(ctx, state, directory, manager, runtimeCgroups, retireOwner, true); err != nil {
+			defer releaseLifecycle()
+			state, err := loadState(directory)
+			if err != nil {
+				// Corrupt state prevents determining Sandbox ownership; report the error rather than silently leaking VMs or network slots.
+				klog.ErrorS(err, "Firecracker recovery skipped a sandbox with unreadable state", "stateDirectory", directory)
+				return nil
+			}
+			if podUID != "" && state.Config.Identity.FastletPodUID != podUID {
+				return nil
+			}
+			var confirmAbsent func(string) error
+			if runtimeCgroups != nil {
+				confirmAbsent = runtimeCgroups.ConfirmAbsent
+			}
+			deadCapture, err := d.abortDeadRootfsCapture(ctx, state, directory, confirmAbsent)
+			if err != nil {
+				return fmt.Errorf("capture fence: %w", err)
+			}
+			if deadCapture {
+				return d.recoverDeadSandbox(ctx, state, directory, manager, runtimeCgroups, retireOwner, true)
+			}
+			if err := d.recoverRootfsCapture(ctx, state); err != nil {
 				return err
 			}
-			continue
-		}
-		alive, probeErr := d.probeVM(ctx, state)
-		if probeErr != nil || !alive {
-			retainTerminalRecord := state.Phase == PhaseRunning
-			if err := d.recoverDeadSandbox(ctx, state, directory, manager, runtimeCgroups, retireOwner, retainTerminalRecord); err != nil {
-				return err
+			if handled, err := d.recoverInterruptedStart(ctx, state, directory, manager, runtimeCgroups, retireOwner); handled {
+				if err != nil {
+					return err
+				}
+				return nil
 			}
-			continue
+			if state.Phase == PhaseFailed {
+				if err := d.recoverDeadSandbox(ctx, state, directory, manager, runtimeCgroups, retireOwner, true); err != nil {
+					return err
+				}
+				return nil
+			}
+			alive, probeErr := d.probeVM(ctx, state)
+			if probeErr != nil || !alive {
+				retainTerminalRecord := state.Phase == PhaseRunning
+				if err := d.recoverDeadSandbox(ctx, state, directory, manager, runtimeCgroups, retireOwner, retainTerminalRecord); err != nil {
+					return err
+				}
+				return nil
+			}
+			if err := recoverRuntimeCgroup(runtimeCgroups, &state.Config, state.PID); err != nil {
+				return fmt.Errorf("adopt Firecracker sandbox %s during recovery (PID %d, Fastlet Pod %s, phase %s): %w",
+					state.Config.Identity.SandboxUID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
+			}
+			// A Fastlet crash during capture can leave a VM paused; in-process cleanup cannot handle this, so reconciliation restores the surviving VMM.
+			d.resumePausedVM(ctx, state)
+			return nil
+		}(); err != nil {
+			return err
 		}
-		if err := recoverRuntimeCgroup(runtimeCgroups, &state.Config, state.PID); err != nil {
-			return fmt.Errorf("adopt Firecracker sandbox %s during recovery (PID %d, Fastlet Pod %s, phase %s): %w",
-				state.Config.Identity.SandboxUID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
-		}
-		// A Fastlet crash during a snapshot dump leaves the VM paused (the
-		// Snapshotter contract only covers in-process failure paths). The
-		// surviving VMM is resumed here so recovery never strands a guest.
-		d.resumePausedVM(ctx, state)
 	}
 	return nil
 }
@@ -1245,7 +1306,7 @@ func (d *Driver) resumePausedVM(ctx context.Context, state *SandboxState) {
 	client := d.newClient(state.APIAddress)
 	defer client.Close()
 	vmState, err := client.VMState(ctx)
-	if err != nil || vmState != "Paused" {
+	if err != nil || vmState != vmPaused {
 		return
 	}
 	if _, err := resumeVM(ctx, client, d.bootTimeoutOrDefault()); err != nil {
@@ -1343,6 +1404,9 @@ func (d *Driver) launchVM(ctx context.Context, plan launchConfig, slot *fastletn
 	config := d.config
 	launcher := d.launcher
 	d.mu.RUnlock()
+	if slot != nil {
+		plan.NetNSPath = slot.NetNSPath
+	}
 	if config.JailerPath != "" && slot != nil {
 		plan.JailerPath = config.JailerPath
 		plan.ChrootBase = filepath.Join(config.StateRoot, jailerChrootBaseDir)
@@ -1491,7 +1555,7 @@ func (d *Driver) removeJailRoot(sandboxID string) {
 	// A memcg OOM can kill the VMM before the jailer tears that mount down, so
 	// detach it explicitly before RemoveAll or the otherwise-dead jail leaks.
 	_ = unmountPath(jailedKVMDevicePath(root))
-	for _, target := range []string{"rootfs.dev", filepath.Join(jailerChrootSnapshotsDir, vmstateSnapshotName), filepath.Join(jailerChrootSnapshotsDir, memorySnapshotName)} {
+	for _, target := range []string{rootfsDeviceName, "rootfs-kernel", filepath.Join(jailerChrootSnapshotsDir, vmstateSnapshotName), filepath.Join(jailerChrootSnapshotsDir, memorySnapshotName)} {
 		_ = unmountPath(filepath.Join(root, target))
 	}
 	if err := os.RemoveAll(filepath.Dir(root)); err != nil {
@@ -1554,7 +1618,7 @@ func waitVMRunning(ctx context.Context, client *Client, timeoutSeconds int32) (i
 			return polls, fmt.Errorf("query Firecracker VM state: %w", err)
 		}
 		polls++
-		if state == "Running" {
+		if state == vmRunning {
 			return polls, nil
 		}
 		if time.Now().After(deadline) {

@@ -19,6 +19,9 @@ func parseManifest(payload []byte) (manifest, error) {
 	if err != nil {
 		return manifest{}, fmt.Errorf("decode manifest: %w", err)
 	}
+	if document.IsRootfsOnly() {
+		return manifest{}, fmt.Errorf("rootfsOnly requires OCI transport")
+	}
 	if len(document.Files) == 0 {
 		return manifest{}, fmt.Errorf("manifest has no native files; OCI artifacts must be prepared through fsb-vm")
 	}
