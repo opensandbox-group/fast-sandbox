@@ -229,6 +229,10 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.durableReader().List(ctx, &childPods, client.InNamespace(req.Namespace), client.MatchingLabels(poolLabels(pool.Name))); err != nil {
 		return ctrl.Result{}, err
 	}
+	childPods.Items, err = r.removeTerminalFastlets(ctx, &pool, childPods.Items)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	appliedRegistry, totalRegistry := r.registryRolloutCounts(&pool, compiledRegistry, childPods.Items)
 	registryCondition := metav1.Condition{
 		Type: apiv1alpha2.PoolConditionRegistryReady, Status: metav1.ConditionTrue,
@@ -399,6 +403,28 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+func (r *SandboxPoolReconciler) removeTerminalFastlets(ctx context.Context, pool *apiv1alpha2.SandboxPool, pods []corev1.Pod) ([]corev1.Pod, error) {
+	active := pods[:0]
+	for index := range pods {
+		pod := &pods[index]
+		terminal := pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded
+		if !terminal || !metav1.IsControlledBy(pod, pool) {
+			active = append(active, *pod)
+			continue
+		}
+		// Terminal Pods cannot recover or acknowledge a drain. Retire their
+		// exact UID so they no longer satisfy Pool capacity, even if finalizers
+		// delay deletion. Sandbox recovery and orphan cleanup retain their fences.
+		if pod.DeletionTimestamp == nil {
+			if err := r.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}); client.IgnoreNotFound(err) != nil {
+				return nil, err
+			}
+			klog.FromContext(ctx).Info("retired terminal Fastlet Pod", "pod", pod.Name, "podUID", pod.UID, "phase", pod.Status.Phase)
+		}
+	}
+	return active, nil
 }
 
 func (r *SandboxPoolReconciler) aggregateWarmImageStatus(
