@@ -4,7 +4,7 @@ authors:
   - "@Pangjiping"
   - "@Yeaury"
 creation-date: 2026-11-05
-last-updated: 2026-11-06
+last-updated: 2026-11-07
 status: draft
 ---
 
@@ -276,6 +276,33 @@ This alternative is not an automatic fallback. Adopting it requires a reviewed u
 
 `fast-sandbox.json` (VM discovery metadata) is boot-mode agnostic and continues to be written best-effort.
 
+### Compatibility of Full checkpoints after cold boot
+
+Disk lineage and live-instance restore requirements have different owners. After a RootfsOnly artifact from environment A cold-boots in environment B, any new Full snapshot or checkpoint must describe the VM actually running in B. `assembleSnapshotManifest` currently inherits the source manifest's `compatibility` block; retaining that behavior would label B's vmstate with A's CPU template/identity and Firecracker version, potentially rejecting restore even on B.
+
+| Metadata | Source for a cold-booted descendant's Full snapshot |
+|---|---|
+| Disk lineage / source artifact | Preserve the source artifact provenance from A |
+| `compatibility.cpuArch`, CPU vendor/family/model/stepping and CPU model name | Record the actual execution host for this VM incarnation on B |
+| `compatibility.cpuTemplate` | Record the effective template applied to this VM, not the source disk's template or a newly recomputed default |
+| `compatibility.firecrackerVersion` | Record the resolved version of the binary actually launched for this VM, not the binary currently installed when capture runs |
+| Other compatibility provenance, including host kernel | Populate from the same instance startup record under the existing compatibility schema |
+
+The runtime must durably record the effective compatibility tuple, bound to the VM incarnation, as part of successful startup before admitting snapshot/checkpoint operations. Fastlet restart must recover that record. A later node-tool upgrade must not rewrite the identity of an already-running VMM. On a subsequent Full restore, retain the effective restored CPU configuration and record the actual admitted execution environment for the new incarnation; do not substitute cold-boot defaults.
+
+When producing a Full artifact, `assembleSnapshotManifest` must replace inherited compatibility with this instance record and explicitly set the effective snapshot mode to Full, rather than carrying forward `rootfsOnly`. Apply this to both explicit Full snapshots and Full checkpoints created by `PauseSandbox`; the latter's public semantics remain unchanged. Missing or mismatched runtime metadata on a cold-booted descendant must fail capture before publication, not fall back to A's provenance. Existing legacy Full instances retain their current compatibility policy; the new record is mandatory for RootfsOnly cold-booted descendants and their subsequent lifecycle. This proposal does not relax Full restore admission.
+
+```mermaid
+flowchart LR
+    A["A: RootfsOnly artifact<br/>disk provenance A"] --> B["B: Cold boot<br/>persist effective runtime tuple B"]
+    B --> C["Full snapshot or PauseSandbox<br/>vmstate B + compatibility B"]
+    C --> D["Restore on compatible B<br/>normal Full admission"]
+    style A fill:#dbeafe,stroke:#2563eb
+    style B fill:#ede9fe,stroke:#7c3aed
+    style C fill:#fef3c7,stroke:#d97706
+    style D fill:#dcfce7,stroke:#16a34a
+```
+
 ### Runtime guarantees and constraints
 
 | Aspect | Full snapshot (today) | Rootfs-only snapshot |
@@ -328,6 +355,7 @@ Unit (run anywhere, `make test SCOPE=unit`):
 - Validation matrix: `rootfsOnly` accepted for OCI template-kind; rejected for the S3 path, for `SnapshotKindCheckpoint`, unsupported guest/storage capabilities, and by the dispatch gate for a real old fastlet.
 - `validatePackBundle` rootfs-only branch (no vmstate/memfile requirement); `assembleSnapshotManifest` writes `snapshotMode` and `kernel.cmdline`; `dumpFootprintBytes` OCI branch without the memory term.
 - Guest protocol state machines: thaw before freeze, duplicate messages, conflicting replay parameters, cancellation during blocking acquisition, expiry, lost acknowledgements, epoch changes, and stale generations. A terminal token never becomes held; no successor is admitted while compensation is pending.
+- Full manifest assembly for cold-booted descendants: replace A compatibility with the persisted effective B tuple, set Full mode, preserve disk lineage, reject missing/incarnation-mismatched records, and ignore later changes to the node-installed VMM binary. Verify both template-kind snapshots and checkpoint-kind artifacts.
 - Admission branch: `readPreparedOCIMetadata` dispatches on `platform.snapshotMode`; compatibility exemption applies only to `rootfsOnly`.
 
 E2E and integration (Linux, root, KVM, ublkd, XFS StateRoot; skipped platforms reported):
@@ -336,6 +364,7 @@ E2E and integration (Linux, root, KVM, ublkd, XFS StateRoot; skipped platforms r
 - **Repeat boots:** boot the same rootfs-only artifact twice (chain: snapshot the booted sandbox again) — guest-init and bootstrap re-runs stay healthy; layer chain stays ≤ 24 with squash firing and `BaseLayers` preserved (`oci_chain_e2e_test.go` pattern extended).
 - **Consistency:** exercise buffered writes, fsync and rename under load; verify freeze blocks later filesystem mutations, captured file contents and checksums match the protected boundary, and the assembled image passes filesystem checks. Inject delayed VMM/ublk writes and a write between data/index copies to validate the stable capture interval without relying on RAM-dump latency. Inject flush errors; none may produce a successful snapshot. Application transaction consistency is not inferred from e2fsck.
 - **Capture regression:** verify rootfs-only followed by Full on the same source, error propagation from the replacement I/O path, and rejection of unsupported runtime capabilities before freeze. Preserve existing Full requests and their memory output.
+- **Cold-boot descendant round-trip:** A → RootfsOnly → cold boot on B → explicit Full snapshot → restore on compatible B, and separately B → `PauseSandbox` → `ResumeSandbox` on compatible B. Exercise cross-vendor CPU/template changes and supported Firecracker-version changes independently. Assert that both Full artifacts carry B compatibility and Full mode, retain A disk lineage, restore process state, and still reject incompatible Full destinations. Repeat after Fastlet restart and after changing the node-installed VMM binary while the source VM remains running; its recorded version must remain the one actually launched. This is separate from RootfsOnly-then-Full on the original source VM.
 - **Control-channel delivery:** build a capable template, verify the manifest and live handshake, test cold boot and full-template restore/reconnect, then freeze rootfs while status and cleanup remain responsive. Reject old, metadata-only, incompatible-kernel/device, and helper-crashed templates without capture side effects.
 - **Late completion:** delay actual Guest freeze and any introduced backend acquisition beyond cancellation, and verify compensating cleanup before admitting a successor. Separately time out drain/flush while underlying work continues and verify that no upper copy or unordered Resume occurs. Inject helper/Fastlet and relevant backend restarts and cleanup failures; verify stale requests cannot re-freeze or release newer protection, ambiguous sources remain quarantined, and no invalid artifact is published.
 - **Portability:** boot a rootfs-only artifact in both Intel-to-AMD and AMD-to-Intel directions with compatible application ISA and guest kernel; a full snapshot from the same source still restores only on the compatible node.
@@ -343,7 +372,7 @@ E2E and integration (Linux, root, KVM, ublkd, XFS StateRoot; skipped platforms r
 
 Performance (state environment and cache state; reuse `scripts/integration-env.sh` instrumentation `vm_pause_window_ms`, `ping_max_gap_ms`, `checkpoint_dump_window_ms`): guest freeze-to-thaw and vCPU pause windows for rootfs-only vs full at 512MiB and 2GiB memory sizes, varying upper size and reflink availability; boot-to-first-request vs restore-to-first-request; artifact and staging sizes (no memory term); registry push bytes (one new layer vs layer + snapfiles).
 
-Acceptance criteria: confirmed guest filesystem consistency and backend capture boundary, successful bounded source recovery or explicit failure, no snapshot/create invocation on the primary path, measured freeze and pause latency with an agreed workload-specific budget; boot-to-DataPlaneReady within the builder-calibrated budget; zero vmstate/memfile bytes in the bundle, staging, and registry; version-skew matrix behaves fail-closed.
+Acceptance criteria: confirmed guest filesystem consistency and backend capture boundary, successful bounded source recovery or explicit failure, no snapshot/create invocation on the primary path, measured freeze and pause latency with an agreed workload-specific budget; boot-to-DataPlaneReady within the builder-calibrated budget; zero vmstate/memfile bytes in the bundle, staging, and registry; version-skew matrix behaves fail-closed; a cold-booted descendant produces Full snapshots and PauseSandbox checkpoints with its effective runtime compatibility and successfully restores them on a compatible destination.
 
 ## Rollout and rollback
 
@@ -353,7 +382,7 @@ Rollout is per-request opt-in and capability-gated; the pieces land inert-first.
 |---|---|---|
 | 1. Protocol and storage feasibility | Guest protocol state machine and replacement drain/completion/flush PoC | Both late-completion races and delayed writes are covered, or return to design review |
 | 2. Guest delivery | FSB helper, builder injection, private vsock wiring, manifest capability, and runtime handshake | New templates pass freeze/thaw and full-restore reconnect tests; old templates fail closed for RootfsOnly |
-| 3. Runtime and contracts | Recovery journal, generation fencing, mode plumbing and generated outputs, kernel asset delivery, cold-boot path, and protected upper capture | Integration, failure injection, and real version-skew tests pass with capture still disabled by default |
+| 3. Runtime and contracts | Recovery journal, generation fencing, mode plumbing and generated outputs, kernel asset delivery, cold-boot path with durable instance compatibility records, Full descendant manifest refresh, and protected upper capture | Integration, failure injection, and real version-skew tests pass with capture still disabled by default |
 | 4. Opt-in enablement | Workload latency budgets and documentation updates | Maintainer acceptance and successful consistency, portability, and recovery validation |
 
 Update `sandbox-snapshots.md`, `overlaybd-oci-sandboxes.md`, `artifact-manifest-reference.md`, and `pause-resume-snapshot-integration.md`, plus the execd-image reboot contract note. Guest freeze remains owned by FSB; execd only participates in the existing bootstrap/readiness contract.

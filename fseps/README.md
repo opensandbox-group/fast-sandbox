@@ -15,4 +15,4 @@ Add an entry in the same PR as a new proposal; when its content or status change
 
 | FSEP | Title | Status | Last updated |
 |:----:|-------|--------|:------------:|
-| [FSEP-0001](0001-rootfs-only-snapshots-overlaybd.md) | Rootfs-Only Snapshots on the OverlayBD Path | draft | 2026-11-05 |
+| [FSEP-0001](0001-rootfs-only-snapshots-overlaybd.md) | Rootfs-Only Snapshots on the OverlayBD Path | draft | 2026-11-07 |
