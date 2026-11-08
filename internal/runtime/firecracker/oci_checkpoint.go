@@ -3,6 +3,7 @@ package firecracker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -121,11 +122,22 @@ func prepareOCIPublication(plan dumpPlan) (ociPublication, error) {
 	return ociPublication{destination: destination}, nil
 }
 
-func (d *Driver) publishOCISnapshot(ctx context.Context, plan dumpPlan, sizeBytes int64, kind fastletapi.SnapshotKind, onPublishing func()) (*runtimecontract.SnapshotResult, error) {
+func (d *Driver) publishOCISnapshot(ctx context.Context, plan dumpPlan, sizeBytes int64, kind fastletapi.SnapshotKind, onPublishing func()) (result *runtimecontract.SnapshotResult, resultErr error) {
+	// Preparation writes ownership metadata into staging before packing starts.
+	// Keep cleanup ownership here until preparation succeeds; otherwise a
+	// failed metadata write can orphan a full-snapshot staging directory.
+	prepared := false
+	defer func() {
+		if prepared {
+			return
+		}
+		resultErr = errors.Join(resultErr, d.cleanupSnapshotStaging(ctx, plan.staging))
+	}()
 	publication, err := prepareOCIPublication(plan)
 	if err != nil {
 		return nil, err
 	}
+	prepared = true
 	return d.publishPreparedOCISnapshot(ctx, plan, sizeBytes, publication, onPublishing)
 }
 

@@ -46,6 +46,25 @@ func TestResolveKernelDefaultBuilderFilename(t *testing.T) {
 	require.ErrorContains(t, err, "not found")
 }
 
+func TestResolveKernelMakesRelativeOverrideAbsolute(t *testing.T) {
+	dir := t.TempDir()
+	relativeDir := filepath.Join(dir, "kernels")
+	require.NoError(t, os.MkdirAll(relativeDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(relativeDir, "custom-kernel"), []byte("kernel"), 0o600))
+
+	oldWorkingDir, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(dir))
+	t.Cleanup(func() { require.NoError(t, os.Chdir(oldWorkingDir)) })
+
+	got, err := ResolveKernel("/unused", "vmlinux.bin", filepath.Join("kernels", "custom-kernel"))
+	require.NoError(t, err)
+	expected, err := filepath.Abs(filepath.Join("kernels", "custom-kernel"))
+	require.NoError(t, err)
+	require.Equal(t, expected, got)
+	require.True(t, filepath.IsAbs(got))
+}
+
 func TestResolveKernelRejectsMetadataTraversal(t *testing.T) {
 	for _, version := range []string{"../other", "../../../../etc/passwd", "/etc/passwd", ".", "..", ""} {
 		if _, err := ResolveKernel(t.TempDir(), version, ""); err == nil {

@@ -45,6 +45,13 @@ func RootfsBoot(m artifacts.VMManifest, kernel, rootfs, tap, socket string) ([]O
 // ResolveKernel resolves the Builder default filename, versioned filenames, and explicit path overrides consistently.
 func ResolveKernel(kernelDir, kernelVersion, override string) (string, error) {
 	path := override
+	if path != "" {
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return "", fmt.Errorf("resolve kernel override %q: %w", path, err)
+		}
+		path = absolute
+	}
 	if path == "" {
 		if kernelVersion == "" || filepath.Base(kernelVersion) != kernelVersion || kernelVersion == "." || kernelVersion == ".." || strings.ContainsAny(kernelVersion, "\x00\\") {
 			return "", fmt.Errorf("invalid kernel.version %q", kernelVersion)
