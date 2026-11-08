@@ -1756,7 +1756,144 @@ func TestPoolReplacesTerminalFastletAtCapacityLimit(t *testing.T) {
 	}
 }
 
-func TestRemoveTerminalFastletsPreservesNonterminalAndForeignPods(t *testing.T) {
+func TestPoolReplacesDeletingFastletBeforeTerminationCompletes(t *testing.T) {
+	for _, resourceAware := range []bool{false, true} {
+		for _, phase := range []corev1.PodPhase{corev1.PodRunning, corev1.PodPending, corev1.PodUnknown} {
+			t.Run(fmt.Sprintf("resourceAware=%t/%s", resourceAware, phase), func(t *testing.T) {
+				ctx := context.Background()
+				now := time.Date(2026, 11, 8, 0, 0, 0, 0, time.UTC)
+				reconciler, k8sClient, drainer, pool := newDrainHarness(t, nil)
+				reconciler.Now = func() time.Time { return now }
+				for _, name := range []string{"fastlet-a", "fastlet-b"} {
+					require.NoError(t, k8sClient.Delete(ctx, getFastletPod(t, k8sClient, name)))
+				}
+				pool.Spec.Capacity = apiv1alpha2.PoolCapacity{PoolMin: 1, PoolMax: 1}
+				if resourceAware {
+					pool.Spec.SandboxResources = resourceAwareScalingPool().Spec.SandboxResources
+				}
+				require.NoError(t, k8sClient.Update(ctx, pool))
+				plan, err := runtimeenv.ResolveDefault(reconciler.Catalog, pool.Spec.Runtime)
+				require.NoError(t, err)
+				pod, err := reconciler.constructPodWithRuntimePlan(pool, plan)
+				require.NoError(t, err)
+				pod.Name, pod.GenerateName, pod.UID = "deleting-fastlet", "", "deleting-uid"
+				pod.Status.Phase = phase
+				pod.Finalizers = []string{"test.fast-sandbox.io/cleanup"}
+				require.NoError(t, k8sClient.Create(ctx, pod))
+				// Model an operator deleting the only Fastlet. Its finalizer
+				// keeps the nonterminal Pod visible throughout reconciliation.
+				require.NoError(t, k8sClient.Delete(ctx, pod))
+				require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(pod), pod))
+				require.NotNil(t, pod.DeletionTimestamp)
+				now = pod.DeletionTimestamp.Time
+				creates, deletes := 0, 0
+				reconciler.Client = interceptor.NewClient(k8sClient.(client.WithWatch), interceptor.Funcs{
+					Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+						if _, ok := obj.(*corev1.Pod); ok {
+							creates++
+						}
+						return c.Create(ctx, obj, opts...)
+					},
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						if _, ok := obj.(*corev1.Pod); ok {
+							deletes++
+						}
+						return c.Delete(ctx, obj, opts...)
+					},
+				})
+				var replacementName string
+				for range 3 {
+					_, err = reconciler.Reconcile(ctx, poolRequest(pool))
+					require.NoError(t, err)
+					var pods corev1.PodList
+					require.NoError(t, k8sClient.List(ctx, &pods, client.InNamespace(pool.Namespace), client.MatchingLabels(poolLabels(pool.Name))))
+					require.Len(t, pods.Items, 2, "the terminating Pod and exactly one replacement must coexist")
+					for _, child := range pods.Items {
+						if child.Name == pod.Name {
+							require.Equal(t, pod.UID, child.UID)
+							require.Equal(t, phase, child.Status.Phase)
+							require.NotNil(t, child.DeletionTimestamp)
+							continue
+						}
+						if replacementName == "" {
+							replacementName = child.Name
+						}
+						require.Equal(t, replacementName, child.Name)
+						require.Nil(t, child.DeletionTimestamp)
+						require.True(t, metav1.IsControlledBy(&child, pool))
+					}
+					now = now.Add(10 * time.Minute)
+				}
+				require.Equal(t, 1, creates, "repeated reconciles must create only one replacement")
+				require.Zero(t, deletes, "do not repeat an operator's deletion or drain the replacement")
+				require.Empty(t, drainer.requests)
+				require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool))
+				require.Equal(t, int32(1), pool.Status.CurrentPods)
+			})
+		}
+	}
+}
+
+func TestDeletingPoolDoesNotProvisionFastlets(t *testing.T) {
+	for _, resourceAware := range []bool{false, true} {
+		for _, deletingChild := range []bool{false, true} {
+			t.Run(fmt.Sprintf("resourceAware=%t/deletingChild=%t", resourceAware, deletingChild), func(t *testing.T) {
+				ctx := context.Background()
+				reconciler, k8sClient, drainer, pool := newDrainHarness(t, nil)
+				for _, name := range []string{"fastlet-a", "fastlet-b"} {
+					require.NoError(t, k8sClient.Delete(ctx, getFastletPod(t, k8sClient, name)))
+				}
+				pool.Spec.Capacity = apiv1alpha2.PoolCapacity{PoolMin: 1, PoolMax: 1}
+				if resourceAware {
+					pool.Spec.SandboxResources = resourceAwareScalingPool().Spec.SandboxResources
+				}
+				pool.Finalizers = []string{"test.fast-sandbox.io/pool-cleanup"}
+				require.NoError(t, k8sClient.Update(ctx, pool))
+				if deletingChild {
+					plan, err := runtimeenv.ResolveDefault(reconciler.Catalog, pool.Spec.Runtime)
+					require.NoError(t, err)
+					pod, err := reconciler.constructPodWithRuntimePlan(pool, plan)
+					require.NoError(t, err)
+					pod.Name, pod.GenerateName, pod.UID = "deleting-fastlet", "", "deleting-uid"
+					pod.Status.Phase = corev1.PodRunning
+					pod.Finalizers = []string{"test.fast-sandbox.io/pod-cleanup"}
+					require.NoError(t, k8sClient.Create(ctx, pod))
+					require.NoError(t, k8sClient.Delete(ctx, pod))
+				}
+				require.NoError(t, k8sClient.Delete(ctx, pool))
+				require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool))
+				require.NotNil(t, pool.DeletionTimestamp)
+				creates, deletes := 0, 0
+				reconciler.Client = interceptor.NewClient(k8sClient.(client.WithWatch), interceptor.Funcs{
+					Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+						creates++
+						return c.Create(ctx, obj, opts...)
+					},
+					Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+						deletes++
+						return c.Delete(ctx, obj, opts...)
+					},
+				})
+				for range 3 {
+					_, err := reconciler.Reconcile(ctx, poolRequest(pool))
+					require.NoError(t, err)
+				}
+				require.Zero(t, creates, "a deleting Pool must not create any child resources")
+				require.Zero(t, deletes, "leave child deletion to the existing deletion flow")
+				require.Empty(t, drainer.requests)
+				var pods corev1.PodList
+				require.NoError(t, k8sClient.List(ctx, &pods, client.InNamespace(pool.Namespace)))
+				expected := 0
+				if deletingChild {
+					expected = 1
+				}
+				require.Equal(t, expected, len(pods.Items))
+			})
+		}
+	}
+}
+
+func TestRemoveRetiredFastletsPreservesActiveAndForeignPods(t *testing.T) {
 	ctx := context.Background()
 	reconciler, k8sClient, _, pool := newDrainHarness(t, nil)
 	var pods []corev1.Pod
@@ -1773,14 +1910,22 @@ func TestRemoveTerminalFastletsPreservesNonterminalAndForeignPods(t *testing.T) 
 	foreign.OwnerReferences[0].UID = "previous-pool-uid"
 	require.NoError(t, k8sClient.Create(ctx, foreign))
 	pods = append(pods, *foreign)
-	remaining, err := reconciler.removeTerminalFastlets(ctx, pool, pods)
+	foreignDeleting := foreign.DeepCopy()
+	foreignDeleting.Name, foreignDeleting.UID, foreignDeleting.ResourceVersion = "foreign-deleting", "foreign-deleting-uid", ""
+	foreignDeleting.Status.Phase = corev1.PodRunning
+	foreignDeleting.Finalizers = []string{"test.fast-sandbox.io/cleanup"}
+	require.NoError(t, k8sClient.Create(ctx, foreignDeleting))
+	require.NoError(t, k8sClient.Delete(ctx, foreignDeleting))
+	require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(foreignDeleting), foreignDeleting))
+	pods = append(pods, *foreignDeleting)
+	remaining, err := reconciler.removeRetiredFastlets(ctx, pool, pods)
 	require.NoError(t, err)
 	var names []string
 	for _, pod := range remaining {
 		names = append(names, pod.Name)
 		require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(&pod), &corev1.Pod{}))
 	}
-	require.ElementsMatch(t, []string{"Running", "Pending", "Unknown", "foreign"}, names)
+	require.ElementsMatch(t, []string{"Running", "Pending", "Unknown", "foreign", "foreign-deleting"}, names)
 }
 
 func TestPoolDoesNotReplaceFastletWhenTerminalDeletionFails(t *testing.T) {

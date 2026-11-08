@@ -126,6 +126,10 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.Get(ctx, req.NamespacedName, &pool); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	// A deleting Pool must not replenish the children being removed.
+	if pool.DeletionTimestamp != nil {
+		return ctrl.Result{}, nil
+	}
 	// The Identity struct has no pool field, so attach the pool key directly:
 	// every log in this reconcile (drain retries, scale-up, condition writes)
 	// must stay attributable when multiple pools share the controller.
@@ -229,7 +233,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.durableReader().List(ctx, &childPods, client.InNamespace(req.Namespace), client.MatchingLabels(poolLabels(pool.Name))); err != nil {
 		return ctrl.Result{}, err
 	}
-	childPods.Items, err = r.removeTerminalFastlets(ctx, &pool, childPods.Items)
+	childPods.Items, err = r.removeRetiredFastlets(ctx, &pool, childPods.Items)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -405,18 +409,18 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-func (r *SandboxPoolReconciler) removeTerminalFastlets(ctx context.Context, pool *apiv1alpha2.SandboxPool, pods []corev1.Pod) ([]corev1.Pod, error) {
+func (r *SandboxPoolReconciler) removeRetiredFastlets(ctx context.Context, pool *apiv1alpha2.SandboxPool, pods []corev1.Pod) ([]corev1.Pod, error) {
 	active := pods[:0]
 	for index := range pods {
 		pod := &pods[index]
 		terminal := pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded
-		if !terminal || !metav1.IsControlledBy(pod, pool) {
+		if !metav1.IsControlledBy(pod, pool) || (!terminal && pod.DeletionTimestamp == nil) {
 			active = append(active, *pod)
 			continue
 		}
-		// Terminal Pods cannot recover or acknowledge a drain. Retire their
-		// exact UID so they no longer satisfy Pool capacity, even if finalizers
-		// delay deletion. Sandbox recovery and orphan cleanup retain their fences.
+		// Deleting Pods no longer admit work, even while Running. Terminal
+		// Pods cannot recover or acknowledge a drain, so retire their exact UID.
+		// Preserve deletion in progress and leave cleanup fences intact.
 		if pod.DeletionTimestamp == nil {
 			if err := r.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}); client.IgnoreNotFound(err) != nil {
 				return nil, err
