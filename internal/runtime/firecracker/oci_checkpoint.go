@@ -112,14 +112,49 @@ func prepareOCIPublication(plan dumpPlan) (ociPublication, error) {
 	if err != nil {
 		return ociPublication{}, err
 	}
-	owner, err := json.Marshal(state.Config.Identity)
-	if err != nil {
-		return ociPublication{}, err
-	}
-	if err := os.WriteFile(filepath.Join(plan.staging, ".pack-owner.json"), owner, 0600); err != nil {
+	if err := persistSnapshotOwner(plan.staging, state.Config.Identity); err != nil {
 		return ociPublication{}, err
 	}
 	return ociPublication{destination: destination}, nil
+}
+
+func prepareCaptureStaging(staging string, owner fastletapi.SandboxIdentity) error {
+	if err := os.MkdirAll(staging, 0700); err != nil {
+		return err
+	}
+	return persistSnapshotOwner(staging, owner)
+}
+
+// Persist ownership before capture writes any upper bytes. The marker makes
+// staging discoverable after Pod replacement; it does not transfer publication ownership.
+func persistSnapshotOwner(staging string, owner fastletapi.SandboxIdentity) error {
+	raw, err := json.Marshal(owner)
+	if err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(staging, ".owner-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if _, err = file.Write(raw); err != nil {
+		file.Close()
+		return err
+	}
+	if err = file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err = file.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(file.Name(), filepath.Join(staging, ".pack-owner.json")); err != nil {
+		return err
+	}
+	if err = syncCaptureDirectory(staging); err != nil {
+		return err
+	}
+	return syncCaptureDirectory(filepath.Dir(staging))
 }
 
 func (d *Driver) publishOCISnapshot(ctx context.Context, plan dumpPlan, sizeBytes int64, kind fastletapi.SnapshotKind, onPublishing func()) (result *runtimecontract.SnapshotResult, resultErr error) {

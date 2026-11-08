@@ -835,7 +835,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	configureStarted := time.Now()
 	configureCtx, configureSpan := observability.Start(ctx, "fastlet.firecracker.configure")
 	if ociMetadata.IsRootfsOnly() {
-		err = configureRootfsVM(configureCtx, client, slot, ociMetadata, rootfsKernel, filepath.Join(filepath.Dir(apiAddress), "guest-control.sock"), jailRoot != "")
+		err = configureRootfsVM(configureCtx, client, slot, ociMetadata, rootfsKernel, jailRoot != "")
 	} else {
 		err = configureRestoreVM(configureCtx, client, slot, vmstatePath, memoryPath, jailRoot != "")
 	}

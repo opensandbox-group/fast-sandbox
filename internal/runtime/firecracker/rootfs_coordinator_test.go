@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/janitor"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
@@ -214,4 +215,37 @@ func TestRootfsFailedCaptureStagingRecovery(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRootfsCaptureOwnerVisibleBeforePublicationAfterPodReplacement(t *testing.T) {
+	root := t.TempDir()
+	old := fastletapi.SandboxIdentity{SandboxUID: "source", FastletPodUID: "old-pod"}
+	staging := snapshotStagingPath(root, old.FastletPodUID, "capture", true)
+	require.NoError(t, os.MkdirAll(staging, 0700))
+	require.NoError(t, prepareCaptureStaging(staging, old))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "writable_data"), []byte("partial upper"), 0600))
+	// Publication has not started; a different Driver must not adopt the old Pod.
+	replacement := &Driver{config: firecrackerConfigForTest(t, root)}
+	replacement.SetFastletPodUID("replacement-pod")
+	directory := filepath.Join(root, sandboxStateDir, old.SandboxUID)
+	require.NoError(t, os.MkdirAll(directory, 0700))
+	state := &SandboxState{Phase: PhaseRunning}
+	state.Config.Identity = old
+	require.NoError(t, saveState(directory, state))
+	fixture := &captureFixture{}
+	request := fixture.transaction().Request
+	request.OperationID = "capture"
+	_, err := newCaptureJournal(filepath.Join(directory, "rootfs-capture"), captureRecord{Owner: &old, Incarnation: "old-vmm", Device: "/dev/ublkb0", Staging: staging, Request: request})
+	require.NoError(t, err)
+	require.NoError(t, replacement.RecoverRuntimeResources(t.Context(), nil, nil))
+	require.FileExists(t, filepath.Join(staging, "writable_data"), "replacement must leave old Pod ownership to Janitor")
+	resources, err := janitor.NewOCIBackend(replacement.config.StateRoot).Scan(t.Context())
+	require.NoError(t, err)
+	require.Len(t, resources, 1)
+	require.Equal(t, "old-pod", resources[0].FastletPodUID)
+	require.Equal(t, "pack/old-pod/capture", resources[0].ResourceID)
+	require.NoFileExists(t, filepath.Join(staging, "manifest.json"))
+	entries, err := os.ReadDir(staging)
+	require.NoError(t, err)
+	require.Len(t, entries, 2, "atomic ownership publication must not leave temporary markers")
 }

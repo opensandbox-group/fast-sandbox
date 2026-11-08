@@ -402,7 +402,7 @@ func configureRootfsBoot(ctx context.Context, client *firecrackerClient, layout 
 			_ = cleanup()
 		}
 	}()
-	ops, err := firecrackerconfig.RootfsBoot(metadata, kernel, rootfsDriveLink, host, filepath.Join(layout.runtime, "guest-control.sock"))
+	ops, err := firecrackerconfig.RootfsBoot(metadata, kernel, rootfsDriveLink, host, "guest-control.sock")
 	if err != nil {
 		return err
 	}

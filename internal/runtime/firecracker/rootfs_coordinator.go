@@ -316,7 +316,7 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 			resultErr = errors.Join(resultErr, d.cleanupUnpublishedCapture(cleanupCtx, state, journal))
 		}
 	}()
-	if err = os.MkdirAll(plan.staging, 0700); err != nil {
+	if err = prepareCaptureStaging(plan.staging, state.Config.Identity); err != nil {
 		return nil, err
 	}
 	lease := &productionCaptureLease{driver: d, state: state, client: client, device: device, record: record, journal: journal}

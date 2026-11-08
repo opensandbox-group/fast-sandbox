@@ -56,7 +56,7 @@ func (d *Driver) prepareRootfsBootInstance(id, directory, rootfs, kernel string)
 	}
 	return filepath.Join(root, rootfsDeviceName), root, filepath.Join(root, "api.sock"), nil
 }
-func configureRootfsVM(ctx context.Context, c *Client, slot *fastletnetwork.Slot, m artifacts.VMManifest, kernel, socket string, jailed bool) error {
+func configureRootfsVM(ctx context.Context, c *Client, slot *fastletnetwork.Slot, m artifacts.VMManifest, kernel string, jailed bool) error {
 	if slot == nil || slot.GuestTap == "" {
 		return ErrNetworkUnavailable
 	}
@@ -65,9 +65,8 @@ func configureRootfsVM(ctx context.Context, c *Client, slot *fastletnetwork.Slot
 	}
 	if jailed {
 		kernel = "/rootfs-kernel"
-		socket = "/guest-control.sock"
 	}
-	ops, err := firecrackerconfig.RootfsBoot(m, kernel, rootfsDeviceName, slot.GuestTap, socket)
+	ops, err := firecrackerconfig.RootfsBoot(m, kernel, rootfsDeviceName, slot.GuestTap, "guest-control.sock")
 	if err != nil {
 		return err
 	}
