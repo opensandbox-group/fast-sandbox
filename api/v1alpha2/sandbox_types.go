@@ -1,6 +1,8 @@
 package v1alpha2
 
 import (
+	"encoding/json"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -348,6 +350,44 @@ type SandboxList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []Sandbox `json:"items"`
+}
+
+// MarshalJSON preserves fractional reset revisions without changing the public metav1.Time field type or the encoding of other Sandbox timestamps.
+func (s SandboxSpec) MarshalJSON() ([]byte, error) {
+	type specAlias SandboxSpec
+	revision, err := marshalResetRevision(s.ResetRevision)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(struct {
+		*specAlias
+		ResetRevision json.RawMessage `json:"resetRevision,omitempty"`
+	}{specAlias: (*specAlias)(&s), ResetRevision: revision})
+}
+
+// MarshalJSON acknowledges the exact reset instant. metav1.Time's default second-resolution encoding would leave a fractional request pending forever.
+func (s RuntimeStatus) MarshalJSON() ([]byte, error) {
+	type statusAlias RuntimeStatus
+	revision, err := marshalResetRevision(s.AcceptedResetRevision)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(struct {
+		*statusAlias
+		AcceptedResetRevision json.RawMessage `json:"acceptedResetRevision,omitempty"`
+	}{statusAlias: (*statusAlias)(&s), AcceptedResetRevision: revision})
+}
+
+func marshalResetRevision(revision *metav1.Time) (json.RawMessage, error) {
+	if revision == nil {
+		return nil, nil
+	}
+	if revision.IsZero() {
+		return json.RawMessage("null"), nil
+	}
+	// time.Time emits RFC3339Nano, retaining the same precision accepted by
+	// metav1.Time.UnmarshalJSON. Keep the existing UTC normalization.
+	return revision.UTC().MarshalJSON()
 }
 
 func init() {
