@@ -1038,28 +1038,13 @@ func (d *Driver) deleteSandbox(ctx context.Context, sandboxID string, retainTerm
 	if expectedIdentity != nil && !runtimecontract.SameRuntimeIdentity(state.Config.Identity, *expectedIdentity) {
 		return fmt.Errorf("terminal cleanup identity for sandbox %s no longer matches the durable runtime", sandboxID)
 	}
-	if state.Phase == PhaseFailed {
-		// Retry staging cleanup after an abort persisted but its cleanup failed.
-		// Keep normal owner-retirement ordering for VM/network reclamation.
-		var confirmAbsent func(string) error
-		if runtimeCgroups != nil {
-			confirmAbsent = runtimeCgroups.ConfirmAbsent
-		}
-		if _, err := d.abortDeadRootfsCapture(ctx, state, directory, confirmAbsent); err != nil {
-			return err
-		}
+	// Retry aborted staging cleanup before releasing its source resources.
+	if _, err := d.abortExitedRootfsCapture(ctx, state, directory); err != nil {
+		return err
 	}
-	pid := state.PID
-	if state.Phase == PhaseFailed && runtimeCgroups != nil {
-		if err := runtimeCgroups.ConfirmAbsent(sandboxID); err != nil {
-			return fmt.Errorf("confirm terminal Firecracker sandbox %s exited (PID %d, Fastlet Pod %s, phase %s): %w",
-				sandboxID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
-		}
-		// Terminal cleanup can retry after the tracked process was forgotten
-		// but before PID=0 was persisted. An empty cgroup proves this runtime
-		// exited; its historical numeric PID may now identify another process.
-		// Apply this fence to Controller Delete as well as retained cleanup.
-		pid = 0
+	pid, err := terminalCleanupPID(state, runtimeCgroups)
+	if err != nil {
+		return err
 	}
 	d.killAndForget(sandboxID, pid)
 	if manager != nil && state.Config.Identity.SandboxUID != "" {
@@ -1885,4 +1870,15 @@ func (d *Driver) prepareSnapshotSpill(jailRoot string) {
 			klog.InfoS("bind the snapshot spill root into the jail root failed; spilling disabled", "err", err)
 		}
 	}
+}
+
+// An empty owned cgroup fences historical PID reuse before terminal cleanup.
+func terminalCleanupPID(state *SandboxState, cgroups *podcgroup.RuntimeManager) (int, error) {
+	if state.Phase != PhaseFailed || cgroups == nil {
+		return state.PID, nil
+	}
+	if err := cgroups.ConfirmAbsent(state.Config.Identity.SandboxUID); err != nil {
+		return 0, fmt.Errorf("confirm terminal Firecracker sandbox %s exited (PID %d, Fastlet Pod %s, phase %s): %w", state.Config.Identity.SandboxUID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
+	}
+	return 0, nil
 }

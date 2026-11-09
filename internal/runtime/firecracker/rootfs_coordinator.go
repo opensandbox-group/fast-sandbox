@@ -360,14 +360,7 @@ func (d *Driver) ReconcileSandbox(ctx context.Context, identity fastletapi.Sandb
 	if !runtimecontract.SameRuntimeIdentity(state.Config.Identity, identity) || (d.podUID != "" && d.podUID != identity.FastletPodUID) {
 		return errCaptureIdentityMismatch
 	}
-	d.mu.RLock()
-	cgroups := d.runtimeCgroups
-	d.mu.RUnlock()
-	var confirmAbsent func(string) error
-	if cgroups != nil {
-		confirmAbsent = cgroups.ConfirmAbsent
-	}
-	dead, err := d.abortDeadRootfsCapture(ctx, state, filepath.Join(d.config.StateRoot, sandboxStateDir, identity.SandboxUID), confirmAbsent)
+	dead, err := d.abortExitedRootfsCapture(ctx, state, filepath.Join(d.config.StateRoot, sandboxStateDir, identity.SandboxUID))
 	if err != nil || dead {
 		return err
 	}
@@ -678,4 +671,16 @@ func validateCaptureHelper(expected *artifacts.VMGuestControl, actual guestcontr
 		return errors.New("running helper version does not match template; rebuild with a verified helper")
 	}
 	return nil
+}
+
+// Both live reconciliation and cleanup retry use the configured cgroup fence.
+func (d *Driver) abortExitedRootfsCapture(ctx context.Context, state *SandboxState, directory string) (bool, error) {
+	d.mu.RLock()
+	cgroups := d.runtimeCgroups
+	d.mu.RUnlock()
+	var confirmAbsent func(string) error
+	if cgroups != nil {
+		confirmAbsent = cgroups.ConfirmAbsent
+	}
+	return d.abortDeadRootfsCapture(ctx, state, directory, confirmAbsent)
 }

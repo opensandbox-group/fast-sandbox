@@ -190,3 +190,29 @@ func TestTerminalFailureCleanupHandsOffConcurrentDelete(t *testing.T) {
 		})
 	}
 }
+
+type exitedCaptureRuntime struct{ *terminalFailureMockRuntime }
+
+func (r *exitedCaptureRuntime) ReconcileSandbox(context.Context, fastletapi.SandboxIdentity) error {
+	return nil
+}
+
+func TestRootfsConfirmedExitLeavesQuarantineThroughTerminalCleanup(t *testing.T) {
+	r := &exitedCaptureRuntime{terminalFailureMockRuntime: &terminalFailureMockRuntime{MockRuntime: NewMockRuntime()}}
+	m, err := NewSandboxManagerWithConfig(r, SandboxManagerConfig{Capacity: 2})
+	require.NoError(t, err)
+	identity := fastletapi.SandboxIdentity{SandboxUID: "dead-capture", FastletPodUID: "pod", RuntimeInstanceID: "runtime"}
+	metadata := &SandboxMetadata{Config: fastletapi.RuntimeSandboxConfig{Identity: identity}, Phase: sandboxStateRunning, RecoveryRequired: true}
+	m.sandboxes[identity.SandboxUID] = metadata
+	r.sandboxes[identity.SandboxUID] = &SandboxMetadata{Config: metadata.Config, Phase: sandboxStateRuntimeFailed, RuntimeMessage: "capture source exited"}
+	m.refreshRuntimeRecovery(t.Context(), identity, false)
+	require.Eventually(t, func() bool {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		return metadata.Phase == sandboxStateRuntimeFailed && !metadata.RecoveryRequired
+	}, time.Second, time.Millisecond)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	require.Equal(t, 1, r.recordCalls)
+	require.Equal(t, 1, r.cleanupCalls)
+}

@@ -171,3 +171,34 @@ func TestRootfsLostPodCaptureAllowsSameNodeEnsureAfterCleanup(t *testing.T) {
 	require.NotContains(t, fixture.killCalls, process.Process.Pid)
 	require.NoDirExists(t, filepath.Join(directory, "rootfs-capture"))
 }
+
+func TestRootfsRuntimeRecoveryAbortsExitedQuarantine(t *testing.T) {
+	root := t.TempDir()
+	d := &Driver{config: firecrackerConfigForTest(t, root), podUID: "pod"}
+	owner := fastletapi.SandboxIdentity{SandboxUID: "exited", FastletPodUID: "pod", Namespace: "test"}
+	dir, err := ensureSandboxDir(root, owner.SandboxUID)
+	require.NoError(t, err)
+	process := exec.Command("true")
+	require.NoError(t, process.Run())
+	state := &SandboxState{Config: fastletapi.RuntimeSandboxConfig{Identity: owner}, PID: process.Process.Pid, APIAddress: "/absent/socket", Phase: PhaseRunning}
+	require.NoError(t, saveState(dir, state))
+	fixture := &captureFixture{}
+	req := fixture.transaction().Request
+	staging := snapshotStagingPath(root, "pod", req.OperationID, true)
+	require.NoError(t, os.MkdirAll(staging, 0700))
+	j, err := newCaptureJournal(filepath.Join(dir, "rootfs-capture"), captureRecord{Owner: &owner, Incarnation: "dead", Device: "/absent/device", Staging: staging, Request: req})
+	require.NoError(t, err)
+	require.NoError(t, j.Quarantine(errors.New("resume lost")))
+	// No startup recovery, API client, or live device is available.
+	require.NoError(t, d.ReconcileSandbox(t.Context(), owner))
+	observed, err := d.InspectSandbox(t.Context(), owner.SandboxUID)
+	require.NoError(t, err)
+	require.False(t, observed.RecoveryRequired)
+	require.Equal(t, string(PhaseFailed), observed.Phase)
+	require.NoDirExists(t, staging)
+	require.NoError(t, checkSandboxCaptureFence(root, owner.SandboxUID))
+	require.NoError(t, d.ReconcileSandbox(t.Context(), owner))
+	j, err = loadCaptureJournal(j.directory)
+	require.NoError(t, err)
+	require.Equal(t, captureAborted, j.record.Phase)
+}
