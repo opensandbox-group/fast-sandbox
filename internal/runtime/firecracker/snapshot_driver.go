@@ -1358,6 +1358,10 @@ func snapshotSourceDocument(stateRoot, ociRoot string, state *SandboxState) (map
 	if err = json.Unmarshal(raw, &document); err != nil {
 		return nil, "", err
 	}
+	// Never upgrade an old live instance from a template inspected only now.
+	if err := setSnapshotKernelDigest(document, state.BootKernelSHA256); err != nil {
+		return nil, "", err
+	}
 	if state.BootCompatibility != nil {
 		document["compatibility"], err = json.Marshal(state.BootCompatibility)
 		if err != nil {
@@ -1365,4 +1369,25 @@ func snapshotSourceDocument(stateRoot, ociRoot string, state *SandboxState) (map
 		}
 	}
 	return document, sourceRef, nil
+}
+
+// Preserve kernel extension fields while carrying the running VM's provenance.
+func setSnapshotKernelDigest(document map[string]json.RawMessage, sum string) error {
+	var kernel map[string]json.RawMessage
+	if err := json.Unmarshal(document["kernel"], &kernel); err != nil {
+		return err
+	}
+	if kernel == nil {
+		return errors.New("source kernel metadata missing")
+	}
+	delete(kernel, "sha256")
+	if sum != "" {
+		kernel["sha256"], _ = json.Marshal(sum)
+	}
+	encoded, err := json.Marshal(kernel)
+	if err != nil {
+		return err
+	}
+	document["kernel"] = encoded
+	return nil
 }

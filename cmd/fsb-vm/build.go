@@ -26,34 +26,35 @@ import (
 const defaultBuildDiskSizeGiB = 20
 
 type buildOptions struct {
-	guestControlPort     uint32
-	guestControlVerified bool
-	rootfsOnly           bool
-	snapfilesProgress    func(string) error
-	snapshotManifest     []byte
-	snapshotExtras       map[string]string
-	manifestExtraFile    string
-	injectDir            string
-	tapName              string
-	guestMAC             string
-	source               string
-	output               string
-	kernel               string
-	kernelVersion        string
-	vcpu                 int
-	memoryMB             int
-	diskSizeGiB          int
-	snapfilesSizeMB      int
-	rootfsDriveID        string
-	bootArgs             string
-	initPath             string
-	initScriptFile       string
-	readyPattern         string
-	readyTimeout         time.Duration
-	authFile             string
-	username             string
-	noCompress           bool
-	keepWorkDir          bool
+	guestControlPort    uint32
+	guestControlVersion string
+	kernelSHA256        string
+	rootfsOnly          bool
+	snapfilesProgress   func(string) error
+	snapshotManifest    []byte
+	snapshotExtras      map[string]string
+	manifestExtraFile   string
+	injectDir           string
+	tapName             string
+	guestMAC            string
+	source              string
+	output              string
+	kernel              string
+	kernelVersion       string
+	vcpu                int
+	memoryMB            int
+	diskSizeGiB         int
+	snapfilesSizeMB     int
+	rootfsDriveID       string
+	bootArgs            string
+	initPath            string
+	initScriptFile      string
+	readyPattern        string
+	readyTimeout        time.Duration
+	authFile            string
+	username            string
+	noCompress          bool
+	keepWorkDir         bool
 }
 
 func newBuildCommand() *cobra.Command {

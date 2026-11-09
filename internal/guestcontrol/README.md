@@ -1,6 +1,6 @@
 # Experimental Guest filesystem control
 
-This package and `cmd/fsb-guest-control` implement the Guest-control portion of FSEP-0001. They are not injected into templates or connected to RootfsOnly snapshot creation yet. Production enablement remains blocked on lifecycle recovery, template/runtime integration, and qualification of the filesystem write boundary for each supported runtime configuration.
+This package and `cmd/fsb-guest-control` implement the Guest-control portion of FSEP-0001. The opt-in Builder injection and internal Fastlet RootfsOnly capture path use this helper. Production enablement requires qualified templates, node binaries, and filesystem writer coverage for each supported runtime configuration.
 
 ## Components
 
@@ -78,6 +78,10 @@ The transaction rejects mismatched Guest identities, incomplete freeze/cleanup s
 ### Opt-in Fastlet integration
 
 The internal request uses `snapshot.mode: "RootfsOnly"` and `snapshot.kind: "Template"`. Checkpoints and non-OCI sources are rejected. The template must declare validated `guestControl` on vsock port 1234 and a cold-boot kernel command line. Nodes need the matching kernel file, `fsb-vm`, and OverlayBD tools and daemon at the existing OCI runtime paths. Direct (non-jailer) launches also require `nsenter` to enter the allocated network namespace.
+
+The helper reports `helperVersion` as the SHA-256 fingerprint of its running executable, independently of the `fsb-freeze-v1` wire protocol. The Builder records the value returned by the successfully probed helper; capture requires the live helper to match that declaration. An older helper without this field, or a template with the old hard-coded `"1"` declaration, must be rebuilt before RootfsOnly capture. Ordinary Full restore remains available.
+
+The Builder and Driver cold-boot paths copy the kernel into a private boot file and record its digest. Full restoration inherits `kernel.sha256` from the artifact because its kernel is already in RAM; a matching host installation cannot qualify a different running kernel. The Driver persists `bootKernelSHA256` and carries it into subsequent Full and RootfsOnly artifacts. Capture rejects legacy live instances without that boot provenance; rebuild legacy Full templates and recreate those instances. Installing a different host kernel after boot does not change the source VM's qualification.
 
 Set `FAST_SANDBOX_ROOTFS_QUALIFICATION` to an absolute, operator-owned JSON file:
 

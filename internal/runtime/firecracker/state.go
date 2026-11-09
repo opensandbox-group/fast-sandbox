@@ -44,6 +44,7 @@ const (
 // runtime configuration separate from Driver-produced allocation state so
 // restart recovery preserves both authority boundaries.
 type SandboxState struct {
+	BootKernelSHA256  string                              `json:"bootKernelSHA256,omitempty"`
 	BootCompatibility *artifacts.SnapshotCompatibility    `json:"bootCompatibility,omitempty"`
 	Config            fastletapi.RuntimeSandboxConfig     `json:"config"`
 	Allocation        fastletapi.RuntimeAllocation        `json:"allocation"`

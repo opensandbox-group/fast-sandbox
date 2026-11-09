@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/guestcontrol"
 	"fast-sandbox/internal/janitor"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
@@ -69,6 +70,7 @@ func TestRootfsBootCompatibilityAndKernelTraversal(t *testing.T) {
 	m.Compatibility.CPUArch = artifacts.HostCPUArch()
 	m.Compatibility.FirecrackerVersion = "1.16.1"
 	m.Platform = &artifacts.VMPlatform{SnapshotMode: "rootfsOnly"}
+	m.Kernel.SHA256 = strings.Repeat("c", 64)
 	m.Kernel.Cmdline = "root=/dev/vda rw"
 	require.NoError(t, checkRootfsBootCompatibility(m, "1.16.1"))
 	require.Error(t, checkRootfsBootCompatibility(m, "1.17.0"))
@@ -83,6 +85,7 @@ func TestRootfsSnapshotPreservesExtensionsAndDropsMemory(t *testing.T) {
 	m := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 256, RootfsSizeMiB: 1024, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.dev"}, "6.1.177", "", artifacts.CPUTemplateNone)
 	m.Compatibility.CPUArch = artifacts.HostCPUArch()
 	m.Compatibility.FirecrackerVersion = "1.16.1"
+	m.Kernel.SHA256 = strings.Repeat("c", 64)
 	m.Kernel.Cmdline = "root=/dev/vda rw"
 	m.Platform = &artifacts.VMPlatform{SnapshotMode: "rootfsOnly"}
 	raw, err := json.Marshal(m)
@@ -95,11 +98,13 @@ func TestRootfsSnapshotPreservesExtensionsAndDropsMemory(t *testing.T) {
 	source["platform"].(map[string]any)["checkpoint"] = map[string]any{"sandboxUID": "old"}
 	raw, err = json.Marshal(source)
 	require.NoError(t, err)
+	m.Kernel.SHA256 = strings.Repeat("d", 64)
 	result, err := marshalRootfsSnapshotManifest(raw, m)
 	require.NoError(t, err)
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(result, &got))
 	require.Equal(t, source["extension"], got["extension"])
+	require.Equal(t, m.Kernel.SHA256, got["kernel"].(map[string]any)["sha256"])
 	require.NotContains(t, got, "files")
 	platform := got["platform"].(map[string]any)
 	require.Equal(t, "keep", platform["extension"])
@@ -248,4 +253,37 @@ func TestRootfsCaptureOwnerVisibleBeforePublicationAfterPodReplacement(t *testin
 	entries, err := os.ReadDir(staging)
 	require.NoError(t, err)
 	require.Len(t, entries, 2, "atomic ownership publication must not leave temporary markers")
+}
+
+func TestRootfsQualificationUsesRunningKernelProvenance(t *testing.T) {
+	qualified := strings.Repeat("a", 64)
+	require.NoError(t, qualifyBootKernel(qualified, qualified))
+	require.ErrorContains(t, qualifyBootKernel("", qualified), "provenance is missing")
+	// Full RAM may hold B while this host has a qualified A installation.
+	// No current host path is consulted to promote B to a qualified kernel.
+	require.ErrorContains(t, qualifyBootKernel(strings.Repeat("b", 64), qualified), "running guest kernel")
+	state := &SandboxState{BootKernelSHA256: qualified, Config: fastletapi.RuntimeSandboxConfig{Identity: fastletapi.SandboxIdentity{SandboxUID: "kernel-source"}}, Phase: PhaseRunning}
+	directory := t.TempDir()
+	require.NoError(t, saveState(directory, state))
+	restored, err := loadState(directory)
+	require.NoError(t, err)
+	require.Equal(t, qualified, restored.BootKernelSHA256)
+}
+
+func TestRootfsCaptureChecksActualHelperImplementation(t *testing.T) {
+	for _, version := range []string{"sha256:" + strings.Repeat("a", 64), "sha256:" + strings.Repeat("b", 64)} {
+		manifest := &artifacts.VMGuestControl{Protocol: guestcontrol.Protocol, HelperVersion: version}
+		require.NoError(t, validateCaptureHelper(manifest, guestcontrol.Response{Protocol: guestcontrol.Protocol, HelperVersion: version}))
+		require.Error(t, validateCaptureHelper(manifest, guestcontrol.Response{Protocol: guestcontrol.Protocol, HelperVersion: "1"}))
+		require.Error(t, validateCaptureHelper(manifest, guestcontrol.Response{Protocol: guestcontrol.Protocol}))
+	}
+}
+
+func TestRootfsKernelProvenancePreservesExtensions(t *testing.T) {
+	document := map[string]json.RawMessage{"kernel": json.RawMessage(`{"version":"6.1","sha256":"old","future":{"keep":true}}`)}
+	require.NoError(t, setSnapshotKernelDigest(document, strings.Repeat("b", 64)))
+	require.Contains(t, string(document["kernel"]), `"future":{"keep":true}`)
+	require.Contains(t, string(document["kernel"]), strings.Repeat("b", 64))
+	require.NoError(t, setSnapshotKernelDigest(document, ""))
+	require.NotContains(t, string(document["kernel"]), `"sha256"`)
 }

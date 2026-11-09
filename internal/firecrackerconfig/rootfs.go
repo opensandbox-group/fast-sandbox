@@ -2,8 +2,11 @@
 package firecrackerconfig
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,4 +74,43 @@ func ResolveKernel(kernelDir, kernelVersion, override string) (string, error) {
 		return "", fmt.Errorf("kernel %s is not a regular file", path)
 	}
 	return path, nil
+}
+
+// PinKernel copies the boot input into a private inode before the VMM opens it.
+// Hashing a mutable installation path after boot cannot identify the running kernel.
+func PinKernel(source, target string) (sum string, resultErr error) {
+	input, err := os.Open(source)
+	if err != nil {
+		return "", err
+	}
+	defer input.Close()
+	info, err := input.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		return "", errors.New("kernel must be a regular file")
+	}
+	output, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0444)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, output.Close())
+		if resultErr != nil {
+			_ = os.Remove(target)
+		}
+	}()
+	hash := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(output, hash), input); err != nil {
+		return "", err
+	}
+	// Jailer may switch UID; the private parent directory controls access.
+	if err := output.Chmod(0444); err != nil {
+		return "", err
+	}
+	if err := output.Sync(); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }

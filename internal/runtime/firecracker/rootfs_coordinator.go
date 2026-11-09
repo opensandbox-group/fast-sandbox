@@ -192,6 +192,9 @@ func (d *Driver) captureGuest(ctx context.Context, state *SandboxState, m artifa
 	if err != nil {
 		return guest, caps, err
 	}
+	if err := validateCaptureHelper(m.GuestControl, caps); err != nil {
+		return guest, caps, err
+	}
 	if caps.ProtectedMount != "/" || caps.Filesystem != rootfsFilesystem || caps.MaxLeaseMillis < 10000 || caps.Generation == math.MaxUint64 {
 		return guest, caps, errors.New("guest root protection is incompatible")
 	}
@@ -261,7 +264,7 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	if err != nil {
 		return nil, err
 	}
-	identity, err := d.qualifyRootfsSource(ctx, state, manifest)
+	identity, err := d.qualifyRootfsSource(ctx, state)
 	if err != nil {
 		return nil, err
 	}
@@ -278,6 +281,8 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	if err != nil {
 		return nil, err
 	}
+	manifest.Kernel.SHA256 = state.BootKernelSHA256
+	manifest.GuestControl.HelperVersion = caps.HelperVersion
 	devicePath := filepath.Join(dir, rootfsDeviceName)
 	if d.config.JailerPath != "" {
 		devicePath = filepath.Join(jailerRoot(filepath.Join(d.config.StateRoot, jailerChrootBaseDir), filepath.Base(d.config.BinaryPath), truncatedSandboxID(input.SandboxID)), rootfsDeviceName)
@@ -445,6 +450,9 @@ func marshalRootfsSnapshotManifest(source []byte, manifest artifacts.VMManifest)
 		return nil, err
 	}
 	document["platform"] = raw
+	if err := setSnapshotKernelDigest(document, manifest.Kernel.SHA256); err != nil {
+		return nil, err
+	}
 	delete(document, "files")
 	return json.MarshalIndent(document, "", "  ")
 }
@@ -507,27 +515,19 @@ func (d *Driver) abortDeadRootfsCapture(ctx context.Context, state *SandboxState
 	return true, nil
 }
 
-func (d *Driver) qualifyRootfsSource(ctx context.Context, state *SandboxState, manifest artifacts.VMManifest) (string, error) {
+func (d *Driver) qualifyRootfsSource(ctx context.Context, state *SandboxState) (string, error) {
 	q, err := readRootfsQualification()
 	if err != nil {
 		return "", err
 	}
-	kernel, err := d.rootfsKernel(manifest)
-	if err != nil {
+	if err := qualifyBootKernel(state.BootKernelSHA256, q.KernelSHA256); err != nil {
 		return "", err
-	}
-	sum, err := captureFileHash(kernel)
-	if err != nil {
-		return "", err
-	}
-	if sum != q.KernelSHA256 {
-		return "", errors.New("guest kernel does not match qualified artifact")
 	}
 	identity, err := captureProcessIdentity(ctx, state.APIAddress, state.PID)
 	if err != nil {
 		return "", err
 	}
-	sum, err = captureFileHash(fmt.Sprintf("/proc/%d/exe", state.PID))
+	sum, err := captureFileHash(fmt.Sprintf("/proc/%d/exe", state.PID))
 	if err != nil {
 		return "", err
 	}
@@ -650,4 +650,21 @@ func (d *Driver) prepareRootfsPublication(ctx context.Context, plan dumpPlan, ra
 		return ociPublication{}, err
 	}
 	return prepareOCIPublication(plan)
+}
+
+func qualifyBootKernel(actual, qualified string) error {
+	if actual == "" {
+		return errors.New("running kernel provenance is missing; rebuild legacy Full templates and recreate the sandbox")
+	}
+	if actual != qualified {
+		return errors.New("running guest kernel does not match qualified artifact")
+	}
+	return nil
+}
+
+func validateCaptureHelper(expected *artifacts.VMGuestControl, actual guestcontrol.Response) error {
+	if expected == nil || actual.HelperVersion == "" || actual.HelperVersion != expected.HelperVersion {
+		return errors.New("running helper version does not match template; rebuild with a verified helper")
+	}
+	return nil
 }

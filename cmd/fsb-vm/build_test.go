@@ -237,6 +237,7 @@ func TestKernelVersionFromPath(t *testing.T) {
 
 func TestBuildSnapfilesManifestStandaloneAndExtras(t *testing.T) {
 	options := validBuildOptions(t)
+	options.kernelSHA256 = strings.Repeat("a", 64)
 	previous := global
 	t.Cleanup(func() { global = previous })
 	binary := filepath.Join(t.TempDir(), "firecracker")
@@ -251,6 +252,7 @@ func TestBuildSnapfilesManifestStandaloneAndExtras(t *testing.T) {
 	require.Equal(t, int64(1024), document.Machine.MemoryMiB)
 	require.Equal(t, int64(20480), document.Machine.RootfsSizeMiB)
 	require.Equal(t, "5.10.0", document.Kernel.Version)
+	require.Equal(t, options.kernelSHA256, document.Kernel.SHA256)
 	require.Equal(t, options.source, document.Lineage.Image)
 	require.Equal(t, created.Format(time.RFC3339), document.Lineage.CreatedAt)
 	require.Nil(t, document.Platform, "standalone builds need no platform input")
@@ -766,4 +768,29 @@ func TestCopyFile(t *testing.T) {
 	if err := copyFile(filepath.Join(dir, "absent"), target, 0o640); err == nil {
 		t.Error("missing source must fail")
 	}
+}
+
+func TestBuildManifestRecordsProbedHelperImplementation(t *testing.T) {
+	previous := global
+	t.Cleanup(func() { global = previous })
+	binary := filepath.Join(t.TempDir(), "firecracker")
+	require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\necho 'Firecracker v1.16.1'\n"), 0755))
+	global.firecrackerBin = binary
+	options := validBuildOptions(t)
+	options.kernelSHA256 = strings.Repeat("a", 64)
+	options.guestControlPort = 1234
+	_, err := buildSnapfilesManifest(options, time.Now())
+	require.ErrorContains(t, err, "freeze/thaw probe")
+	for _, version := range []string{"sha256:" + strings.Repeat("a", 64), "sha256:" + strings.Repeat("b", 64)} {
+		options.guestControlVersion = version
+		raw, err := buildSnapfilesManifest(options, time.Now())
+		require.NoError(t, err)
+		manifest, err := artifacts.DecodeVMManifest(raw)
+		require.NoError(t, err)
+		require.Equal(t, version, manifest.GuestControl.HelperVersion)
+		require.Equal(t, options.kernelSHA256, manifest.Kernel.SHA256)
+	}
+	options.kernelSHA256 = ""
+	_, err = buildSnapfilesManifest(options, time.Now())
+	require.ErrorContains(t, err, "boot kernel digest")
 }

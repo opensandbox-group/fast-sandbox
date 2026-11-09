@@ -74,11 +74,15 @@ func buildSnapfilesManifest(options *buildOptions, createdAt time.Time) ([]byte,
 	}
 	manifest := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: options.vcpu, MemoryMiB: int64(options.memoryMB), RootfsSizeMiB: int64(size), RootfsDriveID: options.rootfsDriveID, RootfsDrivePath: rootfsDriveLink}, version, global.firecrackerBin, artifacts.CPUTemplateNone)
 	if options.guestControlPort != 0 {
-		if !options.guestControlVerified {
+		if options.guestControlVersion == "" {
 			return nil, fmt.Errorf("guest control capability requires successful freeze/thaw probe")
 		}
-		manifest.GuestControl = &artifacts.VMGuestControl{Protocol: "fsb-freeze-v1", Transport: "vsock", Port: options.guestControlPort, HelperVersion: "1"}
+		manifest.GuestControl = &artifacts.VMGuestControl{Protocol: "fsb-freeze-v1", Transport: "vsock", Port: options.guestControlPort, HelperVersion: options.guestControlVersion}
 	}
+	if options.kernelSHA256 == "" {
+		return nil, fmt.Errorf("boot kernel digest is missing")
+	}
+	manifest.Kernel.SHA256 = options.kernelSHA256
 	manifest.Kernel.Cmdline = options.bootArgs
 	if strings.TrimSpace(manifest.Kernel.Cmdline) == "" {
 		manifest.Kernel.Cmdline = defaultBootArgs + " init=" + options.initPath

@@ -3,10 +3,13 @@ package guestcontrol
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -25,6 +28,7 @@ type Request struct {
 	LeaseMillis int64  `json:"leaseMillis,omitempty"`
 }
 type Response struct {
+	HelperVersion  string `json:"helperVersion,omitempty"`
 	ProtectedMount string `json:"protectedMount,omitempty"`
 	Filesystem     string `json:"filesystem,omitempty"`
 	Protocol       string `json:"protocol"`
@@ -40,11 +44,12 @@ type Response struct {
 // Service binds each generation to a unique operation ID.
 // Callers provide transport authentication, source incarnation fencing, and restart reconciliation.
 type Service struct {
-	mu          sync.Mutex
-	manager     *Manager
-	epoch       string
-	generation  uint64
-	operationID string
+	helperVersion string
+	mu            sync.Mutex
+	manager       *Manager
+	epoch         string
+	generation    uint64
+	operationID   string
 }
 
 func NewService(manager *Manager) (*Service, error) {
@@ -55,12 +60,42 @@ func NewService(manager *Manager) (*Service, error) {
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return nil, err
 	}
-	return &Service{manager: manager, epoch: hex.EncodeToString(nonce[:])}, nil
+	version, err := helperExecutableVersion()
+	if err != nil {
+		return nil, err
+	}
+	return &Service{manager: manager, epoch: hex.EncodeToString(nonce[:]), helperVersion: version}, nil
 }
+
+var helperExecutableVersion = sync.OnceValues(func() (string, error) {
+	// Fingerprint the running executable, independently of the wire protocol.
+	// Linux exposes the loaded inode even if a deployment replaced its path.
+	file, err := os.Open("/proc/self/exe")
+	if err != nil {
+		if runtime.GOOS == "linux" {
+			return "", err
+		}
+		path, pathErr := os.Executable()
+		if pathErr != nil {
+			return "", pathErr
+		}
+		file, err = os.Open(path)
+	}
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err = io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+})
+
 func (s *Service) Handle(r Request) Response {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := Response{Protocol: Protocol, Epoch: s.epoch, Generation: s.generation, MaxLeaseMillis: s.manager.maxLease.Milliseconds()}
+	out := Response{HelperVersion: s.helperVersion, Protocol: Protocol, Epoch: s.epoch, Generation: s.generation, MaxLeaseMillis: s.manager.maxLease.Milliseconds()}
 	if identity, ok := s.manager.fs.(interface{ ProtectionIdentity() (string, string) }); ok {
 		out.ProtectedMount, out.Filesystem = identity.ProtectionIdentity()
 	}

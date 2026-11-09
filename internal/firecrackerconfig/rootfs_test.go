@@ -1,7 +1,9 @@
 package firecrackerconfig
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -74,4 +76,26 @@ func TestResolveKernelRejectsMetadataTraversal(t *testing.T) {
 	if _, err := ResolveKernel(t.TempDir(), "6.1.177", t.TempDir()); err == nil {
 		t.Fatal("accepted directory as kernel")
 	}
+}
+
+func TestPinKernelBindsLoadedBytesAndDoesNotOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	source, target := filepath.Join(dir, "installed"), filepath.Join(dir, "boot")
+	require.NoError(t, os.WriteFile(source, []byte("boot kernel A"), 0600))
+	sum, err := PinKernel(source, target)
+	require.NoError(t, err)
+	require.Equal(t, fmt.Sprintf("%x", sha256.Sum256([]byte("boot kernel A"))), sum)
+	// An in-place installation update must not mutate the VMM's boot input.
+	require.NoError(t, os.WriteFile(source, []byte("replacement kernel B"), 0600))
+	loaded, err := os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, "boot kernel A", string(loaded))
+	_, err = PinKernel(source, target)
+	require.Error(t, err)
+	loaded, err = os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, "boot kernel A", string(loaded))
+	_, err = PinKernel(dir, filepath.Join(dir, "bad"))
+	require.Error(t, err)
+	require.NoFileExists(t, filepath.Join(dir, "bad"))
 }

@@ -53,6 +53,8 @@ type VMMachine struct {
 }
 
 type VMKernel struct {
+	// SHA256 identifies the kernel used at cold boot, including the kernel in Full RAM state.
+	SHA256  string `json:"sha256,omitempty"`
 	Cmdline string `json:"cmdline,omitempty"`
 	Version string `json:"version"`
 }
@@ -131,8 +133,14 @@ func DecodeVMManifest(raw []byte) (VMManifest, error) {
 }
 
 func (m VMManifest) Validate() error {
+	if m.Kernel.SHA256 != "" {
+		decoded, err := hex.DecodeString(m.Kernel.SHA256)
+		if err != nil || len(decoded) != sha256.Size {
+			return errors.New("invalid kernel.sha256")
+		}
+	}
 	if c := m.GuestControl; c != nil {
-		if c.Protocol != "fsb-freeze-v1" || c.Transport != "vsock" || c.Port == 0 || c.Port == 4294967295 || c.HelperVersion != "1" {
+		if c.Protocol != "fsb-freeze-v1" || c.Transport != "vsock" || c.Port == 0 || c.Port == 4294967295 || strings.TrimSpace(c.HelperVersion) == "" || len(c.HelperVersion) > 128 {
 			return errors.New("unsupported guestControl capability")
 		}
 	}

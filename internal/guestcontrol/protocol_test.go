@@ -101,7 +101,7 @@ func TestProtocolCapabilitiesRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
 		t.Fatal(err)
 	}
-	if r.Protocol != Protocol || r.Epoch == "" || r.MaxLeaseMillis != time.Minute.Milliseconds() {
+	if !strings.HasPrefix(r.HelperVersion, "sha256:") || len(r.HelperVersion) != 71 || r.Protocol != Protocol || r.Epoch == "" || r.MaxLeaseMillis != time.Minute.Milliseconds() {
 		t.Fatalf("%+v", r)
 	}
 }

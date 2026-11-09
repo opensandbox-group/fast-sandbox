@@ -91,7 +91,9 @@ func TestRootfsColdBootIntegration(t *testing.T) {
 		bootCount = "2"
 	}
 	require.NoError(t, waitSerialFor(filepath.Join(dir, "console.log"), "FSB_ROOT_BOOT "+bootCount, 20*time.Second))
-	require.NoError(t, probeRootfsHelper(ctx, filepath.Join(dir, "guest-control.sock"), 1234))
+	versionID, err := probeRootfsHelper(ctx, filepath.Join(dir, "guest-control.sock"), 1234)
+	require.NoError(t, err)
+	require.NotEmpty(t, versionID)
 	t.Log(fmt.Sprintf("cold boot completed via rootfsOnly API path; Firecracker %s", version))
 }
 

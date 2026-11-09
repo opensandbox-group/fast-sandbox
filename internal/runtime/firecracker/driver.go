@@ -23,6 +23,7 @@ import (
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/fastlet/podcgroup"
+	"fast-sandbox/internal/firecrackerconfig"
 	infracontract "fast-sandbox/internal/infra/contract"
 	"fast-sandbox/internal/nodecleanup"
 	"fast-sandbox/internal/observability"
@@ -571,7 +572,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	var ociRootfs, vmstatePath, memoryPath string
 	var ociMetadata ociRestoreMetadata
 	var ociPrepareDur time.Duration
-	var rootfsKernel string
+	var rootfsKernel, bootKernelSHA256 string
 	ociAttached := false
 	createdComplete := false
 	defer func() {
@@ -660,6 +661,12 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 			if ociMetadata.IsRootfsOnly() {
 				rootfsKernel, err = d.rootfsKernel(ociMetadata)
 				if err == nil {
+					pinned := filepath.Join(directory, "boot-kernel")
+					bootKernelSHA256, err = firecrackerconfig.PinKernel(rootfsKernel, pinned)
+					rootfsKernel = pinned
+					defer os.Remove(pinned) // The VMM loads the kernel before Ensure returns.
+				}
+				if err == nil {
 					instanceRootfs, jailRoot, apiAddress, err = d.prepareRootfsBootInstance(identity.SandboxUID, directory, ociRootfs, rootfsKernel)
 				}
 			} else {
@@ -743,7 +750,10 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		APIAddress: apiAddress, CreatedAt: time.Now().Unix(),
 		InfraServices: infraServices, InfraDiagnostics: infraDiagnostics,
 	}
+	// Full restores execute the kernel already present in RAM, not KernelPath.
+	state.BootKernelSHA256 = ociMetadata.Kernel.SHA256
 	if ociMetadata.IsRootfsOnly() {
+		state.BootKernelSHA256 = bootKernelSHA256
 		provenance := artifacts.NewVMManifest(ociMetadata.Machine, ociMetadata.Kernel.Version, d.config.BinaryPath, artifacts.CPUTemplateNone).Compatibility
 		state.BootCompatibility = &provenance
 	}

@@ -10,7 +10,7 @@ import (
 )
 
 // probeRootfsHelper verifies the actual root filesystem only in a disposable build VM; a failed probe fails the build without declaring support.
-func probeRootfsHelper(ctx context.Context, socket string, port uint32) (resultErr error) {
+func probeRootfsHelper(ctx context.Context, socket string, port uint32) (version string, resultErr error) {
 	client := guestcontrol.Client{SocketPath: socket, Port: port, Timeout: time.Second}
 	probe, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -23,12 +23,12 @@ func probeRootfsHelper(ctx context.Context, socket string, port uint32) (resultE
 		}
 		select {
 		case <-probe.Done():
-			return fmt.Errorf("guest helper handshake: %w", err)
+			return "", fmt.Errorf("guest helper handshake: %w", err)
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
-	if caps.Protocol != guestcontrol.Protocol || caps.Epoch == "" || caps.ProtectedMount != "/" || caps.Filesystem != "ext4" || caps.MaxLeaseMillis < 5000 {
-		return errors.New("helper must protect the actual ext4 root with a compatible lease")
+	if caps.HelperVersion == "" || caps.Protocol != guestcontrol.Protocol || caps.Epoch == "" || caps.ProtectedMount != "/" || caps.Filesystem != "ext4" || caps.MaxLeaseMillis < 5000 {
+		return "", errors.New("helper must protect the actual ext4 root with a compatible lease")
 	}
 	req := guestcontrol.Request{Protocol: guestcontrol.Protocol, Epoch: caps.Epoch, Generation: 1, OperationID: "builder-rootfs-probe", LeaseMillis: 5000}
 	defer func() {
@@ -42,10 +42,10 @@ func probeRootfsHelper(ctx context.Context, socket string, port uint32) (resultE
 	}()
 	response, err := client.FreezeAndWait(probe, req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if response.Epoch != req.Epoch || response.Generation != req.Generation || response.State != guestcontrol.Held || response.CleanupPending {
-		return errors.New("builder root freeze not confirmed")
+		return "", errors.New("builder root freeze not confirmed")
 	}
-	return nil
+	return caps.HelperVersion, nil
 }

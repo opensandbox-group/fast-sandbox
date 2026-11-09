@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"fast-sandbox/internal/firecrackerconfig"
 )
 
 // This file encapsulates the build-flow Firecracker phase: inject an init
@@ -148,6 +150,11 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 		bootArgs = defaultBootArgs + " init=" + options.initPath
 	}
 
+	pinnedKernel := filepath.Join(runtimeDir, "boot-kernel")
+	options.kernelSHA256, err = firecrackerconfig.PinKernel(options.kernel, pinnedKernel)
+	if err != nil {
+		return "", "", err
+	}
 	process, err := launchFirecracker(global.firecrackerBin, runtimeDir, apiSocket, buildVMID, serialLog)
 	if err != nil {
 		return "", "", err
@@ -169,7 +176,7 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 	if err := client.waitReady(readyCtx); err != nil {
 		return "", "", err
 	}
-	if err := client.setBootSource(ctx, bootSource{KernelImagePath: options.kernel, BootArgs: bootArgs}); err != nil {
+	if err := client.setBootSource(ctx, bootSource{KernelImagePath: pinnedKernel, BootArgs: bootArgs}); err != nil {
 		return "", "", fmt.Errorf("configure boot source: %w", err)
 	}
 	if err := client.addDrive(ctx, drive{
@@ -202,10 +209,10 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 	}
 
 	if options.guestControlPort != 0 {
-		if err := probeRootfsHelper(ctx, filepath.Join(runtimeDir, "guest-control.sock"), options.guestControlPort); err != nil {
+		options.guestControlVersion, err = probeRootfsHelper(ctx, filepath.Join(runtimeDir, "guest-control.sock"), options.guestControlPort)
+		if err != nil {
 			return "", "", err
 		}
-		options.guestControlVerified = true
 	}
 	snapDir := filepath.Join(workDir, "snapshot")
 	if err := os.MkdirAll(snapDir, 0o750); err != nil {
