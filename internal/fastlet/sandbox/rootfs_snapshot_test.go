@@ -3,7 +3,6 @@ package sandbox
 import (
 	"context"
 	"errors"
-	"fast-sandbox/internal/dataplane/fastletproxy"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"fast-sandbox/internal/dataplane/fastletproxy"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
 
@@ -83,6 +83,8 @@ type recoverySnapshotRuntime struct {
 	required      bool
 	recoveryErr   error
 	recoveryCalls int
+	inspectCalls  int
+	inspectErr    error
 	recoveryBlock <-chan struct{}
 	identity      fastletapi.SandboxIdentity
 }
@@ -90,6 +92,10 @@ type recoverySnapshotRuntime struct {
 func (r *recoverySnapshotRuntime) InspectSandbox(context.Context, string) (*SandboxMetadata, error) {
 	r.recoveryMu.Lock()
 	defer r.recoveryMu.Unlock()
+	r.inspectCalls++
+	if r.inspectErr != nil {
+		return nil, r.inspectErr
+	}
 	return &SandboxMetadata{Config: fastletapi.RuntimeSandboxConfig{Identity: r.identity}, Phase: "Running", RecoveryRequired: r.required, RuntimeMessage: "capture recovery pending"}, nil
 }
 func (r *recoverySnapshotRuntime) ReconcileSandbox(ctx context.Context, identity fastletapi.SandboxIdentity) error {
@@ -297,4 +303,22 @@ func TestRootfsDeletingRecoveryRetriesWithoutRestoringReadiness(t *testing.T) {
 	publisher.mu.Lock()
 	require.Empty(t, publisher.applied, "deletion must never republish access")
 	publisher.mu.Unlock()
+}
+
+func TestRootfsHeartbeatUsesOneRuntimeObservation(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "success", true: "probe-failure"}[failed], func(t *testing.T) {
+			r := &recoverySnapshotRuntime{snapshotRuntime: newSnapshotRuntime()}
+			m := newSnapshotManager(t, r)
+			r.identity = m.sandboxes["uid-a"].Config.Identity
+			if failed {
+				r.inspectErr = errors.New("temporary API failure")
+			}
+			statuses := m.GetSandboxStatuses(t.Context())
+			require.Len(t, statuses, 1)
+			r.recoveryMu.Lock()
+			defer r.recoveryMu.Unlock()
+			require.Equal(t, 1, r.inspectCalls, "a heartbeat must not perform a second Inspect even after probe failure")
+		})
+	}
 }

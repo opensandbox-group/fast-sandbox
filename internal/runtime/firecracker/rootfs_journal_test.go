@@ -46,7 +46,7 @@ func TestCaptureJournalRejectsLostPersistence(t *testing.T) {
 	tx.Progress = j
 	require.NoError(t, os.RemoveAll(dir))
 	require.Error(t, tx.run(t.Context()))
-	require.Equal(t, []string{"verify", "quarantine"}, f.calls)
+	require.Equal(t, []string{"verify"}, f.calls)
 }
 
 func TestCaptureJournalQuarantineSurvivesReload(t *testing.T) {

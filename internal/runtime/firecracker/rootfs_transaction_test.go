@@ -243,3 +243,25 @@ func TestRootfsCaptureCanceledQualificationDoesNotFreeze(t *testing.T) {
 	require.ErrorIs(t, f.transaction().run(ctx), context.Canceled)
 	require.Equal(t, []string{"verify", "release"}, f.calls)
 }
+
+type countingCaptureProgress struct {
+	*captureFixture
+}
+
+func (*countingCaptureProgress) Record(capturePhase) error { return nil }
+
+func TestRootfsQuarantineHasOnePersistenceOwner(t *testing.T) {
+	for _, fail := range []string{"", "quarantine"} {
+		lease, progress := &captureFixture{}, &countingCaptureProgress{&captureFixture{fail: fail}}
+		tx := lease.transaction()
+		tx.Progress = progress
+		err := tx.quarantine(errors.New("resume failed"))
+		if fail != "" {
+			require.ErrorContains(t, err, "quarantine")
+		} else {
+			require.NoError(t, err)
+		}
+		require.Equal(t, []string{"quarantine"}, progress.calls)
+		require.Empty(t, lease.calls, "the same production journal must not be written again through Lease")
+	}
+}

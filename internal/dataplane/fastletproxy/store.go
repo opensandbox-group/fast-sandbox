@@ -85,24 +85,29 @@ type Snapshot struct {
 	Routes   []Route `json:"routes"`
 }
 
+type routeAvailability struct {
+	generation int64
+	suspended  bool
+}
+
 // Store keeps generation tombstones after deletion. This prevents a delayed
 // ApplyRoute from resurrecting an old runtime even though no active route is
 // currently present. Active entries are immutable *Route values in sync.Map,
 // so stable data-plane lookups do not take writeMu. The mutex only serializes
 // control-plane transitions and their revision/watcher ordering.
 type Store struct {
-	writeMu     sync.Mutex
-	active      sync.Map // Sandbox UID string -> immutable *Route
-	suspended   map[string]int64
-	highWater   map[string]int64
-	revision    uint64
-	nextWatcher uint64
-	watchers    map[uint64]chan Event
+	writeMu      sync.Mutex
+	active       sync.Map // Sandbox UID string -> immutable *Route
+	availability map[string]routeAvailability
+	highWater    map[string]int64
+	revision     uint64
+	nextWatcher  uint64
+	watchers     map[uint64]chan Event
 }
 
 func NewStore() *Store {
 	store := &Store{
-		suspended: make(map[string]int64), highWater: make(map[string]int64), watchers: make(map[uint64]chan Event),
+		availability: make(map[string]routeAvailability), highWater: make(map[string]int64), watchers: make(map[uint64]chan Event),
 	}
 	return store
 }
@@ -118,11 +123,11 @@ func (s *Store) Apply(route Route) (uint64, error) {
 	defer s.writeMu.Unlock()
 	// An Apply already in flight when suspension began may populate the
 	// route, but must not reopen it. Suspension also covers absent routes.
-	if generation := s.suspended[route.SandboxUID]; generation != 0 {
-		if route.RouteGeneration < generation {
+	if availability, ok := s.availability[route.SandboxUID]; ok {
+		if route.RouteGeneration < availability.generation {
 			return s.revision, ErrRouteStale
 		}
-		if route.RouteGeneration == generation {
+		if route.RouteGeneration == availability.generation && availability.suspended {
 			route.State = RouteSuspended
 		}
 	}
@@ -298,23 +303,18 @@ func (s *Store) SetSuspended(uid string, generation int64, revision uint64, susp
 	}
 	route, exists := s.loadRoute(uid)
 	high := s.highWater[uid]
-	if generation < high || generation < s.suspended[uid] || (generation == high && high != 0 && !exists) {
+	if generation < high || generation < s.availability[uid].generation || (generation == high && high != 0 && !exists) {
 		return s.revision, ErrRouteStale
 	}
-	if exists && route.RouteGeneration < generation {
-		exists = false // A newer owner will install its complete route through Apply.
-	}
-	if exists && (route.RouteGeneration != generation || route.State == RouteDraining) {
+	if exists && route.RouteGeneration == generation && route.State == RouteDraining {
 		return s.revision, ErrRouteConflict
 	}
-	if suspended {
-		s.suspended[uid] = generation
-	} else {
-		delete(s.suspended, uid)
-	}
+	// Retain the availability generation after resume to fence older Apply calls.
+	s.availability[uid] = routeAvailability{generation: generation, suspended: suspended}
 	s.revision++ // Fence late requests even when the route is not installed yet.
 	if exists {
-		if suspended {
+		// A newer owner must install its own full route before becoming ready.
+		if suspended || route.RouteGeneration < generation {
 			route.State = RouteSuspended
 		} else {
 			route.State = RouteReady

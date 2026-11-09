@@ -190,9 +190,15 @@ func (m *SandboxManager) removeRoute(ctx context.Context, metadata *SandboxMetad
 // declaring it dead. Heartbeats retry recovery only after the snapshot worker
 // has finished; status-only callers never initiate VM operations.
 func (m *SandboxManager) refreshRuntimeRecovery(ctx context.Context, identity fastletapi.SandboxIdentity, retry bool) {
+	if _, err := m.observeRuntimeRecovery(ctx, identity, retry); err != nil {
+		klog.V(2).InfoS("runtime recovery observation unavailable", "sandboxID", identity.SandboxUID, "err", err)
+	}
+}
+
+func (m *SandboxManager) observeRuntimeRecovery(ctx context.Context, identity fastletapi.SandboxIdentity, retry bool) (observed *SandboxMetadata, inspectErr error) {
 	reconciler, supported := m.runtime.(runtimecontract.RecoveryReconciler)
 	if !supported {
-		return
+		return observed, inspectErr
 	}
 	m.recoveryMu.Lock()
 	defer m.recoveryMu.Unlock()
@@ -200,7 +206,7 @@ func (m *SandboxManager) refreshRuntimeRecovery(ctx context.Context, identity fa
 	metadata := m.sandboxes[identity.SandboxUID]
 	if metadata == nil || metadata.Config.Identity != identity || !runtimeCreatedPhase(metadata.Phase) {
 		m.mu.RUnlock()
-		return
+		return observed, inspectErr
 	}
 	required := metadata.RecoveryRequired
 	for _, task := range m.snapshots {
@@ -209,23 +215,26 @@ func (m *SandboxManager) refreshRuntimeRecovery(ctx context.Context, identity fa
 		}
 	}
 	m.mu.RUnlock()
-	observed, err := m.runtime.InspectSandbox(ctx, identity.SandboxUID)
-	if err != nil || observed == nil || !runtimecontract.SameRuntimeIdentity(observed.Config.Identity, identity) {
-		return
+	observed, inspectErr = m.runtime.InspectSandbox(ctx, identity.SandboxUID)
+	if inspectErr != nil {
+		return nil, inspectErr
+	}
+	if observed == nil || !runtimecontract.SameRuntimeIdentity(observed.Config.Identity, identity) {
+		return nil, errors.New("runtime inspection returned no matching owner")
 	}
 	if !observed.RecoveryRequired && observed.Phase == sandboxStateRuntimeFailed {
 		// The driver has durably confirmed process exit. Use the existing
 		// owner-retirement and terminal cleanup path, never republish access.
 		m.preserveExitedRuntime(ctx, identity.SandboxUID, identity, observed.RuntimeMessage)
-		return
+		return observed, inspectErr
 	}
 	if required && !observed.RecoveryRequired && !strings.EqualFold(observed.Phase, "running") {
-		return
+		return observed, inspectErr
 	}
 	m.mu.Lock()
 	if m.sandboxes[identity.SandboxUID] != metadata || metadata.Config.Identity != identity || !runtimeCreatedPhase(metadata.Phase) {
 		m.mu.Unlock()
-		return
+		return observed, inspectErr
 	}
 	wasRequired := metadata.RecoveryRequired
 	metadata.RecoveryRequired = observed.RecoveryRequired
@@ -249,16 +258,24 @@ func (m *SandboxManager) refreshRuntimeRecovery(ctx context.Context, identity fa
 	} else if restartDataPlane {
 		m.startDataPlaneReconcile(metadata, m.clock.Now())
 	}
+	return observed, inspectErr
 }
 
-func (m *SandboxManager) refreshRecoveryMetadata(ctx context.Context, metadata SandboxMetadata) SandboxMetadata {
-	m.refreshRuntimeRecovery(ctx, metadata.Config.Identity, true)
+func (m *SandboxManager) refreshRecoveryMetadata(ctx context.Context, metadata SandboxMetadata) (SandboxMetadata, *SandboxMetadata) {
+	observed, err := m.observeRuntimeRecovery(ctx, metadata.Config.Identity, true)
+	if observed == nil && err == nil {
+		// Runtimes without recovery support and terminal phases still need one probe.
+		observed, err = m.runtime.InspectSandbox(ctx, metadata.Config.Identity.SandboxUID)
+	}
+	if err != nil {
+		observed = nil
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if current := m.sandboxes[metadata.Config.Identity.SandboxUID]; current != nil && current.Config.Identity == metadata.Config.Identity {
-		return *current
+		return *current, observed
 	}
-	return metadata
+	return metadata, observed
 }
 
 func applyRecoveryObservation(metadata *SandboxMetadata, runtime fastletapi.RuntimeObservation, dataPlane fastletapi.DataPlaneObservation) (fastletapi.RuntimeObservation, fastletapi.DataPlaneObservation) {

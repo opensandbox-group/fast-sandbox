@@ -703,7 +703,7 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 
 	result := make([]fastletapi.SandboxStatus, 0, len(snapshots))
 	for sandboxID, meta := range snapshots {
-		meta = m.refreshRecoveryMetadata(ctx, meta)
+		meta, inspected := m.refreshRecoveryMetadata(ctx, meta)
 		m.retryFailedDeletion(meta)
 		if meta.Phase == sandboxStateRuntimeFailureCleanup {
 			m.mu.RLock()
@@ -719,7 +719,7 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 		if message := messages[sandboxID]; message != "" {
 			runtimeObservation.Message = message
 		}
-		if inspected, err := m.runtime.InspectSandbox(ctx, sandboxID); err == nil {
+		if inspected != nil {
 			if runtimeObservation.State != fastletapi.RuntimeStateFailed || messages[sandboxID] == "" {
 				runtimeObservation.Message = inspected.Phase
 			}

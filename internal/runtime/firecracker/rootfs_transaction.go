@@ -178,11 +178,12 @@ func (t rootfsCapture) record(phase capturePhase) error {
 }
 
 func (t rootfsCapture) quarantine(cause error) error {
-	var persistenceErr error
+	// Production Progress and Lease share the same journal. Persist once and
+	// preserve any error; only transactions without Progress use the lease.
 	if t.Progress != nil {
-		persistenceErr = t.Progress.Quarantine(cause)
+		return t.Progress.Quarantine(cause)
 	}
-	return errors.Join(persistenceErr, t.Lease.Quarantine(cause))
+	return t.Lease.Quarantine(cause)
 }
 
 func (t rootfsCapture) recoverSource(ctx context.Context, freezeAttempted, pauseAttempted, sourceUncertain bool, err error) error {
