@@ -44,6 +44,13 @@ type ComponentRoute struct {
 	Port     uint32 `json:"port"`
 }
 
+// RecoveryRoutePublisher temporarily fences access without deleting ownership.
+// Resume must be explicit; ordinary delayed publications cannot lift the fence.
+type RecoveryRoutePublisher interface {
+	SuspendRoute(context.Context, RoutePublication) error
+	ResumeRoute(context.Context, RoutePublication) error
+}
+
 type RoutePublisher interface {
 	ApplyRoute(context.Context, RoutePublication) error
 	RemoveRoute(context.Context, RoutePublication) error

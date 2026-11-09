@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -28,6 +29,9 @@ func (m *SandboxManager) ReconcileProxyRoutes(ctx context.Context) error {
 	owners := make([]*SandboxMetadata, 0, len(m.sandboxes))
 	pendingInfra := false
 	for _, sandbox := range m.sandboxes {
+		if sandbox.RecoveryRequired {
+			pendingInfra = true
+		}
 		if !m.runtimeWorkAllowedLocked(sandbox) {
 			continue
 		}
@@ -146,6 +150,12 @@ func (m *SandboxManager) publishRoute(ctx context.Context, metadata *SandboxMeta
 		m.MarkProxyRouteUnavailable()
 		return err
 	}
+	if publisher, ok := m.routePublisher.(dataplane.RecoveryRoutePublisher); ok {
+		if err := publisher.ResumeRoute(ctx, publication); err != nil {
+			m.MarkProxyRouteUnavailable()
+			return err
+		}
+	}
 	if err := m.routePublisher.ApplyRoute(ctx, publication); err != nil {
 		m.MarkProxyRouteUnavailable()
 		return err
@@ -229,7 +239,7 @@ func (m *SandboxManager) refreshRuntimeRecovery(ctx context.Context, identity fa
 	restartDataPlane := !observed.RecoveryRequired && dataPlaneWorkPending(metadata.Phase)
 	m.mu.Unlock()
 	if observed.RecoveryRequired {
-		if err := m.removeRoute(ctx, metadata); err != nil {
+		if err := m.suspendRecoveryRoute(ctx, metadata); err != nil {
 			m.MarkProxyRouteUnavailable()
 			klog.ErrorS(err, "cannot withdraw route during runtime recovery", "sandboxID", identity.SandboxUID)
 		}
@@ -290,4 +300,29 @@ func (m *SandboxManager) startRuntimeRecovery(metadata *SandboxMetadata, reconci
 		defer cancelProbe()
 		m.refreshRuntimeRecovery(probe, identity, false)
 	}()
+}
+
+func (m *SandboxManager) suspendRecoveryRoute(ctx context.Context, metadata *SandboxMetadata) error {
+	if m.routePublisher == nil {
+		return nil
+	}
+	m.routeMu.Lock()
+	defer m.routeMu.Unlock()
+	m.mu.RLock()
+	current := m.sandboxes[metadata.Config.Identity.SandboxUID] == metadata && runtimeCreatedPhase(metadata.Phase)
+	identity := metadata.Config.Identity
+	m.mu.RUnlock()
+	// Accepted deletion owns irreversible withdrawal.
+	if !current {
+		return nil
+	}
+	publisher, ok := m.routePublisher.(dataplane.RecoveryRoutePublisher)
+	if !ok {
+		return errors.New("proxy does not support reversible recovery suspension")
+	}
+	generation := identity.RouteGeneration
+	if generation <= 0 {
+		generation = 1
+	}
+	return publisher.SuspendRoute(ctx, RoutePublication{SandboxUID: identity.SandboxUID, RouteGeneration: generation})
 }

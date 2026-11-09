@@ -13,8 +13,9 @@ import (
 type RouteState string
 
 const (
-	RouteReady    RouteState = "Ready"
-	RouteDraining RouteState = "Draining"
+	RouteReady     RouteState = "Ready"
+	RouteDraining  RouteState = "Draining"
+	RouteSuspended RouteState = "Suspended"
 )
 
 var (
@@ -58,7 +59,7 @@ func (r Route) validate() error {
 	if r.State == "" {
 		r.State = RouteReady
 	}
-	if r.State != RouteReady && r.State != RouteDraining {
+	if r.State != RouteReady && r.State != RouteDraining && r.State != RouteSuspended {
 		return fmt.Errorf("%w: invalid route state %q", ErrRouteConflict, r.State)
 	}
 	return nil
@@ -92,6 +93,7 @@ type Snapshot struct {
 type Store struct {
 	writeMu     sync.Mutex
 	active      sync.Map // Sandbox UID string -> immutable *Route
+	suspended   map[string]int64
 	highWater   map[string]int64
 	revision    uint64
 	nextWatcher uint64
@@ -100,7 +102,7 @@ type Store struct {
 
 func NewStore() *Store {
 	store := &Store{
-		highWater: make(map[string]int64), watchers: make(map[uint64]chan Event),
+		suspended: make(map[string]int64), highWater: make(map[string]int64), watchers: make(map[uint64]chan Event),
 	}
 	return store
 }
@@ -114,6 +116,16 @@ func (s *Store) Apply(route Route) (uint64, error) {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	// An Apply already in flight when suspension began may populate the
+	// route, but must not reopen it. Suspension also covers absent routes.
+	if generation := s.suspended[route.SandboxUID]; generation != 0 {
+		if route.RouteGeneration < generation {
+			return s.revision, ErrRouteStale
+		}
+		if route.RouteGeneration == generation {
+			route.State = RouteSuspended
+		}
+	}
 	high := s.highWater[route.SandboxUID]
 	if route.RouteGeneration < high {
 		return s.revision, ErrRouteStale
@@ -188,7 +200,7 @@ func (s *Store) Lookup(sandboxUID string) (Route, error) {
 	if !ok {
 		return Route{}, ErrRouteNotFound
 	}
-	if route.State == RouteDraining {
+	if route.State == RouteDraining || route.State == RouteSuspended {
 		return Route{}, ErrRouteDraining
 	}
 	return cloneRoute(route), nil
@@ -274,4 +286,41 @@ func routeSpecPtr(spec RouteSpec) *RouteSpec {
 		}
 	}
 	return &clone
+}
+
+// SetSuspended uses optimistic control revisions so a delayed suspend/resume
+// cannot override a newer transition. Delete tombstones remain irreversible.
+func (s *Store) SetSuspended(uid string, generation int64, revision uint64, suspended bool) (uint64, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if uid == "" || generation <= 0 || revision != s.revision {
+		return s.revision, ErrRouteConflict
+	}
+	route, exists := s.loadRoute(uid)
+	high := s.highWater[uid]
+	if generation < high || generation < s.suspended[uid] || (generation == high && high != 0 && !exists) {
+		return s.revision, ErrRouteStale
+	}
+	if exists && route.RouteGeneration < generation {
+		exists = false // A newer owner will install its complete route through Apply.
+	}
+	if exists && (route.RouteGeneration != generation || route.State == RouteDraining) {
+		return s.revision, ErrRouteConflict
+	}
+	if suspended {
+		s.suspended[uid] = generation
+	} else {
+		delete(s.suspended, uid)
+	}
+	s.revision++ // Fence late requests even when the route is not installed yet.
+	if exists {
+		if suspended {
+			route.State = RouteSuspended
+		} else {
+			route.State = RouteReady
+		}
+		s.storeRouteLocked(route)
+		s.publishLocked(Event{Revision: s.revision, Type: EventApplied, Key: route.RouteKey, Spec: routeSpecPtr(route.RouteSpec)})
+	}
+	return s.revision, nil
 }

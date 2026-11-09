@@ -1012,7 +1012,7 @@ func (d *Driver) deleteSandbox(ctx context.Context, sandboxID string, retainTerm
 	manager := d.networkManager
 	runtimeCgroups := d.runtimeCgroups
 	d.mu.RUnlock()
-	releaseLifecycle, err := lockSandboxMutation(ctx, stateRoot, sandboxID)
+	releaseLifecycle, err := lockSandboxLifecycle(ctx, stateRoot, sandboxID)
 	if err != nil {
 		return err
 	}
@@ -1037,6 +1037,9 @@ func (d *Driver) deleteSandbox(ctx context.Context, sandboxID string, retainTerm
 	}
 	if expectedIdentity != nil && !runtimecontract.SameRuntimeIdentity(state.Config.Identity, *expectedIdentity) {
 		return fmt.Errorf("terminal cleanup identity for sandbox %s no longer matches the durable runtime", sandboxID)
+	}
+	if err := d.reconcileCaptureForDelete(ctx, state, directory); err != nil {
+		return err
 	}
 	// Retry aborted staging cleanup before releasing its source resources.
 	if _, err := d.abortExitedRootfsCapture(ctx, state, directory); err != nil {

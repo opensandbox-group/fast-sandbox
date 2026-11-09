@@ -1824,3 +1824,8 @@ func TestStrictDeleteBeforeCreateSurvivesManagerRestart(t *testing.T) {
 	ensures, _ = runtime.counts()
 	require.Equal(t, 1, ensures)
 }
+
+func (p *admissionRoutePublisher) SuspendRoute(ctx context.Context, route RoutePublication) error {
+	return p.RemoveRoute(ctx, route)
+}
+func (p *admissionRoutePublisher) ResumeRoute(context.Context, RoutePublication) error { return nil }

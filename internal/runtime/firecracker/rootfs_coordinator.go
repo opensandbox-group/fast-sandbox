@@ -684,3 +684,24 @@ func (d *Driver) abortExitedRootfsCapture(ctx context.Context, state *SandboxSta
 	}
 	return d.abortDeadRootfsCapture(ctx, state, directory, confirmAbsent)
 }
+
+// Deletion owns the lifecycle lock and never republishes the recovered source.
+// A transient recovery failure keeps all source resources for a later retry.
+func (d *Driver) reconcileCaptureForDelete(ctx context.Context, state *SandboxState, directory string) (resultErr error) {
+	defer func() {
+		if resultErr != nil {
+			resultErr = fmt.Errorf("capture fence: %w", resultErr)
+		}
+	}()
+	if err := checkSandboxCaptureFence(d.config.StateRoot, state.Config.Identity.SandboxUID); err == nil {
+		return nil
+	}
+	if d.podUID != "" && state.Config.Identity.FastletPodUID != d.podUID {
+		return errCaptureIdentityMismatch
+	}
+	dead, err := d.abortExitedRootfsCapture(ctx, state, directory)
+	if err != nil || dead {
+		return err
+	}
+	return d.recoverRootfsCapture(ctx, state)
+}

@@ -202,3 +202,34 @@ func TestRootfsRuntimeRecoveryAbortsExitedQuarantine(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, captureAborted, j.record.Phase)
 }
+
+func TestRootfsDeleteReconcilesCaptureBeforeCleanup(t *testing.T) {
+	fixture := newDriverFixture(t)
+	require.NoError(t, fixture.driver.Initialize(t.Context(), ""))
+	owner := fixture.sandboxSpec.Identity
+	directory, err := ensureSandboxDir(fixture.stateRoot, owner.SandboxUID)
+	require.NoError(t, err)
+	process := exec.Command("sleep", "60")
+	require.NoError(t, process.Start())
+	t.Cleanup(func() { _ = process.Process.Kill(); _ = process.Wait() })
+	state := &SandboxState{Config: fixture.sandboxSpec, PID: process.Process.Pid, APIAddress: "/absent/socket", Phase: PhaseRunning}
+	require.NoError(t, saveState(directory, state))
+	f := &captureFixture{}
+	req := f.transaction().Request
+	staging := snapshotStagingPath(fixture.stateRoot, owner.FastletPodUID, req.OperationID, true)
+	require.NoError(t, os.MkdirAll(staging, 0700))
+	j, err := newCaptureJournal(filepath.Join(directory, "rootfs-capture"), captureRecord{Owner: &owner, Incarnation: "source", Device: "/absent/device", Staging: staging, Request: req})
+	require.NoError(t, err)
+	require.NoError(t, j.Quarantine(errors.New("resume response lost")))
+	// A failed transport probe is not evidence of death. Retain every resource.
+	require.ErrorContains(t, fixture.driver.DeleteSandbox(t.Context(), owner.SandboxUID), "capture fence")
+	require.DirExists(t, staging)
+	require.Empty(t, fixture.killCalls)
+	require.NoError(t, process.Process.Kill())
+	_ = process.Wait()
+	// A retry after independently proven exit must abort the capture and delete,
+	// without depending on a Guest channel or a Fastlet restart.
+	require.NoError(t, fixture.driver.DeleteSandbox(t.Context(), owner.SandboxUID))
+	require.NoDirExists(t, staging)
+	require.NoDirExists(t, directory)
+}

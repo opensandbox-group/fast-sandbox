@@ -442,6 +442,21 @@ func (m *SandboxManager) validateInfraRevision(spec *fastletapi.SandboxDesiredSp
 	return nil
 }
 
+// Heartbeats retry accepted deletion without returning the source to service.
+func (m *SandboxManager) retryFailedDeletion(meta SandboxMetadata) {
+	if meta.Phase != sandboxStateDeleteFailed {
+		return
+	}
+	id := meta.Config.Identity.SandboxUID
+	m.mu.RLock()
+	current := m.sandboxes[id]
+	retry := current != nil && current.Config.Identity == meta.Config.Identity && current.Phase == sandboxStateDeleteFailed
+	m.mu.RUnlock()
+	if retry {
+		go m.asyncDelete(id, current)
+	}
+}
+
 func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata) {
 	const gracefulTimeout = 10 * time.Second
 	m.mu.Lock()
@@ -689,6 +704,7 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 	result := make([]fastletapi.SandboxStatus, 0, len(snapshots))
 	for sandboxID, meta := range snapshots {
 		meta = m.refreshRecoveryMetadata(ctx, meta)
+		m.retryFailedDeletion(meta)
 		if meta.Phase == sandboxStateRuntimeFailureCleanup {
 			m.mu.RLock()
 			current := m.sandboxes[sandboxID]

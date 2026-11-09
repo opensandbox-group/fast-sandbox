@@ -3,6 +3,8 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fast-sandbox/internal/dataplane/fastletproxy"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -154,9 +156,9 @@ func TestRootfsSnapshotFailureWithdrawsReadinessAndRetriesRecovery(t *testing.T)
 				return done && r.recoveryCalls == 1
 			}, time.Second, time.Millisecond)
 			require.Zero(t, r.deleteCalls)
-			require.NoError(t, m.ReconcileProxyRoutes(t.Context()))
+			require.ErrorIs(t, m.ReconcileProxyRoutes(t.Context()), ErrInfraUnavailable)
 			publisher.mu.Lock()
-			require.Empty(t, publisher.reconciled[len(publisher.reconciled)-1], "quarantined source must not be republished")
+			require.Empty(t, publisher.reconciled, "quarantined routes must not be permanently deleted during reconciliation")
 			publisher.mu.Unlock()
 			_, err = m.CreateSnapshot(t.Context(), snapshotRequest("another"))
 			requireFastletCode(t, err, fastletapi.ErrorRuntimeUnavailable)
@@ -218,4 +220,81 @@ func TestRootfsRecoveryWorkerDoesNotBlockHeartbeatsOrTouchReplacement(t *testing
 	defer m.mu.RUnlock()
 	require.True(t, replacement.RecoveryRequired)
 	require.Equal(t, sandboxStateCreating, replacement.Phase)
+}
+
+func TestRootfsRecoveryRestoresRealProxyRoute(t *testing.T) {
+	r := &recoverySnapshotRuntime{snapshotRuntime: newSnapshotRuntime()}
+	m := newSnapshotManager(t, r)
+	meta := m.sandboxes["uid-a"]
+	r.identity = meta.Config.Identity
+	r.admissionRuntime.sandboxes["uid-a"] = &SandboxMetadata{Config: meta.Config}
+	store := fastletproxy.NewStore()
+	socket := filepath.Join(t.TempDir(), "proxy.sock")
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- (&fastletproxy.ControlServer{Store: store, SocketPath: socket}).Serve(ctx) }()
+	t.Cleanup(func() { cancel(); require.NoError(t, <-done) })
+	client := fastletproxy.NewControlClient(socket)
+	require.Eventually(t, func() bool { _, err := client.Snapshot(t.Context()); return err == nil }, time.Second, time.Millisecond)
+	m.routePublisher = fastletproxy.NewRoutePublisher(client)
+	m.routeReady = true
+	require.NoError(t, m.publishRoute(t.Context(), meta))
+	_, err := store.Lookup("uid-a")
+	require.NoError(t, err)
+	r.recoveryMu.Lock()
+	r.required = true
+	r.recoveryMu.Unlock()
+	m.refreshRuntimeRecovery(t.Context(), r.identity, false)
+	_, err = store.Lookup("uid-a")
+	require.ErrorIs(t, err, fastletproxy.ErrRouteDraining)
+	require.ErrorIs(t, m.ReconcileProxyRoutes(t.Context()), ErrInfraUnavailable)
+	require.Len(t, store.Snapshot().Routes, 1, "temporary quarantine must retain route ownership")
+	r.recoveryMu.Lock()
+	r.required = false
+	r.recoveryMu.Unlock()
+	m.refreshRuntimeRecovery(t.Context(), r.identity, false)
+	require.Eventually(t, func() bool {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		return meta.Phase == sandboxStateRunning && !meta.RecoveryRequired
+	}, time.Second, time.Millisecond)
+	require.NoError(t, m.ReconcileProxyRoutes(t.Context()))
+	route, err := store.Lookup("uid-a")
+	require.NoError(t, err)
+	require.Equal(t, r.identity.RouteGeneration, route.RouteGeneration)
+	require.NoError(t, m.removeRoute(t.Context(), meta))
+	require.Error(t, m.publishRoute(t.Context(), meta), "accepted deletion must not be undone by late publication")
+}
+
+func TestRootfsDeletingRecoveryRetriesWithoutRestoringReadiness(t *testing.T) {
+	r := &recoverySnapshotRuntime{snapshotRuntime: newSnapshotRuntime(), required: true}
+	m := newSnapshotManager(t, r)
+	meta := m.sandboxes["uid-a"]
+	r.identity = meta.Config.Identity
+	meta.RecoveryRequired = true
+	publisher := &admissionRoutePublisher{}
+	m.routePublisher, m.routeReady = publisher, true
+	r.admissionRuntime.deleteError = errors.New("temporary capture recovery failure")
+	_, err := m.DeleteSandbox(&fastletapi.DeleteSandboxRequest{Identity: r.identity})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		return meta.Phase == sandboxStateDeleteFailed && m.deleteWorkers["uid-a"] == nil
+	}, time.Second, time.Millisecond)
+	r.admissionRuntime.mu.Lock()
+	r.admissionRuntime.deleteError = nil
+	r.admissionRuntime.mu.Unlock()
+	m.GetSandboxStatuses(t.Context())
+	require.Eventually(t, func() bool {
+		m.mu.RLock()
+		defer m.mu.RUnlock()
+		return m.sandboxes["uid-a"] == nil
+	}, time.Second, time.Millisecond)
+	r.recoveryMu.Lock()
+	require.Zero(t, r.recoveryCalls, "only the deleting driver may recover the source")
+	r.recoveryMu.Unlock()
+	publisher.mu.Lock()
+	require.Empty(t, publisher.applied, "deletion must never republish access")
+	publisher.mu.Unlock()
 }
