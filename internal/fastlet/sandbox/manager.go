@@ -549,7 +549,9 @@ func (m *SandboxManager) preserveExitedRuntime(ctx context.Context, sandboxID st
 	}
 	m.mu.Lock()
 	metadata := m.sandboxes[sandboxID]
-	if !m.runtimeWorkAllowedLocked(metadata) || metadata.Config.Identity != identity {
+	// A durably confirmed exit may follow a capture quarantine. Keep its
+	// readiness fence until terminal failure recording succeeds.
+	if metadata == nil || metadata.Config.Identity != identity || !runtimeCreatedPhase(metadata.Phase) || m.terminalFailureWorkers[sandboxID] == metadata {
 		m.mu.Unlock()
 		return
 	}
@@ -569,6 +571,7 @@ func (m *SandboxManager) preserveExitedRuntime(ctx context.Context, sandboxID st
 		m.finishTerminalFailureWorker(sandboxID, metadata)
 		return
 	}
+	metadata.RecoveryRequired = false
 	metadata.Phase = sandboxStateRuntimeFailureCleanup
 	m.runtimeMessages[sandboxID] = message
 	m.recordDiagnosticLocked(sandboxID, "error", "runtime", sandboxStateRuntimeFailureCleanup, message)

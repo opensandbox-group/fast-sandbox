@@ -203,6 +203,12 @@ func (m *SandboxManager) refreshRuntimeRecovery(ctx context.Context, identity fa
 	if err != nil || observed == nil || !runtimecontract.SameRuntimeIdentity(observed.Config.Identity, identity) {
 		return
 	}
+	if !observed.RecoveryRequired && observed.Phase == sandboxStateRuntimeFailed {
+		// The driver has durably confirmed process exit. Use the existing
+		// owner-retirement and terminal cleanup path, never republish access.
+		m.preserveExitedRuntime(ctx, identity.SandboxUID, identity, observed.RuntimeMessage)
+		return
+	}
 	if required && !observed.RecoveryRequired && !strings.EqualFold(observed.Phase, "running") {
 		return
 	}

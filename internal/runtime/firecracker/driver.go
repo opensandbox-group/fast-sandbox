@@ -947,6 +947,9 @@ func (d *Driver) InspectSandbox(ctx context.Context, sandboxID string) (_ *Sandb
 		metadata.RuntimeMessage = fenceErr.Error()
 		return metadata, nil
 	}
+	if state.Phase == PhaseFailed {
+		return existingMetadata(state), nil
+	}
 	if alive, probeErr := d.probeVM(ctx, state); probeErr == nil && !alive {
 		state.Phase = PhaseStopped
 	}
@@ -1034,6 +1037,17 @@ func (d *Driver) deleteSandbox(ctx context.Context, sandboxID string, retainTerm
 	}
 	if expectedIdentity != nil && !runtimecontract.SameRuntimeIdentity(state.Config.Identity, *expectedIdentity) {
 		return fmt.Errorf("terminal cleanup identity for sandbox %s no longer matches the durable runtime", sandboxID)
+	}
+	if state.Phase == PhaseFailed {
+		// Retry staging cleanup after an abort persisted but its cleanup failed.
+		// Keep normal owner-retirement ordering for VM/network reclamation.
+		var confirmAbsent func(string) error
+		if runtimeCgroups != nil {
+			confirmAbsent = runtimeCgroups.ConfirmAbsent
+		}
+		if _, err := d.abortDeadRootfsCapture(ctx, state, directory, confirmAbsent); err != nil {
+			return err
+		}
 	}
 	pid := state.PID
 	if state.Phase == PhaseFailed && runtimeCgroups != nil {

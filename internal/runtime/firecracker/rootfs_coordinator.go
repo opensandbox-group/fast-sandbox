@@ -360,6 +360,17 @@ func (d *Driver) ReconcileSandbox(ctx context.Context, identity fastletapi.Sandb
 	if !runtimecontract.SameRuntimeIdentity(state.Config.Identity, identity) || (d.podUID != "" && d.podUID != identity.FastletPodUID) {
 		return errCaptureIdentityMismatch
 	}
+	d.mu.RLock()
+	cgroups := d.runtimeCgroups
+	d.mu.RUnlock()
+	var confirmAbsent func(string) error
+	if cgroups != nil {
+		confirmAbsent = cgroups.ConfirmAbsent
+	}
+	dead, err := d.abortDeadRootfsCapture(ctx, state, filepath.Join(d.config.StateRoot, sandboxStateDir, identity.SandboxUID), confirmAbsent)
+	if err != nil || dead {
+		return err
+	}
 	return d.recoverRootfsCapture(ctx, state)
 }
 
