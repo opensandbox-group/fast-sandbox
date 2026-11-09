@@ -43,7 +43,11 @@ type SandboxManagerConfig struct {
 }
 
 type SandboxManager struct {
-	mu sync.RWMutex
+	// Serialize recovery observations so an older successful probe cannot
+	// clear a fence observed by a concurrent snapshot failure callback.
+	recoveryMu      sync.Mutex
+	recoveryWorkers map[string]*SandboxMetadata
+	mu              sync.RWMutex
 	// routeMu orders route writes and removal before runtime/network cleanup.
 	// Acquire it before mu; never wait for routeMu while holding mu.
 	routeMu                     sync.Mutex
@@ -531,7 +535,7 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 // record is being written, and after the runtime enters cleanup or deletion.
 // Callers hold m.mu; physical cleanup still waits for durable failure recording.
 func (m *SandboxManager) runtimeWorkAllowedLocked(metadata *SandboxMetadata) bool {
-	if metadata == nil {
+	if metadata == nil || metadata.RecoveryRequired {
 		return false
 	}
 	id := metadata.Config.Identity.SandboxUID
@@ -681,6 +685,7 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 
 	result := make([]fastletapi.SandboxStatus, 0, len(snapshots))
 	for sandboxID, meta := range snapshots {
+		meta = m.refreshRecoveryMetadata(ctx, meta)
 		if meta.Phase == sandboxStateRuntimeFailureCleanup {
 			m.mu.RLock()
 			current := m.sandboxes[sandboxID]
@@ -708,6 +713,8 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 				}
 			}
 		}
+		dataPlaneReady = dataPlaneReady && !meta.RecoveryRequired
+		runtimeObservation, dataPlaneObservation = applyRecoveryObservation(&meta, runtimeObservation, dataPlaneObservation)
 		result = append(result, fastletapi.SandboxStatus{
 			SandboxID:          sandboxID,
 			InstanceGeneration: identity.InstanceGeneration,

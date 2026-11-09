@@ -528,7 +528,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		return nil, err
 	}
 
-	releaseLifecycle, err := lockSandboxMutation(ctx, stateRoot, identity.SandboxUID)
+	releaseLifecycle, err := d.lockSandboxEnsure(ctx, stateRoot, identity.SandboxUID)
 	if err != nil {
 		return nil, err
 	}
@@ -930,6 +930,13 @@ func (d *Driver) InspectSandbox(ctx context.Context, sandboxID string) (_ *Sandb
 		}
 		return nil, err
 	}
+	if fenceErr := checkSandboxCaptureFence(stateRoot, sandboxID); fenceErr != nil {
+		metadata := existingMetadata(state)
+		metadata.RecoveryRequired = true
+		metadata.Phase = "RecoveryRequired"
+		metadata.RuntimeMessage = fenceErr.Error()
+		return metadata, nil
+	}
 	if alive, probeErr := d.probeVM(ctx, state); probeErr == nil && !alive {
 		state.Phase = PhaseStopped
 	}
@@ -1329,6 +1336,9 @@ func (d *Driver) bootTimeoutOrDefault() int32 {
 
 // GetAccessDescriptor returns the pod-side DirectIP descriptor of the Sandbox.
 func (d *Driver) GetAccessDescriptor(sandboxID string) (dataplane.AccessDescriptor, error) {
+	if err := checkSandboxCaptureFence(d.config.StateRoot, sandboxID); err != nil {
+		return dataplane.AccessDescriptor{}, err
+	}
 	d.mu.RLock()
 	manager := d.networkManager
 	d.mu.RUnlock()

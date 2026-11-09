@@ -21,21 +21,18 @@ func reconcileCapture(ctx context.Context, j *captureJournal, target captureReco
 	if j == nil || target == nil || guest == nil || timeout <= 0 {
 		return errors.New("incomplete capture recovery")
 	}
-	if j.record.Phase == captureRecovered {
+	if j.record.Phase == captureRecovered || j.record.Phase == captureAborted {
 		return nil
 	}
-	if j.record.Phase == captureQuarantined {
-		return errors.New("capture quarantined; explicit reconciliation required")
+	if err = target.VerifyIdentity(ctx, j.record); err != nil {
+		return recoveryIdentityError(j, err)
 	}
 	defer func() {
 		if err != nil {
 			err = errors.Join(err, j.Quarantine(err))
 		}
 	}()
-	if err = target.VerifyIdentity(ctx, j.record); err != nil {
-		return fmt.Errorf("verify recovery identity: %w", err)
-	}
-	if err = j.Record(captureRecovering); err != nil {
+	if err = j.beginVerifiedRecovery(); err != nil {
 		return err
 	}
 	recovery, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
@@ -63,4 +60,15 @@ func reconcileCapture(ctx context.Context, j *captureJournal, target captureReco
 		return err
 	}
 	return j.Record(captureRecovered)
+}
+
+// A failed probe does not establish an identity mismatch. Keep its current
+// durable fence so a fresh request can retry without sending any VM command.
+var errCaptureIdentityMismatch = errors.New("capture identity mismatch")
+
+func recoveryIdentityError(j *captureJournal, err error) error {
+	if errors.Is(err, errCaptureIdentityMismatch) {
+		err = errors.Join(err, j.Quarantine(err))
+	}
+	return fmt.Errorf("verify recovery identity: %w", err)
 }

@@ -217,6 +217,86 @@ func TestRootfsCaptureRestartIntegration(t *testing.T) {
 	}
 }
 
+// Inject a transport failure before the real Resume/Thaw request is delivered.
+type captureLabRecoveryFailure struct {
+	captureLabRecovery
+	failResume bool
+}
+
+func (r captureLabRecoveryFailure) Resume(ctx context.Context) error {
+	if r.failResume {
+		return errors.New("injected Resume transport failure")
+	}
+	return r.Client.Resume(ctx)
+}
+
+type captureLabThawFailure struct {
+	guestcontrol.Client
+	failThaw bool
+}
+
+func (g captureLabThawFailure) ThawAndWait(ctx context.Context, req guestcontrol.Request) (guestcontrol.Response, error) {
+	if g.failThaw {
+		return guestcontrol.Response{}, errors.New("injected Thaw transport failure")
+	}
+	return g.Client.ThawAndWait(ctx, req)
+}
+
+func TestRootfsCaptureQuarantineRetryIntegration(t *testing.T) {
+	if os.Getenv("FSB_TEST_ROOTFS_CAPTURE") != "1" {
+		t.Skip("requires disposable single-drive VM")
+	}
+	vm := NewClient(os.Getenv("FSB_TEST_API_SOCKET"))
+	defer vm.Close()
+	guest := guestcontrol.Client{SocketPath: os.Getenv("FSB_TEST_VSOCK_SOCKET"), Port: 1234, Timeout: 2 * time.Second}
+	for _, failure := range []string{"resume", "thaw"} {
+		t.Run(failure, func(t *testing.T) {
+			caps, err := guest.Call(t.Context(), guestcontrol.Request{Protocol: guestcontrol.Protocol, Method: "capabilities"})
+			require.NoError(t, err)
+			req := guestcontrol.Request{Protocol: guestcontrol.Protocol, Epoch: caps.Epoch, Generation: caps.Generation + 1, OperationID: "retry-" + failure, LeaseMillis: 10000}
+			dir := filepath.Join(os.Getenv("FSB_TEST_CAPTURE_OUTPUT"), "quarantine-"+failure)
+			j, err := newCaptureJournal(dir, captureRecord{Incarnation: "disposable-lab-vm", Device: os.Getenv("FSB_TEST_FLUSH_BLOCK_DEVICE"), Staging: dir, Request: req})
+			require.NoError(t, err)
+			_, err = guest.FreezeAndWait(t.Context(), req)
+			require.NoError(t, err)
+			require.NoError(t, vm.Pause(t.Context()))
+			// Always attempt recovery even if an assertion below fails.
+			t.Cleanup(func() {
+				cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if state, e := vm.VMState(cleanup); e == nil && state == vmPaused {
+					_ = vm.Resume(cleanup)
+				}
+				_, _ = guest.ThawAndWait(cleanup, req)
+			})
+			target := captureLabRecoveryFailure{captureLabRecovery: captureLabRecovery{vm}, failResume: failure == "resume"}
+			faultyGuest := captureLabThawFailure{Client: guest, failThaw: failure == "thaw"}
+			require.Error(t, reconcileCapture(t.Context(), j, target, faultyGuest, 5*time.Second))
+			j, err = loadCaptureJournal(dir)
+			require.NoError(t, err)
+			require.Equal(t, captureQuarantined, j.record.Phase)
+			state, err := vm.VMState(t.Context())
+			require.NoError(t, err)
+			if failure == "resume" {
+				require.Equal(t, vmPaused, state)
+			} else {
+				require.Equal(t, vmRunning, state)
+			}
+			require.NoError(t, reconcileCapture(t.Context(), j, captureLabRecovery{vm}, guest, 5*time.Second))
+			state, err = vm.VMState(t.Context())
+			require.NoError(t, err)
+			require.Equal(t, vmRunning, state)
+			require.Equal(t, captureRecovered, j.record.Phase)
+			req.Method, req.LeaseMillis = "status", 0
+			status, err := guest.Call(t.Context(), req)
+			require.NoError(t, err)
+			require.Equal(t, guestcontrol.Released, status.State)
+			require.False(t, status.CleanupPending)
+			t.Logf("%s failure: reloaded quarantine recovered; VMM Running and Guest Released", failure)
+		})
+	}
+}
+
 func TestFlushCapturedBlockRejectsNonBlockDevice(t *testing.T) {
 	require.ErrorContains(t, flushCapturedBlock(nil), "open block device")
 	file, err := os.Create(filepath.Join(t.TempDir(), "regular"))

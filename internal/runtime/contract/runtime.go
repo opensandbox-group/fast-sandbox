@@ -16,6 +16,9 @@ import (
 )
 
 type Metadata struct {
+	// RecoveryRequired keeps a live runtime unavailable without declaring it
+	// dead or allowing destructive cleanup. Reconciliation must clear the fence.
+	RecoveryRequired       bool
 	Config                 fastletapi.RuntimeSandboxConfig
 	Allocation             fastletapi.RuntimeAllocation
 	ContainerID            string
@@ -153,6 +156,12 @@ type Snapshotter interface {
 // releasing any sandbox-owned resources. A failure must leave those resources
 // intact so recovery can be retried.
 type ResourceRecoveryOwnerRetirer func(ctx context.Context, metadata *Metadata) error
+
+// RecoveryReconciler retries a fenced live runtime using its complete identity.
+// It must serialize with capture/replacement and never publish interrupted cuts.
+type RecoveryReconciler interface {
+	ReconcileSandbox(ctx context.Context, identity fastletapi.SandboxIdentity) error
+}
 
 type ResourceRecoverer interface {
 	RecoverRuntimeResources(ctx context.Context, managed []*Metadata, retireOwner ResourceRecoveryOwnerRetirer) error

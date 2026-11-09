@@ -116,6 +116,25 @@ func loadCaptureJournal(directory string) (*captureJournal, error) {
 	}
 	return &captureJournal{directory: directory, record: r}, nil
 }
+
+// beginVerifiedRecovery is reserved for the reconciler after identity validation.
+// Ordinary progress cannot release quarantine; the lifecycle lock serializes
+// validation and this durable transition with replacement and deletion.
+func (j *captureJournal) beginVerifiedRecovery() error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.record.Phase == captureRecovered || j.record.Phase == captureAborted {
+		return errors.New("capture already terminal")
+	}
+	old := j.record
+	j.record.Phase = captureRecovering
+	if err := j.persist(); err != nil {
+		j.record = old
+		return err
+	}
+	return nil
+}
+
 func (j *captureJournal) Record(next capturePhase) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()

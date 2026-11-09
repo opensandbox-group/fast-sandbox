@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
 
 // Keep the lifecycle lock outside the Sandbox directory and never delete its inode, avoiding duplicate locks after delete/replace.
@@ -85,4 +87,81 @@ func checkSandboxCaptureFence(stateRoot, id string) error {
 		return fmt.Errorf("sandbox %s capture fence: %w", id, err)
 	}
 	return nil
+}
+
+// Ensure may retire a lost Pod's fence only after node-level cleanup has
+// removed its resources. It never adopts, signals, or deletes another Pod's VM.
+func (d *Driver) lockSandboxEnsure(ctx context.Context, stateRoot, id string) (func(), error) {
+	release, err := lockSandboxLifecycle(ctx, stateRoot, id)
+	if err != nil {
+		return nil, err
+	}
+	directory := filepath.Join(stateRoot, sandboxStateDir, id)
+	state, readErr := loadState(directory)
+	if readErr == nil && d.podUID != "" && state.Config.Identity.FastletPodUID != d.podUID {
+		err = d.reconcileOrphanedCapture(state, directory)
+	}
+	if err == nil {
+		err = checkSandboxCaptureFence(stateRoot, id)
+	}
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return release, nil
+}
+
+func (d *Driver) reconcileOrphanedCapture(state *SandboxState, directory string) error {
+	path := filepath.Join(directory, "rootfs-capture")
+	if _, err := os.Lstat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	journal, err := loadCaptureJournal(path)
+	if err != nil {
+		return err
+	}
+	if journal.record.Phase == captureRecovered {
+		return nil
+	}
+	if journal.record.Owner == nil || !runtimecontract.SameRuntimeIdentity(*journal.record.Owner, state.Config.Identity) {
+		return fmt.Errorf("capture fence: %w", errCaptureIdentityMismatch)
+	}
+	owner := state.Config.Identity
+	network := state.Allocation.Network
+	// Network records are shared across Pods. Janitor removes a slot record
+	// only AFTER the host process cleaner confirms the old VMM is gone.
+	// A Pod-local PID must never be interpreted in a replacement Pod.
+	if network.SlotID == "" || filepath.Base(network.SlotID) != network.SlotID || !filepath.IsAbs(network.DNSPath) ||
+		filepath.Base(network.DNSPath) != network.SlotID+".resolv.conf" || filepath.Base(filepath.Dir(network.DNSPath)) != owner.FastletPodUID {
+		return errors.New("capture fence: previous Pod network cleanup identity is unavailable")
+	}
+	expected := snapshotStagingPath(d.config.StateRoot, owner.FastletPodUID, journal.record.Request.OperationID, true)
+	if expected != journal.record.Staging {
+		return errors.New("capture fence: previous Pod staging ownership mismatch")
+	}
+	paths := []string{
+		filepath.Join(filepath.Dir(network.DNSPath), network.SlotID+".json"), network.DNSPath,
+		filepath.Join(ociRootForPod(d.config.StateRoot, owner.FastletPodUID), "sandboxes", owner.SandboxUID), expected,
+	}
+	// fsb-vm removes the old Pod's OCI directory only after device teardown.
+	// Jailer nodes and dangling rootfs links may remain; ordinary stale
+	// cleanup removes those after the terminal journal and cleared PID persist.
+	for _, resource := range paths {
+		if _, err := os.Lstat(resource); !errors.Is(err, os.ErrNotExist) {
+			return errors.Join(fmt.Errorf("capture fence: previous Pod resource cleanup pending: %s", resource), err)
+		}
+	}
+	if journal.record.Phase != captureAborted {
+		if err := journal.Record(captureAborted); err != nil {
+			return err
+		}
+	}
+	// Also repeat this after a crash between the terminal journal and meta.json.
+	// Never let ordinary stale cleanup signal a PID that may have been reused.
+	state.PID, state.APIAddress = 0, ""
+	state.Phase = PhaseFailed
+	state.FailureMessage = "previous Pod capture resources reclaimed; interrupted artifact discarded"
+	return saveState(directory, state)
 }

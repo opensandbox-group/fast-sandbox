@@ -112,7 +112,7 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletError(fastletapi.ErrorSnapshotUnsupported,
 			"Actions v2 management does not support snapshots in this release", false))
 	}
-	if metadata.Phase != sandboxStateRunning {
+	if metadata.Phase != sandboxStateRunning || metadata.RecoveryRequired {
 		m.mu.Unlock()
 		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletError(fastletapi.ErrorRuntimeUnavailable,
 			fmt.Sprintf("target Sandbox runtime is %q, not running", metadata.Phase), true))
@@ -258,6 +258,9 @@ func (m *SandboxManager) runSnapshotWorker(snapshotter RuntimeSnapshotter, task 
 		}
 		klog.ErrorS(err, "Sandbox snapshot task failed",
 			"sandboxID", sandboxUID, "snapshotID", task.snapshotID, "kind", task.kind, "reason", reason, "message", message)
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), time.Second)
+		m.refreshRuntimeRecovery(probeCtx, task.identity.Sandbox, false)
+		probeCancel()
 		m.finishSnapshotTaskWithReason(task, fastletapi.SnapshotPhaseFailed, reason, message)
 		return
 	}

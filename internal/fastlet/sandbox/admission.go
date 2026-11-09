@@ -565,8 +565,18 @@ func (m *SandboxManager) InspectSandbox(req *fastletapi.InspectSandboxRequest) (
 		m.mu.RUnlock()
 		return &fastletapi.InspectSandboxResponse{Error: failure}, failure
 	}
-	status := m.sandboxStatusLocked(metadata)
 	actionManager := m.actionManager
+	m.mu.RUnlock()
+	probeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	m.refreshRuntimeRecovery(probeCtx, req.Identity, false)
+	cancel()
+	m.mu.RLock()
+	if m.sandboxes[req.Identity.SandboxUID] != metadata {
+		m.mu.RUnlock()
+		failure := fastletError(fastletapi.ErrorConflict, "Sandbox changed while inspecting runtime", true)
+		return &fastletapi.InspectSandboxResponse{Error: failure}, failure
+	}
+	status := m.sandboxStatusLocked(metadata)
 	m.mu.RUnlock()
 
 	// The Action Manager owns the freshest Handler observation. In particular,
@@ -1186,6 +1196,8 @@ func computeResourcesFromRuntimeLimits(limits fastletapi.SandboxRuntimeLimits) (
 func (m *SandboxManager) sandboxStatusLocked(metadata *SandboxMetadata) fastletapi.SandboxStatus {
 	dataPlaneReady := (m.routePublisher == nil || m.routeReady) && routeReadyForPhase(metadata.Phase)
 	runtime, dataPlane := observationsForPhase(metadata.Phase, dataPlaneReady)
+	dataPlaneReady = dataPlaneReady && !metadata.RecoveryRequired
+	runtime, dataPlane = applyRecoveryObservation(metadata, runtime, dataPlane)
 	if message := m.runtimeMessages[metadata.Config.Identity.SandboxUID]; message != "" && metadata.Phase != sandboxStateRunning {
 		runtime.Message = message
 	}

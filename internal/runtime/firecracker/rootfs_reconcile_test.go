@@ -14,14 +14,15 @@ type recoveryFixture struct {
 	*captureFixture
 	state         string
 	identityError bool
+	probeError    error
 }
 
-func (f *recoveryFixture) VerifyIdentity(context.Context, captureRecord) error {
+func (f *recoveryFixture) VerifyIdentity(ctx context.Context, _ captureRecord) error {
 	f.calls = append(f.calls, "identity")
 	if f.identityError {
-		return errors.New("different VMM incarnation")
+		return errCaptureIdentityMismatch
 	}
-	return nil
+	return errors.Join(ctx.Err(), f.probeError)
 }
 func (f *recoveryFixture) VMState(context.Context) (string, error) {
 	f.calls = append(f.calls, "state")
@@ -69,6 +70,63 @@ func TestCaptureRestartRecovery(t *testing.T) {
 					require.NotContains(t, f.calls, "thaw")
 				}
 				require.NotContains(t, f.calls, "cut")
+			})
+		}
+	}
+}
+
+func TestCaptureRecoveryRetriesQuarantineAfterReload(t *testing.T) {
+	for _, failure := range []string{"resume", "thaw"} {
+		t.Run(failure, func(t *testing.T) {
+			f := &recoveryFixture{captureFixture: &captureFixture{fail: failure}, state: vmPaused}
+			j, err := newCaptureJournal(filepath.Join(t.TempDir(), "capture"), captureRecord{Incarnation: "boot-1", Device: "/dev/test", Staging: "/tmp/cut", Request: f.transaction().Request})
+			require.NoError(t, err)
+			require.Error(t, reconcileCapture(t.Context(), j, f, f, time.Second))
+			j, err = loadCaptureJournal(j.directory)
+			require.NoError(t, err)
+			require.Equal(t, captureQuarantined, j.record.Phase)
+			f.fail, f.calls = "", nil
+			// Quarantine still rejects a replacement, even when transport works.
+			f.identityError = true
+			require.ErrorIs(t, reconcileCapture(t.Context(), j, f, f, time.Second), errCaptureIdentityMismatch)
+			require.Equal(t, []string{"identity"}, f.calls)
+			f.identityError, f.calls = false, nil
+			require.NoError(t, reconcileCapture(t.Context(), j, f, f, time.Second))
+			require.Equal(t, []string{"identity", "state", "resume", "thaw"}, f.calls)
+			saved, err := loadCaptureJournal(j.directory)
+			require.NoError(t, err)
+			require.Equal(t, captureRecovered, saved.record.Phase)
+		})
+	}
+}
+
+func TestCaptureRecoveryProbeFailureIsRetryable(t *testing.T) {
+	for _, phase := range []capturePhase{capturePrepared, captureQuarantined} {
+		for _, failure := range []string{"canceled", "deadline", "transport"} {
+			t.Run(string(phase)+"/"+failure, func(t *testing.T) {
+				f := &recoveryFixture{captureFixture: &captureFixture{}, state: vmRunning}
+				j, err := newCaptureJournal(filepath.Join(t.TempDir(), "capture"), captureRecord{Incarnation: "boot-1", Device: "/dev/test", Staging: "/tmp/cut", Request: f.transaction().Request})
+				require.NoError(t, err)
+				j.record.Phase = phase
+				require.NoError(t, j.persist())
+				ctx := t.Context()
+				if failure == "canceled" {
+					canceled, cancel := context.WithCancel(ctx)
+					cancel()
+					ctx = canceled
+				} else if failure == "deadline" {
+					f.probeError = context.DeadlineExceeded
+				} else {
+					f.probeError = errors.New("connection refused")
+				}
+				require.Error(t, reconcileCapture(ctx, j, f, f, time.Second))
+				require.Equal(t, []string{"identity"}, f.calls)
+				j, err = loadCaptureJournal(j.directory)
+				require.NoError(t, err)
+				require.Equal(t, phase, j.record.Phase)
+				f.probeError, f.calls = nil, nil
+				require.NoError(t, reconcileCapture(t.Context(), j, f, f, time.Second))
+				require.Equal(t, []string{"identity", "state", "thaw"}, f.calls)
 			})
 		}
 	}

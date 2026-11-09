@@ -4,10 +4,14 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
+	"time"
 
 	"k8s.io/klog/v2"
 
 	dataplane "fast-sandbox/internal/dataplane/contract"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
 
 // ReconcileProxyRoutes is invoked after Fastlet Proxy reconnects. It rebuilds
@@ -170,4 +174,114 @@ func (m *SandboxManager) removeRoute(ctx context.Context, metadata *SandboxMetad
 		publication.RouteGeneration = 1
 	}
 	return m.routePublisher.RemoveRoute(ctx, publication)
+}
+
+// refreshRuntimeRecovery withdraws access to a fenced live runtime without
+// declaring it dead. Heartbeats retry recovery only after the snapshot worker
+// has finished; status-only callers never initiate VM operations.
+func (m *SandboxManager) refreshRuntimeRecovery(ctx context.Context, identity fastletapi.SandboxIdentity, retry bool) {
+	reconciler, supported := m.runtime.(runtimecontract.RecoveryReconciler)
+	if !supported {
+		return
+	}
+	m.recoveryMu.Lock()
+	defer m.recoveryMu.Unlock()
+	m.mu.RLock()
+	metadata := m.sandboxes[identity.SandboxUID]
+	if metadata == nil || metadata.Config.Identity != identity || !runtimeCreatedPhase(metadata.Phase) {
+		m.mu.RUnlock()
+		return
+	}
+	required := metadata.RecoveryRequired
+	for _, task := range m.snapshots {
+		if task.identity.Sandbox.SandboxUID == identity.SandboxUID && holdsPauseWindow(task.phase) {
+			retry = false
+		}
+	}
+	m.mu.RUnlock()
+	observed, err := m.runtime.InspectSandbox(ctx, identity.SandboxUID)
+	if err != nil || observed == nil || !runtimecontract.SameRuntimeIdentity(observed.Config.Identity, identity) {
+		return
+	}
+	if required && !observed.RecoveryRequired && !strings.EqualFold(observed.Phase, "running") {
+		return
+	}
+	m.mu.Lock()
+	if m.sandboxes[identity.SandboxUID] != metadata || metadata.Config.Identity != identity || !runtimeCreatedPhase(metadata.Phase) {
+		m.mu.Unlock()
+		return
+	}
+	wasRequired := metadata.RecoveryRequired
+	metadata.RecoveryRequired = observed.RecoveryRequired
+	if observed.RecoveryRequired {
+		metadata.RuntimeMessage = observed.RuntimeMessage
+	} else if wasRequired {
+		metadata.RuntimeMessage = ""
+		// Re-run Infra checks and route publication after thaw before readiness.
+		metadata.Phase = sandboxStateInfraPending
+	}
+	restartDataPlane := !observed.RecoveryRequired && dataPlaneWorkPending(metadata.Phase)
+	m.mu.Unlock()
+	if observed.RecoveryRequired {
+		if err := m.removeRoute(ctx, metadata); err != nil {
+			m.MarkProxyRouteUnavailable()
+			klog.ErrorS(err, "cannot withdraw route during runtime recovery", "sandboxID", identity.SandboxUID)
+		}
+		if retry {
+			m.startRuntimeRecovery(metadata, reconciler)
+		}
+	} else if restartDataPlane {
+		m.startDataPlaneReconcile(metadata, m.clock.Now())
+	}
+}
+
+func (m *SandboxManager) refreshRecoveryMetadata(ctx context.Context, metadata SandboxMetadata) SandboxMetadata {
+	m.refreshRuntimeRecovery(ctx, metadata.Config.Identity, true)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if current := m.sandboxes[metadata.Config.Identity.SandboxUID]; current != nil && current.Config.Identity == metadata.Config.Identity {
+		return *current
+	}
+	return metadata
+}
+
+func applyRecoveryObservation(metadata *SandboxMetadata, runtime fastletapi.RuntimeObservation, dataPlane fastletapi.DataPlaneObservation) (fastletapi.RuntimeObservation, fastletapi.DataPlaneObservation) {
+	if metadata.RecoveryRequired {
+		return fastletapi.RuntimeObservation{State: fastletapi.RuntimeStateUnavailable, Message: metadata.RuntimeMessage},
+			fastletapi.DataPlaneObservation{State: fastletapi.DataPlaneStateUnavailable, Message: "runtime recovery required"}
+	}
+	return runtime, dataPlane
+}
+
+// A slow Guest must not stall heartbeats for the entire Fastlet. One bounded
+// worker per runtime identity retries under the driver's durable lifecycle lock.
+func (m *SandboxManager) startRuntimeRecovery(metadata *SandboxMetadata, reconciler runtimecontract.RecoveryReconciler) {
+	m.mu.Lock()
+	identity := metadata.Config.Identity
+	id := identity.SandboxUID
+	if m.sandboxes[id] != metadata || !metadata.RecoveryRequired || !runtimeCreatedPhase(metadata.Phase) || m.recoveryWorkers[id] != nil {
+		m.mu.Unlock()
+		return
+	}
+	if m.recoveryWorkers == nil {
+		m.recoveryWorkers = make(map[string]*SandboxMetadata)
+	}
+	m.recoveryWorkers[id] = metadata
+	m.mu.Unlock()
+	go func() {
+		defer func() {
+			m.mu.Lock()
+			delete(m.recoveryWorkers, id)
+			m.mu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := reconciler.ReconcileSandbox(ctx, identity)
+		cancel()
+		if err != nil {
+			klog.V(2).InfoS("runtime recovery remains pending", "sandboxID", id, "err", err)
+		}
+		probe, cancelProbe := context.WithTimeout(context.Background(), time.Second)
+		defer cancelProbe()
+		m.refreshRuntimeRecovery(probe, identity, false)
+	}()
 }

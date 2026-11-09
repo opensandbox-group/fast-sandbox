@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -72,4 +73,101 @@ func TestRootfsProcessIdentityFencesSocketReuse(t *testing.T) {
 	require.Equal(t, first, second)
 	_, err = captureProcessIdentity(t.Context(), socket, os.Getpid()+1)
 	require.ErrorContains(t, err, "recorded VMM PID")
+}
+
+func TestRootfsLostPodFenceWaitsForResourceCleanup(t *testing.T) {
+	for _, phase := range []capturePhase{captureFreezing, captureCutting, captureQuarantined, captureAborted} {
+		t.Run(string(phase), func(t *testing.T) {
+			root := t.TempDir()
+			d := &Driver{config: firecrackerConfigForTest(t, root), podUID: "new-pod"}
+			owner := fastletapi.SandboxIdentity{SandboxUID: "source", FastletPodUID: "old-pod"}
+			directory := filepath.Join(root, sandboxStateDir, owner.SandboxUID)
+			require.NoError(t, os.MkdirAll(directory, 0700))
+			state := &SandboxState{PID: os.Getpid(), Phase: PhaseRunning, Config: fastletapi.RuntimeSandboxConfig{Identity: owner}}
+			state.Allocation.Network = fastletapi.NetworkAllocation{SlotID: "old-slot", DNSPath: filepath.Join(root, "network", owner.FastletPodUID, "old-slot.resolv.conf")}
+			networkRecord := filepath.Join(filepath.Dir(state.Allocation.Network.DNSPath), "old-slot.json")
+			require.NoError(t, os.MkdirAll(filepath.Dir(networkRecord), 0700))
+			require.NoError(t, os.WriteFile(networkRecord, []byte("owned network slot"), 0600))
+			require.NoError(t, os.WriteFile(state.Allocation.Network.DNSPath, nil, 0600))
+			require.NoError(t, saveState(directory, state))
+			f := &captureFixture{}
+			req := f.transaction().Request
+			staging := snapshotStagingPath(root, owner.FastletPodUID, req.OperationID, true)
+			device := filepath.Join(root, "old-device")
+			upper := filepath.Join(ociRootForPod(root, owner.FastletPodUID), "sandboxes", owner.SandboxUID)
+			currentUpper := filepath.Join(d.ociRoot(), "sandboxes", owner.SandboxUID)
+			require.NoError(t, os.MkdirAll(currentUpper, 0700))
+			require.NoError(t, os.MkdirAll(staging, 0700))
+			require.NoError(t, os.MkdirAll(upper, 0700))
+			require.NoError(t, os.WriteFile(device, nil, 0600))
+			j, err := newCaptureJournal(filepath.Join(directory, "rootfs-capture"), captureRecord{Owner: &owner, Incarnation: "old-vmm", Device: device, Staging: staging, Request: req})
+			require.NoError(t, err)
+			j.record.Phase = phase
+			require.NoError(t, j.persist())
+			// Each independent leftover must keep Ensure fenced until Janitor removes it.
+			for _, resource := range []string{networkRecord, state.Allocation.Network.DNSPath, staging, upper} {
+				unlock, err := d.lockSandboxEnsure(t.Context(), root, owner.SandboxUID)
+				require.ErrorContains(t, err, "capture fence")
+				require.Nil(t, unlock)
+				require.NoError(t, os.RemoveAll(resource))
+			}
+			// A reused Pod-local PID and a stale device node do not name a live old VMM.
+			require.FileExists(t, device)
+			unlock, err := d.lockSandboxEnsure(t.Context(), root, owner.SandboxUID)
+			require.NoError(t, err)
+			unlock()
+			saved, err := loadState(directory)
+			require.NoError(t, err)
+			require.Zero(t, saved.PID)
+			require.Empty(t, saved.APIAddress)
+			j, err = loadCaptureJournal(j.directory)
+			require.NoError(t, err)
+			require.Equal(t, captureAborted, j.record.Phase)
+			require.DirExists(t, currentUpper, "old Pod reconciliation must not consume the replacement's resources")
+			// A retry after terminal journal persistence is safe even if meta.json was stale.
+			state.PID = os.Getpid()
+			require.NoError(t, saveState(directory, state))
+			unlock, err = d.lockSandboxEnsure(t.Context(), root, owner.SandboxUID)
+			require.NoError(t, err)
+			unlock()
+			saved, err = loadState(directory)
+			require.NoError(t, err)
+			require.Zero(t, saved.PID)
+		})
+	}
+}
+
+func TestRootfsLostPodCaptureAllowsSameNodeEnsureAfterCleanup(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("native Full fixture requires x86 CPU identity; orphan fence recovery is tested above on all Linux architectures")
+	}
+	fixture := newDriverFixture(t)
+	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
+	require.NoError(t, fixture.driver.Initialize(t.Context(), ""))
+	fixture.driver.SetFastletPodUID("replacement-pod")
+	fixture.sandboxSpec.Identity.FastletPodUID = "replacement-pod"
+	old := fixture.sandboxSpec
+	old.Identity.FastletPodUID = "old-pod"
+	directory, err := ensureSandboxDir(fixture.stateRoot, old.Identity.SandboxUID)
+	require.NoError(t, err)
+	process := exec.Command("true")
+	require.NoError(t, process.Run())
+	state := &SandboxState{Config: old, PID: process.Process.Pid, Phase: PhaseRunning}
+	state.Allocation.Network = fastletapi.NetworkAllocation{SlotID: "old-slot", DNSPath: filepath.Join(fixture.stateRoot, "network", "old-pod", "old-slot.resolv.conf")}
+	require.NoError(t, saveState(directory, state))
+	f := &captureFixture{}
+	req := f.transaction().Request
+	j, err := newCaptureJournal(filepath.Join(directory, "rootfs-capture"), captureRecord{Owner: &old.Identity, Incarnation: "old-vmm", Device: filepath.Join(directory, "missing-device"), Staging: snapshotStagingPath(fixture.stateRoot, "old-pod", req.OperationID, true), Request: req})
+	require.NoError(t, err)
+	j.record.Phase = captureCutting
+	require.NoError(t, j.persist())
+	// Recovery inventory must not adopt another Pod. Ensure handles its retired fence.
+	require.NoError(t, fixture.driver.RecoverRuntimeResources(t.Context(), nil, nil))
+	metadata, err := fixture.driver.EnsureSandbox(t.Context(), ensureInput(&fixture.sandboxSpec))
+	require.NoError(t, err)
+	require.Equal(t, fixture.sandboxSpec.Identity, metadata.Config.Identity)
+	require.Equal(t, string(PhaseRunning), metadata.Phase)
+	require.Len(t, fixture.launcher.started, 1)
+	require.NotContains(t, fixture.killCalls, process.Process.Pid)
+	require.NoDirExists(t, filepath.Join(directory, "rootfs-capture"))
 }

@@ -109,3 +109,29 @@ func TestDriverLifecyclePreservesUnreconciledCapture(t *testing.T) {
 	require.Equal(t, 777, state.PID)
 	require.Empty(t, fixture.killCalls)
 }
+
+func TestRootfsRecoveryRequiredOverridesLiveAPI(t *testing.T) {
+	for _, failure := range []string{"resume-not-delivered", "thaw-failed"} {
+		t.Run(failure, func(t *testing.T) {
+			fixture := newDriverFixture(t)
+			directory, err := ensureSandboxDir(fixture.stateRoot, "sandbox-1")
+			require.NoError(t, err)
+			state := &SandboxState{Config: fixture.sandboxSpec, Phase: PhaseRunning, PID: 777, APIAddress: "/unused/api.sock"}
+			require.NoError(t, saveState(directory, state))
+			f := &captureFixture{}
+			j, err := newCaptureJournal(filepath.Join(directory, "rootfs-capture"), captureRecord{Owner: &state.Config.Identity, Incarnation: "boot", Device: "/dev/test", Staging: "/tmp/cut", Request: f.transaction().Request})
+			require.NoError(t, err)
+			require.NoError(t, j.Quarantine(errors.New(failure)))
+			metadata, err := fixture.driver.InspectSandbox(t.Context(), "sandbox-1")
+			require.NoError(t, err)
+			require.True(t, metadata.RecoveryRequired)
+			require.Equal(t, "RecoveryRequired", metadata.Phase)
+			_, err = fixture.driver.GetAccessDescriptor("sandbox-1")
+			require.ErrorContains(t, err, "capture fence")
+			saved, err := loadState(directory)
+			require.NoError(t, err)
+			require.Equal(t, PhaseRunning, saved.Phase, "readiness must not declare the fenced runtime dead")
+			require.Empty(t, fixture.killCalls)
+		})
+	}
+}

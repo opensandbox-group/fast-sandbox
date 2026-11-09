@@ -21,7 +21,7 @@ func captureProcessIdentity(ctx context.Context, socket string, pid int) (string
 		return "", err
 	}
 	if peer != pid {
-		return "", fmt.Errorf("API socket does not belong to recorded VMM PID")
+		return "", fmt.Errorf("%w: API socket does not belong to recorded VMM PID", errCaptureIdentityMismatch)
 	}
 	return capturePIDIdentity(pid)
 }

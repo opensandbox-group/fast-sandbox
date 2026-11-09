@@ -82,21 +82,21 @@ type productionCaptureLease struct {
 
 func (l *productionCaptureLease) VerifyIdentity(ctx context.Context, r captureRecord) error {
 	if r.Owner == nil || !runtimecontract.SameRuntimeIdentity(*r.Owner, l.state.Config.Identity) {
-		return errors.New("capture durable owner differs from source")
+		return fmt.Errorf("%w: capture durable owner differs from source", errCaptureIdentityMismatch)
 	}
 	current, err := loadState(filepath.Join(l.driver.config.StateRoot, sandboxStateDir, l.state.Config.Identity.SandboxUID))
 	if err != nil {
 		return err
 	}
 	if !runtimecontract.SameRuntimeIdentity(current.Config.Identity, l.state.Config.Identity) || current.PID != l.state.PID || current.APIAddress != l.state.APIAddress {
-		return errors.New("capture runtime ownership changed")
+		return fmt.Errorf("%w: capture runtime ownership changed", errCaptureIdentityMismatch)
 	}
 	identity, err := captureProcessIdentity(ctx, current.APIAddress, current.PID)
 	if err != nil {
 		return err
 	}
 	if identity != r.Incarnation {
-		return errors.New("capture VMM incarnation changed")
+		return fmt.Errorf("%w: capture VMM incarnation changed", errCaptureIdentityMismatch)
 	}
 	var config struct {
 		Drives []struct {
@@ -109,7 +109,7 @@ func (l *productionCaptureLease) VerifyIdentity(ctx context.Context, r captureRe
 		return err
 	}
 	if len(config.Drives) != 1 || config.Drives[0].ReadOnly {
-		return errors.New("capture requires one writable rootfs drive")
+		return fmt.Errorf("%w: capture requires one writable rootfs drive", errCaptureIdentityMismatch)
 	}
 	path := config.Drives[0].Path
 	if filepath.IsAbs(path) {
@@ -126,14 +126,14 @@ func (l *productionCaptureLease) VerifyIdentity(ctx context.Context, r captureRe
 		return err
 	}
 	if !os.SameFile(actual, held) || actual.Mode()&os.ModeDevice == 0 || actual.Mode()&os.ModeCharDevice != 0 {
-		return errors.New("capture drive is not the owned block device")
+		return fmt.Errorf("%w: capture drive is not the owned block device", errCaptureIdentityMismatch)
 	}
 	expected, err := os.Stat(r.Device)
 	if err != nil {
 		return err
 	}
 	if !os.SameFile(expected, held) {
-		return errors.New("capture device ownership changed")
+		return fmt.Errorf("%w: capture device ownership changed", errCaptureIdentityMismatch)
 	}
 	engine := config.Drives[0].Engine
 	if engine == "" {
@@ -340,6 +340,24 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	return d.publishPreparedOCISnapshot(ctx, plan, upperBytes, publication, input.OnPublishing)
 }
 
+// ReconcileSandbox retries source recovery without accepting or publishing an
+// interrupted cut. The caller must supply the complete current runtime identity.
+func (d *Driver) ReconcileSandbox(ctx context.Context, identity fastletapi.SandboxIdentity) error {
+	release, err := lockSandboxLifecycle(ctx, d.config.StateRoot, identity.SandboxUID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	state, err := loadState(filepath.Join(d.config.StateRoot, sandboxStateDir, identity.SandboxUID))
+	if err != nil {
+		return err
+	}
+	if !runtimecontract.SameRuntimeIdentity(state.Config.Identity, identity) || (d.podUID != "" && d.podUID != identity.FastletPodUID) {
+		return errCaptureIdentityMismatch
+	}
+	return d.recoverRootfsCapture(ctx, state)
+}
+
 func (d *Driver) recoverRootfsCapture(ctx context.Context, state *SandboxState) (resultErr error) {
 	defer func() {
 		if resultErr != nil {
@@ -359,8 +377,8 @@ func (d *Driver) recoverRootfsCapture(ctx context.Context, state *SandboxState) 
 	if journal.record.Phase == captureRecovered {
 		return d.cleanupUnpublishedCapture(ctx, state, journal)
 	}
-	if journal.record.Phase == captureQuarantined {
-		return errors.New("capture fence: quarantined operation requires explicit reconciliation")
+	if journal.record.Phase == captureAborted {
+		return nil
 	}
 	client := d.newClient(state.APIAddress)
 	defer client.Close()
@@ -372,7 +390,7 @@ func (d *Driver) recoverRootfsCapture(ctx context.Context, state *SandboxState) 
 	lease := &productionCaptureLease{driver: d, state: state, client: client, device: device, record: journal.record, journal: journal}
 	// Verify peer identity before reading config or sending Resume; never act on a reused PID/socket.
 	if err = lease.VerifyIdentity(ctx, journal.record); err != nil {
-		return errors.Join(err, journal.Quarantine(err))
+		return recoveryIdentityError(journal, err)
 	}
 	source, err := restoreReference(state.Config.Desired)
 	if err != nil {

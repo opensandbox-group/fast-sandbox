@@ -148,7 +148,7 @@ func TestRootfsFailedCaptureStagingRecovery(t *testing.T) {
 	for _, scenario := range []string{"partial-upper", "partial-upper-live", "prepare-failed", "published", "quarantined", "wrong-path", "cleanup-failed"} {
 		t.Run(scenario, func(t *testing.T) {
 			root := t.TempDir()
-			d := &Driver{config: firecrackerConfigForTest(t, root)}
+			d := &Driver{config: firecrackerConfigForTest(t, root), newClient: NewClient}
 			state := &SandboxState{Phase: PhaseRunning}
 			state.Config.Identity = fastletapi.SandboxIdentity{SandboxUID: "source", FastletPodUID: "pod", Namespace: "test"}
 			directory := filepath.Join(root, sandboxStateDir, "source")
