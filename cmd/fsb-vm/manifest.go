@@ -73,6 +73,12 @@ func buildSnapfilesManifest(options *buildOptions, createdAt time.Time) ([]byte,
 		return nil, err
 	}
 	manifest := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: options.vcpu, MemoryMiB: int64(options.memoryMB), RootfsSizeMiB: int64(size), RootfsDriveID: options.rootfsDriveID, RootfsDrivePath: rootfsDriveLink}, version, global.firecrackerBin, artifacts.CPUTemplateNone)
+	return completeBuildManifest(options, createdAt, manifest)
+}
+
+// Complete metadata from a manifest whose compatibility identifies the build
+// environment. Production supplies the real host; metadata tests use fixtures.
+func completeBuildManifest(options *buildOptions, createdAt time.Time, manifest artifacts.VMManifest) ([]byte, error) {
 	if options.guestControlPort != 0 {
 		if options.guestControlVersion == "" {
 			return nil, fmt.Errorf("guest control capability requires successful freeze/thaw probe")
