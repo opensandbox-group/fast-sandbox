@@ -75,6 +75,19 @@ func resolvePair(ctx context.Context, repo MetadataRepository, ref registry.Refe
 	if err := validatePairID(id); err != nil {
 		return nil, err
 	}
+	root, err := repo.Resolve(ctx, id+"_rootfs")
+	if err != nil {
+		return nil, err
+	}
+	if root.MediaType != oci.MediaTypeImageManifest {
+		return nil, fmt.Errorf("unexpected rootfs manifest media type %q", root.MediaType)
+	}
+	return pairMetadata(ref, snap, root, manifest)
+}
+
+func pairMetadata(ref registry.Reference, snap, root oci.Descriptor, manifest oci.Manifest) ([]byte, error) {
+	annotations := manifest.Annotations
+	id := annotations[AnnotationTemplateID]
 	doc := map[string]json.RawMessage{}
 	// Owner annotations are authoritative; never infer ownership from tag text.
 	uid, namespace, checkpoint := annotations[AnnotationSandboxUID], annotations[AnnotationNamespace], annotations[AnnotationCheckpointID]
@@ -87,13 +100,6 @@ func resolvePair(ctx context.Context, repo MetadataRepository, ref registry.Refe
 			return nil, err
 		}
 		doc["checkpoint"] = raw
-	}
-	root, err := repo.Resolve(ctx, id+"_rootfs")
-	if err != nil {
-		return nil, err
-	}
-	if root.MediaType != oci.MediaTypeImageManifest {
-		return nil, fmt.Errorf("unexpected rootfs manifest media type %q", root.MediaType)
 	}
 	repository := ref.Registry + "/" + ref.Repository
 	pair := Pair{Rootfs: repository + "@" + root.Digest.String(), Snapfiles: repository + "@" + snap.Digest.String()}

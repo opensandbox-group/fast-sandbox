@@ -108,6 +108,10 @@ func acquireSharedSnapfiles(ctx context.Context, client *ublkdClient, sandboxHom
 		}
 	}
 	if cached.Device == nil {
+		// Persist cleanup ownership before local lower hard links are created.
+		if err := persist(); err != nil {
+			return err
+		}
 		config, err := writeSnapfilesConfig(home, image)
 		if err != nil {
 			return err

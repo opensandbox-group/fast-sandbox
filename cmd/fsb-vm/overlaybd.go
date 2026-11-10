@@ -79,7 +79,7 @@ func writeRootfsConfig(ctx context.Context, home string, image resolvedImage, di
 	}
 	config := OverlayBDBSConfig{
 		RepoBlobURL: image.RepoBlobURL,
-		Lowers:      lowersFor(image),
+		Lowers:      cachedLowers(home, image),
 		Upper:       OverlayBDBSConfigUpper{Index: indexFile, Data: dataFile, Vsize: vsizeGiB},
 		ResultFile:  filepath.Join(home, "rootfs."+overlaybdResultName),
 	}
@@ -91,7 +91,7 @@ func writeRootfsConfig(ctx context.Context, home string, image resolvedImage, di
 func writeSnapfilesConfig(home string, image resolvedImage) (string, error) {
 	config := OverlayBDBSConfig{
 		RepoBlobURL: image.RepoBlobURL,
-		Lowers:      lowersFor(image),
+		Lowers:      cachedLowers(home, image),
 		ResultFile:  filepath.Join(home, "snapfiles."+overlaybdResultName),
 	}
 	return writeConfig(filepath.Join(home, snapfilesConfigName), config)

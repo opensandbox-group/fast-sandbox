@@ -41,6 +41,8 @@ type config struct {
 	kernelDir                 string
 	stateDir                  string
 	manifestCacheDir          string
+	blobCacheDir              string
+	blobCacheMaxBytes         int64
 	runtimeDir                string
 	firecrackerBin            string
 	overlaybdCreate           string
@@ -97,6 +99,16 @@ func (c *config) absolutize() error {
 		}
 		c.manifestCacheDir = absolute
 	}
+	if c.blobCacheDir != "" {
+		absolute, err := filepath.Abs(c.blobCacheDir)
+		if err != nil {
+			return fmt.Errorf("resolve blob cache: %w", err)
+		}
+		c.blobCacheDir = absolute
+	}
+	if c.blobCacheMaxBytes < 0 {
+		return fmt.Errorf("blob-cache-max-bytes must be nonnegative")
+	}
 	for _, path := range []*string{&c.credFile, &c.kernelDir, &c.stateDir, &c.runtimeDir, &c.buildWorkDir, &c.buildOutputDir} {
 		absolute, err := filepath.Abs(*path)
 		if err != nil {
@@ -123,6 +135,8 @@ func init() {
 	flags.StringVar(&global.kernelDir, "kernel-dir", defaultKernelDir, "directory holding vmlinux-<kernel_version> kernels")
 	flags.StringVar(&global.stateDir, "state-dir", defaultStateDir, "persistent per-sandbox state directory root")
 	flags.StringVar(&global.manifestCacheDir, "manifest-cache-dir", "", "shared immutable registry metadata cache (default <state-dir>/.manifest-cache)")
+	flags.StringVar(&global.blobCacheDir, "blob-cache-dir", "", "local checkpoint blob cache (default <state-dir>/.blob-cache)")
+	flags.Int64Var(&global.blobCacheMaxBytes, "blob-cache-max-bytes", 16<<30, "local checkpoint cache byte budget; zero disables admission and lookup")
 	flags.StringVar(&global.runtimeDir, "runtime-dir", defaultRuntimeDir, "volatile per-sandbox runtime directory root")
 	flags.StringVar(&global.firecrackerBin, "firecracker", defaultFirecrackerBin, "firecracker binary path")
 	flags.StringVar(&global.overlaybdCreate, "overlaybd-create", defaultOverlaybdCreate, "overlaybd-create binary path")
@@ -144,6 +158,7 @@ func init() {
 	rootCmd.AddCommand(newPushCommand())
 	rootCmd.AddCommand(newPackCommand())
 	rootCmd.AddCommand(newPackCleanupCommand())
+	rootCmd.AddCommand(newCacheCheckpointCommand())
 }
 
 func newQualifyBackendCommand() *cobra.Command {
