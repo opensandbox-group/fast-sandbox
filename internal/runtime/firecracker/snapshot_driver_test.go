@@ -311,11 +311,13 @@ func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
 	require.NoError(t, err)
 	restore := &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/publish/abcdef/manifest.json", ArtifactDigest: "lineage-digest"}
 	state.Config.Desired.Restore = restore
+	state.BootKernelSHA256 = strings.Repeat("b", 64)
 	require.NoError(t, saveState(dir, state))
 
 	cacheDir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(artifacts.CheckpointReference(restore.ArtifactDigest)))
 	require.NoError(t, os.MkdirAll(cacheDir, 0o750))
 	sourceDocument := testManifestDocument(t)
+	sourceDocument["kernel"].(map[string]any)["sha256"] = strings.Repeat("a", 64)
 	sourceDocument["freePageReporting"] = true
 	sourceDocument["guestNetwork"].(map[string]any)["ip"] = "10.0.0.2"
 	sourceDocument["guestNetwork"].(map[string]any)["gateway"] = "10.0.0.1"
@@ -338,6 +340,7 @@ func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
 	require.NoError(t, err)
 	var document map[string]any
 	require.NoError(t, json.Unmarshal(payload, &document))
+	require.Equal(t, state.BootKernelSHA256, document["kernel"].(map[string]any)["sha256"])
 	require.Equal(t, true, document["freePageReporting"], "checkpoints inherit guest FPR support provenance")
 	require.Equal(t, "10.0.0.2", document["guestNetwork"].(map[string]any)["ip"],
 		"the checkpoint lineage facts ride forward into the new checkpoint")

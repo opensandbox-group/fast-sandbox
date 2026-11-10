@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
+
+	"fast-sandbox/internal/backendidentity"
 )
 
 // Host conventions (ADR-002/003/004/009). Every path is overridable through a
@@ -131,6 +135,7 @@ func init() {
 	flags.StringVar(&global.buildOutputDir, "build-output-dir", defaultBuildOutputDir, "artifact output directory root (build command)")
 	flags.BoolVar(&global.plainHTTP, "plain-http", false, "use plain HTTP for registry requests (ORAS and overlaybd repoBlobUrl)")
 
+	rootCmd.AddCommand(newQualifyBackendCommand())
 	rootCmd.AddCommand(newCreateCommand())
 	rootCmd.AddCommand(newListCommand())
 	rootCmd.AddCommand(newDeleteCommand())
@@ -140,4 +145,16 @@ func init() {
 	rootCmd.AddCommand(newPackCommand())
 	rootCmd.AddCommand(newCacheCheckpointCommand())
 	rootCmd.AddCommand(newPackCleanupCommand())
+}
+
+func newQualifyBackendCommand() *cobra.Command {
+	var digest string
+	command := &cobra.Command{Use: "qualify-backend", Short: "Bind a node qualification record to the running OverlayBD daemon", RunE: func(cmd *cobra.Command, _ []string) error {
+		ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
+		defer cancel()
+		return backendidentity.Attest(ctx, global.ublkdSocket, digest)
+	}}
+	command.Flags().StringVar(&digest, "sha256", "", "expected qualified daemon executable SHA256")
+	_ = command.MarkFlagRequired("sha256")
+	return command
 }

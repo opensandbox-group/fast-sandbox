@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -23,6 +25,7 @@ import (
 // Checkpoint rootfs chain policy: at maxRootfsLayers, merge the newest
 // squashLayers layers into one; template base layers stay at the bottom.
 const (
+	packMemorySnapshotName = "memory.snap"
 	defaultMaxRootfsLayers = 24
 	defaultSquashLayers    = 16
 )
@@ -31,6 +34,7 @@ const (
 func newPackCommand() *cobra.Command {
 	var bundle, output string
 	var maxLayers, squashLayers int
+	var rootfsOnly bool
 	cmd := &cobra.Command{Use: "pack", Short: "Package captured rootfs, memory and VM state as an OverlayBD pair", RunE: func(cmd *cobra.Command, _ []string) error {
 		if squashLayers < 2 {
 			return fmt.Errorf("--squash-layers must be at least 2, got %d", squashLayers)
@@ -38,8 +42,9 @@ func newPackCommand() *cobra.Command {
 		if maxLayers <= squashLayers {
 			return fmt.Errorf("--max-rootfs-layers (%d) must exceed --squash-layers (%d)", maxLayers, squashLayers)
 		}
-		return packCheckpoint(cmd.Context(), bundle, output, maxLayers, squashLayers)
+		return packCapturedBundle(cmd.Context(), bundle, output, maxLayers, squashLayers, rootfsOnly)
 	}}
+	cmd.Flags().BoolVar(&rootfsOnly, "rootfs-only", false, "package an explicit rootfsOnly template without RAM or VM state")
 	cmd.Flags().StringVar(&bundle, "bundle-dir", "", "captured checkpoint directory")
 	cmd.Flags().StringVar(&output, "output", "", "local logical output name:tag")
 	cmd.Flags().IntVar(&maxLayers, "max-rootfs-layers", defaultMaxRootfsLayers, "squash the inherited rootfs layer chain once it reaches this many layers")
@@ -49,7 +54,7 @@ func newPackCommand() *cobra.Command {
 	return cmd
 }
 
-func packCheckpoint(ctx context.Context, bundle, outputName string, maxLayers, squashLayers int) (resultErr error) {
+func packCapturedBundle(ctx context.Context, bundle, outputName string, maxLayers, squashLayers int, rootfsOnly bool) (resultErr error) {
 	releaseBundle, err := lockPackBundle(bundle)
 	if err != nil {
 		return err
@@ -62,7 +67,7 @@ func packCheckpoint(ctx context.Context, bundle, outputName string, maxLayers, s
 	if err != nil {
 		return err
 	}
-	metadata, upper, err := validatePackBundle(bundle)
+	metadata, upper, err := validatePackBundleMode(bundle, rootfsOnly)
 	if err != nil {
 		return err
 	}
@@ -94,20 +99,25 @@ func packCheckpoint(ctx context.Context, bundle, outputName string, maxLayers, s
 	if err != nil {
 		return err
 	}
-	rootLayers, err := packRootfs(ctx, bundle, work, layout, upper, maxLayers, squashLayers)
+	rootLayers, err := packRootfs(ctx, bundle, work, layout, upper)
 	if err != nil {
 		return err
 	}
 	ublkd := newUblkdClient(global.ublkdSocket)
-	options := &buildOptions{snapshotManifest: metadata, snapshotExtras: extras, snapfilesProgress: func(phase string) error { return writePackResources(activeMarker, work, phase) }}
+	options := &buildOptions{rootfsOnly: rootfsOnly, snapshotManifest: metadata, snapshotExtras: extras, snapfilesProgress: func(phase string) error { return writePackResources(activeMarker, work, phase) }}
 	// Preserve backing files if this process is killed or resource rollback fails.
 	if err = writePackResources(activeMarker, work, packPhasePrepared); err != nil {
 		return err
 	}
-	if err = captureSnapfiles(ctx, ublkd, options, work, filepath.Join(bundle, "vmstate.snap"), filepath.Join(bundle, "memory.snap"), undo); err != nil {
+	if err = captureSnapfiles(ctx, ublkd, options, work, filepath.Join(bundle, "vmstate.snap"), filepath.Join(bundle, packMemorySnapshotName), undo); err != nil {
 		return err
 	}
 	snap, err := sealUpper(ctx, layout, work, "snapfiles", true)
+	if err != nil {
+		return err
+	}
+	// Complete mandatory snapfiles before optional compaction can consume space.
+	rootLayers, err = squashRootfsTail(ctx, layout, rootLayers, upper, maxLayers, squashLayers)
 	if err != nil {
 		return err
 	}
@@ -140,7 +150,7 @@ func packSnapshotExtras(bundle string) (map[string]string, error) {
 	return extras, nil
 }
 
-func validatePackBundle(bundle string) ([]byte, *ocitemplate.RootfsUpper, error) {
+func validatePackBundleMode(bundle string, rootfsOnly bool) ([]byte, *ocitemplate.RootfsUpper, error) {
 	metadata, err := os.ReadFile(filepath.Join(bundle, inDiskManifest))
 	if err != nil {
 		return nil, nil, err
@@ -149,14 +159,29 @@ func validatePackBundle(bundle string) ([]byte, *ocitemplate.RootfsUpper, error)
 	if err != nil {
 		return nil, nil, err
 	}
+	if manifest.IsRootfsOnly() != rootfsOnly {
+		return nil, nil, errors.New("snapshot mode does not match --rootfs-only")
+	}
 	machine := manifest.Machine
 
 	upper, upperErr := ocitemplate.ReadRootfsUpper(bundle)
 	if upperErr != nil && !errors.Is(upperErr, os.ErrNotExist) {
 		return nil, nil, upperErr
 	}
-	required := []string{"vmstate.snap", "memory.snap", "manifest.json"}
-	sizes := map[string]int64{"memory.snap": int64(machine.MemoryMiB) << 20}
+	required := []string{"vmstate.snap", packMemorySnapshotName, "manifest.json"}
+	sizes := map[string]int64{packMemorySnapshotName: int64(machine.MemoryMiB) << 20}
+	if rootfsOnly {
+		if upper == nil {
+			return nil, nil, errors.New("rootfsOnly requires an OverlayBD upper")
+		}
+		for _, name := range []string{"vmstate.snap", packMemorySnapshotName} {
+			if _, err := os.Lstat(filepath.Join(bundle, name)); !errors.Is(err, os.ErrNotExist) {
+				return nil, nil, fmt.Errorf("rootfsOnly forbids %s or cannot verify its absence", name)
+			}
+		}
+		required = []string{"manifest.json"}
+		sizes = map[string]int64{}
+	}
 	if upper != nil {
 		if upper.VirtualSizeBytes != int64(machine.RootfsSizeMiB)<<20 {
 			return nil, nil, fmt.Errorf("rootfs upper size does not match machine metadata")
@@ -184,7 +209,7 @@ func validatePackBundle(bundle string) ([]byte, *ocitemplate.RootfsUpper, error)
 	return metadata, upper, nil
 }
 
-func packRootfs(ctx context.Context, bundle, work string, layout artifactLayout, upper *ocitemplate.RootfsUpper, maxLayers, squashLayers int) ([]ocispec.Descriptor, error) {
+func packRootfs(ctx context.Context, bundle, work string, layout artifactLayout, upper *ocitemplate.RootfsUpper) ([]ocispec.Descriptor, error) {
 	compressed := filepath.Join(work, "rootfs.zfile")
 	var rootLayers []ocispec.Descriptor
 	if upper != nil {
@@ -218,13 +243,13 @@ func packRootfs(ctx context.Context, bundle, work string, layout artifactLayout,
 		return nil, err
 	}
 	rootLayers = append(rootLayers, root)
-	return squashRootfsTail(ctx, layout, rootLayers, upper, maxLayers, squashLayers)
+	return rootLayers, nil
 }
 
 // squashRootfsTail merges the newest inherited layers into one whenever the
 // chain reaches maxLayers, keeping the template base layers at the bottom.
-// Squashing repeats until the published chain is below the bound; any
-// failure skips the squash and publishes the un-squashed chain.
+// Squashing repeats until the published chain is below the bound. A failed
+// optimization keeps the un-squashed chain; failed cleanup aborts publication.
 func squashRootfsTail(ctx context.Context, layout artifactLayout, rootLayers []ocispec.Descriptor, upper *ocitemplate.RootfsUpper, maxLayers, squashLayers int) ([]ocispec.Descriptor, error) {
 	if upper == nil {
 		return rootLayers, nil
@@ -245,6 +270,9 @@ func squashRootfsTail(ctx context.Context, layout artifactLayout, rootLayers []o
 	for len(rootLayers) >= maxLayers {
 		next, err := squashOnce(ctx, layout, rootLayers, upper, resolveCredentials, squashLayers)
 		if err != nil {
+			if errors.Is(err, errSquashCleanup) {
+				return nil, err
+			}
 			return rootLayers, squashMiss(err)
 		}
 		if len(next) == len(rootLayers) {
@@ -258,7 +286,7 @@ func squashRootfsTail(ctx context.Context, layout artifactLayout, rootLayers []o
 
 // squashOnce merges the newest non-base layers into one. It returns the input
 // unchanged when no merge is possible.
-func squashOnce(ctx context.Context, layout artifactLayout, rootLayers []ocispec.Descriptor, upper *ocitemplate.RootfsUpper, resolveCredentials func() (ocitemplate.CredentialFunc, error), squashLayers int) ([]ocispec.Descriptor, error) {
+func squashOnce(ctx context.Context, layout artifactLayout, rootLayers []ocispec.Descriptor, upper *ocitemplate.RootfsUpper, resolveCredentials func() (ocitemplate.CredentialFunc, error), squashLayers int) (_ []ocispec.Descriptor, resultErr error) {
 	tailCount := squashLayers
 	if tailCount > len(rootLayers)-1 {
 		tailCount = len(rootLayers) - 1
@@ -276,9 +304,30 @@ func squashOnce(ctx context.Context, layout artifactLayout, rootLayers []ocispec
 	}
 	bottom := rootLayers[:len(rootLayers)-tailCount]
 	tail := rootLayers[len(rootLayers)-tailCount:]
+	if err := checkSquashCapacity(layout, tail, upper.VirtualSizeBytes); err != nil {
+		return rootLayers, err
+	}
+	fetched := make([]string, 0, len(tail))
+	defer func() {
+		// A failed optional squash must not strand remote downloads. Existing
+		// blobs are identified before fetch and are never removed here.
+		for _, path := range fetched {
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				resultErr = errors.Join(resultErr, errSquashCleanup, err)
+			}
+		}
+	}()
 	for _, layer := range tail {
+		path := layout.blobPath(layer.Digest)
+		before, statErr := os.Stat(path)
+		if statErr != nil && !os.IsNotExist(statErr) {
+			return nil, statErr
+		}
 		if err := ensureLocalBlob(ctx, layout, upper.Repository, resolveCredentials, layer); err != nil {
 			return nil, err
+		}
+		if before == nil {
+			fetched = append(fetched, path)
 		}
 	}
 	merged := filepath.Join(layout.blobDir(), fmt.Sprintf(".squash-%s.tmp", digest.FromString(filepath.Base(layout.root)).Encoded()))
@@ -308,6 +357,7 @@ func squashOnce(ctx context.Context, layout artifactLayout, rootLayers []ocispec
 	}
 	fmt.Fprintf(os.Stderr, "squashed %d rootfs layers into %s\n", tailCount, desc.Digest)
 	removeSquashedBlobs(layout, tail, bottom, desc)
+	fetched = nil
 	return append(bottom, desc), nil
 }
 
@@ -403,9 +453,12 @@ func squashMiss(err error) error {
 // resolved through resolveCredentials only when a fetch is actually needed.
 func ensureLocalBlob(ctx context.Context, layout artifactLayout, repository string, resolveCredentials func() (ocitemplate.CredentialFunc, error), desc ocispec.Descriptor) error {
 	path := layout.blobPath(desc.Digest)
-	if info, err := os.Stat(path); err == nil && info.Size() == desc.Size {
+	if info, err := os.Stat(path); err == nil {
+		if !info.Mode().IsRegular() || info.Size() != desc.Size {
+			return errors.New("existing squash blob has invalid size/type")
+		}
 		return nil
-	} else if err != nil && !os.IsNotExist(err) {
+	} else if !os.IsNotExist(err) {
 		return err
 	}
 	credentials, err := resolveCredentials()
@@ -431,7 +484,11 @@ func ensureLocalBlob(ctx context.Context, layout artifactLayout, repository stri
 	tempName := temp.Name()
 	defer os.Remove(tempName)
 	verifier := desc.Digest.Verifier()
-	size, err := io.Copy(io.MultiWriter(temp, verifier), stream)
+	if desc.Size < 0 || desc.Size == math.MaxInt64 {
+		_ = temp.Close()
+		return errors.New("invalid squash blob size")
+	}
+	size, err := io.Copy(io.MultiWriter(temp, verifier), io.LimitReader(stream, desc.Size+1))
 	if err != nil {
 		_ = temp.Close()
 		return err
@@ -460,4 +517,56 @@ func packCredentials() (ocitemplate.CredentialFunc, error) {
 		credential, _, err := credentialFor(config, ref)
 		return credential, err
 	}, nil
+}
+
+var errSquashCleanup = errors.New("optional squash cleanup failed")
+
+// Reserve missing compressed inputs plus two full virtual-disk outputs (merge
+// and blob installation), allowing 12.5% encoding overhead and 64 MiB metadata.
+// Compressed input sizes cannot bound a decompressed/re-encoded merge output.
+func checkSquashCapacity(layout artifactLayout, tail []ocispec.Descriptor, virtualBytes int64) error {
+	const headroom int64 = 64 << 20
+	if virtualBytes <= 0 || virtualBytes > (math.MaxInt64-headroom)/3 {
+		return errors.New("unknown or overflowing squash virtual size")
+	}
+	required := 2*(virtualBytes+virtualBytes/8) + headroom
+	seen := make(map[digest.Digest]bool)
+	for _, layer := range tail {
+		if layer.Size < 0 || layer.Digest.Validate() != nil {
+			return errors.New("invalid squash layer descriptor")
+		}
+		if seen[layer.Digest] {
+			continue
+		}
+		seen[layer.Digest] = true
+		if info, err := os.Stat(layout.blobPath(layer.Digest)); os.IsNotExist(err) {
+			if layer.Size > math.MaxInt64-required {
+				return errors.New("squash capacity overflows")
+			}
+			required += layer.Size
+		} else if err != nil {
+			return err
+		} else if !info.Mode().IsRegular() || info.Size() != layer.Size {
+			return errors.New("existing squash blob has invalid size/type")
+		}
+	}
+	free, err := squashAvailableBytes(layout.root)
+	if err != nil {
+		return err
+	}
+	if free < required {
+		return fmt.Errorf("insufficient space for optional rootfs squash: need %d bytes, have %d", required, free)
+	}
+	return nil
+}
+
+var squashAvailableBytes = func(path string) (int64, error) {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0, err
+	}
+	if stat.Bsize <= 0 || uint64(stat.Bavail) > uint64(math.MaxInt64)/uint64(stat.Bsize) {
+		return 0, errors.New("invalid filesystem capacity")
+	}
+	return int64(stat.Bavail) * int64(stat.Bsize), nil
 }

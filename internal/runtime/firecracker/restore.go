@@ -215,6 +215,9 @@ func (d *Driver) validateRestoreCompatibility(stateRoot, image string) error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
+	if document.IsRootfsOnly() {
+		return fmt.Errorf("%w: RootfsOnly cold boot is not yet enabled in Fastlet", ErrIncompatibleArtifact)
+	}
 	return checkRestoreCompatibility(document.Compatibility, artifacts.HostCPUIdentity(), d.firecrackerVersion(), image)
 }
 

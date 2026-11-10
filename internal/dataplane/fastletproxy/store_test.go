@@ -126,3 +126,95 @@ func TestStoreConcurrentLookupAndRouteTransitions(t *testing.T) {
 	default:
 	}
 }
+
+func TestStoreRecoverySuspensionPreservesGenerationFence(t *testing.T) {
+	for _, installed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "before-apply", true: "published"}[installed], func(t *testing.T) {
+			s := NewStore()
+			route := testRoute(1)
+			if installed {
+				_, err := s.Apply(route)
+				require.NoError(t, err)
+			}
+			revision := s.Snapshot().Revision
+			_, err := s.SetSuspended("uid-a", 1, revision, true)
+			require.NoError(t, err)
+			_, err = s.Apply(route) // A late ordinary publication cannot lift suspension.
+			require.NoError(t, err)
+			_, err = s.Lookup("uid-a")
+			require.ErrorIs(t, err, ErrRouteDraining)
+			_, err = s.SetSuspended("uid-a", 1, revision, false)
+			require.ErrorIs(t, err, ErrRouteConflict)
+			_, err = s.SetSuspended("uid-a", 1, s.Snapshot().Revision, false)
+			require.NoError(t, err)
+			restored, err := s.Lookup("uid-a")
+			require.NoError(t, err)
+			require.Equal(t, route, restored)
+			lateRevision := s.Snapshot().Revision
+			_, err = s.SetSuspended("uid-a", 1, lateRevision, true)
+			require.NoError(t, err)
+			_, err = s.SetSuspended("uid-a", 1, lateRevision, false)
+			require.ErrorIs(t, err, ErrRouteConflict, "late resume cannot undo a newer suspension")
+			_, err = s.Delete("uid-a", 1)
+			require.NoError(t, err)
+			_, err = s.SetSuspended("uid-a", 1, s.Snapshot().Revision, false)
+			require.ErrorIs(t, err, ErrRouteStale)
+			_, err = s.Apply(route)
+			require.ErrorIs(t, err, ErrRouteStale, "permanent deletion remains irreversible")
+			_, err = s.Apply(testRoute(2))
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestStoreSuspensionRejectsOlderAbsentOwner(t *testing.T) {
+	s := NewStore()
+	_, err := s.SetSuspended("uid-a", 2, s.Snapshot().Revision, true)
+	require.NoError(t, err)
+	_, err = s.SetSuspended("uid-a", 1, s.Snapshot().Revision, true)
+	require.ErrorIs(t, err, ErrRouteStale)
+	_, err = s.SetSuspended("uid-a", 1, s.Snapshot().Revision, false)
+	require.ErrorIs(t, err, ErrRouteStale)
+	_, err = s.Apply(testRoute(1))
+	require.ErrorIs(t, err, ErrRouteStale)
+	_, err = s.Apply(testRoute(2))
+	require.NoError(t, err)
+	_, err = s.SetSuspended("uid-a", 3, s.Snapshot().Revision, false)
+	require.NoError(t, err)
+	_, err = s.Apply(testRoute(3))
+	require.NoError(t, err)
+	route, err := s.Lookup("uid-a")
+	require.NoError(t, err)
+	require.EqualValues(t, 3, route.RouteGeneration)
+}
+
+func TestStoreNewOwnerCannotReactivatePreviousRoute(t *testing.T) {
+	s := NewStore()
+	_, err := s.Apply(testRoute(1))
+	require.NoError(t, err)
+	_, err = s.SetSuspended("uid-a", 2, s.Snapshot().Revision, true)
+	require.NoError(t, err)
+	_, err = s.Lookup("uid-a")
+	require.ErrorIs(t, err, ErrRouteDraining)
+	_, err = s.SetSuspended("uid-a", 2, s.Snapshot().Revision, false)
+	require.NoError(t, err)
+	_, err = s.Lookup("uid-a")
+	require.ErrorIs(t, err, ErrRouteDraining, "resume for a new generation must not activate the previous destination")
+	_, err = s.Apply(testRoute(2))
+	require.NoError(t, err)
+	route, err := s.Lookup("uid-a")
+	require.NoError(t, err)
+	require.EqualValues(t, 2, route.RouteGeneration)
+}
+
+func TestStoreResumeBeforeApplyFencesOlderGeneration(t *testing.T) {
+	s := NewStore()
+	_, err := s.SetSuspended("uid-a", 2, s.Snapshot().Revision, true)
+	require.NoError(t, err)
+	_, err = s.SetSuspended("uid-a", 2, s.Snapshot().Revision, false)
+	require.NoError(t, err)
+	_, err = s.Apply(testRoute(1))
+	require.ErrorIs(t, err, ErrRouteStale)
+	_, err = s.Apply(testRoute(2))
+	require.NoError(t, err)
+}

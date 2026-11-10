@@ -3,8 +3,8 @@
 set -eu
 out=${1:?usage: build-overlaybd.sh OUTPUT_DIR}
 tools_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-# Native local blob import from containerd/overlaybd PR #480.
-revision=${OVERLAYBD_REV:-9e01600b55400af74b53c51bc0d17ca5eaac4dc0}
+# Temporary source branch for containerd/overlaybd PR #480; return to upstream after merge.
+revision=${OVERLAYBD_REV:-feat/local-blob-cache-import}
 
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -16,7 +16,7 @@ rm -rf /var/lib/apt/lists/*
 
 git init /src/overlaybd
 cd /src/overlaybd
-git remote add origin https://github.com/containerd/overlaybd.git
+git remote add origin https://github.com/jwx0925/overlaybd.git
 # Retry the fetch: the GitHub connection can stall.
 for attempt in 1 2 3; do
   git -c http.version=HTTP/1.1 fetch --depth 1 origin "$revision" && break

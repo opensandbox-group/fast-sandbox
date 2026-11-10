@@ -201,3 +201,9 @@ credentials) see the sections below.
   [#61](https://github.com/opensandbox-group/fast-sandbox/issues/61) overlap
   the manifest hashing with the dump window (per-file SHA256 currently
   serializes ~15.5 s before the upload starts).
+
+## RootfsOnly runtime recovery
+
+A failed RootfsOnly source recovery temporarily suspends its Proxy route without deleting the route generation. Fastlet resumes access only after runtime recovery and Infra checks succeed. The Proxy control API uses `POST /v1/routes/{sandboxUID}/availability?routeGeneration=...` with `{ "revision": <snapshot revision>, "suspended": true|false }`; stale revisions are rejected, and ordinary route publication cannot clear suspension. Permanent deletion still creates an irreversible generation tombstone. Deploy matching Fastlet and Fastlet Proxy builds when enabling this recovery path; an older Proxy does not implement the availability endpoint.
+
+Once deletion is accepted, recovery serves cleanup only and never republishes access. The driver reconciles the capture fence under its lifecycle lock before releasing source resources. Heartbeats retry failed deletion; a transport error alone never establishes that the source VMM exited.

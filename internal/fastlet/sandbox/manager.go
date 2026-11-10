@@ -43,7 +43,11 @@ type SandboxManagerConfig struct {
 }
 
 type SandboxManager struct {
-	mu sync.RWMutex
+	// Serialize recovery observations so an older successful probe cannot
+	// clear a fence observed by a concurrent snapshot failure callback.
+	recoveryMu      sync.Mutex
+	recoveryWorkers map[string]*SandboxMetadata
+	mu              sync.RWMutex
 	// routeMu orders route writes and removal before runtime/network cleanup.
 	// Acquire it before mu; never wait for routeMu while holding mu.
 	routeMu                     sync.Mutex
@@ -438,6 +442,21 @@ func (m *SandboxManager) validateInfraRevision(spec *fastletapi.SandboxDesiredSp
 	return nil
 }
 
+// Heartbeats retry accepted deletion without returning the source to service.
+func (m *SandboxManager) retryFailedDeletion(meta SandboxMetadata) {
+	if meta.Phase != sandboxStateDeleteFailed {
+		return
+	}
+	id := meta.Config.Identity.SandboxUID
+	m.mu.RLock()
+	current := m.sandboxes[id]
+	retry := current != nil && current.Config.Identity == meta.Config.Identity && current.Phase == sandboxStateDeleteFailed
+	m.mu.RUnlock()
+	if retry {
+		go m.asyncDelete(id, current)
+	}
+}
+
 func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata) {
 	const gracefulTimeout = 10 * time.Second
 	m.mu.Lock()
@@ -531,7 +550,7 @@ func (m *SandboxManager) asyncDelete(sandboxID string, expected *SandboxMetadata
 // record is being written, and after the runtime enters cleanup or deletion.
 // Callers hold m.mu; physical cleanup still waits for durable failure recording.
 func (m *SandboxManager) runtimeWorkAllowedLocked(metadata *SandboxMetadata) bool {
-	if metadata == nil {
+	if metadata == nil || metadata.RecoveryRequired {
 		return false
 	}
 	id := metadata.Config.Identity.SandboxUID
@@ -545,7 +564,9 @@ func (m *SandboxManager) preserveExitedRuntime(ctx context.Context, sandboxID st
 	}
 	m.mu.Lock()
 	metadata := m.sandboxes[sandboxID]
-	if !m.runtimeWorkAllowedLocked(metadata) || metadata.Config.Identity != identity {
+	// A durably confirmed exit may follow a capture quarantine. Keep its
+	// readiness fence until terminal failure recording succeeds.
+	if metadata == nil || metadata.Config.Identity != identity || !runtimeCreatedPhase(metadata.Phase) || m.terminalFailureWorkers[sandboxID] == metadata {
 		m.mu.Unlock()
 		return
 	}
@@ -565,6 +586,7 @@ func (m *SandboxManager) preserveExitedRuntime(ctx context.Context, sandboxID st
 		m.finishTerminalFailureWorker(sandboxID, metadata)
 		return
 	}
+	metadata.RecoveryRequired = false
 	metadata.Phase = sandboxStateRuntimeFailureCleanup
 	m.runtimeMessages[sandboxID] = message
 	m.recordDiagnosticLocked(sandboxID, "error", "runtime", sandboxStateRuntimeFailureCleanup, message)
@@ -681,6 +703,8 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 
 	result := make([]fastletapi.SandboxStatus, 0, len(snapshots))
 	for sandboxID, meta := range snapshots {
+		meta, inspected := m.refreshRecoveryMetadata(ctx, meta)
+		m.retryFailedDeletion(meta)
 		if meta.Phase == sandboxStateRuntimeFailureCleanup {
 			m.mu.RLock()
 			current := m.sandboxes[sandboxID]
@@ -695,7 +719,7 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 		if message := messages[sandboxID]; message != "" {
 			runtimeObservation.Message = message
 		}
-		if inspected, err := m.runtime.InspectSandbox(ctx, sandboxID); err == nil {
+		if inspected != nil {
 			if runtimeObservation.State != fastletapi.RuntimeStateFailed || messages[sandboxID] == "" {
 				runtimeObservation.Message = inspected.Phase
 			}
@@ -708,6 +732,8 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 				}
 			}
 		}
+		dataPlaneReady = dataPlaneReady && !meta.RecoveryRequired
+		runtimeObservation, dataPlaneObservation = applyRecoveryObservation(&meta, runtimeObservation, dataPlaneObservation)
 		result = append(result, fastletapi.SandboxStatus{
 			SandboxID:          sandboxID,
 			InstanceGeneration: identity.InstanceGeneration,

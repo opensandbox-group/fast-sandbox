@@ -207,3 +207,16 @@ func argvIndex(argv []string, flag string) int {
 	}
 	return -1
 }
+
+// Identically named TAP devices are independent in each netns; neither direct nor cgroup launches may bypass that boundary.
+func TestLaunchDirectEntersAssignedNetworkNamespace(t *testing.T) {
+	for _, group := range []string{"", "/sys/fs/cgroup/test"} {
+		runner := &fakeProcessRunner{}
+		_, err := launch(t.Context(), runner, launchConfig{SandboxID: "sandbox", BinaryPath: "/usr/bin/firecracker", APIAddress: "/run/api.sock", NetNSPath: "/run/netns/slot", CgroupPath: group})
+		require.NoError(t, err)
+		require.Equal(t, []string{"nsenter", "--net=/run/netns/slot", "--", "/usr/bin/firecracker", "--id", "sandbox", "--api-sock", "/run/api.sock"}, runner.started[0])
+		if group != "" {
+			require.Equal(t, []string{group}, runner.cgroups)
+		}
+	}
+}

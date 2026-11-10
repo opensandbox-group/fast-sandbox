@@ -54,7 +54,7 @@ type snapshotLoadRequest struct {
 }
 
 type versionResponse struct {
-	Version string `json:"version"`
+	Version string `json:"firecracker_version"`
 }
 
 // version reports the Firecracker version served on the socket; it doubles as
@@ -63,6 +63,9 @@ func (c *firecrackerClient) version(ctx context.Context) (string, error) {
 	var response versionResponse
 	if err := c.do(ctx, http.MethodGet, "/version", nil, &response); err != nil {
 		return "", err
+	}
+	if response.Version == "" {
+		return "", fmt.Errorf("Firecracker /version response missing firecracker_version")
 	}
 	return response.Version, nil
 }

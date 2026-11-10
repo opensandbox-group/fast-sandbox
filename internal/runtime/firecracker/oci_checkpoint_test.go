@@ -91,6 +91,27 @@ func TestPrepareOCISnapshotKeepsNativeFlowIndependentOfRegistry(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidConfig)
 }
 
+func TestPublishOCISnapshotCleansStagingWhenPreparationFails(t *testing.T) {
+	root := t.TempDir()
+	d := &Driver{config: firecrackerConfigForTest(t, root)}
+	stateDir := filepath.Join(root, sandboxStateDir, "source")
+	state := &SandboxState{Config: fastletapi.RuntimeSandboxConfig{Identity: fastletapi.SandboxIdentity{SandboxUID: "source", Namespace: "tenant"}}}
+	state.Config.Desired.Image = "oci://r.example/templates/base:seed"
+	state.Phase = PhaseRunning
+	require.NoError(t, os.MkdirAll(stateDir, 0o750))
+	require.NoError(t, saveState(stateDir, state))
+
+	// Force the ownership metadata write to fail even when tests run as root.
+	staging := filepath.Join(root, "staging")
+	require.NoError(t, os.Mkdir(staging, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "memory.snap"), []byte("partial snapshot"), 0o600))
+	require.NoError(t, os.Mkdir(filepath.Join(staging, ".pack-owner.json"), 0o700))
+	_, err := d.publishOCISnapshot(t.Context(), dumpPlan{sandboxDir: stateDir, staging: staging, snapshotID: "snapshot"}, 1, fastletapi.SnapshotKindTemplate, nil)
+	require.ErrorContains(t, err, ".pack-owner.json")
+	_, statErr := os.Stat(staging)
+	require.ErrorIs(t, statErr, os.ErrNotExist)
+}
+
 func TestDisabledOCIRejectsLiveSnapshotBeforeDump(t *testing.T) {
 	t.Setenv("FAST_SANDBOX_OCI_ENABLED", "false")
 	fixture := newSnapshotDriverFixture(t)

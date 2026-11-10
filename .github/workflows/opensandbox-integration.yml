@@ -81,11 +81,17 @@ jobs:
             sleep 60
           done
           [[ -n "$run_id" ]] || { echo "::error::no dispatched run appeared"; exit 1; }
-          echo "tracking run https://github.com/opensandbox-group/OpenSandbox/actions/runs/$run_id"
+          echo "tracking run https://github.com/opensandbox-group/OpenSandbox/actions/runs/$run_id (poll every 90s)"
 
+          # Anonymous (the token expires after 1h; 90s polls stay under the
+          # 60 req/h unauthenticated limit). Assign first so curl errors
+          # fail the step instead of being swallowed by read.
           while (( SECONDS < 19200 )); do
-            read -r status conclusion <<<"$(curl -sSf -H "Authorization: Bearer $OSB_TOKEN" \
+            body="$(curl -sSf --retry 5 --retry-all-errors --retry-delay 15 \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
               "$OSB_RUNS/runs/$run_id" | jq -r '[.status, .conclusion] | join(" ")')"
+            read -r status conclusion <<<"$body"
             if [[ "$status" == "completed" ]]; then
               if [[ "$conclusion" == "success" ]]; then
                 echo "OpenSandbox KVM integration passed"
@@ -96,7 +102,7 @@ jobs:
               exit 1
             fi
             echo "run $run_id: $status"
-            sleep 60
+            sleep 90
           done
           echo "::error::timed out waiting for the OpenSandbox run"
           exit 1

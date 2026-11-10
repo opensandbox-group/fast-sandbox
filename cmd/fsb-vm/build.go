@@ -26,31 +26,35 @@ import (
 const defaultBuildDiskSizeGiB = 20
 
 type buildOptions struct {
-	snapfilesProgress func(string) error
-	snapshotManifest  []byte
-	snapshotExtras    map[string]string
-	manifestExtraFile string
-	injectDir         string
-	tapName           string
-	guestMAC          string
-	source            string
-	output            string
-	kernel            string
-	kernelVersion     string
-	vcpu              int
-	memoryMB          int
-	diskSizeGiB       int
-	snapfilesSizeMB   int
-	rootfsDriveID     string
-	bootArgs          string
-	initPath          string
-	initScriptFile    string
-	readyPattern      string
-	readyTimeout      time.Duration
-	authFile          string
-	username          string
-	noCompress        bool
-	keepWorkDir       bool
+	guestControlPort    uint32
+	guestControlVersion string
+	kernelSHA256        string
+	rootfsOnly          bool
+	snapfilesProgress   func(string) error
+	snapshotManifest    []byte
+	snapshotExtras      map[string]string
+	manifestExtraFile   string
+	injectDir           string
+	tapName             string
+	guestMAC            string
+	source              string
+	output              string
+	kernel              string
+	kernelVersion       string
+	vcpu                int
+	memoryMB            int
+	diskSizeGiB         int
+	snapfilesSizeMB     int
+	rootfsDriveID       string
+	bootArgs            string
+	initPath            string
+	initScriptFile      string
+	readyPattern        string
+	readyTimeout        time.Duration
+	authFile            string
+	username            string
+	noCompress          bool
+	keepWorkDir         bool
 }
 
 func newBuildCommand() *cobra.Command {
@@ -63,6 +67,7 @@ func newBuildCommand() *cobra.Command {
 		},
 	}
 	flags := command.Flags()
+	flags.Uint32Var(&options.guestControlPort, "guest-control-port", 0, "validate an injected root filesystem helper on the reserved vsock port 1234")
 	flags.StringVar(&options.manifestExtraFile, "manifest-extra-file", "", "optional guestNetwork, lineage and platform fields to supplement the VM manifest")
 	flags.StringVar(&options.injectDir, "inject-dir", "", "directory of guest files to inject before snapshot")
 	flags.StringVar(&options.tapName, "tap-name", "", "preconfigured build tap (optional)")
@@ -120,6 +125,9 @@ func (o outputNames) snapfilesName() string {
 
 // validateBuildOptions checks flag combinations before any side effect.
 func validateBuildOptions(options *buildOptions) error {
+	if options.guestControlPort != 0 && options.guestControlPort != 1234 {
+		return errors.New("guest control uses reserved port 1234")
+	}
 	if strings.TrimSpace(options.source) == "" {
 		return fmt.Errorf("--source is required")
 	}
@@ -218,6 +226,10 @@ func bytesToGiBCeil(size int64) (int, error) {
 // vmstate + 256 MiB of ext4/metadata headroom, rounded up to whole GiB with
 // a 2 GiB floor (a 1 GiB memory file alone needs more than 1 GiB of disk).
 func snapfilesSizeGiB(options *buildOptions, vmstatePath, memfilePath string) (int, error) {
+	// Size the metadata disk independently of Guest memory; do not access RAM files.
+	if options.rootfsOnly {
+		return 1, nil
+	}
 	if options.snapfilesSizeMB > 0 {
 		return gibCeil(options.snapfilesSizeMB), nil
 	}
@@ -703,11 +715,13 @@ func captureSnapfiles(ctx context.Context, ublkd *ublkdClient, options *buildOpt
 		return err
 	}
 	undo.push("mount "+snapMount, func() error { return unmount(snapMount) })
-	if err := copyFile(vmstatePath, filepath.Join(snapMount, inDiskVMState), 0o640); err != nil {
-		return err
-	}
-	if err := copyFile(memfilePath, filepath.Join(snapMount, inDiskMemfile), 0o640); err != nil {
-		return err
+	if !options.rootfsOnly {
+		if err := copyFile(vmstatePath, filepath.Join(snapMount, inDiskVMState), 0o640); err != nil {
+			return err
+		}
+		if err := copyFile(memfilePath, filepath.Join(snapMount, inDiskMemfile), 0o640); err != nil {
+			return err
+		}
 	}
 	metadataPayload := options.snapshotManifest
 	if len(metadataPayload) == 0 {

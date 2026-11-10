@@ -41,9 +41,12 @@ RUN go mod download
 COPY api ./api
 COPY internal/artifacts ./internal/artifacts
 COPY internal/guestnetwork ./internal/guestnetwork
+COPY internal/guestcontrol ./internal/guestcontrol
+COPY cmd/fsb-guest-control ./cmd/fsb-guest-control
 COPY internal/ocitemplate ./internal/ocitemplate
 COPY cmd/sandboxtemplate-builder ./cmd/sandboxtemplate-builder
-RUN CGO_ENABLED=0 go build -o /out/sandboxtemplate-builder ./cmd/sandboxtemplate-builder
+RUN CGO_ENABLED=0 go build -o /out/sandboxtemplate-builder ./cmd/sandboxtemplate-builder \
+    && CGO_ENABLED=0 go build -o /out/fsb-guest-control ./cmd/fsb-guest-control
 
 # --- runtime image ---------------------------------------------------------
 FROM ubuntu:22.04
@@ -92,6 +95,7 @@ COPY --from=oci2rootfs-build /src/oci2rootfs/target/release/oci2rootfs /usr/loca
 COPY --from=oci-tools /opt/overlaybd/ /opt/overlaybd/
 COPY --from=oci-tools /usr/local/bin/convertor /usr/local/bin/convertor
 COPY --from=oci-tools /usr/local/bin/fsb-vm /usr/local/bin/fsb-vm
+COPY --from=builder-build /out/fsb-guest-control /usr/local/lib/fsb-guest-control
 COPY --from=builder-build /out/sandboxtemplate-builder /usr/local/bin/sandboxtemplate-builder
 COPY build/oci/overlaybd.json /etc/overlaybd/ublkd.json
 COPY build/oci/entrypoint.sh /usr/local/bin/oci-entrypoint

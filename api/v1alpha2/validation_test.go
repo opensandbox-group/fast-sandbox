@@ -3,10 +3,13 @@ package v1alpha2
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 func TestActionProtocolSelectionIsNotPartOfPublicPoolSchema(t *testing.T) {
@@ -230,4 +233,68 @@ func TestValidateResourceContractBranchesByMode(t *testing.T) {
 
 	resourceAware.FastletTemplate.Spec.Containers[0].Resources = corev1.ResourceRequirements{}
 	require.NoError(t, resourceAware.ValidateResourceContract())
+}
+
+func TestResetRevisionJSONPreservesPrecision(t *testing.T) {
+	for _, timestamp := range []string{
+		"2026-11-04T12:57:50Z",
+		"2026-11-04T12:57:50.536117Z",
+		"2026-11-04T12:57:50.536117123Z",
+		"2026-11-04T20:57:50.000000001+08:00",
+	} {
+		t.Run(timestamp, func(t *testing.T) {
+			instant, err := time.Parse(time.RFC3339Nano, timestamp)
+			require.NoError(t, err)
+			revision := metav1.NewTime(instant)
+			sandbox := Sandbox{
+				Spec: SandboxSpec{Image: "alpine:latest", PoolRef: "pool-a", ResetRevision: &revision, ExpireTime: &revision},
+				Status: SandboxStatus{Runtime: RuntimeStatus{
+					State: RuntimePending, Generation: 2, AcceptedResetRevision: &revision, LastTransitionTime: &revision,
+				}},
+			}
+			payload, err := json.Marshal(sandbox)
+			require.NoError(t, err)
+			var fields map[string]any
+			require.NoError(t, json.Unmarshal(payload, &fields))
+			expected := instant.UTC().Format(time.RFC3339Nano)
+			require.Equal(t, expected, fields["spec"].(map[string]any)["resetRevision"])
+			require.Equal(t, expected, fields["status"].(map[string]any)["runtime"].(map[string]any)["acceptedResetRevision"])
+			// Other timestamp fields keep their existing second-resolution encoding.
+			require.Equal(t, instant.UTC().Format(time.RFC3339), fields["spec"].(map[string]any)["expireTime"])
+			require.Equal(t, instant.UTC().Format(time.RFC3339), fields["status"].(map[string]any)["runtime"].(map[string]any)["lastTransitionTime"])
+			var decoded Sandbox
+			require.NoError(t, json.Unmarshal(payload, &decoded))
+			require.True(t, instant.Equal(decoded.Spec.ResetRevision.Time))
+			require.True(t, instant.Equal(decoded.Status.Runtime.AcceptedResetRevision.Time))
+			require.Equal(t, "alpine:latest", decoded.Spec.Image)
+			require.Equal(t, "pool-a", decoded.Spec.PoolRef)
+			require.Equal(t, int64(2), decoded.Status.Runtime.Generation)
+			require.Equal(t, RuntimePending, decoded.Status.Runtime.State)
+
+			unstructured, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&sandbox)
+			require.NoError(t, err)
+			var converted Sandbox
+			require.NoError(t, runtime.DefaultUnstructuredConverter.FromUnstructured(unstructured, &converted))
+			require.True(t, instant.Equal(converted.Spec.ResetRevision.Time))
+			require.True(t, instant.Equal(converted.Status.Runtime.AcceptedResetRevision.Time))
+		})
+	}
+}
+
+func TestResetRevisionJSONRetainsAbsentAndNullEncoding(t *testing.T) {
+	for _, revision := range []*metav1.Time{nil, {}} {
+		spec, err := json.Marshal(SandboxSpec{ResetRevision: revision})
+		require.NoError(t, err)
+		status, err := json.Marshal(RuntimeStatus{AcceptedResetRevision: revision})
+		require.NoError(t, err)
+		for field, payload := range map[string][]byte{"resetRevision": spec, "acceptedResetRevision": status} {
+			var fields map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(payload, &fields))
+			if revision == nil {
+				require.NotContains(t, fields, field)
+			} else {
+				require.JSONEq(t, "null", string(fields[field]))
+			}
+		}
+	}
 }

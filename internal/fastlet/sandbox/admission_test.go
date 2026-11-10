@@ -1624,6 +1624,14 @@ func TestDeleteRemovesRouteWhenRuntimeAccessIsAlreadyAbsent(t *testing.T) {
 	_, err = manager.CreateSandbox(context.Background(), request)
 	require.NoError(t, err)
 
+	// Finish initial publication before modeling a prior runtime deletion.
+	// Otherwise its stale-publication cleanup may also remove the same route.
+	require.Eventually(t, func() bool {
+		manager.mu.RLock()
+		defer manager.mu.RUnlock()
+		return manager.sandboxes[request.Identity.SandboxUID].Phase == sandboxStateRunning
+	}, time.Second, time.Millisecond)
+
 	// Model a partial prior delete: the runtime/container is already gone, but
 	// the manager still owns admission state and must retry route removal.
 	runtime.mu.Lock()
@@ -1824,3 +1832,8 @@ func TestStrictDeleteBeforeCreateSurvivesManagerRestart(t *testing.T) {
 	ensures, _ = runtime.counts()
 	require.Equal(t, 1, ensures)
 }
+
+func (p *admissionRoutePublisher) SuspendRoute(ctx context.Context, route RoutePublication) error {
+	return p.RemoveRoute(ctx, route)
+}
+func (p *admissionRoutePublisher) ResumeRoute(context.Context, RoutePublication) error { return nil }
