@@ -4,9 +4,9 @@ name: OpenSandbox Integration
 # the PR head SHA, then waits for that run and mirrors its conclusion, so this
 # check is the real merge gate. pull_request_target keeps the workflow file and
 # secrets on the base branch (PRs can't rewrite the guard or mint tokens); the
-# job only calls the API, never checks out PR code. External PRs need a
-# maintainer-added `ok-to-test` label — their code runs on a self-hosted
-# runner. Requires OSB_APP_ID / OSB_APP_PRIVATE_KEY (GitHub App with Contents
+# jobs only call the API, never check out PR code. Authors without repository
+# write access need a maintainer-added `ok-to-test` label — their code runs on
+# a self-hosted runner. Requires OSB_APP_ID / OSB_APP_PRIVATE_KEY (GitHub App with Contents
 # read/write + Actions read, installed on the OpenSandbox repo only).
 
 on:
@@ -30,14 +30,53 @@ permissions:
   contents: read
 
 jobs:
+  authorize:
+    name: Authorize OpenSandbox integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      allowed: ${{ steps.permission.outputs.allowed }}
+    steps:
+      - name: Check PR author's repository permission
+        id: permission
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          APPROVED: ${{ contains(github.event.pull_request.labels.*.name, 'ok-to-test') }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$APPROVED" == "true" ]]; then
+            echo 'allowed=true' >> "$GITHUB_OUTPUT"
+            echo 'Integration authorized by manual dispatch or ok-to-test label.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          : "${PR_AUTHOR:?Missing PR author}"
+          response="$RUNNER_TEMP/integration-permission.json"
+          status="$(curl -sS --connect-timeout 10 --max-time 60 --retry 2 \
+            -o "$response" -w '%{http_code}' \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/collaborators/$PR_AUTHOR/permission")"
+          case "$status" in
+            200) permission="$(jq -er '.permission | select(type == "string")' "$response")" ;;
+            404) permission=none ;;
+            *) echo "::error::Cannot determine PR author permission (HTTP $status)"; exit 1 ;;
+          esac
+
+          allowed=false
+          case "$permission" in
+            admin|maintain|write) allowed=true ;;
+          esac
+          echo "allowed=$allowed" >> "$GITHUB_OUTPUT"
+          echo "PR author $PR_AUTHOR: repository permission=$permission; integration allowed=$allowed." >> "$GITHUB_STEP_SUMMARY"
+
   integration:
     name: OpenSandbox integration (KVM)
-    # Untrusted PRs need a maintainer's ok-to-test label.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.author_association == 'MEMBER' ||
-      github.event.pull_request.author_association == 'COLLABORATOR' ||
-      contains(github.event.pull_request.labels.*.name, 'ok-to-test')
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
     runs-on: ubuntu-latest
     # Remote run caps at 180min plus queue time on the single KVM runner.
     timeout-minutes: 330

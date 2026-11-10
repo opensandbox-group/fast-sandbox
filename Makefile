@@ -32,7 +32,7 @@ ALL_BINARIES := controller fastlet sandbox-init sandbox-action-fixture fastlet-p
 CORE_IMAGES := controller fastlet fastlet-proxy sandbox-proxy janitor
 ALL_IMAGES := $(CORE_IMAGES) sandbox-action-fixture firecracker-runtime
 IMAGE_COMPONENTS := $(ALL_IMAGES) oci-tools sandboxtemplate-builder
-UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./build/oci ./test/e2e/env/... ./test/e2e/support/... ./test/performance/...
+UNIT_PACKAGES := ./api/... ./cmd/... ./internal/... ./pkg/... ./build/ci ./build/oci ./test/e2e/env/... ./test/e2e/support/... ./test/performance/...
 
 ifeq ($(DEBUG),1)
 GO_BUILD_FLAGS := -gcflags="all=-N -l"

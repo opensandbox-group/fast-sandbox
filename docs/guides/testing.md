@@ -13,6 +13,12 @@ make test SCOPE=network
 
 `make generate` updates protobuf, Python protobuf, deepcopy, and CRD output. Generated output must be committed with its source change.
 
+## OpenSandbox integration authorization
+
+The separate OpenSandbox KVM integration workflow checks the PR author's current repository permission through the GitHub API. Authors with `write`, `maintain`, or `admin` access are authorized automatically, regardless of whether their organization membership is public. Other authors require a maintainer-added `ok-to-test` label; manual workflow dispatch remains available. API errors fail the authorization job instead of granting access. The authorization job summary records the decision, and the downstream KVM job runs only after authorization succeeds.
+
+This workflow uses `pull_request_target` and only calls APIs; it never checks out PR code. Changes to its authorization logic must reach the base branch before they affect PR-triggered runs. A skipped KVM job is not a passed integration test. The authorization regression tests execute the workflow's actual shell script with a mocked API and require Bash and jq: `go test ./build/ci`. They are included in the unit and race suites.
+
 ## E2E interface
 
 Run every Kubernetes suite:
