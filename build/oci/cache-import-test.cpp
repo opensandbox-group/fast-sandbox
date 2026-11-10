@@ -14,7 +14,8 @@
 #include <fstream>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "cache-import.h"
+#include <openssl/sha.h>
+#include "cache_import.h"
 
 size_t cache_fn_trans_sha256(void*, std::string_view, char*, size_t);
 
@@ -50,7 +51,7 @@ static std::string make_blob(const std::string& root, size_t size, unsigned char
 static int import(ImageService& service,const std::string& path,const std::string& digest,size_t size) {
     std::string body="{\"path\":\""+path+"\",\"url\":\"https://registry.test/v2/repo/blobs/"+digest+"\",\"digest\":\""+digest+"\",\"size\":"+std::to_string(size)+"}";
     int code=0; std::string msg;
-    handle_cache_import(&service,body,code,msg);
+    ublkd_handle_cache_import(&service,body,code,msg);
     if(code!=200) std::cout<<"import status="<<code<<" "<<msg<<std::endl;
     return code;
 }

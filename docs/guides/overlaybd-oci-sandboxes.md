@@ -195,6 +195,8 @@ The publisher uploads rootfs first and snapfiles last. It rejects replacing an e
 
 After an OCI checkpoint is published, Fastlet seeds the existing credential-scoped manifest cache and imports newly packed local blobs through the node daemon's managed file cache before reporting publication complete. Same-node Resume can reuse these bytes after pack staging is removed. Imported blobs share `OVERLAYBD_CACHE_SIZE_GB`, LRU eviction, and free-disk protection with registry-fetched blobs; there is no second retained checkpoint directory or separate GC policy. Cache population is best effort: an older daemon, a full cache, eviction, or a different restore node falls back to the published OCI artifact. Registry publication is still required for durability. Resume still prepares devices and mounts and loads Firecracker state; this optimization does not retain a running VM across Pause. Deploy matching Fastlet and node OCI tools to enable local blob import.
 
+The OCI tools build pins OverlayBD [PR #480](https://github.com/containerd/overlaybd/pull/480) at `9e01600b55400af74b53c51bc0d17ca5eaac4dc0` and uses its native `/v1/cache/import` endpoint. Imports verify the complete SHA-256 and recheck each chunk before writing, accept blobs up to 64 GiB, and admit one active import per daemon. Unsupported or busy imports remain best effort. The standard node configuration disables OverlayBD P2P; a custom P2P configuration must also enable `p2pConfig.cacheFirst` with the managed file cache for imported data to serve subsequent reads.
+
 ## 4. Create, pause, and resume through FastPath
 
 Run the examples in Bash from the repository root, with `grpcurl` and `jq` installed. First, forward FastPath in one terminal:
