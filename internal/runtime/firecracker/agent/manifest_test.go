@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"fast-sandbox/internal/artifacts"
 )
 
 func TestObjectStoreRejectsOCIManifestWithoutNativeFiles(t *testing.T) {
@@ -126,4 +128,42 @@ func TestValidSHA256(t *testing.T) {
 	require.False(t, validSHA256(strings.Repeat("A", 64)))
 	require.False(t, validSHA256(strings.Repeat("g", 64)))
 	require.False(t, validSHA256(""))
+}
+
+func TestNativeRootfsManifestModeBoundaries(t *testing.T) {
+	for _, scenario := range []string{"valid", "legacy-full", "vmstate.snap", "memory.snap", "invalid-size", "invalid-digest"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := stageRootfsArtifactSet(t)
+			document, err := artifacts.DecodeVMManifest(mustManifestBytes(t, dir))
+			require.NoError(t, err)
+			switch scenario {
+			case "legacy-full":
+				document.Platform.SnapshotMode = ""
+			case "vmstate.snap", "memory.snap":
+				document.Files[scenario] = artifacts.ManifestFile{SHA256: strings.Repeat("a", 64), SizeBytes: 1}
+			case "invalid-size":
+				entry := document.Files["rootfs.ext4"]
+				entry.SizeBytes = -1
+				document.Files["rootfs.ext4"] = entry
+			case "invalid-digest":
+				entry := document.Files["rootfs.ext4"]
+				entry.SHA256 = "broken"
+				document.Files["rootfs.ext4"] = entry
+			}
+			payload, err := json.Marshal(document)
+			require.NoError(t, err)
+			parsed, err := parseManifest(payload)
+			if err == nil {
+				var files []nativeFile
+				files, err = parsed.nativeFiles()
+				if scenario == "valid" {
+					require.NoError(t, err)
+					require.Len(t, files, 1)
+					require.Equal(t, nativeRootfsCacheName, files[0].cache)
+					return
+				}
+			}
+			require.Error(t, err, "invalid or incomplete modes must not downgrade to RootfsOnly")
+		})
+	}
 }

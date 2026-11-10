@@ -259,3 +259,54 @@ func TestClientDialsLongProcSocketPath(t *testing.T) {
 		})
 	}
 }
+
+type probeFilesystem struct{ fail bool }
+
+func (f *probeFilesystem) Freeze() error {
+	if f.fail {
+		return errors.New("probe freeze failed")
+	}
+	return nil
+}
+func (*probeFilesystem) Thaw() error                          { return nil }
+func (*probeFilesystem) ProtectionIdentity() (string, string) { return "/", "ext4" }
+
+func TestRootFilesystemProbeSupportsRestoredGeneration(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+			manager, err := NewManager(&probeFilesystem{fail: fail}, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			service, err := NewService(manager)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := operationClient(t, service)
+			for range 2 {
+				version, err := ProbeRootFilesystem(t.Context(), client.SocketPath, client.Port)
+				if fail {
+					if err == nil {
+						t.Fatal("failed probe declared support")
+					}
+					return // An ioctl failure intentionally leaves the disposable VM unqualified.
+				} else if err != nil || version == "" {
+					t.Fatalf("probe: %s %v", version, err)
+				}
+				caps, err := client.Call(t.Context(), Request{Protocol: Protocol, Method: "capabilities"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				status, err := manager.Status(caps.Generation)
+				deadline := time.Now().Add(time.Second)
+				for err == nil && status.CleanupPending && time.Now().Before(deadline) {
+					time.Sleep(time.Millisecond)
+					status, err = manager.Status(caps.Generation)
+				}
+				if err != nil || status.CleanupPending || status.State != Released {
+					t.Fatalf("probe leaked freeze: %+v %v", status, err)
+				}
+			}
+		})
+	}
+}

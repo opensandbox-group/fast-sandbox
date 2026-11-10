@@ -79,6 +79,12 @@ var _ runtimecontract.Snapshotter = (*Driver)(nil)
 // to dispatch RootfsOnly snapshots without it.
 func (d *Driver) SupportsRootfsOnlySnapshots() bool { return true }
 
+func (d *Driver) SupportsNativeRootfsOnlySnapshots() bool {
+	// Per-instance VMM and kernel checks run at capture, after selection.
+	q, _, err := readQualificationOverrides()
+	return err == nil && q.Backend == captureBackendNative && q.ExclusiveExt4 && strings.TrimSpace(q.StorageRevision) != ""
+}
+
 // snapshotMu serializes the pause/dump/resume window across all Sandboxes of
 // this driver (one Fastlet process): only one of its VMs is paused at a time,
 // and the spill capacity check sees every dump still occupying the spill

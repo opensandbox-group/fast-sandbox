@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -13,6 +14,7 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/controlplane/assignment"
 	"fast-sandbox/internal/controlplane/placement"
+	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
 
@@ -141,7 +143,11 @@ func (o *Orchestrator) CreateSnapshot(ctx context.Context, snapshot *apiv1alpha2
 		return nil, err
 	}
 	mode := fastletapi.SnapshotMode(apiv1alpha2.NormalizeSandboxSnapshotMode(snapshot.Spec.Mode))
-	if mode == fastletapi.SnapshotModeRootfsOnly && !fastlet.SupportsCapability(fastletapi.CapabilityRootfsOnlySnapshots) {
+	requiredCapability := fastletapi.CapabilityRootfsOnlySnapshots
+	if !strings.HasPrefix(sandbox.Spec.Image, ocitemplate.Prefix) {
+		requiredCapability = fastletapi.CapabilityNativeRootfsOnlySnapshots
+	}
+	if mode == fastletapi.SnapshotModeRootfsOnly && !fastlet.SupportsCapability(requiredCapability) {
 		// Version-skew gate: an old Fastlet ignores the unknown mode JSON
 		// field and would silently run Full. An observed heartbeat without
 		// the capability is a confirmed rejection — ErrorSnapshotUnsupported
@@ -154,7 +160,7 @@ func (o *Orchestrator) CreateSnapshot(ctx context.Context, snapshot *apiv1alpha2
 		if fastlet.LastHeartbeat.IsZero() {
 			fastlet = o.refreshFastletObservation(ctx, fastlet)
 		}
-		if !fastlet.SupportsCapability(fastletapi.CapabilityRootfsOnlySnapshots) {
+		if !fastlet.SupportsCapability(requiredCapability) {
 			if fastlet.LastHeartbeat.IsZero() {
 				return nil, fmt.Errorf("%w: rootfs-only snapshot capability of the assigned Fastlet is not observed yet", ErrAssignedFastletUnavailable)
 			}

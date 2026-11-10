@@ -1,12 +1,16 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
+	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/guestnetwork"
 )
 
@@ -179,4 +183,37 @@ func TestSnapshotStageKeepsPipelineVMMSelection(t *testing.T) {
 	if err := selectBuildVMM(t.Context()); err == nil {
 		t.Fatal("missing managed inventory must not fall back to PATH")
 	}
+}
+
+// Run the production native builder stage against a disposable rootfs whose init
+// emits readiness/heartbeat markers and starts the delivered helper.
+func TestNativeSnapshotStageIntegration(t *testing.T) {
+	rootfs := os.Getenv("FSB_TEST_NATIVE_BUILDER_ROOTFS")
+	if rootfs == "" {
+		t.Skip("requires disposable KVM builder rootfs")
+	}
+	kernel := os.Getenv("FC_KERNEL")
+	binary := os.Getenv("FC_BINARY")
+	require.NotEmpty(t, kernel)
+	require.NotEmpty(t, binary)
+	work, err := os.MkdirTemp(filepath.Dir(rootfs), "builder-")
+	require.NoError(t, err)
+	t.Logf("builder evidence: %s", work)
+	require.NoError(t, os.Symlink(binary, filepath.Join(work, "firecracker")))
+	t.Setenv("PATH", work+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(workDirEnv, work)
+	t.Setenv("FSB_GUEST_CONTROL_ENABLED", "1")
+	spec := apiv1alpha2.SandboxTemplateSpec{Machine: apiv1alpha2.MachineSpec{VCPU: "1", Memory: "256Mi"}, Output: apiv1alpha2.OutputSpec{Format: apiv1alpha2.ArtifactFormatNative}, Init: "/init"}
+	raw, err := json.Marshal(spec)
+	require.NoError(t, err)
+	t.Setenv(specEnv, string(raw))
+	require.NoError(t, runSnapshotStage([]string{kernel, rootfs, filepath.Join(work, "vmstate.snap"), filepath.Join(work, "memory.snap")}))
+	raw, err = os.ReadFile(filepath.Join(work, "snapshot-phases.json"))
+	require.NoError(t, err)
+	var phases snapshotPhaseTimings
+	require.NoError(t, json.Unmarshal(raw, &phases))
+	require.NotNil(t, phases.GuestControl)
+	require.NotEmpty(t, phases.GuestControl.HelperVersion)
+	require.NotEmpty(t, phases.KernelSHA256)
+	require.Contains(t, phases.KernelCmdline, "root=/dev/vda")
 }

@@ -29,6 +29,10 @@ const (
 // captureRecord persists intent before side effects; phase names do not imply remote completion.
 // Incarnation must bind to the actual VMM startup instance, not merely a reusable PID.
 type captureRecord struct {
+	// Version 2 binds native recovery to the original file inode. Version 1 is OverlayBD only.
+	Backend    string `json:"backend,omitempty"`
+	FileDevice uint64 `json:"fileDevice,omitempty"`
+	FileInode  uint64 `json:"fileInode,omitempty"`
 	// PublicationOwned means the independent copy belongs to the publication flow; recovered refers only to source VM recovery.
 	PublicationOwned bool                        `json:"publicationOwned,omitempty"`
 	Owner            *fastletapi.SandboxIdentity `json:"owner,omitempty"`
@@ -80,6 +84,14 @@ func newCaptureJournal(directory string, r captureRecord) (*captureJournal, erro
 func publishInitialCaptureJournal(directory, temporary string, r captureRecord) (journal *captureJournal, resultErr error) {
 	defer func() { resultErr = errors.Join(resultErr, os.RemoveAll(temporary)) }()
 	r.Version = 1
+	if r.Backend == captureBackendNative {
+		r.Version = 2
+		if r.FileInode == 0 {
+			return nil, errors.New("native capture requires durable file identity")
+		}
+	} else if r.Backend != "" {
+		return nil, errors.New("unknown capture backend")
+	}
 	r.Phase = capturePrepared
 	j := &captureJournal{directory: temporary, record: r}
 	if err := j.persist(); err != nil {
@@ -106,7 +118,7 @@ func loadCaptureJournal(directory string) (*captureJournal, error) {
 	if err = json.Unmarshal(raw, &r); err != nil {
 		return nil, err
 	}
-	if r.Version != 1 || r.Incarnation == "" || !filepath.IsAbs(r.Device) || !filepath.IsAbs(r.Staging) || r.Request.Protocol != guestcontrol.Protocol || r.Request.Epoch == "" || r.Request.Generation == 0 || r.Request.OperationID == "" {
+	if !(r.Version == 1 && r.Backend == "" || r.Version == 2 && r.Backend == captureBackendNative && r.FileInode != 0) || r.Incarnation == "" || !filepath.IsAbs(r.Device) || !filepath.IsAbs(r.Staging) || r.Request.Protocol != guestcontrol.Protocol || r.Request.Epoch == "" || r.Request.Generation == 0 || r.Request.OperationID == "" {
 		return nil, errors.New("invalid capture recovery record")
 	}
 	switch r.Phase {

@@ -339,3 +339,97 @@ func TestManagedVMMQualificationAcceptsCopyAndRejectsReplacement(t *testing.T) {
 	require.NoError(t, os.WriteFile(copyPath, []byte("different executable"), 0600))
 	require.ErrorContains(t, qualifyVMMExecutable(state, ""), "does not match")
 }
+
+// Exercise the real file flush/reflink implementation without a VM. The
+// transaction fixtures verify that all storage errors still restore the source.
+func TestNativeRootfsCutIsolation(t *testing.T) {
+	root := os.Getenv("FSB_TEST_NATIVE_XFS")
+	if root == "" {
+		t.Skip("requires disposable XFS storage")
+	}
+	dir, err := os.MkdirTemp(root, "cut-")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+	sourcePath := filepath.Join(dir, "disk.img")
+	require.NoError(t, os.WriteFile(sourcePath, []byte("before"), 0600))
+	source, err := os.OpenFile(sourcePath, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer source.Close()
+	dev, ino, err := captureNativeIdentity(source)
+	require.NoError(t, err)
+	require.NotZero(t, ino)
+	for _, scenario := range []string{"success", "existing-target", "missing-directory", "cancelled"} {
+		t.Run(scenario, func(t *testing.T) {
+			stage := filepath.Join(dir, scenario)
+			require.NoError(t, os.Mkdir(stage, 0700))
+			if scenario == "existing-target" {
+				require.NoError(t, os.WriteFile(filepath.Join(stage, publishedRootfsName), []byte("do-not-overwrite"), 0600))
+			}
+			if scenario == "missing-directory" {
+				require.NoError(t, os.Remove(stage))
+			}
+			fixture := &captureFixture{}
+			tx := fixture.transaction()
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			if scenario == "cancelled" {
+				cancel()
+			}
+			err := captureNativeRootfs(ctx, tx, source, stage)
+			if scenario == "success" {
+				require.NoError(t, err)
+				_, err = source.WriteAt([]byte("after!"), 0)
+				require.NoError(t, err)
+				require.NoError(t, source.Sync())
+				data, err := os.ReadFile(filepath.Join(stage, publishedRootfsName))
+				require.NoError(t, err)
+				require.Equal(t, "before", string(data))
+			} else {
+				require.Error(t, err)
+			}
+			if scenario != "cancelled" {
+				require.Contains(t, fixture.calls, "resume")
+				require.Contains(t, fixture.calls, "thaw")
+			}
+		})
+	}
+	// Holding the descriptor does not make a path replacement the same file.
+	require.NoError(t, os.Rename(sourcePath, sourcePath+".old"))
+	require.NoError(t, os.WriteFile(sourcePath, []byte("replacement"), 0600))
+	replacement, err := os.Open(sourcePath)
+	require.NoError(t, err)
+	defer replacement.Close()
+	newDev, newIno, err := captureNativeIdentity(replacement)
+	require.NoError(t, err)
+	require.False(t, dev == newDev && ino == newIno)
+}
+
+func TestNativeRootfsCaptureTransactionIntegration(t *testing.T) {
+	if os.Getenv("FSB_TEST_NATIVE_CAPTURE") != "1" {
+		t.Skip("requires disposable file-backed VM")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	vm := NewClient(os.Getenv("FSB_TEST_API_SOCKET"))
+	defer vm.Close()
+	guest := guestcontrol.Client{SocketPath: os.Getenv("FSB_TEST_VSOCK_SOCKET"), Port: 1234, Timeout: 2 * time.Second}
+	var caps guestcontrol.Response
+	require.Eventually(t, func() bool {
+		var err error
+		caps, err = guest.Call(ctx, guestcontrol.Request{Protocol: guestcontrol.Protocol, Method: "capabilities"})
+		return err == nil
+	}, 10*time.Second, 50*time.Millisecond)
+	require.Equal(t, "/", caps.ProtectedMount)
+	require.Equal(t, "ext4", caps.Filesystem)
+	source, err := os.OpenFile(os.Getenv("FSB_TEST_NATIVE_DISK"), os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer source.Close()
+	lease := &captureLabLease{vm: vm, device: source, engine: os.Getenv("FSB_TEST_CAPTURE_ENGINE")}
+	tx := rootfsCapture{Lease: lease, VM: vm, Guest: guest, Request: guestcontrol.Request{Protocol: guestcontrol.Protocol, Epoch: caps.Epoch, Generation: caps.Generation + 1, OperationID: "native-file-cut", LeaseMillis: 10000}, RecoveryTimeout: 10 * time.Second}
+	require.NoError(t, captureNativeRootfs(ctx, tx, source, os.Getenv("FSB_TEST_CAPTURE_OUTPUT")))
+	state, err := vm.VMState(ctx)
+	require.NoError(t, err)
+	require.Equal(t, vmRunning, state)
+	require.True(t, lease.released)
+	require.False(t, lease.quarantined)
+}

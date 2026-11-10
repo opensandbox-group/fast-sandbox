@@ -77,7 +77,11 @@ func (m *SandboxManager) SnapshotCapabilities() []string {
 	if !ok || !capable.SupportsRootfsOnlySnapshots() {
 		return nil
 	}
-	return []string{fastletapi.CapabilityRootfsOnlySnapshots}
+	capabilities := []string{fastletapi.CapabilityRootfsOnlySnapshots}
+	if native, ok := snapshotter.(runtimecontract.NativeRootfsOnlySnapshotCapability); ok && native.SupportsNativeRootfsOnlySnapshots() {
+		capabilities = append(capabilities, fastletapi.CapabilityNativeRootfsOnlySnapshots)
+	}
+	return capabilities
 }
 
 func snapshotFailure(disposition fastletapi.CreateDisposition, failure *fastletapi.FastletError) (*fastletapi.CreateSnapshotResponse, error) {
@@ -146,8 +150,11 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 		image = metadata.Config.Desired.Restore.ManifestRef
 	}
 	if req.Snapshot.Mode == fastletapi.SnapshotModeRootfsOnly && !strings.HasPrefix(image, ocitemplate.Prefix) {
-		m.mu.Unlock()
-		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletError(fastletapi.ErrorSnapshotUnsupported, "RootfsOnly requires OCI rootfs", false))
+		capable, ok := m.runtime.(runtimecontract.NativeRootfsOnlySnapshotCapability)
+		if !ok || !capable.SupportsNativeRootfsOnlySnapshots() {
+			m.mu.Unlock()
+			return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletError(fastletapi.ErrorSnapshotUnsupported, "native RootfsOnly capture is not qualified on this node", false))
+		}
 	}
 	if req.Snapshot.Kind != fastletapi.SnapshotKindCheckpoint && req.Snapshot.TemplateName == "" && !strings.HasPrefix(image, ocitemplate.Prefix) {
 		m.mu.Unlock()

@@ -576,8 +576,12 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 
 	createStarted := time.Now()
 	isOCI := strings.HasPrefix(restoreRef, ocitemplate.Prefix)
+	rootfsDriveName := rootfsDeviceName
+	if !isOCI {
+		rootfsDriveName = rootfsImageName
+	}
 	var ociRootfs, vmstatePath, memoryPath string
-	var ociMetadata ociRestoreMetadata
+	var restoreMetadata ociRestoreMetadata
 	var selectedVMM *firecrackervmm.Selection
 	var ociPrepareDur time.Duration
 	var rootfsKernel, bootKernelSHA256 string
@@ -599,8 +603,21 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 			return nil, prepareErr
 		}
 		ociRootfs, vmstatePath, memoryPath = attachment.rootfs, attachment.vmstate, attachment.memory
-		ociMetadata, ociPrepareDur = attachment.metadata, attachment.duration
+		restoreMetadata, ociPrepareDur = attachment.metadata, attachment.duration
 		selectedVMM = attachment.vmm
+	} else {
+		payload, readErr := os.ReadFile(cachedManifestPath(stateRoot, restoreRef))
+		if readErr == nil {
+			restoreMetadata, err = artifacts.DecodeVMManifest(payload)
+			if err != nil {
+				return nil, err
+			}
+			if restoreMetadata.IsRootfsOnly() && config.Desired.Restore != nil {
+				return nil, fmt.Errorf("%w: RootfsOnly cannot resume a checkpoint", ErrInvalidConfig)
+			}
+		} else if !os.IsNotExist(readErr) {
+			return nil, readErr
+		}
 	}
 
 	if !isOCI {
@@ -638,7 +655,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// comes from the cached manifest guestNetwork; the BakedGuestIP
 	// convention is the fallback for hand-seeded caches. Slots are prepared
 	// before the image is known, so the NAT rules are applied now.
-	guestIP, guestMTU, err := resolveRestoreGuestIP(stateRoot, restoreRef, slot, ociMetadata)
+	guestIP, guestMTU, err := resolveRestoreGuestIP(stateRoot, restoreRef, slot, restoreMetadata)
 	if err != nil {
 		releaseSlot()
 		return nil, err
@@ -659,7 +676,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 
 	rootfsStarted := time.Now()
 	_, rootfsSpan := observability.Start(ctx, "fastlet.firecracker.rootfs")
-	if !isOCI {
+	if !isOCI && !restoreMetadata.IsRootfsOnly() {
 		vmstatePath, memoryPath, err = resolveRestoreSnapshotFiles(stateRoot, restoreRef)
 	}
 	// The machine tuple of the golden snapshot is baked in the vmstate
@@ -677,30 +694,38 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	}
 	var instanceRootfs, jailRoot, apiAddress string
 	if err == nil {
-		if isOCI {
-			if ociMetadata.IsRootfsOnly() {
-				rootfsKernel, err = d.rootfsKernel(ociMetadata)
-				if err == nil {
-					pinned := filepath.Join(directory, "boot-kernel")
-					bootKernelSHA256, err = firecrackerconfig.PinKernel(rootfsKernel, pinned)
-					rootfsKernel = pinned
-					defer os.Remove(pinned) // The VMM loads the kernel before Ensure returns.
-				}
-				if err == nil {
-					instanceRootfs, jailRoot, apiAddress, err = d.prepareRootfsBootInstance(identity.SandboxUID, directory, ociRootfs, rootfsKernel)
-				}
-			} else {
-				instanceRootfs, jailRoot, apiAddress, err = d.prepareOCIInstance(identity.SandboxUID, directory, ociRootfs, vmstatePath, memoryPath)
+		if restoreMetadata.IsRootfsOnly() {
+			rootfsKernel, err = d.rootfsKernel(restoreMetadata)
+			if err == nil {
+				pinned := filepath.Join(directory, "boot-kernel")
+				bootKernelSHA256, err = firecrackerconfig.PinKernel(rootfsKernel, pinned)
+				rootfsKernel = pinned
+				defer os.Remove(pinned)
 			}
+			if err == nil && !isOCI {
+				var source string
+				source, err = resolveRootfsImage(stateRoot, restoreRef)
+				if err == nil {
+					ociRootfs = filepath.Join(directory, instanceRootfsName)
+					err = copyReflinkOrCopy(source, ociRootfs)
+				}
+			}
+			if err == nil {
+				instanceRootfs, jailRoot, apiAddress, err = d.prepareRootfsBootInstance(identity.SandboxUID, directory, ociRootfs, rootfsKernel, rootfsDriveName)
+			}
+		} else if isOCI {
+			instanceRootfs, jailRoot, apiAddress, err = d.prepareOCIInstance(identity.SandboxUID, directory, ociRootfs, vmstatePath, memoryPath)
 		} else {
-			instanceRootfs, jailRoot, apiAddress, err = d.prepareInstance(
-				stateRoot, identity.SandboxUID, restoreRef, directory, vmstatePath, memoryPath,
-			)
+			instanceRootfs, jailRoot, apiAddress, err = d.prepareInstance(stateRoot, identity.SandboxUID, restoreRef, directory, vmstatePath, memoryPath)
 		}
 	}
 	observability.End(rootfsSpan, err)
 	if err != nil {
 		releaseSlot()
+		if !isOCI && restoreMetadata.IsRootfsOnly() {
+			d.removeJailRoot(identity.SandboxUID)
+			_ = removeSandboxDir(directory)
+		}
 		return nil, err
 	}
 	// A failed Create must not leak the jail and per-sandbox state
@@ -772,10 +797,10 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		InfraServices: infraServices, InfraDiagnostics: infraDiagnostics,
 	}
 	// Full restores execute the kernel already present in RAM, not KernelPath.
-	state.BootKernelSHA256 = ociMetadata.Kernel.SHA256
-	if ociMetadata.IsRootfsOnly() {
+	state.BootKernelSHA256 = restoreMetadata.Kernel.SHA256
+	if restoreMetadata.IsRootfsOnly() {
 		state.BootKernelSHA256 = bootKernelSHA256
-		provenance := artifacts.NewVMManifest(ociMetadata.Machine, ociMetadata.Kernel.Version, binaryPath, artifacts.CPUTemplateNone).Compatibility
+		provenance := artifacts.NewVMManifest(restoreMetadata.Machine, restoreMetadata.Kernel.Version, binaryPath, artifacts.CPUTemplateNone).Compatibility
 		state.BootCompatibility = &provenance
 	}
 	if err := saveState(directory, state); err != nil {
@@ -875,8 +900,8 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	defer client.Close()
 	configureStarted := time.Now()
 	configureCtx, configureSpan := observability.Start(ctx, "fastlet.firecracker.configure")
-	if ociMetadata.IsRootfsOnly() {
-		err = configureRootfsVM(configureCtx, client, slot, ociMetadata, rootfsKernel, jailRoot != "")
+	if restoreMetadata.IsRootfsOnly() {
+		err = configureRootfsVM(configureCtx, client, slot, restoreMetadata, rootfsKernel, rootfsDriveName, jailRoot != "")
 	} else {
 		err = configureRestoreVM(configureCtx, client, slot, vmstatePath, memoryPath, jailRoot != "")
 	}
@@ -891,7 +916,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	bootStarted := time.Now()
 	bootCtx, bootSpan := observability.Start(ctx, "fastlet.firecracker.resume")
 	var polls int
-	if ociMetadata.IsRootfsOnly() {
+	if restoreMetadata.IsRootfsOnly() {
 		err = client.Start(bootCtx)
 		if err == nil {
 			polls, err = waitVMRunning(bootCtx, client, d.config.BootTimeoutSeconds)
@@ -1610,7 +1635,7 @@ func (d *Driver) removeJailRoot(sandboxID string) {
 	// A memcg OOM can kill the VMM before the jailer tears that mount down, so
 	// detach it explicitly before RemoveAll or the otherwise-dead jail leaks.
 	_ = unmountPath(jailedKVMDevicePath(root))
-	for _, target := range []string{rootfsDeviceName, "rootfs-kernel", filepath.Join(jailerChrootSnapshotsDir, vmstateSnapshotName), filepath.Join(jailerChrootSnapshotsDir, memorySnapshotName)} {
+	for _, target := range []string{rootfsDeviceName, rootfsImageName, "rootfs-kernel", filepath.Join(jailerChrootSnapshotsDir, vmstateSnapshotName), filepath.Join(jailerChrootSnapshotsDir, memorySnapshotName)} {
 		_ = unmountPath(filepath.Join(root, target))
 	}
 	if err := os.RemoveAll(filepath.Dir(root)); err != nil {

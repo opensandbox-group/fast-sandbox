@@ -21,6 +21,8 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/firecrackerconfig"
+	"fast-sandbox/internal/guestcontrol"
 	"fast-sandbox/internal/guestnetwork"
 )
 
@@ -28,9 +30,12 @@ import (
 // the workdir for the pipeline: sub-phase durations, the effective CPU
 // template, and detected guest FPR support.
 type snapshotPhaseTimings struct {
-	BootToReadyMs        int64 `json:"bootToReadyMs"`
-	SnapshotCreateMs     int64 `json:"snapshotCreateMs"`
-	RestoreToHeartbeatMs int64 `json:"restoreToHeartbeatMs"`
+	KernelSHA256         string                    `json:"kernelSHA256,omitempty"`
+	KernelCmdline        string                    `json:"kernelCmdline,omitempty"`
+	GuestControl         *artifacts.VMGuestControl `json:"guestControl,omitempty"`
+	BootToReadyMs        int64                     `json:"bootToReadyMs"`
+	SnapshotCreateMs     int64                     `json:"snapshotCreateMs"`
+	RestoreToHeartbeatMs int64                     `json:"restoreToHeartbeatMs"`
 	// CPUTemplate is the tier in effect ("T2"/"T2A"/"none"), normalized by
 	// compatibilityCPUTemplate.
 	CPUTemplate string `json:"cpuTemplate"`
@@ -128,7 +133,14 @@ func runSnapshotStage(args []string) error {
 	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off nomodules net.ifnames=0 biosdevname=0 random.trust_cpu=on root=/dev/vda rw"
 	bootArgs += " init=" + guestInitPath(spec)
 	bootArgs = bakedNetworkBootArgs(bootArgs)
-	vm, cpuTemplate, err := bootPreparationVM(bootSocket, bootLog, workdir, kernel, rootfs, bootArgs, spec)
+	// Hash the same private bytes the VMM loads, not a mutable node path after boot.
+	pinnedKernel := filepath.Join(workdir, "boot-kernel")
+	kernelSHA256, err := firecrackerconfig.PinKernel(kernel, pinnedKernel)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(pinnedKernel)
+	vm, cpuTemplate, err := bootPreparationVM(bootSocket, bootLog, workdir, pinnedKernel, rootfs, bootArgs, spec)
 	if err != nil {
 		return err
 	}
@@ -149,6 +161,13 @@ func runSnapshotStage(args []string) error {
 	}
 	if !freePageReporting {
 		klog.Warning("guest free-page reporting unavailable; snapshot will retain legacy memory behavior")
+	}
+
+	// Publish capability only after probing the real root on this disposable VM.
+	control, err := probeNativeGuestControl(workdir)
+	if err != nil {
+		vm.stop()
+		return err
 	}
 
 	// Pause and create the full snapshot.
@@ -180,6 +199,13 @@ func runSnapshotStage(args []string) error {
 	restoreStarted := time.Now()
 	restoreLog := filepath.Join(workdir, "restore.console.log")
 	restoreSocket := filepath.Join(workdir, "restore.sock")
+	// The preparation VMM has exited. Its host UDS is not part of vmstate,
+	// but restore rebinds the same relative path; remove that stale socket first.
+	if control != nil {
+		if err := os.Remove(filepath.Join(workdir, "guest-control.sock")); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
 	restored, err := startVMM(restoreSocket, restoreLog, workdir)
 	if err != nil {
 		return err
@@ -202,8 +228,18 @@ func runSnapshotStage(args []string) error {
 	if _, err := waitForAnyMarker(restoreLog, restoreTimeout(spec), "SANDBOX_HEARTBEAT"); err != nil {
 		return err
 	}
+	if control != nil {
+		version, err := guestcontrol.ProbeRootFilesystem(context.Background(), filepath.Join(workdir, "guest-control.sock"), control.Port)
+		if err != nil {
+			return fmt.Errorf("restored native guest helper probe: %w", err)
+		}
+		if version != control.HelperVersion {
+			return errors.New("restored helper version changed")
+		}
+	}
 	restoreToHeartbeatMs := time.Since(restoreStarted).Milliseconds()
 	phases := snapshotPhaseTimings{
+		KernelSHA256: kernelSHA256, KernelCmdline: bootArgs, GuestControl: control,
 		BootToReadyMs:        bootToReadyMs,
 		SnapshotCreateMs:     snapshotCreateMs,
 		RestoreToHeartbeatMs: restoreToHeartbeatMs,
@@ -324,6 +360,14 @@ func bootVMM(socket, logPath, workdir, kernel, rootfs, bootArgs string, spec api
 	if err := configureVM(vm, kernel, rootfs, bootArgs, spec, cpuTemplate); err != nil {
 		vm.stop()
 		return nil, err
+	}
+	if spec.Output.Format == apiv1alpha2.ArtifactFormatNative {
+		// Relative paths survive snapshot restore into a different instance cwd.
+		_ = os.Remove(filepath.Join(workdir, "guest-control.sock"))
+		if err := api(vm.socket, "PUT", "/vsock", map[string]any{"guest_cid": 3, "uds_path": "guest-control.sock"}); err != nil {
+			vm.stop()
+			return nil, err
+		}
 	}
 	if err := vm.start(); err != nil {
 		vm.stop()

@@ -19,3 +19,10 @@ func capturePIDAbsent(int) (bool, error) { return false, errors.New("requires Li
 func captureRootfsUpper(context.Context, rootfsCapture, *os.File, string, string, string) error {
 	return errors.New("rootfs capture requires Linux")
 }
+
+func captureNativeIdentity(*os.File) (uint64, uint64, error) {
+	return 0, 0, errors.New("native capture requires Linux")
+}
+func captureNativeRootfs(context.Context, rootfsCapture, *os.File, string) error {
+	return errors.New("native capture requires Linux")
+}

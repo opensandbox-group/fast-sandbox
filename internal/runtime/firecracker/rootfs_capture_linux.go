@@ -2,8 +2,10 @@ package firecracker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"golang.org/x/sys/unix"
 )
@@ -40,4 +42,55 @@ func flushCapturedBlock(device *os.File) error {
 		return fmt.Errorf("flush capture block device: %w", err)
 	}
 	return nil
+}
+
+// captureNativeIdentity requires the independently qualified XFS file backend.
+func captureNativeIdentity(file *os.File) (uint64, uint64, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return 0, 0, err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		return 0, 0, fmt.Errorf("native capture requires a regular disk image")
+	}
+	var fs unix.Statfs_t
+	if err := unix.Fstatfs(int(file.Fd()), &fs); err != nil {
+		return 0, 0, err
+	}
+	if fs.Type != unix.XFS_SUPER_MAGIC {
+		return 0, 0, fmt.Errorf("native capture currently requires qualified XFS reflink storage")
+	}
+	return uint64(stat.Dev), stat.Ino, nil
+}
+
+// Clone the held inode, never a reopened pathname. There is no full-copy fallback
+// inside the protected window; the source lease remains held until ioctl returns.
+func cutNativeRootfs(source *os.File, staging string) (resultErr error) {
+	if _, _, err := captureNativeIdentity(source); err != nil {
+		return err
+	}
+	target := filepath.Join(staging, publishedRootfsName)
+	out, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	defer func() { resultErr = errors.Join(resultErr, out.Close()) }()
+	if err := unix.IoctlFileClone(int(out.Fd()), int(source.Fd())); err != nil {
+		return fmt.Errorf("native reflink cut: %w", err)
+	}
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	return syncCaptureDirectory(staging)
+}
+
+func captureNativeRootfs(ctx context.Context, tx rootfsCapture, source *os.File, staging string) error {
+	tx.Flush = func() error {
+		if _, _, err := captureNativeIdentity(source); err != nil {
+			return err
+		}
+		return source.Sync()
+	}
+	tx.Cut = func() error { return cutNativeRootfs(source, staging) }
+	return tx.run(ctx)
 }

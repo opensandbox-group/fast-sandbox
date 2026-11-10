@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,17 +35,20 @@ const (
 // and SHA256SUMS in the workdir. Checksums are computed once and shared
 // between the two outputs via the cache. The serialization and checksum
 // conventions live in internal/artifacts so every producer (builder, live
-// snapshot driver, runtime-agent) emits byte-identical layouts. cpuTemplate
-// and freePageReporting are the snapshot stage's effective CPU template and
-// guest support detection; mitmCA carries the baked egress MITM CA lineage.
-func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory, workdir, cpuTemplate string, freePageReporting bool, mitmCA []mitmCALineage) ([]byte, error) {
+// snapshot driver, runtime-agent) emits byte-identical layouts. phases records
+// the verified boot inputs and detected Guest capabilities; mitmCA carries
+// the baked egress MITM CA lineage.
+func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, rootfs, vmstate, memory, workdir string, phases snapshotPhaseTimings, mitmCA []mitmCALineage) ([]byte, error) {
 	cache := map[string]string{}
 	rootfsGiB, err := sizeGiB(spec.Output.RootfsSize)
 	if err != nil {
 		return nil, err
 	}
-	manifest, err := buildManifest(spec, sourceDigest, kernel, rootfs, vmstate, memory, cache, rootfsGiB, cpuTemplate, freePageReporting, mitmCA)
+	manifest, err := buildManifest(spec, sourceDigest, kernel, rootfs, vmstate, memory, cache, rootfsGiB, phases.CPUTemplate, phases.FreePageReporting, mitmCA)
 	if err != nil {
+		return nil, err
+	}
+	if err := applyNativeBootProvenance(&manifest, phases, kernel); err != nil {
 		return nil, err
 	}
 	manifestBytes, err := artifacts.MarshalVMManifest(manifest)
@@ -123,4 +127,23 @@ func compatibilityCPUTemplate(cpuTemplate string) string {
 func writeChecksums(workdir string, cache map[string]string) error {
 	files := []string{rootfsImageName, vmstateFileName, memoryFileName}
 	return artifacts.WriteSHA256SUMS(workdir, files, cache)
+}
+
+// Bind the published capability to the successful boot/restore report and the
+// same kernel bytes. Enabling injection without a probe report fails closed.
+func applyNativeBootProvenance(manifest *artifacts.VMManifest, phases snapshotPhaseTimings, kernel string) error {
+	if phases.GuestControl == nil {
+		return fmt.Errorf("native guest control requires a successful freeze/thaw probe")
+	}
+	entry, err := artifacts.FileEntry(kernel, map[string]string{})
+	if err != nil {
+		return err
+	}
+	if phases.KernelSHA256 != entry.SHA256 || strings.TrimSpace(phases.KernelCmdline) == "" {
+		return fmt.Errorf("native snapshot kernel provenance is missing or changed")
+	}
+	manifest.Kernel.SHA256 = phases.KernelSHA256
+	manifest.Kernel.Cmdline = phases.KernelCmdline
+	manifest.GuestControl = phases.GuestControl
+	return nil
 }

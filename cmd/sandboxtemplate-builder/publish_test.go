@@ -20,7 +20,7 @@ func TestNativePublishDoesNotUploadStaleOverlayBDLayers(t *testing.T) {
 	spec, kernel, rootfs, vmstate, memory := buildManifestFixture(t)
 	workdir := filepath.Dir(rootfs)
 	spec.Output.Publish = "s3://bucket/templates"
-	raw, err := stageManifest(spec, "sha256:source", kernel, rootfs, vmstate, memory, workdir, "", false, nil)
+	raw, err := stageManifest(spec, "sha256:source", kernel, rootfs, vmstate, memory, workdir, nativeManifestPhases(t, kernel), nil)
 	require.NoError(t, err)
 	for _, kind := range []string{"rootfs", "memory"} {
 		dir := filepath.Join(workdir, "overlaybd", kind)

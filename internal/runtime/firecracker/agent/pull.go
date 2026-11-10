@@ -13,11 +13,13 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"k8s.io/klog/v2"
 
+	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/registryconfig"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
@@ -188,7 +190,7 @@ func (c *Client) PullImage(ctx context.Context, stateRoot, image string) (result
 	if err != nil {
 		return err
 	}
-	if err := c.materializeSet(ctx, dir, manifestKey, index.ArtifactDigest); err != nil {
+	if err := c.materializeSet(ctx, dir, manifestKey, index.ArtifactDigest, false); err != nil {
 		return err
 	}
 	completed = true
@@ -212,6 +214,17 @@ func (c *Client) PullCheckpoint(ctx context.Context, stateRoot, reference, manif
 	if complete, err := cacheComplete(dir); err != nil {
 		return err
 	} else if complete {
+		payload, err := os.ReadFile(filepath.Join(dir, manifestName))
+		if err != nil {
+			return err
+		}
+		document, err := parseManifest(payload)
+		if err != nil {
+			return err
+		}
+		if artifacts.VMManifest(document).IsRootfsOnly() {
+			return fmt.Errorf("rootfsOnly cannot be restored as a checkpoint")
+		}
 		return nil
 	}
 	if err := os.MkdirAll(dir, cacheDirMode); err != nil {
@@ -234,7 +247,7 @@ func (c *Client) PullCheckpoint(ctx context.Context, stateRoot, reference, manif
 	if err != nil {
 		return err
 	}
-	if err := c.materializeSet(ctx, dir, manifestKey, artifactDigest); err != nil {
+	if err := c.materializeSet(ctx, dir, manifestKey, artifactDigest, true); err != nil {
 		return err
 	}
 	completed = true
@@ -246,7 +259,7 @@ func (c *Client) PullCheckpoint(ctx context.Context, stateRoot, reference, manif
 // native artifact next to it in the same per-build namespace, and the local
 // manifest as the commit point. It is shared by the index-addressed image
 // pull and the ref-addressed checkpoint pull.
-func (c *Client) materializeSet(ctx context.Context, dir, manifestKey, artifactDigest string) error {
+func (c *Client) materializeSet(ctx context.Context, dir, manifestKey, artifactDigest string, checkpoint bool) error {
 	payload, err := c.fetchManifest(ctx, manifestKey, artifactDigest)
 	if err != nil {
 		return err
@@ -255,22 +268,12 @@ func (c *Client) materializeSet(ctx context.Context, dir, manifestKey, artifactD
 	if err != nil {
 		return err
 	}
-	files, err := document.nativeFiles()
+	if checkpoint && artifacts.VMManifest(document).IsRootfsOnly() {
+		return fmt.Errorf("rootfsOnly cannot be restored as a checkpoint")
+	}
+	files, err := document.downloadFiles()
 	if err != nil {
 		return err
-	}
-	// The optional state bundle files of a snapshot set (checkpoint vault,
-	// recorded policy) materialize next to the snapshot files so the restore
-	// path can hand them to egress. A malformed entry fails the pull like
-	// any native artifact.
-	for _, bundleFile := range []func() (nativeFile, bool, error){document.vaultFile, document.policyFile} {
-		file, ok, err := bundleFile()
-		if err != nil {
-			return err
-		}
-		if ok {
-			files = append(files, file)
-		}
 	}
 
 	// Artifacts live in the same per-build digest namespace as the
