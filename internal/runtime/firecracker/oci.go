@@ -78,6 +78,7 @@ func (d *Driver) fsbArgs() []string {
 	args := []string{
 		"--state-dir", filepath.Join(d.ociRoot(), "sandboxes"),
 		"--manifest-cache-dir", filepath.Join(d.config.StateRoot, "oci/manifest-cache"),
+		"--blob-cache-dir", filepath.Join(d.config.StateRoot, "oci/blobs"),
 		"--runtime-dir", filepath.Join(d.ociRoot(), "runtime"),
 		"--build-work-dir", filepath.Join(d.ociRoot(), "builds"),
 		"--build-output-dir", filepath.Join(d.ociRoot(), "artifacts"),
@@ -92,6 +93,9 @@ func (d *Driver) fsbArgs() []string {
 	}
 	if ociPlainHTTP() {
 		args = append(args, "--plain-http")
+	}
+	if budget := os.Getenv("FAST_SANDBOX_OCI_BLOB_CACHE_SIZE_BYTES"); budget != "" {
+		args = append(args, "--blob-cache-max-bytes", budget)
 	}
 	return args
 }

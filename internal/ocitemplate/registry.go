@@ -147,15 +147,32 @@ func fetchSmall(ctx context.Context, repo MetadataRepository, desc oci.Descripto
 	return content.FetchAll(ctx, repo, desc)
 }
 
-// Push publishes exactly two images. Rootfs is uploaded first; the snapfiles
-// manifest carries pairing/owner annotations and is the final publication point.
+// PublishedCheckpoint contains the exact immutable metadata that was published.
+// It can seed the existing restore cache without another registry round trip.
+type PublishedCheckpoint struct {
+	Reference string                     `json:"reference"`
+	Metadata  json.RawMessage            `json:"metadata"`
+	Manifests map[string]json.RawMessage `json:"manifests"`
+}
+
+// Push publishes rootfs first and the snapfiles manifest last as the publication point.
 func Push(ctx context.Context, dir, destination string, metadata []byte, credentials CredentialFunc, options ...RepositoryOption) (string, string, error) {
-	repo, ref, err := Repository(destination, credentials, options...)
+	result, err := PushForCache(ctx, dir, destination, metadata, credentials, options...)
 	if err != nil {
 		return "", "", err
 	}
+	ref, err := registry.ParseReference(strings.TrimPrefix(result.Reference, Prefix))
+	return result.Reference, strings.TrimPrefix(ref.Reference, "sha256:"), err
+}
+
+// PushForCache also returns the published immutable metadata for local cache population.
+func PushForCache(ctx context.Context, dir, destination string, metadata []byte, credentials CredentialFunc, options ...RepositoryOption) (*PublishedCheckpoint, error) {
+	repo, ref, err := Repository(destination, credentials, options...)
+	if err != nil {
+		return nil, err
+	}
 	if strings.HasPrefix(ref.Reference, "sha256:") {
-		return "", "", fmt.Errorf("publish destination must have a tag")
+		return nil, fmt.Errorf("publish destination must have a tag")
 	}
 	var index struct {
 		Images []localImage `json:"images"`
@@ -163,27 +180,27 @@ func Push(ctx context.Context, dir, destination string, metadata []byte, credent
 
 	raw, err := os.ReadFile(filepath.Join(dir, "manifest/index.json"))
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 	if err = json.Unmarshal(raw, &index); err != nil {
-		return "", "", err
+		return nil, err
 	}
 	if len(index.Images) != 2 {
-		return "", "", fmt.Errorf("expected exactly two template images")
+		return nil, fmt.Errorf("expected exactly two template images")
 	}
 	// Incremental exports carry descriptors for inherited remote layers, not
 	// local copies. Keep those blobs reachable from the checkpoint repository.
 	sources := map[string]string{}
 	if rawSources, e := os.ReadFile(filepath.Join(dir, RemoteSourcesName)); e == nil {
 		if e = json.Unmarshal(rawSources, &sources); e != nil {
-			return "", "", e
+			return nil, e
 		}
 	} else if !os.IsNotExist(e) {
-		return "", "", e
+		return nil, e
 	}
 	annotations, err := pairAnnotations(ref.Reference, metadata)
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
 	var root, snap *localImage
 	for i := range index.Images {
@@ -191,30 +208,41 @@ func Push(ctx context.Context, dir, destination string, metadata []byte, credent
 		switch {
 		case strings.HasSuffix(image.Name, "_rootfs"):
 			if root != nil {
-				return "", "", fmt.Errorf("duplicate rootfs image")
+				return nil, fmt.Errorf("duplicate rootfs image")
 			}
 			root = image
 		case strings.HasSuffix(image.Name, "_snapfiles"):
 			if snap != nil {
-				return "", "", fmt.Errorf("duplicate snapfiles image")
+				return nil, fmt.Errorf("duplicate snapfiles image")
 			}
 			snap = image
 		default:
-			return "", "", fmt.Errorf("unknown pair image %q", image.Name)
+			return nil, fmt.Errorf("unknown pair image %q", image.Name)
 		}
 	}
 	if root == nil || snap == nil {
-		return "", "", fmt.Errorf("template requires rootfs and snapfiles")
+		return nil, fmt.Errorf("template requires rootfs and snapfiles")
 	}
-	if _, _, err = pushLocalImage(ctx, repo, dir, ref.Reference, *root, sources, credentials, map[string]string{AnnotationTemplateID: ref.Reference}); err != nil {
-		return "", "", err
-	}
-	_, immutable, err := pushLocalImage(ctx, repo, dir, ref.Reference, *snap, sources, credentials, annotations)
+	rootRaw, rootRef, err := pushLocalImage(ctx, repo, dir, ref.Reference, *root, sources, credentials, map[string]string{AnnotationTemplateID: ref.Reference})
 	if err != nil {
-		return "", "", err
+		return nil, err
 	}
-	sum := strings.SplitN(immutable, "@", 2)[1]
-	return Prefix + immutable, strings.TrimPrefix(sum, "sha256:"), nil
+	snapRaw, immutable, err := pushLocalImage(ctx, repo, dir, ref.Reference, *snap, sources, credentials, annotations)
+	if err != nil {
+		return nil, err
+	}
+	snapDesc := content.NewDescriptorFromBytes(oci.MediaTypeImageManifest, snapRaw)
+	rootDesc := content.NewDescriptorFromBytes(oci.MediaTypeImageManifest, rootRaw)
+	var manifest oci.Manifest
+	if err := json.Unmarshal(snapRaw, &manifest); err != nil {
+		return nil, err
+	}
+	payload, err := pairMetadata(ref, snapDesc, rootDesc, manifest)
+	if err != nil {
+		return nil, err
+	}
+	return &PublishedCheckpoint{Reference: Prefix + immutable, Metadata: payload,
+		Manifests: map[string]json.RawMessage{rootRef: rootRaw, immutable: snapRaw}}, nil
 }
 
 // ValidateDigestReference binds a checkpoint's immutable address to its durable
@@ -274,20 +302,20 @@ type localImage struct {
 	Digest string `json:"manifest_digest"`
 }
 
-func pushLocalImage(ctx context.Context, repo *remote.Repository, dir, tag string, image localImage, sources map[string]string, credentials CredentialFunc, annotations map[string]string) (string, string, error) {
+func pushLocalImage(ctx context.Context, repo *remote.Repository, dir, tag string, image localImage, sources map[string]string, credentials CredentialFunc, annotations map[string]string) ([]byte, string, error) {
 	if filepath.Base(image.File) != image.File {
-		return "", "", fmt.Errorf("invalid manifest file")
+		return nil, "", fmt.Errorf("invalid manifest file")
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, "manifest", image.File))
 	if err != nil {
-		return "", "", err
+		return nil, "", err
 	}
 	if digest.FromBytes(raw).String() != image.Digest {
-		return "", "", fmt.Errorf("manifest digest mismatch")
+		return nil, "", fmt.Errorf("manifest digest mismatch")
 	}
 	var manifest oci.Manifest
 	if err = json.Unmarshal(raw, &manifest); err != nil {
-		return "", "", err
+		return nil, "", err
 	}
 	if len(annotations) != 0 {
 		if manifest.Annotations == nil {
@@ -301,15 +329,15 @@ func pushLocalImage(ctx context.Context, repo *remote.Repository, dir, tag strin
 		}
 		raw, err = json.Marshal(manifest)
 		if err != nil {
-			return "", "", err
+			return nil, "", err
 		}
 		if len(raw) > 1<<20 {
-			return "", "", fmt.Errorf("snapfiles manifest exceeds 1 MiB metadata limit")
+			return nil, "", fmt.Errorf("snapfiles manifest exceeds 1 MiB metadata limit")
 		}
 	}
 	for _, desc := range append([]oci.Descriptor{manifest.Config}, manifest.Layers...) {
 		if err = pushLocalBlob(ctx, repo, dir, desc, sources, credentials); err != nil {
-			return "", "", err
+			return nil, "", err
 		}
 	}
 
@@ -319,14 +347,14 @@ func pushLocalImage(ctx context.Context, repo *remote.Repository, dir, tag strin
 	} else if strings.HasSuffix(image.Name, "_snapfiles") {
 		suffix = "_snapfiles"
 	} else {
-		return "", "", fmt.Errorf("unknown pair image %q", image.Name)
+		return nil, "", fmt.Errorf("unknown pair image %q", image.Name)
 	}
 	desc := content.NewDescriptorFromBytes(oci.MediaTypeImageManifest, raw)
 	if err = pushImmutableManifest(ctx, repo, tag+suffix, desc, raw); err != nil {
-		return "", "", err
+		return nil, "", err
 	}
 	immutable := repo.Reference.Registry + "/" + repo.Reference.Repository + "@" + desc.Digest.String()
-	return suffix, immutable, nil
+	return raw, immutable, nil
 }
 
 func pushLocalBlob(ctx context.Context, repo *remote.Repository, dir string, desc oci.Descriptor, sources map[string]string, credentials CredentialFunc) error {

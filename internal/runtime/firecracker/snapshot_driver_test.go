@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -259,6 +260,72 @@ func TestCreateSnapshotRejectsInsufficientStagingBeforePause(t *testing.T) {
 	require.True(t, fixture.server.running)
 	require.Empty(t, fixture.server.snapshotDumps)
 	require.Empty(t, agent.fakeAgentClient.publishes)
+}
+
+func TestCreateSnapshotReclaimsCheckpointCacheBeforePause(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		initiallyFree  bool
+		reclaimed      bool
+		commandFailure bool
+	}{
+		{name: "space already available", initiallyFree: true},
+		{name: "reclaim permits capture", reclaimed: true},
+		{name: "partial recovery still sufficient", reclaimed: true, commandFailure: true},
+		{name: "pinned or busy cache still insufficient", commandFailure: true},
+		{name: "successful command still insufficient"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, agent := newSnapshotFixture(t)
+			fixture.driver.snapshotCapacityWait = 100 * time.Millisecond
+			sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+			plan := dumpPlan{sandboxDir: filepath.Join(fixture.stateRoot, sandboxStateDir, sandboxID)}
+			need, err := fixture.driver.dumpFootprintBytes(plan)
+			require.NoError(t, err)
+			cache := filepath.Join(fixture.stateRoot, "oci/blobs")
+			require.NoError(t, os.MkdirAll(filepath.Join(cache, "sha256"), 0700))
+			bin := t.TempDir()
+			argsFile := filepath.Join(bin, "args")
+			script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$BLOB_GC_TEST_ARGS\"\n"
+			if test.commandFailure {
+				script += "exit 1\n"
+			}
+			require.NoError(t, os.WriteFile(filepath.Join(bin, "fsb-vm"), []byte(script), 0700))
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("BLOB_GC_TEST_ARGS", argsFile)
+			t.Setenv("FAST_SANDBOX_OCI_BLOB_CACHE_SIZE_BYTES", "0")
+			fixture.driver.snapshotFree = func(root string) int64 {
+				require.Equal(t, fixture.stateRoot, root)
+				require.Empty(t, fixture.server.snapshotDumps, "capacity recovery must finish before capture")
+				_, err := os.Stat(argsFile)
+				if test.initiallyFree || (test.reclaimed && err == nil) {
+					return need
+				}
+				return need - 1
+			}
+			_, err = fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+				SandboxID: sandboxID, SnapshotID: "snap-capacity", TemplateName: "app-v2",
+			})
+			if test.initiallyFree || test.reclaimed {
+				require.NoError(t, err)
+				require.Len(t, fixture.server.snapshotDumps, 1)
+			} else {
+				require.ErrorIs(t, err, runtimecontract.ErrInsufficientStorage)
+				require.Empty(t, fixture.server.snapshotDumps)
+				require.Empty(t, agent.fakeAgentClient.publishes)
+			}
+			require.True(t, fixture.server.running)
+			if test.initiallyFree {
+				require.NoFileExists(t, argsFile, "normal snapshots must not launch cache GC")
+			} else {
+				args, err := os.ReadFile(argsFile)
+				require.NoError(t, err)
+				require.Contains(t, string(args), "--blob-cache-dir\n"+cache+"\n")
+				require.Contains(t, string(args), "--blob-cache-max-bytes\n0\n")
+				require.Contains(t, string(args), "trim-blob-cache\n--min-free-bytes\n"+strconv.FormatInt(need, 10)+"\n")
+			}
+		})
+	}
 }
 
 func TestDeleteSnapshotDiscardsStaging(t *testing.T) {
