@@ -10,17 +10,18 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 )
 
-// Explicitly enable the new capability; existing templates retain their startup scripts. Injection alone does not declare support.
+// Guest control ships with every OverlayBD (OCI) template: the builder injects
+// the statically linked helper, guest-init starts it before user workloads, and
+// fsb-vm's build-time freeze/thaw probe validates the stack end to end before
+// the guestControl declaration is recorded. There is no opt-out: the capability
+// is inert unless a capture uses the control channel, and the probe, not
+// operator configuration, is the validation gate. Native (object-store)
+// templates do not carry the helper because rootfs-only capture is
+// OverlayBD-only. Existing templates are unchanged; rebuilding is the migration
+// path. Injection alone does not declare support.
 func injectGuestControl(spec apiv1alpha2.SandboxTemplateSpec, rootfs string) (bool, error) {
-	enabled := os.Getenv("FSB_GUEST_CONTROL_ENABLED")
-	if enabled == "" || enabled == "0" {
-		return false, nil
-	}
-	if enabled != "1" {
-		return false, fmt.Errorf("FSB_GUEST_CONTROL_ENABLED must be 0 or 1")
-	}
 	if spec.Output.Format != apiv1alpha2.ArtifactFormatOverlayBD {
-		return false, fmt.Errorf("guest control currently requires the OCI builder validation path")
+		return false, nil
 	}
 	source := os.Getenv("FSB_GUEST_CONTROL_HELPER")
 	if source == "" {

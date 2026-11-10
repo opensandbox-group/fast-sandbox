@@ -1,6 +1,6 @@
 # Experimental Guest filesystem control
 
-This package and `cmd/fsb-guest-control` implement the Guest-control portion of FSEP-0001. The opt-in Builder injection and internal Fastlet RootfsOnly capture path use this helper. Production enablement requires qualified templates, node binaries, and filesystem writer coverage for each supported runtime configuration.
+This package and `cmd/fsb-guest-control` implement the Guest-control portion of FSEP-0001. The builder injects the helper unconditionally into OverlayBD templates, and the internal Fastlet RootfsOnly capture path uses it at capture time. Production enablement requires qualified templates, node binaries, and filesystem writer coverage for each supported runtime configuration.
 
 ## Components
 
@@ -19,7 +19,7 @@ Build for the intended guest architecture:
 GOOS=linux GOARCH=arm64 go build -o fsb-guest-control ./cmd/fsb-guest-control
 ```
 
-On a disposable guest with a configured vsock device, run as root with an explicit mount and private port. The opt-in template integration uses port 1234; the standalone helper still requires an explicit mount:
+On a disposable guest with a configured vsock device, run as root with an explicit mount and private port. Template builds and the Fastlet coordinator use port 1234; the standalone helper still requires an explicit mount:
 
 ```bash
 ./fsb-guest-control --mount /mnt/test-ext4 --port 1234 --max-lease 30s

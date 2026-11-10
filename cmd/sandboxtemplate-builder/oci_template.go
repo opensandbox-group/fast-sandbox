@@ -90,9 +90,12 @@ func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 	}
 	defer deleteBuildTap()
 	args := []string{"--firecracker", firecrackerBin, "--overlaybd-convertor", "/usr/local/bin/convertor", "--build-work-dir", filepath.Join(workdir, "builds"), "--build-output-dir", filepath.Join(workdir, "artifacts"), "build", "--source", source, "--output", "template:build", "--kernel", kernel, "--kernel-version", strings.TrimPrefix(filepath.Base(kernel), "vmlinux-"), "--vcpu", strconv.FormatInt(vcpu.Value(), 10), "--memory-mb", strconv.FormatInt((memory.Value()+(1<<20)-1)/(1<<20), 10), "--disk-size-gb", strconv.Itoa(size), "--inject-dir", inject, "--init-path", guestInitPath(spec), "--init-script-file", filepath.Join(inject, strings.TrimPrefix(guestInitPath(spec), "/")), "--boot-args", bakedNetworkBootArgs("console=ttyS0 reboot=k panic=1 pci=off nomodules net.ifnames=0 biosdevname=0 random.trust_cpu=on root=/dev/vda rw init=" + guestInitPath(spec)), "--tap-name", tap, "--guest-mac", bakedGuestMAC, "--ready-pattern", "SANDBOX_READY", "--ready-timeout", readinessTimeout(spec).String(), "--auth-file", authFile}
-	if os.Getenv("FSB_GUEST_CONTROL_ENABLED") == "1" {
-		args = append(args, "--guest-control-port", "1234")
-	}
+	// The build-time freeze/thaw probe validates the injected helper end to
+	// end and is what records the guestControl declaration: it runs on every
+	// OverlayBD build, so a builder image with an incompatible helper or
+	// guest kernel vsock stack fails the build instead of shipping a template
+	// that silently cannot capture.
+	args = append(args, "--guest-control-port", "1234")
 	platform := templatePlatform(spec, ca)
 	extra := struct {
 		Lineage      *artifacts.VMLineage  `json:"lineage"`
