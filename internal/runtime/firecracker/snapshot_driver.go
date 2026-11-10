@@ -72,6 +72,13 @@ const snapshotSpillDirEnv = "FAST_SANDBOX_SNAPSHOT_SPILL_DIR"
 // Driver implements the optional snapshot extension.
 var _ runtimecontract.Snapshotter = (*Driver)(nil)
 
+// SupportsRootfsOnlySnapshots advertises the rootfs-only capture branch
+// (runtimecontract.RootfsOnlySnapshotCapability): SnapshotInput.Mode ==
+// RootfsOnly dispatches to the rootfs snapshot coordinator. The Fastlet
+// surfaces this as its heartbeat capability, and the control plane refuses
+// to dispatch RootfsOnly snapshots without it.
+func (d *Driver) SupportsRootfsOnlySnapshots() bool { return true }
+
 // snapshotMu serializes the pause/dump/resume window across all Sandboxes of
 // this driver: only one VM on the node is ever paused at a time. Manifest
 // assembly and publication run outside the lock.
@@ -223,6 +230,7 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 		ManifestRef:    outcome.ManifestRef,
 		ArtifactDigest: outcome.ArtifactDigest,
 		SizeBytes:      sizeBytes,
+		Mode:           fastletapi.SnapshotModeFull,
 	}
 	// A checkpoint keeps the published set in the node-local image cache: a
 	// resume that still lands on this node restores locally (~ms) instead of

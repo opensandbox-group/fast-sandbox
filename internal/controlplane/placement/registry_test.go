@@ -370,6 +370,43 @@ func TestApplyHeartbeatFencesPodUIDSequenceAndCacheRevision(t *testing.T) {
 	require.ErrorIs(t, registry.ApplyHeartbeat("fastlet-a", "pod-uid-a", heartbeat, registryNow), ErrStaleHeartbeat)
 }
 
+func TestApplyHeartbeatCarriesCapabilitiesAndPodReplacementClearsThem(t *testing.T) {
+	registry := NewInMemoryRegistry()
+	registry.UpsertPod(FastletInfo{
+		ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-uid-a", PodIP: "10.0.0.1",
+		Namespace: "default", PoolName: "pool-a", PodReady: true,
+	})
+	heartbeat := &fastletapi.HeartbeatResponse{
+		FastletStatus: fastletapi.FastletStatus{
+			FastletPodUID: "pod-uid-a", RuntimeReady: true,
+			Capabilities: []string{fastletapi.CapabilityRootfsOnlySnapshots},
+			Admission:    fastletapi.AdmissionStatus{Capacity: 5, Used: 2, Running: 2},
+		},
+		Sequence: 1, Cache: fastletapi.CacheSnapshot{Epoch: "boot-a", Revision: 1, Full: true, Complete: true},
+	}
+	require.NoError(t, registry.ApplyHeartbeat("fastlet-a", "pod-uid-a", heartbeat, registryNow))
+	stored, _ := registry.GetFastletByID("fastlet-a")
+	require.True(t, stored.SupportsCapability(fastletapi.CapabilityRootfsOnlySnapshots))
+	require.False(t, stored.SupportsCapability("something-else"))
+
+	// A Pod refresh under the same UID preserves heartbeat-learned facts.
+	registry.UpsertPod(FastletInfo{
+		ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-uid-a", PodIP: "10.0.0.2",
+		Namespace: "default", PoolName: "pool-a", PodReady: true,
+	})
+	stored, _ = registry.GetFastletByID("fastlet-a")
+	require.True(t, stored.SupportsCapability(fastletapi.CapabilityRootfsOnlySnapshots))
+
+	// A replaced Pod inherits nothing: the capability is lost until the new
+	// Fastlet advertises it again (fail closed during version skew).
+	registry.UpsertPod(FastletInfo{
+		ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-uid-b", PodIP: "10.0.0.3",
+		Namespace: "default", PoolName: "pool-a", PodReady: true,
+	})
+	stored, _ = registry.GetFastletByID("fastlet-a")
+	require.False(t, stored.SupportsCapability(fastletapi.CapabilityRootfsOnlySnapshots))
+}
+
 func TestApplyHeartbeatFailsClosedOnProfileMismatch(t *testing.T) {
 	registry := NewInMemoryRegistry()
 	registry.UpsertPod(FastletInfo{

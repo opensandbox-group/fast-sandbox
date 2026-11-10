@@ -60,12 +60,14 @@ func (*fakeRegistry) ReleaseLocal(placement.FastletID, placement.ResourceDemand)
 type fakeFastletClient struct {
 	heartbeat func(string, *fastletapi.HeartbeatRequest) (*fastletapi.HeartbeatResponse, error)
 
-	create       func(string, *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error)
-	inspect      func(string, *fastletapi.InspectSandboxRequest) (*fastletapi.InspectSandboxResponse, error)
-	delete       func(string, *fastletapi.DeleteSandboxRequest) (*fastletapi.DeleteSandboxResponse, error)
-	inspectCalls int
-	deleted      bool
-	actions      *fastletapi.ReconcileBindingsRequest
+	create          func(string, *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error)
+	inspect         func(string, *fastletapi.InspectSandboxRequest) (*fastletapi.InspectSandboxResponse, error)
+	delete          func(string, *fastletapi.DeleteSandboxRequest) (*fastletapi.DeleteSandboxResponse, error)
+	createSnapshot  func(string, *fastletapi.CreateSnapshotRequest) (*fastletapi.CreateSnapshotResponse, error)
+	inspectCalls    int
+	deleted         bool
+	actions         *fastletapi.ReconcileBindingsRequest
+	snapshotRequest *fastletapi.CreateSnapshotRequest
 }
 
 func (f *fakeFastletClient) Heartbeat(_ context.Context, ip string, request *fastletapi.HeartbeatRequest) (*fastletapi.HeartbeatResponse, error) {
@@ -104,7 +106,11 @@ func (f *fakeFastletClient) DeleteSandbox(_ context.Context, ip string, request 
 	return &fastletapi.DeleteSandboxResponse{}, nil
 }
 
-func (f *fakeFastletClient) CreateSnapshot(context.Context, string, *fastletapi.CreateSnapshotRequest) (*fastletapi.CreateSnapshotResponse, error) {
+func (f *fakeFastletClient) CreateSnapshot(_ context.Context, fastletIP string, request *fastletapi.CreateSnapshotRequest) (*fastletapi.CreateSnapshotResponse, error) {
+	f.snapshotRequest = request
+	if f.createSnapshot != nil {
+		return f.createSnapshot(fastletIP, request)
+	}
 	return nil, errors.New("snapshot create is not configured in this fake")
 }
 

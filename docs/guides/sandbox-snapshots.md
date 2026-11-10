@@ -40,8 +40,9 @@ CreateSandboxSnapshot(
   request_id    = "ckpt-2026-09-11-01",   // becomes the CR name; replay-safe
   sandbox       = { namespaced_name = { namespace: "default", name: "my-sandbox" },
                     expected_uid    = "<uid>" },          // optional, fences renames
-  template_name = "my-app-v2"                             // the image name this
-)                                                         // snapshot will get
+  template_name = "my-app-v2",                             // the image name this
+  mode          = SNAPSHOT_MODE_FULL                       // snapshot will get
+)
 ```
 
 - `request_id` is the idempotency key: resending the same request returns
@@ -49,8 +50,23 @@ CreateSandboxSnapshot(
 - `template_name` is **global and permanent for the store**: after
   publishing, `my-app-v2` resolves to this artifact set. Pick it like an
   image tag (`my-app`, version or timestamp suffixes recommended).
+- `mode` selects what the snapshot persists. `SNAPSHOT_MODE_FULL` (default,
+  also when omitted) captures guest memory and device state so consumers
+  restore in place. `SNAPSHOT_MODE_ROOTFS_ONLY` persists only the writable
+  rootfs layer; consumers cold-boot from the disk (the entrypoint re-runs
+  and processes running at snapshot time are gone). `ROOT_FS_ONLY` requires
+  the OverlayBD artifact path: FastPath rejects it with `INVALID_ARGUMENT`
+  for a Sandbox that is not on the OCI path, the assigned Fastlet must have
+  advertised the rootfs-only capability (otherwise the request fails
+  deterministically with `UNIMPLEMENTED` instead of silently producing a
+  Full artifact), and it is not available for `PauseSandbox` checkpoints.
+  An absent, `UNSPECIFIED`, and explicit `FULL` mode are the same intent:
+  replays keep working across the field's introduction, while changing the
+  effective mode under the same `request_id` is rejected as spec drift.
 - The call returns as soon as the intent is persisted (phase `Pending`);
-  it does not wait for the dump.
+  it does not wait for the dump. `GetSandboxSnapshot` reports the produced
+  artifact class in `snapshot.mode` (`FULL` or `ROOT_FS_ONLY`), so clients
+  can tell the two artifact classes apart.
 
 **Declarative (kubectl)** — the controller drives the same flow:
 
@@ -65,6 +81,7 @@ spec:
     name: my-sandbox
     namespace: default
   templateName: my-app-v2
+  mode: RootfsOnly                # Full (default) or RootfsOnly
 ```
 
 ## Watch it converge

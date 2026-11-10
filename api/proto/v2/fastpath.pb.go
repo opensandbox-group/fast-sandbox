@@ -575,6 +575,57 @@ func (SnapshotPhase) EnumDescriptor() ([]byte, []int) {
 	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{9}
 }
 
+// SnapshotMode selects what a snapshot persists. UNSPECIFIED resolves to
+// FULL for compatibility with callers predating the mode field.
+type SnapshotMode int32
+
+const (
+	SnapshotMode_SNAPSHOT_MODE_UNSPECIFIED SnapshotMode = 0
+	SnapshotMode_SNAPSHOT_MODE_FULL        SnapshotMode = 1
+	SnapshotMode_SNAPSHOT_MODE_ROOTFS_ONLY SnapshotMode = 2
+)
+
+// Enum value maps for SnapshotMode.
+var (
+	SnapshotMode_name = map[int32]string{
+		0: "SNAPSHOT_MODE_UNSPECIFIED",
+		1: "SNAPSHOT_MODE_FULL",
+		2: "SNAPSHOT_MODE_ROOTFS_ONLY",
+	}
+	SnapshotMode_value = map[string]int32{
+		"SNAPSHOT_MODE_UNSPECIFIED": 0,
+		"SNAPSHOT_MODE_FULL":        1,
+		"SNAPSHOT_MODE_ROOTFS_ONLY": 2,
+	}
+)
+
+func (x SnapshotMode) Enum() *SnapshotMode {
+	p := new(SnapshotMode)
+	*p = x
+	return p
+}
+
+func (x SnapshotMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SnapshotMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_api_proto_v2_fastpath_proto_enumTypes[10].Descriptor()
+}
+
+func (SnapshotMode) Type() protoreflect.EnumType {
+	return &file_api_proto_v2_fastpath_proto_enumTypes[10]
+}
+
+func (x SnapshotMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SnapshotMode.Descriptor instead.
+func (SnapshotMode) EnumDescriptor() ([]byte, []int) {
+	return file_api_proto_v2_fastpath_proto_rawDescGZIP(), []int{10}
+}
+
 type NamespacedName struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Namespace     string                 `protobuf:"bytes,1,opt,name=namespace,proto3" json:"namespace,omitempty"`
@@ -3228,7 +3279,14 @@ type CreateSandboxSnapshotRequest struct {
 	TemplateName string `protobuf:"bytes,3,opt,name=template_name,json=templateName,proto3" json:"template_name,omitempty"`
 	// metadata is projected as sandbox.fast.io/<k> labels, mirroring
 	// CreateSandboxRequest.metadata.
-	Metadata      map[string]string `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Metadata map[string]string `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// mode selects what the snapshot persists. FULL (default, also when
+	// UNSPECIFIED) captures memory and device state; ROOT_FS_ONLY persists
+	// only the writable rootfs layer and consumers boot from disk.
+	// ROOT_FS_ONLY requires the OverlayBD artifact path: it is rejected with
+	// INVALID_ARGUMENT for a Sandbox that is not on the OCI path.
+	// Immutable per request_id.
+	Mode          SnapshotMode `protobuf:"varint,5,opt,name=mode,proto3,enum=fastpath.v2.SnapshotMode" json:"mode,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3291,6 +3349,13 @@ func (x *CreateSandboxSnapshotRequest) GetMetadata() map[string]string {
 	return nil
 }
 
+func (x *CreateSandboxSnapshotRequest) GetMode() SnapshotMode {
+	if x != nil {
+		return x.Mode
+	}
+	return SnapshotMode_SNAPSHOT_MODE_UNSPECIFIED
+}
+
 // SandboxSnapshotInfo is the observed state of one SandboxSnapshot.
 type SandboxSnapshotInfo struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -3316,7 +3381,11 @@ type SandboxSnapshotInfo struct {
 	CompletedUnixSeconds int64 `protobuf:"varint,12,opt,name=completed_unix_seconds,json=completedUnixSeconds,proto3" json:"completed_unix_seconds,omitempty"`
 	// snapshot_id is the random UUID assigned by Fastlet on admission. OCI
 	// publication uses it as the prefix of the rootfs and snapfiles tags.
-	SnapshotId    string `protobuf:"bytes,13,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	SnapshotId string `protobuf:"bytes,13,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	// mode reports the artifact class of the produced snapshot (the mode the
+	// Fastlet confirmed, not the raw request) so clients can tell Full and
+	// RootfsOnly snapshots apart.
+	Mode          SnapshotMode `protobuf:"varint,14,opt,name=mode,proto3,enum=fastpath.v2.SnapshotMode" json:"mode,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3440,6 +3509,13 @@ func (x *SandboxSnapshotInfo) GetSnapshotId() string {
 		return x.SnapshotId
 	}
 	return ""
+}
+
+func (x *SandboxSnapshotInfo) GetMode() SnapshotMode {
+	if x != nil {
+		return x.Mode
+	}
+	return SnapshotMode_SNAPSHOT_MODE_UNSPECIFIED
 }
 
 type CreateSandboxSnapshotResponse struct {
@@ -4340,16 +4416,17 @@ const file_api_proto_v2_fastpath_proto_rawDesc = "" +
 	"\x10ListPoolsRequest\x12\x1c\n" +
 	"\tnamespace\x18\x01 \x01(\tR\tnamespace\"@\n" +
 	"\x11ListPoolsResponse\x12+\n" +
-	"\x05items\x18\x01 \x03(\v2\x15.fastpath.v2.PoolInfoR\x05items\"\xad\x02\n" +
+	"\x05items\x18\x01 \x03(\v2\x15.fastpath.v2.PoolInfoR\x05items\"\xdc\x02\n" +
 	"\x1cCreateSandboxSnapshotRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x127\n" +
 	"\asandbox\x18\x02 \x01(\v2\x1d.fastpath.v2.SandboxReferenceR\asandbox\x12#\n" +
 	"\rtemplate_name\x18\x03 \x01(\tR\ftemplateName\x12S\n" +
-	"\bmetadata\x18\x04 \x03(\v27.fastpath.v2.CreateSandboxSnapshotRequest.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\x04 \x03(\v27.fastpath.v2.CreateSandboxSnapshotRequest.MetadataEntryR\bmetadata\x12-\n" +
+	"\x04mode\x18\x05 \x01(\x0e2\x19.fastpath.v2.SnapshotModeR\x04mode\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x9b\x04\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xca\x04\n" +
 	"\x13SandboxSnapshotInfo\x128\n" +
 	"\bidentity\x18\x01 \x01(\v2\x1c.fastpath.v2.SandboxIdentityR\bidentity\x12!\n" +
 	"\fsandbox_name\x18\x02 \x01(\tR\vsandboxName\x12\x1f\n" +
@@ -4367,7 +4444,8 @@ const file_api_proto_v2_fastpath_proto_rawDesc = "" +
 	"\x14created_unix_seconds\x18\v \x01(\x03R\x12createdUnixSeconds\x124\n" +
 	"\x16completed_unix_seconds\x18\f \x01(\x03R\x14completedUnixSeconds\x12\x1f\n" +
 	"\vsnapshot_id\x18\r \x01(\tR\n" +
-	"snapshotId\"]\n" +
+	"snapshotId\x12-\n" +
+	"\x04mode\x18\x0e \x01(\x0e2\x19.fastpath.v2.SnapshotModeR\x04mode\"]\n" +
 	"\x1dCreateSandboxSnapshotResponse\x12<\n" +
 	"\bsnapshot\x18\x01 \x01(\v2 .fastpath.v2.SandboxSnapshotInfoR\bsnapshot\"w\n" +
 	"\x19GetSandboxSnapshotRequest\x127\n" +
@@ -4469,7 +4547,11 @@ const file_api_proto_v2_fastpath_proto_rawDesc = "" +
 	"\x17SNAPSHOT_PHASE_CREATING\x10\x02\x12\x1d\n" +
 	"\x19SNAPSHOT_PHASE_PUBLISHING\x10\x03\x12\x1c\n" +
 	"\x18SNAPSHOT_PHASE_SUCCEEDED\x10\x04\x12\x19\n" +
-	"\x15SNAPSHOT_PHASE_FAILED\x10\x052\xe3\n" +
+	"\x15SNAPSHOT_PHASE_FAILED\x10\x05*d\n" +
+	"\fSnapshotMode\x12\x1d\n" +
+	"\x19SNAPSHOT_MODE_UNSPECIFIED\x10\x00\x12\x16\n" +
+	"\x12SNAPSHOT_MODE_FULL\x10\x01\x12\x1d\n" +
+	"\x19SNAPSHOT_MODE_ROOTFS_ONLY\x10\x022\xe3\n" +
 	"\n" +
 	"\x0fFastPathService\x12V\n" +
 	"\rCreateSandbox\x12!.fastpath.v2.CreateSandboxRequest\x1a\".fastpath.v2.CreateSandboxResponse\x12H\n" +
@@ -4501,7 +4583,7 @@ func file_api_proto_v2_fastpath_proto_rawDescGZIP() []byte {
 	return file_api_proto_v2_fastpath_proto_rawDescData
 }
 
-var file_api_proto_v2_fastpath_proto_enumTypes = make([]protoimpl.EnumInfo, 10)
+var file_api_proto_v2_fastpath_proto_enumTypes = make([]protoimpl.EnumInfo, 11)
 var file_api_proto_v2_fastpath_proto_msgTypes = make([]protoimpl.MessageInfo, 58)
 var file_api_proto_v2_fastpath_proto_goTypes = []any{
 	(FailurePolicy)(0),                    // 0: fastpath.v2.FailurePolicy
@@ -4514,164 +4596,167 @@ var file_api_proto_v2_fastpath_proto_goTypes = []any{
 	(EndpointAccessMode)(0),               // 7: fastpath.v2.EndpointAccessMode
 	(SandboxResourceMode)(0),              // 8: fastpath.v2.SandboxResourceMode
 	(SnapshotPhase)(0),                    // 9: fastpath.v2.SnapshotPhase
-	(*NamespacedName)(nil),                // 10: fastpath.v2.NamespacedName
-	(*SandboxReference)(nil),              // 11: fastpath.v2.SandboxReference
-	(*SandboxIdentity)(nil),               // 12: fastpath.v2.SandboxIdentity
-	(*RuntimeInfo)(nil),                   // 13: fastpath.v2.RuntimeInfo
-	(*DataPlaneInfo)(nil),                 // 14: fastpath.v2.DataPlaneInfo
-	(*InfraComponentInfo)(nil),            // 15: fastpath.v2.InfraComponentInfo
-	(*ActionBindingInfo)(nil),             // 16: fastpath.v2.ActionBindingInfo
-	(*SandboxInfo)(nil),                   // 17: fastpath.v2.SandboxInfo
-	(*CheckpointInfo)(nil),                // 18: fastpath.v2.CheckpointInfo
-	(*ActionBinding)(nil),                 // 19: fastpath.v2.ActionBinding
-	(*CreateSandboxRequest)(nil),          // 20: fastpath.v2.CreateSandboxRequest
-	(*CreateSandboxResponse)(nil),         // 21: fastpath.v2.CreateSandboxResponse
-	(*GetSandboxRequest)(nil),             // 22: fastpath.v2.GetSandboxRequest
-	(*GetSandboxResponse)(nil),            // 23: fastpath.v2.GetSandboxResponse
-	(*SandboxSummary)(nil),                // 24: fastpath.v2.SandboxSummary
-	(*ListSandboxesRequest)(nil),          // 25: fastpath.v2.ListSandboxesRequest
-	(*ListSandboxesResponse)(nil),         // 26: fastpath.v2.ListSandboxesResponse
-	(*DeleteRequest)(nil),                 // 27: fastpath.v2.DeleteRequest
-	(*DeleteResponse)(nil),                // 28: fastpath.v2.DeleteResponse
-	(*ReplaceActionBindings)(nil),         // 29: fastpath.v2.ReplaceActionBindings
-	(*UpdateSandboxRequest)(nil),          // 30: fastpath.v2.UpdateSandboxRequest
-	(*UpdateSandboxResponse)(nil),         // 31: fastpath.v2.UpdateSandboxResponse
-	(*SandboxDiagnosticsRequest)(nil),     // 32: fastpath.v2.SandboxDiagnosticsRequest
-	(*SandboxDiagnosticEvent)(nil),        // 33: fastpath.v2.SandboxDiagnosticEvent
-	(*SandboxDiagnosticsResponse)(nil),    // 34: fastpath.v2.SandboxDiagnosticsResponse
-	(*EndpointTarget)(nil),                // 35: fastpath.v2.EndpointTarget
-	(*ResolveEndpointRequest)(nil),        // 36: fastpath.v2.ResolveEndpointRequest
-	(*ResolvedEndpoint)(nil),              // 37: fastpath.v2.ResolvedEndpoint
-	(*ResolveEndpointResponse)(nil),       // 38: fastpath.v2.ResolveEndpointResponse
-	(*ComponentCapability)(nil),           // 39: fastpath.v2.ComponentCapability
-	(*WarmImageInfo)(nil),                 // 40: fastpath.v2.WarmImageInfo
-	(*ComputeResourceProfile)(nil),        // 41: fastpath.v2.ComputeResourceProfile
-	(*SandboxResourceRequirements)(nil),   // 42: fastpath.v2.SandboxResourceRequirements
-	(*SandboxResourceProfileInfo)(nil),    // 43: fastpath.v2.SandboxResourceProfileInfo
-	(*PoolInfo)(nil),                      // 44: fastpath.v2.PoolInfo
-	(*GetPoolRequest)(nil),                // 45: fastpath.v2.GetPoolRequest
-	(*ListPoolsRequest)(nil),              // 46: fastpath.v2.ListPoolsRequest
-	(*ListPoolsResponse)(nil),             // 47: fastpath.v2.ListPoolsResponse
-	(*CreateSandboxSnapshotRequest)(nil),  // 48: fastpath.v2.CreateSandboxSnapshotRequest
-	(*SandboxSnapshotInfo)(nil),           // 49: fastpath.v2.SandboxSnapshotInfo
-	(*CreateSandboxSnapshotResponse)(nil), // 50: fastpath.v2.CreateSandboxSnapshotResponse
-	(*GetSandboxSnapshotRequest)(nil),     // 51: fastpath.v2.GetSandboxSnapshotRequest
-	(*GetSandboxSnapshotResponse)(nil),    // 52: fastpath.v2.GetSandboxSnapshotResponse
-	(*DeleteSandboxSnapshotRequest)(nil),  // 53: fastpath.v2.DeleteSandboxSnapshotRequest
-	(*DeleteSandboxSnapshotResponse)(nil), // 54: fastpath.v2.DeleteSandboxSnapshotResponse
-	(*PauseSandboxRequest)(nil),           // 55: fastpath.v2.PauseSandboxRequest
-	(*PauseSandboxResponse)(nil),          // 56: fastpath.v2.PauseSandboxResponse
-	(*ResumeSandboxRequest)(nil),          // 57: fastpath.v2.ResumeSandboxRequest
-	(*ResumeSandboxResponse)(nil),         // 58: fastpath.v2.ResumeSandboxResponse
-	(*InvokeHandlerActionRequest)(nil),    // 59: fastpath.v2.InvokeHandlerActionRequest
-	(*HandlerActionResult)(nil),           // 60: fastpath.v2.HandlerActionResult
-	(*InvokeHandlerActionResponse)(nil),   // 61: fastpath.v2.InvokeHandlerActionResponse
-	nil,                                   // 62: fastpath.v2.CreateSandboxRequest.EnvsEntry
-	nil,                                   // 63: fastpath.v2.CreateSandboxRequest.MetadataEntry
-	nil,                                   // 64: fastpath.v2.ListSandboxesRequest.MetadataEntry
-	nil,                                   // 65: fastpath.v2.UpdateSandboxRequest.MetadataUpsertEntry
-	nil,                                   // 66: fastpath.v2.ResolveEndpointResponse.RequiredHeadersEntry
-	nil,                                   // 67: fastpath.v2.CreateSandboxSnapshotRequest.MetadataEntry
+	(SnapshotMode)(0),                     // 10: fastpath.v2.SnapshotMode
+	(*NamespacedName)(nil),                // 11: fastpath.v2.NamespacedName
+	(*SandboxReference)(nil),              // 12: fastpath.v2.SandboxReference
+	(*SandboxIdentity)(nil),               // 13: fastpath.v2.SandboxIdentity
+	(*RuntimeInfo)(nil),                   // 14: fastpath.v2.RuntimeInfo
+	(*DataPlaneInfo)(nil),                 // 15: fastpath.v2.DataPlaneInfo
+	(*InfraComponentInfo)(nil),            // 16: fastpath.v2.InfraComponentInfo
+	(*ActionBindingInfo)(nil),             // 17: fastpath.v2.ActionBindingInfo
+	(*SandboxInfo)(nil),                   // 18: fastpath.v2.SandboxInfo
+	(*CheckpointInfo)(nil),                // 19: fastpath.v2.CheckpointInfo
+	(*ActionBinding)(nil),                 // 20: fastpath.v2.ActionBinding
+	(*CreateSandboxRequest)(nil),          // 21: fastpath.v2.CreateSandboxRequest
+	(*CreateSandboxResponse)(nil),         // 22: fastpath.v2.CreateSandboxResponse
+	(*GetSandboxRequest)(nil),             // 23: fastpath.v2.GetSandboxRequest
+	(*GetSandboxResponse)(nil),            // 24: fastpath.v2.GetSandboxResponse
+	(*SandboxSummary)(nil),                // 25: fastpath.v2.SandboxSummary
+	(*ListSandboxesRequest)(nil),          // 26: fastpath.v2.ListSandboxesRequest
+	(*ListSandboxesResponse)(nil),         // 27: fastpath.v2.ListSandboxesResponse
+	(*DeleteRequest)(nil),                 // 28: fastpath.v2.DeleteRequest
+	(*DeleteResponse)(nil),                // 29: fastpath.v2.DeleteResponse
+	(*ReplaceActionBindings)(nil),         // 30: fastpath.v2.ReplaceActionBindings
+	(*UpdateSandboxRequest)(nil),          // 31: fastpath.v2.UpdateSandboxRequest
+	(*UpdateSandboxResponse)(nil),         // 32: fastpath.v2.UpdateSandboxResponse
+	(*SandboxDiagnosticsRequest)(nil),     // 33: fastpath.v2.SandboxDiagnosticsRequest
+	(*SandboxDiagnosticEvent)(nil),        // 34: fastpath.v2.SandboxDiagnosticEvent
+	(*SandboxDiagnosticsResponse)(nil),    // 35: fastpath.v2.SandboxDiagnosticsResponse
+	(*EndpointTarget)(nil),                // 36: fastpath.v2.EndpointTarget
+	(*ResolveEndpointRequest)(nil),        // 37: fastpath.v2.ResolveEndpointRequest
+	(*ResolvedEndpoint)(nil),              // 38: fastpath.v2.ResolvedEndpoint
+	(*ResolveEndpointResponse)(nil),       // 39: fastpath.v2.ResolveEndpointResponse
+	(*ComponentCapability)(nil),           // 40: fastpath.v2.ComponentCapability
+	(*WarmImageInfo)(nil),                 // 41: fastpath.v2.WarmImageInfo
+	(*ComputeResourceProfile)(nil),        // 42: fastpath.v2.ComputeResourceProfile
+	(*SandboxResourceRequirements)(nil),   // 43: fastpath.v2.SandboxResourceRequirements
+	(*SandboxResourceProfileInfo)(nil),    // 44: fastpath.v2.SandboxResourceProfileInfo
+	(*PoolInfo)(nil),                      // 45: fastpath.v2.PoolInfo
+	(*GetPoolRequest)(nil),                // 46: fastpath.v2.GetPoolRequest
+	(*ListPoolsRequest)(nil),              // 47: fastpath.v2.ListPoolsRequest
+	(*ListPoolsResponse)(nil),             // 48: fastpath.v2.ListPoolsResponse
+	(*CreateSandboxSnapshotRequest)(nil),  // 49: fastpath.v2.CreateSandboxSnapshotRequest
+	(*SandboxSnapshotInfo)(nil),           // 50: fastpath.v2.SandboxSnapshotInfo
+	(*CreateSandboxSnapshotResponse)(nil), // 51: fastpath.v2.CreateSandboxSnapshotResponse
+	(*GetSandboxSnapshotRequest)(nil),     // 52: fastpath.v2.GetSandboxSnapshotRequest
+	(*GetSandboxSnapshotResponse)(nil),    // 53: fastpath.v2.GetSandboxSnapshotResponse
+	(*DeleteSandboxSnapshotRequest)(nil),  // 54: fastpath.v2.DeleteSandboxSnapshotRequest
+	(*DeleteSandboxSnapshotResponse)(nil), // 55: fastpath.v2.DeleteSandboxSnapshotResponse
+	(*PauseSandboxRequest)(nil),           // 56: fastpath.v2.PauseSandboxRequest
+	(*PauseSandboxResponse)(nil),          // 57: fastpath.v2.PauseSandboxResponse
+	(*ResumeSandboxRequest)(nil),          // 58: fastpath.v2.ResumeSandboxRequest
+	(*ResumeSandboxResponse)(nil),         // 59: fastpath.v2.ResumeSandboxResponse
+	(*InvokeHandlerActionRequest)(nil),    // 60: fastpath.v2.InvokeHandlerActionRequest
+	(*HandlerActionResult)(nil),           // 61: fastpath.v2.HandlerActionResult
+	(*InvokeHandlerActionResponse)(nil),   // 62: fastpath.v2.InvokeHandlerActionResponse
+	nil,                                   // 63: fastpath.v2.CreateSandboxRequest.EnvsEntry
+	nil,                                   // 64: fastpath.v2.CreateSandboxRequest.MetadataEntry
+	nil,                                   // 65: fastpath.v2.ListSandboxesRequest.MetadataEntry
+	nil,                                   // 66: fastpath.v2.UpdateSandboxRequest.MetadataUpsertEntry
+	nil,                                   // 67: fastpath.v2.ResolveEndpointResponse.RequiredHeadersEntry
+	nil,                                   // 68: fastpath.v2.CreateSandboxSnapshotRequest.MetadataEntry
 }
 var file_api_proto_v2_fastpath_proto_depIdxs = []int32{
-	10, // 0: fastpath.v2.SandboxReference.namespaced_name:type_name -> fastpath.v2.NamespacedName
+	11, // 0: fastpath.v2.SandboxReference.namespaced_name:type_name -> fastpath.v2.NamespacedName
 	1,  // 1: fastpath.v2.RuntimeInfo.state:type_name -> fastpath.v2.RuntimeState
 	3,  // 2: fastpath.v2.DataPlaneInfo.state:type_name -> fastpath.v2.DataPlaneState
 	4,  // 3: fastpath.v2.InfraComponentInfo.state:type_name -> fastpath.v2.InfraComponentState
 	5,  // 4: fastpath.v2.ActionBindingInfo.state:type_name -> fastpath.v2.ActionState
-	12, // 5: fastpath.v2.SandboxInfo.identity:type_name -> fastpath.v2.SandboxIdentity
-	13, // 6: fastpath.v2.SandboxInfo.runtime:type_name -> fastpath.v2.RuntimeInfo
-	14, // 7: fastpath.v2.SandboxInfo.data_plane:type_name -> fastpath.v2.DataPlaneInfo
-	15, // 8: fastpath.v2.SandboxInfo.infra_components:type_name -> fastpath.v2.InfraComponentInfo
-	16, // 9: fastpath.v2.SandboxInfo.action_bindings:type_name -> fastpath.v2.ActionBindingInfo
+	13, // 5: fastpath.v2.SandboxInfo.identity:type_name -> fastpath.v2.SandboxIdentity
+	14, // 6: fastpath.v2.SandboxInfo.runtime:type_name -> fastpath.v2.RuntimeInfo
+	15, // 7: fastpath.v2.SandboxInfo.data_plane:type_name -> fastpath.v2.DataPlaneInfo
+	16, // 8: fastpath.v2.SandboxInfo.infra_components:type_name -> fastpath.v2.InfraComponentInfo
+	17, // 9: fastpath.v2.SandboxInfo.action_bindings:type_name -> fastpath.v2.ActionBindingInfo
 	2,  // 10: fastpath.v2.SandboxInfo.state:type_name -> fastpath.v2.SandboxState
-	18, // 11: fastpath.v2.SandboxInfo.checkpoint:type_name -> fastpath.v2.CheckpointInfo
-	42, // 12: fastpath.v2.SandboxInfo.resources:type_name -> fastpath.v2.SandboxResourceRequirements
-	62, // 13: fastpath.v2.CreateSandboxRequest.envs:type_name -> fastpath.v2.CreateSandboxRequest.EnvsEntry
-	63, // 14: fastpath.v2.CreateSandboxRequest.metadata:type_name -> fastpath.v2.CreateSandboxRequest.MetadataEntry
+	19, // 11: fastpath.v2.SandboxInfo.checkpoint:type_name -> fastpath.v2.CheckpointInfo
+	43, // 12: fastpath.v2.SandboxInfo.resources:type_name -> fastpath.v2.SandboxResourceRequirements
+	63, // 13: fastpath.v2.CreateSandboxRequest.envs:type_name -> fastpath.v2.CreateSandboxRequest.EnvsEntry
+	64, // 14: fastpath.v2.CreateSandboxRequest.metadata:type_name -> fastpath.v2.CreateSandboxRequest.MetadataEntry
 	0,  // 15: fastpath.v2.CreateSandboxRequest.failure_policy:type_name -> fastpath.v2.FailurePolicy
-	19, // 16: fastpath.v2.CreateSandboxRequest.action_bindings:type_name -> fastpath.v2.ActionBinding
+	20, // 16: fastpath.v2.CreateSandboxRequest.action_bindings:type_name -> fastpath.v2.ActionBinding
 	6,  // 17: fastpath.v2.CreateSandboxRequest.completion:type_name -> fastpath.v2.CreateCompletion
-	42, // 18: fastpath.v2.CreateSandboxRequest.resources:type_name -> fastpath.v2.SandboxResourceRequirements
-	17, // 19: fastpath.v2.CreateSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
+	43, // 18: fastpath.v2.CreateSandboxRequest.resources:type_name -> fastpath.v2.SandboxResourceRequirements
+	18, // 19: fastpath.v2.CreateSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
 	6,  // 20: fastpath.v2.CreateSandboxResponse.completion:type_name -> fastpath.v2.CreateCompletion
-	11, // 21: fastpath.v2.GetSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
-	17, // 22: fastpath.v2.GetSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
-	12, // 23: fastpath.v2.SandboxSummary.identity:type_name -> fastpath.v2.SandboxIdentity
-	64, // 24: fastpath.v2.ListSandboxesRequest.metadata:type_name -> fastpath.v2.ListSandboxesRequest.MetadataEntry
-	24, // 25: fastpath.v2.ListSandboxesResponse.items:type_name -> fastpath.v2.SandboxSummary
-	11, // 26: fastpath.v2.DeleteRequest.sandbox:type_name -> fastpath.v2.SandboxReference
-	19, // 27: fastpath.v2.ReplaceActionBindings.items:type_name -> fastpath.v2.ActionBinding
-	11, // 28: fastpath.v2.UpdateSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	12, // 21: fastpath.v2.GetSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	18, // 22: fastpath.v2.GetSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
+	13, // 23: fastpath.v2.SandboxSummary.identity:type_name -> fastpath.v2.SandboxIdentity
+	65, // 24: fastpath.v2.ListSandboxesRequest.metadata:type_name -> fastpath.v2.ListSandboxesRequest.MetadataEntry
+	25, // 25: fastpath.v2.ListSandboxesResponse.items:type_name -> fastpath.v2.SandboxSummary
+	12, // 26: fastpath.v2.DeleteRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	20, // 27: fastpath.v2.ReplaceActionBindings.items:type_name -> fastpath.v2.ActionBinding
+	12, // 28: fastpath.v2.UpdateSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
 	0,  // 29: fastpath.v2.UpdateSandboxRequest.failure_policy:type_name -> fastpath.v2.FailurePolicy
-	29, // 30: fastpath.v2.UpdateSandboxRequest.action_bindings:type_name -> fastpath.v2.ReplaceActionBindings
-	65, // 31: fastpath.v2.UpdateSandboxRequest.metadata_upsert:type_name -> fastpath.v2.UpdateSandboxRequest.MetadataUpsertEntry
-	12, // 32: fastpath.v2.UpdateSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxIdentity
-	17, // 33: fastpath.v2.SandboxDiagnosticsResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
-	33, // 34: fastpath.v2.SandboxDiagnosticsResponse.events:type_name -> fastpath.v2.SandboxDiagnosticEvent
-	11, // 35: fastpath.v2.ResolveEndpointRequest.sandbox:type_name -> fastpath.v2.SandboxReference
-	35, // 36: fastpath.v2.ResolveEndpointRequest.target:type_name -> fastpath.v2.EndpointTarget
+	30, // 30: fastpath.v2.UpdateSandboxRequest.action_bindings:type_name -> fastpath.v2.ReplaceActionBindings
+	66, // 31: fastpath.v2.UpdateSandboxRequest.metadata_upsert:type_name -> fastpath.v2.UpdateSandboxRequest.MetadataUpsertEntry
+	13, // 32: fastpath.v2.UpdateSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxIdentity
+	18, // 33: fastpath.v2.SandboxDiagnosticsResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
+	34, // 34: fastpath.v2.SandboxDiagnosticsResponse.events:type_name -> fastpath.v2.SandboxDiagnosticEvent
+	12, // 35: fastpath.v2.ResolveEndpointRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	36, // 36: fastpath.v2.ResolveEndpointRequest.target:type_name -> fastpath.v2.EndpointTarget
 	7,  // 37: fastpath.v2.ResolveEndpointRequest.access_mode:type_name -> fastpath.v2.EndpointAccessMode
-	37, // 38: fastpath.v2.ResolveEndpointResponse.endpoint:type_name -> fastpath.v2.ResolvedEndpoint
-	66, // 39: fastpath.v2.ResolveEndpointResponse.required_headers:type_name -> fastpath.v2.ResolveEndpointResponse.RequiredHeadersEntry
-	41, // 40: fastpath.v2.SandboxResourceRequirements.limits:type_name -> fastpath.v2.ComputeResourceProfile
+	38, // 38: fastpath.v2.ResolveEndpointResponse.endpoint:type_name -> fastpath.v2.ResolvedEndpoint
+	67, // 39: fastpath.v2.ResolveEndpointResponse.required_headers:type_name -> fastpath.v2.ResolveEndpointResponse.RequiredHeadersEntry
+	42, // 40: fastpath.v2.SandboxResourceRequirements.limits:type_name -> fastpath.v2.ComputeResourceProfile
 	8,  // 41: fastpath.v2.SandboxResourceProfileInfo.mode:type_name -> fastpath.v2.SandboxResourceMode
-	41, // 42: fastpath.v2.SandboxResourceProfileInfo.requests:type_name -> fastpath.v2.ComputeResourceProfile
-	41, // 43: fastpath.v2.SandboxResourceProfileInfo.limits:type_name -> fastpath.v2.ComputeResourceProfile
-	41, // 44: fastpath.v2.SandboxResourceProfileInfo.overcommit_ratio:type_name -> fastpath.v2.ComputeResourceProfile
-	39, // 45: fastpath.v2.PoolInfo.components:type_name -> fastpath.v2.ComponentCapability
-	40, // 46: fastpath.v2.PoolInfo.warm_images:type_name -> fastpath.v2.WarmImageInfo
-	43, // 47: fastpath.v2.PoolInfo.sandbox_resource_profile:type_name -> fastpath.v2.SandboxResourceProfileInfo
-	44, // 48: fastpath.v2.ListPoolsResponse.items:type_name -> fastpath.v2.PoolInfo
-	11, // 49: fastpath.v2.CreateSandboxSnapshotRequest.sandbox:type_name -> fastpath.v2.SandboxReference
-	67, // 50: fastpath.v2.CreateSandboxSnapshotRequest.metadata:type_name -> fastpath.v2.CreateSandboxSnapshotRequest.MetadataEntry
-	12, // 51: fastpath.v2.SandboxSnapshotInfo.identity:type_name -> fastpath.v2.SandboxIdentity
-	9,  // 52: fastpath.v2.SandboxSnapshotInfo.phase:type_name -> fastpath.v2.SnapshotPhase
-	49, // 53: fastpath.v2.CreateSandboxSnapshotResponse.snapshot:type_name -> fastpath.v2.SandboxSnapshotInfo
-	10, // 54: fastpath.v2.GetSandboxSnapshotRequest.snapshot:type_name -> fastpath.v2.NamespacedName
-	49, // 55: fastpath.v2.GetSandboxSnapshotResponse.snapshot:type_name -> fastpath.v2.SandboxSnapshotInfo
-	11, // 56: fastpath.v2.DeleteSandboxSnapshotRequest.snapshot:type_name -> fastpath.v2.SandboxReference
-	11, // 57: fastpath.v2.PauseSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
-	17, // 58: fastpath.v2.PauseSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
-	11, // 59: fastpath.v2.ResumeSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
-	17, // 60: fastpath.v2.ResumeSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
-	11, // 61: fastpath.v2.InvokeHandlerActionRequest.sandbox:type_name -> fastpath.v2.SandboxReference
-	60, // 62: fastpath.v2.InvokeHandlerActionResponse.result:type_name -> fastpath.v2.HandlerActionResult
-	20, // 63: fastpath.v2.FastPathService.CreateSandbox:input_type -> fastpath.v2.CreateSandboxRequest
-	27, // 64: fastpath.v2.FastPathService.DeleteSandbox:input_type -> fastpath.v2.DeleteRequest
-	30, // 65: fastpath.v2.FastPathService.UpdateSandbox:input_type -> fastpath.v2.UpdateSandboxRequest
-	25, // 66: fastpath.v2.FastPathService.ListSandboxes:input_type -> fastpath.v2.ListSandboxesRequest
-	22, // 67: fastpath.v2.FastPathService.GetSandbox:input_type -> fastpath.v2.GetSandboxRequest
-	32, // 68: fastpath.v2.FastPathService.GetSandboxDiagnostics:input_type -> fastpath.v2.SandboxDiagnosticsRequest
-	36, // 69: fastpath.v2.FastPathService.ResolveEndpoint:input_type -> fastpath.v2.ResolveEndpointRequest
-	45, // 70: fastpath.v2.FastPathService.GetPool:input_type -> fastpath.v2.GetPoolRequest
-	46, // 71: fastpath.v2.FastPathService.ListPools:input_type -> fastpath.v2.ListPoolsRequest
-	48, // 72: fastpath.v2.FastPathService.CreateSandboxSnapshot:input_type -> fastpath.v2.CreateSandboxSnapshotRequest
-	51, // 73: fastpath.v2.FastPathService.GetSandboxSnapshot:input_type -> fastpath.v2.GetSandboxSnapshotRequest
-	53, // 74: fastpath.v2.FastPathService.DeleteSandboxSnapshot:input_type -> fastpath.v2.DeleteSandboxSnapshotRequest
-	55, // 75: fastpath.v2.FastPathService.PauseSandbox:input_type -> fastpath.v2.PauseSandboxRequest
-	57, // 76: fastpath.v2.FastPathService.ResumeSandbox:input_type -> fastpath.v2.ResumeSandboxRequest
-	59, // 77: fastpath.v2.FastPathService.InvokeHandlerAction:input_type -> fastpath.v2.InvokeHandlerActionRequest
-	21, // 78: fastpath.v2.FastPathService.CreateSandbox:output_type -> fastpath.v2.CreateSandboxResponse
-	28, // 79: fastpath.v2.FastPathService.DeleteSandbox:output_type -> fastpath.v2.DeleteResponse
-	31, // 80: fastpath.v2.FastPathService.UpdateSandbox:output_type -> fastpath.v2.UpdateSandboxResponse
-	26, // 81: fastpath.v2.FastPathService.ListSandboxes:output_type -> fastpath.v2.ListSandboxesResponse
-	23, // 82: fastpath.v2.FastPathService.GetSandbox:output_type -> fastpath.v2.GetSandboxResponse
-	34, // 83: fastpath.v2.FastPathService.GetSandboxDiagnostics:output_type -> fastpath.v2.SandboxDiagnosticsResponse
-	38, // 84: fastpath.v2.FastPathService.ResolveEndpoint:output_type -> fastpath.v2.ResolveEndpointResponse
-	44, // 85: fastpath.v2.FastPathService.GetPool:output_type -> fastpath.v2.PoolInfo
-	47, // 86: fastpath.v2.FastPathService.ListPools:output_type -> fastpath.v2.ListPoolsResponse
-	50, // 87: fastpath.v2.FastPathService.CreateSandboxSnapshot:output_type -> fastpath.v2.CreateSandboxSnapshotResponse
-	52, // 88: fastpath.v2.FastPathService.GetSandboxSnapshot:output_type -> fastpath.v2.GetSandboxSnapshotResponse
-	54, // 89: fastpath.v2.FastPathService.DeleteSandboxSnapshot:output_type -> fastpath.v2.DeleteSandboxSnapshotResponse
-	56, // 90: fastpath.v2.FastPathService.PauseSandbox:output_type -> fastpath.v2.PauseSandboxResponse
-	58, // 91: fastpath.v2.FastPathService.ResumeSandbox:output_type -> fastpath.v2.ResumeSandboxResponse
-	61, // 92: fastpath.v2.FastPathService.InvokeHandlerAction:output_type -> fastpath.v2.InvokeHandlerActionResponse
-	78, // [78:93] is the sub-list for method output_type
-	63, // [63:78] is the sub-list for method input_type
-	63, // [63:63] is the sub-list for extension type_name
-	63, // [63:63] is the sub-list for extension extendee
-	0,  // [0:63] is the sub-list for field type_name
+	42, // 42: fastpath.v2.SandboxResourceProfileInfo.requests:type_name -> fastpath.v2.ComputeResourceProfile
+	42, // 43: fastpath.v2.SandboxResourceProfileInfo.limits:type_name -> fastpath.v2.ComputeResourceProfile
+	42, // 44: fastpath.v2.SandboxResourceProfileInfo.overcommit_ratio:type_name -> fastpath.v2.ComputeResourceProfile
+	40, // 45: fastpath.v2.PoolInfo.components:type_name -> fastpath.v2.ComponentCapability
+	41, // 46: fastpath.v2.PoolInfo.warm_images:type_name -> fastpath.v2.WarmImageInfo
+	44, // 47: fastpath.v2.PoolInfo.sandbox_resource_profile:type_name -> fastpath.v2.SandboxResourceProfileInfo
+	45, // 48: fastpath.v2.ListPoolsResponse.items:type_name -> fastpath.v2.PoolInfo
+	12, // 49: fastpath.v2.CreateSandboxSnapshotRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	68, // 50: fastpath.v2.CreateSandboxSnapshotRequest.metadata:type_name -> fastpath.v2.CreateSandboxSnapshotRequest.MetadataEntry
+	10, // 51: fastpath.v2.CreateSandboxSnapshotRequest.mode:type_name -> fastpath.v2.SnapshotMode
+	13, // 52: fastpath.v2.SandboxSnapshotInfo.identity:type_name -> fastpath.v2.SandboxIdentity
+	9,  // 53: fastpath.v2.SandboxSnapshotInfo.phase:type_name -> fastpath.v2.SnapshotPhase
+	10, // 54: fastpath.v2.SandboxSnapshotInfo.mode:type_name -> fastpath.v2.SnapshotMode
+	50, // 55: fastpath.v2.CreateSandboxSnapshotResponse.snapshot:type_name -> fastpath.v2.SandboxSnapshotInfo
+	11, // 56: fastpath.v2.GetSandboxSnapshotRequest.snapshot:type_name -> fastpath.v2.NamespacedName
+	50, // 57: fastpath.v2.GetSandboxSnapshotResponse.snapshot:type_name -> fastpath.v2.SandboxSnapshotInfo
+	12, // 58: fastpath.v2.DeleteSandboxSnapshotRequest.snapshot:type_name -> fastpath.v2.SandboxReference
+	12, // 59: fastpath.v2.PauseSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	18, // 60: fastpath.v2.PauseSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
+	12, // 61: fastpath.v2.ResumeSandboxRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	18, // 62: fastpath.v2.ResumeSandboxResponse.sandbox:type_name -> fastpath.v2.SandboxInfo
+	12, // 63: fastpath.v2.InvokeHandlerActionRequest.sandbox:type_name -> fastpath.v2.SandboxReference
+	61, // 64: fastpath.v2.InvokeHandlerActionResponse.result:type_name -> fastpath.v2.HandlerActionResult
+	21, // 65: fastpath.v2.FastPathService.CreateSandbox:input_type -> fastpath.v2.CreateSandboxRequest
+	28, // 66: fastpath.v2.FastPathService.DeleteSandbox:input_type -> fastpath.v2.DeleteRequest
+	31, // 67: fastpath.v2.FastPathService.UpdateSandbox:input_type -> fastpath.v2.UpdateSandboxRequest
+	26, // 68: fastpath.v2.FastPathService.ListSandboxes:input_type -> fastpath.v2.ListSandboxesRequest
+	23, // 69: fastpath.v2.FastPathService.GetSandbox:input_type -> fastpath.v2.GetSandboxRequest
+	33, // 70: fastpath.v2.FastPathService.GetSandboxDiagnostics:input_type -> fastpath.v2.SandboxDiagnosticsRequest
+	37, // 71: fastpath.v2.FastPathService.ResolveEndpoint:input_type -> fastpath.v2.ResolveEndpointRequest
+	46, // 72: fastpath.v2.FastPathService.GetPool:input_type -> fastpath.v2.GetPoolRequest
+	47, // 73: fastpath.v2.FastPathService.ListPools:input_type -> fastpath.v2.ListPoolsRequest
+	49, // 74: fastpath.v2.FastPathService.CreateSandboxSnapshot:input_type -> fastpath.v2.CreateSandboxSnapshotRequest
+	52, // 75: fastpath.v2.FastPathService.GetSandboxSnapshot:input_type -> fastpath.v2.GetSandboxSnapshotRequest
+	54, // 76: fastpath.v2.FastPathService.DeleteSandboxSnapshot:input_type -> fastpath.v2.DeleteSandboxSnapshotRequest
+	56, // 77: fastpath.v2.FastPathService.PauseSandbox:input_type -> fastpath.v2.PauseSandboxRequest
+	58, // 78: fastpath.v2.FastPathService.ResumeSandbox:input_type -> fastpath.v2.ResumeSandboxRequest
+	60, // 79: fastpath.v2.FastPathService.InvokeHandlerAction:input_type -> fastpath.v2.InvokeHandlerActionRequest
+	22, // 80: fastpath.v2.FastPathService.CreateSandbox:output_type -> fastpath.v2.CreateSandboxResponse
+	29, // 81: fastpath.v2.FastPathService.DeleteSandbox:output_type -> fastpath.v2.DeleteResponse
+	32, // 82: fastpath.v2.FastPathService.UpdateSandbox:output_type -> fastpath.v2.UpdateSandboxResponse
+	27, // 83: fastpath.v2.FastPathService.ListSandboxes:output_type -> fastpath.v2.ListSandboxesResponse
+	24, // 84: fastpath.v2.FastPathService.GetSandbox:output_type -> fastpath.v2.GetSandboxResponse
+	35, // 85: fastpath.v2.FastPathService.GetSandboxDiagnostics:output_type -> fastpath.v2.SandboxDiagnosticsResponse
+	39, // 86: fastpath.v2.FastPathService.ResolveEndpoint:output_type -> fastpath.v2.ResolveEndpointResponse
+	45, // 87: fastpath.v2.FastPathService.GetPool:output_type -> fastpath.v2.PoolInfo
+	48, // 88: fastpath.v2.FastPathService.ListPools:output_type -> fastpath.v2.ListPoolsResponse
+	51, // 89: fastpath.v2.FastPathService.CreateSandboxSnapshot:output_type -> fastpath.v2.CreateSandboxSnapshotResponse
+	53, // 90: fastpath.v2.FastPathService.GetSandboxSnapshot:output_type -> fastpath.v2.GetSandboxSnapshotResponse
+	55, // 91: fastpath.v2.FastPathService.DeleteSandboxSnapshot:output_type -> fastpath.v2.DeleteSandboxSnapshotResponse
+	57, // 92: fastpath.v2.FastPathService.PauseSandbox:output_type -> fastpath.v2.PauseSandboxResponse
+	59, // 93: fastpath.v2.FastPathService.ResumeSandbox:output_type -> fastpath.v2.ResumeSandboxResponse
+	62, // 94: fastpath.v2.FastPathService.InvokeHandlerAction:output_type -> fastpath.v2.InvokeHandlerActionResponse
+	80, // [80:95] is the sub-list for method output_type
+	65, // [65:80] is the sub-list for method input_type
+	65, // [65:65] is the sub-list for extension type_name
+	65, // [65:65] is the sub-list for extension extendee
+	0,  // [0:65] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_v2_fastpath_proto_init() }
@@ -4695,7 +4780,7 @@ func file_api_proto_v2_fastpath_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_v2_fastpath_proto_rawDesc), len(file_api_proto_v2_fastpath_proto_rawDesc)),
-			NumEnums:      10,
+			NumEnums:      11,
 			NumMessages:   58,
 			NumExtensions: 0,
 			NumServices:   1,

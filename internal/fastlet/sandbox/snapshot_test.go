@@ -50,6 +50,8 @@ func (r *snapshotRuntime) CreateSnapshot(_ context.Context, input *RuntimeSnapsh
 	return &SnapshotResult{
 		SnapshotID: input.SnapshotID, ManifestRef: "s3://bucket/publish/" + input.SnapshotID[:8] + "/manifest.json",
 		ArtifactDigest: "digest-" + input.SnapshotID, SizeBytes: 1234,
+		// A mode-aware runtime reports the artifact class it produced.
+		Mode: fastletapi.NormalizeSnapshotMode(input.Mode),
 	}, nil
 }
 
@@ -391,4 +393,73 @@ func TestCreateOCITemplateSnapshotUsesIndependentUUIDsWithoutNameFence(t *testin
 	manager.mu.RLock()
 	defer manager.mu.RUnlock()
 	require.Equal(t, sandboxStateRunning, manager.sandboxes["uid-a"].Phase)
+}
+
+func TestSnapshotTaskStatusEchoesMode(t *testing.T) {
+	// In flight, the status reports the admitted mode...
+	task := &snapshotTask{mode: fastletapi.SnapshotModeRootfsOnly, phase: fastletapi.SnapshotPhaseCreating}
+	require.Equal(t, fastletapi.SnapshotModeRootfsOnly, task.status().Mode)
+	// ...and once terminal, the produced artifact's class from the result.
+	task.result = &SnapshotResult{Mode: fastletapi.SnapshotModeRootfsOnly}
+	require.Equal(t, fastletapi.SnapshotModeRootfsOnly, task.status().Mode)
+	// A result without a mode report falls back to the admitted mode.
+	task.result = &SnapshotResult{}
+	require.Equal(t, fastletapi.SnapshotModeRootfsOnly, task.status().Mode)
+	// A legacy Full task normalizes an absent mode.
+	legacy := &snapshotTask{phase: fastletapi.SnapshotPhasePending}
+	require.Equal(t, fastletapi.SnapshotModeFull, legacy.status().Mode)
+}
+
+// modeBlindRuntime strips the produced-mode report, emulating a runtime
+// that predates the mode contract.
+type modeBlindRuntime struct{ *snapshotRuntime }
+
+func (r *modeBlindRuntime) CreateSnapshot(ctx context.Context, input *RuntimeSnapshotInput) (*SnapshotResult, error) {
+	result, err := r.snapshotRuntime.CreateSnapshot(ctx, input)
+	if result != nil {
+		result.Mode = ""
+	}
+	return result, err
+}
+
+func TestSnapshotWorkerFailsClosedOnProducedModeDrift(t *testing.T) {
+	runtime := &modeBlindRuntime{snapshotRuntime: newSnapshotRuntime()}
+	manager := newSnapshotManager(t, runtime)
+	manager.sandboxes["uid-a"].Config.Desired.Image = "oci://r.example/ns/template:base"
+	request := snapshotRequest("snap-drift")
+	request.Snapshot.Mode = fastletapi.SnapshotModeRootfsOnly
+	request.Snapshot.TemplateName = ""
+	_, err := manager.CreateSnapshot(t.Context(), request)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		inspected, inspectErr := manager.InspectSnapshot(&fastletapi.InspectSnapshotRequest{Identity: snapshotIdentityFor("snap-drift")})
+		return inspectErr == nil && inspected.Snapshot.Phase == fastletapi.SnapshotPhaseFailed
+	}, 2*time.Second, 10*time.Millisecond)
+	inspected, err := manager.InspectSnapshot(&fastletapi.InspectSnapshotRequest{Identity: snapshotIdentityFor("snap-drift")})
+	require.NoError(t, err)
+	require.Equal(t, "SnapshotModeDrift", inspected.Snapshot.Reason)
+	require.Contains(t, inspected.Snapshot.Message, "admitted mode")
+	// The artifact was already published when the drift was detected: the
+	// reference stays on the task so deleting the object can clean up the
+	// remote set instead of orphaning it.
+	require.NotEmpty(t, inspected.Snapshot.ManifestRef, "the drifted artifact reference must be retained for cleanup")
+	require.NotEmpty(t, inspected.Snapshot.ArtifactDigest)
+	// The task itself never reports success.
+	require.Equal(t, fastletapi.SnapshotPhaseFailed, inspected.Snapshot.Phase)
+}
+
+// capableSnapshotRuntime advertises the rootfs-only capture branch.
+type capableSnapshotRuntime struct{ *snapshotRuntime }
+
+func (capableSnapshotRuntime) SupportsRootfsOnlySnapshots() bool { return true }
+
+func TestSnapshotCapabilitiesFollowRuntimeSupport(t *testing.T) {
+	// A runtime without the Snapshotter extension reports nothing.
+	require.Empty(t, newSnapshotManager(t, newAdmissionRuntime()).SnapshotCapabilities())
+	// A mode-aware snapshotter that did not implement the capability probe
+	// reports nothing (fail closed for version skew).
+	require.Empty(t, newSnapshotManager(t, newSnapshotRuntime()).SnapshotCapabilities())
+	// A runtime with the rootfs-only branch advertises exactly that.
+	require.Equal(t, []string{fastletapi.CapabilityRootfsOnlySnapshots},
+		newSnapshotManager(t, &capableSnapshotRuntime{snapshotRuntime: newSnapshotRuntime()}).SnapshotCapabilities())
 }

@@ -43,18 +43,59 @@ func validateTemplateName(name string) error {
 	return nil
 }
 
+// validateSnapshotMode accepts the defined proto enum values only. proto3
+// preserves unrecognized enum numbers, so an out-of-band value must be
+// rejected before it reaches the hash or the persisted intent.
+func validateSnapshotMode(mode fastpathv2.SnapshotMode) error {
+	switch mode {
+	case fastpathv2.SnapshotMode_SNAPSHOT_MODE_UNSPECIFIED,
+		fastpathv2.SnapshotMode_SNAPSHOT_MODE_FULL,
+		fastpathv2.SnapshotMode_SNAPSHOT_MODE_ROOTFS_ONLY:
+		return nil
+	default:
+		return fmt.Errorf("unknown snapshot mode %d", int32(mode))
+	}
+}
+
+// snapshotSpecMode resolves the proto mode onto the CRD spec value: only
+// ROOT_FS_ONLY changes the persisted intent; UNSPECIFIED and FULL both mean
+// Full.
+func snapshotSpecMode(mode fastpathv2.SnapshotMode) apiv1alpha2.SandboxSnapshotMode {
+	if mode == fastpathv2.SnapshotMode_SNAPSHOT_MODE_ROOTFS_ONLY {
+		return apiv1alpha2.SandboxSnapshotModeRootfsOnly
+	}
+	return apiv1alpha2.SandboxSnapshotModeFull
+}
+
+// protoSnapshotMode maps the CRD mode back onto the proto enum. The status
+// mode is the fastlet-confirmed artifact class; an absent value is a legacy
+// Full snapshot.
+func protoSnapshotMode(mode apiv1alpha2.SandboxSnapshotMode) fastpathv2.SnapshotMode {
+	if apiv1alpha2.NormalizeSandboxSnapshotMode(mode) == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+		return fastpathv2.SnapshotMode_SNAPSHOT_MODE_ROOTFS_ONLY
+	}
+	return fastpathv2.SnapshotMode_SNAPSHOT_MODE_FULL
+}
+
 // SnapshotSpecHash returns a deterministic digest of the immutable snapshot
 // intent. The transport-only request_id is excluded from the identity. The
 // caller must have normalized the namespace (CreateSandboxSnapshot rewrites
 // an omitted namespace to the server default before hashing, mirroring
 // CreateSandbox), so an omitted-namespace request and its explicit replay
-// hash identically.
+// hash identically. Mode is normalized the same way: UNSPECIFIED (absent)
+// and explicit FULL are the same effective intent, so both collapse to
+// UNSPECIFIED before hashing — the field is then omitted from the
+// marshaled bytes and every Full request, including replays of pre-mode
+// requests, keeps its historical hash.
 func SnapshotSpecHash(request *fastpathv2.CreateSandboxSnapshotRequest) (string, error) {
 	if request == nil {
 		return "", errors.New("snapshot request is required")
 	}
 	normalized := proto.Clone(request).(*fastpathv2.CreateSandboxSnapshotRequest)
 	normalized.RequestId = ""
+	if normalized.Mode == fastpathv2.SnapshotMode_SNAPSHOT_MODE_FULL {
+		normalized.Mode = fastpathv2.SnapshotMode_SNAPSHOT_MODE_UNSPECIFIED
+	}
 	payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(normalized)
 	if err != nil {
 		return "", err
@@ -79,6 +120,7 @@ func snapshotFromCreateRequest(request *fastpathv2.CreateSandboxSnapshotRequest,
 				Name: sandbox.Name, Namespace: sandbox.Namespace, UID: sandbox.UID,
 			},
 			TemplateName: request.TemplateName,
+			Mode:         snapshotSpecMode(request.Mode),
 		},
 	}
 }
@@ -95,6 +137,9 @@ func (s *Server) CreateSandboxSnapshot(ctx context.Context, request *fastpathv2.
 			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
 	}
+	if err := validateSnapshotMode(request.Mode); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 	if err := validateMetadata(request.Metadata); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -110,6 +155,12 @@ func (s *Server) CreateSandboxSnapshot(ctx context.Context, request *fastpathv2.
 	}
 	if request.TemplateName == "" && !strings.HasPrefix(sandbox.Spec.Image, ocitemplate.Prefix) {
 		return nil, status.Error(codes.InvalidArgument, "template_name is required for a native snapshot")
+	}
+	// Rootfs-only artifacts need the OverlayBD path: reject before any
+	// intent is persisted, matching the fail-fast style of the checks
+	// above. The Fastlet re-checks the effective source authoritatively.
+	if request.Mode == fastpathv2.SnapshotMode_SNAPSHOT_MODE_ROOTFS_ONLY && !strings.HasPrefix(sandbox.Spec.Image, ocitemplate.Prefix) {
+		return nil, status.Error(codes.InvalidArgument, "mode ROOT_FS_ONLY requires a Sandbox on the OCI artifact path")
 	}
 	ctx = observability.WithIdentity(ctx, observability.Identity{
 		RequestID: request.RequestId, Namespace: sandbox.Namespace, SandboxName: sandbox.Name, SandboxUID: string(sandbox.UID),
@@ -251,7 +302,7 @@ func (s *Server) triggerSnapshot(ctx context.Context, snapshot *apiv1alpha2.Sand
 			}
 		}
 		if observed != nil {
-			orchestration.ProjectSnapshotStatus(status, observed)
+			orchestration.ProjectSnapshotStatus(status, snapshot.Spec.Mode, observed)
 		} else if status.Phase == "" {
 			status.Phase = apiv1alpha2.SandboxSnapshotPhasePending
 			status.Message = "SandboxSnapshot intent is persisted and will be triggered by the Controller"
@@ -410,6 +461,7 @@ func snapshotInfo(snapshot *apiv1alpha2.SandboxSnapshot) *fastpathv2.SandboxSnap
 		SandboxName:    snapshot.Spec.SandboxRef.Name,
 		SandboxUid:     string(snapshot.Spec.SandboxRef.UID),
 		TemplateName:   snapshot.Spec.TemplateName,
+		Mode:           protoSnapshotMode(snapshot.Status.Mode),
 		Phase:          protoSnapshotPhase(snapshot.Status.Phase),
 		Message:        snapshot.Status.Message,
 		FastletName:    snapshot.Status.FastletName,
