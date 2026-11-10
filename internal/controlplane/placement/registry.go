@@ -67,10 +67,15 @@ type FastletInfo struct {
 	PreparedArtifacts   []string
 	RegistryRevision    string
 	WarmImages          []fastletapi.WarmImageState
-	PodReady            bool
-	RuntimeReady        bool
-	DrainRequested      bool
-	Draining            bool
+	// Capabilities are the heartbeat-advertised feature capabilities
+	// (fastletapi.CapabilityXxx). Dispatch sites gate on them so a request
+	// whose semantics an old Fastlet would silently ignore never reaches
+	// that Fastlet; an absent list means baseline-only behavior.
+	Capabilities   []string
+	PodReady       bool
+	RuntimeReady   bool
+	DrainRequested bool
+	Draining       bool
 
 	Admission fastletapi.AdmissionStatus
 	// ResourceCapacity is the Controller-resolved Sandbox commitment capacity
@@ -105,6 +110,19 @@ func (i FastletInfo) Capacity() int {
 
 func (i FastletInfo) SchedulingUsed() int {
 	return i.Admission.Used + i.InFlightSlots
+}
+
+// SupportsCapability reports whether the Fastlet explicitly advertised the
+// capability in a heartbeat. Absence is authoritative baseline behavior:
+// the caller must fail closed, never assume an old Fastlet understands the
+// feature.
+func (i FastletInfo) SupportsCapability(capability string) bool {
+	for _, item := range i.Capabilities {
+		if item == capability {
+			return true
+		}
+	}
+	return false
 }
 
 // FastletRegistry is the scheduling view consumed by the Pool controller.
@@ -262,6 +280,7 @@ func preserveHeartbeat(target *FastletInfo, previous FastletInfo) {
 	target.PreparedArtifacts = append([]string(nil), previous.PreparedArtifacts...)
 	target.RegistryRevision = previous.RegistryRevision
 	target.WarmImages = cloneWarmImageStates(previous.WarmImages)
+	target.Capabilities = append([]string(nil), previous.Capabilities...)
 	target.CacheEpoch = previous.CacheEpoch
 	target.CacheRevision = previous.CacheRevision
 	target.CacheComplete = previous.CacheComplete
@@ -303,6 +322,7 @@ func (r *InMemoryRegistry) ApplyHeartbeat(id FastletID, expectedPodUID string, h
 	slot.info.PreparedArtifacts = append([]string(nil), heartbeat.PreparedArtifacts...)
 	slot.info.RegistryRevision = heartbeat.RegistryRevision
 	slot.info.WarmImages = cloneWarmImageStates(heartbeat.WarmImages)
+	slot.info.Capabilities = append([]string(nil), heartbeat.Capabilities...)
 	applyHeartbeatAdmission(&slot.info, heartbeat.Admission, observedAt)
 	applyAdmissionResources(&slot.info)
 	if slot.info.RuntimeProfileHash == "" {
@@ -742,6 +762,7 @@ func cloneInfo(info FastletInfo) FastletInfo {
 	info.Images = append([]string(nil), info.Images...)
 	info.PreparedArtifacts = append([]string(nil), info.PreparedArtifacts...)
 	info.WarmImages = cloneWarmImageStates(info.WarmImages)
+	info.Capabilities = append([]string(nil), info.Capabilities...)
 	info.SandboxStatuses = cloneStatuses(info.SandboxStatuses)
 	return info
 }

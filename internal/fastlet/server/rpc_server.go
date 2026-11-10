@@ -314,6 +314,7 @@ func (s *FastletServer) heartbeat(r *http.Request, cursor fastletapi.CacheCursor
 		InfraReady:          infraReady, PreparedArtifacts: preparedArtifacts,
 		RegistryRevision: s.sandboxManager.RegistryRevision(),
 		WarmImages:       s.sandboxManager.WarmImageStates(),
+		Capabilities:     s.sandboxManager.SnapshotCapabilities(),
 	}
 	return fastletapi.HeartbeatResponse{
 		FastletStatus: status,

@@ -287,7 +287,7 @@ func TestSnapshotFailedReasonFlowsToCondition(t *testing.T) {
 	// The fastlet observation is a pure projection: a Failed task carrying a
 	// stable reason must surface it verbatim in the Completed condition.
 	status := &apiv1alpha2.SandboxSnapshotStatus{}
-	orchestration.ProjectSnapshotStatus(status, &fastletapi.SnapshotStatus{
+	orchestration.ProjectSnapshotStatus(status, "", &fastletapi.SnapshotStatus{
 		Phase: fastletapi.SnapshotPhaseFailed, Reason: "InsufficientStorage",
 		Message: "staging needs X bytes, Y free",
 	})

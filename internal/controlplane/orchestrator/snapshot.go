@@ -15,20 +15,42 @@ import (
 )
 
 // ProjectSnapshotStatus is the pure projection from a Fastlet snapshot
-// observation onto the SandboxSnapshot status. It is used by both FastPath
-// (after the direct trigger) and the Controller (observe loop). A terminal
-// phase is final: a stale observation from the optimistic-concurrency loser
-// must never roll Succeeded/Failed back to an in-flight phase (the
-// Controller already stopped reconciling a terminal object, so a rollback
-// would wedge it non-terminal forever).
-func ProjectSnapshotStatus(status *apiv1alpha2.SandboxSnapshotStatus, observed *fastletapi.SnapshotStatus) {
+// observation onto the SandboxSnapshot status. requestedMode is the mode of
+// the snapshot intent (spec.mode) the observation is checked against. It is
+// used by both FastPath (after the direct trigger) and the Controller
+// (observe loop). A terminal phase is final: a stale observation from the
+// optimistic-concurrency loser must never roll Succeeded/Failed back to an
+// in-flight phase (the Controller already stopped reconciling a terminal
+// object, so a rollback would wedge it non-terminal forever).
+func ProjectSnapshotStatus(status *apiv1alpha2.SandboxSnapshotStatus, requestedMode apiv1alpha2.SandboxSnapshotMode, observed *fastletapi.SnapshotStatus) {
 	if status == nil || observed == nil || status.Phase.Terminal() {
 		return
 	}
 	now := metav1.Now()
+	requested := fastletapi.NormalizeSnapshotMode(fastletapi.SnapshotMode(requestedMode))
+	produced := fastletapi.NormalizeSnapshotMode(observed.Mode)
+	if observed.Phase == fastletapi.SnapshotPhaseSucceeded && produced != requested {
+		// Mode drift fence: a success whose produced artifact class does
+		// not match the requested mode is never reported as success. This
+		// is the projection-side counterpart of the dispatch capability
+		// gate: an old Fastlet that ignored the mode field would report a
+		// Full artifact (no mode echo) from a RootfsOnly request.
+		status.Phase = apiv1alpha2.SandboxSnapshotPhaseFailed
+		status.Message = fmt.Sprintf("snapshot produced %s artifacts for a %s request", produced, requested)
+		status.Mode = apiv1alpha2.SandboxSnapshotMode(produced)
+		if status.CompletedAt == nil {
+			status.CompletedAt = &now
+		}
+		meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+			Type: apiv1alpha2.SandboxSnapshotConditionCompleted, Status: metav1.ConditionFalse,
+			Reason: "SnapshotModeDrift", Message: status.Message, LastTransitionTime: now,
+		})
+		return
+	}
 	status.Phase = apiv1alpha2.SandboxSnapshotPhase(observed.Phase)
 	status.Message = observed.Message
 	status.SnapshotID = observed.SnapshotID
+	status.Mode = apiv1alpha2.SandboxSnapshotMode(produced)
 	status.ManifestRef = observed.ManifestRef
 	status.ArtifactDigest = observed.ArtifactDigest
 	status.SizeBytes = observed.SizeBytes
@@ -114,9 +136,22 @@ func (o *Orchestrator) CreateSnapshot(ctx context.Context, snapshot *apiv1alpha2
 	if err != nil {
 		return nil, err
 	}
+	mode := fastletapi.SnapshotMode(apiv1alpha2.NormalizeSandboxSnapshotMode(snapshot.Spec.Mode))
+	if mode == fastletapi.SnapshotModeRootfsOnly && !fastlet.SupportsCapability(fastletapi.CapabilityRootfsOnlySnapshots) {
+		// Version-skew gate: an old Fastlet ignores the unknown mode JSON
+		// field and would silently run Full. Require the explicit
+		// heartbeat capability before dispatch; ErrorSnapshotUnsupported
+		// is deterministic (the trigger path fails the one-shot object
+		// instead of retrying into the same rejection).
+		return nil, &fastletapi.FastletError{
+			Code:      fastletapi.ErrorSnapshotUnsupported,
+			Message:   "assigned Fastlet does not advertise the rootfs-only snapshot capability",
+			Retryable: false,
+		}
+	}
 	request := &fastletapi.CreateSnapshotRequest{
 		RequestID: snapshot.Annotations[assignment.AnnotationRequestID], Identity: identity,
-		Snapshot: fastletapi.SnapshotSpec{TemplateName: snapshot.Spec.TemplateName},
+		Snapshot: fastletapi.SnapshotSpec{Mode: mode, TemplateName: snapshot.Spec.TemplateName},
 	}
 	response, callErr := o.FastletClient.CreateSnapshot(ctx, fastlet.PodIP, request)
 	if callErr == nil && response != nil &&

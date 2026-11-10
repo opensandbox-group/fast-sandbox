@@ -399,6 +399,14 @@ enum SnapshotPhase {
   SNAPSHOT_PHASE_FAILED = 5;
 }
 
+// SnapshotMode selects what a snapshot persists. UNSPECIFIED resolves to
+// FULL for compatibility with callers predating the mode field.
+enum SnapshotMode {
+  SNAPSHOT_MODE_UNSPECIFIED = 0;
+  SNAPSHOT_MODE_FULL = 1;
+  SNAPSHOT_MODE_ROOTFS_ONLY = 2;
+}
+
 // CreateSandboxSnapshotRequest snapshots the referenced running Sandbox. The
 // request is rejected while any non-terminal SandboxSnapshot exists for the
 // same Sandbox or the same template_name (no reentrancy): retry after the
@@ -419,6 +427,13 @@ message CreateSandboxSnapshotRequest {
   // metadata is projected as sandbox.fast.io/<k> labels, mirroring
   // CreateSandboxRequest.metadata.
   map<string, string> metadata = 4;
+  // mode selects what the snapshot persists. FULL (default, also when
+  // UNSPECIFIED) captures memory and device state; ROOT_FS_ONLY persists
+  // only the writable rootfs layer and consumers boot from disk.
+  // ROOT_FS_ONLY requires the OverlayBD artifact path: it is rejected with
+  // INVALID_ARGUMENT for a Sandbox that is not on the OCI path.
+  // Immutable per request_id.
+  SnapshotMode mode = 5;
 }
 
 // SandboxSnapshotInfo is the observed state of one SandboxSnapshot.
@@ -446,6 +461,10 @@ message SandboxSnapshotInfo {
   // snapshot_id is the random UUID assigned by Fastlet on admission. OCI
   // publication uses it as the prefix of the rootfs and snapfiles tags.
   string snapshot_id = 13;
+  // mode reports the artifact class of the produced snapshot (the mode the
+  // Fastlet confirmed, not the raw request) so clients can tell Full and
+  // RootfsOnly snapshots apart.
+  SnapshotMode mode = 14;
 }
 
 message CreateSandboxSnapshotResponse {

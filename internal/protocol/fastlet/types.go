@@ -256,7 +256,19 @@ type FastletStatus struct {
 	PreparedArtifacts   []string         `json:"preparedArtifacts,omitempty"`
 	RegistryRevision    string           `json:"registryRevision,omitempty"`
 	WarmImages          []WarmImageState `json:"warmImages,omitempty"`
+	// Capabilities are the explicitly advertised feature capabilities of
+	// this Fastlet build (CapabilityXxx constants). The control plane gates
+	// dispatch on them: an old Fastlet reports none and must never receive
+	// a request whose semantics depend on a capability it silently ignores.
+	Capabilities []string `json:"capabilities,omitempty"`
 }
+
+// CapabilityRootfsOnlySnapshots marks a Fastlet whose runtime driver
+// implements rootfs-only snapshot capture (SnapshotSpec.Mode == RootfsOnly).
+// The control plane requires this capability before dispatching a
+// RootfsOnly snapshot; a Fastlet that does not advertise it would silently
+// execute Full (unknown JSON fields are ignored).
+const CapabilityRootfsOnlySnapshots = "rootfsOnlySnapshots"
 
 type WarmImageState struct {
 	Image   string `json:"image"`
@@ -658,8 +670,12 @@ type SnapshotStatus struct {
 	ManifestRef    string        `json:"manifestRef,omitempty"`
 	ArtifactDigest string        `json:"artifactDigest,omitempty"`
 	SizeBytes      int64         `json:"sizeBytes,omitempty"`
-	StartedAt      time.Time     `json:"startedAt,omitempty"`
-	CompletedAt    time.Time     `json:"completedAt,omitempty"`
+	// Mode is the artifact class of the task: the admitted mode while
+	// in flight, the produced artifact's mode once terminal. Empty means
+	// Full (a pre-mode Fastlet never sets it).
+	Mode        SnapshotMode `json:"mode,omitempty"`
+	StartedAt   time.Time    `json:"startedAt,omitempty"`
+	CompletedAt time.Time    `json:"completedAt,omitempty"`
 }
 
 // CreateSnapshotRequest registers one snapshot task. The response returns

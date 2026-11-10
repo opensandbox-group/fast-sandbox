@@ -306,7 +306,7 @@ record imported by Fastlet remains authoritative over those bootstrap inputs.
 
 Call the gRPC API directly; it creates and drives the `SandboxSnapshot` CR internally. Creating the CR yourself is an alternative entry point to the same flow.
 
-`CreateSandboxSnapshot` supports running OCI Sandboxes. Omit `template_name` on this path: Fastlet generates a random UUID `snapshot_id` and publishes `<snapshot_id>_rootfs` and `<snapshot_id>_snapfiles` to `FAST_SANDBOX_OCI_SNAPSHOT_REPOSITORY`, or to the source repository when that setting is absent. No third OCI artifact or name index is written.
+`CreateSandboxSnapshot` supports running OCI Sandboxes. Omit `template_name` on this path: Fastlet generates a random UUID `snapshot_id` and publishes `<snapshot_id>_rootfs` and `<snapshot_id>_snapfiles` to `FAST_SANDBOX_OCI_SNAPSHOT_REPOSITORY`, or to the source repository when that setting is absent. No third OCI artifact or name index is written. Set `mode = SNAPSHOT_MODE_ROOTFS_ONLY` (CRD: `spec.mode: RootfsOnly`) to persist only the writable rootfs layer: the artifact's manifest records `platform.snapshotMode: rootfsOnly`, consumers cold-boot from the disk instead of restoring in place, and `GetSandboxSnapshot` reports the produced class as `snapshot.mode = ROOT_FS_ONLY`. The mode requires a Fastlet that advertises the rootfs-only capability; an older Fastlet never receives the request, so it cannot silently produce a Full artifact.
 
 ```text
 CreateSandboxSnapshot(request_id="capture-001", sandbox=<running sandbox>)

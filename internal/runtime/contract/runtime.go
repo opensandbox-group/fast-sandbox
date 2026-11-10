@@ -101,6 +101,11 @@ type SnapshotResult struct {
 	ArtifactDigest string
 	// SizeBytes is the total logical size of the artifact set.
 	SizeBytes int64
+	// Mode is the artifact class actually produced (the mode the driver
+	// executed and recorded in the published manifest, not the raw
+	// request). Empty means Full. The Fastlet verifies it against the
+	// admitted mode before reporting success.
+	Mode fastletapi.SnapshotMode
 }
 
 // SnapshotInput carries one snapshot request to the runtime driver.
@@ -149,6 +154,17 @@ type SnapshotInput struct {
 type Snapshotter interface {
 	CreateSnapshot(ctx context.Context, input *SnapshotInput) (*SnapshotResult, error)
 	DeleteSnapshot(ctx context.Context, snapshotID string) error
+}
+
+// RootfsOnlySnapshotCapability is the optional Snapshotter extension through
+// which a driver advertises that it implements rootfs-only capture
+// (SnapshotInput.Mode == RootfsOnly). A Fastlet whose runtime does not
+// implement it (or answers false) never reports the rootfs-only heartbeat
+// capability, and the control plane refuses to dispatch a RootfsOnly
+// snapshot to it: an older runtime ignores the mode and would silently
+// produce a Full artifact.
+type RootfsOnlySnapshotCapability interface {
+	SupportsRootfsOnlySnapshots() bool
 }
 
 // ResourceRecoveryOwnerRetirer gates destructive recovery of one dead runtime.

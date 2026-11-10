@@ -248,6 +248,7 @@ type fastpathFastlet struct {
 	diagnostics    *fastletapi.SandboxDiagnosticsResponse
 	diagnosticsErr error
 	snapshotErr    error
+	snapshotSpecs  []fastletapi.SnapshotSpec
 	invokeResponse *fastletapi.InvokeHandlerResponse
 	invokeFailure  error
 	invokeRequests []*fastletapi.InvokeHandlerRequest
@@ -305,6 +306,7 @@ func (*fastpathFastlet) DeleteSandbox(context.Context, string, *fastletapi.Delet
 func (f *fastpathFastlet) CreateSnapshot(_ context.Context, _ string, request *fastletapi.CreateSnapshotRequest) (*fastletapi.CreateSnapshotResponse, error) {
 	f.mu.Lock()
 	snapshotErr := f.snapshotErr
+	f.snapshotSpecs = append(f.snapshotSpecs, request.Snapshot)
 	f.mu.Unlock()
 	if snapshotErr != nil {
 		return &fastletapi.CreateSnapshotResponse{Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects}, snapshotErr
@@ -313,6 +315,7 @@ func (f *fastpathFastlet) CreateSnapshot(_ context.Context, _ string, request *f
 		Disposition: fastletapi.CreateDispositionCreated,
 		Snapshot: &fastletapi.SnapshotStatus{
 			SnapshotID: "snap-" + request.Identity.SnapshotUID, Phase: fastletapi.SnapshotPhaseCreating,
+			Mode: fastletapi.NormalizeSnapshotMode(request.Snapshot.Mode),
 		},
 	}, nil
 }

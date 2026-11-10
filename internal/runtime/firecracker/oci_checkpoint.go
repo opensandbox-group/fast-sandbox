@@ -198,7 +198,11 @@ func (d *Driver) publishPreparedOCISnapshot(ctx context.Context, plan dumpPlan, 
 	if err != nil {
 		return nil, err
 	}
+	// Report the artifact class from the manifest that was actually packed
+	// and published: the produced mode, not the caller's request.
+	producedMode := fastletapi.SnapshotModeFull
 	if document.IsRootfsOnly() {
+		producedMode = fastletapi.SnapshotModeRootfsOnly
 		args = append(args, "--rootfs-only")
 	}
 	if output, err := exec.CommandContext(ctx, "fsb-vm", args...).CombinedOutput(); err != nil {
@@ -219,7 +223,7 @@ func (d *Driver) publishPreparedOCISnapshot(ctx context.Context, plan dumpPlan, 
 	if err != nil {
 		return nil, err
 	}
-	return &runtimecontract.SnapshotResult{SnapshotID: plan.snapshotID, ManifestRef: ref, ArtifactDigest: strings.TrimPrefix(parsed.Reference, "sha256:"), SizeBytes: sizeBytes}, nil
+	return &runtimecontract.SnapshotResult{SnapshotID: plan.snapshotID, ManifestRef: ref, ArtifactDigest: strings.TrimPrefix(parsed.Reference, "sha256:"), SizeBytes: sizeBytes, Mode: producedMode}, nil
 }
 
 // Checkpoints are instance-private even though their bytes use an OCI envelope.
