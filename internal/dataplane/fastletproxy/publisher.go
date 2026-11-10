@@ -51,6 +51,9 @@ func (p *RoutePublisher) ReconcileRoutes(ctx context.Context, publications []dat
 		}
 	}
 	for _, publication := range publications {
+		if err := p.ResumeRoute(ctx, publication); err != nil {
+			return err
+		}
 		if err := p.ApplyRoute(ctx, publication); err != nil {
 			return err
 		}
@@ -70,3 +73,19 @@ func routeFromPublication(publication dataplane.RoutePublication) Route {
 }
 
 var _ dataplane.RoutePublisher = (*RoutePublisher)(nil)
+
+func (p *RoutePublisher) SuspendRoute(ctx context.Context, publication dataplane.RoutePublication) error {
+	return p.setSuspended(ctx, publication, true)
+}
+func (p *RoutePublisher) ResumeRoute(ctx context.Context, publication dataplane.RoutePublication) error {
+	return p.setSuspended(ctx, publication, false)
+}
+func (p *RoutePublisher) setSuspended(ctx context.Context, publication dataplane.RoutePublication, suspended bool) error {
+	snapshot, err := p.client.Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	return p.client.SetSuspended(ctx, publication.SandboxUID, publication.RouteGeneration, snapshot.Revision, suspended)
+}
+
+var _ dataplane.RecoveryRoutePublisher = (*RoutePublisher)(nil)

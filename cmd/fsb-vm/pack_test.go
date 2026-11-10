@@ -6,18 +6,23 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/opencontainers/go-digest"
+	oci "github.com/opencontainers/image-spec/specs-go/v1"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 
+	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/ocitemplate"
 )
 
@@ -469,7 +474,7 @@ func TestPackRootfsSquashBoundsChainGrowth(t *testing.T) {
 		for _, name := range []string{ocitemplate.UpperDataName, ocitemplate.UpperIndexName} {
 			require.NoError(t, os.WriteFile(filepath.Join(bundle, name), []byte("cycle payload"), 0600))
 		}
-		layers, err := packRootfs(ctx, bundle, t.TempDir(), layout, squashTestUpper(chain), maxLayers, squashCount)
+		layers, err := packRootfsAndSquash(ctx, bundle, t.TempDir(), layout, squashTestUpper(chain), maxLayers, squashCount)
 		require.NoError(t, err)
 		require.LessOrEqual(t, len(layers), maxLayers, "cycle %d exceeds the layer bound", cycle)
 		if chain != nil && len(chain)+1 >= maxLayers && len(layers) == len(chain)-squashCount+2 {
@@ -516,7 +521,7 @@ func TestPackRootfsSquashFallsBackOnMergeFailure(t *testing.T) {
 	for _, name := range []string{ocitemplate.UpperDataName, ocitemplate.UpperIndexName} {
 		require.NoError(t, os.WriteFile(filepath.Join(bundle, name), []byte("payload"), 0600))
 	}
-	layers, err := packRootfs(context.Background(), bundle, t.TempDir(), layout, squashTestUpper(chain), 3, 2)
+	layers, err := packRootfsAndSquash(context.Background(), bundle, t.TempDir(), layout, squashTestUpper(chain), 3, 2)
 	require.NoError(t, err)
 	require.Len(t, layers, len(chain)+1, "un-squashed chain is published when merge fails")
 }
@@ -558,7 +563,7 @@ func TestPackRootfsSquashPreservesBaseLayers(t *testing.T) {
 	}
 	// 5 inherited layers + the new root reach the bound of 6; the positional
 	// tail of 4 would reach into the base, the clamp keeps it to 3.
-	layers, err := packRootfs(context.Background(), bundle, t.TempDir(), layout, upper, 6, 4)
+	layers, err := packRootfsAndSquash(context.Background(), bundle, t.TempDir(), layout, upper, 6, 4)
 	require.NoError(t, err)
 	require.Len(t, layers, len(base)+1)
 	require.Equal(t, base, layers[:len(base)], "template base layers must survive untouched")
@@ -603,7 +608,7 @@ func TestPackRootfsSquashRecoversOvershootChain(t *testing.T) {
 	for _, name := range []string{ocitemplate.UpperDataName, ocitemplate.UpperIndexName} {
 		require.NoError(t, os.WriteFile(filepath.Join(bundle, name), []byte("payload"), 0600))
 	}
-	layers, err := packRootfs(context.Background(), bundle, t.TempDir(), layout, squashTestUpper(chain), maxLayers, squashCount)
+	layers, err := packRootfsAndSquash(context.Background(), bundle, t.TempDir(), layout, squashTestUpper(chain), maxLayers, squashCount)
 	require.NoError(t, err)
 	// 40 inherited + the new root: 41 -> 26 -> 11, below the bound in one pack.
 	require.Less(t, len(layers), maxLayers)
@@ -619,5 +624,142 @@ func TestPackRootfsSquashRecoversOvershootChain(t *testing.T) {
 	require.Len(t, entries, len(layers), "absorbed blobs are cleaned up")
 	for _, entry := range entries {
 		require.Regexp(t, `^[0-9a-f]{64}$`, entry.Name())
+	}
+}
+
+func packCheckpoint(ctx context.Context, bundle, outputName string, maxLayers, squashLayers int) error {
+	return packCapturedBundle(ctx, bundle, outputName, maxLayers, squashLayers, false)
+}
+
+func validatePackBundle(bundle string) ([]byte, *ocitemplate.RootfsUpper, error) {
+	return validatePackBundleMode(bundle, false)
+}
+
+func TestRootfsOnlyPackBoundary(t *testing.T) {
+	for _, scenario := range []string{"valid", "wrong-mode", "memory.snap", "vmstate.snap", "vault.json", "policy.json", "missing-upper", "checkpoint", "missing-cmdline", "unknown-mode"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			m := testVMManifest()
+			m.Platform = &artifacts.VMPlatform{SnapshotMode: "rootfsOnly"}
+			m.Kernel.Cmdline = "console=ttyS0 root=/dev/vda rw init=/init"
+			if scenario == "checkpoint" {
+				m.Platform.Checkpoint = &artifacts.CheckpointOwner{SandboxUID: "uid", Namespace: "ns"}
+			}
+			if scenario == "missing-cmdline" {
+				m.Kernel.Cmdline = ""
+			}
+			if scenario == "unknown-mode" {
+				m.Platform.SnapshotMode = "typo"
+			}
+			raw, err := json.Marshal(m)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), raw, 0600))
+			u := ocitemplate.RootfsUpper{Repository: "example.com/test/rootfs", VirtualSizeBytes: 1 << 20, Lowers: []oci.Descriptor{{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("parent"), Size: 100}}}
+			raw, err = json.Marshal(u)
+			require.NoError(t, err)
+			if scenario != "missing-upper" {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, ocitemplate.RootfsUpperName), raw, 0600))
+			}
+			for _, name := range []string{ocitemplate.UpperDataName, ocitemplate.UpperIndexName} {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte("upper"), 0600))
+			}
+			if scenario == "memory.snap" || scenario == "vmstate.snap" || scenario == "vault.json" || scenario == "policy.json" {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, scenario), nil, 0600))
+			}
+			_, _, err = validatePackBundleMode(dir, scenario != "wrong-mode")
+			if scenario == "valid" || scenario == "vault.json" || scenario == "policy.json" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+	size, err := snapfilesSizeGiB(&buildOptions{rootfsOnly: true}, "/absent/vmstate", "/absent/memory")
+	require.NoError(t, err)
+	require.Equal(t, 1, size)
+}
+
+func TestCheckSquashCapacityIncludesRemoteInputsAndMergeOutput(t *testing.T) {
+	layout, _, err := createStagedArtifactLayout(t.TempDir(), "capacity")
+	require.NoError(t, err)
+	// An impossible descriptor must be rejected before a registry fetch.
+	_, err = os.Stat(layout.root)
+	require.NoError(t, err)
+	layer := ocispec.Descriptor{Digest: digest.FromString("remote"), Size: int64(1) << 62}
+	require.Error(t, checkSquashCapacity(layout, []ocispec.Descriptor{layer}, 1<<30))
+}
+
+func packRootfsAndSquash(ctx context.Context, bundle, work string, layout artifactLayout, upper *ocitemplate.RootfsUpper, maxLayers, squashLayers int) ([]ocispec.Descriptor, error) {
+	layers, err := packRootfs(ctx, bundle, work, layout, upper)
+	if err != nil {
+		return nil, err
+	}
+	return squashRootfsTail(ctx, layout, layers, upper, maxLayers, squashLayers)
+}
+
+func TestSquashBudgetSkipsBeforeRemoteFetch(t *testing.T) {
+	previous := squashAvailableBytes
+	t.Cleanup(func() { squashAvailableBytes = previous })
+	layout, _, err := createStagedArtifactLayout(t.TempDir(), "budget")
+	require.NoError(t, err)
+	layers := []ocispec.Descriptor{{Digest: digest.FromString("base"), Size: 10}, {Digest: digest.FromString("remote"), Size: 10}, {Digest: digest.FromString("local"), Size: 10}}
+	require.NoError(t, os.WriteFile(layout.blobPath(layers[2].Digest), []byte("0123456789"), 0600))
+	upper := &ocitemplate.RootfsUpper{VirtualSizeBytes: 1 << 30, BaseLayers: 1}
+	var free int64 = 3 << 30
+	squashAvailableBytes = func(string) (int64, error) { return free, nil }
+	require.NoError(t, checkSquashCapacity(layout, layers[1:], upper.VirtualSizeBytes))
+	free = 2 << 30 // tiny compressed inputs do not imply a tiny merge workspace
+	called := false
+	_, err = squashOnce(t.Context(), layout, layers, upper, func() (ocitemplate.CredentialFunc, error) { called = true; return nil, errors.New("must not fetch") }, 2)
+	require.ErrorContains(t, err, "insufficient space")
+	require.False(t, called)
+	got, err := squashRootfsTail(t.Context(), layout, layers, upper, 3, 2)
+	require.NoError(t, err)
+	require.Equal(t, layers, got)
+	require.Error(t, checkSquashCapacity(layout, layers, math.MaxInt64))
+}
+
+func TestSquashFailureRemovesOnlyNewDownloads(t *testing.T) {
+	for _, failure := range []string{"fetch", "merge"} {
+		t.Run(failure, func(t *testing.T) {
+			previous, previousSpace := global, squashAvailableBytes
+			t.Cleanup(func() { global = previous; squashAvailableBytes = previousSpace })
+			squashAvailableBytes = func(string) (int64, error) { return math.MaxInt64, nil }
+			global.plainHTTP = true
+			global.overlaybdMerge = "/missing/merge"
+			global.overlaybdServiceConfig = filepath.Join(t.TempDir(), "service.json")
+			layout, _, err := createStagedArtifactLayout(t.TempDir(), "cleanup")
+			require.NoError(t, err)
+			payload := []byte("downloaded")
+			remote := ocispec.Descriptor{Digest: digest.FromBytes(payload), Size: int64(len(payload)), MediaType: ocitemplate.OverlayBDLayerMediaType}
+			local := ocispec.Descriptor{Digest: digest.FromString("existing"), Size: 4}
+			require.NoError(t, os.WriteFile(layout.blobPath(local.Digest), []byte("keep"), 0600))
+			var fetched atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, remote.Digest.String()) {
+					fetched.Add(1)
+					w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+					_, _ = w.Write(payload)
+					return
+				}
+				http.NotFound(w, r)
+			}))
+			defer server.Close()
+			layers := []ocispec.Descriptor{{Digest: digest.FromString("base"), Size: 4}, local, remote}
+			if failure == "fetch" {
+				layers = append(layers, ocispec.Descriptor{Digest: digest.FromString("missing"), Size: 4})
+			}
+			upper := &ocitemplate.RootfsUpper{VirtualSizeBytes: 1 << 20, BaseLayers: 1, Repository: strings.TrimPrefix(server.URL, "http://") + "/layers"}
+			_, err = squashOnce(t.Context(), layout, layers, upper, func() (ocitemplate.CredentialFunc, error) { return nil, nil }, len(layers)-1)
+			require.Error(t, err)
+			require.Positive(t, fetched.Load())
+			require.NoFileExists(t, layout.blobPath(remote.Digest))
+			content, err := os.ReadFile(layout.blobPath(local.Digest))
+			require.NoError(t, err)
+			require.Equal(t, "keep", string(content))
+			files, err := os.ReadDir(layout.blobDir())
+			require.NoError(t, err)
+			require.Len(t, files, 1)
+		})
 	}
 }

@@ -621,7 +621,23 @@ type SnapshotIdentity struct {
 }
 
 // SnapshotSpec is the desired snapshot configuration.
+// SnapshotMode explicitly distinguishes Full from disk-only capture; an empty value preserves legacy Full semantics.
+type SnapshotMode string
+
+const (
+	SnapshotModeFull       SnapshotMode = "Full"
+	SnapshotModeRootfsOnly SnapshotMode = "RootfsOnly"
+)
+
+func NormalizeSnapshotMode(mode SnapshotMode) SnapshotMode {
+	if mode == "" {
+		return SnapshotModeFull
+	}
+	return mode
+}
+
 type SnapshotSpec struct {
+	Mode SnapshotMode `json:"mode,omitempty"`
 	// Kind selects the publish mode. Empty is treated as SnapshotKindTemplate
 	// so callers that predate checkpoints keep working.
 	Kind SnapshotKind `json:"kind,omitempty"`

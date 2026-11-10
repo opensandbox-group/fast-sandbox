@@ -562,7 +562,11 @@ func TestSandboxManager_CreateSandbox_MultipleSandboxes(t *testing.T) {
 }
 
 func TestSandboxManager_DeleteSandbox_Success(t *testing.T) {
-	mockRuntime := NewMockRuntime()
+	mockRuntime := newAdmissionRuntime()
+	mockRuntime.deleteEntered = make(chan struct{}, 1)
+	mockRuntime.deleteBlock = make(chan struct{})
+	releaseDelete := sync.OnceFunc(func() { close(mockRuntime.deleteBlock) })
+	t.Cleanup(releaseDelete)
 	manager := NewSandboxManager(mockRuntime)
 
 	ctx := context.Background()
@@ -576,17 +580,22 @@ func TestSandboxManager_DeleteSandbox_Success(t *testing.T) {
 	require.NoError(t, err, "DeleteSandbox should succeed")
 	assert.NotNil(t, resp)
 
+	// Keep deletion in flight while verifying the intermediate observations.
+	select {
+	case <-mockRuntime.deleteEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("runtime deletion did not start")
+	}
 	statuses := manager.GetSandboxStatuses(ctx)
 	require.Len(t, statuses, 1, "Should have one status")
 	assert.Equal(t, spec.SandboxID, statuses[0].SandboxID)
 	assert.Equal(t, fastletapi.RuntimeStateStopping, statuses[0].Runtime.State)
 	assert.Equal(t, fastletapi.DataPlaneStateDraining, statuses[0].DataPlane.State)
 
-	// Wait for async deletion to complete
-	time.Sleep(100 * time.Millisecond)
-
-	statuses = manager.GetSandboxStatuses(ctx)
-	assert.Empty(t, statuses, "Sandbox should be completely removed after async delete")
+	releaseDelete()
+	require.Eventually(t, func() bool {
+		return len(manager.GetSandboxStatuses(ctx)) == 0
+	}, 3*time.Second, time.Millisecond, "Sandbox should be completely removed after async delete")
 }
 
 func TestSandboxManager_DeleteSandbox_Idempotent(t *testing.T) {
