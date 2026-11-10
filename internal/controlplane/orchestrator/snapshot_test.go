@@ -2,7 +2,9 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,7 +17,8 @@ import (
 
 // newSnapshotDispatchHarness builds an Orchestrator whose target Sandbox is
 // durably assigned to one registry fastlet. The candidate's capabilities are
-// the caller's version-skew scenario.
+// the caller's version-skew scenario; the heartbeat is marked observed so a
+// missing capability reads as confirmed, not unobserved.
 func newSnapshotDispatchHarness(t *testing.T, capabilities []string) (*Orchestrator, *fakeFastletClient, *apiv1alpha2.Sandbox, *apiv1alpha2.SandboxSnapshot) {
 	t.Helper()
 	orchestrator, registry, fastletClient, sandbox := newHarness(t)
@@ -23,7 +26,7 @@ func newSnapshotDispatchHarness(t *testing.T, capabilities []string) (*Orchestra
 	candidate := placement.FastletInfo{
 		ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", PodIP: "10.0.0.1",
 		RuntimeName: apiv1alpha2.RuntimeContainer, RuntimeProfileHash: "runtime-a", ResourceProfileHash: "resources-a", InfraRevision: "infra-a",
-		Capabilities: capabilities,
+		Capabilities: capabilities, LastHeartbeat: time.Now(),
 	}
 	registry.fastlets[candidate.ID] = candidate
 	envelope, err := AssignmentForCandidate(candidate, 1, 1, 1, "runtime-a")
@@ -63,8 +66,8 @@ func TestCreateSnapshotDispatchesSpecMode(t *testing.T) {
 }
 
 func TestCreateSnapshotRequiresRootfsOnlyCapability(t *testing.T) {
-	// An old Fastlet reports no capabilities and would silently ignore the
-	// mode field: the dispatch gate must fail closed before the call.
+	// An observed Fastlet reporting no capabilities would silently ignore
+	// the mode field: the dispatch gate must fail closed before the call.
 	orchestrator, fastletClient, sandbox, snapshot := newSnapshotDispatchHarness(t, nil)
 	dispatched := false
 	fastletClient.createSnapshot = func(string, *fastletapi.CreateSnapshotRequest) (*fastletapi.CreateSnapshotResponse, error) {
@@ -86,6 +89,71 @@ func TestCreateSnapshotRequiresRootfsOnlyCapability(t *testing.T) {
 	_, err = orchestrator.CreateSnapshot(context.Background(), snapshot, sandbox)
 	require.NoError(t, err)
 	require.True(t, dispatched)
+}
+
+// An unobserved capability is unknown, not absent: after a control-plane
+// restart the Pod informer can populate the registry before the first
+// heartbeat arrives, and permanently failing the one-shot snapshot in that
+// window would burn a valid request_id. The gate refreshes once and
+// otherwise stays retryable; a refreshed heartbeat can satisfy it in the
+// same call.
+func TestCreateSnapshotUnobservedCapabilityStaysRetryable(t *testing.T) {
+	_, _, fastletClient, _ := newHarness(t)
+	candidate := placement.FastletInfo{
+		ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", PodIP: "10.0.0.1",
+		RuntimeName: apiv1alpha2.RuntimeContainer, RuntimeProfileHash: "runtime-a", ResourceProfileHash: "resources-a", InfraRevision: "infra-a",
+		// No capabilities and no heartbeat yet: the informer-only view a
+		// restarted control plane sees before the first heartbeat lands.
+	}
+	registry := placement.NewInMemoryRegistry()
+	registry.UpsertPod(candidate)
+	orchestrator := &Orchestrator{Registry: registry, FastletClient: fastletClient}
+	sandbox := &apiv1alpha2.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{Name: "sandbox-a", Namespace: "default", UID: "sandbox-uid-a"},
+		Spec:       apiv1alpha2.SandboxSpec{Image: "oci://r.example/ns/template:base", PoolRef: "pool-a"},
+	}
+	envelope, err := AssignmentForCandidate(candidate, 1, 1, 1, "runtime-a")
+	require.NoError(t, err)
+	require.NoError(t, assignment.SetAssignmentAnnotation(sandbox, envelope))
+	snapshot := &apiv1alpha2.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{Name: "snap-a", Namespace: "default", UID: "snapshot-uid-a"},
+		Spec:       apiv1alpha2.SandboxSnapshotSpec{Mode: apiv1alpha2.SandboxSnapshotModeRootfsOnly},
+	}
+
+	// The refresh cannot reach a heartbeat: the capability stays unobserved
+	// and the rejection must stay retryable (ErrAssignedFastletUnavailable),
+	// never the deterministic ErrorSnapshotUnsupported that permanently
+	// fails the one-shot object.
+	fastletClient.heartbeat = func(string, *fastletapi.HeartbeatRequest) (*fastletapi.HeartbeatResponse, error) {
+		return nil, errors.New("fastlet heartbeat unreachable")
+	}
+	dispatched := false
+	fastletClient.createSnapshot = func(string, *fastletapi.CreateSnapshotRequest) (*fastletapi.CreateSnapshotResponse, error) {
+		dispatched = true
+		return &fastletapi.CreateSnapshotResponse{Disposition: fastletapi.CreateDispositionCreated,
+			Snapshot: &fastletapi.SnapshotStatus{SnapshotID: "snap-1", Phase: fastletapi.SnapshotPhasePending}}, nil
+	}
+	_, err = orchestrator.CreateSnapshot(context.Background(), snapshot, sandbox)
+	require.ErrorIs(t, err, ErrAssignedFastletUnavailable)
+	require.False(t, dispatched)
+
+	// The next attempt finds the capable heartbeat via the synchronous
+	// refresh and dispatches with the mode intact.
+	fastletClient.heartbeat = func(string, *fastletapi.HeartbeatRequest) (*fastletapi.HeartbeatResponse, error) {
+		return &fastletapi.HeartbeatResponse{
+			FastletStatus: fastletapi.FastletStatus{
+				FastletPodUID: "pod-a", RuntimeReady: true,
+				RuntimeProfileHash: "runtime-a", ResourceProfileHash: "resources-a", InfraRevision: "infra-a",
+				Capabilities: []string{fastletapi.CapabilityRootfsOnlySnapshots},
+			},
+			Sequence: 1, Cache: fastletapi.CacheSnapshot{Epoch: "boot-a", Revision: 1},
+		}, nil
+	}
+	observed, err := orchestrator.CreateSnapshot(context.Background(), snapshot, sandbox)
+	require.NoError(t, err)
+	require.NotNil(t, observed)
+	require.True(t, dispatched)
+	require.Equal(t, fastletapi.SnapshotModeRootfsOnly, fastletClient.snapshotRequest.Snapshot.Mode)
 }
 
 func TestProjectSnapshotStatusReportsProducedMode(t *testing.T) {
@@ -114,7 +182,8 @@ func TestProjectSnapshotStatusFailsClosedOnModeDrift(t *testing.T) {
 	// from a RootfsOnly request.
 	status := &apiv1alpha2.SandboxSnapshotStatus{}
 	ProjectSnapshotStatus(status, apiv1alpha2.SandboxSnapshotModeRootfsOnly, &fastletapi.SnapshotStatus{
-		Phase: fastletapi.SnapshotPhaseSucceeded, ManifestRef: "oci://r.example/ns/snap@sha256:abc",
+		Phase: fastletapi.SnapshotPhaseSucceeded, SnapshotID: "snap-1",
+		ManifestRef: "oci://r.example/ns/snap@sha256:abc", ArtifactDigest: "abc", SizeBytes: 42,
 	})
 	require.Equal(t, apiv1alpha2.SandboxSnapshotPhaseFailed, status.Phase)
 	require.Equal(t, apiv1alpha2.SandboxSnapshotModeFull, status.Mode)
@@ -123,6 +192,12 @@ func TestProjectSnapshotStatusFailsClosedOnModeDrift(t *testing.T) {
 	require.Equal(t, apiv1alpha2.SandboxSnapshotConditionCompleted, condition.Type)
 	require.Equal(t, metav1.ConditionFalse, condition.Status)
 	require.Equal(t, "SnapshotModeDrift", condition.Reason)
+	// The drift rejection still published: the artifact facts stay on the
+	// status so deletion retains remote cleanup ownership.
+	require.Equal(t, "snap-1", status.SnapshotID)
+	require.Equal(t, "oci://r.example/ns/snap@sha256:abc", status.ManifestRef)
+	require.Equal(t, "abc", status.ArtifactDigest)
+	require.Equal(t, int64(42), status.SizeBytes)
 
 	// Terminal monotonicity: a later drift projection cannot roll a
 	// Succeeded snapshot back.

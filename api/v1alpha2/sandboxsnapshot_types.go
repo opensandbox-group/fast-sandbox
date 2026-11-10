@@ -189,7 +189,9 @@ type SandboxSnapshotStatus struct {
 	Mode SandboxSnapshotMode `json:"mode,omitempty"`
 
 	// ManifestRef is the published s3:// manifest.json or immutable oci://
-	// snapfiles manifest reference (Succeeded only).
+	// snapfiles manifest reference. Set on Succeeded, and also on a Failed
+	// snapshot whose publication already completed (e.g. a mode-drift
+	// rejection) so deletion retains ownership of remote cleanup.
 	// +optional
 	ManifestRef string `json:"manifestRef,omitempty"`
 	// ArtifactDigest is the sha256 of the published manifest document.

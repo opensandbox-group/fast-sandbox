@@ -290,14 +290,21 @@ func (m *SandboxManager) runSnapshotWorker(snapshotter RuntimeSnapshotter, task 
 	}
 	// The driver has already transitioned the task through Publishing (via
 	// the OnPublishing callback above); CreateSnapshot returning nil means
-	// the artifact upload finished, so the projection lands on Succeeded.
-	// Before reporting success, verify the produced artifact's class: a
-	// driver that ignored the admitted mode (version skew) produced a Full
-	// set from a RootfsOnly task — fail closed instead of publishing a
-	// success that lies about what the artifact contains.
+	// the artifact upload finished. Before reporting success, verify the
+	// produced artifact's class: a driver that ignored the admitted mode
+	// (version skew) produced a Full set from a RootfsOnly task — fail
+	// closed instead of publishing a success that lies about what the
+	// artifact contains. The published reference is still retained on the
+	// task: the object never reported success, but the registry did receive
+	// the artifact set, and dropping the reference would orphan it (remote
+	// cleanup resolves it when the object is deleted).
 	if produced := fastletapi.NormalizeSnapshotMode(result.Mode); produced != fastletapi.NormalizeSnapshotMode(task.mode) {
+		m.mu.Lock()
+		task.result = result
+		m.mu.Unlock()
 		klog.ErrorS(nil, "Sandbox snapshot produced a mode-drifted artifact",
-			"sandboxID", sandboxUID, "snapshotID", task.snapshotID, "admittedMode", task.mode, "producedMode", produced)
+			"sandboxID", sandboxUID, "snapshotID", task.snapshotID, "admittedMode", task.mode, "producedMode", produced,
+			"manifestRef", result.ManifestRef)
 		m.finishSnapshotTaskWithReason(task, fastletapi.SnapshotPhaseFailed, "SnapshotModeDrift",
 			fmt.Sprintf("produced artifact mode %q does not match the admitted mode %q", produced, fastletapi.NormalizeSnapshotMode(task.mode)))
 		return

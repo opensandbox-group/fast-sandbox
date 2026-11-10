@@ -439,7 +439,13 @@ func TestSnapshotWorkerFailsClosedOnProducedModeDrift(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "SnapshotModeDrift", inspected.Snapshot.Reason)
 	require.Contains(t, inspected.Snapshot.Message, "admitted mode")
-	require.Empty(t, inspected.Snapshot.ManifestRef, "a drifted artifact is never reported as published")
+	// The artifact was already published when the drift was detected: the
+	// reference stays on the task so deleting the object can clean up the
+	// remote set instead of orphaning it.
+	require.NotEmpty(t, inspected.Snapshot.ManifestRef, "the drifted artifact reference must be retained for cleanup")
+	require.NotEmpty(t, inspected.Snapshot.ArtifactDigest)
+	// The task itself never reports success.
+	require.Equal(t, fastletapi.SnapshotPhaseFailed, inspected.Snapshot.Phase)
 }
 
 // capableSnapshotRuntime advertises the rootfs-only capture branch.
