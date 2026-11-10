@@ -98,6 +98,9 @@ func TestOCIBuildUsesRemoteSourceWithoutDownloadingSourceLayers(t *testing.T) {
 			bin := t.TempDir()
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 			t.Setenv("TEST_OCI_COMMANDS", dir)
+			// Guest control is unconditional on OverlayBD builds: the test
+			// builder image ships the helper through this override.
+			t.Setenv("FSB_GUEST_CONTROL_HELPER", staticHelperBinary(t))
 			buildID := uuid.NewString()
 			t.Setenv(buildIDEnvName, buildID)
 			require.NoError(t, os.WriteFile(filepath.Join(bin, "ip"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TEST_OCI_COMMANDS/ip.log\"\n"), 0755))
@@ -140,6 +143,7 @@ func TestOCIBuildUsesRemoteSourceWithoutDownloadingSourceLayers(t *testing.T) {
 			require.Equal(t, bakedGuestIP, manifest["guestNetwork"].(map[string]any)["ip"])
 			require.Equal(t, "11m0s", value("--ready-timeout"))
 			require.Equal(t, buildTap, value("--tap-name"))
+			require.Equal(t, "1234", value("--guest-control-port"), "the freeze/thaw probe runs on every OverlayBD build")
 			require.Zero(t, sourceLayerReads.Load())
 			require.NoDirExists(t, filepath.Join(dir, "oci-layout"))
 			raw, err = os.ReadFile(filepath.Join(value("--inject-dir"), "etc/sandbox-init.env"))

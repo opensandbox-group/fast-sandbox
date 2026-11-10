@@ -202,6 +202,7 @@ Common build options:
 | `--username` | empty | Registry credentials as `username:password` |
 | `--keep-work-dir` | `false` | Keep build scratch after success |
 | `--no-compress` | `false` | Disable zfile compression when committing layers |
+| `--guest-control-port` | `0` (disabled) | Cold-boot probe that validates the guest-control helper injected via `--inject-dir` over vsock; only the reserved port `1234` is accepted. On success the template manifest records the `guestControl` capability; a failed probe fails the build |
 
 `build` does not execute the source image's OCI Entrypoint, Cmd, or Env automatically. For non-Redis workloads, provide `--init-script-file` and make the script print a stable string matching `--ready-pattern` only after the service is ready. `--init-path` must be a clean absolute guest path without whitespace; `os.Root`-confined writes prevent image symlinks from escaping onto the host. Every build uses an independent temporary scratch directory, and a non-blocking per-output lock rejects a second concurrent build of the same `--output`.
 
