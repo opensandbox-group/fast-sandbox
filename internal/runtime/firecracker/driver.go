@@ -107,6 +107,9 @@ type Driver struct {
 	// snapshot staging capacity gate (tests shorten it; 0 selects the
 	// default).
 	snapshotCapacityWait time.Duration
+	// snapshotFree overrides the staging filesystem probe in capacity tests.
+	// A nil value uses stagingFree.
+	snapshotFree func(string) int64
 	// fcVersion caches the last successfully resolved local Firecracker
 	// binary version (restore admission); unresolved lookups are retried.
 	fcVersion string

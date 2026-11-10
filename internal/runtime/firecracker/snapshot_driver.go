@@ -147,8 +147,8 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 	}
 
 	// Capacity gate BEFORE any pause: a dump that cannot land wastes the
-	// business interruption. Self-heal once through the image cache GC.
-	if err := d.ensureDumpCapacity(plan); err != nil {
+	// business interruption. Reclaim unused image and checkpoint caches first.
+	if err := d.ensureDumpCapacity(ctx, plan); err != nil {
 		return nil, err
 	}
 
@@ -360,10 +360,10 @@ const defaultSnapshotCapacityWait = 15 * time.Second
 
 // ensureDumpCapacity verifies the staging filesystem can hold the full
 // artifact set (instance rootfs + memory + margin), once after triggering
-// the image-cache GC. It must run before the VM is paused: an ENOSPC
-// mid-dump would burn the pause window for nothing. Returns the
-// retryable ErrInsufficientStorage sentinel when space stays short.
-func (d *Driver) ensureDumpCapacity(plan dumpPlan) error {
+// the image-cache GC and reclaiming unpinned OCI blobs. It must run before
+// the VM is paused: an ENOSPC mid-dump would burn the pause window for nothing.
+// Returns the retryable ErrInsufficientStorage sentinel when space stays short.
+func (d *Driver) ensureDumpCapacity(ctx context.Context, plan dumpPlan) error {
 	need, err := d.dumpFootprintBytes(plan)
 	if err != nil {
 		// The dump itself will report a precise error; do not block on
@@ -373,7 +373,11 @@ func (d *Driver) ensureDumpCapacity(plan dumpPlan) error {
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	d.mu.RUnlock()
-	if stagingFree(stateRoot) >= need {
+	freeBytes := d.snapshotFree
+	if freeBytes == nil {
+		freeBytes = stagingFree
+	}
+	if freeBytes(stateRoot) >= need {
 		return nil
 	}
 	d.TriggerImageGC()
@@ -381,17 +385,27 @@ func (d *Driver) ensureDumpCapacity(plan dumpPlan) error {
 	if wait <= 0 {
 		wait = defaultSnapshotCapacityWait
 	}
-	deadline := time.Now().Add(wait)
-	for time.Now().Before(deadline) {
-		time.Sleep(3 * time.Second)
-		if stagingFree(stateRoot) >= need {
+	recoveryCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	if err := d.reclaimCheckpointBlobs(recoveryCtx, need); err != nil {
+		klog.InfoS("checkpoint blob capacity recovery incomplete", "error", err)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if freeBytes(stateRoot) >= need {
 			return nil
 		}
+		select {
+		case <-recoveryCtx.Done():
+			free := freeBytes(stateRoot)
+			klog.InfoS("firecracker snapshot staging space insufficient; parking the task",
+				"stateRoot", stateRoot, "needBytes", need, "freeBytes", free)
+			return fmt.Errorf("%w: staging needs %d bytes, %d free", runtimecontract.ErrInsufficientStorage, need, free)
+		case <-time.After(3 * time.Second):
+		}
 	}
-	free := stagingFree(stateRoot)
-	klog.InfoS("firecracker snapshot staging space insufficient; parking the task",
-		"stateRoot", stateRoot, "needBytes", need, "freeBytes", free)
-	return fmt.Errorf("%w: staging needs %d bytes, %d free", runtimecontract.ErrInsufficientStorage, need, free)
 }
 
 // dumpFootprintBytes computes the full artifact set size: the instance

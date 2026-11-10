@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -282,6 +283,21 @@ func (d *Driver) cleanupSnapshotStaging(ctx context.Context, staging string) err
 		return err
 	}
 	return os.RemoveAll(staging)
+}
+
+// Reclaim before capture, when old cache entries would otherwise prevent the
+// staging files from being created. The final capacity probe remains authoritative.
+func (d *Driver) reclaimCheckpointBlobs(ctx context.Context, minFree int64) error {
+	if _, err := os.Stat(filepath.Join(d.config.StateRoot, "oci/blobs/sha256")); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	args := append(d.fsbArgs(), "trim-blob-cache", "--min-free-bytes", strconv.FormatInt(minFree, 10))
+	if output, err := exec.CommandContext(ctx, "fsb-vm", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("reclaim checkpoint blobs: %w: %s", err, output)
+	}
+	return nil
 }
 
 func (d *Driver) cacheOCICheckpoint(ctx context.Context, staging, snapshotID string, published *ocitemplate.PublishedCheckpoint) error {

@@ -9,11 +9,37 @@ import (
 	"time"
 
 	"github.com/opencontainers/go-digest"
+	"github.com/spf13/cobra"
 	"golang.org/x/sys/unix"
 )
 
 const blobCacheMaxFiles = 4096
 const blobCacheMinFreeBytes = 1 << 30
+
+// Capacity recovery also reclaims retained entries after admission is disabled.
+func newTrimBlobCacheCommand() *cobra.Command {
+	var minFree uint64
+	command := &cobra.Command{Use: "trim-blob-cache", Short: "Reclaim unpinned checkpoint blobs for snapshot staging", Hidden: true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := cmd.Context().Err(); err != nil {
+				return err
+			}
+			if _, err := os.Stat(filepath.Join(blobCacheRoot(), "sha256")); os.IsNotExist(err) {
+				return nil
+			} else if err != nil {
+				return err
+			}
+			unlock, err := tryLock(blobCacheRoot(), "cache")
+			if err != nil {
+				return err
+			}
+			defer unlock()
+			return trimBlobCache(global.blobCacheMaxBytes, blobCacheMaxFiles, minFree)
+		}}
+	command.Flags().Uint64Var(&minFree, "min-free-bytes", 0, "required free bytes on the cache/staging filesystem")
+	_ = command.MarkFlagRequired("min-free-bytes")
+	return command
+}
 
 func blobCacheRoot() string {
 	if global.blobCacheDir != "" {

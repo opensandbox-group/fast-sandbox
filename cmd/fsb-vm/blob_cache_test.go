@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -192,4 +193,38 @@ func TestLocalBlobCrossFilesystemFallsBackWithoutCopy(t *testing.T) {
 	require.ErrorIs(t, err, syscall.EXDEV)
 	require.FileExists(t, path)
 	require.NoFileExists(t, blobCachePath(digest.FromString("new")))
+}
+
+func TestTrimBlobCacheForSnapshotCapacity(t *testing.T) {
+	setupBlobCache(t)
+	unpinned, _ := retainTestBlob(t, "reclaimable")
+	pinned, _ := retainTestBlob(t, "live")
+	home := t.TempDir()
+	lower := cachedLowers(home, blobTestImage(t, pinned))[0]
+	require.NotEmpty(t, lower.File)
+	run := func(minFree uint64) error {
+		command := newTrimBlobCacheCommand()
+		command.SetArgs([]string{"--min-free-bytes", strconv.FormatUint(minFree, 10)})
+		return command.Execute()
+	}
+	// Even with entries below the byte/file budget, a staging-space request
+	// reclaims unpinned data. An impossible target must not unlink live files.
+	require.ErrorContains(t, run(^uint64(0)), "live device files retained")
+	require.NoFileExists(t, blobCachePath(unpinned.Digest))
+	require.FileExists(t, blobCachePath(pinned.Digest))
+	data, err := os.ReadFile(lower.File)
+	require.NoError(t, err)
+	require.Equal(t, "live", string(data))
+
+	// Disabling admission must not strand old cache contents. Reclamation
+	// uses the same lock as admission and device pin creation.
+	require.NoError(t, os.RemoveAll(home))
+	global.blobCacheMaxBytes = 0
+	unlock, err := tryLock(blobCacheRoot(), "cache")
+	require.NoError(t, err)
+	require.ErrorIs(t, run(0), errBusy)
+	require.FileExists(t, blobCachePath(pinned.Digest))
+	unlock()
+	require.NoError(t, run(0))
+	require.NoFileExists(t, blobCachePath(pinned.Digest))
 }

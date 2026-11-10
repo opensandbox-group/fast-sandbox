@@ -159,6 +159,7 @@ func init() {
 	rootCmd.AddCommand(newPackCommand())
 	rootCmd.AddCommand(newPackCleanupCommand())
 	rootCmd.AddCommand(newCacheCheckpointCommand())
+	rootCmd.AddCommand(newTrimBlobCacheCommand())
 }
 
 func newQualifyBackendCommand() *cobra.Command {
