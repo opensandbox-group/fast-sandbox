@@ -254,3 +254,9 @@ func SameRuntimeIdentity(existing, requested fastletapi.SandboxIdentity) bool {
 		existing.AssignmentAttempt == requested.AssignmentAttempt &&
 		existing.RouteGeneration == requested.RouteGeneration
 }
+
+// NativeRootfsOnlySnapshotCapability distinguishes file-backed capture from
+// older OCI-only implementations during rolling upgrades.
+type NativeRootfsOnlySnapshotCapability interface {
+	SupportsNativeRootfsOnlySnapshots() bool
+}

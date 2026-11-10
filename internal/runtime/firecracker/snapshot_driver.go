@@ -79,6 +79,12 @@ var _ runtimecontract.Snapshotter = (*Driver)(nil)
 // to dispatch RootfsOnly snapshots without it.
 func (d *Driver) SupportsRootfsOnlySnapshots() bool { return true }
 
+func (d *Driver) SupportsNativeRootfsOnlySnapshots() bool {
+	// Per-instance VMM and kernel checks run at capture, after selection.
+	q, _, err := readQualificationOverrides()
+	return err == nil && q.Backend == captureBackendNative && q.ExclusiveExt4 && strings.TrimSpace(q.StorageRevision) != ""
+}
+
 // snapshotMu serializes the pause/dump/resume window across all Sandboxes of
 // this driver: only one VM on the node is ever paused at a time. Manifest
 // assembly and publication run outside the lock.

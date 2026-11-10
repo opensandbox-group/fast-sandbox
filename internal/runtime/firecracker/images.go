@@ -18,6 +18,7 @@ import (
 	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/ocitemplate"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
+	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 )
 
 // imageCacheDir holds content-addressed rootfs images:
@@ -95,6 +96,18 @@ func verifyRestorableImage(stateRoot, image string) error {
 	}
 	if _, err := resolveRootfsImage(stateRoot, image); err != nil {
 		return err
+	}
+	if payload, err := os.ReadFile(cachedManifestPath(stateRoot, image)); err == nil {
+		if document, err := artifacts.DecodeVMManifest(payload); err == nil && document.IsRootfsOnly() {
+			ready, err := agentpull.ImageReady(stateRoot, image)
+			if err != nil {
+				return err
+			}
+			if !ready {
+				return ErrImageNotReady
+			}
+			return nil
+		}
 	}
 	if _, _, err := resolveRestoreSnapshotFiles(stateRoot, image); err != nil {
 		return err

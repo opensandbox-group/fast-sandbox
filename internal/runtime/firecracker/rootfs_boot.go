@@ -27,8 +27,13 @@ func checkRootfsBootCompatibility(m artifacts.VMManifest, version string) error 
 func (d *Driver) rootfsKernel(m artifacts.VMManifest) (string, error) {
 	return firecrackerconfig.ResolveKernel("/usr/local/share/firecracker", m.Kernel.Version, d.config.KernelPath)
 }
-func (d *Driver) prepareRootfsBootInstance(id, directory, rootfs, kernel string) (devicePath, jailPath, socketPath string, resultErr error) {
+func (d *Driver) prepareRootfsBootInstance(id, directory, rootfs, kernel, driveName string) (devicePath, jailPath, socketPath string, resultErr error) {
 	if d.config.JailerPath == "" {
+		if driveName == rootfsImageName {
+			// Native boot already owns directory/rootfs.img. Keep the same
+			// relative drive name that native Full snapshots restore later.
+			return rootfs, "", filepath.Join(directory, "api.sock"), nil
+		}
 		return d.prepareOCIInstance(id, directory, rootfs, "", "")
 	}
 	root := jailerRoot(filepath.Join(d.config.StateRoot, jailerChrootBaseDir), filepath.Base(d.config.BinaryPath), truncatedSandboxID(id))
@@ -41,7 +46,7 @@ func (d *Driver) prepareRootfsBootInstance(id, directory, rootfs, kernel string)
 			d.removeJailRoot(id)
 		}
 	}()
-	for _, entry := range []struct{ source, target string }{{rootfs, rootfsDeviceName}, {kernel, "rootfs-kernel"}} {
+	for _, entry := range []struct{ source, target string }{{rootfs, driveName}, {kernel, "rootfs-kernel"}} {
 		target := filepath.Join(root, entry.target)
 		f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, 0640)
 		if err != nil {
@@ -54,9 +59,9 @@ func (d *Driver) prepareRootfsBootInstance(id, directory, rootfs, kernel string)
 			return "", "", "", err
 		}
 	}
-	return filepath.Join(root, rootfsDeviceName), root, filepath.Join(root, "api.sock"), nil
+	return filepath.Join(root, driveName), root, filepath.Join(root, "api.sock"), nil
 }
-func configureRootfsVM(ctx context.Context, c *Client, slot *fastletnetwork.Slot, m artifacts.VMManifest, kernel string, jailed bool) error {
+func configureRootfsVM(ctx context.Context, c *Client, slot *fastletnetwork.Slot, m artifacts.VMManifest, kernel, driveName string, jailed bool) error {
 	if slot == nil || slot.GuestTap == "" {
 		return ErrNetworkUnavailable
 	}
@@ -66,7 +71,7 @@ func configureRootfsVM(ctx context.Context, c *Client, slot *fastletnetwork.Slot
 	if jailed {
 		kernel = "/rootfs-kernel"
 	}
-	ops, err := firecrackerconfig.RootfsBoot(m, kernel, rootfsDeviceName, slot.GuestTap, "guest-control.sock")
+	ops, err := firecrackerconfig.RootfsBoot(m, kernel, driveName, slot.GuestTap, "guest-control.sock")
 	if err != nil {
 		return err
 	}

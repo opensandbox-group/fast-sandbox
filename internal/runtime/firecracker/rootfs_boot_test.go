@@ -2,7 +2,10 @@ package firecracker
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -39,7 +42,7 @@ func TestRootfsDriverBootAPIsAndFailure(t *testing.T) {
 			c := NewClient(socket)
 			defer c.Close()
 			m := artifacts.VMManifest{Machine: artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 256, RootfsDriveID: "rootfs"}, Kernel: artifacts.VMKernel{Version: "6.1", Cmdline: "root=/dev/vda rw"}, GuestNetwork: &artifacts.VMGuestNetwork{Iface: "eth0", MAC: "02:00:00:00:00:01", IP: "172.30.0.3", Gateway: "172.30.0.1", Netmask: "255.255.255.0", MTU: 1500}, GuestControl: &artifacts.VMGuestControl{Port: 1234}}
-			err := configureRootfsVM(t.Context(), c, &fastletnetwork.Slot{GuestTap: "tap0"}, m, "/kernel", false)
+			err := configureRootfsVM(t.Context(), c, &fastletnetwork.Slot{GuestTap: "tap0"}, m, "/kernel", rootfsDeviceName, false)
 			if failure < 0 {
 				require.NoError(t, err)
 			} else {
@@ -58,4 +61,40 @@ func TestRootfsDriverBootAPIsAndFailure(t *testing.T) {
 			require.NotContains(t, machine, "cpu_template")
 		})
 	}
+}
+
+// Both storage layouts must preserve the drive name in vmstate so the
+// corresponding Full restore can find it without source-path aliases.
+func TestRootfsBootDriveContract(t *testing.T) {
+	for _, name := range []string{rootfsImageName, rootfsDeviceName} {
+		for _, jailed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/jailed=%t", name, jailed), func(t *testing.T) {
+				var drive map[string]any
+				socket := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/drives/rootfs" {
+						require.NoError(t, json.NewDecoder(r.Body).Decode(&drive))
+					}
+					w.WriteHeader(http.StatusNoContent)
+				})
+				client := NewClient(socket)
+				defer client.Close()
+				manifest := artifacts.VMManifest{Machine: artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 256, RootfsDriveID: "rootfs"}, Kernel: artifacts.VMKernel{Cmdline: "root=/dev/vda rw"}, GuestNetwork: &artifacts.VMGuestNetwork{Iface: "eth0", MAC: "02:00:00:00:00:01", IP: "172.30.0.3", Gateway: "172.30.0.1", Netmask: "255.255.255.0", MTU: 1500}}
+				require.NoError(t, configureRootfsVM(t.Context(), client, &fastletnetwork.Slot{GuestTap: "tap0"}, manifest, "/kernel", name, jailed))
+				require.Equal(t, name, drive["path_on_host"])
+			})
+		}
+	}
+}
+
+func TestRootfsNativeDirectBootKeepsFullLayout(t *testing.T) {
+	directory := t.TempDir()
+	disk := filepath.Join(directory, rootfsImageName)
+	require.NoError(t, os.WriteFile(disk, []byte("native-rootfs"), 0600))
+	driver := &Driver{}
+	path, jail, socket, err := driver.prepareRootfsBootInstance("source", directory, disk, "/kernel", rootfsImageName)
+	require.NoError(t, err)
+	require.Equal(t, disk, path)
+	require.Empty(t, jail)
+	require.Equal(t, filepath.Join(directory, "api.sock"), socket)
+	require.NoFileExists(t, filepath.Join(directory, rootfsDeviceName))
 }
