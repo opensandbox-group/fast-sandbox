@@ -1529,7 +1529,12 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 	annotations["fast-sandbox.io/settings-revision"] = settingsRevision
 
 	podSpec := pool.Spec.FastletTemplate.Spec.DeepCopy()
-	podSpec.HostNetwork = false
+	// HostNetwork is opt-in via the pool template: bare-metal pools whose
+	// nodes have no usable pod networking run fastlets on the host network.
+	// One fastlet per node (e.g. via topologySpreadConstraints) keeps the
+	// FastPath pod-IP routing unambiguous, because status.podIP becomes the
+	// node IP. Templates that do not set the field keep the historical
+	// default (the zero value).
 	podSpec.HostPID = false
 	podSpec.RuntimeClassName = nil
 	podSpec.AutomountServiceAccountToken = boolPtr(false)

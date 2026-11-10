@@ -1211,6 +1211,8 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
 				RuntimeClassName:             &runtimeClass,
 				AutomountServiceAccountToken: &automount,
+				HostNetwork:                  true,
+				HostPID:                      true,
 				Containers: []corev1.Container{{
 					Name: "fastlet", Image: "fastlet:test",
 					Env: []corev1.EnvVar{
@@ -1229,6 +1231,8 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	pod, err := reconciler.constructPodWithRuntimePlan(pool, runtimePlan)
 	require.NoError(t, err)
 	require.Nil(t, pod.Spec.RuntimeClassName)
+	require.True(t, pod.Spec.HostNetwork, "template hostNetwork is opt-in and preserved")
+	require.False(t, pod.Spec.HostPID, "hostPID stays platform-forced off")
 	require.NotNil(t, pod.Spec.AutomountServiceAccountToken)
 	require.False(t, *pod.Spec.AutomountServiceAccountToken)
 	require.Equal(t, "container", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RUNTIME"))
