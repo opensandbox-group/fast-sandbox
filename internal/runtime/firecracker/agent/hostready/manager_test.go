@@ -115,7 +115,7 @@ func TestManagerKeepsSettingsOnReloadError(t *testing.T) {
 func TestManagerRejectsIncompleteVersionedInstallation(t *testing.T) {
 	probes, assets := healthyProbes(t)
 	bundle := versionBundleFixture(t)
-	require.NoError(t, os.Remove(filepath.Join(bundle, "versions", "1.16.2", "jailer")))
+	require.NoError(t, os.Remove(filepath.Join(bundle, "versions", "1.17.0", "jailer")))
 	manager := NewManager(ManagerConfig{
 		Check:  CheckConfig{StateRoot: t.TempDir(), AssetsDir: assets},
 		Assets: &AssetConfig{Dir: assets, BundleDir: bundle, VerifyBinary: func(string) error { return nil }},

@@ -327,8 +327,8 @@ func TestBundlePinsMatchGoDefaults(t *testing.T) {
 func versionBundleFixture(t *testing.T) string {
 	t.Helper()
 	bundle := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(bundle, "catalog.json"), []byte(`{"schemaVersion":1,"legacyVersion":"1.16.1","versions":["1.16.1","1.16.2"]}`), 0644))
-	for _, version := range []string{"1.16.1", "1.16.2"} {
+	require.NoError(t, os.WriteFile(filepath.Join(bundle, "catalog.json"), []byte(`{"schemaVersion":1,"legacyVersion":"1.16.1","versions":["1.16.1","1.17.0"]}`), 0644))
+	for _, version := range []string{"1.16.1", "1.17.0"} {
 		dir := filepath.Join(bundle, "versions", version)
 		require.NoError(t, os.MkdirAll(dir, 0755))
 		var sums strings.Builder
@@ -362,7 +362,7 @@ func TestVersionedAssetsAtomicAndImmutable(t *testing.T) {
 		require.NoError(t, err)
 	}
 	require.FileExists(t, filepath.Join(dir, "catalog.json"))
-	for _, v := range []string{"1.16.1", "1.16.2"} {
+	for _, v := range []string{"1.16.1", "1.17.0"} {
 		require.FileExists(t, filepath.Join(dir, "versions", v, "firecracker"))
 		require.FileExists(t, filepath.Join(dir, "versions", v, "jailer"))
 	}
@@ -370,7 +370,7 @@ func TestVersionedAssetsAtomicAndImmutable(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "legacy", string(old))
 	require.Empty(t, mustGlob(t, filepath.Join(dir, "versions", ".install-*")))
-	changed := filepath.Join(dir, "versions", "1.16.2", "firecracker")
+	changed := filepath.Join(dir, "versions", "1.17.0", "firecracker")
 	require.NoError(t, os.WriteFile(changed, []byte("changed"), 0755))
 	require.ErrorContains(t, c.installVersionedBundle(t.Context()), "checksum mismatch")
 	raw, err := os.ReadFile(changed)
@@ -383,7 +383,7 @@ func TestVersionedAssetsRejectIncompleteAndWrongVersion(t *testing.T) {
 		t.Run(scenario, func(t *testing.T) {
 			bundle, dir := versionBundleFixture(t), t.TempDir()
 			c := AssetConfig{Dir: dir, BundleDir: bundle}
-			source := filepath.Join(bundle, "versions", "1.16.2")
+			source := filepath.Join(bundle, "versions", "1.17.0")
 			ctx := t.Context()
 			switch scenario {
 			case "missing-jailer":
@@ -397,7 +397,7 @@ func TestVersionedAssetsRejectIncompleteAndWrongVersion(t *testing.T) {
 				require.NoError(t, os.WriteFile(filepath.Join(source, "SHA256SUMS"), []byte(sums), 0644))
 			case "symlink":
 				require.NoError(t, os.MkdirAll(filepath.Join(dir, "versions"), 0755))
-				require.NoError(t, os.Symlink(t.TempDir(), filepath.Join(dir, "versions", "1.16.2")))
+				require.NoError(t, os.Symlink(t.TempDir(), filepath.Join(dir, "versions", "1.17.0")))
 			case "cancelled":
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithCancel(ctx)
@@ -405,7 +405,7 @@ func TestVersionedAssetsRejectIncompleteAndWrongVersion(t *testing.T) {
 			}
 			require.Error(t, c.installVersionedBundle(ctx))
 			require.NoFileExists(t, filepath.Join(dir, "catalog.json"))
-			require.NoFileExists(t, filepath.Join(dir, "versions", "1.16.2", "firecracker"))
+			require.NoFileExists(t, filepath.Join(dir, "versions", "1.17.0", "firecracker"))
 			require.Empty(t, mustGlob(t, filepath.Join(dir, "versions", ".install-*")))
 		})
 	}
