@@ -9,7 +9,6 @@
 
 ARG OCI_TOOLS_IMAGE=fast-sandbox/oci-tools:dev
 ARG OCI2ROOTFS_REV=76d3f4648a591066a4419f972e4118f2d1d68a35
-ARG FIRECRACKER_VERSION=v1.16.1
 
 # --- shared OCI artifacts ------------------------------------------------
 FROM ${OCI_TOOLS_IMAGE} AS oci-tools
@@ -23,6 +22,13 @@ RUN git clone https://github.com/arcboxlabs/oci2rootfs.git /src/oci2rootfs \
     && cd /src/oci2rootfs \
     && git checkout --detach "$OCI2ROOTFS_REV" \
     && cargo build --release --locked -p oci2rootfs-cli
+
+# --- shared Firecracker release bundle -------------------------------------
+FROM alpine:3.19 AS fc-assets
+COPY internal/firecrackervmm/releases.json /releases.json
+COPY build/firecracker/package.sh /package.sh
+RUN apk add --no-cache curl jq coreutils \
+    && sh /package.sh /releases.json /bundle x86_64
 
 # --- sandboxtemplate-builder binary ----------------------------------------
 FROM golang:1.25 AS builder-build
@@ -51,7 +57,6 @@ RUN CGO_ENABLED=0 go build -o /out/sandboxtemplate-builder ./cmd/sandboxtemplate
 # --- runtime image ---------------------------------------------------------
 FROM ubuntu:22.04
 
-ARG FIRECRACKER_VERSION
 ARG OCI2ROOTFS_REV
 # The default pins the Firecracker CI Amazon microvm kernel (6.18, ACPI +
 # VMGenID) under its real name; override both together to embed a
@@ -83,13 +88,8 @@ RUN set -eux; \
     /tmp/aws/install; \
     rm -rf /tmp/aws /tmp/awscliv2.zip
 
-# Firecracker release binary.
-RUN set -eux; \
-    archive="firecracker-${FIRECRACKER_VERSION}-x86_64.tgz"; \
-    curl -fsSL --retry 5 "https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/${archive}" -o "/tmp/${archive}"; \
-    tar -xzf "/tmp/${archive}" -C /tmp; \
-    install -m 0755 "/tmp/release-${FIRECRACKER_VERSION}-x86_64/firecracker-${FIRECRACKER_VERSION}-x86_64" /usr/local/bin/firecracker; \
-    rm -rf "/tmp/${archive}" "/tmp/release-${FIRECRACKER_VERSION}-x86_64"
+COPY --from=fc-assets /bundle /opt/fast-sandbox/firecracker
+RUN ln -s /opt/fast-sandbox/firecracker/firecracker /usr/local/bin/firecracker
 
 COPY --from=oci2rootfs-build /src/oci2rootfs/target/release/oci2rootfs /usr/local/bin/oci2rootfs
 COPY --from=oci-tools /opt/overlaybd/ /opt/overlaybd/

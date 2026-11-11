@@ -10,11 +10,8 @@
 ARG OCI_TOOLS_IMAGE=fast-sandbox/oci-tools:dev
 ARG DART_REV=a85f39f13d81241b3d57f7f7fe7b7c84d58b7aa2
 
-# Firecracker assets baked in (fc-assets stage below): the hostready
-# installer copies them onto the node instead of downloading. The pin must
-# match hostready.DefaultFCVersion (asserted by assets_test.go). No guest
-# kernel: snapshots bake their own and restore never boots one (#84).
-ARG FC_VERSION=v1.16.1
+# Official VMM release pairs are selected by the shared releases.json.
+# The flat legacy pair remains available while consumers roll forward.
 
 # --- shared OCI artifacts ------------------------------------------------
 FROM ${OCI_TOOLS_IMAGE} AS oci-tools
@@ -44,17 +41,10 @@ RUN git init /src/dart \
 # nesting; the manifest self-check fails the build on a bad extraction.
 FROM alpine:3.19 AS fc-assets
 
-ARG FC_VERSION
-RUN apk add --no-cache curl \
-    && mkdir /bundle /stage \
-    && curl --retry 3 --retry-all-errors --connect-timeout 20 --max-time 120 -fsSL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VERSION}/firecracker-${FC_VERSION}-x86_64.tgz" -o /stage/fc.tgz \
-    && tar -xzf /stage/fc.tgz -C /stage \
-    && find /stage -type f -name "firecracker-${FC_VERSION}-x86_64" -exec mv {} /bundle/firecracker \; \
-    && find /stage -type f -name "jailer-${FC_VERSION}-x86_64" -exec mv {} /bundle/jailer \; \
-    && chmod 0755 /bundle/firecracker /bundle/jailer \
-    && cd /bundle \
-    && sha256sum firecracker jailer > SHA256SUMS \
-    && sha256sum -c SHA256SUMS
+COPY internal/firecrackervmm/releases.json /releases.json
+COPY build/firecracker/package.sh /package.sh
+RUN apk add --no-cache curl jq coreutils \
+    && sh /package.sh /releases.json /bundle x86_64
 
 # --- runtime image -----------------------------------------------------------
 FROM ubuntu:22.04

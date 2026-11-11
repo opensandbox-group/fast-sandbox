@@ -102,6 +102,9 @@ func assetArch() (string, error) {
 // and verifiable directory short-circuits without network.
 func (c AssetConfig) Ensure(ctx context.Context) error {
 	dir := c.dir()
+	if err := c.installVersionedBundle(ctx); err != nil {
+		return err
+	}
 	if err := c.verify(); err == nil {
 		klog.InfoS("firecracker assets already installed", "dir", dir)
 		return nil
