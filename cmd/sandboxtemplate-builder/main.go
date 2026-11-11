@@ -37,6 +37,7 @@ import (
 	"k8s.io/klog/v2"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/firecrackervmm"
 )
 
 const (
@@ -49,11 +50,29 @@ const (
 
 // Tool paths inside the builder image.
 const (
-	oci2rootfsBin  = "oci2rootfs"
-	firecrackerBin = "firecracker"
-	awsBin         = "aws"
-	kernelDir      = "/usr/local/share/firecracker"
+	oci2rootfsBin = "oci2rootfs"
+	awsBin        = "aws"
+	kernelDir     = "/usr/local/share/firecracker"
 )
+
+var firecrackerBin = "firecracker"
+
+func selectBuildVMM(ctx context.Context) error {
+	if binary := os.Getenv("FAST_SANDBOX_SELECTED_FIRECRACKER"); binary != "" {
+		firecrackerBin = binary
+		return nil
+	}
+	directory := os.Getenv("FAST_SANDBOX_VMM_DIR")
+	if directory == "" {
+		return nil
+	}
+	selected, err := firecrackervmm.Resolve(ctx, directory, os.Getenv("FAST_SANDBOX_FIRECRACKER_VERSION"), false)
+	if err != nil {
+		return err
+	}
+	firecrackerBin = selected.BinaryPath
+	return nil
+}
 
 func main() {
 	// Two ways to reach the snapshot stage entry: the symlinked binary name
@@ -83,6 +102,10 @@ func main() {
 
 // run selects the build pipeline by publication destination.
 func run(ctx context.Context) error {
+	if err := selectBuildVMM(ctx); err != nil {
+		return err
+	}
+
 	spec, workdir, err := loadSpecAndWorkdir()
 	if err != nil {
 		return err

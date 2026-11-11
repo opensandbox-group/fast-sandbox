@@ -46,6 +46,7 @@ RUN go mod download
 # snapshot producer (checksums, manifest encoding, index layout).
 COPY api ./api
 COPY internal/artifacts ./internal/artifacts
+COPY internal/firecrackervmm ./internal/firecrackervmm
 COPY internal/guestnetwork ./internal/guestnetwork
 COPY internal/guestcontrol ./internal/guestcontrol
 COPY cmd/fsb-guest-control ./cmd/fsb-guest-control
@@ -105,6 +106,7 @@ RUN sed 's/"enable": true, "uriPrefix"/"enable": false, "uriPrefix"/' /etc/overl
 ENV LD_LIBRARY_PATH=/opt/overlaybd/lib
 ENV PATH=/opt/overlaybd/bin:${PATH}
 ENV FAST_SANDBOX_OCI_ENABLED=auto
+ENV FAST_SANDBOX_VMM_DIR=/opt/fast-sandbox/firecracker
 
 # Guest kernel, embedded in the builder image so builds do not download a
 # kernel at build time. Override KERNEL_URL to pin a specific build.

@@ -16,6 +16,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/spf13/cobra"
 
+	"fast-sandbox/internal/firecrackervmm"
 	"fast-sandbox/internal/ocitemplate"
 )
 
@@ -495,6 +496,10 @@ func prepareBuildSource(ctx context.Context, repository ocitemplate.MetadataRepo
 // A rollback that cannot release a resource keeps everything it depends on
 // and reports it alongside the build error.
 func runBuild(ctx context.Context, options *buildOptions) (err error) {
+	if err := selectBuildVMM(ctx); err != nil {
+		return err
+	}
+
 	if err := validateBuildOptions(options); err != nil {
 		return err
 	}
@@ -846,4 +851,16 @@ func printBuildResult(layout artifactLayout, output outputNames, rootfsDigest, s
 	fmt.Printf("  %s (manifest %s)\n", output.snapfilesName(), snapDigest)
 	fmt.Printf("  blobs    : %s\n", layout.blobDir())
 	fmt.Printf("  manifests: %s\n", layout.manifestDir())
+}
+
+func selectBuildVMM(ctx context.Context) error {
+	if global.vmmDir == "" {
+		return nil
+	}
+	selected, err := firecrackervmm.Resolve(ctx, global.vmmDir, "", false)
+	if err != nil {
+		return err
+	}
+	global.firecrackerBin = selected.BinaryPath
+	return nil
 }

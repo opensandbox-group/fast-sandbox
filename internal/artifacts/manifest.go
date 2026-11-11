@@ -491,6 +491,17 @@ var cpuTemplateAllowlists = map[string]map[string][]fms{
 			{vendor: VendorAuthenticAMD, family: 25, model: 1, stepping: 1}, // EPYC Milan
 		},
 	},
+	// T2 and T2A are unchanged between upstream v1.16.1 and v1.17.0.
+	"1.17.0": {
+		CPUTemplateT2: {
+			{vendor: VendorGenuineIntel, family: 6, model: 85, stepping: 4},  // Skylake-SP
+			{vendor: VendorGenuineIntel, family: 6, model: 85, stepping: 7},  // Cascade Lake-SP
+			{vendor: VendorGenuineIntel, family: 6, model: 106, stepping: 6}, // Ice Lake-SP
+		},
+		CPUTemplateT2A: {
+			{vendor: VendorAuthenticAMD, family: 25, model: 1, stepping: 1}, // EPYC Milan
+		},
+	},
 }
 
 // CompatibilityCPUTemplate reports which template tier the identity

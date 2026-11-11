@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/firecrackervmm"
 	infracontract "fast-sandbox/internal/infra/contract"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
@@ -44,6 +45,7 @@ const (
 // runtime configuration separate from Driver-produced allocation state so
 // restart recovery preserves both authority boundaries.
 type SandboxState struct {
+	VMM               *firecrackervmm.Selection           `json:"vmm,omitempty"`
 	BootKernelSHA256  string                              `json:"bootKernelSHA256,omitempty"`
 	BootCompatibility *artifacts.SnapshotCompatibility    `json:"bootCompatibility,omitempty"`
 	Config            fastletapi.RuntimeSandboxConfig     `json:"config"`
