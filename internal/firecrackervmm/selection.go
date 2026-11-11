@@ -2,11 +2,15 @@ package firecrackervmm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 )
+
+// ErrVersionUnavailable means the artifact requests a release outside the installed inventory.
+var ErrVersionUnavailable = errors.New("Firecracker version unavailable")
 
 // Selection is immutable for the lifetime of one VM.
 type Selection struct {
@@ -40,7 +44,7 @@ func Resolve(ctx context.Context, root, version string, jailed bool) (Selection,
 			}
 		}
 	} else if !slices.Contains(catalog.Versions, version) {
-		return result, fmt.Errorf("Firecracker %q unavailable; installed versions: %v", version, catalog.Versions)
+		return result, fmt.Errorf("%w: %q; installed versions: %v", ErrVersionUnavailable, version, catalog.Versions)
 	}
 	dir := filepath.Join(root, "versions", version)
 	for _, path := range []string{filepath.Join(root, "versions"), dir} {

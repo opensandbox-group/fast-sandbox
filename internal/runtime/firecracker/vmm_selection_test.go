@@ -92,3 +92,16 @@ func TestManagedRootfsCaptureVersionGate(t *testing.T) {
 	require.NoError(t, checkRootfsCaptureVersion(nil, "1.17.0"))
 	require.ErrorContains(t, qualifyVMMExecutable(&SandboxState{}, ""), "custom VMM requires")
 }
+
+func TestManagedVMMUnavailableIsArtifactMismatch(t *testing.T) {
+	root := vmmTestBundle(t)
+	d := &Driver{config: runtimecatalog.FirecrackerConfig{VMMDir: root, StateRoot: t.TempDir()}}
+	_, err := d.selectVMM(t.Context(), "1.15.0")
+	require.ErrorIs(t, err, ErrIncompatibleArtifact)
+	require.ErrorIs(t, err, firecrackervmm.ErrVersionUnavailable)
+	// A broken installation is a runtime fault, not an artifact mismatch.
+	require.NoError(t, os.Remove(filepath.Join(root, "versions", "1.17.0", "firecracker")))
+	_, err = d.selectVMM(t.Context(), "1.17.0")
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrIncompatibleArtifact)
+}

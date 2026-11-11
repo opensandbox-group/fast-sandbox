@@ -3,6 +3,7 @@ package firecracker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,6 +22,9 @@ func (d *Driver) selectVMM(ctx context.Context, version string) (*firecrackervmm
 		return nil, fmt.Errorf("existing artifact has no Firecracker version")
 	}
 	selected, err := firecrackervmm.Resolve(ctx, d.config.VMMDir, version, d.config.JailerPath != "")
+	if errors.Is(err, firecrackervmm.ErrVersionUnavailable) {
+		return nil, fmt.Errorf("%w: %w", ErrIncompatibleArtifact, err)
+	}
 	if err != nil {
 		return nil, err
 	}
