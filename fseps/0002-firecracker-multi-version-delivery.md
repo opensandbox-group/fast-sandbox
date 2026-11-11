@@ -21,7 +21,7 @@ This proposal does not introduce a Firecracker fork, automatic tracking of upstr
 
 ### Delivery: separate immutable version directories
 
-Runtime-agent and Builder images consume one FSB-maintained release list. The initial target is official **1.16.1 and 1.16.2**, subject to the acceptance tests below. Adding a version is an explicit FSB release change, not a request-time download of whichever version upstream currently publishes.
+Runtime-agent and Builder images consume one FSB-maintained release list. The initial target is official **1.16.1 and 1.17.0**, subject to the acceptance tests below. Adding a version is an explicit FSB release change, not a request-time download of whichever version upstream currently publishes. The initial implementation skips 1.16.2 and uses 1.17.0, which also includes the upstream vsock fix. Runtime-agent, Fastlet, Builder, and their tools upgrade together; supporting mixed components from different FSB releases is out of scope.
 
 ```mermaid
 flowchart LR
@@ -29,7 +29,7 @@ flowchart LR
     R --> B["Builder image"]
     A --> I["Verify and atomically install<br/>Each complete VMM pair"]
     I --> O["versions/1.16.1<br/>firecracker + jailer"]
-    I --> N["versions/1.16.2<br/>firecracker + jailer"]
+    I --> N["versions/1.17.0<br/>firecracker + jailer"]
     O --> F["Fastlet<br/>Read-only directory mount"]
     N --> F
     classDef blue fill:#dbeafe,stroke:#2563eb,color:#172554;
@@ -94,12 +94,12 @@ The intended initial matrix is:
 | Runtime | Full templates/checkpoints | RootfsOnly capture | RootfsOnly cold boot |
 | --- | --- | --- | --- |
 | Official 1.16.1 | Preserve same-version restore and creation | Reject before Guest freeze because bare Resume breaks vsock | Preserve same-version support |
-| Official 1.16.2 | Qualify same-version creation/restore and CPU policy | Enable after the qualified control/storage chain passes | Qualify same-version boot |
+| Official 1.17.0 | Qualify same-version creation/restore and CPU policy | Enable after the qualified control/storage chain passes | Qualify same-version boot |
 | Missing or unsupported version | Reject | Reject | Reject |
 
 Selection and capability are different checks. A matching version or explicit executable digest does not establish a safe RootfsOnly capture path. The interim gate and qualification work in [#185](https://github.com/opensandbox-group/fast-sandbox/pull/185) must recognize managed version directories without weakening the kernel, Guest helper, backend identity or filesystem checks.
 
-Do not rewrite a 1.16.1 Full manifest to claim 1.16.2 compatibility. New 1.16.2 templates must be built using that runtime. Cross-version RootfsOnly cold boot may be considered later, but this proposal does not promise it or depend on capturing a RootfsOnly artifact from an affected stock 1.16.1 source.
+Do not rewrite a 1.16.1 Full manifest to claim 1.17.0 compatibility. New 1.17.0 templates must be built using that runtime. Cross-version RootfsOnly cold boot may be considered later, but this proposal does not promise it or depend on capturing a RootfsOnly artifact from an affected stock 1.16.1 source.
 
 CPU-template policy remains version-specific. FSB currently has static-template mappings for 1.16.1; mappings for a new release require review against that upstream release and execution tests. A node/profile must not advertise a CPU tier that is invalid for versions it admits. If their policies differ, restrict the eligible profile or adjust capability reporting before enabling that combination; choosing a different VMM is not a CPU-compatibility workaround.
 
@@ -110,21 +110,19 @@ Each implementation batch receives focused tests and review. Release acceptance 
 | Layer | Required checks |
 | --- | --- |
 | Installation and selection | Offline bundled install; paired versions/checksums; interruption and concurrent installation; immutable existing releases; numeric latest selection; missing/invalid manifests and versions; no fallback; custom fixed-binary behavior |
-| CLI and lifecycle | Prepare-only and Fastlet agree on selection; concurrent 1.16.1/1.16.2 instances; persisted selection survives Fastlet restart and installation of another release; legacy-state recovery; correct jail and attachment cleanup |
+| CLI and lifecycle | Prepare-only and Fastlet agree on selection; concurrent 1.16.1/1.17.0 instances; persisted selection survives Fastlet restart and installation of another release; legacy-state recovery; correct jail and attachment cleanup |
 | Builder and Full compatibility | Both object-store and OCI Builder outputs record the actual selected version; each supported version passes its own Full save/restore and checkpoint cycle on supported x86_64 CPUs; wrong-version restore is rejected |
-| RootfsOnly integration | A production-built 1.16.2 template passes repeated bare Pause/Resume with fresh vsock connections, capture, confirmed thaw and continued writes, publication and cold boot; then Full capture/restore from the cold-booted instance; direct and jailer launches |
+| RootfsOnly integration | A production-built 1.17.0 template passes repeated bare Pause/Resume with fresh vsock connections, capture, confirmed thaw and continued writes, publication and cold boot; then Full capture/restore from the cold-booted instance; direct and jailer launches |
 | Negative capability test | Stock 1.16.1 capture is rejected before freeze, including with a correct explicit digest; no artifact is published and the source remains usable |
 | Deployment | Actual runtime-agent/Fastlet separate Pods see the same complete read-only release directories; new and legacy templates coexist after rollout |
 
 ARM64 lab runs can supplement these checks but do not replace x86_64 shipped-image acceptance or establish Intel/AMD portability. Cross-vendor RootfsOnly validation remains a separate FSEP-0001 acceptance concern. Until the relevant deployment chain passes, the downstream failure tracked in [#187](https://github.com/opensandbox-group/fast-sandbox/issues/187) is not considered resolved.
 
-## Rollout and rollback
+## Release delivery
 
-1. Deliver versioned node assets first while preserving the old flat binaries. Then deploy managed-selection Fastlets and the matching Builder. During a mixed-node rollout, constrain the affected Pool to nodes with the required installed releases, or defer admitting new-version templates. Missing-version rejection remains the final safety check; this phase does not require a new cluster scheduler.
-2. Build new templates with 1.16.2 and validate them while existing 1.16.1 templates keep using their original runtime. Re-enable the downstream RootfsOnly integration lane only after its real deployment acceptance passes.
-3. Observe selected/required versions in lifecycle diagnostics, installation failures, missing-version rejections, Full restore failures, and Guest thaw/recovery failures. On regression, stop new-version builds/admission and return new workloads to retained compatible templates.
+Publish runtime-agent, Fastlet, Builder, and their tools together with the same selected VMM release set. This proposal does not implement or validate compatibility between components from different FSB releases. Missing-version rejection remains the final safety check for an incomplete installation.
 
-Retain old release directories; automatic deletion is out of scope. Rolling back the FSB executable/image does not make 1.16.2 Full artifacts loadable by 1.16.1. Keep compatible multi-version nodes available for those instances/checkpoints, or deliberately drain/recreate the affected workloads before reverting to an older single-version deployment. Never rewrite manifests or silently substitute a VMM to make rollback appear successful.
+Build new templates with 1.17.0 while existing 1.16.1 templates keep using their recorded runtime. Validate the downstream RootfsOnly deployment before enabling production capture. Retain old version directories; automatic garbage collection and automatic VMM substitution are outside this change. A rollback must retain a VMM compatible with each remaining artifact; relabeling a Full manifest is never a compatibility mechanism.
 
 ## Related links
 
