@@ -7,7 +7,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"fast-sandbox/internal/firecrackervmm"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +18,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"fast-sandbox/internal/firecrackervmm"
 )
 
 // serveAssets spins an httptest server acting as the Firecracker release
