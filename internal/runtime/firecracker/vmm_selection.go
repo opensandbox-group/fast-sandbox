@@ -98,16 +98,13 @@ func qualifyVMMExecutable(state *SandboxState, expectedDigest string) error {
 }
 
 func checkRootfsCaptureVersion(selected *firecrackervmm.Selection, version string) error {
-	if selected != nil {
-		if selected.Version != version || version != managedRootfsCaptureVersion {
-			return fmt.Errorf("managed RootfsOnly capture requires Firecracker 1.17.0; running %s", version)
-		}
-		return nil
+	if selected != nil && selected.Version != version {
+		return fmt.Errorf("running VMM version %s differs from persisted selection %s", version, selected.Version)
 	}
-	// Preserve explicitly qualified custom 1.16.1 deployments, including the
-	// historical vsock fix backport; stock managed 1.16.1 must never capture.
-	if version != "1.16.1" && version != managedRootfsCaptureVersion {
-		return fmt.Errorf("unsupported RootfsOnly capture version %s", version)
+	// A digest approves executable contents, not a missing lifecycle capability.
+	// Custom binaries must meet the same version gate as managed releases.
+	if version != managedRootfsCaptureVersion {
+		return fmt.Errorf("RootfsOnly capture requires Firecracker %s; running %s", managedRootfsCaptureVersion, version)
 	}
 	return nil
 }

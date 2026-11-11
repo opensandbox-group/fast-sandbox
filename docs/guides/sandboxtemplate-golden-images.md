@@ -17,6 +17,8 @@ templates must explicitly set `format: native`. OverlayBD + S3 builds and
 artifacts are rejected. Rebuild an old S3 template as native, or rebuild and
 publish it to OCI; changing a format label does not convert its artifacts.
 
+Builder ships the managed Firecracker bundle and defaults new templates to its latest installed release (currently 1.17.0). Existing templates retain their recorded VMM version. See [managed VMM selection](snapshot-cpu-compatibility.md#managed-firecracker-versions) for explicit pins, paired delivery, and RootfsOnly capture requirements.
+
 ## End-to-end workflow
 
 ```text

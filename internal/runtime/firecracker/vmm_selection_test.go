@@ -88,5 +88,7 @@ func TestManagedRootfsCaptureVersionGate(t *testing.T) {
 		}
 	}
 	require.Error(t, checkRootfsCaptureVersion(&firecrackervmm.Selection{Version: "1.17.0"}, "1.16.1"))
+	require.Error(t, checkRootfsCaptureVersion(nil, "1.16.1"), "an explicit digest cannot bypass the lifecycle gate")
+	require.NoError(t, checkRootfsCaptureVersion(nil, "1.17.0"))
 	require.ErrorContains(t, qualifyVMMExecutable(&SandboxState{}, ""), "custom VMM requires")
 }
