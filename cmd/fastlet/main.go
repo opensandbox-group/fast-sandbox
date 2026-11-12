@@ -20,6 +20,7 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	infracatalog "fast-sandbox/internal/catalog/infra"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/componentlog"
 	"fast-sandbox/internal/dataplane/fastletproxy"
 	fastletaction "fast-sandbox/internal/fastlet/action"
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
@@ -39,9 +40,15 @@ import (
 )
 
 func main() {
-	klog.InitFlags(nil)
+	componentlog.InitFlags(nil)
 	flag.Parse()
-	defer klog.Flush()
+	closeLogs, err := componentlog.Configure("fastlet")
+	if err != nil {
+		klog.ErrorS(err, "configure component logging")
+		klog.Flush()
+		os.Exit(1)
+	}
+	defer closeLogs()
 	klog.InfoS("starting sandbox fastlet")
 	traceShutdown, err := observability.Configure(context.Background(), "fast-sandbox-fastlet")
 	if err != nil {

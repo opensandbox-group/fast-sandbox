@@ -22,6 +22,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/componentlog"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/janitor"
 	"fast-sandbox/internal/nodecleanup"
@@ -52,9 +53,15 @@ func main() {
 
 	flag.StringVar(&ociStateRoot, "oci-state-root", "", "Shared Firecracker StateRoot for orphan OCI device cleanup; empty disables it")
 
-	klog.InitFlags(nil)
+	componentlog.InitFlags(nil)
 	flag.Parse()
-	defer klog.Flush()
+	closeLogs, err := componentlog.Configure("janitor")
+	if err != nil {
+		klog.ErrorS(err, "configure component logging")
+		klog.Flush()
+		os.Exit(1)
+	}
+	defer closeLogs()
 
 	if nodeName == "" {
 		klog.ErrorS(nil, "node-name is required (or set NODE_NAME env)")
@@ -62,7 +69,6 @@ func main() {
 	}
 
 	var config *rest.Config
-	var err error
 	if kubeconfig != "" {
 		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
 	} else {

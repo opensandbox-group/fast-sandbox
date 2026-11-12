@@ -42,6 +42,7 @@ Fast Sandbox documentation is organized by reader intent:
 - [Resource-aware overcommit tuning](guides/resource-aware-overcommit-tuning.md)
 - [Resource-aware capacity validation](guides/resource-aware-capacity-validation.md)
 - [Observability](guides/observability.md)
+- [Component file logging and rotation](guides/component-logging.md)
 - [Performance](guides/performance.md)
 - [Testing](guides/testing.md)
 - [Firecracker runtime E2E](guides/firecracker-runtime-e2e.md)

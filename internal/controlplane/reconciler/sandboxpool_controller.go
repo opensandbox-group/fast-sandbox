@@ -34,6 +34,7 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	infracatalog "fast-sandbox/internal/catalog/infra"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/componentlog"
 	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 	"fast-sandbox/internal/controlplane/placement"
 	"fast-sandbox/internal/fastlet/podcgroup"
@@ -1622,6 +1623,7 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			corev1.VolumeMount{Name: fastletsettings.VolumeName, MountPath: fastletsettings.MountPath, ReadOnly: true},
 			corev1.VolumeMount{Name: proxyControlVolumeName, MountPath: proxyRunDir},
 		)
+		c.VolumeMounts = append(c.VolumeMounts, componentLogVolumeMounts()...)
 		if needsHostCgroup {
 			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{
 				Name: podcgroup.VolumeName, MountPath: podcgroup.HostRoot,
@@ -1661,7 +1663,7 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			{Name: "data-proxy", ContainerPort: 5780, Protocol: corev1.ProtocolTCP},
 			{Name: "proxy-metrics", ContainerPort: 9093, Protocol: corev1.ProtocolTCP},
 		},
-		VolumeMounts: []corev1.VolumeMount{{Name: proxyControlVolumeName, MountPath: proxyRunDir}},
+		VolumeMounts: append(componentLogVolumeMounts(), corev1.VolumeMount{Name: proxyControlVolumeName, MountPath: proxyRunDir}),
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 				Path: "/readyz", Port: intstr.FromInt32(5780), Scheme: corev1.URISchemeHTTP,
@@ -1712,6 +1714,7 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 		},
 		corev1.Volume{Name: proxyControlVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 	)
+	podSpec.Volumes = append(podSpec.Volumes, componentLogVolumes()...)
 	if needsHostCgroup {
 		podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
 			Name: podcgroup.VolumeName,
@@ -1838,17 +1841,43 @@ func podConditionTrue(conditions []corev1.PodCondition, conditionType corev1.Pod
 	return false
 }
 
+func componentLogVolumeMounts() []corev1.VolumeMount {
+	return []corev1.VolumeMount{
+		{Name: componentlog.ConfigVolumeName, MountPath: componentlog.ConfigMountPath, ReadOnly: true},
+		{Name: componentlog.LogVolumeName, MountPath: componentlog.LogDirectory},
+	}
+}
+
+func componentLogVolumes() []corev1.Volume {
+	return []corev1.Volume{
+		{
+			Name: componentlog.ConfigVolumeName,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: componentlog.ConfigMapName},
+				Optional:             boolPtr(true),
+				Items:                []corev1.KeyToPath{{Key: componentlog.ConfigFileName, Path: componentlog.ConfigFileName}},
+			}},
+		},
+		{
+			Name:         componentlog.LogVolumeName,
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+	}
+}
+
 func validatePlatformOwnedStorage(podSpec *corev1.PodSpec) error {
 	reservedVolumes := map[string]string{
-		tmpVolumeName:              tmpDir,
-		infraToolsVolumeName:       infraHostPath,
-		infraPlanVolumeName:        "/etc/fast-sandbox/infra",
-		runtimePlanVolumeName:      runtimeenv.PlanMountPath,
-		registryConfigVolumeName:   registryConfigDir,
-		fastletsettings.VolumeName: fastletsettings.MountPath,
-		proxyControlVolumeName:     proxyRunDir,
-		nodeCleanupVolumeName:      filepath.Dir(nodecleanup.DefaultSocketPath),
-		podcgroup.VolumeName:       podcgroup.HostRoot,
+		tmpVolumeName:                 tmpDir,
+		infraToolsVolumeName:          infraHostPath,
+		infraPlanVolumeName:           "/etc/fast-sandbox/infra",
+		runtimePlanVolumeName:         runtimeenv.PlanMountPath,
+		registryConfigVolumeName:      registryConfigDir,
+		fastletsettings.VolumeName:    fastletsettings.MountPath,
+		proxyControlVolumeName:        proxyRunDir,
+		nodeCleanupVolumeName:         filepath.Dir(nodecleanup.DefaultSocketPath),
+		podcgroup.VolumeName:          podcgroup.HostRoot,
+		componentlog.ConfigVolumeName: componentlog.ConfigMountPath,
+		componentlog.LogVolumeName:    componentlog.LogDirectory,
 	}
 	for _, volume := range podSpec.Volumes {
 		if _, reserved := reservedVolumes[volume.Name]; reserved {

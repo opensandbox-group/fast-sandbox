@@ -30,6 +30,7 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifactstore"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/componentlog"
 	"fast-sandbox/internal/controlplane"
 	"fast-sandbox/internal/controlplane/fastletcontrol"
 	"fast-sandbox/internal/controlplane/fastpath"
@@ -105,15 +106,21 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	flag.StringVar(&cacheNamespaces, "namespaces", "", "Comma-separated namespaces the informer cache watches; empty watches the whole cluster. Must cover every namespace holding SandboxPool/Sandbox objects and the runtime environment ConfigMap.")
 	flag.Float64Var(&kubeClientQPS, "kube-client-qps", 0, "API-server client rate limit in queries per second; 0 keeps the client-go default.")
 	flag.IntVar(&kubeClientBurst, "kube-client-burst", 0, "API-server client burst budget for the rate limiter; 0 keeps the client-go default.")
-	klog.InitFlags(nil)
+	componentlog.InitFlags(nil)
 	flag.Parse()
-	defer klog.Flush()
 
 	role, err := controlplane.ParseRole(roleValue)
 	if err != nil {
 		klog.ErrorS(err, "Invalid control-plane role")
 		os.Exit(1)
 	}
+	closeLogs, err := componentlog.Configure(string(role))
+	if err != nil {
+		klog.ErrorS(err, "configure component logging")
+		klog.Flush()
+		os.Exit(1)
+	}
+	defer closeLogs()
 	traceShutdown, err := observability.Configure(context.Background(), "fast-sandbox-"+string(role))
 	if err != nil {
 		klog.ErrorS(err, "Configure OpenTelemetry")

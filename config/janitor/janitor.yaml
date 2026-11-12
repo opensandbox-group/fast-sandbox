@@ -43,6 +43,8 @@ spec:
             fieldRef:
               fieldPath: spec.nodeName
         volumeMounts:
+        - {name: component-log-config, mountPath: /etc/fast-sandbox/logging, readOnly: true}
+        - {name: component-logs, mountPath: /var/log/fast-sandbox}
         - name: sock
           mountPath: /run/containerd/containerd.sock
         - name: fifo
@@ -58,6 +60,14 @@ spec:
           mountPath: /etc/fast-sandbox/runtime-environments
           readOnly: true
       volumes:
+      - name: component-log-config
+        configMap:
+          name: fast-sandbox-logging
+          optional: true
+          items:
+          - {key: logging.yaml, path: logging.yaml}
+      - name: component-logs
+        emptyDir: {}
       - name: sock
         hostPath:
           path: /run/containerd/containerd.sock

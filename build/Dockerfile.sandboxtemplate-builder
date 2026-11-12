@@ -47,6 +47,7 @@ RUN go mod download
 COPY api ./api
 COPY internal/artifacts ./internal/artifacts
 COPY internal/firecrackervmm ./internal/firecrackervmm
+COPY internal/componentlog ./internal/componentlog
 COPY internal/guestnetwork ./internal/guestnetwork
 COPY internal/guestcontrol ./internal/guestcontrol
 COPY cmd/fsb-guest-control ./cmd/fsb-guest-control
