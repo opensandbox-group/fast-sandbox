@@ -20,7 +20,7 @@ ARG FC_VERSION=v1.16.1
 FROM ${OCI_TOOLS_IMAGE} AS oci-tools
 
 # --- dart (P2P daemon, pinned) ------------------------------------------------
-FROM golang:1.25 AS dart-build
+FROM golang:1.26.11 AS dart-build
 
 ARG DART_REV
 # GOPROXY is overridable (docker build --build-arg GOPROXY=...) for hosts
