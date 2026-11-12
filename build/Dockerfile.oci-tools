@@ -8,7 +8,7 @@ ARG OVERLAYBD_REV
 COPY build/oci/build-overlaybd.sh build/sandboxtemplate-builder/overlaybd-import-raw.cpp /build-tools/
 RUN sh /build-tools/build-overlaybd.sh /out
 
-FROM golang:1.26.3 AS convertor-build
+FROM golang:1.26.11 AS convertor-build
 ARG CONVERTOR_REV=a00e366f9bfc970ec4aaa00887541c4c1d9f9dab
 ARG GOPROXY
 ENV GOPROXY=${GOPROXY}
@@ -23,7 +23,7 @@ RUN git init /src/convertor \
     && git checkout --detach FETCH_HEAD \
     && CGO_ENABLED=0 go build -o /out/convertor ./cmd/convertor
 
-FROM --platform=$BUILDPLATFORM golang:1.25 AS fsb-build
+FROM --platform=$BUILDPLATFORM golang:1.26.11 AS fsb-build
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 ARG GOPROXY
