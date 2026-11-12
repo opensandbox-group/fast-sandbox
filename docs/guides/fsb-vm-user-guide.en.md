@@ -185,6 +185,10 @@ sudo "$FSB_VM" build \
 - `<registry-repository>:v1.0.0_rootfs`;
 - `<registry-repository>:v1.0.0_snapfiles`.
 
+`build` streams phase logs to stdout before the final artifact summary. Each entry includes a UTC timestamp, cumulative build time (`[build ...]`), phase name, status (`started`, `completed`, or `failed`), and phase duration. Stages cover source resolution and layer preparation, rootfs preparation, runtime injection, guest startup and readiness, the optional guest-control probe, snapshot capture and packaging, layer sealing, and local artifact finalization. A phase starts before its blocking work, so a stalled build leaves the active phase visible. Guest serial output remains in the build work directory; it is not streamed.
+
+For OCI template builds, `sandboxtemplate-builder` also records its own preparation, `fsb-vm build`, publication, and result-reporting phases through the [component logger](component-logging.md), with `elapsedMs` and `durationMs` fields. These logs follow the configured file rotation and optional stderr mirroring. Registry publication is a separate `fsb-vm push` command; its stdout remains a single JSON result, without progress text.
+
 Common build options:
 
 | Option | Default | Description |

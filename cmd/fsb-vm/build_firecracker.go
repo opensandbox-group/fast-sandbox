@@ -134,7 +134,8 @@ func writeGuestFile(rootDir, guestPath string, payload []byte, mode os.FileMode)
 // before returning; it also joins the rollback, so a VMM that could not be
 // stopped keeps the rootfs device it holds attached. The produced file
 // paths are returned.
-func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, rootfsDevPath string, undo *rollback) (vmstatePath, memfilePath string, err error) {
+func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, rootfsDevPath string, undo *rollback, progress *buildProgress) (vmstatePath, memfilePath string, err error) {
+	progress.start("starting guest VM")
 	runtimeDir := filepath.Join(workDir, "fc")
 	if err := os.MkdirAll(runtimeDir, 0o750); err != nil {
 		return "", "", fmt.Errorf("create firecracker runtime dir: %w", err)
@@ -204,16 +205,19 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 		return "", "", fmt.Errorf("start instance: %w", err)
 	}
 
+	progress.start("waiting for guest readiness")
 	if err := waitSerialFor(serialLog, options.readyPattern, options.readyTimeout); err != nil {
 		return "", "", err
 	}
 
 	if options.guestControlPort != 0 {
+		progress.start("probing guest-control helper")
 		options.guestControlVersion, err = probeRootfsHelper(ctx, filepath.Join(runtimeDir, "guest-control.sock"), options.guestControlPort)
 		if err != nil {
 			return "", "", err
 		}
 	}
+	progress.start("capturing VM snapshot")
 	snapDir := filepath.Join(workDir, "snapshot")
 	if err := os.MkdirAll(snapDir, 0o750); err != nil {
 		return "", "", fmt.Errorf("create snapshot dir: %w", err)

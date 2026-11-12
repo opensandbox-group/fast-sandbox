@@ -5,12 +5,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -27,8 +30,10 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/klog/v2"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/componentlog"
 	"fast-sandbox/internal/guestnetwork"
 )
 
@@ -37,17 +42,28 @@ func TestOCIBuildUsesRemoteSourceWithoutDownloadingSourceLayers(t *testing.T) {
 		private bool
 		kernel  string
 		version string
+		failure string
+		wantErr string
 	}{
-		{false, "/kernels/vmlinux-6.1.0", "6.1.0"},
-		{true, "/kernels/vmlinux-6.1.0", "6.1.0"},
-		{false, "/kernels/vmlinux.bin", "vmlinux.bin"},
-		{true, "/kernels/vmlinux.bin", "vmlinux.bin"},
+		{false, "/kernels/vmlinux-6.1.0", "6.1.0", "", ""},
+		{true, "/kernels/vmlinux-6.1.0", "6.1.0", "", ""},
+		{false, "/kernels/vmlinux.bin", "vmlinux.bin", "", ""},
+		{true, "/kernels/vmlinux.bin", "vmlinux.bin", "", ""},
+		{true, "/kernels/vmlinux-6.1.0", "6.1.0", "build", "fsb-vm build: exit status 8"},
+		{true, "/kernels/vmlinux-6.1.0", "6.1.0", "push", "fsb-vm push: exit status 9"},
+		{true, "/kernels/vmlinux-6.1.0", "6.1.0", "invalid-json", "invalid character 'i' looking for beginning of value"},
+		{true, "/kernels/vmlinux-6.1.0", "6.1.0", "incomplete-json", "fsb-vm push returned incomplete publication"},
 	} {
-		t.Run(map[bool]string{false: "anonymous", true: "basic-auth"}[test.private]+"/"+filepath.Base(test.kernel), func(t *testing.T) {
+		testName := map[bool]string{false: "anonymous", true: "basic-auth"}[test.private] + "/" + filepath.Base(test.kernel)
+		if test.failure != "" {
+			testName += "/" + test.failure
+		}
+		t.Run(testName, func(t *testing.T) {
 			private := test.private
 			dir := t.TempDir()
 			t.Setenv("DOCKER_CONFIG", dir)
 			t.Setenv("SANDBOX_TEMPLATE_IMAGE_TAR", "")
+			t.Setenv("KUBERNETES_SERVICE_HOST", "") // Standalone annotation reporting.
 			amd64 := ociTestImage(t, "amd64")
 			arm64 := ociTestImage(t, "arm64")
 			index := mutate.AppendManifests(empty.Index,
@@ -104,7 +120,26 @@ func TestOCIBuildUsesRemoteSourceWithoutDownloadingSourceLayers(t *testing.T) {
 			buildID := uuid.NewString()
 			t.Setenv(buildIDEnvName, buildID)
 			require.NoError(t, os.WriteFile(filepath.Join(bin, "ip"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TEST_OCI_COMMANDS/ip.log\"\n"), 0755))
-			require.NoError(t, os.WriteFile(filepath.Join(bin, "fsb-vm"), []byte("#!/bin/sh\nif [ \"$1\" = push ]; then\n  printf '%s\\n' \"$@\" > \"$TEST_OCI_COMMANDS/push-args\"\n  exit 9\nfi\nprintf '%s\\n' \"$@\" > \"$TEST_OCI_COMMANDS/fsb-args\"\n"), 0755))
+			t.Setenv("TEST_OCI_FAILURE", test.failure)
+			require.NoError(t, os.WriteFile(filepath.Join(bin, "fsb-vm"), []byte(`#!/bin/sh
+if [ "$1" = push ]; then
+  printf '%s\n' "$@" > "$TEST_OCI_COMMANDS/push-args"
+  printf 'push stderr\n' >&2
+  case "$TEST_OCI_FAILURE" in
+    push) exit 9 ;;
+    invalid-json) printf 'invalid JSON\n'; exit 0 ;;
+    incomplete-json) printf '{}\n'; exit 0 ;;
+  esac
+  printf '%s\n' '{"manifestRef":"oci://registry.example.com/template@sha256:abc","artifactDigest":"sha256:abc"}'
+  exit 0
+fi
+printf '%s\n' "$@" > "$TEST_OCI_COMMANDS/fsb-args"
+printf 'build stdout\n'
+printf 'build stderr\n' >&2
+if [ "$TEST_OCI_FAILURE" = build ]; then
+  exit 8
+fi
+`), 0755))
 			spec := apiv1alpha2.SandboxTemplateSpec{
 				Image: tag.String(), Execd: execdTag.String(),
 				Machine: apiv1alpha2.MachineSpec{VCPU: "1", Memory: "512Mi"},
@@ -112,8 +147,38 @@ func TestOCIBuildUsesRemoteSourceWithoutDownloadingSourceLayers(t *testing.T) {
 				Output:  apiv1alpha2.OutputSpec{Format: apiv1alpha2.ArtifactFormatOverlayBD, RootfsSize: "1Gi", Publish: "oci://" + host + "/template"},
 			}
 			spec.Readiness.WarmupSeconds = 600
+			stdout, stderr := captureOCIChildOutput(t)
+			readLogs := captureOCIBuildLogs(t)
 			err = buildOCITemplate(context.Background(), spec, dir, test.kernel)
-			require.ErrorContains(t, err, "fsb-vm push: exit status 9")
+			logs := readLogs()
+			failedPhase := ""
+			if test.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, test.wantErr)
+				require.Contains(t, logs, fmt.Sprintf("err=%q", err.Error()))
+				failedPhase = "push"
+				if test.failure == "build" {
+					failedPhase = "build"
+				}
+			}
+			requireOCIBuildPhases(t, logs, failedPhase)
+			for _, sensitive := range []string{"secret", "--auth-file", "--source", "--destination"} {
+				require.NotContains(t, logs, sensitive)
+			}
+			for _, marker := range []string{"build stdout", "build stderr", "push stderr", "manifestRef"} {
+				require.NotContains(t, logs, marker, "child output must not be redirected to the component log")
+			}
+			raw, err = os.ReadFile(stdout.Name())
+			require.NoError(t, err)
+			require.Equal(t, "build stdout\n", string(raw), "push JSON must remain captured, not streamed")
+			raw, err = os.ReadFile(stderr.Name())
+			require.NoError(t, err)
+			wantStderr := "build stderr\n"
+			if test.failure != "build" {
+				wantStderr += "push stderr\n"
+			}
+			require.Equal(t, wantStderr, string(raw), "push diagnostics must remain separate from JSON stdout")
 			raw, err = os.ReadFile(filepath.Join(dir, "fsb-args"))
 			require.NoError(t, err)
 			args := strings.Split(strings.TrimSpace(string(raw)), "\n")
@@ -161,6 +226,10 @@ func TestOCIBuildUsesRemoteSourceWithoutDownloadingSourceLayers(t *testing.T) {
 			require.Equal(t, "link set dev "+buildTap+" address "+guestnetwork.GatewayMAC, commands[1])
 			require.Equal(t, "link set dev "+buildTap+" up", commands[2])
 			require.Equal(t, "link del "+buildTap, commands[3])
+			if test.failure == "build" {
+				require.NoFileExists(t, filepath.Join(dir, "push-args"))
+				return
+			}
 			raw, err = os.ReadFile(filepath.Join(dir, "push-args"))
 			require.NoError(t, err)
 			args = strings.Split(strings.TrimSpace(string(raw)), "\n")
@@ -169,6 +238,83 @@ func TestOCIBuildUsesRemoteSourceWithoutDownloadingSourceLayers(t *testing.T) {
 			require.Equal(t, filepath.Join(dir, ".dockerconfigjson"), value("--auth-file"))
 		})
 	}
+}
+
+func captureOCIChildOutput(t *testing.T) (*os.File, *os.File) {
+	t.Helper()
+	dir := t.TempDir()
+	stdout, err := os.Create(filepath.Join(dir, "stdout"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, stdout.Close()) })
+	stderr, err := os.Create(filepath.Join(dir, "stderr"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, stderr.Close()) })
+	oldStdout, oldStderr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = stdout, stderr
+	t.Cleanup(func() { os.Stdout, os.Stderr = oldStdout, oldStderr })
+	return stdout, stderr
+}
+
+func captureOCIBuildLogs(t *testing.T) func() string {
+	t.Helper()
+	state := klog.CaptureState()
+	t.Cleanup(state.Restore)
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "logging.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte(fmt.Sprintf("directory: %q\nalsoStderr: false\n", dir)), 0600))
+	t.Setenv(componentlog.ConfigEnv, configPath)
+	closeLogs, err := componentlog.Configure("sandboxtemplate-builder")
+	require.NoError(t, err)
+	t.Cleanup(closeLogs)
+	return func() string {
+		t.Helper()
+		klog.Flush()
+		raw, err := os.ReadFile(filepath.Join(dir, "sandboxtemplate-builder.log"))
+		require.NoError(t, err)
+		return string(raw)
+	}
+}
+
+func requireOCIBuildPhases(t *testing.T, logs, failedPhase string) {
+	t.Helper()
+	var want, got []string
+	for _, phase := range []string{"validate-output", "prepare-credentials", "prepare-source", "inject-runtime", "prepare-build", "build", "push", "patch-annotations"} {
+		want = append(want, phase+" started")
+		if phase == failedPhase {
+			want = append(want, phase+" failed")
+			break
+		}
+		want = append(want, phase+" completed")
+	}
+	fields := regexp.MustCompile(`phase="([^"]+)" status="([^"]+)" elapsedMs=(\d+) durationMs=(\d+)`)
+	var previousElapsed int64
+	for _, line := range strings.Split(logs, "\n") {
+		if !strings.Contains(line, `"OCI template build stage"`) {
+			continue
+		}
+		require.Regexp(t, `^[IE]\d{4} \d{2}:\d{2}:\d{2}\.\d{6} `, line, "component logging must retain timestamps")
+		match := fields.FindStringSubmatch(line)
+		require.Len(t, match, 5, line)
+		got = append(got, match[1]+" "+match[2])
+		elapsed, err := strconv.ParseInt(match[3], 10, 64)
+		require.NoError(t, err)
+		duration, err := strconv.ParseInt(match[4], 10, 64)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, elapsed, previousElapsed)
+		require.LessOrEqual(t, duration, elapsed)
+		previousElapsed = elapsed
+		if match[2] == "started" {
+			require.Zero(t, duration)
+		}
+		if match[2] == "failed" {
+			require.True(t, strings.HasPrefix(line, "E"), line)
+			require.Contains(t, line, "err=")
+		} else {
+			require.True(t, strings.HasPrefix(line, "I"), line)
+			require.NotContains(t, line, "err=")
+		}
+	}
+	require.Equal(t, want, got, "stages must stop at the first failure")
 }
 
 func ociTestImage(t *testing.T, architecture string) v1.Image {
@@ -204,7 +350,9 @@ func ociTestExecd(t *testing.T) v1.Image {
 func TestOCIBuilderRejectsLocalTarSource(t *testing.T) {
 	t.Setenv("SANDBOX_TEMPLATE_IMAGE_TAR", "/unused/source.tar")
 	spec := apiv1alpha2.SandboxTemplateSpec{Output: apiv1alpha2.OutputSpec{Format: apiv1alpha2.ArtifactFormatOverlayBD}}
+	readLogs := captureOCIBuildLogs(t)
 	require.ErrorContains(t, buildOCITemplate(context.Background(), spec, t.TempDir(), ""), "supported only for object-store output")
+	requireOCIBuildPhases(t, readLogs(), "validate-output")
 }
 
 func TestObjectStoreSourceStillStagesLocalTar(t *testing.T) {
@@ -254,7 +402,9 @@ func TestOCIBuilderRejectsTaggedOrInvalidPublishBeforeBuild(t *testing.T) {
 		t.Run(publish, func(t *testing.T) {
 			dir := t.TempDir()
 			spec := apiv1alpha2.SandboxTemplateSpec{Output: apiv1alpha2.OutputSpec{Format: apiv1alpha2.ArtifactFormatOverlayBD, Publish: publish}}
+			readLogs := captureOCIBuildLogs(t)
 			require.ErrorContains(t, buildOCITemplate(context.Background(), spec, dir, ""), "without a tag or digest")
+			requireOCIBuildPhases(t, readLogs(), "validate-output")
 			entries, err := os.ReadDir(dir)
 			require.NoError(t, err)
 			require.Empty(t, entries, "invalid output must fail before credentials, source pull or build setup")
