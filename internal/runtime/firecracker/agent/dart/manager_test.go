@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"fast-sandbox/internal/componentlog"
-
 	"github.com/stretchr/testify/require"
 	"k8s.io/klog/v2"
+
+	"fast-sandbox/internal/componentlog"
 )
 
 func TestArgs(t *testing.T) {
