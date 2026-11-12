@@ -40,6 +40,7 @@ RUN go mod download
 # snapshot producer (checksums, manifest encoding, index layout).
 COPY api ./api
 COPY internal/artifacts ./internal/artifacts
+COPY internal/componentlog ./internal/componentlog
 COPY internal/guestnetwork ./internal/guestnetwork
 COPY internal/guestcontrol ./internal/guestcontrol
 COPY cmd/fsb-guest-control ./cmd/fsb-guest-control
