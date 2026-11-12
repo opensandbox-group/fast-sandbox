@@ -170,6 +170,9 @@ func applyFirecrackerBinding(config *runtimecatalog.FirecrackerConfig, binding *
 	if config == nil || binding == nil {
 		return
 	}
+	if binding.VMMDir != "" {
+		config.VMMDir = binding.VMMDir
+	}
 	if binding.BinaryPath != "" {
 		config.BinaryPath = binding.BinaryPath
 	}
@@ -210,6 +213,9 @@ func replaceFirecrackerHostPaths(values []runtimecatalog.HostPathRequirement, co
 	}
 	if config.JailerPath != "" {
 		kept = append(kept, runtimecatalog.HostPathRequirement{Name: "firecracker-jailer", HostPath: config.JailerPath, MountPath: config.JailerPath, Type: corev1.HostPathFile, ReadOnly: true})
+	}
+	if config.VMMDir != "" {
+		kept = append(kept, runtimecatalog.HostPathRequirement{Name: "firecracker-versions", HostPath: config.VMMDir, MountPath: config.VMMDir, Type: corev1.HostPathDirectory, ReadOnly: true})
 	}
 	return kept
 }

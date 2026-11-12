@@ -319,3 +319,31 @@ func hasHostPath(profile runtimecatalog.RuntimeProfile, hostPath string) bool {
 	}
 	return false
 }
+
+func TestManagedFirecrackerDirectoryIsDeliveredReadOnly(t *testing.T) {
+	config, err := Parse([]byte(`version: v1alpha2
+environments:
+  default:
+    runtimes:
+      firecracker:
+        firecracker:
+          vmmDir: /opt/fast-sandbox/firecracker
+`))
+	require.NoError(t, err)
+	plan, err := Resolve(runtimecatalog.Builtin(), config, apiv1alpha2.RuntimeFirecracker)
+	require.NoError(t, err)
+	require.Equal(t, "/opt/fast-sandbox/firecracker", plan.Profile.Firecracker.VMMDir)
+	found := false
+	for _, mount := range plan.Profile.Deployment.HostPaths {
+		if mount.Name == "firecracker-versions" {
+			found = true
+			require.True(t, mount.ReadOnly)
+			require.Equal(t, corev1.HostPathDirectory, mount.Type)
+			require.Equal(t, plan.Profile.Firecracker.VMMDir, mount.MountPath)
+		}
+	}
+	require.True(t, found)
+	legacy, err := ResolveDefault(runtimecatalog.Builtin(), apiv1alpha2.RuntimeFirecracker)
+	require.NoError(t, err)
+	require.NotEqual(t, legacy.Revision, plan.Revision)
+}

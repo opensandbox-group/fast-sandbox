@@ -218,7 +218,11 @@ func (d *Driver) validateRestoreCompatibility(stateRoot, image string) error {
 	if document.IsRootfsOnly() {
 		return fmt.Errorf("%w: RootfsOnly cold boot is not yet enabled in Fastlet", ErrIncompatibleArtifact)
 	}
-	return checkRestoreCompatibility(document.Compatibility, artifacts.HostCPUIdentity(), d.firecrackerVersion(), image)
+	selected, err := d.selectVMM(context.Background(), document.Compatibility.FirecrackerVersion)
+	if err != nil {
+		return err
+	}
+	return checkRestoreCompatibility(document.Compatibility, artifacts.HostCPUIdentity(), d.selectionVersion(selected), image)
 }
 
 // parseMemMiB parses a resource quantity into whole MiB.

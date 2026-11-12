@@ -163,3 +163,20 @@ func TestCPUTemplateForVendor(t *testing.T) {
 		}
 	}
 }
+
+func TestSnapshotStageKeepsPipelineVMMSelection(t *testing.T) {
+	previous := firecrackerBin
+	t.Cleanup(func() { firecrackerBin = previous })
+	t.Setenv("FAST_SANDBOX_VMM_DIR", "/missing-new-inventory")
+	t.Setenv("FAST_SANDBOX_SELECTED_FIRECRACKER", "/bundle/versions/1.16.1/firecracker")
+	if err := selectBuildVMM(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if firecrackerBin != "/bundle/versions/1.16.1/firecracker" {
+		t.Fatalf("subprocess reselected VMM: %s", firecrackerBin)
+	}
+	t.Setenv("FAST_SANDBOX_SELECTED_FIRECRACKER", "")
+	if err := selectBuildVMM(t.Context()); err == nil {
+		t.Fatal("missing managed inventory must not fall back to PATH")
+	}
+}

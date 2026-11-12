@@ -24,6 +24,7 @@ import (
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/fastlet/podcgroup"
 	"fast-sandbox/internal/firecrackerconfig"
+	"fast-sandbox/internal/firecrackervmm"
 	infracontract "fast-sandbox/internal/infra/contract"
 	"fast-sandbox/internal/nodecleanup"
 	"fast-sandbox/internal/observability"
@@ -266,6 +267,9 @@ func (d *Driver) gcImageCache() {
 }
 
 func validateConfig(config runtimecatalog.FirecrackerConfig) error {
+	if config.VMMDir != "" && (!filepath.IsAbs(config.VMMDir) || filepath.Base(config.BinaryPath) != "firecracker") {
+		return fmt.Errorf("%w: managed VMMs require an absolute vmmDir and binary basename firecracker", ErrInvalidConfig)
+	}
 	// KernelPath is optional (#84): only direct-boot operators pin it.
 	if config.BinaryPath == "" || config.RootfsPath == "" || config.StateRoot == "" {
 		return fmt.Errorf("%w: firecracker binary, rootfs, and state root are required", ErrInvalidConfig)
@@ -574,6 +578,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	isOCI := strings.HasPrefix(restoreRef, ocitemplate.Prefix)
 	var ociRootfs, vmstatePath, memoryPath string
 	var ociMetadata ociRestoreMetadata
+	var selectedVMM *firecrackervmm.Selection
 	var ociPrepareDur time.Duration
 	var rootfsKernel, bootKernelSHA256 string
 	ociAttached := false
@@ -595,6 +600,18 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		}
 		ociRootfs, vmstatePath, memoryPath = attachment.rootfs, attachment.vmstate, attachment.memory
 		ociMetadata, ociPrepareDur = attachment.metadata, attachment.duration
+		selectedVMM = attachment.vmm
+	}
+
+	if !isOCI {
+		selectedVMM, err = d.selectCachedVMM(ctx, restoreRef)
+		if err != nil {
+			return nil, err
+		}
+	}
+	binaryPath, jailerPath := d.config.BinaryPath, d.config.JailerPath
+	if selectedVMM != nil {
+		binaryPath, jailerPath = selectedVMM.BinaryPath, selectedVMM.JailerPath
 	}
 
 	owner := d.networkOwner(config)
@@ -744,6 +761,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// state), and the NIC host tap is replaced per instance via the load
 	// request's network_overrides. Nothing else is injected into the rootfs.
 	state := &SandboxState{
+		VMM:    selectedVMM,
 		Config: *config,
 		Allocation: fastletapi.RuntimeAllocation{Network: fastletapi.NetworkAllocation{
 			SlotID: slot.ID, NamespacePath: slot.HostNetNSPath, IP: slot.IP, Gateway: slot.Gateway,
@@ -757,7 +775,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	state.BootKernelSHA256 = ociMetadata.Kernel.SHA256
 	if ociMetadata.IsRootfsOnly() {
 		state.BootKernelSHA256 = bootKernelSHA256
-		provenance := artifacts.NewVMManifest(ociMetadata.Machine, ociMetadata.Kernel.Version, d.config.BinaryPath, artifacts.CPUTemplateNone).Compatibility
+		provenance := artifacts.NewVMManifest(ociMetadata.Machine, ociMetadata.Kernel.Version, binaryPath, artifacts.CPUTemplateNone).Compatibility
 		state.BootCompatibility = &provenance
 	}
 	if err := saveState(directory, state); err != nil {
@@ -794,7 +812,8 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	launchCtx, launchSpan := observability.Start(ctx, "fastlet.firecracker.launch")
 	launchStarted := time.Now()
 	process, err := d.launchVM(launchCtx, launchConfig{
-		BinaryPath: d.config.BinaryPath,
+		BinaryPath: binaryPath,
+		JailerPath: jailerPath,
 		SandboxID:  identity.SandboxUID,
 		APIAddress: apiAddress,
 		WorkingDir: directory,
@@ -811,6 +830,15 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 			return nil, saveErr
 		}
 		err = d.waitSocket(launchCtx, state.APIAddress, firecrackerSocketWaitTimeout)
+		if err == nil && selectedVMM != nil {
+			client := d.newClient(state.APIAddress)
+			var actual string
+			actual, err = client.Version(launchCtx)
+			client.Close()
+			if err == nil && actual != selectedVMM.Version {
+				err = fmt.Errorf("launched VMM version %s differs from selected %s", actual, selectedVMM.Version)
+			}
+		}
 		if err != nil {
 			detail := readProcessLog(logDir)
 			d.killAndForget(identity.SandboxUID, process.PID())
@@ -1433,7 +1461,9 @@ func (d *Driver) launchVM(ctx context.Context, plan launchConfig, slot *fastletn
 		plan.NetNSPath = slot.NetNSPath
 	}
 	if config.JailerPath != "" && slot != nil {
-		plan.JailerPath = config.JailerPath
+		if plan.JailerPath == "" {
+			plan.JailerPath = config.JailerPath
+		}
 		plan.ChrootBase = filepath.Join(config.StateRoot, jailerChrootBaseDir)
 		plan.NetNSPath = slot.NetNSPath
 		// The jailer chroot fixes the working directory to the jail root;

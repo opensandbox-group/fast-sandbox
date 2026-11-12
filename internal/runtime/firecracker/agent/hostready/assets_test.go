@@ -14,9 +14,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"fast-sandbox/internal/firecrackervmm"
 )
 
 // serveAssets spins an httptest server acting as the Firecracker release
@@ -314,16 +317,97 @@ func TestParseSHA256SumsMalformedLine(t *testing.T) {
 	require.ErrorContains(t, err, "malformed")
 }
 
-func TestDockerfileBundlePinsMatchGoDefaults(t *testing.T) {
-	// A drift would silently strand the bundle (or serve a different
-	// binary than the download path).
-	payload, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "..", "build", "Dockerfile.firecracker-runtime"))
+func TestBundlePinsMatchGoDefaults(t *testing.T) {
+	payload, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "firecrackervmm", "releases.json"))
 	require.NoError(t, err)
-	pins := map[string]string{}
-	for _, line := range strings.Split(string(payload), "\n") {
-		if value, ok := strings.CutPrefix(strings.TrimSpace(line), "ARG FC_VERSION="); ok {
-			pins["FC_VERSION"] = value
+	catalog, err := firecrackervmm.ParseCatalog(payload)
+	require.NoError(t, err)
+	require.Equal(t, DefaultFCVersion, "v"+catalog.LegacyVersion)
+}
+
+func versionBundleFixture(t *testing.T) string {
+	t.Helper()
+	bundle := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(bundle, "catalog.json"), []byte(`{"schemaVersion":1,"legacyVersion":"1.16.1","versions":["1.16.1","1.17.0"]}`), 0644))
+	for _, version := range []string{"1.16.1", "1.17.0"} {
+		dir := filepath.Join(bundle, "versions", version)
+		require.NoError(t, os.MkdirAll(dir, 0755))
+		var sums strings.Builder
+		for _, name := range []string{"firecracker", "jailer"} {
+			program := "Firecracker"
+			if name == "jailer" {
+				program = "Jailer"
+			}
+			raw := []byte("#!/bin/sh\necho '" + program + " v" + version + "'\n")
+			require.NoError(t, os.WriteFile(filepath.Join(dir, name), raw, 0755))
+			fmt.Fprintf(&sums, "%x  %s\n", sha256.Sum256(raw), name)
 		}
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "SHA256SUMS"), []byte(sums.String()), 0644))
 	}
-	require.Equal(t, DefaultFCVersion, pins["FC_VERSION"], "Dockerfile FC_VERSION drifted from DefaultFCVersion")
+	return bundle
+}
+
+func TestVersionedAssetsAtomicAndImmutable(t *testing.T) {
+	bundle, dir := versionBundleFixture(t), t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "firecracker"), []byte("legacy"), 0755))
+	c := AssetConfig{Dir: dir, BundleDir: bundle}
+	var wg sync.WaitGroup
+	failures := make(chan error, 4)
+	for range 4 {
+		wg.Add(1)
+		go func() { defer wg.Done(); failures <- c.installVersionedBundle(t.Context()) }()
+	}
+	wg.Wait()
+	close(failures)
+	for err := range failures {
+		require.NoError(t, err)
+	}
+	require.FileExists(t, filepath.Join(dir, "catalog.json"))
+	for _, v := range []string{"1.16.1", "1.17.0"} {
+		require.FileExists(t, filepath.Join(dir, "versions", v, "firecracker"))
+		require.FileExists(t, filepath.Join(dir, "versions", v, "jailer"))
+	}
+	old, err := os.ReadFile(filepath.Join(dir, "firecracker"))
+	require.NoError(t, err)
+	require.Equal(t, "legacy", string(old))
+	require.Empty(t, mustGlob(t, filepath.Join(dir, "versions", ".install-*")))
+	changed := filepath.Join(dir, "versions", "1.17.0", "firecracker")
+	require.NoError(t, os.WriteFile(changed, []byte("changed"), 0755))
+	require.ErrorContains(t, c.installVersionedBundle(t.Context()), "checksum mismatch")
+	raw, err := os.ReadFile(changed)
+	require.NoError(t, err)
+	require.Equal(t, "changed", string(raw), "never overwrite a live version")
+}
+
+func TestVersionedAssetsRejectIncompleteAndWrongVersion(t *testing.T) {
+	for _, scenario := range []string{"missing-jailer", "wrong-version", "symlink", "cancelled"} {
+		t.Run(scenario, func(t *testing.T) {
+			bundle, dir := versionBundleFixture(t), t.TempDir()
+			c := AssetConfig{Dir: dir, BundleDir: bundle}
+			source := filepath.Join(bundle, "versions", "1.17.0")
+			ctx := t.Context()
+			switch scenario {
+			case "missing-jailer":
+				require.NoError(t, os.Remove(filepath.Join(source, "jailer")))
+			case "wrong-version":
+				raw := []byte("#!/bin/sh\necho 'Jailer v1.16.1'\n")
+				require.NoError(t, os.WriteFile(filepath.Join(source, "jailer"), raw, 0755))
+				fc, err := os.ReadFile(filepath.Join(source, "firecracker"))
+				require.NoError(t, err)
+				sums := fmt.Sprintf("%x  firecracker\n%x  jailer\n", sha256.Sum256(fc), sha256.Sum256(raw))
+				require.NoError(t, os.WriteFile(filepath.Join(source, "SHA256SUMS"), []byte(sums), 0644))
+			case "symlink":
+				require.NoError(t, os.MkdirAll(filepath.Join(dir, "versions"), 0755))
+				require.NoError(t, os.Symlink(t.TempDir(), filepath.Join(dir, "versions", "1.17.0")))
+			case "cancelled":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
+			require.Error(t, c.installVersionedBundle(ctx))
+			require.NoFileExists(t, filepath.Join(dir, "catalog.json"))
+			require.NoFileExists(t, filepath.Join(dir, "versions", "1.17.0", "firecracker"))
+			require.Empty(t, mustGlob(t, filepath.Join(dir, "versions", ".install-*")))
+		})
+	}
 }

@@ -15,6 +15,7 @@ import (
 
 	"fast-sandbox/internal/artifacts"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/firecrackervmm"
 	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
@@ -82,7 +83,6 @@ func (d *Driver) fsbArgs() []string {
 		"--runtime-dir", filepath.Join(d.ociRoot(), "runtime"),
 		"--build-work-dir", filepath.Join(d.ociRoot(), "builds"),
 		"--build-output-dir", filepath.Join(d.ociRoot(), "artifacts"),
-		"--firecracker", d.config.BinaryPath,
 		"--ublkd-socket", filepath.Join(runtimecatalog.OCISocketDir, "ublkd.sock"),
 		"--cred-file", filepath.Join(runtimecatalog.OCISocketDir, "cred.json"),
 		"--reject-credential-conflicts",
@@ -90,6 +90,11 @@ func (d *Driver) fsbArgs() []string {
 		"--overlaybd-commit", filepath.Join(tools, "overlaybd-commit"),
 		"--overlaybd-merge", filepath.Join(tools, "overlaybd-merge"),
 		"--overlaybd-resize", filepath.Join(tools, "overlaybd-resize"),
+	}
+	if d.config.VMMDir != "" {
+		args = append(args, "--vmm-dir", d.config.VMMDir)
+	} else {
+		args = append(args, "--firecracker", d.config.BinaryPath)
 	}
 	if ociPlainHTTP() {
 		args = append(args, "--plain-http")
@@ -174,6 +179,7 @@ func (d *Driver) attachOCI(ctx context.Context, id, image string) (rootfs, vmsta
 type ociRestoreMetadata = artifacts.VMManifest
 
 type ociAttachment struct {
+	vmm                     *firecrackervmm.Selection
 	rootfs, vmstate, memory string
 	metadata                ociRestoreMetadata
 	duration                time.Duration
@@ -206,6 +212,10 @@ func (d *Driver) prepareOCIRestore(ctx context.Context, directory, reference str
 		return attachment, err
 	}
 	metadata := attachment.metadata
+	attachment.vmm, err = d.preparedVMM(ctx, id, metadata)
+	if err != nil {
+		return attachment, err
+	}
 
 	if err := validateOCIResumeOwner(metadata, config); err != nil {
 		return attachment, err
@@ -215,11 +225,11 @@ func (d *Driver) prepareOCIRestore(ctx context.Context, directory, reference str
 		return attachment, err
 	}
 	if metadata.IsRootfsOnly() {
-		if err := checkRootfsBootCompatibility(metadata, d.firecrackerVersion()); err != nil {
+		if err := checkRootfsBootCompatibility(metadata, d.selectionVersion(attachment.vmm)); err != nil {
 			return attachment, err
 		}
 	} else {
-		if err := checkRestoreCompatibility(metadata.Compatibility, artifacts.HostCPUIdentity(), d.firecrackerVersion(), reference); err != nil {
+		if err := checkRestoreCompatibility(metadata.Compatibility, artifacts.HostCPUIdentity(), d.selectionVersion(attachment.vmm), reference); err != nil {
 			return attachment, err
 		}
 	}
