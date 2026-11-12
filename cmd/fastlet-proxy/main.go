@@ -13,15 +13,22 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"k8s.io/klog/v2"
 
+	"fast-sandbox/internal/componentlog"
 	routeauth "fast-sandbox/internal/dataplane/auth"
 	"fast-sandbox/internal/dataplane/fastletproxy"
 	"fast-sandbox/internal/observability"
 )
 
 func main() {
-	klog.InitFlags(nil)
+	componentlog.InitFlags(nil)
 	flag.Parse()
-	defer klog.Flush()
+	closeLogs, err := componentlog.Configure("fastlet-proxy")
+	if err != nil {
+		klog.ErrorS(err, "configure component logging")
+		klog.Flush()
+		os.Exit(1)
+	}
+	defer closeLogs()
 	traceShutdown, err := observability.Configure(context.Background(), "fast-sandbox-fastlet-proxy")
 	if err != nil {
 		klog.ErrorS(err, "Configure OpenTelemetry")
