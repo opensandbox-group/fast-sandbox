@@ -14,6 +14,7 @@ import (
 
 	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/firecrackerconfig"
+	"fast-sandbox/internal/firecrackervmm"
 )
 
 // createOptions holds the create-command flags (ADR-007/009/010). The machine
@@ -198,7 +199,18 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	if err != nil {
 		return err
 	}
-	if err := validateManifest(metadata, global.firecrackerBin, options.force); err != nil {
+	if global.vmmDir != "" {
+		selected, err := firecrackervmm.Resolve(ctx, global.vmmDir, metadata.Compatibility.FirecrackerVersion, false)
+		if err != nil {
+			return err
+		}
+		global.firecrackerBin = selected.BinaryPath
+		state.VMM = &selected
+		if err := persist(); err != nil {
+			return err
+		}
+	}
+	if err := validateManifest(metadata, global.firecrackerBin, options.force && global.vmmDir == ""); err != nil {
 		return err
 	}
 	state.VCPU, state.MemoryMB = metadata.Machine.VCPUCount, int(metadata.Machine.MemoryMiB)

@@ -84,6 +84,8 @@ type RuntimeBinding struct {
 // driver configuration (internal/catalog/runtime.FirecrackerConfig). Every
 // field is optional; empty values keep the builtin profile default.
 type FirecrackerBinding struct {
+	// VMMDir enables manifest-driven selection from a managed installation.
+	VMMDir     string `json:"vmmDir,omitempty"`
 	BinaryPath string `json:"binaryPath,omitempty"`
 	JailerPath string `json:"jailerPath,omitempty"`
 	KernelPath string `json:"kernelPath,omitempty"`

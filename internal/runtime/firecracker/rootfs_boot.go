@@ -19,8 +19,8 @@ func checkRootfsBootCompatibility(m artifacts.VMManifest, version string) error 
 	if !m.IsRootfsOnly() || m.Compatibility.CPUArch != artifacts.HostCPUArch() {
 		return fmt.Errorf("%w: RootfsOnly architecture mismatch", ErrIncompatibleArtifact)
 	}
-	if version != rootfsFirecrackerVersion || m.Compatibility.FirecrackerVersion != rootfsFirecrackerVersion {
-		return fmt.Errorf("%w: RootfsOnly currently requires Firecracker 1.16.1", ErrIncompatibleArtifact)
+	if (version != rootfsFirecrackerVersion && version != managedRootfsCaptureVersion) || m.Compatibility.FirecrackerVersion != version {
+		return fmt.Errorf("%w: RootfsOnly requires a supported, matching Firecracker version", ErrIncompatibleArtifact)
 	}
 	return nil
 }

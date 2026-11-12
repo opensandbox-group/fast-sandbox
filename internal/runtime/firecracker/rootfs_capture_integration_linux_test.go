@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"fast-sandbox/internal/firecrackervmm"
 	"fast-sandbox/internal/guestcontrol"
 )
 
@@ -322,4 +323,19 @@ func TestFlushCapturedBlockIntegration(t *testing.T) {
 	} else {
 		require.NoError(t, err)
 	}
+}
+
+// A jailer copy has a different inode but must contain the selected VMM bytes.
+func TestManagedVMMQualificationAcceptsCopyAndRejectsReplacement(t *testing.T) {
+	executable, err := os.Executable()
+	require.NoError(t, err)
+	copyPath := filepath.Join(t.TempDir(), "firecracker")
+	payload, err := os.ReadFile(executable)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(copyPath, payload, 0600))
+	state := &SandboxState{PID: os.Getpid(), VMM: &firecrackervmm.Selection{BinaryPath: copyPath}}
+	require.NoError(t, qualifyVMMExecutable(state, ""))
+	require.Error(t, qualifyVMMExecutable(state, "wrong-explicit-digest"))
+	require.NoError(t, os.WriteFile(copyPath, []byte("different executable"), 0600))
+	require.ErrorContains(t, qualifyVMMExecutable(state, ""), "does not match")
 }

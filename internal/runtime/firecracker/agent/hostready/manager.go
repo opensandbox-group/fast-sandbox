@@ -122,14 +122,20 @@ func (m *Manager) Run(ctx context.Context) {
 // pass runs one full check/install/label cycle.
 func (m *Manager) pass(ctx context.Context) {
 	klog.InfoS("host readiness pass started")
+	var assetErr error
 	if m.current.Assets != nil {
 		if err := m.current.Assets.Ensure(ctx); err != nil {
+			assetErr = err
 			// The fc-assets check below fails on the same condition;
 			// the error detail goes to the log for diagnosis.
 			klog.ErrorS(err, "firecracker asset installation failed; the fc-assets check will report the outcome")
 		}
 	}
 	report := RunChecks(m.current.Check, m.config.Probes)
+	if assetErr != nil {
+		report.fail("fc-assets-install", assetErr.Error())
+		report.summarize()
+	}
 	for _, check := range report.Checks {
 		if check.Status == StatusWarn {
 			klog.Warningf("host readiness %s: %s", check.Name, check.Detail)

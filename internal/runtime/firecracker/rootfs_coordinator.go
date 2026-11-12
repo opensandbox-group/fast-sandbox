@@ -46,7 +46,11 @@ func readRootfsQualification() (rootfsQualification, error) {
 	if err = json.Unmarshal(raw, &q); err != nil {
 		return q, err
 	}
-	for _, sum := range []string{q.FirecrackerSHA256, q.KernelSHA256, q.OverlayBDSHA256} {
+	digests := []string{q.KernelSHA256, q.OverlayBDSHA256}
+	if q.FirecrackerSHA256 != "" {
+		digests = append(digests, q.FirecrackerSHA256)
+	}
+	for _, sum := range digests {
 		b, e := hex.DecodeString(sum)
 		if e != nil || len(b) != 32 || strings.ToLower(sum) != sum {
 			return q, errors.New("qualification requires SHA256 digests")
@@ -274,8 +278,8 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	if err != nil {
 		return nil, err
 	}
-	if version != rootfsFirecrackerVersion {
-		return nil, errors.New("RootfsOnly requires Firecracker 1.16.1")
+	if err := checkRootfsCaptureVersion(state.VMM, version); err != nil {
+		return nil, err
 	}
 	guest, caps, err := d.captureGuest(ctx, state, manifest, client)
 	if err != nil {
@@ -531,12 +535,8 @@ func (d *Driver) qualifyRootfsSource(ctx context.Context, state *SandboxState) (
 	if err != nil {
 		return "", err
 	}
-	sum, err := captureFileHash(fmt.Sprintf("/proc/%d/exe", state.PID))
-	if err != nil {
+	if err := qualifyVMMExecutable(state, q.FirecrackerSHA256); err != nil {
 		return "", err
-	}
-	if sum != q.FirecrackerSHA256 {
-		return "", errors.New("VMM executable does not match qualified artifact")
 	}
 	if err := backendidentity.Verify(ctx, filepath.Join(runtimecatalog.OCISocketDir, "ublkd.sock"), q.OverlayBDSHA256); err != nil {
 		return "", err

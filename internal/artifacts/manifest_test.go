@@ -325,3 +325,16 @@ func TestRootfsManifestRetainsArchitectureButNotCPUState(t *testing.T) {
 		require.Error(t, copy.Validate())
 	}
 }
+
+func TestFirecracker117TemplateCompatibility(t *testing.T) {
+	for _, cpu := range []CPUIdentity{
+		{Vendor: VendorGenuineIntel, Family: 6, Model: 85, Stepping: 7},
+		{Vendor: VendorAuthenticAMD, Family: 25, Model: 1, Stepping: 1},
+	} {
+		template := CompatibilityCPUTemplate("1.17.0", cpu)
+		require.Equal(t, CompatibilityCPUTemplate("1.16.1", cpu), template)
+		compat := SnapshotCompatibility{FirecrackerVersion: "1.17.0", CPUTemplate: template}
+		require.NoError(t, MatchRestoreCompatibility(compat, cpu, "1.17.0"))
+		require.ErrorIs(t, MatchRestoreCompatibility(compat, cpu, "1.16.1"), ErrFirecrackerVersionMismatch)
+	}
+}

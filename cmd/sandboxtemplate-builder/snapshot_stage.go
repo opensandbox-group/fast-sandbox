@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -70,6 +71,9 @@ const (
 // for the guest's SANDBOX_READY marker, pauses, creates a full snapshot, and
 // restores it once for validation.
 func runSnapshotStage(args []string) error {
+	if err := selectBuildVMM(context.Background()); err != nil {
+		return err
+	}
 	if len(args) != 4 {
 		return fmt.Errorf("usage: sandbox-snapshot-stage <kernel> <rootfs> <vmstate> <memory>")
 	}

@@ -74,6 +74,8 @@ func TestRootfsBootCompatibilityAndKernelTraversal(t *testing.T) {
 	m.Kernel.Cmdline = "root=/dev/vda rw"
 	require.NoError(t, checkRootfsBootCompatibility(m, "1.16.1"))
 	require.Error(t, checkRootfsBootCompatibility(m, "1.17.0"))
+	m.Compatibility.FirecrackerVersion = "1.17.0"
+	require.NoError(t, checkRootfsBootCompatibility(m, "1.17.0"))
 	m.Compatibility.CPUArch = "unsupported"
 	require.Error(t, checkRootfsBootCompatibility(m, "1.16.1"))
 	m.Kernel.Version = "../../kernel"

@@ -45,6 +45,7 @@ type config struct {
 	blobCacheMaxBytes         int64
 	runtimeDir                string
 	firecrackerBin            string
+	vmmDir                    string
 	overlaybdCreate           string
 	overlaybdCommit           string
 	overlaybdMerge            string
@@ -138,6 +139,7 @@ func init() {
 	flags.StringVar(&global.blobCacheDir, "blob-cache-dir", "", "local checkpoint blob cache (default <state-dir>/.blob-cache)")
 	flags.Int64Var(&global.blobCacheMaxBytes, "blob-cache-max-bytes", 16<<30, "local checkpoint cache byte budget; zero disables admission and lookup")
 	flags.StringVar(&global.runtimeDir, "runtime-dir", defaultRuntimeDir, "volatile per-sandbox runtime directory root")
+	flags.StringVar(&global.vmmDir, "vmm-dir", "", "managed Firecracker release directory; selects the manifest version, or latest for builds")
 	flags.StringVar(&global.firecrackerBin, "firecracker", defaultFirecrackerBin, "firecracker binary path")
 	flags.StringVar(&global.overlaybdCreate, "overlaybd-create", defaultOverlaybdCreate, "overlaybd-create binary path")
 	flags.StringVar(&global.overlaybdCommit, "overlaybd-commit", defaultOverlaybdCommit, "overlaybd-commit binary path")
@@ -149,6 +151,7 @@ func init() {
 	flags.StringVar(&global.buildOutputDir, "build-output-dir", defaultBuildOutputDir, "artifact output directory root (build command)")
 	flags.BoolVar(&global.plainHTTP, "plain-http", false, "use plain HTTP for registry requests (ORAS and overlaybd repoBlobUrl)")
 
+	rootCmd.MarkFlagsMutuallyExclusive("vmm-dir", "firecracker")
 	rootCmd.AddCommand(newQualifyBackendCommand())
 	rootCmd.AddCommand(newCreateCommand())
 	rootCmd.AddCommand(newListCommand())

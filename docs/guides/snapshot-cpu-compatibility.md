@@ -30,6 +30,28 @@ hosts the template covers ([docs/cpu_templates/cpu-templates.md](https://github.
 > the guests will experience a consistent feature set supported by the
 > host.
 
+## Managed Firecracker versions
+
+FSB ships the versions listed in [`internal/firecrackervmm/releases.json`](../../internal/firecrackervmm/releases.json): currently **1.16.1 and 1.17.0**. Runtime-agent and Builder consume the same release list. Add upstream versions only when needed, and publish the updated components together as one FSB release; mixed FSB component releases are outside this contract.
+
+The runtime-agent verifies and installs paired executables under `/opt/fast-sandbox/firecracker/versions/<version>/{firecracker,jailer}`, then atomically publishes `catalog.json`. Existing version directories are verified rather than overwritten. Fastlets mount the directory read-only when their runtime environment sets `firecracker.vmmDir`; the shipped runtime environment enables this setting. The flat 1.16.1 binaries remain available for explicit fixed-binary deployments.
+
+| Operation | VMM selection |
+| --- | --- |
+| Create/restore from an existing Full or RootfsOnly manifest | Exact `compatibility.firecrackerVersion`; unavailable or invalid versions fail before VM launch |
+| New Builder template | Numerically newest installed version, currently 1.17.0 |
+| Explicit Builder pin | `FAST_SANDBOX_FIRECRACKER_VERSION`, resolved inside `FAST_SANDBOX_VMM_DIR` |
+| Existing VM after Fastlet restart | Persisted per-instance selection; installing another release does not reselect a running VM |
+| Standalone CLI | `fsb-vm --vmm-dir <directory> build/create`; `--firecracker <binary>` is a separate fixed-binary mode |
+
+OCI `--prepare-only` resolves the version before compatibility validation and hands the selection to Fastlet. Builder's native snapshot subprocess inherits the selected executable, and both native and OCI output record the actual VMM version. Do not relabel an existing Full artifact to a newer VMM; rebuild the template. Managed mode does not allow `--force` to bypass version selection.
+
+Managed **RootfsOnly capture requires 1.17.0**, which includes upstream [the bare Pause/Resume vsock fix](https://github.com/firecracker-microvm/firecracker/pull/6100). A managed source on 1.16.1 is rejected before freeze. RootfsOnly cold boot still requires an exact, supported recorded version (1.16.1 or 1.17.0); automatic cross-version cold boot is not introduced here.
+
+For managed capture, `firecrackerSHA256` is optional in the node qualification profile: capture verifies the running executable against the selected installed binary, including the copy made by jailer. An explicit digest is still enforced. Custom fixed-binary deployments retain explicit digest qualification and must satisfy the same 1.17.0 capture gate; an explicit digest does not bypass the lifecycle requirement. Kernel digest, OverlayBD attestation, and exclusive-ext4 qualification remain required; this change does not complete the separate automatic backend-qualification work.
+
+T2 and T2A have identical upstream implementation blobs in 1.16.1 and 1.17.0, so both use the FMS allowlists below. T2S changed in 1.17.0 but is not an FSB scheduling tier. Version equality and CPU admission still apply independently.
+
 ## The three tiers
 
 The builder pins the vendor-native template and falls back to the raw
@@ -38,7 +60,7 @@ host CPUID when the host refuses it
 `compatibility.cpuTemplate` records which of the three tiers produced
 the snapshot, and restore admission enforces the matching rule.
 
-| Tier | Snapshot built on | Restores on | Allowlist (Firecracker v1.16.1, exact FMS incl. stepping) |
+| Tier | Snapshot built on | Restores on | Allowlist (Firecracker v1.16.1 / v1.17.0, exact FMS incl. stepping) |
 |---|---|---|---|
 | `T2` | Intel host that accepts T2 | Any CPU in the T2 allowlist | Skylake-SP `6/85/4`, Cascade Lake-SP `6/85/7`, Ice Lake-SP `6/106/6` |
 | `T2A` | AMD EPYC Milan (stepping 1) | Any CPU in the T2A allowlist | Milan `25/1/1` (CPUID EAX `0x00a00f11`) |
