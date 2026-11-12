@@ -457,6 +457,8 @@ Do not reuse a `sandbox_id` that still exists locally.
 
 Snapfiles devices and mounts are shared by default for identical resolved layers and credential scope within the same `--state-dir` and mount namespace. Writable rootfs devices and uppers remain private. Each Sandbox keeps a durable snapfiles lease until deletion.
 
+If a cached snapfiles device disappears, for example after an `overlaybd-ublkd` restart, the next create rebuilds it from the template after safely unmounting and cleaning up the stale attachment. Recovery is allowed only when no other Sandbox holds a lease; otherwise creation fails without replacing the shared device. Delete the affected Sandboxes before retrying rather than manually removing the shared cache.
+
 ## 8. Inspect VMs
 
 ```bash

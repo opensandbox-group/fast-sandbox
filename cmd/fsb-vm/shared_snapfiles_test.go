@@ -159,16 +159,172 @@ func TestSharedSnapfilesDeleteKeepsOtherLeaseAndRetainsFailedRelease(t *testing.
 }
 
 func TestSharedSnapfilesMissingDeviceFailsClosed(t *testing.T) {
-	client, adds, _ := sharedSnapfilesFixture(t)
-	image := resolvedImage{RepoBlobURL: "https://r.example/v2/team/t/blobs"}
-	state := &sandboxState{SandboxID: "first", SnapfilesRef: "r.example/team/t:v1"}
-	require.NoError(t, os.MkdirAll(global.sandboxHome("first"), 0750))
-	require.NoError(t, acquireSharedSnapfiles(context.Background(), client, global.sandboxHome("first"), state, image, dockerConfig{}))
-	require.NoError(t, client.Del(context.Background(), 1))
-	second := &sandboxState{SandboxID: "second", SnapfilesRef: state.SnapfilesRef}
-	require.NoError(t, os.MkdirAll(global.sandboxHome("second"), 0750))
-	require.ErrorContains(t, acquireSharedSnapfiles(context.Background(), client, global.sandboxHome("second"), second, image, dockerConfig{}), "device missing")
-	require.Equal(t, 1, *adds, "must not silently replace a device held by another VM")
+	for _, lease := range []string{"state", "alias", "unreadable-state"} {
+		t.Run(lease, func(t *testing.T) {
+			client, adds, _ := sharedSnapfilesFixture(t)
+			image := resolvedImage{RepoBlobURL: "https://r.example/v2/team/t/blobs"}
+			state := &sandboxState{SandboxID: "first", SnapfilesRef: "r.example/team/t:v1"}
+			home := global.sandboxHome(state.SandboxID)
+			require.NoError(t, os.MkdirAll(home, 0750))
+			require.NoError(t, acquireSharedSnapfiles(context.Background(), client, home, state, image, dockerConfig{}))
+			cached, err := readSharedSnapfiles(filepath.Dir(state.MountPoint))
+			require.NoError(t, err)
+			config, err := os.ReadFile(cached.Device.Config)
+			require.NoError(t, err)
+			switch lease {
+			case "alias":
+				require.NoError(t, os.Remove(statePath(home)))
+			case "unreadable-state":
+				require.NoError(t, os.WriteFile(statePath(home), []byte("invalid"), 0600))
+			}
+			require.NoError(t, client.Del(context.Background(), 1))
+			second := &sandboxState{SandboxID: "second", SnapfilesRef: state.SnapfilesRef}
+			require.NoError(t, os.MkdirAll(global.sandboxHome(second.SandboxID), 0750))
+			require.Error(t, acquireSharedSnapfiles(context.Background(), client, global.sandboxHome(second.SandboxID), second, image, dockerConfig{}))
+			require.Equal(t, 1, *adds, "must not silently replace a device held by another VM")
+			require.True(t, isMounted(state.MountPoint))
+			after, err := os.ReadFile(cached.Device.Config)
+			require.NoError(t, err)
+			require.Equal(t, config, after, "must not fence a config with other Sandbox leases")
+		})
+	}
+}
+
+func TestSharedSnapfilesRecoversIdleMissingDevice(t *testing.T) {
+	for _, scenario := range []string{"retained-config", "missing-config", "unmounted", "concurrent"} {
+		t.Run(scenario, func(t *testing.T) {
+			fences := 0
+			client, adds, _ := sharedSnapfilesFixture(t, func(w http.ResponseWriter, config string) bool {
+				raw, err := os.ReadFile(config)
+				if err != nil {
+					http.Error(w, err.Error(), 500)
+					return true
+				}
+				if isMounted(filepath.Join(filepath.Dir(config), snapfilesMount)) {
+					http.Error(w, "old snapfiles mount is still present", 500)
+					return true
+				}
+				if strings.Contains(string(raw), "retired pack config") {
+					fences++
+					w.WriteHeader(http.StatusInternalServerError)
+					_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "device failed to start (see daemon log)"})
+					return true
+				}
+				if !json.Valid(raw) {
+					http.Error(w, "snapfiles config was not rebuilt", 500)
+					return true
+				}
+				return false
+			})
+			ctx := context.Background()
+			image := resolvedImage{RepoBlobURL: "https://r.example/v2/team/t/blobs"}
+			first := &sandboxState{SandboxID: "first", SnapfilesRef: "r.example/team/t:v1"}
+			layout := newSandboxLayout(first.SandboxID)
+			require.NoError(t, claimSandbox(layout, first.SandboxID))
+			require.NoError(t, acquireSharedSnapfiles(ctx, client, layout.home, first, image, dockerConfig{}))
+			cacheHome := filepath.Dir(first.MountPoint)
+			cached, err := readSharedSnapfiles(cacheHome)
+			require.NoError(t, err)
+			config, err := os.ReadFile(cached.Device.Config)
+			require.NoError(t, err)
+			require.NoError(t, releaseSandbox(ctx, client, layout, first))
+			require.NoError(t, client.Del(ctx, cached.Device.DevID))
+			if scenario == "missing-config" {
+				require.NoError(t, os.Remove(cached.Device.Config))
+			}
+			if scenario == "unmounted" {
+				require.NoError(t, unmount(first.MountPoint))
+			}
+			states := []*sandboxState{first}
+			if scenario == "concurrent" {
+				second := &sandboxState{SandboxID: "second", SnapfilesRef: first.SnapfilesRef}
+				require.NoError(t, claimSandbox(newSandboxLayout(second.SandboxID), second.SandboxID))
+				states = append(states, second)
+			}
+			results := make(chan error, len(states))
+			for _, state := range states {
+				go func() {
+					results <- acquireSharedSnapfiles(ctx, client, global.sandboxHome(state.SandboxID), state, image, dockerConfig{})
+				}()
+			}
+			var failures []error
+			for range states {
+				failures = append(failures, <-results)
+			}
+			require.NoError(t, errors.Join(failures...))
+			require.Equal(t, 1, fences)
+			require.Equal(t, 2, *adds, "concurrent creates must share one replacement device")
+			recovered, err := readSharedSnapfiles(cacheHome)
+			require.NoError(t, err)
+			require.NotEqual(t, cached.Device.DevPath, recovered.Device.DevPath)
+			for _, state := range states {
+				require.True(t, isMounted(state.MountPoint))
+				require.Equal(t, first.MountPoint, state.MountPoint)
+			}
+			after, err := os.ReadFile(recovered.Device.Config)
+			require.NoError(t, err)
+			require.JSONEq(t, string(config), string(after))
+		})
+	}
+}
+
+func TestSharedSnapfilesMissingDeviceRecoveryRetainsFailedCleanup(t *testing.T) {
+	for _, failure := range []string{"unmount", "fence"} {
+		t.Run(failure, func(t *testing.T) {
+			fences := 0
+			failFence := failure == "fence"
+			client, adds, _ := sharedSnapfilesFixture(t, func(w http.ResponseWriter, config string) bool {
+				raw, err := os.ReadFile(config)
+				if err != nil || !strings.Contains(string(raw), "retired pack config") {
+					return false
+				}
+				fences++
+				message := "device failed to start (see daemon log)"
+				if failFence {
+					message = "unrecognized failure"
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": message})
+				return true
+			})
+			ctx := context.Background()
+			state := &sandboxState{SandboxID: "first", SnapfilesRef: "r.example/team/t:v1"}
+			layout := newSandboxLayout(state.SandboxID)
+			require.NoError(t, claimSandbox(layout, state.SandboxID))
+			require.NoError(t, acquireSharedSnapfiles(ctx, client, layout.home, state, resolvedImage{}, dockerConfig{}))
+			cacheHome := filepath.Dir(state.MountPoint)
+			cached, err := readSharedSnapfiles(cacheHome)
+			require.NoError(t, err)
+			require.NoError(t, releaseSandbox(ctx, client, layout, state))
+			require.NoError(t, client.Del(ctx, cached.Device.DevID))
+			if failure == "unmount" {
+				bin := t.TempDir()
+				require.NoError(t, os.WriteFile(filepath.Join(bin, "umount"), []byte("#!/bin/sh\nexit 1\n"), 0755))
+				t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+			}
+			err = acquireSharedSnapfiles(ctx, client, layout.home, state, resolvedImage{}, dockerConfig{})
+			if failure == "unmount" {
+				require.ErrorContains(t, err, "umount")
+				require.Zero(t, fences)
+				require.True(t, isMounted(state.MountPoint))
+			} else {
+				require.ErrorContains(t, err, "did not acknowledge")
+				require.Equal(t, 1, fences)
+				require.False(t, isMounted(state.MountPoint))
+			}
+			require.Equal(t, 1, *adds)
+			retained, err := readSharedSnapfiles(cacheHome)
+			require.NoError(t, err)
+			require.Equal(t, cached, retained)
+			if failure == "fence" {
+				failFence = false
+				require.NoError(t, releaseSandbox(ctx, client, layout, state))
+				require.NoError(t, acquireSharedSnapfiles(ctx, client, layout.home, state, resolvedImage{}, dockerConfig{}))
+				require.Equal(t, 2, *adds)
+				require.True(t, isMounted(state.MountPoint))
+			}
+		})
+	}
 }
 
 func TestSharedSnapfilesPrunesExpiredOnlyWithoutLeases(t *testing.T) {
@@ -224,7 +380,7 @@ func TestSharedSnapfilesAliasProtectsLostState(t *testing.T) {
 	require.NoError(t, acquireSharedSnapfiles(context.Background(), client, layout.home, state, resolvedImage{}, dockerConfig{}))
 	key, mount := state.SharedSnapfiles, state.MountPoint
 	require.NoError(t, os.Remove(statePath(layout.home)))
-	referenced, err := sharedSnapfilesReferenced(key)
+	referenced, err := sharedSnapfilesReferenced(key, "")
 	require.NoError(t, err)
 	require.True(t, referenced)
 	// delete's unreadable-state fallback must recover the shared ownership.
@@ -337,46 +493,53 @@ func TestSharedSnapfilesAdoptsCompletedPendingAdd(t *testing.T) {
 }
 
 func TestSharedSnapfilesRecoveryReleasesAddCompletedDuringFence(t *testing.T) {
-	config := filepath.Join(t.TempDir(), "snapfiles.config.json")
-	require.NoError(t, os.WriteFile(config, []byte(`{}`), 0600))
-	lateDevice := false
-	var deleted []int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/v1/list":
-			devices := []ublkdDevice{{DevID: 9, Config: "/other/config"}}
-			if lateDevice {
-				devices = append(devices, ublkdDevice{DevID: 7, Config: config, Dev: "/dev/ublkb7"})
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "devices": devices})
-		case "/v1/add":
-			// The old request finishes after the first List, before the fence acknowledges it.
-			lateDevice = true
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "device failed to start (see daemon log)"})
-		case "/v1/del", "/v1/release":
-			var body struct {
-				ID int `json:"dev_id"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			deleted = append(deleted, body.ID)
-			lateDevice = false
-			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
-		}
-	}))
-	defer server.Close()
-	target, err := url.Parse(server.URL)
-	require.NoError(t, err)
-	client := &ublkdClient{httpClient: &http.Client{Transport: snapfilesTransport{target}}}
-	cached := sharedSnapfilesState{Device: &deviceRecord{Config: config, DevID: -1}}
-	persisted := false
-	require.NoError(t, recoverSharedSnapfilesDevice(context.Background(), client, &cached, func() error {
-		persisted = true
-		return nil
-	}))
-	require.Equal(t, []int{7}, deleted, "release only the late device owned by this cache config")
-	require.Nil(t, cached.Device)
-	require.True(t, persisted)
+	for _, recordedPath := range []string{"", "/dev/ublkb9"} {
+		t.Run("recorded="+recordedPath, func(t *testing.T) {
+			setupManifestCache(t)
+			home := t.TempDir()
+			config := filepath.Join(home, "snapfiles.config.json")
+			require.NoError(t, os.WriteFile(config, []byte(`{}`), 0600))
+			lateDevice := false
+			var deleted []int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/v1/list":
+					devices := []ublkdDevice{{DevID: 9, Dev: "/dev/ublkb9", Config: "/other/config"}}
+					if lateDevice {
+						devices = append(devices, ublkdDevice{DevID: 7, Config: config, Dev: "/dev/ublkb7"})
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "devices": devices})
+				case "/v1/add":
+					// The old request finishes after the first List, before the fence acknowledges it.
+					lateDevice = true
+					w.WriteHeader(http.StatusInternalServerError)
+					_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "device failed to start (see daemon log)"})
+				case "/v1/del", "/v1/release":
+					var body struct {
+						ID int `json:"dev_id"`
+					}
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					deleted = append(deleted, body.ID)
+					lateDevice = false
+					_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+				}
+			}))
+			defer server.Close()
+			target, err := url.Parse(server.URL)
+			require.NoError(t, err)
+			client := &ublkdClient{httpClient: &http.Client{Transport: snapfilesTransport{target}}}
+			cached := sharedSnapfilesState{Device: &deviceRecord{Config: config, DevID: 9, DevPath: recordedPath}}
+			state := &sandboxState{SandboxID: "first", SharedSnapfiles: "key", MountPoint: filepath.Join(home, snapfilesMount)}
+			persisted := false
+			require.NoError(t, recoverSharedSnapfilesDevice(context.Background(), client, state, &cached, func() error {
+				persisted = true
+				return nil
+			}))
+			require.Equal(t, []int{7}, deleted, "release only the late device owned by this cache config, not the recycled dev_id")
+			require.Nil(t, cached.Device)
+			require.True(t, persisted)
+		})
+	}
 }
 
 func TestSharedSnapfilesForcedCleanupRejectsBusyCache(t *testing.T) {
