@@ -601,6 +601,8 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 			}},
 		},
 	}
+	volumeMounts = append(volumeMounts, componentLogVolumeMounts()...)
+	volumes = append(volumes, componentLogVolumes()...)
 	if strings.HasPrefix(output.Publish, "oci://") {
 		env = append(env, corev1.EnvVar{Name: buildIDEnvName, Value: uuid.NewString()})
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "host-dev", MountPath: "/dev"})

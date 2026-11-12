@@ -3,6 +3,7 @@ package dart
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/klog/v2"
+
+	"fast-sandbox/internal/componentlog"
 )
 
 func TestArgs(t *testing.T) {
@@ -67,8 +71,7 @@ func helperScript(t *testing.T, behavior string) string {
 	return path
 }
 
-// safeBuffer is a bytes.Buffer safe for concurrent writes and reads (the
-// manager and its child write logs while the test asserts on them).
+// Child output can arrive while a test reads the buffer.
 type safeBuffer struct {
 	mu sync.Mutex
 	b  bytes.Buffer
@@ -84,6 +87,44 @@ func (s *safeBuffer) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.b.String()
+}
+
+func TestManagerLogsUseComponentFileWithoutRedirectingChildOutput(t *testing.T) {
+	state := klog.CaptureState()
+	t.Cleanup(state.Restore)
+	directory := t.TempDir()
+	configPath := filepath.Join(t.TempDir(), "logging.yaml")
+	require.NoError(t, os.WriteFile(configPath, []byte(fmt.Sprintf("directory: %q\n", directory)), 0o600))
+	t.Setenv(componentlog.ConfigEnv, configPath)
+	closeLogs, err := componentlog.Configure("firecracker-runtime")
+	require.NoError(t, err)
+	t.Cleanup(closeLogs)
+
+	childOutput := &safeBuffer{}
+	manager := New(Config{Binary: filepath.Join(t.TempDir(), "missing-dart"), Log: childOutput})
+	_, _, err = manager.start(context.Background())
+	require.Error(t, err)
+	require.Empty(t, childOutput.String())
+
+	binary := filepath.Join(t.TempDir(), "dart")
+	require.NoError(t, os.WriteFile(binary, []byte("#!/bin/sh\nprintf 'child stdout\\n'\nprintf 'child stderr\\n' >&2\n"), 0o755))
+	manager = New(Config{Binary: binary, Log: childOutput})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, waitCh, err := manager.start(ctx)
+	require.NoError(t, err)
+	require.NoError(t, <-waitCh)
+	require.Contains(t, childOutput.String(), "child stdout\n")
+	require.Contains(t, childOutput.String(), "child stderr\n")
+	require.NotContains(t, childOutput.String(), "DART started")
+
+	klog.Flush()
+	data, err := os.ReadFile(filepath.Join(directory, "firecracker-runtime.log"))
+	require.NoError(t, err)
+	require.Contains(t, string(data), "DART start failed")
+	require.Contains(t, string(data), "DART started")
+	require.NotContains(t, string(data), "child stdout")
+	require.NotContains(t, string(data), "child stderr")
 }
 
 func TestManagerRestartsCrashingChild(t *testing.T) {

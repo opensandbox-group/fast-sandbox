@@ -2,14 +2,18 @@ package reconciler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
@@ -17,13 +21,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/yaml"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/componentlog"
 	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 	"fast-sandbox/internal/controlplane/placement"
 	"fast-sandbox/internal/fastlet/podcgroup"
@@ -1228,6 +1235,7 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	profile := runtimePlan.Profile
 	pod, err := reconciler.constructPodWithRuntimePlan(pool, runtimePlan)
 	require.NoError(t, err)
+	requireComponentLogging(t, &pod.Spec, "fastlet", fastletProxyContainerName)
 	require.Nil(t, pod.Spec.RuntimeClassName)
 	require.NotNil(t, pod.Spec.AutomountServiceAccountToken)
 	require.False(t, *pod.Spec.AutomountServiceAccountToken)
@@ -1455,6 +1463,8 @@ func TestConstructResourceAwarePodProjectsOneResolvedCapacity(t *testing.T) {
 	require.Equal(t, "41088Mi", pod.Spec.Containers[0].Resources.Requests.Memory().String())
 	require.Equal(t, pod.Spec.Containers[0].Resources.Requests, pod.Spec.Containers[0].Resources.Limits)
 	require.Equal(t, "20m", pod.Spec.Containers[1].Resources.Limits.Cpu().String(), "sidecar resources remain independent")
+	requireComponentLogging(t, &pod.Spec, "fastlet", fastletProxyContainerName)
+	require.Equal(t, pool.Spec.FastletTemplate.Spec.Containers[1], pod.Spec.Containers[1], "tenant sidecar must remain unchanged")
 }
 
 func TestEnsureBoundedPodContainersRejectsUnboundedUserSidecar(t *testing.T) {
@@ -2164,6 +2174,62 @@ func TestConstructPodRejectsReservedControlMountFromUserSidecarOrInitContainer(t
 	require.ErrorContains(t, err, "reserved by the platform")
 }
 
+func TestConstructPodRejectsReservedComponentLoggingStorage(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	reconciler := &SandboxPoolReconciler{Scheme: scheme, Catalog: runtimecatalog.Builtin()}
+	base := &apiv1alpha2.SandboxPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "tenant-a", UID: types.UID("pool-uid")},
+		Spec: apiv1alpha2.SandboxPoolSpec{
+			Runtime: apiv1alpha2.RuntimeContainer, MaxSandboxesPerPod: 1, SandboxResources: testSandboxResources(),
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}},
+			}},
+		},
+	}
+	profile, err := reconciler.resolveRuntimeProfile(base)
+	require.NoError(t, err)
+	for _, reserved := range []struct{ name, path string }{
+		{componentlog.ConfigVolumeName, componentlog.ConfigMountPath},
+		{componentlog.LogVolumeName, componentlog.LogDirectory},
+	} {
+		t.Run(reserved.name, func(t *testing.T) {
+			pool := base.DeepCopy()
+			pool.Spec.FastletTemplate.Spec.Volumes = []corev1.Volume{{
+				Name: reserved.name, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+			}}
+			_, err := reconciler.constructPod(pool, profile)
+			require.ErrorContains(t, err, "platform-owned volume name")
+
+			for _, location := range []string{"fastlet", "sidecar", "init"} {
+				for _, collision := range []string{"name", "path"} {
+					t.Run(location+"/"+collision, func(t *testing.T) {
+						pool := base.DeepCopy()
+						mount := corev1.VolumeMount{Name: "user-data", MountPath: "/user"}
+						if collision == "name" {
+							mount.Name = reserved.name
+						} else {
+							mount.MountPath = reserved.path
+						}
+						container := corev1.Container{Name: "user", Image: "user:test", VolumeMounts: []corev1.VolumeMount{mount}}
+						spec := &pool.Spec.FastletTemplate.Spec
+						switch location {
+						case "fastlet":
+							spec.Containers[0].VolumeMounts = container.VolumeMounts
+						case "sidecar":
+							spec.Containers = append(spec.Containers, container)
+						case "init":
+							spec.InitContainers = []corev1.Container{container}
+						}
+						_, err := reconciler.constructPod(pool, profile)
+						require.ErrorContains(t, err, "reserved by the platform")
+					})
+				}
+			}
+		})
+	}
+}
+
 func TestConstructPodRejectsInfraArtifactStorageOverride(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
@@ -2482,6 +2548,153 @@ func TestBuildFastletSettingsIncludesSidecarsInPodMemoryBudget(t *testing.T) {
 		"the aggregate Pod observer includes the runtime owner, long-running sidecars, and platform proxy but not one-shot init containers")
 	require.Equal(t, "256Mi", settings.ResourceAdmission.RuntimeEnvelope.Memory.String(),
 		"sidecars never increase Sandbox commitment or the runtime-owner envelope")
+}
+
+func TestComponentLoggingManifests(t *testing.T) {
+	for _, test := range []struct {
+		path       string
+		containers map[string][]string
+	}{
+		{"manager/controller.yaml", map[string][]string{
+			"fast-sandbox-controller": {"manager"},
+			"fast-sandbox-fastpath":   {"manager"},
+			"fast-sandbox-proxy":      {"proxy"},
+		}},
+		{"janitor/janitor.yaml", map[string][]string{"fast-sandbox-janitor": {"janitor"}}},
+		{"dev/agent-daemonset.yaml", map[string][]string{"firecracker-runtime": {"firecracker-agent", "janitor"}}},
+	} {
+		t.Run(test.path, func(t *testing.T) {
+			found := map[string][]string{}
+			for _, document := range strings.Split(string(readLoggingManifest(t, test.path)), "\n---\n") {
+				var workload struct {
+					Kind     string            `json:"kind"`
+					Metadata metav1.ObjectMeta `json:"metadata"`
+					Spec     struct {
+						Template corev1.PodTemplateSpec `json:"template"`
+					} `json:"spec"`
+				}
+				require.NoError(t, yaml.Unmarshal([]byte(document), &workload))
+				if workload.Kind != "Deployment" && workload.Kind != "DaemonSet" {
+					continue
+				}
+				containers, ok := test.containers[workload.Metadata.Name]
+				require.True(t, ok, "unexpected workload %s", workload.Metadata.Name)
+				require.Equal(t, "fast-sandbox-system", workload.Metadata.Namespace)
+				requireComponentLogging(t, &workload.Spec.Template.Spec, containers...)
+				found[workload.Metadata.Name] = containers
+			}
+			require.Equal(t, test.containers, found)
+		})
+	}
+}
+
+func TestComponentLoggingConfigMapAndKustomizations(t *testing.T) {
+	var config corev1.ConfigMap
+	require.NoError(t, yaml.Unmarshal(readLoggingManifest(t, "logging/configmap.yaml"), &config))
+	require.Equal(t, componentlog.ConfigMapName, config.Name)
+	require.Equal(t, "fast-sandbox-system", config.Namespace)
+	require.Len(t, config.Data, 1)
+	var settings map[string]any
+	require.NoError(t, yaml.Unmarshal([]byte(config.Data[componentlog.ConfigFileName]), &settings))
+	require.Equal(t, map[string]any{
+		"directory": componentlog.LogDirectory,
+		"maxSizeMB": float64(100), "maxBackups": float64(10), "maxAgeDays": float64(7),
+		"compress": true, "alsoStderr": false,
+	}, settings)
+
+	for _, test := range []struct{ path, resource string }{
+		{"logging/kustomization.yaml", "configmap.yaml"},
+		{"default/kustomization.yaml", "../logging"},
+		{"default/kustomization.yaml", "../manager"},
+		{"default/kustomization.yaml", "../janitor"},
+		{"dev/kustomization.yaml", "../default"},
+		{"all-in-one/kustomization.yaml", "../dev"},
+	} {
+		var kustomization struct {
+			Resources []string `json:"resources"`
+		}
+		require.NoError(t, yaml.Unmarshal(readLoggingManifest(t, test.path), &kustomization))
+		require.Contains(t, kustomization.Resources, test.resource, test.path)
+	}
+}
+
+func TestAllInOnePatchPreservesComponentLogging(t *testing.T) {
+	for _, document := range strings.Split(string(readLoggingManifest(t, "manager/controller.yaml")), "\n---\n") {
+		var deployment appsv1.Deployment
+		require.NoError(t, yaml.Unmarshal([]byte(document), &deployment))
+		if deployment.Kind != "Deployment" || deployment.Name != "fast-sandbox-controller" {
+			continue
+		}
+		// Kustomize applies this named-container strategic merge over the base.
+		base, err := yaml.YAMLToJSON([]byte(document))
+		require.NoError(t, err)
+		patch, err := yaml.YAMLToJSON(readLoggingManifest(t, "all-in-one/controller-all-in-one.yaml"))
+		require.NoError(t, err)
+		merged, err := strategicpatch.StrategicMergePatch(base, patch, appsv1.Deployment{})
+		require.NoError(t, err)
+		require.NoError(t, json.Unmarshal(merged, &deployment))
+		require.Contains(t, deployment.Spec.Template.Spec.Containers[0].Args, "--role=all")
+		requireComponentLogging(t, &deployment.Spec.Template.Spec, "manager")
+		return
+	}
+	t.Fatal("base controller Deployment not found")
+}
+
+func readLoggingManifest(t *testing.T, path string) []byte {
+	t.Helper()
+	absolute, err := filepath.Abs(filepath.Join("..", "..", "..", "config", path))
+	require.NoError(t, err)
+	data, err := os.ReadFile(absolute)
+	require.NoError(t, err)
+	return data
+}
+
+func requireComponentLogging(t *testing.T, spec *corev1.PodSpec, containerNames ...string) {
+	t.Helper()
+	var volumes []corev1.Volume
+	for _, volume := range spec.Volumes {
+		if volume.Name == componentlog.ConfigVolumeName || volume.Name == componentlog.LogVolumeName {
+			volumes = append(volumes, volume)
+		}
+	}
+	require.ElementsMatch(t, []corev1.Volume{
+		{
+			Name: componentlog.ConfigVolumeName,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: componentlog.ConfigMapName},
+				Optional:             ptr(true),
+				Items:                []corev1.KeyToPath{{Key: componentlog.ConfigFileName, Path: componentlog.ConfigFileName}},
+			}},
+		},
+		{
+			Name:         componentlog.LogVolumeName,
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+	}, volumes, "exactly one optional config volume and one disk-backed log emptyDir per Pod")
+
+	var found []string
+	for _, container := range append(append([]corev1.Container(nil), spec.Containers...), spec.InitContainers...) {
+		var mounts []corev1.VolumeMount
+		for _, mount := range container.VolumeMounts {
+			if mount.Name == componentlog.ConfigVolumeName || mount.Name == componentlog.LogVolumeName ||
+				mount.MountPath == componentlog.ConfigMountPath || mount.MountPath == componentlog.LogDirectory {
+				mounts = append(mounts, mount)
+			}
+		}
+		if !slices.Contains(containerNames, container.Name) {
+			require.Empty(t, mounts, "non-target container %s must not receive logging mounts", container.Name)
+			continue
+		}
+		found = append(found, container.Name)
+		require.ElementsMatch(t, []corev1.VolumeMount{
+			{Name: componentlog.ConfigVolumeName, MountPath: componentlog.ConfigMountPath, ReadOnly: true},
+			{Name: componentlog.LogVolumeName, MountPath: componentlog.LogDirectory},
+		}, mounts, container.Name)
+		for _, env := range container.Env {
+			require.NotEqual(t, componentlog.ConfigEnv, env.Name, "use the optional default config path, not an explicit override")
+		}
+	}
+	require.ElementsMatch(t, containerNames, found)
 }
 
 func testSandboxResources() apiv1alpha2.SandboxResourceProfile {

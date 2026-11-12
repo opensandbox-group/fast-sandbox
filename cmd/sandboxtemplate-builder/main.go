@@ -37,6 +37,7 @@ import (
 	"k8s.io/klog/v2"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/componentlog"
 )
 
 const (
@@ -72,11 +73,18 @@ func main() {
 		}
 		return
 	}
-	klog.InitFlags(nil)
-	// Parse flags so klog's -v/-logtostderr work on the command line.
+	componentlog.InitFlags(nil)
 	flag.Parse()
+	closeLogs, err := componentlog.Configure("sandboxtemplate-builder")
+	if err != nil {
+		klog.ErrorS(err, "configure component logging")
+		klog.Flush()
+		os.Exit(1)
+	}
+	defer closeLogs()
 	if err := run(context.Background()); err != nil {
 		klog.ErrorS(err, "sandbox template build failed")
+		klog.Flush()
 		os.Exit(1)
 	}
 }

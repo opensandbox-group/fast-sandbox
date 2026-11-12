@@ -132,6 +132,7 @@ func TestSandboxTemplateReconcileCreatesPodAndTracksPhase(t *testing.T) {
 		t.Fatalf("expected one build pod in %s, got %d", namespace, len(pods))
 	}
 	pod := &pods[0]
+	requireComponentLogging(t, &pod.Spec, "build")
 	if pod.Namespace != namespace {
 		t.Fatalf("expected the build pod in the template namespace, got %q", pod.Namespace)
 	}
@@ -1105,6 +1106,7 @@ func TestSandboxTemplateOCIOutputAndDeviceMount(t *testing.T) {
 	if !found {
 		t.Fatal("OCI builder must see dynamically created host ublk devices")
 	}
+	requireComponentLogging(t, &pod.Spec, "build")
 	output.Format = apiv1alpha2.ArtifactFormatNative
 	if _, err = r.effectiveOutput(output, "s3://native/store"); err == nil {
 		t.Fatal("native OCI output must fail")
