@@ -41,7 +41,12 @@ func TestPushPackedPairWithCheckpointAnnotations(t *testing.T) {
 	require.NoError(t, os.WriteFile(auth, []byte(`{"auths":{}}`), 0600))
 	cmd := newPushCommand()
 	cmd.SetArgs([]string{"--artifact-dir", layout.root, "--destination", strings.TrimPrefix(server.URL, "https://") + "/checkpoint/test:checkpoint-1", "--metadata-file", metadata, "--auth-file", auth})
-	require.NoError(t, cmd.Execute())
+	output := captureCommandStdout(t, func() { require.NoError(t, cmd.Execute()) })
+	var result map[string]string
+	require.NoError(t, json.Unmarshal([]byte(output), &result))
+	require.Len(t, result, 2)
+	require.NotEmpty(t, result["manifestRef"])
+	require.NotEmpty(t, result["artifactDigest"])
 	// Resolve through the default paired-tag convention, then inspect exactly
 	// the snapfiles manifest returned as the checkpoint publication point.
 	ref := strings.TrimPrefix(server.URL, "https://") + "/checkpoint/test:checkpoint-1"

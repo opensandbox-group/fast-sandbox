@@ -19,6 +19,90 @@ import (
 	"fast-sandbox/internal/artifacts"
 )
 
+func TestBuildProgress(t *testing.T) {
+	for _, buildErr := range []error{nil, errors.New("build failed")} {
+		status := "completed"
+		if buildErr != nil {
+			status = "failed"
+		}
+		t.Run(status, func(t *testing.T) {
+			var output bytes.Buffer
+			progress := &buildProgress{output: &output}
+			progress.start("resolving source image")
+			require.Contains(t, output.String(), `phase="resolving source image" status=started`)
+			require.NotContains(t, output.String(), "status=completed")
+			progress.start("preparing build rootfs")
+			progress.finish(buildErr)
+			progress.finish(nil)
+
+			lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+			require.Len(t, lines, 4)
+			require.Contains(t, lines[1], `phase="resolving source image" status=completed`)
+			require.Contains(t, lines[2], `phase="preparing build rootfs" status=started`)
+			require.Contains(t, lines[3], `phase="preparing build rootfs" status=`+status)
+			for _, line := range lines {
+				timestamp, _, ok := strings.Cut(line, " ")
+				require.True(t, ok)
+				_, err := time.Parse(time.RFC3339Nano, timestamp)
+				require.NoError(t, err)
+				require.True(t, strings.HasSuffix(timestamp, "Z"))
+				require.Contains(t, line, "[build ")
+				require.Contains(t, line, " duration=")
+			}
+		})
+	}
+}
+
+func TestBuildProgressDurations(t *testing.T) {
+	var output bytes.Buffer
+	started := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.FixedZone("UTC+2", 2*60*60))
+	progress := &buildProgress{
+		output: &output, started: started, phaseStarted: started.Add(2 * time.Second), phase: "pulling source image",
+	}
+	progress.log(started.Add(4250*time.Millisecond), "completed")
+	require.Equal(t, "2026-01-02T01:04:09.25Z [build 4.25s] phase=\"pulling source image\" status=completed duration=2.25s\n", output.String())
+}
+
+func TestBuildProgressStopsAtFailedPhase(t *testing.T) {
+	for _, invalid := range []bool{true, false} {
+		t.Run(strconv.FormatBool(invalid), func(t *testing.T) {
+			options := validBuildOptions(t)
+			previous := global
+			t.Cleanup(func() { global = previous })
+			global.ublkdSocket = filepath.Join(t.TempDir(), "missing.sock")
+			failedPhase := "preparing build workspace"
+			if invalid {
+				options.diskSizeGiB = 0
+				failedPhase = "validating build inputs"
+			}
+			output := captureCommandStdout(t, func() {
+				require.Error(t, runBuild(context.Background(), options))
+			})
+			require.Contains(t, output, fmt.Sprintf("phase=%q status=started", failedPhase))
+			require.Contains(t, output, fmt.Sprintf("phase=%q status=failed", failedPhase))
+			require.NotContains(t, output, fmt.Sprintf("phase=%q status=completed", failedPhase))
+			require.NotContains(t, output, "resolving source image")
+			require.NotContains(t, output, "built template pair")
+		})
+	}
+}
+
+func captureCommandStdout(t *testing.T, run func()) string {
+	t.Helper()
+	output, err := os.Create(filepath.Join(t.TempDir(), "stdout"))
+	require.NoError(t, err)
+	previous := os.Stdout
+	os.Stdout = output
+	defer func() {
+		os.Stdout = previous
+		_ = output.Close()
+	}()
+	run()
+	data, err := os.ReadFile(output.Name())
+	require.NoError(t, err)
+	return string(data)
+}
+
 func TestParseOutput(t *testing.T) {
 	names, err := parseOutput("redis:6.2.1")
 	if err != nil {

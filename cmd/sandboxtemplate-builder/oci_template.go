@@ -9,12 +9,14 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/uuid"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/klog/v2"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifacts"
@@ -23,9 +25,45 @@ import (
 
 const buildIDEnvName = "SANDBOX_TEMPLATE_BUILD_ID"
 
+type ociBuildProgress struct {
+	started      time.Time
+	phaseStarted time.Time
+	phase        string
+}
+
+func (p *ociBuildProgress) start(phase string) {
+	p.finish(nil)
+	p.phase = phase
+	p.phaseStarted = time.Now()
+	klog.InfoS("OCI template build stage", "phase", p.phase, "status", "started",
+		"elapsedMs", p.phaseStarted.Sub(p.started).Milliseconds(), "durationMs", int64(0))
+}
+
+func (p *ociBuildProgress) finish(err error) {
+	if p.phase == "" {
+		return
+	}
+	now := time.Now()
+	status := "completed"
+	if err != nil {
+		status = "failed"
+	}
+	fields := []any{"phase", p.phase, "status", status,
+		"elapsedMs", now.Sub(p.started).Milliseconds(), "durationMs", now.Sub(p.phaseStarted).Milliseconds()}
+	if err != nil {
+		klog.ErrorS(err, "OCI template build stage", fields...)
+	} else {
+		klog.InfoS("OCI template build stage", fields...)
+	}
+	p.phase = ""
+}
+
 // buildOCITemplate delegates disk conversion, cold boot and snapshots to fsb-vm.
 // It shares the existing guest bootstrap contract with native templates.
-func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir, kernel string) error {
+func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir, kernel string) (err error) {
+	progress := ociBuildProgress{started: time.Now()}
+	defer func() { progress.finish(err) }()
+	progress.start("validate-output")
 	if spec.Output.Format != apiv1alpha2.ArtifactFormatOverlayBD {
 		return fmt.Errorf("OCI templates require output.format=overlaybd")
 	}
@@ -36,6 +74,7 @@ func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 	if err != nil {
 		return err
 	}
+	progress.start("prepare-credentials")
 	authDir := os.Getenv(publishCredentialsDirEnv)
 	authFile := filepath.Join(authDir, ".dockerconfigjson")
 	if _, err := os.Stat(authFile); err != nil {
@@ -58,10 +97,12 @@ func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 	if err = stageOCICredentials(spec, dockerDir); err != nil {
 		return err
 	}
+	progress.start("prepare-source")
 	source, sourceDigest, err := prepareOCISource(ctx, spec, workdir)
 	if err != nil {
 		return err
 	}
+	progress.start("inject-runtime")
 	inject := filepath.Join(workdir, "inject")
 	if err = os.MkdirAll(filepath.Join(inject, "etc"), 0755); err != nil {
 		return err
@@ -70,6 +111,7 @@ func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 	if err != nil {
 		return err
 	}
+	progress.start("prepare-build")
 	vcpu, err := resource.ParseQuantity(spec.Machine.VCPU)
 	if err != nil {
 		return err
@@ -112,12 +154,14 @@ func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 		return err
 	}
 	args = append(args, "--manifest-extra-file", extraFile)
+	progress.start("build")
 	cmd := exec.CommandContext(ctx, "fsb-vm", args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err = cmd.Run(); err != nil {
 		return fmt.Errorf("fsb-vm build: %w", err)
 	}
+	progress.start("push")
 	cmd = exec.CommandContext(ctx, "fsb-vm", "push", "--artifact-dir", filepath.Join(workdir, "artifacts", "template_build"), "--destination", destination, "--auth-file", authFile)
 	cmd.Stderr = os.Stderr
 	output, err := cmd.Output()
@@ -134,6 +178,7 @@ func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 	if result.ManifestRef == "" || result.ArtifactDigest == "" {
 		return fmt.Errorf("fsb-vm push returned incomplete publication")
 	}
+	progress.start("patch-annotations")
 	return patchPodAnnotations(ctx, result.ManifestRef, result.ArtifactDigest)
 }
 
