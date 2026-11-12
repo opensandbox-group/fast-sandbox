@@ -103,7 +103,7 @@ func acquireSharedSnapfiles(ctx context.Context, client *ublkdClient, sandboxHom
 		return writeFileAtomic(statePath(home), raw, 0600)
 	}
 	if cached.Device != nil {
-		if err := recoverSharedSnapfilesDevice(ctx, client, &cached, persist); err != nil {
+		if err := recoverSharedSnapfilesDevice(ctx, client, state, &cached, persist); err != nil {
 			return err
 		}
 	}
@@ -131,7 +131,7 @@ func acquireSharedSnapfiles(ctx context.Context, client *ublkdClient, sandboxHom
 
 // A pending Add can finish after its caller exits. Fence it before replacing the
 // config, then release any device it produced before starting a fresh Add.
-func recoverSharedSnapfilesDevice(ctx context.Context, client *ublkdClient, cached *sharedSnapfilesState, persist func() error) error {
+func recoverSharedSnapfilesDevice(ctx context.Context, client *ublkdClient, state *sandboxState, cached *sharedSnapfilesState, persist func() error) error {
 	devices, err := client.List(ctx)
 	if err != nil {
 		return err
@@ -146,8 +146,15 @@ func recoverSharedSnapfilesDevice(ctx context.Context, client *ublkdClient, cach
 		}
 		return nil
 	}
-	if cached.Device.DevPath != "" {
-		return fmt.Errorf("shared snapfiles device missing: %s; retained for cleanup", cached.Device.Config)
+	referenced, err := sharedSnapfilesReferenced(state.SharedSnapfiles, state.SandboxID)
+	if err != nil {
+		return err
+	}
+	if referenced {
+		return fmt.Errorf("shared snapfiles device missing: %s; other Sandbox leases remain; retained for cleanup", cached.Device.Config)
+	}
+	if err := unmount(state.MountPoint); err != nil {
+		return err
 	}
 	if err := client.FenceAdd(ctx, cached.Device.Config); err != nil {
 		return err
@@ -205,12 +212,15 @@ func releaseSharedSnapfilesLease(home string, state *sandboxState) error {
 
 // Sandbox states are the leases. No process-local count can disappear on a CLI
 // exit, and an unreadable state prevents eviction rather than risking a live VM.
-func sharedSnapfilesReferenced(key string) (bool, error) {
+func sharedSnapfilesReferenced(key, excludeSandboxID string) (bool, error) {
 	ids, err := listSandboxIDs(global.stateDir)
 	if err != nil {
 		return false, err
 	}
 	for _, id := range ids {
+		if id == excludeSandboxID {
+			continue
+		}
 		state, err := readState(global.sandboxHome(id))
 		if errors.Is(err, os.ErrNotExist) {
 			alias, aliasErr := sharedSnapfilesAlias(global.sandboxHome(id))
@@ -286,7 +296,7 @@ func pruneSharedSnapfilesEntry(ctx context.Context, client *ublkdClient, key str
 		return false, err
 	}
 	defer unlock()
-	referenced, err := sharedSnapfilesReferenced(key)
+	referenced, err := sharedSnapfilesReferenced(key, "")
 	if err != nil {
 		return false, err
 	}
