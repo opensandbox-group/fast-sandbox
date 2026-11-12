@@ -3,7 +3,7 @@ title: "Firecracker Multi-Version Delivery and Selection"
 authors:
   - "@Yeaury"
 creation-date: 2026-11-11
-last-updated: 2026-11-11
+last-updated: 2026-11-12
 status: draft
 ---
 
@@ -122,7 +122,11 @@ ARM64 lab runs can supplement these checks but do not replace x86_64 shipped-ima
 
 Publish runtime-agent, Fastlet, Builder, and their tools together with the same selected VMM release set. This proposal does not implement or validate compatibility between components from different FSB releases. Missing-version rejection remains the final safety check for an incomplete installation.
 
-Build new templates with 1.17.0 while existing 1.16.1 templates keep using their recorded runtime. Validate the downstream RootfsOnly deployment before enabling production capture. Retain old version directories; automatic garbage collection and automatic VMM substitution are outside this change. A rollback must retain a VMM compatible with each remaining artifact; relabeling a Full manifest is never a compatibility mechanism.
+Build new templates with 1.17.0 while existing 1.16.1 templates keep using their recorded runtime. Validate the downstream RootfsOnly deployment before enabling production capture. Retain old version directories; automatic garbage collection and automatic VMM substitution are outside this change. Retaining a compatible VMM is necessary for artifact restore, but does not establish that an FSB component downgrade is safe.
+
+Once 1.17.0 Full templates or checkpoints have been produced, downgrading to an FSB release without multi-version selection support is outside the supported boundary. Keeping the 1.17.0 executable on disk does not give an older Fastlet the selection, compatibility checks or persisted-instance handling needed to use it. This applies even when all FSB components are downgraded together; it is separate from the exclusion of mixed-release components above.
+
+If the rollout must be stopped, stop creating new 1.17.0 templates and enabling new RootfsOnly captures while retaining the coordinated multi-version-capable FSB release needed to operate existing instances and restore existing artifacts. Any future supported component downgrade would need separate compatibility validation; this proposal neither implements nor promises it. Relabeling a Full manifest is never a compatibility mechanism.
 
 ## Related links
 
