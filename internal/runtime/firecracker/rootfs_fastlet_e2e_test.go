@@ -186,7 +186,7 @@ func TestRootfsFastletChainE2E(t *testing.T) {
 				require.NoError(t, err, "no profile: deployed bundles and boot manifest must qualify the live VM")
 				for _, mismatch := range []struct{ field, message string }{
 					{"firecrackerSHA256", "managed VMM differs from explicit qualification digest"},
-					{"kernelSHA256", "running guest kernel"},
+					{"kernelSHA256", "qualification pins kernelSHA256"},
 					{"overlaybdSHA256", "stale or mismatched"},
 				} {
 					t.Run("reject-"+mismatch.field, func(t *testing.T) {
