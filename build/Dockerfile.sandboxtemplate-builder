@@ -31,7 +31,7 @@ RUN apk add --no-cache curl jq coreutils \
     && sh /package.sh /releases.json /bundle x86_64
 
 # --- sandboxtemplate-builder binary ----------------------------------------
-FROM golang:1.25 AS builder-build
+FROM golang:1.26.11 AS builder-build
 
 # GOPROXY is overridable (docker build --build-arg GOPROXY=...) so hosts
 # without direct proxy.golang.org access can download modules from a mirror;

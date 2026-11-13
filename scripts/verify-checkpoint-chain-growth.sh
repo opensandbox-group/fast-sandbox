@@ -5,7 +5,7 @@
 # Usage: scripts/verify-checkpoint-chain-growth.sh [cycles] [max-layers] [squash-layers]
 set -eu
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GO_IMAGE="${GO_IMAGE:-golang:1.25}"
+GO_IMAGE="${GO_IMAGE:-golang:1.26.11}"
 CYCLES="${1:-30}"
 MAX_LAYERS="${2:-8}"
 SQUASH="${3:-4}"
