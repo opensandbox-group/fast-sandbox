@@ -20,12 +20,12 @@ const (
 	runscContainerdConfigPath = "/etc/containerd/runsc.toml"
 	// kvmDevicePath is the host KVM character device required by VM runtimes.
 	kvmDevicePath = "/dev/kvm"
-	// firecrackerStateRootDir is the host state root directory of the Firecracker runtime.
-	firecrackerStateRootDir = "/var/lib/fast-sandbox/firecracker"
+	// FirecrackerStateRootDir is the host state root directory of the Firecracker runtime.
+	FirecrackerStateRootDir = "/var/lib/fast-sandbox/firecracker"
 	// firecrackerBinaryPath is the host Firecracker binary installed by hostready.
 	firecrackerBinaryPath = "/usr/local/bin/firecracker"
 	// firecrackerRootfsDir is the host rootfs directory of the Firecracker runtime.
-	firecrackerRootfsDir = firecrackerStateRootDir + "/rootfs"
+	firecrackerRootfsDir = FirecrackerStateRootDir + "/rootfs"
 	// kvmDeviceRequirementName is the host-path requirement name of the KVM device.
 	kvmDeviceRequirementName = "dev-kvm"
 )
@@ -84,7 +84,7 @@ func builtinProfiles() map[apiv1alpha2.RuntimeName]RuntimeProfile {
 					// and restore never boots one (#84); direct boot pins an
 					// operator kernelPath.
 					BinaryPath: firecrackerBinaryPath,
-					RootfsPath: firecrackerRootfsDir, StateRoot: firecrackerStateRootDir,
+					RootfsPath: firecrackerRootfsDir, StateRoot: FirecrackerStateRootDir,
 					DefaultVCPUs: 1, DefaultMemory: "512Mi", BootTimeoutSeconds: 30,
 				},
 				Deployment: DeploymentRequirements{
@@ -98,7 +98,7 @@ func builtinProfiles() map[apiv1alpha2.RuntimeName]RuntimeProfile {
 						{Name: "dev-net-tun", HostPath: "/dev/net/tun", MountPath: "/dev/net/tun", Type: corev1.HostPathCharDev},
 						{Name: "firecracker-bin", HostPath: firecrackerBinaryPath, MountPath: firecrackerBinaryPath, Type: corev1.HostPathFile, ReadOnly: true},
 						{Name: "firecracker-rootfs", HostPath: firecrackerRootfsDir, MountPath: firecrackerRootfsDir, Type: corev1.HostPathDirectoryOrCreate},
-						{Name: "firecracker-state", HostPath: firecrackerStateRootDir, MountPath: firecrackerStateRootDir, Type: corev1.HostPathDirectoryOrCreate},
+						{Name: "firecracker-state", HostPath: FirecrackerStateRootDir, MountPath: FirecrackerStateRootDir, Type: corev1.HostPathDirectoryOrCreate},
 					}, linuxNetworkPaths...),
 				},
 				// The on-demand loading chain is implemented and E2E-verified

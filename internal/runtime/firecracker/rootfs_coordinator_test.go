@@ -366,6 +366,9 @@ func TestRootfsQualificationBrokenBundlesFailClosed(t *testing.T) {
 			}
 			_, err := readRootfsQualification(source)
 			require.Error(t, err)
+			if test == "missing-entry" {
+				require.ErrorContains(t, err, "bundle does not list libexec/overlaybd-ublkd")
+			}
 		})
 	}
 }
@@ -402,4 +405,21 @@ func TestRootfsQualificationCustomVMMNeedsExplicitDigest(t *testing.T) {
 	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
 	_, err = readRootfsQualification(source)
 	require.NoError(t, err)
+}
+
+func TestRootfsQualificationKernelDiagnostics(t *testing.T) {
+	d := &Driver{}
+	state := &SandboxState{BootKernelSHA256: strings.Repeat("a", 64)}
+	_, err := d.qualifyRootfsSource(t.Context(), state, artifacts.VMManifest{})
+	require.ErrorContains(t, err, "rebuild the template and recreate the sandbox")
+	profile := filepath.Join(t.TempDir(), "qualification.json")
+	q := rootfsQualification{FirecrackerSHA256: strings.Repeat("a", 64), KernelSHA256: strings.Repeat("b", 64), OverlayBDSHA256: strings.Repeat("c", 64), StorageRevision: "tested", ExclusiveExt4: true}
+	raw, err := json.Marshal(q)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(profile, raw, 0600))
+	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", profile)
+	manifest := artifacts.VMManifest{}
+	manifest.Kernel.SHA256 = state.BootKernelSHA256
+	_, err = d.qualifyRootfsSource(t.Context(), state, manifest)
+	require.ErrorContains(t, err, "qualification pins kernelSHA256")
 }

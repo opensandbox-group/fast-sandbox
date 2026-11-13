@@ -486,6 +486,9 @@ func (d *Driver) abortDeadRootfsCapture(ctx context.Context, state *SandboxState
 }
 
 func (d *Driver) qualifyRootfsSource(ctx context.Context, state *SandboxState, manifest artifacts.VMManifest) (string, error) {
+	if manifest.Kernel.SHA256 == "" {
+		return "", errors.New("source manifest does not record a kernel digest; rebuild the template and recreate the sandbox")
+	}
 	// The template records the actual boot kernel; an override cannot replace
 	// this provenance check with a digest of a different node kernel.
 	if err := qualifyBootKernel(state.BootKernelSHA256, manifest.Kernel.SHA256); err != nil {
@@ -496,9 +499,7 @@ func (d *Driver) qualifyRootfsSource(ctx context.Context, state *SandboxState, m
 		return "", err
 	}
 	if q.KernelSHA256 != manifest.Kernel.SHA256 {
-		if err := qualifyBootKernel(state.BootKernelSHA256, q.KernelSHA256); err != nil {
-			return "", err
-		}
+		return "", fmt.Errorf("qualification pins kernelSHA256 %s; the template records %s", q.KernelSHA256, manifest.Kernel.SHA256)
 	}
 	identity, err := captureProcessIdentity(ctx, state.APIAddress, state.PID)
 	if err != nil {

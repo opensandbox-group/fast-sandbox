@@ -34,12 +34,11 @@ type rootfsQualificationSources struct {
 }
 
 func (d *Driver) rootfsQualificationSources(state *SandboxState, m artifacts.VMManifest) rootfsQualificationSources {
-	managed := state.VMM != nil && d.config.VMMDir != "" &&
-		state.VMM.BinaryPath == filepath.Join(d.config.VMMDir, "versions", state.VMM.Version, "firecracker")
+	managed := state.VMM.IsManaged(d.config.VMMDir)
 	return rootfsQualificationSources{
 		KernelSHA256: m.Kernel.SHA256, ManagedVMM: managed,
 		OverlayBDBundle:  filepath.Join(runtimecatalog.OCIToolsDir, "current"),
-		StandardTopology: managed && filepath.Clean(d.config.VMMDir) == firecrackervmm.DefaultDir && filepath.Clean(d.config.StateRoot) == "/var/lib/fast-sandbox/firecracker",
+		StandardTopology: managed && filepath.Clean(d.config.VMMDir) == firecrackervmm.DefaultDir && filepath.Clean(d.config.StateRoot) == runtimecatalog.FirecrackerStateRootDir,
 	}
 }
 
@@ -63,7 +62,11 @@ func readRootfsQualification(source rootfsQualificationSources) (rootfsQualifica
 		}
 		if !hasBackend {
 			// bin/overlaybd-ublkd is a wrapper, not the running executable.
-			q.OverlayBDSHA256 = entries["libexec/overlaybd-ublkd"]
+			var exists bool
+			q.OverlayBDSHA256, exists = entries["libexec/overlaybd-ublkd"]
+			if !exists {
+				return q, errors.New("OverlayBD bundle does not list libexec/overlaybd-ublkd")
+			}
 		}
 		if !hasRevision {
 			q.StorageRevision = revision

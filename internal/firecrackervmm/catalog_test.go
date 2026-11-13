@@ -75,3 +75,14 @@ func TestResolveRejectsInvalidPairs(t *testing.T) {
 		})
 	}
 }
+
+func TestSelectionManagedLayout(t *testing.T) {
+	var absent *Selection
+	require.False(t, absent.IsManaged(DefaultDir))
+	s := &Selection{Version: "1.17.0", BinaryPath: filepath.Join(DefaultDir, "versions", "1.17.0", "firecracker")}
+	require.True(t, s.IsManaged(DefaultDir))
+	require.False(t, s.IsManaged(""))
+	require.False(t, s.IsManaged("/custom"))
+	s.Version = "../1.17.0"
+	require.False(t, s.IsManaged(DefaultDir))
+}

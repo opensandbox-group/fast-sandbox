@@ -22,7 +22,7 @@ func TestNodeDaemonAttestationDoesNotStopStorage(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("node launcher requires Linux flock and process signals")
 	}
-	for _, mode := range []string{"success", "attestation-failure", "socket-timeout", "daemon-exit"} {
+	for _, mode := range []string{"success", "attestation-retry", "attestation-failure", "socket-timeout", "daemon-exit"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
 			socketDir, tools := filepath.Join(dir, "socket"), filepath.Join(dir, "tools")
@@ -45,6 +45,8 @@ fi
 exec /bin/sleep 60
 `,
 				"fsb-vm": `#!/bin/sh
+echo attempt >> "$TEST_NODE_DIR/attempts"
+if [ "$TEST_NODE_MODE" = attestation-retry ] && [ "$(wc -l < "$TEST_NODE_DIR/attempts")" -lt 3 ]; then exit 9; fi
 echo record > "$TEST_NODE_DIR/socket/ublkd.sock.qualification.json"
 if [ "$TEST_NODE_MODE" = attestation-failure ]; then exit 9; fi
 `,
@@ -52,7 +54,7 @@ if [ "$TEST_NODE_MODE" = attestation-failure ]; then exit 9; fi
 			} {
 				require.NoError(t, os.WriteFile(filepath.Join(tools, name), []byte(contents), 0755))
 			}
-			if mode == "success" || mode == "attestation-failure" {
+			if mode == "success" || mode == "attestation-retry" || mode == "attestation-failure" {
 				// Startup removes old sockets, so the fake daemon publishes this one.
 				listener, err := net.Listen("unix", filepath.Join(socketDir, "ready.sock"))
 				require.NoError(t, err)
@@ -93,15 +95,20 @@ if [ "$TEST_NODE_MODE" = attestation-failure ]; then exit 9; fi
 			}
 			record := filepath.Join(socketDir, "ublkd.sock.qualification.json")
 			require.Eventually(t, func() bool {
-				if mode == "success" {
+				if mode == "success" || mode == "attestation-retry" {
 					_, err := os.Stat(record)
 					return err == nil
 				}
 				raw, _ := os.ReadFile(logPath)
 				return strings.Contains(string(raw), "RootfsOnly qualification unavailable")
 			}, 5*time.Second, 10*time.Millisecond)
-			if mode != "success" {
+			if mode != "success" && mode != "attestation-retry" {
 				require.NoFileExists(t, record, "failed attestation must revoke even a partial record")
+			}
+			if mode == "attestation-retry" || mode == "attestation-failure" {
+				attempts, err := os.ReadFile(filepath.Join(dir, "attempts"))
+				require.NoError(t, err)
+				require.Equal(t, 3, strings.Count(string(attempts), "attempt\n"))
 			}
 			pidRaw, err := os.ReadFile(filepath.Join(dir, "daemon.pid"))
 			require.NoError(t, err)

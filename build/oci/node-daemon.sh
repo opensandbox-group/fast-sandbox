@@ -57,7 +57,15 @@ attest_backend() {
     [ "$attempts" -lt 100 ] || return 1
     sleep 0.1
   done
-  "$tools/fsb-vm" --ublkd-socket "$socket_dir/ublkd.sock" qualify-backend
+  # bind() exposes the path before listen(); retry transient startup failures.
+  attempts=0
+  until "$tools/fsb-vm" --ublkd-socket "$socket_dir/ublkd.sock" qualify-backend; do
+    rm -f "$socket_dir/ublkd.sock.qualification.json"
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 3 ] || return 1
+    kill -0 "$daemon_pid" 2>/dev/null || return 1
+    sleep 0.2
+  done
 }
 if ! attest_backend; then
   # Also revoke any partial record written by a failed attestation command.
