@@ -54,6 +54,15 @@ Klog verbosity flags `-v` and `-vmodule` keep their existing behavior across all
 | `--namespaces` | *(empty = whole cluster)* | Comma-separated namespaces the informer cache watches |
 | `--kube-client-qps` | *(client-go default)* | API-server client rate limit in queries per second |
 | `--kube-client-burst` | *(client-go default)* | API-server client burst budget for the rate limiter |
+| `--fastlet-auth-subjects` | *(Fastlet built-in platform default)* | Comma-separated ServiceAccount subjects allowed to call the Fastlet control API, injected into Fastlet Pods; set it when the control plane runs outside `fast-sandbox-system` (env fallback `FASTLET_AUTH_SUBJECTS`) |
+
+Fastlet control authentication is always enabled: every call to the Fastlet
+control API carries an audience-bound ServiceAccount token minted through the
+TokenRequest API for the role's own ServiceAccount, and the Pool Controller
+injects the issuer anchor into Fastlet Pods. Two environment overrides cover
+processes running outside a Pod (integration tooling):
+`FASTLET_AUTH_NAMESPACE` and `FASTLET_AUTH_SERVICE_ACCOUNT` pin the minting
+identity; `FASTLET_AUTH_AUDIENCE` overrides the token audience on both sides.
 
 Resource-aware placement requires static admission. Resource-aware Pool
 scaling requires placement. These constraints prevent a downstream component
@@ -199,7 +208,30 @@ at `/etc/fast-sandbox/registry/registry.json`. See
 - `FAST_SANDBOX_NETWORK_HOST_NETNS_ROOT`;
 - `FAST_SANDBOX_NETWORK_MTU`.
 
-Pool templates cannot override these variables or other platform-owned containers, mounts, runtime handlers, and security settings. Fastlet Pods never mount the service-account token (`automountServiceAccountToken: false` is forced), so they have no Kubernetes API access; control-plane components reach Fastlet over the Pod network.
+Pool templates cannot override these variables or other platform-owned containers, mounts, runtime handlers, and security settings. Fastlet Pods never mount the service-account token (`automountServiceAccountToken: false` is forced), so they hold no Kubernetes credentials; control-plane components reach Fastlet over the Pod network and authenticate with ServiceAccount tokens the Pool Controller anchors at Pod creation.
+
+### Control authentication
+
+Fastlet control authentication is always on. The Pool Controller injects the
+issuer anchor into every Fastlet Pod:
+
+- `FASTLET_AUTH_ISSUER`;
+- `FASTLET_AUTH_CA_BUNDLE` (base64-encoded PEM).
+
+The Fastlet verifies each control call's bearer token against the issuer's
+published signing keys and rejects callers whose ServiceAccount is not on the
+allow list. The allow list itself is injected by the Pool Controller from the
+control plane's `--fastlet-auth-subjects` flag (environment fallback
+`FASTLET_AUTH_SUBJECTS`); unset, it defaults to the platform
+`fast-sandbox-fastpath` and `fast-sandbox-controller` ServiceAccounts in
+`fast-sandbox-system`. Set the flag when the control plane runs in another
+namespace. The three injected variables above are runtime-owned: Pool
+templates cannot override them, so a Pool cannot weaken the allow list or
+redirect the issuer anchor.
+
+`FASTLET_AUTH_AUDIENCE` overrides the token audience on both sides. The
+`/livez`, `/readyz`, `/metrics`, and `/api/v2/fastlet/heartbeat` endpoints
+stay unauthenticated; every other control endpoint requires a valid token.
 
 ## Proxy configuration
 

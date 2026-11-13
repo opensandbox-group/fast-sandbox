@@ -123,6 +123,51 @@ roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: fast-san
 subjects:
 - {kind: ServiceAccount, name: fast-sandbox-proxy, namespace: fast-sandbox-system}
 ---
+# Fastlet control authentication, two grants:
+#
+# 1. Token minting is namespaced on purpose: serviceaccounts/token RBAC is
+#    evaluated in the target ServiceAccount's namespace, and resourceNames
+#    matches the bare resource name, so a cluster-scoped rule would let a
+#    compromised control plane mint tokens for same-named ServiceAccounts in
+#    tenant namespaces. A Role + RoleBinding in the control-plane namespace
+#    fences minting to the platform identities at the only namespace where
+#    they exist.
+# 2. The Fastlet verifies control-plane tokens locally against the issuer's
+#    published keys and holds no Kubernetes credentials, so the OIDC
+#    discovery and JWKS endpoints (non-resource paths served by the API
+#    server) must be readable anonymously. system:service-account-issuer-
+#    discovery is bound to system:serviceaccounts by default; this binding
+#    extends it to unauthenticated callers, exposing exactly the two
+#    public-key endpoints and nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fast-sandbox-fastlet-token-minter
+  namespace: fast-sandbox-system
+rules:
+- apiGroups: [""]
+  resources: ["serviceaccounts/token"]
+  resourceNames: ["fast-sandbox-fastpath", "fast-sandbox-controller"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fast-sandbox-fastlet-token-minter
+  namespace: fast-sandbox-system
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: fast-sandbox-fastlet-token-minter}
+subjects:
+- {kind: ServiceAccount, name: fast-sandbox-fastpath, namespace: fast-sandbox-system}
+- {kind: ServiceAccount, name: fast-sandbox-controller, namespace: fast-sandbox-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fast-sandbox-fastlet-issuer-discovery
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: system:service-account-issuer-discovery}
+subjects:
+- {kind: Group, name: system:unauthenticated, apiGroup: rbac.authorization.k8s.io}
+---
 # The SandboxTemplate build Pod runs in the template's (tenant) namespace,
 # owned by the template for cascading deletion. The controller provisions
 # the builder ServiceAccount + Role + RoleBinding (pods/patch only, for the
