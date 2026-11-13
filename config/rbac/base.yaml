@@ -125,20 +125,14 @@ subjects:
 ---
 # Fastlet control authentication, two grants:
 #
-# 1. Token minting is namespaced on purpose: serviceaccounts/token RBAC is
-#    evaluated in the target ServiceAccount's namespace, and resourceNames
-#    matches the bare resource name, so a cluster-scoped rule would let a
-#    compromised control plane mint tokens for same-named ServiceAccounts in
-#    tenant namespaces. A Role + RoleBinding in the control-plane namespace
-#    fences minting to the platform identities at the only namespace where
-#    they exist.
-# 2. The Fastlet verifies control-plane tokens locally against the issuer's
-#    published keys and holds no Kubernetes credentials, so the OIDC
-#    discovery and JWKS endpoints (non-resource paths served by the API
-#    server) must be readable anonymously. system:service-account-issuer-
-#    discovery is bound to system:serviceaccounts by default; this binding
-#    extends it to unauthenticated callers, exposing exactly the two
-#    public-key endpoints and nothing else.
+# 1. Token minting stays namespaced: serviceaccounts/token RBAC is evaluated
+#    in the target SA's namespace and resourceNames matches the bare name, so
+#    a cluster-scoped rule would let a compromised control plane mint tokens
+#    for same-named SAs in tenant namespaces.
+# 2. The credential-less Fastlet reads OIDC discovery and JWKS anonymously;
+#    this extends the default system:service-account-issuer-discovery role
+#    (normally bound only to system:serviceaccounts) to unauthenticated
+#    callers, exposing exactly the two public-key endpoints.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

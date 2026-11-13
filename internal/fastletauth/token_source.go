@@ -38,11 +38,9 @@ type PodServiceAccountIdentity struct {
 }
 
 // ResolvePodServiceAccountIdentity reads the in-pod ServiceAccount identity:
-// the namespace from the projected namespace file and the ServiceAccount name
-// from the projected token's `sub` claim. Environment overrides win when set,
-// which covers processes running outside a Pod (integration tooling). The
-// projected token is only parsed, never verified: the file is written by the
-// kubelet for this Pod.
+// namespace from the projected namespace file, name from the projected
+// token's `sub` claim (parsed, not verified — the kubelet wrote it for this
+// Pod). Env overrides cover processes running outside a Pod.
 func ResolvePodServiceAccountIdentity(namespaceEnv, serviceAccountEnv string) (PodServiceAccountIdentity, error) {
 	identity := PodServiceAccountIdentity{Namespace: namespaceEnv, ServiceAccount: serviceAccountEnv}
 	if identity.Namespace == "" {
@@ -79,11 +77,9 @@ func ResolvePodServiceAccountIdentity(namespaceEnv, serviceAccountEnv string) (P
 }
 
 // ResolvePodIssuer reads the issuer URL of this Pod's projected ServiceAccount
-// token. It anchors the Fastlet-side JWT verifier: key material is fetched
-// only from this issuer, never from a URL named by an incoming token. An
-// explicit issuerEnv override covers processes running outside a Pod. The
-// projected token is only parsed, never verified: the file is written by the
-// kubelet for this Pod.
+// token; it anchors Fastlet-side verification, so key material is fetched
+// only from this issuer, never from a URL named by an incoming token.
+// issuerEnv overrides for processes running outside a Pod.
 func ResolvePodIssuer(issuerEnv string) (string, error) {
 	if issuerEnv != "" {
 		return issuerEnv, nil
@@ -95,15 +91,10 @@ func ResolvePodIssuer(issuerEnv string) (string, error) {
 	return unverifiedJWTStringClaim(strings.TrimSpace(string(raw)), "iss")
 }
 
-// ResolveIssuerAnchor reads the issuer anchor the Pool Controller injects
-// into Fastlet Pods: this Pod's own issuer URL and the cluster CA bundle that
-// authenticates TLS to it. Fastlet Pods run with
-// automountServiceAccountToken forced off, so they cannot derive the anchor
-// themselves; the control plane, which holds its projected ServiceAccount
-// token, ships it with the Pod template. Both inputs honor environment
-// overrides (FASTLET_AUTH_ISSUER, FASTLET_AUTH_CA_BUNDLE, base64-encoded
-// PEM) for processes running outside a Pod; the override format matches the
-// injected format exactly.
+// ResolveIssuerAnchor reads the issuer and cluster CA bundle the Pool
+// Controller injects into Fastlet Pods (which run without
+// automountServiceAccountToken, so they cannot derive the anchor themselves).
+// Both inputs honor env overrides for non-Pod processes.
 func ResolveIssuerAnchor(issuerEnv, caBundleEnv string) (issuer string, caBundle string, err error) {
 	issuer, err = ResolvePodIssuer(issuerEnv)
 	if err != nil {
@@ -143,10 +134,8 @@ func unverifiedJWTStringClaim(token, claim string) (string, error) {
 type CreateTokenFunc func(ctx context.Context, namespace, name string, request *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error)
 
 // TokenRequestSource mints audience-bound, expiring ServiceAccount tokens
-// through the Kubernetes TokenRequest API and refreshes them before expiry.
-// Kubernetes signs and later revokes the credential: the deployment holds no
-// key material, and rotation is driven by token lifetime instead of operator
-// action.
+// through the TokenRequest API and refreshes them before expiry: Kubernetes
+// signs and rotates the credential, so the deployment holds no key material.
 type TokenRequestSource struct {
 	// CreateToken is the TokenRequest API binding, typically
 	// authenticationv1client's ServiceAccounts().CreateToken.
@@ -212,9 +201,8 @@ func (s *TokenRequestSource) Token(ctx context.Context) (string, error) {
 	}
 	s.token = issued.Status.Token
 	// Clamp the refresh margin to half the granted lifetime: a cluster may
-	// serve a shorter token than requested (--service-account-max-token-
-	// expiration), and pinning refreshAt to now would otherwise mint one
-	// token per control call.
+	// serve a shorter token than requested, and pinning refreshAt to now
+	// would mint one token per call.
 	margin := s.refreshBefore()
 	if lifetime := expiresAt.Sub(s.now()); margin > lifetime/2 {
 		margin = lifetime / 2

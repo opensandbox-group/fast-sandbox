@@ -225,24 +225,24 @@ func getFastletJSON[Response any](c *FastletClient, ctx context.Context, fastlet
 	return doFastletJSON[Response](c, httpRequest)
 }
 
-// authorize attaches the Fastlet control authentication token. A token
-// acquisition failure fails the call closed: an unauthenticated lifecycle
-// mutation must never be sent on the assumption that the Fastlet will
-// accept it.
+// authorize attaches the control auth token. A mint failure fails the call
+// closed — no unauthenticated request is ever sent.
 func (c *FastletClient) authorize(ctx context.Context, request *http.Request) error {
 	if c.tokens == nil {
 		return nil
 	}
 	token, err := c.tokens.Token(ctx)
 	if err != nil {
-		return err
+		// Typed and provably pre-send, so callers classify it as
+		// REJECTED_BEFORE_SIDE_EFFECTS rather than UnknownOutcome.
+		return &FastletError{Code: ErrorAuthUnavailable, Message: fmt.Sprintf("acquire control auth token: %v", err), Retryable: true}
 	}
 	request.Header.Set("Authorization", fastletauth.BearerPrefix+token)
 	return nil
 }
 
-// IsAuthFailure reports whether the failure originated from the Fastlet
-// control authentication middleware rather than admission.
+// IsAuthFailure reports whether the failure came from the authentication
+// middleware rather than admission.
 func IsAuthFailure(failure *FastletError) bool {
 	if failure == nil {
 		return false
@@ -255,12 +255,10 @@ func IsAuthFailure(failure *FastletError) bool {
 	}
 }
 
-// createDispositionForFailure keeps the Fastlet-reported disposition, except
-// that an authentication failure is classified as a rejection before side
-// effects: the middleware rejected the call before admission, so nothing
-// happened and a retry is always safe. This keeps the disposition truthful
-// instead of empty (the middleware envelope carries no disposition) and
-// permanently distinct from UNKNOWN.
+// createDispositionForFailure classifies authentication failures as
+// REJECTED_BEFORE_SIDE_EFFECTS: the middleware rejected the call before
+// admission, so a retry is always safe. Other failures keep the
+// Fastlet-reported disposition.
 func createDispositionForFailure(reported CreateDisposition, failure *FastletError) CreateDisposition {
 	if IsAuthFailure(failure) {
 		return CreateDispositionRejectedBeforeSideEffects
@@ -281,12 +279,14 @@ func doFastletJSON[Response any](c *FastletClient, request *http.Request) (*Resp
 		return nil, err
 	}
 	defer response.Body.Close()
-	// Read the body before classifying the outcome: an authentication
-	// rejection or an infrastructure failure may carry a non-JSON body, and
-	// surfacing a decode error would hide the HTTP status from callers.
+	// Read the body before classifying the outcome: non-JSON rejections must
+	// surface the HTTP status, not a decode error.
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxControlResponseBodyBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(body) > maxControlResponseBodyBytes {
+		return nil, fmt.Errorf("fastlet response exceeds %d bytes (status %d)", maxControlResponseBodyBytes, response.StatusCode)
 	}
 	var result Response
 	if decodeErr := json.Unmarshal(body, &result); decodeErr != nil {
@@ -304,13 +304,11 @@ func doFastletJSON[Response any](c *FastletClient, request *http.Request) (*Resp
 	return &result, nil
 }
 
-// maxControlResponseBodyBytes bounds a control response body. Fastlet
-// responses are small JSON documents; the cap protects against a misbehaving
-// peer rather than serving as an expected limit.
+// maxControlResponseBodyBytes bounds a control response body; Fastlet
+// responses are small JSON documents.
 const maxControlResponseBodyBytes = 1 << 20
 
-// summarizeControlBody keeps a bounded snippet of an error body for the
-// error message.
+// summarizeControlBody keeps a bounded snippet of an error body.
 func summarizeControlBody(body []byte) string {
 	snippet := strings.TrimSpace(string(body))
 	if len(snippet) > 256 {

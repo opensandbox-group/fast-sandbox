@@ -5,14 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+
+	"k8s.io/klog/v2"
 )
 
-// exemptPaths are served without authentication. Health probes are scraped
-// by the kubelet without a token, metrics are scrape-only, and the heartbeat
-// reports node health and inventory to the control plane: it grants no
-// intent-changing authority and diagnostics tooling relies on it staying
-// open. Every other path, including the whole /api prefix, requires a valid
-// allow-listed ServiceAccount token.
+// exemptPaths are served without authentication: kubelet probes have no
+// token, metrics are scrape-only, and heartbeat grants no intent-changing
+// authority. Everything else, including the whole /api prefix, requires a
+// valid allow-listed ServiceAccount token.
 var exemptPaths = map[string]struct{}{
 	"/livez":                    {},
 	"/readyz":                   {},
@@ -30,14 +30,11 @@ func SubjectFrom(ctx context.Context) string {
 	return subject
 }
 
-// Middleware enforces Fastlet control authentication on every request except
-// the exempt health and heartbeat endpoints. Responses:
-//
-//   - 401 when the request carries no valid bearer token;
-//   - 403 when the token is valid but its ServiceAccount is not allow-listed;
-//   - 503 when validation itself is unavailable (issuer unreachable), so
-//     callers retry instead of treating the call as rejected;
-//   - otherwise the request proceeds with the subject attached to its context.
+// Middleware enforces authentication on every request except the exempt
+// health and heartbeat endpoints: 401 without a valid token, 403 for a
+// non-allow-listed subject, 503 when validation itself is unavailable (the
+// caller may be legitimate, so it retries rather than treating the call as
+// rejected). The subject is attached to the request context.
 //
 // Every rejection carries a machine-readable JSON error envelope so the
 // control-plane client can classify the outcome — the auth codes deliberately
@@ -64,8 +61,9 @@ func Middleware(authenticator *Authenticator, next http.Handler) http.Handler {
 			writeAuthError(writer, http.StatusForbidden, CodeAuthNotAllowed, "fastlet control caller is not permitted")
 			return
 		default:
-			// ErrUnavailable and anything unexpected: the caller may be
-			// legitimate, so do not translate the failure into a rejection.
+			// Never translate validator faults into rejections; log the
+			// cause server-side since the envelope stays generic.
+			klog.ErrorS(err, "Fastlet control authentication is unavailable")
 			writeAuthError(writer, http.StatusServiceUnavailable, CodeAuthUnavailable, "fastlet control authentication is temporarily unavailable")
 			return
 		}
@@ -74,10 +72,9 @@ func Middleware(authenticator *Authenticator, next http.Handler) http.Handler {
 	})
 }
 
-// writeAuthError writes the middleware's JSON error envelope. The envelope
-// mirrors the FastletError wire shape ("error" object with code, message,
-// retryable) so a control-plane client decoding its typed response populates
-// the Error field without any cross-package coupling.
+// writeAuthError emits the JSON rejection envelope. It mirrors the
+// FastletError wire shape, so the control-plane client populates its Error
+// field without cross-package coupling.
 func writeAuthError(writer http.ResponseWriter, status int, code, message string) {
 	writer.Header().Set("Content-Type", "application/json")
 	if status == http.StatusUnauthorized {

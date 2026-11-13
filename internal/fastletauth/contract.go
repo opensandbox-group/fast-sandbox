@@ -7,68 +7,50 @@ import (
 	"strings"
 )
 
-// Audience is the TokenRequest audience of every Fastlet control token. It
-// scopes the credential to this consumer: a token minted for another audience
-// (including the API server's own audience) is rejected, so a caller cannot
-// reuse an unrelated ServiceAccount token against a Fastlet.
+// Audience is the TokenRequest audience of every Fastlet control token: a
+// token minted for another audience is rejected, so unrelated ServiceAccount
+// tokens cannot be reused against a Fastlet.
 const Audience = "fast-sandbox-fastlet"
 
 // BearerPrefix is the accepted Authorization scheme prefix.
 const BearerPrefix = "Bearer "
 
-// AllowedSubjectsEnv is the environment variable holding the comma-separated
-// ServiceAccount subjects allowed to call the Fastlet control API. It
-// narrows the built-in platform default; it never disables authentication.
-const AllowedSubjectsEnv = "FASTLET_AUTH_ALLOWED_SUBJECTS"
+// Env vars. AllowedSubjectsEnv replaces (never disables) the built-in allow
+// list. IssuerEnv/CABundleEnv are injected by the Pool Controller into
+// Fastlet Pods and double as overrides for processes outside a Pod.
+// NamespaceEnv/ServiceAccountEnv/AudienceEnv are likewise non-Pod overrides.
+const (
+	AllowedSubjectsEnv = "FASTLET_AUTH_ALLOWED_SUBJECTS"
+	NamespaceEnv       = "FASTLET_AUTH_NAMESPACE"
+	ServiceAccountEnv  = "FASTLET_AUTH_SERVICE_ACCOUNT"
+	CABundleEnv        = "FASTLET_AUTH_CA_BUNDLE"
+	IssuerEnv          = "FASTLET_AUTH_ISSUER"
+	AudienceEnv        = "FASTLET_AUTH_AUDIENCE"
+)
 
-// NamespaceEnv is the environment variable overriding the caller Pod's
-// namespace when it runs outside a Pod.
-const NamespaceEnv = "FASTLET_AUTH_NAMESPACE"
-
-// ServiceAccountEnv is the environment variable overriding the caller Pod's
-// ServiceAccount name when it runs outside a Pod.
-const ServiceAccountEnv = "FASTLET_AUTH_SERVICE_ACCOUNT"
-
-// IssuerEnv is the environment variable holding the issuer anchor injected
-// into Fastlet Pods by the Pool Controller. A local override covers
-// processes running outside a Pod.
-const IssuerEnv = "FASTLET_AUTH_ISSUER"
-
-// Auth error codes carried in the middleware's JSON error envelope. Their
-// string values match the FastletError codes in internal/protocol/fastlet;
-// a test in the protocol package locks the two spellings together.
+// Auth error codes carried in the middleware's JSON error envelope; the
+// string values match the FastletError codes in internal/protocol/fastlet
+// (locked by a protocol-package test).
 const (
 	CodeAuthRejected    = "AuthRejected"
 	CodeAuthNotAllowed  = "AuthNotAllowed"
 	CodeAuthUnavailable = "AuthUnavailable"
 )
 
-// CABundleEnv is the environment variable holding the base64-encoded cluster
-// CA bundle that authenticates TLS to the issuer, injected alongside
-// IssuerEnv.
-const CABundleEnv = "FASTLET_AUTH_CA_BUNDLE"
-
-// AudienceEnv is the environment variable overriding the token audience on
-// both sides for non-default deployments.
-const AudienceEnv = "FASTLET_AUTH_AUDIENCE"
-
 var (
 	// ErrUnauthenticated reports a missing, malformed, expired, or
 	// incorrectly signed token.
 	ErrUnauthenticated = errors.New("fastlet auth: unauthenticated")
-	// ErrUnauthorized reports a valid token whose ServiceAccount subject is
-	// not in the allow list.
+	// ErrUnauthorized reports a valid token whose subject is not allowed.
 	ErrUnauthorized = errors.New("fastlet auth: subject is not permitted")
-	// ErrUnavailable reports a transient failure to validate a token, such
-	// as the OIDC discovery or JWKS endpoint being unreachable. Callers map
-	// it to a retriable server error, not to a rejection of the caller.
+	// ErrUnavailable reports a transient validation failure (issuer
+	// unreachable); callers map it to a retriable 503, not a rejection.
 	ErrUnavailable = errors.New("fastlet auth: validator unavailable")
 )
 
-// ParseSubjects splits a comma-separated ServiceAccount subject list,
-// trimming whitespace and dropping empty entries. It is the shared parser
-// for the control-plane flag that seeds the Fastlet allow list and for the
-// Fastlet-side environment override.
+// ParseSubjects splits a comma-separated subject list, dropping whitespace
+// and empty entries. Shared by the control-plane flag and the Fastlet-side
+// env override.
 func ParseSubjects(raw string) []string {
 	var subjects []string
 	for _, candidate := range strings.Split(raw, ",") {
@@ -99,9 +81,9 @@ func BearerToken(header http.Header) (string, bool) {
 	return token, token != ""
 }
 
-// TokenSource supplies the bearer token presented to Fastlets. Implementations
-// must be safe for concurrent use and must return short-lived credentials,
-// refreshing them without caller involvement.
+// TokenSource supplies the bearer token presented to Fastlets.
+// Implementations must be safe for concurrent use and refresh their
+// credentials without caller involvement.
 type TokenSource interface {
 	Token(ctx context.Context) (string, error)
 }

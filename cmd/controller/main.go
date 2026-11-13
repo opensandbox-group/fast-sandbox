@@ -110,7 +110,7 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	flag.DurationVar(&resourceAwareStartupGrace, "resource-aware-fastlet-startup-grace", 2*time.Minute, "Maximum time a Fastlet without a heartbeat contributes nominal in-flight capacity.")
 	flag.DurationVar(&resourceAwareScaleDownStabilization, "resource-aware-scale-down-stabilization", time.Minute, "Continuous excess-capacity window required before ResourceAware scale-down.")
 	flag.StringVar(&cacheNamespaces, "namespaces", "", "Comma-separated namespaces the informer cache watches; empty watches the whole cluster. Must cover every namespace holding SandboxPool/Sandbox objects and the runtime environment ConfigMap.")
-	flag.StringVar(&fastletAuthSubjects, fastletauth.SubjectsFlag, envOrDefault(fastletauth.SubjectsEnv, ""), "Comma-separated ServiceAccount subjects allowed to call the Fastlet control API; empty applies the Fastlet built-in platform default. Set it when the control plane runs outside the fast-sandbox-system namespace.")
+	flag.StringVar(&fastletAuthSubjects, fastletauth.SubjectsFlag, envOrDefault(fastletauth.SubjectsEnv, ""), "Comma-separated ServiceAccount subjects allowed to call the Fastlet control API; empty applies the platform default. Custom control-plane namespaces must also replicate the namespaced Role/RoleBinding (serviceaccounts/token create, resourceNames-fenced) that config/rbac/base.yaml ships in fast-sandbox-system, or every Fastlet call fails closed with Forbidden.")
 	flag.Float64Var(&kubeClientQPS, "kube-client-qps", 0, "API-server client rate limit in queries per second; 0 keeps the client-go default.")
 	flag.IntVar(&kubeClientBurst, "kube-client-burst", 0, "API-server client burst budget for the rate limiter; 0 keeps the client-go default.")
 	componentlog.InitFlags(nil)
@@ -212,7 +212,8 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	registry.SetServerSeed(os.Getenv("POD_UID"))
 	catalog := runtimecatalog.Builtin()
 	fastletClient := fastletapi.NewFastletClient(fastletPort)
-	fastletAuthIssuer, fastletAuthCABundle, err := installFastletAuthTokenSource(restConfig, fastletClient)
+	fastletAuthAudience := envOrDefault(fastletauth.AudienceEnv, fastletauth.Audience)
+	fastletAuthIssuer, fastletAuthCABundle, err := installFastletAuthTokenSource(restConfig, fastletClient, fastletAuthAudience)
 	if err != nil {
 		klog.ErrorS(err, "Configure Fastlet control authentication: it is always enabled and cannot start without it")
 		os.Exit(1)
@@ -253,6 +254,7 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 			DisableResourceAwarePoolScaling:     !resourceAwarePoolScaling,
 			FastletAuthIssuer:                   fastletAuthIssuer, FastletAuthCABundle: fastletAuthCABundle,
 			FastletAuthSubjects: fastletAuthSubjectList,
+			FastletAuthAudience: fastletAuthAudience,
 		}).SetupWithManager(manager); err != nil {
 			klog.ErrorS(err, "Register SandboxPool controller")
 			os.Exit(1)
@@ -342,14 +344,11 @@ func envOrDefault(name, fallback string) string {
 }
 
 // installFastletAuthTokenSource wires the Fastlet control authentication onto
-// the shared Fastlet client and resolves the issuer anchor that the Pool
-// Controller injects into Fastlet Pods. Audience-bound ServiceAccount tokens
-// are minted through the TokenRequest API for this Pod's own ServiceAccount:
-// Kubernetes signs and rotates the credential, so no key material is
-// configured. A cluster whose RBAC has not granted serviceaccounts/token yet
-// fails closed at the first Fastlet call rather than silently degrading to
-// unauthenticated.
-func installFastletAuthTokenSource(restConfig *rest.Config, fastletClient *fastletapi.FastletClient) (issuer, caBundle string, err error) {
+// the shared Fastlet client and resolves the issuer anchor for the Pool
+// Controller to inject into Fastlet Pods. Tokens are minted via the
+// TokenRequest API for this Pod's own ServiceAccount; a cluster without the
+// serviceaccounts/token grant fails closed at the first Fastlet call.
+func installFastletAuthTokenSource(restConfig *rest.Config, fastletClient *fastletapi.FastletClient, audience string) (issuer, caBundle string, err error) {
 	identity, err := fastletauth.ResolvePodServiceAccountIdentity(
 		os.Getenv(fastletauth.NamespaceEnv), os.Getenv(fastletauth.ServiceAccountEnv))
 	if err != nil {
@@ -359,21 +358,16 @@ func installFastletAuthTokenSource(restConfig *rest.Config, fastletClient *fastl
 	if err != nil {
 		return "", "", fmt.Errorf("create core client for Fastlet auth TokenRequest: %w", err)
 	}
-	audience := envOrDefault(fastletauth.AudienceEnv, fastletauth.Audience)
 	tokenSource := fastletauth.NewTokenRequestSource(func(ctx context.Context, namespace, name string, request *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 		return authenticationClient.ServiceAccounts(namespace).CreateToken(ctx, name, request, metav1.CreateOptions{})
 	}, identity, audience)
 	fastletClient.SetTokenSource(tokenSource)
 	issuer, caBundle, err = fastletauth.ResolveIssuerAnchor(os.Getenv(fastletauth.IssuerEnv), os.Getenv(fastletauth.CABundleEnv))
 	if err != nil {
-		// The token source still works: the control plane can call Fastlets.
-		// The anchor is what new Fastlet Pods verify callers with, so log it
-		// loudly instead of exiting; Pods created without it fail their own
-		// startup. Resolution reads local state only — a restart with the
-		// projected ServiceAccount identity in place (or FASTLET_AUTH_ISSUER
-		// / FASTLET_AUTH_CA_BUNDLE overrides) is required to recover.
-		klog.ErrorS(err, "Resolve Fastlet auth issuer anchor; Fastlet Pods created by this process will fail startup until it is resolved")
-		return "", "", nil
+		// Auth is always on and the anchor cannot be re-resolved while
+		// running: refuse to start rather than create Fastlets that
+		// crash-loop.
+		return "", "", fmt.Errorf("resolve Fastlet auth issuer anchor: %w", err)
 	}
 	klog.InfoS("Fastlet control authentication enabled",
 		"namespace", identity.Namespace, "serviceAccount", identity.ServiceAccount, "audience", audience, "issuer", issuer)

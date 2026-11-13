@@ -75,8 +75,11 @@ type SandboxPoolReconciler struct {
 	FastletAuthCABundle string
 	// FastletAuthSubjects is the caller allow list injected into Fastlet
 	// Pods. It comes from the --fastlet-auth-subjects flag; when empty the
-	// Fastlet applies its built-in platform default.
+	// platform default is injected so the entry always shadows templates.
 	FastletAuthSubjects []string
+	// FastletAuthAudience is the token audience injected into Fastlet Pods,
+	// resolved from the control plane's own configuration.
+	FastletAuthAudience string
 }
 
 type FastletDrainer interface {
@@ -1572,6 +1575,12 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 		}
 		c.SecurityContext.Privileged = boolPtr(profile.Deployment.Privileged)
 		c.Env = removeRuntimeOwnedEnv(c.Env)
+		// The runtime container's env contract is platform-owned: envFrom is
+		// cleared so a Pool template cannot supply auth env keys the platform
+		// leaves unset (kubelet lets envFrom feed keys that explicit env does
+		// not define). Any envFrom need can be expressed through env entries,
+		// which pass through removal only when they are not platform-owned.
+		c.EnvFrom = nil
 
 		c.Env = append(c.Env,
 			corev1.EnvVar{Name: "FASTLET_CONTROL_PORT", Value: ":5758"},
@@ -1623,19 +1632,25 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			corev1.EnvVar{Name: envFastSandboxRegistryConfigPath, Value: registryconfig.MountPath},
 			corev1.EnvVar{Name: "INFRA_DIR_IN_POD", Value: infraHostPath},
 		)
-		// Fastlet Pods run with the service account token forced off, so the
-		// control authentication anchor (issuer URL and cluster CA) and the
-		// caller allow list are injected by the platform rather than derived
-		// or configured in the Pod. Without the anchor a Fastlet fails at
-		// startup instead of serving an unauthenticated control API.
+		// Control authentication is platform-owned end to end: the anchor
+		// (issuer + CA), the caller allow list, and the audience are all
+		// injected here, and EnvFrom is cleared above so a Pool template
+		// can supply none of them.
 		if r.FastletAuthIssuer != "" {
 			c.Env = append(c.Env, corev1.EnvVar{Name: fastletauth.IssuerEnv, Value: r.FastletAuthIssuer})
 		}
 		if r.FastletAuthCABundle != "" {
 			c.Env = append(c.Env, corev1.EnvVar{Name: fastletauth.CABundleEnv, Value: r.FastletAuthCABundle})
 		}
-		if len(r.FastletAuthSubjects) > 0 {
-			c.Env = append(c.Env, corev1.EnvVar{Name: fastletauth.AllowedSubjectsEnv, Value: strings.Join(r.FastletAuthSubjects, ",")})
+		subjects := r.FastletAuthSubjects
+		if len(subjects) == 0 {
+			// Explicit entry even for the default: it shadows any envFrom
+			// key of the same name.
+			subjects = fastletauth.DefaultAllowedSubjects
+		}
+		c.Env = append(c.Env, corev1.EnvVar{Name: fastletauth.AllowedSubjectsEnv, Value: strings.Join(subjects, ",")})
+		if r.FastletAuthAudience != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: fastletauth.AudienceEnv, Value: r.FastletAuthAudience})
 		}
 		if profile.ResidualProcess != runtimecatalog.ResidualProcessNone {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "FAST_SANDBOX_NODE_CLEANUP_SOCKET", Value: nodecleanup.DefaultSocketPath})
@@ -2487,10 +2502,11 @@ var runtimeOwnedEnv = map[string]struct{}{
 	"FAST_SANDBOX_ACTIONS":         {},
 	"FAST_SANDBOX_SETTINGS_DIR":    {},
 	"NODE_NAME":                    {}, envPodName: {}, "POD_IP": {}, envPodUID: {}, "NAMESPACE": {},
-	// Control authentication is platform-owned end to end: the Pool
-	// Controller injects the caller allow list and the issuer anchor, and a
-	// Pool template must not be able to relax either.
+	// Control authentication env keys are platform-owned: the Pool
+	// Controller injects allow list, audience, and anchor, and a Pool
+	// template must not be able to relax or redirect any of them.
 	fastletauth.AllowedSubjectsEnv: {}, fastletauth.IssuerEnv: {}, fastletauth.CABundleEnv: {},
+	fastletauth.AudienceEnv: {},
 }
 
 func removeRuntimeOwnedEnv(env []corev1.EnvVar) []corev1.EnvVar {

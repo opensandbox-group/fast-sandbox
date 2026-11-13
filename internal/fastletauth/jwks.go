@@ -28,10 +28,9 @@ type oidcDiscovery struct {
 }
 
 // fetchDiscovery resolves the issuer's JWKS URI from its OIDC discovery
-// document. The issuer URL is the trust anchor: it comes from the
-// kubelet-written projected token of this Pod (or an explicit override),
-// never from an incoming token, so an attacker cannot redirect key material
-// to a host they control.
+// document. The issuer is the trust anchor — it comes from this Pod's
+// kubelet-written projected token, never from an incoming token — so key
+// material cannot be redirected to an attacker-controlled host.
 func fetchDiscovery(ctx context.Context, client *http.Client, issuer string) (*oidcDiscovery, error) {
 	if issuer == "" {
 		return nil, fmt.Errorf("issuer is empty")
@@ -41,8 +40,8 @@ func fetchDiscovery(ctx context.Context, client *http.Client, issuer string) (*o
 		return nil, fmt.Errorf("issuer %q is not a valid URL", issuer)
 	}
 	// The issuer anchors signature verification: a plaintext anchor outside
-	// loopback would let an on-path attacker serve forged key material. Plain
-	// http stays available for loopback test servers only.
+	// loopback would let an on-path attacker serve forged keys. Plain http
+	// stays available for loopback test servers only.
 	if parsed.Scheme == "http" {
 		if hostname := parsed.Hostname(); hostname != "127.0.0.1" && hostname != "localhost" && hostname != "::1" {
 			return nil, fmt.Errorf("issuer %q must use https outside loopback", issuer)
@@ -85,11 +84,9 @@ func fetchJSONDocument(ctx context.Context, client *http.Client, url string, tar
 	return json.Unmarshal(raw, target)
 }
 
-// defaultHTTPClient builds the client used to fetch issuer key material. The
-// trust set is the cluster CA bundle injected by the Pool Controller
-// (CABundleEnv, base64 PEM) or the Pod's own projected ca.crt, whichever is
-// available; a managed-cluster issuer signed by a public CA verifies through
-// the system roots fallback.
+// defaultHTTPClient builds the client for issuer key material, trusting the
+// injected CA bundle (CABundleEnv) or the projected pod ca.crt; managed-
+// cluster issuers verify through the system roots fallback.
 func defaultHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if pool, ok := injectedCABundle(); ok {
@@ -98,9 +95,8 @@ func defaultHTTPClient() *http.Client {
 	return &http.Client{Transport: transport, Timeout: 5 * time.Second}
 }
 
-// injectedCABundle resolves the CA trust set: the injected base64 bundle
-// first, the projected service account CA second. It returns ok=false when
-// neither is present, leaving the transport on the system roots.
+// injectedCABundle resolves the CA trust set: injected base64 bundle first,
+// projected pod ca.crt second; ok=false leaves the system roots.
 func injectedCABundle() (*x509.CertPool, bool) {
 	pool := x509.NewCertPool()
 	if encoded := os.Getenv(CABundleEnv); encoded != "" {

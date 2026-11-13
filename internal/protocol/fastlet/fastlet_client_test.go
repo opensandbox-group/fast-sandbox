@@ -1,6 +1,7 @@
 package fastlet
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -239,4 +240,16 @@ func TestFastletClientKeepsRuntimeUnknownOutcomeDistinct(t *testing.T) {
 	require.False(t, IsAuthFailure(callError.Failure), "a runtime UnknownOutcome must not be misclassified as authentication")
 	require.Equal(t, CreateDispositionUnknown, callError.Disposition, "the Fastlet-reported disposition must be preserved")
 	require.NotNil(t, response)
+}
+
+func TestFastletClientReportsOversizedResponseBodies(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(bytes.Repeat([]byte("a"), maxControlResponseBodyBytes+64))
+	})
+	client, endpoint := testFastletClient(t, handler)
+	_, err := client.InspectSandbox(context.Background(), endpoint, &InspectSandboxRequest{})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "exceeds", "an oversized body must be reported as a size cap, not a decode error")
 }

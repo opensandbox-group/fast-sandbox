@@ -64,10 +64,13 @@ func TestAuthenticateFollowsKeyRotation(t *testing.T) {
 	// Mint with an unpublished key: verification must fail closed.
 	_, err = authenticator.Authenticate(t.Context(), issuer.Mint(fastletauthtest.MintOptions{Kid: rotatedKid, Signer: rotatedKey}))
 	require.Error(t, err)
-	// Publish the rotated key: the next unknown-kid lookup refreshes the
-	// JWKS and accepts the same token.
+	// Publish the rotated key: the next attempt uses a distinct token (so
+	// the negative verdict does not mask it) whose unknown kid triggers the
+	// rate-limited JWKS refresh, which now serves the key.
 	issuer.PublishKey(rotatedKid, rotatedKey)
-	subject, err := authenticator.Authenticate(t.Context(), issuer.Mint(fastletauthtest.MintOptions{Kid: rotatedKid, Signer: rotatedKey}))
+	subject, err := authenticator.Authenticate(t.Context(), issuer.Mint(fastletauthtest.MintOptions{
+		Kid: rotatedKid, Signer: rotatedKey, ExpiresAt: time.Now().Add(3601 * time.Second).Unix(),
+	}))
 	require.NoError(t, err)
 	require.Equal(t, "system:serviceaccount:fast-sandbox-system:fast-sandbox-fastpath", subject)
 }
@@ -96,9 +99,11 @@ func TestAuthenticateRejectsInvalidTokens(t *testing.T) {
 		{"no exp claim", issuer.Mint(fastletauthtest.MintOptions{OmitExp: true}), ErrUnauthenticated},
 		{"malformed segments", issuer.Mint(fastletauthtest.MintOptions{Segments: []string{"a", "b"}}), ErrUnauthenticated},
 		{"not base64 payload", issuer.Mint(fastletauthtest.MintOptions{Segments: []string{"a", "!!not-base64!!", "c"}}), ErrUnauthenticated},
-		// An unknown signing key may be rotation lag: it fails closed with
-		// the retryable validator-fault class, not a hard rejection.
-		{"unknown kid", issuer.Mint(fastletauthtest.MintOptions{Kid: "missing", Signer: otherKey}), ErrUnavailable},
+		// A kid that remains unpublished even after refresh is definitive:
+		// the issuer does not serve it, so the token cannot be authentic.
+		// It is classified as unauthenticated (cached 401) rather than a
+		// retryable 503 that would hold refresh limiter budget.
+		{"unknown kid", issuer.Mint(fastletauthtest.MintOptions{Kid: "missing", Signer: otherKey}), ErrUnauthenticated},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -171,19 +176,20 @@ func TestAuthenticateBoundsVerdictCache(t *testing.T) {
 
 // TestAuthenticateRateLimitsUnknownKeyRefreshes proves the refresh limiter:
 // repeated unknown-kid requests must wait for the rate limit between JWKS
-// fetches instead of issuing one fetch per request.
+// fetches instead of issuing one fetch per request. Each attempt presents a
+// fresh token so the negative-verdict cache cannot mask the limiter.
 func TestAuthenticateRateLimitsUnknownKeyRefreshes(t *testing.T) {
 	issuer := fastletauthtest.NewIssuer(t)
 	const interval = 200 * time.Millisecond
 	authenticator := newTestAuthenticatorWithInterval(t, issuer, interval)
 	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
-	token := issuer.Mint(fastletauthtest.MintOptions{Kid: "missing", Signer: otherKey})
 	start := time.Now()
 	const attempts = 4
-	for range attempts {
+	for i := range attempts {
+		token := issuer.Mint(fastletauthtest.MintOptions{Kid: "missing", Signer: otherKey, ExpiresAt: time.Now().Add(3600*time.Second + time.Duration(i)*time.Second).Unix()})
 		_, err := authenticator.Authenticate(t.Context(), token)
-		require.Error(t, err)
+		require.ErrorIs(t, err, ErrUnauthenticated)
 	}
 	elapsed := time.Since(start)
 	require.GreaterOrEqual(t, elapsed, interval*time.Duration(attempts-1),
