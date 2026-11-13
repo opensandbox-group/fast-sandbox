@@ -2,33 +2,48 @@ package fastletauth
 
 import (
 	"context"
-	"crypto"
-	"crypto/ecdsa"
-	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
-	"encoding/json"
+	"errors"
 	"fmt"
-	"math/big"
 	"net/http"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/MicahParks/jwkset"
+	"github.com/MicahParks/keyfunc/v3"
+	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/time/rate"
 )
 
-// verdictCacheTTL is how long a validation verdict is reused. A cached
-// verdict makes the per-request cost a hash and a map lookup: signature
-// verification and subject checks run once per token per interval, not once
-// per request. Negative verdicts use a shorter TTL so an operator fixing the
-// allow list or RBAC recovers quickly.
 const (
+	// positiveVerdictTTL is how long a successful validation verdict is
+	// reused, clamped to the token's remaining lifetime (see Authenticate).
+	// A cached verdict makes the per-request cost a hash and a map lookup:
+	// signature verification and subject checks run once per token per
+	// interval, not once per request.
 	positiveVerdictTTL = time.Minute
+	// negativeVerdictTTL is how long a rejection verdict is reused, so an
+	// operator fixing the allow list or RBAC recovers quickly.
 	negativeVerdictTTL = 5 * time.Second
 	// expiryLeeway tolerates minor clock skew between the issuer and the
 	// Fastlet node.
 	expiryLeeway = 30 * time.Second
+	// maxCachedVerdicts bounds the verdict cache. The middleware sits on the
+	// unauthenticated control port, so a flood of distinct tokens must not
+	// grow the cache without limit; dropping a verdict only costs the next
+	// request one re-verification.
+	maxCachedVerdicts = 8192
+	// defaultRefreshInterval is the unknown-KID refresh rate limit: JWKS
+	// refreshes are triggered by unknown signing keys and rate-limited so a
+	// flood of forged kid values cannot become a request storm against the
+	// API server's OIDC endpoints.
+	defaultRefreshInterval = 30 * time.Second
+	// refreshWaitMax bounds how long a request waits for a rate-limited
+	// refresh; past it the request fails fast with a retryable error.
+	refreshWaitMax = 2 * time.Second
 )
 
 // DefaultAllowedSubjects is the subject allow list when the deployment does
@@ -38,17 +53,14 @@ var DefaultAllowedSubjects = []string{
 	"system:serviceaccount:fast-sandbox-system:fast-sandbox-controller",
 }
 
-// AuthenticatedJWT is the verified identity of a token.
-type AuthenticatedJWT struct {
-	Subject string
-}
-
 // Authenticator validates Fastlet control tokens locally against the issuer's
 // published signing keys and an explicit ServiceAccount allow list. It is
 // fail-closed: any signature, expiry, issuer, audience, or subject mismatch
 // rejects the request.
 type Authenticator struct {
-	fetcher  *jwksFetcher
+	parser   *jwt.Parser
+	keyfunc  keyfunc.Keyfunc
+	issuer   string
 	audience string
 	allowed  map[string]struct{}
 	now      func() time.Time
@@ -63,24 +75,91 @@ type cachedVerdict struct {
 	expiresAt time.Time
 }
 
+type authenticatorOptions struct {
+	refreshInterval time.Duration
+}
+
+// AuthenticatorOption customizes the authenticator at construction.
+type AuthenticatorOption func(*authenticatorOptions)
+
+// WithRefreshInterval overrides the unknown-KID JWKS refresh rate limit. It
+// exists for tests; production uses the default interval.
+func WithRefreshInterval(d time.Duration) AuthenticatorOption {
+	return func(o *authenticatorOptions) { o.refreshInterval = d }
+}
+
 // NewAuthenticator builds an authenticator anchored at issuer, accepting only
 // the given ServiceAccount subjects (exact `system:serviceaccount:<namespace>:<name>`
-// usernames). An empty allow list rejects every token; httpClient is optional
-// and lets tests pin the transport.
-func NewAuthenticator(issuer, audience string, allowedSubjects []string, httpClient *http.Client) *Authenticator {
+// usernames; an empty allow list rejects every token). The issuer's OIDC
+// discovery document is fetched once here and its JWKS is served through a
+// rate-limited, self-refreshing key set. httpClient is optional and lets
+// tests pin the transport.
+func NewAuthenticator(issuer, audience string, allowedSubjects []string, httpClient *http.Client, opts ...AuthenticatorOption) (*Authenticator, error) {
+	options := authenticatorOptions{refreshInterval: defaultRefreshInterval}
+	for _, opt := range opts {
+		opt(&options)
+	}
 	allowed := make(map[string]struct{}, len(allowedSubjects))
 	for _, subject := range allowedSubjects {
 		if subject = strings.TrimSpace(subject); subject != "" {
 			allowed[subject] = struct{}{}
 		}
 	}
+	if httpClient == nil {
+		httpClient = defaultHTTPClient()
+	}
+	discovery, err := fetchDiscovery(context.Background(), httpClient, issuer)
+	if err != nil {
+		return nil, err
+	}
+	// RefreshInterval stays unset on purpose: no background refresh
+	// goroutine. Keys refresh only when an unknown signing key shows up,
+	// rate-limited by the limiter below.
+	storage, err := jwkset.NewStorageFromHTTP(discovery.JWKSURI, jwkset.HTTPClientStorageOptions{
+		Ctx:    context.Background(),
+		Client: httpClient,
+		RefreshErrorHandler: func(ctx context.Context, err error) {
+			// Only effectual with RefreshInterval; kept for symmetry and
+			// future use.
+			_ = ctx
+			_ = err
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create issuer key set for %q: %w", issuer, err)
+	}
+	jwks, err := jwkset.NewHTTPClient(jwkset.HTTPClientOptions{
+		HTTPURLs:          map[string]jwkset.Storage{discovery.JWKSURI: storage},
+		RefreshUnknownKID: rate.NewLimiter(rate.Every(options.refreshInterval), 1),
+		RateLimitWaitMax:  refreshWaitMax,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create issuer key client for %q: %w", issuer, err)
+	}
+	keyFunc, err := keyfunc.New(keyfunc.Options{Ctx: context.Background(), Storage: jwks})
+	if err != nil {
+		return nil, fmt.Errorf("create issuer keyfunc for %q: %w", issuer, err)
+	}
+	parser := jwt.NewParser(
+		// Pin the algorithms: a token naming any other algorithm is rejected
+		// before any key material is considered.
+		jwt.WithValidMethods([]string{"RS256", "ES256"}),
+		jwt.WithIssuer(issuer),
+		jwt.WithAudience(audience),
+		// Never-expiring tokens are not accepted: an absent exp claim is a
+		// rejection, not a pass.
+		jwt.WithExpirationRequired(),
+		jwt.WithLeeway(expiryLeeway),
+	)
 	return &Authenticator{
-		fetcher:  newJWKSFetcher(issuer, httpClient, time.Now),
+		parser:   parser,
+		keyfunc:  keyFunc,
+		issuer:   issuer,
 		audience: audience,
 		allowed:  allowed,
 		now:      time.Now,
 		cache:    map[string]cachedVerdict{},
-	}
+	}, nil
 }
 
 // AllowedSubjects returns the caller subjects accepted by this authenticator.
@@ -105,12 +184,26 @@ func (a *Authenticator) Authenticate(ctx context.Context, token string) (string,
 	if subject, err, ok := a.cachedVerdict(key); ok {
 		return subject, err
 	}
-	subject, verdict := a.verify(ctx, token)
-	ttl := positiveVerdictTTL
-	if verdict != nil {
-		ttl = negativeVerdictTTL
+	subject, expiresAt, verdict := a.verify(ctx, token)
+	if verdict != nil && errors.Is(verdict, ErrUnavailable) {
+		// Unavailability is a property of the validator, not of the token:
+		// never cache it, or one failed fetch pins a 503 for this token and
+		// undermines the documented retry contract.
+		return subject, verdict
 	}
-	a.storeVerdict(key, subject, verdict, a.now().Add(ttl))
+	ttl := negativeVerdictTTL
+	if verdict == nil {
+		ttl = positiveVerdictTTL
+		// Clamp the verdict to the token's acceptance horizon: a token near
+		// expiry must not stay accepted past its own lifetime, and revoking
+		// a subject must take effect when the verdict expires.
+		if remaining := expiresAt.Add(-expiryLeeway).Sub(a.now()); remaining < ttl {
+			ttl = remaining
+		}
+	}
+	if ttl > 0 {
+		a.storeVerdict(key, subject, verdict, a.now().Add(ttl))
+	}
 	return subject, verdict
 }
 
@@ -131,138 +224,71 @@ func (a *Authenticator) cachedVerdict(key string) (string, error, bool) {
 func (a *Authenticator) storeVerdict(key, subject string, verdict error, expiresAt time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	now := a.now()
+	// Sweep expired entries: lookups alone never revisit them, so distinct
+	// tokens would otherwise accumulate forever.
+	for cachedKey, cached := range a.cache {
+		if !now.Before(cached.expiresAt) {
+			delete(a.cache, cachedKey)
+		}
+	}
+	if len(a.cache) >= maxCachedVerdicts {
+		// The cache is full of live verdicts: drop this one rather than
+		// evicting live entries. The next request for the token simply
+		// re-verifies.
+		return
+	}
 	a.cache[key] = cachedVerdict{subject: subject, err: verdict, expiresAt: expiresAt}
 }
 
-// verify runs the full verification pipeline: parse, signature against the
-// issuer key set, and the exp/iss/aud/sub claims.
-func (a *Authenticator) verify(ctx context.Context, token string) (string, error) {
-	header, payload, signature, err := parseJWT(token)
+// verify runs the full verification pipeline: library-side parsing with
+// pinned algorithms and iss/aud/exp/nbf validation against the issuer key
+// set, then the subject allow list. It returns the token's expiry so the
+// caller can clamp verdict caching to the token's acceptance horizon.
+func (a *Authenticator) verify(ctx context.Context, token string) (string, time.Time, error) {
+	parsed, err := a.parser.Parse(token, a.keyfunc.Keyfunc)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrUnauthenticated, err)
+		return "", time.Time{}, a.classifyParseError(err)
 	}
-	if header.Algorithm != "RS256" && header.Algorithm != "ES256" {
-		return "", fmt.Errorf("%w: unsupported signing algorithm %q", ErrUnauthenticated, header.Algorithm)
+	claims, ok := parsed.Claims.(jwt.MapClaims)
+	if !ok {
+		return "", time.Time{}, fmt.Errorf("%w: token claims are not a map", ErrUnauthenticated)
 	}
-	key, err := a.fetcher.keyFor(ctx, header.KeyID)
-	if err != nil {
-		return "", err
+	subject, ok := claims["sub"].(string)
+	if !ok || subject == "" {
+		return "", time.Time{}, fmt.Errorf("%w: token has no string sub claim", ErrUnauthenticated)
 	}
-	signingInput := []byte(token[:strings.LastIndex(token, ".")])
-	if err := verifySignature(header.Algorithm, key, signingInput, signature); err != nil {
-		return "", fmt.Errorf("%w: %v", ErrUnauthenticated, err)
+	if _, permitted := a.allowed[subject]; !permitted {
+		return "", time.Time{}, fmt.Errorf("%w: subject %q is not in the allow list", ErrUnauthorized, subject)
 	}
-	var claims jwtClaims
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return "", fmt.Errorf("%w: token payload is not valid JSON: %v", ErrUnauthenticated, err)
+	var expiresAt time.Time
+	if raw, ok := claims["exp"].(float64); ok {
+		expiresAt = time.Unix(int64(raw), 0)
 	}
-	if claims.ExpiresAt == 0 {
-		return "", fmt.Errorf("%w: token has no exp claim; never-expiring tokens are not accepted", ErrUnauthenticated)
-	}
-	if !a.now().Add(expiryLeeway).Before(time.Unix(claims.ExpiresAt, 0)) {
-		return "", fmt.Errorf("%w: token is expired", ErrUnauthenticated)
-	}
-	if claims.NotBefore != 0 && a.now().Add(expiryLeeway).Before(time.Unix(claims.NotBefore, 0)) {
-		return "", fmt.Errorf("%w: token is not valid yet", ErrUnauthenticated)
-	}
-	if claims.Issuer != a.fetcher.issuer {
-		return "", fmt.Errorf("%w: token issuer %q is not the anchored issuer", ErrUnauthenticated, claims.Issuer)
-	}
-	if !containsAudience(claims.Audiences, a.audience) {
-		return "", fmt.Errorf("%w: token audience %v does not include %q", ErrUnauthenticated, claims.Audiences, a.audience)
-	}
-	if claims.Subject == "" {
-		return "", fmt.Errorf("%w: token has no sub claim", ErrUnauthenticated)
-	}
-	if _, permitted := a.allowed[claims.Subject]; !permitted {
-		return "", fmt.Errorf("%w: subject %q is not in the allow list", ErrUnauthorized, claims.Subject)
-	}
-	return claims.Subject, nil
+	return subject, expiresAt, nil
 }
 
-// jwtHeader is the JWT header subset the verifier enforces.
-type jwtHeader struct {
-	Algorithm string `json:"alg"`
-	KeyID     string `json:"kid"`
-	Type      string `json:"typ"`
-}
-
-// jwtClaims is the JWT claim subset the verifier enforces. Audiences may be
-// a string or a list per the JWT spec; k8s TokenRequest tokens emit a list.
-type jwtClaims struct {
-	Issuer    string   `json:"iss"`
-	Subject   string   `json:"sub"`
-	Audiences []string `json:"aud"`
-	ExpiresAt int64    `json:"exp"`
-	NotBefore int64    `json:"nbf"`
-	IssuedAt  int64    `json:"iat"`
-}
-
-func parseJWT(token string) (jwtHeader, []byte, []byte, error) {
-	headerSegment, rest, found := strings.Cut(token, ".")
-	if !found {
-		return jwtHeader{}, nil, nil, fmt.Errorf("token is not a JWT")
+// classifyParseError maps a jwt validation failure onto the caller-facing
+// error classes. Malformed tokens, bad signatures, and failed claim
+// validation are caller faults (unauthenticated). Key retrieval failures —
+// an unreachable issuer, an exhausted refresh rate limit — are validator
+// faults (unavailable): the request may be legitimate, so they must surface
+// as retryable 503s, never as rejections.
+func (a *Authenticator) classifyParseError(err error) error {
+	unauthenticatedSentinels := []error{
+		jwt.ErrTokenMalformed,
+		jwt.ErrTokenSignatureInvalid,
+		jwt.ErrTokenExpired,
+		jwt.ErrTokenNotValidYet,
+		jwt.ErrTokenUsedBeforeIssued,
+		jwt.ErrTokenInvalidClaims,
+		jwt.ErrTokenInvalidAudience,
+		jwt.ErrTokenInvalidIssuer,
 	}
-	payloadSegment, signatureSegment, found := strings.Cut(rest, ".")
-	if !found || strings.Contains(signatureSegment, ".") {
-		return jwtHeader{}, nil, nil, fmt.Errorf("token is not a three-part JWT")
-	}
-	headerRaw, err := base64.RawURLEncoding.DecodeString(headerSegment)
-	if err != nil {
-		return jwtHeader{}, nil, nil, fmt.Errorf("decode token header: %w", err)
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(payloadSegment)
-	if err != nil {
-		return jwtHeader{}, nil, nil, fmt.Errorf("decode token payload: %w", err)
-	}
-	signature, err := base64.RawURLEncoding.DecodeString(signatureSegment)
-	if err != nil {
-		return jwtHeader{}, nil, nil, fmt.Errorf("decode token signature: %w", err)
-	}
-	var header jwtHeader
-	if err := json.Unmarshal(headerRaw, &header); err != nil {
-		return jwtHeader{}, nil, nil, fmt.Errorf("parse token header: %w", err)
-	}
-	if header.KeyID == "" {
-		return jwtHeader{}, nil, nil, fmt.Errorf("token header has no kid")
-	}
-	return header, payload, signature, nil
-}
-
-func verifySignature(algorithm string, key cryptoPublicKey, signingInput, signature []byte) error {
-	digest := sha256.Sum256(signingInput)
-	switch algorithm {
-	case "RS256":
-		publicKey := key.RSAPublicKey()
-		if publicKey == nil {
-			return fmt.Errorf("RS256 token presented with a non-RSA signing key")
-		}
-		return rsa.VerifyPKCS1v15(publicKey, crypto.SHA256, digest[:], signature)
-	case "ES256":
-		publicKey := key.ECDSAPublicKey()
-		if publicKey == nil {
-			return fmt.Errorf("ES256 token presented with a non-EC signing key")
-		}
-		if len(signature) != 64 {
-			return fmt.Errorf("ES256 signature is not a 64-byte r||s value")
-		}
-		var r, s big.Int
-		r.SetBytes(signature[:32])
-		s.SetBytes(signature[32:])
-		if !ecdsa.Verify(publicKey, digest[:], &r, &s) {
-			return fmt.Errorf("ES256 signature verification failed")
-		}
-		return nil
-	default:
-		return fmt.Errorf("unsupported signing algorithm %q", algorithm)
-	}
-}
-
-func containsAudience(audiences []string, audience string) bool {
-	for _, candidate := range audiences {
-		if subtle.ConstantTimeCompare([]byte(candidate), []byte(audience)) == 1 {
-			return true
+	for _, sentinel := range unauthenticatedSentinels {
+		if errors.Is(err, sentinel) {
+			return fmt.Errorf("%w: %v", ErrUnauthenticated, err)
 		}
 	}
-	return false
+	return fmt.Errorf("%w: %v", ErrUnavailable, err)
 }

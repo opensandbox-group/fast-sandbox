@@ -364,13 +364,15 @@ func installFastletAuthTokenSource(restConfig *rest.Config, fastletClient *fastl
 		return authenticationClient.ServiceAccounts(namespace).CreateToken(ctx, name, request, metav1.CreateOptions{})
 	}, identity, audience)
 	fastletClient.SetTokenSource(tokenSource)
-	issuer, caBundle, err = fastletauth.ResolveIssuerAnchor()
+	issuer, caBundle, err = fastletauth.ResolveIssuerAnchor(os.Getenv(fastletauth.IssuerEnv), os.Getenv(fastletauth.CABundleEnv))
 	if err != nil {
 		// The token source still works: the control plane can call Fastlets.
 		// The anchor is what new Fastlet Pods verify callers with, so log it
 		// loudly instead of exiting; Pods created without it fail their own
-		// startup.
-		klog.ErrorS(err, "Resolve Fastlet auth issuer anchor; newly created Fastlet Pods will fail startup until this is available")
+		// startup. Resolution reads local state only — a restart with the
+		// projected ServiceAccount identity in place (or FASTLET_AUTH_ISSUER
+		// / FASTLET_AUTH_CA_BUNDLE overrides) is required to recover.
+		klog.ErrorS(err, "Resolve Fastlet auth issuer anchor; Fastlet Pods created by this process will fail startup until it is resolved")
 		return "", "", nil
 	}
 	klog.InfoS("Fastlet control authentication enabled",

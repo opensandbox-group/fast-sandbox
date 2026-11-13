@@ -1,6 +1,8 @@
 package fastletauth
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -83,11 +85,17 @@ func TestMiddlewareRejectsNonAllowListedSubject(t *testing.T) {
 }
 
 func TestMiddlewareMapsUnavailableValidationToServiceUnavailable(t *testing.T) {
-	authenticator := NewAuthenticator("http://127.0.0.1:1", Audience, DefaultAllowedSubjects, nil)
-	handler := Middleware(authenticator, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	issuer := fastletauthtest.NewIssuer(t)
+	authenticator, err := NewAuthenticator(issuer.URL(), Audience, DefaultAllowedSubjects, nil, WithRefreshInterval(time.Millisecond))
+	require.NoError(t, err)
+	handler := Middleware(authenticator, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	// Kill the issuer after construction: a refresh on an unknown signing
+	// key now fails, which is a validator fault (503), not a rejection.
+	issuer.Close()
+	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
 	request := httptest.NewRequest(http.MethodPost, "/api/v2/fastlet/create", nil)
-	request.Header.Set("Authorization", BearerPrefix+issuer.Mint(fastletauthtest.MintOptions{Issuer: "http://127.0.0.1:1"}))
+	request.Header.Set("Authorization", BearerPrefix+issuer.Mint(fastletauthtest.MintOptions{Kid: "late-key", Signer: otherKey}))
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
 	require.Equal(t, http.StatusServiceUnavailable, recorder.Code)

@@ -3,6 +3,7 @@ package fastletauth
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -65,21 +66,29 @@ func TestTokenRequestSourceMintsOnceAndRefreshes(t *testing.T) {
 	require.Equal(t, 2, mintCalls)
 }
 
-func TestTokenRequestSourceRefreshesImmediatelyWhenLifetimeIsShort(t *testing.T) {
+func TestTokenRequestSourceClampsRefreshMarginToShortLifetimes(t *testing.T) {
 	var mintCalls int
+	base := time.Now()
+	now := base
 	source := NewTokenRequestSource(func(ctx context.Context, namespace, name string, request *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 		mintCalls++
-		// The granted lifetime is inside the refresh margin: every call must
-		// re-mint instead of caching an immediately stale token.
+		// The cluster granted a lifetime shorter than the refresh margin (as
+		// when --service-account-max-token-expiration clamps the request).
 		return &authenticationv1.TokenRequest{Status: authenticationv1.TokenRequestStatus{
-			Token:               "token",
-			ExpirationTimestamp: metav1.NewTime(time.Now().Add(time.Second)),
+			Token:               "token-" + strconv.Itoa(mintCalls),
+			ExpirationTimestamp: metav1.NewTime(base.Add(time.Second)),
 		}}, nil
 	}, PodServiceAccountIdentity{Namespace: "ns", ServiceAccount: "sa"}, Audience)
 	source.RefreshBefore = time.Minute
 
 	_, err := source.Token(t.Context())
 	require.NoError(t, err)
+	_, err = source.Token(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, 1, mintCalls, "the margin must clamp to half the granted lifetime instead of re-minting per call")
+	// Past the clamped horizon (lifetime/2 = 0.5s) the source re-mints.
+	now = base.Add(600 * time.Millisecond)
+	source.now = func() time.Time { return now }
 	_, err = source.Token(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, 2, mintCalls)

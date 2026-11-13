@@ -87,6 +87,9 @@ func NewIssuer(t *testing.T) *Issuer {
 // URL is the issuer URL served by the discovery document.
 func (i *Issuer) URL() string { return i.server.URL }
 
+// Close shuts the issuer down early (tests normally rely on t.Cleanup).
+func (i *Issuer) Close() { i.server.Close() }
+
 // Fetches counts discovery plus JWKS requests served so far.
 func (i *Issuer) Fetches() int64 { return i.fetches.Load() }
 
@@ -113,6 +116,12 @@ type MintOptions struct {
 	Algorithm string
 	Subject   string
 	Audience  string
+	// AudienceScalar emits the audience as a JSON string instead of an
+	// array (RFC 7519 allows both).
+	AudienceScalar bool
+	// OmitExp builds the payload without an exp claim (never-expiring
+	// legacy token shape).
+	OmitExp   bool
 	Issuer    string
 	ExpiresAt int64
 	NotBefore int64
@@ -161,13 +170,19 @@ func (i *Issuer) Mint(options MintOptions) string {
 		signer = entry.signer
 	}
 	header := map[string]any{"alg": options.Algorithm, "kid": options.Kid, "typ": "JWT"}
+	audienceClaim := any([]string{options.Audience})
+	if options.AudienceScalar {
+		audienceClaim = options.Audience
+	}
 	claims := map[string]any{
 		"iss": options.Issuer,
 		"sub": options.Subject,
-		"aud": []string{options.Audience},
-		"exp": options.ExpiresAt,
+		"aud": audienceClaim,
 		"nbf": options.NotBefore,
 		"iat": now,
+	}
+	if !options.OmitExp {
+		claims["exp"] = options.ExpiresAt
 	}
 	headerSegment := encodeSegment(header)
 	claimsSegment := encodeSegment(claims)

@@ -3,12 +3,13 @@ package fastletauth
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	jwt "github.com/golang-jwt/jwt/v5"
 
 	authenticationv1 "k8s.io/api/authentication/v1"
 )
@@ -99,11 +100,20 @@ func ResolvePodIssuer(issuerEnv string) (string, error) {
 // authenticates TLS to it. Fastlet Pods run with
 // automountServiceAccountToken forced off, so they cannot derive the anchor
 // themselves; the control plane, which holds its projected ServiceAccount
-// token, ships it with the Pod template.
-func ResolveIssuerAnchor() (issuer string, caBundle string, err error) {
-	issuer, err = ResolvePodIssuer("")
+// token, ships it with the Pod template. Both inputs honor environment
+// overrides (FASTLET_AUTH_ISSUER, FASTLET_AUTH_CA_BUNDLE, base64-encoded
+// PEM) for processes running outside a Pod; the override format matches the
+// injected format exactly.
+func ResolveIssuerAnchor(issuerEnv, caBundleEnv string) (issuer string, caBundle string, err error) {
+	issuer, err = ResolvePodIssuer(issuerEnv)
 	if err != nil {
 		return "", "", err
+	}
+	if encoded := strings.TrimSpace(caBundleEnv); encoded != "" {
+		if _, err := base64.StdEncoding.DecodeString(encoded); err != nil {
+			return "", "", fmt.Errorf("decode %s override: %w", CABundleEnv, err)
+		}
+		return issuer, encoded, nil
 	}
 	caRaw, err := os.ReadFile(serviceAccountCAFile)
 	if err != nil {
@@ -113,23 +123,17 @@ func ResolveIssuerAnchor() (issuer string, caBundle string, err error) {
 }
 
 // unverifiedJWTStringClaim decodes a string claim of a JWT payload without
-// verifying the signature.
+// verifying the signature. ParseUnverified still parses the real wire shape
+// (numeric exp, array aud, the kubernetes.io object), so kubelet-projected
+// tokens decode cleanly.
 func unverifiedJWTStringClaim(token, claim string) (string, error) {
-	_, payload, found := strings.Cut(token, ".")
-	if !found {
-		return "", fmt.Errorf("pod token is not a JWT")
+	claims := jwt.MapClaims{}
+	if _, _, err := jwt.NewParser().ParseUnverified(token, claims); err != nil {
+		return "", fmt.Errorf("parse pod token: %w", err)
 	}
-	decoded, err := base64.RawURLEncoding.DecodeString(payload)
-	if err != nil {
-		return "", fmt.Errorf("decode pod token payload: %w", err)
-	}
-	var claims map[string]string
-	if err := json.Unmarshal(decoded, &claims); err != nil {
-		return "", fmt.Errorf("parse pod token payload: %w", err)
-	}
-	value := claims[claim]
-	if value == "" {
-		return "", fmt.Errorf("pod token payload has no %s claim", claim)
+	value, ok := claims[claim].(string)
+	if !ok {
+		return "", fmt.Errorf("pod token payload has no string %s claim", claim)
 	}
 	return value, nil
 }
@@ -207,13 +211,15 @@ func (s *TokenRequestSource) Token(ctx context.Context) (string, error) {
 		expiresAt = issued.Status.ExpirationTimestamp.Time
 	}
 	s.token = issued.Status.Token
-	s.refreshAt = expiresAt.Add(-s.refreshBefore())
-	if !s.now().Before(s.refreshAt) {
-		// The granted lifetime is already inside the refresh margin (for
-		// example a short override in tests): force a re-mint on the next
-		// call instead of handing out an immediately stale token.
-		s.refreshAt = s.now()
+	// Clamp the refresh margin to half the granted lifetime: a cluster may
+	// serve a shorter token than requested (--service-account-max-token-
+	// expiration), and pinning refreshAt to now would otherwise mint one
+	// token per control call.
+	margin := s.refreshBefore()
+	if lifetime := expiresAt.Sub(s.now()); margin > lifetime/2 {
+		margin = lifetime / 2
 	}
+	s.refreshAt = expiresAt.Add(-margin)
 	return s.token, nil
 }
 

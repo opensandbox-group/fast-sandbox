@@ -222,6 +222,7 @@ func main() {
 	fastletServer.SetAuthenticator(authenticator)
 	klog.InfoS("Fastlet control authentication enabled",
 		"audience", getEnv(fastletauth.AudienceEnv, fastletauth.Audience),
+		"issuer", getEnv(fastletauth.IssuerEnv, ""),
 		"subjects", strings.Join(authenticator.AllowedSubjects(), ","))
 	klog.InfoS("starting fastlet HTTP server", "port", fastletPort)
 
@@ -259,7 +260,11 @@ func newFastletAuthenticator() (*fastletauth.Authenticator, error) {
 		}
 	}
 	audience := getEnv(fastletauth.AudienceEnv, fastletauth.Audience)
-	return fastletauth.NewAuthenticator(issuer, audience, allowedSubjects, nil), nil
+	authenticator, err := fastletauth.NewAuthenticator(issuer, audience, allowedSubjects, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build authenticator: %w", err)
+	}
+	return authenticator, nil
 }
 
 func loadFastletStartupSettings() (fastletStartupSettings, error) {

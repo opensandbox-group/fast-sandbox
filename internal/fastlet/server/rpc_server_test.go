@@ -287,8 +287,9 @@ func TestInvokeHandlerRouteDispatchesToFallback(t *testing.T) {
 func TestFastletServerEnforcesControlAuthentication(t *testing.T) {
 	manager := newServerManager(t, newServerRuntime(), false)
 	issuer := fastletauthtest.NewIssuer(t)
-	authenticator := fastletauth.NewAuthenticator(issuer.URL(), fastletauth.Audience,
+	authenticator, err := fastletauth.NewAuthenticator(issuer.URL(), fastletauth.Audience,
 		[]string{"system:serviceaccount:fast-sandbox-system:fast-sandbox-fastpath"}, nil)
+	require.NoError(t, err)
 	fastletServer := NewFastletServer(":0", manager)
 	fastletServer.SetAuthenticator(authenticator)
 	handler := fastletServer.Handler()
