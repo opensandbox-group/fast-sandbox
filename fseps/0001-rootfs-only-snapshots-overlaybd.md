@@ -158,6 +158,14 @@ sequenceDiagram
 
 **Latency.** Removing the RAM dump eliminates that component of capture cost, not all pauses. Report guest freeze-to-thaw time, vCPU Pause-to-Resume time, upper-copy time, and publish time separately. Sparse-copy fallback can dominate the protected interval. The historical 512MiB spill measurement is a comparison baseline, not a guarantee for this new protocol.
 
+### Deployment-derived qualification (Issue #184)
+
+The default OverlayBD deployment uses the source instance's persisted managed Firecracker selection. Versioned delivery verifies the executable pair; capture compares the running VMM with that selected binary, rather than a separate global checksum manifest. Only Firecracker 1.17.0 is accepted for capture, including custom binaries; an explicit digest cannot bypass this lifecycle gate. Older templates keep their selected version and Full restore rules. This does not enable cross-version restoration or rewrite manifests.
+
+The kernel expectation comes from the source manifest's boot provenance. Resolve the OCI `current` link once per qualification so its checksum entries and `REVISION` belong to one release, and require `REVISION` to match the checksum-manifest digest. The node daemon always attempts to publish its observed process digest bound to the socket and boot ID. Fastlet compares that observation with the release bundle expectation. Attestation failure revokes the record and disables RootfsOnly without stopping healthy Full storage operation.
+
+`FAST_SANDBOX_ROOTFS_QUALIFICATION` is an optional partial override; explicit malformed values or `exclusiveExt4: false` reject capture. The standard managed VMM directory and state root imply the platform's exclusive-ext4 deployment contract; custom topologies must declare it explicitly, and custom VMMs require an explicit digest. Filesystem detection alone cannot establish absence of raw block, swap or host bypass writers. FSB components are upgraded together; no mixed-FSB-release compatibility is promised. Release validation still qualifies the shipped kernel/storage/VMM combination.
+
 ### Guest control: ownership, delivery, and capability gate
 
 **Proposed v1 decision, pending maintainer acceptance.** FSB owns a dedicated `fsb-guest-control` helper and host client, separate from execd and the user-facing data plane. Use a private virtio-vsock control channel for the minimal protocol below, keeping privileged filesystem control independent of user networking, execd availability, and its release cycle. The cost is a new helper and device/template integration. This is new implementation work, not an existing FSB capability. Mandatory guest-filesystem consistency adds helper, device, and template dependencies beyond simply removing a memory dump; accepting this draft explicitly accepts that scope. No OpenSandbox API or execd change is required for freeze/thaw.

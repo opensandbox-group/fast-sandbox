@@ -1,8 +1,10 @@
 package firecracker
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"fast-sandbox/internal/artifacts"
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/firecrackervmm"
 	"fast-sandbox/internal/guestcontrol"
 	"fast-sandbox/internal/janitor"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
@@ -38,7 +42,7 @@ func TestRootfsQualificationFailClosed(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "qualification.json")
 			require.NoError(t, os.WriteFile(path, raw, 0600))
 			t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
-			_, err = readRootfsQualification()
+			_, err = readRootfsQualification(rootfsQualificationSources{})
 			if tc.ok {
 				require.NoError(t, err)
 			} else {
@@ -47,7 +51,7 @@ func TestRootfsQualificationFailClosed(t *testing.T) {
 		})
 	}
 	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", "")
-	_, err := readRootfsQualification()
+	_, err := readRootfsQualification(rootfsQualificationSources{})
 	require.Error(t, err)
 }
 
@@ -288,4 +292,134 @@ func TestRootfsKernelProvenancePreservesExtensions(t *testing.T) {
 	require.Contains(t, string(document["kernel"]), strings.Repeat("b", 64))
 	require.NoError(t, setSnapshotKernelDigest(document, ""))
 	require.NotContains(t, string(document["kernel"]), `"sha256"`)
+}
+
+func qualificationSourcesFixture(t *testing.T) rootfsQualificationSources {
+	t.Helper()
+	dir := t.TempDir()
+	bundle := filepath.Join(dir, "oci")
+	require.NoError(t, os.Mkdir(bundle, 0700))
+	raw := []byte(strings.Repeat("b", 64) + "  libexec/overlaybd-ublkd\n" + strings.Repeat("d", 64) + "  bin/overlaybd-ublkd\n")
+	require.NoError(t, os.WriteFile(filepath.Join(bundle, "SHA256SUMS"), raw, 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(bundle, "REVISION"), []byte(fmt.Sprintf("%x\n", sha256.Sum256(raw))), 0600))
+	return rootfsQualificationSources{KernelSHA256: strings.Repeat("c", 64), ManagedVMM: true, OverlayBDBundle: bundle, StandardTopology: true}
+}
+
+func TestRootfsQualificationDefaultsAndOverrides(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", "")
+	source := qualificationSourcesFixture(t)
+	q, err := readRootfsQualification(source)
+	require.NoError(t, err)
+	require.Empty(t, q.FirecrackerSHA256)
+	require.Equal(t, strings.Repeat("b", 64), q.OverlayBDSHA256, "use executable, not wrapper digest")
+	require.Equal(t, source.KernelSHA256, q.KernelSHA256)
+	require.True(t, q.ExclusiveExt4)
+	require.Len(t, q.StorageRevision, 64)
+	for _, test := range []struct {
+		name, body string
+		ok         bool
+	}{
+		{"partial", `{"storageRevision":"operator-tested"}`, true},
+		{"explicit-disable", `{"exclusiveExt4":false}`, false},
+		{"empty-digest", `{"firecrackerSHA256":""}`, false},
+		{"invalid-digest", `{"kernelSHA256":"wrong"}`, false},
+		{"null", `{"exclusiveExt4":null}`, false},
+		{"typo", `{"exclusiveEXT4":true}`, false},
+		{"not-object", `null`, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "profile.json")
+			require.NoError(t, os.WriteFile(path, []byte(test.body), 0600))
+			t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
+			_, err := readRootfsQualification(source)
+			if test.ok {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+	source.StandardTopology = false
+	_, err = readRootfsQualification(source)
+	require.ErrorContains(t, err, "custom topologies")
+	path := filepath.Join(t.TempDir(), "profile.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"exclusiveExt4":true}`), 0600))
+	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
+	_, err = readRootfsQualification(source)
+	require.NoError(t, err)
+}
+
+func TestRootfsQualificationBrokenBundlesFailClosed(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", "")
+	for _, test := range []string{"missing-manifest", "missing-entry", "wrong-revision"} {
+		t.Run(test, func(t *testing.T) {
+			source := qualificationSourcesFixture(t)
+			switch test {
+			case "missing-manifest":
+				require.NoError(t, os.Remove(filepath.Join(source.OverlayBDBundle, "SHA256SUMS")))
+			case "missing-entry":
+				raw := []byte(strings.Repeat("a", 64) + "  bin/overlaybd-ublkd\n")
+				require.NoError(t, os.WriteFile(filepath.Join(source.OverlayBDBundle, "SHA256SUMS"), raw, 0600))
+				require.NoError(t, os.WriteFile(filepath.Join(source.OverlayBDBundle, "REVISION"), []byte(fmt.Sprintf("%x", sha256.Sum256(raw))), 0600))
+			case "wrong-revision":
+				require.NoError(t, os.WriteFile(filepath.Join(source.OverlayBDBundle, "REVISION"), []byte("stale"), 0600))
+			}
+			_, err := readRootfsQualification(source)
+			require.Error(t, err)
+			if test == "missing-entry" {
+				require.ErrorContains(t, err, "bundle does not list libexec/overlaybd-ublkd")
+			}
+		})
+	}
+}
+
+func TestRootfsQualificationTopologyDefaults(t *testing.T) {
+	for _, test := range []struct {
+		dir, state        string
+		managed, standard bool
+	}{
+		{firecrackervmm.DefaultDir, "/var/lib/fast-sandbox/firecracker", true, true},
+		{firecrackervmm.DefaultDir, "/custom/state", true, false},
+		{"/custom/vmm", "/var/lib/fast-sandbox/firecracker", true, false},
+		{"", "/var/lib/fast-sandbox/firecracker", false, false},
+	} {
+		d := &Driver{config: runtimecatalog.FirecrackerConfig{VMMDir: test.dir, StateRoot: test.state}}
+		state := &SandboxState{}
+		if test.managed {
+			state.VMM = &firecrackervmm.Selection{Version: "1.17.0", BinaryPath: filepath.Join(test.dir, "versions", "1.17.0", "firecracker")}
+		}
+		source := d.rootfsQualificationSources(state, artifacts.VMManifest{})
+		require.Equal(t, test.standard, source.StandardTopology)
+		require.Equal(t, test.managed, source.ManagedVMM)
+	}
+}
+
+func TestRootfsQualificationCustomVMMNeedsExplicitDigest(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", "")
+	source := qualificationSourcesFixture(t)
+	source.ManagedVMM = false
+	_, err := readRootfsQualification(source)
+	require.ErrorContains(t, err, "custom VMM")
+	path := filepath.Join(t.TempDir(), "profile.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"firecrackerSHA256":"`+strings.Repeat("a", 64)+`"}`), 0600))
+	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
+	_, err = readRootfsQualification(source)
+	require.NoError(t, err)
+}
+
+func TestRootfsQualificationKernelDiagnostics(t *testing.T) {
+	d := &Driver{}
+	state := &SandboxState{BootKernelSHA256: strings.Repeat("a", 64)}
+	_, err := d.qualifyRootfsSource(t.Context(), state, artifacts.VMManifest{})
+	require.ErrorContains(t, err, "rebuild the template and recreate the sandbox")
+	profile := filepath.Join(t.TempDir(), "qualification.json")
+	q := rootfsQualification{FirecrackerSHA256: strings.Repeat("a", 64), KernelSHA256: strings.Repeat("b", 64), OverlayBDSHA256: strings.Repeat("c", 64), StorageRevision: "tested", ExclusiveExt4: true}
+	raw, err := json.Marshal(q)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(profile, raw, 0600))
+	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", profile)
+	manifest := artifacts.VMManifest{}
+	manifest.Kernel.SHA256 = state.BootKernelSHA256
+	_, err = d.qualifyRootfsSource(t.Context(), state, manifest)
+	require.ErrorContains(t, err, "qualification pins kernelSHA256")
 }

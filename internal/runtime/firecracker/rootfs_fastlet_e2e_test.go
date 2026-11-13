@@ -67,6 +67,17 @@ func TestRootfsFastletChainE2E(t *testing.T) {
 	require.NotEmpty(t, kernel)
 	pod := "rootfs-e2e-pod"
 	profile := runtimecatalog.RuntimeProfile{Name: apiv1alpha2.RuntimeFirecracker, ProfileHash: "rootfs-e2e", Firecracker: &runtimecatalog.FirecrackerConfig{BinaryPath: binary, VMMDir: os.Getenv("FC_VMM_DIR"), KernelPath: kernel, JailerPath: os.Getenv("FC_JAILER"), RootfsPath: "/unused-oci-rootfs", StateRoot: filepath.Join(root, "state"), DefaultVCPUs: 1, DefaultMemory: "256Mi", BootTimeoutSeconds: 30}, Capabilities: runtimecatalog.Capabilities{DefaultState: runtimecatalog.CapabilityReady}}
+	autoQualification := os.Getenv("FSB_TEST_AUTO_QUALIFICATION") == "1"
+	if autoQualification {
+		// The external harness must mount disposable assets and an empty state
+		// directory at the production paths; never use a populated node here.
+		require.Empty(t, os.Getenv("FAST_SANDBOX_ROOTFS_QUALIFICATION"))
+		require.Equal(t, "/opt/fast-sandbox/firecracker", profile.Firecracker.VMMDir)
+		profile.Firecracker.StateRoot = "/var/lib/fast-sandbox/firecracker"
+		entries, err := os.ReadDir(profile.Firecracker.StateRoot)
+		require.NoError(t, err)
+		require.Empty(t, entries, "auto-qualification E2E requires isolated empty production paths")
+	}
 	driver, err := New(profile)
 	require.NoError(t, err)
 	driver.SetFastletPodUID(pod)
@@ -150,10 +161,15 @@ func TestRootfsFastletChainE2E(t *testing.T) {
 		c := driver.newClient(state.APIAddress)
 		var guest guestcontrol.Client
 		require.Eventually(t, func() bool { var e error; guest, _, e = driver.captureGuest(ctx, state, manifest, c); return e == nil }, 30*time.Second, 100*time.Millisecond)
-		log, e := os.ReadFile(filepath.Join(filepath.Dir(state.APIAddress), processLogName))
-		require.NoError(t, e)
-		marker := regexp.MustCompile(`FSB_ROOT_BOOT (\d+)`).FindSubmatch(log)
-		require.Len(t, marker, 2)
+		var marker [][]byte
+		require.Eventually(t, func() bool {
+			log, err := os.ReadFile(filepath.Join(filepath.Dir(state.APIAddress), processLogName))
+			if err != nil {
+				return false
+			}
+			marker = regexp.MustCompile(`FSB_ROOT_BOOT (\d+)`).FindSubmatch(log)
+			return len(marker) == 2
+		}, 10*time.Second, 50*time.Millisecond, "guest helper readiness can precede the console boot marker")
 		boot, e := strconv.Atoi(string(marker[1]))
 		require.NoError(t, e)
 		if cycle == 0 {
@@ -165,6 +181,27 @@ func TestRootfsFastletChainE2E(t *testing.T) {
 		ping, e := exec.CommandContext(ctx, "ping", "-c", "1", "-W", "3", state.Allocation.Network.IP).CombinedOutput()
 		require.NoError(t, e, string(ping))
 		if cycle == 0 {
+			if autoQualification {
+				_, err := driver.qualifyRootfsSource(ctx, state, manifest)
+				require.NoError(t, err, "no profile: deployed bundles and boot manifest must qualify the live VM")
+				for _, mismatch := range []struct{ field, message string }{
+					{"firecrackerSHA256", "managed VMM differs from explicit qualification digest"},
+					{"kernelSHA256", "qualification pins kernelSHA256"},
+					{"overlaybdSHA256", "stale or mismatched"},
+				} {
+					t.Run("reject-"+mismatch.field, func(t *testing.T) {
+						path := filepath.Join(root, "override.json")
+						raw, err := json.Marshal(map[string]string{mismatch.field: strings.Repeat("0", 64)})
+						require.NoError(t, err)
+						require.NoError(t, os.WriteFile(path, raw, 0600))
+						t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
+						_, err = driver.qualifyRootfsSource(ctx, state, manifest)
+						require.ErrorContains(t, err, mismatch.message)
+					})
+				}
+				require.Empty(t, os.Getenv("FAST_SANDBOX_ROOTFS_QUALIFICATION"))
+				t.Log("automatic qualification passed; mismatched VMM, kernel and daemon overrides rejected")
+			}
 			snap := &fastletapi.CreateSnapshotRequest{RequestID: "rootfs-snapshot", Identity: fastletapi.SnapshotIdentity{SnapshotUID: "rootfs-snapshot", Namespace: "e2e", Name: "rootfs-snapshot", Sandbox: identity}, Snapshot: fastletapi.SnapshotSpec{Mode: fastletapi.SnapshotModeRootfsOnly, Kind: fastletapi.SnapshotKindTemplate}}
 			started := time.Now()
 			accepted, e := manager.CreateSnapshot(ctx, snap)

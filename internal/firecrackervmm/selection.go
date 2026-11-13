@@ -19,6 +19,22 @@ type Selection struct {
 	JailerPath string `json:"jailerPath,omitempty"`
 }
 
+// IsManaged reports whether the selection uses the managed release layout.
+// It does not replace executable identity or installed-release validation.
+func (s *Selection) IsManaged(root string) bool {
+	if s == nil || !filepath.IsAbs(root) {
+		return false
+	}
+	if _, err := versionParts(s.Version); err != nil {
+		return false
+	}
+	return s.BinaryPath == filepath.Join(releaseDir(root, s.Version), "firecracker")
+}
+
+func releaseDir(root, version string) string {
+	return filepath.Join(root, "versions", version)
+}
+
 // Resolve uses an exact recorded version; only a new build may request latest
 // with an empty version. The inventory is controlled by the FSB release image.
 func Resolve(ctx context.Context, root, version string, jailed bool) (Selection, error) {
@@ -46,7 +62,7 @@ func Resolve(ctx context.Context, root, version string, jailed bool) (Selection,
 	} else if !slices.Contains(catalog.Versions, version) {
 		return result, fmt.Errorf("%w: %q; installed versions: %v", ErrVersionUnavailable, version, catalog.Versions)
 	}
-	dir := filepath.Join(root, "versions", version)
+	dir := releaseDir(root, version)
 	for _, path := range []string{filepath.Join(root, "versions"), dir} {
 		info, err := os.Lstat(path)
 		if err != nil {

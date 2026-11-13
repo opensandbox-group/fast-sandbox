@@ -172,7 +172,6 @@ func newQualifyBackendCommand() *cobra.Command {
 		defer cancel()
 		return backendidentity.Attest(ctx, global.ublkdSocket, digest)
 	}}
-	command.Flags().StringVar(&digest, "sha256", "", "expected qualified daemon executable SHA256")
-	_ = command.MarkFlagRequired("sha256")
+	command.Flags().StringVar(&digest, "sha256", "", "optional expected daemon executable SHA256; omitted records the running executable")
 	return command
 }

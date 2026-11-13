@@ -307,14 +307,14 @@ func TestBundleMissingManifestIsAnError(t *testing.T) {
 	require.ErrorContains(t, config.installFromBundle(config.Dir), "SHA256SUMS")
 }
 
-func TestParseSHA256SumsMalformedLine(t *testing.T) {
+func TestParseSHA256SumsRejectsShortDigest(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "SHA256SUMS")
 	if err := os.WriteFile(path, []byte("deadbeef  firecracker\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	_, err := parseSHA256Sums(path)
-	require.ErrorContains(t, err, "malformed")
+	require.ErrorContains(t, err, "SHA256SUMS line 1: digest must be 64 lowercase hex characters")
 }
 
 func TestBundlePinsMatchGoDefaults(t *testing.T) {

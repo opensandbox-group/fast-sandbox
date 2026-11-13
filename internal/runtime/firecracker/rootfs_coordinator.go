@@ -23,44 +23,6 @@ import (
 	"fast-sandbox/internal/ublkd"
 )
 
-// Node operators bind qualification to verified binaries and the storage stack; client requests cannot supply it.
-// ExclusiveExt4 is a deployment constraint: no Guest raw block/swap, host bypass writers, or external freeze/thaw.
-type rootfsQualification struct {
-	FirecrackerSHA256 string `json:"firecrackerSHA256"`
-	KernelSHA256      string `json:"kernelSHA256"`
-	OverlayBDSHA256   string `json:"overlaybdSHA256"`
-	StorageRevision   string `json:"storageRevision"`
-	ExclusiveExt4     bool   `json:"exclusiveExt4"`
-}
-
-func readRootfsQualification() (rootfsQualification, error) {
-	var q rootfsQualification
-	path := os.Getenv("FAST_SANDBOX_ROOTFS_QUALIFICATION")
-	if !filepath.IsAbs(path) {
-		return q, errors.New("RootfsOnly requires an absolute FAST_SANDBOX_ROOTFS_QUALIFICATION profile")
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return q, err
-	}
-	if err = json.Unmarshal(raw, &q); err != nil {
-		return q, err
-	}
-	digests := []string{q.KernelSHA256, q.OverlayBDSHA256}
-	if q.FirecrackerSHA256 != "" {
-		digests = append(digests, q.FirecrackerSHA256)
-	}
-	for _, sum := range digests {
-		b, e := hex.DecodeString(sum)
-		if e != nil || len(b) != 32 || strings.ToLower(sum) != sum {
-			return q, errors.New("qualification requires SHA256 digests")
-		}
-	}
-	if !q.ExclusiveExt4 || q.StorageRevision == "" {
-		return q, errors.New("qualification requires exclusive ext4 and validated storage revision")
-	}
-	return q, nil
-}
 func captureFileHash(path string) (string, error) {
 	f, e := os.Open(path)
 	if e != nil {
@@ -268,7 +230,7 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	if err != nil {
 		return nil, err
 	}
-	identity, err := d.qualifyRootfsSource(ctx, state)
+	identity, err := d.qualifyRootfsSource(ctx, state, manifest)
 	if err != nil {
 		return nil, err
 	}
@@ -523,13 +485,21 @@ func (d *Driver) abortDeadRootfsCapture(ctx context.Context, state *SandboxState
 	return true, nil
 }
 
-func (d *Driver) qualifyRootfsSource(ctx context.Context, state *SandboxState) (string, error) {
-	q, err := readRootfsQualification()
+func (d *Driver) qualifyRootfsSource(ctx context.Context, state *SandboxState, manifest artifacts.VMManifest) (string, error) {
+	if manifest.Kernel.SHA256 == "" {
+		return "", errors.New("source manifest does not record a kernel digest; rebuild the template and recreate the sandbox")
+	}
+	// The template records the actual boot kernel; an override cannot replace
+	// this provenance check with a digest of a different node kernel.
+	if err := qualifyBootKernel(state.BootKernelSHA256, manifest.Kernel.SHA256); err != nil {
+		return "", err
+	}
+	q, err := readRootfsQualification(d.rootfsQualificationSources(state, manifest))
 	if err != nil {
 		return "", err
 	}
-	if err := qualifyBootKernel(state.BootKernelSHA256, q.KernelSHA256); err != nil {
-		return "", err
+	if q.KernelSHA256 != manifest.Kernel.SHA256 {
+		return "", fmt.Errorf("qualification pins kernelSHA256 %s; the template records %s", q.KernelSHA256, manifest.Kernel.SHA256)
 	}
 	identity, err := captureProcessIdentity(ctx, state.APIAddress, state.PID)
 	if err != nil {

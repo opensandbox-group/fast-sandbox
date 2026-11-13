@@ -36,7 +36,8 @@ func TestBackendQualificationRejectsStaleRecord(t *testing.T) {
 	sum, err := hashFile("/proc/self/exe")
 	require.NoError(t, err)
 	require.Error(t, Verify(t.Context(), socket, sum))
-	require.NoError(t, Attest(t.Context(), socket, sum))
+	require.Error(t, Attest(t.Context(), socket, "wrong"))
+	require.NoError(t, Attest(t.Context(), socket, ""))
 	require.NoError(t, Verify(t.Context(), socket, sum))
 	require.Error(t, Verify(t.Context(), socket, "wrong"))
 	path := socket + ".qualification.json"

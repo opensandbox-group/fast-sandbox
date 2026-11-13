@@ -3,6 +3,7 @@ package artifacts
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -323,6 +324,18 @@ func TestRootfsManifestRetainsArchitectureButNotCPUState(t *testing.T) {
 		copy := m
 		mutate(&copy)
 		require.Error(t, copy.Validate())
+	}
+}
+
+func TestBundleChecksumsRejectAmbiguousExpectations(t *testing.T) {
+	sum := strings.Repeat("a", 64)
+	entries, err := ParseSHA256SUMS([]byte("# bundle\n" + sum + "  ./firecracker\n" + sum + " *libexec/overlaybd-ublkd\n"))
+	require.NoError(t, err)
+	require.Equal(t, sum, entries["firecracker"])
+	require.Equal(t, sum, entries["libexec/overlaybd-ublkd"])
+	for _, raw := range []string{"", sum + "  ../firecracker", sum + "  /firecracker", strings.Repeat("z", 64) + "  firecracker", sum + "  firecracker\n" + sum + "  ./firecracker"} {
+		_, err := ParseSHA256SUMS([]byte(raw))
+		require.Error(t, err)
 	}
 }
 
