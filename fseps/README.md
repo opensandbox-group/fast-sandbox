@@ -17,3 +17,4 @@ Add an entry in the same PR as a new proposal; when its content or status change
 |:----:|-------|--------|:------------:|
 | [FSEP-0001](0001-rootfs-only-snapshots-overlaybd.md) | Rootfs-Only Snapshots on the OverlayBD Path | draft | 2026-11-07 |
 | [FSEP-0002](0002-firecracker-multi-version-delivery.md) | Firecracker Multi-Version Delivery and Selection | draft | 2026-11-12 |
+| [FSEP-0003](0003-vmm-capability-drop.md) | Drop Firecracker VMM Capabilities by Default | draft | 2026-11-13 |
