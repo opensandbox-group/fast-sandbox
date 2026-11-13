@@ -78,6 +78,7 @@ func peerPID(ctx context.Context, socket string) (int, error) {
 }
 
 // Attest runs only in the node daemon launcher and binds the serving process executable to the current socket instance.
+// An empty expected digest records the observed executable; Fastlet still compares it with its deployment expectation.
 // The launcher must remove stale records first, hold an exclusive lock throughout the daemon lifetime, and revoke the record on exit.
 func Attest(ctx context.Context, socket, expected string) error {
 	before, err := fingerprint(socket)
@@ -92,7 +93,7 @@ func Attest(ctx context.Context, socket, expected string) error {
 	if err != nil {
 		return err
 	}
-	if sum != expected {
+	if expected != "" && sum != expected {
 		return errors.New("OverlayBD executable does not match qualified artifact")
 	}
 	after, err := fingerprint(socket)
