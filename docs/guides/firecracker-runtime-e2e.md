@@ -41,12 +41,21 @@ Artifacts download on first run.
 machine/drive/network call before it is rejected). The driver:
 
 1. prepares the jail root `<StateRoot>/jails/firecracker/<id[:32]>/root/`
-   (instance rootfs reflink copy + hard-linked `vmstate.snap`/`memory.snap`
-   under `snapshots/`) and launches
-   `jailer --id <id> --netns <slot netns> --uid 0 --gid 0 --exec-file <firecracker>
+   (instance rootfs reflink copy + the real Firecracker binary at
+   `vmm/firecracker` + hard-linked `vmstate.snap`/`memory.snap` under
+   `snapshots/`) and launches
+   `jailer --id <id> --netns <slot netns> --uid 0 --gid 0 --exec-file <capability-drop helper>
    --chroot-base-dir <StateRoot>/jails -- --api-sock /api.sock`; the VMM
-   enters the per-clone slot netns and its chroot (jailer execs firecracker,
-   PID unchanged);
+   enters the per-clone slot netns and its chroot. The exec file is the
+   capability-drop helper (FSEP-0003), installed in the Fastlet image with
+   the `firecracker` basename so the jail path is unchanged: the jailer
+   copies the helper into the jail as `/firecracker`, the helper drops the
+   fixed capability set (`net_admin`, `net_raw`, `ipc_lock`, `perfmon`,
+   `bpf`) with `PR_SET_NO_NEW_PRIVS` set, and execs `/vmm/firecracker` —
+   one execve chain, PID unchanged. After the API socket is ready the
+   driver asserts on `/proc/<pid>/status` that the dropped bits are absent
+   from `CapEff`/`CapBnd` with `NoNewPrivs: 1` and fails the create
+   otherwise;
 2. `PUT /snapshot/load` with chroot-relative `/snapshots/*` paths, file-backed
    memory, and the in-netns tap `vmtap0` via `network_overrides`;
 3. `PATCH /vm {"state":"Resumed"}` (InstanceStart is rejected after load),
@@ -66,7 +75,10 @@ clones and made safe by namespace isolation (upstream clone model).
   guest)
 - Static in-netns rules (slot preparation): `FORWARD` gateway ACCEPT,
   sibling REJECT (`-i vmtap0 -o eth0 -d <CIDR>`), egress/ingress ACCEPT,
-  conntrack; proxy ARP on the **tap only**; `ip_forward=1`
+  conntrack; proxy ARP on the **tap only**; `ip_forward=1`; the tap is
+  created with `user 0` so the uid-0 VMM attaches by ownership match
+  (capability-free on every kernel, including post-CVE-2026-99281 kernels
+  that require `CAP_NET_ADMIN` for ownerless attach)
 - Per-restore data plane (from the manifest `guestNetwork`): ingress
   `DNAT slot IP → baked guest IP`, egress `SNAT guest IP → slot IP`
   (OSEP-0022 source-IP dispatch), delivery via a `/32` route — the guest

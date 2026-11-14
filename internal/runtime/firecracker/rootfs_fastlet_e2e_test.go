@@ -81,6 +81,10 @@ func TestRootfsFastletChainE2E(t *testing.T) {
 	driver, err := New(profile)
 	require.NoError(t, err)
 	driver.SetFastletPodUID(pod)
+	// FSEP-0003: the driver always launches the VMM through the
+	// capability-drop helper; this source-tree E2E builds it from the module.
+	helper := e2eVMMExecHelper(t)
+	driver.resolveVMMExec = func() (string, error) { return helper, nil }
 	var counter atomic.Int64
 	network, err := fastletnetwork.NewManager(fastletnetwork.Config{Capacity: 2, PodUID: pod, StateRoot: filepath.Join(root, "network"), NetNSRoot: "/run/netns", HostNetNSRoot: "/run/netns", IDGenerator: func() (string, error) { return fmt.Sprintf("rootfs-%d-%d", os.Getpid(), counter.Add(1)), nil }, Now: time.Now, ReplenishTimeout: time.Minute}, fastletnetwork.NewGuestVMNetNSDriver(fastletnetwork.LinuxDriverConfig{}), newMemoryStateStore())
 	require.NoError(t, err)

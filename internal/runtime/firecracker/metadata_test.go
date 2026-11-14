@@ -129,7 +129,7 @@ func TestVMMetadataRejectsInvalid(t *testing.T) {
 
 func TestEnsureSandboxWritesVMMetadataInJail(t *testing.T) {
 	fixture := newDriverFixture(t)
-	fixture.enableJailer()
+	fixture.enableJailer(t)
 	fixture.sandboxSpec.Identity.SandboxUID = longSandboxUID
 	fixture.sandboxSpec.Identity.Namespace = "team-a"
 	fixture.sandboxSpec.Identity.Name = "sbx-7d9f2c"
@@ -206,7 +206,7 @@ func TestEnsureSandboxDoesNotWaitForMetadataPayload(t *testing.T) {
 
 func TestStaleMetadataPublisherCannotWriteReplacementRecord(t *testing.T) {
 	fixture := newDriverFixture(t)
-	fixture.enableJailer()
+	fixture.enableJailer(t)
 	fixture.sandboxSpec.Identity.SandboxUID = longSandboxUID
 	fixture.sandboxSpec.Identity.Namespace = "team-a"
 	fixture.sandboxSpec.Identity.Name = "sbx-7d9f2c"

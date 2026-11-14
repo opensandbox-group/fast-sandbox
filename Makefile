@@ -28,7 +28,7 @@ ACCELERATED_CONTAINER_IMAGE_DIR ?= $(abspath $(CURDIR)/../accelerated-container-
 
 BIN_DIR := $(CURDIR)/bin
 LINUX_BIN_DIR := $(CURDIR)/.build/linux-amd64
-ALL_BINARIES := controller fastlet sandbox-init sandbox-action-fixture fastlet-proxy sandbox-proxy janitor fastctl firecracker-runtime fsb-vm
+ALL_BINARIES := controller fastlet sandbox-init sandbox-action-fixture fastlet-proxy sandbox-proxy janitor fastctl firecracker-runtime fsb-vm vmm-capdrop
 CORE_IMAGES := controller fastlet fastlet-proxy sandbox-proxy janitor
 ALL_IMAGES := $(CORE_IMAGES) sandbox-action-fixture firecracker-runtime
 IMAGE_COMPONENTS := $(ALL_IMAGES) oci-tools sandboxtemplate-builder

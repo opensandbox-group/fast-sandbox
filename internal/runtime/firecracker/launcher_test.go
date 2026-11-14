@@ -5,9 +5,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"fast-sandbox/internal/vmmexec"
 )
 
 type fakeProcess struct {
@@ -124,6 +127,84 @@ func TestBuildArgvJailer(t *testing.T) {
 	require.Equal(t, 1, countOccurrences(argv, "--api-sock"))
 }
 
+// TestBuildArgvJailerExecHelper pins the FSEP-0003 exec-file contract: the
+// jailer's exec file is the capability-drop helper, installed with the
+// "firecracker" basename so the jailer-derived jail root
+// (<chroot-base>/firecracker/<id>/root) and every Fastlet path consumer
+// stay unchanged.
+func TestBuildArgvJailerExecHelper(t *testing.T) {
+	argv := (launchConfig{
+		BinaryPath: "/opt/fast-sandbox/firecracker/versions/1.17.0/firecracker",
+		ExecFile:   "/usr/local/libexec/fast-sandbox/vmm-capdrop/firecracker",
+		JailerPath: "/opt/fast-sandbox/firecracker/versions/1.17.0/jailer",
+		ChrootBase: "/var/lib/fast-sandbox/jails", NetNSPath: "/run/netns/fsb-pod-1",
+		SandboxID: "sandbox-1",
+	}).buildArgv()
+	require.Equal(t, "/usr/local/libexec/fast-sandbox/vmm-capdrop/firecracker", argv[argvIndex(argv, "--exec-file")+1])
+}
+
+// TestLaunchJailerRejectsForeignHelperBasename keeps the jail-path contract
+// loud: an exec file with any other basename would move the jail root
+// without a single path consumer following it.
+func TestLaunchJailerRejectsForeignHelperBasename(t *testing.T) {
+	runner := &fakeProcessRunner{}
+	_, err := launch(context.Background(), runner, launchConfig{
+		BinaryPath: "/usr/local/bin/firecracker",
+		ExecFile:   "/usr/local/libexec/fast-sandbox/vmm-capdrop/vmm-exec",
+		JailerPath: "/usr/local/bin/jailer", ChrootBase: "/jails",
+		NetNSPath: "/run/netns/fsb-1", SandboxID: "sandbox-1", APIAddress: "/run/api.sock",
+	})
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.ErrorContains(t, err, "basename")
+	require.Empty(t, runner.started)
+}
+
+// TestLaunchDirectInsertsExecHelper pins the direct-launch argv: the helper
+// runs and names the real binary with --exec; argv and process identity
+// stay otherwise unchanged, with or without the netns entry.
+func TestLaunchDirectInsertsExecHelper(t *testing.T) {
+	helper := "/usr/local/libexec/fast-sandbox/vmm-capdrop/firecracker"
+	for _, testCase := range []struct {
+		name         string
+		netns        string
+		expectedName string
+		expectedArgs []string
+	}{
+		{
+			name: "plain", netns: "",
+			expectedName: helper,
+			expectedArgs: []string{helper, vmmexec.ExecFlag, "/usr/local/bin/firecracker", "--id", "sandbox", "--api-sock", "/run/api.sock"},
+		},
+		{
+			name: "netns", netns: "/run/netns/slot",
+			expectedName: "nsenter",
+			expectedArgs: []string{"nsenter", "--net=/run/netns/slot", "--", helper,
+				vmmexec.ExecFlag, "/usr/local/bin/firecracker", "--id", "sandbox", "--api-sock", "/run/api.sock"},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			runner := &fakeProcessRunner{}
+			_, err := launch(context.Background(), runner, launchConfig{
+				SandboxID: "sandbox", BinaryPath: "/usr/local/bin/firecracker", ExecFile: helper,
+				APIAddress: "/run/api.sock", NetNSPath: testCase.netns,
+			})
+			require.NoError(t, err)
+			require.Equal(t, testCase.expectedArgs, runner.started[0])
+		})
+	}
+	// Without the helper the launch stays the legacy direct exec of the
+	// binary (the E2E preparation VM keeps its privileges; production
+	// resolves the helper unconditionally and the launch-time capability
+	// assertion fails any create that skipped the drop).
+	runner := &fakeProcessRunner{}
+	_, err := launch(context.Background(), runner, launchConfig{
+		SandboxID: "sandbox", BinaryPath: "/usr/local/bin/firecracker", APIAddress: "/run/api.sock",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "/usr/local/bin/firecracker", runner.started[0][0])
+	require.NotContains(t, runner.started[0], vmmexec.ExecFlag)
+}
+
 func TestLaunchJailerValidation(t *testing.T) {
 	runner := &fakeProcessRunner{}
 	ctx := context.Background()
@@ -154,16 +235,28 @@ func TestPrepareJailRoot(t *testing.T) {
 	cached := filepath.Join(root, "cache", "rootfs.img")
 	vmstate := filepath.Join(root, "cache", "vmstate.snap")
 	memory := filepath.Join(root, "cache", "memory.snap")
-	for path, content := range map[string]string{cached: "rootfs-data", vmstate: "vmstate-data", memory: "memory-data"} {
+	vmmBinary := filepath.Join(root, "bin", "firecracker")
+	for path, content := range map[string]string{cached: "rootfs-data", vmstate: "vmstate-data", memory: "memory-data", vmmBinary: "vmm-binary-data"} {
 		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o640))
 	}
 
-	require.NoError(t, prepareJailRoot(jailRoot, cached, vmstate, memory))
+	require.NoError(t, prepareJailRoot(jailRoot, cached, vmstate, memory, vmmBinary))
 
 	rootfs, err := os.ReadFile(filepath.Join(jailRoot, rootfsImageName))
 	require.NoError(t, err)
 	require.Equal(t, "rootfs-data", string(rootfs))
+	// The real VMM binary is content-identical at the fixed in-jail
+	// convention the capability-drop helper execs (/vmm/firecracker); it is
+	// a copy, not a hard link (the jailer rejects multi-link copy targets,
+	// and the managed host binary must not be reachable for mutation
+	// through the jail).
+	vmmInJail, err := os.ReadFile(jailedVMMBinaryPath(jailRoot))
+	require.NoError(t, err)
+	require.Equal(t, "vmm-binary-data", string(vmmInJail))
+	vmmInJailInfo, err := os.Stat(jailedVMMBinaryPath(jailRoot))
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), uint64(vmmInJailInfo.Sys().(*syscall.Stat_t).Nlink), "the jail VMM binary must not be a hard link")
 	// The snapshot files are hard-linked to the cache (same inode).
 	vmstateInJail, err := os.Stat(filepath.Join(jailRoot, jailerChrootSnapshotsDir, vmstateSnapshotName))
 	require.NoError(t, err)
@@ -178,7 +271,7 @@ func TestPrepareJailRoot(t *testing.T) {
 
 	// A stale jail root is replaced.
 	require.NoError(t, os.WriteFile(filepath.Join(jailRoot, "stale"), []byte("stale"), 0o640))
-	require.NoError(t, prepareJailRoot(jailRoot, cached, vmstate, memory))
+	require.NoError(t, prepareJailRoot(jailRoot, cached, vmstate, memory, vmmBinary))
 	_, err = os.Stat(filepath.Join(jailRoot, "stale"))
 	require.True(t, os.IsNotExist(err))
 }

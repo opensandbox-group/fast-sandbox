@@ -75,8 +75,9 @@ func TestGuestVMNetNSDriverPrepare(t *testing.T) {
 
 	joined := strings.Join(runner.commands, "\n")
 	// The tap is created INSIDE the slot netns with the fixed name, no
-	// bridge membership.
-	require.Contains(t, joined, "ip netns exec ns-1 ip tuntap add dev vmtap0 mode tap")
+	// bridge membership, and owned by uid 0 so the VMM attaches by
+	// ownership match without CAP_NET_ADMIN (FSEP-0003).
+	require.Contains(t, joined, "ip netns exec ns-1 ip tuntap add dev vmtap0 mode tap user 0")
 	require.Contains(t, joined, "ip netns exec ns-1 ip link set vmtap0 address "+guestnetwork.GatewayMAC)
 	require.Less(t, strings.Index(joined, "address "+guestnetwork.GatewayMAC), strings.Index(joined, "link set vmtap0 up"))
 	require.Contains(t, joined, "ip netns exec ns-1 ip link set vmtap0 mtu 1400")

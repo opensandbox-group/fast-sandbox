@@ -14,7 +14,7 @@ COPY pkg ./pkg
 ARG DEBUG=0
 RUN case "$DEBUG" in 0) set -- ;; 1) set -- '-gcflags=all=-N -l' ;; *) exit 2 ;; esac \
     && mkdir -p /out \
-    && for binary in fastlet sandbox-init; do \
+    && for binary in fastlet sandbox-init vmm-capdrop; do \
          CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build "$@" -o "/out/$binary" "./cmd/$binary" || exit $?; \
        done
 
@@ -25,6 +25,11 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && rm -rf /var/lib/apt/lists/*
 COPY --from=fastlet-build /out/fastlet /workspace/fastlet
 COPY --from=fastlet-build /out/sandbox-init /opt/fast-sandbox/bin/sandbox-init
+# The Firecracker VMM capability-drop exec helper (FSEP-0003). The file
+# basename is contractual: the jailer derives the jail root from the
+# exec-file basename, so the helper must be installed as .../vmm-capdrop/firecracker
+# to keep the jail layout and every Fastlet path consumer unchanged.
+COPY --from=fastlet-build /out/vmm-capdrop /usr/local/libexec/fast-sandbox/vmm-capdrop/firecracker
 ENV PATH=/opt/fast-sandbox/oci/current/bin:${PATH}
 ENV FASTLET_CONTROL_PORT=":5758"
 ENV FAST_SANDBOX_RUNTIME="container"

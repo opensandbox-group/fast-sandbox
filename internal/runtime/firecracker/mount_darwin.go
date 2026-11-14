@@ -11,6 +11,11 @@ func bindMount(_, _ string) error {
 	return errors.New("bind mounts are not supported on this platform")
 }
 
+// bindMountReadOnly mirrors bindMount's platform stub.
+func bindMountReadOnly(_, _ string) error {
+	return errors.New("bind mounts are not supported on this platform")
+}
+
 // unmountPath mirrors bindMount's platform stub.
 func unmountPath(_ string) error {
 	return errors.New("bind mounts are not supported on this platform")

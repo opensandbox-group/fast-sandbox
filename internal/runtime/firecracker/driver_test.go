@@ -233,15 +233,18 @@ func (s *statefulFakeServer) recordedSnapshotLoads() []SnapshotLoadRequest {
 // driverFixture wires a Driver with fake Firecracker, process, and network
 // backends.
 type driverFixture struct {
-	driver      *Driver
-	runner      *infraRunner
-	launcher    *fakeProcessRunner
-	server      *statefulFakeServer
-	killCalls   []int
-	alignCalls  []string
-	stateRoot   string
-	manager     *fastletnetwork.Manager
-	sandboxSpec fastletapi.RuntimeSandboxConfig
+	driver        *Driver
+	runner        *infraRunner
+	launcher      *fakeProcessRunner
+	server        *statefulFakeServer
+	killCalls     []int
+	alignCalls    []string
+	assertCalls   []int
+	capabilityErr error
+	helperPath    string
+	stateRoot     string
+	manager       *fastletnetwork.Manager
+	sandboxSpec   fastletapi.RuntimeSandboxConfig
 }
 
 func newDriverFixture(t *testing.T) *driverFixture {
@@ -274,6 +277,15 @@ func newDriverFixture(t *testing.T) *driverFixture {
 		alignJailKVM: func(hostPath, jailPath string) error {
 			fixture.alignCalls = append(fixture.alignCalls, hostPath+"->"+jailPath)
 			return nil
+		},
+		// The default fixture keeps the helper unresolved (production always
+		// resolves it; direct-mode tests override this stub, and the
+		// launch-time capability assertion below fails any create that
+		// skipped the drop).
+		resolveVMMExec: func() (string, error) { return fixture.helperPath, nil },
+		assertCapabilities: func(pid int) error {
+			fixture.assertCalls = append(fixture.assertCalls, pid)
+			return fixture.capabilityErr
 		},
 		checkStorage:           func(context.Context, string) error { return nil },
 		writeVMMetadataPayload: writeVMMetadataPayload,
@@ -1404,13 +1416,23 @@ func TestCloseResetsDriver(t *testing.T) {
 
 // enableJailer activates the jailer mode on a fixture (the fake launcher
 // records the jailer argv; the jail root is prepared on the real StateRoot).
-func (f *driverFixture) enableJailer() {
+// The fixture gains real files for the configured VMM binary (the jail prep
+// places it in the jail) and the capability-drop helper, which the fixture
+// resolver returns.
+func (f *driverFixture) enableJailer(t *testing.T) {
+	t.Helper()
+	f.driver.config.BinaryPath = filepath.Join(f.stateRoot, "bin", "firecracker")
+	require.NoError(t, os.MkdirAll(filepath.Dir(f.driver.config.BinaryPath), 0o750))
+	require.NoError(t, os.WriteFile(f.driver.config.BinaryPath, []byte("vmm-binary-data"), 0o750))
+	f.helperPath = filepath.Join(f.stateRoot, "vmm-capdrop", "firecracker")
+	require.NoError(t, os.MkdirAll(filepath.Dir(f.helperPath), 0o750))
+	require.NoError(t, os.WriteFile(f.helperPath, []byte("#!/bin/sh\n"), 0o750))
 	f.driver.config.JailerPath = "/usr/local/bin/jailer"
 }
 
 func TestEnsureSandboxJailerMode(t *testing.T) {
 	fixture := newDriverFixture(t)
-	fixture.enableJailer()
+	fixture.enableJailer(t)
 	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
 	require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
 
@@ -1426,6 +1448,8 @@ func TestEnsureSandboxJailerMode(t *testing.T) {
 	require.Equal(t, "--netns", started[argvIndex(started, "--netns")])
 	require.Equal(t, "--chroot-base-dir", started[argvIndex(started, "--chroot-base-dir")])
 	require.Equal(t, filepath.Join(fixture.stateRoot, jailerChrootBaseDir), started[argvIndex(started, "--chroot-base-dir")+1])
+	// The exec file is the capability-drop helper (FSEP-0003).
+	require.Equal(t, fixture.helperPath, started[argvIndex(started, "--exec-file")+1])
 	// The slot netns is the manager's NetNSPath.
 	slot, exists := fixture.manager.Lookup("sandbox-1")
 	require.True(t, exists)
@@ -1433,8 +1457,9 @@ func TestEnsureSandboxJailerMode(t *testing.T) {
 	// The post--- firecracker args use the chroot-relative socket path.
 	require.Contains(t, started, jailerChrootAPISock)
 
-	// The jail root holds the instance rootfs copy and the hard-linked
-	// snapshot files; the persisted API address points at the jail socket.
+	// The jail root holds the instance rootfs copy, the real VMM binary at
+	// the fixed helper convention, and the hard-linked snapshot files; the
+	// persisted API address points at the jail socket.
 	jailRoot := jailerRoot(filepath.Join(fixture.stateRoot, jailerChrootBaseDir), "firecracker", "sandbox-1")
 	// The jailed KVM device is aligned with the host device numbers between
 	// the jailer launch and the first restore API call.
@@ -1442,6 +1467,9 @@ func TestEnsureSandboxJailerMode(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join(jailRoot, rootfsImageName))
 	require.NoError(t, err)
 	require.Equal(t, "rootfs-image-data", string(content))
+	vmmInJail, err := os.ReadFile(jailedVMMBinaryPath(jailRoot))
+	require.NoError(t, err)
+	require.Equal(t, "vmm-binary-data", string(vmmInJail))
 	for _, name := range []string{vmstateSnapshotName, memorySnapshotName} {
 		inJail, statErr := os.Stat(filepath.Join(jailRoot, jailerChrootSnapshotsDir, name))
 		require.NoError(t, statErr)
@@ -1465,6 +1493,69 @@ func TestEnsureSandboxJailerMode(t *testing.T) {
 	require.Len(t, loads[0].NetworkOverrides, 1)
 	require.Equal(t, "eth0", loads[0].NetworkOverrides[0].IfaceID)
 	require.Equal(t, slot.GuestTap, loads[0].NetworkOverrides[0].HostDevName)
+
+	// The launch-time capability assertion ran on the surviving VMM PID.
+	require.Equal(t, []int{fixture.launcher.processes[0].pid}, fixture.assertCalls)
+}
+
+// TestEnsureSandboxCapabilityAssertionFailure fails the launch-time
+// assertion (FSEP-0003): the create fails with a structured error, the VMM
+// is killed, the slot is released, and the partial jail is removed — the
+// sandbox must never become ready on a VMM that kept a dropped capability.
+func TestEnsureSandboxCapabilityAssertionFailure(t *testing.T) {
+	fixture := newDriverFixture(t)
+	fixture.enableJailer(t)
+	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
+	require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
+	fixture.driver.assertCapabilities = func(int) error { return errors.New("CapEff still holds net_admin") }
+
+	_, err := fixture.driver.EnsureSandbox(context.Background(), ensureInput(&fixture.sandboxSpec))
+	require.ErrorIs(t, err, ErrRuntimeNotInitialized)
+	require.Contains(t, err.Error(), "verify VMM capability drop")
+	require.NotEmpty(t, fixture.launcher.processes)
+	require.True(t, fixture.launcher.processes[0].killed, "the half-launched VMM must be killed")
+	require.Equal(t, 0, fixture.manager.Snapshot().Bound)
+	_, statErr := os.Stat(jailerRoot(filepath.Join(fixture.stateRoot, jailerChrootBaseDir), "firecracker", "sandbox-1"))
+	require.True(t, os.IsNotExist(statErr))
+}
+
+// TestEnsureSandboxHelperResolutionFailure fails the helper resolution: the
+// create fails before any network slot or jail is touched — a missing
+// helper must never downgrade to a full-capability launch.
+func TestEnsureSandboxHelperResolutionFailure(t *testing.T) {
+	fixture := newDriverFixture(t)
+	fixture.enableJailer(t)
+	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
+	require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
+	fixture.driver.resolveVMMExec = func() (string, error) {
+		return "", errors.New("capability-drop helper firecracker is not installed")
+	}
+
+	_, err := fixture.driver.EnsureSandbox(context.Background(), ensureInput(&fixture.sandboxSpec))
+	require.ErrorContains(t, err, "resolve VMM capability-drop helper")
+	require.Empty(t, fixture.launcher.started)
+	require.Equal(t, 0, fixture.manager.Snapshot().Bound)
+}
+
+// TestEnsureSandboxDirectModeCapabilityHelper covers the direct-launch mode
+// with the helper inserted: the runner starts the helper, which names the
+// real binary with --exec, and the launch-time assertion still runs.
+func TestEnsureSandboxDirectModeCapabilityHelper(t *testing.T) {
+	fixture := newDriverFixture(t)
+	fixture.helperPath = filepath.Join(fixture.stateRoot, "vmm-capdrop", "firecracker")
+	require.NoError(t, os.MkdirAll(filepath.Dir(fixture.helperPath), 0o750))
+	require.NoError(t, os.WriteFile(fixture.helperPath, []byte("#!/bin/sh\n"), 0o750))
+	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
+	require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
+
+	_, err := fixture.driver.EnsureSandbox(context.Background(), ensureInput(&fixture.sandboxSpec))
+	require.NoError(t, err)
+	require.Len(t, fixture.launcher.started, 1)
+	started := fixture.launcher.started[0]
+	require.Equal(t, fixture.helperPath, started[0])
+	require.Equal(t, fixture.helperPath, started[argvIndex(started, "--exec")+1])
+	require.Equal(t, fixture.driver.config.BinaryPath, started[argvIndex(started, "--exec")+2])
+	require.Equal(t, []int{fixture.launcher.processes[0].pid}, fixture.assertCalls)
 }
 
 // TestEnsureSandboxJailerKVMAlignFailure fails the jailed KVM device
@@ -1473,7 +1564,7 @@ func TestEnsureSandboxJailerMode(t *testing.T) {
 // the partial jail is removed.
 func TestEnsureSandboxJailerKVMAlignFailure(t *testing.T) {
 	fixture := newDriverFixture(t)
-	fixture.enableJailer()
+	fixture.enableJailer(t)
 	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
 	require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
 	fixture.driver.alignJailKVM = func(string, string) error { return errors.New("mknod broke") }
@@ -1490,7 +1581,7 @@ func TestEnsureSandboxJailerKVMAlignFailure(t *testing.T) {
 
 func TestDeleteSandboxRemovesJailRoot(t *testing.T) {
 	fixture := newDriverFixture(t)
-	fixture.enableJailer()
+	fixture.enableJailer(t)
 	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
 	require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
 
@@ -1507,7 +1598,7 @@ func TestDeleteSandboxRemovesJailRoot(t *testing.T) {
 
 func TestRecoverRuntimeResourcesRemovesJailRoot(t *testing.T) {
 	fixture := newDriverFixture(t)
-	fixture.enableJailer()
+	fixture.enableJailer(t)
 	fixture.driver.probeProcess = func(int) error { return os.ErrNotExist }
 	require.NoError(t, fixture.driver.Initialize(context.Background(), ""))
 

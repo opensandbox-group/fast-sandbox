@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"k8s.io/klog/v2"
+
+	"fast-sandbox/internal/vmmexec"
 )
 
 // firecrackerIDLimit matches the NodeJanitor residual-process matcher
@@ -42,6 +44,16 @@ const (
 // api.sock, rootfs.img and snapshots/ prepared by the driver.
 func jailerRoot(chrootBase, execBase, id string) string {
 	return filepath.Join(chrootBase, execBase, id, jailerChrootRootDir)
+}
+
+// jailedVMMBinaryPath returns the jail-root path of the real Firecracker
+// binary (host view of the in-jail /vmm/firecracker): the capability-drop
+// helper execs it after the drop. The jailer-made /firecracker is the
+// helper copy; the real binary must never occupy that path, because the
+// jailer copies the exec file with a truncating create (a writable mount
+// there would let the copy corrupt the managed host binary).
+func jailedVMMBinaryPath(jailRoot string) string {
+	return filepath.Join(jailRoot, vmmexec.VMMJailDir, vmmexec.VMMJailName)
 }
 
 // truncatedSandboxID returns the NodeJanitor-compatible VM id.
@@ -153,8 +165,18 @@ func (p *execProcess) Wait() error {
 
 // launchConfig is the immutable per-Sandbox Firecracker launch plan.
 type launchConfig struct {
-	// BinaryPath is the host path of the firecracker binary.
+	// BinaryPath is the host path of the real firecracker binary: the
+	// capability-drop exec target (direct mode names it with --exec, and
+	// jailer mode places it in the jail at /vmm/firecracker).
 	BinaryPath string
+	// ExecFile is the capability-drop exec helper (FSEP-0003): what the
+	// jailer execs inside the jail (--exec-file) and what a direct launch
+	// starts with the --exec target. Installed with the "firecracker"
+	// basename so the jailer-derived jail root stays unchanged. Empty
+	// preserves the legacy direct launch of BinaryPath; the driver sets it
+	// unconditionally and the launch-time capability assertion fails any
+	// create that skipped the drop.
+	ExecFile string
 	// JailerPath activates the jailer; empty keeps the direct launch.
 	JailerPath string
 	// ChrootBase is the jailer chroot base (a subdirectory of the StateRoot
@@ -185,16 +207,22 @@ type launchConfig struct {
 // consumes --id/--netns/--uid/--gid/--exec-file/--chroot-base-dir and
 // forwards the remaining arguments (after --) to firecracker; --id must not
 // be repeated after the separator (the jailer passes it on automatically).
-// The binary name must stay "firecracker" and the --id value must match the
-// NodeJanitor matcher.
+// The final process name must stay "firecracker" and the --id value must
+// match the NodeJanitor matcher: in jailer mode the exec file is the
+// capability-drop helper (installed with the firecracker basename, and the
+// helper execs /vmm/firecracker, preserving the basename in argv[0]).
 func (c launchConfig) buildArgv() []string {
 	if c.JailerPath != "" {
+		execFile := c.BinaryPath
+		if c.ExecFile != "" {
+			execFile = c.ExecFile
+		}
 		return []string{
 			"--id", c.truncatedID(),
 			"--netns", c.NetNSPath,
 			"--uid", "0",
 			"--gid", "0",
-			"--exec-file", c.BinaryPath,
+			"--exec-file", execFile,
 			"--chroot-base-dir", c.ChrootBase,
 			"--",
 			"--api-sock", jailerChrootAPISock,
@@ -223,6 +251,13 @@ func launch(ctx context.Context, runner ProcessRunner, config launchConfig) (Pro
 		if strings.TrimSpace(config.BinaryPath) == "" || strings.TrimSpace(config.ChrootBase) == "" || strings.TrimSpace(config.NetNSPath) == "" {
 			return nil, fmt.Errorf("%w: jailer mode requires the firecracker binary, chroot base, and slot netns", ErrInvalidConfig)
 		}
+		// The jailer derives the jail root from the exec-file basename; with
+		// the helper as exec file the basename must match the firecracker
+		// layout every Fastlet path consumer computes
+		// (<chroot-base>/firecracker/<id>/root).
+		if config.ExecFile != "" && filepath.Base(config.ExecFile) != vmmexec.HelperBasename {
+			return nil, fmt.Errorf("%w: the capability-drop helper must be installed with the %q basename (the jail root is derived from the exec-file basename)", ErrInvalidConfig, vmmexec.HelperBasename)
+		}
 		if config.CgroupPath != "" {
 			cgroupRunner, ok := runner.(CgroupRunner)
 			if !ok {
@@ -239,46 +274,70 @@ func launch(ctx context.Context, runner ProcessRunner, config launchConfig) (Pro
 		return nil, fmt.Errorf("%w: firecracker API address must be an absolute path", ErrInvalidConfig)
 	}
 	// Direct launches must also enter the allocated netns; otherwise VMs contend for identically named TAP devices on the host.
-	name, args := config.BinaryPath, config.buildArgv()
+	// With the capability-drop helper resolved, the helper is what runs: it
+	// drops the fixed capability set and execs the real binary named by
+	// --exec, preserving argv and process identity.
+	target, args := config.BinaryPath, config.buildArgv()
+	if config.ExecFile != "" {
+		target = config.ExecFile
+		args = append([]string{vmmexec.ExecFlag, config.BinaryPath}, args...)
+	}
+	name, launchArgs := target, args
 	if config.NetNSPath != "" {
 		name = "nsenter"
-		args = append([]string{"--net=" + config.NetNSPath, "--", config.BinaryPath}, args...)
+		launchArgs = append([]string{"--net=" + config.NetNSPath, "--", target}, args...)
 	}
 	if config.CgroupPath != "" {
 		cgroupRunner, ok := runner.(CgroupRunner)
 		if !ok {
 			return nil, fmt.Errorf("%w: process runner cannot launch into a cgroup", ErrInvalidConfig)
 		}
-		return cgroupRunner.StartInCgroup(ctx, config.CgroupPath, config.WorkingDir, name, args, config.LogPath)
+		return cgroupRunner.StartInCgroup(ctx, config.CgroupPath, config.WorkingDir, name, launchArgs, config.LogPath)
 	}
 	if runnerInDir, ok := runner.(WorkingDirRunner); ok && config.WorkingDir != "" {
-		return runnerInDir.StartInDir(ctx, config.WorkingDir, name, args, config.LogPath)
+		return runnerInDir.StartInDir(ctx, config.WorkingDir, name, launchArgs, config.LogPath)
 	}
-	return runner.Start(ctx, name, args, config.LogPath)
+	return runner.Start(ctx, name, launchArgs, config.LogPath)
 }
 
 // prepareJailRoot assembles the jail root of a Sandbox before launch: the
 // instance rootfs reflink copy at the chroot root (so the relative
-// "rootfs.img" path baked in the vmstate resolves inside the chroot) and
-// hard links of the golden snapshot files under snapshots/ (restore
-// addresses them with the chroot-relative /snapshots/ paths; memory.snap is
-// COW-read, so sharing the cached file is safe). Hard links fall back to
-// copies across filesystems. A stale jail root from a crashed run is removed
-// first.
-func prepareJailRoot(jailRoot, cachedRootfs, vmstatePath, memoryPath string) error {
+// "rootfs.img" path baked in the vmstate resolves inside the chroot), the
+// real Firecracker binary reflink-or-copied at /vmm/firecracker (the
+// capability-drop helper execs it; the jailer-made /firecracker is the
+// helper copy, so the real binary must live elsewhere — see
+// jailedVMMBinaryPath), and hard links of the golden snapshot files under
+// snapshots/ (restore addresses them with the chroot-relative /snapshots/
+// paths; memory.snap is COW-read, so sharing the cached file is safe). Hard
+// links fall back to copies across filesystems. A stale jail root from a
+// crashed run is removed first.
+func prepareJailRoot(jailRoot, cachedRootfs, vmstatePath, memoryPath, vmmBinary string) error {
 	if jailRoot == "" || filepath.Base(jailRoot) != jailerChrootRootDir {
 		return fmt.Errorf("%w: invalid jail root %q", ErrInvalidConfig, jailRoot)
 	}
 	// A stale jail root may hold a surviving spill bind: unmount it first,
 	// or the RemoveAll below would descend into the SHARED spill root and
-	// delete other sandboxes' dumps.
+	// delete other sandboxes' dumps. The same applies to the real VMM
+	// binary bind of the RootfsOnly/OCI paths.
 	_ = unmountPath(filepath.Join(jailRoot, jailerSpillDirName))
+	_ = unmountPath(jailedVMMBinaryPath(jailRoot))
 	_ = os.RemoveAll(filepath.Dir(jailRoot))
 	if err := os.MkdirAll(filepath.Join(jailRoot, jailerChrootSnapshotsDir), 0o750); err != nil {
 		return fmt.Errorf("create jail root: %w", err)
 	}
+	if err := os.MkdirAll(filepath.Join(jailRoot, vmmexec.VMMJailDir), 0o750); err != nil {
+		return fmt.Errorf("create jail VMM directory: %w", err)
+	}
 	if err := copyReflinkOrCopy(cachedRootfs, filepath.Join(jailRoot, rootfsImageName)); err != nil {
 		return fmt.Errorf("copy instance rootfs into the jail root: %w", err)
+	}
+	if err := copyReflinkOrCopy(vmmBinary, jailedVMMBinaryPath(jailRoot)); err != nil {
+		return fmt.Errorf("place the VMM binary in the jail root: %w", err)
+	}
+	// The plain-copy fallback of copyReflinkOrCopy would leave the binary
+	// non-executable (0640); the helper execve needs the execute bit.
+	if err := os.Chmod(jailedVMMBinaryPath(jailRoot), 0o750); err != nil {
+		return fmt.Errorf("make the jail VMM binary executable: %w", err)
 	}
 	for source, name := range map[string]string{
 		vmstatePath: vmstateSnapshotName,
@@ -289,6 +348,20 @@ func prepareJailRoot(jailRoot, cachedRootfs, vmstatePath, memoryPath string) err
 		}
 	}
 	return nil
+}
+
+// bindFileReadOnly bind-mounts a host file over an empty target file
+// read-only. The real VMM binary enters the jail this way: read-only so the
+// jailed VMM cannot rewrite the managed host binary through the mount.
+func bindFileReadOnly(source, target string) error {
+	file, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0o640)
+	if err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return bindMountReadOnly(source, target)
 }
 
 // linkOrCopy hard-links source to target and falls back to a full copy when

@@ -20,6 +20,7 @@ import (
 	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	"fast-sandbox/internal/registryconfig"
+	"fast-sandbox/internal/vmmexec"
 )
 
 const ociEnabled = "true"
@@ -297,7 +298,7 @@ func (d *Driver) releaseOCI(ctx context.Context, id string) error {
 	}
 	return nil
 }
-func (d *Driver) prepareOCIInstance(id, directory, rootfs, vmstate, memory string) (string, string, string, error) {
+func (d *Driver) prepareOCIInstance(id, directory, rootfs, vmstate, memory, vmmBinary string) (string, string, string, error) {
 	if d.config.JailerPath == "" {
 		if err := os.Symlink(rootfs, filepath.Join(directory, rootfsDeviceName)); err != nil {
 			return "", "", "", err
@@ -318,6 +319,16 @@ func (d *Driver) prepareOCIInstance(id, directory, rootfs, vmstate, memory strin
 		if err = bindMount(entry.source, target); err != nil {
 			return "", "", "", err
 		}
+	}
+	// The real VMM binary joins the jail read-only at the fixed convention
+	// /vmm/firecracker: the capability-drop helper execs it, and the
+	// jailer's truncating exec-file copy must never find a writable mount
+	// at its own copy destination.
+	if err := os.MkdirAll(filepath.Join(root, vmmexec.VMMJailDir), 0750); err != nil {
+		return "", "", "", err
+	}
+	if err := bindFileReadOnly(vmmBinary, jailedVMMBinaryPath(root)); err != nil {
+		return "", "", "", fmt.Errorf("bind the VMM binary into the jail root: %w", err)
 	}
 	d.prepareSnapshotSpill(root)
 	return filepath.Join(root, rootfsDeviceName), root, filepath.Join(root, "api.sock"), nil

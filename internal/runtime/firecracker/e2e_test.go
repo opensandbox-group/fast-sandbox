@@ -31,6 +31,7 @@ import (
 	"fast-sandbox/internal/guestnetwork"
 	"fast-sandbox/internal/observability"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	"fast-sandbox/internal/vmmexec"
 )
 
 // TestFirecrackerDriverE2E boots a real Firecracker microVM through the
@@ -687,7 +688,10 @@ type e2eEnvironment struct {
 	podUID       string
 	infraEnabled bool
 	jailer       bool
-	created      []string
+	// helper is the built capability-drop exec helper wired into the
+	// driver (assertBooted compares the jail copy against it).
+	helper  string
+	created []string
 }
 
 // purgeStaleFSBResources removes leftover per-run netns and bridge devices
@@ -726,6 +730,68 @@ func purgeStaleFSBResources(t *testing.T) {
 		}
 		_, _ = exec.Command("ip", "link", "del", device).CombinedOutput()
 		t.Logf("purged stale bridge device %s", device)
+	}
+}
+
+// e2eVMMExecHelper builds the capability-drop exec helper from this module
+// (once per test process) into a directory layout that satisfies the
+// installation contract, and returns the path the driver must resolve. The
+// runtime E2E runs the driver from a source tree instead of the Fastlet
+// image, so the helper cannot come from the image's default path.
+func e2eVMMExecHelper(t *testing.T) string {
+	t.Helper()
+	helper, err := buildVMMExecHelper()
+	require.NoError(t, err)
+	return helper
+}
+
+var (
+	vmmExecHelperOnce     sync.Once
+	vmmExecHelperPath     string
+	vmmExecHelperBuildErr error
+)
+
+func buildVMMExecHelper() (string, error) {
+	vmmExecHelperOnce.Do(func() {
+		root, err := findModuleRoot()
+		if err != nil {
+			vmmExecHelperBuildErr = err
+			return
+		}
+		dir, err := os.MkdirTemp("", "fsb-vmm-capdrop")
+		if err != nil {
+			vmmExecHelperBuildErr = err
+			return
+		}
+		helper := filepath.Join(dir, vmmexec.HelperBasename)
+		command := exec.Command("go", "build", "-o", helper, "./cmd/vmm-capdrop")
+		command.Dir = root
+		command.Env = append(os.Environ(), "CGO_ENABLED=0")
+		if output, err := command.CombinedOutput(); err != nil {
+			vmmExecHelperBuildErr = fmt.Errorf("build the capability-drop helper: %w: %s", err, output)
+			return
+		}
+		vmmExecHelperPath = helper
+	})
+	return vmmExecHelperPath, vmmExecHelperBuildErr
+}
+
+// findModuleRoot walks up from the working directory to the go.mod of this
+// module.
+func findModuleRoot() (string, error) {
+	directory, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(directory, "go.mod")); err == nil {
+			return directory, nil
+		}
+		parent := filepath.Dir(directory)
+		if parent == directory {
+			return "", fmt.Errorf("go.mod not found above %s", directory)
+		}
+		directory = parent
 	}
 }
 
@@ -824,6 +890,11 @@ func newE2EEnvironment(t *testing.T, capacity int, infraEnabled bool) *e2eEnviro
 	driver, err := New(profile)
 	require.NoError(t, err)
 	driver.SetNetworkManager(manager)
+	// FSEP-0003: the driver always launches the VMM through the
+	// capability-drop helper; the source-tree E2E builds it from this
+	// module and wires the resolution directly.
+	helper := e2eVMMExecHelper(t)
+	driver.resolveVMMExec = func() (string, error) { return helper, nil }
 	// When the chain E2E runs a real runtime-agent (FC_AGENT_SOCKET), wire
 	// the driver to it: DeleteSandbox then releases/unpins through the UDS
 	// API instead of staying in local mode.
@@ -835,7 +906,7 @@ func newE2EEnvironment(t *testing.T, capacity int, infraEnabled bool) *e2eEnviro
 	env := &e2eEnvironment{
 		t: t, manager: manager, driver: driver, imageRef: imageRef,
 		stateRoot: stateRoot, podUID: podUID, infraEnabled: infraEnabled,
-		jailer: jailer != "",
+		jailer: jailer != "", helper: helper,
 	}
 	if infraEnabled {
 		// Real Infra plan: EnsureSandbox performs a genuine GuestCopy delivery
@@ -925,6 +996,35 @@ func (env *e2eEnvironment) assertBooted(metadata *SandboxMetadata, spec *fastlet
 	cmdline := readProcCmdline(t, metadata.PID)
 	require.Equal(t, "firecracker", filepath.Base(cmdline[0]))
 	require.Equal(t, spec.Identity.SandboxUID, cmdline[indexOf(cmdline, "--id")+1])
+	// FSEP-0003 acceptance: the surviving VMM (the same PID through the
+	// jailer → helper → firecracker exec chain) shows the fixed capability
+	// set absent from CapEff/CapBnd with NoNewPrivs set — the driver's
+	// launch-time assertion already enforced this; the E2E re-checks it as
+	// an explicit acceptance criterion.
+	status := readProcStatus(t, metadata.PID)
+	for _, field := range []string{"CapEff", "CapBnd"} {
+		mask, err := strconv.ParseUint(status[field], 16, 64)
+		require.NoErrorf(t, err, "parse %s", field)
+		require.Zerof(t, mask&vmmexec.DropMask(), "%s must not hold the dropped capability bits", field)
+	}
+	require.Equal(t, "1", status["NoNewPrivs"])
+	// Jailed launches: the jail root holds the helper copy at /firecracker
+	// (the jailer's truncating exec-file copy destination) and the real
+	// managed binary at /vmm/firecracker.
+	if env.jailer {
+		jail := filepath.Join(env.stateRoot, jailerChrootBaseDir, "firecracker",
+			truncatedSandboxID(spec.Identity.SandboxUID), jailerChrootRootDir)
+		helperInJail, err := os.ReadFile(filepath.Join(jail, "firecracker"))
+		require.NoError(t, err)
+		helperOnHost, err := os.ReadFile(env.helper)
+		require.NoError(t, err)
+		require.Equal(t, string(helperOnHost), string(helperInJail), "/firecracker must be the capability-drop helper copy")
+		vmmInJail, err := os.ReadFile(jailedVMMBinaryPath(jail))
+		require.NoError(t, err)
+		vmmOnHost, err := os.ReadFile(env.driver.config.BinaryPath)
+		require.NoError(t, err)
+		require.Equal(t, string(vmmOnHost), string(vmmInJail), "/vmm/firecracker must be content-identical to the managed binary")
+	}
 }
 
 // assertInfra verifies the delivered Infra plan: services for route
@@ -1199,6 +1299,24 @@ func readProcCmdline(t *testing.T, pid int) []string {
 	payload, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
 	require.NoError(t, err)
 	return strings.Split(strings.TrimRight(string(payload), "\x00"), "\x00")
+}
+
+// readProcStatus parses the /proc/<pid>/status document into its
+// "field: value" entries, for the FSEP-0003 acceptance re-check on the
+// surviving VMM process.
+func readProcStatus(t *testing.T, pid int) map[string]string {
+	t.Helper()
+	payload, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+	require.NoError(t, err)
+	status := map[string]string{}
+	for _, line := range strings.Split(string(payload), "\n") {
+		name, value, found := strings.Cut(line, ":")
+		if !found {
+			continue
+		}
+		status[strings.TrimSpace(name)] = strings.TrimSpace(value)
+	}
+	return status
 }
 
 func indexOf(values []string, target string) int {
