@@ -4,8 +4,9 @@
 # every readiness pass, so edits here land without a pod restart.
 #
 # Reload semantics per section:
-#   socket/stateRoot/registryConfig/hostnameFile/p2p — startup only (they
-#     wire long-lived resources; changing them requires a pod restart).
+#   socket/stateRoot/registryConfig/hostnameFile/p2p/transfer — startup
+#     only (they wire long-lived resources; changing them requires a pod
+#     restart).
 #   nodeReadiness — hot: thresholds, interval and the asset source apply
 #     on the next recheck pass. A pinned asset install is never silently
 #     replaced: changing fcVersion only re-downloads when the current
@@ -62,6 +63,16 @@ data:
       #   # Prefix route in front of presigned upstream URLs; empty =
       #   # "/dart/" (DART's route).
       #   routePrefix: /peer-blocks/
+    # Artifact transfer mode (startup-only). legacy (default) publishes
+    # whole files and keeps the original cache behaviour; chunked publishes
+    # zero-elided, content-addressed chunks and turns on the cache and
+    # connection optimizations. Pulls read both layouts in either mode;
+    # roll this agent image to every node before switching any to chunked.
+    # transfer:
+    #   format: chunked
+    #   compression: none     # none | zstd (chunked only)
+    #   concurrency: 8        # parallel chunk transfers per publish/pull
+    #   chunkSizeMiB: 4
     nodeReadiness:
       # The host-check / firecracker-asset-install / node-label loop.
       # Requires FAST_SANDBOX_NODE_NAME (injected by the DaemonSet).

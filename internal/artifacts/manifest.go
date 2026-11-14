@@ -79,9 +79,15 @@ type CheckpointOwner struct {
 	Namespace  string `json:"namespace"`
 }
 
+// ManifestFile describes one artifact. SHA256 is the whole-file digest; a
+// chunked native artifact published by a chunk-list-aware runtime agent may
+// instead carry only ChunkList (chunklist.go), which binds the same content
+// through its chunk digests. Readers that predate ChunkList reject an entry
+// without SHA256, so such sets fail closed on old agents.
 type ManifestFile struct {
-	SHA256    string `json:"sha256"`
-	SizeBytes int64  `json:"sizeBytes"`
+	SHA256    string           `json:"sha256,omitempty"`
+	SizeBytes int64            `json:"sizeBytes"`
+	ChunkList *ChunkListDigest `json:"chunkList,omitempty"`
 }
 
 type VMGuestControl struct {
