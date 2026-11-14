@@ -71,22 +71,37 @@ func (c *Client) PublishImage(ctx context.Context, kind, key, dir string) (Publi
 	default:
 		return PublishResult{}, fmt.Errorf("unknown publish kind %q", kind)
 	}
-	manifestBytes, err := os.ReadFile(filepath.Join(dir, publishManifestName))
+	started := time.Now()
+	manifestBytes, chunkIndex, err := c.prepareManifest(ctx, kind, key, dir, started)
 	if err != nil {
-		return PublishResult{}, fmt.Errorf("read staged manifest: %w", err)
+		return PublishResult{}, err
 	}
 	artifactDigest := artifacts.SHA256Of(manifestBytes)
 	base := artifacts.Digest16(manifestBytes)
-	started := time.Now()
-	klog.InfoS("runtime-agent publish started", "kind", kind, "key", key, "digest", artifactDigest, "stagingDir", dir)
+	klog.InfoS("runtime-agent publish started", "kind", kind, "key", key, "digest", artifactDigest, "format", c.transfer.normalized().Format, "stagingDir", dir)
+	if c.transfer.Chunked() {
+		// The staged files are exactly the bytes the manifest describes; a
+		// driver that commits them into its cache (same-node restore) then
+		// passes the agent's cache check without a re-hash.
+		defer markStagedVerified(dir, manifestBytes)
+	}
 
 	// Artifacts and SHA256SUMS first: the namespace stays incomplete (and
 	// unaddressable) until the manifest lands. The optional state bundle
 	// files (vault, recorded policy) join the artifact uploads when staged —
 	// any stat failure other than absence fails the publish, since the
 	// staged manifest and SHA256SUMS already reference the files and a
-	// stranded member would break the cross-node resume.
-	entries := append([]string(nil), publishArtifacts...)
+	// stranded member would break the cross-node resume. A chunked set
+	// already uploaded its native artifacts as chunks.
+	var entries []string
+	if c.transfer.Chunked() {
+		if err := c.s3.putBytes(ctx, base+"/"+artifacts.ChunkIndexName, chunkIndex); err != nil {
+			klog.ErrorS(err, "runtime-agent publish failed", "kind", kind, "key", key, "file", artifacts.ChunkIndexName, "elapsed", time.Since(started).String())
+			return PublishResult{}, fmt.Errorf("publish chunk index: %w", err)
+		}
+	} else {
+		entries = append(entries, publishArtifacts...)
+	}
 	for _, bundleName := range []string{publishVaultName, publishPolicyName} {
 		if _, err := os.Stat(filepath.Join(dir, bundleName)); err == nil {
 			entries = append(entries, bundleName)
@@ -132,6 +147,41 @@ func (c *Client) PublishImage(ctx context.Context, kind, key, dir string) (Publi
 	return PublishResult{ManifestRef: manifestURI, ArtifactDigest: artifactDigest}, nil
 }
 
+// prepareManifest returns the manifest bytes the set publishes under. A
+// legacy set publishes the staged manifest as is — only a chunk binding
+// inherited from the manifest of the image the sandbox booted from is
+// dropped, since the set carries whole files. A chunked set first uploads
+// its content-addressed chunks, then binds their index (returned for the
+// upload into the set's namespace) into the manifest: the manifest digest,
+// and with it the namespace, is only known after.
+func (c *Client) prepareManifest(ctx context.Context, kind, key, dir string, started time.Time) ([]byte, []byte, error) {
+	if !c.transfer.Chunked() {
+		manifestBytes, err := bindChunkIndex(dir, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		return manifestBytes, nil, nil
+	}
+	index, stats, err := c.publishChunks(ctx, dir, publishArtifacts)
+	if err != nil {
+		klog.ErrorS(err, "runtime-agent publish failed", "kind", kind, "key", key, "stage", "chunks", "elapsed", time.Since(started).String())
+		return nil, nil, fmt.Errorf("publish chunks: %w", err)
+	}
+	logPublishStats(kind, key, stats)
+	indexBytes, err := artifacts.MarshalChunkIndex(index)
+	if err != nil {
+		return nil, nil, err
+	}
+	manifestBytes, err := bindChunkIndex(dir, &artifacts.ChunkIndexRef{
+		Version: artifacts.ChunkIndexVersion, Ref: artifacts.ChunkIndexName,
+		SHA256: sha256Hex(indexBytes), SizeBytes: int64(len(indexBytes)),
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return manifestBytes, indexBytes, nil
+}
+
 // putFile streams one staged file into the store under a store-relative
 // key. The opener reopens the file per attempt (net/http closes request
 // bodies), so a transient failure retries against a fresh reader.
@@ -144,6 +194,20 @@ func (c *Client) putFile(ctx context.Context, dir, name, storeKey string) error 
 	return c.s3.put(ctx, storeKey, info.Size(), func() (io.ReadCloser, error) {
 		return os.Open(path)
 	})
+}
+
+// markStagedVerified records the manifest digests of the staged artifacts as
+// verified markers. Best-effort: a failure only costs a re-hash later.
+func markStagedVerified(dir string, manifestBytes []byte) {
+	document, err := parseManifest(manifestBytes)
+	if err != nil {
+		return
+	}
+	for _, name := range publishArtifacts {
+		if entry, ok := document.Files[name]; ok && validSHA256(entry.SHA256) {
+			markVerified(filepath.Join(dir, name), entry.SHA256)
+		}
+	}
 }
 
 // nowFunc is the publish clock; factored for tests.

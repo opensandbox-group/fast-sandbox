@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 	agentprotocol "fast-sandbox/internal/runtime/firecracker/agent/protocol"
@@ -49,6 +51,11 @@ type Service struct {
 	// hostReady reports the node-readiness check outcome (ready flag +
 	// summary); nil when the hostready manager is not running.
 	hostReady func() (bool, string)
+	// transferFormat is the agent's artifact transfer mode, reported to
+	// fastlets in Health and PublishImage; "" (tests) means legacy.
+	transferFormat string
+	// pulls single-flights cache ensures per reference (chunked mode).
+	pulls singleflight.Group
 }
 
 // NewService assembles the stage-1 backend. When the pull client also
@@ -70,6 +77,26 @@ type ServiceOption func(*Service)
 // WithServiceClock overrides the clock.
 func WithServiceClock(now func() time.Time) ServiceOption {
 	return func(service *Service) { service.now = now }
+}
+
+// WithTransferFormat sets the artifact transfer mode ("legacy" or
+// "chunked"). The chunked mode trusts verified-cache markers and collapses
+// concurrent ensures of one cache entry; both modes report it to fastlets.
+func WithTransferFormat(format string) ServiceOption {
+	return func(service *Service) { service.transferFormat = format }
+}
+
+// chunked reports whether the chunked transfer mode is on.
+func (s *Service) chunked() bool {
+	return s.transferFormat == agentpull.TransferFormatChunked
+}
+
+// imageReady is the cache check of the configured transfer mode.
+func (s *Service) imageReady(reference string) (bool, error) {
+	if s.chunked() {
+		return agentpull.ImageReadyVerified(s.stateRoot, reference)
+	}
+	return agentpull.ImageReady(s.stateRoot, reference)
 }
 
 // WithP2PProbe wires the peer-distribution state into Health. Informational
@@ -183,6 +210,8 @@ func (s *Service) Health(_ context.Context) (agentprotocol.HealthResponse, error
 		LeaseCount: snapshot.LeaseCount,
 		PinCount:   snapshot.PinCount,
 		ImageCount: snapshot.ImageCount,
+
+		TransferFormat: s.transferFormat,
 	}
 	if s.p2pUp != nil {
 		response.P2PUp = s.p2pUp()
@@ -215,7 +244,7 @@ func (s *Service) PublishImage(ctx context.Context, request agentprotocol.Publis
 		}
 		return agentprotocol.PublishImageResponse{}, err
 	}
-	return agentprotocol.PublishImageResponse{ManifestRef: result.ManifestRef, ArtifactDigest: result.ArtifactDigest}, nil
+	return agentprotocol.PublishImageResponse{ManifestRef: result.ManifestRef, ArtifactDigest: result.ArtifactDigest, TransferFormat: s.transferFormat}, nil
 }
 
 // manifestDigestFor re-reads the committed manifest digest of an image.
@@ -230,7 +259,23 @@ func (s *Service) manifestDigestFor(image string) string {
 // ensureImage pulls the image unless the cache already holds a committed
 // pull. A missing published index maps to ErrImageNotReady for the driver.
 func (s *Service) ensureImage(ctx context.Context, image string) error {
-	ready, err := agentpull.ImageReady(s.stateRoot, image)
+	return s.ensureOnce(image, func() error { return s.ensureImageLocked(ctx, image) })
+}
+
+// ensureOnce collapses concurrent ensures of one cache entry (a Pin racing
+// a Lease of the same image) into a single pull in the chunked transfer
+// mode; the cache directory is keyed by the reference, so images and
+// checkpoints share the key space. The legacy mode runs ensure directly.
+func (s *Service) ensureOnce(reference string, ensure func() error) error {
+	if !s.chunked() {
+		return ensure()
+	}
+	_, err, _ := s.pulls.Do(reference, func() (any, error) { return nil, ensure() })
+	return err
+}
+
+func (s *Service) ensureImageLocked(ctx context.Context, image string) error {
+	ready, err := s.imageReady(image)
 	if err != nil {
 		return err
 	}
@@ -240,7 +285,7 @@ func (s *Service) ensureImage(ctx context.Context, image string) error {
 	if err := s.pull.PullImage(ctx, s.stateRoot, image); err != nil {
 		return err
 	}
-	ready, err = agentpull.ImageReady(s.stateRoot, image)
+	ready, err = s.imageReady(image)
 	if err != nil {
 		return err
 	}
@@ -254,7 +299,13 @@ func (s *Service) ensureImage(ctx context.Context, image string) error {
 // ref + digest, e.g. the canonical checkpoint reference) unless the cache
 // already holds the complete committed set.
 func (s *Service) ensureCheckpoint(ctx context.Context, reference, manifestRef, artifactDigest string) error {
-	ready, err := agentpull.ImageReady(s.stateRoot, reference)
+	return s.ensureOnce(reference, func() error {
+		return s.ensureCheckpointLocked(ctx, reference, manifestRef, artifactDigest)
+	})
+}
+
+func (s *Service) ensureCheckpointLocked(ctx context.Context, reference, manifestRef, artifactDigest string) error {
+	ready, err := s.imageReady(reference)
 	if err != nil {
 		return err
 	}
@@ -264,7 +315,7 @@ func (s *Service) ensureCheckpoint(ctx context.Context, reference, manifestRef, 
 	if err := s.pull.PullCheckpoint(ctx, s.stateRoot, reference, manifestRef, artifactDigest); err != nil {
 		return err
 	}
-	ready, err = agentpull.ImageReady(s.stateRoot, reference)
+	ready, err = s.imageReady(reference)
 	if err != nil {
 		return err
 	}
