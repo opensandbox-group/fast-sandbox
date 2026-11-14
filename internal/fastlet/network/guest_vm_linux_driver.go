@@ -87,7 +87,13 @@ func (d *GuestVMNetNSDriver) Prepare(ctx context.Context, slot *Slot) error {
 		return append([]string{ipObjectNetns, execSubcommand, slot.NetNSName, d.iptablesCommand}, arguments...)
 	}
 	commands := [][]string{
-		nsTap("tuntap", "add", netDevFlag, guestVMDefaultTapName, "mode", "tap"),
+		// The tap is created with owner 0: a uid-0 VMM attaches by ownership
+		// match, which keeps the capability drop (FSEP-0003) working on
+		// every kernel — ownerless tap attach requires CAP_NET_ADMIN since
+		// CVE-2026-99281 ("tun: Require CAP_NET_ADMIN to attach to an
+		// ownerless device", fixed 2026-11) and stays capability-free via
+		// the owner check on older kernels.
+		nsTap("tuntap", "add", netDevFlag, guestVMDefaultTapName, "mode", "tap", "user", "0"),
 		nsTap(linkSubcommand, ipSetSubcommand, guestVMDefaultTapName, "address", guestnetwork.GatewayMAC),
 		nsTap(linkSubcommand, ipSetSubcommand, guestVMDefaultTapName, "mtu", strconv.Itoa(slot.MTU)),
 		nsTap(linkSubcommand, ipSetSubcommand, guestVMDefaultTapName, "up"),
