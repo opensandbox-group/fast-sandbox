@@ -246,3 +246,71 @@ func TestCopyFileSparseHashedReportsReadError(t *testing.T) {
 	_, err := copyFileSparseHashed(dir, filepath.Join(t.TempDir(), "target"))
 	require.Error(t, err)
 }
+
+// chunkListSnapshotAgent is a chunked snapshot agent fake that also publishes
+// native artifacts under chunk-list digests.
+type chunkListSnapshotAgent struct {
+	chunkedSnapshotAgent
+}
+
+func (a chunkListSnapshotAgent) ChunkListDigest() bool { return true }
+
+func TestCreateSnapshotSkipsWholeFileHashesWithChunkListAgent(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	fixture.driver.agentClient = chunkListSnapshotAgent{chunkedSnapshotAgent{agent}}
+	require.True(t, fixture.driver.agentChunkListDigest())
+	withClonedRootfs(t)
+	calls := observeRootfsHash(t, false)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+
+	_, err := fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "snap-1", Kind: fastletapi.SnapshotKindTemplate, TemplateName: "app-v2",
+	})
+	require.NoError(t, err)
+	require.Empty(t, *calls, "no background rootfs hash when the agent identifies chunks")
+	files, ok := agent.manifest["files"].(map[string]any)
+	require.True(t, ok, "manifest files section")
+	for name, entry := range files {
+		fields := entry.(map[string]any)
+		require.NotContains(t, fields, "sha256", "%s is recorded by size only", name)
+		require.Positive(t, fields["sizeBytes"], "%s keeps its size", name)
+	}
+}
+
+func TestCollectSnapshotManifestEntriesChunkListHashesOnlyStateFiles(t *testing.T) {
+	staging := t.TempDir()
+	for name, payload := range map[string]string{
+		publishedRootfsName: "rootfs", memorySnapshotName: "memory", vmstateSnapshotName: "vmstate",
+		vaultBundleName: "vault", policyBundleName: "policy",
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(staging, name), []byte(payload), 0o640))
+	}
+	entries, err := collectSnapshotManifestEntries(staging, false, nil, true, true)
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{vaultBundleName, policyBundleName}, entries.HashedNames)
+	for name, file := range entries.Files {
+		require.Empty(t, file.SHA256, "%s", name)
+		require.Positive(t, file.SizeBytes, "%s", name)
+	}
+	for name, file := range entries.StateFiles {
+		require.NotEmpty(t, file.SHA256, "state file %s keeps its sha256", name)
+	}
+
+	entries, err = collectSnapshotManifestEntries(staging, false, nil, true, false)
+	require.NoError(t, err)
+	require.Len(t, entries.HashedNames, len(entries.Names), "without chunk-list digests every file is hashed")
+}
+
+func TestRelocateSpilledFileWithChunkListRecordsNoDigest(t *testing.T) {
+	dir := t.TempDir()
+	payload := append(make([]byte, 1<<20), bytes.Repeat([]byte{7}, 4096)...)
+	source := filepath.Join(dir, "memory.dump")
+	require.NoError(t, os.WriteFile(source, payload, 0o640))
+	target := filepath.Join(dir, "memory.snap")
+	plan := &dumpPlan{chunked: true, chunkList: true}
+	require.NoError(t, relocateSpilledFile(plan, source, target))
+	got, err := os.ReadFile(target)
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(payload, got))
+	require.Empty(t, plan.knownSums, "no whole-file digest is computed")
+}

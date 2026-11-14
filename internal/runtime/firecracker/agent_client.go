@@ -82,6 +82,12 @@ type transferFormatReporter interface {
 	TransferFormat() string
 }
 
+// chunkListDigestReporter is implemented by agent clients that remember
+// whether the agent identifies chunked artifacts by chunk-list digest.
+type chunkListDigestReporter interface {
+	ChunkListDigest() bool
+}
+
 // agentHTTPClient implements AgentClient over the UDS socket.
 type agentHTTPClient struct {
 	client    *http.Client
@@ -89,7 +95,14 @@ type agentHTTPClient struct {
 	podUID    string
 	// transferFormat is the transfer mode the agent last reported.
 	transferFormat atomic.Value
+	// chunkListDigest is the agent's last reported chunk-list capability.
+	chunkListDigest atomic.Bool
 }
+
+// ChunkListDigest reports whether the agent last said it identifies chunked
+// artifacts by chunk-list digest (false until the first response, or from
+// an older agent).
+func (c *agentHTTPClient) ChunkListDigest() bool { return c.chunkListDigest.Load() }
 
 // TransferFormat returns the transfer mode the agent last reported ("" until
 // the first Health or PublishImage response, or from an older agent).
@@ -153,6 +166,7 @@ func (c *agentHTTPClient) PublishImage(ctx context.Context, requestID, kind, key
 		return PublishOutcome{}, err
 	}
 	c.transferFormat.Store(response.TransferFormat)
+	c.chunkListDigest.Store(response.ChunkListDigest)
 	return PublishOutcome{ManifestRef: response.ManifestRef, ArtifactDigest: response.ArtifactDigest, TransferFormat: response.TransferFormat}, nil
 }
 
@@ -205,6 +219,7 @@ func (c *agentHTTPClient) Health(ctx context.Context) error {
 		return err
 	}
 	c.transferFormat.Store(response.TransferFormat)
+	c.chunkListDigest.Store(response.ChunkListDigest)
 	if !response.OK {
 		return fmt.Errorf("runtime-agent reports unhealthy: leases=%d images=%d", response.LeaseCount, response.ImageCount)
 	}

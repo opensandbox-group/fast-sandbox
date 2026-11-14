@@ -156,7 +156,7 @@ func (c *Client) PublishImage(ctx context.Context, kind, key, dir string) (Publi
 // and with it the namespace, is only known after.
 func (c *Client) prepareManifest(ctx context.Context, kind, key, dir string, started time.Time) ([]byte, []byte, error) {
 	if !c.transfer.Chunked() {
-		manifestBytes, err := bindChunkIndex(dir, nil)
+		manifestBytes, err := bindChunkIndex(dir, nil, nil)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -172,10 +172,20 @@ func (c *Client) prepareManifest(ctx context.Context, kind, key, dir string, sta
 	if err != nil {
 		return nil, nil, err
 	}
+	// Every chunked artifact also gets its chunk-list digest, from the index
+	// just built: the identity a staged entry without a whole-file sha256
+	// (a fastlet that skipped the pause-path hash) is published under.
+	lists := map[string]artifacts.ChunkListDigest{}
+	for name, file := range index.Files {
+		lists[name] = artifacts.ChunkListDigest{
+			Version: artifacts.ChunkListDigestVersion, ChunkSize: index.ChunkSize,
+			SHA256: artifacts.ChunkListSHA256(index.ChunkSize, file.SizeBytes, file.Chunks),
+		}
+	}
 	manifestBytes, err := bindChunkIndex(dir, &artifacts.ChunkIndexRef{
 		Version: artifacts.ChunkIndexVersion, Ref: artifacts.ChunkIndexName,
 		SHA256: sha256Hex(indexBytes), SizeBytes: int64(len(indexBytes)),
-	})
+	}, lists)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -203,10 +213,12 @@ func markStagedVerified(dir string, manifestBytes []byte) {
 	if err != nil {
 		return
 	}
-	for _, name := range publishArtifacts {
-		if entry, ok := document.Files[name]; ok && validSHA256(entry.SHA256) {
-			markVerified(filepath.Join(dir, name), entry.SHA256)
-		}
+	files, err := document.nativeFiles()
+	if err != nil {
+		return
+	}
+	for _, file := range files {
+		markVerified(filepath.Join(dir, file.publish), file.markerSum())
 	}
 }
 

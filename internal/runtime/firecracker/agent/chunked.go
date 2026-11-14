@@ -324,9 +324,11 @@ func (c *Client) storeChunkOnce(ctx context.Context, key, encoding string, block
 // bindChunkIndex rewrites the staged manifest so it binds the chunk index
 // (or, with ref == nil, drops a binding inherited from a source manifest:
 // assembleSnapshotManifest copies every field of the image the sandbox
-// booted from). The rewrite is atomic and deterministic; an unchanged
+// booted from). lists sets each named file entry's chunk-list digest (a
+// whole-file sha256 the entry already has is kept, so older readers still
+// accept the set). The rewrite is atomic and deterministic; an unchanged
 // document keeps its exact bytes. It returns the manifest bytes to publish.
-func bindChunkIndex(dir string, ref *artifacts.ChunkIndexRef) ([]byte, error) {
+func bindChunkIndex(dir string, ref *artifacts.ChunkIndexRef, lists map[string]artifacts.ChunkListDigest) ([]byte, error) {
 	manifestPath := filepath.Join(dir, publishManifestName)
 	original, err := os.ReadFile(manifestPath)
 	if err != nil {
@@ -344,12 +346,22 @@ func bindChunkIndex(dir string, ref *artifacts.ChunkIndexRef) ([]byte, error) {
 		return nil, fmt.Errorf("decode staged manifest: %w", err)
 	}
 	_, had := document[artifacts.ManifestChunksField]
-	if ref == nil && !had {
+	if ref == nil && !had && len(lists) == 0 {
 		return original, nil
 	}
 	delete(document, artifacts.ManifestChunksField)
 	if ref != nil {
 		document[artifacts.ManifestChunksField] = ref
+	}
+	if len(lists) > 0 {
+		files, _ := document["files"].(map[string]any)
+		for name, list := range lists {
+			entry, ok := files[name].(map[string]any)
+			if !ok {
+				continue
+			}
+			entry["chunkList"] = list
+		}
 	}
 	// Same layout as artifacts.MarshalVMManifest (two-space indent and a
 	// trailing newline); the generic map keeps every unknown field.
@@ -373,7 +385,7 @@ func bindChunkIndex(dir string, ref *artifacts.ChunkIndexRef) ([]byte, error) {
 // parallel into sparse temporary files, each chunk verified against its
 // digest. The whole-file digests in the manifest are recorded as the
 // verified markers: they are implied by the verified chain.
-func (c *Client) materializeChunked(ctx context.Context, dir, buildDir string, ref artifacts.ChunkIndexRef, files []nativeFile) error {
+func (c *Client) materializeChunked(ctx context.Context, dir, buildDir string, ref artifacts.ChunkIndexRef, files []nativeFile) error { //nolint:gocognit // verify-then-write chain kept in one place for review
 	// Version 1 sets carry their index under one fixed name in the set's
 	// namespace; anything else would address an object outside it.
 	if ref.Ref != artifacts.ChunkIndexName {
@@ -411,6 +423,13 @@ func (c *Client) materializeChunked(ctx context.Context, dir, buildDir string, r
 		if entry.SizeBytes != file.sizeBytes {
 			return fmt.Errorf("chunk index %s size %d does not match the manifest size %d", file.publish, entry.SizeBytes, file.sizeBytes)
 		}
+		if list := file.chunkList; list != nil {
+			// The manifest's chunk-list digest must describe exactly the
+			// verified index: chunk size and every chunk's place and digest.
+			if list.ChunkSize != index.ChunkSize || artifacts.ChunkListSHA256(index.ChunkSize, entry.SizeBytes, entry.Chunks) != list.SHA256 {
+				return fmt.Errorf("chunk index %s does not match the manifest chunk-list digest", file.publish)
+			}
+		}
 		if match, err := verifyCacheFile(filepath.Join(dir, file.cache), file, c.transfer.Chunked()); err == nil && match {
 			continue
 		}
@@ -445,7 +464,7 @@ func (c *Client) materializeChunked(ctx context.Context, dir, buildDir string, r
 		return err
 	}
 	for name, entry := range targets {
-		if err := finishCacheFile(entry.tmp, filepath.Join(dir, entry.file.cache), entry.file.sha256, c.transfer.Chunked()); err != nil {
+		if err := finishCacheFile(entry.tmp, filepath.Join(dir, entry.file.cache), entry.file.markerSum(), c.transfer.Chunked()); err != nil {
 			return fmt.Errorf("commit %s: %w", name, err)
 		}
 		delete(targets, name)

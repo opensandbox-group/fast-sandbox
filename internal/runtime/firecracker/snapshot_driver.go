@@ -139,6 +139,7 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 	}
 	d.mu.RUnlock()
 	plan.chunked = d.agentTransferChunked()
+	plan.chunkList = plan.chunked && d.agentChunkListDigest()
 	plan.sandboxDir = filepath.Join(plan.stateRoot, sandboxStateDir, plan.sandboxID)
 	ociSnapshot, err := prepareOCISnapshot(plan)
 	if err != nil {
@@ -252,7 +253,7 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 func (d *Driver) assemblePlanManifest(plan *dumpPlan, kind fastletapi.SnapshotKind) (int64, error) {
 	plan.awaitRootfsHash()
 	if plan.chunked {
-		return assembleSnapshotManifestWith(plan.stateRoot, d.ociRoot(), plan.staging, plan.sandboxDir, kind, plan.knownSums, true)
+		return assembleSnapshotManifestWith(plan.stateRoot, d.ociRoot(), plan.staging, plan.sandboxDir, kind, plan.knownSums, true, plan.chunkList)
 	}
 	return assembleSnapshotManifest(plan.stateRoot, d.ociRoot(), plan.staging, plan.sandboxDir, kind)
 }
@@ -526,6 +527,9 @@ type dumpPlan struct {
 	// chunked mirrors the runtime-agent's chunked transfer mode: the spill
 	// copy hashes as it goes and the manifest assembly hashes in parallel.
 	chunked bool
+	// chunkList: the chunked agent identifies the native artifacts by
+	// chunk-list digest, so they are staged without any whole-file hash.
+	chunkList bool
 	// knownSums carries staged-file digests computed while the dump was
 	// relocated (path -> sha256), so the manifest assembly skips re-reading
 	// those files.
@@ -648,7 +652,7 @@ func (d *Driver) spillDirFor(snapshotID, memoryQuantity string) string {
 // window pays the spill area's bandwidth (tmpfs/local NVMe) instead of the
 // StateRoot filesystem. The Sandbox keeps running on every failure path,
 // with a failed resume joined after (and never masking) the dump error.
-func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error { //nolint:gocognit,maintidx // pre-existing pause/dump/resume window; refactor tracked separately
+func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error { //nolint:gocognit,gocyclo,maintidx // pre-existing pause/dump/resume window; refactor tracked separately
 	releaseLifecycle, err := lockSandboxMutation(ctx, plan.stateRoot, plan.sandboxID)
 	if err != nil {
 		return err
@@ -765,7 +769,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		}
 	}
 	plan.rootfsClone = time.Since(reflinkStarted)
-	if rootfsCloned && plan.chunked {
+	if rootfsCloned && plan.chunked && !plan.chunkList {
 		plan.startRootfsHash(stagedRootfs)
 	}
 
@@ -1303,13 +1307,16 @@ type snapshotManifestEntries struct {
 	RootfsSize, SizeBytes int64
 	Cache                 map[string]string
 	Names                 []string
+	// HashedNames are the staged files with a whole-file sha256 (all of them,
+	// unless native artifacts are recorded by size only); SHA256SUMS lists them.
+	HashedNames []string
 }
 
 // collectSnapshotManifestEntries describes the staged files of a snapshot
 // set. With parallel (chunked transfer mode) known digests (path -> sha256) are
 // reused and the remaining files are hashed concurrently before the entries
 // are built; otherwise each file is hashed in turn as it is described.
-func collectSnapshotManifestEntries(staging string, isOCI bool, known map[string]string, parallel bool) (snapshotManifestEntries, error) {
+func collectSnapshotManifestEntries(staging string, isOCI bool, known map[string]string, parallel, chunkList bool) (snapshotManifestEntries, error) {
 	bundleFiles, err := stagedBundleFiles(staging)
 	if err != nil {
 		return snapshotManifestEntries{}, err
@@ -1318,17 +1325,36 @@ func collectSnapshotManifestEntries(staging string, isOCI bool, known map[string
 	if isOCI {
 		bundleFiles = bundleFiles[1:]
 	}
+	// sizeOnly: native artifacts recorded by size alone. An OCI source keeps
+	// no native file entries (only their sizes count), and with chunk-list
+	// digests the runtime-agent adds each native artifact's identity when it
+	// publishes. Only the small state files (vault, policy) are hashed then.
+	sizeOnly := func(name string) bool {
+		return (isOCI || chunkList) && name != vaultBundleName && name != policyBundleName
+	}
+	hashed := make([]string, 0, len(bundleFiles))
+	for _, name := range bundleFiles {
+		if !sizeOnly(name) {
+			hashed = append(hashed, name)
+		}
+	}
 	files, stateFiles := map[string]artifacts.ManifestFile{}, map[string]artifacts.ManifestFile{}
 	var sizeBytes, rootfsSize int64
 	cache := map[string]string{}
 	if parallel {
-		if cache, err = hashStagedFiles(staging, bundleFiles, known); err != nil {
+		if cache, err = hashStagedFiles(staging, hashed, known); err != nil {
 			return snapshotManifestEntries{}, err
 		}
 	}
 	for _, name := range bundleFiles {
-		file, err := artifacts.FileEntry(filepath.Join(staging, name), cache)
-		if err != nil {
+		var file artifacts.ManifestFile
+		if sizeOnly(name) {
+			info, statErr := os.Stat(filepath.Join(staging, name))
+			if statErr != nil {
+				return snapshotManifestEntries{}, statErr
+			}
+			file = artifacts.ManifestFile{SizeBytes: info.Size()}
+		} else if file, err = artifacts.FileEntry(filepath.Join(staging, name), cache); err != nil {
 			return snapshotManifestEntries{}, err
 		}
 		sizeBytes += file.SizeBytes
@@ -1352,17 +1378,17 @@ func collectSnapshotManifestEntries(staging string, isOCI bool, known map[string
 		rootfsSize = upper.VirtualSizeBytes
 		sizeBytes += rootfsSize
 	}
-	return snapshotManifestEntries{Files: files, StateFiles: stateFiles, RootfsSize: rootfsSize, SizeBytes: sizeBytes, Cache: cache, Names: bundleFiles}, nil
+	return snapshotManifestEntries{Files: files, StateFiles: stateFiles, RootfsSize: rootfsSize, SizeBytes: sizeBytes, Cache: cache, Names: bundleFiles, HashedNames: hashed}, nil
 }
 
 func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, kind fastletapi.SnapshotKind) (int64, error) {
-	return assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir, kind, nil, false)
+	return assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir, kind, nil, false, false)
 }
 
 // assembleSnapshotManifestWith is assembleSnapshotManifest with the
 // chunked-mode hashing (see collectSnapshotManifestEntries): the set's
 // wall time is its largest file, not the sum of all of them.
-func assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir string, kind fastletapi.SnapshotKind, known map[string]string, parallel bool) (int64, error) {
+func assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir string, kind fastletapi.SnapshotKind, known map[string]string, parallel, chunkList bool) (int64, error) {
 	state, err := loadState(sandboxDir)
 	if err != nil {
 		return 0, err
@@ -1372,7 +1398,7 @@ func assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir string
 		return 0, err
 	}
 	isOCI := strings.HasPrefix(sourceRef, ocitemplate.Prefix)
-	entries, err := collectSnapshotManifestEntries(staging, isOCI, known, parallel)
+	entries, err := collectSnapshotManifestEntries(staging, isOCI, known, parallel, chunkList)
 	if err != nil {
 		return 0, err
 	}
@@ -1438,7 +1464,7 @@ func assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir string
 		}
 	}
 	if !isOCI {
-		if err = artifacts.WriteSHA256SUMS(staging, entries.Names, entries.Cache); err != nil {
+		if err = artifacts.WriteSHA256SUMS(staging, entries.HashedNames, entries.Cache); err != nil {
 			return 0, err
 		}
 	}
@@ -1471,6 +1497,17 @@ func (d *Driver) agentTransferChunked() bool {
 	return ok && reporter.TransferFormat() == agentTransferFormatChunked
 }
 
+// agentChunkListDigest reports whether the runtime-agent publishes chunked
+// native artifacts under chunk-list digests (a chunk-list-aware agent).
+func (d *Driver) agentChunkListDigest() bool {
+	client, err := d.agentClientOrNil()
+	if err != nil || client == nil {
+		return false
+	}
+	reporter, ok := client.(chunkListDigestReporter)
+	return ok && reporter.ChunkListDigest()
+}
+
 // relocateSpilled is the post-resume relocation of one spilled dump file
 // (a variable so tests can observe it).
 var relocateSpilled = relocateSpilledFile
@@ -1482,6 +1519,9 @@ var relocateSpilled = relocateSpilledFile
 func relocateSpilledFile(plan *dumpPlan, source, target string) error {
 	if !plan.chunked {
 		return copyFile(source, target)
+	}
+	if plan.chunkList {
+		return copyFileSparse(source, target)
 	}
 	sum, err := copyFileSparseHashed(source, target)
 	if err != nil {
@@ -1545,6 +1585,19 @@ const (
 // without SHA extensions hashing dominates, and the copy then costs about the
 // hash alone instead of hash plus write.
 func copyFileSparseHashed(source, target string) (string, error) {
+	return copyFileSparseWith(source, target, true)
+}
+
+// copyFileSparse is copyFileSparseHashed without the digest, for a staged
+// file the runtime-agent identifies by chunk-list digest: the copy then costs
+// about the read and the sparse write.
+func copyFileSparse(source, target string) error {
+	_, err := copyFileSparseWith(source, target, false)
+	return err
+}
+
+// copyFileSparseWith copies sparse and, with hash, returns the content sha256.
+func copyFileSparseWith(source, target string, hash bool) (string, error) { //nolint:gocognit // one read/hash/write pipeline; splitting it scatters the ordering invariants
 	input, err := os.Open(source)
 	if err != nil {
 		return "", err
@@ -1585,7 +1638,9 @@ func copyFileSparseHashed(source, target string) (string, error) {
 	go func() { // hasher: strictly in order, so the digest equals a serial hash
 		defer workers.Done()
 		for current := range hashQueue {
-			_, _ = digest.Write(current.data)
+			if hash {
+				_, _ = digest.Write(current.data)
+			}
 			current.users.Done()
 		}
 	}()
@@ -1650,6 +1705,9 @@ func copyFileSparseHashed(source, target string) (string, error) {
 	}
 	if err := output.Close(); err != nil {
 		return "", err
+	}
+	if !hash {
+		return "", nil
 	}
 	return hex.EncodeToString(digest.Sum(nil)), nil
 }
