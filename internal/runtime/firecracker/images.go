@@ -195,8 +195,10 @@ const defaultImageCacheLimitBytes = 20 << 30
 // from filesystem timestamps) are removed first, newest/unknown entries
 // counting as zero uses. References are read from the durable per-Sandbox
 // state, so a VM that died with its Fastlet still pins its image until its
-// state directory is removed. Reflink instance copies are independent once
-// created, so deleting a cache entry never affects a running VM. A Sandbox
+// state directory is removed. A Sandbox also pins the cache entry it was
+// restored from (the checkpoint of a resume): its rootfs is an independent
+// reflink copy, but its later snapshots read that entry's manifest as their
+// source image. A Sandbox
 // whose state cannot be read aborts the whole collection: it might reference
 // an image, and the cost of keeping a few hundred MiB beats breaking a
 // recoverable Sandbox.
@@ -219,6 +221,9 @@ func garbageCollectImages(stateRoot string, limitBytes int64, useCount map[strin
 			return nil, fmt.Errorf("read Sandbox state %s for image GC: %w", directory, err)
 		}
 		referenced[imageKey(state.Config.Desired.Image)] = struct{}{}
+		if source, err := restoreReference(state.Config.Desired); err == nil {
+			referenced[imageKey(source)] = struct{}{}
+		}
 	}
 	cached, err := listCachedImages(stateRoot)
 	if err != nil {

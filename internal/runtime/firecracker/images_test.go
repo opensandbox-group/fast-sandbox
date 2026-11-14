@@ -6,12 +6,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
@@ -162,6 +164,47 @@ func TestGarbageCollectImages(t *testing.T) {
 	require.ElementsMatch(t, []string{used}, removed)
 	_, err = os.Stat(filepath.Join(root, imageCacheDir, hot))
 	require.NoError(t, err, "high-frequency image must survive eviction")
+}
+
+// TestGarbageCollectImagesPinsRestoreCheckpoint covers a Sandbox resumed from
+// a pause checkpoint: its later snapshots read the checkpoint's cached
+// manifest as the source image, so the GC must keep that entry as well as the
+// template image.
+func TestGarbageCollectImagesPinsRestoreCheckpoint(t *testing.T) {
+	root := t.TempDir()
+	seed := func(reference string) string {
+		path, err := imageCachePath(root, reference)
+		require.NoError(t, err)
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+		require.NoError(t, os.WriteFile(path, []byte("rootfs"), 0o640))
+		return imageKey(reference)
+	}
+	digest := strings.Repeat("ab", 32)
+	template := seed("tpl-resumed")
+	checkpoint := seed(artifacts.CheckpointReference(digest))
+	other := seed("example.com/other:v1")
+
+	directory, err := ensureSandboxDir(root, "sbx-resumed")
+	require.NoError(t, err)
+	require.NoError(t, saveState(directory, &SandboxState{
+		Config: fastletapi.RuntimeSandboxConfig{
+			Desired: fastletapi.SandboxDesiredSpec{Image: "tpl-resumed", Restore: &fastletapi.RestoreSpec{
+				ManifestRef: "s3://bucket/publish/abababababababab/manifest.json", ArtifactDigest: digest,
+			}},
+			Identity: fastletapi.SandboxIdentity{SandboxUID: "sbx-resumed"},
+		},
+		Phase: PhaseRunning,
+	}))
+
+	// The limit (6 bytes) fits only one entry: every unpinned entry goes,
+	// the pinned ones stay even though the cache remains over the limit.
+	removed, err := garbageCollectImages(root, 6, map[string]int64{})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{other}, removed)
+	for _, pinned := range []string{template, checkpoint} {
+		_, err = os.Stat(filepath.Join(root, imageCacheDir, pinned))
+		require.NoError(t, err, "the template and the restore checkpoint of a live Sandbox must survive GC")
+	}
 }
 
 // TestImageGCLoopRunsIndependently verifies the cache GC is driven by its own
