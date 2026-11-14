@@ -12,6 +12,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
 	"syscall"
 )
 
@@ -31,6 +32,9 @@ func SHA256File(path string) (string, error) { //nolint:gocognit // pre-existing
 	if _, err := handle.Seek(0, io.SeekStart); err != nil {
 		return "", err
 	}
+	bufferRef := hashBuffers.Get().(*[]byte)
+	defer hashBuffers.Put(bufferRef)
+	hashBuffer := *bufferRef
 	digest := sha256.New()
 	// Fragmented sparse files (e.g. Firecracker memory snapshots with
 	// 4K-granular holes) are faster hashed with a plain full read: the
@@ -97,9 +101,11 @@ func SHA256File(path string) (string, error) { //nolint:gocognit // pre-existing
 	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
-// hashBuffer keeps a large read buffer for hashing so high-latency storage
-// does not dominate the phase with syscall round trips.
-var hashBuffer = make([]byte, 4*1024*1024)
+// hashBuffers hands each SHA256File call its own large read buffer, so
+// high-latency storage does not dominate the phase with syscall round trips.
+// One buffer per call: concurrent hashes (the parallel manifest assembly)
+// must never share it, or one file's bytes would land in another's digest.
+var hashBuffers = sync.Pool{New: func() any { buffer := make([]byte, 4*1024*1024); return &buffer }}
 
 // scanSparse walks the SEEK_DATA/SEEK_HOLE map of a file without reading
 // payload and returns the total data bytes and the segment count. ENXIO is
