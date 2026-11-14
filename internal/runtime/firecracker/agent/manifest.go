@@ -43,12 +43,28 @@ func chunkBinding(payload []byte) (*artifacts.ChunkIndexRef, error) {
 }
 
 // nativeFile pairs a published artifact with its local cache name and the
-// expected digest.
+// expected digest: the whole-file sha256, or for a chunked artifact published
+// without one, its chunk-list digest (artifacts.ChunkListDigest).
 type nativeFile struct {
 	publish   string
 	cache     string
 	sha256    string
 	sizeBytes int64
+	chunkList *artifacts.ChunkListDigest
+}
+
+// chunkListMarkerPrefix keeps a chunk-list digest apart from any whole-file
+// sha256 in the verified-cache marker.
+const chunkListMarkerPrefix = "chunklist-v1:"
+
+// markerSum is the identity the verified-cache marker records for the file:
+// the whole-file sha256 when the manifest has one (so markers written before
+// chunk-list digests stay valid), else the prefixed chunk-list digest.
+func (f nativeFile) markerSum() string {
+	if f.sha256 != "" || f.chunkList == nil {
+		return f.sha256
+	}
+	return chunkListMarkerPrefix + f.chunkList.SHA256
 }
 
 // manifestVMStateName and manifestMemoryName are the published artifact
@@ -78,13 +94,22 @@ func (m manifest) nativeFiles() ([]nativeFile, error) {
 		if !ok {
 			return nil, fmt.Errorf("manifest is missing the %s artifact", name.publish)
 		}
-		if !validSHA256(entry.SHA256) {
+		file := nativeFile{publish: name.publish, cache: name.cache, sizeBytes: entry.SizeBytes}
+		switch {
+		case entry.SHA256 != "":
+			if !validSHA256(entry.SHA256) {
+				return nil, fmt.Errorf("manifest artifact %s has an invalid sha256", name.publish)
+			}
+			file.sha256 = entry.SHA256
+		case entry.ChunkList != nil:
+			if err := entry.ChunkList.Validate(); err != nil {
+				return nil, fmt.Errorf("manifest artifact %s: %w", name.publish, err)
+			}
+		default:
 			return nil, fmt.Errorf("manifest artifact %s has an invalid sha256", name.publish)
 		}
-		files = append(files, nativeFile{
-			publish: name.publish, cache: name.cache,
-			sha256: entry.SHA256, sizeBytes: entry.SizeBytes,
-		})
+		file.chunkList = entry.ChunkList
+		files = append(files, file)
 	}
 	return files, nil
 }

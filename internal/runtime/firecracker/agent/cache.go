@@ -147,12 +147,12 @@ func fileVerified(path string, file nativeFile) (bool, error) {
 	if info.Size() != file.sizeBytes {
 		return false, nil
 	}
-	if markerMatches(path, info, file.sha256) {
+	if markerMatches(path, info, file.markerSum()) {
 		return true, nil
 	}
 	match, err := fileMatches(path, file)
 	if err == nil && match {
-		markVerified(path, file.sha256)
+		markVerified(path, file.markerSum())
 	}
 	return match, err
 }
@@ -166,6 +166,11 @@ func fileVerified(path string, file nativeFile) (bool, error) {
 func stageFile(ctx context.Context, c *Client, dir, storeKey string, file nativeFile) error {
 	chunked := c.transfer.Chunked()
 	target := filepath.Join(dir, file.cache)
+	if file.sha256 == "" {
+		// Only a chunked set may describe an artifact by chunk-list digest:
+		// a whole-file download has nothing to verify it against.
+		return fmt.Errorf("artifact %s has no whole-file sha256 in a whole-file set", file.publish)
+	}
 	match, err := verifyCacheFile(target, file, chunked)
 	if err == nil && match {
 		return nil
@@ -234,6 +239,10 @@ func stageFile(ctx context.Context, c *Client, dir, storeKey string, file native
 	keep = true
 	return nil
 }
+
+// chunkListVerifyWorkers bounds the parallel reads of a chunk-list re-verify
+// (a cached file whose marker is gone, e.g. after a reboot).
+const chunkListVerifyWorkers = 8
 
 // finishCacheFile commits a verified temporary cache file: mode, then the
 // close that flushes it before the rename so the committed name never
@@ -350,6 +359,14 @@ func fileMatches(path string, file nativeFile) (bool, error) {
 	}
 	if info.Size() != file.sizeBytes {
 		return false, nil
+	}
+	if file.sha256 == "" && file.chunkList != nil {
+		// Chunk-list identity: hash only the non-zero chunks, in parallel.
+		sum, err := artifacts.FileChunkListSHA256(path, file.chunkList.ChunkSize, chunkListVerifyWorkers)
+		if err != nil {
+			return false, err
+		}
+		return sum == file.chunkList.SHA256, nil
 	}
 	input, err := os.Open(path)
 	if err != nil {

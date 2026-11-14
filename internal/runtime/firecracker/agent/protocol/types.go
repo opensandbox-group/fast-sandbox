@@ -175,6 +175,11 @@ type PublishImageResponse struct {
 	// "chunked"); empty from agents that predate the setting, which callers
 	// treat as legacy.
 	TransferFormat string `json:"transferFormat,omitempty"`
+	// ChunkListDigest reports that the agent identifies chunked native
+	// artifacts by chunk-list digest (artifacts.ChunkListDigest), so the
+	// caller may stage them without a whole-file sha256. False from agents
+	// that predate it: callers keep hashing.
+	ChunkListDigest bool `json:"chunkListDigest,omitempty"`
 }
 
 // CompatibilityResponse returns the node compatibility class (a placeholder
@@ -199,6 +204,8 @@ type HealthResponse struct {
 	// "chunked"); empty from agents that predate the setting, which callers
 	// treat as legacy.
 	TransferFormat string `json:"transferFormat,omitempty"`
+	// ChunkListDigest: see PublishImageResponse.ChunkListDigest.
+	ChunkListDigest bool `json:"chunkListDigest,omitempty"`
 	// HostReady reports the last node-readiness check outcome (the KVM/
 	// storage/asset check behind the scheduling labels). Nil when the
 	// readiness manager is not running (no node name configured).
