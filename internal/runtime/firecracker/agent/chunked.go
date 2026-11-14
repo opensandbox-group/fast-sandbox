@@ -281,7 +281,7 @@ func (c *Client) storeChunk(ctx context.Context, sum, encoding string, block []b
 		reused bool
 	}
 	outcome, err, shared := c.chunkFlight.Do(key, func() (any, error) {
-		size, reused, err := c.storeChunkOnce(ctx, key, encoding, block)
+		size, reused, err := c.storeChunkOnce(ctx, key, sum, encoding, block)
 		return stored{size: size, reused: reused}, err
 	})
 	if err != nil {
@@ -291,7 +291,7 @@ func (c *Client) storeChunk(ctx context.Context, sum, encoding string, block []b
 	return result.size, result.reused || shared, nil
 }
 
-func (c *Client) storeChunkOnce(ctx context.Context, key, encoding string, block []byte) (int64, bool, error) {
+func (c *Client) storeChunkOnce(ctx context.Context, key, sum, encoding string, block []byte) (int64, bool, error) {
 	if size, ok := c.knownChunks.Load(key); ok {
 		return size.(int64), true, nil
 	}
@@ -310,11 +310,15 @@ func (c *Client) storeChunkOnce(ctx context.Context, key, encoding string, block
 		c.knownChunks.Store(key, size)
 		return size, true, nil
 	}
-	payload := block
+	// A raw chunk is uploaded as exactly the bytes its sha256 names, so that
+	// digest doubles as the signed payload hash; an encoded payload is
+	// different bytes and is hashed for the signature.
+	payload, payloadSHA256 := block, sum
 	if encoding == artifacts.ChunkEncodingZstd {
 		payload = chunkEncoder().EncodeAll(block, make([]byte, 0, len(block)/2))
+		payloadSHA256 = sha256Hex(payload)
 	}
-	if err := c.s3.putBytes(ctx, key, payload); err != nil {
+	if err := c.s3.putBytesWithSHA256(ctx, key, payload, payloadSHA256); err != nil {
 		return 0, false, fmt.Errorf("upload chunk %s: %w", key, err)
 	}
 	c.knownChunks.Store(key, int64(len(payload)))

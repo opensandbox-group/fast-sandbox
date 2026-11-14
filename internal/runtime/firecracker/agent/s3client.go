@@ -184,7 +184,16 @@ var chunkAttemptTimeout = 10 * time.Second
 // then guaranteed correct by construction, which is what makes skipping an
 // existing key safe.
 func (c *s3Client) putBytes(ctx context.Context, storeKey string, payload []byte) error {
-	return c.putSigned(ctx, storeKey, int64(len(payload)), sha256Hex(payload), chunkAttemptTimeout, func() (io.ReadCloser, error) {
+	return c.putBytesWithSHA256(ctx, storeKey, payload, sha256Hex(payload))
+}
+
+// putBytesWithSHA256 is putBytes for a caller that already holds the
+// SHA-256 of exactly these payload bytes (a raw chunk named by its sha256):
+// the digest is signed as is instead of hashing the payload a second time.
+// The store still checks the body against it, so a wrong digest fails the
+// upload and the existing-key skip stays safe.
+func (c *s3Client) putBytesWithSHA256(ctx context.Context, storeKey string, payload []byte, payloadSHA256 string) error {
+	return c.putSigned(ctx, storeKey, int64(len(payload)), payloadSHA256, chunkAttemptTimeout, func() (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(payload)), nil
 	})
 }
