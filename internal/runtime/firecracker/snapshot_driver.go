@@ -1529,9 +1529,21 @@ func hashStagedFiles(staging string, names []string, known map[string]string) (m
 	return cache, firstErr
 }
 
+// sparseCopyBlockSize is the read unit of copyFileSparseHashed, and
+// sparseCopySlots how many blocks are in flight between the reader, the
+// hasher and the writer.
+const (
+	sparseCopyBlockSize = 4 << 20
+	sparseCopySlots     = 4
+	sparseZeroGranule   = 64 << 10
+)
+
 // copyFileSparseHashed copies source to target and returns the sha256 of the
-// content. All-zero 64 KiB blocks are seeked over instead of written, so the
-// target is sparse while its logical content (and digest) is unchanged.
+// content. All-zero 64 KiB granules are left as holes, so the target is
+// sparse while its logical content (and digest) is unchanged. Reading,
+// hashing and writing run concurrently over a small ring of blocks: on hosts
+// without SHA extensions hashing dominates, and the copy then costs about the
+// hash alone instead of hash plus write.
 func copyFileSparseHashed(source, target string) (string, error) {
 	input, err := os.Open(source)
 	if err != nil {
@@ -1542,34 +1554,94 @@ func copyFileSparseHashed(source, target string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
+	type block struct {
+		data   []byte
+		offset int64
+		users  sync.WaitGroup
+	}
+	free := make(chan []byte, sparseCopySlots)
+	for range sparseCopySlots {
+		free <- make([]byte, sparseCopyBlockSize)
+	}
+	hashQueue := make(chan *block, sparseCopySlots)
+	writeQueue := make(chan *block, sparseCopySlots)
+	recycleQueue := make(chan *block, sparseCopySlots)
+	stop := make(chan struct{})
+	var (
+		failOnce sync.Once
+		failure  error
+	)
+	fail := func(err error) {
+		failOnce.Do(func() {
+			failure = err
+			close(stop)
+		})
+	}
+
 	digest := sha256.New()
-	buffer := make([]byte, 4<<20)
+	var workers sync.WaitGroup
+	workers.Add(3)
+	go func() { // hasher: strictly in order, so the digest equals a serial hash
+		defer workers.Done()
+		for current := range hashQueue {
+			_, _ = digest.Write(current.data)
+			current.users.Done()
+		}
+	}()
+	go func() { // writer: one pwrite per run of non-zero granules
+		defer workers.Done()
+		for current := range writeQueue {
+			if err := writeNonZeroRuns(output, current.data, current.offset); err != nil {
+				fail(err)
+			}
+			current.users.Done()
+		}
+	}()
+	go func() { // recycler: a buffer is reused only after both consumers are done
+		defer workers.Done()
+		for current := range recycleQueue {
+			current.users.Wait()
+			free <- current.data[:cap(current.data)]
+		}
+	}()
+
 	var size int64
-	for {
-		n, readErr := io.ReadFull(input, buffer)
-		block := buffer[:n]
-		_, _ = digest.Write(block)
-		for len(block) > 0 {
-			step := min(len(block), 64<<10)
-			if artifacts.IsZero(block[:step]) {
-				_, err = output.Seek(int64(step), io.SeekCurrent)
-			} else {
-				_, err = output.Write(block[:step])
+	func() {
+		defer func() {
+			close(hashQueue)
+			close(writeQueue)
+			close(recycleQueue)
+		}()
+		for {
+			var buffer []byte
+			select {
+			case buffer = <-free:
+			case <-stop:
+				return
 			}
-			if err != nil {
-				_ = output.Close()
-				return "", err
+			n, readErr := io.ReadFull(input, buffer)
+			if n > 0 {
+				current := &block{data: buffer[:n], offset: size}
+				current.users.Add(2)
+				hashQueue <- current
+				writeQueue <- current
+				recycleQueue <- current
+				size += int64(n)
 			}
-			block = block[step:]
+			if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+				return
+			}
+			if readErr != nil {
+				fail(readErr)
+				return
+			}
 		}
-		size += int64(n)
-		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
-			break
-		}
-		if readErr != nil {
-			_ = output.Close()
-			return "", readErr
-		}
+	}()
+	workers.Wait()
+	if failure != nil {
+		_ = output.Close()
+		return "", failure
 	}
 	// A trailing hole has no write behind it: set the logical size.
 	if err := output.Truncate(size); err != nil {
@@ -1580,6 +1652,33 @@ func copyFileSparseHashed(source, target string) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+// writeNonZeroRuns writes data at offset, skipping all-zero granules and
+// merging consecutive non-zero granules into a single write.
+func writeNonZeroRuns(output *os.File, data []byte, offset int64) error {
+	runStart := -1
+	flush := func(end int) error {
+		if runStart < 0 {
+			return nil
+		}
+		_, err := output.WriteAt(data[runStart:end], offset+int64(runStart))
+		runStart = -1
+		return err
+	}
+	for start := 0; start < len(data); start += sparseZeroGranule {
+		end := min(start+sparseZeroGranule, len(data))
+		if artifacts.IsZero(data[start:end]) {
+			if err := flush(start); err != nil {
+				return err
+			}
+			continue
+		}
+		if runStart < 0 {
+			runStart = start
+		}
+	}
+	return flush(len(data))
 }
 
 func readSourceManifest(stateRoot, ociRoot, image, sandboxID string) ([]byte, error) {
