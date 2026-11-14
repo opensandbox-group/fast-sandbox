@@ -2,6 +2,7 @@ package firecracker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -16,17 +17,20 @@ import (
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
 
-// materializingAgent is a fake agent whose PinImage commits the rootfs into
-// the shared cache root, mirroring the real agent's pull-commit behavior.
+// materializingAgent is a fake agent whose PinImage commits the restore set
+// into the shared cache root, mirroring the real agent's pull-commit behavior:
+// the artifacts first, manifest.json last as the commit point.
 // noCommit simulates an agent journal replay: PinImage succeeds without
-// materializing any artifact.
+// materializing any artifact. withholdManifest freezes the pull inside its
+// commit window: every artifact is in place but manifest.json is not yet.
 type materializingAgent struct {
 	*fakeAgentClient
-	cacheRoot string
-	mu        sync.Mutex
-	pinErr    error
-	pinCount  int
-	noCommit  bool
+	cacheRoot        string
+	mu               sync.Mutex
+	pinErr           error
+	pinCount         int
+	noCommit         bool
+	withholdManifest bool
 }
 
 func (m *materializingAgent) PinImage(ctx context.Context, requestID, image string) (string, error) {
@@ -43,26 +47,50 @@ func (m *materializingAgent) PinImage(ctx context.Context, requestID, image stri
 	m.mu.Lock()
 	m.pinCount++
 	noCommit := m.noCommit
+	withholdManifest := m.withholdManifest
 	m.mu.Unlock()
 	if noCommit {
 		return digest, nil
 	}
 	dir := filepath.Join(m.cacheRoot, imageCacheDir, imageKey(image))
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	if err := writeRestoreArtifacts(dir); err != nil {
 		return "", err
 	}
-	// The real agent commits the complete restore set; a partial commit
-	// (rootfs only) must NOT count as delivered.
+	if withholdManifest {
+		return digest, nil
+	}
+	if err := commitTestManifest(dir); err != nil {
+		return "", err
+	}
+	return digest, nil
+}
+
+// writeRestoreArtifacts writes the restore set's artifacts (rootfs, vmstate,
+// memory) without the manifest: the cache state inside a pull's commit window.
+// A partial set (rootfs only) must NOT count as delivered either.
+func writeRestoreArtifacts(dir string) error {
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return err
+	}
 	for name, payload := range map[string]string{
 		rootfsImageName:     "rootfs-image-data",
 		vmstateSnapshotName: "vmstate-snapshot-data",
 		memorySnapshotName:  "memory-snapshot-data",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(payload), 0o640); err != nil {
-			return "", err
+			return err
 		}
 	}
-	return digest, nil
+	return nil
+}
+
+// commitTestManifest writes manifest.json, the pull's commit point.
+func commitTestManifest(dir string) error {
+	payload, err := json.Marshal(newTestVMManifest())
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, artifacts.VMManifestName), payload, 0o640)
 }
 
 // PinCheckpoint materializes the checkpoint set through the same fake
@@ -284,6 +312,66 @@ func TestDeliverImagePartialCacheIsNotDelivered(t *testing.T) {
 	// The same criterion gates the synchronous create path: a partial cache
 	// parks (or fails in local mode) before any network slot is acquired.
 	require.ErrorIs(t, verifyRestorableImage(fixture.stateRoot, image), ErrImageNotReady)
+}
+
+// TestDeliverImageWithoutCommittedManifestIsNotDelivered is the regression
+// test for the cross-node restore race: the agent renames rootfs, vmstate and
+// memory into the cache before it commits manifest.json. A delivery poll that
+// lands in that window must report Delivering, never Delivered, or the boot
+// worker reaches EnsureSandbox while manifest.json is still absent.
+func TestDeliverImageWithoutCommittedManifestIsNotDelivered(t *testing.T) {
+	fixture := newDriverFixture(t)
+	agent := &materializingAgent{fakeAgentClient: &fakeAgentClient{}, cacheRoot: fixture.stateRoot, withholdManifest: true}
+	fixture.installMaterializingAgent(agent)
+	image := fixture.sandboxSpec.Desired.Image
+	dir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(image))
+	require.NoError(t, writeRestoreArtifacts(dir))
+	require.NoError(t, verifyRestorableImage(fixture.stateRoot, image), "precondition: the artifacts alone pass the restore-set check")
+
+	status, err := fixture.driver.DeliverImage(context.Background(), image)
+	require.NoError(t, err)
+	require.Equal(t, runtimecontract.ImageDelivering, status, "artifacts without the committed manifest are a pull in flight")
+
+	require.NoError(t, commitTestManifest(dir))
+	require.Eventually(t, func() bool {
+		status, err := fixture.driver.DeliverImage(context.Background(), image)
+		return err == nil && status == runtimecontract.ImageDelivered
+	}, 5*time.Second, 20*time.Millisecond, "the committed manifest completes the delivery")
+}
+
+// TestDeliverCheckpointWithoutCommittedManifestIsNotDelivered covers the same
+// window for a checkpoint pulled onto another node (cross-node restore/resume).
+func TestDeliverCheckpointWithoutCommittedManifestIsNotDelivered(t *testing.T) {
+	fixture := newDriverFixture(t)
+	agent := &materializingAgent{fakeAgentClient: &fakeAgentClient{}, cacheRoot: fixture.stateRoot, withholdManifest: true}
+	fixture.installMaterializingAgent(agent)
+	restore := &fastletapi.RestoreSpec{
+		ManifestRef: "s3://bucket/publish/0123456789abcdef/manifest.json", ArtifactDigest: "checkpoint-digest",
+	}
+	dir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(artifacts.CheckpointReference(restore.ArtifactDigest)))
+	require.NoError(t, writeRestoreArtifacts(dir))
+
+	status, err := fixture.driver.DeliverCheckpoint(context.Background(), restore)
+	require.NoError(t, err)
+	require.Equal(t, runtimecontract.ImageDelivering, status)
+
+	require.NoError(t, commitTestManifest(dir))
+	require.Eventually(t, func() bool {
+		status, err := fixture.driver.DeliverCheckpoint(context.Background(), restore)
+		return err == nil && status == runtimecontract.ImageDelivered
+	}, 5*time.Second, 20*time.Millisecond)
+}
+
+// TestDeliverImageLocalModeAdmitsRestoreSetWithoutManifest: without an agent
+// nothing commits a manifest, so a hand-seeded restore set stays deliverable.
+func TestDeliverImageLocalModeAdmitsRestoreSetWithoutManifest(t *testing.T) {
+	fixture := newDriverFixture(t)
+	image := fixture.sandboxSpec.Desired.Image
+	require.NoError(t, writeRestoreArtifacts(filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(image))))
+
+	status, err := fixture.driver.DeliverImage(context.Background(), image)
+	require.NoError(t, err)
+	require.Equal(t, runtimecontract.ImageDelivered, status)
 }
 
 func TestDeliverCheckpointMaterializesAndReportsDelivered(t *testing.T) {

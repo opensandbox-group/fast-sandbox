@@ -102,6 +102,29 @@ func verifyRestorableImage(stateRoot, image string) error {
 	return nil
 }
 
+// verifyDeliveredImage is verifyRestorableImage plus, when requireCommit is
+// set, the pull's commit point. The runtime-agent renames rootfs, vmstate and
+// memory into the cache before it writes manifest.json, so in agent mode the
+// artifacts alone can be a pull still inside its commit window; reporting it
+// delivered lets the boot worker reach the restore path, which reads the
+// manifest, while it is absent. Callers set requireCommit only in agent mode:
+// a local-mode cache is hand-seeded and may have no manifest at all.
+func verifyDeliveredImage(stateRoot, image string, requireCommit bool) error {
+	if err := verifyRestorableImage(stateRoot, image); err != nil {
+		return err
+	}
+	if !requireCommit || strings.HasPrefix(image, ocitemplate.Prefix) {
+		return nil
+	}
+	if _, err := os.Stat(cachedManifestPath(stateRoot, image)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: %q has no committed manifest yet", ErrImageNotReady, image)
+		}
+		return err
+	}
+	return nil
+}
+
 // listCachedImages returns the converted image references stored under the
 // StateRoot, keyed by their content-addressed cache directory.
 func listCachedImages(stateRoot string) ([]string, error) {
