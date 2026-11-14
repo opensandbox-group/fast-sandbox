@@ -91,8 +91,19 @@ func (l *productionCaptureLease) VerifyIdentity(ctx context.Context, r captureRe
 	if err != nil {
 		return err
 	}
-	if !os.SameFile(actual, held) || actual.Mode()&os.ModeDevice == 0 || actual.Mode()&os.ModeCharDevice != 0 {
+	if !os.SameFile(actual, held) {
 		return fmt.Errorf("%w: capture drive is not the owned block device", errCaptureIdentityMismatch)
+	}
+	if r.Backend == captureBackendNative {
+		dev, ino, err := captureNativeIdentity(l.device)
+		if err != nil {
+			return err
+		}
+		if dev != r.FileDevice || ino != r.FileInode {
+			return fmt.Errorf("%w: native rootfs inode changed", errCaptureIdentityMismatch)
+		}
+	} else if actual.Mode()&os.ModeDevice == 0 || actual.Mode()&os.ModeCharDevice != 0 {
+		return fmt.Errorf("%w: capture drive is not a block device", errCaptureIdentityMismatch)
 	}
 	expected, err := os.Stat(r.Device)
 	if err != nil {
@@ -112,25 +123,27 @@ func (l *productionCaptureLease) Verify(ctx context.Context) (rootfsCaptureBound
 	if err := l.VerifyIdentity(ctx, l.record); err != nil {
 		return rootfsCaptureBoundary{}, err
 	}
-	// A block-device rootfs.dev is insufficient to copy upper: verify that the daemon binds the device to the same config.
-	devices, err := ublkd.ListSocket(ctx, filepath.Join(runtimecatalog.OCISocketDir, "ublkd.sock"))
-	if err != nil {
-		return rootfsCaptureBoundary{}, err
-	}
-	held, err := l.device.Stat()
-	if err != nil {
-		return rootfsCaptureBoundary{}, err
-	}
-	expectedConfig := filepath.Join(l.driver.ociRoot(), "sandboxes", l.state.Config.Identity.SandboxUID, "rootfs.config.v1.json")
-	matched := false
-	for _, dev := range devices {
-		actual, e := os.Stat(dev.Dev)
-		if e == nil && os.SameFile(actual, held) && dev.Config == expectedConfig && dev.Writable && dev.State == "running" && dev.Mode == "exclusive" {
-			matched = true
+	if l.record.Backend != captureBackendNative {
+		// A block-device rootfs.dev is insufficient to copy upper: verify that the daemon binds the device to the same config.
+		devices, err := ublkd.ListSocket(ctx, filepath.Join(runtimecatalog.OCISocketDir, "ublkd.sock"))
+		if err != nil {
+			return rootfsCaptureBoundary{}, err
 		}
-	}
-	if !matched {
-		return rootfsCaptureBoundary{}, errors.New("OverlayBD device is not exclusively bound to the captured upper config")
+		held, err := l.device.Stat()
+		if err != nil {
+			return rootfsCaptureBoundary{}, err
+		}
+		expectedConfig := filepath.Join(l.driver.ociRoot(), "sandboxes", l.state.Config.Identity.SandboxUID, "rootfs.config.v1.json")
+		matched := false
+		for _, dev := range devices {
+			actual, e := os.Stat(dev.Dev)
+			if e == nil && os.SameFile(actual, held) && dev.Config == expectedConfig && dev.Writable && dev.State == "running" && dev.Mode == "exclusive" {
+				matched = true
+			}
+		}
+		if !matched {
+			return rootfsCaptureBoundary{}, errors.New("OverlayBD device is not exclusively bound to the captured upper config")
+		}
 	}
 	state, err := l.client.VMState(ctx)
 	if err != nil {
@@ -194,16 +207,7 @@ func resolveCaptureGuest(ctx context.Context, state *SandboxState, m artifacts.V
 }
 
 func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontract.SnapshotInput) (result *runtimecontract.SnapshotResult, resultErr error) {
-	if input.Kind == fastletapi.SnapshotKindCheckpoint {
-		return nil, errors.New("RootfsOnly is template-only")
-	}
-	if input.Kind != "" && input.Kind != fastletapi.SnapshotKindTemplate {
-		return nil, errors.New("unknown snapshot kind")
-	}
-	if input.Identity == nil {
-		return nil, errors.New("RootfsOnly requires admitted runtime identity")
-	}
-	if err := validateSandboxID(input.SnapshotID); err != nil {
+	if err := validateRootfsSnapshotInput(input); err != nil {
 		return nil, err
 	}
 	release, err := lockSandboxLifecycle(ctx, d.config.StateRoot, input.SandboxID)
@@ -249,31 +253,23 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	}
 	manifest.Kernel.SHA256 = state.BootKernelSHA256
 	manifest.GuestControl.HelperVersion = caps.HelperVersion
-	devicePath := filepath.Join(dir, rootfsDeviceName)
-	if d.config.JailerPath != "" {
-		devicePath = filepath.Join(jailerRoot(filepath.Join(d.config.StateRoot, jailerChrootBaseDir), filepath.Base(d.config.BinaryPath), truncatedSandboxID(input.SandboxID)), rootfsDeviceName)
-	}
-	device, err := os.OpenFile(devicePath, os.O_RDWR, 0)
+	native := !strings.HasPrefix(source, "oci://")
+	device, plan, upperBytes, err := d.prepareRootfsCut(input, source, native)
 	if err != nil {
 		return nil, err
 	}
 	defer device.Close()
-	plan := dumpPlan{stateRoot: d.config.StateRoot, sandboxDir: dir, sandboxID: input.SandboxID, snapshotID: input.SnapshotID, staging: snapshotStagingPath(d.config.StateRoot, d.podUID, input.SnapshotID, true)}
-	if _, err = checkpointDestinationForSource(source, input.SnapshotID); err != nil {
-		return nil, err
-	}
-	// Budget only upper and pack workspace capacity, without reserving space for RAM.
-	upperBytes, err := allocatedUpperBytes(filepath.Join(d.ociRoot(), "sandboxes", input.SandboxID, "upper"))
-	if err != nil {
-		return nil, err
-	}
-	if stagingFree(d.config.StateRoot) < 3*upperBytes+(512<<20) {
-		return nil, runtimecontract.ErrInsufficientStorage
-	}
 	if err = d.cleanupSnapshotStaging(ctx, plan.staging); err != nil {
 		return nil, err
 	}
-	record := captureRecord{Owner: &state.Config.Identity, Incarnation: identity, Device: devicePath, Staging: plan.staging, Request: guestcontrol.Request{Protocol: guestcontrol.Protocol, Epoch: caps.Epoch, Generation: caps.Generation + 1, OperationID: input.SnapshotID, LeaseMillis: 10000}}
+	record := captureRecord{Owner: &state.Config.Identity, Incarnation: identity, Device: device.Name(), Staging: plan.staging, Request: guestcontrol.Request{Protocol: guestcontrol.Protocol, Epoch: caps.Epoch, Generation: caps.Generation + 1, OperationID: input.SnapshotID, LeaseMillis: 10000}}
+	if native {
+		record.Backend = captureBackendNative
+		record.FileDevice, record.FileInode, err = captureNativeIdentity(device)
+		if err != nil {
+			return nil, err
+		}
+	}
 	journal, err := prepareRootfsJournal(dir, record)
 	if err != nil {
 		return nil, errors.Join(err, os.RemoveAll(plan.staging))
@@ -292,11 +288,16 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	}
 	lease := &productionCaptureLease{driver: d, state: state, client: client, device: device, record: record, journal: journal}
 	tx := rootfsCapture{Progress: journal, Lease: lease, VM: client, Guest: guest, Request: record.Request, RecoveryTimeout: 10 * time.Second}
-	if err = captureRootfsUpper(ctx, tx, device, d.ociRoot(), input.SandboxID, plan.staging); err != nil {
+	if native {
+		err = captureNativeRootfs(ctx, tx, device, plan.staging)
+	} else {
+		err = captureRootfsUpper(ctx, tx, device, d.ociRoot(), input.SandboxID, plan.staging)
+	}
+	if err != nil {
 		return nil, err
 	}
 	// Once ownership and destination are fixed, pack/upload consume independent staging without holding the source lifecycle lock.
-	publication, err := d.prepareRootfsPublication(ctx, plan, raw, manifest)
+	publication, err := d.prepareRootfsPublication(ctx, plan, raw, manifest, native)
 	if err != nil {
 		return nil, err
 	}
@@ -308,6 +309,9 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	publicationOwned = true
 	release()
 	release = nil
+	if native {
+		return d.publishNativeRootfs(ctx, plan, input, upperBytes)
+	}
 	return d.publishPreparedOCISnapshot(ctx, plan, upperBytes, publication, input.OnPublishing)
 }
 
@@ -424,6 +428,13 @@ func marshalRootfsSnapshotManifest(source []byte, manifest artifacts.VMManifest)
 		return nil, err
 	}
 	delete(document, "files")
+	if len(manifest.Files) > 0 {
+		files, err := json.Marshal(manifest.Files)
+		if err != nil {
+			return nil, err
+		}
+		document["files"] = files
+	}
 	return json.MarshalIndent(document, "", "  ")
 }
 
@@ -494,7 +505,13 @@ func (d *Driver) qualifyRootfsSource(ctx context.Context, state *SandboxState, m
 	if err := qualifyBootKernel(state.BootKernelSHA256, manifest.Kernel.SHA256); err != nil {
 		return "", err
 	}
-	q, err := readRootfsQualification(d.rootfsQualificationSources(state, manifest))
+	source, err := restoreReference(state.Config.Desired)
+	if err != nil {
+		return "", err
+	}
+	sources := d.rootfsQualificationSources(state, manifest)
+	sources.Native = !strings.HasPrefix(source, "oci://")
+	q, err := readRootfsQualification(sources)
 	if err != nil {
 		return "", err
 	}
@@ -507,6 +524,9 @@ func (d *Driver) qualifyRootfsSource(ctx context.Context, state *SandboxState, m
 	}
 	if err := qualifyVMMExecutable(state, q.FirecrackerSHA256); err != nil {
 		return "", err
+	}
+	if q.Backend == captureBackendNative {
+		return identity, nil
 	}
 	if err := backendidentity.Verify(ctx, filepath.Join(runtimecatalog.OCISocketDir, "ublkd.sock"), q.OverlayBDSHA256); err != nil {
 		return "", err
@@ -523,6 +543,16 @@ func writeRootfsCapturedManifest(staging string, raw []byte, manifest artifacts.
 	manifest.Platform.Checkpoint = nil
 	manifest.Platform.StateFiles = nil
 	manifest.Files = nil
+	// A native cut owns an entire disk file; OCI cuts own upper metadata instead.
+	if _, err := os.Stat(filepath.Join(staging, publishedRootfsName)); err == nil {
+		entry, err := artifacts.FileEntry(filepath.Join(staging, publishedRootfsName), map[string]string{})
+		if err != nil {
+			return err
+		}
+		manifest.Files = map[string]artifacts.ManifestFile{publishedRootfsName: entry}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
 	for _, name := range []string{vaultBundleName, policyBundleName} {
 		if _, e := os.Stat(filepath.Join(staging, name)); e == nil {
 			entry, e := artifacts.FileEntry(filepath.Join(staging, name), map[string]string{})
@@ -535,6 +565,17 @@ func writeRootfsCapturedManifest(staging string, raw []byte, manifest artifacts.
 			manifest.Platform.StateFiles[name] = entry
 		} else if !os.IsNotExist(e) {
 			return e
+		}
+	}
+	if len(manifest.Files) > 0 {
+		names := []string{publishedRootfsName}
+		for _, name := range []string{vaultBundleName, policyBundleName} {
+			if _, ok := manifest.Platform.StateFiles[name]; ok {
+				names = append(names, name)
+			}
+		}
+		if err := artifacts.WriteSHA256SUMS(staging, names, map[string]string{}); err != nil {
+			return err
 		}
 	}
 	metadata, err := marshalRootfsSnapshotManifest(raw, manifest)
@@ -551,9 +592,6 @@ func (d *Driver) readRootfsCaptureManifest(state *SandboxState) ([]byte, artifac
 	source, err := restoreReference(state.Config.Desired)
 	if err != nil {
 		return nil, artifacts.VMManifest{}, "", err
-	}
-	if !strings.HasPrefix(source, "oci://") {
-		return nil, artifacts.VMManifest{}, "", errors.New("RootfsOnly requires OCI rootfs")
 	}
 	raw, err := readSourceManifest(d.config.StateRoot, d.ociRoot(), source, state.Config.Identity.SandboxUID)
 	if err != nil {
@@ -592,6 +630,7 @@ func prepareRootfsJournal(dir string, record captureRecord) (*captureJournal, er
 }
 
 const (
+	captureBackendNative     = "native"
 	vmPaused                 = "Paused"
 	vmRunning                = "Running"
 	rootfsDeviceName         = "rootfs.dev"
@@ -616,12 +655,15 @@ func (d *Driver) cleanupUnpublishedCapture(ctx context.Context, state *SandboxSt
 }
 
 // If template file or publication ownership preparation fails, the capture coordinator remains responsible for reclaiming the copy.
-func (d *Driver) prepareRootfsPublication(ctx context.Context, plan dumpPlan, raw []byte, manifest artifacts.VMManifest) (ociPublication, error) {
+func (d *Driver) prepareRootfsPublication(ctx context.Context, plan dumpPlan, raw []byte, manifest artifacts.VMManifest, native bool) (ociPublication, error) {
 	if err := d.stageTemplateState(ctx, plan.sandboxID, plan.staging); err != nil {
 		return ociPublication{}, err
 	}
 	if err := writeRootfsCapturedManifest(plan.staging, raw, manifest); err != nil {
 		return ociPublication{}, err
+	}
+	if native {
+		return ociPublication{}, nil
 	}
 	return prepareOCIPublication(plan)
 }
@@ -674,4 +716,93 @@ func (d *Driver) reconcileCaptureForDelete(ctx context.Context, state *SandboxSt
 		return err
 	}
 	return d.recoverRootfsCapture(ctx, state)
+}
+
+func (d *Driver) publishNativeRootfs(ctx context.Context, plan dumpPlan, input *runtimecontract.SnapshotInput, size int64) (result *runtimecontract.SnapshotResult, resultErr error) {
+	defer func() { resultErr = errors.Join(resultErr, os.RemoveAll(plan.staging)) }()
+	client, err := d.agentClientOrNil()
+	if err != nil {
+		return nil, err
+	}
+	if client == nil {
+		return nil, errors.New("native RootfsOnly requires runtime-agent publication")
+	}
+	if input.OnPublishing != nil {
+		input.OnPublishing()
+	}
+	out, err := client.PublishImage(ctx, "snapshot-"+plan.snapshotID, publishKind(fastletapi.SnapshotKindTemplate), input.TemplateName, plan.staging)
+	if err != nil {
+		return nil, err
+	}
+	return &runtimecontract.SnapshotResult{SnapshotID: input.SnapshotID, ManifestRef: out.ManifestRef, ArtifactDigest: out.ArtifactDigest, SizeBytes: size, Mode: fastletapi.SnapshotModeRootfsOnly}, nil
+}
+
+// Resolve source ownership and capacity before acquiring filesystem protection.
+func (d *Driver) prepareRootfsCut(input *runtimecontract.SnapshotInput, source string, native bool) (_ *os.File, _ dumpPlan, _ int64, resultErr error) {
+	if native && input.TemplateName == "" {
+		return nil, dumpPlan{}, 0, errors.New("native RootfsOnly requires templateName")
+	}
+
+	dir := filepath.Join(d.config.StateRoot, sandboxStateDir, input.SandboxID)
+	devicePath := filepath.Join(dir, rootfsDeviceName)
+	if native {
+		devicePath = filepath.Join(dir, instanceRootfsName)
+	}
+	if d.config.JailerPath != "" {
+		root := jailerRoot(filepath.Join(d.config.StateRoot, jailerChrootBaseDir), filepath.Base(d.config.BinaryPath), truncatedSandboxID(input.SandboxID))
+		if !native {
+			devicePath = filepath.Join(root, rootfsDeviceName)
+		} else {
+			devicePath = filepath.Join(root, rootfsImageName)
+		}
+	}
+	device, err := os.OpenFile(devicePath, os.O_RDWR, 0)
+	if err != nil {
+		return nil, dumpPlan{}, 0, err
+	}
+	defer func() {
+		if resultErr != nil {
+			device.Close()
+		}
+	}()
+	plan := dumpPlan{stateRoot: d.config.StateRoot, sandboxDir: dir, sandboxID: input.SandboxID, snapshotID: input.SnapshotID, staging: snapshotStagingPath(d.config.StateRoot, d.podUID, input.SnapshotID, true)}
+	var upperBytes int64
+	if native {
+		if _, _, err := captureNativeIdentity(device); err != nil {
+			return nil, dumpPlan{}, 0, err
+		}
+		info, err := device.Stat()
+		if err != nil {
+			return nil, dumpPlan{}, 0, err
+		}
+		upperBytes = info.Size()
+	} else {
+		if _, err = checkpointDestinationForSource(source, input.SnapshotID); err != nil {
+			return nil, dumpPlan{}, 0, err
+		}
+		upperBytes, err = allocatedUpperBytes(filepath.Join(d.ociRoot(), "sandboxes", input.SandboxID, "upper"))
+		if err != nil {
+			return nil, dumpPlan{}, 0, err
+		}
+	}
+	if stagingFree(d.config.StateRoot) < 3*upperBytes+(512<<20) {
+		return nil, dumpPlan{}, 0, runtimecontract.ErrInsufficientStorage
+	}
+	return device, plan, upperBytes, nil
+}
+
+func validateRootfsSnapshotInput(input *runtimecontract.SnapshotInput) error {
+	if input.Kind == fastletapi.SnapshotKindCheckpoint {
+		return errors.New("RootfsOnly is template-only")
+	}
+	if input.Kind != "" && input.Kind != fastletapi.SnapshotKindTemplate {
+		return errors.New("unknown snapshot kind")
+	}
+	if input.Identity == nil {
+		return errors.New("RootfsOnly requires admitted runtime identity")
+	}
+	if err := validateSandboxID(input.SnapshotID); err != nil {
+		return err
+	}
+	return nil
 }

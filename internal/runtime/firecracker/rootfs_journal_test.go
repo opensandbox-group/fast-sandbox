@@ -1,6 +1,7 @@
 package firecracker
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -111,4 +112,25 @@ func TestCaptureJournalPreservesExistingEmptyFence(t *testing.T) {
 	_, err := newCaptureJournal(directory, captureRecord{Incarnation: "boot", Device: "/dev/ublkb0", Staging: "/tmp/cut", Request: fixture.transaction().Request})
 	require.ErrorIs(t, err, os.ErrExist)
 	require.DirExists(t, directory)
+}
+
+func TestNativeCaptureJournalVersionAndIdentity(t *testing.T) {
+	tx := (&captureFixture{}).transaction()
+	r := captureRecord{Backend: "native", FileDevice: 42, FileInode: 123, Incarnation: "vm", Device: "/disk.img", Staging: "/cut", Request: tx.Request}
+	path := filepath.Join(t.TempDir(), "journal")
+	j, err := newCaptureJournal(path, r)
+	require.NoError(t, err)
+	require.Equal(t, 2, j.record.Version, "old readers must reject native records")
+	reloaded, err := loadCaptureJournal(path)
+	require.NoError(t, err)
+	require.Equal(t, uint64(123), reloaded.record.FileInode)
+	for _, mutate := range []func(*captureRecord){func(r *captureRecord) { r.Version = 1 }, func(r *captureRecord) { r.FileInode = 0 }, func(r *captureRecord) { r.Backend = "unknown" }} {
+		bad := j.record
+		mutate(&bad)
+		payload, err := json.Marshal(bad)
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(path, "capture.json"), payload, 0600))
+		_, err = loadCaptureJournal(path)
+		require.Error(t, err)
+	}
 }

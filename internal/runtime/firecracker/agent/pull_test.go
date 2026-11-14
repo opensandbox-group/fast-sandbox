@@ -113,7 +113,8 @@ func testManifest(contents map[string][]byte) []byte {
 		}
 	}
 	document := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 1, RootfsSizeMiB: 1, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.img"}, "6.1.177", "/missing/firecracker", artifacts.CPUTemplateNone)
-	document.Compatibility.FirecrackerVersion = "1.16.1"
+	// Transport tests must not depend on the host CPU or installed VMM.
+	document.Compatibility = artifacts.SnapshotCompatibility{CPUArch: "x86_64", FirecrackerVersion: "1.16.1", CPUTemplate: artifacts.CPUTemplateNone, Vendor: artifacts.VendorGenuineIntel, CPUFamily: 6, CPUModel: 85, CPUStepping: 7}
 	document.Lineage = &artifacts.VMLineage{Image: testImage}
 	document.Files = map[string]artifacts.ManifestFile{}
 	document.Platform = &artifacts.VMPlatform{StateFiles: map[string]artifacts.ManifestFile{}}

@@ -30,6 +30,8 @@ func TestRootfsQualificationFailClosed(t *testing.T) {
 		ok     bool
 	}{
 		{"qualified", func(*rootfsQualification) {}, true},
+		{"native", func(q *rootfsQualification) { q.Backend = "native"; q.OverlayBDSHA256 = "" }, true},
+		{"unknown-backend", func(q *rootfsQualification) { q.Backend = "unknown" }, false},
 		{"unqualified-storage", func(q *rootfsQualification) { q.OverlayBDSHA256 = "" }, false},
 		{"raw-writers", func(q *rootfsQualification) { q.ExclusiveExt4 = false }, false},
 		{"bad-kernel", func(q *rootfsQualification) { q.KernelSHA256 = "unknown" }, false},
@@ -42,7 +44,7 @@ func TestRootfsQualificationFailClosed(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "qualification.json")
 			require.NoError(t, os.WriteFile(path, raw, 0600))
 			t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
-			_, err = readRootfsQualification(rootfsQualificationSources{})
+			_, err = readRootfsQualification(rootfsQualificationSources{Native: tc.name == "native"})
 			if tc.ok {
 				require.NoError(t, err)
 			} else {
@@ -183,7 +185,7 @@ func TestRootfsFailedCaptureStagingRecovery(t *testing.T) {
 			}
 			switch scenario {
 			case "prepare-failed":
-				_, err = d.prepareRootfsPublication(t.Context(), dumpPlan{sandboxID: "source", sandboxDir: directory, staging: staging}, nil, artifacts.VMManifest{})
+				_, err = d.prepareRootfsPublication(t.Context(), dumpPlan{sandboxID: "source", sandboxDir: directory, staging: staging}, nil, artifacts.VMManifest{}, false)
 				require.Error(t, err)
 			case "partial-upper-live":
 				require.NoError(t, d.cleanupUnpublishedCapture(t.Context(), state, journal))
@@ -410,6 +412,7 @@ func TestRootfsQualificationCustomVMMNeedsExplicitDigest(t *testing.T) {
 func TestRootfsQualificationKernelDiagnostics(t *testing.T) {
 	d := &Driver{}
 	state := &SandboxState{BootKernelSHA256: strings.Repeat("a", 64)}
+	state.Config.Desired.Image = "oci://example.com/template:latest"
 	_, err := d.qualifyRootfsSource(t.Context(), state, artifacts.VMManifest{})
 	require.ErrorContains(t, err, "rebuild the template and recreate the sandbox")
 	profile := filepath.Join(t.TempDir(), "qualification.json")
@@ -422,4 +425,62 @@ func TestRootfsQualificationKernelDiagnostics(t *testing.T) {
 	manifest.Kernel.SHA256 = state.BootKernelSHA256
 	_, err = d.qualifyRootfsSource(t.Context(), state, manifest)
 	require.ErrorContains(t, err, "qualification pins kernelSHA256")
+}
+
+func TestNativeRootfsCapturedManifestAndReadiness(t *testing.T) {
+	root := t.TempDir()
+	image := "native-captured"
+	staging := filepath.Join(root, "staging")
+	require.NoError(t, os.MkdirAll(staging, 0700))
+	m := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 256, RootfsSizeMiB: 1, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.img"}, "vmlinux.bin", "", artifacts.CPUTemplateNone)
+	m.Compatibility.FirecrackerVersion = "1.16.1"
+	m.Platform = &artifacts.VMPlatform{SnapshotMode: "rootfsOnly"}
+	m.Kernel.Cmdline = "root=/dev/vda rw"
+	m.Kernel.SHA256 = strings.Repeat("a", 64)
+	raw, err := artifacts.MarshalVMManifest(m)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(staging, publishedRootfsName), []byte("disk"), 0600))
+	require.NoError(t, writeRootfsCapturedManifest(staging, raw, m))
+	payload, err := os.ReadFile(filepath.Join(staging, snapshotManifestName))
+	require.NoError(t, err)
+	got, err := artifacts.DecodeVMManifest(payload)
+	require.NoError(t, err)
+	require.True(t, got.IsRootfsOnly())
+	require.Len(t, got.Files, 1)
+	require.Equal(t, artifacts.SHA256Of([]byte("disk")), got.Files[publishedRootfsName].SHA256)
+	require.FileExists(t, filepath.Join(staging, artifacts.SHA256SUMSName))
+	cache := filepath.Dir(cachedManifestPath(root, image))
+	require.NoError(t, os.MkdirAll(cache, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(cache, rootfsImageName), []byte("disk"), 0600))
+	require.NoError(t, os.WriteFile(cachedManifestPath(root, image), payload, 0600))
+	require.NoError(t, verifyRestorableImage(root, image))
+	require.NoError(t, os.WriteFile(filepath.Join(cache, rootfsImageName), []byte("oops"), 0600))
+	require.ErrorIs(t, verifyRestorableImage(root, image), ErrImageNotReady)
+}
+
+func TestNativeQualificationUsesSelectedVMMWithoutOverlayBDBundle(t *testing.T) {
+	source := rootfsQualificationSources{Native: true, ManagedVMM: true, KernelSHA256: strings.Repeat("a", 64), OverlayBDBundle: "/missing-oci-bundle", StandardTopology: true}
+	path := filepath.Join(t.TempDir(), "profile.json")
+	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
+	for _, tc := range []struct {
+		body string
+		ok   bool
+	}{
+		{`{"backend":"native","storageRevision":"qualified-xfs","exclusiveExt4":true}`, true},
+		{`{"backend":"native","storageRevision":"qualified-xfs"}`, false},
+		{`{"backend":"native","exclusiveExt4":true}`, false},
+		{`{"backend":"native","storageRevision":null,"exclusiveExt4":true}`, false},
+		{`{"backend":"other","storageRevision":"qualified-xfs","exclusiveExt4":true}`, false},
+	} {
+		require.NoError(t, os.WriteFile(path, []byte(tc.body), 0600))
+		q, err := readRootfsQualification(source)
+		if tc.ok {
+			require.NoError(t, err)
+			require.Equal(t, source.KernelSHA256, q.KernelSHA256)
+			require.Empty(t, q.FirecrackerSHA256)
+			require.Empty(t, q.OverlayBDSHA256)
+		} else {
+			require.Error(t, err)
+		}
+	}
 }

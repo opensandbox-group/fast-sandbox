@@ -99,7 +99,7 @@ func cacheComplete(dir string) (bool, error) {
 	if err != nil {
 		return false, nil //nolint:nilerr // a corrupt cached manifest means the pull is not complete
 	}
-	files, err := document.nativeFiles()
+	files, err := document.downloadFiles()
 	if err != nil {
 		return false, nil //nolint:nilerr // an incomplete native file set means the pull is not complete
 	}

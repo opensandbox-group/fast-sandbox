@@ -105,3 +105,22 @@ func TestManagedVMMUnavailableIsArtifactMismatch(t *testing.T) {
 	require.Error(t, err)
 	require.NotErrorIs(t, err, ErrIncompatibleArtifact)
 }
+
+func TestManagedNativeRootfsUsesManifestVMM(t *testing.T) {
+	root := vmmTestBundle(t)
+	stateRoot := t.TempDir()
+	d := &Driver{config: runtimecatalog.FirecrackerConfig{VMMDir: root, BinaryPath: "/legacy/firecracker", StateRoot: stateRoot}, fcVersion: "1.16.1"}
+	m := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 256, RootfsSizeMiB: 1, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.img"}, "vmlinux.bin", "", artifacts.CPUTemplateNone)
+	m.Platform = &artifacts.VMPlatform{SnapshotMode: "rootfsOnly"}
+	m.Kernel.Cmdline = "root=/dev/vda rw"
+	m.Kernel.SHA256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	m.Compatibility.FirecrackerVersion = "1.17.0"
+	raw, err := artifacts.MarshalVMManifest(m)
+	require.NoError(t, err)
+	path := cachedManifestPath(stateRoot, "native")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0700))
+	require.NoError(t, os.WriteFile(path, raw, 0600))
+	require.NoError(t, d.validateRestoreCompatibility(stateRoot, "native"))
+	require.NoError(t, os.RemoveAll(filepath.Join(root, "versions", "1.17.0")))
+	require.Error(t, d.validateRestoreCompatibility(stateRoot, "native"))
+}

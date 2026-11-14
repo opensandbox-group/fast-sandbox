@@ -1,6 +1,6 @@
 # Experimental Guest filesystem control
 
-This package and `cmd/fsb-guest-control` implement the Guest-control portion of FSEP-0001. The builder injects the helper unconditionally into OverlayBD templates, and the internal Fastlet RootfsOnly capture path uses it at capture time. Production enablement requires qualified templates, node binaries, and filesystem writer coverage for each supported runtime configuration.
+This package and `cmd/fsb-guest-control` implement the Guest-control portion of FSEP-0001. The builder injects the helper unconditionally into native and OverlayBD templates, and the internal Fastlet RootfsOnly capture path uses it at capture time. Production enablement requires qualified templates, node binaries, and filesystem writer coverage for each supported runtime configuration.
 
 ## Components
 
@@ -121,3 +121,17 @@ After successful capture, source recovery, and state-file staging, the coordinat
 ### Optional layer compaction
 
 The capture preflight budgets upper copies and mandatory packing; it does not reserve a download of every inherited layer. Pack completes mandatory snapfiles before optional squash. Before fetching a squash tail it checks free space on the artifact filesystem for missing compressed inputs, two virtual-disk-sized outputs with encoding headroom, and metadata overhead. This is a conservative preflight estimate, not a quota reservation against unrelated concurrent writers. Insufficient capacity skips compaction and publishes the original layer chain. Fetch/merge failure removes newly downloaded inputs; cleanup failure aborts publication instead of silently stranding files. Existing local blobs are preserved on failure.
+
+### Native/S3 RootfsOnly capture
+
+Native templates use a file-backed ext4 disk rather than OverlayBD upper data/index. Capture freezes the Guest filesystem, pauses the VM, synchronizes the held disk descriptor, and cuts an XFS reflink before recovery. Publication uploads `rootfs.ext4`, checksums, the manifest and declared platform bundles through the runtime-agent object-store path. RootfsOnly artifacts contain no memory or vmstate; cold boot restarts the Guest and its processes. Checkpoint resume from a RootfsOnly artifact is rejected.
+
+Native capture remains an explicit storage opt-in. Set `FAST_SANDBOX_ROOTFS_QUALIFICATION` to an operator-owned absolute JSON path containing:
+
+```json
+{"backend":"native","storageRevision":"YOUR_VALIDATED_XFS_STACK","exclusiveExt4":true}
+```
+
+For managed VMM delivery, the running Firecracker is checked against the instance's selected installation and the kernel against the source manifest; no manual VMM/kernel digest is required. Custom fixed binaries still require an explicit `firecrackerSHA256`. Capture requires Firecracker 1.17.0. Native profiles do not read the OverlayBD tools bundle or daemon attestation. The storage revision and exclusive-writer declaration must describe the actual validated deployment; the driver requires XFS reflink and has no full-copy fallback during capture. A native profile cannot qualify an OverlayBD source, or vice versa. Configure separate Fastlets for the two profile contracts.
+
+Rebuild native templates to include the default helper and verified kernel metadata. Injection alone is insufficient: the native builder configures vsock and requires the freeze/thaw probe before publishing the capability. Existing templates without this metadata remain usable for their existing Full flow but cannot provide RootfsOnly capture.
