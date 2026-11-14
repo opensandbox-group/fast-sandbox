@@ -1524,8 +1524,9 @@ func TestRecoverRuntimeResourcesRemovesJailRoot(t *testing.T) {
 	require.True(t, os.IsNotExist(err))
 }
 
-func testManifestDocument(t *testing.T) map[string]any {
-	t.Helper()
+// newTestVMManifest is the VM manifest test caches commit. It takes no
+// *testing.T so fake agents can write it as their pull commit point.
+func newTestVMManifest() artifacts.VMManifest {
 	doc := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: 2, MemoryMiB: 1024, RootfsSizeMiB: 1024, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.img"}, "6.1.177", "/missing/firecracker", artifacts.CPUTemplateNone)
 	doc.Compatibility.FirecrackerVersion = "1.16.1"
 	doc.GuestNetwork = &artifacts.VMGuestNetwork{Iface: "eth0", MAC: "02:00:00:00:00:01", IP: "172.30.0.3", Gateway: "172.30.0.1", Netmask: "255.255.255.0", MTU: 1500}
@@ -1533,7 +1534,12 @@ func testManifestDocument(t *testing.T) map[string]any {
 	for _, name := range []string{"rootfs.ext4", "vmstate.snap", "memory.snap"} {
 		doc.Files[name] = artifacts.ManifestFile{SHA256: artifacts.SHA256Of([]byte(name)), SizeBytes: 1}
 	}
-	raw, err := json.Marshal(doc)
+	return doc
+}
+
+func testManifestDocument(t *testing.T) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(newTestVMManifest())
 	require.NoError(t, err)
 	var result map[string]any
 	require.NoError(t, json.Unmarshal(raw, &result))

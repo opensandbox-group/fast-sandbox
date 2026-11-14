@@ -37,6 +37,13 @@ func (d *Driver) selectCachedVMM(ctx context.Context, image string) (*firecracke
 	}
 	raw, err := os.ReadFile(cachedManifestPath(d.config.StateRoot, image))
 	if err != nil {
+		// The runtime-agent commits manifest.json last: without it the pull
+		// is still in flight (or was interrupted). Report it as not ready so
+		// the boot worker retries, like validateRestoreCompatibility does,
+		// instead of failing the Sandbox on a transient ENOENT.
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %q has no committed manifest yet", ErrImageNotReady, image)
+		}
 		return nil, err
 	}
 	manifest, err := artifacts.DecodeVMManifest(raw)
