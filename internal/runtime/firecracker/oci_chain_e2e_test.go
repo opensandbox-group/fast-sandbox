@@ -123,6 +123,10 @@ func TestFirecrackerOCICheckpointChainE2E(t *testing.T) {
 	require.NoError(t, err)
 	driver.SetNetworkManager(manager)
 	driver.SetFastletPodUID(podUID)
+	// FSEP-0003: the driver always launches the VMM through the
+	// capability-drop helper; this source-tree E2E builds it from the module.
+	helper := e2eVMMExecHelper(t)
+	driver.resolveVMMExec = func() (string, error) { return helper, nil }
 	require.NoError(t, driver.Initialize(ctx, ""))
 	t.Cleanup(func() {
 		_ = driver.DeleteSandbox(context.Background(), ociChainSandboxID)

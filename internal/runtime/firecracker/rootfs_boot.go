@@ -9,6 +9,7 @@ import (
 	"fast-sandbox/internal/artifacts"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/firecrackerconfig"
+	"fast-sandbox/internal/vmmexec"
 )
 
 // Cold boot uses only a resolved rootfs of the same architecture; it does not reuse the source host CPU template or register state.
@@ -27,9 +28,9 @@ func checkRootfsBootCompatibility(m artifacts.VMManifest, version string) error 
 func (d *Driver) rootfsKernel(m artifacts.VMManifest) (string, error) {
 	return firecrackerconfig.ResolveKernel("/usr/local/share/firecracker", m.Kernel.Version, d.config.KernelPath)
 }
-func (d *Driver) prepareRootfsBootInstance(id, directory, rootfs, kernel string) (devicePath, jailPath, socketPath string, resultErr error) {
+func (d *Driver) prepareRootfsBootInstance(id, directory, rootfs, kernel, vmmBinary string) (devicePath, jailPath, socketPath string, resultErr error) {
 	if d.config.JailerPath == "" {
-		return d.prepareOCIInstance(id, directory, rootfs, "", "")
+		return d.prepareOCIInstance(id, directory, rootfs, "", "", vmmBinary)
 	}
 	root := jailerRoot(filepath.Join(d.config.StateRoot, jailerChrootBaseDir), filepath.Base(d.config.BinaryPath), truncatedSandboxID(id))
 	if err := os.MkdirAll(root, 0750); err != nil {
@@ -53,6 +54,14 @@ func (d *Driver) prepareRootfsBootInstance(id, directory, rootfs, kernel string)
 		if err = bindMount(entry.source, target); err != nil {
 			return "", "", "", err
 		}
+	}
+	// The real VMM binary joins the jail read-only at the fixed convention
+	// /vmm/firecracker for the capability-drop helper to exec.
+	if err := os.MkdirAll(filepath.Join(root, vmmexec.VMMJailDir), 0750); err != nil {
+		return "", "", "", err
+	}
+	if err := bindFileReadOnly(vmmBinary, jailedVMMBinaryPath(root)); err != nil {
+		return "", "", "", fmt.Errorf("bind the VMM binary into the jail root: %w", err)
 	}
 	return filepath.Join(root, rootfsDeviceName), root, filepath.Join(root, "api.sock"), nil
 }

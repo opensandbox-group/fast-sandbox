@@ -33,6 +33,7 @@ import (
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 	"fast-sandbox/internal/runtime/firecracker/agent/hostready"
+	"fast-sandbox/internal/vmmexec"
 )
 
 // bootPollInterval is the VM state polling interval after start/resume.
@@ -53,16 +54,24 @@ type Driver struct {
 	// alignJailKVM rebinds the jailed /dev/kvm inode to the host device
 	// numbers before the first restore API call (jailer mode only; see
 	// kvm_device.go; tests stub it).
-	alignJailKVM   func(hostPath, jailPath string) error
-	newClient      func(socketPath string) *Client
-	stat           func(string) (os.FileInfo, error)
-	killProcess    func(pid int) error
-	probeProcess   func(pid int) error
-	waitSocket     func(ctx context.Context, socketPath string, timeout time.Duration) error
-	checkStorage   func(context.Context, string) error
-	networkManager *fastletnetwork.Manager
-	runtimeCgroups *podcgroup.RuntimeManager
-	infraMgr       *fastletinfra.Manager
+	alignJailKVM func(hostPath, jailPath string) error
+	// resolveVMMExec resolves the capability-drop exec helper (FSEP-0003):
+	// the helper performs the final exec of the VMM with the fixed
+	// capability set removed.
+	resolveVMMExec func() (string, error)
+	// assertCapabilities verifies the launch-time capability assertion on
+	// the VMM process (the fixed set absent from CapEff/CapBnd with
+	// NoNewPrivs set); tests stub it.
+	assertCapabilities func(pid int) error
+	newClient          func(socketPath string) *Client
+	stat               func(string) (os.FileInfo, error)
+	killProcess        func(pid int) error
+	probeProcess       func(pid int) error
+	waitSocket         func(ctx context.Context, socketPath string, timeout time.Duration) error
+	checkStorage       func(context.Context, string) error
+	networkManager     *fastletnetwork.Manager
+	runtimeCgroups     *podcgroup.RuntimeManager
+	infraMgr           *fastletinfra.Manager
 	// stateMover carries the egress-owned state files (credential vault,
 	// recorded network policy) across pause/resume; nil disables the
 	// transfers.
@@ -137,8 +146,10 @@ func New(profile runtimecatalog.RuntimeProfile) (*Driver, error) {
 		profile: profile, config: *profile.Firecracker,
 		runner: fastletnetwork.ExecRunner{}, launcher: ExecProcessRunner{},
 		newClient: NewClient, stat: os.Stat, killProcess: killPID, probeProcess: pidAlive,
-		alignJailKVM: defaultAlignJailKVM,
-		waitSocket:   waitForAPISocket, processes: make(map[string]Process),
+		alignJailKVM:       defaultAlignJailKVM,
+		resolveVMMExec:     vmmexec.ResolveHelperPath,
+		assertCapabilities: assertVMMCapabilities,
+		waitSocket:         waitForAPISocket, processes: make(map[string]Process),
 		checkStorage:           checkStateRootStorage,
 		writeVMMetadataPayload: writeVMMetadataPayload,
 		imageGCInterval:        defaultImageGCInterval,
@@ -269,6 +280,13 @@ func (d *Driver) gcImageCache() {
 func validateConfig(config runtimecatalog.FirecrackerConfig) error {
 	if config.VMMDir != "" && (!filepath.IsAbs(config.VMMDir) || filepath.Base(config.BinaryPath) != "firecracker") {
 		return fmt.Errorf("%w: managed VMMs require an absolute vmmDir and binary basename firecracker", ErrInvalidConfig)
+	}
+	// The capability-drop helper is installed with the "firecracker"
+	// basename (the jailer derives the jail root from the exec-file
+	// basename), so the jail layout and the NodeJanitor matcher require the
+	// configured binary to carry the same basename in jailer mode.
+	if config.JailerPath != "" && filepath.Base(config.BinaryPath) != vmmexec.HelperBasename {
+		return fmt.Errorf("%w: jailer mode requires the firecracker binary basename %q (the jail layout and the NodeJanitor matcher derive from it)", ErrInvalidConfig, vmmexec.HelperBasename)
 	}
 	// KernelPath is optional (#84): only direct-boot operators pin it.
 	if config.BinaryPath == "" || config.RootfsPath == "" || config.StateRoot == "" {
@@ -520,6 +538,19 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		return nil, fmt.Errorf("%w: firecracker requires the Fastlet network manager", ErrNetworkUnavailable)
 	}
 
+	// FSEP-0003: every VMM launches through the capability-drop exec
+	// helper — in jailer mode as the jailer's --exec-file (installed with
+	// the "firecracker" basename, so the jailer-derived jail root and every
+	// Fastlet path consumer stay unchanged) and in direct mode as the
+	// process the Fastlet starts with the --exec target. The helper ships
+	// in the Fastlet image; a missing helper is a node-level fault that
+	// fails every create loudly here — before any image or network step —
+	// instead of launching the VMM with the full Pod capability set.
+	execFile, err := d.resolveVMMExec()
+	if err != nil {
+		return nil, fmt.Errorf("resolve VMM capability-drop helper: %w", err)
+	}
+
 	// Image readiness: a create whose image is not yet cached never blocks
 	// on the node-side pull. Fastlet routes cold creates through the
 	// driver's asynchronous delivery (DeliverImage): the artifact set is
@@ -687,14 +718,14 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 					defer os.Remove(pinned) // The VMM loads the kernel before Ensure returns.
 				}
 				if err == nil {
-					instanceRootfs, jailRoot, apiAddress, err = d.prepareRootfsBootInstance(identity.SandboxUID, directory, ociRootfs, rootfsKernel)
+					instanceRootfs, jailRoot, apiAddress, err = d.prepareRootfsBootInstance(identity.SandboxUID, directory, ociRootfs, rootfsKernel, binaryPath)
 				}
 			} else {
-				instanceRootfs, jailRoot, apiAddress, err = d.prepareOCIInstance(identity.SandboxUID, directory, ociRootfs, vmstatePath, memoryPath)
+				instanceRootfs, jailRoot, apiAddress, err = d.prepareOCIInstance(identity.SandboxUID, directory, ociRootfs, vmstatePath, memoryPath, binaryPath)
 			}
 		} else {
 			instanceRootfs, jailRoot, apiAddress, err = d.prepareInstance(
-				stateRoot, identity.SandboxUID, restoreRef, directory, vmstatePath, memoryPath,
+				stateRoot, identity.SandboxUID, restoreRef, directory, vmstatePath, memoryPath, binaryPath,
 			)
 		}
 	}
@@ -813,6 +844,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	launchStarted := time.Now()
 	process, err := d.launchVM(launchCtx, launchConfig{
 		BinaryPath: binaryPath,
+		ExecFile:   execFile,
 		JailerPath: jailerPath,
 		SandboxID:  identity.SandboxUID,
 		APIAddress: apiAddress,
@@ -853,6 +885,26 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		return nil, err
 	}
 	launchDur := time.Since(launchStarted)
+
+	// FSEP-0003 launch-time assertion: on every create, in both launch
+	// modes, the fixed capability set must be absent from the VMM's
+	// effective and bounding sets with NoNewPrivs set. The assertion proves
+	// the bits are absent; operation-level denial of BPF/perf is
+	// established by the seccomp policy check
+	// (seccomp_policy_test.go) while CAP_SYS_ADMIN is retained in this
+	// batch. A failure kills the half-launched VMM and fails the create.
+	_, assertSpan := observability.Start(ctx, "fastlet.firecracker.capability_assert")
+	assertErr := d.assertCapabilities(process.PID())
+	observability.End(assertSpan, assertErr)
+	if assertErr != nil {
+		detail := readProcessLog(logDir)
+		d.killAndForget(identity.SandboxUID, process.PID())
+		releaseSlot()
+		return nil, fmt.Errorf("%w: verify VMM capability drop: %w%s", ErrRuntimeNotInitialized, assertErr, detail)
+	}
+	klog.V(2).InfoS("VMM capability drop verified",
+		"sandboxID", identity.SandboxUID, "pid", process.PID(),
+		"dropped", vmmexec.DropNames(), "noNewPrivs", true)
 
 	// Jailer mode only: the jailer bound the jailed /dev/kvm to the upstream
 	// default device number; rebind it to the host numbers before the
@@ -1570,9 +1622,10 @@ func bakedGuestIP(slot *fastletnetwork.Slot, guestNetwork manifestGuestNetwork, 
 
 // prepareInstance assembles the per-instance runtime assets: the writable
 // instance rootfs and, in jailer mode, the jail root with the restore
-// snapshot links. It returns the instance rootfs path, the jail root (empty
-// in direct mode), and the host path of the firecracker API socket.
-func (d *Driver) prepareInstance(stateRoot, sandboxID, image, stateDir, vmstatePath, memoryPath string) (instanceRootfs, jailRoot, apiAddress string, err error) {
+// snapshot links and the real VMM binary at /vmm/firecracker. It returns
+// the instance rootfs path, the jail root (empty in direct mode), and the
+// host path of the firecracker API socket.
+func (d *Driver) prepareInstance(stateRoot, sandboxID, image, stateDir, vmstatePath, memoryPath, vmmBinary string) (instanceRootfs, jailRoot, apiAddress string, err error) {
 	if d.config.JailerPath != "" {
 		id := truncatedSandboxID(sandboxID)
 		jailRoot = jailerRoot(filepath.Join(d.config.StateRoot, jailerChrootBaseDir), filepath.Base(d.config.BinaryPath), id)
@@ -1582,7 +1635,7 @@ func (d *Driver) prepareInstance(stateRoot, sandboxID, image, stateDir, vmstateP
 		if resolveErr != nil {
 			return "", "", "", resolveErr
 		}
-		if prepareErr := prepareJailRoot(jailRoot, cached, vmstatePath, memoryPath); prepareErr != nil {
+		if prepareErr := prepareJailRoot(jailRoot, cached, vmstatePath, memoryPath, vmmBinary); prepareErr != nil {
 			return "", "", "", prepareErr
 		}
 		d.prepareSnapshotSpill(jailRoot)
@@ -1610,6 +1663,9 @@ func (d *Driver) removeJailRoot(sandboxID string) {
 	// A memcg OOM can kill the VMM before the jailer tears that mount down, so
 	// detach it explicitly before RemoveAll or the otherwise-dead jail leaks.
 	_ = unmountPath(jailedKVMDevicePath(root))
+	// The real VMM binary enters the jail as a read-only bind (OCI restore
+	// and RootfsOnly boot) and must detach before the removal.
+	_ = unmountPath(jailedVMMBinaryPath(root))
 	for _, target := range []string{rootfsDeviceName, "rootfs-kernel", filepath.Join(jailerChrootSnapshotsDir, vmstateSnapshotName), filepath.Join(jailerChrootSnapshotsDir, memorySnapshotName)} {
 		_ = unmountPath(filepath.Join(root, target))
 	}
