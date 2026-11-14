@@ -37,8 +37,8 @@ flowchart LR
   Client -->|"declarative objects"| API
   FP -->|"persist intent"| API
   RC <-->|"watch and reconcile"| API
-  FP -->|"atomic Create"| FPOD
-  RC -->|"inspect / delete / drain"| FPOD
+  FP -->|"authenticated atomic Create"| FPOD
+  RC -->|"authenticated inspect / delete / drain"| FPOD
   Client -->|"component protocol"| SP
   SP -->|"authenticated route"| FPOD
   FPOD --> Driver --> Runtime --> Infra

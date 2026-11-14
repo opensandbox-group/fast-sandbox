@@ -14,9 +14,13 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -38,6 +42,7 @@ import (
 	"fast-sandbox/internal/controlplane/placement"
 	"fast-sandbox/internal/controlplane/reconciler"
 	routeauth "fast-sandbox/internal/dataplane/auth"
+	"fast-sandbox/internal/fastletauth"
 	"fast-sandbox/internal/observability"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	"fast-sandbox/internal/runtimeenv"
@@ -78,6 +83,7 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	var cacheNamespaces string
 	var kubeClientQPS float64
 	var kubeClientBurst int
+	var fastletAuthSubjects string
 
 	flag.StringVar(&roleValue, "role", "all", "Control-plane role: fastpath, controller, or all.")
 	flag.StringVar(&metricsAddress, "metrics-bind-address", ":9091", "Metrics listen address.")
@@ -104,6 +110,7 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	flag.DurationVar(&resourceAwareStartupGrace, "resource-aware-fastlet-startup-grace", 2*time.Minute, "Maximum time a Fastlet without a heartbeat contributes nominal in-flight capacity.")
 	flag.DurationVar(&resourceAwareScaleDownStabilization, "resource-aware-scale-down-stabilization", time.Minute, "Continuous excess-capacity window required before ResourceAware scale-down.")
 	flag.StringVar(&cacheNamespaces, "namespaces", "", "Comma-separated namespaces the informer cache watches; empty watches the whole cluster. Must cover every namespace holding SandboxPool/Sandbox objects and the runtime environment ConfigMap.")
+	flag.StringVar(&fastletAuthSubjects, fastletauth.SubjectsFlag, envOrDefault(fastletauth.SubjectsEnv, ""), "Comma-separated ServiceAccount subjects allowed to call the Fastlet control API; empty applies the platform default. Custom control-plane namespaces must also replicate the namespaced Role/RoleBinding (serviceaccounts/token create, resourceNames-fenced) that config/rbac/base.yaml ships in fast-sandbox-system, or every Fastlet call fails closed with Forbidden.")
 	flag.Float64Var(&kubeClientQPS, "kube-client-qps", 0, "API-server client rate limit in queries per second; 0 keeps the client-go default.")
 	flag.IntVar(&kubeClientBurst, "kube-client-burst", 0, "API-server client burst budget for the rate limiter; 0 keeps the client-go default.")
 	componentlog.InitFlags(nil)
@@ -205,6 +212,23 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	registry.SetServerSeed(os.Getenv("POD_UID"))
 	catalog := runtimecatalog.Builtin()
 	fastletClient := fastletapi.NewFastletClient(fastletPort)
+	fastletAuthAudience := envOrDefault(fastletauth.AudienceEnv, fastletauth.Audience)
+	fastletAuthIssuer, fastletAuthCABundle, err := installFastletAuthTokenSource(restConfig, fastletClient, fastletAuthAudience)
+	if err != nil {
+		klog.ErrorS(err, "Configure Fastlet control authentication: it is always enabled and cannot start without it")
+		os.Exit(1)
+	}
+	// The allow list travels to Fastlet Pods through the Pool Controller: a
+	// flag set with no usable subject is a configuration error, not a signal
+	// to fall back to the built-in default silently.
+	fastletAuthSubjectList := fastletauth.ParseSubjects(fastletAuthSubjects)
+	if fastletAuthSubjects != "" && len(fastletAuthSubjectList) == 0 {
+		klog.ErrorS(nil, "--fastlet-auth-subjects is set but contains no usable subject")
+		os.Exit(1)
+	}
+	if len(fastletAuthSubjectList) > 0 {
+		klog.InfoS("Fastlet control allow list override", "subjects", strings.Join(fastletAuthSubjectList, ","))
+	}
 	orchestrator := &orchestration.Orchestrator{
 		Client: durableClient, Registry: registry, FastletClient: fastletClient, Catalog: catalog,
 		DisableResourceAwarePlacement: !resourceAwarePlacement,
@@ -228,6 +252,9 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 			DisableResourceAwareStaticAdmission: !resourceAwareStaticAdmission,
 			DisableResourceAwareMemoryAdmission: !resourceAwareMemoryAdmission,
 			DisableResourceAwarePoolScaling:     !resourceAwarePoolScaling,
+			FastletAuthIssuer:                   fastletAuthIssuer, FastletAuthCABundle: fastletAuthCABundle,
+			FastletAuthSubjects: fastletAuthSubjectList,
+			FastletAuthAudience: fastletAuthAudience,
 		}).SetupWithManager(manager); err != nil {
 			klog.ErrorS(err, "Register SandboxPool controller")
 			os.Exit(1)
@@ -314,6 +341,37 @@ func envOrDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// installFastletAuthTokenSource wires the Fastlet control authentication onto
+// the shared Fastlet client and resolves the issuer anchor for the Pool
+// Controller to inject into Fastlet Pods. Tokens are minted via the
+// TokenRequest API for this Pod's own ServiceAccount; a cluster without the
+// serviceaccounts/token grant fails closed at the first Fastlet call.
+func installFastletAuthTokenSource(restConfig *rest.Config, fastletClient *fastletapi.FastletClient, audience string) (issuer, caBundle string, err error) {
+	identity, err := fastletauth.ResolvePodServiceAccountIdentity(
+		os.Getenv(fastletauth.NamespaceEnv), os.Getenv(fastletauth.ServiceAccountEnv))
+	if err != nil {
+		return "", "", fmt.Errorf("resolve Fastlet auth identity: %w", err)
+	}
+	authenticationClient, err := corev1client.NewForConfig(restConfig)
+	if err != nil {
+		return "", "", fmt.Errorf("create core client for Fastlet auth TokenRequest: %w", err)
+	}
+	tokenSource := fastletauth.NewTokenRequestSource(func(ctx context.Context, namespace, name string, request *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+		return authenticationClient.ServiceAccounts(namespace).CreateToken(ctx, name, request, metav1.CreateOptions{})
+	}, identity, audience)
+	fastletClient.SetTokenSource(tokenSource)
+	issuer, caBundle, err = fastletauth.ResolveIssuerAnchor(os.Getenv(fastletauth.IssuerEnv), os.Getenv(fastletauth.CABundleEnv))
+	if err != nil {
+		// Auth is always on and the anchor cannot be re-resolved while
+		// running: refuse to start rather than create Fastlets that
+		// crash-loop.
+		return "", "", fmt.Errorf("resolve Fastlet auth issuer anchor: %w", err)
+	}
+	klog.InfoS("Fastlet control authentication enabled",
+		"namespace", identity.Namespace, "serviceAccount", identity.ServiceAccount, "audience", audience, "issuer", issuer)
+	return issuer, caBundle, nil
 }
 
 // parseCacheNamespaces splits the comma-separated --namespaces value

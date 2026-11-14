@@ -14,6 +14,7 @@ import (
 	"k8s.io/klog/v2"
 
 	fastletsandbox "fast-sandbox/internal/fastlet/sandbox"
+	"fast-sandbox/internal/fastletauth"
 	"fast-sandbox/internal/observability"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
@@ -22,6 +23,7 @@ import (
 type FastletServer struct {
 	addr           string
 	sandboxManager *fastletsandbox.SandboxManager
+	authenticator  *fastletauth.Authenticator
 }
 
 // NewFastletServer creates a new fastlet HTTP server.
@@ -30,6 +32,12 @@ func NewFastletServer(addr string, sandboxManager *fastletsandbox.SandboxManager
 		addr:           addr,
 		sandboxManager: sandboxManager,
 	}
+}
+
+// SetAuthenticator installs the Fastlet control authentication. When nil,
+// the control API is served unauthenticated (test and diagnostic harnesses).
+func (s *FastletServer) SetAuthenticator(authenticator *fastletauth.Authenticator) {
+	s.authenticator = authenticator
 }
 
 // Start starts the HTTP server.
@@ -58,7 +66,11 @@ func (s *FastletServer) Handler() http.Handler {
 	mux.HandleFunc("/api/v2/fastlet/draining", s.handleSetDraining)
 
 	klog.InfoS("starting fastlet HTTP server", "addr", s.addr)
-	return traceFastletAPI(mux)
+	handler := traceFastletAPI(mux)
+	if s.authenticator != nil {
+		handler = fastletauth.Middleware(s.authenticator, handler)
+	}
+	return handler
 }
 
 func traceFastletAPI(next http.Handler) http.Handler {

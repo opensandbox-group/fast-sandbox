@@ -299,6 +299,18 @@ const (
 	// ErrorSnapshotUnsupported reports that the Fastlet's runtime driver
 	// does not implement snapshots.
 	ErrorSnapshotUnsupported FastletErrorCode = "SnapshotUnsupported"
+	// ErrorAuthRejected reports that the control authentication middleware
+	// rejected the request before admission: the bearer token is missing,
+	// malformed, or invalid (HTTP 401).
+	ErrorAuthRejected FastletErrorCode = "AuthRejected"
+	// ErrorAuthNotAllowed reports a valid token whose ServiceAccount subject
+	// is not on the Fastlet allow list (HTTP 403).
+	ErrorAuthNotAllowed FastletErrorCode = "AuthNotAllowed"
+	// ErrorAuthUnavailable reports that token validation itself could not
+	// complete, such as an unreachable issuer (HTTP 503). It is a distinct
+	// class from ErrorUnknownOutcome: the request provably never reached
+	// admission, so a rejected Create is always safe to retry.
+	ErrorAuthUnavailable FastletErrorCode = "AuthUnavailable"
 )
 
 type FastletError struct {

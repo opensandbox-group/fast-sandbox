@@ -14,6 +14,8 @@ import (
 
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	fastletsandbox "fast-sandbox/internal/fastlet/sandbox"
+	"fast-sandbox/internal/fastletauth"
+	"fast-sandbox/internal/fastletauth/fastletauthtest"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
@@ -280,4 +282,50 @@ func TestInvokeHandlerRouteDispatchesToFallback(t *testing.T) {
 	}, &unknown)
 	require.Equal(t, http.StatusNotFound, recorder.Code)
 	require.Equal(t, fastletapi.ErrorNotFound, unknown.Error.Code)
+}
+
+func TestFastletServerEnforcesControlAuthentication(t *testing.T) {
+	manager := newServerManager(t, newServerRuntime(), false)
+	issuer := fastletauthtest.NewIssuer(t)
+	authenticator, err := fastletauth.NewAuthenticator(issuer.URL(), fastletauth.Audience,
+		[]string{"system:serviceaccount:fast-sandbox-system:fast-sandbox-fastpath"}, nil)
+	require.NoError(t, err)
+	fastletServer := NewFastletServer(":0", manager)
+	fastletServer.SetAuthenticator(authenticator)
+	handler := fastletServer.Handler()
+	identity := fastletapi.SandboxIdentity{SandboxUID: "sandbox-auth", Namespace: "default", Name: "sandbox-auth", InstanceGeneration: 1, RuntimeInstanceID: "runtime-auth", AssignmentAttempt: 1, FastletPodUID: "pod-uid-a"}
+	createRequest := func(requestID string) *bytes.Reader {
+		body, err := json.Marshal(fastletapi.CreateSandboxRequest{RequestID: requestID, Identity: identity, SpecGeneration: 1, Sandbox: fastletapi.SandboxDesiredSpec{Image: "alpine:latest"}})
+		require.NoError(t, err)
+		return bytes.NewReader(body)
+	}
+
+	// Without a token the lifecycle API fails closed...
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v2/fastlet/create", createRequest("request-unauth")))
+	require.Equal(t, http.StatusUnauthorized, recorder.Code)
+
+	// ...while the exempt heartbeat keeps serving diagnostics.
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v2/fastlet/heartbeat", nil))
+	require.Equal(t, http.StatusOK, recorder.Code)
+
+	// A valid platform token admits the call.
+	request := httptest.NewRequest(http.MethodPost, "/api/v2/fastlet/create", createRequest("request-auth"))
+	request.Header.Set("Authorization", fastletauth.BearerPrefix+issuer.Mint(fastletauthtest.MintOptions{}))
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var created fastletapi.CreateSandboxResponse
+	require.NoError(t, json.NewDecoder(recorder.Body).Decode(&created))
+	require.Equal(t, fastletapi.CreateDispositionCreated, created.Disposition)
+
+	// A foreign subject is rejected even with a valid signature.
+	request = httptest.NewRequest(http.MethodPost, "/api/v2/fastlet/create", createRequest("request-foreign"))
+	request.Header.Set("Authorization", fastletauth.BearerPrefix+issuer.Mint(fastletauthtest.MintOptions{
+		Subject: "system:serviceaccount:attacker:default",
+	}))
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusForbidden, recorder.Code)
 }

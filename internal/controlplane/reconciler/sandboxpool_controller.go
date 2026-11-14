@@ -38,6 +38,7 @@ import (
 	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 	"fast-sandbox/internal/controlplane/placement"
 	"fast-sandbox/internal/fastlet/podcgroup"
+	"fast-sandbox/internal/fastletauth"
 	"fast-sandbox/internal/fastletsettings"
 	"fast-sandbox/internal/nodecleanup"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
@@ -65,6 +66,20 @@ type SandboxPoolReconciler struct {
 	DisableResourceAwareMemoryAdmission bool
 	DisableResourceAwarePoolScaling     bool
 	Now                                 func() time.Time
+	// FastletAuthIssuer and FastletAuthCABundle are the control
+	// authentication anchor injected into Fastlet Pods. They come from this
+	// Pod's own projected ServiceAccount identity; when empty (a host-process
+	// development run) new Fastlets fail at startup rather than serve an
+	// unauthenticated control API.
+	FastletAuthIssuer   string
+	FastletAuthCABundle string
+	// FastletAuthSubjects is the caller allow list injected into Fastlet
+	// Pods. It comes from the --fastlet-auth-subjects flag; when empty the
+	// platform default is injected so the entry always shadows templates.
+	FastletAuthSubjects []string
+	// FastletAuthAudience is the token audience injected into Fastlet Pods,
+	// resolved from the control plane's own configuration.
+	FastletAuthAudience string
 }
 
 type FastletDrainer interface {
@@ -1560,6 +1575,12 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 		}
 		c.SecurityContext.Privileged = boolPtr(profile.Deployment.Privileged)
 		c.Env = removeRuntimeOwnedEnv(c.Env)
+		// The runtime container's env contract is platform-owned: envFrom is
+		// cleared so a Pool template cannot supply auth env keys the platform
+		// leaves unset (kubelet lets envFrom feed keys that explicit env does
+		// not define). Any envFrom need can be expressed through env entries,
+		// which pass through removal only when they are not platform-owned.
+		c.EnvFrom = nil
 
 		c.Env = append(c.Env,
 			corev1.EnvVar{Name: "FASTLET_CONTROL_PORT", Value: ":5758"},
@@ -1611,6 +1632,26 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			corev1.EnvVar{Name: envFastSandboxRegistryConfigPath, Value: registryconfig.MountPath},
 			corev1.EnvVar{Name: "INFRA_DIR_IN_POD", Value: infraHostPath},
 		)
+		// Control authentication is platform-owned end to end: the anchor
+		// (issuer + CA), the caller allow list, and the audience are all
+		// injected here, and EnvFrom is cleared above so a Pool template
+		// can supply none of them.
+		if r.FastletAuthIssuer != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: fastletauth.IssuerEnv, Value: r.FastletAuthIssuer})
+		}
+		if r.FastletAuthCABundle != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: fastletauth.CABundleEnv, Value: r.FastletAuthCABundle})
+		}
+		subjects := r.FastletAuthSubjects
+		if len(subjects) == 0 {
+			// Explicit entry even for the default: it shadows any envFrom
+			// key of the same name.
+			subjects = fastletauth.DefaultAllowedSubjects
+		}
+		c.Env = append(c.Env, corev1.EnvVar{Name: fastletauth.AllowedSubjectsEnv, Value: strings.Join(subjects, ",")})
+		if r.FastletAuthAudience != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: fastletauth.AudienceEnv, Value: r.FastletAuthAudience})
+		}
 		if profile.ResidualProcess != runtimecatalog.ResidualProcessNone {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "FAST_SANDBOX_NODE_CLEANUP_SOCKET", Value: nodecleanup.DefaultSocketPath})
 		}
@@ -2461,6 +2502,11 @@ var runtimeOwnedEnv = map[string]struct{}{
 	"FAST_SANDBOX_ACTIONS":         {},
 	"FAST_SANDBOX_SETTINGS_DIR":    {},
 	"NODE_NAME":                    {}, envPodName: {}, "POD_IP": {}, envPodUID: {}, "NAMESPACE": {},
+	// Control authentication env keys are platform-owned: the Pool
+	// Controller injects allow list, audience, and anchor, and a Pool
+	// template must not be able to relax or redirect any of them.
+	fastletauth.AllowedSubjectsEnv: {}, fastletauth.IssuerEnv: {}, fastletauth.CABundleEnv: {},
+	fastletauth.AudienceEnv: {},
 }
 
 func removeRuntimeOwnedEnv(env []corev1.EnvVar) []corev1.EnvVar {

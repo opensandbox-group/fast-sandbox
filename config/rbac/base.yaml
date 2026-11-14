@@ -123,6 +123,45 @@ roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: fast-san
 subjects:
 - {kind: ServiceAccount, name: fast-sandbox-proxy, namespace: fast-sandbox-system}
 ---
+# Fastlet control authentication, two grants:
+#
+# 1. Token minting stays namespaced: serviceaccounts/token RBAC is evaluated
+#    in the target SA's namespace and resourceNames matches the bare name, so
+#    a cluster-scoped rule would let a compromised control plane mint tokens
+#    for same-named SAs in tenant namespaces.
+# 2. The credential-less Fastlet reads OIDC discovery and JWKS anonymously;
+#    this extends the default system:service-account-issuer-discovery role
+#    (normally bound only to system:serviceaccounts) to unauthenticated
+#    callers, exposing exactly the two public-key endpoints.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fast-sandbox-fastlet-token-minter
+  namespace: fast-sandbox-system
+rules:
+- apiGroups: [""]
+  resources: ["serviceaccounts/token"]
+  resourceNames: ["fast-sandbox-fastpath", "fast-sandbox-controller"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fast-sandbox-fastlet-token-minter
+  namespace: fast-sandbox-system
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: fast-sandbox-fastlet-token-minter}
+subjects:
+- {kind: ServiceAccount, name: fast-sandbox-fastpath, namespace: fast-sandbox-system}
+- {kind: ServiceAccount, name: fast-sandbox-controller, namespace: fast-sandbox-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: fast-sandbox-fastlet-issuer-discovery
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: system:service-account-issuer-discovery}
+subjects:
+- {kind: Group, name: system:unauthenticated, apiGroup: rbac.authorization.k8s.io}
+---
 # The SandboxTemplate build Pod runs in the template's (tenant) namespace,
 # owned by the template for cascading deletion. The controller provisions
 # the builder ServiceAccount + Role + RoleBinding (pods/patch only, for the

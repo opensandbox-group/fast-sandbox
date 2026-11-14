@@ -29,6 +29,7 @@ import (
 	fastletresourceadmission "fast-sandbox/internal/fastlet/resourceadmission"
 	fastletsandbox "fast-sandbox/internal/fastlet/sandbox"
 	"fast-sandbox/internal/fastlet/server"
+	"fast-sandbox/internal/fastletauth"
 	"fast-sandbox/internal/fastletsettings"
 	"fast-sandbox/internal/nodecleanup"
 	"fast-sandbox/internal/observability"
@@ -213,6 +214,16 @@ func main() {
 	go recoverUntilReady(ctx, sandboxManager, proxyControlClient)
 
 	fastletServer := server.NewFastletServer(fastletPort, sandboxManager)
+	authenticator, authIssuer, err := newFastletAuthenticator()
+	if err != nil {
+		klog.ErrorS(err, "Configure Fastlet control authentication: it is always enabled and cannot start without an issuer anchor")
+		os.Exit(1)
+	}
+	fastletServer.SetAuthenticator(authenticator)
+	klog.InfoS("Fastlet control authentication enabled",
+		"audience", getEnv(fastletauth.AudienceEnv, fastletauth.Audience),
+		"issuer", authIssuer,
+		"subjects", strings.Join(authenticator.AllowedSubjects(), ","))
 	klog.InfoS("starting fastlet HTTP server", "port", fastletPort)
 
 	if err := fastletServer.Start(); err != nil {
@@ -228,6 +239,31 @@ type fastletStartupSettings struct {
 	resourceAdmission *fastletsettings.ResourceAdmissionSettings
 	warmImages        []string
 	actionManager     *fastletaction.Manager
+}
+
+// newFastletAuthenticator builds the always-on Fastlet control authenticator.
+// The issuer anchor comes from this Pod's projected ServiceAccount token, so
+// key material is fetched only from the API server that minted this Pod's
+// identity. FASTLET_AUTH_ALLOWED_SUBJECTS overrides the caller allow list;
+// it defaults to the platform control-plane ServiceAccounts.
+func newFastletAuthenticator() (*fastletauth.Authenticator, string, error) {
+	issuer, err := fastletauth.ResolvePodIssuer(os.Getenv(fastletauth.IssuerEnv))
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve issuer: %w", err)
+	}
+	allowedSubjects := fastletauth.DefaultAllowedSubjects
+	if raw := os.Getenv(fastletauth.AllowedSubjectsEnv); raw != "" {
+		allowedSubjects = fastletauth.ParseSubjects(raw)
+		if len(allowedSubjects) == 0 {
+			return nil, "", fmt.Errorf("%s is set but contains no usable subject", fastletauth.AllowedSubjectsEnv)
+		}
+	}
+	audience := getEnv(fastletauth.AudienceEnv, fastletauth.Audience)
+	authenticator, err := fastletauth.NewAuthenticator(issuer, audience, allowedSubjects, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("build authenticator: %w", err)
+	}
+	return authenticator, issuer, nil
 }
 
 func loadFastletStartupSettings() (fastletStartupSettings, error) {
