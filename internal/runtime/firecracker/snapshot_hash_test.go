@@ -5,6 +5,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -183,4 +185,64 @@ func TestCreateSnapshotLegacyModeSkipsBackgroundRootfsHash(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Empty(t, *calls, "legacy mode keeps the sequential assembly")
+}
+
+// The pipelined copy must produce exactly the content and digest of a serial
+// copy for dense, zero-heavy and unaligned files that span many in-flight
+// blocks, and leave zero granules as holes.
+func TestCopyFileSparseHashedPipelineShapes(t *testing.T) {
+	dense := make([]byte, 9*sparseCopyBlockSize+12345)
+	for i := range dense {
+		dense[i] = byte(i*7 + i>>13)
+	}
+	zeroHeavy := make([]byte, 6*sparseCopyBlockSize+sparseZeroGranule/2)
+	for offset := 0; offset < len(zeroHeavy); offset += 3 * sparseZeroGranule {
+		copy(zeroHeavy[offset:], bytes.Repeat([]byte{0x5a}, 100))
+	}
+	shapes := map[string][]byte{
+		"empty":       {},
+		"one byte":    {1},
+		"dense":       dense,
+		"zero heavy":  zeroHeavy,
+		"all zero":    make([]byte, 2*sparseCopyBlockSize+1),
+		"block exact": bytes.Repeat([]byte{0xff}, sparseCopySlots*sparseCopyBlockSize),
+	}
+	for name, payload := range shapes {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			source := filepath.Join(dir, "source")
+			require.NoError(t, os.WriteFile(source, payload, 0o640))
+			target := filepath.Join(dir, "target")
+			sum, err := copyFileSparseHashed(source, target)
+			require.NoError(t, err)
+			want, err := artifacts.SHA256File(source)
+			require.NoError(t, err)
+			require.Equal(t, want, sum)
+			got, err := os.ReadFile(target)
+			require.NoError(t, err)
+			require.True(t, bytes.Equal(payload, got))
+		})
+	}
+
+	if runtime.GOOS != "linux" {
+		t.Skip("hole layout is checked on linux filesystems")
+	}
+	dir := t.TempDir()
+	source := filepath.Join(dir, "zero-heavy")
+	require.NoError(t, os.WriteFile(source, zeroHeavy, 0o640))
+	target := filepath.Join(dir, "zero-heavy.copy")
+	_, err := copyFileSparseHashed(source, target)
+	require.NoError(t, err)
+	info, err := os.Stat(target)
+	require.NoError(t, err)
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	require.True(t, ok)
+	require.Less(t, stat.Blocks*512, int64(len(zeroHeavy))/2, "zero granules stay holes")
+}
+
+// A read failure stops the pipeline and is returned.
+func TestCopyFileSparseHashedReportsReadError(t *testing.T) {
+	dir := t.TempDir()
+	_, err := copyFileSparseHashed(dir, filepath.Join(t.TempDir(), "target"))
+	require.Error(t, err)
 }
