@@ -160,7 +160,7 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 
 	dumpErr := d.dumpRunningSandbox(ctx, &plan)
 	if dumpErr != nil {
-		_ = os.RemoveAll(plan.staging)
+		plan.discardStaging()
 		return nil, dumpErr
 	}
 	klog.InfoS("firecracker sandbox dumped",
@@ -186,22 +186,22 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 	//     boundary.
 	if kind == fastletapi.SnapshotKindCheckpoint {
 		if err := d.stageCheckpointVault(ctx, input.SandboxID, plan.staging); err != nil {
-			_ = os.RemoveAll(plan.staging)
+			plan.discardStaging()
 			return nil, err
 		}
 		if err := d.stageCheckpointPolicy(ctx, input.SandboxID, plan.staging); err != nil {
-			_ = os.RemoveAll(plan.staging)
+			plan.discardStaging()
 			return nil, err
 		}
 	} else if err := d.stageTemplateState(ctx, input.SandboxID, plan.staging); err != nil {
-		_ = os.RemoveAll(plan.staging)
+		plan.discardStaging()
 		return nil, err
 	}
 
 	assembleStarted := time.Now()
 	sizeBytes, err := d.assemblePlanManifest(&plan, kind)
 	if err != nil {
-		_ = os.RemoveAll(plan.staging)
+		plan.discardStaging()
 		return nil, err
 	}
 	klog.InfoS("firecracker checkpoint manifest assembled",
@@ -213,11 +213,11 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 	}
 	client, err := d.agentClientOrNil()
 	if err != nil {
-		_ = os.RemoveAll(plan.staging)
+		plan.discardStaging()
 		return nil, err
 	}
 	if client == nil {
-		_ = os.RemoveAll(plan.staging)
+		plan.discardStaging()
 		return nil, fmt.Errorf("%w: live snapshots require the firecracker runtime-agent for artifact publication", ErrInvalidConfig)
 	}
 	// The pause window is closed and the staged set is complete: report
@@ -229,7 +229,7 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 	publishStarted := time.Now()
 	outcome, publishErr := client.PublishImage(ctx, "snapshot-"+plan.snapshotID, publishKind(kind), input.TemplateName, plan.staging)
 	if publishErr != nil {
-		_ = os.RemoveAll(plan.staging)
+		plan.discardStaging()
 		return nil, fmt.Errorf("publish snapshot artifacts: %w", publishErr)
 	}
 	result := &runtimecontract.SnapshotResult{
@@ -250,6 +250,7 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 // original sequential assembly, or in chunked transfer mode the parallel one
 // reusing the digests the spill copy computed.
 func (d *Driver) assemblePlanManifest(plan *dumpPlan, kind fastletapi.SnapshotKind) (int64, error) {
+	plan.awaitRootfsHash()
 	if plan.chunked {
 		return assembleSnapshotManifestWith(plan.stateRoot, d.ociRoot(), plan.staging, plan.sandboxDir, kind, plan.knownSums, true)
 	}
@@ -529,6 +530,63 @@ type dumpPlan struct {
 	// relocated (path -> sha256), so the manifest assembly skips re-reading
 	// those files.
 	knownSums map[string]string
+	// rootfsHash delivers the digest of the reflinked staged rootfs, hashed
+	// in the background from the clone on (chunked mode), so the hash runs
+	// during the pause/dump/relocation instead of after them.
+	rootfsHash chan stagedDigest
+}
+
+// stagedDigest is the outcome of one background staged-file hash.
+type stagedDigest struct {
+	path, sum string
+	err       error
+}
+
+// cloneRootfs clones the instance rootfs into the staging directory (a
+// variable so tests can stand in for a reflink-capable filesystem).
+var cloneRootfs = reflinkOnly
+
+// hashStagedRootfs hashes the staged rootfs (a variable so tests can
+// observe the background hash).
+var hashStagedRootfs = artifacts.SHA256File
+
+// startRootfsHash hashes the staged rootfs in the background. Only for a
+// reflink clone: it is immutable from the clone on (guest writes COW into the
+// instance's own extents), so hashing it concurrently with the pause window
+// is safe.
+func (p *dumpPlan) startRootfsHash(path string) {
+	p.rootfsHash = make(chan stagedDigest, 1)
+	go func(out chan<- stagedDigest) {
+		sum, err := hashStagedRootfs(path)
+		out <- stagedDigest{path: path, sum: sum, err: err}
+	}(p.rootfsHash)
+}
+
+// discardStaging drops the staged set of a failed snapshot, after the
+// background rootfs hash (which reads from it) has finished.
+func (p *dumpPlan) discardStaging() {
+	p.awaitRootfsHash()
+	_ = os.RemoveAll(p.staging)
+}
+
+// awaitRootfsHash waits for the background rootfs hash (if any) and records
+// it in knownSums. A failed hash is dropped: the manifest assembly then
+// hashes the file itself. Every path that discards the staging directory
+// calls it first, so no hash outlives its snapshot.
+func (p *dumpPlan) awaitRootfsHash() {
+	if p.rootfsHash == nil {
+		return
+	}
+	result := <-p.rootfsHash
+	p.rootfsHash = nil
+	if result.err != nil {
+		klog.InfoS("background rootfs hash failed; the manifest assembly hashes it", "path", result.path, "err", result.err)
+		return
+	}
+	if p.knownSums == nil {
+		p.knownSums = map[string]string{}
+	}
+	p.knownSums[result.path] = result.sum
 }
 
 // jailRoot returns the jail root of the plan's Sandbox (jailer mode only).
@@ -702,11 +760,14 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 	rootfsCloned := false
 	reflinkStarted := time.Now()
 	if !ociRoot {
-		if err := reflinkOnly(rootfs, stagedRootfs); err == nil {
+		if err := cloneRootfs(rootfs, stagedRootfs); err == nil {
 			rootfsCloned = true
 		}
 	}
 	plan.rootfsClone = time.Since(reflinkStarted)
+	if rootfsCloned && plan.chunked {
+		plan.startRootfsHash(stagedRootfs)
+	}
 
 	client := d.newClient(state.APIAddress)
 	defer client.Close()

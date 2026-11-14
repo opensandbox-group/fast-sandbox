@@ -101,3 +101,86 @@ func TestCreateTemplateSnapshotDiscardsStagingInLegacyMode(t *testing.T) {
 	require.NoError(t, err)
 	require.ErrorIs(t, verifyRestorableImage(fixture.stateRoot, "app-v2"), ErrImageNotReady)
 }
+
+// withClonedRootfs stands in for a reflink-capable filesystem: the snapshot
+// rootfs "clone" succeeds (as a plain copy), enabling the background hash.
+func withClonedRootfs(t *testing.T) {
+	t.Helper()
+	original := cloneRootfs
+	cloneRootfs = copyFile
+	t.Cleanup(func() { cloneRootfs = original })
+}
+
+// observeRootfsHash wraps the background rootfs hash, failing it when fail is
+// set, and returns the paths it was called with.
+func observeRootfsHash(t *testing.T, fail bool) *[]string {
+	t.Helper()
+	var calls []string
+	original := hashStagedRootfs
+	hashStagedRootfs = func(path string) (string, error) {
+		calls = append(calls, path)
+		if fail {
+			return "", os.ErrPermission
+		}
+		return original(path)
+	}
+	t.Cleanup(func() { hashStagedRootfs = original })
+	return &calls
+}
+
+func manifestRootfsDigest(t *testing.T, agent *snapshotAgentFake) string {
+	t.Helper()
+	files, ok := agent.manifest["files"].(map[string]any)
+	require.True(t, ok, "manifest files section")
+	entry, ok := files[publishedRootfsName].(map[string]any)
+	require.True(t, ok, "manifest rootfs entry")
+	return entry["sha256"].(string)
+}
+
+func TestCreateSnapshotHashesClonedRootfsInBackground(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	fixture.driver.agentClient = chunkedSnapshotAgent{agent}
+	withClonedRootfs(t)
+	calls := observeRootfsHash(t, false)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+	want, err := artifacts.SHA256File(filepath.Join(fixture.stateRoot, sandboxStateDir, sandboxID, instanceRootfsName))
+	require.NoError(t, err)
+
+	_, err = fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "snap-1", Kind: fastletapi.SnapshotKindTemplate, TemplateName: "app-v2",
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{filepath.Join(fixture.stateRoot, snapshotStagingDir, "snap-1", publishedRootfsName)}, *calls,
+		"the cloned rootfs is hashed once, by the background hash")
+	require.Equal(t, want, manifestRootfsDigest(t, agent))
+}
+
+func TestCreateSnapshotFallsBackWhenBackgroundRootfsHashFails(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	fixture.driver.agentClient = chunkedSnapshotAgent{agent}
+	withClonedRootfs(t)
+	calls := observeRootfsHash(t, true)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+	want, err := artifacts.SHA256File(filepath.Join(fixture.stateRoot, sandboxStateDir, sandboxID, instanceRootfsName))
+	require.NoError(t, err)
+
+	_, err = fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "snap-1", Kind: fastletapi.SnapshotKindTemplate, TemplateName: "app-v2",
+	})
+	require.NoError(t, err)
+	require.Len(t, *calls, 1)
+	require.Equal(t, want, manifestRootfsDigest(t, agent), "the manifest assembly hashes the rootfs itself")
+}
+
+func TestCreateSnapshotLegacyModeSkipsBackgroundRootfsHash(t *testing.T) {
+	fixture, _ := newSnapshotFixture(t)
+	withClonedRootfs(t)
+	calls := observeRootfsHash(t, false)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+
+	_, err := fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "snap-1", Kind: fastletapi.SnapshotKindTemplate, TemplateName: "app-v2",
+	})
+	require.NoError(t, err)
+	require.Empty(t, *calls, "legacy mode keeps the sequential assembly")
+}
