@@ -24,6 +24,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"fast-sandbox/internal/registryconfig"
+	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 	agenthostready "fast-sandbox/internal/runtime/firecracker/agent/hostready"
 )
 
@@ -56,6 +57,34 @@ type agentConfig struct {
 	Dart *agentDartConfig `yaml:"dart,omitempty"`
 	// NodeReadiness configures the host-check/asset-install/label loop.
 	NodeReadiness agentNodeReadinessConfig `yaml:"nodeReadiness"`
+	// Transfer selects the artifact transfer mode (startup-only): legacy
+	// (default) or chunked. Pulls read both layouts regardless.
+	Transfer agentTransferConfig `yaml:"transfer"`
+}
+
+// agentTransferConfig mirrors agent.TransferConfig.
+type agentTransferConfig struct {
+	// Format is the one transfer switch: "legacy" (whole-file sets and the
+	// original cache behaviour, the default) or "chunked" (zero-elided,
+	// content-addressed chunks plus the cache and connection
+	// optimizations). Roll every reader to a chunk-aware agent before
+	// switching any writer to chunked.
+	Format string `yaml:"format"`
+	// Compression is "none" (default) or "zstd" for chunk objects
+	// (chunked only).
+	Compression string `yaml:"compression"`
+	// Concurrency is the parallel chunk transfers per publish/pull (8).
+	Concurrency int `yaml:"concurrency"`
+	// ChunkSizeMiB is the chunk size of new chunked sets (4).
+	ChunkSizeMiB int `yaml:"chunkSizeMiB"`
+}
+
+// transfer converts the YAML section into the pull-client configuration.
+func (c agentTransferConfig) transfer() agentpull.TransferConfig {
+	return agentpull.TransferConfig{
+		Format: c.Format, Compression: c.Compression,
+		Concurrency: c.Concurrency, ChunkSize: int64(c.ChunkSizeMiB) << 20,
+	}
 }
 
 // agentP2PConfig selects the peer-distribution provider; dart and gateway
@@ -178,6 +207,9 @@ func (c *agentConfig) normalize() error {
 	// never boots one (#84). minFree/minMemory/interval are resolved by
 	// the readiness settings loader against the hostready package
 	// defaults — no duplicated default literals here.
+	if err := c.Transfer.transfer().Validate(); err != nil {
+		return fmt.Errorf("transfer: %w", err)
+	}
 	return nil
 }
 

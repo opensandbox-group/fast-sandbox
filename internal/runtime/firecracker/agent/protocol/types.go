@@ -171,6 +171,10 @@ type PublishImageRequest struct {
 type PublishImageResponse struct {
 	ManifestRef    string `json:"manifestRef"`
 	ArtifactDigest string `json:"artifactDigest"`
+	// TransferFormat is the agent's artifact transfer mode ("legacy" or
+	// "chunked"); empty from agents that predate the setting, which callers
+	// treat as legacy.
+	TransferFormat string `json:"transferFormat,omitempty"`
 }
 
 // CompatibilityResponse returns the node compatibility class (a placeholder
@@ -191,6 +195,10 @@ type HealthResponse struct {
 	// Informational: agent health never depends on it (a broken gateway
 	// keeps pulls on the direct S3 fallback path).
 	P2PUp bool `json:"p2pUp"`
+	// TransferFormat is the agent's artifact transfer mode ("legacy" or
+	// "chunked"); empty from agents that predate the setting, which callers
+	// treat as legacy.
+	TransferFormat string `json:"transferFormat,omitempty"`
 	// HostReady reports the last node-readiness check outcome (the KVM/
 	// storage/asset check behind the scheduling labels). Nil when the
 	// readiness manager is not running (no node name configured).
