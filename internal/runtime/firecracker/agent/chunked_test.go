@@ -426,3 +426,50 @@ func TestFileVerifiedMarkerInvalidatesOnChange(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, match)
 }
+
+// TestChunkPutSignsPayloadDigest pins the signed payload hash of chunk PUTs:
+// a raw chunk reuses its chunk digest instead of re-hashing the block, a
+// zstd chunk signs the hash of the compressed body, and either way the store
+// receives the real SHA-256 of the body it stores.
+func TestChunkPutSignsPayloadDigest(t *testing.T) {
+	for _, compression := range []string{TransferCompressionNone, TransferCompressionZstd} {
+		t.Run(compression, func(t *testing.T) {
+			store := newFakeObjectStore()
+			var mu sync.Mutex
+			signed := map[string]string{}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPut && strings.Contains(r.URL.Path, "/chunks/") {
+					mu.Lock()
+					signed[strings.TrimPrefix(r.URL.Path, "/bucket/")] = r.Header.Get("X-Amz-Content-Sha256")
+					mu.Unlock()
+				}
+				store.handle(w, r)
+			}))
+			defer server.Close()
+			_, err := newTestClient(t, server, chunkedTransfer(compression)).
+				PublishImage(context.Background(), agentprotocol.PublishKindCheckpoint, "", stageSet(t, stagedFiles(), nil))
+			require.NoError(t, err)
+			require.NotEmpty(t, signed)
+			for key, claimed := range signed {
+				require.Equal(t, sha256Hex(store.object(key)), claimed, "chunk %s signed with a wrong payload hash", key)
+				if compression == TransferCompressionNone {
+					require.Equal(t, filepath.Base(key), claimed, "a raw chunk signs its own digest")
+				}
+			}
+		})
+	}
+}
+
+// TestChunkPutRejectsWrongDigest keeps the existing-key skip safe: the
+// digest handed to the signer is checked by the store against the body, so
+// a chunk can never land under a key that does not name its bytes.
+func TestChunkPutRejectsWrongDigest(t *testing.T) {
+	store := newFakeObjectStore()
+	server := httptest.NewServer(http.HandlerFunc(store.handle))
+	defer server.Close()
+	client := newTestClient(t, server, chunkedTransfer(TransferCompressionNone))
+	wrong := sha256Hex([]byte("other bytes"))
+	_, _, err := client.storeChunkOnce(context.Background(), artifacts.ChunkObjectKey(wrong, artifacts.ChunkEncodingRaw), wrong, artifacts.ChunkEncodingRaw, []byte("chunk bytes"))
+	require.Error(t, err)
+	require.Empty(t, store.putKeys())
+}
