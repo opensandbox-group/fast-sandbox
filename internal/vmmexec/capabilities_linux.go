@@ -5,6 +5,7 @@ package vmmexec
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"syscall"
 	"unsafe"
 
@@ -153,7 +154,7 @@ func dropOneFromBoundingSet(capability int) error {
 			// verified by boundingSetContains.
 			return nil
 		}
-		name := fmt.Sprintf("%d", capability)
+		name := strconv.Itoa(capability)
 		if known, ok := Offender(1 << uint(capability)); ok {
 			name = known.Name
 		}
