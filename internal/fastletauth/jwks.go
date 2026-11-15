@@ -13,8 +13,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	"k8s.io/klog/v2"
 )
 
 // maxKeyDocumentBytes bounds the discovery and JWKS response bodies.
@@ -35,17 +33,8 @@ func fetchDiscovery(ctx context.Context, client *http.Client, issuer string) (*o
 	if issuer == "" {
 		return nil, fmt.Errorf("issuer is empty")
 	}
-	parsed, err := url.Parse(issuer)
-	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
-		return nil, fmt.Errorf("issuer %q is not a valid URL", issuer)
-	}
-	// The issuer anchors signature verification: a plaintext anchor outside
-	// loopback would let an on-path attacker serve forged keys. Plain http
-	// stays available for loopback test servers only.
-	if parsed.Scheme == "http" {
-		if hostname := parsed.Hostname(); hostname != "127.0.0.1" && hostname != "localhost" && hostname != "::1" {
-			return nil, fmt.Errorf("issuer %q must use https outside loopback", issuer)
-		}
+	if err := validateKeyMaterialURL(issuer, "issuer"); err != nil {
+		return nil, err
 	}
 	document := &oidcDiscovery{}
 	if err := fetchJSONDocument(ctx, client, strings.TrimSuffix(issuer, "/")+"/.well-known/openid-configuration", document); err != nil {
@@ -57,7 +46,31 @@ func fetchDiscovery(ctx context.Context, client *http.Client, issuer string) (*o
 	if document.JWKSURI == "" {
 		return nil, fmt.Errorf("discovery document has no jwks_uri")
 	}
+	// The discovery document names where signing keys are fetched from. An
+	// unvalidated jwks_uri would let an https issuer hand its keys over
+	// plaintext, where an on-path attacker can substitute forgeries — apply
+	// the same trust-anchor boundary as the issuer itself.
+	if err := validateKeyMaterialURL(document.JWKSURI, "jwks_uri"); err != nil {
+		return nil, err
+	}
 	return document, nil
+}
+
+// validateKeyMaterialURL enforces the trust-anchor transport boundary: https
+// everywhere, with plain http confined to loopback so test servers keep
+// working. Both the issuer and the discovery-served jwks_uri anchor
+// signature verification and must satisfy it.
+func validateKeyMaterialURL(raw, role string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+		return fmt.Errorf("%s %q is not a valid URL", role, raw)
+	}
+	if parsed.Scheme == "http" {
+		if hostname := parsed.Hostname(); hostname != "127.0.0.1" && hostname != "localhost" && hostname != "::1" {
+			return fmt.Errorf("%s %q must use https outside loopback", role, raw)
+		}
+	}
+	return nil
 }
 
 func fetchJSONDocument(ctx context.Context, client *http.Client, url string, target any) error {
@@ -87,26 +100,44 @@ func fetchJSONDocument(ctx context.Context, client *http.Client, url string, tar
 // defaultHTTPClient builds the client for issuer key material, trusting the
 // injected CA bundle (CABundleEnv) or the projected pod ca.crt; managed-
 // cluster issuers verify through the system roots fallback.
-func defaultHTTPClient() *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if pool, ok := injectedCABundle(); ok {
-		transport.TLSClientConfig = &tls.Config{RootCAs: pool}
+func defaultHTTPClient() (*http.Client, error) {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		// Instrumentation may have replaced the default transport; lose the
+		// cloned tuning rather than panic at startup.
+		base = &http.Transport{}
+	} else {
+		base = base.Clone()
 	}
-	return &http.Client{Transport: transport, Timeout: 5 * time.Second}
+	pool, err := injectedCABundle()
+	if err != nil {
+		return nil, err
+	}
+	if pool != nil {
+		base.TLSClientConfig = &tls.Config{RootCAs: pool}
+	}
+	return &http.Client{Transport: base, Timeout: 5 * time.Second}, nil
 }
 
 // injectedCABundle resolves the CA trust set: injected base64 bundle first,
-// projected pod ca.crt second; ok=false leaves the system roots.
-func injectedCABundle() (*x509.CertPool, bool) {
-	pool := x509.NewCertPool()
-	if encoded := os.Getenv(CABundleEnv); encoded != "" {
-		if raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(encoded)); err == nil && pool.AppendCertsFromPEM(raw) {
-			return pool, true
+// projected pod ca.crt second. A nil pool leaves the system roots. A set-but-
+// malformed bundle is a configuration error, not a degradation: the bundle is
+// the trust anchor for signature verification, so silently falling back to a
+// weaker set would betray the fail-closed posture.
+func injectedCABundle() (*x509.CertPool, error) {
+	if encoded := strings.TrimSpace(os.Getenv(CABundleEnv)); encoded != "" {
+		raw, err := base64.StdEncoding.DecodeString(encoded)
+		pool := x509.NewCertPool()
+		if err != nil || !pool.AppendCertsFromPEM(raw) {
+			return nil, fmt.Errorf("%s is set but is not parseable as base64-encoded PEM", CABundleEnv)
 		}
-		klog.ErrorS(nil, "Fastlet auth CA bundle is set but not parseable as base64 PEM; falling back to system roots")
+		return pool, nil
 	}
-	if raw, err := os.ReadFile(serviceAccountCAFile); err == nil && pool.AppendCertsFromPEM(raw) {
-		return pool, true
+	if raw, err := os.ReadFile(serviceAccountCAFile); err == nil {
+		pool := x509.NewCertPool()
+		if pool.AppendCertsFromPEM(raw) {
+			return pool, nil
+		}
 	}
-	return nil, false
+	return nil, nil
 }

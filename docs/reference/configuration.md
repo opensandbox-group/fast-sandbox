@@ -233,6 +233,12 @@ redirect the issuer anchor.
 `/livez`, `/readyz`, `/metrics`, and `/api/v2/fastlet/heartbeat` endpoints
 stay unauthenticated; every other control endpoint requires a valid token.
 
+The control channel itself is plaintext HTTP on the Fastlet control port.
+NetworkPolicy strictness is a required compensating control, not an
+optimization: the policy restricting port 5758 to control-plane Pods is what
+protects the bearer token on the pod network, where a captured token remains
+a valid Fastlet control credential for up to its one-hour lifetime.
+
 ## Proxy configuration
 
 Sandbox Proxy flags:

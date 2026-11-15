@@ -30,6 +30,15 @@ func SubjectFrom(ctx context.Context) string {
 	return subject
 }
 
+// IsExemptPath reports whether the server serves the path without
+// authentication. The control-plane client shares it: a token-mint failure
+// must not fail calls the server would serve unauthenticated anyway (health
+// and heartbeat grant no intent-changing authority).
+func IsExemptPath(path string) bool {
+	_, exempt := exemptPaths[path]
+	return exempt
+}
+
 // Middleware enforces authentication on every request except the exempt
 // health and heartbeat endpoints: 401 without a valid token, 403 for a
 // non-allow-listed subject, 503 when validation itself is unavailable (the
@@ -42,7 +51,7 @@ func SubjectFrom(ctx context.Context) string {
 // decode failure.
 func Middleware(authenticator *Authenticator, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if _, exempt := exemptPaths[request.URL.Path]; exempt {
+		if IsExemptPath(request.URL.Path) {
 			next.ServeHTTP(writer, request)
 			return
 		}

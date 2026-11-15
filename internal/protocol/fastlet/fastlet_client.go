@@ -90,12 +90,20 @@ func (c *FastletClient) CreateSandbox(ctx context.Context, fastletIP string, req
 		ctx = observability.WithIdentity(ctx, observability.Identity{RequestID: req.RequestID, Namespace: req.Identity.Namespace, SandboxName: req.Identity.Name})
 	}
 	response, err := postFastletJSONWithTimeout[CreateSandboxRequest, CreateSandboxResponse](c, ctx, fastletIP, "/api/v2/fastlet/create", req, c.createTimeout)
-	if err == nil || response == nil {
-		return response, err
+	if err == nil {
+		return response, nil
 	}
+	// A typed FastletError must always produce a CreateCallError, including
+	// the nil-response fail-closed mint path: that failure is provably
+	// pre-send, so classifying it keeps retries safe instead of degrading
+	// the disposition to Unknown.
 	var failure *FastletError
 	if errors.As(err, &failure) {
-		return response, &CreateCallError{Disposition: createDispositionForFailure(response.Disposition, failure), Failure: failure}
+		reported := CreateDispositionUnknown
+		if response != nil {
+			reported = response.Disposition
+		}
+		return response, &CreateCallError{Disposition: createDispositionForFailure(reported, failure), Failure: failure}
 	}
 	return response, err
 }
@@ -133,12 +141,18 @@ func (c *FastletClient) CreateSnapshot(ctx context.Context, fastletIP string, re
 		ctx = withFastletIdentity(ctx, req.Identity.Sandbox)
 	}
 	response, err := postFastletJSON[CreateSnapshotRequest, CreateSnapshotResponse](c, ctx, fastletIP, "/api/v2/fastlet/snapshots/create", req)
-	if err == nil || response == nil {
-		return response, err
+	if err == nil {
+		return response, nil
 	}
+	// Mirror CreateSandbox: the nil-response fail-closed mint failure is
+	// provably pre-send and must classify as such.
 	var failure *FastletError
 	if errors.As(err, &failure) {
-		return response, &CreateCallError{Disposition: createDispositionForFailure(response.Disposition, failure), Failure: failure}
+		reported := CreateDispositionUnknown
+		if response != nil {
+			reported = response.Disposition
+		}
+		return response, &CreateCallError{Disposition: createDispositionForFailure(reported, failure), Failure: failure}
 	}
 	return response, err
 }
@@ -226,13 +240,20 @@ func getFastletJSON[Response any](c *FastletClient, ctx context.Context, fastlet
 }
 
 // authorize attaches the control auth token. A mint failure fails the call
-// closed — no unauthenticated request is ever sent.
+// closed — no unauthenticated request is ever sent — except on paths the
+// server itself serves unauthenticated (health and heartbeat): those grant no
+// intent-changing authority, and starving them during a token-mint outage
+// would turn a scoped auth misconfiguration into fleet-wide observability
+// loss.
 func (c *FastletClient) authorize(ctx context.Context, request *http.Request) error {
 	if c.tokens == nil {
 		return nil
 	}
 	token, err := c.tokens.Token(ctx)
 	if err != nil {
+		if fastletauth.IsExemptPath(request.URL.Path) {
+			return nil
+		}
 		// Typed and provably pre-send, so callers classify it as
 		// REJECTED_BEFORE_SIDE_EFFECTS rather than UnknownOutcome.
 		return &FastletError{Code: ErrorAuthUnavailable, Message: fmt.Sprintf("acquire control auth token: %v", err), Retryable: true}
@@ -344,6 +365,12 @@ func responseFastletError(response any) *FastletError {
 	}
 }
 
+// endpoint builds the control-channel URL. The transport is deliberately
+// plaintext HTTP on the Fastlet control port: the required compensating
+// control is the NetworkPolicy restricting port 5758 to control-plane Pods,
+// since a bearer token captured on the pod network is a valid Fastlet control
+// credential for up to its one-hour lifetime. Keep that policy strict when
+// deploying; TLS on this port would be the durable fix.
 func (c *FastletClient) endpoint(fastletIP, path string) string {
 	return "http://" + net.JoinHostPort(fastletIP, strconv.Itoa(c.fastletPort)) + path
 }

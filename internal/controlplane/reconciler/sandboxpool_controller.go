@@ -1580,6 +1580,13 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 		// leaves unset (kubelet lets envFrom feed keys that explicit env does
 		// not define). Any envFrom need can be expressed through env entries,
 		// which pass through removal only when they are not platform-owned.
+		if len(c.EnvFrom) > 0 {
+			// The wipe is unconditional, so say so: a template that loses
+			// envFrom-supplied variables on pool replacement must be
+			// diagnosable instead of silently regressed.
+			klog.InfoS("Discarding pool template envFrom on the runtime container: the runtime env contract is platform-owned",
+				"pool", pool.Name, "namespace", pool.Namespace, "envFromEntries", len(c.EnvFrom))
+		}
 		c.EnvFrom = nil
 
 		c.Env = append(c.Env,

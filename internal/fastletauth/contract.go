@@ -71,13 +71,13 @@ const SubjectsEnv = "FASTLET_AUTH_SUBJECTS"
 
 // BearerToken extracts the bearer token from an Authorization header. It
 // returns false when the header is absent, uses another scheme, or carries an
-// empty credential.
+// empty credential. The scheme comparison is case-insensitive per RFC 7235.
 func BearerToken(header http.Header) (string, bool) {
 	value := header.Get("Authorization")
-	if !strings.HasPrefix(value, BearerPrefix) {
+	if len(value) < len(BearerPrefix) || !strings.EqualFold(value[:len(BearerPrefix)], BearerPrefix) {
 		return "", false
 	}
-	token := strings.TrimSpace(strings.TrimPrefix(value, BearerPrefix))
+	token := strings.TrimSpace(value[len(BearerPrefix):])
 	return token, token != ""
 }
 

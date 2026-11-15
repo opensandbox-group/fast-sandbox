@@ -24,6 +24,17 @@ func TestBearerToken(t *testing.T) {
 	token, found := BearerToken(header)
 	require.True(t, found)
 	require.Equal(t, "token-value", token)
+
+	// RFC 7235 auth-scheme names are case-insensitive.
+	header.Set("Authorization", "bearer token-value")
+	token, found = BearerToken(header)
+	require.True(t, found)
+	require.Equal(t, "token-value", token)
+
+	header.Set("Authorization", "BEARER token-value")
+	token, found = BearerToken(header)
+	require.True(t, found)
+	require.Equal(t, "token-value", token)
 }
 
 func TestSubjectFromDefaultsToEmpty(t *testing.T) {

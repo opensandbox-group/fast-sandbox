@@ -152,6 +152,19 @@ type TokenRequestSource struct {
 	mu        sync.Mutex
 	token     string
 	refreshAt time.Time
+	// mint is the in-flight mint. Concurrent callers join one flight and
+	// await its shared outcome with their own contexts, instead of queueing
+	// sequential network calls while mu is held; closing flight.done
+	// broadcasts the stored outcome to every joined caller.
+	mint *tokenFlight
+}
+
+// tokenFlight is one shared mint: the outcome is stored before done closes,
+// so every caller that observes the close reads a complete result.
+type tokenFlight struct {
+	done  chan struct{}
+	token string
+	err   error
 }
 
 // NewTokenRequestSource builds a source with the package defaults applied to
@@ -171,44 +184,80 @@ func NewTokenRequestSource(createToken CreateTokenFunc, identity PodServiceAccou
 
 // Token returns the current token, minting a replacement through the
 // TokenRequest API when none is cached or the cached one is close to expiry.
+// Mints are single-flight: one leader performs the API call while followers
+// await its shared outcome under their own deadlines, so an N-caller stampede
+// on an expired token costs one TokenRequest instead of N sequential network
+// calls that per-call timeouts cannot bound.
 func (s *TokenRequestSource) Token(ctx context.Context) (string, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.token != "" && s.now().Before(s.refreshAt) {
-		return s.token, nil
+		token := s.token
+		s.mu.Unlock()
+		return token, nil
 	}
 	if s.CreateToken == nil {
+		s.mu.Unlock()
 		return "", fmt.Errorf("%w: token source has no TokenRequest binding", ErrUnavailable)
 	}
-	expirationSeconds := s.ExpirationSeconds
-	requestContext, cancel := context.WithTimeout(ctx, s.requestTimeout())
+	if s.mint == nil {
+		s.mint = &tokenFlight{done: make(chan struct{})}
+		go s.mintToken(s.mint)
+	}
+	flight := s.mint
+	s.mu.Unlock()
+
+	select {
+	case <-flight.done:
+		return flight.token, flight.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// mintToken performs the TokenRequest outside mu, stores the outcome, and
+// broadcasts it to every caller that joined the flight. The request is
+// bounded by RequestTimeout alone: a leader whose caller cancels still
+// completes the shared mint, because followers are already awaiting its
+// outcome.
+func (s *TokenRequestSource) mintToken(flight *tokenFlight) {
+	requestContext, cancel := context.WithTimeout(context.Background(), s.requestTimeout())
 	defer cancel()
+	expirationSeconds := s.ExpirationSeconds
 	issued, err := s.CreateToken(requestContext, s.Namespace, s.ServiceAccount, &authenticationv1.TokenRequest{
 		Spec: authenticationv1.TokenRequestSpec{
 			Audiences:         []string{s.audience()},
 			ExpirationSeconds: &expirationSeconds,
 		},
 	})
-	if err != nil {
-		return "", fmt.Errorf("%w: request %s/%s token: %v", ErrUnavailable, s.Namespace, s.ServiceAccount, err)
+	switch {
+	case err != nil:
+		flight.err = fmt.Errorf("%w: request %s/%s token: %v", ErrUnavailable, s.Namespace, s.ServiceAccount, err)
+	case issued.Status.Token == "":
+		flight.err = fmt.Errorf("%w: TokenRequest returned an empty token", ErrUnavailable)
+	default:
+		flight.token = issued.Status.Token
+		expiresAt := s.now().Add(time.Duration(expirationSeconds) * time.Second)
+		if !issued.Status.ExpirationTimestamp.IsZero() {
+			expiresAt = issued.Status.ExpirationTimestamp.Time
+		}
+		// Clamp the refresh margin to half the granted lifetime: a cluster
+		// may serve a shorter token than requested, and pinning refreshAt to
+		// now would mint one token per call.
+		margin := s.refreshBefore()
+		if lifetime := expiresAt.Sub(s.now()); margin > lifetime/2 {
+			margin = lifetime / 2
+		}
+		s.mu.Lock()
+		s.token = flight.token
+		s.refreshAt = expiresAt.Add(-margin)
+		s.mu.Unlock()
 	}
-	if issued.Status.Token == "" {
-		return "", fmt.Errorf("%w: TokenRequest returned an empty token", ErrUnavailable)
+	s.mu.Lock()
+	if s.mint == flight {
+		s.mint = nil
 	}
-	expiresAt := s.now().Add(time.Duration(expirationSeconds) * time.Second)
-	if !issued.Status.ExpirationTimestamp.IsZero() {
-		expiresAt = issued.Status.ExpirationTimestamp.Time
-	}
-	s.token = issued.Status.Token
-	// Clamp the refresh margin to half the granted lifetime: a cluster may
-	// serve a shorter token than requested, and pinning refreshAt to now
-	// would mint one token per call.
-	margin := s.refreshBefore()
-	if lifetime := expiresAt.Sub(s.now()); margin > lifetime/2 {
-		margin = lifetime / 2
-	}
-	s.refreshAt = expiresAt.Add(-margin)
-	return s.token, nil
+	s.mu.Unlock()
+	close(flight.done)
 }
 
 func (s *TokenRequestSource) requestTimeout() time.Duration {

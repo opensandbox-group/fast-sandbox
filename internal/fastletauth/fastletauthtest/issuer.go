@@ -125,6 +125,9 @@ type MintOptions struct {
 	Issuer    string
 	ExpiresAt int64
 	NotBefore int64
+	// IssuedAt overrides the iat claim (0 means now); it proves the
+	// parser's issued-at validation.
+	IssuedAt int64
 	// Signer overrides the signing key; it need not be published.
 	Signer crypto.Signer
 	// Segments overrides the emitted token text entirely (for malformed
@@ -180,6 +183,9 @@ func (i *Issuer) Mint(options MintOptions) string {
 		"aud": audienceClaim,
 		"nbf": options.NotBefore,
 		"iat": now,
+	}
+	if options.IssuedAt != 0 {
+		claims["iat"] = options.IssuedAt
 	}
 	if !options.OmitExp {
 		claims["exp"] = options.ExpiresAt

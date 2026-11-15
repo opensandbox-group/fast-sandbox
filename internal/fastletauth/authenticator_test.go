@@ -172,6 +172,14 @@ func TestAuthenticateBoundsVerdictCache(t *testing.T) {
 	size := len(authenticator.cache)
 	authenticator.mu.Unlock()
 	require.LessOrEqual(t, size, maxCachedVerdicts, "the verdict cache must stay bounded under a flood of distinct tokens")
+	// A full cache evicts to admit the incoming verdict: shedding the
+	// newcomer would let a distinct-token flood monopolize every slot and
+	// strip legitimate tokens of positive caching entirely.
+	authenticator.storeVerdict(sha256SumForTest(maxCachedVerdicts+16), "", ErrUnauthenticated, time.Now().Add(time.Minute))
+	authenticator.mu.Lock()
+	_, stored := authenticator.cache[sha256SumForTest(maxCachedVerdicts+16)]
+	authenticator.mu.Unlock()
+	require.True(t, stored, "a full cache must evict an entry rather than reject the incoming verdict")
 }
 
 // TestAuthenticateRateLimitsUnknownKeyRefreshes proves the refresh limiter:
@@ -196,6 +204,37 @@ func TestAuthenticateRateLimitsUnknownKeyRefreshes(t *testing.T) {
 		"unknown-kid refreshes must be rate limited between fetches")
 	require.Less(t, issuer.Fetches(), int64(attempts*2),
 		"fetches must be bounded below one discovery+JWKS pair per request")
+}
+
+// TestAuthenticateClassifiesLimiterExhaustionAsUnavailable pins the
+// classification contract: an unknown kid whose refresh actually ran and
+// still missed is a definitive forgery (cached 401), but a request aborted
+// inside the rate limiter — no fetch ran, so the kid truth is unknown — must
+// stay a retryable 503, or a legitimately rotated token would be rejected as
+// a forgery during the refresh window.
+func TestAuthenticateClassifiesLimiterExhaustionAsUnavailable(t *testing.T) {
+	issuer := fastletauthtest.NewIssuer(t)
+	// An interval longer than refreshWaitMax makes the second unknown-kid
+	// request abort inside the limiter before any fetch runs.
+	authenticator := newTestAuthenticatorWithInterval(t, issuer, refreshWaitMax+time.Second)
+	otherKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	_, err = authenticator.Authenticate(t.Context(), issuer.Mint(fastletauthtest.MintOptions{Kid: "missing", Signer: otherKey}))
+	require.ErrorIs(t, err, ErrUnauthenticated, "an absent kid after a refresh that ran is definitive")
+	// Distinct token (different hash), so the negative verdict cannot mask
+	// the limiter outcome.
+	_, err = authenticator.Authenticate(t.Context(), issuer.Mint(fastletauthtest.MintOptions{
+		Kid: "missing", Signer: otherKey, ExpiresAt: time.Now().Add(7200 * time.Second).Unix(),
+	}))
+	require.ErrorIs(t, err, ErrUnavailable, "limiter exhaustion aborts before any fetch: the outcome must stay retryable")
+}
+
+func TestAuthenticateRejectsFutureIssuedAt(t *testing.T) {
+	issuer := fastletauthtest.NewIssuer(t)
+	authenticator := newTestAuthenticator(t, issuer)
+	token := issuer.Mint(fastletauthtest.MintOptions{IssuedAt: time.Now().Add(10 * time.Minute).Unix()})
+	_, err := authenticator.Authenticate(t.Context(), token)
+	require.ErrorIs(t, err, ErrUnauthenticated, "a future-dated iat must be rejected: issued-at validation is enabled")
 }
 
 func TestAuthenticateFailsUnavailableIssuer(t *testing.T) {

@@ -29,7 +29,7 @@ const (
 	// expiryLeeway tolerates issuer/Fastlet clock skew.
 	expiryLeeway = 30 * time.Second
 	// maxCachedVerdicts bounds the cache against distinct-token floods on
-	// the unauthenticated control port; dropping a verdict only costs one
+	// the unauthenticated control port; evicting a verdict only costs one
 	// re-verification.
 	maxCachedVerdicts = 8192
 	// defaultRefreshInterval rate-limits unknown-KID JWKS refreshes so
@@ -105,7 +105,11 @@ func NewAuthenticator(issuer, audience string, allowedSubjects []string, httpCli
 		}
 	}
 	if httpClient == nil {
-		httpClient = defaultHTTPClient()
+		var clientErr error
+		httpClient, clientErr = defaultHTTPClient()
+		if clientErr != nil {
+			return nil, clientErr
+		}
 	}
 	authenticator := &Authenticator{
 		issuer:   issuer,
@@ -148,20 +152,23 @@ func NewAuthenticator(issuer, audience string, allowedSubjects []string, httpCli
 	if err != nil {
 		return nil, fmt.Errorf("create issuer keyfunc for %q: %w", issuer, err)
 	}
-	// Classify retrieval failures: after a recent refresh failure the kid
-	// truth is unknown (retryable 503); otherwise the issuer served its set
-	// and the kid is definitively absent (401).
+	// Classify retrieval failures. Only a refresh that demonstrably ran and
+	// still missed proves the kid is definitively absent: ErrKeyNotFound
+	// without a recent refresh failure. Limiter exhaustion aborts before any
+	// fetch — the refresh handler never fires, and jwkset's limiter error
+	// does not wrap ErrKeyNotFound — so it stays a retryable 503 instead of
+	// misclassifying a legitimately rotated token as a forgery.
 	keyfuncFn := func(token *jwt.Token) (any, error) {
 		key, err := keyFunc.Keyfunc(token)
 		if err != nil {
 			authenticator.refreshMu.Lock()
 			failedRecently := !authenticator.lastRefreshFailure.IsZero() &&
-				authenticator.now().Sub(authenticator.lastRefreshFailure) < defaultRefreshInterval
+				authenticator.now().Sub(authenticator.lastRefreshFailure) < options.refreshInterval
 			authenticator.refreshMu.Unlock()
-			if failedRecently {
-				return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+			if errors.Is(err, jwkset.ErrKeyNotFound) && !failedRecently {
+				return nil, fmt.Errorf("%w: %v", ErrUnauthenticated, err)
 			}
-			return nil, fmt.Errorf("%w: %v", ErrUnauthenticated, err)
+			return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 		}
 		return key, nil
 	}
@@ -170,6 +177,7 @@ func NewAuthenticator(issuer, audience string, allowedSubjects []string, httpCli
 		jwt.WithIssuer(issuer),
 		jwt.WithAudience(audience),
 		jwt.WithExpirationRequired(), // reject never-expiring tokens
+		jwt.WithIssuedAt(),           // defense in depth: reject future-dated iat
 		jwt.WithLeeway(expiryLeeway),
 	)
 	authenticator.parser = parser
@@ -250,9 +258,15 @@ func (a *Authenticator) storeVerdict(key, subject string, verdict error, expires
 		}
 	}
 	if len(a.cache) >= maxCachedVerdicts {
-		// Still full of live verdicts: drop this one; its next request
-		// simply re-verifies.
-		return
+		// Still full of live verdicts: evict one (map iteration order is
+		// randomized) to admit the incoming verdict. Shedding the newcomer
+		// would invert the cache into a flood amplifier: a stream of distinct
+		// forged tokens would monopolize every slot and strip legitimate
+		// tokens of positive caching entirely.
+		for cachedKey := range a.cache {
+			delete(a.cache, cachedKey)
+			break
+		}
 	}
 	a.cache[key] = cachedVerdict{subject: subject, err: verdict, expiresAt: expiresAt}
 }

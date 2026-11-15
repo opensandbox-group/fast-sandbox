@@ -213,7 +213,7 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	catalog := runtimecatalog.Builtin()
 	fastletClient := fastletapi.NewFastletClient(fastletPort)
 	fastletAuthAudience := envOrDefault(fastletauth.AudienceEnv, fastletauth.Audience)
-	fastletAuthIssuer, fastletAuthCABundle, err := installFastletAuthTokenSource(restConfig, fastletClient, fastletAuthAudience)
+	fastletAuthIssuer, fastletAuthCABundle, fastletAuthIdentity, err := installFastletAuthTokenSource(restConfig, fastletClient, fastletAuthAudience)
 	if err != nil {
 		klog.ErrorS(err, "Configure Fastlet control authentication: it is always enabled and cannot start without it")
 		os.Exit(1)
@@ -224,6 +224,14 @@ func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bo
 	fastletAuthSubjectList := fastletauth.ParseSubjects(fastletAuthSubjects)
 	if fastletAuthSubjects != "" && len(fastletAuthSubjectList) == 0 {
 		klog.ErrorS(nil, "--fastlet-auth-subjects is set but contains no usable subject")
+		os.Exit(1)
+	}
+	effectiveSubjects := fastletAuthSubjectList
+	if len(effectiveSubjects) == 0 {
+		effectiveSubjects = fastletauth.DefaultAllowedSubjects
+	}
+	if err := validateFastletAuthSubjects(effectiveSubjects, fastletAuthIdentity); err != nil {
+		klog.ErrorS(err, "Invalid Fastlet control allow list")
 		os.Exit(1)
 	}
 	if len(fastletAuthSubjectList) > 0 {
@@ -347,16 +355,17 @@ func envOrDefault(name, fallback string) string {
 // the shared Fastlet client and resolves the issuer anchor for the Pool
 // Controller to inject into Fastlet Pods. Tokens are minted via the
 // TokenRequest API for this Pod's own ServiceAccount; a cluster without the
-// serviceaccounts/token grant fails closed at the first Fastlet call.
-func installFastletAuthTokenSource(restConfig *rest.Config, fastletClient *fastletapi.FastletClient, audience string) (issuer, caBundle string, err error) {
-	identity, err := fastletauth.ResolvePodServiceAccountIdentity(
+// serviceaccounts/token grant fails closed at the first Fastlet call. It
+// returns the resolved identity so startup can cross-check the allow list.
+func installFastletAuthTokenSource(restConfig *rest.Config, fastletClient *fastletapi.FastletClient, audience string) (issuer, caBundle string, identity fastletauth.PodServiceAccountIdentity, err error) {
+	identity, err = fastletauth.ResolvePodServiceAccountIdentity(
 		os.Getenv(fastletauth.NamespaceEnv), os.Getenv(fastletauth.ServiceAccountEnv))
 	if err != nil {
-		return "", "", fmt.Errorf("resolve Fastlet auth identity: %w", err)
+		return "", "", fastletauth.PodServiceAccountIdentity{}, fmt.Errorf("resolve Fastlet auth identity: %w", err)
 	}
 	authenticationClient, err := corev1client.NewForConfig(restConfig)
 	if err != nil {
-		return "", "", fmt.Errorf("create core client for Fastlet auth TokenRequest: %w", err)
+		return "", "", fastletauth.PodServiceAccountIdentity{}, fmt.Errorf("create core client for Fastlet auth TokenRequest: %w", err)
 	}
 	tokenSource := fastletauth.NewTokenRequestSource(func(ctx context.Context, namespace, name string, request *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 		return authenticationClient.ServiceAccounts(namespace).CreateToken(ctx, name, request, metav1.CreateOptions{})
@@ -367,11 +376,38 @@ func installFastletAuthTokenSource(restConfig *rest.Config, fastletClient *fastl
 		// Auth is always on and the anchor cannot be re-resolved while
 		// running: refuse to start rather than create Fastlets that
 		// crash-loop.
-		return "", "", fmt.Errorf("resolve Fastlet auth issuer anchor: %w", err)
+		return "", "", fastletauth.PodServiceAccountIdentity{}, fmt.Errorf("resolve Fastlet auth issuer anchor: %w", err)
 	}
 	klog.InfoS("Fastlet control authentication enabled",
 		"namespace", identity.Namespace, "serviceAccount", identity.ServiceAccount, "audience", audience, "issuer", issuer)
-	return issuer, caBundle, nil
+	return issuer, caBundle, identity, nil
+}
+
+// validateFastletAuthSubjects rejects configurations that deterministically
+// fail every later Fastlet call, surfacing them at startup instead of as
+// Forbidden on every control operation: a subject a ServiceAccount token can
+// never present (token subjects are always
+// system:serviceaccount:<namespace>:<name>), and an allow list that excludes
+// this process's own minting identity.
+func validateFastletAuthSubjects(subjects []string, identity fastletauth.PodServiceAccountIdentity) error {
+	const subjectPrefix = "system:serviceaccount:"
+	for _, subject := range subjects {
+		rest, found := strings.CutPrefix(subject, subjectPrefix)
+		if !found {
+			return fmt.Errorf("subject %q is not a %s<namespace>:<name> identity: no ServiceAccount token can present it", subject, subjectPrefix)
+		}
+		namespace, name, found := strings.Cut(rest, ":")
+		if !found || namespace == "" || name == "" {
+			return fmt.Errorf("subject %q is not a parseable service account identity", subject)
+		}
+	}
+	own := subjectPrefix + identity.Namespace + ":" + identity.ServiceAccount
+	for _, subject := range subjects {
+		if subject == own {
+			return nil
+		}
+	}
+	return fmt.Errorf("allow list does not contain this process's own identity %s: every Fastlet call would fail with Forbidden", own)
 }
 
 // parseCacheNamespaces splits the comma-separated --namespaces value

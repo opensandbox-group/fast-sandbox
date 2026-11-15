@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -115,4 +116,66 @@ func TestTokenRequestSourceDefaultsAudience(t *testing.T) {
 	_, err := source.Token(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, []string{Audience}, audiences)
+}
+
+// TestTokenRequestSourceSingleFlightsConcurrentMints proves concurrent
+// callers share one TokenRequest: the mint runs outside the source lock, and
+// followers await its single outcome instead of queueing sequential network
+// calls.
+func TestTokenRequestSourceSingleFlightsConcurrentMints(t *testing.T) {
+	var mintCalls atomic.Int32
+	release := make(chan struct{})
+	source := NewTokenRequestSource(func(ctx context.Context, namespace, name string, request *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+		<-release
+		mintCalls.Add(1)
+		return &authenticationv1.TokenRequest{Status: authenticationv1.TokenRequestStatus{
+			Token:               "shared-token",
+			ExpirationTimestamp: metav1.NewTime(time.Now().Add(time.Hour)),
+		}}, nil
+	}, PodServiceAccountIdentity{Namespace: "ns", ServiceAccount: "sa"}, Audience)
+
+	const callers = 8
+	results := make(chan string, callers)
+	for range callers {
+		go func() {
+			token, err := source.Token(t.Context())
+			require.NoError(t, err)
+			results <- token
+		}()
+	}
+	// Let every caller join the in-flight mint before the leader proceeds;
+	// stragglers that arrive after completion simply read the cached token,
+	// so the assertions below hold either way.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	for range callers {
+		require.Equal(t, "shared-token", <-results, "every concurrent caller must share the minted token")
+	}
+	require.Equal(t, int32(1), mintCalls.Load(), "a concurrent stampede must cost exactly one TokenRequest")
+}
+
+func TestTokenRequestSourceSingleFlightsFailures(t *testing.T) {
+	var mintCalls atomic.Int32
+	release := make(chan struct{})
+	source := NewTokenRequestSource(func(ctx context.Context, namespace, name string, request *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+		<-release
+		mintCalls.Add(1)
+		return nil, errors.New("forbidden: no serviceaccounts/token grant")
+	}, PodServiceAccountIdentity{Namespace: "ns", ServiceAccount: "sa"}, Audience)
+
+	const callers = 4
+	errs := make(chan error, callers)
+	for range callers {
+		go func() {
+			_, err := source.Token(t.Context())
+			errs <- err
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	for range callers {
+		err := <-errs
+		require.ErrorIs(t, err, ErrUnavailable, "every joined caller must share the failed mint's outcome")
+	}
+	require.Equal(t, int32(1), mintCalls.Load(), "a failed mint must not trigger back-to-back TokenRequests from queued callers")
 }

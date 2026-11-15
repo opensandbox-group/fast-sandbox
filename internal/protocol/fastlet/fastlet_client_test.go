@@ -176,6 +176,48 @@ func TestFastletClientFailsClosedWhenTokenMintFails(t *testing.T) {
 	require.Equal(t, 0, requests, "no request may leave without a token")
 }
 
+// TestFastletClientClassifiesMintFailureAsPreSideEffect pins the retry-safety
+// contract: the fail-closed mint failure is provably pre-send, so its
+// disposition must be REJECTED_BEFORE_SIDE_EFFECTS rather than Unknown —
+// including through CreateDispositionFromError, whose nil-response path used
+// to bypass the CreateCallError promotion.
+func TestFastletClientClassifiesMintFailureAsPreSideEffect(t *testing.T) {
+	client, endpoint := testFastletClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("no request may leave without a token")
+	}))
+	client.SetTokenSource(failingTokenSource{})
+	_, err := client.CreateSandbox(context.Background(), endpoint, &CreateSandboxRequest{RequestID: "request-a"})
+	require.Error(t, err)
+	require.Equal(t, CreateDispositionRejectedBeforeSideEffects, CreateDispositionFromError(err),
+		"a mint failure never reached the wire, so retries are provably safe")
+	var failure *FastletError
+	require.ErrorAs(t, err, &failure)
+	require.True(t, IsAuthFailure(failure))
+
+	_, err = client.CreateSnapshot(context.Background(), endpoint, &CreateSnapshotRequest{})
+	require.Error(t, err)
+	require.Equal(t, CreateDispositionRejectedBeforeSideEffects, CreateDispositionFromError(err))
+}
+
+// TestFastletClientServesHeartbeatWhenMintFails pins the observability
+// carve-out: the server serves heartbeat unauthenticated, so a token-mint
+// outage must not starve it — otherwise an auth misconfiguration would turn
+// into fleet-wide placement loss — while intent-changing calls still fail
+// closed.
+func TestFastletClientServesHeartbeatWhenMintFails(t *testing.T) {
+	client, endpoint := testFastletClient(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		require.NoError(t, json.NewEncoder(w).Encode(HeartbeatResponse{FastletStatus: FastletStatus{RuntimeReady: true}}))
+	}))
+	client.SetTokenSource(failingTokenSource{})
+	heartbeat, err := client.Heartbeat(context.Background(), endpoint, &HeartbeatRequest{})
+	require.NoError(t, err, "a mint failure must not starve a server-exempt endpoint")
+	require.True(t, heartbeat.RuntimeReady)
+
+	_, err = client.CreateSandbox(context.Background(), endpoint, &CreateSandboxRequest{RequestID: "request-a"})
+	require.Error(t, err, "non-exempt calls still fail closed")
+}
+
 func TestFastletClientPreservesStatusOnPlainTextRejection(t *testing.T) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
