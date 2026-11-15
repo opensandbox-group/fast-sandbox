@@ -10,7 +10,6 @@ import (
 	"time"
 
 	jwt "github.com/golang-jwt/jwt/v5"
-
 	authenticationv1 "k8s.io/api/authentication/v1"
 )
 
