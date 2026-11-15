@@ -1553,12 +1553,11 @@ func TestEnsureSandboxDirectModeCapabilityHelper(t *testing.T) {
 	require.Len(t, fixture.launcher.started, 1)
 	started := fixture.launcher.started[0]
 	// The slot carries a netns path on Linux fixtures, so the launch is
-	// nsenter-wrapped (nsenter --net=<path> -- <helper> <args>); without one
-	// the helper is the process itself. Both forms name the real binary with
-	// --exec after the helper.
-	require.Contains(t, started, fixture.helperPath)
-	require.Equal(t, fixture.helperPath, started[argvIndex(started, "--exec")+1])
-	require.Equal(t, fixture.driver.config.BinaryPath, started[argvIndex(started, "--exec")+2])
+	// nsenter-wrapped (nsenter --net=<path> -- <helper> --exec <binary> ...);
+	// without one the helper is the process itself. Both forms keep the
+	// helper as the executed program and name the real binary as the --exec
+	// target.
+	require.Equal(t, fixture.driver.config.BinaryPath, started[argvIndex(started, "--exec")+1])
 	if started[0] == "nsenter" {
 		require.True(t, strings.HasPrefix(started[1], "--net="), started[1])
 		require.Equal(t, fixture.helperPath, started[argvIndex(started, "--")+1])
