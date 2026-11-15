@@ -24,12 +24,18 @@ func TestResolveHelperPath(t *testing.T) {
 	t.Setenv(HelperPathEnv, helper)
 	resolved, err := ResolveHelperPath()
 	require.NoError(t, err)
-	require.Equal(t, helper, resolved)
+	// The canonical path is returned; on macOS the TempDir prefix itself is
+	// a symlink (/var -> /private/var).
+	canonical, err := filepath.EvalSymlinks(helper)
+	require.NoError(t, err)
+	require.Equal(t, canonical, resolved)
 
 	// The basename is contractual: the jailer derives the jail root from
 	// the exec-file basename, so any other name would silently move every
 	// Fastlet jail path.
-	t.Setenv(HelperPathEnv, filepath.Join(dir, "vmm-capdrop"))
+	misnamed := filepath.Join(dir, "vmm-capdrop")
+	require.NoError(t, os.WriteFile(misnamed, []byte("x"), 0o755))
+	t.Setenv(HelperPathEnv, misnamed)
 	_, err = ResolveHelperPath()
 	require.ErrorContains(t, err, "basename")
 
@@ -46,6 +52,35 @@ func TestResolveHelperPath(t *testing.T) {
 	t.Setenv(HelperPathEnv, asDir) // a directory, not a regular file
 	_, err = ResolveHelperPath()
 	require.ErrorContains(t, err, "regular file")
+
+	// The override is resolved through symlinks and the canonical path is
+	// returned: the jailer canonicalizes the exec file before deriving the
+	// jail basename, so a misnamed symlink target must be rejected even
+	// though the link itself is named firecracker.
+	link := filepath.Join(dir, "linked", HelperBasename)
+	require.NoError(t, os.MkdirAll(filepath.Dir(link), 0o750))
+	foreign := filepath.Join(dir, "foreign", "vmm-capdrop")
+	require.NoError(t, os.MkdirAll(filepath.Dir(foreign), 0o750))
+	require.NoError(t, os.WriteFile(foreign, []byte("x"), 0o755))
+	require.NoError(t, os.Symlink(foreign, link))
+	t.Setenv(HelperPathEnv, link)
+	_, err = ResolveHelperPath()
+	require.ErrorContains(t, err, "basename")
+
+	// A symlink whose canonical target carries the contract basename
+	// resolves to the target path (which the jailer canonicalizes to).
+	target := filepath.Join(dir, "real", HelperBasename)
+	require.NoError(t, os.MkdirAll(filepath.Dir(target), 0o750))
+	require.NoError(t, os.WriteFile(target, []byte("x"), 0o755))
+	okLink := filepath.Join(dir, "ok", HelperBasename)
+	require.NoError(t, os.MkdirAll(filepath.Dir(okLink), 0o750))
+	require.NoError(t, os.Symlink(target, okLink))
+	t.Setenv(HelperPathEnv, okLink)
+	resolved, err = ResolveHelperPath()
+	require.NoError(t, err)
+	canonicalTarget, err := filepath.EvalSymlinks(target)
+	require.NoError(t, err)
+	require.Equal(t, canonicalTarget, resolved)
 
 	binary := filepath.Join(dir, "noexec", HelperBasename)
 	require.NoError(t, os.MkdirAll(filepath.Dir(binary), 0o750))

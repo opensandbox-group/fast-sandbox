@@ -33,9 +33,15 @@ const HelperBasename = "firecracker"
 
 // ResolveHelperPath returns the installed helper path and validates that it
 // satisfies the launch contract: an absolute path with the "firecracker"
-// basename, pointing at a regular executable file. A missing or invalid
-// helper is a loud error — the VMM must never launch with the full Pod
-// capability set because the image forgot to ship the helper.
+// basename, pointing at a regular executable file. The path is resolved
+// through symlinks and the CANONICAL path is returned (and validated): the
+// jailer canonicalizes the exec file before deriving the jail basename, so
+// a "firecracker" symlink pointing at a differently named binary would
+// otherwise pass a plain basename check while the jailer enters a jail at
+// <base>/<target-basename>/<id>/root — away from every Fastlet-computed
+// <base>/firecracker/<id>/root path. A missing or invalid helper is a loud
+// error — the VMM must never launch with the full Pod capability set
+// because the image forgot to ship the helper.
 func ResolveHelperPath() (string, error) {
 	path := os.Getenv(HelperPathEnv)
 	if path == "" {
@@ -44,18 +50,22 @@ func ResolveHelperPath() (string, error) {
 	if !filepath.IsAbs(path) {
 		return "", fmt.Errorf("capability-drop helper path %q must be absolute", path)
 	}
-	if filepath.Base(path) != HelperBasename {
-		return "", fmt.Errorf("capability-drop helper %q must be installed with the %q basename: the jailer derives the jail root from the exec-file basename", path, HelperBasename)
-	}
-	info, err := os.Stat(path)
+	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return "", fmt.Errorf("capability-drop helper %s is not installed: %w (the Fastlet image must ship it at %s)", path, err, DefaultHelperPath)
 	}
+	if filepath.Base(resolved) != HelperBasename {
+		return "", fmt.Errorf("capability-drop helper %s resolves to %q, which must carry the %q basename: the jailer derives the jail root from the canonicalized exec-file basename", path, resolved, HelperBasename)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("capability-drop helper %s is not usable: %w", resolved, err)
+	}
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("capability-drop helper %s must be a regular file", path)
+		return "", fmt.Errorf("capability-drop helper %s must be a regular file", resolved)
 	}
 	if info.Mode().Perm()&0o111 == 0 {
-		return "", fmt.Errorf("capability-drop helper %s is not executable", path)
+		return "", fmt.Errorf("capability-drop helper %s is not executable", resolved)
 	}
-	return path, nil
+	return resolved, nil
 }

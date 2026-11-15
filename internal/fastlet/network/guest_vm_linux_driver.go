@@ -277,7 +277,12 @@ func BakedGuestIP(slot *Slot) (string, error) {
 
 // Validate checks the TAP identity before recovered slots become available.
 // The manager rebuilds invalid Clean slots and rejects invalid Bound slots;
-// validation must never change an active interface's MAC.
+// validation must never change an active interface's MAC. The tap must be
+// owned by uid 0 for the capability-dropped VMM to attach (FSEP-0003): a
+// Clean slot carrying a tap created by the previous code is ownerless and
+// fails here so the manager rebuilds it with the owner set, while Bound
+// slots skip the check — their VMM is already attached and legacy
+// ownership is harmless for it.
 func (d *GuestVMNetNSDriver) Validate(ctx context.Context, slot *Slot) error {
 	if err := d.LinuxNetNSDriver.Validate(ctx, slot); err != nil {
 		return err
@@ -285,18 +290,26 @@ func (d *GuestVMNetNSDriver) Validate(ctx context.Context, slot *Slot) error {
 	if slot.GuestTap == "" {
 		return fmt.Errorf("guest-VM slot has no tap name")
 	}
-	output, err := d.runner.Run(ctx, d.ipCommand, "-j", "-n", slot.NetNSName, linkSubcommand, "show", netDevFlag, guestVMDefaultTapName)
+	output, err := d.runner.Run(ctx, d.ipCommand, "-j", "-d", "-n", slot.NetNSName, linkSubcommand, "show", netDevFlag, guestVMDefaultTapName)
 	if err != nil {
 		return fmt.Errorf("guest tap %s: %w", guestVMDefaultTapName, err)
 	}
 	var links []struct {
-		Address string `json:"address"`
+		Address string          `json:"address"`
+		User    json.RawMessage `json:"user"`
 	}
 	if err := json.Unmarshal(output, &links); err != nil {
 		return fmt.Errorf("decode guest tap %s: %w", guestVMDefaultTapName, err)
 	}
 	if len(links) != 1 || links[0].Address != guestnetwork.GatewayMAC {
 		return fmt.Errorf("guest tap %s must use gateway MAC %s: %s", guestVMDefaultTapName, guestnetwork.GatewayMAC, output)
+	}
+	// The tun link detail emits "user" only when the tap carries an owner
+	// (the passwd name, or the numeric uid when the name cannot be
+	// resolved). An ownerless tap needs CAP_NET_ADMIN to attach since
+	// CVE-2026-99281, which the capability-dropped VMM no longer holds.
+	if slot.Phase != SlotPhaseBound && !tapOwnedByUID0(links[0].User) {
+		return fmt.Errorf("guest tap %s is not owned by uid 0: rebuild the slot before a capability-dropped VMM attaches (FSEP-0003): %s", guestVMDefaultTapName, output)
 	}
 	if slot.GuestNATBatch {
 		for _, hook := range []struct{ chain, target string }{{"PREROUTING", guestDNATChain}, {"POSTROUTING", guestSNATChain}} {
@@ -346,6 +359,17 @@ func (d *GuestVMNetNSDriver) Destroy(ctx context.Context, slot *Slot) error {
 		result = errorsJoin(result, err)
 	}
 	return result
+}
+
+// tapOwnedByUID0 reports whether the detailed link JSON carries a tap owner
+// of uid 0: iproute2 prints the passwd name ("root") or falls back to the
+// numeric uid when the name cannot be resolved.
+func tapOwnedByUID0(user json.RawMessage) bool {
+	switch string(user) {
+	case `"root"`, `0`:
+		return true
+	}
+	return false
 }
 
 // checkThenAdd installs an iptables rule only when it is not present yet.

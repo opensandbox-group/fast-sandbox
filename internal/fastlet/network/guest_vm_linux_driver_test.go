@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -51,11 +52,11 @@ type failCheckRunner struct {
 func (r *failCheckRunner) Run(_ context.Context, command string, args ...string) ([]byte, error) {
 	line := command + " " + strings.Join(args, " ")
 	r.commands = append(r.commands, line)
-	if strings.Contains(line, "-j -n ns-1 link show dev vmtap0") {
+	if strings.Contains(line, "-j -d -n ns-1 link show dev vmtap0") {
 		if r.tapJSON != "" {
 			return []byte(r.tapJSON), nil
 		}
-		return []byte(`[{"address":"` + guestnetwork.GatewayMAC + `"}]`), nil
+		return []byte(`[{"address":"` + guestnetwork.GatewayMAC + `","user":"root"}]`), nil
 	}
 	if strings.Contains(line, "link show dev fsb0") || strings.Contains(line, " -C ") {
 		return nil, errors.New("not found")
@@ -196,9 +197,9 @@ func TestGuestVMNetNSDriverValidate(t *testing.T) {
 	require.NoError(t, driver.Validate(context.Background(), slot))
 
 	joined := strings.Join(runner.commands, "\n")
-	require.Contains(t, joined, "ip -j -n ns-1 link show dev vmtap0")
+	require.Contains(t, joined, "ip -j -d -n ns-1 link show dev vmtap0")
 
-	for _, payload := range []string{`[{"address":"d6:1f:c2:4e:4d:6e"}]`, `[]`, `[{"address":""}]`, `invalid json`} {
+	for _, payload := range []string{`[{"address":"d6:1f:c2:4e:4d:6e","user":"root"}]`, `[]`, `[{"address":""}]`, `invalid json`} {
 		runner.tapJSON = payload
 		require.Error(t, driver.Validate(context.Background(), slot), payload)
 	}
@@ -209,6 +210,44 @@ func TestGuestVMNetNSDriverValidate(t *testing.T) {
 
 	slot.GuestTap = ""
 	require.Error(t, driver.Validate(context.Background(), slot))
+}
+
+// TestGuestVMNetNSDriverValidateTapOwnership pins the FSEP-0003 upgrade
+// boundary: a Clean slot whose tap was created by the previous code is
+// ownerless and must fail validation (the manager then rebuilds it with the
+// owner set), while a Bound slot is skipped — its VMM is already attached
+// and legacy ownership is harmless for it.
+func TestGuestVMNetNSDriverValidateTapOwnership(t *testing.T) {
+	root := t.TempDir()
+	// The parent LinuxNetNSDriver validation checks the netns mount and the
+	// resolver path before the tap checks below.
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "netns", "ns-1"), 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "dns"), []byte("nameserver 10.0.0.1\n"), 0o600))
+	runner := &failCheckRunner{}
+	driver := NewGuestVMNetNSDriver(LinuxDriverConfig{Runner: runner, ResolverPath: "/etc/resolv.conf"})
+	slot := guestVMSlotForTest(root)
+	slot.GuestTap = guestVMDefaultTapName
+	slot.Phase = SlotPhaseClean
+
+	// Ownerless tap on a Clean slot: rebuild required.
+	runner.tapJSON = `[{"address":"` + guestnetwork.GatewayMAC + `"}]`
+	err := driver.Validate(context.Background(), slot)
+	require.ErrorContains(t, err, "not owned by uid 0")
+
+	// Owned by uid 0 (passwd name or numeric fallback): admitted.
+	for _, owned := range []string{`"root"`, `0`} {
+		runner.tapJSON = `[{"address":"` + guestnetwork.GatewayMAC + `","user":` + owned + `}]`
+		require.NoErrorf(t, driver.Validate(context.Background(), slot), "user=%s", owned)
+	}
+	// Another uid is not the ownership match.
+	runner.tapJSON = `[{"address":"` + guestnetwork.GatewayMAC + `","user":"1000"}]`
+	require.ErrorContains(t, driver.Validate(context.Background(), slot), "not owned by uid 0")
+
+	// A Bound slot skips the ownership check (non-disruptive recovery of a
+	// VM that attached before the upgrade).
+	slot.Phase = SlotPhaseBound
+	runner.tapJSON = `[{"address":"` + guestnetwork.GatewayMAC + `"}]`
+	require.NoError(t, driver.Validate(context.Background(), slot))
 }
 
 // batchRunner preserves the legacy command fake and records stdin transactions.
@@ -304,6 +343,7 @@ func TestGuestNATBatchRecoveryRejectsMissingHook(t *testing.T) {
 	driver := NewGuestVMNetNSDriver(LinuxDriverConfig{Runner: runner})
 	slot := guestVMSlotForTest(root)
 	slot.GuestTap = guestVMDefaultTapName
+	slot.Phase = SlotPhaseBound
 	require.NoError(t, os.MkdirAll(slot.NetNSPath, 0o755))
 	require.NoError(t, os.WriteFile(slot.DNSPath, []byte("nameserver 10.0.0.1"), 0o600))
 	require.NoError(t, driver.Validate(context.Background(), slot)) // old slot
