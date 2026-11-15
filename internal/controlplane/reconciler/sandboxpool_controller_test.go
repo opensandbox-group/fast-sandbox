@@ -1273,6 +1273,8 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	require.Equal(t, ":9093", envValue(pod.Spec.Containers[1].Env, "FASTLET_PROXY_METRICS_ADDRESS"))
 	require.Equal(t, int32(9093), containerPortForName(t, &pod.Spec.Containers[1], "proxy-metrics"))
 	require.Equal(t, int32(5780), pod.Spec.Containers[1].ReadinessProbe.HTTPGet.Port.IntVal)
+	require.Equal(t, "50m", pod.Spec.Containers[1].Resources.Requests.Cpu().String())
+	require.Equal(t, "64Mi", pod.Spec.Containers[1].Resources.Requests.Memory().String())
 	require.Equal(t, "250m", pod.Spec.Containers[1].Resources.Limits.Cpu().String())
 	require.Equal(t, "256Mi", pod.Spec.Containers[1].Resources.Limits.Memory().String())
 	require.Equal(t, "/run/fast-sandbox/proxy/control.sock", envValue(pod.Spec.Containers[0].Env, "FASTLET_PROXY_CONTROL_SOCKET"))
@@ -1295,6 +1297,22 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	propagation := volumeMount(pod, "fast-sandbox-netns")
 	require.NotNil(t, propagation)
 	require.Equal(t, corev1.MountPropagationBidirectional, *propagation)
+	configuredReconciler := *reconciler
+	configuredReconciler.FastletProxyResources = corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse("250m"), corev1.ResourceMemory: resource.MustParse("1Gi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("4Gi"),
+		},
+	}
+	configuredPod, err := configuredReconciler.constructPod(pool, profile)
+	require.NoError(t, err)
+	require.Equal(t, "250m", configuredPod.Spec.Containers[1].Resources.Requests.Cpu().String())
+	require.Equal(t, "1Gi", configuredPod.Spec.Containers[1].Resources.Requests.Memory().String())
+	require.Equal(t, "1", configuredPod.Spec.Containers[1].Resources.Limits.Cpu().String())
+	require.Equal(t, "4Gi", configuredPod.Spec.Containers[1].Resources.Limits.Memory().String())
+	require.NotEqual(t, pod.Annotations[placement.AnnotationPodTemplateHash], configuredPod.Annotations[placement.AnnotationPodTemplateHash])
 
 	samePod, err := reconciler.constructPod(pool, profile)
 	require.NoError(t, err)
@@ -2548,6 +2566,20 @@ func TestBuildFastletSettingsIncludesSidecarsInPodMemoryBudget(t *testing.T) {
 		"the aggregate Pod observer includes the runtime owner, long-running sidecars, and platform proxy but not one-shot init containers")
 	require.Equal(t, "256Mi", settings.ResourceAdmission.RuntimeEnvelope.Memory.String(),
 		"sidecars never increase Sandbox commitment or the runtime-owner envelope")
+
+	resolved, err := compileFastletResources(pool, profile.Deployment.Overhead)
+	require.NoError(t, err)
+	proxyResources := DefaultFastletProxyResources()
+	proxyResources.Limits[corev1.ResourceMemory] = resource.MustParse("4Gi")
+	configuredSettings, err := buildFastletSettingsFromResolved(pool, resolved, proxyResources)
+	require.NoError(t, err)
+	require.Equal(t, "6912Mi", configuredSettings.ResourceAdmission.PodMemoryBudget.String(),
+		"the aggregate Pod observer uses the configured platform proxy memory limit")
+	defaultRevision, err := settings.Revision()
+	require.NoError(t, err)
+	configuredRevision, err := configuredSettings.Revision()
+	require.NoError(t, err)
+	require.NotEqual(t, defaultRevision, configuredRevision)
 }
 
 func TestComponentLoggingManifests(t *testing.T) {
