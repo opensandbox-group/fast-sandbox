@@ -86,7 +86,7 @@ func writeRestoreArtifacts(dir string) error {
 
 // commitTestManifest writes manifest.json, the pull's commit point.
 func commitTestManifest(dir string) error {
-	payload, err := json.Marshal(newTestVMManifest())
+	payload, err := json.Marshal(newMetadataTestVMManifest())
 	if err != nil {
 		return err
 	}
