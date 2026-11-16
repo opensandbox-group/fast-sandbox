@@ -387,8 +387,11 @@ func TestDeliverCheckpointMaterializesAndReportsDelivered(t *testing.T) {
 	status, err := fixture.driver.DeliverCheckpoint(context.Background(), restore)
 	require.NoError(t, err)
 	require.Equal(t, runtimecontract.ImageDelivering, status, "a cold checkpoint is delivered in the background")
+	// Wait for the pull's commit point (manifest.json), not just the restore
+	// artifacts: the agent writes the manifest last, and until then delivery
+	// correctly reports Delivering.
 	require.Eventually(t, func() bool {
-		return verifyRestorableImage(fixture.stateRoot, reference) == nil
+		return verifyDeliveredImage(fixture.stateRoot, reference, true) == nil
 	}, 2*time.Second, 10*time.Millisecond)
 
 	status, err = fixture.driver.DeliverCheckpoint(context.Background(), restore)
