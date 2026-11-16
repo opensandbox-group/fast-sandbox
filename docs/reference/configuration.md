@@ -54,7 +54,7 @@ Klog verbosity flags `-v` and `-vmodule` keep their existing behavior across all
 | `--namespaces` | *(empty = whole cluster)* | Comma-separated namespaces the informer cache watches |
 | `--kube-client-qps` | *(client-go default)* | API-server client rate limit in queries per second |
 | `--kube-client-burst` | *(client-go default)* | API-server client burst budget for the rate limiter |
-| `--fastlet-auth-subjects` | *(Fastlet built-in platform default)* | Comma-separated ServiceAccount subjects allowed to call the Fastlet control API, injected into Fastlet Pods; set it when the control plane runs outside `fast-sandbox-system` (env fallback `FASTLET_AUTH_SUBJECTS`) |
+| `--fastlet-auth-subjects` | *(platform ServiceAccounts in the control plane's own namespace)* | Comma-separated ServiceAccount subjects allowed to call the Fastlet control API, injected into Fastlet Pods; set it only when the deployment uses identities that do not follow the platform naming convention (env fallback `FASTLET_AUTH_SUBJECTS`) |
 
 Fastlet control authentication is always enabled: every call to the Fastlet
 control API carries an audience-bound ServiceAccount token minted through the
@@ -223,11 +223,12 @@ published signing keys and rejects callers whose ServiceAccount is not on the
 allow list. The allow list itself is injected by the Pool Controller from the
 control plane's `--fastlet-auth-subjects` flag (environment fallback
 `FASTLET_AUTH_SUBJECTS`); unset, it defaults to the platform
-`fast-sandbox-fastpath` and `fast-sandbox-controller` ServiceAccounts in
-`fast-sandbox-system`. Set the flag when the control plane runs in another
-namespace. The three injected variables above are runtime-owned: Pool
-templates cannot override them, so a Pool cannot weaken the allow list or
-redirect the issuer anchor.
+`fast-sandbox-fastpath` and `fast-sandbox-controller` ServiceAccounts in the
+control plane's own namespace, so same-convention deployments in any namespace
+need no override. Set the flag only when the deployment uses other identities.
+The three injected variables above are runtime-owned: Pool templates cannot
+override them, so a Pool cannot weaken the allow list or redirect the issuer
+anchor.
 
 `FASTLET_AUTH_AUDIENCE` overrides the token audience on both sides. The
 `/livez`, `/readyz`, `/metrics`, and `/api/v2/fastlet/heartbeat` endpoints

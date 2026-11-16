@@ -110,7 +110,7 @@ func main() { //nolint:gocognit,gocyclo,maintidx // pre-existing flag wiring and
 	flag.DurationVar(&resourceAwareStartupGrace, "resource-aware-fastlet-startup-grace", 2*time.Minute, "Maximum time a Fastlet without a heartbeat contributes nominal in-flight capacity.")
 	flag.DurationVar(&resourceAwareScaleDownStabilization, "resource-aware-scale-down-stabilization", time.Minute, "Continuous excess-capacity window required before ResourceAware scale-down.")
 	flag.StringVar(&cacheNamespaces, "namespaces", "", "Comma-separated namespaces the informer cache watches; empty watches the whole cluster. Must cover every namespace holding SandboxPool/Sandbox objects and the runtime environment ConfigMap.")
-	flag.StringVar(&fastletAuthSubjects, fastletauth.SubjectsFlag, envOrDefault(fastletauth.SubjectsEnv, ""), "Comma-separated ServiceAccount subjects allowed to call the Fastlet control API; empty applies the platform default. Custom control-plane namespaces must also replicate the namespaced Role/RoleBinding (serviceaccounts/token create, resourceNames-fenced) that config/rbac/base.yaml ships in fast-sandbox-system, or every Fastlet call fails closed with Forbidden.")
+	flag.StringVar(&fastletAuthSubjects, fastletauth.SubjectsFlag, envOrDefault(fastletauth.SubjectsEnv, ""), "Comma-separated ServiceAccount subjects allowed to call the Fastlet control API; empty allows the platform ServiceAccounts (fast-sandbox-fastpath, fast-sandbox-controller) in this control plane's own namespace. Set it when the deployment uses other identities. Custom namespaces must also replicate the namespaced Role/RoleBinding (serviceaccounts/token create, resourceNames-fenced) that config/rbac/base.yaml ships in fast-sandbox-system, or every Fastlet call fails closed with Forbidden.")
 	flag.Float64Var(&kubeClientQPS, "kube-client-qps", 0, "API-server client rate limit in queries per second; 0 keeps the client-go default.")
 	flag.IntVar(&kubeClientBurst, "kube-client-burst", 0, "API-server client burst budget for the rate limiter; 0 keeps the client-go default.")
 	componentlog.InitFlags(nil)
@@ -226,15 +226,19 @@ func main() { //nolint:gocognit,gocyclo,maintidx // pre-existing flag wiring and
 		klog.ErrorS(nil, "--fastlet-auth-subjects is set but contains no usable subject")
 		os.Exit(1)
 	}
-	effectiveSubjects := fastletAuthSubjectList
-	if len(effectiveSubjects) == 0 {
-		effectiveSubjects = fastletauth.DefaultAllowedSubjects
+	// Effective list: the flag override, else the platform ServiceAccounts in
+	// this control plane's own namespace — the deployment convention keeps the
+	// platform identities callable without a per-namespace flag, and the
+	// validation below still cross-checks the result against the identity
+	// tokens this process actually mints.
+	if len(fastletAuthSubjectList) == 0 {
+		fastletAuthSubjectList = fastletauth.PlatformSubjectsForNamespace(fastletAuthIdentity.Namespace)
 	}
-	if err := validateFastletAuthSubjects(effectiveSubjects, fastletAuthIdentity); err != nil {
+	if err := validateFastletAuthSubjects(fastletAuthSubjectList, fastletAuthIdentity); err != nil {
 		klog.ErrorS(err, "Invalid Fastlet control allow list")
 		os.Exit(1)
 	}
-	if len(fastletAuthSubjectList) > 0 {
+	if len(fastletAuthSubjects) > 0 {
 		klog.InfoS("Fastlet control allow list override", "subjects", strings.Join(fastletAuthSubjectList, ","))
 	}
 	orchestrator := &orchestration.Orchestrator{

@@ -40,12 +40,26 @@ const (
 	refreshWaitMax = 2 * time.Second
 )
 
-// DefaultAllowedSubjects is the allow list when the deployment does not
-// override it: the platform control-plane ServiceAccounts.
-var DefaultAllowedSubjects = []string{
-	"system:serviceaccount:fast-sandbox-system:fast-sandbox-fastpath",
-	"system:serviceaccount:fast-sandbox-system:fast-sandbox-controller",
+// SystemNamespace is the default platform control-plane namespace.
+const SystemNamespace = "fast-sandbox-system"
+
+// PlatformSubjectsForNamespace returns the default caller allow list for a
+// control-plane namespace: the platform control-plane ServiceAccounts
+// (fastpath and controller) in that namespace. Deployments that follow the
+// platform naming convention need no flag override, even when the control
+// plane runs outside SystemNamespace.
+func PlatformSubjectsForNamespace(namespace string) []string {
+	return []string{
+		"system:serviceaccount:" + namespace + ":fast-sandbox-fastpath",
+		"system:serviceaccount:" + namespace + ":fast-sandbox-controller",
+	}
 }
+
+// DefaultAllowedSubjects is the allow list for a control plane deployed in
+// SystemNamespace. The controller derives the effective default from its own
+// namespace (PlatformSubjectsForNamespace); --fastlet-auth-subjects replaces
+// the derived list for non-conventional setups.
+var DefaultAllowedSubjects = PlatformSubjectsForNamespace(SystemNamespace)
 
 // Authenticator verifies control tokens against the issuer's published keys
 // and a ServiceAccount allow list, fail-closed.

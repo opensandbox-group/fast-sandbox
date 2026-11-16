@@ -1652,7 +1652,9 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 		subjects := r.FastletAuthSubjects
 		if len(subjects) == 0 {
 			// Explicit entry even for the default: it shadows any envFrom
-			// key of the same name.
+			// key of the same name. The controller normally passes its
+			// namespace-derived list; this fallback keeps directly
+			// constructed reconcilers on the platform default.
 			subjects = fastletauth.DefaultAllowedSubjects
 		}
 		c.Env = append(c.Env, corev1.EnvVar{Name: fastletauth.AllowedSubjectsEnv, Value: strings.Join(subjects, ",")})
