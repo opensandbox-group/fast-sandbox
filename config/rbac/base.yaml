@@ -125,10 +125,12 @@ subjects:
 ---
 # Fastlet control authentication, two grants:
 #
-# 1. Token minting stays namespaced: serviceaccounts/token RBAC is evaluated
-#    in the target SA's namespace and resourceNames matches the bare name, so
-#    a cluster-scoped rule would let a compromised control plane mint tokens
-#    for same-named SAs in tenant namespaces.
+# 1. Token minting is per identity and namespaced: serviceaccounts/token RBAC
+#    is evaluated in the target SA's namespace and each Role is
+#    resourceNames-fenced to exactly the ServiceAccount its RoleBinding
+#    binds, so a compromised fastpath cannot mint controller tokens (and
+#    thereby inherit their broader permissions), and a cluster-scoped rule
+#    could not mint for same-named SAs in tenant namespaces.
 # 2. The credential-less Fastlet reads OIDC discovery and JWKS anonymously;
 #    this extends the default system:service-account-issuer-discovery role
 #    (normally bound only to system:serviceaccounts) to unauthenticated
@@ -136,22 +138,41 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: fast-sandbox-fastlet-token-minter
+  name: fast-sandbox-fastpath-token-minter
   namespace: fast-sandbox-system
 rules:
 - apiGroups: [""]
   resources: ["serviceaccounts/token"]
-  resourceNames: ["fast-sandbox-fastpath", "fast-sandbox-controller"]
+  resourceNames: ["fast-sandbox-fastpath"]
   verbs: ["create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: fast-sandbox-fastlet-token-minter
+  name: fast-sandbox-fastpath-token-minter
   namespace: fast-sandbox-system
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: fast-sandbox-fastlet-token-minter}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: fast-sandbox-fastpath-token-minter}
 subjects:
 - {kind: ServiceAccount, name: fast-sandbox-fastpath, namespace: fast-sandbox-system}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fast-sandbox-controller-token-minter
+  namespace: fast-sandbox-system
+rules:
+- apiGroups: [""]
+  resources: ["serviceaccounts/token"]
+  resourceNames: ["fast-sandbox-controller"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fast-sandbox-controller-token-minter
+  namespace: fast-sandbox-system
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: fast-sandbox-controller-token-minter}
+subjects:
 - {kind: ServiceAccount, name: fast-sandbox-controller, namespace: fast-sandbox-system}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
