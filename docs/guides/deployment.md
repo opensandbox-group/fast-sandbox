@@ -83,7 +83,61 @@ This overlay removes the separate Fast-Path Deployment, HPA, and PDB. The Fast-P
 
 Applying an overlay does not prune objects left by another overlay. When changing an existing split development deployment to all-in-one, explicitly delete the old Fast-Path Deployment, HPA, and PDB. Do not use a broad `--prune` operation.
 
+## Control authentication rollout
+
+Fastlet control calls carry audience-bound ServiceAccount tokens, and Fastlets reject unauthenticated callers. The two control-plane Deployments (Fast-Path and Controller) roll independently of the Fastlet pools, so a version upgrade that enables control authentication must be sequenced: the window where an old Fast-Path calls a new Fastlet fails with 401, and a new Fast-Path without the token-mint RBAC fails closed against every Fastlet. The order below keeps every mixed-version window functional.
+
+The same sequence applies whether the manifests come from `config/default` or the Helm chart; only the apply command differs.
+
+1. Apply the RBAC grants and verify token minting before any image roll. The grants ship in `config/rbac` (included by `config/default`) or in the chart's RBAC templates.
+
+```bash
+kubectl apply -k config/rbac
+kubectl auth can-i create serviceaccounts/token -n fast-sandbox-system \
+  --as=system:serviceaccount:fast-sandbox-system:fast-sandbox-fastpath
+```
+
+The preflight must answer `yes`. A `no` here means a rolled Fast-Path would fail closed on every Fastlet call.
+
+2. Roll Fast-Path and wait for completion. New Fast-Path replicas send tokens on every control call; Fastlets still on the old image ignore the header.
+
+```bash
+kubectl -n fast-sandbox-system set image deployment/fast-sandbox-fastpath \
+  manager=fast-sandbox/controller:<version>
+kubectl -n fast-sandbox-system rollout status deployment/fast-sandbox-fastpath --timeout=5m
+```
+
+3. Roll the Controller and wait for completion. The new Controller injects the issuer anchor, the caller allow list, and the audience into every Fastlet Pod; the injected environment changes the Pod template hash, so each pool rolls itself with normal Pod replacement.
+
+```bash
+kubectl -n fast-sandbox-system set image deployment/fast-sandbox-controller \
+  manager=fast-sandbox/controller:<version>
+kubectl -n fast-sandbox-system rollout status deployment/fast-sandbox-controller --timeout=5m
+```
+
+4. Wait for the Fastlet pools to finish rolling.
+
+```bash
+kubectl -n fast-sandbox wait --for=condition=Ready pod \
+  -l fast-sandbox.io/runtime --timeout=10m
+```
+
+Verify on the Fastlet Pods: the startup log `Fastlet control authentication enabled`, and the absence of TokenRequest `Forbidden` errors on the control plane. Authentication rejections are visible in the Fastlet's own spans (`http.response.status_code` 401/403) once tracing is exported.
+
+### Rollback
+
+Roll back in reverse: pools first, then the control plane.
+
+1. Revert the Fastlet image in each SandboxPool template and wait for the pools to settle. The previous Fastlet ignores the injected authentication environment, and tokens sent by the still-new control plane are accepted but not verified.
+
+2. Revert the Controller and Fast-Path Deployments (either order) and wait for both rollouts.
+
+3. The RBAC grants are harmless to leave in place.
+
+Do not revert the Controller while pools still run the new Fastlet image: the new Fastlet fails startup without the injected issuer anchor and crash-loops until the Controller is rolled forward again.
+
 ## Runtime nodes
+
 
 Fastlet and NodeJanitor are privileged node components. Production clusters should:
 

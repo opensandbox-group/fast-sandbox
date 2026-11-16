@@ -218,27 +218,34 @@ Pool templates cannot override these variables or other platform-owned container
 
 ### Control authentication
 
-Fastlet control authentication is always on. The Pool Controller injects the
-issuer anchor into every Fastlet Pod:
+Fastlet control authentication is always on. The Pool Controller injects
+the authentication environment into every Fastlet Pod:
 
 - `FASTLET_AUTH_ISSUER`;
-- `FASTLET_AUTH_CA_BUNDLE` (base64-encoded PEM).
+- `FASTLET_AUTH_CA_BUNDLE` (base64-encoded PEM);
+- `FASTLET_AUTH_ALLOWED_SUBJECTS`;
+- `FASTLET_AUTH_AUDIENCE`.
 
 The Fastlet verifies each control call's bearer token against the issuer's
 published signing keys and rejects callers whose ServiceAccount is not on the
-allow list. The allow list itself is injected by the Pool Controller from the
-control plane's `--fastlet-auth-subjects` flag (environment fallback
-`FASTLET_AUTH_SUBJECTS`); unset, it defaults to the platform
-`fast-sandbox-fastpath` and `fast-sandbox-controller` ServiceAccounts in the
-control plane's own namespace, so same-convention deployments in any namespace
-need no override. Set the flag only when the deployment uses other identities.
-The three injected variables above are runtime-owned: Pool templates cannot
-override them, so a Pool cannot weaken the allow list or redirect the issuer
-anchor.
+allow list. The allow list defaults to the platform `fast-sandbox-fastpath`
+and `fast-sandbox-controller` ServiceAccounts in the control plane's own
+namespace, so same-convention deployments in any namespace need no override.
+Set `--fastlet-auth-subjects` only when the deployment uses other identities.
+All four injected variables are runtime-owned: Pool templates cannot override
+them through `env` entries (stripped) or through `envFrom` (an explicit env
+entry resolves over an envFrom key of the same name regardless of value), so
+a Pool can neither weaken the allow list nor redirect the issuer anchor or
+audience. Other `envFrom` inputs a Pool template relies on keep working.
+The injected CA bundle extends — never replaces — the system trust roots, so
+issuers served with publicly trusted certificates verify alongside
+cluster-internal ones.
 
 `FASTLET_AUTH_AUDIENCE` overrides the token audience on both sides. The
 `/livez`, `/readyz`, `/metrics`, and `/api/v2/fastlet/heartbeat` endpoints
 stay unauthenticated; every other control endpoint requires a valid token.
+For the required release sequence when upgrading a mixed-version cluster, see
+[Deployment](deployment.md#control-authentication-rollout).
 
 The control channel itself is plaintext HTTP on the Fastlet control port.
 NetworkPolicy strictness is a required compensating control, not an

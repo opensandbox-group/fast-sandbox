@@ -2992,10 +2992,13 @@ func TestConstructPodStripsTemplateOwnedAuthEnv(t *testing.T) {
 						{Name: fastletauth.CABundleEnv, Value: "attacker-ca"},
 						{Name: fastletauth.AudienceEnv, Value: "attacker-audience"},
 					},
-					// envFrom supplies keys explicit env does not define, so
-					// it must be cleared on the runtime container: a
-					// ConfigMap reference could otherwise inject an auth env
-					// key the platform leaves unset.
+					// envFrom may supply keys explicit env does not
+					// define. The platform answers by injecting every
+					// auth key explicitly (an env entry resolves over an
+					// envFrom key of the same name regardless of value),
+					// so a ConfigMap reference can no longer inject an
+					// auth key the platform leaves unset — while
+					// legitimate envFrom inputs keep working.
 					EnvFrom: []corev1.EnvFromSource{{
 						ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "attacker-config"}},
 					}},
@@ -3016,8 +3019,52 @@ func TestConstructPodStripsTemplateOwnedAuthEnv(t *testing.T) {
 		"the template must not relax the allow list")
 	require.Equal(t, "https://kubernetes.default.svc", envValue(pod.Spec.Containers[0].Env, fastletauth.AudienceEnv),
 		"the audience must come from the platform, not the template")
-	require.Empty(t, pod.Spec.Containers[0].EnvFrom,
-		"envFrom on the runtime container would supply auth env keys the platform leaves unset")
+	require.Len(t, pod.Spec.Containers[0].EnvFrom, 1,
+		"envFrom is preserved for non-auth keys; explicit env entries shadow any auth key it could supply")
+}
+
+// TestConstructPodInjectsAuthEnvUnconditionally pins the shadowing guarantee:
+// every auth env key carries an explicit entry even when the platform value is
+// empty, because kubelet resolves an env entry over an envFrom key of the same
+// name regardless of value. A missing entry would reopen the envFrom supply
+// path that TestConstructPodStripsTemplateOwnedAuthEnv closes for values.
+func TestConstructPodInjectsAuthEnvUnconditionally(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	// Directly constructed reconciler with no auth fields populated: the
+	// entries must still exist (empty values read as unset on the Fastlet
+	// side and fall back to the projected-token anchor).
+	poolReconciler := &SandboxPoolReconciler{Scheme: scheme, Catalog: runtimecatalog.Builtin()}
+	pool := &apiv1alpha2.SandboxPool{
+		TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha2.GroupVersion.String(), Kind: "SandboxPool"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-empty", Namespace: "default", UID: types.UID("pool-uid")},
+		Spec: apiv1alpha2.SandboxPoolSpec{
+			Runtime:            apiv1alpha2.RuntimeContainer,
+			MaxSandboxesPerPod: 5,
+			SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+				resource.MustParse("1"), resource.MustParse("1Gi"), 256,
+			),
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}},
+			}},
+		},
+	}
+	runtimePlan, err := runtimeenv.ResolveDefault(poolReconciler.Catalog, pool.Spec.Runtime)
+	require.NoError(t, err)
+	pod, err := poolReconciler.constructPodWithRuntimePlan(pool, runtimePlan)
+	require.NoError(t, err)
+	for _, key := range []string{fastletauth.IssuerEnv, fastletauth.CABundleEnv, fastletauth.AllowedSubjectsEnv, fastletauth.AudienceEnv} {
+		require.Contains(t, envNames(pod.Spec.Containers[0].Env), key,
+			"every auth env key must carry an explicit entry so envFrom can never supply it")
+	}
+}
+
+func envNames(env []corev1.EnvVar) []string {
+	names := make([]string, 0, len(env))
+	for _, item := range env {
+		names = append(names, item.Name)
+	}
+	return names
 }
 
 func TestConstructPodSeedsDefaultAuthSubjects(t *testing.T) {

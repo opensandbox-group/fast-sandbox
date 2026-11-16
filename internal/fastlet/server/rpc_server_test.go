@@ -11,6 +11,10 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	fastletsandbox "fast-sandbox/internal/fastlet/sandbox"
@@ -328,4 +332,58 @@ func TestFastletServerEnforcesControlAuthentication(t *testing.T) {
 	recorder = httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
 	require.Equal(t, http.StatusForbidden, recorder.Code)
+}
+
+// TestFastletServerTracesAuthenticationRejections pins the instrumentation
+// order: authentication runs inside the HTTP tracing wrapper, so 401/403
+// responses are recorded in the Fastlet's own telemetry. During a mixed
+// version rollout the Fastlet is the only side that knows why calls fail.
+func TestFastletServerTracesAuthenticationRejections(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	previous := otel.GetTracerProvider()
+	otel.SetTracerProvider(provider)
+	t.Cleanup(func() {
+		_ = provider.Shutdown(context.Background())
+		otel.SetTracerProvider(previous)
+	})
+
+	manager := newServerManager(t, newServerRuntime(), false)
+	issuer := fastletauthtest.NewIssuer(t)
+	authenticator, err := fastletauth.NewAuthenticator(issuer.URL(), fastletauth.Audience,
+		[]string{"system:serviceaccount:fast-sandbox-system:fast-sandbox-fastpath"}, nil)
+	require.NoError(t, err)
+	fastletServer := NewFastletServer(":0", manager)
+	fastletServer.SetAuthenticator(authenticator)
+
+	identity := fastletapi.SandboxIdentity{SandboxUID: "sandbox-trace", Namespace: "default", Name: "sandbox-trace", InstanceGeneration: 1, RuntimeInstanceID: "runtime-trace", AssignmentAttempt: 1, FastletPodUID: "pod-uid-a"}
+	body, err := json.Marshal(fastletapi.CreateSandboxRequest{RequestID: "request-trace", Identity: identity, SpecGeneration: 1, Sandbox: fastletapi.SandboxDesiredSpec{Image: "alpine:latest"}})
+	require.NoError(t, err)
+
+	unauthenticated := httptest.NewRequest(http.MethodPost, "/api/v2/fastlet/create", bytes.NewReader(body))
+	foreign := httptest.NewRequest(http.MethodPost, "/api/v2/fastlet/create", bytes.NewReader(body))
+	foreign.Header.Set("Authorization", fastletauth.BearerPrefix+issuer.Mint(fastletauthtest.MintOptions{
+		Subject: "system:serviceaccount:attacker:default",
+	}))
+	for _, tc := range []struct {
+		request *http.Request
+		status  int
+	}{{unauthenticated, http.StatusUnauthorized}, {foreign, http.StatusForbidden}} {
+		recorderResponse := httptest.NewRecorder()
+		fastletServer.Handler().ServeHTTP(recorderResponse, tc.request)
+		require.Equal(t, tc.status, recorderResponse.Code)
+	}
+
+	statuses := map[int64]bool{}
+	for _, span := range recorder.Ended() {
+		for _, item := range span.Attributes() {
+			if item.Key == attribute.Key("http.response.status_code") {
+				statuses[item.Value.AsInt64()] = true
+			}
+		}
+	}
+	require.True(t, statuses[http.StatusUnauthorized],
+		"authentication rejections must appear in the Fastlet's own spans with their status code")
+	require.True(t, statuses[http.StatusForbidden],
+		"forbidden subjects must appear in the Fastlet's own spans with their status code")
 }

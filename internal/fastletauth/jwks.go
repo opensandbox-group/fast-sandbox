@@ -97,9 +97,11 @@ func fetchJSONDocument(ctx context.Context, client *http.Client, url string, tar
 	return json.Unmarshal(raw, target)
 }
 
-// defaultHTTPClient builds the client for issuer key material, trusting the
-// injected CA bundle (CABundleEnv) or the projected pod ca.crt; managed-
-// cluster issuers verify through the system roots fallback.
+// defaultHTTPClient builds the client for issuer key material. The trust set
+// is the system roots extended with the injected bundle (CABundleEnv) or the
+// projected pod ca.crt: a Kubernetes whose ServiceAccount issuer (or
+// discovery-served jwks_uri) is served with a publicly trusted certificate is
+// a supported deployment and must keep verifying.
 func defaultHTTPClient() (*http.Client, error) {
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
@@ -119,25 +121,45 @@ func defaultHTTPClient() (*http.Client, error) {
 	return &http.Client{Transport: base, Timeout: 5 * time.Second}, nil
 }
 
-// injectedCABundle resolves the CA trust set: injected base64 bundle first,
-// projected pod ca.crt second; found=false leaves the system roots. A set-but-
-// malformed bundle is a configuration error, not a degradation: the bundle is
-// the trust anchor for signature verification, so silently falling back to a
-// weaker set would betray the fail-closed posture.
+// injectedCABundle resolves the CA trust set: the system roots extended with
+// the injected base64 bundle (CABundleEnv), or with the projected pod ca.crt
+// when no bundle is injected; found=false leaves the transport on its
+// system-roots default. The bundle extends rather than replaces the system
+// roots, so issuers with publicly trusted certificates verify alongside
+// cluster-internal ones. A set-but-malformed bundle is a configuration
+// error, not a degradation: the bundle is the trust anchor for signature
+// verification, so silently falling back to a weaker set would betray the
+// fail-closed posture.
 func injectedCABundle() (pool *x509.CertPool, found bool, err error) {
 	if encoded := strings.TrimSpace(os.Getenv(CABundleEnv)); encoded != "" {
 		raw, decodeErr := base64.StdEncoding.DecodeString(encoded)
-		pool := x509.NewCertPool()
-		if decodeErr != nil || !pool.AppendCertsFromPEM(raw) {
-			return nil, false, fmt.Errorf("%s is set but is not parseable as base64-encoded PEM", CABundleEnv)
+		if decodeErr != nil {
+			return nil, false, fmt.Errorf("%s is set but is not base64-encoded", CABundleEnv)
+		}
+		pool, err := systemRootsExtendedWith(raw)
+		if err != nil {
+			return nil, false, fmt.Errorf("%s is set but carries no parseable PEM certificate", CABundleEnv)
 		}
 		return pool, true, nil
 	}
 	if raw, readErr := os.ReadFile(serviceAccountCAFile); readErr == nil {
-		pool := x509.NewCertPool()
-		if pool.AppendCertsFromPEM(raw) {
+		if pool, err := systemRootsExtendedWith(raw); err == nil {
 			return pool, true, nil
 		}
 	}
 	return nil, false, nil
+}
+
+// systemRootsExtendedWith returns the system root pool with the PEM bundle
+// appended. Containers without usable system roots (scratch images) degrade
+// to the bundle alone rather than failing startup.
+func systemRootsExtendedWith(pemBundle []byte) (*x509.CertPool, error) {
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(pemBundle) {
+		return nil, fmt.Errorf("CA bundle carries no PEM certificate")
+	}
+	return pool, nil
 }

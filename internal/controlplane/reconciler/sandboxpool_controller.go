@@ -1585,19 +1585,6 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 		}
 		c.SecurityContext.Privileged = boolPtr(profile.Deployment.Privileged)
 		c.Env = removeRuntimeOwnedEnv(c.Env)
-		// The runtime container's env contract is platform-owned: envFrom is
-		// cleared so a Pool template cannot supply auth env keys the platform
-		// leaves unset (kubelet lets envFrom feed keys that explicit env does
-		// not define). Any envFrom need can be expressed through env entries,
-		// which pass through removal only when they are not platform-owned.
-		if len(c.EnvFrom) > 0 {
-			// The wipe is unconditional, so say so: a template that loses
-			// envFrom-supplied variables on pool replacement must be
-			// diagnosable instead of silently regressed.
-			klog.InfoS("Discarding pool template envFrom on the runtime container: the runtime env contract is platform-owned",
-				"pool", pool.Name, "namespace", pool.Namespace, "envFromEntries", len(c.EnvFrom))
-		}
-		c.EnvFrom = nil
 
 		c.Env = append(c.Env,
 			corev1.EnvVar{Name: "FASTLET_CONTROL_PORT", Value: ":5758"},
@@ -1650,27 +1637,27 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			corev1.EnvVar{Name: "INFRA_DIR_IN_POD", Value: infraHostPath},
 		)
 		// Control authentication is platform-owned end to end: the anchor
-		// (issuer + CA), the caller allow list, and the audience are all
-		// injected here, and EnvFrom is cleared above so a Pool template
-		// can supply none of them.
-		if r.FastletAuthIssuer != "" {
-			c.Env = append(c.Env, corev1.EnvVar{Name: fastletauth.IssuerEnv, Value: r.FastletAuthIssuer})
-		}
-		if r.FastletAuthCABundle != "" {
-			c.Env = append(c.Env, corev1.EnvVar{Name: fastletauth.CABundleEnv, Value: r.FastletAuthCABundle})
-		}
+		// (issuer + CA), the caller allow list, and the audience all come
+		// from here. Every auth env key is removed from template env above
+		// and re-injected unconditionally — including entries whose platform
+		// value is empty — because kubelet resolves an explicit env entry
+		// over an envFrom key of the same name regardless of value. That
+		// closes every template supply path for the auth keys while the
+		// template's other envFrom inputs (ConfigMap/Secret references)
+		// keep working.
 		subjects := r.FastletAuthSubjects
 		if len(subjects) == 0 {
-			// Explicit entry even for the default: it shadows any envFrom
-			// key of the same name. The controller normally passes its
-			// namespace-derived list; this fallback keeps directly
-			// constructed reconcilers on the platform default.
+			// The controller normally passes its namespace-derived list;
+			// this fallback keeps directly constructed reconcilers on the
+			// platform default.
 			subjects = fastletauth.DefaultAllowedSubjects
 		}
-		c.Env = append(c.Env, corev1.EnvVar{Name: fastletauth.AllowedSubjectsEnv, Value: strings.Join(subjects, ",")})
-		if r.FastletAuthAudience != "" {
-			c.Env = append(c.Env, corev1.EnvVar{Name: fastletauth.AudienceEnv, Value: r.FastletAuthAudience})
-		}
+		c.Env = append(c.Env,
+			corev1.EnvVar{Name: fastletauth.IssuerEnv, Value: r.FastletAuthIssuer},
+			corev1.EnvVar{Name: fastletauth.CABundleEnv, Value: r.FastletAuthCABundle},
+			corev1.EnvVar{Name: fastletauth.AllowedSubjectsEnv, Value: strings.Join(subjects, ",")},
+			corev1.EnvVar{Name: fastletauth.AudienceEnv, Value: r.FastletAuthAudience},
+		)
 		if profile.ResidualProcess != runtimecatalog.ResidualProcessNone {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "FAST_SANDBOX_NODE_CLEANUP_SOCKET", Value: nodecleanup.DefaultSocketPath})
 		}
