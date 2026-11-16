@@ -149,9 +149,10 @@ func TestDeliverImageKicksBackgroundAttemptUntilCommitted(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, runtimecontract.ImageDelivering, status)
 
+	// Wait for the pull's commit point (manifest.json), not just the rootfs:
+	// until the agent commits, delivery correctly reports Delivering.
 	require.Eventually(t, func() bool {
-		_, resolveErr := resolveRootfsImage(fixture.stateRoot, fixture.sandboxSpec.Desired.Image)
-		return resolveErr == nil
+		return verifyDeliveredImage(fixture.stateRoot, fixture.sandboxSpec.Desired.Image, true) == nil
 	}, 5*time.Second, 20*time.Millisecond, "background delivery must commit the image")
 
 	require.GreaterOrEqual(t, agent.deliveredPins(), 1)
