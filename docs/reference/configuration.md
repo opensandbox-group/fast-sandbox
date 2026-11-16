@@ -41,6 +41,10 @@ Klog verbosity flags `-v` and `-vmodule` keep their existing behavior across all
 | `--fastlet-heartbeat-timeout` | `5s` | One heartbeat timeout |
 | `--fastlet-heartbeat-concurrency` | `8` | Heartbeat concurrency limit |
 | `--fastlet-drain-timeout` | `5m` | Drain deadline before failure policy |
+| `--fastlet-proxy-request-cpu` | `50m` | CPU request for the injected Fastlet Proxy sidecar |
+| `--fastlet-proxy-request-memory` | `64Mi` | Memory request for the injected Fastlet Proxy sidecar |
+| `--fastlet-proxy-limit-cpu` | `250m` | CPU limit for the injected Fastlet Proxy sidecar |
+| `--fastlet-proxy-limit-memory` | `256Mi` | Memory limit for the injected Fastlet Proxy sidecar |
 | `--route-credential-ttl` | `5m` | Caller route credential lifetime |
 | `--sandbox-proxy-base-url` | cluster Service URL | Client-visible proxy base URL |
 | `--runtime-environment-namespace` | `fast-sandbox-system` | Namespace of the platform runtime environment ConfigMap |
@@ -58,6 +62,8 @@ Klog verbosity flags `-v` and `-vmodule` keep their existing behavior across all
 Resource-aware placement requires static admission. Resource-aware Pool
 scaling requires placement. These constraints prevent a downstream component
 from acting on capacity that an upstream authority does not enforce.
+
+Fastlet Proxy requests and limits must be positive Kubernetes resource quantities, and each request must not exceed its matching limit. The flags apply only to `controller` and `all` roles. A resource change alters the Fastlet Pod template hash and follows the existing surge-and-drain replacement flow; for ResourceAware Pools, the configured proxy memory limit is also included in the aggregate Pod memory observer budget.
 
 ### Cache scoping and client rate limiting
 
