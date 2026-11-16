@@ -23,6 +23,8 @@ import (
 	"path/filepath"
 
 	"k8s.io/klog/v2"
+
+	"fast-sandbox/internal/artifacts"
 )
 
 const (
@@ -64,6 +66,13 @@ func ImageReady(stateRoot, image string) (bool, error) {
 	return cacheComplete(imageDir(stateRoot, image))
 }
 
+// ImageReadyVerified is ImageReady for the chunked transfer mode: a file
+// whose verified-cache marker still describes it is trusted without being
+// re-hashed (see marker.go).
+func ImageReadyVerified(stateRoot, image string) (bool, error) {
+	return cacheCompleteWith(imageDir(stateRoot, image), true)
+}
+
 // CachedManifestDigest returns the sha256 digest of the committed local
 // manifest of an image reference. The digest matches the index
 // artifactDigest the pull verified, so callers can trust it without a
@@ -88,6 +97,12 @@ func CachedManifestDigest(stateRoot, image string) (string, bool, error) {
 // idempotency check: a complete cache is never touched again (the trade-off
 // is documented on Client.PullImage).
 func cacheComplete(dir string) (bool, error) {
+	return cacheCompleteWith(dir, false)
+}
+
+// cacheCompleteWith is cacheComplete; marked trusts verified-cache markers
+// (chunked transfer mode) instead of re-hashing every file.
+func cacheCompleteWith(dir string, marked bool) (bool, error) {
 	payload, err := os.ReadFile(filepath.Join(dir, manifestName))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -104,12 +119,42 @@ func cacheComplete(dir string) (bool, error) {
 		return false, nil //nolint:nilerr // an incomplete native file set means the pull is not complete
 	}
 	for _, file := range files {
-		match, err := fileMatches(filepath.Join(dir, file.cache), file)
+		match, err := verifyCacheFile(filepath.Join(dir, file.cache), file, marked)
 		if err != nil || !match {
 			return false, nil //nolint:nilerr // any mismatch or read failure means the pull is not complete; the next pull redoes it
 		}
 	}
 	return true, nil
+}
+
+// verifyCacheFile checks one cached file: a full fileMatches, or with
+// marked the marker-fronted fileVerified.
+func verifyCacheFile(path string, file nativeFile, marked bool) (bool, error) {
+	if marked {
+		return fileVerified(path, file)
+	}
+	return fileMatches(path, file)
+}
+
+// fileVerified is fileMatches with the verified-cache marker in front: a
+// file whose marker still describes it is trusted without reading it, and a
+// file that verifies the slow way gets a marker for the next check.
+func fileVerified(path string, file nativeFile) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	if info.Size() != file.sizeBytes {
+		return false, nil
+	}
+	if markerMatches(path, info, file.markerSum()) {
+		return true, nil
+	}
+	match, err := fileMatches(path, file)
+	if err == nil && match {
+		markVerified(path, file.markerSum())
+	}
+	return match, err
 }
 
 // stageFile ensures the artifact is in the cache with the expected size and
@@ -119,8 +164,14 @@ func cacheComplete(dir string) (bool, error) {
 // verifies. The object is fetched through the client, which routes artifact
 // bytes over the P2P gateway when configured (falling back to direct S3).
 func stageFile(ctx context.Context, c *Client, dir, storeKey string, file nativeFile) error {
+	chunked := c.transfer.Chunked()
 	target := filepath.Join(dir, file.cache)
-	match, err := fileMatches(target, file)
+	if file.sha256 == "" {
+		// Only a chunked set may describe an artifact by chunk-list digest:
+		// a whole-file download has nothing to verify it against.
+		return fmt.Errorf("artifact %s has no whole-file sha256 in a whole-file set", file.publish)
+	}
+	match, err := verifyCacheFile(target, file, chunked)
 	if err == nil && match {
 		return nil
 	}
@@ -157,37 +208,109 @@ func stageFile(ctx context.Context, c *Client, dir, storeKey string, file native
 		}
 	}()
 	digest := sha256.New()
-	written, err := io.Copy(tmp, io.TeeReader(body, digest))
+	var sink io.Writer = tmp
+	if chunked {
+		// All-zero blocks become holes: the logical content (and digest)
+		// is unchanged, but empty disk and RAM ranges never hit the disk.
+		sink = sparseWriter{file: tmp}
+	}
+	written, err := io.Copy(sink, io.TeeReader(body, digest))
 	if err != nil {
 		return fmt.Errorf("download %s: %w", file.publish, err)
 	}
 	if written != file.sizeBytes {
 		return fmt.Errorf("artifact %s size mismatch: got %d bytes, want %d", file.publish, written, file.sizeBytes)
 	}
+	if chunked {
+		// A trailing hole has no write behind it: set the logical size.
+		if err := tmp.Truncate(written); err != nil {
+			return err
+		}
+	}
 	sum := hex.EncodeToString(digest.Sum(nil))
 	if sum != file.sha256 {
 		return fmt.Errorf("artifact %s digest mismatch: got %s, want %s", file.publish, sum, file.sha256)
 	}
-	if err := tmp.Chmod(cacheFileMode); err != nil {
-		return err
-	}
-	// Flush before the rename so the committed name never points at a
-	// half-written file; the deferred cleanup skips the already-closed file.
-	if err := tmp.Close(); err != nil {
-		return err
-	}
+	// The deferred cleanup skips the file finishCacheFile closes.
 	closed = true
-	if err := os.Rename(tmp.Name(), target); err != nil {
+	if err := finishCacheFile(tmp, target, file.sha256, chunked); err != nil {
 		return err
 	}
 	keep = true
 	return nil
 }
 
+// chunkListVerifyWorkers bounds the parallel reads of a chunk-list re-verify
+// (a cached file whose marker is gone, e.g. after a reboot).
+const chunkListVerifyWorkers = 8
+
+// finishCacheFile commits a verified temporary cache file: mode, then the
+// close that flushes it before the rename so the committed name never
+// points at a half-written file. With marked (chunked transfer mode) the
+// file is also fsynced and gets its verified-cache marker: the marker
+// replaces the per-lease re-hash, so nothing would catch a torn file later.
+// The file is closed on every path.
+func finishCacheFile(tmp *os.File, target, sum string, marked bool) error {
+	if err := tmp.Chmod(cacheFileMode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if marked {
+		if err := tmp.Sync(); err != nil {
+			_ = tmp.Close()
+			return err
+		}
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if marked {
+		markVerified(tmp.Name(), sum)
+	}
+	return os.Rename(tmp.Name(), target)
+}
+
+// sparseBlock is the zero-detection granularity of sparse cache writes.
+const sparseBlock = 64 << 10
+
+// sparseWriter writes a byte stream into a file, seeking over all-zero
+// 64 KiB-aligned blocks instead of writing them. io.Copy hands it reads of
+// arbitrary size; blocks are judged on the slices it receives.
+type sparseWriter struct{ file *os.File }
+
+func (w sparseWriter) Write(payload []byte) (int, error) {
+	total := len(payload)
+	for len(payload) > 0 {
+		n := min(len(payload), sparseBlock)
+		block := payload[:n]
+		if artifacts.IsZero(block) {
+			if _, err := w.file.Seek(int64(n), io.SeekCurrent); err != nil {
+				return total - len(payload), err
+			}
+		} else if _, err := w.file.Write(block); err != nil {
+			return total - len(payload), err
+		}
+		payload = payload[n:]
+	}
+	return total, nil
+}
+
+// syncDir fsyncs a directory so renames into it are durable.
+func syncDir(dir string) error {
+	handle, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer handle.Close()
+	return handle.Sync()
+}
+
 // commitManifest writes the downloaded manifest as the pull commit point:
 // its presence with matching files means the pull is complete. The write is
-// atomic so a crash never leaves a half-written manifest.
-func commitManifest(dir string, payload []byte) error {
+// atomic so a crash never leaves a half-written manifest. With durable
+// (chunked transfer mode) the manifest is fsynced and one directory fsync
+// makes the artifact renames and the commit point durable together.
+func commitManifest(dir string, payload []byte, durable bool) error {
 	tmp, err := os.CreateTemp(dir, manifestName+".tmp-*")
 	if err != nil {
 		return err
@@ -205,13 +328,24 @@ func commitManifest(dir string, payload []byte) error {
 	if err := tmp.Chmod(cacheFileMode); err != nil {
 		return err
 	}
+	if durable {
+		if err := tmp.Sync(); err != nil {
+			return err
+		}
+	}
 	// Flush before the rename so the committed name never points at a
 	// half-written file; the deferred cleanup skips the already-closed file.
 	if err := tmp.Close(); err != nil {
 		return err
 	}
 	closed = true
-	return os.Rename(tmp.Name(), filepath.Join(dir, manifestName))
+	if err := os.Rename(tmp.Name(), filepath.Join(dir, manifestName)); err != nil {
+		return err
+	}
+	if !durable {
+		return nil
+	}
+	return syncDir(dir)
 }
 
 // fileMatches reports whether the file exists with the expected size and
@@ -225,6 +359,14 @@ func fileMatches(path string, file nativeFile) (bool, error) {
 	}
 	if info.Size() != file.sizeBytes {
 		return false, nil
+	}
+	if file.sha256 == "" && file.chunkList != nil {
+		// Chunk-list identity: hash only the non-zero chunks, in parallel.
+		sum, err := artifacts.FileChunkListSHA256(path, file.chunkList.ChunkSize, chunkListVerifyWorkers)
+		if err != nil {
+			return false, err
+		}
+		return sum == file.chunkList.SHA256, nil
 	}
 	input, err := os.Open(path)
 	if err != nil {
