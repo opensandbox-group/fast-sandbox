@@ -135,6 +135,10 @@ subjects:
 #    this extends the default system:service-account-issuer-discovery role
 #    (normally bound only to system:serviceaccounts) to unauthenticated
 #    callers, exposing exactly the two public-key endpoints.
+#
+# The OpenSandbox base chart mirrors these grants for chart installs
+# (OpenSandbox manifests/charts/base/templates/fast-sandbox-rbac.yaml);
+# keep the two in sync when changing either.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
