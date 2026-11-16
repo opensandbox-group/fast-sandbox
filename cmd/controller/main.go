@@ -15,6 +15,8 @@ import (
 
 	"google.golang.org/grpc"
 	authenticationv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -55,7 +57,7 @@ func init() {
 	utilruntime.Must(apiv1alpha2.AddToScheme(scheme))
 }
 
-func main() { //nolint:gocognit,gocyclo,maintidx // pre-existing flag wiring and role bootstrap; refactor tracked separately
+func main() { //nolint:gocognit,gocyclo,funlen,maintidx // pre-existing flag wiring and role bootstrap; refactor tracked separately
 	var roleValue string
 	var metricsAddress string
 	var probeAddress string
@@ -66,6 +68,10 @@ func main() { //nolint:gocognit,gocyclo,maintidx // pre-existing flag wiring and
 	var heartbeatConcurrency int
 	var fastletDrainTimeout time.Duration
 	var fastletProxyImage string
+	var fastletProxyRequestCPU string
+	var fastletProxyRequestMemory string
+	var fastletProxyLimitCPU string
+	var fastletProxyLimitMemory string
 	var sandboxTemplateBuilderImage string
 	var sandboxReconcileWorkers int
 	var routeVerifyPublicKey string
@@ -84,6 +90,7 @@ func main() { //nolint:gocognit,gocyclo,maintidx // pre-existing flag wiring and
 	var kubeClientQPS float64
 	var kubeClientBurst int
 	var fastletAuthSubjects string
+	defaultFastletProxyResources := reconciler.DefaultFastletProxyResources()
 
 	flag.StringVar(&roleValue, "role", "all", "Control-plane role: fastpath, controller, or all.")
 	flag.StringVar(&metricsAddress, "metrics-bind-address", ":9091", "Metrics listen address.")
@@ -95,6 +102,10 @@ func main() { //nolint:gocognit,gocyclo,maintidx // pre-existing flag wiring and
 	flag.IntVar(&heartbeatConcurrency, "fastlet-heartbeat-concurrency", 8, "Maximum concurrent Fastlet heartbeat requests.")
 	flag.DurationVar(&fastletDrainTimeout, "fastlet-drain-timeout", 5*time.Minute, "Maximum time to wait for a draining Fastlet Pod to become empty before applying Sandbox failure policies.")
 	flag.StringVar(&fastletProxyImage, "fastlet-proxy-image", envOrDefault("FASTLET_PROXY_IMAGE", "fast-sandbox/fastlet-proxy:dev"), "Image injected as the platform-owned Fastlet Proxy sidecar.")
+	flag.StringVar(&fastletProxyRequestCPU, "fastlet-proxy-request-cpu", defaultFastletProxyResources.Requests.Cpu().String(), "CPU request for the injected Fastlet Proxy sidecar.")
+	flag.StringVar(&fastletProxyRequestMemory, "fastlet-proxy-request-memory", defaultFastletProxyResources.Requests.Memory().String(), "Memory request for the injected Fastlet Proxy sidecar.")
+	flag.StringVar(&fastletProxyLimitCPU, "fastlet-proxy-limit-cpu", defaultFastletProxyResources.Limits.Cpu().String(), "CPU limit for the injected Fastlet Proxy sidecar.")
+	flag.StringVar(&fastletProxyLimitMemory, "fastlet-proxy-limit-memory", defaultFastletProxyResources.Limits.Memory().String(), "Memory limit for the injected Fastlet Proxy sidecar.")
 	flag.StringVar(&sandboxTemplateBuilderImage, "sandboxtemplate-builder-image", envOrDefault("SANDBOXTEMPLATE_BUILDER_IMAGE", "fast-sandbox/sandboxtemplate-builder:dev"), "Image that executes SandboxTemplate golden-image builds.")
 	flag.StringVar(&routeVerifyPublicKey, "route-verify-public-key", os.Getenv("FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY"), "Comma-separated base64 Ed25519 public keys injected into data-plane proxies.")
 	flag.StringVar(&routeSigningPrivateKey, "route-signing-private-key", os.Getenv("FAST_SANDBOX_ROUTE_SIGNING_PRIVATE_KEY"), "Base64 Ed25519 seed/private key used only by FastPath.")
@@ -121,6 +132,11 @@ func main() { //nolint:gocognit,gocyclo,maintidx // pre-existing flag wiring and
 		klog.ErrorS(err, "Invalid control-plane role")
 		os.Exit(1)
 	}
+	fastletProxyResources := mustParseFastletProxyResources(
+		role.RunsControllers(), defaultFastletProxyResources,
+		fastletProxyRequestCPU, fastletProxyRequestMemory,
+		fastletProxyLimitCPU, fastletProxyLimitMemory,
+	)
 	closeLogs, err := componentlog.Configure(string(role))
 	if err != nil {
 		klog.ErrorS(err, "configure component logging")
@@ -257,7 +273,7 @@ func main() { //nolint:gocognit,gocyclo,maintidx // pre-existing flag wiring and
 		if err := (&reconciler.SandboxPoolReconciler{
 			Client: manager.GetClient(), DurableReader: durableClient, Scheme: manager.GetScheme(), Registry: registry, Catalog: catalog,
 			FastletDrainer: fastletClient, DrainTimeout: fastletDrainTimeout,
-			FastletProxyImage: fastletProxyImage, RouteVerifyPublicKey: routeVerifyPublicKey,
+			FastletProxyImage: fastletProxyImage, FastletProxyResources: fastletProxyResources, RouteVerifyPublicKey: routeVerifyPublicKey,
 			RuntimeEnvironmentNamespace: runtimeEnvironmentNamespace, RuntimeEnvironmentConfigMap: runtimeEnvironmentConfigMap,
 			FastletStartupGrace:                 resourceAwareStartupGrace,
 			ResourceScaleDownStabilization:      resourceAwareScaleDownStabilization,
@@ -346,6 +362,60 @@ func main() { //nolint:gocognit,gocyclo,maintidx // pre-existing flag wiring and
 		klog.ErrorS(err, "Control-plane manager exited")
 		os.Exit(1)
 	}
+}
+
+func mustParseFastletProxyResources(
+	runsControllers bool,
+	defaults corev1.ResourceRequirements,
+	requestCPU, requestMemory, limitCPU, limitMemory string,
+) corev1.ResourceRequirements {
+	if !runsControllers {
+		return defaults
+	}
+	resources, err := parseFastletProxyResources(requestCPU, requestMemory, limitCPU, limitMemory)
+	if err != nil {
+		klog.ErrorS(err, "Invalid Fastlet Proxy resources")
+		os.Exit(1)
+	}
+	return resources
+}
+
+func parseFastletProxyResources(requestCPU, requestMemory, limitCPU, limitMemory string) (corev1.ResourceRequirements, error) {
+	parse := func(flagName, value string) (resource.Quantity, error) {
+		quantity, err := resource.ParseQuantity(value)
+		if err != nil {
+			return resource.Quantity{}, fmt.Errorf("--%s must be a Kubernetes resource quantity: %w", flagName, err)
+		}
+		if quantity.Sign() <= 0 {
+			return resource.Quantity{}, fmt.Errorf("--%s must be greater than zero", flagName)
+		}
+		return quantity, nil
+	}
+
+	cpuRequest, err := parse("fastlet-proxy-request-cpu", requestCPU)
+	if err != nil {
+		return corev1.ResourceRequirements{}, err
+	}
+	memoryRequest, err := parse("fastlet-proxy-request-memory", requestMemory)
+	if err != nil {
+		return corev1.ResourceRequirements{}, err
+	}
+	cpuLimit, err := parse("fastlet-proxy-limit-cpu", limitCPU)
+	if err != nil {
+		return corev1.ResourceRequirements{}, err
+	}
+	memoryLimit, err := parse("fastlet-proxy-limit-memory", limitMemory)
+	if err != nil {
+		return corev1.ResourceRequirements{}, err
+	}
+	resources := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: cpuRequest, corev1.ResourceMemory: memoryRequest},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: cpuLimit, corev1.ResourceMemory: memoryLimit},
+	}
+	if err := reconciler.ValidateFastletProxyResources(resources); err != nil {
+		return corev1.ResourceRequirements{}, err
+	}
+	return resources, nil
 }
 
 func envOrDefault(name, fallback string) string {

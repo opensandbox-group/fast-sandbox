@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -52,5 +53,62 @@ func TestSha256FileSparse(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("sparse hash mismatch: got %s want %s", got, want)
+	}
+}
+
+// TestSha256FileConcurrent hashes sparse files of different content
+// concurrently: every digest must equal its sequential one (regression: the
+// SEEK_DATA path read through a package-global buffer shared by concurrent
+// calls, e.g. the rootfs hashes of two snapshots assembled at once).
+func TestSha256FileConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	var paths, want []string
+	for i := range 6 {
+		path := filepath.Join(dir, "sparse-"+string(rune('a'+i)))
+		size := int64(32 << 20)
+		handle, err := os.Create(path)
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if err := handle.Truncate(size); err != nil {
+			t.Fatalf("truncate: %v", err)
+		}
+		full := make([]byte, size)
+		// Two data extents, well under half the file: SHA256File takes the
+		// SEEK_DATA path (holes fed as zeros, extents read through the buffer).
+		for _, offset := range []int64{4 << 20, 20 << 20} {
+			block := make([]byte, 5<<20)
+			for j := range block {
+				block[j] = byte(i*31 + j + int(offset>>20))
+			}
+			if _, err := handle.WriteAt(block, offset); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			copy(full[offset:], block)
+		}
+		if err := handle.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		sum := sha256.Sum256(full)
+		paths = append(paths, path)
+		want = append(want, hex.EncodeToString(sum[:]))
+	}
+	got := make([]string, len(paths))
+	errs := make([]error, len(paths))
+	for round := 0; round < 4; round++ {
+		var wg sync.WaitGroup
+		for i, path := range paths {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				got[i], errs[i] = SHA256File(path)
+			}()
+		}
+		wg.Wait()
+		for i := range paths {
+			if errs[i] != nil || got[i] != want[i] {
+				t.Fatalf("round %d file %d: got %q (%v), want %q", round, i, got[i], errs[i], want[i])
+			}
+		}
 	}
 }

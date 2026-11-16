@@ -80,8 +80,10 @@ var _ runtimecontract.Snapshotter = (*Driver)(nil)
 func (d *Driver) SupportsRootfsOnlySnapshots() bool { return true }
 
 // snapshotMu serializes the pause/dump/resume window across all Sandboxes of
-// this driver: only one VM on the node is ever paused at a time. Manifest
-// assembly and publication run outside the lock.
+// this driver (one Fastlet process): only one of its VMs is paused at a time,
+// and the spill capacity check sees every dump still occupying the spill
+// area. The post-resume relocation, manifest assembly and publication run
+// outside the lock.
 var snapshotMu sync.Mutex
 
 // CreateSnapshot snapshots a running Sandbox in place and publishes the
@@ -549,7 +551,14 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 	}
 	defer releaseLifecycle()
 	snapshotMu.Lock()
-	defer snapshotMu.Unlock()
+	locked := true
+	releasePauseWindow := func() {
+		if locked {
+			locked = false
+			snapshotMu.Unlock()
+		}
+	}
+	defer releasePauseWindow()
 
 	state, err := loadState(plan.sandboxDir)
 	if err != nil {
@@ -695,7 +704,11 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 	// The VM resumes regardless of the dump outcome: the business-visible
 	// pause window closes here.
 	resumeStarted := time.Now()
-	if _, resumeErr := resumeVM(ctx, client, plan.bootTimeout); resumeErr != nil {
+	_, resumeErr := resumeVM(ctx, client, plan.bootTimeout)
+	// The pause window is closed: the next VM of this Fastlet may pause while
+	// this dump is moved out of the jail / spill area (its own directory).
+	releasePauseWindow()
+	if resumeErr != nil {
 		plan.pauseWindow = time.Since(pauseStarted)
 		cleanupSpill()
 		if dumpErr != nil {
@@ -738,7 +751,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		jailedDumpVMStateName: vmstateSnapshotName,
 		jailedDumpMemoryName:  memorySnapshotName,
 	} {
-		if err := copyFile(filepath.Join(spillDir, dumped), filepath.Join(plan.staging, staged)); err != nil {
+		if err := relocateSpilled(plan, filepath.Join(spillDir, dumped), filepath.Join(plan.staging, staged)); err != nil {
 			_ = os.RemoveAll(spillDir)
 			return fmt.Errorf("move spilled %s into the staging directory: %w", dumped, err)
 		}
@@ -1317,6 +1330,12 @@ func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, ki
 		return 0, err
 	}
 	return entries.SizeBytes, nil
+}
+
+// relocateSpilled is the post-resume relocation of one spilled dump file
+// (a variable so tests can observe it).
+var relocateSpilled = func(_ *dumpPlan, source, target string) error {
+	return copyFile(source, target)
 }
 
 func readSourceManifest(stateRoot, ociRoot, image, sandboxID string) ([]byte, error) {
