@@ -55,7 +55,7 @@ func init() {
 	utilruntime.Must(apiv1alpha2.AddToScheme(scheme))
 }
 
-func main() { //nolint:gocognit,maintidx // pre-existing flag wiring and role bootstrap; refactor tracked separately
+func main() { //nolint:gocognit,gocyclo,maintidx // pre-existing flag wiring and role bootstrap; refactor tracked separately
 	var roleValue string
 	var metricsAddress string
 	var probeAddress string

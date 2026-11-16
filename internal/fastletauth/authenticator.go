@@ -166,9 +166,9 @@ func NewAuthenticator(issuer, audience string, allowedSubjects []string, httpCli
 				authenticator.now().Sub(authenticator.lastRefreshFailure) < options.refreshInterval
 			authenticator.refreshMu.Unlock()
 			if errors.Is(err, jwkset.ErrKeyNotFound) && !failedRecently {
-				return nil, fmt.Errorf("%w: %v", ErrUnauthenticated, err)
+				return nil, fmt.Errorf("%w: %w", ErrUnauthenticated, err)
 			}
-			return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
+			return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
 		}
 		return key, nil
 	}
@@ -305,13 +305,13 @@ func (a *Authenticator) verify(ctx context.Context, token string) (string, time.
 func (a *Authenticator) classifyParseError(err error) error {
 	// The keyfunc wrapper pre-classifies retrieval outcomes; honor that.
 	if errors.Is(err, ErrUnavailable) {
-		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
 	}
 	if errors.Is(err, ErrUnauthenticated) {
-		return fmt.Errorf("%w: %v", ErrUnauthenticated, err)
+		return fmt.Errorf("%w: %w", ErrUnauthenticated, err)
 	}
 	if errors.Is(err, jwkset.ErrKeyNotFound) {
-		return fmt.Errorf("%w: %v", ErrUnauthenticated, err)
+		return fmt.Errorf("%w: %w", ErrUnauthenticated, err)
 	}
 	unauthenticatedSentinels := []error{
 		jwt.ErrTokenMalformed,
@@ -325,8 +325,8 @@ func (a *Authenticator) classifyParseError(err error) error {
 	}
 	for _, sentinel := range unauthenticatedSentinels {
 		if errors.Is(err, sentinel) {
-			return fmt.Errorf("%w: %v", ErrUnauthenticated, err)
+			return fmt.Errorf("%w: %w", ErrUnauthenticated, err)
 		}
 	}
-	return fmt.Errorf("%w: %v", ErrUnavailable, err)
+	return fmt.Errorf("%w: %w", ErrUnavailable, err)
 }

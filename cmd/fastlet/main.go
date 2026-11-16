@@ -137,35 +137,7 @@ func main() {
 	if configurable, ok := rt.(registryConfigurable); ok {
 		configurable.SetRegistryProvider(registryProvider)
 	}
-	if runtimeProfile.UsesFastletNetNS() {
-		tuneNeighborGCThresholds()
-		// The slot CIDR must not overlap any live pod/node route (CNI pod
-		// CIDR, Docker bridge pool, VPC overlay): the slot bridge would
-		// hijack the range and the isolation rules would blackhole it.
-		if err := fastletnetwork.DetectCIDROverlap(ctx,
-			getEnv("FAST_SANDBOX_NETWORK_CIDR", fastletnetwork.DefaultPrivateCIDR),
-			getEnv("FAST_SANDBOX_NETWORK_BRIDGE", fastletnetwork.DefaultBridge),
-			fastletnetwork.ExecRunner{}); err != nil {
-			klog.ErrorS(err, "Fastlet slot CIDR conflicts with live host routes; set FAST_SANDBOX_NETWORK_CIDR to a free range")
-			os.Exit(1)
-		}
-		networkManager, err := newNetworkManager(capacityFromEnvironment(), podUID, runtimeProfile.NetworkMode)
-		if err != nil {
-			klog.ErrorS(err, "Failed to configure Fastlet-owned network")
-			os.Exit(1)
-		}
-		if err := networkManager.Initialize(ctx); err != nil {
-			klog.ErrorS(err, "Failed to initialize Fastlet-owned network")
-			os.Exit(1)
-		}
-		configurable, ok := rt.(networkConfigurable)
-		if !ok {
-			klog.ErrorS(runtimecontract.ErrUnsupportedRuntime, "Runtime profile requires Linux netns but driver is not network configurable")
-			os.Exit(1)
-		}
-		configurable.SetNetworkManager(networkManager)
-		klog.InfoS("fastlet-owned network initialized", "capacity", networkManager.Snapshot().Capacity, "cleanSlots", networkManager.Snapshot().Clean)
-	}
+	setupFastletNetwork(ctx, rt, podUID, runtimeProfile)
 	infraRevision := getEnv("FAST_SANDBOX_INFRA_REVISION", "")
 	infraManager, err := newInfraManager(
 		podUID,
@@ -230,6 +202,43 @@ func main() {
 		klog.ErrorS(err, "Fastlet server failed")
 		os.Exit(1)
 	}
+}
+
+// setupFastletNetwork wires the Fastlet-owned network stack for profiles that
+// use a dedicated netns: slot CIDR conflict detection, the network manager,
+// and the driver binding. It is a no-op otherwise. Fatal misconfigurations
+// exit the process, matching main's startup posture.
+func setupFastletNetwork(ctx context.Context, rt runtimecontract.Driver, podUID string, runtimeProfile runtimecatalog.RuntimeProfile) {
+	if !runtimeProfile.UsesFastletNetNS() {
+		return
+	}
+	tuneNeighborGCThresholds()
+	// The slot CIDR must not overlap any live pod/node route (CNI pod
+	// CIDR, Docker bridge pool, VPC overlay): the slot bridge would
+	// hijack the range and the isolation rules would blackhole it.
+	if err := fastletnetwork.DetectCIDROverlap(ctx,
+		getEnv("FAST_SANDBOX_NETWORK_CIDR", fastletnetwork.DefaultPrivateCIDR),
+		getEnv("FAST_SANDBOX_NETWORK_BRIDGE", fastletnetwork.DefaultBridge),
+		fastletnetwork.ExecRunner{}); err != nil {
+		klog.ErrorS(err, "Fastlet slot CIDR conflicts with live host routes; set FAST_SANDBOX_NETWORK_CIDR to a free range")
+		os.Exit(1)
+	}
+	networkManager, err := newNetworkManager(capacityFromEnvironment(), podUID, runtimeProfile.NetworkMode)
+	if err != nil {
+		klog.ErrorS(err, "Failed to configure Fastlet-owned network")
+		os.Exit(1)
+	}
+	if err := networkManager.Initialize(ctx); err != nil {
+		klog.ErrorS(err, "Failed to initialize Fastlet-owned network")
+		os.Exit(1)
+	}
+	configurable, ok := rt.(networkConfigurable)
+	if !ok {
+		klog.ErrorS(runtimecontract.ErrUnsupportedRuntime, "Runtime profile requires Linux netns but driver is not network configurable")
+		os.Exit(1)
+	}
+	configurable.SetNetworkManager(networkManager)
+	klog.InfoS("fastlet-owned network initialized", "capacity", networkManager.Snapshot().Capacity, "cleanSlots", networkManager.Snapshot().Clean)
 }
 
 type fastletStartupSettings struct {

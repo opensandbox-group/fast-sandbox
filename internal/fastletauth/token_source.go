@@ -230,7 +230,7 @@ func (s *TokenRequestSource) mintToken(flight *tokenFlight) {
 	})
 	switch {
 	case err != nil:
-		flight.err = fmt.Errorf("%w: request %s/%s token: %v", ErrUnavailable, s.Namespace, s.ServiceAccount, err)
+		flight.err = fmt.Errorf("%w: request %s/%s token: %w", ErrUnavailable, s.Namespace, s.ServiceAccount, err)
 	case issued.Status.Token == "":
 		flight.err = fmt.Errorf("%w: TokenRequest returned an empty token", ErrUnavailable)
 	default:

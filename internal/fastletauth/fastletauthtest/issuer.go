@@ -17,6 +17,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,6 +28,13 @@ import (
 const (
 	DefaultRSAKeyID = "test-rsa"
 	DefaultECKeyID  = "test-ec"
+)
+
+// algHeaderKey and kidHeaderKey are the JWK/JWT header parameter names shared
+// by the minted token header and the served JWKS entries.
+const (
+	algHeaderKey = "alg"
+	kidHeaderKey = "kid"
 )
 
 // Issuer is a local OIDC issuer bound to the test lifetime.
@@ -172,7 +180,7 @@ func (i *Issuer) Mint(options MintOptions) string {
 		}
 		signer = entry.signer
 	}
-	header := map[string]any{"alg": options.Algorithm, "kid": options.Kid, "typ": "JWT"}
+	header := map[string]any{algHeaderKey: options.Algorithm, kidHeaderKey: options.Kid, "typ": "JWT"}
 	audienceClaim := any([]string{options.Audience})
 	if options.AudienceScalar {
 		audienceClaim = options.Audience
@@ -214,14 +222,14 @@ func jwksEntry(kid string, signer crypto.Signer) map[string]any {
 	switch key := signer.(type) {
 	case *rsa.PrivateKey:
 		return map[string]any{
-			"kty": "RSA", "kid": kid, "alg": "RS256", "use": "sig",
+			"kty": "RSA", kidHeaderKey: kid, algHeaderKey: "RS256", "use": "sig",
 			"n": base64.RawURLEncoding.EncodeToString(key.PublicKey.N.Bytes()),
 			"e": base64.RawURLEncoding.EncodeToString(big.NewInt(int64(key.PublicKey.E)).Bytes()),
 		}
 	case *ecdsa.PrivateKey:
 		size := (key.Curve.Params().BitSize + 7) / 8
 		return map[string]any{
-			"kty": "EC", "kid": kid, "alg": "ES256", "use": "sig", "crv": "P-256",
+			"kty": "EC", kidHeaderKey: kid, algHeaderKey: "ES256", "use": "sig", "crv": "P-256",
 			"x": base64.RawURLEncoding.EncodeToString(key.PublicKey.X.FillBytes(make([]byte, size))),
 			"y": base64.RawURLEncoding.EncodeToString(key.PublicKey.Y.FillBytes(make([]byte, size))),
 		}
@@ -264,9 +272,12 @@ func encodeSegment(value any) string {
 func encodeRaw(raw []byte) string { return base64.RawURLEncoding.EncodeToString(raw) }
 
 func joinSegments(segments []string) string {
-	joined := segments[0]
-	for _, segment := range segments[1:] {
-		joined += "." + segment
+	var joined strings.Builder
+	for i, segment := range segments {
+		if i > 0 {
+			joined.WriteByte('.')
+		}
+		joined.WriteString(segment)
 	}
-	return joined
+	return joined.String()
 }

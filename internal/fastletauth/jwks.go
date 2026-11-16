@@ -109,35 +109,35 @@ func defaultHTTPClient() (*http.Client, error) {
 	} else {
 		base = base.Clone()
 	}
-	pool, err := injectedCABundle()
+	pool, found, err := injectedCABundle()
 	if err != nil {
 		return nil, err
 	}
-	if pool != nil {
+	if found {
 		base.TLSClientConfig = &tls.Config{RootCAs: pool}
 	}
 	return &http.Client{Transport: base, Timeout: 5 * time.Second}, nil
 }
 
 // injectedCABundle resolves the CA trust set: injected base64 bundle first,
-// projected pod ca.crt second. A nil pool leaves the system roots. A set-but-
+// projected pod ca.crt second; found=false leaves the system roots. A set-but-
 // malformed bundle is a configuration error, not a degradation: the bundle is
 // the trust anchor for signature verification, so silently falling back to a
 // weaker set would betray the fail-closed posture.
-func injectedCABundle() (*x509.CertPool, error) {
+func injectedCABundle() (pool *x509.CertPool, found bool, err error) {
 	if encoded := strings.TrimSpace(os.Getenv(CABundleEnv)); encoded != "" {
-		raw, err := base64.StdEncoding.DecodeString(encoded)
+		raw, decodeErr := base64.StdEncoding.DecodeString(encoded)
 		pool := x509.NewCertPool()
-		if err != nil || !pool.AppendCertsFromPEM(raw) {
-			return nil, fmt.Errorf("%s is set but is not parseable as base64-encoded PEM", CABundleEnv)
+		if decodeErr != nil || !pool.AppendCertsFromPEM(raw) {
+			return nil, false, fmt.Errorf("%s is set but is not parseable as base64-encoded PEM", CABundleEnv)
 		}
-		return pool, nil
+		return pool, true, nil
 	}
-	if raw, err := os.ReadFile(serviceAccountCAFile); err == nil {
+	if raw, readErr := os.ReadFile(serviceAccountCAFile); readErr == nil {
 		pool := x509.NewCertPool()
 		if pool.AppendCertsFromPEM(raw) {
-			return pool, nil
+			return pool, true, nil
 		}
 	}
-	return nil, nil
+	return nil, false, nil
 }
