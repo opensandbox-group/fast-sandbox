@@ -5,7 +5,7 @@ This package and `cmd/fsb-guest-control` implement the Guest-control portion of 
 ## Components
 
 - `Manager` serializes filesystem protection within one agent epoch. A caller explicitly cancels with `Thaw`; cancellation cannot interrupt an ioctl already executing. Terminal intent and completed cleanup are separate states. Failed freeze/thaw quarantines the manager for service-level recovery.
-- `Service` accepts bounded newline-delimited JSON requests: `capabilities`, `freeze`, `status`, and `thaw`. Requests identify protocol `fsb-freeze-v1`; mutations and status also carry the discovered agent epoch, a monotonic generation, and an operation ID. Freeze supplies `leaseMillis`. Conflicting identities and stale epochs are rejected. One operation is permitted per connection.
+- `Service` accepts bounded newline-delimited JSON requests: `capabilities`, `freeze`, `status`, `thaw`, and `settime`. Requests identify protocol `fsb-freeze-v1`; mutations and status also carry the discovered agent epoch, a monotonic generation, and an operation ID. Freeze supplies `leaseMillis`. `settime` is a stateless one-shot: it echoes only the agent epoch, applies the host-provided `CLOCK_REALTIME` reading so a restored or resumed guest can recalibrate its RTC-less clock, and ignores generation identity. Conflicting identities and stale epochs are rejected. One operation is permitted per connection.
 - `ServeVSock` accepts only host CID 2, caps concurrent connections, and applies I/O deadlines. The host Unix socket must remain private to the runtime. This boundary does not defend against guest root.
 - `Client` speaks Firecracker's host Unix-socket `CONNECT <port>` handshake, honors context deadlines/cancellation, and never retries mutations automatically. A lost reply after sending freeze is ambiguous. Inspect both response state and `cleanupPending`; the `failure` field reports asynchronous ioctl errors.
 - `FreezeAndWait` and `ThawAndWait` poll completion without retrying mutations. Failed acquisition still requires explicit cleanup with the same identity and a fresh bounded recovery context. Thaw must follow VM Resume and termination of capture work; these helpers do not provide lifecycle fencing or a storage barrier.
@@ -44,6 +44,12 @@ An opt-in Linux test creates a dedicated loopback ext4 mount, verifies that a wr
 sudo env FSB_TEST_GUEST_FREEZE=1 go test ./internal/guestcontrol -run '^TestLinuxFreezeBlocksWritesAndThaws$' -v -count=1 -timeout=30s
 ```
 
+An opt-in Linux test invokes the real `clock_settime` and moves the test host's realtime clock; run it only on a disposable guest whose clock may be changed (ordinary unit tests cover `settime` through the injectable clock seam instead):
+
+```bash
+sudo env FSB_TEST_GUEST_CLOCK=1 go test ./internal/guestcontrol -run '^TestSetGuestClockAppliesRealtime$' -v -count=1
+```
+
 Run it only in a disposable Linux test VM. It is skipped by default. Cross-compilation of the test or binary is not execution of this test.
 
 ### Real VMM continuation check
@@ -59,6 +65,8 @@ go test ./internal/runtime/firecracker -run '^TestGuestControlPlainResume$' -v -
 ```
 
 This opt-in test checks baseline connectivity, then three plain Pause/Resume cycles with new control connections and an unchanged helper epoch. It never freezes a filesystem or invokes snapshot/create. An ambiguous lifecycle reply triggers a bounded best-effort Resume; the operator owns VM teardown. Success qualifies only this control-channel path, not storage consistency or Full restore. Failure after a successful Resume reply is a blocker for vsock-based thaw, not a reason to retry freeze or silently create a Full snapshot. Firecracker v1.16.1 on the tested ARM64 KVM setup fails this check because plain Resume waits for a vsock reset acknowledgement without supplying the reset event.
+
+The opt-in `TestGuestControlClockCalibration` shares the same environment and verifies the `settime` method end to end: the helper applies the host reading and the echoed guest clock lands within 5 seconds of the host. It also never pauses the VM. A helper predating `settime` must be rebuilt before running it.
 
 ### Host block flush is not VMM drain
 

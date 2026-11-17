@@ -18,7 +18,9 @@ const Protocol = "fsb-freeze-v1"
 const MaxRequestBytes = 4096
 
 // Request is a single-line JSON record on a stream authenticated as the host.
-// Capabilities discovers the agent epoch; other operations must echo that epoch.
+// Capabilities discovers the agent epoch; other operations must echo that
+// epoch. Freeze-family methods additionally fence on generation and
+// operation ID.
 type Request struct {
 	Protocol    string `json:"protocol"`
 	Method      string `json:"method"`
@@ -26,6 +28,8 @@ type Request struct {
 	Generation  uint64 `json:"generation,omitempty"`
 	OperationID string `json:"operationId,omitempty"`
 	LeaseMillis int64  `json:"leaseMillis,omitempty"`
+	// TimeUnixNano carries the host CLOCK_REALTIME reading for settime.
+	TimeUnixNano int64 `json:"timeUnixNano,omitempty"`
 }
 type Response struct {
 	HelperVersion  string `json:"helperVersion,omitempty"`
@@ -39,6 +43,8 @@ type Response struct {
 	CleanupPending bool   `json:"cleanupPending"`
 	Error          string `json:"error,omitempty"`
 	Failure        string `json:"failure,omitempty"`
+	// TimeUnixNano echoes the guest CLOCK_REALTIME reading after settime.
+	TimeUnixNano int64 `json:"timeUnixNano,omitempty"`
 }
 
 // Service binds each generation to a unique operation ID.
@@ -109,7 +115,20 @@ func (s *Service) Handle(r Request) Response {
 	if r.Epoch != s.epoch {
 		return fail("agent epoch mismatch")
 	}
-	if r.Method != methodFreeze && r.Method != methodThaw && r.Method != methodStatus {
+	// settime returns before the freeze generation/operation fencing below;
+	// every other method must be classified by stateMachineMethod.
+	switch r.Method {
+	case methodSetTime:
+		if r.TimeUnixNano <= 0 {
+			return fail("positive timeUnixNano required")
+		}
+		if err := setTimeClock(time.Unix(0, r.TimeUnixNano)); err != nil {
+			return fail("set realtime clock: " + err.Error())
+		}
+		out.TimeUnixNano = time.Now().UnixNano()
+		return out
+	}
+	if !stateMachineMethod(r.Method) {
 		return fail("unknown method")
 	}
 	if r.Generation == 0 || r.OperationID == "" || len(r.OperationID) > 128 {
@@ -191,4 +210,16 @@ const (
 	methodFreeze       = "freeze"
 	methodThaw         = "thaw"
 	methodStatus       = "status"
+	methodSetTime      = "settime"
 )
+
+// stateMachineMethod is the single classifier for the freeze-family methods
+// (freeze/thaw/status): Service.Handle rejects unclassified methods on it
+// and Client.Call gates response validation on it, so a classified method
+// is fenced on both sides.
+func stateMachineMethod(method string) bool {
+	return method == methodFreeze || method == methodThaw || method == methodStatus
+}
+
+// setTimeClock is the injectable clock seam; only Linux can set it.
+var setTimeClock = setGuestClock

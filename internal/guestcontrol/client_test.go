@@ -217,6 +217,30 @@ func TestFreezeWaitRejectsAsynchronousFailure(t *testing.T) {
 	}
 }
 
+func TestClientSetTimeRoundTrip(t *testing.T) {
+	manager, _ := fixture(t)
+	service, err := NewService(manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := operationClient(t, service)
+	caps, err := client.Call(context.Background(), Request{Protocol: Protocol, Method: "capabilities"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := setTimeClock
+	setTimeClock = func(time.Time) error { return nil }
+	t.Cleanup(func() { setTimeClock = previous })
+	response, err := client.SetTime(context.Background(), Request{Protocol: Protocol, Epoch: caps.Epoch}, time.Unix(0, 5678))
+	if err != nil || response.TimeUnixNano <= 0 {
+		t.Fatalf("settime round trip failed: %+v, err %v", response, err)
+	}
+	// A stale epoch must fail closed instead of moving the guest clock.
+	if _, err = client.SetTime(context.Background(), Request{Protocol: Protocol, Epoch: "stale"}, time.Unix(0, 5678)); err == nil {
+		t.Fatal("stale epoch accepted")
+	}
+}
+
 func TestClientDialsLongProcSocketPath(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("requires Linux procfs")
