@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"debug/elf"
 	"fmt"
 	"os"
@@ -8,19 +9,15 @@ import (
 	"runtime"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/guestcontrol"
 )
 
-// Guest control ships with every OverlayBD (OCI) template: the builder injects
-// the statically linked helper, guest-init starts it before user workloads, and
-// fsb-vm's build-time freeze/thaw probe validates the stack end to end before
-// the guestControl declaration is recorded. There is no opt-out: the capability
-// is inert unless a capture uses the control channel, and the probe, not
-// operator configuration, is the validation gate. Native (object-store)
-// templates do not carry the helper because rootfs-only capture is
-// OverlayBD-only. Existing templates are unchanged; rebuilding is the migration
-// path. Injection alone does not declare support.
+// Guest control ships with every native and OverlayBD template. Injection is
+// followed by a freeze/thaw probe before the builder declares the capability.
+// Existing templates require a rebuild to acquire verified helper metadata.
 func injectGuestControl(spec apiv1alpha2.SandboxTemplateSpec, rootfs string) (bool, error) {
-	if spec.Output.Format != apiv1alpha2.ArtifactFormatOverlayBD {
+	if spec.Output.Format != apiv1alpha2.ArtifactFormatOverlayBD && spec.Output.Format != apiv1alpha2.ArtifactFormatNative {
 		return false, nil
 	}
 	source := os.Getenv("FSB_GUEST_CONTROL_HELPER")
@@ -76,4 +73,12 @@ func injectGuestControl(spec apiv1alpha2.SandboxTemplateSpec, rootfs string) (bo
 		return false, err
 	}
 	return true, nil
+}
+
+func probeNativeGuestControl(workdir string) (*artifacts.VMGuestControl, error) {
+	version, err := guestcontrol.ProbeRootFilesystem(context.Background(), filepath.Join(workdir, "guest-control.sock"), 1234)
+	if err != nil {
+		return nil, fmt.Errorf("native guest helper probe: %w", err)
+	}
+	return &artifacts.VMGuestControl{Protocol: guestcontrol.Protocol, Transport: "vsock", Port: 1234, HelperVersion: version}, nil
 }

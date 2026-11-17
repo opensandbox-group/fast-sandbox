@@ -241,7 +241,8 @@ func TestCreateSandboxSnapshotRootfsOnlyRequiresFastletCapability(t *testing.T) 
 
 	_, err := server.CreateSandboxSnapshot(t.Context(), snapshotModeRequest("snap-rootfs", "", fastpathv2.SnapshotMode_SNAPSHOT_MODE_ROOTFS_ONLY))
 	require.Equal(t, codes.Unimplemented, status.Code(err))
-	require.ErrorContains(t, err, "does not advertise the rootfs-only snapshot capability")
+	require.ErrorContains(t, err, "does not advertise capability")
+	require.ErrorContains(t, err, fastletapi.CapabilityRootfsOnlySnapshots)
 
 	fastlet.mu.Lock()
 	defer fastlet.mu.Unlock()

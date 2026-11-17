@@ -14,6 +14,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/guestcontrol"
 )
 
 // staticHelperBinary writes a minimal statically linked ELF64 image for the
@@ -82,13 +84,17 @@ func TestGuestControlInjection(t *testing.T) {
 	t.Setenv("FSB_GUEST_CONTROL_ENABLED", "1")
 	_, err = injectGuestControl(spec, t.TempDir())
 	require.Error(t, err)
-	// Native (object-store) builds never inject and never fail on the helper.
+	// Unsupported output formats do not inject a helper.
 	enabled, err := injectGuestControl(apiv1alpha2.SandboxTemplateSpec{}, t.TempDir())
 	require.NoError(t, err)
 	require.False(t, enabled)
 	// OverlayBD injection requires a static helper matching the builder arch.
 	t.Setenv("FSB_GUEST_CONTROL_HELPER", staticHelperBinary(t))
 	root := t.TempDir()
+	enabled, err = injectGuestControl(spec, root)
+	require.NoError(t, err)
+	require.True(t, enabled)
+	spec.Output.Format = apiv1alpha2.ArtifactFormatNative
 	enabled, err = injectGuestControl(spec, root)
 	require.NoError(t, err)
 	require.True(t, enabled)
@@ -124,6 +130,14 @@ func TestGuestControlBinaryInjectionIntegration(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(root, "usr/local/sbin/fsb-guest-control"))
 	require.NoError(t, err)
 	require.Equal(t, want, got)
+	spec.Output.Format = apiv1alpha2.ArtifactFormatNative
+	nativeRoot := t.TempDir()
+	enabled, err = injectGuestControl(spec, nativeRoot)
+	require.NoError(t, err)
+	require.True(t, enabled)
+	nativePayload, err := os.ReadFile(filepath.Join(nativeRoot, "usr/local/sbin/fsb-guest-control"))
+	require.NoError(t, err)
+	require.Equal(t, want, nativePayload)
 	// Image symlinks must not let injection write outside rootfs.
 	root = t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(root, "usr/local"), 0755))
@@ -134,4 +148,23 @@ func TestGuestControlBinaryInjectionIntegration(t *testing.T) {
 
 func renderGuestInit(spec apiv1alpha2.SandboxTemplateSpec) string {
 	return renderGuestInitWithControl(spec, false)
+}
+
+func TestNativeBootProvenanceRequiresProbeAndPinnedKernel(t *testing.T) {
+	_, kernel, _, _, _ := buildManifestFixture(t)
+	entry, err := artifacts.FileEntry(kernel, map[string]string{})
+	require.NoError(t, err)
+	t.Setenv("FSB_GUEST_CONTROL_ENABLED", "1")
+	var document artifacts.VMManifest
+	require.ErrorContains(t, applyNativeBootProvenance(&document, snapshotPhaseTimings{}, kernel), "freeze/thaw")
+	phases := snapshotPhaseTimings{
+		KernelSHA256: entry.SHA256, KernelCmdline: "root=/dev/vda rw",
+		GuestControl: &artifacts.VMGuestControl{Protocol: guestcontrol.Protocol, Transport: "vsock", Port: 1234, HelperVersion: "sha256:" + strings.Repeat("a", 64)},
+	}
+	require.NoError(t, applyNativeBootProvenance(&document, phases, kernel))
+	require.Equal(t, phases.GuestControl, document.GuestControl)
+	require.Equal(t, phases.KernelSHA256, document.Kernel.SHA256)
+	require.Equal(t, phases.KernelCmdline, document.Kernel.Cmdline)
+	require.NoError(t, os.WriteFile(kernel, []byte("replaced-kernel"), 0600))
+	require.ErrorContains(t, applyNativeBootProvenance(&document, phases, kernel), "changed")
 }

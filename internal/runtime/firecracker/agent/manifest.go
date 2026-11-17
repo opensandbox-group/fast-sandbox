@@ -19,9 +19,6 @@ func parseManifest(payload []byte) (manifest, error) {
 	if err != nil {
 		return manifest{}, fmt.Errorf("decode manifest: %w", err)
 	}
-	if document.IsRootfsOnly() {
-		return manifest{}, fmt.Errorf("rootfsOnly requires OCI transport")
-	}
 	if len(document.Files) == 0 {
 		return manifest{}, fmt.Errorf("manifest has no native files; OCI artifacts must be prepared through fsb-vm")
 	}
@@ -56,16 +53,22 @@ var nativeArtifactNames = []struct{ publish, cache string }{
 }
 
 // nativeFiles validates that the manifest carries the complete native
-// artifact set and returns the mapping with their expected digests.
+// artifact set for its snapshot mode and returns the expected digests.
 func (m manifest) nativeFiles() ([]nativeFile, error) {
 	files := make([]nativeFile, 0, len(nativeArtifactNames))
 	for _, name := range nativeArtifactNames {
+		if artifacts.VMManifest(m).IsRootfsOnly() && name.publish != "rootfs.ext4" {
+			continue
+		}
 		entry, ok := m.Files[name.publish]
 		if !ok {
 			return nil, fmt.Errorf("manifest is missing the %s artifact", name.publish)
 		}
 		if !validSHA256(entry.SHA256) {
 			return nil, fmt.Errorf("manifest artifact %s has an invalid sha256", name.publish)
+		}
+		if entry.SizeBytes <= 0 {
+			return nil, fmt.Errorf("manifest artifact %s has an invalid size", name.publish)
 		}
 		files = append(files, nativeFile{
 			publish: name.publish, cache: name.cache,
@@ -119,4 +122,23 @@ func validSHA256(sum string) bool {
 		}
 	}
 	return true
+}
+
+// downloadFiles includes declared platform state in the cache completeness
+// contract, so a missing policy or vault bundle is repaired on the next pull.
+func (m manifest) downloadFiles() ([]nativeFile, error) {
+	files, err := m.nativeFiles()
+	if err != nil {
+		return nil, err
+	}
+	for _, bundleFile := range []func() (nativeFile, bool, error){m.vaultFile, m.policyFile} {
+		file, ok, err := bundleFile()
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			files = append(files, file)
+		}
+	}
+	return files, nil
 }

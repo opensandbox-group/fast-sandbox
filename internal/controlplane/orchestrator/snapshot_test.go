@@ -23,6 +23,7 @@ func newSnapshotDispatchHarness(t *testing.T, capabilities []string) (*Orchestra
 	t.Helper()
 	orchestrator, registry, fastletClient, sandbox := newHarness(t)
 	sandbox.UID = "sandbox-uid-a"
+	sandbox.Spec.Image = "oci://registry.example/template:base"
 	candidate := placement.FastletInfo{
 		ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", PodIP: "10.0.0.1",
 		RuntimeName: apiv1alpha2.RuntimeContainer, RuntimeProfileHash: "runtime-a", ResourceProfileHash: "resources-a", InfraRevision: "infra-a",
@@ -83,6 +84,7 @@ func TestCreateSnapshotRequiresRootfsOnlyCapability(t *testing.T) {
 	var failure *fastletapi.FastletError
 	require.ErrorAs(t, err, &failure)
 	require.Equal(t, fastletapi.ErrorSnapshotUnsupported, failure.Code)
+	require.Contains(t, failure.Message, fastletapi.CapabilityRootfsOnlySnapshots)
 
 	// Full snapshots stay dispatchable without any capability.
 	snapshot.Spec.Mode = apiv1alpha2.SandboxSnapshotModeFull
@@ -135,6 +137,12 @@ func TestCreateSnapshotUnobservedCapabilityStaysRetryable(t *testing.T) {
 	}
 	_, err = orchestrator.CreateSnapshot(context.Background(), snapshot, sandbox)
 	require.ErrorIs(t, err, ErrAssignedFastletUnavailable)
+	require.ErrorContains(t, err, fastletapi.CapabilityRootfsOnlySnapshots)
+	sandbox.Spec.Image = "native-template"
+	_, nativeErr := orchestrator.CreateSnapshot(context.Background(), snapshot, sandbox)
+	require.ErrorIs(t, nativeErr, ErrAssignedFastletUnavailable)
+	require.ErrorContains(t, nativeErr, fastletapi.CapabilityNativeRootfsOnlySnapshots)
+	sandbox.Spec.Image = "oci://r.example/ns/template:base"
 	require.False(t, dispatched)
 
 	// The next attempt finds the capable heartbeat via the synchronous
@@ -204,4 +212,28 @@ func TestProjectSnapshotStatusFailsClosedOnModeDrift(t *testing.T) {
 	succeeded := &apiv1alpha2.SandboxSnapshotStatus{Phase: apiv1alpha2.SandboxSnapshotPhaseSucceeded}
 	ProjectSnapshotStatus(succeeded, apiv1alpha2.SandboxSnapshotModeRootfsOnly, &fastletapi.SnapshotStatus{Phase: fastletapi.SnapshotPhaseSucceeded})
 	require.Equal(t, apiv1alpha2.SandboxSnapshotPhaseSucceeded, succeeded.Phase)
+}
+
+func TestNativeRootfsRequiresDistinctCapability(t *testing.T) {
+	for _, native := range []bool{false, true} {
+		caps := []string{fastletapi.CapabilityRootfsOnlySnapshots}
+		if native {
+			caps = append(caps, fastletapi.CapabilityNativeRootfsOnlySnapshots)
+		}
+		o, client, sandbox, snapshot := newSnapshotDispatchHarness(t, caps)
+		sandbox.Spec.Image = "native-template"
+		snapshot.Spec.Mode = apiv1alpha2.SandboxSnapshotModeRootfsOnly
+		called := false
+		client.createSnapshot = func(_ string, _ *fastletapi.CreateSnapshotRequest) (*fastletapi.CreateSnapshotResponse, error) {
+			called = true
+			return &fastletapi.CreateSnapshotResponse{Disposition: fastletapi.CreateDispositionCreated, Snapshot: &fastletapi.SnapshotStatus{Phase: fastletapi.SnapshotPhasePending}}, nil
+		}
+		_, err := o.CreateSnapshot(t.Context(), snapshot, sandbox)
+		if native {
+			require.NoError(t, err)
+		} else {
+			require.ErrorContains(t, err, fastletapi.CapabilityNativeRootfsOnlySnapshots)
+		}
+		require.Equal(t, native, called)
+	}
 }

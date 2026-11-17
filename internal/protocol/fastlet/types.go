@@ -270,6 +270,9 @@ type FastletStatus struct {
 // execute Full (unknown JSON fields are ignored).
 const CapabilityRootfsOnlySnapshots = "rootfsOnlySnapshots"
 
+// CapabilityNativeRootfsOnlySnapshots marks file-backed RootfsOnly capture and S3 publication.
+const CapabilityNativeRootfsOnlySnapshots = "nativeRootfsOnlySnapshots"
+
 type WarmImageState struct {
 	Image   string `json:"image"`
 	State   string `json:"state"`

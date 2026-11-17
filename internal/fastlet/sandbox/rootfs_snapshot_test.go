@@ -322,3 +322,20 @@ func TestRootfsHeartbeatUsesOneRuntimeObservation(t *testing.T) {
 		})
 	}
 }
+
+type nativeSnapshotRuntime struct{ *snapshotRuntime }
+
+func (nativeSnapshotRuntime) SupportsRootfsOnlySnapshots() bool       { return true }
+func (nativeSnapshotRuntime) SupportsNativeRootfsOnlySnapshots() bool { return true }
+
+func TestNativeRootfsSnapshotAdmission(t *testing.T) {
+	runtime := nativeSnapshotRuntime{newSnapshotRuntime()}
+	manager := newSnapshotManager(t, runtime)
+	manager.sandboxes["uid-a"].Config.Desired.Image = "native-template"
+	require.Contains(t, manager.SnapshotCapabilities(), fastletapi.CapabilityNativeRootfsOnlySnapshots)
+	req := snapshotRequest("native-capture")
+	req.Snapshot.Mode = fastletapi.SnapshotModeRootfsOnly
+	_, err := manager.CreateSnapshot(t.Context(), req)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { runtime.mu.Lock(); defer runtime.mu.Unlock(); return runtime.createCalls == 1 }, time.Second, time.Millisecond)
+}

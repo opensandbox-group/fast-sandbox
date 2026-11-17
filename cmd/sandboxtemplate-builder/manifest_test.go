@@ -10,6 +10,7 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/guestcontrol"
 )
 
 func TestNativeManifestExcludesStaleOverlayBDLayers(t *testing.T) {
@@ -20,7 +21,7 @@ func TestNativeManifestExcludesStaleOverlayBDLayers(t *testing.T) {
 		require.NoError(t, os.MkdirAll(dir, 0755))
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "layer.lsmt"), []byte("stale-layer"), 0600))
 	}
-	raw, err := stageManifest(spec, "sha256:source", kernel, rootfs, vmstate, memory, workdir, "", false, nil)
+	raw, err := stageManifest(spec, "sha256:source", kernel, rootfs, vmstate, memory, workdir, nativeManifestPhases(t, kernel), nil)
 	require.NoError(t, err)
 	var manifest struct {
 		Format string         `json:"format"`
@@ -67,14 +68,18 @@ func TestManifestRecordsFreePageReporting(t *testing.T) {
 			require.NoError(t, os.WriteFile(bootLog, []byte(test.log), 0o600))
 			supported, err := readFreePageReportingSupport(bootLog)
 			require.NoError(t, err)
-			report, err := json.Marshal(snapshotPhaseTimings{CPUTemplate: "none", FreePageReporting: supported})
+			report, err := json.Marshal(func() snapshotPhaseTimings {
+				p := nativeManifestPhases(t, kernel)
+				p.FreePageReporting = supported
+				return p
+			}())
 			require.NoError(t, err)
 			var fields map[string]any
 			require.NoError(t, json.Unmarshal(report, &fields))
 			require.Equal(t, test.want, fields["freePageReporting"], "the stage report must include false explicitly")
 			var phases snapshotPhaseTimings
 			require.NoError(t, json.Unmarshal(report, &phases))
-			raw, err := stageManifest(spec, "sha256:source", kernel, rootfs, vmstate, memory, workdir, phases.CPUTemplate, phases.FreePageReporting, nil)
+			raw, err := stageManifest(spec, "sha256:source", kernel, rootfs, vmstate, memory, workdir, phases, nil)
 			require.NoError(t, err)
 			manifest, err := artifacts.DecodeVMManifest(raw)
 			require.NoError(t, err)
@@ -119,7 +124,7 @@ func TestBuildManifestMitmCALineage(t *testing.T) {
 	spec, kernel, rootfs, vmstate, memory := buildManifestFixture(t)
 
 	manifest, err := buildManifest(spec, "sha256:source", kernel, rootfs, vmstate, memory,
-		map[string]string{}, 1, "", false, nil)
+		map[string]string{}, 1, "T2", false, nil)
 	if err != nil {
 		t.Fatalf("buildManifest: %v", err)
 	}
@@ -131,10 +136,17 @@ func TestBuildManifestMitmCALineage(t *testing.T) {
 		NotAfter:   "2036-01-01T00:00:00Z",
 	}
 	manifest, err = buildManifest(spec, "sha256:source", kernel, rootfs, vmstate, memory,
-		map[string]string{}, 1, "", false, []mitmCALineage{wantEntry})
+		map[string]string{}, 1, "T2", false, []mitmCALineage{wantEntry})
 	if err != nil {
 		t.Fatalf("buildManifest: %v", err)
 	}
 	require.NotNil(t, manifest.Platform.EgressMitmCA)
 	require.Equal(t, []mitmCALineage{wantEntry}, manifest.Platform.EgressMitmCA.Certificates)
+}
+
+func nativeManifestPhases(t *testing.T, kernel string) snapshotPhaseTimings {
+	t.Helper()
+	entry, err := artifacts.FileEntry(kernel, map[string]string{})
+	require.NoError(t, err)
+	return snapshotPhaseTimings{CPUTemplate: "T2", KernelSHA256: entry.SHA256, KernelCmdline: "root=/dev/vda rw", GuestControl: &artifacts.VMGuestControl{Protocol: guestcontrol.Protocol, Transport: "vsock", Port: 1234, HelperVersion: "sha256:" + entry.SHA256}}
 }

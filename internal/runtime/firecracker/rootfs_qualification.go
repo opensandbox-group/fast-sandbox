@@ -19,6 +19,7 @@ import (
 // Expectations come from deployed bundles, with optional operator overrides.
 // ExclusiveExt4 remains a topology assumption, not a proof about arbitrary writers.
 type rootfsQualification struct {
+	Backend           string `json:"backend,omitempty"`
 	FirecrackerSHA256 string `json:"firecrackerSHA256"`
 	KernelSHA256      string `json:"kernelSHA256"`
 	OverlayBDSHA256   string `json:"overlaybdSHA256"`
@@ -27,6 +28,7 @@ type rootfsQualification struct {
 }
 
 type rootfsQualificationSources struct {
+	Native           bool
 	KernelSHA256     string
 	ManagedVMM       bool
 	OverlayBDBundle  string
@@ -47,6 +49,12 @@ func readRootfsQualification(source rootfsQualificationSources) (rootfsQualifica
 	if err != nil {
 		return q, err
 	}
+	if source.Native && q.Backend != captureBackendNative {
+		return q, errors.New("native RootfsOnly requires a separately qualified native storage profile")
+	}
+	if !source.Native && q.Backend != "" {
+		return q, errors.New("OverlayBD requires an OverlayBD qualification profile")
+	}
 	if _, ok := provided["kernelSHA256"]; !ok {
 		q.KernelSHA256 = source.KernelSHA256
 	}
@@ -55,7 +63,7 @@ func readRootfsQualification(source rootfsQualificationSources) (rootfsQualifica
 	}
 	_, hasBackend := provided["overlaybdSHA256"]
 	_, hasRevision := provided["storageRevision"]
-	if !hasBackend || !hasRevision {
+	if !source.Native && (!hasBackend || !hasRevision) {
 		entries, revision, err := readOverlayBDBundle(source.OverlayBDBundle)
 		if err != nil {
 			return q, err
@@ -73,15 +81,17 @@ func readRootfsQualification(source rootfsQualificationSources) (rootfsQualifica
 		}
 	}
 	if _, ok := provided["exclusiveExt4"]; !ok {
-		q.ExclusiveExt4 = source.StandardTopology
+		q.ExclusiveExt4 = source.StandardTopology && !source.Native
 	}
-	digests := []string{q.KernelSHA256, q.OverlayBDSHA256}
+	digests := []string{q.KernelSHA256}
+	if !source.Native {
+		digests = append(digests, q.OverlayBDSHA256)
+	}
 	if _, explicit := provided["firecrackerSHA256"]; explicit || q.FirecrackerSHA256 != "" {
 		digests = append(digests, q.FirecrackerSHA256)
 	}
 	for _, sum := range digests {
-		b, err := hex.DecodeString(sum)
-		if err != nil || len(b) != sha256.Size || strings.ToLower(sum) != sum {
+		if !validQualificationDigest(sum) {
 			return q, errors.New("qualification requires SHA256 digests")
 		}
 	}
@@ -112,7 +122,7 @@ func readQualificationOverrides() (rootfsQualification, map[string]json.RawMessa
 		}
 		for name, value := range provided {
 			switch name {
-			case "firecrackerSHA256", "kernelSHA256", "overlaybdSHA256", "storageRevision", "exclusiveExt4":
+			case "backend", "firecrackerSHA256", "kernelSHA256", "overlaybdSHA256", "storageRevision", "exclusiveExt4":
 			default:
 				return q, nil, fmt.Errorf("unknown qualification override %s", name)
 			}
@@ -147,4 +157,9 @@ func readOverlayBDBundle(path string) (map[string]string, string, error) {
 		return nil, "", errors.New("OverlayBD REVISION does not match SHA256SUMS")
 	}
 	return entries, wantRevision, nil
+}
+
+func validQualificationDigest(sum string) bool {
+	b, err := hex.DecodeString(sum)
+	return err == nil && len(b) == sha256.Size && strings.ToLower(sum) == sum
 }

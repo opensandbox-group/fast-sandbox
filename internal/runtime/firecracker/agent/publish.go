@@ -26,10 +26,6 @@ import (
 	agentprotocol "fast-sandbox/internal/runtime/firecracker/agent/protocol"
 )
 
-// publishArtifacts are the artifact files of a native (non-overlaybd) set,
-// uploaded in this order before the manifest.
-var publishArtifacts = []string{"rootfs.ext4", manifestVMStateName, manifestMemoryName}
-
 // publishVaultName / publishPolicyName are the optional state bundle files
 // of a snapshot set (checkpoint vault; recorded policy on checkpoint AND
 // template sets): uploaded when staged next to the manifest. The names are
@@ -75,6 +71,19 @@ func (c *Client) PublishImage(ctx context.Context, kind, key, dir string) (Publi
 	if err != nil {
 		return PublishResult{}, fmt.Errorf("read staged manifest: %w", err)
 	}
+	document, err := parseManifest(manifestBytes)
+	if err != nil {
+		return PublishResult{}, err
+	}
+	files, err := document.nativeFiles()
+	if err != nil {
+		return PublishResult{}, err
+	}
+	if artifacts.VMManifest(document).IsRootfsOnly() {
+		if err := validateRootfsStaging(document, kind, dir); err != nil {
+			return PublishResult{}, err
+		}
+	}
 	artifactDigest := artifacts.SHA256Of(manifestBytes)
 	base := artifacts.Digest16(manifestBytes)
 	started := time.Now()
@@ -86,7 +95,10 @@ func (c *Client) PublishImage(ctx context.Context, kind, key, dir string) (Publi
 	// any stat failure other than absence fails the publish, since the
 	// staged manifest and SHA256SUMS already reference the files and a
 	// stranded member would break the cross-node resume.
-	entries := append([]string(nil), publishArtifacts...)
+	entries := make([]string, 0, len(files)+3)
+	for _, file := range files {
+		entries = append(entries, file.publish)
+	}
 	for _, bundleName := range []string{publishVaultName, publishPolicyName} {
 		if _, err := os.Stat(filepath.Join(dir, bundleName)); err == nil {
 			entries = append(entries, bundleName)
@@ -148,3 +160,32 @@ func (c *Client) putFile(ctx context.Context, dir, name, storeKey string) error 
 
 // nowFunc is the publish clock; factored for tests.
 var nowFunc = time.Now
+
+func validateRootfsStaging(document manifest, kind, dir string) error {
+	if kind == agentprotocol.PublishKindCheckpoint {
+		return fmt.Errorf("rootfsOnly cannot be published as a checkpoint")
+	}
+	// Reject mixed staging directories rather than silently ignoring VM state.
+	for _, name := range []string{manifestVMStateName, manifestMemoryName} {
+		if _, err := os.Lstat(filepath.Join(dir, name)); err == nil {
+			return fmt.Errorf("rootfsOnly staging contains %s", name)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat staged %s: %w", name, err)
+		}
+	}
+	// All declared members must exist before making any part of this set public.
+	members, err := document.downloadFiles()
+	if err != nil {
+		return err
+	}
+	for _, member := range members {
+		info, err := os.Stat(filepath.Join(dir, member.publish))
+		if err != nil {
+			return fmt.Errorf("stat staged %s: %w", member.publish, err)
+		}
+		if !info.Mode().IsRegular() || info.Size() != member.sizeBytes {
+			return fmt.Errorf("staged %s has invalid type or size", member.publish)
+		}
+	}
+	return nil
+}
