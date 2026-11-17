@@ -277,3 +277,44 @@ func TestImageGCLoopRunsIndependently(t *testing.T) {
 	_, err = os.Stat(filepath.Join(root, imageCacheDir, after))
 	require.NoError(t, err, "loop must stop when the driver is closed")
 }
+
+// Native cold boots need only rootfs and declared platform files, but the
+// manifest remains the commit point and every declared digest must match.
+func TestNativeRootfsDeliveryRequiresCommittedCompleteCache(t *testing.T) {
+	root, image := t.TempDir(), "native-rootfs"
+	dir := filepath.Dir(cachedManifestPath(root, image))
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	disk, policy := []byte("native-disk"), []byte(`{"version":1}`)
+	manifest := newMetadataTestVMManifest()
+	manifest.Platform = &artifacts.VMPlatform{SnapshotMode: "rootfsOnly", StateFiles: map[string]artifacts.ManifestFile{
+		"policy.json": {SHA256: artifacts.SHA256Of(policy), SizeBytes: int64(len(policy))},
+	}}
+	manifest.Kernel.Cmdline = "root=/dev/vda rw"
+	manifest.Files = map[string]artifacts.ManifestFile{
+		"rootfs.ext4": {SHA256: artifacts.SHA256Of(disk), SizeBytes: int64(len(disk))},
+	}
+	raw, err := artifacts.MarshalVMManifest(manifest)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, rootfsImageName), disk, 0600))
+	require.ErrorIs(t, verifyDeliveredImage(root, image, true), ErrImageNotReady)
+
+	// A committed manifest must not hide a missing declared platform file.
+	require.NoError(t, os.WriteFile(cachedManifestPath(root, image), raw, 0600))
+	require.ErrorIs(t, verifyDeliveredImage(root, image, true), ErrImageNotReady)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "policy.json"), policy, 0600))
+	require.NoError(t, verifyDeliveredImage(root, image, true))
+	require.NoFileExists(t, filepath.Join(dir, vmstateSnapshotName))
+	require.NoFileExists(t, filepath.Join(dir, memorySnapshotName))
+
+	// Size-only checks cannot detect a corrupt native disk or policy bundle.
+	for name, content := range map[string][]byte{rootfsImageName: disk, "policy.json": policy} {
+		t.Run(name, func(t *testing.T) {
+			corrupt := append([]byte(nil), content...)
+			corrupt[0] ^= 1
+			require.NoError(t, os.WriteFile(filepath.Join(dir, name), corrupt, 0600))
+			require.ErrorIs(t, verifyDeliveredImage(root, image, true), ErrImageNotReady)
+			require.NoError(t, os.WriteFile(filepath.Join(dir, name), content, 0600))
+			require.NoError(t, verifyDeliveredImage(root, image, true))
+		})
+	}
+}

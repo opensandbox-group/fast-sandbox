@@ -333,6 +333,16 @@ func TestDeliverImageWithoutCommittedManifestIsNotDelivered(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, runtimecontract.ImageDelivering, status, "artifacts without the committed manifest are a pull in flight")
 
+	// The fake agent returns without a manifest. Wait for its background
+	// attempt before committing externally or cleaning up the cache.
+	fixture.driver.mu.Lock()
+	entry := fixture.driver.imageDeliveryLocked(image)
+	fixture.driver.mu.Unlock()
+	require.Eventually(t, func() bool {
+		entry.mu.Lock()
+		defer entry.mu.Unlock()
+		return !entry.inFlight
+	}, 5*time.Second, time.Millisecond)
 	require.NoError(t, commitTestManifest(dir))
 	require.Eventually(t, func() bool {
 		status, err := fixture.driver.DeliverImage(context.Background(), image)
@@ -356,6 +366,16 @@ func TestDeliverCheckpointWithoutCommittedManifestIsNotDelivered(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, runtimecontract.ImageDelivering, status)
 
+	// The fake agent returns without a manifest. Wait for its background
+	// attempt before committing externally or cleaning up the cache.
+	fixture.driver.mu.Lock()
+	entry := fixture.driver.imageDeliveryLocked(artifacts.CheckpointReference(restore.ArtifactDigest))
+	fixture.driver.mu.Unlock()
+	require.Eventually(t, func() bool {
+		entry.mu.Lock()
+		defer entry.mu.Unlock()
+		return !entry.inFlight
+	}, 5*time.Second, time.Millisecond)
 	require.NoError(t, commitTestManifest(dir))
 	require.Eventually(t, func() bool {
 		status, err := fixture.driver.DeliverCheckpoint(context.Background(), restore)

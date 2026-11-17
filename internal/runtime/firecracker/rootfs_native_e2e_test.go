@@ -122,7 +122,7 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 	pull, err := agentpull.NewClient(storeRoot, credential, options...)
 	require.NoError(t, err)
 	pod := "native-rootfs-e2e"
-	profile := runtimecatalog.RuntimeProfile{Name: apiv1alpha2.RuntimeFirecracker, ProfileHash: "native-rootfs", Firecracker: &runtimecatalog.FirecrackerConfig{BinaryPath: binary, KernelPath: kernel, JailerPath: os.Getenv("FC_JAILER"), RootfsPath: "/unused", StateRoot: filepath.Join(root, "state"), DefaultVCPUs: 1, DefaultMemory: "256Mi", BootTimeoutSeconds: 30}, Capabilities: runtimecatalog.Capabilities{DefaultState: runtimecatalog.CapabilityReady}}
+	profile := runtimecatalog.RuntimeProfile{Name: apiv1alpha2.RuntimeFirecracker, ProfileHash: "native-rootfs", Firecracker: &runtimecatalog.FirecrackerConfig{BinaryPath: binary, VMMDir: os.Getenv("FC_VMM_DIR"), KernelPath: kernel, JailerPath: os.Getenv("FC_JAILER"), RootfsPath: "/unused", StateRoot: filepath.Join(root, "state"), DefaultVCPUs: 1, DefaultMemory: "256Mi", BootTimeoutSeconds: 30}, Capabilities: runtimecatalog.Capabilities{DefaultState: runtimecatalog.CapabilityReady}}
 	driver, err := New(profile)
 	require.NoError(t, err)
 	driver.SetFastletPodUID(pod)
@@ -155,7 +155,11 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 	require.NoError(t, err)
 	vmmEntry, err := artifacts.FileEntry(binary, sums)
 	require.NoError(t, err)
-	qualification := rootfsQualification{Backend: "native", KernelSHA256: kernelEntry.SHA256, FirecrackerSHA256: vmmEntry.SHA256, StorageRevision: "disposable-XFS-KVM-test", ExclusiveExt4: true}
+	qualification := map[string]any{"backend": "native", "storageRevision": "disposable-XFS-KVM-test", "exclusiveExt4": true}
+	if profile.Firecracker.VMMDir == "" {
+		qualification["kernelSHA256"] = kernelEntry.SHA256
+		qualification["firecrackerSHA256"] = vmmEntry.SHA256
+	}
 	raw, err := json.Marshal(qualification)
 	require.NoError(t, err)
 	qualificationPath := filepath.Join(root, "qualification.json")
@@ -238,13 +242,24 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 		defer driver.DeleteSandbox(context.Background(), id)
 		live, err := loadState(filepath.Join(driver.config.StateRoot, sandboxStateDir, id))
 		require.NoError(t, err)
+		if profile.Firecracker.VMMDir != "" {
+			require.NotNil(t, live.VMM)
+			require.Equal(t, m.Compatibility.FirecrackerVersion, live.VMM.Version)
+			require.Equal(t, filepath.Join(profile.Firecracker.VMMDir, "versions", live.VMM.Version, "firecracker"), live.VMM.BinaryPath)
+			require.NoError(t, qualifyVMMExecutable(live, ""))
+		}
 		vm := driver.newClient(live.APIAddress)
 		defer vm.Close()
 		require.Eventually(t, func() bool { _, _, err := driver.captureGuest(ctx, live, m, vm); return err == nil }, 30*time.Second, 100*time.Millisecond)
-		log, err := os.ReadFile(filepath.Join(filepath.Dir(live.APIAddress), processLogName))
-		require.NoError(t, err)
-		marker := regexp.MustCompile(`FSB_ROOT_BOOT (\d+)`).FindSubmatch(log)
-		require.Len(t, marker, 2)
+		var marker [][]byte
+		require.Eventually(t, func() bool {
+			log, err := os.ReadFile(filepath.Join(filepath.Dir(live.APIAddress), processLogName))
+			if err != nil {
+				return false
+			}
+			marker = regexp.MustCompile(`FSB_ROOT_BOOT (\d+)`).FindSubmatch(log)
+			return len(marker) == 2
+		}, 10*time.Second, 50*time.Millisecond, "helper readiness may precede the console boot marker")
 		boot, err := strconv.Atoi(string(marker[1]))
 		require.NoError(t, err)
 		if cycle == 0 {
