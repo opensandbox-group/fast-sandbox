@@ -115,8 +115,8 @@ func TestOCIBuildUsesRemoteSourceWithoutDownloadingSourceLayers(t *testing.T) {
 			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 			t.Setenv("TEST_OCI_COMMANDS", dir)
 			// Guest control is unconditional on OverlayBD builds: the test
-			// builder image ships the helper through this override.
-			t.Setenv("FSB_GUEST_CONTROL_HELPER", staticHelperBinary(t))
+			// points the helper path at a fixture binary.
+			setGuestControlHelper(t, staticHelperBinary(t))
 			buildID := uuid.NewString()
 			t.Setenv(buildIDEnvName, buildID)
 			require.NoError(t, os.WriteFile(filepath.Join(bin, "ip"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TEST_OCI_COMMANDS/ip.log\"\n"), 0755))
