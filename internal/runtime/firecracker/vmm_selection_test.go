@@ -105,3 +105,23 @@ func TestManagedVMMUnavailableIsArtifactMismatch(t *testing.T) {
 	require.Error(t, err)
 	require.NotErrorIs(t, err, ErrIncompatibleArtifact)
 }
+
+// TestSelectCachedVMMUncommittedManifestIsNotReady: in managed-VMM mode the
+// restore path reads the cached manifest to pick the Firecracker version. A
+// restore set whose manifest.json is not committed yet (the agent writes it
+// last) is a pull in flight: it must report ErrImageNotReady so the boot
+// worker retries, never a raw ENOENT that fails the Sandbox for good.
+func TestSelectCachedVMMUncommittedManifestIsNotReady(t *testing.T) {
+	d := &Driver{config: runtimecatalog.FirecrackerConfig{VMMDir: vmmTestBundle(t), StateRoot: t.TempDir()}}
+	image := "example.com/app:v1"
+	dir := filepath.Join(d.config.StateRoot, imageCacheDir, imageKey(image))
+	require.NoError(t, writeRestoreArtifacts(dir))
+
+	_, err := d.selectCachedVMM(t.Context(), image)
+	require.ErrorIs(t, err, ErrImageNotReady)
+
+	require.NoError(t, commitTestManifest(dir))
+	selected, err := d.selectCachedVMM(t.Context(), image)
+	require.NoError(t, err)
+	require.Equal(t, "1.16.1", d.selectionVersion(selected))
+}
