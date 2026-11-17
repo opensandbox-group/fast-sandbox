@@ -3,11 +3,11 @@ title: "Drop Firecracker VMM Capabilities by Default"
 authors:
   - "@Pangjiping"
 creation-date: 2026-11-13
-last-updated: 2026-11-13
+last-updated: 2026-11-17
 status: draft
 ---
 
-# FSEP-0003: Drop Firecracker VMM Capabilities by Default
+# FSEP-0004: Drop Firecracker VMM Capabilities by Default
 
 ## Problem and goals
 

@@ -55,6 +55,7 @@ type SandboxPoolReconciler struct {
 	Catalog                             *runtimecatalog.Catalog
 	FastletDrainer                      FastletDrainer
 	FastletProxyImage                   string
+	FastletProxyResources               corev1.ResourceRequirements
 	RouteVerifyPublicKey                string
 	RuntimeEnvironmentNamespace         string
 	RuntimeEnvironmentConfigMap         string
@@ -260,7 +261,11 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.ensureRuntimePlanConfigMap(ctx, &pool, runtimePlan); err != nil {
 		return ctrl.Result{}, err
 	}
-	settings, err := buildFastletSettingsFromResolved(&pool, resolvedResources)
+	fastletProxyResources, err := r.resolvedFastletProxyResources()
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	settings, err := buildFastletSettingsFromResolved(&pool, resolvedResources, fastletProxyResources)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -314,7 +319,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		maxPerPod = 1
 	}
 
-	desiredPod, err := r.constructPodWithResolvedResources(&pool, runtimePlan, resolvedResources, settings)
+	desiredPod, err := r.constructPodWithResolvedResources(&pool, runtimePlan, resolvedResources, settings, fastletProxyResources)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1478,11 +1483,15 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 		return nil, err
 	}
 	r.applyResourceAwareFeatureGates(&resolvedResources)
-	settings, err := buildFastletSettingsFromResolved(pool, resolvedResources)
+	fastletProxyResources, err := r.resolvedFastletProxyResources()
 	if err != nil {
 		return nil, err
 	}
-	return r.constructPodWithResolvedResources(pool, runtimePlan, resolvedResources, settings)
+	settings, err := buildFastletSettingsFromResolved(pool, resolvedResources, fastletProxyResources)
+	if err != nil {
+		return nil, err
+	}
+	return r.constructPodWithResolvedResources(pool, runtimePlan, resolvedResources, settings, fastletProxyResources)
 }
 
 //nolint:gocognit,maintidx // Pod assembly covers all runtime variants.
@@ -1491,6 +1500,7 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 	runtimePlan runtimeenv.ResolvedRuntimePlan,
 	resolvedResources resolvedFastletResources,
 	settings fastletsettings.Bundle,
+	fastletProxyResources corev1.ResourceRequirements,
 ) (*corev1.Pod, error) {
 	profile := runtimePlan.Profile
 	sandboxResources := pool.Spec.SandboxResources
@@ -1653,6 +1663,7 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 	}
 	podSpec.Containers = append(podSpec.Containers, corev1.Container{
 		Name: fastletProxyContainerName, Image: proxyImage, ImagePullPolicy: corev1.PullIfNotPresent,
+		Resources: *fastletProxyResources.DeepCopy(),
 		Env: []corev1.EnvVar{
 			{Name: envFastletProxyControlSocket, Value: "/run/fast-sandbox/proxy/control.sock"},
 			{Name: "FASTLET_PROXY_DATA_ADDRESS", Value: ":5780"},
@@ -2027,10 +2038,14 @@ func buildFastletSettings(pool *apiv1alpha2.SandboxPool, profile runtimecatalog.
 	if err != nil {
 		return fastletsettings.Bundle{}, err
 	}
-	return buildFastletSettingsFromResolved(pool, resolved)
+	return buildFastletSettingsFromResolved(pool, resolved, DefaultFastletProxyResources())
 }
 
-func buildFastletSettingsFromResolved(pool *apiv1alpha2.SandboxPool, resolved resolvedFastletResources) (fastletsettings.Bundle, error) {
+func buildFastletSettingsFromResolved(
+	pool *apiv1alpha2.SandboxPool,
+	resolved resolvedFastletResources,
+	fastletProxyResources corev1.ResourceRequirements,
+) (fastletsettings.Bundle, error) {
 	bundle := fastletsettings.Bundle{
 		WarmImages:      uniqueWarmImages(pool.Spec.WarmImages),
 		ActionHandlers:  pool.Spec.ActionHandlers,
@@ -2055,9 +2070,9 @@ func buildFastletSettingsFromResolved(pool *apiv1alpha2.SandboxPool, resolved re
 		}
 	}
 	// The platform-owned proxy is always injected and runs in the same Pod
-	// cgroup. Its default memory limit must therefore be part of that scope's
+	// cgroup. Its configured memory limit must therefore be part of that scope's
 	// observer budget, while remaining outside Sandbox commitment capacity.
-	podMemoryBudget.Add(defaultPlatformResourceLimit(corev1.ResourceMemory))
+	podMemoryBudget.Add(fastletProxyResources.Limits[corev1.ResourceMemory])
 	bundle.ResourceAdmission = &fastletsettings.ResourceAdmissionSettings{
 		Version: "v2", Mode: apiv1alpha2.SandboxResourceModeResourceAware,
 		StaticAdmission: resolved.StaticAdmission, MemoryAdmission: resolved.MemoryAdmission,
@@ -2562,10 +2577,6 @@ func ensureBoundedPodContainers(podSpec *corev1.PodSpec, runtimeResourceOwner st
 		if container.Name == runtimeResourceOwner {
 			continue
 		}
-		if index == 0 || container.Name == fastletProxyContainerName {
-			applyDefaultPlatformResources(container)
-			continue
-		}
 		if err := validateContainerHasLimits(container); err != nil {
 			return fmt.Errorf("fastlet sidecar resources: %w", err)
 		}
@@ -2576,46 +2587,6 @@ func ensureBoundedPodContainers(podSpec *corev1.PodSpec, runtimeResourceOwner st
 		}
 	}
 	return nil
-}
-
-func applyDefaultPlatformResources(container *corev1.Container) {
-	if container.Resources.Requests == nil {
-		container.Resources.Requests = corev1.ResourceList{}
-	}
-	if container.Resources.Limits == nil {
-		container.Resources.Limits = corev1.ResourceList{}
-	}
-	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
-		defaultRequest := defaultPlatformResourceRequest(name)
-		defaultLimit := defaultPlatformResourceLimit(name)
-		request, hasRequest := container.Resources.Requests[name]
-		if !hasRequest || request.IsZero() {
-			request = defaultRequest
-			container.Resources.Requests[name] = request
-		}
-		limit, hasLimit := container.Resources.Limits[name]
-		if !hasLimit || limit.IsZero() {
-			limit = defaultLimit
-			if request.Cmp(limit) > 0 {
-				limit = request.DeepCopy()
-			}
-			container.Resources.Limits[name] = limit
-		}
-	}
-}
-
-func defaultPlatformResourceRequest(name corev1.ResourceName) resource.Quantity {
-	if name == corev1.ResourceCPU {
-		return resource.MustParse("50m")
-	}
-	return resource.MustParse("64Mi")
-}
-
-func defaultPlatformResourceLimit(name corev1.ResourceName) resource.Quantity {
-	if name == corev1.ResourceCPU {
-		return resource.MustParse("250m")
-	}
-	return resource.MustParse("256Mi")
 }
 
 func validateContainerHasLimits(container *corev1.Container) error {

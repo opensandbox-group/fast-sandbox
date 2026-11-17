@@ -1524,8 +1524,11 @@ func TestRecoverRuntimeResourcesRemovesJailRoot(t *testing.T) {
 	require.True(t, os.IsNotExist(err))
 }
 
-func testManifestDocument(t *testing.T) map[string]any {
-	t.Helper()
+// newTestVMManifest is the VM manifest test caches commit. It takes no
+// *testing.T so fake agents can write it as their pull commit point. Its CPU
+// identity is the test host's, because boot and restore tests check it
+// against this node; metadata-only tests use newMetadataTestVMManifest.
+func newTestVMManifest() artifacts.VMManifest {
 	doc := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: 2, MemoryMiB: 1024, RootfsSizeMiB: 1024, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.img"}, "6.1.177", "/missing/firecracker", artifacts.CPUTemplateNone)
 	doc.Compatibility.FirecrackerVersion = "1.16.1"
 	doc.GuestNetwork = &artifacts.VMGuestNetwork{Iface: "eth0", MAC: "02:00:00:00:00:01", IP: "172.30.0.3", Gateway: "172.30.0.1", Netmask: "255.255.255.0", MTU: 1500}
@@ -1533,7 +1536,27 @@ func testManifestDocument(t *testing.T) map[string]any {
 	for _, name := range []string{"rootfs.ext4", "vmstate.snap", "memory.snap"} {
 		doc.Files[name] = artifacts.ManifestFile{SHA256: artifacts.SHA256Of([]byte(name)), SizeBytes: 1}
 	}
-	raw, err := json.Marshal(doc)
+	return doc
+}
+
+// newMetadataTestVMManifest is newTestVMManifest with a fixed, valid
+// compatibility tuple instead of the test host's CPU identity. Tests that only
+// exercise manifest metadata (the commit point, VMM version selection) use it
+// so the unmasked manifest validates the same on x86_64, ARM64 and non-Linux
+// hosts. It must not reach a restore compatibility check against this node.
+func newMetadataTestVMManifest() artifacts.VMManifest {
+	doc := newTestVMManifest()
+	doc.Compatibility = artifacts.SnapshotCompatibility{
+		CPUArch: "x86_64", Vendor: "GenuineIntel", CPUFamily: 6, CPUModel: 106, CPUStepping: 6,
+		CPUModelName: "Intel(R) Xeon(R) test fixture", CPUTemplate: artifacts.CPUTemplateNone,
+		FirecrackerVersion: "1.16.1", HostKernel: "6.1.0-test",
+	}
+	return doc
+}
+
+func testManifestDocument(t *testing.T) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(newTestVMManifest())
 	require.NoError(t, err)
 	var result map[string]any
 	require.NoError(t, json.Unmarshal(raw, &result))

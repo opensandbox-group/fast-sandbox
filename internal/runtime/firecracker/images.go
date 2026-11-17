@@ -102,6 +102,29 @@ func verifyRestorableImage(stateRoot, image string) error {
 	return nil
 }
 
+// verifyDeliveredImage is verifyRestorableImage plus, when requireCommit is
+// set, the pull's commit point. The runtime-agent renames rootfs, vmstate and
+// memory into the cache before it writes manifest.json, so in agent mode the
+// artifacts alone can be a pull still inside its commit window; reporting it
+// delivered lets the boot worker reach the restore path, which reads the
+// manifest, while it is absent. Callers set requireCommit only in agent mode:
+// a local-mode cache is hand-seeded and may have no manifest at all.
+func verifyDeliveredImage(stateRoot, image string, requireCommit bool) error {
+	if err := verifyRestorableImage(stateRoot, image); err != nil {
+		return err
+	}
+	if !requireCommit || strings.HasPrefix(image, ocitemplate.Prefix) {
+		return nil
+	}
+	if _, err := os.Stat(cachedManifestPath(stateRoot, image)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: %q has no committed manifest yet", ErrImageNotReady, image)
+		}
+		return err
+	}
+	return nil
+}
+
 // listCachedImages returns the converted image references stored under the
 // StateRoot, keyed by their content-addressed cache directory.
 func listCachedImages(stateRoot string) ([]string, error) {
@@ -195,8 +218,10 @@ const defaultImageCacheLimitBytes = 20 << 30
 // from filesystem timestamps) are removed first, newest/unknown entries
 // counting as zero uses. References are read from the durable per-Sandbox
 // state, so a VM that died with its Fastlet still pins its image until its
-// state directory is removed. Reflink instance copies are independent once
-// created, so deleting a cache entry never affects a running VM. A Sandbox
+// state directory is removed. A Sandbox also pins the cache entry it was
+// restored from (the checkpoint of a resume): its rootfs is an independent
+// reflink copy, but its later snapshots read that entry's manifest as their
+// source image. A Sandbox
 // whose state cannot be read aborts the whole collection: it might reference
 // an image, and the cost of keeping a few hundred MiB beats breaking a
 // recoverable Sandbox.
@@ -219,6 +244,9 @@ func garbageCollectImages(stateRoot string, limitBytes int64, useCount map[strin
 			return nil, fmt.Errorf("read Sandbox state %s for image GC: %w", directory, err)
 		}
 		referenced[imageKey(state.Config.Desired.Image)] = struct{}{}
+		if source, err := restoreReference(state.Config.Desired); err == nil {
+			referenced[imageKey(source)] = struct{}{}
+		}
 	}
 	cached, err := listCachedImages(stateRoot)
 	if err != nil {

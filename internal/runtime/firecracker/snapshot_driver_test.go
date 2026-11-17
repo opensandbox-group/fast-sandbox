@@ -107,6 +107,32 @@ func TestCreateSnapshotSpillsDumpOutsideStateRoot(t *testing.T) {
 	require.Empty(t, entries, "the per-snapshot spill directory is removed")
 }
 
+// The pause window lock covers pause/dump/resume only: the post-resume
+// relocation of the spilled dump (a full memory copy) must not hold back the
+// next VM of the Fastlet from pausing.
+func TestCreateSnapshotRelocatesSpillOutsidePauseWindowLock(t *testing.T) {
+	fixture, _ := newSnapshotFixture(t)
+	withSnapshotSpill(t)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+	var lockedDuringRelocation []bool
+	original := relocateSpilled
+	relocateSpilled = func(plan *dumpPlan, source, target string) error {
+		free := snapshotMu.TryLock()
+		if free {
+			snapshotMu.Unlock()
+		}
+		lockedDuringRelocation = append(lockedDuringRelocation, !free)
+		return original(plan, source, target)
+	}
+	t.Cleanup(func() { relocateSpilled = original })
+
+	_, err := fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "snap-1", TemplateName: "app-v2",
+	})
+	require.NoError(t, err)
+	require.Equal(t, []bool{false, false}, lockedDuringRelocation, "both dump files relocate with the pause window lock released")
+}
+
 func TestCreateSnapshotFallsBackWhenSpillUnavailable(t *testing.T) {
 	fixture, agent := newSnapshotFixture(t)
 	// A spill root that does not exist: the capacity guard fails and the
