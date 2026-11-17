@@ -43,7 +43,8 @@ Goals:
 
 ### Non-goals
 
-- No API, CRD, SDK, CLI or FastPath changes.
+- No public API, CRD, SDK, CLI or FastPath changes. The internal agent
+  protocol gains optional response fields (see Compatibility).
 - No new store requirements beyond today's path-style SigV4 `GET`, `PUT` and
   `HEAD`.
 - The OverlayBD/OCI path (FSEP-0001) is unchanged; only native Firecracker
@@ -52,9 +53,16 @@ Goals:
   follow-up).
 - Local optimizations that change no protocol go in separate small PRs and
   are not part of this proposal:
-  - the verified-cache marker;
+  - the verified-cache marker, with fsynced cache writes and single-flighted
+    cache ensures;
   - template snapshots kept in the node cache (#57);
   - parallel and overlapped hashing (#61).
+
+  In #213 the marker and the fsynced cache writes are still switched on by
+  `transfer.format: chunked`. The split removes that coupling: these PRs land
+  before PR 1, independent of `transfer.format`, and #213 is rebased onto
+  them. After that, `transfer.format` selects only the store format. Sparse
+  cache files stay a property of the chunked pull, which skips zero chunks.
 
   The standalone fixes from #213 are already merged in #214.
 
@@ -68,6 +76,8 @@ Goals:
     manifest.json                  # gains an optional "chunks" ref
     chunks.json                    # chunk index of this set (new)
     SHA256SUMS, vault/policy ...   # small files stay whole-file objects
+                                   # (SHA256SUMS still lists every file, also
+                                   # those stored only as chunks; informational)
   chunks/sha256/<aa>/<sha256>      # raw chunk, shared by all sets (new)
   chunks/sha256/<aa>/<sha256>.zst  # zstd-encoded chunk (compression: zstd)
 ```
@@ -169,15 +179,36 @@ today.
    - **Mark:** read `manifest.json` → `chunks.json` of every root and
      collect the chunk keys.
    - **Sweep:** delete a chunk only when it was unmarked in **two** marks
-     spaced further apart than the longest publish, **and** its
-     `LastModified` is older than a grace period.
+     and its `LastModified` was already older than the grace period `G` when
+     mark 1 started. Right before each `DELETE`, the sweep `HEAD`s the chunk
+     again and skips it if `LastModified` has changed.
+3. **Publisher refresh (part of PR 4, before any deletion is enabled):** a
+   publisher reuses an existing chunk only if it is younger than a refresh
+   age `R` (`R` < `G`). A `HEAD` that finds an older chunk is followed by a
+   re-`PUT`, which refreshes its `LastModified`. The in-memory known-key set
+   follows the same rule: an entry older than `R` is checked again.
 
-**Why two marks:**
-- A publish that skipped a chunk because `HEAD` found it does not refresh
-  that chunk's `LastModified`. A single mark could run before the new
-  manifest exists and delete a chunk the publish relied on.
-- The publisher's known-key set also gets a TTL shorter than the mark
-  spacing.
+**Why the refresh is needed** (review on this PR): marks alone do not
+protect a publish that starts after mark 1 and reuses an old, unmarked
+chunk C by `HEAD`. Its manifest can land after the sweep, and C, unmarked
+twice and old, would be deleted. The grace period does not help either,
+since reuse does not change C's `LastModified`.
+
+**Invariant with the refresh:** every chunk a publish binds was uploaded or
+refreshed by a publish within the last `R`. So its `LastModified` stays
+younger than `G` for at least `G` − `R` after the publish uses it. A mark
+that starts after that has to find the publish's manifest, as long as the
+manifest lands and becomes a root within `G` − `R`. Marks that start earlier
+cannot make the chunk a sweep candidate, because the chunk is still younger
+than `G`. Typical values: `R` = 1 day, `G` = 7 days. Re-`PUT`s fall only on
+chunks that no publish has used for `R`, which are rare.
+
+**Remaining window:** a re-`PUT` that lands between the sweep's last `HEAD`
+and its `DELETE` is lost. The final `HEAD` shrinks this to the time of one
+request. To close it, the publisher `HEAD`s the chunks it refreshed once
+more after its manifest has landed, and uploads any that are missing. Where
+the store supports conditional deletes, the sweep can use them instead.
+Which of the two to require is part of open question 1.
 
 **Namespace cleanup** stays where it is today. The chunk GC only assumes
 that a deleted namespace is no longer a root.
@@ -230,14 +261,23 @@ transfer:
 | 4 | `fsb-store gc` | 1 |
 | – | OpenSandbox chart value and pin bump (OpenSandbox#2422) | 1 merged |
 
-[#213](https://github.com/opensandbox-group/fast-sandbox/pull/213) is the complete reference implementation. It stays a draft until this
-proposal is decided.
+[#213](https://github.com/opensandbox-group/fast-sandbox/pull/213) is the complete reference implementation and already spans PRs 1–3
+(the `chunkList` digest, digest-signed `PUT`s, the pooled transport, the 10 s
+attempt timeout and the `HEAD` 403 fallback are all in it). Landing the split
+means carving up that branch. PR 1 is not an existing subset of it. #213 stays
+a draft until this proposal is decided.
+
+PR 1 also covers the inherited `chunks` binding (see Compatibility): the
+publisher drops it in `legacy`, and the Fastlet drops it when it assembles a
+snapshot manifest.
 
 ### Open questions
 
-1. **GC roots:** which component can list every live reference (templates,
-   snapshots, Sandbox checkpoints)? Should the controller own
-   `fsb-store gc`?
+1. **GC roots and safety:** which component can list every live reference
+   (templates, snapshots, Sandbox checkpoints)? Should the controller own
+   `fsb-store gc`? And for the remaining sweep window: does the publisher's
+   post-publish check suffice, or should GC require stores with
+   conditional deletes?
 2. **Rollback:** is the `chunkListOnly` finalize step acceptable (see
    "Rollout and rollback"), or should manifests always keep the whole-file
    `sha256` and accept the hash cost?
@@ -256,6 +296,15 @@ proposal is decided.
   - Whole-file sets keep their exact layout and bytes. In `legacy` the
     published manifest is byte-identical to today's.
   - New readers read both layouts in both modes.
+  - **Inherited `chunks` binding:** the Fastlet builds a snapshot manifest
+    from the manifest the Sandbox booted from and keeps its other fields. A
+    Sandbox restored from a chunked set and paused again with the agent in
+    `legacy` would publish a `chunks` ref to a `chunks.json` that was never
+    uploaded. The `legacy` publisher drops the binding (#213 does this:
+    `bindChunkIndex` with a nil ref), and from PR 1 the Fastlet drops it too.
+    An agent older than PR 1 can still restore a chunked set from its
+    node cache and republish such a manifest with an old Fastlet. This is one
+    more reason not to downgrade below PR 1 (see "Downgrade limits").
 - **Existing templates, checkpoints and snapshots:** restore unchanged.
 
 **Version combinations** ("new" = a release containing PR 1/2):
@@ -271,9 +320,12 @@ proposal is decided.
 **Restore by an old agent:**
 - An agent older than PR 1 cannot read a chunked set: it looks for
   whole-file objects that were never uploaded.
-- An agent with PR 1 but not PR 2 rejects a manifest entry that has
-  `chunkList` but no `sha256`.
-- Both cases are handled by the rollout order below.
+- An agent with PR 1 but not PR 2 would reject a manifest entry that has
+  `chunkList` but no `sha256`. **PR 1 and PR 2 ship in the same release**, so
+  this agent never exists in a fleet. The E2E matrix covers only agents
+  from before PR 1 and from after PR 2. If the two PRs end up in different
+  releases, the matrix adds a PR 1-only build.
+- The first case is handled by the rollout order below.
 
 ## Test plan
 
@@ -306,7 +358,10 @@ proposal is decided.
 - **Compatibility:**
   - every row of the version table above;
   - switch `chunked` → `legacy` and restore the earlier chunked checkpoints
-    and snapshots.
+    and snapshots;
+  - restore a chunked snapshot, switch to `legacy`, pause again, and verify
+    that the new manifest has no `chunks` ref and restores on an agent from
+    before PR 1.
 
 **Performance:**
 - **Boundary:** the client-observed duration of the pause, snapshot and
@@ -353,13 +408,17 @@ proposal is decided.
 
 **Disable:** set `transfer.format: legacy`.
 - New publishes return to whole-file sets.
+- Only the store format changes: the local cache optimizations no longer
+  depend on `transfer.format` (see Non-goals). In #213 as it stands today,
+  this switch also turns off the verified-cache marker.
 - The chunk reader stays on, so every chunked set already published remains
   restorable. This is the supported rollback.
 
 **Downgrade limits:**
-- **Agent below PR 1:** cannot read any chunked set. Do not downgrade below
-  PR 1 once `chunked` has been enabled anywhere, or recover by rolling
-  forward.
+- **Agent below PR 1:** cannot read any chunked set from the store, and
+  from a node-cached chunked set it can republish a manifest with an
+  inherited `chunks` ref (see Compatibility). Do not downgrade below PR 1
+  once `chunked` has been enabled anywhere, or recover by rolling forward.
 - **Agent below PR 2 after `chunkListOnly: true`:** cannot read those
   manifests. That is why the setting is a separate, explicit last step.
 - **Recovery plan for a forced downgrade:** keep one pool on the new agent,
