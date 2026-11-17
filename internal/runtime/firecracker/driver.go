@@ -945,7 +945,11 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// with the template's state: land the records for the clone's first
 	// registration (re-stamped to the clone's fence) — same pre-
 	// data-plane-ready ordering, same degrade-don't-fail posture.
-	d.importTemplateCarry(ctx, spec, restoreRef, filepath.Dir(vmstatePath), identity.SandboxUID)
+	bundleDir := filepath.Dir(vmstatePath)
+	if !isOCI {
+		bundleDir = filepath.Dir(cachedManifestPath(stateRoot, restoreRef))
+	}
+	d.importTemplateCarry(ctx, spec, restoreRef, bundleDir, identity.SandboxUID)
 
 	state.Phase = PhaseRunning
 	state.StageDurations = map[string]time.Duration{

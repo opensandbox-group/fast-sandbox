@@ -82,7 +82,11 @@ func (d *Driver) SupportsRootfsOnlySnapshots() bool { return true }
 func (d *Driver) SupportsNativeRootfsOnlySnapshots() bool {
 	// Per-instance VMM and kernel checks run at capture, after selection.
 	q, _, err := readQualificationOverrides()
-	return err == nil && q.Backend == captureBackendNative && q.ExclusiveExt4 && strings.TrimSpace(q.StorageRevision) != ""
+	if err != nil {
+		klog.ErrorS(err, "native rootfs qualification overrides unreadable; reporting node as not native-capable")
+		return false
+	}
+	return q.Backend == captureBackendNative && q.ExclusiveExt4 && strings.TrimSpace(q.StorageRevision) != ""
 }
 
 // snapshotMu serializes the pause/dump/resume window across all Sandboxes of

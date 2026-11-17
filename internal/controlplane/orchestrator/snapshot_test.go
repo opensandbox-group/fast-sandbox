@@ -84,6 +84,7 @@ func TestCreateSnapshotRequiresRootfsOnlyCapability(t *testing.T) {
 	var failure *fastletapi.FastletError
 	require.ErrorAs(t, err, &failure)
 	require.Equal(t, fastletapi.ErrorSnapshotUnsupported, failure.Code)
+	require.Contains(t, failure.Message, fastletapi.CapabilityRootfsOnlySnapshots)
 
 	// Full snapshots stay dispatchable without any capability.
 	snapshot.Spec.Mode = apiv1alpha2.SandboxSnapshotModeFull
@@ -136,6 +137,12 @@ func TestCreateSnapshotUnobservedCapabilityStaysRetryable(t *testing.T) {
 	}
 	_, err = orchestrator.CreateSnapshot(context.Background(), snapshot, sandbox)
 	require.ErrorIs(t, err, ErrAssignedFastletUnavailable)
+	require.ErrorContains(t, err, fastletapi.CapabilityRootfsOnlySnapshots)
+	sandbox.Spec.Image = "native-template"
+	_, nativeErr := orchestrator.CreateSnapshot(context.Background(), snapshot, sandbox)
+	require.ErrorIs(t, nativeErr, ErrAssignedFastletUnavailable)
+	require.ErrorContains(t, nativeErr, fastletapi.CapabilityNativeRootfsOnlySnapshots)
+	sandbox.Spec.Image = "oci://r.example/ns/template:base"
 	require.False(t, dispatched)
 
 	// The next attempt finds the capable heartbeat via the synchronous
@@ -225,7 +232,7 @@ func TestNativeRootfsRequiresDistinctCapability(t *testing.T) {
 		if native {
 			require.NoError(t, err)
 		} else {
-			require.Error(t, err)
+			require.ErrorContains(t, err, fastletapi.CapabilityNativeRootfsOnlySnapshots)
 		}
 		require.Equal(t, native, called)
 	}

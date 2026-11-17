@@ -98,3 +98,36 @@ func TestRootfsNativeDirectBootKeepsFullLayout(t *testing.T) {
 	require.Equal(t, filepath.Join(directory, "api.sock"), socket)
 	require.NoFileExists(t, filepath.Join(directory, rootfsDeviceName))
 }
+
+func TestNativeRootfsBootImportsTemplateCarry(t *testing.T) {
+	fixture := newDriverFixture(t)
+	require.NoError(t, fixture.driver.Initialize(t.Context(), ""))
+	mover := &fakeTemplateCapableMover{fakeStateMover: &fakeStateMover{}}
+	fixture.driver.SetStateMover(mover)
+	cache := filepath.Dir(cachedManifestPath(fixture.stateRoot, fixture.sandboxSpec.Desired.Image))
+	require.NoError(t, os.MkdirAll(cache, 0700))
+	disk, kernel := []byte("native-disk"), []byte("kernel")
+	require.NoError(t, os.WriteFile(filepath.Join(cache, rootfsImageName), disk, 0600))
+	fixture.driver.config.KernelPath = filepath.Join(t.TempDir(), "kernel")
+	require.NoError(t, os.WriteFile(fixture.driver.config.KernelPath, kernel, 0600))
+	manifest := newMetadataTestVMManifest()
+	manifest.Compatibility.CPUArch = artifacts.HostCPUArch()
+	manifest.Platform = &artifacts.VMPlatform{SnapshotMode: "rootfsOnly", StateFiles: map[string]artifacts.ManifestFile{}}
+	manifest.Kernel.Cmdline = "root=/dev/vda rw"
+	manifest.Kernel.SHA256 = artifacts.SHA256Of(kernel)
+	manifest.Files = map[string]artifacts.ManifestFile{"rootfs.ext4": {SHA256: artifacts.SHA256Of(disk), SizeBytes: int64(len(disk))}}
+	for _, name := range []string{vaultBundleName, policyBundleName} {
+		content := []byte(`{"version":1}`)
+		require.NoError(t, os.WriteFile(filepath.Join(cache, name), content, 0600))
+		manifest.Platform.StateFiles[name] = artifacts.ManifestFile{SHA256: artifacts.SHA256Of(content), SizeBytes: int64(len(content))}
+	}
+	raw, err := artifacts.MarshalVMManifest(manifest)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(cache, snapshotManifestName), raw, 0600))
+	_, err = fixture.driver.EnsureSandbox(t.Context(), ensureInput(&fixture.sandboxSpec))
+	require.NoError(t, err)
+	_, imports := mover.snapshotTemplate()
+	require.Len(t, imports, 2, "native cold boot must import the verified vault and policy without vmstate")
+	require.NoFileExists(t, filepath.Join(cache, vmstateSnapshotName))
+	require.NoFileExists(t, filepath.Join(cache, memorySnapshotName))
+}

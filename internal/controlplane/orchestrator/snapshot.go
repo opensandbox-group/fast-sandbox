@@ -162,11 +162,11 @@ func (o *Orchestrator) CreateSnapshot(ctx context.Context, snapshot *apiv1alpha2
 		}
 		if !fastlet.SupportsCapability(requiredCapability) {
 			if fastlet.LastHeartbeat.IsZero() {
-				return nil, fmt.Errorf("%w: rootfs-only snapshot capability of the assigned Fastlet is not observed yet", ErrAssignedFastletUnavailable)
+				return nil, fmt.Errorf("%w: capability %q of the assigned Fastlet is not observed yet", ErrAssignedFastletUnavailable, requiredCapability)
 			}
 			return nil, &fastletapi.FastletError{
 				Code:      fastletapi.ErrorSnapshotUnsupported,
-				Message:   "assigned Fastlet does not advertise the rootfs-only snapshot capability",
+				Message:   fmt.Sprintf("assigned Fastlet does not advertise capability %q", requiredCapability),
 				Retryable: false,
 			}
 		}
