@@ -8,7 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 
 	"fast-sandbox/internal/artifacts"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
@@ -86,8 +87,8 @@ func readRootfsQualification(source rootfsQualificationSources) (rootfsQualifica
 // path derives: changing the backing filesystem invalidates prior native
 // capture journals and attestations.
 func stateRootStorageRevision(stateRoot string) (string, error) {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(stateRoot, &st); err != nil {
+	var st unix.Statfs_t
+	if err := unix.Statfs(stateRoot, &st); err != nil {
 		return "", fmt.Errorf("read the StateRoot storage identity: %w", err)
 	}
 	sum := sha256.Sum256([]byte(fmt.Sprintf("statfs:%x:%x:%d", st.Fsid.Val[0], st.Fsid.Val[1], st.Blocks)))
