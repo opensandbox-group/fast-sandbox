@@ -1,5 +1,6 @@
 .DEFAULT_GOAL := help
 
+# Dummy PR marker: exercises the OpenSandbox integration dispatch lane E2E.
 REGISTRY ?= fast-sandbox
 FASTLET_IMAGE ?= $(REGISTRY)/fastlet:dev
 FASTLET_PROXY_IMAGE ?= $(REGISTRY)/fastlet-proxy:dev
