@@ -23,6 +23,8 @@ import (
 	"k8s.io/klog/v2"
 
 	"fast-sandbox/internal/artifacts"
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/firecrackervmm"
 	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
@@ -80,13 +82,20 @@ var _ runtimecontract.Snapshotter = (*Driver)(nil)
 func (d *Driver) SupportsRootfsOnlySnapshots() bool { return true }
 
 func (d *Driver) SupportsNativeRootfsOnlySnapshots() bool {
-	// Per-instance VMM and kernel checks run at capture, after selection.
-	q, _, err := readQualificationOverrides()
+	// An authored profile speaks for the node; without one, the standard
+	// topology implies the native contract the same way it implies the
+	// OverlayBD ext4 contract (#224). Per-instance VMM and kernel checks
+	// run at capture, after selection.
+	q, provided, err := readQualificationOverrides()
 	if err != nil {
 		klog.ErrorS(err, "native rootfs qualification overrides unreadable; reporting node as not native-capable")
 		return false
 	}
-	return q.Backend == captureBackendNative && q.ExclusiveExt4 && strings.TrimSpace(q.StorageRevision) != ""
+	if len(provided) > 0 {
+		return q.Backend == captureBackendNative && q.ExclusiveExt4 && strings.TrimSpace(q.StorageRevision) != ""
+	}
+	return filepath.Clean(d.config.VMMDir) == firecrackervmm.DefaultDir &&
+		filepath.Clean(d.config.StateRoot) == runtimecatalog.FirecrackerStateRootDir
 }
 
 // snapshotMu serializes the pause/dump/resume window across all Sandboxes of

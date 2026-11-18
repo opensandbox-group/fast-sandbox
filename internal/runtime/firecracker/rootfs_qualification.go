@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"fast-sandbox/internal/artifacts"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
@@ -33,6 +34,7 @@ type rootfsQualificationSources struct {
 	ManagedVMM       bool
 	OverlayBDBundle  string
 	StandardTopology bool
+	StateRoot        string
 }
 
 func (d *Driver) rootfsQualificationSources(state *SandboxState, m artifacts.VMManifest) rootfsQualificationSources {
@@ -41,6 +43,7 @@ func (d *Driver) rootfsQualificationSources(state *SandboxState, m artifacts.VMM
 		KernelSHA256: m.Kernel.SHA256, ManagedVMM: managed,
 		OverlayBDBundle:  filepath.Join(runtimecatalog.OCIToolsDir, "current"),
 		StandardTopology: managed && filepath.Clean(d.config.VMMDir) == firecrackervmm.DefaultDir && filepath.Clean(d.config.StateRoot) == runtimecatalog.FirecrackerStateRootDir,
+		StateRoot:        d.config.StateRoot,
 	}
 }
 
@@ -48,6 +51,13 @@ func readRootfsQualification(source rootfsQualificationSources) (rootfsQualifica
 	q, provided, err := readQualificationOverrides()
 	if err != nil {
 		return q, err
+	}
+	// Native captures need no authored profile: the storage identity derives
+	// from the StateRoot below and the exclusive-writer contract follows the
+	// same standard topology the OverlayBD path trusts (#224). An explicit
+	// profile still speaks for the node.
+	if _, hasProfileBackend := provided["backend"]; !hasProfileBackend && source.Native {
+		q.Backend = captureBackendNative
 	}
 	if source.Native && q.Backend != captureBackendNative {
 		return q, errors.New("native RootfsOnly requires a separately qualified native storage profile")
@@ -80,8 +90,13 @@ func readRootfsQualification(source rootfsQualificationSources) (rootfsQualifica
 			q.StorageRevision = revision
 		}
 	}
+	if source.Native && !hasRevision {
+		if q.StorageRevision, err = stateRootStorageRevision(source.StateRoot); err != nil {
+			return q, err
+		}
+	}
 	if _, ok := provided["exclusiveExt4"]; !ok {
-		q.ExclusiveExt4 = source.StandardTopology && !source.Native
+		q.ExclusiveExt4 = source.StandardTopology
 	}
 	digests := []string{q.KernelSHA256}
 	if !source.Native {
@@ -99,6 +114,19 @@ func readRootfsQualification(source rootfsQualificationSources) (rootfsQualifica
 		return q, errors.New("qualification requires exclusive ext4 and a storage revision; custom topologies need explicit overrides")
 	}
 	return q, nil
+}
+
+// stateRootStorageRevision derives a stable storage identity from the
+// StateRoot filesystem, standing in for the bundle REVISION the OverlayBD
+// path derives: changing the backing filesystem invalidates prior native
+// capture journals and attestations.
+func stateRootStorageRevision(stateRoot string) (string, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(stateRoot, &st); err != nil {
+		return "", fmt.Errorf("read the StateRoot storage identity: %w", err)
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("statfs:%x:%x:%d", st.Fsid.Val[0], st.Fsid.Val[1], st.Blocks)))
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func readQualificationOverrides() (rootfsQualification, map[string]json.RawMessage, error) {

@@ -57,6 +57,49 @@ func TestRootfsQualificationFailClosed(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestNativeRootfsQualificationSelfDerives(t *testing.T) {
+	// #224: a standard-topology node needs no authored profile — the backend
+	// and the exclusive-ext4 contract follow the topology, and the storage
+	// revision derives from the StateRoot filesystem identity.
+	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", "")
+	sum := strings.Repeat("b", 64)
+	stateRoot := t.TempDir()
+	sources := rootfsQualificationSources{
+		Native: true, KernelSHA256: sum, ManagedVMM: true, StandardTopology: true, StateRoot: stateRoot,
+	}
+	q, err := readRootfsQualification(sources)
+	require.NoError(t, err)
+	require.Equal(t, captureBackendNative, q.Backend)
+	require.True(t, q.ExclusiveExt4)
+	require.NotEmpty(t, q.StorageRevision)
+	stable, err := readRootfsQualification(sources)
+	require.NoError(t, err)
+	require.Equal(t, q.StorageRevision, stable.StorageRevision)
+
+	// A non-existent StateRoot cannot yield a storage identity.
+	_, err = readRootfsQualification(rootfsQualificationSources{
+		Native: true, KernelSHA256: sum, ManagedVMM: true, StandardTopology: true,
+		StateRoot: filepath.Join(stateRoot, "missing"),
+	})
+	require.Error(t, err)
+
+	// Off-topology nodes stay fail-closed without an explicit profile.
+	_, err = readRootfsQualification(rootfsQualificationSources{
+		Native: true, KernelSHA256: sum, ManagedVMM: true, StandardTopology: false, StateRoot: stateRoot,
+	})
+	require.Error(t, err)
+}
+
+func TestNativeCapabilityImpliedByStandardTopology(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", "")
+	standard := &Driver{config: runtimecatalog.FirecrackerConfig{
+		VMMDir: firecrackervmm.DefaultDir, StateRoot: runtimecatalog.FirecrackerStateRootDir,
+	}}
+	require.True(t, standard.SupportsNativeRootfsOnlySnapshots())
+	custom := &Driver{config: runtimecatalog.FirecrackerConfig{VMMDir: "/custom/vmm", StateRoot: "/custom/state"}}
+	require.False(t, custom.SupportsNativeRootfsOnlySnapshots())
+}
+
 func TestRootfsCoordinatorRejectsBeforeSideEffects(t *testing.T) {
 	d := &Driver{}
 	for _, input := range []*runtimecontract.SnapshotInput{
@@ -459,16 +502,19 @@ func TestNativeRootfsCapturedManifestAndReadiness(t *testing.T) {
 }
 
 func TestNativeQualificationUsesSelectedVMMWithoutOverlayBDBundle(t *testing.T) {
-	source := rootfsQualificationSources{Native: true, ManagedVMM: true, KernelSHA256: strings.Repeat("a", 64), OverlayBDBundle: "/missing-oci-bundle", StandardTopology: true}
+	source := rootfsQualificationSources{Native: true, ManagedVMM: true, KernelSHA256: strings.Repeat("a", 64), OverlayBDBundle: "/missing-oci-bundle", StandardTopology: true, StateRoot: t.TempDir()}
 	path := filepath.Join(t.TempDir(), "profile.json")
 	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
 	for _, tc := range []struct {
 		body string
 		ok   bool
 	}{
+		// #224: partial native profiles inherit the topology defaults —
+		// exclusiveExt4 from StandardTopology, storageRevision from the
+		// StateRoot identity — exactly like OverlayBD partial overrides.
 		{`{"backend":"native","storageRevision":"qualified-xfs","exclusiveExt4":true}`, true},
-		{`{"backend":"native","storageRevision":"qualified-xfs"}`, false},
-		{`{"backend":"native","exclusiveExt4":true}`, false},
+		{`{"backend":"native","storageRevision":"qualified-xfs"}`, true},
+		{`{"backend":"native","exclusiveExt4":true}`, true},
 		{`{"backend":"native","storageRevision":null,"exclusiveExt4":true}`, false},
 		{`{"backend":"other","storageRevision":"qualified-xfs","exclusiveExt4":true}`, false},
 	} {
@@ -479,6 +525,8 @@ func TestNativeQualificationUsesSelectedVMMWithoutOverlayBDBundle(t *testing.T) 
 			require.Equal(t, source.KernelSHA256, q.KernelSHA256)
 			require.Empty(t, q.FirecrackerSHA256)
 			require.Empty(t, q.OverlayBDSHA256)
+			require.NotEmpty(t, q.StorageRevision)
+			require.True(t, q.ExclusiveExt4)
 		} else {
 			require.Error(t, err)
 		}
