@@ -177,7 +177,7 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 	require.NotEmpty(t, m.GuestControl.HelperVersion)
 	m.GuestNetwork = &artifacts.VMGuestNetwork{Iface: "eth0", MAC: e2ePrepMAC, IP: e2ePrepGuestIP, Gateway: "172.30.0.1", Netmask: "255.255.255.0", MTU: fastletnetwork.DefaultMTU}
 	m.Files = map[string]artifacts.ManifestFile{publishedRootfsName: disk}
-	raw, err = artifacts.MarshalVMManifest(m)
+	raw, err := artifacts.MarshalVMManifest(m)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(bundle, snapshotManifestName), raw, 0600))
 	require.NoError(t, artifacts.WriteSHA256SUMS(bundle, []string{publishedRootfsName}, sums))
