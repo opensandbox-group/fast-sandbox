@@ -13,6 +13,10 @@ import (
 	"fast-sandbox/internal/guestcontrol"
 )
 
+// guestControlHelperPath is where the builder image installs the statically
+// linked guest-control helper; tests point it at a fixture binary.
+var guestControlHelperPath = "/usr/local/lib/fsb-guest-control"
+
 // Guest control ships with every native and OverlayBD template. Injection is
 // followed by a freeze/thaw probe before the builder declares the capability.
 // Existing templates require a rebuild to acquire verified helper metadata.
@@ -20,10 +24,7 @@ func injectGuestControl(spec apiv1alpha2.SandboxTemplateSpec, rootfs string) (bo
 	if spec.Output.Format != apiv1alpha2.ArtifactFormatOverlayBD && spec.Output.Format != apiv1alpha2.ArtifactFormatNative {
 		return false, nil
 	}
-	source := os.Getenv("FSB_GUEST_CONTROL_HELPER")
-	if source == "" {
-		source = "/usr/local/lib/fsb-guest-control"
-	}
+	source := guestControlHelperPath
 	binary, err := elf.Open(source)
 	if err != nil {
 		return false, err

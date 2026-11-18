@@ -72,10 +72,19 @@ func staticHelperBinary(t *testing.T) string {
 	return path
 }
 
+// setGuestControlHelper points injection at path and restores the default
+// (the builder image location) when the test finishes.
+func setGuestControlHelper(t *testing.T, path string) {
+	t.Helper()
+	previous := guestControlHelperPath
+	guestControlHelperPath = path
+	t.Cleanup(func() { guestControlHelperPath = previous })
+}
+
 func TestGuestControlInjection(t *testing.T) {
 	spec := apiv1alpha2.SandboxTemplateSpec{}
 	spec.Output.Format = apiv1alpha2.ArtifactFormatOverlayBD
-	t.Setenv("FSB_GUEST_CONTROL_HELPER", filepath.Join(t.TempDir(), "missing"))
+	setGuestControlHelper(t, filepath.Join(t.TempDir(), "missing"))
 	// The retired FSB_GUEST_CONTROL_ENABLED gate has no effect in either
 	// direction: a missing helper fails OverlayBD builds with or without it.
 	t.Setenv("FSB_GUEST_CONTROL_ENABLED", "0")
@@ -89,7 +98,7 @@ func TestGuestControlInjection(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, enabled)
 	// OverlayBD injection requires a static helper matching the builder arch.
-	t.Setenv("FSB_GUEST_CONTROL_HELPER", staticHelperBinary(t))
+	setGuestControlHelper(t, staticHelperBinary(t))
 	root := t.TempDir()
 	enabled, err = injectGuestControl(spec, root)
 	require.NoError(t, err)
@@ -118,7 +127,7 @@ func TestGuestControlBinaryInjectionIntegration(t *testing.T) {
 	if source == "" {
 		t.Skip("requires static Linux helper")
 	}
-	t.Setenv("FSB_GUEST_CONTROL_HELPER", source)
+	setGuestControlHelper(t, source)
 	root := t.TempDir()
 	spec := apiv1alpha2.SandboxTemplateSpec{}
 	spec.Output.Format = apiv1alpha2.ArtifactFormatOverlayBD
