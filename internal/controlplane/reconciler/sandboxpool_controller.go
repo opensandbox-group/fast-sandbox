@@ -38,6 +38,7 @@ import (
 	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 	"fast-sandbox/internal/controlplane/placement"
 	"fast-sandbox/internal/fastlet/podcgroup"
+	"fast-sandbox/internal/fastletauth"
 	"fast-sandbox/internal/fastletsettings"
 	"fast-sandbox/internal/nodecleanup"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
@@ -66,6 +67,20 @@ type SandboxPoolReconciler struct {
 	DisableResourceAwareMemoryAdmission bool
 	DisableResourceAwarePoolScaling     bool
 	Now                                 func() time.Time
+	// FastletAuthIssuer and FastletAuthCABundle are the control
+	// authentication anchor injected into Fastlet Pods. They come from this
+	// Pod's own projected ServiceAccount identity; when empty (a host-process
+	// development run) new Fastlets fail at startup rather than serve an
+	// unauthenticated control API.
+	FastletAuthIssuer   string
+	FastletAuthCABundle string
+	// FastletAuthSubjects is the caller allow list injected into Fastlet
+	// Pods. It comes from the --fastlet-auth-subjects flag; when empty the
+	// platform default is injected so the entry always shadows templates.
+	FastletAuthSubjects []string
+	// FastletAuthAudience is the token audience injected into Fastlet Pods,
+	// resolved from the control plane's own configuration.
+	FastletAuthAudience string
 }
 
 type FastletDrainer interface {
@@ -1621,6 +1636,28 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			corev1.EnvVar{Name: envFastSandboxRegistryConfigPath, Value: registryconfig.MountPath},
 			corev1.EnvVar{Name: "INFRA_DIR_IN_POD", Value: infraHostPath},
 		)
+		// Control authentication is platform-owned end to end: the anchor
+		// (issuer + CA), the caller allow list, and the audience all come
+		// from here. Every auth env key is removed from template env above
+		// and re-injected unconditionally — including entries whose platform
+		// value is empty — because kubelet resolves an explicit env entry
+		// over an envFrom key of the same name regardless of value. That
+		// closes every template supply path for the auth keys while the
+		// template's other envFrom inputs (ConfigMap/Secret references)
+		// keep working.
+		subjects := r.FastletAuthSubjects
+		if len(subjects) == 0 {
+			// The controller normally passes its namespace-derived list;
+			// this fallback keeps directly constructed reconcilers on the
+			// platform default.
+			subjects = fastletauth.DefaultAllowedSubjects
+		}
+		c.Env = append(c.Env,
+			corev1.EnvVar{Name: fastletauth.IssuerEnv, Value: r.FastletAuthIssuer},
+			corev1.EnvVar{Name: fastletauth.CABundleEnv, Value: r.FastletAuthCABundle},
+			corev1.EnvVar{Name: fastletauth.AllowedSubjectsEnv, Value: strings.Join(subjects, ",")},
+			corev1.EnvVar{Name: fastletauth.AudienceEnv, Value: r.FastletAuthAudience},
+		)
 		if profile.ResidualProcess != runtimecatalog.ResidualProcessNone {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "FAST_SANDBOX_NODE_CLEANUP_SOCKET", Value: nodecleanup.DefaultSocketPath})
 		}
@@ -2476,6 +2513,11 @@ var runtimeOwnedEnv = map[string]struct{}{
 	"FAST_SANDBOX_ACTIONS":         {},
 	"FAST_SANDBOX_SETTINGS_DIR":    {},
 	"NODE_NAME":                    {}, envPodName: {}, "POD_IP": {}, envPodUID: {}, "NAMESPACE": {},
+	// Control authentication env keys are platform-owned: the Pool
+	// Controller injects allow list, audience, and anchor, and a Pool
+	// template must not be able to relax or redirect any of them.
+	fastletauth.AllowedSubjectsEnv: {}, fastletauth.IssuerEnv: {}, fastletauth.CABundleEnv: {},
+	fastletauth.AudienceEnv: {},
 }
 
 func removeRuntimeOwnedEnv(env []corev1.EnvVar) []corev1.EnvVar {

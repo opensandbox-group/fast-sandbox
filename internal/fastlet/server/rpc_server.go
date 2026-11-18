@@ -11,9 +11,11 @@ import (
 	"strings"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/attribute"
 	"k8s.io/klog/v2"
 
 	fastletsandbox "fast-sandbox/internal/fastlet/sandbox"
+	"fast-sandbox/internal/fastletauth"
 	"fast-sandbox/internal/observability"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
@@ -22,6 +24,7 @@ import (
 type FastletServer struct {
 	addr           string
 	sandboxManager *fastletsandbox.SandboxManager
+	authenticator  *fastletauth.Authenticator
 }
 
 // NewFastletServer creates a new fastlet HTTP server.
@@ -30,6 +33,12 @@ func NewFastletServer(addr string, sandboxManager *fastletsandbox.SandboxManager
 		addr:           addr,
 		sandboxManager: sandboxManager,
 	}
+}
+
+// SetAuthenticator installs the Fastlet control authentication. When nil,
+// the control API is served unauthenticated (test and diagnostic harnesses).
+func (s *FastletServer) SetAuthenticator(authenticator *fastletauth.Authenticator) {
+	s.authenticator = authenticator
 }
 
 // Start starts the HTTP server.
@@ -58,7 +67,16 @@ func (s *FastletServer) Handler() http.Handler {
 	mux.HandleFunc("/api/v2/fastlet/draining", s.handleSetDraining)
 
 	klog.InfoS("starting fastlet HTTP server", "addr", s.addr)
-	return traceFastletAPI(mux)
+	var handler http.Handler = mux
+	if s.authenticator != nil {
+		handler = fastletauth.Middleware(s.authenticator, handler)
+	}
+	// Tracing wraps authentication so rejections reach the HTTP
+	// instrumentation: a Fastlet refusing traffic (401/403 during a rollout
+	// or a mixed-version window) stays visible in its own telemetry instead
+	// of short-circuiting above the only status-recording layer. Non-API
+	// paths remain untraced exactly as before.
+	return traceFastletAPI(handler)
 }
 
 func traceFastletAPI(next http.Handler) http.Handler {
@@ -69,7 +87,13 @@ func traceFastletAPI(next http.Handler) http.Handler {
 		}
 		request, span := observability.StartHTTPServer(request, "fastlet")
 		recorder := &statusRecorder{ResponseWriter: writer, status: http.StatusOK}
-		defer func() { observability.End(span, recorder.err()) }()
+		defer func() {
+			// Record the status per HTTP semantics so 4xx rejections are
+			// distinguishable from served traffic; only 5xx additionally
+			// fail the span.
+			span.SetAttributes(attribute.Int("http.response.status_code", recorder.status))
+			observability.End(span, recorder.err())
+		}()
 		next.ServeHTTP(recorder, request)
 	})
 }

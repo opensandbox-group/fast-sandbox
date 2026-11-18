@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"fast-sandbox/internal/fastletauth"
 )
 
 func TestCreateRequestSerializesIdentityDesiredSpecAndRequestMetadataOnce(t *testing.T) {
@@ -131,4 +133,13 @@ func TestHeartbeatUsesAdmissionAndCacheAsSingleAuthorities(t *testing.T) {
 	require.NotContains(t, object, "images")
 	require.Equal(t, float64(8), object["admission"].(map[string]any)["capacity"])
 	require.Equal(t, []any{"alpine:latest"}, object["cache"].(map[string]any)["images"])
+}
+
+// TestAuthErrorCodesMatchFastletAuthEnvelope locks the middleware's auth
+// error code spellings (fastletauth writes the envelope; this package
+// decodes it) together at compile-review time.
+func TestAuthErrorCodesMatchFastletAuthEnvelope(t *testing.T) {
+	require.Equal(t, string(ErrorAuthRejected), fastletauth.CodeAuthRejected)
+	require.Equal(t, string(ErrorAuthNotAllowed), fastletauth.CodeAuthNotAllowed)
+	require.Equal(t, string(ErrorAuthUnavailable), fastletauth.CodeAuthUnavailable)
 }

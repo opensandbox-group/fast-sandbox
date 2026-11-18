@@ -34,6 +34,7 @@ import (
 	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 	"fast-sandbox/internal/controlplane/placement"
 	"fast-sandbox/internal/fastlet/podcgroup"
+	"fast-sandbox/internal/fastletauth"
 	"fast-sandbox/internal/fastletsettings"
 	"fast-sandbox/internal/nodecleanup"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
@@ -1249,6 +1250,7 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	require.Equal(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_REVISION"), pod.Annotations["fast-sandbox.io/infra-revision"])
 	require.Equal(t, "/etc/fast-sandbox/infra/plan.json", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_INFRA_PLAN_PATH"))
 	require.Equal(t, "/etc/fast-sandbox/runtime/plan.json", envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_RUNTIME_PLAN_PATH"))
+	require.Empty(t, envValue(pod.Spec.Containers[0].Env, fastletauth.IssuerEnv), "the auth anchor is injected only when the reconciler resolved it")
 	require.Empty(t, envValue(pod.Spec.Containers[0].Env, "RUNTIME_SOCKET"))
 	require.Empty(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_SNAPSHOTTER"))
 	require.Empty(t, envValue(pod.Spec.Containers[0].Env, "FAST_SANDBOX_KUBELET_ROOT"))
@@ -2910,4 +2912,191 @@ func TestUpdatePoolObservationRetriesConflictByRefetchingLatest(t *testing.T) {
 	require.Equal(t, "runtime-1", persisted.Status.RuntimeRevision)
 	require.NotNil(t, apiMeta.FindStatusCondition(persisted.Status.Conditions, apiv1alpha2.PoolConditionRuntimeReady), "conditions written by another writer must be preserved")
 	require.Equal(t, observation.warmImages, stale.Status.WarmImages, "the caller must adopt the persisted status")
+}
+
+func TestConstructPodInjectsFastletAuthAnchor(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	poolReconciler := &SandboxPoolReconciler{
+		Scheme: scheme, Catalog: runtimecatalog.Builtin(),
+		FastletAuthIssuer:   "https://kubernetes.default.svc",
+		FastletAuthCABundle: "TUlJQ2VqQ0NBZUNnQXc9PQ==",
+		FastletAuthSubjects: []string{
+			"system:serviceaccount:opensandbox-system:fast-sandbox-fastpath",
+			"system:serviceaccount:opensandbox-system:fast-sandbox-controller",
+		},
+	}
+	runtimeClass := "must-not-leak"
+	automount := true
+	pool := &apiv1alpha2.SandboxPool{
+		TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha2.GroupVersion.String(), Kind: "SandboxPool"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default", UID: types.UID("pool-uid")},
+		Spec: apiv1alpha2.SandboxPoolSpec{
+			Runtime:            apiv1alpha2.RuntimeContainer,
+			MaxSandboxesPerPod: 5,
+			SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+				resource.MustParse("1"), resource.MustParse("1Gi"), 256,
+			),
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				RuntimeClassName:             &runtimeClass,
+				AutomountServiceAccountToken: &automount,
+				Containers:                   []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}},
+			}},
+		},
+	}
+	catalog := runtimecatalog.Builtin()
+	runtimePlan, err := runtimeenv.ResolveDefault(catalog, pool.Spec.Runtime)
+	require.NoError(t, err)
+	pod, err := poolReconciler.constructPodWithRuntimePlan(pool, runtimePlan)
+	require.NoError(t, err)
+	require.Equal(t, "https://kubernetes.default.svc", envValue(pod.Spec.Containers[0].Env, fastletauth.IssuerEnv),
+		"Fastlet Pods are anchored at the issuer the control plane resolved")
+	require.Equal(t, poolReconciler.FastletAuthCABundle, envValue(pod.Spec.Containers[0].Env, fastletauth.CABundleEnv))
+	require.Equal(t, "system:serviceaccount:opensandbox-system:fast-sandbox-fastpath,system:serviceaccount:opensandbox-system:fast-sandbox-controller",
+		envValue(pod.Spec.Containers[0].Env, fastletauth.AllowedSubjectsEnv),
+		"the caller allow list is injected through the platform env path")
+	require.False(t, *pod.Spec.AutomountServiceAccountToken, "the anchor injection must not reintroduce token mounts")
+}
+
+func TestConstructPodStripsTemplateOwnedAuthEnv(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	poolReconciler := &SandboxPoolReconciler{
+		Scheme: scheme, Catalog: runtimecatalog.Builtin(),
+		FastletAuthIssuer:   "https://kubernetes.default.svc",
+		FastletAuthCABundle: "TUlJQ2VqQ0NBZUNnQXc9PQ==",
+		FastletAuthSubjects: []string{"system:serviceaccount:opensandbox-system:fast-sandbox-fastpath"},
+		FastletAuthAudience: "https://kubernetes.default.svc",
+	}
+	runtimeClass := "must-not-leak"
+	automount := true
+	pool := &apiv1alpha2.SandboxPool{
+		TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha2.GroupVersion.String(), Kind: "SandboxPool"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default", UID: types.UID("pool-uid")},
+		Spec: apiv1alpha2.SandboxPoolSpec{
+			Runtime:            apiv1alpha2.RuntimeContainer,
+			MaxSandboxesPerPod: 5,
+			SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+				resource.MustParse("1"), resource.MustParse("1Gi"), 256,
+			),
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				RuntimeClassName:             &runtimeClass,
+				AutomountServiceAccountToken: &automount,
+				Containers: []corev1.Container{{
+					Name: "fastlet", Image: "fastlet:test",
+					Env: []corev1.EnvVar{
+						// A Pool template must not be able to relax the allow
+						// list or redirect the issuer anchor.
+						{Name: fastletauth.AllowedSubjectsEnv, Value: "system:serviceaccount:attacker:default"},
+						{Name: fastletauth.IssuerEnv, Value: "https://attacker.example"},
+						{Name: fastletauth.CABundleEnv, Value: "attacker-ca"},
+						{Name: fastletauth.AudienceEnv, Value: "attacker-audience"},
+					},
+					// envFrom may supply keys explicit env does not
+					// define. The platform answers by injecting every
+					// auth key explicitly (an env entry resolves over an
+					// envFrom key of the same name regardless of value),
+					// so a ConfigMap reference can no longer inject an
+					// auth key the platform leaves unset — while
+					// legitimate envFrom inputs keep working.
+					EnvFrom: []corev1.EnvFromSource{{
+						ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "attacker-config"}},
+					}},
+				}},
+			}},
+		},
+	}
+	runtimePlan, err := runtimeenv.ResolveDefault(poolReconciler.Catalog, pool.Spec.Runtime)
+	require.NoError(t, err)
+	pod, err := poolReconciler.constructPodWithRuntimePlan(pool, runtimePlan)
+	require.NoError(t, err)
+	require.Equal(t, "https://kubernetes.default.svc", envValue(pod.Spec.Containers[0].Env, fastletauth.IssuerEnv),
+		"the template must not redirect the issuer anchor")
+	require.Equal(t, "TUlJQ2VqQ0NBZUNnQXc9PQ==", envValue(pod.Spec.Containers[0].Env, fastletauth.CABundleEnv),
+		"the template must not replace the CA bundle")
+	require.Equal(t, "system:serviceaccount:opensandbox-system:fast-sandbox-fastpath",
+		envValue(pod.Spec.Containers[0].Env, fastletauth.AllowedSubjectsEnv),
+		"the template must not relax the allow list")
+	require.Equal(t, "https://kubernetes.default.svc", envValue(pod.Spec.Containers[0].Env, fastletauth.AudienceEnv),
+		"the audience must come from the platform, not the template")
+	require.Len(t, pod.Spec.Containers[0].EnvFrom, 1,
+		"envFrom is preserved for non-auth keys; explicit env entries shadow any auth key it could supply")
+}
+
+// TestConstructPodInjectsAuthEnvUnconditionally pins the shadowing guarantee:
+// every auth env key carries an explicit entry even when the platform value is
+// empty, because kubelet resolves an env entry over an envFrom key of the same
+// name regardless of value. A missing entry would reopen the envFrom supply
+// path that TestConstructPodStripsTemplateOwnedAuthEnv closes for values.
+func TestConstructPodInjectsAuthEnvUnconditionally(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	// Directly constructed reconciler with no auth fields populated: the
+	// entries must still exist (empty values read as unset on the Fastlet
+	// side and fall back to the projected-token anchor).
+	poolReconciler := &SandboxPoolReconciler{Scheme: scheme, Catalog: runtimecatalog.Builtin()}
+	pool := &apiv1alpha2.SandboxPool{
+		TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha2.GroupVersion.String(), Kind: "SandboxPool"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-empty", Namespace: "default", UID: types.UID("pool-uid")},
+		Spec: apiv1alpha2.SandboxPoolSpec{
+			Runtime:            apiv1alpha2.RuntimeContainer,
+			MaxSandboxesPerPod: 5,
+			SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+				resource.MustParse("1"), resource.MustParse("1Gi"), 256,
+			),
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}},
+			}},
+		},
+	}
+	runtimePlan, err := runtimeenv.ResolveDefault(poolReconciler.Catalog, pool.Spec.Runtime)
+	require.NoError(t, err)
+	pod, err := poolReconciler.constructPodWithRuntimePlan(pool, runtimePlan)
+	require.NoError(t, err)
+	for _, key := range []string{fastletauth.IssuerEnv, fastletauth.CABundleEnv, fastletauth.AllowedSubjectsEnv, fastletauth.AudienceEnv} {
+		require.Contains(t, envNames(pod.Spec.Containers[0].Env), key,
+			"every auth env key must carry an explicit entry so envFrom can never supply it")
+	}
+}
+
+func envNames(env []corev1.EnvVar) []string {
+	names := make([]string, 0, len(env))
+	for _, item := range env {
+		names = append(names, item.Name)
+	}
+	return names
+}
+
+func TestConstructPodSeedsDefaultAuthSubjects(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	poolReconciler := &SandboxPoolReconciler{
+		Scheme: scheme, Catalog: runtimecatalog.Builtin(),
+		FastletAuthIssuer:   "https://kubernetes.default.svc",
+		FastletAuthCABundle: "TUlJQ2VqQ0NBZUNnQXc9PQ==",
+		// No flag override: the platform default allow list must still be
+		// injected explicitly so it shadows any envFrom key of the same
+		// name in the default configuration.
+	}
+	pool := &apiv1alpha2.SandboxPool{
+		TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha2.GroupVersion.String(), Kind: "SandboxPool"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "default", UID: types.UID("pool-uid")},
+		Spec: apiv1alpha2.SandboxPoolSpec{
+			Runtime:            apiv1alpha2.RuntimeContainer,
+			MaxSandboxesPerPod: 5,
+			SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+				resource.MustParse("1"), resource.MustParse("1Gi"), 256,
+			),
+			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}},
+			}},
+		},
+	}
+	runtimePlan, err := runtimeenv.ResolveDefault(poolReconciler.Catalog, pool.Spec.Runtime)
+	require.NoError(t, err)
+	pod, err := poolReconciler.constructPodWithRuntimePlan(pool, runtimePlan)
+	require.NoError(t, err)
+	require.Equal(t, strings.Join(fastletauth.DefaultAllowedSubjects, ","),
+		envValue(pod.Spec.Containers[0].Env, fastletauth.AllowedSubjectsEnv),
+		"the platform default allow list must be injected explicitly when no flag override is set")
 }
