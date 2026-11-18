@@ -3,6 +3,7 @@ package guestcontrol
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -68,6 +69,44 @@ func TestProtocolThawBeforeFreezeAndUnknownStatus(t *testing.T) {
 	default:
 	}
 }
+func TestProtocolSetTimeAppliesHostClockWithoutFreezeIdentity(t *testing.T) {
+	m, _ := fixture(t)
+	s, err := NewService(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var applied time.Time
+	appliedErr := errors.New("clock is read-only")
+	previous := setTimeClock
+	setTimeClock = func(at time.Time) error {
+		applied = at
+		return appliedErr
+	}
+	t.Cleanup(func() { setTimeClock = previous })
+
+	// settime echoes the live epoch like every non-capabilities operation.
+	if out := s.Handle(Request{Protocol: Protocol, Method: methodSetTime, TimeUnixNano: 1234}); out.Error == "" {
+		t.Fatal("missing epoch accepted")
+	}
+	// An implausible reading must not reach the clock.
+	if out := s.Handle(Request{Protocol: Protocol, Method: methodSetTime, Epoch: s.epoch}); out.Error == "" {
+		t.Fatal("zero time accepted")
+	}
+	out := s.Handle(Request{Protocol: Protocol, Method: methodSetTime, Epoch: s.epoch, TimeUnixNano: 1234})
+	if out.Error == "" || !strings.Contains(out.Error, "clock is read-only") {
+		t.Fatalf("setter failure not reported: %+v", out)
+	}
+	appliedErr = nil
+	out = s.Handle(Request{Protocol: Protocol, Method: methodSetTime, Epoch: s.epoch, TimeUnixNano: 1234})
+	if out.Error != "" || !applied.Equal(time.Unix(0, 1234)) || out.TimeUnixNano <= 0 {
+		t.Fatalf("apply failed: applied=%v out=%+v", applied, out)
+	}
+	// settime is stateless: it must not mint a freeze generation identity.
+	if s.generation != 0 || s.operationID != "" {
+		t.Fatalf("settime created freeze identity: generation=%d operationID=%q", s.generation, s.operationID)
+	}
+}
+
 func TestProtocolRejectsMalformedFramesWithoutSideEffects(t *testing.T) {
 	for _, frame := range []string{
 		strings.Repeat("x", MaxRequestBytes+1) + "\n",

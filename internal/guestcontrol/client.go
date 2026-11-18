@@ -92,10 +92,10 @@ func (c Client) Call(ctx context.Context, r Request) (response Response, callErr
 	if out.Error != "" {
 		return out, fmt.Errorf("guest control: %s", out.Error)
 	}
-	if r.Method != methodCapabilities && out.Generation != r.Generation {
-		return out, errors.New("response generation mismatch")
-	}
-	if r.Method != methodCapabilities {
+	if stateMachineMethod(r.Method) {
+		if out.Generation != r.Generation {
+			return out, errors.New("response generation mismatch")
+		}
 		switch out.State {
 		case Pending, Held, Released, Expired:
 		default:
@@ -103,6 +103,15 @@ func (c Client) Call(ctx context.Context, r Request) (response Response, callErr
 		}
 	}
 	return out, nil
+}
+
+// SetTime sends one settime request: the guest applies at as its wall
+// clock. The request only needs Protocol and Epoch; settime has no
+// generation identity or lease.
+func (c Client) SetTime(ctx context.Context, request Request, at time.Time) (Response, error) {
+	request.Method = methodSetTime
+	request.TimeUnixNano = at.UnixNano()
+	return c.Call(ctx, request)
 }
 
 // FreezeAndWait sends freeze once, then polls until the ioctl completes.

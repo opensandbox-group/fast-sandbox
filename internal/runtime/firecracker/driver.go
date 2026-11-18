@@ -932,6 +932,14 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	}
 	bootDur := time.Since(bootStarted)
 
+	// A restored guest inherits the snapshot's clock; re-sync it before the
+	// sandbox becomes reachable. RootfsOnly cold boots are calibrated by
+	// kvmclock at boot and skip this. See syncGuestClock for the
+	// best-effort posture.
+	if !restoreMetadata.IsRootfsOnly() {
+		d.syncGuestClock(ctx, state, restoreMetadata, client)
+	}
+
 	// A resumed checkpoint may carry the egress-owned vault and policy
 	// files: import them into egress here — before EnsureSandbox returns, so
 	// strictly before the Fastlet dispatches the data-plane-ready hook
@@ -1394,6 +1402,14 @@ func (d *Driver) resumePausedVM(ctx context.Context, state *SandboxState) {
 		return
 	}
 	klog.InfoS("resumed paused microVM after crash recovery", "sandboxID", state.Config.Identity.SandboxUID)
+	// The paused VM froze its clock at the pause instant; the backend-aware
+	// manifest lookup keeps OCI paused instances calibratable too.
+	if manifest, ok, manifestErr := resumeSourceManifest(d.config.StateRoot, d.ociRoot(), state); manifestErr != nil {
+		klog.V(2).InfoS("guest clock sync skipped; source manifest unreadable",
+			"sandboxID", state.Config.Identity.SandboxUID, "err", manifestErr)
+	} else if ok {
+		d.syncGuestClock(ctx, state, manifest, client)
+	}
 }
 
 // bootTimeoutOrDefault returns the configured boot (resume) poll timeout.
