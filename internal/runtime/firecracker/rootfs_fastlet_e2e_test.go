@@ -65,19 +65,19 @@ func TestRootfsFastletChainE2E(t *testing.T) {
 	binary, kernel := os.Getenv("FC_BINARY"), os.Getenv("FC_KERNEL")
 	require.NotEmpty(t, binary)
 	require.NotEmpty(t, kernel)
-	pod := "rootfs-e2e-pod"
-	profile := runtimecatalog.RuntimeProfile{Name: apiv1alpha2.RuntimeFirecracker, ProfileHash: "rootfs-e2e", Firecracker: &runtimecatalog.FirecrackerConfig{BinaryPath: binary, VMMDir: os.Getenv("FC_VMM_DIR"), KernelPath: kernel, JailerPath: os.Getenv("FC_JAILER"), RootfsPath: "/unused-oci-rootfs", StateRoot: filepath.Join(root, "state"), DefaultVCPUs: 1, DefaultMemory: "256Mi", BootTimeoutSeconds: 30}, Capabilities: runtimecatalog.Capabilities{DefaultState: runtimecatalog.CapabilityReady}}
+	// Rootfs-only capture qualifies via the standard managed VMM directory
+	// and StateRoot (no authored profile), so the harness must mount an
+	// empty production StateRoot in an isolated namespace.
 	autoQualification := os.Getenv("FSB_TEST_AUTO_QUALIFICATION") == "1"
-	if autoQualification {
-		// The external harness must mount disposable assets and an empty state
-		// directory at the production paths; never use a populated node here.
-		require.Empty(t, os.Getenv("FAST_SANDBOX_ROOTFS_QUALIFICATION"))
-		require.Equal(t, "/opt/fast-sandbox/firecracker", profile.Firecracker.VMMDir)
-		profile.Firecracker.StateRoot = "/var/lib/fast-sandbox/firecracker"
-		entries, err := os.ReadDir(profile.Firecracker.StateRoot)
-		require.NoError(t, err)
-		require.Empty(t, entries, "auto-qualification E2E requires isolated empty production paths")
-	}
+	require.True(t, autoQualification, "set FSB_TEST_AUTO_QUALIFICATION=1 and mount an empty production StateRoot")
+	require.Equal(t, "/opt/fast-sandbox/firecracker", os.Getenv("FC_VMM_DIR"))
+	pod := "rootfs-e2e-pod"
+	profile := runtimecatalog.RuntimeProfile{Name: apiv1alpha2.RuntimeFirecracker, ProfileHash: "rootfs-e2e", Firecracker: &runtimecatalog.FirecrackerConfig{BinaryPath: binary, VMMDir: os.Getenv("FC_VMM_DIR"), KernelPath: kernel, JailerPath: os.Getenv("FC_JAILER"), RootfsPath: "/unused-oci-rootfs", StateRoot: "/var/lib/fast-sandbox/firecracker", DefaultVCPUs: 1, DefaultMemory: "256Mi", BootTimeoutSeconds: 30}, Capabilities: runtimecatalog.Capabilities{DefaultState: runtimecatalog.CapabilityReady}}
+	// The external harness must mount disposable assets and an empty state
+	// directory at the production paths; never use a populated node here.
+	entries, err := os.ReadDir(profile.Firecracker.StateRoot)
+	require.NoError(t, err)
+	require.Empty(t, entries, "auto-qualification E2E requires isolated empty production paths")
 	driver, err := New(profile)
 	require.NoError(t, err)
 	driver.SetFastletPodUID(pod)
@@ -151,7 +151,7 @@ func TestRootfsFastletChainE2E(t *testing.T) {
 			require.NotNil(t, state.VMM)
 			require.Equal(t, manifest.Compatibility.FirecrackerVersion, state.VMM.Version)
 			require.Equal(t, filepath.Join(profile.Firecracker.VMMDir, "versions", state.VMM.Version, "firecracker"), state.VMM.BinaryPath)
-			require.NoError(t, qualifyVMMExecutable(state, ""))
+			require.NoError(t, qualifyVMMExecutable(state))
 		}
 		actualNS, e := os.Stat(fmt.Sprintf("/proc/%d/ns/net", state.PID))
 		require.NoError(t, e)
@@ -183,24 +183,8 @@ func TestRootfsFastletChainE2E(t *testing.T) {
 		if cycle == 0 {
 			if autoQualification {
 				_, err := driver.qualifyRootfsSource(ctx, state, manifest)
-				require.NoError(t, err, "no profile: deployed bundles and boot manifest must qualify the live VM")
-				for _, mismatch := range []struct{ field, message string }{
-					{"firecrackerSHA256", "managed VMM differs from explicit qualification digest"},
-					{"kernelSHA256", "qualification pins kernelSHA256"},
-					{"overlaybdSHA256", "stale or mismatched"},
-				} {
-					t.Run("reject-"+mismatch.field, func(t *testing.T) {
-						path := filepath.Join(root, "override.json")
-						raw, err := json.Marshal(map[string]string{mismatch.field: strings.Repeat("0", 64)})
-						require.NoError(t, err)
-						require.NoError(t, os.WriteFile(path, raw, 0600))
-						t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
-						_, err = driver.qualifyRootfsSource(ctx, state, manifest)
-						require.ErrorContains(t, err, mismatch.message)
-					})
-				}
-				require.Empty(t, os.Getenv("FAST_SANDBOX_ROOTFS_QUALIFICATION"))
-				t.Log("automatic qualification passed; mismatched VMM, kernel and daemon overrides rejected")
+				require.NoError(t, err, "no profile: boot provenance, deployed bundles and the managed VMM selection must qualify the live VM")
+				t.Log("automatic qualification passed; no authored profile involved")
 			}
 			snap := &fastletapi.CreateSnapshotRequest{RequestID: "rootfs-snapshot", Identity: fastletapi.SnapshotIdentity{SnapshotUID: "rootfs-snapshot", Namespace: "e2e", Name: "rootfs-snapshot", Sandbox: identity}, Snapshot: fastletapi.SnapshotSpec{Mode: fastletapi.SnapshotModeRootfsOnly, Kind: fastletapi.SnapshotKindTemplate}}
 			started := time.Now()

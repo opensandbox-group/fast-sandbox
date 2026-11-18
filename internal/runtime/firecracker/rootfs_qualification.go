@@ -1,10 +1,8 @@
 package firecracker
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -16,15 +14,18 @@ import (
 	"fast-sandbox/internal/firecrackervmm"
 )
 
-// Expectations come from deployed bundles, with optional operator overrides.
-// ExclusiveExt4 remains a topology assumption, not a proof about arbitrary writers.
+// The derived qualification records everything a native or OverlayBD
+// capture attests. There is no authored profile: the node derives the whole
+// contract from its own deployment — the source manifest's boot provenance,
+// the deployed OverlayBD bundle, and the exclusive-writer contract implied
+// by the standard managed VMM directory and StateRoot (#224). Other layouts
+// reject capture: a relocated or shared StateRoot cannot prove the absence
+// of host-side writers to the frozen guest.
 type rootfsQualification struct {
-	Backend           string `json:"backend,omitempty"`
-	FirecrackerSHA256 string `json:"firecrackerSHA256"`
-	KernelSHA256      string `json:"kernelSHA256"`
-	OverlayBDSHA256   string `json:"overlaybdSHA256"`
-	StorageRevision   string `json:"storageRevision"`
-	ExclusiveExt4     bool   `json:"exclusiveExt4"`
+	Backend         string
+	KernelSHA256    string
+	OverlayBDSHA256 string
+	ExclusiveExt4   bool
 }
 
 type rootfsQualificationSources struct {
@@ -45,93 +46,33 @@ func (d *Driver) rootfsQualificationSources(state *SandboxState, m artifacts.VMM
 }
 
 func readRootfsQualification(source rootfsQualificationSources) (rootfsQualification, error) {
-	q, provided, err := readQualificationOverrides()
-	if err != nil {
-		return q, err
-	}
-	if source.Native && q.Backend != captureBackendNative {
-		return q, errors.New("native RootfsOnly requires a separately qualified native storage profile")
-	}
-	if !source.Native && q.Backend != "" {
-		return q, errors.New("OverlayBD requires an OverlayBD qualification profile")
-	}
-	if _, ok := provided["kernelSHA256"]; !ok {
-		q.KernelSHA256 = source.KernelSHA256
-	}
-	if _, ok := provided["firecrackerSHA256"]; !ok && !source.ManagedVMM {
-		return q, errors.New("custom VMM requires explicit firecrackerSHA256 qualification")
-	}
-	_, hasBackend := provided["overlaybdSHA256"]
-	_, hasRevision := provided["storageRevision"]
-	if !source.Native && (!hasBackend || !hasRevision) {
-		entries, revision, err := readOverlayBDBundle(source.OverlayBDBundle)
+	q := rootfsQualification{ExclusiveExt4: source.StandardTopology}
+	// The backend follows the source encoding.
+	if source.Native {
+		q.Backend = captureBackendNative
+	} else {
+		entries, _, err := readOverlayBDBundle(source.OverlayBDBundle)
 		if err != nil {
-			return q, err
+			return rootfsQualification{}, err
 		}
-		if !hasBackend {
-			// bin/overlaybd-ublkd is a wrapper, not the running executable.
-			var exists bool
-			q.OverlayBDSHA256, exists = entries["libexec/overlaybd-ublkd"]
-			if !exists {
-				return q, errors.New("OverlayBD bundle does not list libexec/overlaybd-ublkd")
-			}
-		}
-		if !hasRevision {
-			q.StorageRevision = revision
+		// bin/overlaybd-ublkd is a wrapper, not the running executable.
+		var exists bool
+		q.OverlayBDSHA256, exists = entries["libexec/overlaybd-ublkd"]
+		if !exists {
+			return rootfsQualification{}, errors.New("OverlayBD bundle does not list libexec/overlaybd-ublkd")
 		}
 	}
-	if _, ok := provided["exclusiveExt4"]; !ok {
-		q.ExclusiveExt4 = source.StandardTopology && !source.Native
+	q.KernelSHA256 = source.KernelSHA256
+	if !validQualificationDigest(q.KernelSHA256) {
+		return rootfsQualification{}, errors.New("the source template does not record a valid kernel SHA-256; rebuild the template and recreate the sandbox")
 	}
-	digests := []string{q.KernelSHA256}
-	if !source.Native {
-		digests = append(digests, q.OverlayBDSHA256)
+	if !source.Native && !validQualificationDigest(q.OverlayBDSHA256) {
+		return rootfsQualification{}, errors.New("the deployed OverlayBD bundle does not provide a valid libexec/overlaybd-ublkd digest")
 	}
-	if _, explicit := provided["firecrackerSHA256"]; explicit || q.FirecrackerSHA256 != "" {
-		digests = append(digests, q.FirecrackerSHA256)
-	}
-	for _, sum := range digests {
-		if !validQualificationDigest(sum) {
-			return q, errors.New("qualification requires SHA256 digests")
-		}
-	}
-	if !q.ExclusiveExt4 || strings.TrimSpace(q.StorageRevision) == "" {
-		return q, errors.New("qualification requires exclusive ext4 and a storage revision; custom topologies need explicit overrides")
+	if !q.ExclusiveExt4 {
+		return rootfsQualification{}, errors.New("rootfs-only capture requires the standard managed VMM directory and StateRoot; relocated or shared storage layouts cannot attest the exclusive-writer contract")
 	}
 	return q, nil
-}
-
-func readQualificationOverrides() (rootfsQualification, map[string]json.RawMessage, error) {
-	var q rootfsQualification
-	provided := map[string]json.RawMessage{}
-	if path := os.Getenv("FAST_SANDBOX_ROOTFS_QUALIFICATION"); path != "" {
-		if !filepath.IsAbs(path) {
-			return q, nil, errors.New("FAST_SANDBOX_ROOTFS_QUALIFICATION must be an absolute path")
-		}
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			return q, nil, err
-		}
-		decoder := json.NewDecoder(bytes.NewReader(raw))
-		decoder.DisallowUnknownFields()
-		if err = decoder.Decode(&q); err != nil {
-			return q, nil, err
-		}
-		if err = json.Unmarshal(raw, &provided); err != nil || provided == nil {
-			return q, nil, errors.New("qualification overrides must be a JSON object")
-		}
-		for name, value := range provided {
-			switch name {
-			case "backend", "firecrackerSHA256", "kernelSHA256", "overlaybdSHA256", "storageRevision", "exclusiveExt4":
-			default:
-				return q, nil, fmt.Errorf("unknown qualification override %s", name)
-			}
-			if string(value) == "null" {
-				return q, nil, fmt.Errorf("qualification override %s cannot be null", name)
-			}
-		}
-	}
-	return q, provided, nil
 }
 
 func readOverlayBDBundle(path string) (map[string]string, string, error) {

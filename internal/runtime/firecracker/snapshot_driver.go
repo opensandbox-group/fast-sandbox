@@ -23,6 +23,8 @@ import (
 	"k8s.io/klog/v2"
 
 	"fast-sandbox/internal/artifacts"
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/firecrackervmm"
 	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
@@ -79,14 +81,15 @@ var _ runtimecontract.Snapshotter = (*Driver)(nil)
 // to dispatch RootfsOnly snapshots without it.
 func (d *Driver) SupportsRootfsOnlySnapshots() bool { return true }
 
+// SupportsNativeRootfsOnlySnapshots advertises the node-level eligibility
+// predicate: the fastlet runs the managed release chain at the standard
+// paths, which implies the exclusive-writer storage contract (#224).
+// Fixed-binary or relocated-path fastlets omit the capability and reject at
+// admission; per-instance VMM, kernel and storage checks stay at capture
+// time.
 func (d *Driver) SupportsNativeRootfsOnlySnapshots() bool {
-	// Per-instance VMM and kernel checks run at capture, after selection.
-	q, _, err := readQualificationOverrides()
-	if err != nil {
-		klog.ErrorS(err, "native rootfs qualification overrides unreadable; reporting node as not native-capable")
-		return false
-	}
-	return q.Backend == captureBackendNative && q.ExclusiveExt4 && strings.TrimSpace(q.StorageRevision) != ""
+	return filepath.Clean(d.config.VMMDir) == firecrackervmm.DefaultDir &&
+		filepath.Clean(d.config.StateRoot) == runtimecatalog.FirecrackerStateRootDir
 }
 
 // snapshotMu serializes the pause/dump/resume window across all Sandboxes of

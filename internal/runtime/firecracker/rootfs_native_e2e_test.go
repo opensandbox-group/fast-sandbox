@@ -45,6 +45,13 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 	binary, kernel := os.Getenv("FC_BINARY"), os.Getenv("FC_KERNEL")
 	require.NotEmpty(t, binary)
 	require.NotEmpty(t, kernel)
+	// Native rootfs-only capture qualifies via the standard managed VMM
+	// directory and StateRoot (no authored profile), so the harness must
+	// mount an empty production StateRoot in an isolated namespace.
+	autoQualification := os.Getenv("FSB_TEST_AUTO_QUALIFICATION") == "1"
+	require.True(t, autoQualification, "set FSB_TEST_AUTO_QUALIFICATION=1 and mount an empty production StateRoot")
+	vmmDir := os.Getenv("FC_VMM_DIR")
+	require.Equal(t, "/opt/fast-sandbox/firecracker", vmmDir)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
 	defer cancel()
 	root, err := os.MkdirTemp(filepath.Dir(seed), "ns3-")
@@ -122,7 +129,10 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 	pull, err := agentpull.NewClient(storeRoot, credential, options...)
 	require.NoError(t, err)
 	pod := "native-rootfs-e2e"
-	profile := runtimecatalog.RuntimeProfile{Name: apiv1alpha2.RuntimeFirecracker, ProfileHash: "native-rootfs", Firecracker: &runtimecatalog.FirecrackerConfig{BinaryPath: binary, VMMDir: os.Getenv("FC_VMM_DIR"), KernelPath: kernel, JailerPath: os.Getenv("FC_JAILER"), RootfsPath: "/unused", StateRoot: filepath.Join(root, "state"), DefaultVCPUs: 1, DefaultMemory: "256Mi", BootTimeoutSeconds: 30}, Capabilities: runtimecatalog.Capabilities{DefaultState: runtimecatalog.CapabilityReady}}
+	profile := runtimecatalog.RuntimeProfile{Name: apiv1alpha2.RuntimeFirecracker, ProfileHash: "native-rootfs", Firecracker: &runtimecatalog.FirecrackerConfig{BinaryPath: binary, VMMDir: vmmDir, KernelPath: kernel, JailerPath: os.Getenv("FC_JAILER"), RootfsPath: "/unused", StateRoot: runtimecatalog.FirecrackerStateRootDir, DefaultVCPUs: 1, DefaultMemory: "256Mi", BootTimeoutSeconds: 30}, Capabilities: runtimecatalog.Capabilities{DefaultState: runtimecatalog.CapabilityReady}}
+	entries, err := os.ReadDir(profile.Firecracker.StateRoot)
+	require.NoError(t, err)
+	require.Empty(t, entries, "auto-qualification E2E requires isolated empty production paths")
 	driver, err := New(profile)
 	require.NoError(t, err)
 	driver.SetFastletPodUID(pod)
@@ -153,18 +163,6 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 	sums := map[string]string{}
 	kernelEntry, err := artifacts.FileEntry(kernel, sums)
 	require.NoError(t, err)
-	vmmEntry, err := artifacts.FileEntry(binary, sums)
-	require.NoError(t, err)
-	qualification := map[string]any{"backend": "native", "storageRevision": "disposable-XFS-KVM-test", "exclusiveExt4": true}
-	if profile.Firecracker.VMMDir == "" {
-		qualification["kernelSHA256"] = kernelEntry.SHA256
-		qualification["firecrackerSHA256"] = vmmEntry.SHA256
-	}
-	raw, err := json.Marshal(qualification)
-	require.NoError(t, err)
-	qualificationPath := filepath.Join(root, "qualification.json")
-	require.NoError(t, os.WriteFile(qualificationPath, raw, 0600))
-	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", qualificationPath)
 	require.Contains(t, manager.SnapshotCapabilities(), fastletapi.CapabilityNativeRootfsOnlySnapshots)
 	bundle := filepath.Join(root, "seed")
 	require.NoError(t, os.Mkdir(bundle, 0700))
@@ -179,7 +177,7 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 	require.NotEmpty(t, m.GuestControl.HelperVersion)
 	m.GuestNetwork = &artifacts.VMGuestNetwork{Iface: "eth0", MAC: e2ePrepMAC, IP: e2ePrepGuestIP, Gateway: "172.30.0.1", Netmask: "255.255.255.0", MTU: fastletnetwork.DefaultMTU}
 	m.Files = map[string]artifacts.ManifestFile{publishedRootfsName: disk}
-	raw, err = artifacts.MarshalVMManifest(m)
+	raw, err := artifacts.MarshalVMManifest(m)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(bundle, snapshotManifestName), raw, 0600))
 	require.NoError(t, artifacts.WriteSHA256SUMS(bundle, []string{publishedRootfsName}, sums))
@@ -242,12 +240,10 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 		defer driver.DeleteSandbox(context.Background(), id)
 		live, err := loadState(filepath.Join(driver.config.StateRoot, sandboxStateDir, id))
 		require.NoError(t, err)
-		if profile.Firecracker.VMMDir != "" {
-			require.NotNil(t, live.VMM)
-			require.Equal(t, m.Compatibility.FirecrackerVersion, live.VMM.Version)
-			require.Equal(t, filepath.Join(profile.Firecracker.VMMDir, "versions", live.VMM.Version, "firecracker"), live.VMM.BinaryPath)
-			require.NoError(t, qualifyVMMExecutable(live, ""))
-		}
+		require.NotNil(t, live.VMM)
+		require.Equal(t, m.Compatibility.FirecrackerVersion, live.VMM.Version)
+		require.Equal(t, filepath.Join(profile.Firecracker.VMMDir, "versions", live.VMM.Version, "firecracker"), live.VMM.BinaryPath)
+		require.NoError(t, qualifyVMMExecutable(live))
 		vm := driver.newClient(live.APIAddress)
 		defer vm.Close()
 		require.Eventually(t, func() bool { _, _, err := driver.captureGuest(ctx, live, m, vm); return err == nil }, 30*time.Second, 100*time.Millisecond)

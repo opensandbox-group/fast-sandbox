@@ -21,40 +21,33 @@ import (
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
 
-func TestRootfsQualificationFailClosed(t *testing.T) {
-	sum := strings.Repeat("a", 64)
-	valid := rootfsQualification{FirecrackerSHA256: sum, KernelSHA256: sum, OverlayBDSHA256: sum, StorageRevision: "validated", ExclusiveExt4: true}
-	for _, tc := range []struct {
-		name   string
-		mutate func(*rootfsQualification)
-		ok     bool
-	}{
-		{"qualified", func(*rootfsQualification) {}, true},
-		{"native", func(q *rootfsQualification) { q.Backend = "native"; q.OverlayBDSHA256 = "" }, true},
-		{"unknown-backend", func(q *rootfsQualification) { q.Backend = "unknown" }, false},
-		{"unqualified-storage", func(q *rootfsQualification) { q.OverlayBDSHA256 = "" }, false},
-		{"raw-writers", func(q *rootfsQualification) { q.ExclusiveExt4 = false }, false},
-		{"bad-kernel", func(q *rootfsQualification) { q.KernelSHA256 = "unknown" }, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			q := valid
-			tc.mutate(&q)
-			raw, err := json.Marshal(q)
-			require.NoError(t, err)
-			path := filepath.Join(t.TempDir(), "qualification.json")
-			require.NoError(t, os.WriteFile(path, raw, 0600))
-			t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
-			_, err = readRootfsQualification(rootfsQualificationSources{Native: tc.name == "native"})
-			if tc.ok {
-				require.NoError(t, err)
-			} else {
-				require.Error(t, err)
-			}
-		})
+func TestNativeRootfsQualificationSelfDerives(t *testing.T) {
+	// #224: there is no authored profile — the backend follows the source
+	// encoding and the exclusive-writer contract follows the standard
+	// managed VMM directory and StateRoot.
+	sum := strings.Repeat("b", 64)
+	standard := rootfsQualificationSources{
+		Native: true, KernelSHA256: sum, ManagedVMM: true, StandardTopology: true,
 	}
-	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", "")
-	_, err := readRootfsQualification(rootfsQualificationSources{})
-	require.Error(t, err)
+	q, err := readRootfsQualification(standard)
+	require.NoError(t, err)
+	require.Equal(t, captureBackendNative, q.Backend)
+	require.True(t, q.ExclusiveExt4)
+
+	// Regression (#225 review): a managed VMM with a relocated StateRoot is
+	// NOT qualified — the same disk file can carry host-side writers that a
+	// guest freeze cannot quiesce.
+	relocated := rootfsQualificationSources{
+		Native: true, KernelSHA256: sum, ManagedVMM: true, StandardTopology: false,
+	}
+	_, err = readRootfsQualification(relocated)
+	require.ErrorContains(t, err, "standard managed VMM directory and StateRoot")
+
+	// A VMM outside the managed release layout stays fail-closed.
+	_, err = readRootfsQualification(rootfsQualificationSources{
+		Native: true, KernelSHA256: sum, ManagedVMM: false, StandardTopology: false,
+	})
+	require.ErrorContains(t, err, "standard managed VMM directory and StateRoot")
 }
 
 func TestRootfsCoordinatorRejectsBeforeSideEffects(t *testing.T) {
@@ -308,51 +301,21 @@ func qualificationSourcesFixture(t *testing.T) rootfsQualificationSources {
 }
 
 func TestRootfsQualificationDefaultsAndOverrides(t *testing.T) {
-	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", "")
 	source := qualificationSourcesFixture(t)
 	q, err := readRootfsQualification(source)
 	require.NoError(t, err)
-	require.Empty(t, q.FirecrackerSHA256)
 	require.Equal(t, strings.Repeat("b", 64), q.OverlayBDSHA256, "use executable, not wrapper digest")
 	require.Equal(t, source.KernelSHA256, q.KernelSHA256)
 	require.True(t, q.ExclusiveExt4)
-	require.Len(t, q.StorageRevision, 64)
-	for _, test := range []struct {
-		name, body string
-		ok         bool
-	}{
-		{"partial", `{"storageRevision":"operator-tested"}`, true},
-		{"explicit-disable", `{"exclusiveExt4":false}`, false},
-		{"empty-digest", `{"firecrackerSHA256":""}`, false},
-		{"invalid-digest", `{"kernelSHA256":"wrong"}`, false},
-		{"null", `{"exclusiveExt4":null}`, false},
-		{"typo", `{"exclusiveEXT4":true}`, false},
-		{"not-object", `null`, false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "profile.json")
-			require.NoError(t, os.WriteFile(path, []byte(test.body), 0600))
-			t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
-			_, err := readRootfsQualification(source)
-			if test.ok {
-				require.NoError(t, err)
-			} else {
-				require.Error(t, err)
-			}
-		})
-	}
+	// A VMM outside the managed release layout, or a non-standard StateRoot,
+	// stays fail-closed.
+	source.ManagedVMM = false
 	source.StandardTopology = false
 	_, err = readRootfsQualification(source)
-	require.ErrorContains(t, err, "custom topologies")
-	path := filepath.Join(t.TempDir(), "profile.json")
-	require.NoError(t, os.WriteFile(path, []byte(`{"exclusiveExt4":true}`), 0600))
-	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
-	_, err = readRootfsQualification(source)
-	require.NoError(t, err)
+	require.ErrorContains(t, err, "standard managed VMM directory and StateRoot")
 }
 
 func TestRootfsQualificationBrokenBundlesFailClosed(t *testing.T) {
-	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", "")
 	for _, test := range []string{"missing-manifest", "missing-entry", "wrong-revision"} {
 		t.Run(test, func(t *testing.T) {
 			source := qualificationSourcesFixture(t)
@@ -391,22 +354,35 @@ func TestRootfsQualificationTopologyDefaults(t *testing.T) {
 			state.VMM = &firecrackervmm.Selection{Version: "1.17.0", BinaryPath: filepath.Join(test.dir, "versions", "1.17.0", "firecracker")}
 		}
 		source := d.rootfsQualificationSources(state, artifacts.VMManifest{})
-		require.Equal(t, test.standard, source.StandardTopology)
 		require.Equal(t, test.managed, source.ManagedVMM)
+		require.Equal(t, test.standard, source.StandardTopology)
 	}
 }
 
-func TestRootfsQualificationCustomVMMNeedsExplicitDigest(t *testing.T) {
-	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", "")
+func TestNativeCapabilityImpliedByStandardTopology(t *testing.T) {
+	// The heartbeat carries the node-level eligibility predicate: a
+	// fixed-binary or relocated-path fastlet omits the capability and
+	// rejects at admission instead of failing later at capture.
+	standard := &Driver{config: runtimecatalog.FirecrackerConfig{
+		VMMDir: firecrackervmm.DefaultDir, StateRoot: runtimecatalog.FirecrackerStateRootDir,
+	}}
+	require.True(t, standard.SupportsNativeRootfsOnlySnapshots())
+	customState := &Driver{config: runtimecatalog.FirecrackerConfig{
+		VMMDir: firecrackervmm.DefaultDir, StateRoot: "/custom/state",
+	}}
+	require.False(t, customState.SupportsNativeRootfsOnlySnapshots())
+	fixedBinary := &Driver{config: runtimecatalog.FirecrackerConfig{
+		VMMDir: "", StateRoot: runtimecatalog.FirecrackerStateRootDir,
+	}}
+	require.False(t, fixedBinary.SupportsNativeRootfsOnlySnapshots())
+}
+
+func TestRootfsQualificationRejectsUnmanagedVMM(t *testing.T) {
 	source := qualificationSourcesFixture(t)
 	source.ManagedVMM = false
+	source.StandardTopology = false
 	_, err := readRootfsQualification(source)
-	require.ErrorContains(t, err, "custom VMM")
-	path := filepath.Join(t.TempDir(), "profile.json")
-	require.NoError(t, os.WriteFile(path, []byte(`{"firecrackerSHA256":"`+strings.Repeat("a", 64)+`"}`), 0600))
-	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
-	_, err = readRootfsQualification(source)
-	require.NoError(t, err)
+	require.ErrorContains(t, err, "standard managed VMM directory and StateRoot")
 }
 
 func TestRootfsQualificationKernelDiagnostics(t *testing.T) {
@@ -415,16 +391,6 @@ func TestRootfsQualificationKernelDiagnostics(t *testing.T) {
 	state.Config.Desired.Image = "oci://example.com/template:latest"
 	_, err := d.qualifyRootfsSource(t.Context(), state, artifacts.VMManifest{})
 	require.ErrorContains(t, err, "rebuild the template and recreate the sandbox")
-	profile := filepath.Join(t.TempDir(), "qualification.json")
-	q := rootfsQualification{FirecrackerSHA256: strings.Repeat("a", 64), KernelSHA256: strings.Repeat("b", 64), OverlayBDSHA256: strings.Repeat("c", 64), StorageRevision: "tested", ExclusiveExt4: true}
-	raw, err := json.Marshal(q)
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(profile, raw, 0600))
-	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", profile)
-	manifest := artifacts.VMManifest{}
-	manifest.Kernel.SHA256 = state.BootKernelSHA256
-	_, err = d.qualifyRootfsSource(t.Context(), state, manifest)
-	require.ErrorContains(t, err, "qualification pins kernelSHA256")
 }
 
 func TestNativeRootfsCapturedManifestAndReadiness(t *testing.T) {
@@ -459,28 +425,14 @@ func TestNativeRootfsCapturedManifestAndReadiness(t *testing.T) {
 }
 
 func TestNativeQualificationUsesSelectedVMMWithoutOverlayBDBundle(t *testing.T) {
+	// #224: native capture never touches the OverlayBD bundle — backend,
+	// exclusive-writer contract and kernel provenance all derive from the
+	// managed selection and the source template.
 	source := rootfsQualificationSources{Native: true, ManagedVMM: true, KernelSHA256: strings.Repeat("a", 64), OverlayBDBundle: "/missing-oci-bundle", StandardTopology: true}
-	path := filepath.Join(t.TempDir(), "profile.json")
-	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
-	for _, tc := range []struct {
-		body string
-		ok   bool
-	}{
-		{`{"backend":"native","storageRevision":"qualified-xfs","exclusiveExt4":true}`, true},
-		{`{"backend":"native","storageRevision":"qualified-xfs"}`, false},
-		{`{"backend":"native","exclusiveExt4":true}`, false},
-		{`{"backend":"native","storageRevision":null,"exclusiveExt4":true}`, false},
-		{`{"backend":"other","storageRevision":"qualified-xfs","exclusiveExt4":true}`, false},
-	} {
-		require.NoError(t, os.WriteFile(path, []byte(tc.body), 0600))
-		q, err := readRootfsQualification(source)
-		if tc.ok {
-			require.NoError(t, err)
-			require.Equal(t, source.KernelSHA256, q.KernelSHA256)
-			require.Empty(t, q.FirecrackerSHA256)
-			require.Empty(t, q.OverlayBDSHA256)
-		} else {
-			require.Error(t, err)
-		}
-	}
+	q, err := readRootfsQualification(source)
+	require.NoError(t, err)
+	require.Equal(t, source.KernelSHA256, q.KernelSHA256)
+	require.Equal(t, captureBackendNative, q.Backend)
+	require.Empty(t, q.OverlayBDSHA256)
+	require.True(t, q.ExclusiveExt4)
 }

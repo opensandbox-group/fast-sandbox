@@ -99,25 +99,15 @@ The driver reads `libexec/overlaybd-ublkd` from the resolved OCI tools release's
 
 Attestation is best-effort for storage availability: a socket startup timeout or attestation failure revokes the record and logs a warning without stopping a healthy daemon. RootfsOnly remains unavailable without a valid record; Full storage operation does not depend on that record. The launcher continues to supervise the daemon and propagates its exit status. Restart the launcher to retry attestation after correcting the failure.
 
-`FAST_SANDBOX_ROOTFS_QUALIFICATION` is now optional. When set, it must name an absolute, operator-owned JSON file. Fields explicitly supplied override automatic values; malformed, empty, null, unknown, or false `exclusiveExt4` overrides fail closed. A complete legacy profile still works without bundles, provided the source template records `kernel.sha256` and the live instance has matching boot provenance. Missing manifest digests require rebuilding the template and recreating the sandbox; overrides cannot supply that provenance:
+`FAST_SANDBOX_ROOTFS_QUALIFICATION` is no longer read. Qualification derives entirely from the deployment: the kernel digest comes from the source template's boot provenance, the OverlayBD backend digest comes from the deployed bundle, and the exclusive-writer contract follows the managed VMM release layout. Missing manifest digests require rebuilding the template and recreating the sandbox.
 
-```json
-{
-  "firecrackerSHA256": "<expected Firecracker executable digest>",
-  "kernelSHA256": "<expected boot kernel digest>",
-  "overlaybdSHA256": "<expected overlaybd-ublkd executable digest>",
-  "storageRevision": "<operator-validated storage revision>",
-  "exclusiveExt4": true
-}
-```
-
-With a persisted managed VMM selection under `/opt/fast-sandbox/firecracker` and StateRoot `/var/lib/fast-sandbox/firecracker`, `exclusiveExt4` defaults to true as a platform deployment assumption. It is not an automatic proof: raw block writers, swap on the protected device, host bypass writers, extra writable drives and external freeze/thaw must still be excluded. Custom topologies require explicit `exclusiveExt4: true`; fixed/custom VMMs require explicit `firecrackerSHA256`. Explicit false always rejects capture. Partial profiles inherit remaining expected values. Kernel overrides cannot bypass the independent comparison with the source template's boot provenance.
+With a persisted managed VMM selection, `exclusiveExt4` holds as a platform deployment assumption. It is not an automatic proof: raw block writers, swap on the protected device, host bypass writers, extra writable drives and external freeze/thaw must still be excluded by the deployment. A VMM selection outside the managed release layout has no deployment-rooted identity and rejects RootfsOnly capture.
 
 Fastlet, runtime-agent and tools are delivered as one coordinated FSB release. Missing backend metadata rejects RootfsOnly while Full storage operation continues. Existing templates retain their recorded VMM version; no historical manifests are rewritten and Full restore compatibility checks remain unchanged. Rebuild/recreate a source with the supported version to capture it. This removes redundant manual digest configuration, not release-level validation.
 
 `TestRootfsFastletChainE2E` (Linux, build tag `firecracker`) exercises Fastlet manager admission and worker dispatch, real KVM/OverlayBD capture, a temporary local Registry, a second cold boot with a higher disk boot counter, independent network namespaces and ping, and recovery through a fresh Driver from a paused capture journal. It does not run a Kubernetes control plane, HTTP ingress, production application image, actual Fastlet SIGKILL, or Intel/AMD migration. The test uses a previously qualified rootfs seed bundle through `FSB_TEST_FASTLET_SEED`, plus `FC_BINARY`, `FC_KERNEL` and the node qualification profile. It does not install node prerequisites.
 
-To exercise automatic qualification, set `FSB_TEST_AUTO_QUALIFICATION=1`, leave `FAST_SANDBOX_ROOTFS_QUALIFICATION` unset, and use `FC_VMM_DIR=/opt/fast-sandbox/firecracker` with a 1.17.0 source template. An external harness must provide the deployed checksum bundles, a launcher-attested daemon, and an empty `/var/lib/fast-sandbox/firecracker` in an isolated mount namespace. Never run this mode against a populated node. Set `FC_JAILER` to exercise the jailer launch path. This mode also rejects deliberately mismatched VMM, kernel and backend overrides before exercising capture, publication, cold boot and recovery.
+To exercise automatic qualification, set `FSB_TEST_AUTO_QUALIFICATION=1` and use `FC_VMM_DIR=/opt/fast-sandbox/firecracker` with a 1.17.0 source template. The chain E2E tests require the flag: rootfs-only capture qualifies via the standard managed VMM directory and StateRoot, so the external harness must provide the deployed checksum bundles, a launcher-attested daemon, and an empty `/var/lib/fast-sandbox/firecracker` in an isolated mount namespace. Never run this mode against a populated node. Set `FC_JAILER` to exercise the jailer launch path.
 
 
 ### Recovery and publication ownership
@@ -134,13 +124,7 @@ The capture preflight budgets upper copies and mandatory packing; it does not re
 
 Native templates use a file-backed ext4 disk rather than OverlayBD upper data/index. Capture freezes the Guest filesystem, pauses the VM, synchronizes the held disk descriptor, and cuts an XFS reflink before recovery. Publication uploads `rootfs.ext4`, checksums, the manifest and declared platform bundles through the runtime-agent object-store path. RootfsOnly artifacts contain no memory or vmstate; cold boot restarts the Guest and its processes. Checkpoint resume from a RootfsOnly artifact is rejected.
 
-Native capture remains an explicit storage opt-in. Set `FAST_SANDBOX_ROOTFS_QUALIFICATION` to an operator-owned absolute JSON path containing:
-
-```json
-{"backend":"native","storageRevision":"YOUR_VALIDATED_XFS_STACK","exclusiveExt4":true}
-```
-
-For managed VMM delivery, the running Firecracker is checked against the instance's selected installation and the kernel against the source manifest; no manual VMM/kernel digest is required. Custom fixed binaries still require an explicit `firecrackerSHA256`. Capture requires Firecracker 1.17.0. Native profiles do not read the OverlayBD tools bundle or daemon attestation. The storage revision and exclusive-writer declaration must describe the actual validated deployment; the driver requires XFS reflink and has no full-copy fallback during capture. A native profile cannot qualify an OverlayBD source, or vice versa. Configure separate Fastlets for the two profile contracts.
+Native capture requires no storage opt-in beyond the standard deployment: capture requires Firecracker 1.17.0 and the driver requires XFS reflink with no full-copy fallback; the running Firecracker is checked against the instance's selected installation and the kernel against the source manifest. A VMM selection outside the managed release layout, or a non-standard StateRoot, rejects native capture.
 
 Rebuild native templates to include the default helper and verified kernel metadata. Injection alone is insufficient: the native builder configures vsock and requires the freeze/thaw probe before publishing the capability. Existing templates without this metadata remain usable for their existing Full flow but cannot provide RootfsOnly capture.
 
