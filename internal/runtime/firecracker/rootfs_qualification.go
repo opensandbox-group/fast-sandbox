@@ -17,15 +17,23 @@ import (
 	"fast-sandbox/internal/firecrackervmm"
 )
 
-// Expectations come from deployed bundles, with optional operator overrides.
+// The authored profile carries only what the node cannot derive: the
+// executable digest of a custom VMM and an explicit exclusive-writer
+// declaration. Everything else — backend, kernel and overlaybd digests, the
+// storage revision — follows the deployed source and topology.
+type rootfsQualificationProfile struct {
+	FirecrackerSHA256 string `json:"firecrackerSHA256,omitempty"`
+	ExclusiveExt4     *bool  `json:"exclusiveExt4,omitempty"`
+}
+
 // ExclusiveExt4 remains a topology assumption, not a proof about arbitrary writers.
 type rootfsQualification struct {
-	Backend           string `json:"backend,omitempty"`
-	FirecrackerSHA256 string `json:"firecrackerSHA256"`
-	KernelSHA256      string `json:"kernelSHA256"`
-	OverlayBDSHA256   string `json:"overlaybdSHA256"`
-	StorageRevision   string `json:"storageRevision"`
-	ExclusiveExt4     bool   `json:"exclusiveExt4"`
+	Backend           string
+	FirecrackerSHA256 string
+	KernelSHA256      string
+	OverlayBDSHA256   string
+	StorageRevision   string
+	ExclusiveExt4     bool
 }
 
 type rootfsQualificationSources struct {
@@ -48,70 +56,46 @@ func (d *Driver) rootfsQualificationSources(state *SandboxState, m artifacts.VMM
 }
 
 func readRootfsQualification(source rootfsQualificationSources) (rootfsQualification, error) {
-	q, provided, err := readQualificationOverrides()
+	profile, err := readQualificationOverrides()
 	if err != nil {
-		return q, err
+		return rootfsQualification{}, err
 	}
-	// Native captures need no authored profile: the storage identity derives
-	// from the StateRoot below and the exclusive-writer contract follows the
-	// same standard topology the OverlayBD path trusts (#224). An explicit
-	// profile still speaks for the node.
-	if _, hasProfileBackend := provided["backend"]; !hasProfileBackend && source.Native {
+	q := rootfsQualification{FirecrackerSHA256: profile.FirecrackerSHA256}
+	// The backend follows the source encoding; there is no profile field for
+	// it. Native captures derive their storage identity from the StateRoot —
+	// the same role the deployed bundle's REVISION plays for OverlayBD (#224).
+	if source.Native {
 		q.Backend = captureBackendNative
-	}
-	if source.Native && q.Backend != captureBackendNative {
-		return q, errors.New("native RootfsOnly requires a separately qualified native storage profile")
-	}
-	if !source.Native && q.Backend != "" {
-		return q, errors.New("OverlayBD requires an OverlayBD qualification profile")
-	}
-	if _, ok := provided["kernelSHA256"]; !ok {
-		q.KernelSHA256 = source.KernelSHA256
-	}
-	if _, ok := provided["firecrackerSHA256"]; !ok && !source.ManagedVMM {
-		return q, errors.New("custom VMM requires explicit firecrackerSHA256 qualification")
-	}
-	_, hasBackend := provided["overlaybdSHA256"]
-	_, hasRevision := provided["storageRevision"]
-	if !source.Native && (!hasBackend || !hasRevision) {
+		if q.StorageRevision, err = stateRootStorageRevision(source.StateRoot); err != nil {
+			return rootfsQualification{}, err
+		}
+	} else {
 		entries, revision, err := readOverlayBDBundle(source.OverlayBDBundle)
 		if err != nil {
-			return q, err
+			return rootfsQualification{}, err
 		}
-		if !hasBackend {
-			// bin/overlaybd-ublkd is a wrapper, not the running executable.
-			var exists bool
-			q.OverlayBDSHA256, exists = entries["libexec/overlaybd-ublkd"]
-			if !exists {
-				return q, errors.New("OverlayBD bundle does not list libexec/overlaybd-ublkd")
-			}
+		// bin/overlaybd-ublkd is a wrapper, not the running executable.
+		var exists bool
+		q.OverlayBDSHA256, exists = entries["libexec/overlaybd-ublkd"]
+		if !exists {
+			return rootfsQualification{}, errors.New("OverlayBD bundle does not list libexec/overlaybd-ublkd")
 		}
-		if !hasRevision {
-			q.StorageRevision = revision
-		}
+		q.StorageRevision = revision
 	}
-	if source.Native && !hasRevision {
-		if q.StorageRevision, err = stateRootStorageRevision(source.StateRoot); err != nil {
-			return q, err
-		}
+	q.KernelSHA256 = source.KernelSHA256
+	if !validQualificationDigest(q.KernelSHA256) || (!source.Native && !validQualificationDigest(q.OverlayBDSHA256)) {
+		return rootfsQualification{}, errors.New("qualification requires SHA-256 digests")
 	}
-	if _, ok := provided["exclusiveExt4"]; !ok {
+	if !source.ManagedVMM && q.FirecrackerSHA256 == "" {
+		return rootfsQualification{}, errors.New("custom VMM requires firecrackerSHA256 qualification")
+	}
+	if profile.ExclusiveExt4 != nil {
+		q.ExclusiveExt4 = *profile.ExclusiveExt4
+	} else {
 		q.ExclusiveExt4 = source.StandardTopology
 	}
-	digests := []string{q.KernelSHA256}
-	if !source.Native {
-		digests = append(digests, q.OverlayBDSHA256)
-	}
-	if _, explicit := provided["firecrackerSHA256"]; explicit || q.FirecrackerSHA256 != "" {
-		digests = append(digests, q.FirecrackerSHA256)
-	}
-	for _, sum := range digests {
-		if !validQualificationDigest(sum) {
-			return q, errors.New("qualification requires SHA256 digests")
-		}
-	}
-	if !q.ExclusiveExt4 || strings.TrimSpace(q.StorageRevision) == "" {
-		return q, errors.New("qualification requires exclusive ext4 and a storage revision; custom topologies need explicit overrides")
+	if !q.ExclusiveExt4 {
+		return rootfsQualification{}, errors.New("capture requires the exclusive-writer storage contract; custom topologies must declare exclusiveExt4")
 	}
 	return q, nil
 }
@@ -129,37 +113,50 @@ func stateRootStorageRevision(stateRoot string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func readQualificationOverrides() (rootfsQualification, map[string]json.RawMessage, error) {
-	var q rootfsQualification
-	provided := map[string]json.RawMessage{}
-	if path := os.Getenv("FAST_SANDBOX_ROOTFS_QUALIFICATION"); path != "" {
-		if !filepath.IsAbs(path) {
-			return q, nil, errors.New("FAST_SANDBOX_ROOTFS_QUALIFICATION must be an absolute path")
+func readQualificationOverrides() (rootfsQualificationProfile, error) {
+	var profile rootfsQualificationProfile
+	path := os.Getenv("FAST_SANDBOX_ROOTFS_QUALIFICATION")
+	if path == "" {
+		return profile, nil
+	}
+	if !filepath.IsAbs(path) {
+		return profile, errors.New("FAST_SANDBOX_ROOTFS_QUALIFICATION must be an absolute path")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return profile, err
+	}
+	// Exact-key matching: encoding/json also accepts case variants of the
+	// known fields, so DisallowUnknownFields alone would let a typo'd
+	// override silently fall back to the derived default.
+	var provided map[string]json.RawMessage
+	if err = json.Unmarshal(raw, &provided); err != nil || provided == nil {
+		return profile, errors.New("FAST_SANDBOX_ROOTFS_QUALIFICATION must be a JSON object")
+	}
+	for name, value := range provided {
+		if name != "firecrackerSHA256" && name != "exclusiveExt4" {
+			return profile, fmt.Errorf("unknown qualification override %s", name)
 		}
-		raw, err := os.ReadFile(path)
-		if err != nil {
-			return q, nil, err
-		}
-		decoder := json.NewDecoder(bytes.NewReader(raw))
-		decoder.DisallowUnknownFields()
-		if err = decoder.Decode(&q); err != nil {
-			return q, nil, err
-		}
-		if err = json.Unmarshal(raw, &provided); err != nil || provided == nil {
-			return q, nil, errors.New("qualification overrides must be a JSON object")
-		}
-		for name, value := range provided {
-			switch name {
-			case "backend", "firecrackerSHA256", "kernelSHA256", "overlaybdSHA256", "storageRevision", "exclusiveExt4":
-			default:
-				return q, nil, fmt.Errorf("unknown qualification override %s", name)
-			}
-			if string(value) == "null" {
-				return q, nil, fmt.Errorf("qualification override %s cannot be null", name)
-			}
+		if string(value) == "null" {
+			return profile, fmt.Errorf("qualification override %s cannot be null", name)
 		}
 	}
-	return q, provided, nil
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err = decoder.Decode(&profile); err != nil {
+		return profile, fmt.Errorf("parse FAST_SANDBOX_ROOTFS_QUALIFICATION: %w", err)
+	}
+	if rawDigest, ok := provided["firecrackerSHA256"]; ok {
+		var digest string
+		if err = json.Unmarshal(rawDigest, &digest); err != nil {
+			return profile, fmt.Errorf("firecrackerSHA256 must be a string digest: %w", err)
+		}
+		if !validQualificationDigest(digest) {
+			return profile, errors.New("firecrackerSHA256 must be a lowercase SHA-256 digest")
+		}
+		profile.FirecrackerSHA256 = digest
+	}
+	return profile, nil
 }
 
 func readOverlayBDBundle(path string) (map[string]string, string, error) {

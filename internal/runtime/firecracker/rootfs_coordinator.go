@@ -515,9 +515,6 @@ func (d *Driver) qualifyRootfsSource(ctx context.Context, state *SandboxState, m
 	if err != nil {
 		return "", err
 	}
-	if q.KernelSHA256 != manifest.Kernel.SHA256 {
-		return "", fmt.Errorf("qualification pins kernelSHA256 %s; the template records %s", q.KernelSHA256, manifest.Kernel.SHA256)
-	}
 	identity, err := captureProcessIdentity(ctx, state.APIAddress, state.PID)
 	if err != nil {
 		return "", err

@@ -82,17 +82,18 @@ var _ runtimecontract.Snapshotter = (*Driver)(nil)
 func (d *Driver) SupportsRootfsOnlySnapshots() bool { return true }
 
 func (d *Driver) SupportsNativeRootfsOnlySnapshots() bool {
-	// An authored profile speaks for the node; without one, the standard
-	// topology implies the native contract the same way it implies the
-	// OverlayBD ext4 contract (#224). Per-instance VMM and kernel checks
-	// run at capture, after selection.
-	q, provided, err := readQualificationOverrides()
+	// The profile only narrows: an explicit exclusiveExt4=false disables
+	// native capture, true declares it on a custom topology. Without a
+	// profile, the standard topology implies the native contract the same
+	// way it implies the OverlayBD ext4 contract (#224). Per-instance VMM
+	// and kernel checks run at capture, after selection.
+	profile, err := readQualificationOverrides()
 	if err != nil {
-		klog.ErrorS(err, "native rootfs qualification overrides unreadable; reporting node as not native-capable")
+		klog.ErrorS(err, "native rootfs qualification profile unreadable; reporting node as not native-capable")
 		return false
 	}
-	if len(provided) > 0 {
-		return q.Backend == captureBackendNative && q.ExclusiveExt4 && strings.TrimSpace(q.StorageRevision) != ""
+	if profile.ExclusiveExt4 != nil {
+		return *profile.ExclusiveExt4
 	}
 	return filepath.Clean(d.config.VMMDir) == firecrackervmm.DefaultDir &&
 		filepath.Clean(d.config.StateRoot) == runtimecatalog.FirecrackerStateRootDir

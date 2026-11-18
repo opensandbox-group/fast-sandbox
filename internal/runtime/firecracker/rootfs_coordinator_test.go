@@ -22,29 +22,31 @@ import (
 )
 
 func TestRootfsQualificationFailClosed(t *testing.T) {
+	// The authored profile carries only firecrackerSHA256 (custom VMM
+	// attestation) and exclusiveExt4 (topology declaration / kill switch);
+	// unknown fields and malformed digests fail loudly rather than falling
+	// back to derived defaults.
 	sum := strings.Repeat("a", 64)
-	valid := rootfsQualification{FirecrackerSHA256: sum, KernelSHA256: sum, OverlayBDSHA256: sum, StorageRevision: "validated", ExclusiveExt4: true}
+	source := rootfsQualificationSources{
+		Native: true, KernelSHA256: sum, ManagedVMM: true, StandardTopology: true, StateRoot: t.TempDir(),
+	}
 	for _, tc := range []struct {
-		name   string
-		mutate func(*rootfsQualification)
-		ok     bool
+		name, body string
+		ok         bool
 	}{
-		{"qualified", func(*rootfsQualification) {}, true},
-		{"native", func(q *rootfsQualification) { q.Backend = "native"; q.OverlayBDSHA256 = "" }, true},
-		{"unknown-backend", func(q *rootfsQualification) { q.Backend = "unknown" }, false},
-		{"unqualified-storage", func(q *rootfsQualification) { q.OverlayBDSHA256 = "" }, false},
-		{"raw-writers", func(q *rootfsQualification) { q.ExclusiveExt4 = false }, false},
-		{"bad-kernel", func(q *rootfsQualification) { q.KernelSHA256 = "unknown" }, false},
+		{"empty-profile", `{}`, true},
+		{"explicit-disable", `{"exclusiveExt4":false}`, false},
+		{"explicit-enable", `{"exclusiveExt4":true}`, true},
+		{"empty-digest", `{"firecrackerSHA256":""}`, false},
+		{"bad-digest", `{"firecrackerSHA256":"nope"}`, false},
+		{"typo", `{"exclusiveEXT4":true}`, false},
+		{"removed-field", `{"kernelSHA256":"` + sum + `"}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			q := valid
-			tc.mutate(&q)
-			raw, err := json.Marshal(q)
-			require.NoError(t, err)
-			path := filepath.Join(t.TempDir(), "qualification.json")
-			require.NoError(t, os.WriteFile(path, raw, 0600))
+			path := filepath.Join(t.TempDir(), "profile.json")
+			require.NoError(t, os.WriteFile(path, []byte(tc.body), 0600))
 			t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
-			_, err = readRootfsQualification(rootfsQualificationSources{Native: tc.name == "native"})
+			_, err := readRootfsQualification(source)
 			if tc.ok {
 				require.NoError(t, err)
 			} else {
@@ -52,9 +54,6 @@ func TestRootfsQualificationFailClosed(t *testing.T) {
 			}
 		})
 	}
-	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", "")
-	_, err := readRootfsQualification(rootfsQualificationSources{})
-	require.Error(t, err)
 }
 
 func TestNativeRootfsQualificationSelfDerives(t *testing.T) {
@@ -98,6 +97,18 @@ func TestNativeCapabilityImpliedByStandardTopology(t *testing.T) {
 	require.True(t, standard.SupportsNativeRootfsOnlySnapshots())
 	custom := &Driver{config: runtimecatalog.FirecrackerConfig{VMMDir: "/custom/vmm", StateRoot: "/custom/state"}}
 	require.False(t, custom.SupportsNativeRootfsOnlySnapshots())
+
+	// The profile's exclusiveExt4 is the override in both directions: it
+	// declares the contract on a custom topology and disables it on a
+	// standard one.
+	declare := filepath.Join(t.TempDir(), "profile.json")
+	require.NoError(t, os.WriteFile(declare, []byte(`{"exclusiveExt4":true}`), 0600))
+	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", declare)
+	require.True(t, custom.SupportsNativeRootfsOnlySnapshots())
+	disable := filepath.Join(t.TempDir(), "profile.json")
+	require.NoError(t, os.WriteFile(disable, []byte(`{"exclusiveExt4":false}`), 0600))
+	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", disable)
+	require.False(t, standard.SupportsNativeRootfsOnlySnapshots())
 }
 
 func TestRootfsCoordinatorRejectsBeforeSideEffects(t *testing.T) {
@@ -364,10 +375,8 @@ func TestRootfsQualificationDefaultsAndOverrides(t *testing.T) {
 		name, body string
 		ok         bool
 	}{
-		{"partial", `{"storageRevision":"operator-tested"}`, true},
 		{"explicit-disable", `{"exclusiveExt4":false}`, false},
 		{"empty-digest", `{"firecrackerSHA256":""}`, false},
-		{"invalid-digest", `{"kernelSHA256":"wrong"}`, false},
 		{"null", `{"exclusiveExt4":null}`, false},
 		{"typo", `{"exclusiveEXT4":true}`, false},
 		{"not-object", `null`, false},
@@ -458,16 +467,6 @@ func TestRootfsQualificationKernelDiagnostics(t *testing.T) {
 	state.Config.Desired.Image = "oci://example.com/template:latest"
 	_, err := d.qualifyRootfsSource(t.Context(), state, artifacts.VMManifest{})
 	require.ErrorContains(t, err, "rebuild the template and recreate the sandbox")
-	profile := filepath.Join(t.TempDir(), "qualification.json")
-	q := rootfsQualification{FirecrackerSHA256: strings.Repeat("a", 64), KernelSHA256: strings.Repeat("b", 64), OverlayBDSHA256: strings.Repeat("c", 64), StorageRevision: "tested", ExclusiveExt4: true}
-	raw, err := json.Marshal(q)
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(profile, raw, 0600))
-	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", profile)
-	manifest := artifacts.VMManifest{}
-	manifest.Kernel.SHA256 = state.BootKernelSHA256
-	_, err = d.qualifyRootfsSource(t.Context(), state, manifest)
-	require.ErrorContains(t, err, "qualification pins kernelSHA256")
 }
 
 func TestNativeRootfsCapturedManifestAndReadiness(t *testing.T) {
@@ -509,21 +508,20 @@ func TestNativeQualificationUsesSelectedVMMWithoutOverlayBDBundle(t *testing.T) 
 		body string
 		ok   bool
 	}{
-		// #224: partial native profiles inherit the topology defaults —
-		// exclusiveExt4 from StandardTopology, storageRevision from the
-		// StateRoot identity — exactly like OverlayBD partial overrides.
-		{`{"backend":"native","storageRevision":"qualified-xfs","exclusiveExt4":true}`, true},
-		{`{"backend":"native","storageRevision":"qualified-xfs"}`, true},
-		{`{"backend":"native","exclusiveExt4":true}`, true},
-		{`{"backend":"native","storageRevision":null,"exclusiveExt4":true}`, false},
-		{`{"backend":"other","storageRevision":"qualified-xfs","exclusiveExt4":true}`, false},
+		// #224: native capture never touches the OverlayBD bundle, and the
+		// profile narrows only firecrackerSHA256/exclusiveExt4 — everything
+		// else derives from the source and topology.
+		{`{}`, true},
+		{`{"exclusiveExt4":false}`, false},
+		{`{"firecrackerSHA256":"` + strings.Repeat("a", 64) + `"}`, true},
+		{`{"bogus":1}`, false},
 	} {
 		require.NoError(t, os.WriteFile(path, []byte(tc.body), 0600))
 		q, err := readRootfsQualification(source)
 		if tc.ok {
 			require.NoError(t, err)
 			require.Equal(t, source.KernelSHA256, q.KernelSHA256)
-			require.Empty(t, q.FirecrackerSHA256)
+			require.Equal(t, captureBackendNative, q.Backend)
 			require.Empty(t, q.OverlayBDSHA256)
 			require.NotEmpty(t, q.StorageRevision)
 			require.True(t, q.ExclusiveExt4)
