@@ -45,6 +45,7 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 	binary, kernel := os.Getenv("FC_BINARY"), os.Getenv("FC_KERNEL")
 	require.NotEmpty(t, binary)
 	require.NotEmpty(t, kernel)
+	require.NotEmpty(t, os.Getenv("FC_VMM_DIR"), "rootfs-only capture requires a managed VMM release layout (set FC_VMM_DIR)")
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
 	defer cancel()
 	root, err := os.MkdirTemp(filepath.Dir(seed), "ns3-")
@@ -153,18 +154,6 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 	sums := map[string]string{}
 	kernelEntry, err := artifacts.FileEntry(kernel, sums)
 	require.NoError(t, err)
-	vmmEntry, err := artifacts.FileEntry(binary, sums)
-	require.NoError(t, err)
-	qualification := map[string]any{"backend": "native", "storageRevision": "disposable-XFS-KVM-test", "exclusiveExt4": true}
-	if profile.Firecracker.VMMDir == "" {
-		qualification["kernelSHA256"] = kernelEntry.SHA256
-		qualification["firecrackerSHA256"] = vmmEntry.SHA256
-	}
-	raw, err := json.Marshal(qualification)
-	require.NoError(t, err)
-	qualificationPath := filepath.Join(root, "qualification.json")
-	require.NoError(t, os.WriteFile(qualificationPath, raw, 0600))
-	t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", qualificationPath)
 	require.Contains(t, manager.SnapshotCapabilities(), fastletapi.CapabilityNativeRootfsOnlySnapshots)
 	bundle := filepath.Join(root, "seed")
 	require.NoError(t, os.Mkdir(bundle, 0700))
@@ -242,12 +231,10 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 		defer driver.DeleteSandbox(context.Background(), id)
 		live, err := loadState(filepath.Join(driver.config.StateRoot, sandboxStateDir, id))
 		require.NoError(t, err)
-		if profile.Firecracker.VMMDir != "" {
-			require.NotNil(t, live.VMM)
-			require.Equal(t, m.Compatibility.FirecrackerVersion, live.VMM.Version)
-			require.Equal(t, filepath.Join(profile.Firecracker.VMMDir, "versions", live.VMM.Version, "firecracker"), live.VMM.BinaryPath)
-			require.NoError(t, qualifyVMMExecutable(live, ""))
-		}
+		require.NotNil(t, live.VMM)
+		require.Equal(t, m.Compatibility.FirecrackerVersion, live.VMM.Version)
+		require.Equal(t, filepath.Join(profile.Firecracker.VMMDir, "versions", live.VMM.Version, "firecracker"), live.VMM.BinaryPath)
+		require.NoError(t, qualifyVMMExecutable(live))
 		vm := driver.newClient(live.APIAddress)
 		defer vm.Close()
 		require.Eventually(t, func() bool { _, _, err := driver.captureGuest(ctx, live, m, vm); return err == nil }, 30*time.Second, 100*time.Millisecond)

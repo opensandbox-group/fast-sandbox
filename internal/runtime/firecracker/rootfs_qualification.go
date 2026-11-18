@@ -9,8 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"golang.org/x/sys/unix"
-
 	"fast-sandbox/internal/artifacts"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 )
@@ -18,15 +16,12 @@ import (
 // The derived qualification records everything a native or OverlayBD
 // capture attests. There is no authored profile: the node derives the whole
 // contract from its own deployment — the source manifest's boot provenance,
-// the deployed OverlayBD bundle, and the StateRoot filesystem identity.
-// ExclusiveExt4 follows the managed VMM release layout: a Fastlet that boots
-// its microVMs from the configured releases directory owns the deployment's
-// storage contract (#224).
+// the deployed OverlayBD bundle, and the exclusive-writer contract implied
+// by the managed VMM release layout (#224).
 type rootfsQualification struct {
 	Backend         string
 	KernelSHA256    string
 	OverlayBDSHA256 string
-	StorageRevision string
 	ExclusiveExt4   bool
 }
 
@@ -49,18 +44,11 @@ func (d *Driver) rootfsQualificationSources(state *SandboxState, m artifacts.VMM
 
 func readRootfsQualification(source rootfsQualificationSources) (rootfsQualification, error) {
 	q := rootfsQualification{ExclusiveExt4: source.ManagedVMM}
-	// The backend follows the source encoding. Native captures derive their
-	// storage identity from the StateRoot — the same role the deployed
-	// bundle's REVISION plays for OverlayBD (#224).
+	// The backend follows the source encoding.
 	if source.Native {
 		q.Backend = captureBackendNative
-		revision, err := stateRootStorageRevision(source.StateRoot)
-		if err != nil {
-			return rootfsQualification{}, err
-		}
-		q.StorageRevision = revision
 	} else {
-		entries, revision, err := readOverlayBDBundle(source.OverlayBDBundle)
+		entries, _, err := readOverlayBDBundle(source.OverlayBDBundle)
 		if err != nil {
 			return rootfsQualification{}, err
 		}
@@ -70,29 +58,18 @@ func readRootfsQualification(source rootfsQualificationSources) (rootfsQualifica
 		if !exists {
 			return rootfsQualification{}, errors.New("OverlayBD bundle does not list libexec/overlaybd-ublkd")
 		}
-		q.StorageRevision = revision
 	}
 	q.KernelSHA256 = source.KernelSHA256
-	if !validQualificationDigest(q.KernelSHA256) || (!source.Native && !validQualificationDigest(q.OverlayBDSHA256)) {
-		return rootfsQualification{}, errors.New("qualification requires SHA-256 digests")
+	if !validQualificationDigest(q.KernelSHA256) {
+		return rootfsQualification{}, errors.New("the source template does not record a valid kernel SHA-256; rebuild the template and recreate the sandbox")
+	}
+	if !source.Native && !validQualificationDigest(q.OverlayBDSHA256) {
+		return rootfsQualification{}, errors.New("the deployed OverlayBD bundle does not provide a valid libexec/overlaybd-ublkd digest")
 	}
 	if !q.ExclusiveExt4 {
 		return rootfsQualification{}, errors.New("rootfs-only capture requires a managed VMM release layout")
 	}
 	return q, nil
-}
-
-// stateRootStorageRevision derives a stable storage identity from the
-// StateRoot filesystem, standing in for the bundle REVISION the OverlayBD
-// path derives: changing the backing filesystem invalidates prior native
-// capture journals and attestations.
-func stateRootStorageRevision(stateRoot string) (string, error) {
-	var st unix.Statfs_t
-	if err := unix.Statfs(stateRoot, &st); err != nil {
-		return "", fmt.Errorf("read the StateRoot storage identity: %w", err)
-	}
-	sum := sha256.Sum256([]byte(fmt.Sprintf("statfs:%x:%x:%d", st.Fsid.Val[0], st.Fsid.Val[1], st.Blocks)))
-	return hex.EncodeToString(sum[:]), nil
 }
 
 func readOverlayBDBundle(path string) (map[string]string, string, error) {

@@ -23,32 +23,19 @@ import (
 
 func TestNativeRootfsQualificationSelfDerives(t *testing.T) {
 	// #224: there is no authored profile — the backend and the
-	// exclusive-writer contract follow the managed release layout, and the
-	// storage revision derives from the StateRoot filesystem identity.
+	// exclusive-writer contract follow the managed release layout.
 	sum := strings.Repeat("b", 64)
-	stateRoot := t.TempDir()
 	sources := rootfsQualificationSources{
-		Native: true, KernelSHA256: sum, ManagedVMM: true, StateRoot: stateRoot,
+		Native: true, KernelSHA256: sum, ManagedVMM: true,
 	}
 	q, err := readRootfsQualification(sources)
 	require.NoError(t, err)
 	require.Equal(t, captureBackendNative, q.Backend)
 	require.True(t, q.ExclusiveExt4)
-	require.NotEmpty(t, q.StorageRevision)
-	stable, err := readRootfsQualification(sources)
-	require.NoError(t, err)
-	require.Equal(t, q.StorageRevision, stable.StorageRevision)
-
-	// A non-existent StateRoot cannot yield a storage identity.
-	_, err = readRootfsQualification(rootfsQualificationSources{
-		Native: true, KernelSHA256: sum, ManagedVMM: true,
-		StateRoot: filepath.Join(stateRoot, "missing"),
-	})
-	require.Error(t, err)
 
 	// A VMM outside the managed release layout stays fail-closed.
 	_, err = readRootfsQualification(rootfsQualificationSources{
-		Native: true, KernelSHA256: sum, ManagedVMM: false, StateRoot: stateRoot,
+		Native: true, KernelSHA256: sum, ManagedVMM: false,
 	})
 	require.ErrorContains(t, err, "managed VMM release layout")
 }
@@ -310,7 +297,6 @@ func TestRootfsQualificationDefaultsAndOverrides(t *testing.T) {
 	require.Equal(t, strings.Repeat("b", 64), q.OverlayBDSHA256, "use executable, not wrapper digest")
 	require.Equal(t, source.KernelSHA256, q.KernelSHA256)
 	require.True(t, q.ExclusiveExt4)
-	require.Len(t, q.StorageRevision, 64)
 	// A VMM outside the managed release layout stays fail-closed.
 	source.ManagedVMM = false
 	_, err = readRootfsQualification(source)
@@ -408,14 +394,13 @@ func TestNativeRootfsCapturedManifestAndReadiness(t *testing.T) {
 
 func TestNativeQualificationUsesSelectedVMMWithoutOverlayBDBundle(t *testing.T) {
 	// #224: native capture never touches the OverlayBD bundle — backend,
-	// exclusive-writer contract and storage identity all derive from the
-	// managed selection and the StateRoot filesystem.
-	source := rootfsQualificationSources{Native: true, ManagedVMM: true, KernelSHA256: strings.Repeat("a", 64), OverlayBDBundle: "/missing-oci-bundle", StateRoot: t.TempDir()}
+	// exclusive-writer contract and kernel provenance all derive from the
+	// managed selection and the source template.
+	source := rootfsQualificationSources{Native: true, ManagedVMM: true, KernelSHA256: strings.Repeat("a", 64), OverlayBDBundle: "/missing-oci-bundle"}
 	q, err := readRootfsQualification(source)
 	require.NoError(t, err)
 	require.Equal(t, source.KernelSHA256, q.KernelSHA256)
 	require.Equal(t, captureBackendNative, q.Backend)
 	require.Empty(t, q.OverlayBDSHA256)
-	require.NotEmpty(t, q.StorageRevision)
 	require.True(t, q.ExclusiveExt4)
 }

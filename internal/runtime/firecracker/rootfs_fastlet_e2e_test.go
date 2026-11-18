@@ -65,6 +65,7 @@ func TestRootfsFastletChainE2E(t *testing.T) {
 	binary, kernel := os.Getenv("FC_BINARY"), os.Getenv("FC_KERNEL")
 	require.NotEmpty(t, binary)
 	require.NotEmpty(t, kernel)
+	require.NotEmpty(t, os.Getenv("FC_VMM_DIR"), "rootfs-only capture requires a managed VMM release layout (set FC_VMM_DIR)")
 	pod := "rootfs-e2e-pod"
 	profile := runtimecatalog.RuntimeProfile{Name: apiv1alpha2.RuntimeFirecracker, ProfileHash: "rootfs-e2e", Firecracker: &runtimecatalog.FirecrackerConfig{BinaryPath: binary, VMMDir: os.Getenv("FC_VMM_DIR"), KernelPath: kernel, JailerPath: os.Getenv("FC_JAILER"), RootfsPath: "/unused-oci-rootfs", StateRoot: filepath.Join(root, "state"), DefaultVCPUs: 1, DefaultMemory: "256Mi", BootTimeoutSeconds: 30}, Capabilities: runtimecatalog.Capabilities{DefaultState: runtimecatalog.CapabilityReady}}
 	autoQualification := os.Getenv("FSB_TEST_AUTO_QUALIFICATION") == "1"
@@ -150,7 +151,7 @@ func TestRootfsFastletChainE2E(t *testing.T) {
 			require.NotNil(t, state.VMM)
 			require.Equal(t, manifest.Compatibility.FirecrackerVersion, state.VMM.Version)
 			require.Equal(t, filepath.Join(profile.Firecracker.VMMDir, "versions", state.VMM.Version, "firecracker"), state.VMM.BinaryPath)
-			require.NoError(t, qualifyVMMExecutable(state, ""))
+			require.NoError(t, qualifyVMMExecutable(state))
 		}
 		actualNS, e := os.Stat(fmt.Sprintf("/proc/%d/ns/net", state.PID))
 		require.NoError(t, e)
