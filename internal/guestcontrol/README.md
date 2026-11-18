@@ -107,7 +107,7 @@ Fastlet, runtime-agent and tools are delivered as one coordinated FSB release. M
 
 `TestRootfsFastletChainE2E` (Linux, build tag `firecracker`) exercises Fastlet manager admission and worker dispatch, real KVM/OverlayBD capture, a temporary local Registry, a second cold boot with a higher disk boot counter, independent network namespaces and ping, and recovery through a fresh Driver from a paused capture journal. It does not run a Kubernetes control plane, HTTP ingress, production application image, actual Fastlet SIGKILL, or Intel/AMD migration. The test uses a previously qualified rootfs seed bundle through `FSB_TEST_FASTLET_SEED`, plus `FC_BINARY`, `FC_KERNEL` and the node qualification profile. It does not install node prerequisites.
 
-To exercise automatic qualification, set `FSB_TEST_AUTO_QUALIFICATION=1` and use `FC_VMM_DIR=/opt/fast-sandbox/firecracker` with a 1.17.0 source template. An external harness must provide the deployed checksum bundles, a launcher-attested daemon, and an empty `/var/lib/fast-sandbox/firecracker` in an isolated mount namespace. Never run this mode against a populated node. Set `FC_JAILER` to exercise the jailer launch path.
+To exercise automatic qualification, set `FSB_TEST_AUTO_QUALIFICATION=1` and use `FC_VMM_DIR=/opt/fast-sandbox/firecracker` with a 1.17.0 source template. The chain E2E tests require the flag: rootfs-only capture qualifies via the standard managed VMM directory and StateRoot, so the external harness must provide the deployed checksum bundles, a launcher-attested daemon, and an empty `/var/lib/fast-sandbox/firecracker` in an isolated mount namespace. Never run this mode against a populated node. Set `FC_JAILER` to exercise the jailer launch path.
 
 
 ### Recovery and publication ownership
@@ -124,7 +124,7 @@ The capture preflight budgets upper copies and mandatory packing; it does not re
 
 Native templates use a file-backed ext4 disk rather than OverlayBD upper data/index. Capture freezes the Guest filesystem, pauses the VM, synchronizes the held disk descriptor, and cuts an XFS reflink before recovery. Publication uploads `rootfs.ext4`, checksums, the manifest and declared platform bundles through the runtime-agent object-store path. RootfsOnly artifacts contain no memory or vmstate; cold boot restarts the Guest and its processes. Checkpoint resume from a RootfsOnly artifact is rejected.
 
-Native capture requires no storage opt-in. Capture requires Firecracker 1.17.0 and the driver requires XFS reflink with no full-copy fallback; the running Firecracker is checked against the instance's selected installation and the kernel against the source manifest. A VMM selection outside the managed release layout rejects native capture.
+Native capture requires no storage opt-in beyond the standard deployment: capture requires Firecracker 1.17.0 and the driver requires XFS reflink with no full-copy fallback; the running Firecracker is checked against the instance's selected installation and the kernel against the source manifest. A VMM selection outside the managed release layout, or a non-standard StateRoot, rejects native capture.
 
 Rebuild native templates to include the default helper and verified kernel metadata. Injection alone is insufficient: the native builder configures vsock and requires the freeze/thaw probe before publishing the capability. Existing templates without this metadata remain usable for their existing Full flow but cannot provide RootfsOnly capture.
 

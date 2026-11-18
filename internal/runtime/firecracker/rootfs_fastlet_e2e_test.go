@@ -65,19 +65,19 @@ func TestRootfsFastletChainE2E(t *testing.T) {
 	binary, kernel := os.Getenv("FC_BINARY"), os.Getenv("FC_KERNEL")
 	require.NotEmpty(t, binary)
 	require.NotEmpty(t, kernel)
-	require.NotEmpty(t, os.Getenv("FC_VMM_DIR"), "rootfs-only capture requires a managed VMM release layout (set FC_VMM_DIR)")
-	pod := "rootfs-e2e-pod"
-	profile := runtimecatalog.RuntimeProfile{Name: apiv1alpha2.RuntimeFirecracker, ProfileHash: "rootfs-e2e", Firecracker: &runtimecatalog.FirecrackerConfig{BinaryPath: binary, VMMDir: os.Getenv("FC_VMM_DIR"), KernelPath: kernel, JailerPath: os.Getenv("FC_JAILER"), RootfsPath: "/unused-oci-rootfs", StateRoot: filepath.Join(root, "state"), DefaultVCPUs: 1, DefaultMemory: "256Mi", BootTimeoutSeconds: 30}, Capabilities: runtimecatalog.Capabilities{DefaultState: runtimecatalog.CapabilityReady}}
+	// Rootfs-only capture qualifies via the standard managed VMM directory
+	// and StateRoot (no authored profile), so the harness must mount an
+	// empty production StateRoot in an isolated namespace.
 	autoQualification := os.Getenv("FSB_TEST_AUTO_QUALIFICATION") == "1"
-	if autoQualification {
-		// The external harness must mount disposable assets and an empty state
-		// directory at the production paths; never use a populated node here.
-		require.Equal(t, "/opt/fast-sandbox/firecracker", profile.Firecracker.VMMDir)
-		profile.Firecracker.StateRoot = "/var/lib/fast-sandbox/firecracker"
-		entries, err := os.ReadDir(profile.Firecracker.StateRoot)
-		require.NoError(t, err)
-		require.Empty(t, entries, "auto-qualification E2E requires isolated empty production paths")
-	}
+	require.True(t, autoQualification, "set FSB_TEST_AUTO_QUALIFICATION=1 and mount an empty production StateRoot")
+	require.Equal(t, "/opt/fast-sandbox/firecracker", os.Getenv("FC_VMM_DIR"))
+	pod := "rootfs-e2e-pod"
+	profile := runtimecatalog.RuntimeProfile{Name: apiv1alpha2.RuntimeFirecracker, ProfileHash: "rootfs-e2e", Firecracker: &runtimecatalog.FirecrackerConfig{BinaryPath: binary, VMMDir: os.Getenv("FC_VMM_DIR"), KernelPath: kernel, JailerPath: os.Getenv("FC_JAILER"), RootfsPath: "/unused-oci-rootfs", StateRoot: "/var/lib/fast-sandbox/firecracker", DefaultVCPUs: 1, DefaultMemory: "256Mi", BootTimeoutSeconds: 30}, Capabilities: runtimecatalog.Capabilities{DefaultState: runtimecatalog.CapabilityReady}}
+	// The external harness must mount disposable assets and an empty state
+	// directory at the production paths; never use a populated node here.
+	entries, err := os.ReadDir(profile.Firecracker.StateRoot)
+	require.NoError(t, err)
+	require.Empty(t, entries, "auto-qualification E2E requires isolated empty production paths")
 	driver, err := New(profile)
 	require.NoError(t, err)
 	driver.SetFastletPodUID(pod)

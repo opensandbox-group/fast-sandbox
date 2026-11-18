@@ -11,13 +11,16 @@ import (
 
 	"fast-sandbox/internal/artifacts"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/firecrackervmm"
 )
 
 // The derived qualification records everything a native or OverlayBD
 // capture attests. There is no authored profile: the node derives the whole
 // contract from its own deployment — the source manifest's boot provenance,
 // the deployed OverlayBD bundle, and the exclusive-writer contract implied
-// by the managed VMM release layout (#224).
+// by the standard managed VMM directory and StateRoot (#224). Other layouts
+// reject capture: a relocated or shared StateRoot cannot prove the absence
+// of host-side writers to the frozen guest.
 type rootfsQualification struct {
 	Backend         string
 	KernelSHA256    string
@@ -26,24 +29,24 @@ type rootfsQualification struct {
 }
 
 type rootfsQualificationSources struct {
-	Native          bool
-	KernelSHA256    string
-	ManagedVMM      bool
-	OverlayBDBundle string
-	StateRoot       string
+	Native           bool
+	KernelSHA256     string
+	ManagedVMM       bool
+	OverlayBDBundle  string
+	StandardTopology bool
 }
 
 func (d *Driver) rootfsQualificationSources(state *SandboxState, m artifacts.VMManifest) rootfsQualificationSources {
 	managed := state.VMM.IsManaged(d.config.VMMDir)
 	return rootfsQualificationSources{
 		KernelSHA256: m.Kernel.SHA256, ManagedVMM: managed,
-		OverlayBDBundle: filepath.Join(runtimecatalog.OCIToolsDir, "current"),
-		StateRoot:       d.config.StateRoot,
+		OverlayBDBundle:  filepath.Join(runtimecatalog.OCIToolsDir, "current"),
+		StandardTopology: managed && filepath.Clean(d.config.VMMDir) == firecrackervmm.DefaultDir && filepath.Clean(d.config.StateRoot) == runtimecatalog.FirecrackerStateRootDir,
 	}
 }
 
 func readRootfsQualification(source rootfsQualificationSources) (rootfsQualification, error) {
-	q := rootfsQualification{ExclusiveExt4: source.ManagedVMM}
+	q := rootfsQualification{ExclusiveExt4: source.StandardTopology}
 	// The backend follows the source encoding.
 	if source.Native {
 		q.Backend = captureBackendNative
@@ -67,7 +70,7 @@ func readRootfsQualification(source rootfsQualificationSources) (rootfsQualifica
 		return rootfsQualification{}, errors.New("the deployed OverlayBD bundle does not provide a valid libexec/overlaybd-ublkd digest")
 	}
 	if !q.ExclusiveExt4 {
-		return rootfsQualification{}, errors.New("rootfs-only capture requires a managed VMM release layout")
+		return rootfsQualification{}, errors.New("rootfs-only capture requires the standard managed VMM directory and StateRoot; relocated or shared storage layouts cannot attest the exclusive-writer contract")
 	}
 	return q, nil
 }

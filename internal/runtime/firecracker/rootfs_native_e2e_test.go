@@ -45,7 +45,13 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 	binary, kernel := os.Getenv("FC_BINARY"), os.Getenv("FC_KERNEL")
 	require.NotEmpty(t, binary)
 	require.NotEmpty(t, kernel)
-	require.NotEmpty(t, os.Getenv("FC_VMM_DIR"), "rootfs-only capture requires a managed VMM release layout (set FC_VMM_DIR)")
+	// Native rootfs-only capture qualifies via the standard managed VMM
+	// directory and StateRoot (no authored profile), so the harness must
+	// mount an empty production StateRoot in an isolated namespace.
+	autoQualification := os.Getenv("FSB_TEST_AUTO_QUALIFICATION") == "1"
+	require.True(t, autoQualification, "set FSB_TEST_AUTO_QUALIFICATION=1 and mount an empty production StateRoot")
+	vmmDir := os.Getenv("FC_VMM_DIR")
+	require.Equal(t, "/opt/fast-sandbox/firecracker", vmmDir)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
 	defer cancel()
 	root, err := os.MkdirTemp(filepath.Dir(seed), "ns3-")
@@ -123,7 +129,10 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 	pull, err := agentpull.NewClient(storeRoot, credential, options...)
 	require.NoError(t, err)
 	pod := "native-rootfs-e2e"
-	profile := runtimecatalog.RuntimeProfile{Name: apiv1alpha2.RuntimeFirecracker, ProfileHash: "native-rootfs", Firecracker: &runtimecatalog.FirecrackerConfig{BinaryPath: binary, VMMDir: os.Getenv("FC_VMM_DIR"), KernelPath: kernel, JailerPath: os.Getenv("FC_JAILER"), RootfsPath: "/unused", StateRoot: filepath.Join(root, "state"), DefaultVCPUs: 1, DefaultMemory: "256Mi", BootTimeoutSeconds: 30}, Capabilities: runtimecatalog.Capabilities{DefaultState: runtimecatalog.CapabilityReady}}
+	profile := runtimecatalog.RuntimeProfile{Name: apiv1alpha2.RuntimeFirecracker, ProfileHash: "native-rootfs", Firecracker: &runtimecatalog.FirecrackerConfig{BinaryPath: binary, VMMDir: vmmDir, KernelPath: kernel, JailerPath: os.Getenv("FC_JAILER"), RootfsPath: "/unused", StateRoot: runtimecatalog.FirecrackerStateRootDir, DefaultVCPUs: 1, DefaultMemory: "256Mi", BootTimeoutSeconds: 30}, Capabilities: runtimecatalog.Capabilities{DefaultState: runtimecatalog.CapabilityReady}}
+	entries, err := os.ReadDir(profile.Firecracker.StateRoot)
+	require.NoError(t, err)
+	require.Empty(t, entries, "auto-qualification E2E requires isolated empty production paths")
 	driver, err := New(profile)
 	require.NoError(t, err)
 	driver.SetFastletPodUID(pod)

@@ -22,22 +22,32 @@ import (
 )
 
 func TestNativeRootfsQualificationSelfDerives(t *testing.T) {
-	// #224: there is no authored profile — the backend and the
-	// exclusive-writer contract follow the managed release layout.
+	// #224: there is no authored profile — the backend follows the source
+	// encoding and the exclusive-writer contract follows the standard
+	// managed VMM directory and StateRoot.
 	sum := strings.Repeat("b", 64)
-	sources := rootfsQualificationSources{
-		Native: true, KernelSHA256: sum, ManagedVMM: true,
+	standard := rootfsQualificationSources{
+		Native: true, KernelSHA256: sum, ManagedVMM: true, StandardTopology: true,
 	}
-	q, err := readRootfsQualification(sources)
+	q, err := readRootfsQualification(standard)
 	require.NoError(t, err)
 	require.Equal(t, captureBackendNative, q.Backend)
 	require.True(t, q.ExclusiveExt4)
 
+	// Regression (#225 review): a managed VMM with a relocated StateRoot is
+	// NOT qualified — the same disk file can carry host-side writers that a
+	// guest freeze cannot quiesce.
+	relocated := rootfsQualificationSources{
+		Native: true, KernelSHA256: sum, ManagedVMM: true, StandardTopology: false,
+	}
+	_, err = readRootfsQualification(relocated)
+	require.ErrorContains(t, err, "standard managed VMM directory and StateRoot")
+
 	// A VMM outside the managed release layout stays fail-closed.
 	_, err = readRootfsQualification(rootfsQualificationSources{
-		Native: true, KernelSHA256: sum, ManagedVMM: false,
+		Native: true, KernelSHA256: sum, ManagedVMM: false, StandardTopology: false,
 	})
-	require.ErrorContains(t, err, "managed VMM release layout")
+	require.ErrorContains(t, err, "standard managed VMM directory and StateRoot")
 }
 
 func TestRootfsCoordinatorRejectsBeforeSideEffects(t *testing.T) {
@@ -287,7 +297,7 @@ func qualificationSourcesFixture(t *testing.T) rootfsQualificationSources {
 	raw := []byte(strings.Repeat("b", 64) + "  libexec/overlaybd-ublkd\n" + strings.Repeat("d", 64) + "  bin/overlaybd-ublkd\n")
 	require.NoError(t, os.WriteFile(filepath.Join(bundle, "SHA256SUMS"), raw, 0600))
 	require.NoError(t, os.WriteFile(filepath.Join(bundle, "REVISION"), []byte(fmt.Sprintf("%x\n", sha256.Sum256(raw))), 0600))
-	return rootfsQualificationSources{KernelSHA256: strings.Repeat("c", 64), ManagedVMM: true, OverlayBDBundle: bundle, StateRoot: t.TempDir()}
+	return rootfsQualificationSources{KernelSHA256: strings.Repeat("c", 64), ManagedVMM: true, OverlayBDBundle: bundle, StandardTopology: true}
 }
 
 func TestRootfsQualificationDefaultsAndOverrides(t *testing.T) {
@@ -328,13 +338,13 @@ func TestRootfsQualificationBrokenBundlesFailClosed(t *testing.T) {
 
 func TestRootfsQualificationTopologyDefaults(t *testing.T) {
 	for _, test := range []struct {
-		dir, state string
-		managed    bool
+		dir, state        string
+		managed, standard bool
 	}{
-		{firecrackervmm.DefaultDir, "/var/lib/fast-sandbox/firecracker", true},
-		{firecrackervmm.DefaultDir, "/custom/state", true},
-		{"/custom/vmm", "/var/lib/fast-sandbox/firecracker", true},
-		{"", "/var/lib/fast-sandbox/firecracker", false},
+		{firecrackervmm.DefaultDir, "/var/lib/fast-sandbox/firecracker", true, true},
+		{firecrackervmm.DefaultDir, "/custom/state", true, false},
+		{"/custom/vmm", "/var/lib/fast-sandbox/firecracker", true, false},
+		{"", "/var/lib/fast-sandbox/firecracker", false, false},
 	} {
 		d := &Driver{config: runtimecatalog.FirecrackerConfig{VMMDir: test.dir, StateRoot: test.state}}
 		state := &SandboxState{}
@@ -343,7 +353,26 @@ func TestRootfsQualificationTopologyDefaults(t *testing.T) {
 		}
 		source := d.rootfsQualificationSources(state, artifacts.VMManifest{})
 		require.Equal(t, test.managed, source.ManagedVMM)
+		require.Equal(t, test.standard, source.StandardTopology)
 	}
+}
+
+func TestNativeCapabilityImpliedByStandardTopology(t *testing.T) {
+	// The heartbeat carries the node-level eligibility predicate: a
+	// fixed-binary or relocated-path fastlet omits the capability and
+	// rejects at admission instead of failing later at capture.
+	standard := &Driver{config: runtimecatalog.FirecrackerConfig{
+		VMMDir: firecrackervmm.DefaultDir, StateRoot: runtimecatalog.FirecrackerStateRootDir,
+	}}
+	require.True(t, standard.SupportsNativeRootfsOnlySnapshots())
+	customState := &Driver{config: runtimecatalog.FirecrackerConfig{
+		VMMDir: firecrackervmm.DefaultDir, StateRoot: "/custom/state",
+	}}
+	require.False(t, customState.SupportsNativeRootfsOnlySnapshots())
+	fixedBinary := &Driver{config: runtimecatalog.FirecrackerConfig{
+		VMMDir: "", StateRoot: runtimecatalog.FirecrackerStateRootDir,
+	}}
+	require.False(t, fixedBinary.SupportsNativeRootfsOnlySnapshots())
 }
 
 func TestRootfsQualificationRejectsUnmanagedVMM(t *testing.T) {
