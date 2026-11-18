@@ -84,25 +84,22 @@ func (d *Driver) selectionVersion(selected *firecrackervmm.Selection) string {
 // Managed releases are verified at delivery. Compare executable contents:
 // jailer copies the selected executable into its chroot, producing a new inode.
 // Operators need not maintain a second digest profile for managed VMMs.
-func qualifyVMMExecutable(state *SandboxState, expectedDigest string) error {
-	if state.VMM != nil {
-		installed, err := captureFileHash(state.VMM.BinaryPath)
-		if err != nil {
-			return err
-		}
-		if expectedDigest != "" && expectedDigest != installed {
-			return fmt.Errorf("managed VMM differs from explicit qualification digest")
-		}
-		expectedDigest = installed
+// qualifyVMMExecutable attests that the running capture process is the
+// installed release binary. A selection outside the managed release layout
+// has no deployment-rooted identity to attest against.
+func qualifyVMMExecutable(state *SandboxState) error {
+	if state.VMM == nil {
+		return fmt.Errorf("rootfs-only capture requires a managed VMM release layout")
 	}
-	if expectedDigest == "" {
-		return fmt.Errorf("custom VMM requires firecrackerSHA256 qualification")
+	installed, err := captureFileHash(state.VMM.BinaryPath)
+	if err != nil {
+		return err
 	}
 	sum, err := captureFileHash(fmt.Sprintf("/proc/%d/exe", state.PID))
 	if err != nil {
 		return err
 	}
-	if sum != expectedDigest {
+	if sum != installed {
 		return fmt.Errorf("VMM executable does not match qualified artifact")
 	}
 	return nil

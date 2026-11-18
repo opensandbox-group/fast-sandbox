@@ -23,8 +23,6 @@ import (
 	"k8s.io/klog/v2"
 
 	"fast-sandbox/internal/artifacts"
-	runtimecatalog "fast-sandbox/internal/catalog/runtime"
-	"fast-sandbox/internal/firecrackervmm"
 	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
@@ -81,23 +79,11 @@ var _ runtimecontract.Snapshotter = (*Driver)(nil)
 // to dispatch RootfsOnly snapshots without it.
 func (d *Driver) SupportsRootfsOnlySnapshots() bool { return true }
 
-func (d *Driver) SupportsNativeRootfsOnlySnapshots() bool {
-	// The profile only narrows: an explicit exclusiveExt4=false disables
-	// native capture, true declares it on a custom topology. Without a
-	// profile, the standard topology implies the native contract the same
-	// way it implies the OverlayBD ext4 contract (#224). Per-instance VMM
-	// and kernel checks run at capture, after selection.
-	profile, err := readQualificationOverrides()
-	if err != nil {
-		klog.ErrorS(err, "native rootfs qualification profile unreadable; reporting node as not native-capable")
-		return false
-	}
-	if profile.ExclusiveExt4 != nil {
-		return *profile.ExclusiveExt4
-	}
-	return filepath.Clean(d.config.VMMDir) == firecrackervmm.DefaultDir &&
-		filepath.Clean(d.config.StateRoot) == runtimecatalog.FirecrackerStateRootDir
-}
+// SupportsNativeRootfsOnlySnapshots advertises the native capture branch.
+// There is no operator configuration: the Fastlet runs the managed release
+// chain by construction, and the per-instance VMM, kernel and storage
+// identity checks run at capture, after selection (#224).
+func (d *Driver) SupportsNativeRootfsOnlySnapshots() bool { return true }
 
 // snapshotMu serializes the pause/dump/resume window across all Sandboxes of
 // this driver (one Fastlet process): only one of its VMs is paused at a time,

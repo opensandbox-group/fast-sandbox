@@ -519,7 +519,7 @@ func (d *Driver) qualifyRootfsSource(ctx context.Context, state *SandboxState, m
 	if err != nil {
 		return "", err
 	}
-	if err := qualifyVMMExecutable(state, q.FirecrackerSHA256); err != nil {
+	if err := qualifyVMMExecutable(state); err != nil {
 		return "", err
 	}
 	if q.Backend == captureBackendNative {

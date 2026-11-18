@@ -71,7 +71,6 @@ func TestRootfsFastletChainE2E(t *testing.T) {
 	if autoQualification {
 		// The external harness must mount disposable assets and an empty state
 		// directory at the production paths; never use a populated node here.
-		require.Empty(t, os.Getenv("FAST_SANDBOX_ROOTFS_QUALIFICATION"))
 		require.Equal(t, "/opt/fast-sandbox/firecracker", profile.Firecracker.VMMDir)
 		profile.Firecracker.StateRoot = "/var/lib/fast-sandbox/firecracker"
 		entries, err := os.ReadDir(profile.Firecracker.StateRoot)
@@ -183,24 +182,8 @@ func TestRootfsFastletChainE2E(t *testing.T) {
 		if cycle == 0 {
 			if autoQualification {
 				_, err := driver.qualifyRootfsSource(ctx, state, manifest)
-				require.NoError(t, err, "no profile: deployed bundles and boot manifest must qualify the live VM")
-				for _, mismatch := range []struct{ field, message string }{
-					{"firecrackerSHA256", "managed VMM differs from explicit qualification digest"},
-					{"kernelSHA256", "qualification pins kernelSHA256"},
-					{"overlaybdSHA256", "stale or mismatched"},
-				} {
-					t.Run("reject-"+mismatch.field, func(t *testing.T) {
-						path := filepath.Join(root, "override.json")
-						raw, err := json.Marshal(map[string]string{mismatch.field: strings.Repeat("0", 64)})
-						require.NoError(t, err)
-						require.NoError(t, os.WriteFile(path, raw, 0600))
-						t.Setenv("FAST_SANDBOX_ROOTFS_QUALIFICATION", path)
-						_, err = driver.qualifyRootfsSource(ctx, state, manifest)
-						require.ErrorContains(t, err, mismatch.message)
-					})
-				}
-				require.Empty(t, os.Getenv("FAST_SANDBOX_ROOTFS_QUALIFICATION"))
-				t.Log("automatic qualification passed; mismatched VMM, kernel and daemon overrides rejected")
+				require.NoError(t, err, "no profile: boot provenance, deployed bundles and the managed VMM selection must qualify the live VM")
+				t.Log("automatic qualification passed; no authored profile involved")
 			}
 			snap := &fastletapi.CreateSnapshotRequest{RequestID: "rootfs-snapshot", Identity: fastletapi.SnapshotIdentity{SnapshotUID: "rootfs-snapshot", Namespace: "e2e", Name: "rootfs-snapshot", Sandbox: identity}, Snapshot: fastletapi.SnapshotSpec{Mode: fastletapi.SnapshotModeRootfsOnly, Kind: fastletapi.SnapshotKindTemplate}}
 			started := time.Now()

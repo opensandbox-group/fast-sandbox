@@ -334,10 +334,10 @@ func TestManagedVMMQualificationAcceptsCopyAndRejectsReplacement(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(copyPath, payload, 0600))
 	state := &SandboxState{PID: os.Getpid(), VMM: &firecrackervmm.Selection{BinaryPath: copyPath}}
-	require.NoError(t, qualifyVMMExecutable(state, ""))
-	require.Error(t, qualifyVMMExecutable(state, "wrong-explicit-digest"))
+	require.NoError(t, qualifyVMMExecutable(state))
 	require.NoError(t, os.WriteFile(copyPath, []byte("different executable"), 0600))
-	require.ErrorContains(t, qualifyVMMExecutable(state, ""), "does not match")
+	require.ErrorContains(t, qualifyVMMExecutable(state), "does not match")
+	require.ErrorContains(t, qualifyVMMExecutable(&SandboxState{PID: os.Getpid()}), "managed VMM release layout")
 }
 
 // Exercise the real file flush/reflink implementation without a VM. The
