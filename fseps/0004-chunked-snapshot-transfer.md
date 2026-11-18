@@ -3,7 +3,7 @@ title: "Chunked Snapshot Transfer"
 authors:
   - "@kaustubh-765"
 creation-date: 2026-11-17
-last-updated: 2026-11-17
+last-updated: 2026-11-18
 status: draft
 ---
 
@@ -169,11 +169,19 @@ today.
   could delete data that live sets still need.
 
 **Proposal:**
-1. **First release: no store-side deletion**, the same as today. Document
-   that lifecycle rules must not target `chunks/`.
+1. **First release: no store-side deletion**, the same as today. Turning
+   off the built-in GC does not protect `chunks/` from other deleters, so
+   enabling `chunked` has a rollout gate: no store expiration rule
+   (including bucket-wide rules) and no external cleanup job may delete
+   objects under `chunks/` (see "Rollout and rollback").
 2. **Then a separate, explicit mark-and-sweep tool** (`fsb-store gc`, run as
-   a CronJob, dry-run by default, with its own credentials that can list and
-   delete; the agent's credentials stay as they are):
+   a CronJob, with its own credentials that can list and delete; the agent's
+   credentials stay as they are). It ships **dry-run only**. Destructive mode
+   stays off until both gates below hold:
+   - every live root can be enumerated (open question 1);
+   - a stale sweep decision provably cannot delete a newly reused chunk
+     (see "Remaining window"), with that interleaving in the GC acceptance
+     tests.
    - **Roots:** every live reference (SandboxTemplate image index keys,
      snapshot index keys, checkpoint references of existing Sandboxes).
    - **Mark:** read `manifest.json` → `chunks.json` of every root and
@@ -203,12 +211,16 @@ cannot make the chunk a sweep candidate, because the chunk is still younger
 than `G`. Typical values: `R` = 1 day, `G` = 7 days. Re-`PUT`s fall only on
 chunks that no publish has used for `R`, which are rare.
 
-**Remaining window:** a re-`PUT` that lands between the sweep's last `HEAD`
-and its `DELETE` is lost. The final `HEAD` shrinks this to the time of one
-request. To close it, the publisher `HEAD`s the chunks it refreshed once
-more after its manifest has landed, and uploads any that are missing. Where
-the store supports conditional deletes, the sweep can use them instead.
-Which of the two to require is part of open question 1.
+**Remaining window (not closed by this design):** the sweep decides from a
+`HEAD`, then issues an unconditional `DELETE`. A publisher can act in
+between. For example: GC does its final `HEAD`; the publisher refreshes the
+chunk, publishes its manifest and completes a post-publish `HEAD`; only then
+does GC issue the `DELETE`. Both checks succeeded, but the published set has
+lost a chunk. Checks on either side only shrink this window. Closing it
+needs a delete that fails when the chunk has been refreshed since the
+sweep's decision, or another protocol with the same guarantee. Which
+mechanism, and which stores support it, is open question 1. Until it is
+answered, destructive GC stays off.
 
 **Namespace cleanup** stays where it is today. The chunk GC only assumes
 that a deleted namespace is no longer a root.
@@ -273,11 +285,12 @@ snapshot manifest.
 
 ### Open questions
 
-1. **GC roots and safety:** which component can list every live reference
-   (templates, snapshots, Sandbox checkpoints)? Should the controller own
-   `fsb-store gc`? And for the remaining sweep window: does the publisher's
-   post-publish check suffice, or should GC require stores with
-   conditional deletes?
+1. **GC roots and safety (gate for destructive GC):** which component can
+   list every live reference (templates, snapshots, Sandbox checkpoints)?
+   Should the controller own `fsb-store gc`? And which delete mechanism
+   closes the sweep window ("Remaining window"): a delete conditioned on
+   the chunk not having been refreshed, where the store supports it, or a
+   different protocol?
 2. **Rollback:** is the `chunkListOnly` finalize step acceptable (see
    "Rollout and rollback"), or should manifests always keep the whole-file
    `sha256` and accept the hash cost?
@@ -362,6 +375,12 @@ snapshot manifest.
   - restore a chunked snapshot, switch to `legacy`, pause again, and verify
     that the new manifest has no `chunks` ref and restores on an agent from
     before PR 1.
+- **GC acceptance (PR 4, before destructive mode is enabled):**
+  - dry-run lists candidates and deletes nothing;
+  - a publish that reuses an old chunk after mark 1 keeps it;
+  - the interleaving from "Remaining window": final `HEAD`, then the
+    publisher's refresh, manifest and post-publish `HEAD`, then the GC
+    `DELETE`. The published set must stay restorable.
 
 **Performance:**
 - **Boundary:** the client-observed duration of the pause, snapshot and
@@ -383,6 +402,10 @@ snapshot manifest.
 ## Rollout and rollback
 
 **Rollout:**
+0. **Gate before enabling `chunked`:** check that no store expiration rule
+   (including bucket-wide rules) and no external cleanup job deletes
+   objects under the shared `chunks/` prefix. Turning off the built-in GC
+   does not protect against those deletions.
 1. Upgrade every runtime-agent to the release with PR 1 (and PR 2), still
    in `legacy`. The readers are now everywhere.
 2. Upgrade the Fastlets.
