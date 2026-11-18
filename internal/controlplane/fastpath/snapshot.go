@@ -156,12 +156,10 @@ func (s *Server) CreateSandboxSnapshot(ctx context.Context, request *fastpathv2.
 	if request.TemplateName == "" && !strings.HasPrefix(sandbox.Spec.Image, ocitemplate.Prefix) {
 		return nil, status.Error(codes.InvalidArgument, "template_name is required for a native snapshot")
 	}
-	// Rootfs-only artifacts need the OverlayBD path: reject before any
-	// intent is persisted, matching the fail-fast style of the checks
-	// above. The Fastlet re-checks the effective source authoritatively.
-	if request.Mode == fastpathv2.SnapshotMode_SNAPSHOT_MODE_ROOTFS_ONLY && !strings.HasPrefix(sandbox.Spec.Image, ocitemplate.Prefix) {
-		return nil, status.Error(codes.InvalidArgument, "mode ROOT_FS_ONLY requires a Sandbox on the OCI artifact path")
-	}
+	// Rootfs-only admission is gated by fastlet capability, not by the
+	// artifact path: the orchestrator requires rootfsOnlySnapshots for an
+	// OCI source and nativeRootfsOnlySnapshots for a native one, and the
+	// Fastlet re-checks the effective source authoritatively (fail-closed).
 	ctx = observability.WithIdentity(ctx, observability.Identity{
 		RequestID: request.RequestId, Namespace: sandbox.Namespace, SandboxName: sandbox.Name, SandboxUID: string(sandbox.UID),
 	})
