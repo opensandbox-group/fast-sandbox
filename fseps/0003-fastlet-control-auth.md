@@ -3,8 +3,8 @@ title: "Fastlet Control Authentication"
 authors:
   - "@Pangjiping"
 creation-date: 2026-11-13
-last-updated: 2026-11-13
-status: draft
+last-updated: 2026-11-18
+status: accepted
 ---
 
 # FSEP-0003: Fastlet Control Authentication
