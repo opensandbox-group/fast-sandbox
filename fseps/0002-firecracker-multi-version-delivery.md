@@ -3,8 +3,8 @@ title: "Firecracker Multi-Version Delivery and Selection"
 authors:
   - "@Yeaury"
 creation-date: 2026-11-11
-last-updated: 2026-11-12
-status: draft
+last-updated: 2026-11-18
+status: implemented
 ---
 
 # FSEP-0002: Firecracker Multi-Version Delivery and Selection

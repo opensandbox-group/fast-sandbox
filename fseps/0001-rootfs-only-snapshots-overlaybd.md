@@ -4,8 +4,8 @@ authors:
   - "@Pangjiping"
   - "@Yeaury"
 creation-date: 2026-11-05
-last-updated: 2026-11-07
-status: draft
+last-updated: 2026-11-18
+status: implemented
 ---
 
 # FSEP-0001: Rootfs-Only Snapshots on the OverlayBD Path
