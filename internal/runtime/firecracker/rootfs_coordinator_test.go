@@ -307,10 +307,12 @@ func TestRootfsQualificationDefaultsAndOverrides(t *testing.T) {
 	require.Equal(t, strings.Repeat("b", 64), q.OverlayBDSHA256, "use executable, not wrapper digest")
 	require.Equal(t, source.KernelSHA256, q.KernelSHA256)
 	require.True(t, q.ExclusiveExt4)
-	// A VMM outside the managed release layout stays fail-closed.
+	// A VMM outside the managed release layout, or a non-standard StateRoot,
+	// stays fail-closed.
 	source.ManagedVMM = false
+	source.StandardTopology = false
 	_, err = readRootfsQualification(source)
-	require.ErrorContains(t, err, "managed VMM release layout")
+	require.ErrorContains(t, err, "standard managed VMM directory and StateRoot")
 }
 
 func TestRootfsQualificationBrokenBundlesFailClosed(t *testing.T) {
@@ -378,8 +380,9 @@ func TestNativeCapabilityImpliedByStandardTopology(t *testing.T) {
 func TestRootfsQualificationRejectsUnmanagedVMM(t *testing.T) {
 	source := qualificationSourcesFixture(t)
 	source.ManagedVMM = false
+	source.StandardTopology = false
 	_, err := readRootfsQualification(source)
-	require.ErrorContains(t, err, "managed VMM release layout")
+	require.ErrorContains(t, err, "standard managed VMM directory and StateRoot")
 }
 
 func TestRootfsQualificationKernelDiagnostics(t *testing.T) {
@@ -425,7 +428,7 @@ func TestNativeQualificationUsesSelectedVMMWithoutOverlayBDBundle(t *testing.T) 
 	// #224: native capture never touches the OverlayBD bundle — backend,
 	// exclusive-writer contract and kernel provenance all derive from the
 	// managed selection and the source template.
-	source := rootfsQualificationSources{Native: true, ManagedVMM: true, KernelSHA256: strings.Repeat("a", 64), OverlayBDBundle: "/missing-oci-bundle"}
+	source := rootfsQualificationSources{Native: true, ManagedVMM: true, KernelSHA256: strings.Repeat("a", 64), OverlayBDBundle: "/missing-oci-bundle", StandardTopology: true}
 	q, err := readRootfsQualification(source)
 	require.NoError(t, err)
 	require.Equal(t, source.KernelSHA256, q.KernelSHA256)
