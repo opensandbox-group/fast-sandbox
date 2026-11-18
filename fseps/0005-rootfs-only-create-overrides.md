@@ -13,7 +13,7 @@ status: draft
 
 A RootfsOnly Sandbox boots a new kernel from a captured filesystem. Today the [cold-boot builder](../internal/firecrackerconfig/rootfs.go) configures the VM from the source manifest's vCPU and memory tuple. Restore checks can reject a smaller caller limit; a larger limit alone does not enlarge the VM. This proposal lets a ResourceAware pool admit and boot the same RootfsOnly artifact at caller-selected CPU and memory limits, and preserve the result across retries and snapshots.
 
-The companion [OSEP-0032, CPU and Memory Overrides for Rootfs-Only Sandbox Creation](https://github.com/opensandbox-group/OpenSandbox/pull/2902) owns the public API, SDK defaults and HTTP compatibility. This FSEP owns source resolution, resource admission, boot and snapshot metadata. Business entrypoint overrides are a future candidate and require a separate decision about guest initialization. CPU and memory overrides need no guest helper upgrade.
+The companion [OSEP-0028, CPU and Memory Overrides for Rootfs-Only Sandbox Creation](https://github.com/opensandbox-group/OpenSandbox/blob/main/oseps/0028-rootfs-only-create-overrides.md) owns the public API, SDK defaults and HTTP compatibility. This FSEP owns source resolution, resource admission, boot and snapshot metadata. Business entrypoint overrides are a future candidate and require a separate decision about guest initialization. CPU and memory overrides need no guest helper upgrade.
 
 ## Proposal and tradeoffs
 
