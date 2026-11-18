@@ -3283,8 +3283,10 @@ type CreateSandboxSnapshotRequest struct {
 	// mode selects what the snapshot persists. FULL (default, also when
 	// UNSPECIFIED) captures memory and device state; ROOT_FS_ONLY persists
 	// only the writable rootfs layer and consumers boot from disk.
-	// ROOT_FS_ONLY requires the OverlayBD artifact path: it is rejected with
-	// INVALID_ARGUMENT for a Sandbox that is not on the OCI path.
+	// ROOT_FS_ONLY works on both publication paths: the assigned Fastlet must
+	// advertise the matching rootfs-only capability (rootfsOnlySnapshots for
+	// an OCI source, nativeRootfsOnlySnapshots for a native one); otherwise
+	// the request fails deterministically with UNIMPLEMENTED.
 	// Immutable per request_id.
 	Mode          SnapshotMode `protobuf:"varint,5,opt,name=mode,proto3,enum=fastpath.v2.SnapshotMode" json:"mode,omitempty"`
 	unknownFields protoimpl.UnknownFields

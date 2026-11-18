@@ -172,19 +172,57 @@ func TestCreateSandboxSnapshotRejectsUnknownMode(t *testing.T) {
 	require.ErrorContains(t, err, "unknown snapshot mode")
 }
 
-func TestCreateSandboxSnapshotRejectsRootfsOnlyForNativeImage(t *testing.T) {
+func TestCreateSandboxSnapshotRootfsOnlyForNativeRequiresCapability(t *testing.T) {
+	// Version skew, confirmed: the assigned fastlet observed a heartbeat and
+	// advertises only the OCI rootfs-only capability (an old build without
+	// native capture support). The gate is the same capability fence as the
+	// OCI path: deterministic Unimplemented, the one-shot object terminates
+	// Failed, and no dispatch ever reaches the fastlet.
 	server, k8sClient, fastlet := newSnapshotServer(t)
-	// sandbox-a runs a native (non-OCI) image: the mode must be rejected
-	// before the intent is persisted or any fastlet is contacted.
-	_, err := server.CreateSandboxSnapshot(t.Context(), snapshotModeRequest("snapshot-a", "app-v2", fastpathv2.SnapshotMode_SNAPSHOT_MODE_ROOTFS_ONLY))
-	require.Equal(t, codes.InvalidArgument, status.Code(err))
-	require.ErrorContains(t, err, "ROOT_FS_ONLY requires a Sandbox on the OCI artifact path")
-	var list apiv1alpha2.SandboxSnapshotList
-	require.NoError(t, k8sClient.Client.List(t.Context(), &list))
-	require.Empty(t, list.Items, "the rejected intent must not be persisted")
+	markFastletObserved(t, server, []string{fastletapi.CapabilityRootfsOnlySnapshots})
+
+	_, err := server.CreateSandboxSnapshot(t.Context(), snapshotModeRequest("snap-rootfs", "app-v2", fastpathv2.SnapshotMode_SNAPSHOT_MODE_ROOTFS_ONLY))
+	require.Equal(t, codes.Unimplemented, status.Code(err))
+	require.ErrorContains(t, err, "does not advertise capability")
+	require.ErrorContains(t, err, fastletapi.CapabilityNativeRootfsOnlySnapshots)
+
 	fastlet.mu.Lock()
 	defer fastlet.mu.Unlock()
-	require.Empty(t, fastlet.snapshotSpecs, "no sandbox side effects")
+	require.Empty(t, fastlet.snapshotSpecs, "the gated dispatch must never reach the fastlet")
+	var persisted apiv1alpha2.SandboxSnapshot
+	require.NoError(t, k8sClient.Client.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "snap-rootfs"}, &persisted))
+	require.Equal(t, apiv1alpha2.SandboxSnapshotPhaseFailed, persisted.Status.Phase)
+	require.Equal(t, apiv1alpha2.SandboxSnapshotModeRootfsOnly, persisted.Spec.Mode)
+}
+
+func TestCreateSandboxSnapshotRootfsOnlyForNative(t *testing.T) {
+	// Native (S3 artifact) sandboxes follow the same capability-based gate
+	// as the OCI path: an assigned fastlet advertising the native rootfs-only
+	// capability accepts the request, the intent is persisted, and the
+	// dispatch carries the RootfsOnly mode.
+	server, k8sClient, fastlet := newSnapshotServer(t)
+	markFastletObserved(t, server, []string{fastletapi.CapabilityRootfsOnlySnapshots, fastletapi.CapabilityNativeRootfsOnlySnapshots})
+
+	request := snapshotModeRequest("snap-rootfs", "app-v2", fastpathv2.SnapshotMode_SNAPSHOT_MODE_ROOTFS_ONLY)
+	response, err := server.CreateSandboxSnapshot(t.Context(), request)
+	require.NoError(t, err)
+	require.Equal(t, fastpathv2.SnapshotMode_SNAPSHOT_MODE_ROOTFS_ONLY, response.Snapshot.Mode)
+
+	fastlet.mu.Lock()
+	dispatched := append([]fastletapi.SnapshotSpec(nil), fastlet.snapshotSpecs...)
+	fastlet.mu.Unlock()
+	require.Len(t, dispatched, 1)
+	require.Equal(t, fastletapi.SnapshotModeRootfsOnly, dispatched[0].Mode)
+
+	var persisted apiv1alpha2.SandboxSnapshot
+	require.NoError(t, k8sClient.Client.Get(t.Context(), types.NamespacedName{Namespace: "default", Name: "snap-rootfs"}, &persisted))
+	require.Equal(t, apiv1alpha2.SandboxSnapshotModeRootfsOnly, persisted.Spec.Mode)
+	require.Equal(t, apiv1alpha2.SandboxSnapshotModeRootfsOnly, persisted.Status.Mode)
+
+	// The identical replay is idempotent and reports the produced mode.
+	response, err = server.CreateSandboxSnapshot(t.Context(), request)
+	require.NoError(t, err)
+	require.Equal(t, fastpathv2.SnapshotMode_SNAPSHOT_MODE_ROOTFS_ONLY, response.Snapshot.Mode)
 }
 
 func TestCreateSandboxSnapshotRootfsOnlyForOCI(t *testing.T) {

@@ -65,7 +65,7 @@ type SandboxRef struct {
 
 // SandboxSnapshotMode selects what a snapshot persists. Full captures
 // memory and device state; RootfsOnly persists only the writable rootfs
-// layer and consumers boot from disk (OverlayBD artifact path only).
+// layer and consumers boot from disk.
 // +kubebuilder:validation:Enum=Full;RootfsOnly
 type SandboxSnapshotMode string
 
@@ -74,8 +74,9 @@ const (
 	// and device state; consumers restore in place.
 	SandboxSnapshotModeFull SandboxSnapshotMode = "Full"
 	// SandboxSnapshotModeRootfsOnly persists only the writable rootfs layer;
-	// consumers cold-boot from the disk. Requires the OverlayBD artifact
-	// path and is rejected for checkpoint-style snapshots.
+	// consumers cold-boot from the disk. It works on both publication paths
+	// and requires the assigned fastlet to advertise the matching rootfs-only
+	// capability; it is rejected for checkpoint-style snapshots.
 	SandboxSnapshotModeRootfsOnly SandboxSnapshotMode = "RootfsOnly"
 )
 
@@ -118,8 +119,9 @@ type SandboxSnapshotSpec struct {
 
 	// Mode selects what the snapshot persists. RootfsOnly persists only the
 	// writable rootfs layer (consumers boot from disk) and requires the
-	// OverlayBD artifact path; Full (default) also captures memory and
-	// device state. Immutable per the one-shot spec convention.
+	// assigned fastlet to advertise the matching rootfs-only capability;
+	// Full (default) also captures memory and device state. Immutable per
+	// the one-shot spec convention.
 	// +optional
 	// +kubebuilder:default=Full
 	Mode SandboxSnapshotMode `json:"mode,omitempty"`

@@ -54,12 +54,13 @@ CreateSandboxSnapshot(
   also when omitted) captures guest memory and device state so consumers
   restore in place. `SNAPSHOT_MODE_ROOTFS_ONLY` persists only the writable
   rootfs layer; consumers cold-boot from the disk (the entrypoint re-runs
-  and processes running at snapshot time are gone). `ROOT_FS_ONLY` requires
-  the OverlayBD artifact path: FastPath rejects it with `INVALID_ARGUMENT`
-  for a Sandbox that is not on the OCI path, the assigned Fastlet must have
-  advertised the rootfs-only capability (otherwise the request fails
-  deterministically with `UNIMPLEMENTED` instead of silently producing a
-  Full artifact), and it is not available for `PauseSandbox` checkpoints.
+  and processes running at snapshot time are gone). `ROOT_FS_ONLY` works on
+  both publication paths: the assigned Fastlet must have advertised the
+  matching rootfs-only capability in its heartbeat (`rootfsOnlySnapshots`
+  for the OCI path, `nativeRootfsOnlySnapshots` for native + S3; otherwise
+  the request fails deterministically with `UNIMPLEMENTED` instead of
+  silently producing a Full artifact), and it is not available for
+  `PauseSandbox` checkpoints.
   An absent, `UNSPECIFIED`, and explicit `FULL` mode are the same intent:
   replays keep working across the field's introduction, while changing the
   effective mode under the same `request_id` is rejected as spec drift.
