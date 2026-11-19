@@ -36,26 +36,29 @@ const (
 // config holds the resolved global options shared by every subcommand. It is
 // populated from the root command's persistent flags before RunE fires.
 type config struct {
-	ublkdSocket               string
-	credFile                  string
-	kernelDir                 string
-	stateDir                  string
-	manifestCacheDir          string
-	blobCacheDir              string
-	blobCacheMaxBytes         int64
-	runtimeDir                string
-	firecrackerBin            string
-	vmmDir                    string
-	overlaybdCreate           string
-	overlaybdCommit           string
-	overlaybdMerge            string
-	overlaybdResize           string
-	overlaybdServiceConfig    string
-	convertor                 string
-	buildWorkDir              string
-	buildOutputDir            string
-	plainHTTP                 bool
-	rejectCredentialConflicts bool
+	ublkdSocket                  string
+	credFile                     string
+	kernelDir                    string
+	stateDir                     string
+	manifestCacheDir             string
+	blobCacheDir                 string
+	blobCacheMaxBytes            int64
+	blobCacheEvictTriggerPercent int
+	blobCacheEvictTargetPercent  int
+	blobCacheWarnPercent         int
+	runtimeDir                   string
+	firecrackerBin               string
+	vmmDir                       string
+	overlaybdCreate              string
+	overlaybdCommit              string
+	overlaybdMerge               string
+	overlaybdResize              string
+	overlaybdServiceConfig       string
+	convertor                    string
+	buildWorkDir                 string
+	buildOutputDir               string
+	plainHTTP                    bool
+	rejectCredentialConflicts    bool
 }
 
 // global is the process-wide configuration bound to the persistent flags.
@@ -110,6 +113,9 @@ func (c *config) absolutize() error {
 	if c.blobCacheMaxBytes < 0 {
 		return fmt.Errorf("blob-cache-max-bytes must be nonnegative")
 	}
+	if err := validateBlobCacheWatermarks(c.blobCacheEvictTriggerPercent, c.blobCacheEvictTargetPercent, c.blobCacheWarnPercent); err != nil {
+		return err
+	}
 	for _, path := range []*string{&c.credFile, &c.kernelDir, &c.stateDir, &c.runtimeDir, &c.buildWorkDir, &c.buildOutputDir} {
 		absolute, err := filepath.Abs(*path)
 		if err != nil {
@@ -138,6 +144,9 @@ func init() {
 	flags.StringVar(&global.manifestCacheDir, "manifest-cache-dir", "", "shared immutable registry metadata cache (default <state-dir>/.manifest-cache)")
 	flags.StringVar(&global.blobCacheDir, "blob-cache-dir", "", "local checkpoint blob cache (default <state-dir>/.blob-cache)")
 	flags.Int64Var(&global.blobCacheMaxBytes, "blob-cache-max-bytes", 16<<30, "local checkpoint cache byte budget; zero disables admission and lookup")
+	flags.IntVar(&global.blobCacheEvictTriggerPercent, "blob-cache-evict-trigger-percent", defaultBlobCacheEvictTriggerPercent, "start eviction when cache usage plus the incoming admission would exceed this percent of the byte budget")
+	flags.IntVar(&global.blobCacheEvictTargetPercent, "blob-cache-evict-target-percent", defaultBlobCacheEvictTargetPercent, "drive cache usage down to this percent of the byte budget once eviction starts")
+	flags.IntVar(&global.blobCacheWarnPercent, "blob-cache-warn-percent", defaultBlobCacheWarnPercent, "alarm watermark as a percent of the byte budget, measured on allocated disk bytes")
 	flags.StringVar(&global.runtimeDir, "runtime-dir", defaultRuntimeDir, "volatile per-sandbox runtime directory root")
 	flags.StringVar(&global.vmmDir, "vmm-dir", "", "managed Firecracker release directory; selects the manifest version, or latest for builds")
 	flags.StringVar(&global.firecrackerBin, "firecracker", defaultFirecrackerBin, "firecracker binary path")
