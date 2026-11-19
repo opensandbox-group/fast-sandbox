@@ -1,7 +1,6 @@
 # API reference
 
-Fast Sandbox exposes Kubernetes CRDs for declarative lifecycle and a gRPC
-FastPath API for latency-sensitive clients.
+Fast Sandbox exposes Kubernetes CRDs for declarative lifecycle and a FastPath API over gRPC or optional HTTP/1.1 with binary protobuf.
 
 ## Version boundary
 
@@ -372,6 +371,12 @@ The protobuf contract is
 | `PauseSandbox` | Persist `spec.state=Paused` (`expected_uid`/`expected_generation` fenced); completion (`PAUSED`, checkpoint durable) is observed via `GetSandbox` |
 | `ResumeSandbox` | Persist `spec.state=Running` and schedule the recorded checkpoint, possibly cross-host; `expected_checkpoint_id` fences against a re-pause between read and resume; completion (`READY`) is observed via `GetSandbox` |
 | `GetPool`, `ListPools` | Runtime, fixed resources, components, capacity, and warm-image discovery |
+
+### HTTP/1.1 with binary protobuf
+
+Set `--fastpath-http-port=8090` on a `fastpath` or `all` controller to enable HTTP alongside gRPC. The default (`0`) serves FastPath RPCs over gRPC only. For access through the Kubernetes Service, expose the chosen port on `fast-sandbox-fastpath`.
+
+Send `POST /fastpath.v2.FastPathService/<Method>` with `Content-Type: application/x-protobuf`. The body is one serialized request message from `fastpath.proto`, without the five-byte gRPC frame header. HTTP 200 carries the serialized response message. RPC errors carry an HTTP error status and an `X-Grpc-Status` header containing the numeric gRPC code and message. The HTTP listener accepts request bodies up to 4 MiB.
 
 ### Atomic Create
 

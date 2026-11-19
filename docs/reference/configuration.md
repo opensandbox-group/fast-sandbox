@@ -36,6 +36,7 @@ Klog verbosity flags `-v` and `-vmodule` keep their existing behavior across all
 | `--metrics-bind-address` | `:9091` | Prometheus endpoint |
 | `--health-probe-bind-address` | `:5758` | Health endpoint |
 | `--fastpath-bind-address` | `:9090` | FastPath gRPC listener |
+| `--fastpath-http-port` | `0` (disabled) | TCP port for the optional [HTTP/1.1 protobuf listener](api.md#http11-with-binary-protobuf) in the `fastpath` and `all` roles |
 | `--fastlet-port` | `5758` | Fastlet control port |
 | `--fastlet-heartbeat-interval` | `20s` | Jittered heartbeat base interval |
 | `--fastlet-heartbeat-timeout` | `5s` | One heartbeat timeout |
