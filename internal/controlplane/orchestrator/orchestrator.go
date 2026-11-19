@@ -217,7 +217,7 @@ func (o *Orchestrator) Candidates(ctx context.Context, sandbox *apiv1alpha2.Sand
 		RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
 		ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
 		FastletRevision: parameters.FastletRevision,
-		ResourceMode:    o.placementResourceMode(parameters.ResourceMode), Demand: parameters.ResourceDemand,
+		ResourceMode:    o.EffectivePlacementMode(parameters.ResourceMode), Demand: parameters.ResourceDemand,
 		Image: sandbox.Spec.Image, StableKey: stableKey,
 	})
 	if len(candidates) == 0 {
@@ -244,7 +244,7 @@ func (o *Orchestrator) FastPathCandidatesMatching(sandbox *apiv1alpha2.Sandbox, 
 		RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
 		ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
 		FastletRevision: parameters.FastletRevision, ExcludedFastlets: excluded,
-		ResourceMode: o.placementResourceMode(parameters.ResourceMode), Demand: parameters.ResourceDemand,
+		ResourceMode: o.EffectivePlacementMode(parameters.ResourceMode), Demand: parameters.ResourceDemand,
 	})
 	if len(candidates) == 0 {
 		return nil, ErrNoCandidate
@@ -252,7 +252,8 @@ func (o *Orchestrator) FastPathCandidatesMatching(sandbox *apiv1alpha2.Sandbox, 
 	return candidates, nil
 }
 
-func (o *Orchestrator) placementResourceMode(mode apiv1alpha2.SandboxResourceMode) apiv1alpha2.SandboxResourceMode {
+// EffectivePlacementMode includes the controller-wide placement switch.
+func (o *Orchestrator) EffectivePlacementMode(mode apiv1alpha2.SandboxResourceMode) apiv1alpha2.SandboxResourceMode {
 	if o.DisableResourceAwarePlacement && mode == apiv1alpha2.SandboxResourceModeResourceAware {
 		return apiv1alpha2.SandboxResourceModeLegacySlot
 	}
@@ -529,6 +530,9 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 			ManifestRef:    checkpoint.ManifestRef,
 			ArtifactDigest: checkpoint.ArtifactDigest,
 		}
+	}
+	if spec.Restore == nil {
+		spec.RootfsBootDigest = sandbox.Annotations[assignment.AnnotationRootfsBootDigest]
 	}
 	request := &fastletapi.CreateSandboxRequest{
 		RequestID: sandbox.Annotations[assignment.AnnotationRequestID], Identity: identity,

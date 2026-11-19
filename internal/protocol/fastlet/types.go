@@ -20,6 +20,7 @@ const (
 // resources travel separately and are validated against the immutable Fastlet
 // resource profile before RuntimeSandboxConfig is built.
 type SandboxDesiredSpec struct {
+	RootfsBootDigest    string            `json:"rootfsBootDigest,omitempty"`
 	Image               string            `json:"image"`
 	RuntimeProfileHash  string            `json:"runtimeProfileHash,omitempty"`
 	ResourceProfileHash string            `json:"resourceProfileHash,omitempty"`

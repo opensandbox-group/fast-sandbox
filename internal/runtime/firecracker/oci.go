@@ -221,8 +221,10 @@ func (d *Driver) prepareOCIRestore(ctx context.Context, directory, reference str
 		return attachment, err
 	}
 	hasMachine := metadata.Machine.VCPUCount > 0 && metadata.Machine.MemoryMiB > 0
-	if err := validateRestoreMachine(config.Limits, d.config, metadata.Machine, hasMachine); err != nil {
-		return attachment, err
+	if config.Desired.RootfsBootDigest == "" {
+		if err := validateRestoreMachine(config.Limits, d.config, metadata.Machine, hasMachine); err != nil {
+			return attachment, err
+		}
 	}
 	if metadata.IsRootfsOnly() {
 		if err := checkRootfsBootCompatibility(metadata, d.selectionVersion(attachment.vmm)); err != nil {

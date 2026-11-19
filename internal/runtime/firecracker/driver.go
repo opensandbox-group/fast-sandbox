@@ -552,6 +552,9 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 				if err := validateExistingRuntimeProfile(existingMetadata(existing), config); err != nil {
 					return nil, err
 				}
+				if err := d.verifyExistingBoot(ctx, existing); err != nil {
+					return nil, err
+				}
 				if err := recoverRuntimeCgroup(runtimeCgroups, config, existing.PID); err != nil {
 					return nil, err
 				}
@@ -608,6 +611,9 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	} else {
 		payload, readErr := os.ReadFile(cachedManifestPath(stateRoot, restoreRef))
 		if readErr == nil {
+			if sum := config.Desired.RootfsBootDigest; sum != "" && artifacts.SHA256Of(payload) != sum {
+				return nil, fmt.Errorf("%w: native rootfs manifest digest mismatch", ErrInvalidConfig)
+			}
 			restoreMetadata, err = artifacts.DecodeVMManifest(payload)
 			if err != nil {
 				return nil, err
@@ -620,6 +626,19 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		}
 	}
 
+	if sum := config.Desired.RootfsBootDigest; sum != "" {
+		if !restoreMetadata.IsRootfsOnly() || config.Desired.Restore != nil {
+			return nil, fmt.Errorf("%w: expected a RootfsOnly template", ErrInvalidConfig)
+		}
+		if isOCI && ocitemplate.ValidateDigestReference(restoreRef, sum) != nil {
+			return nil, fmt.Errorf("%w: OCI rootfs digest mismatch", ErrInvalidConfig)
+		}
+		machine, e := resolveMachineConfig(config.Limits, d.config)
+		if e != nil {
+			return nil, e
+		}
+		restoreMetadata.Machine.VCPUCount, restoreMetadata.Machine.MemoryMiB = machine.VCPUs, int64(machine.MemSizeMiB)
+	}
 	if !isOCI {
 		selectedVMM, err = d.selectCachedVMM(ctx, restoreRef)
 		if err != nil {
@@ -683,7 +702,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// (v1.16 restores it from the snapshot); the manifest values are only
 	// validated here, not applied via the API (any machine-config call
 	// before snapshot/load is rejected).
-	if err == nil && !isOCI {
+	if err == nil && !isOCI && config.Desired.RootfsBootDigest == "" {
 		err = validateRestoreMachineConfig(config.Limits, d.config, stateRoot, restoreRef)
 	}
 	// Compatibility admission before any staging: a snapshot whose CPU
@@ -800,6 +819,9 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	state.BootKernelSHA256 = restoreMetadata.Kernel.SHA256
 	if restoreMetadata.IsRootfsOnly() {
 		state.BootKernelSHA256 = bootKernelSHA256
+		if config.Desired.RootfsBootDigest != "" {
+			state.BootMachine = &restoreMetadata.Machine
+		}
 		provenance := artifacts.NewVMManifest(restoreMetadata.Machine, restoreMetadata.Kernel.Version, binaryPath, artifacts.CPUTemplateNone).Compatibility
 		state.BootCompatibility = &provenance
 	}
@@ -923,6 +945,9 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		}
 	} else {
 		polls, err = resumeVM(bootCtx, client, d.config.BootTimeoutSeconds)
+	}
+	if err == nil {
+		err = verifyBootMachine(bootCtx, client, state)
 	}
 	observability.End(bootSpan, err)
 	if err != nil {
@@ -1252,6 +1277,9 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 					return err
 				}
 				return nil
+			}
+			if err := d.verifyExistingBoot(ctx, state); err != nil {
+				return fmt.Errorf("verify boot shape before adopting %s: %w", state.Config.Identity.SandboxUID, err)
 			}
 			if err := recoverRuntimeCgroup(runtimeCgroups, &state.Config, state.PID); err != nil {
 				return fmt.Errorf("adopt Firecracker sandbox %s during recovery (PID %d, Fastlet Pod %s, phase %s): %w",

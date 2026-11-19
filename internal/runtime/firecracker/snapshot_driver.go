@@ -1301,6 +1301,9 @@ func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, ki
 	if err != nil {
 		return 0, err
 	}
+	if err := setSnapshotResourceLimits(platform, state.Config.Limits); err != nil {
+		return 0, err
+	}
 	delete(platform, "snapshotMode")
 	delete(platform, "checkpoint")
 	if kind == fastletapi.SnapshotKindCheckpoint {
@@ -1416,6 +1419,14 @@ func snapshotSourceDocument(stateRoot, ociRoot string, state *SandboxState) (map
 	if err := setSnapshotKernelDigest(document, state.BootKernelSHA256); err != nil {
 		return nil, "", err
 	}
+	if state.Config.Desired.RootfsBootDigest != "" {
+		if state.BootMachine == nil {
+			return nil, "", errors.New("missing actual rootfs boot machine")
+		}
+		if err := setSnapshotMachineShape(document, *state.BootMachine); err != nil {
+			return nil, "", err
+		}
+	}
 	if state.BootCompatibility != nil {
 		document["compatibility"], err = json.Marshal(state.BootCompatibility)
 		if err != nil {
@@ -1444,4 +1455,21 @@ func setSnapshotKernelDigest(document map[string]json.RawMessage, sum string) er
 	}
 	document["kernel"] = encoded
 	return nil
+}
+
+func setSnapshotMachineShape(document map[string]json.RawMessage, machine artifacts.VMMachine) error {
+	fields, err := manifestSection(document, "machine")
+	if err != nil {
+		return err
+	}
+	fields["vcpuCount"], err = json.Marshal(machine.VCPUCount)
+	if err != nil {
+		return err
+	}
+	fields["memoryMiB"], err = json.Marshal(machine.MemoryMiB)
+	if err != nil {
+		return err
+	}
+	document["machine"], err = json.Marshal(fields)
+	return err
 }

@@ -11,6 +11,44 @@ import (
 	"fast-sandbox/internal/firecrackerconfig"
 )
 
+// verifyBootMachine reads the live VMM through the same API socket used for
+// configuration. Full restores and ordinary boots have no override contract.
+func verifyBootMachine(ctx context.Context, c *Client, state *SandboxState) error {
+	if state.Config.Desired.RootfsBootDigest == "" {
+		return nil
+	}
+	want := state.BootMachine
+	if want == nil || want.VCPUCount <= 0 || want.MemoryMiB <= 0 {
+		return fmt.Errorf("%w: missing rootfs boot shape for %s", ErrInvalidConfig, state.Config.Identity.SandboxUID)
+	}
+	got, err := c.DescribeMachine(ctx)
+	if err != nil {
+		return fmt.Errorf("read back rootfs boot shape: %w", err)
+	}
+	if got.VCPUs != want.VCPUCount || int64(got.MemSizeMiB) != want.MemoryMiB {
+		return fmt.Errorf("%w: expected %d vCPUs and %d MiB, VMM reports %d vCPUs and %d MiB", ErrInvalidConfig, want.VCPUCount, want.MemoryMiB, got.VCPUs, got.MemSizeMiB)
+	}
+	return nil
+}
+
+func (d *Driver) verifyExistingBoot(ctx context.Context, state *SandboxState) error {
+	if state.Config.Desired.RootfsBootDigest == "" {
+		return nil
+	}
+	client := d.newClient(state.APIAddress)
+	defer client.Close()
+	if state.Phase == PhaseStarting {
+		current, err := client.VMState(ctx)
+		if err != nil {
+			return err
+		}
+		if current != vmRunning {
+			return fmt.Errorf("cannot adopt interrupted rootfs boot: VMM state is %q", current)
+		}
+	}
+	return verifyBootMachine(ctx, client, state)
+}
+
 // Cold boot uses only a resolved rootfs of the same architecture; it does not reuse the source host CPU template or register state.
 func checkRootfsBootCompatibility(m artifacts.VMManifest, version string) error {
 	if err := m.Validate(); err != nil {

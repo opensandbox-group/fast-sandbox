@@ -244,6 +244,8 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.
 		logger.Info("sandbox template build pod succeeded", "template", template.Name, "pod", pod.Name)
 		template.Status.ManifestRef = pod.Annotations[sandboxTemplateManifestRefAnnot]
 		template.Status.ArtifactDigest = pod.Annotations[sandboxTemplateArtifactDigestAnn]
+		// The golden-image builder publishes a Full snapshot (vmstate and RAM).
+		template.Status.Mode = apiv1alpha2.SandboxSnapshotModeFull
 		template.Status.Phase = apiv1alpha2.SandboxTemplatePhaseSucceeded
 		now := metav1.Now()
 		template.Status.LastBuildTime = &now

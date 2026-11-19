@@ -151,6 +151,9 @@ func (m *SandboxManager) prepareCreateInput(req *fastletapi.CreateSandboxRequest
 	if failure := m.validateCreateRequest(req); failure != nil {
 		return fastletapi.EnsureSandboxInput{}, failure
 	}
+	if req.Sandbox.RootfsBootDigest != "" && (m.runtimeName != string(apiv1alpha2.RuntimeFirecracker) || req.Resources == nil || req.Sandbox.Restore != nil) {
+		return fastletapi.EnsureSandboxInput{}, fastletError(fastletapi.ErrorProfileMismatch, "RootfsOnly boot requires an admitted Firecracker create", false)
+	}
 	identity := req.Identity
 	if identity.RouteGeneration <= 0 {
 		identity.RouteGeneration = 1

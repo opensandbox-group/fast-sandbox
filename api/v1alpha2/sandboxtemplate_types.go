@@ -241,6 +241,8 @@ type SandboxTemplateSpec struct {
 
 // SandboxTemplateStatus reports the latest build outcome.
 type SandboxTemplateStatus struct {
+	// Mode is the artifact class confirmed by the builder. Empty means unknown.
+	Mode SandboxSnapshotMode `json:"mode,omitempty"`
 	// Phase is the overall build phase.
 	Phase SandboxTemplatePhase `json:"phase,omitempty"`
 	// Conditions detail progress.

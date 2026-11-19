@@ -39,6 +39,49 @@ type fastpathRegistry struct {
 	reserve    func(placement.FastletID, placement.ResourceDemand) bool
 }
 
+func TestRootfsCreatePinsDigestAndInheritsFractionalCPU(t *testing.T) {
+	s, k, _, fastlet := newV2Server(t)
+	ctx := t.Context()
+	pool := &apiv1alpha2.SandboxPool{}
+	require.NoError(t, k.Get(ctx, types.NamespacedName{Namespace: "default", Name: "pool-a"}, pool))
+	pool.Spec.Runtime = apiv1alpha2.RuntimeFirecracker
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(resource.MustParse("1"), resource.MustParse("4Gi"), resource.MustParse("1"), resource.MustParse("1"), 128)
+	require.NoError(t, k.Update(ctx, pool))
+	sum := fmt.Sprintf("%064x", 7)
+	snap := &apiv1alpha2.SandboxSnapshot{ObjectMeta: metav1.ObjectMeta{Name: "snapshot", Namespace: "default"}, Spec: apiv1alpha2.SandboxSnapshotSpec{TemplateName: "catalog-key"}, Status: apiv1alpha2.SandboxSnapshotStatus{Phase: apiv1alpha2.SandboxSnapshotPhaseSucceeded, Mode: apiv1alpha2.SandboxSnapshotModeRootfsOnly, ManifestRef: "s3://test/key/manifest.json", ArtifactDigest: sum}}
+	require.NoError(t, k.Create(ctx, snap))
+	req := &fastpathv2.CreateRootfsSandboxRequest{Create: createRequest("from-rootfs"), Source: &fastpathv2.CreateRootfsSandboxRequest_SnapshotName{SnapshotName: "snapshot"}, SourceLimits: &fastpathv2.ComputeResourceProfile{Cpu: "500m", Memory: "1Gi"}}
+	req.Create.Resources = &fastpathv2.SandboxResourceRequirements{Limits: &fastpathv2.ComputeResourceProfile{Memory: "2Gi"}}
+	_, err := s.CreateRootfsSandbox(ctx, req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err), "must reject wrong native index")
+	require.Empty(t, fastlet.createRequests)
+	req.Create.Image = "catalog-key"
+	req.SourceLimits.Cpu = ""
+	_, err = s.CreateRootfsSandbox(ctx, req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err), "missing CPU quota cannot be inferred from the machine")
+	require.Empty(t, fastlet.createRequests)
+	req.SourceLimits.Cpu = "500m"
+	snap.Status.Mode = apiv1alpha2.SandboxSnapshotModeFull
+	require.NoError(t, k.Update(ctx, snap))
+	_, err = s.CreateRootfsSandbox(ctx, req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err), "Full source cannot be resized")
+	require.Empty(t, fastlet.createRequests)
+	snap.Status.Mode = apiv1alpha2.SandboxSnapshotModeRootfsOnly
+	require.NoError(t, k.Update(ctx, snap))
+	s.Orchestrator.DisableResourceAwarePlacement = true
+	_, err = s.CreateRootfsSandbox(ctx, req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.True(t, apierrors.IsNotFound(k.Get(ctx, client.ObjectKey{Namespace: req.Create.Namespace, Name: req.Create.RequestId}, &apiv1alpha2.Sandbox{})))
+	require.Empty(t, fastlet.createRequests)
+	s.Orchestrator.DisableResourceAwarePlacement = false
+	response, err := s.CreateRootfsSandbox(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, "500m", response.Sandbox.Resources.Limits.Cpu)
+	require.Equal(t, "2Gi", response.Sandbox.Resources.Limits.Memory)
+	require.Len(t, fastlet.createRequests, 1)
+	require.Equal(t, sum, fastlet.createRequests[0].Sandbox.RootfsBootDigest)
+}
+
 type recordedFeedback struct {
 	id       placement.FastletID
 	feedback placement.LocalFeedback

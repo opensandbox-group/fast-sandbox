@@ -251,6 +251,12 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	if err != nil {
 		return nil, err
 	}
+	if state.Config.Desired.RootfsBootDigest != "" {
+		if state.BootMachine == nil {
+			return nil, errors.New("missing actual rootfs boot machine")
+		}
+		manifest.Machine.VCPUCount, manifest.Machine.MemoryMiB = state.BootMachine.VCPUCount, state.BootMachine.MemoryMiB
+	}
 	manifest.Kernel.SHA256 = state.BootKernelSHA256
 	manifest.GuestControl.HelperVersion = caps.HelperVersion
 	native := !strings.HasPrefix(source, "oci://")
@@ -297,7 +303,7 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 		return nil, err
 	}
 	// Once ownership and destination are fixed, pack/upload consume independent staging without holding the source lifecycle lock.
-	publication, err := d.prepareRootfsPublication(ctx, plan, raw, manifest, native)
+	publication, err := d.prepareRootfsPublication(ctx, plan, raw, manifest, native, state.Config.Limits)
 	if err != nil {
 		return nil, err
 	}
@@ -395,12 +401,28 @@ func (d *Driver) recoverRootfsCapture(ctx context.Context, state *SandboxState) 
 }
 
 // Preserve upstream extension fields; replace only the mode, state files, and file list owned by this capture.
-func marshalRootfsSnapshotManifest(source []byte, manifest artifacts.VMManifest) ([]byte, error) {
+func setSnapshotResourceLimits(platform map[string]json.RawMessage, limits fastletapi.SandboxRuntimeLimits) error {
+	// Legacy instances can lack recorded limits. Never replay their parent's quota.
+	if limits.CPU == "" && limits.Memory == "" {
+		delete(platform, "resourceLimits")
+		return nil
+	}
+	raw, err := json.Marshal(artifacts.VMResourceLimits{CPU: limits.CPU, Memory: limits.Memory})
+	if err == nil {
+		platform["resourceLimits"] = raw
+	}
+	return err
+}
+
+func marshalRootfsSnapshotManifest(source []byte, manifest artifacts.VMManifest, limits fastletapi.SandboxRuntimeLimits) ([]byte, error) {
 	if err := manifest.Validate(); err != nil {
 		return nil, err
 	}
 	var document map[string]json.RawMessage
 	if err := json.Unmarshal(source, &document); err != nil {
+		return nil, err
+	}
+	if err := setSnapshotMachineShape(document, manifest.Machine); err != nil {
 		return nil, err
 	}
 	platform := map[string]json.RawMessage{}
@@ -410,6 +432,9 @@ func marshalRootfsSnapshotManifest(source []byte, manifest artifacts.VMManifest)
 		}
 	}
 	delete(platform, "checkpoint")
+	if err := setSnapshotResourceLimits(platform, limits); err != nil {
+		return nil, err
+	}
 	delete(platform, "stateFiles")
 	platform["snapshotMode"] = json.RawMessage(`"rootfsOnly"`)
 	if len(manifest.Platform.StateFiles) > 0 {
@@ -531,7 +556,7 @@ func (d *Driver) qualifyRootfsSource(ctx context.Context, state *SandboxState, m
 	return identity, nil
 }
 
-func writeRootfsCapturedManifest(staging string, raw []byte, manifest artifacts.VMManifest) error {
+func writeRootfsCapturedManifest(staging string, raw []byte, manifest artifacts.VMManifest, limits fastletapi.SandboxRuntimeLimits) error {
 	var err error
 	if manifest.Platform == nil {
 		manifest.Platform = &artifacts.VMPlatform{}
@@ -575,7 +600,7 @@ func writeRootfsCapturedManifest(staging string, raw []byte, manifest artifacts.
 			return err
 		}
 	}
-	metadata, err := marshalRootfsSnapshotManifest(raw, manifest)
+	metadata, err := marshalRootfsSnapshotManifest(raw, manifest, limits)
 	if err != nil {
 		return err
 	}
@@ -652,11 +677,11 @@ func (d *Driver) cleanupUnpublishedCapture(ctx context.Context, state *SandboxSt
 }
 
 // If template file or publication ownership preparation fails, the capture coordinator remains responsible for reclaiming the copy.
-func (d *Driver) prepareRootfsPublication(ctx context.Context, plan dumpPlan, raw []byte, manifest artifacts.VMManifest, native bool) (ociPublication, error) {
+func (d *Driver) prepareRootfsPublication(ctx context.Context, plan dumpPlan, raw []byte, manifest artifacts.VMManifest, native bool, limits fastletapi.SandboxRuntimeLimits) (ociPublication, error) {
 	if err := d.stageTemplateState(ctx, plan.sandboxID, plan.staging); err != nil {
 		return ociPublication{}, err
 	}
-	if err := writeRootfsCapturedManifest(plan.staging, raw, manifest); err != nil {
+	if err := writeRootfsCapturedManifest(plan.staging, raw, manifest, limits); err != nil {
 		return ociPublication{}, err
 	}
 	if native {

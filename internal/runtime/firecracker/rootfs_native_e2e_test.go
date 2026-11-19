@@ -25,7 +25,9 @@ import (
 	"fast-sandbox/internal/artifacts"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
+	"fast-sandbox/internal/fastlet/podcgroup"
 	fastletsandbox "fast-sandbox/internal/fastlet/sandbox"
+	"fast-sandbox/internal/fastletsettings"
 	"fast-sandbox/internal/guestcontrol"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	"fast-sandbox/internal/registryconfig"
@@ -158,7 +160,23 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 	driver.agentSocket = server.SocketPath()
 	driver.newAgentClient = func(path string) (AgentClient, error) { return NewAgentClient(path, "e2e", pod) }
 	resourceProfile := apiv1alpha2.NewLegacySandboxResourceProfile(resource.MustParse("1"), resource.MustParse("256Mi"), 128)
-	manager, err := fastletsandbox.NewSandboxManagerWithConfig(driver, fastletsandbox.SandboxManagerConfig{Capacity: 2, FastletPodUID: pod, RuntimeName: apiv1alpha2.RuntimeFirecracker, ResourceProfile: &resourceProfile})
+	cfg := fastletsandbox.SandboxManagerConfig{Capacity: 2, FastletPodUID: pod, RuntimeName: apiv1alpha2.RuntimeFirecracker, ResourceProfile: &resourceProfile}
+	override := os.Getenv("FSB_TEST_NATIVE_OVERRIDE") == "1"
+	if override {
+		resourceProfile = apiv1alpha2.NewResourceAwareSandboxResourceProfile(resource.MustParse("1"), resource.MustParse("512Mi"), resource.MustParse("1"), resource.MustParse("1"), 128)
+		budget := apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("2"), Memory: resource.MustParse("1Gi")}
+		cfg.ResourceAdmission = &fastletsettings.ResourceAdmissionSettings{Version: "v2", Mode: apiv1alpha2.SandboxResourceModeResourceAware, StaticAdmission: true, Capacity: budget, SandboxRuntimeBudget: budget, RuntimeEnvelope: budget, PodMemoryBudget: budget.Memory, ResourceProfileHash: resourceProfile.Hash()}
+	}
+	checkpointPod := os.Getenv("FSB_TEST_NATIVE_CHECKPOINT_POD_UID")
+	if checkpointPod != "" {
+		require.True(t, override, "managed checkpoint test requires per-Sandbox limits")
+		cfg.ResourceAdmission.Version = fastletsettings.BoundedFirecrackerVersion
+		cg, err := podcgroup.NewRuntimeManager("/sys/fs/cgroup", checkpointPod, podcgroup.RuntimeBudget{CPU: resource.MustParse("2"), Memory: resource.MustParse("1Gi")})
+		require.NoError(t, err)
+		require.NoError(t, cg.Prepare())
+		require.NoError(t, driver.SetRuntimeCgroupManager(cg))
+	}
+	manager, err := fastletsandbox.NewSandboxManagerWithConfig(driver, cfg)
 	require.NoError(t, err)
 	sums := map[string]string{}
 	kernelEntry, err := artifacts.FileEntry(kernel, sums)
@@ -234,7 +252,15 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 		}
 		id := fmt.Sprintf("native-%d", cycle)
 		identity := fastletapi.SandboxIdentity{SandboxUID: id, Namespace: "e2e", Name: id, FastletPodUID: pod, InstanceGeneration: 1, RuntimeInstanceID: id + "-runtime", AssignmentAttempt: 1, RouteGeneration: 1}
-		response, err := manager.CreateSandbox(ctx, &fastletapi.CreateSandboxRequest{RequestID: id, SpecGeneration: 1, Identity: identity, Sandbox: fastletapi.SandboxDesiredSpec{Image: ref, ResourceProfileHash: resourceProfile.Hash()}})
+		request := &fastletapi.CreateSandboxRequest{RequestID: id, SpecGeneration: 1, Identity: identity, Sandbox: fastletapi.SandboxDesiredSpec{Image: ref, ResourceProfileHash: resourceProfile.Hash()}}
+		mem := []string{"384Mi", "192Mi"}[cycle]
+		if override {
+			payload, err := os.ReadFile(cachedManifestPath(driver.config.StateRoot, ref))
+			require.NoError(t, err)
+			request.Sandbox.RootfsBootDigest = artifacts.SHA256Of(payload)
+			request.Resources = &fastletapi.ResolvedSandboxResources{Requests: fastletapi.SandboxResourceVector{CPU: "500m", Memory: mem}, Limits: fastletapi.SandboxRuntimeLimits{CPU: "500m", Memory: mem, PIDs: 128}}
+		}
+		response, err := manager.CreateSandbox(ctx, request)
 		require.NoError(t, err)
 		require.Equal(t, fastletapi.CreateDispositionCreated, response.Disposition)
 		defer driver.DeleteSandbox(context.Background(), id)
@@ -322,6 +348,11 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 		published, err := artifacts.DecodeVMManifest(payload)
 		require.NoError(t, err)
 		require.Len(t, published.Files, 1)
+		if override {
+			require.Equal(t, &artifacts.VMResourceLimits{CPU: "500m", Memory: mem}, published.Platform.ResourceLimits)
+			require.Equal(t, []int64{384, 192}[cycle], published.Machine.MemoryMiB)
+			require.Equal(t, 1, published.Machine.VCPUCount)
+		}
 		if cycle == 1 {
 			// Reconstruct a new coordinator after a persisted Pause. No captured
 			// bytes may be published by recovery, and the next capture may proceed.
@@ -365,10 +396,86 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 			require.NoDirExists(t, record.Staging)
 		}
 		t.Logf("cycle=%d boot_counter=%d native RootfsOnly published and pulled; source recovered", cycle, boot)
+		if checkpointPod != "" && cycle == 0 {
+			verifyManagedCheckpointQuota(t, ctx, manager, driver, pull, request, live)
+		}
 		if cycle == 0 && os.Getenv("FSB_TEST_NATIVE_FULL_LAYOUT") == "1" {
 			verifyNativeFullLayout(t, ctx, driver, network, live)
 		}
 	}
+}
+
+// Run against a disposable delegated cgroup and a source qualified for Full restore.
+func verifyManagedCheckpointQuota(t *testing.T, ctx context.Context, manager *fastletsandbox.SandboxManager, driver *Driver, pull *agentpull.Client, source *fastletapi.CreateSandboxRequest, live *SandboxState) {
+	t.Helper()
+	verify := func(state *SandboxState) {
+		t.Helper()
+		client := driver.newClient(state.APIAddress)
+		defer client.Close()
+		machine, err := client.DescribeMachine(ctx)
+		require.NoError(t, err)
+		require.Equal(t, 1, machine.VCPUs)
+		require.Equal(t, 384, machine.MemSizeMiB)
+		membership, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", state.PID))
+		require.NoError(t, err)
+		leaf, ok := strings.CutPrefix(strings.TrimSpace(string(membership)), "0::/")
+		require.True(t, ok)
+		require.Contains(t, leaf, "/fast-sandbox/")
+		raw, err := os.ReadFile(filepath.Join("/sys/fs/cgroup", leaf, "cpu.max"))
+		require.NoError(t, err)
+		require.Equal(t, "50000 100000", strings.TrimSpace(string(raw)))
+		t.Logf("VMM pid=%d shape=1/384Mi cpu.max=%s", state.PID, strings.TrimSpace(string(raw)))
+	}
+	capture := func(identity fastletapi.SandboxIdentity, name string, spec fastletapi.SnapshotSpec) *fastletapi.SnapshotStatus {
+		t.Helper()
+		r := &fastletapi.CreateSnapshotRequest{RequestID: name, Identity: fastletapi.SnapshotIdentity{SnapshotUID: name, Namespace: identity.Namespace, Name: name, Sandbox: identity}, Snapshot: spec}
+		_, err := manager.CreateSnapshot(ctx, r)
+		require.NoError(t, err)
+		var result *fastletapi.SnapshotStatus
+		require.Eventually(t, func() bool {
+			got, err := manager.InspectSnapshot(&fastletapi.InspectSnapshotRequest{Identity: r.Identity})
+			if err != nil || got.Snapshot == nil {
+				return false
+			}
+			result = got.Snapshot
+			return fastletapi.SnapshotPhaseTerminal(result.Phase)
+		}, time.Minute, 50*time.Millisecond)
+		require.Equal(t, fastletapi.SnapshotPhaseSucceeded, result.Phase, result.Message)
+		return result
+	}
+	verify(live)
+	full := capture(source.Identity, "quota-checkpoint", fastletapi.SnapshotSpec{Kind: fastletapi.SnapshotKindCheckpoint, Mode: fastletapi.SnapshotModeFull})
+	_, err := manager.DeleteSandboxContext(ctx, &fastletapi.DeleteSandboxRequest{Identity: source.Identity})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		result, err := manager.InspectSandbox(&fastletapi.InspectSandboxRequest{Identity: source.Identity})
+		return err != nil && result != nil && result.Error != nil && result.Error.Code == fastletapi.ErrorNotFound
+	}, time.Minute, 50*time.Millisecond, "previous runtime must finish asynchronous deletion before resume")
+	restore := *source
+	restore.Identity.InstanceGeneration++
+	restore.Identity.AssignmentAttempt++
+	restore.Identity.RouteGeneration++
+	restore.Identity.RuntimeInstanceID += "-resume"
+	restore.RequestID += "-resume"
+	restore.SpecGeneration++
+	restore.Sandbox.RootfsBootDigest = ""
+	restore.Sandbox.Restore = &fastletapi.RestoreSpec{ManifestRef: full.ManifestRef, ArtifactDigest: full.ArtifactDigest}
+	require.NoError(t, pull.PullCheckpoint(ctx, driver.config.StateRoot, artifacts.CheckpointReference(full.ArtifactDigest), full.ManifestRef, full.ArtifactDigest))
+	_, err = manager.CreateSandbox(ctx, &restore)
+	require.NoError(t, err)
+	state, err := loadState(filepath.Join(driver.config.StateRoot, sandboxStateDir, restore.Identity.SandboxUID))
+	require.NoError(t, err)
+	verify(state)
+	const image = "recaptured-after-full"
+	capture(restore.Identity, image, fastletapi.SnapshotSpec{Kind: fastletapi.SnapshotKindTemplate, Mode: fastletapi.SnapshotModeRootfsOnly, TemplateName: image})
+	require.NoError(t, pull.PullImage(ctx, driver.config.StateRoot, image))
+	raw, err := os.ReadFile(cachedManifestPath(driver.config.StateRoot, image))
+	require.NoError(t, err)
+	manifest, err := artifacts.DecodeVMManifest(raw)
+	require.NoError(t, err)
+	require.Equal(t, &artifacts.VMResourceLimits{CPU: "500m", Memory: "384Mi"}, manifest.Platform.ResourceLimits)
+	require.Equal(t, 1, manifest.Machine.VCPUCount)
+	t.Logf("recaptured %s after Full resume: cpu=%s memory=%s vcpus=%d", image, manifest.Platform.ResourceLimits.CPU, manifest.Platform.ResourceLimits.Memory, manifest.Machine.VCPUCount)
 }
 
 // Fault injection keeps real storage and signature verification in the path.

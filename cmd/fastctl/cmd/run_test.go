@@ -19,6 +19,10 @@ type MockClient struct {
 	ResumeFunc      func(ctx context.Context, req *fastpathv2.ResumeSandboxRequest) (*fastpathv2.ResumeSandboxResponse, error)
 }
 
+func (m *MockClient) CreateRootfsSandbox(ctx context.Context, in *fastpathv2.CreateRootfsSandboxRequest, opts ...grpc.CallOption) (*fastpathv2.CreateSandboxResponse, error) {
+	panic("unexpected CreateRootfsSandbox call")
+}
+
 func (m *MockClient) CreateSandbox(ctx context.Context, in *fastpathv2.CreateSandboxRequest, opts ...grpc.CallOption) (*fastpathv2.CreateSandboxResponse, error) {
 	if m.CreateFunc != nil {
 		return m.CreateFunc(ctx, in)

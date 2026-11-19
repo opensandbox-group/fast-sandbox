@@ -76,6 +76,10 @@ type acceptedCreate struct {
 }
 
 func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSandboxRequest) (_ *fastpathv2.CreateSandboxResponse, resultErr error) {
+	return s.createSandbox(ctx, request, "", "")
+}
+
+func (s *Server) createSandbox(ctx context.Context, request *fastpathv2.CreateSandboxRequest, rootfsDigest, overrideIntentHash string) (_ *fastpathv2.CreateSandboxResponse, resultErr error) {
 	started := time.Now()
 	acceptedObserved := false
 	defer func() {
@@ -121,7 +125,14 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	if err != nil {
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
+	if rootfsDigest != "" && (pool.Spec.Runtime != apiv1alpha2.RuntimeFirecracker || orchestrator.EffectivePlacementMode(pool.Spec.SandboxResources.ResourceMode()) != apiv1alpha2.SandboxResourceModeResourceAware) {
+		return nil, status.Error(codes.InvalidArgument, "rootfs resource overrides require active ResourceAware placement on a Firecracker pool")
+	}
 	sandbox := newSandboxCRD(request, bindings, resources, createSpecHash)
+	if rootfsDigest != "" {
+		sandbox.Annotations[assignment.AnnotationRootfsBootDigest] = rootfsDigest
+		sandbox.Annotations[assignment.AnnotationCreateSpecHash] = createSpecHash + ":" + rootfsDigest + ":" + overrideIntentHash
+	}
 	releaseCreate := orchestrator.BeginFastPathCreate(client.ObjectKeyFromObject(sandbox))
 	defer releaseCreate()
 	parameters, err := fastPathRuntimeParameters(pool, sandbox)
