@@ -77,15 +77,49 @@ contains the route/NAT/ARP leaves; these must also not be added twice.
 
 ## Slot lifecycle
 
-A slot has three phases:
+A slot has four phases:
 
 - `Clean`: prepared and available;
 - `Bound`: owned by one Sandbox identity;
+- `Returning`: a pooled return is deep resetting the slot for reuse;
 - `Destroying`: cleanup is in progress and capacity cannot be reused.
 
 The owner contains Sandbox UID, instance generation, runtime instance ID, and assignment attempt. A stale create or delete cannot acquire a slot that belongs to a newer generation.
 
 Slots are prepared before demand where possible. Admission fails fast when no clean slot is available.
+
+## Pooled slot return and residue hygiene
+
+By default a released slot is destroyed and replaced, which makes cross-tenant
+leakage structurally impossible but pays the full namespace teardown and rebuild
+cost on every teardown. Setting `FAST_SANDBOX_NETWORK_CLEAN_RETURN=true` enables
+return-style pooling: `Release` deep resets the namespace and hands the slot
+back to the clean pool with its original identity when a structural audit of the
+result is empty. `FAST_SANDBOX_NETWORK_RESET_TIMEOUT` (default `2s`) bounds one
+reset plus its audit.
+
+Pooling is a trade of one hard guarantee for another, so the contract is exact:
+a slot is returned only when its audited state equals the golden state captured
+from the kernel right after preparation. The audit covers link admin state, MAC,
+MTU, addresses, routes, permanent neighbour entries, qdiscs, namespace `net.*`
+sysctls, in-namespace firewall rules, and foreign members (resident processes
+and listening sockets). Functional checks are not sufficient here: most residue
+classes — extra addresses, stale routes, stray permanent neighbours, MAC drift,
+shaping qdiscs, sysctl drift — leave the next tenant fully working over carried
+state, and a fresh namespace's own state is counterintuitive (sysctls are
+inherited from the creating namespace rather than reset by the kernel), which is
+why the golden state is captured, never assumed.
+
+A reset that fails, times out, or audits dirty quarantines the slot: it is
+destroyed and its capacity rebuilt from scratch, so a suspect namespace is never
+reused. The conntrack table is per-namespace and invisible to the audit, so the
+reset flushes it explicitly with one netlink request.
+
+The reset runs as a single in-namespace execution so a return costs a handful of
+execs rather than one per audited domain. Drivers that cannot audit (or slots
+without a captured golden state) keep the destroy path. Reset and return
+outcomes are reported by `fastlet_network_slot_return_total{result}` and
+`fastlet_network_slot_return_stage_latency_seconds{stage,result}`.
 
 ## Address and port model
 

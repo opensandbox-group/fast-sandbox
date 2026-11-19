@@ -12,8 +12,9 @@ import (
 
 // resultLabel distinguishes acquire/persist outcomes on the slot metrics.
 const (
-	resultLabel       = "result"
-	metricResultError = "error"
+	resultLabel         = "result"
+	metricResultError   = "error"
+	metricResultSuccess = "success"
 )
 
 var (
@@ -43,18 +44,40 @@ var (
 		Help:    "Latency of the durable state write performed when a clean network slot is bound.",
 		Buckets: prometheus.ExponentialBuckets(.00025, 2, 15),
 	}, []string{resultLabel})
+	networkSlotReturnTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fastlet_network_slot_return_total",
+		Help: "Number of pooled network slot returns by result (clean or quarantined).",
+	}, []string{resultLabel})
+	networkSlotReturnStageLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "fastlet_network_slot_return_stage_latency_seconds",
+		Help:    "Latency of pooled return stages: deep reset and post-reset audit.",
+		Buckets: prometheus.ExponentialBuckets(.00025, 2, 17),
+	}, []string{"stage", resultLabel})
 )
 
 func recordSlotAcquire(result string) {
 	networkSlotAcquireTotal.WithLabelValues(result).Inc()
 }
 
-func recordSlotPhases(clean, bound, destroying int) {
+func recordSlotPhases(clean, bound, destroying, returning int) {
 	networkSlots.WithLabelValues("clean").Set(float64(clean))
 	networkSlots.WithLabelValues("bound").Set(float64(bound))
 	networkSlots.WithLabelValues("destroying").Set(float64(destroying))
+	networkSlots.WithLabelValues("returning").Set(float64(returning))
 	networkSlotAvailable.Set(float64(clean))
-	networkSlotInUse.Set(float64(bound + destroying))
+	networkSlotInUse.Set(float64(bound + destroying + returning))
+}
+
+func recordSlotReturn(result string) {
+	networkSlotReturnTotal.WithLabelValues(result).Inc()
+}
+
+func observeSlotReturnStage(stage string, started time.Time, err error) {
+	result := metricResultSuccess
+	if err != nil {
+		result = metricResultError
+	}
+	networkSlotReturnStageLatency.WithLabelValues(stage, result).Observe(time.Since(started).Seconds())
 }
 
 func observeSlotAcquire(result string, started time.Time) {
@@ -62,7 +85,7 @@ func observeSlotAcquire(result string, started time.Time) {
 }
 
 func observeSlotPersist(started time.Time, err error) {
-	result := "success"
+	result := metricResultSuccess
 	if err != nil {
 		result = metricResultError
 	}
@@ -79,7 +102,7 @@ func startGuestApplyStage(ctx context.Context, stage string) (context.Context, f
 	started := time.Now()
 	stageContext, span := observability.Start(ctx, "fastlet.network.guest_apply."+stage)
 	return stageContext, func(err error) {
-		result := "success"
+		result := metricResultSuccess
 		if err != nil {
 			result = metricResultError
 		}

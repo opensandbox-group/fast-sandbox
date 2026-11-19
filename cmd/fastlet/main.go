@@ -448,6 +448,16 @@ func newNetworkManager(capacity int, podUID string, networkMode runtimecatalog.N
 		return nil, runtimecontract.ErrInvalidConfig
 	}
 	config.MTU = mtu
+	cleanReturn, err := strconv.ParseBool(getEnv("FAST_SANDBOX_NETWORK_CLEAN_RETURN", "false"))
+	if err != nil {
+		return nil, runtimecontract.ErrInvalidConfig
+	}
+	config.CleanReturn = cleanReturn
+	resetTimeout, err := time.ParseDuration(getEnv("FAST_SANDBOX_NETWORK_RESET_TIMEOUT", (fastletnetwork.DefaultResetTimeout).String()))
+	if err != nil || resetTimeout <= 0 {
+		return nil, runtimecontract.ErrInvalidConfig
+	}
+	config.ResetTimeout = resetTimeout
 	store := fastletnetwork.NewFileStateStore(filepath.Join(config.StateRoot, podUID))
 	var driver fastletnetwork.Driver = fastletnetwork.NewLinuxNetNSDriver(fastletnetwork.LinuxDriverConfig{})
 	if networkMode == runtimecatalog.NetworkModeFirecracker {

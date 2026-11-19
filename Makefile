@@ -244,7 +244,7 @@ _network-test:
 	@docker run --rm --privileged \
 		-e FAST_SANDBOX_RUN_PRIVILEGED_NETWORK_TEST=1 \
 		fast-sandbox/network-test:dev \
-		-test.run '^TestLinuxNetNSDriverPrivileged$$' -test.v
+		-test.run '^Test.*Privileged$$' -test.v
 
 env:
 	@case "$(PROFILE)" in \

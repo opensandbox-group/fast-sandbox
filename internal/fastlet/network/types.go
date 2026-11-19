@@ -19,8 +19,13 @@ var (
 type SlotPhase string
 
 const (
-	SlotPhaseClean      SlotPhase = "Clean"
-	SlotPhaseBound      SlotPhase = "Bound"
+	SlotPhaseClean SlotPhase = "Clean"
+	SlotPhaseBound SlotPhase = "Bound"
+	// SlotPhaseReturning marks a binding that is being deep reset for reuse.
+	// The slot stays reserved (capacity cannot reuse it) until the reset and
+	// its post-reset audit both succeed; a crash in this phase destroys the
+	// slot on recovery, because the namespace state is not trustworthy.
+	SlotPhaseReturning  SlotPhase = "Returning"
 	SlotPhaseDestroying SlotPhase = "Destroying"
 )
 
@@ -94,8 +99,13 @@ type Slot struct {
 	MTU           int              `json:"mtu"`
 	EgressDevice  string           `json:"egressDevice"`
 	Access        AccessDescriptor `json:"access"`
-	CreatedAt     time.Time        `json:"createdAt"`
-	BoundAt       *time.Time       `json:"boundAt,omitempty"`
+	// Golden is the audited pool-build state of this slot's namespace,
+	// captured from the kernel after Prepare when return-style pooling is
+	// enabled. It is the reference for the post-reset residue audit; slots
+	// without it are never returned to the pool.
+	Golden    *GoldenState `json:"golden,omitempty"`
+	CreatedAt time.Time    `json:"createdAt"`
+	BoundAt   *time.Time   `json:"boundAt,omitempty"`
 }
 
 type Driver interface {
@@ -114,6 +124,7 @@ type Snapshot struct {
 	Capacity   int
 	Clean      int
 	Bound      int
+	Returning  int
 	Destroying int
 	Hit        uint64
 	Miss       uint64
