@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -76,6 +77,27 @@ type oidcDiscovery struct {
 	JWKSURI string `json:"jwks_uri"`
 }
 
+// applyInClusterAPIServerPort rewrites the port of key-material URLs that
+// target the in-cluster apiserver service name (KUBERNETES_SERVICE_HOST
+// and KUBERNETES_SERVICE_PORT, injected into every Pod). Some managed
+// clusters expose the apiserver service on a non-443 port while the issuer
+// anchor keeps the conventional port-less form; without this rewrite the
+// discovery and JWKS fetches would target a closed port and the Fastlet
+// could never start.
+func applyInClusterAPIServerPort(raw string) string {
+	port := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_PORT"))
+	host := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST"))
+	if port == "" || port == "443" || host == "" {
+		return raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Hostname() != "kubernetes.default.svc" || parsed.Port() != "" {
+		return raw
+	}
+	parsed.Host = net.JoinHostPort(parsed.Hostname(), port)
+	return parsed.String()
+}
+
 // fetchDiscovery resolves the issuer's JWKS URI from its OIDC discovery
 // document. The issuer is the trust anchor — it comes from this Pod's
 // kubelet-written projected token, never from an incoming token — so key
@@ -87,8 +109,13 @@ func fetchDiscovery(ctx context.Context, client *http.Client, issuer string) (*o
 	if err := validateKeyMaterialURL(issuer, "issuer"); err != nil {
 		return nil, err
 	}
+	// Some managed clusters expose the apiserver service on a non-443 port
+	// (advertised to Pods through KUBERNETES_SERVICE_HOST/PORT) while the
+	// issuer anchor keeps the conventional port-less form; the fetch URLs
+	// follow the advertised port or they dead-end on a closed 443.
+	discoveryURL := applyInClusterAPIServerPort(strings.TrimSuffix(issuer, "/") + "/.well-known/openid-configuration")
 	document := &oidcDiscovery{}
-	if err := fetchJSONDocument(ctx, client, strings.TrimSuffix(issuer, "/")+"/.well-known/openid-configuration", document); err != nil {
+	if err := fetchJSONDocument(ctx, client, discoveryURL, document); err != nil {
 		return nil, err
 	}
 	if document.Issuer != issuer {
@@ -104,6 +131,7 @@ func fetchDiscovery(ctx context.Context, client *http.Client, issuer string) (*o
 	if err := validateKeyMaterialURL(document.JWKSURI, "jwks_uri"); err != nil {
 		return nil, err
 	}
+	document.JWKSURI = applyInClusterAPIServerPort(document.JWKSURI)
 	return document, nil
 }
 
