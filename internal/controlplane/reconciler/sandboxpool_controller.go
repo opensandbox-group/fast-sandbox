@@ -141,9 +141,14 @@ const (
 	// fastletAuthTokenVolumeName is the reserved volume carrying the
 	// dedicated identity's projected token into the Fastlet container alone.
 	fastletAuthTokenVolumeName = "fastlet-auth-token"
-	// fastletAuthTokenMountPath is the conventional ServiceAccount projection
-	// path; the fastletauth package reads the credential from this location.
-	fastletAuthTokenMountPath = "/var/run/secrets/kubernetes.io/serviceaccount"
+)
+
+// fastletAuthTokenMountPath and fastletAuthTokenProjectionPath are derived
+// from the fastletauth package's projected-token path, so the mount cannot
+// drift from the file the Fastlet reads its key-fetch credential from.
+var (
+	fastletAuthTokenMountPath      = filepath.Dir(fastletauth.ServiceAccountTokenFile)
+	fastletAuthTokenProjectionPath = filepath.Base(fastletauth.ServiceAccountTokenFile)
 )
 
 // Reconcile manages the lifecycle of Fastlet Pods based on the demand from Sandboxes.
@@ -1676,6 +1681,11 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			corev1.EnvVar{Name: fastletauth.CABundleEnv, Value: r.FastletAuthCABundle},
 			corev1.EnvVar{Name: fastletauth.AllowedSubjectsEnv, Value: strings.Join(subjects, ",")},
 			corev1.EnvVar{Name: fastletauth.AudienceEnv, Value: r.FastletAuthAudience},
+			// Empty by design: Pods read the mounted token file, and the
+			// explicit entry shadows any envFrom key of the same name, so a
+			// ConfigMap/Secret reference cannot hand the Fastlet an override
+			// credential.
+			corev1.EnvVar{Name: fastletauth.KeyFetchTokenEnv},
 		)
 		if profile.ResidualProcess != runtimecatalog.ResidualProcessNone {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "FAST_SANDBOX_NODE_CLEANUP_SOCKET", Value: nodecleanup.DefaultSocketPath})
@@ -1796,7 +1806,7 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 						// Fastlet re-reads the file on every key fetch, so
 						// rotation is followed without restarts.
 						ExpirationSeconds: int64Ptr(int64(fastletauth.DefaultExpirationSeconds)),
-						Path:              "token",
+						Path:              fastletAuthTokenProjectionPath,
 					},
 				}},
 			}},
@@ -2556,9 +2566,13 @@ var runtimeOwnedEnv = map[string]struct{}{
 	"NODE_NAME":                    {}, envPodName: {}, "POD_IP": {}, envPodUID: {}, "NAMESPACE": {},
 	// Control authentication env keys are platform-owned: the Pool
 	// Controller injects allow list, audience, and anchor, and a Pool
-	// template must not be able to relax or redirect any of them.
+	// template must not be able to relax or redirect any of them. The
+	// key-fetch credential override is fenced the same way: keyFetchCredential
+	// prefers it over the mounted token file even inside a Pod, so a
+	// template-supplied value could swap the fetching identity or break every
+	// key fetch on the Pool.
 	fastletauth.AllowedSubjectsEnv: {}, fastletauth.IssuerEnv: {}, fastletauth.CABundleEnv: {},
-	fastletauth.AudienceEnv: {},
+	fastletauth.AudienceEnv: {}, fastletauth.KeyFetchTokenEnv: {},
 }
 
 func removeRuntimeOwnedEnv(env []corev1.EnvVar) []corev1.EnvVar {
@@ -2964,20 +2978,20 @@ func int64Ptr(value int64) *int64 {
 
 // ensureFastletServiceAccount provisions the dedicated discovery-only
 // identity Fastlet Pods present as their serviceAccountName so the kubelet
-// can project their key-fetch token. The ServiceAccount is shared by every
-// Pool in the namespace and carries no owner reference: cascading deletion
-// from one Pool would strand the others, and the namespace lifecycle already
-// garbage-collects it. It holds no namespaced RBAC; its only cluster-visible
-// authority is the authenticated issuer-discovery pair in config/rbac/base.yaml.
+// can project their key-fetch token. It Create-then-tolerates-AlreadyExists
+// and never reads the ServiceAccount back: r.Get here would go through the
+// cached client, whose cluster-wide ServiceAccount informer cannot sync
+// without list/watch on serviceaccounts (the RBAC deliberately grants only
+// get/create), and an unsynced informer stalls every Pool reconcile forever —
+// the exact trap documented on the roles/rolebindings rule in
+// config/rbac/base.yaml; ensureBuilderRBAC avoids it the same way. Creation
+// is the whole contract — the identity is never mutated afterwards — so
+// idempotency needs no read. It is shared by every Pool in the namespace and
+// carries no owner reference: cascading deletion from one Pool would strand
+// the others, and the namespace lifecycle already garbage-collects it. It
+// holds no namespaced RBAC; its only cluster-visible authority is the
+// authenticated issuer-discovery pair in config/rbac/base.yaml.
 func (r *SandboxPoolReconciler) ensureFastletServiceAccount(ctx context.Context, pool *apiv1alpha2.SandboxPool) error {
-	var existing corev1.ServiceAccount
-	err := r.Get(ctx, client.ObjectKey{Namespace: pool.Namespace, Name: fastletServiceAccountName}, &existing)
-	if err == nil {
-		return nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return err
-	}
 	serviceAccount := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fastletServiceAccountName,

@@ -2985,6 +2985,11 @@ func TestConstructPodInjectsFastletAuthAnchor(t *testing.T) {
 	require.Equal(t, fastletAuthTokenMountPath, volumeMountForContainer(pod, 0, fastletAuthTokenVolumeName).MountPath)
 	require.Nil(t, volumeMountForContainer(pod, 1, fastletAuthTokenVolumeName),
 		"the proxy sidecar must not receive the key-fetch credential")
+	// The mount and projection item must compose to exactly the file the
+	// Fastlet reads: derived from one constant, but pinned here so a future
+	// edit cannot silently break the composition.
+	require.Equal(t, fastletauth.ServiceAccountTokenFile,
+		filepath.Join(fastletAuthTokenMountPath, tokenProjection.Path))
 }
 
 func TestConstructPodStripsTemplateOwnedAuthEnv(t *testing.T) {
@@ -3015,11 +3020,15 @@ func TestConstructPodStripsTemplateOwnedAuthEnv(t *testing.T) {
 					Name: "fastlet", Image: "fastlet:test",
 					Env: []corev1.EnvVar{
 						// A Pool template must not be able to relax the allow
-						// list or redirect the issuer anchor.
+						// list or redirect the issuer anchor, and must not be
+						// able to hand the Fastlet an override key-fetch
+						// credential — the override would win over the
+						// mounted projected token even inside a Pod.
 						{Name: fastletauth.AllowedSubjectsEnv, Value: "system:serviceaccount:attacker:default"},
 						{Name: fastletauth.IssuerEnv, Value: "https://attacker.example"},
 						{Name: fastletauth.CABundleEnv, Value: "attacker-ca"},
 						{Name: fastletauth.AudienceEnv, Value: "attacker-audience"},
+						{Name: fastletauth.KeyFetchTokenEnv, Value: "attacker-static-token"},
 					},
 					// envFrom may supply keys explicit env does not
 					// define. The platform answers by injecting every
@@ -3048,6 +3057,8 @@ func TestConstructPodStripsTemplateOwnedAuthEnv(t *testing.T) {
 		"the template must not relax the allow list")
 	require.Equal(t, "https://kubernetes.default.svc", envValue(pod.Spec.Containers[0].Env, fastletauth.AudienceEnv),
 		"the audience must come from the platform, not the template")
+	require.Empty(t, envValue(pod.Spec.Containers[0].Env, fastletauth.KeyFetchTokenEnv),
+		"the template must not supply the key-fetch credential override; the Pod reads the mounted file")
 	require.Len(t, pod.Spec.Containers[0].EnvFrom, 1,
 		"envFrom is preserved for non-auth keys; explicit env entries shadow any auth key it could supply")
 }
@@ -3163,7 +3174,7 @@ func TestConstructPodInjectsAuthEnvUnconditionally(t *testing.T) {
 	require.NoError(t, err)
 	pod, err := poolReconciler.constructPodWithRuntimePlan(pool, runtimePlan)
 	require.NoError(t, err)
-	for _, key := range []string{fastletauth.IssuerEnv, fastletauth.CABundleEnv, fastletauth.AllowedSubjectsEnv, fastletauth.AudienceEnv} {
+	for _, key := range []string{fastletauth.IssuerEnv, fastletauth.CABundleEnv, fastletauth.AllowedSubjectsEnv, fastletauth.AudienceEnv, fastletauth.KeyFetchTokenEnv} {
 		require.Contains(t, envNames(pod.Spec.Containers[0].Env), key,
 			"every auth env key must carry an explicit entry so envFrom can never supply it")
 	}

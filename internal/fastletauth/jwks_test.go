@@ -149,6 +149,43 @@ func (c *testCA) serverCertificate(t *testing.T, dnsName string) tls.Certificate
 	return certificate
 }
 
+// TestDefaultHTTPClientRefusesCrossHostRedirect pins the redirect boundary
+// for the credential: authedTransport injects the Authorization header inside
+// RoundTrip, below the client's redirect handling, so without an explicit
+// guard every hop would re-receive the header — silently undoing the standard
+// library's deliberate cross-host Authorization stripping. The issuer is the
+// trust anchor; the client must refuse to leave its host and hand the
+// redirect response to the fetcher, which fails closed on any non-200.
+func TestDefaultHTTPClientRefusesCrossHostRedirect(t *testing.T) {
+	var forwarded []string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		forwarded = append(forwarded, "seen")
+		_, _ = w.Write([]byte("{}"))
+	}))
+	t.Cleanup(target.Close)
+
+	var anchorCredentials []string
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		anchorCredentials = append(anchorCredentials, request.Header.Get("Authorization"))
+		http.Redirect(w, request, target.URL+"/openid/v1/jwks", http.StatusFound)
+	}))
+	t.Cleanup(source.Close)
+
+	t.Setenv(KeyFetchTokenEnv, "live-service-account-token")
+	client, err := defaultHTTPClient()
+	require.NoError(t, err)
+
+	response, err := client.Get(source.URL + "/.well-known/openid-configuration")
+	require.NoError(t, err)
+	defer response.Body.Close()
+	require.Equal(t, http.StatusFound, response.StatusCode,
+		"a cross-host redirect must not be followed: the non-200 reaches the fetcher and fails it closed")
+	require.Equal(t, []string{BearerPrefix + "live-service-account-token"}, anchorCredentials,
+		"the anchor host itself receives the credential")
+	require.Empty(t, forwarded,
+		"the live ServiceAccount credential must never reach a redirect target on another host")
+}
+
 func TestNewAuthenticatorRejectsPlaintextIssuerOutsideLoopback(t *testing.T) {
 	authenticator, err := NewAuthenticator("http://issuer.example.com", Audience, DefaultAllowedSubjects, nil)
 	require.Error(t, err, "a plaintext issuer outside loopback would let an on-path attacker serve forged keys")

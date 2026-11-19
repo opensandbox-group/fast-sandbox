@@ -18,6 +18,9 @@ import (
 // maxKeyDocumentBytes bounds the discovery and JWKS response bodies.
 const maxKeyDocumentBytes = 1 << 20
 
+// maxKeyFetchRedirects caps redirect chains at the standard library default.
+const maxKeyFetchRedirects = 10
+
 // keyFetchCredential returns the bearer token attached to every issuer key
 // fetch. The Fastlet presents its dedicated ServiceAccount's projected token:
 // the kubelet rotates it (refresh at 80% of the TTL), so the credential is
@@ -34,7 +37,7 @@ func keyFetchCredential() (string, error) {
 	case err != nil:
 		return "", fmt.Errorf("no key-fetch credential: set %s or mount the ServiceAccount token file: %w", KeyFetchTokenEnv, err)
 	case strings.TrimSpace(token) == "":
-		return "", fmt.Errorf("no key-fetch credential: %s is empty; set %s or restore the mounted ServiceAccount token", serviceAccountTokenFile, KeyFetchTokenEnv)
+		return "", fmt.Errorf("no key-fetch credential: %s is empty; set %s or restore the mounted ServiceAccount token", ServiceAccountTokenFile, KeyFetchTokenEnv)
 	}
 	return strings.TrimSpace(token), nil
 }
@@ -42,7 +45,7 @@ func keyFetchCredential() (string, error) {
 // readKeyFetchTokenFile reads the mounted projected token verbatim. It is a
 // package variable only so tests can pin the file location.
 var readKeyFetchTokenFile = func() (string, error) {
-	raw, err := os.ReadFile(serviceAccountTokenFile)
+	raw, err := os.ReadFile(ServiceAccountTokenFile)
 	if err != nil {
 		return "", err
 	}
@@ -174,7 +177,26 @@ func defaultHTTPClient() (*http.Client, error) {
 	if found {
 		base.TLSClientConfig = &tls.Config{RootCAs: pool}
 	}
-	return &http.Client{Transport: authedTransport{base: base}, Timeout: 5 * time.Second}, nil
+	// The credential is injected inside RoundTrip, below the client's
+	// redirect handling, so every hop would otherwise receive it — silently
+	// undoing the standard library's deliberate cross-host Authorization
+	// stripping. The issuer is the trust anchor: refuse to leave its host and
+	// hand the redirect response to the fetcher, which fails closed on any
+	// non-200. jwkset's unknown-kid refreshes travel through this same client
+	// and inherit the boundary.
+	return &http.Client{
+		Transport: authedTransport{base: base},
+		Timeout:   5 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= maxKeyFetchRedirects {
+				return fmt.Errorf("stopped after %d redirects", maxKeyFetchRedirects)
+			}
+			if req.URL.Host != via[0].URL.Host {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}, nil
 }
 
 // injectedCABundle resolves the CA trust set: the system roots extended with

@@ -13,12 +13,18 @@ import (
 	authenticationv1 "k8s.io/api/authentication/v1"
 )
 
+// ServiceAccountTokenFile is the conventional in-Pod path of the projected
+// ServiceAccount token the kubelet writes and rotates. The Fastlet reads its
+// key-fetch credential from this file, and the Pool Controller derives the
+// projected volume's mount path and item name from it, so the mount cannot
+// drift from the file the Fastlet reads.
+const ServiceAccountTokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
 // Service account projection locations mounted into every in-cluster Pod by
 // default. The namespace file gives the Pod namespace; the projected token's
 // `sub` claim gives the ServiceAccount name.
 const (
 	serviceAccountNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-	serviceAccountTokenFile     = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	serviceAccountCAFile        = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
 	// DefaultExpirationSeconds asks for a one-hour token. The control plane
@@ -50,7 +56,7 @@ func ResolvePodServiceAccountIdentity(namespaceEnv, serviceAccountEnv string) (P
 		identity.Namespace = strings.TrimSpace(string(raw))
 	}
 	if identity.ServiceAccount == "" {
-		raw, err := os.ReadFile(serviceAccountTokenFile)
+		raw, err := os.ReadFile(ServiceAccountTokenFile)
 		if err != nil {
 			return PodServiceAccountIdentity{}, fmt.Errorf("read pod service account token: %w", err)
 		}
@@ -83,7 +89,7 @@ func ResolvePodIssuer(issuerEnv string) (string, error) {
 	if issuerEnv != "" {
 		return issuerEnv, nil
 	}
-	raw, err := os.ReadFile(serviceAccountTokenFile)
+	raw, err := os.ReadFile(ServiceAccountTokenFile)
 	if err != nil {
 		return "", fmt.Errorf("read pod service account token: %w", err)
 	}
