@@ -86,14 +86,28 @@ func TestRootfsCreatePinsDigestAndInheritsFractionalCPU(t *testing.T) {
 	require.Len(t, fastlet.createRequests, 1)
 	require.Equal(t, sum, fastlet.createRequests[0].Sandbox.RootfsBootDigest)
 	require.NoError(t, k.Delete(ctx, snap))
-	req.Create.Resources.Limits.Memory = "2048Mi"
-	replay, err := s.CreateRootfsSandbox(ctx, req)
-	require.NoError(t, err)
-	require.Equal(t, response.Sandbox.Identity.Uid, replay.Sandbox.Identity.Uid)
-	require.Equal(t, sum, fastlet.createRequests[len(fastlet.createRequests)-1].Sandbox.RootfsBootDigest)
+	for _, memory := range []string{"2048Mi", "2147483648", "2147483648e0"} {
+		req.Create.Resources.Limits.Memory = memory
+		replay, err := s.CreateRootfsSandbox(ctx, req)
+		require.NoError(t, err, memory)
+		require.Equal(t, response.Sandbox.Identity.Uid, replay.Sandbox.Identity.Uid)
+		require.Equal(t, sum, fastlet.createRequests[len(fastlet.createRequests)-1].Sandbox.RootfsBootDigest)
+	}
+	req.Create.Resources.Limits.Cpu = "500m"
+	_, err = s.CreateRootfsSandbox(ctx, req)
+	require.Equal(t, codes.AlreadyExists, status.Code(err), "explicit CPU differs from inherited CPU")
+	req.Create.Resources.Limits.Cpu = ""
 	req.Create.Resources.Limits.Memory = "3Gi"
 	_, err = s.CreateRootfsSandbox(ctx, req)
 	require.Equal(t, codes.AlreadyExists, status.Code(err))
+}
+
+func TestCanonicalCPUOverride(t *testing.T) {
+	for _, input := range []string{"0.5", "500m", "5e-1"} {
+		got, err := canonicalOverrideQuantity(input, resource.DecimalSI)
+		require.NoError(t, err)
+		require.Equal(t, "500m", got)
+	}
 }
 
 type recordedFeedback struct {

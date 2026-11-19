@@ -32,15 +32,14 @@ func (s *Server) CreateRootfsSandbox(ctx context.Context, in *pb.CreateRootfsSan
 	ns := req.Namespace
 	intent := &pb.CreateRootfsSandboxRequest{Source: in.Source}
 	if supplied := req.GetResources().GetLimits(); supplied != nil {
-		for _, value := range []*string{&supplied.Cpu, &supplied.Memory} {
-			if *value == "" {
-				continue
-			}
-			q, err := resource.ParseQuantity(*value)
-			if err != nil {
-				return nil, status.Error(codes.InvalidArgument, err.Error())
-			}
-			*value = q.String()
+		var err error
+		supplied.Cpu, err = canonicalOverrideQuantity(supplied.Cpu, resource.DecimalSI)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
+		}
+		supplied.Memory, err = canonicalOverrideQuantity(supplied.Memory, resource.BinarySI)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, err.Error())
 		}
 		intent.Create = &pb.CreateSandboxRequest{Resources: req.Resources}
 	}
@@ -127,4 +126,19 @@ func (s *Server) CreateRootfsSandbox(ctx context.Context, in *pb.CreateRootfsSan
 	limits.Limits.Memory = resources.Limits.Memory.String()
 	req.Resources = limits
 	return s.createSandbox(ctx, req, sum, intentHash, "")
+}
+
+// Preserve omission in the intent hash. CanonicalizeBytes serializes the
+// numeric value in the requested format even if String cached the input.
+func canonicalOverrideQuantity(value string, format resource.Format) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	q, err := resource.ParseQuantity(value)
+	if err != nil {
+		return "", err
+	}
+	q.Format = format
+	number, suffix := q.CanonicalizeBytes(nil)
+	return string(number) + string(suffix), nil
 }
