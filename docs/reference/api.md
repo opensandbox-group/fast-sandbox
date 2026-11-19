@@ -1,6 +1,6 @@
 # API reference
 
-Fast Sandbox exposes Kubernetes CRDs for declarative lifecycle and a FastPath API over gRPC or optional HTTP/1.1 with binary protobuf.
+Fast Sandbox exposes Kubernetes CRDs for declarative lifecycle and a FastPath API over native gRPC or optional gRPC-Web.
 
 ## Version boundary
 
@@ -372,11 +372,16 @@ The protobuf contract is
 | `ResumeSandbox` | Persist `spec.state=Running` and schedule the recorded checkpoint, possibly cross-host; `expected_checkpoint_id` fences against a re-pause between read and resume; completion (`READY`) is observed via `GetSandbox` |
 | `GetPool`, `ListPools` | Runtime, fixed resources, components, capacity, and warm-image discovery |
 
-### HTTP/1.1 with binary protobuf
+### gRPC-Web over HTTP/1.1
 
 Set `--fastpath-http-port=8090` on a `fastpath` or `all` controller to enable HTTP alongside gRPC. The default (`0`) serves FastPath RPCs over gRPC only. For access through the Kubernetes Service, expose the chosen port on `fast-sandbox-fastpath`.
 
-Send `POST /fastpath.v2.FastPathService/<Method>` with `Content-Type: application/x-protobuf`. The body is one serialized request message from `fastpath.proto`, without the five-byte gRPC frame header. HTTP 200 carries the serialized response message. RPC errors carry an HTTP error status and an `X-Grpc-Status` header containing the numeric gRPC code and message. The HTTP listener accepts request bodies up to 4 MiB.
+The listener serves the same RPC methods using the [gRPC-Web protocol](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md). Java clients can use [Armeria](https://armeria.dev/docs/client/grpc/) with their existing generated stub:
+
+```java
+var fastpath = GrpcClients.newClient("gproto-web+h1c://localhost:8090/",
+        FastPathServiceGrpc.FastPathServiceBlockingStub.class);
+```
 
 ### Atomic Create
 

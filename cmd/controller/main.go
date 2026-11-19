@@ -97,7 +97,7 @@ func main() { //nolint:gocognit,gocyclo,funlen,maintidx // pre-existing flag wir
 	flag.StringVar(&metricsAddress, "metrics-bind-address", ":9091", "Metrics listen address.")
 	flag.StringVar(&probeAddress, "health-probe-bind-address", ":5758", "Health probe listen address.")
 	flag.StringVar(&fastPathAddress, "fastpath-bind-address", ":9090", "FastPath gRPC listen address.")
-	flag.IntVar(&fastPathHTTPPort, "fastpath-http-port", 0, "FastPath HTTP/1.1 protobuf port (0 disables HTTP).")
+	flag.IntVar(&fastPathHTTPPort, "fastpath-http-port", 0, "FastPath gRPC-Web port for HTTP/1.1 clients (0 disables this listener).")
 	flag.IntVar(&fastletPort, "fastlet-port", 5758, "Fastlet control port.")
 	flag.DurationVar(&heartbeatInterval, "fastlet-heartbeat-interval", 20*time.Second, "Base Fastlet heartbeat interval; actual probes use jitter.")
 	flag.DurationVar(&heartbeatTimeout, "fastlet-heartbeat-timeout", 5*time.Second, "Timeout for one Fastlet heartbeat request.")
@@ -338,15 +338,13 @@ func main() { //nolint:gocognit,gocyclo,funlen,maintidx // pre-existing flag wir
 			klog.ErrorS(err, "Listen for FastPath", "address", fastPathAddress)
 			os.Exit(1)
 		}
-		interceptor := observability.UnaryServerInterceptor("fastpath")
-		grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(interceptor))
-		service := &fastpath.Server{
+		grpcServer := grpc.NewServer(grpc.ChainUnaryInterceptor(observability.UnaryServerInterceptor("fastpath")))
+		fastpathv2.RegisterFastPathServiceServer(grpcServer, &fastpath.Server{
 			K8sClient: durableClient, RouteCache: manager.GetClient(), Orchestrator: orchestrator,
 			DiagnosticsClient: fastletClient,
 			CredentialIssuer:  credentialIssuer, SandboxProxyBaseURL: sandboxProxyBaseURL,
-		}
-		fastpathv2.RegisterFastPathServiceServer(grpcServer, service)
-		if httpServer := newFastPathHTTPServer(fastPathHTTPPort, service, interceptor); httpServer != nil {
+		})
+		if httpServer := newFastPathHTTPServer(fastPathHTTPPort, grpcServer); httpServer != nil {
 			if err := manager.Add(httpServer); err != nil {
 				klog.ErrorS(err, "Configure FastPath HTTP listener", "port", fastPathHTTPPort)
 				os.Exit(1)
