@@ -12,8 +12,8 @@ import (
 )
 
 // DefaultInterval is the recheck cadence: frequent enough to pull the
-// labels within minutes of a host healing (KVM module reloaded), rare
-// enough to be free.
+// labels within minutes of a host healing (e.g. after the KVM module is
+// reloaded), rare enough to be free.
 const DefaultInterval = 5 * time.Minute
 
 // Settings is the mutable subset of the manager configuration, re-read
