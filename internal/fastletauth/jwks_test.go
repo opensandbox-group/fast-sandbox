@@ -186,6 +186,44 @@ func TestDefaultHTTPClientRefusesCrossHostRedirect(t *testing.T) {
 		"the live ServiceAccount credential must never reach a redirect target on another host")
 }
 
+// TestDefaultHTTPClientRefusesDowngradeRedirect pins the scheme half of the
+// redirect boundary: a same-host https→http redirect keeps the Host check
+// satisfied, and following it would re-attach the credential in plaintext on
+// every hop. The client must refuse the downgrade client-side — the
+// plaintext endpoint is never contacted and the 302 fails the fetch closed.
+func TestDefaultHTTPClientRefusesDowngradeRedirect(t *testing.T) {
+	// The client is the production defaultHTTPClient, so the TLS anchor must
+	// be one it trusts: a generated CA injected through CABundleEnv, the same
+	// path a real cluster CA bundle takes.
+	ca := newTestCA(t, "fastletauth-downgrade-test-ca")
+	t.Setenv(CABundleEnv, base64.StdEncoding.EncodeToString(ca.pem))
+	t.Setenv(KeyFetchTokenEnv, "live-service-account-token")
+
+	var anchorCredentials []string
+	var server *httptest.Server
+	server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		anchorCredentials = append(anchorCredentials, request.Header.Get("Authorization"))
+		// Same host, downgraded scheme: the Host-only guard would follow it.
+		http.Redirect(w, request, "http://"+server.Listener.Addr().String()+"/downgraded", http.StatusFound)
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{ca.serverCertificate(t, "localhost")}}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	client, err := defaultHTTPClient()
+	require.NoError(t, err)
+
+	response, err := client.Get(server.URL + "/.well-known/openid-configuration")
+	require.NoError(t, err)
+	defer response.Body.Close()
+	require.Equal(t, http.StatusFound, response.StatusCode,
+		"a same-host https→http downgrade must not be followed")
+	require.Equal(t, "http://"+server.Listener.Addr().String()+"/downgraded", response.Header.Get("Location"),
+		"the refused hop is the downgrade target itself")
+	require.Equal(t, []string{BearerPrefix + "live-service-account-token"}, anchorCredentials,
+		"the https anchor hop carries the credential exactly once")
+}
+
 func TestNewAuthenticatorRejectsPlaintextIssuerOutsideLoopback(t *testing.T) {
 	authenticator, err := NewAuthenticator("http://issuer.example.com", Audience, DefaultAllowedSubjects, nil)
 	require.Error(t, err, "a plaintext issuer outside loopback would let an on-path attacker serve forged keys")

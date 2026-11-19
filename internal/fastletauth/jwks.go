@@ -180,10 +180,12 @@ func defaultHTTPClient() (*http.Client, error) {
 	// The credential is injected inside RoundTrip, below the client's
 	// redirect handling, so every hop would otherwise receive it — silently
 	// undoing the standard library's deliberate cross-host Authorization
-	// stripping. The issuer is the trust anchor: refuse to leave its host and
-	// hand the redirect response to the fetcher, which fails closed on any
-	// non-200. jwkset's unknown-kid refreshes travel through this same client
-	// and inherit the boundary.
+	// stripping. The issuer is the trust anchor: refuse to leave its host or
+	// to downgrade below its scheme (a same-host https→http redirect would
+	// otherwise carry the credential in plaintext), and hand the redirect
+	// response to the fetcher, which fails closed on any non-200. jwkset's
+	// unknown-kid refreshes travel through this same client and inherit the
+	// boundary.
 	return &http.Client{
 		Transport: authedTransport{base: base},
 		Timeout:   5 * time.Second,
@@ -191,7 +193,7 @@ func defaultHTTPClient() (*http.Client, error) {
 			if len(via) >= maxKeyFetchRedirects {
 				return fmt.Errorf("stopped after %d redirects", maxKeyFetchRedirects)
 			}
-			if req.URL.Host != via[0].URL.Host {
+			if req.URL.Host != via[0].URL.Host || req.URL.Scheme != via[0].URL.Scheme {
 				return http.ErrUseLastResponse
 			}
 			return nil
