@@ -161,8 +161,11 @@ func fetchDiscovery(ctx context.Context, client *http.Client, issuer string) (*o
 	if err := validateKeyMaterialURL(document.JWKSURI, "jwks_uri"); err != nil {
 		return nil, err
 	}
+	// 同源校验两侧都应用端口改写：jwks 与 issuer 的有效拉取地址在
+	// 非 443 集群上同为 <host>:<KUBERNETES_SERVICE_PORT>
 	jwksURL, parseErr := url.Parse(applyInClusterAPIServerPort(document.JWKSURI))
-	if parseErr != nil || !sameOrigin(jwksURL, issuerURL) {
+	issuerFetchURL, parseErr2 := url.Parse(applyInClusterAPIServerPort(issuer))
+	if parseErr != nil || parseErr2 != nil || !sameOrigin(jwksURL, issuerFetchURL) {
 		return nil, fmt.Errorf("jwks_uri %q is not served by the pinned issuer origin", document.JWKSURI)
 	}
 	return document, nil
