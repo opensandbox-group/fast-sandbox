@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"fast-sandbox/internal/artifacts"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/firecrackerconfig"
+	"fast-sandbox/internal/ocitemplate"
 )
 
 var errIncompleteRootfsStart = errors.New("cannot adopt interrupted rootfs boot")
@@ -31,6 +33,25 @@ func verifyBootMachine(ctx context.Context, c *Client, state *SandboxState) erro
 	if got.VCPUs != want.VCPUCount || int64(got.MemSizeMiB) != want.MemoryMiB {
 		return fmt.Errorf("%w: expected %d vCPUs and %d MiB, VMM reports %d vCPUs and %d MiB", ErrInvalidConfig, want.VCPUCount, want.MemoryMiB, got.VCPUs, got.MemSizeMiB)
 	}
+	return nil
+}
+
+// Called with the lifecycle lock after VMM shape and cgroup ownership checks.
+func (d *Driver) finishVerifiedRootfsAdoption(ctx context.Context, directory string, state *SandboxState) error {
+	if state.Phase != PhaseStarting || state.Config.Desired.RootfsBootDigest == "" {
+		return nil
+	}
+	spec, id := state.Config.Desired, state.Config.Identity
+	bundle := filepath.Dir(cachedManifestPath(d.config.StateRoot, spec.Image))
+	if strings.HasPrefix(spec.Image, ocitemplate.Prefix) {
+		bundle = filepath.Join(d.ociRoot(), "sandboxes", id.SandboxUID, "mnt")
+	}
+	d.importTemplateCarry(ctx, spec, spec.Image, bundle, id.SandboxUID)
+	state.Phase = PhaseRunning
+	if err := saveState(directory, state); err != nil {
+		return err
+	}
+	d.publishVMMetadata(filepath.Dir(state.APIAddress), id)
 	return nil
 }
 

@@ -53,6 +53,7 @@ func (t *snapshotTask) status() fastletapi.SnapshotStatus {
 		Mode: fastletapi.NormalizeSnapshotMode(t.mode), StartedAt: t.startedAt, CompletedAt: t.completedAt,
 	}
 	if t.result != nil {
+		status.ResourceLimits = t.result.ResourceLimits
 		status.ManifestRef = t.result.ManifestRef
 		status.ArtifactDigest = t.result.ArtifactDigest
 		status.SizeBytes = t.result.SizeBytes

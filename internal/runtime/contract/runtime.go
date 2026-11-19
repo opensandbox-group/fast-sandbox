@@ -91,6 +91,7 @@ type CheckpointDelivery interface {
 
 // SnapshotResult reports the artifact set produced by one snapshot.
 type SnapshotResult struct {
+	ResourceLimits *fastletapi.SandboxResourceVector
 	// SnapshotID is the node-local identity of the snapshot; it scopes the
 	// on-disk staging directory and any cleanup.
 	SnapshotID string

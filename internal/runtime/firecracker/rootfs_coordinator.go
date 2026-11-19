@@ -316,9 +316,14 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	release()
 	release = nil
 	if native {
-		return d.publishNativeRootfs(ctx, plan, input, upperBytes)
+		result, err = d.publishNativeRootfs(ctx, plan, input, upperBytes)
+	} else {
+		result, err = d.publishPreparedOCISnapshot(ctx, plan, upperBytes, publication, input.OnPublishing)
 	}
-	return d.publishPreparedOCISnapshot(ctx, plan, upperBytes, publication, input.OnPublishing)
+	if err == nil && result != nil && (state.Config.Limits.CPU != "" || state.Config.Limits.Memory != "") {
+		result.ResourceLimits = &fastletapi.SandboxResourceVector{CPU: state.Config.Limits.CPU, Memory: state.Config.Limits.Memory}
+	}
+	return result, err
 }
 
 // ReconcileSandbox retries source recovery without accepting or publishing an

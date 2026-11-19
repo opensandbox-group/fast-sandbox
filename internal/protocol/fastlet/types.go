@@ -684,13 +684,14 @@ type SnapshotSpec struct {
 // is a stable classification of a Failed task (e.g. InsufficientStorage);
 // empty for in-flight and unclassified failures.
 type SnapshotStatus struct {
-	SnapshotID     string        `json:"snapshotId,omitempty"`
-	Phase          SnapshotPhase `json:"phase"`
-	Reason         string        `json:"reason,omitempty"`
-	Message        string        `json:"message,omitempty"`
-	ManifestRef    string        `json:"manifestRef,omitempty"`
-	ArtifactDigest string        `json:"artifactDigest,omitempty"`
-	SizeBytes      int64         `json:"sizeBytes,omitempty"`
+	ResourceLimits *SandboxResourceVector `json:"resourceLimits,omitempty"`
+	SnapshotID     string                 `json:"snapshotId,omitempty"`
+	Phase          SnapshotPhase          `json:"phase"`
+	Reason         string                 `json:"reason,omitempty"`
+	Message        string                 `json:"message,omitempty"`
+	ManifestRef    string                 `json:"manifestRef,omitempty"`
+	ArtifactDigest string                 `json:"artifactDigest,omitempty"`
+	SizeBytes      int64                  `json:"sizeBytes,omitempty"`
 	// Mode is the artifact class of the task: the admitted mode while
 	// in flight, the produced artifact's mode once terminal. Empty means
 	// Full (a pre-mode Fastlet never sets it).

@@ -76,12 +76,24 @@ func TestRootfsCreatePinsDigestAndInheritsFractionalCPU(t *testing.T) {
 	require.True(t, apierrors.IsNotFound(k.Get(ctx, client.ObjectKey{Namespace: req.Create.Namespace, Name: req.Create.RequestId}, &apiv1alpha2.Sandbox{})))
 	require.Empty(t, fastlet.createRequests)
 	s.Orchestrator.DisableResourceAwarePlacement = false
+	req.SourceLimits = nil
+	snap.Status.ResourceLimits = &apiv1alpha2.SnapshotResourceLimits{CPU: "500m", Memory: "1Gi"}
+	require.NoError(t, k.Update(ctx, snap))
 	response, err := s.CreateRootfsSandbox(ctx, req)
 	require.NoError(t, err)
 	require.Equal(t, "500m", response.Sandbox.Resources.Limits.Cpu)
 	require.Equal(t, "2Gi", response.Sandbox.Resources.Limits.Memory)
 	require.Len(t, fastlet.createRequests, 1)
 	require.Equal(t, sum, fastlet.createRequests[0].Sandbox.RootfsBootDigest)
+	require.NoError(t, k.Delete(ctx, snap))
+	req.Create.Resources.Limits.Memory = "2048Mi"
+	replay, err := s.CreateRootfsSandbox(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, response.Sandbox.Identity.Uid, replay.Sandbox.Identity.Uid)
+	require.Equal(t, sum, fastlet.createRequests[len(fastlet.createRequests)-1].Sandbox.RootfsBootDigest)
+	req.Create.Resources.Limits.Memory = "3Gi"
+	_, err = s.CreateRootfsSandbox(ctx, req)
+	require.Equal(t, codes.AlreadyExists, status.Code(err))
 }
 
 type recordedFeedback struct {

@@ -894,6 +894,35 @@ func TestRecoverInterruptedStartPreservesUnknownCgroupOwnership(t *testing.T) {
 	require.DirExists(t, directory)
 }
 
+func TestRecoverRunningOverrideBeforeCreateCommit(t *testing.T) {
+	f := newDriverFixture(t)
+	f.sandboxSpec.Desired.RootfsBootDigest = "pinned"
+	id := f.sandboxSpec.Identity
+	dir, err := ensureSandboxDir(f.stateRoot, id.SandboxUID)
+	require.NoError(t, err)
+	socket := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			_, _ = w.Write([]byte(`{"state":"Running"}`))
+		case "/version":
+			_, _ = w.Write([]byte(`{"firecracker_version":"1.17.0"}`))
+		case "/machine-config":
+			_, _ = w.Write([]byte(`{"vcpu_count":1,"mem_size_mib":384}`))
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	f.driver.newClient = NewClient
+	require.NoError(t, saveState(dir, &SandboxState{Config: f.sandboxSpec, Phase: PhaseStarting, PID: 4321, APIAddress: socket, BootMachine: &artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 384}}))
+	require.NoError(t, f.driver.RecoverRuntimeResources(t.Context(), nil, nil))
+	f.driver.metadataPublication.Wait()
+	state, err := loadState(dir)
+	require.NoError(t, err)
+	require.Equal(t, PhaseRunning, state.Phase)
+	require.Equal(t, 4321, state.PID)
+	require.Empty(t, f.killCalls)
+}
+
 func TestRecoverInterruptedRootfsStartWithRecordedPID(t *testing.T) {
 	f := newDriverFixture(t)
 	id := f.sandboxSpec.Identity

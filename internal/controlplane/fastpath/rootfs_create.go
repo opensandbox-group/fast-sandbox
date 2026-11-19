@@ -9,11 +9,13 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	pb "fast-sandbox/api/proto/v2"
 	api "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/controlplane/assignment"
 	"fast-sandbox/internal/ocitemplate"
 )
 
@@ -28,6 +30,40 @@ func (s *Server) CreateRootfsSandbox(ctx context.Context, in *pb.CreateRootfsSan
 		return nil, err
 	}
 	ns := req.Namespace
+	intent := &pb.CreateRootfsSandboxRequest{Source: in.Source}
+	if supplied := req.GetResources().GetLimits(); supplied != nil {
+		for _, value := range []*string{&supplied.Cpu, &supplied.Memory} {
+			if *value == "" {
+				continue
+			}
+			q, err := resource.ParseQuantity(*value)
+			if err != nil {
+				return nil, status.Error(codes.InvalidArgument, err.Error())
+			}
+			*value = q.String()
+		}
+		intent.Create = &pb.CreateSandboxRequest{Resources: req.Resources}
+	}
+	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(intent)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	h := sha256.Sum256(wire)
+	intentHash := hex.EncodeToString(h[:])
+	var prior api.Sandbox
+	err = s.K8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: req.RequestId}, &prior)
+	if err == nil {
+		pinned := prior.Annotations[assignment.AnnotationRootfsBootDigest]
+		if pinned == "" || prior.Spec.Resources == nil || !strings.HasSuffix(prior.Annotations[assignment.AnnotationCreateSpecHash], ":"+intentHash) {
+			return nil, status.Error(codes.AlreadyExists, "request ID belongs to a different create intent")
+		}
+		limits := prior.Spec.Resources.Limits
+		req.Resources = &pb.SandboxResourceRequirements{Limits: &pb.ComputeResourceProfile{Cpu: limits.CPU.String(), Memory: limits.Memory.String()}}
+		return s.createSandbox(ctx, req, pinned, intentHash, prior.UID)
+	}
+	if !apierrors.IsNotFound(err) {
+		return nil, grpcKubernetesError(err)
+	}
 	var ref, sum, native string
 	defaults := in.GetSourceLimits()
 	switch {
@@ -40,6 +76,9 @@ func (s *Server) CreateRootfsSandbox(ctx context.Context, in *pb.CreateRootfsSan
 			return nil, status.Error(codes.InvalidArgument, "source must be a ready RootfsOnly snapshot")
 		}
 		ref, sum, native = snap.Status.ManifestRef, snap.Status.ArtifactDigest, snap.Spec.TemplateName
+		if recorded := snap.Status.ResourceLimits; recorded != nil {
+			defaults = &pb.ComputeResourceProfile{Cpu: recorded.CPU, Memory: recorded.Memory}
+		}
 	case in.GetTemplateName() != "":
 		var tmpl api.SandboxTemplate
 		if err := s.K8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: in.GetTemplateName()}, &tmpl); err != nil {
@@ -84,16 +123,8 @@ func (s *Server) CreateRootfsSandbox(ctx context.Context, in *pb.CreateRootfsSan
 	if resources.Limits.CPU.Cmp(maxCPU) > 0 || resources.Limits.CPU.Cmp(minCPU) < 0 || !exact || bytes%(1<<20) != 0 {
 		return nil, status.Error(codes.InvalidArgument, "RootfsOnly requires 10m..32 CPUs and positive whole MiB memory")
 	}
+	limits.Limits.Cpu = resources.Limits.CPU.String()
+	limits.Limits.Memory = resources.Limits.Memory.String()
 	req.Resources = limits
-	// Hash caller-owned dimensions separately so inheritance and an explicit
-	// value cannot become the same idempotency identity.
-	intent := proto.Clone(in).(*pb.CreateRootfsSandboxRequest)
-	intent.Create = &pb.CreateSandboxRequest{Resources: in.Create.Resources}
-	intent.SourceLimits = nil
-	wire, err := proto.MarshalOptions{Deterministic: true}.Marshal(intent)
-	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
-	}
-	h := sha256.Sum256(wire)
-	return s.createSandbox(ctx, req, sum, hex.EncodeToString(h[:]))
+	return s.createSandbox(ctx, req, sum, intentHash, "")
 }

@@ -550,6 +550,9 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	if existing, err := loadState(directory); err == nil {
 		if alive, probeErr := d.probeVM(ctx, existing); probeErr == nil && alive {
 			if runtimecontract.SameRuntimeIdentity(existing.Config.Identity, identity) {
+				if config.Desired.RootfsBootDigest != existing.Config.Desired.RootfsBootDigest {
+					return nil, fmt.Errorf("%w: pinned rootfs digest differs for existing Sandbox", ErrInvalidConfig)
+				}
 				if err := validateExistingRuntimeProfile(existingMetadata(existing), config); err != nil {
 					return nil, err
 				}
@@ -557,6 +560,9 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 					return nil, err
 				}
 				if err := recoverRuntimeCgroup(runtimeCgroups, config, existing.PID); err != nil {
+					return nil, err
+				}
+				if err := d.finishVerifiedRootfsAdoption(ctx, directory, existing); err != nil {
 					return nil, err
 				}
 				return existingMetadata(existing), nil
@@ -1290,6 +1296,9 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 					state.Config.Identity.SandboxUID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
 			}
 			// A Fastlet crash during capture can leave a VM paused; in-process cleanup cannot handle this, so reconciliation restores the surviving VMM.
+			if err := d.finishVerifiedRootfsAdoption(ctx, directory, state); err != nil {
+				return err
+			}
 			d.resumePausedVM(ctx, state)
 			return nil
 		}(); err != nil {
