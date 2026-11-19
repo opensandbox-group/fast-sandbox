@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"net/http"
@@ -75,7 +76,10 @@ func TestInjectedCABundleExtendsSystemRoots(t *testing.T) {
 		"the trust set must be the system roots extended with the injected bundle, not a replacement")
 
 	// End to end: the client built from this bundle fetches from an HTTPS
-	// issuer certified by the injected CA.
+	// issuer certified by the injected CA. The fetch carries the key-fetch
+	// credential; the loopback harness ignores the header but the credential
+	// must resolve, matching the authenticated production path.
+	t.Setenv(KeyFetchTokenEnv, "test-key-fetch-credential")
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("{}"))
 	}))
@@ -148,6 +152,98 @@ func (c *testCA) serverCertificate(t *testing.T, dnsName string) tls.Certificate
 func TestNewAuthenticatorRejectsPlaintextIssuerOutsideLoopback(t *testing.T) {
 	authenticator, err := NewAuthenticator("http://issuer.example.com", Audience, DefaultAllowedSubjects, nil)
 	require.Error(t, err, "a plaintext issuer outside loopback would let an on-path attacker serve forged keys")
+	require.Nil(t, authenticator)
+}
+
+// TestKeyFetchCredentialPrefersEnvOverride pins the override order: an env
+// credential serves host-process runs without a token file, and the file is
+// never consulted when the override resolves.
+func TestKeyFetchCredentialPrefersEnvOverride(t *testing.T) {
+	t.Setenv(KeyFetchTokenEnv, "  env-token  ")
+	previous := readKeyFetchTokenFile
+	t.Cleanup(func() { readKeyFetchTokenFile = previous })
+	readKeyFetchTokenFile = func() (string, error) {
+		return "", errors.New("the mounted file must not be consulted when the override is set")
+	}
+	token, err := keyFetchCredential()
+	require.NoError(t, err)
+	require.Equal(t, "env-token", token, "the override must be trimmed, not echoed verbatim")
+}
+
+// TestKeyFetchCredentialFailsClosed pins the credential posture: a missing or
+// empty mounted token fails the resolution with a directed error, so a fetch
+// never degrades into a silent anonymous request.
+func TestKeyFetchCredentialFailsClosed(t *testing.T) {
+	t.Setenv(KeyFetchTokenEnv, "")
+	previous := readKeyFetchTokenFile
+	t.Cleanup(func() { readKeyFetchTokenFile = previous })
+
+	readKeyFetchTokenFile = func() (string, error) {
+		return "", errors.New("open /var/run/secrets/kubernetes.io/serviceaccount/token: no such file or directory")
+	}
+	_, err := keyFetchCredential()
+	require.ErrorContains(t, err, "no key-fetch credential",
+		"the error must direct the operator at the override and the mount")
+
+	readKeyFetchTokenFile = func() (string, error) { return "\n", nil }
+	_, err = keyFetchCredential()
+	require.ErrorContains(t, err, "is empty", "a whitespace-only token file is no credential")
+}
+
+// TestAuthedTransportAttachesRotatingCredential pins the authenticated key
+// fetch end to end: every request carries the credential resolved at request
+// time, so kubelet's projected-token rotation is followed without restarts,
+// and losing the credential fails the request closed before it is sent.
+func TestAuthedTransportAttachesRotatingCredential(t *testing.T) {
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		seen = append(seen, request.Header.Get("Authorization"))
+		_, _ = w.Write([]byte("{}"))
+	}))
+	t.Cleanup(server.Close)
+
+	client := &http.Client{Transport: authedTransport{base: http.DefaultTransport}}
+	t.Setenv(KeyFetchTokenEnv, "token-one")
+	response, err := client.Get(server.URL)
+	require.NoError(t, err)
+	_ = response.Body.Close()
+	require.Equal(t, []string{"Bearer token-one"}, seen)
+
+	// A rotated credential applies to the next fetch: the resolution happens
+	// inside RoundTrip, never cached on the transport.
+	t.Setenv(KeyFetchTokenEnv, "token-two")
+	response, err = client.Get(server.URL)
+	require.NoError(t, err)
+	_ = response.Body.Close()
+	require.Equal(t, []string{"Bearer token-one", "Bearer token-two"}, seen)
+
+	// Losing the credential fails the fetch closed; no request reaches the
+	// issuer anonymously.
+	t.Setenv(KeyFetchTokenEnv, "")
+	previous := readKeyFetchTokenFile
+	t.Cleanup(func() { readKeyFetchTokenFile = previous })
+	readKeyFetchTokenFile = func() (string, error) {
+		return "", errors.New("simulated missing token file")
+	}
+	_, err = client.Get(server.URL)
+	require.Error(t, err, "a Fastlet without its key-fetch credential must fail closed")
+	require.Len(t, seen, 2, "the failed fetch must not reach the issuer")
+}
+
+// TestNewAuthenticatorFailsClosedWithoutKeyFetchCredential pins the startup
+// contract: construction fetches discovery through the authenticated client,
+// so a Fastlet without its credential fails startup with a directed error
+// instead of falling back to an anonymous fetch.
+func TestNewAuthenticatorFailsClosedWithoutKeyFetchCredential(t *testing.T) {
+	issuer := fastletauthtest.NewIssuer(t)
+	t.Setenv(KeyFetchTokenEnv, "")
+	previous := readKeyFetchTokenFile
+	t.Cleanup(func() { readKeyFetchTokenFile = previous })
+	readKeyFetchTokenFile = func() (string, error) {
+		return "", errors.New("simulated missing token file")
+	}
+	authenticator, err := NewAuthenticator(issuer.URL(), Audience, DefaultAllowedSubjects, nil)
+	require.Error(t, err, "issuer key access is authenticated; an anonymous fallback would betray the design")
 	require.Nil(t, authenticator)
 }
 

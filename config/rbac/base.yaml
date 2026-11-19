@@ -131,10 +131,13 @@ subjects:
 #    binds, so a compromised fastpath cannot mint controller tokens (and
 #    thereby inherit their broader permissions), and a cluster-scoped rule
 #    could not mint for same-named SAs in tenant namespaces.
-# 2. The credential-less Fastlet reads OIDC discovery and JWKS anonymously;
-#    this extends the default system:service-account-issuer-discovery role
-#    (normally bound only to system:serviceaccounts) to unauthenticated
-#    callers, exposing exactly the two public-key endpoints.
+# 2. The Fastlet fetches OIDC discovery and JWKS with a credential: its
+#    dedicated fast-sandbox-fastlet ServiceAccount (provisioned per Pool
+#    namespace by the Pool Controller, projected-token mounted) authenticates
+#    as a member of system:serviceaccounts, which Kubernetes already binds to
+#    its built-in system:service-account-issuer-discovery role. The pair
+#    below restates that grant self-sufficiently for clusters whose operators
+#    stripped the bootstrap bindings. Nothing binds to system:unauthenticated.
 #
 # The OpenSandbox base chart mirrors these grants for chart installs
 # (OpenSandbox manifests/charts/base/templates/fast-sandbox-rbac.yaml);
@@ -180,12 +183,20 @@ subjects:
 - {kind: ServiceAccount, name: fast-sandbox-controller, namespace: fast-sandbox-system}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: fast-sandbox-fastlet-issuer-discovery
+rules:
+- verbs: ["get"]
+  nonResourceURLs: ["/.well-known/openid-configuration", "/openid/v1/jwks"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
   name: fast-sandbox-fastlet-issuer-discovery
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: system:service-account-issuer-discovery}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: fast-sandbox-fastlet-issuer-discovery}
 subjects:
-- {kind: Group, name: system:unauthenticated, apiGroup: rbac.authorization.k8s.io}
+- {kind: Group, name: system:serviceaccounts, apiGroup: rbac.authorization.k8s.io}
 ---
 # The SandboxTemplate build Pod runs in the template's (tenant) namespace,
 # owned by the template for cascading deletion. The controller provisions

@@ -18,6 +18,60 @@ import (
 // maxKeyDocumentBytes bounds the discovery and JWKS response bodies.
 const maxKeyDocumentBytes = 1 << 20
 
+// keyFetchCredential returns the bearer token attached to every issuer key
+// fetch. The Fastlet presents its dedicated ServiceAccount's projected token:
+// the kubelet rotates it (refresh at 80% of the TTL), so the credential is
+// resolved per request and never cached — a stale token cannot outlive its
+// rotation. KeyFetchTokenEnv overrides for processes running outside a Pod.
+// The resolution is fail-closed: a missing or empty credential fails the
+// fetch with a directed error, never a silent anonymous request.
+func keyFetchCredential() (string, error) {
+	if override := strings.TrimSpace(os.Getenv(KeyFetchTokenEnv)); override != "" {
+		return override, nil
+	}
+	token, err := readKeyFetchTokenFile()
+	switch {
+	case err != nil:
+		return "", fmt.Errorf("no key-fetch credential: set %s or mount the ServiceAccount token file: %w", KeyFetchTokenEnv, err)
+	case strings.TrimSpace(token) == "":
+		return "", fmt.Errorf("no key-fetch credential: %s is empty; set %s or restore the mounted ServiceAccount token", serviceAccountTokenFile, KeyFetchTokenEnv)
+	}
+	return strings.TrimSpace(token), nil
+}
+
+// readKeyFetchTokenFile reads the mounted projected token verbatim. It is a
+// package variable only so tests can pin the file location.
+var readKeyFetchTokenFile = func() (string, error) {
+	raw, err := os.ReadFile(serviceAccountTokenFile)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+// authedTransport attaches the key-fetch credential to every request. The
+// discovery fetch and every JWKS load — the initial one and each unknown-kid
+// refresh — travel through the same client, so one transport covers them all,
+// and the credential is resolved inside RoundTrip so rotation is followed
+// without restarts.
+type authedTransport struct {
+	base http.RoundTripper
+}
+
+func (t authedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	credential, err := keyFetchCredential()
+	if err != nil {
+		return nil, err
+	}
+	cloned := request.Clone(request.Context())
+	cloned.Header.Set("Authorization", BearerPrefix+credential)
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(cloned)
+}
+
 // oidcDiscovery is the subset of the OIDC discovery document the verifier
 // needs.
 type oidcDiscovery struct {
@@ -101,7 +155,9 @@ func fetchJSONDocument(ctx context.Context, client *http.Client, url string, tar
 // is the system roots extended with the injected bundle (CABundleEnv) or the
 // projected pod ca.crt: a Kubernetes whose ServiceAccount issuer (or
 // discovery-served jwks_uri) is served with a publicly trusted certificate is
-// a supported deployment and must keep verifying.
+// a supported deployment and must keep verifying. Every request through this
+// client carries the key-fetch credential (authedTransport): issuer discovery
+// is an authenticated read, never an anonymous one.
 func defaultHTTPClient() (*http.Client, error) {
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
@@ -118,7 +174,7 @@ func defaultHTTPClient() (*http.Client, error) {
 	if found {
 		base.TLSClientConfig = &tls.Config{RootCAs: pool}
 	}
-	return &http.Client{Transport: base, Timeout: 5 * time.Second}, nil
+	return &http.Client{Transport: authedTransport{base: base}, Timeout: 5 * time.Second}, nil
 }
 
 // injectedCABundle resolves the CA trust set: the system roots extended with

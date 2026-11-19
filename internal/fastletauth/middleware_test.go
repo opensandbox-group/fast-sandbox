@@ -86,6 +86,7 @@ func TestMiddlewareRejectsNonAllowListedSubject(t *testing.T) {
 
 func TestMiddlewareMapsUnavailableValidationToServiceUnavailable(t *testing.T) {
 	issuer := fastletauthtest.NewIssuer(t)
+	t.Setenv(KeyFetchTokenEnv, "test-key-fetch-credential")
 	authenticator, err := NewAuthenticator(issuer.URL(), Audience, DefaultAllowedSubjects, nil, WithRefreshInterval(time.Millisecond))
 	require.NoError(t, err)
 	handler := Middleware(authenticator, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))

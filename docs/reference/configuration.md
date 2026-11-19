@@ -63,10 +63,14 @@ Klog verbosity flags `-v` and `-vmodule` keep their existing behavior across all
 Fastlet control authentication is always enabled: every call to the Fastlet
 control API carries an audience-bound ServiceAccount token minted through the
 TokenRequest API for the role's own ServiceAccount, and the Pool Controller
-injects the issuer anchor into Fastlet Pods. Two environment overrides cover
+injects the issuer anchor into Fastlet Pods. Three environment overrides cover
 processes running outside a Pod (integration tooling):
 `FASTLET_AUTH_NAMESPACE` and `FASTLET_AUTH_SERVICE_ACCOUNT` pin the minting
-identity; `FASTLET_AUTH_AUDIENCE` overrides the token audience on both sides.
+identity; `FASTLET_AUTH_AUDIENCE` overrides the token audience on both sides;
+`FASTLET_AUTH_KEYFETCH_TOKEN` supplies the credential attached to issuer key
+fetches (OIDC discovery and JWKS) for a Fastlet process running outside a Pod.
+Inside a Pod that credential is the dedicated `fast-sandbox-fastlet`
+ServiceAccount's projected token and needs no configuration.
 
 Resource-aware placement requires static admission. Resource-aware Pool
 scaling requires placement. These constraints prevent a downstream component
@@ -214,7 +218,7 @@ at `/etc/fast-sandbox/registry/registry.json`. See
 - `FAST_SANDBOX_NETWORK_HOST_NETNS_ROOT`;
 - `FAST_SANDBOX_NETWORK_MTU`.
 
-Pool templates cannot override these variables or other platform-owned containers, mounts, runtime handlers, and security settings. Fastlet Pods never mount the service-account token (`automountServiceAccountToken: false` is forced), so they hold no Kubernetes credentials; control-plane components reach Fastlet over the Pod network and authenticate with ServiceAccount tokens the Pool Controller anchors at Pod creation.
+Pool templates cannot override these variables or other platform-owned containers, mounts, runtime handlers, and security settings. Fastlet Pods keep `automountServiceAccountToken: false` and hold exactly one Kubernetes credential: the dedicated `fast-sandbox-fastlet` ServiceAccount's projected token, mounted as a platform-owned volume into the Fastlet container alone and used only to read the issuer's OIDC discovery and JWKS endpoints (the identity holds no resource-API permissions). The key-fetch token file is re-read on every fetch, so kubelet's token rotation is followed without restarts; control-plane components reach Fastlet over the Pod network and authenticate with ServiceAccount tokens the Pool Controller anchors at Pod creation.
 
 ### Control authentication
 
