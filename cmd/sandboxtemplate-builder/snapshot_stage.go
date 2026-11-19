@@ -115,7 +115,13 @@ func runSnapshotStage(args []string) error {
 	// cwd = workdir).
 	driveLink := filepath.Join(workdir, snapshotDriveName)
 	_ = os.Remove(driveLink)
-	if err := os.Symlink(rootfs, driveLink); err != nil {
+	if spec.Output.Mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+		// Boot a private sparse copy so the published filesystem remains clean.
+		if err := exec.Command("cp", "--reflink=auto", "--sparse=always", "--", rootfs, driveLink).Run(); err != nil {
+			return fmt.Errorf("copy template disk for boot verification: %w", err)
+		}
+		defer os.Remove(driveLink)
+	} else if err := os.Symlink(rootfs, driveLink); err != nil {
 		return fmt.Errorf("link snapshot drive %s: %w", driveLink, err)
 	}
 
@@ -171,6 +177,15 @@ func runSnapshotStage(args []string) error {
 	}
 
 	// Pause and create the full snapshot.
+	phases := snapshotPhaseTimings{
+		KernelSHA256: kernelSHA256, KernelCmdline: bootArgs, GuestControl: control,
+		BootToReadyMs: bootToReadyMs, CPUTemplate: compatibilityCPUTemplate(cpuTemplate),
+		FreePageReporting: freePageReporting,
+	}
+	if spec.Output.Mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+		vm.stop()
+		return writeSnapshotReport(workdir, spec, phases)
+	}
 	snapshotStarted := time.Now()
 	if err := api(vm.socket, "PATCH", "/vm", map[string]string{"state": "Paused"}); err != nil {
 		vm.stop()
@@ -237,15 +252,12 @@ func runSnapshotStage(args []string) error {
 			return errors.New("restored helper version changed")
 		}
 	}
-	restoreToHeartbeatMs := time.Since(restoreStarted).Milliseconds()
-	phases := snapshotPhaseTimings{
-		KernelSHA256: kernelSHA256, KernelCmdline: bootArgs, GuestControl: control,
-		BootToReadyMs:        bootToReadyMs,
-		SnapshotCreateMs:     snapshotCreateMs,
-		RestoreToHeartbeatMs: restoreToHeartbeatMs,
-		CPUTemplate:          compatibilityCPUTemplate(cpuTemplate),
-		FreePageReporting:    freePageReporting,
-	}
+	phases.RestoreToHeartbeatMs = time.Since(restoreStarted).Milliseconds()
+	phases.SnapshotCreateMs = snapshotCreateMs
+	return writeSnapshotReport(workdir, spec, phases)
+}
+
+func writeSnapshotReport(workdir string, spec apiv1alpha2.SandboxTemplateSpec, phases snapshotPhaseTimings) error {
 	if payload, err := json.Marshal(phases); err != nil {
 		return fmt.Errorf("marshal snapshot stage report: %w", err)
 	} else if err := os.WriteFile(filepath.Join(workdir, "snapshot-phases.json"), payload, 0o644); err != nil { //nolint:gosec // published stage report, world-readable like every staged artifact
@@ -261,7 +273,6 @@ func runSnapshotStage(args []string) error {
 		"bootToReadyMs", phases.BootToReadyMs,
 		"snapshotCreateMs", phases.SnapshotCreateMs,
 		"restoreToHeartbeatMs", phases.RestoreToHeartbeatMs)
-	_, _ = fmt.Fprintln(os.Stderr, "snapshot stage: boot and restore validation passed")
 	return nil
 }
 

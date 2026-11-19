@@ -102,6 +102,37 @@ func TestRootfsCreatePinsDigestAndInheritsFractionalCPU(t *testing.T) {
 	require.Equal(t, codes.AlreadyExists, status.Code(err))
 }
 
+func TestRootfsCreateFromNativeTemplate(t *testing.T) {
+	s, k, registry, fastlet := newV2Server(t)
+	registry.candidates[0].Capabilities = []string{fastletapi.CapabilityRootfsBootCreate}
+	registry.fastlets[registry.candidates[0].ID] = registry.candidates[0]
+	ctx := t.Context()
+	pool := &apiv1alpha2.SandboxPool{}
+	require.NoError(t, k.Get(ctx, client.ObjectKey{Namespace: "default", Name: "pool-a"}, pool))
+	pool.Spec.Runtime = apiv1alpha2.RuntimeFirecracker
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(resource.MustParse("1"), resource.MustParse("4Gi"), resource.MustParse("1"), resource.MustParse("1"), 128)
+	require.NoError(t, k.Update(ctx, pool))
+	template := &apiv1alpha2.SandboxTemplate{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "golden"},
+		Spec:       apiv1alpha2.SandboxTemplateSpec{IndexKey: "catalog-key", Machine: apiv1alpha2.MachineSpec{VCPU: "1", Memory: "1Gi"}},
+		Status:     apiv1alpha2.SandboxTemplateStatus{Phase: apiv1alpha2.SandboxTemplatePhaseSucceeded, Mode: apiv1alpha2.SandboxSnapshotModeFull, ArtifactDigest: fmt.Sprintf("%064x", 7), ManifestRef: "s3://test/key/manifest.json"},
+	}
+	require.NoError(t, k.Create(ctx, template))
+	req := &fastpathv2.CreateRootfsSandboxRequest{Create: createRequest("from-template"), Source: &fastpathv2.CreateRootfsSandboxRequest_TemplateName{TemplateName: template.Name}}
+	req.Create.Image = template.Spec.IndexKey
+	req.Create.Resources = &fastpathv2.SandboxResourceRequirements{Limits: &fastpathv2.ComputeResourceProfile{Memory: "2Gi"}}
+	_, err := s.CreateRootfsSandbox(ctx, req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Empty(t, fastlet.createRequests)
+	template.Status.Mode = apiv1alpha2.SandboxSnapshotModeRootfsOnly
+	require.NoError(t, k.Update(ctx, template))
+	resp, err := s.CreateRootfsSandbox(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, "1", resp.Sandbox.Resources.Limits.Cpu)
+	require.Equal(t, "2Gi", resp.Sandbox.Resources.Limits.Memory)
+	require.Equal(t, template.Status.ArtifactDigest, fastlet.createRequests[0].Sandbox.RootfsBootDigest)
+}
+
 func TestCanonicalCPUOverride(t *testing.T) {
 	for _, input := range []string{"0.5", "500m", "5e-1"} {
 		got, err := canonicalOverrideQuantity(input, resource.DecimalSI)

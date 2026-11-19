@@ -245,7 +245,7 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.
 		template.Status.ManifestRef = pod.Annotations[sandboxTemplateManifestRefAnnot]
 		template.Status.ArtifactDigest = pod.Annotations[sandboxTemplateArtifactDigestAnn]
 		template.Status.Mode = ""
-		switch mode := apiv1alpha2.SandboxSnapshotMode(pod.Annotations["sandbox.fast.io/artifact-mode"]); mode {
+		switch mode := apiv1alpha2.SandboxSnapshotMode(pod.Annotations[apiv1alpha2.SandboxTemplateArtifactModeAnnotation]); mode {
 		case apiv1alpha2.SandboxSnapshotModeFull, apiv1alpha2.SandboxSnapshotModeRootfsOnly:
 			template.Status.Mode = mode
 		}
@@ -517,6 +517,9 @@ var errArtifactStoreUnconfigured = errors.New("no platform artifact store is con
 // publishing where no node agent reads. Trailing slashes are ignored in the
 // comparison because the builder strips them when naming objects.
 func (r *SandboxTemplateReconciler) effectiveOutput(output apiv1alpha2.OutputSpec, storeRoot string) (apiv1alpha2.OutputSpec, error) {
+	if output.Mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly && output.Format != apiv1alpha2.ArtifactFormatNative {
+		return output, fmt.Errorf("RootfsOnly template builds require native object storage")
+	}
 	if strings.HasPrefix(output.Publish, "oci://") {
 		if output.Format != apiv1alpha2.ArtifactFormatOverlayBD {
 			return output, fmt.Errorf("OCI templates require overlaybd format")

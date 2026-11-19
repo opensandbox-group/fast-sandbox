@@ -31,14 +31,7 @@ func publish(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir 
 		return "", fmt.Errorf("aws CLI not found: %w", err)
 	}
 	base := strings.TrimRight(spec.Output.Publish, "/") + "/" + sha256Of(manifestBytes)[:16]
-	entries := []struct{ local, key string }{
-		{filepath.Join(workdir, rootfsImageName), rootfsImageName},
-		{filepath.Join(workdir, vmstateFileName), vmstateFileName},
-		{filepath.Join(workdir, memoryFileName), memoryFileName},
-		// SHA256SUMS covers only the published artifact set; it belongs to
-		// the immutable build directory and goes up with the artifacts.
-		{filepath.Join(workdir, "SHA256SUMS"), "SHA256SUMS"},
-	}
+	entries := append(templateFiles(spec.Output.Mode), "SHA256SUMS")
 	// The platform endpoint (injected as AWS_ENDPOINT_URL by the controller)
 	// wins over the mounted secret's endpoint; --endpoint-url pins the
 	// S3-compatible target even with awscli v1 (AWS_ENDPOINT_URL is only
@@ -52,8 +45,8 @@ func publish(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir 
 	if endpoint != "" {
 		args = append(args, "--endpoint-url", endpoint)
 	}
-	for _, entry := range entries {
-		if err := uploadWithRetry(ctx, aws, args, env, entry.local, base+"/"+entry.key, entry.key); err != nil {
+	for _, name := range entries {
+		if err := uploadWithRetry(ctx, aws, args, env, filepath.Join(workdir, name), base+"/"+name, name); err != nil {
 			return "", err
 		}
 	}
@@ -184,7 +177,7 @@ func uploadWithRetry(ctx context.Context, aws string, args, env []string, local,
 // controller can surface it on the template status. It uses a merge Patch
 // touching only the two annotations to avoid racing kubelet's own status
 // updates. Standalone runs (E2E, local debugging) simply skip the report.
-func patchPodAnnotations(ctx context.Context, manifestRef, digest string) error {
+func patchPodAnnotations(ctx context.Context, manifestRef, digest string, mode apiv1alpha2.SandboxSnapshotMode) error {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		klog.V(2).InfoS("skipping pod annotation update (not running in a cluster)", "err", err)
@@ -210,9 +203,8 @@ func patchPodAnnotations(ctx context.Context, manifestRef, digest string) error 
 	if err != nil {
 		return err
 	}
-	// Both current builder paths publish the golden VM state and RAM.
-	patch := fmt.Sprintf(`{"metadata":{"annotations":{"sandbox.fast.io/artifact-mode":"Full","%s":%s,"%s":%s}}}`,
-		manifestRefAnnotation, refJSON, digestAnnotation, digestJSON)
+	patch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":"%s","%s":%s,"%s":%s}}}`,
+		apiv1alpha2.SandboxTemplateArtifactModeAnnotation, mode, manifestRefAnnotation, refJSON, digestAnnotation, digestJSON)
 	_, err = clientSet.CoreV1().Pods(namespace).Patch(ctx, name, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
 	return err
 }

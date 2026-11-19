@@ -179,7 +179,7 @@ func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 		return fmt.Errorf("fsb-vm push returned incomplete publication")
 	}
 	progress.start("patch-annotations")
-	return patchPodAnnotations(ctx, result.ManifestRef, result.ArtifactDigest)
+	return patchPodAnnotations(ctx, result.ManifestRef, result.ArtifactDigest, apiv1alpha2.SandboxSnapshotModeFull)
 }
 
 // The controller pins buildID in the Pod. Local builder runs get a fresh UUID.

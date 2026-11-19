@@ -86,7 +86,10 @@ func (s *Server) CreateRootfsSandbox(ctx context.Context, in *pb.CreateRootfsSan
 		if tmpl.Status.Phase != api.SandboxTemplatePhaseSucceeded || tmpl.Status.Mode != api.SandboxSnapshotModeRootfsOnly || !tmpl.DeletionTimestamp.IsZero() {
 			return nil, status.Error(codes.InvalidArgument, "source must be a ready RootfsOnly template")
 		}
-		ref, sum, native = tmpl.Status.ManifestRef, tmpl.Status.ArtifactDigest, tmpl.Name
+		ref, sum, native = tmpl.Status.ManifestRef, tmpl.Status.ArtifactDigest, tmpl.Spec.Image
+		if tmpl.Spec.IndexKey != "" {
+			native = tmpl.Spec.IndexKey
+		}
 		defaults = &pb.ComputeResourceProfile{Cpu: tmpl.Spec.Machine.VCPU, Memory: tmpl.Spec.Machine.Memory}
 	default:
 		return nil, status.Error(codes.InvalidArgument, "snapshot_name or template_name required")

@@ -13,11 +13,26 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifacts"
 )
 
 func TestNativePublishDoesNotUploadStaleOverlayBDLayers(t *testing.T) {
+	testNativePublish(t, apiv1alpha2.SandboxSnapshotModeFull)
+}
+
+func TestNativePublishRootfsOnly(t *testing.T) {
+	testNativePublish(t, apiv1alpha2.SandboxSnapshotModeRootfsOnly)
+}
+
+func testNativePublish(t *testing.T, mode apiv1alpha2.SandboxSnapshotMode) {
+	t.Helper()
 	spec, kernel, rootfs, vmstate, memory := buildManifestFixture(t)
+	spec.Output.Mode = mode
+	if mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+		require.NoError(t, os.Remove(vmstate))
+		require.NoError(t, os.Remove(memory))
+	}
 	workdir := filepath.Dir(rootfs)
 	spec.Output.Publish = "s3://bucket/templates"
 	raw, err := stageManifest(spec, "sha256:source", kernel, rootfs, vmstate, memory, workdir, nativeManifestPhases(t, kernel), nil)
@@ -38,6 +53,21 @@ func TestNativePublishDoesNotUploadStaleOverlayBDLayers(t *testing.T) {
 	uploads, err := os.ReadFile(log)
 	require.NoError(t, err)
 	lines := strings.Split(strings.TrimSpace(string(uploads)), "\n")
+	if mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+		manifest, err := artifacts.DecodeVMManifest(raw)
+		require.NoError(t, err)
+		require.True(t, manifest.IsRootfsOnly())
+		require.Len(t, manifest.Files, 1)
+		require.Contains(t, manifest.Files, rootfsImageName)
+		checksums, err := os.ReadFile(filepath.Join(workdir, "SHA256SUMS"))
+		require.NoError(t, err)
+		require.Len(t, strings.Split(strings.TrimSpace(string(checksums)), "\n"), 1)
+		require.Len(t, lines, 4)
+		for i, suffix := range []string{"/rootfs.ext4", "/SHA256SUMS", "/manifest.json", ".json"} {
+			require.True(t, strings.HasSuffix(lines[i], suffix), lines[i])
+		}
+		return
+	}
 	require.Len(t, lines, 6) // Three artifacts, checksums, manifest, then image index.
 	require.NotContains(t, string(uploads), "overlaybd")
 	require.Contains(t, lines[4], "/manifest.json")

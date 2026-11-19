@@ -502,10 +502,14 @@ func (o *Orchestrator) CreateRuntimeOnCandidateWithCompletion(ctx context.Contex
 }
 
 func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1alpha2.Sandbox, fastlet placement.FastletInfo, envelope assignment.AssignmentEnvelope, identity fastletapi.SandboxIdentity, completion fastletapi.CreateCompletion, parameters RuntimeParameters, declarative bool) (*fastletapi.CreateSandboxResponse, error) {
-	if cap := requiredCreateCapability(sandbox); cap != "" {
+	if capability := requiredCreateCapability(sandbox); capability != "" {
 		current, ok := o.Registry.GetFastletByID(fastlet.ID)
-		if !ok || current.PodUID != envelope.FastletPodUID || !current.SupportsCapability(cap) {
-			failure := &fastletapi.FastletError{Code: fastletapi.ErrorCapacityRejected, Reason: fastletapi.AdmissionReasonUnsupportedProtocol, Message: "assigned Fastlet does not advertise " + cap, Retryable: true}
+		if !ok || current.PodUID != envelope.FastletPodUID || !current.SupportsCapability(capability) {
+			failure := &fastletapi.FastletError{Code: fastletapi.ErrorCapacityRejected, Reason: fastletapi.AdmissionReasonUnsupportedProtocol, Message: "assigned Fastlet does not advertise " + capability, Retryable: true}
+			if !ok || current.PodUID != envelope.FastletPodUID {
+				failure.Reason = fastletapi.AdmissionReasonTelemetryStale
+				failure.Message = "assigned Fastlet disappeared or was replaced in the placement registry"
+			}
 			return nil, &fastletapi.CreateCallError{Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects, Failure: failure}
 		}
 	}
