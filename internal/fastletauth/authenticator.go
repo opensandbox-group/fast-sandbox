@@ -120,7 +120,7 @@ func NewAuthenticator(issuer, audience string, allowedSubjects []string, httpCli
 	}
 	if httpClient == nil {
 		var clientErr error
-		httpClient, clientErr = defaultHTTPClient()
+		httpClient, clientErr = defaultHTTPClient(issuer)
 		if clientErr != nil {
 			return nil, clientErr
 		}

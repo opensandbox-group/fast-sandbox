@@ -1261,6 +1261,10 @@ func TestConstructPodUsesRuntimeProfileAndFixedResources(t *testing.T) {
 	require.Equal(t, fastletsettings.MountPath, envValue(pod.Spec.Containers[0].Env, fastletsettings.EnvDir))
 	require.NotNil(t, pod.Annotations["fast-sandbox.io/settings-revision"])
 	require.NotNil(t, volumeMountForContainer(pod, 0, fastletsettings.VolumeName))
+	require.NotNil(t, volumeMountForContainer(pod, 0, fastletAuthTokenVolumeName),
+		"the Fastlet container mounts its projected key-fetch credential")
+	require.Nil(t, volumeMountForContainer(pod, 1, fastletAuthTokenVolumeName),
+		"the proxy sidecar must not receive the key-fetch credential")
 	require.Equal(t, runtimePlan.Revision, pod.Annotations["fast-sandbox.io/runtime-plan-revision"])
 	require.NotEmpty(t, pod.Annotations[placement.AnnotationPodTemplateHash])
 	require.Equal(t, shortRevision(pod.Annotations["fast-sandbox.io/infra-revision"]), pod.Labels["fast-sandbox.io/infra-revision"])
@@ -2938,7 +2942,9 @@ func TestConstructPodInjectsFastletAuthAnchor(t *testing.T) {
 				resource.MustParse("1"), resource.MustParse("1Gi"), 256,
 			),
 			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
-				RuntimeClassName:             &runtimeClass,
+				RuntimeClassName: &runtimeClass,
+				// A template-chosen ServiceAccount is overridden, never merged.
+				ServiceAccountName:           "attacker-sa",
 				AutomountServiceAccountToken: &automount,
 				Containers:                   []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}},
 			}},
@@ -2955,7 +2961,33 @@ func TestConstructPodInjectsFastletAuthAnchor(t *testing.T) {
 	require.Equal(t, "system:serviceaccount:opensandbox-system:fast-sandbox-fastpath,system:serviceaccount:opensandbox-system:fast-sandbox-controller",
 		envValue(pod.Spec.Containers[0].Env, fastletauth.AllowedSubjectsEnv),
 		"the caller allow list is injected through the platform env path")
-	require.False(t, *pod.Spec.AutomountServiceAccountToken, "the anchor injection must not reintroduce token mounts")
+	require.False(t, *pod.Spec.AutomountServiceAccountToken,
+		"automount stays off: the key-fetch credential ships as an explicit projected volume, not a blanket mount")
+	require.Equal(t, fastletServiceAccountName, pod.Spec.ServiceAccountName,
+		"the Pod presents the dedicated discovery-only identity, not the template's")
+	var authTokenVolume *corev1.Volume
+	for index := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[index].Name == fastletAuthTokenVolumeName {
+			authTokenVolume = &pod.Spec.Volumes[index]
+			break
+		}
+	}
+	require.NotNil(t, authTokenVolume, "the projected key-fetch credential ships as a platform-owned volume")
+	require.NotNil(t, authTokenVolume.VolumeSource.Projected)
+	require.Len(t, authTokenVolume.VolumeSource.Projected.Sources, 1)
+	tokenProjection := authTokenVolume.VolumeSource.Projected.Sources[0].ServiceAccountToken
+	require.NotNil(t, tokenProjection)
+	require.Equal(t, "token", tokenProjection.Path)
+	require.NotNil(t, tokenProjection.ExpirationSeconds)
+	require.Equal(t, int64(fastletauth.DefaultExpirationSeconds), *tokenProjection.ExpirationSeconds)
+	require.NotNil(t, volumeMountForContainer(pod, 0, fastletAuthTokenVolumeName))
+	require.Equal(t, fastletAuthTokenMountPath, volumeMountForContainer(pod, 0, fastletAuthTokenVolumeName).MountPath)
+	require.Nil(t, volumeMountForContainer(pod, 1, fastletAuthTokenVolumeName),
+		"the proxy sidecar must not receive the key-fetch credential")
+	// The mount and projection item must compose to exactly the file the
+	// Fastlet reads.
+	require.Equal(t, fastletauth.ServiceAccountTokenFile,
+		filepath.Join(fastletAuthTokenMountPath, tokenProjection.Path))
 }
 
 func TestConstructPodStripsTemplateOwnedAuthEnv(t *testing.T) {
@@ -2985,12 +3017,14 @@ func TestConstructPodStripsTemplateOwnedAuthEnv(t *testing.T) {
 				Containers: []corev1.Container{{
 					Name: "fastlet", Image: "fastlet:test",
 					Env: []corev1.EnvVar{
-						// A Pool template must not be able to relax the allow
-						// list or redirect the issuer anchor.
+						// A Pool template must not relax the allow list, redirect
+						// the anchor, or hand the Fastlet an override key-fetch
+						// credential.
 						{Name: fastletauth.AllowedSubjectsEnv, Value: "system:serviceaccount:attacker:default"},
 						{Name: fastletauth.IssuerEnv, Value: "https://attacker.example"},
 						{Name: fastletauth.CABundleEnv, Value: "attacker-ca"},
 						{Name: fastletauth.AudienceEnv, Value: "attacker-audience"},
+						{Name: fastletauth.KeyFetchTokenEnv, Value: "attacker-static-token"},
 					},
 					// envFrom may supply keys explicit env does not
 					// define. The platform answers by injecting every
@@ -3019,8 +3053,171 @@ func TestConstructPodStripsTemplateOwnedAuthEnv(t *testing.T) {
 		"the template must not relax the allow list")
 	require.Equal(t, "https://kubernetes.default.svc", envValue(pod.Spec.Containers[0].Env, fastletauth.AudienceEnv),
 		"the audience must come from the platform, not the template")
+	require.Empty(t, envValue(pod.Spec.Containers[0].Env, fastletauth.KeyFetchTokenEnv),
+		"the template must not supply the key-fetch credential override; the Pod reads the mounted file")
 	require.Len(t, pod.Spec.Containers[0].EnvFrom, 1,
 		"envFrom is preserved for non-auth keys; explicit env entries shadow any auth key it could supply")
+}
+
+// TestConstructPodRejectsTemplateOwnedAuthTokenVolume pins that a Pool
+// template can neither supply a volume named like the key-fetch projection nor
+// mount anything at the projection path — either would let a template place
+// attacker-chosen bytes where the Fastlet reads its fetching identity.
+func TestConstructPodRejectsTemplateOwnedAuthTokenVolume(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	poolReconciler := &SandboxPoolReconciler{Scheme: scheme, Catalog: runtimecatalog.Builtin()}
+
+	newPool := func(volumes []corev1.Volume, mounts []corev1.VolumeMount) *apiv1alpha2.SandboxPool {
+		return &apiv1alpha2.SandboxPool{
+			TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha2.GroupVersion.String(), Kind: "SandboxPool"},
+			ObjectMeta: metav1.ObjectMeta{Name: "pool-token-collision", Namespace: "default", UID: types.UID("pool-uid")},
+			Spec: apiv1alpha2.SandboxPoolSpec{
+				Runtime:            apiv1alpha2.RuntimeContainer,
+				MaxSandboxesPerPod: 5,
+				SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+					resource.MustParse("1"), resource.MustParse("1Gi"), 256,
+				),
+				FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					Volumes: volumes,
+					Containers: []corev1.Container{{
+						Name: "fastlet", Image: "fastlet:test", VolumeMounts: mounts,
+					}},
+				}},
+			},
+		}
+	}
+
+	_, err := poolReconciler.constructPodWithRuntimePlan(
+		newPool([]corev1.Volume{{Name: fastletAuthTokenVolumeName}}, nil), mustRuntimePlan(t, poolReconciler.Catalog))
+	require.ErrorContains(t, err, "platform-owned volume name",
+		"a template volume named like the key-fetch projection is rejected")
+
+	_, err = poolReconciler.constructPodWithRuntimePlan(
+		newPool(nil, []corev1.VolumeMount{{Name: "innocent", MountPath: fastletAuthTokenMountPath}}),
+		mustRuntimePlan(t, poolReconciler.Catalog))
+	require.ErrorContains(t, err, "reserved by the platform",
+		"a template mount at the projection path is rejected even under an innocent volume name")
+
+	// Nesting defeats an exact-path check: a subPath mount of a foreign volume
+	// shadows the token file itself, and containerd applies the parent
+	// directory before the subpath.
+	_, err = poolReconciler.constructPodWithRuntimePlan(
+		newPool(nil, []corev1.VolumeMount{{Name: "innocent", MountPath: fastletauth.ServiceAccountTokenFile, SubPath: fastletAuthTokenProjectionPath}}),
+		mustRuntimePlan(t, poolReconciler.Catalog))
+	require.ErrorContains(t, err, "inside the projected credential directory",
+		"a subPath shadowing the token file is rejected")
+
+	_, err = poolReconciler.constructPodWithRuntimePlan(
+		newPool(nil, []corev1.VolumeMount{{Name: "innocent", MountPath: fastletAuthTokenMountPath + "/nested"}}),
+		mustRuntimePlan(t, poolReconciler.Catalog))
+	require.ErrorContains(t, err, "inside the projected credential directory",
+		"any mount at or under the credential directory is rejected")
+}
+
+func mustRuntimePlan(t *testing.T, catalog *runtimecatalog.Catalog) runtimeenv.ResolvedRuntimePlan {
+	t.Helper()
+	runtimePlan, err := runtimeenv.ResolveDefault(catalog, apiv1alpha2.RuntimeContainer)
+	require.NoError(t, err)
+	return runtimePlan
+}
+
+// TestEnsureFastletServiceAccountIsIdempotent pins per-namespace provisioning:
+// created once, tolerated when present, and shared across Pools in the
+// namespace.
+func TestEnsureFastletServiceAccountIsIdempotent(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	reconciler := &SandboxPoolReconciler{Client: k8sClient, Scheme: scheme, Catalog: runtimecatalog.Builtin()}
+
+	pool := &apiv1alpha2.SandboxPool{
+		TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha2.GroupVersion.String(), Kind: "SandboxPool"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "tenant-a", UID: types.UID("pool-uid-a")},
+	}
+	require.NoError(t, reconciler.ensureFastletServiceAccount(context.Background(), pool))
+	require.NoError(t, reconciler.ensureFastletServiceAccount(context.Background(), pool), "a second ensure converges, not errors")
+
+	var projected corev1.ServiceAccount
+	require.NoError(t, k8sClient.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: fastletServiceAccountName}, &projected))
+
+	// A second Pool in the same namespace reuses the identity.
+	poolB := &apiv1alpha2.SandboxPool{
+		TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha2.GroupVersion.String(), Kind: "SandboxPool"},
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-b", Namespace: "tenant-a", UID: types.UID("pool-uid-b")},
+	}
+	require.NoError(t, reconciler.ensureFastletServiceAccount(context.Background(), poolB))
+	require.NoError(t, k8sClient.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: fastletServiceAccountName}, &projected))
+	require.Equal(t, fastletServiceAccountName, projected.Name)
+}
+
+// TestConstructPodPreservesInheritedImagePullSecrets pins the credential
+// carry-over across the identity switch: ServiceAccount admission inherits
+// imagePullSecrets from the selected identity, so forcing the dedicated auth
+// identity must pin the previously effective references onto the Pod spec or
+// uncached private images land in ImagePullBackOff.
+func TestConstructPodPreservesInheritedImagePullSecrets(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.ServiceAccount{
+			ObjectMeta:       metav1.ObjectMeta{Name: "custom-sa", Namespace: "tenant-a"},
+			ImagePullSecrets: []corev1.LocalObjectReference{{Name: "regcred"}},
+		},
+		&corev1.ServiceAccount{
+			ObjectMeta:       metav1.ObjectMeta{Name: "default", Namespace: "tenant-a"},
+			ImagePullSecrets: []corev1.LocalObjectReference{{Name: "default-regcred"}},
+		},
+	).Build()
+	reconciler := &SandboxPoolReconciler{Client: k8sClient, Scheme: scheme, Catalog: runtimecatalog.Builtin()}
+
+	newPool := func(serviceAccountName string, imagePullSecrets []corev1.LocalObjectReference) *apiv1alpha2.SandboxPool {
+		return &apiv1alpha2.SandboxPool{
+			TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha2.GroupVersion.String(), Kind: "SandboxPool"},
+			ObjectMeta: metav1.ObjectMeta{Name: "pool-pull-secrets", Namespace: "tenant-a", UID: types.UID("pool-uid")},
+			Spec: apiv1alpha2.SandboxPoolSpec{
+				Runtime:            apiv1alpha2.RuntimeContainer,
+				MaxSandboxesPerPod: 5,
+				SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+					resource.MustParse("1"), resource.MustParse("1Gi"), 256,
+				),
+				FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					ServiceAccountName: serviceAccountName,
+					ImagePullSecrets:   imagePullSecrets,
+					Containers:         []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}},
+				}},
+			},
+		}
+	}
+	pullSecretNames := func(pod *corev1.Pod) []string {
+		names := make([]string, 0, len(pod.Spec.ImagePullSecrets))
+		for _, secret := range pod.Spec.ImagePullSecrets {
+			names = append(names, secret.Name)
+		}
+		return names
+	}
+
+	// The template identity's credentials are pinned onto the Pod spec while
+	// the fetching identity stays platform-owned.
+	pod, err := reconciler.constructPodWithRuntimePlan(newPool("custom-sa", nil), mustRuntimePlan(t, reconciler.Catalog))
+	require.NoError(t, err)
+	require.Equal(t, fastletServiceAccountName, pod.Spec.ServiceAccountName)
+	require.Equal(t, []string{"regcred"}, pullSecretNames(pod))
+
+	// Template-specified references are unioned with the inherited ones,
+	// deduped by name.
+	pod, err = reconciler.constructPodWithRuntimePlan(
+		newPool("custom-sa", []corev1.LocalObjectReference{{Name: "extra"}, {Name: "regcred"}}),
+		mustRuntimePlan(t, reconciler.Catalog))
+	require.NoError(t, err)
+	require.Equal(t, []string{"extra", "regcred"}, pullSecretNames(pod))
+
+	// No template identity means the namespace default was effective.
+	pod, err = reconciler.constructPodWithRuntimePlan(newPool("", nil), mustRuntimePlan(t, reconciler.Catalog))
+	require.NoError(t, err)
+	require.Equal(t, []string{"default-regcred"}, pullSecretNames(pod))
 }
 
 // TestConstructPodInjectsAuthEnvUnconditionally pins the shadowing guarantee:
@@ -3053,7 +3250,7 @@ func TestConstructPodInjectsAuthEnvUnconditionally(t *testing.T) {
 	require.NoError(t, err)
 	pod, err := poolReconciler.constructPodWithRuntimePlan(pool, runtimePlan)
 	require.NoError(t, err)
-	for _, key := range []string{fastletauth.IssuerEnv, fastletauth.CABundleEnv, fastletauth.AllowedSubjectsEnv, fastletauth.AudienceEnv} {
+	for _, key := range []string{fastletauth.IssuerEnv, fastletauth.CABundleEnv, fastletauth.AllowedSubjectsEnv, fastletauth.AudienceEnv, fastletauth.KeyFetchTokenEnv} {
 		require.Contains(t, envNames(pod.Spec.Containers[0].Env), key,
 			"every auth env key must carry an explicit entry so envFrom can never supply it")
 	}

@@ -18,6 +18,82 @@ import (
 // maxKeyDocumentBytes bounds the discovery and JWKS response bodies.
 const maxKeyDocumentBytes = 1 << 20
 
+// maxKeyFetchRedirects caps redirect chains at the standard library default.
+const maxKeyFetchRedirects = 10
+
+// keyFetchCredential returns the bearer token for issuer key fetches: the
+// KeyFetchTokenEnv override, else the mounted projected ServiceAccount token.
+// Resolved per request so kubelet rotation is followed; a missing credential
+// fails closed with a directed error.
+func keyFetchCredential() (string, error) {
+	if override := strings.TrimSpace(os.Getenv(KeyFetchTokenEnv)); override != "" {
+		return override, nil
+	}
+	token, err := readKeyFetchTokenFile()
+	switch {
+	case err != nil:
+		return "", fmt.Errorf("no key-fetch credential: set %s or mount the ServiceAccount token file: %w", KeyFetchTokenEnv, err)
+	case strings.TrimSpace(token) == "":
+		return "", fmt.Errorf("no key-fetch credential: %s is empty; set %s or restore the mounted ServiceAccount token", ServiceAccountTokenFile, KeyFetchTokenEnv)
+	}
+	return strings.TrimSpace(token), nil
+}
+
+// readKeyFetchTokenFile reads the mounted projected token verbatim. It is a
+// package variable only so tests can pin the file location.
+var readKeyFetchTokenFile = func() (string, error) {
+	raw, err := os.ReadFile(ServiceAccountTokenFile)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+// authedTransport attaches the key-fetch credential to every request through
+// this client — discovery, initial JWKS, and each unknown-kid refresh alike —
+// but only within the pinned issuer origin. The credential is a Kubernetes
+// identity; the discovery document naming another host does not authorize that
+// host to receive it.
+type authedTransport struct {
+	base   http.RoundTripper
+	origin *url.URL
+}
+
+func (t authedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if !sameOrigin(request.URL, t.origin) {
+		return nil, fmt.Errorf("refusing to send the key-fetch credential to %s: outside the pinned issuer origin", request.URL.Host)
+	}
+	credential, err := keyFetchCredential()
+	if err != nil {
+		return nil, err
+	}
+	cloned := request.Clone(request.Context())
+	cloned.Header.Set("Authorization", BearerPrefix+credential)
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(cloned)
+}
+
+// sameOrigin compares scheme and host with default ports applied, so an issuer
+// written without an explicit port still matches its discovery-served URLs.
+func sameOrigin(a, b *url.URL) bool {
+	return a != nil && b != nil && a.Scheme == b.Scheme && canonicalHost(a) == canonicalHost(b)
+}
+
+func canonicalHost(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	return u.Hostname() + ":" + port
+}
+
 // oidcDiscovery is the subset of the OIDC discovery document the verifier
 // needs.
 type oidcDiscovery struct {
@@ -36,6 +112,10 @@ func fetchDiscovery(ctx context.Context, client *http.Client, issuer string) (*o
 	if err := validateKeyMaterialURL(issuer, "issuer"); err != nil {
 		return nil, err
 	}
+	issuerURL, err := url.Parse(issuer)
+	if err != nil || issuerURL.Host == "" {
+		return nil, fmt.Errorf("issuer %q is not a valid URL", issuer)
+	}
 	document := &oidcDiscovery{}
 	if err := fetchJSONDocument(ctx, client, strings.TrimSuffix(issuer, "/")+"/.well-known/openid-configuration", document); err != nil {
 		return nil, err
@@ -49,9 +129,14 @@ func fetchDiscovery(ctx context.Context, client *http.Client, issuer string) (*o
 	// The discovery document names where signing keys are fetched from. An
 	// unvalidated jwks_uri would let an https issuer hand its keys over
 	// plaintext, where an on-path attacker can substitute forgeries — apply
-	// the same trust-anchor boundary as the issuer itself.
+	// the same trust-anchor boundary as the issuer itself. Pin the origin too:
+	// keys served from another host would receive the key-fetch credential.
 	if err := validateKeyMaterialURL(document.JWKSURI, "jwks_uri"); err != nil {
 		return nil, err
+	}
+	jwksURL, parseErr := url.Parse(document.JWKSURI)
+	if parseErr != nil || !sameOrigin(jwksURL, issuerURL) {
+		return nil, fmt.Errorf("jwks_uri %q is not served by the pinned issuer origin", document.JWKSURI)
 	}
 	return document, nil
 }
@@ -99,10 +184,16 @@ func fetchJSONDocument(ctx context.Context, client *http.Client, url string, tar
 
 // defaultHTTPClient builds the client for issuer key material. The trust set
 // is the system roots extended with the injected bundle (CABundleEnv) or the
-// projected pod ca.crt: a Kubernetes whose ServiceAccount issuer (or
-// discovery-served jwks_uri) is served with a publicly trusted certificate is
-// a supported deployment and must keep verifying.
-func defaultHTTPClient() (*http.Client, error) {
+// projected pod ca.crt, so publicly trusted issuers keep verifying. Every
+// request carries the key-fetch credential — discovery is an authenticated
+// read, never anonymous — and the transport refuses any request outside the
+// issuer origin, so neither redirects nor a foreign jwks_uri can receive the
+// credential.
+func defaultHTTPClient(issuer string) (*http.Client, error) {
+	origin, err := url.Parse(issuer)
+	if err != nil || origin.Host == "" {
+		return nil, fmt.Errorf("issuer %q is not a valid URL", issuer)
+	}
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
 		// Instrumentation may have replaced the default transport; lose the
@@ -118,7 +209,23 @@ func defaultHTTPClient() (*http.Client, error) {
 	if found {
 		base.TLSClientConfig = &tls.Config{RootCAs: pool}
 	}
-	return &http.Client{Transport: base, Timeout: 5 * time.Second}, nil
+	// The credential is injected inside RoundTrip, below redirect handling, so
+	// every hop would re-receive it — undoing the standard library's
+	// cross-host and downgrade Authorization stripping. Refuse to leave the
+	// anchor host or scheme; the non-200 redirect fails the fetcher closed.
+	return &http.Client{
+		Transport: authedTransport{base: base, origin: origin},
+		Timeout:   5 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= maxKeyFetchRedirects {
+				return fmt.Errorf("stopped after %d redirects", maxKeyFetchRedirects)
+			}
+			if req.URL.Host != via[0].URL.Host || req.URL.Scheme != via[0].URL.Scheme {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}, nil
 }
 
 // injectedCABundle resolves the CA trust set: the system roots extended with

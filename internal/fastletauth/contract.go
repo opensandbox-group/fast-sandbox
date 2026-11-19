@@ -18,7 +18,9 @@ const BearerPrefix = "Bearer "
 // Env vars. AllowedSubjectsEnv replaces (never disables) the built-in allow
 // list. IssuerEnv/CABundleEnv are injected by the Pool Controller into
 // Fastlet Pods and double as overrides for processes outside a Pod.
-// NamespaceEnv/ServiceAccountEnv/AudienceEnv are likewise non-Pod overrides.
+// NamespaceEnv/ServiceAccountEnv/AudienceEnv/KeyFetchTokenEnv are likewise
+// non-Pod overrides; KeyFetchTokenEnv supplies the issuer key-fetch
+// credential.
 const (
 	AllowedSubjectsEnv = "FASTLET_AUTH_ALLOWED_SUBJECTS"
 	NamespaceEnv       = "FASTLET_AUTH_NAMESPACE"
@@ -26,6 +28,7 @@ const (
 	CABundleEnv        = "FASTLET_AUTH_CA_BUNDLE"
 	IssuerEnv          = "FASTLET_AUTH_ISSUER"
 	AudienceEnv        = "FASTLET_AUTH_AUDIENCE"
+	KeyFetchTokenEnv   = "FASTLET_AUTH_KEYFETCH_TOKEN"
 )
 
 // Auth error codes carried in the middleware's JSON error envelope; the
