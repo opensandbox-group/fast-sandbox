@@ -29,7 +29,7 @@ func (m *SandboxManager) ReconcileProxyRoutes(ctx context.Context) error {
 	owners := make([]*SandboxMetadata, 0, len(m.sandboxes))
 	pendingInfra := false
 	for _, sandbox := range m.sandboxes {
-		if sandbox.RecoveryRequired {
+		if sandbox.RecoveryRequired && !sandbox.BootRecoveryPending {
 			pendingInfra = true
 		}
 		if !m.runtimeWorkAllowedLocked(sandbox) {
@@ -238,6 +238,7 @@ func (m *SandboxManager) observeRuntimeRecovery(ctx context.Context, identity fa
 	}
 	wasRequired := metadata.RecoveryRequired
 	metadata.RecoveryRequired = observed.RecoveryRequired
+	metadata.BootRecoveryPending = observed.BootRecoveryPending
 	if observed.RecoveryRequired {
 		metadata.RuntimeMessage = observed.RuntimeMessage
 	} else if wasRequired {

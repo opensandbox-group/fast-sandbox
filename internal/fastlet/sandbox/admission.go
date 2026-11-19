@@ -788,7 +788,9 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit,
 			metadata.Phase = sandboxStateUnknown
 		}
 		terminalFailure := metadata.Phase == sandboxStateRuntimeFailed
-		if m.infraManager != nil && !terminalFailure {
+		if metadata.RecoveryRequired {
+			metadata.Phase = sandboxStateInfraPending
+		} else if m.infraManager != nil && !terminalFailure {
 			if metadata.Config.Desired.InfraRevision != m.infraRevision {
 				return fmt.Errorf("recovered Sandbox %s Infra revision does not match Fastlet", identity.SandboxUID)
 			}
@@ -813,7 +815,7 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit,
 	publications := make([]RoutePublication, 0, len(recovered))
 	pendingInfra := false
 	for _, metadata := range recovered {
-		if metadata.Phase == sandboxStateRuntimeFailed {
+		if metadata.Phase == sandboxStateRuntimeFailed || metadata.RecoveryRequired {
 			continue
 		}
 		if m.infraManager != nil {
@@ -853,7 +855,7 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit,
 	m.routeReady = m.routePublisher == nil || !pendingInfra
 	m.mu.Unlock()
 	for _, metadata := range recovered {
-		if metadata.Phase == sandboxStateRuntimeFailed {
+		if metadata.Phase == sandboxStateRuntimeFailed || metadata.RecoveryRequired {
 			continue
 		}
 		m.recordActionHook(metadata, actionapi.LifecycleHookRuntimeReady, 1)

@@ -224,7 +224,7 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	if err != nil {
 		return nil, err
 	}
-	if !runtimecontract.SameRuntimeIdentity(state.Config.Identity, *input.Identity) || state.Phase != PhaseRunning {
+	if !runtimecontract.SameRuntimeIdentity(state.Config.Identity, *input.Identity) || state.Phase != PhaseRunning || state.BootRecoveryError != "" {
 		return nil, errors.New("snapshot source identity or phase changed")
 	}
 	if err = d.recoverRootfsCapture(ctx, state); err != nil {
@@ -345,7 +345,24 @@ func (d *Driver) ReconcileSandbox(ctx context.Context, identity fastletapi.Sandb
 	if err != nil || dead {
 		return err
 	}
-	return d.recoverRootfsCapture(ctx, state)
+	if err := d.recoverRootfsCapture(ctx, state); err != nil || state.BootRecoveryError == "" {
+		return err
+	}
+	directory := filepath.Join(d.config.StateRoot, sandboxStateDir, identity.SandboxUID)
+	cgroups := d.runtimeCgroups
+	if cgroups == nil || cgroups.ConfirmAbsent(identity.SandboxUID) != nil {
+		err := d.adoptPinnedBoot(ctx, directory, state, cgroups)
+		if err == nil || state.Phase != PhaseStarting || cgroups == nil || ctx.Err() != nil {
+			return err
+		}
+		if stopErr := d.stopInterruptedStart(ctx, state, cgroups); stopErr != nil {
+			return errors.Join(err, stopErr)
+		}
+	}
+	// The manager retires the Action owner before releasing this instance.
+	state.Phase, state.PID, state.BootRecoveryError = PhaseFailed, 0, ""
+	state.FailureMessage = "rootfs VMM exited during boot recovery"
+	return saveState(directory, state)
 }
 
 func (d *Driver) recoverRootfsCapture(ctx context.Context, state *SandboxState) (resultErr error) {

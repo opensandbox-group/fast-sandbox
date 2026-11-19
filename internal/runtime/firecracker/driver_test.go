@@ -924,43 +924,104 @@ func TestRecoverRunningOverrideBeforeCreateCommit(t *testing.T) {
 }
 
 func TestRecoverInterruptedRootfsStartWithRecordedPID(t *testing.T) {
-	f := newDriverFixture(t)
-	id := f.sandboxSpec.Identity
-	f.driver.SetFastletPodUID(id.FastletPodUID)
-	_, err := f.manager.Acquire(t.Context(), f.driver.networkOwner(&f.sandboxSpec))
-	require.NoError(t, err)
-	dir, err := ensureSandboxDir(f.stateRoot, id.SandboxUID)
-	require.NoError(t, err)
-	f.sandboxSpec.Desired.RootfsBootDigest = "pinned"
-	require.NoError(t, saveState(dir, &SandboxState{Config: f.sandboxSpec, Phase: PhaseStarting, PID: 4321, APIAddress: f.server.socket}))
-	cg, leaf := interruptedStartCgroup(t, id)
-	f.driver.runtimeCgroups = cg
-	f.driver.probeProcess = func(int) error { return nil }
-	require.NoError(t, os.WriteFile(filepath.Join(leaf, "cgroup.procs"), []byte("4321\n"), 0600))
-	require.NoError(t, os.WriteFile(filepath.Join(leaf, "cgroup.events"), []byte("populated 1\n"), 0600))
-	var killed []int
-	f.driver.killProcess = func(pid int) error {
-		require.Equal(t, 1, f.manager.Snapshot().Bound)
-		killed = append(killed, pid)
-		require.NoError(t, os.Remove(filepath.Join(leaf, "cgroup.procs")))
-		return os.Remove(filepath.Join(leaf, "cgroup.events"))
+	for _, tc := range []struct {
+		name, path, response string
+		status               int
+		phase                VMPhase
+		foreignPID           bool
+	}{
+		{"state-read-failure", "/", "", 503, PhaseStarting, false},
+		{"unexpected-state", "/", `{"state":"Paused"}`, 200, PhaseStarting, false},
+		{"machine-read-failure", "/machine-config", "", 503, PhaseStarting, false},
+		{"foreign-pid", "/machine-config", "", 503, PhaseStarting, true},
+		{"running-shape-mismatch", "/machine-config", `{"vcpu_count":4,"mem_size_mib":512}`, 200, PhaseRunning, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDriverFixture(t)
+			id := f.sandboxSpec.Identity
+			f.driver.SetFastletPodUID(id.FastletPodUID)
+			_, err := f.manager.Acquire(t.Context(), f.driver.networkOwner(&f.sandboxSpec))
+			require.NoError(t, err)
+			dir, err := ensureSandboxDir(f.stateRoot, id.SandboxUID)
+			require.NoError(t, err)
+			f.sandboxSpec.Desired.RootfsBootDigest = "pinned"
+			socket := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case tc.path:
+					w.WriteHeader(tc.status)
+					_, _ = w.Write([]byte(tc.response))
+				case "/version":
+					_, _ = w.Write([]byte(`{"firecracker_version":"1.17.0"}`))
+				case "/":
+					_, _ = w.Write([]byte(`{"state":"Running"}`))
+				default:
+					http.NotFound(w, r)
+				}
+			})
+			f.driver.newClient = NewClient
+			require.NoError(t, saveState(dir, &SandboxState{Config: f.sandboxSpec, Phase: tc.phase, PID: 4321, APIAddress: socket, BootMachine: &artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 384}}))
+			cg, leaf := interruptedStartCgroup(t, id)
+			f.driver.runtimeCgroups = cg
+			f.driver.probeProcess = func(int) error { return nil }
+			procs := "4321\n"
+			if tc.foreignPID {
+				procs = "9999\n"
+			}
+			require.NoError(t, os.WriteFile(filepath.Join(leaf, "cgroup.procs"), []byte(procs), 0600))
+			require.NoError(t, os.WriteFile(filepath.Join(leaf, "cgroup.events"), []byte("populated 1\n"), 0600))
+			var killed []int
+			f.driver.killProcess = func(pid int) error {
+				require.Equal(t, 1, f.manager.Snapshot().Bound)
+				killed = append(killed, pid)
+				require.NoError(t, os.Remove(filepath.Join(leaf, "cgroup.procs")))
+				return os.Remove(filepath.Join(leaf, "cgroup.events"))
+			}
+			// A later runtime in the same inventory must also finish recovery.
+			later := f.sandboxSpec
+			later.Identity.SandboxUID = "sandbox-2"
+			nextDir, err := ensureSandboxDir(f.stateRoot, later.Identity.SandboxUID)
+			require.NoError(t, err)
+			require.NoError(t, saveState(nextDir, &SandboxState{Config: later, Phase: PhaseStarting}))
+			require.NoError(t, f.driver.RecoverRuntimeResources(t.Context(), nil, nil))
+			require.NoDirExists(t, nextDir)
+			if tc.foreignPID || tc.phase == PhaseRunning {
+				require.Empty(t, killed)
+				require.Equal(t, 1, f.manager.Snapshot().Bound)
+				metadata, err := f.driver.InspectSandbox(t.Context(), id.SandboxUID)
+				require.NoError(t, err)
+				require.True(t, metadata.RecoveryRequired)
+				_, err = f.driver.GetAccessDescriptor(id.SandboxUID)
+				require.ErrorContains(t, err, "boot recovery pending")
+				if tc.foreignPID {
+					require.Error(t, f.driver.DeleteSandbox(t.Context(), id.SandboxUID))
+					require.Error(t, f.driver.ReconcileSandbox(t.Context(), id))
+					require.Empty(t, killed)
+					require.NoError(t, os.WriteFile(filepath.Join(leaf, "cgroup.procs"), []byte("4321\n"), 0600))
+				} else {
+					require.NoError(t, os.Remove(filepath.Join(leaf, "cgroup.procs")))
+					require.NoError(t, os.Remove(filepath.Join(leaf, "cgroup.events")))
+					require.NoError(t, os.Remove(leaf))
+				}
+				require.NoError(t, f.driver.ReconcileSandbox(t.Context(), id))
+				if tc.foreignPID {
+					require.Equal(t, []int{4321}, killed)
+				}
+				state, err := loadState(dir)
+				require.NoError(t, err)
+				require.Equal(t, PhaseFailed, state.Phase)
+				require.Empty(t, state.BootRecoveryError)
+				return
+			}
+			require.Equal(t, []int{4321}, killed)
+			require.Zero(t, f.manager.Snapshot().Bound)
+			require.NoDirExists(t, leaf)
+			state, err := loadState(dir)
+			require.NoError(t, err)
+			require.Equal(t, PhaseFailed, state.Phase)
+			require.Zero(t, state.PID)
+			require.NoError(t, f.driver.RecoverRuntimeResources(t.Context(), nil, nil))
+		})
 	}
-	// A later runtime in the same inventory must also finish recovery.
-	later := f.sandboxSpec
-	later.Identity.SandboxUID = "sandbox-2"
-	nextDir, err := ensureSandboxDir(f.stateRoot, later.Identity.SandboxUID)
-	require.NoError(t, err)
-	require.NoError(t, saveState(nextDir, &SandboxState{Config: later, Phase: PhaseStarting}))
-	require.NoError(t, f.driver.RecoverRuntimeResources(t.Context(), nil, nil))
-	require.NoDirExists(t, nextDir)
-	require.Equal(t, []int{4321}, killed)
-	require.Zero(t, f.manager.Snapshot().Bound)
-	require.NoDirExists(t, leaf)
-	state, err := loadState(dir)
-	require.NoError(t, err)
-	require.Equal(t, PhaseFailed, state.Phase)
-	require.Zero(t, state.PID)
-	require.NoError(t, f.driver.RecoverRuntimeResources(t.Context(), nil, nil))
 }
 
 func TestRecoverInterruptedStartCleansMissingCgroup(t *testing.T) {

@@ -19,6 +19,7 @@ type Metadata struct {
 	// RecoveryRequired keeps a live runtime unavailable without declaring it
 	// dead or allowing destructive cleanup. Reconciliation must clear the fence.
 	RecoveryRequired       bool
+	BootRecoveryPending    bool
 	Config                 fastletapi.RuntimeSandboxConfig
 	Allocation             fastletapi.RuntimeAllocation
 	ContainerID            string

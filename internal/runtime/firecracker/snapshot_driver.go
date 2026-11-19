@@ -583,7 +583,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 	if plan.identity != nil && !runtimecontract.SameRuntimeIdentity(*plan.identity, state.Config.Identity) {
 		return errors.New("snapshot source runtime identity changed")
 	}
-	if state.Phase != PhaseRunning {
+	if state.Phase != PhaseRunning || state.BootRecoveryError != "" {
 		return fmt.Errorf("%w: sandbox runtime is %q, must be Running", ErrInvalidConfig, state.Phase)
 	}
 	if state.APIAddress == "" {
