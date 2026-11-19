@@ -351,7 +351,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		maxPerPod = 1
 	}
 
-	desiredPod, err := r.constructPodWithResolvedResources(&pool, runtimePlan, resolvedResources, settings, fastletProxyResources)
+	desiredPod, err := r.constructPodWithResolvedResources(ctx, &pool, runtimePlan, resolvedResources, settings, fastletProxyResources)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1523,11 +1523,12 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 	if err != nil {
 		return nil, err
 	}
-	return r.constructPodWithResolvedResources(pool, runtimePlan, resolvedResources, settings, fastletProxyResources)
+	return r.constructPodWithResolvedResources(context.Background(), pool, runtimePlan, resolvedResources, settings, fastletProxyResources)
 }
 
 //nolint:gocognit,maintidx // Pod assembly covers all runtime variants.
 func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
+	ctx context.Context,
 	pool *apiv1alpha2.SandboxPool,
 	runtimePlan runtimeenv.ResolvedRuntimePlan,
 	resolvedResources resolvedFastletResources,
@@ -1576,6 +1577,12 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 	podSpec.HostPID = false
 	podSpec.RuntimeClassName = nil
 	podSpec.AutomountServiceAccountToken = boolPtr(false)
+	// Pin the image pull credentials that were effective before the identity
+	// switch, then force the fetching identity. Order matters: the preservation
+	// reads the template-chosen identity, not the platform one.
+	if err := r.preserveImagePullSecrets(ctx, podSpec, pool.Namespace); err != nil {
+		return nil, err
+	}
 	// The fetching identity is platform-owned, never template-chosen; automount
 	// stays off — the credential ships as the projected volume mounted into the
 	// Fastlet container only.
@@ -1980,6 +1987,13 @@ func validatePlatformOwnedStorage(podSpec *corev1.PodSpec) error {
 				if mount.Name == name || mount.MountPath == path {
 					return fmt.Errorf("container %q uses volume name %s or mount path %s reserved by the platform", container.Name, name, path)
 				}
+			}
+			// An exact-path check is not enough for the credential directory: a
+			// subPath mount of any template volume can shadow an individual file
+			// inside it, and containerd applies the parent directory before the
+			// subpath. Reject everything at or under the directory.
+			if strings.HasPrefix(filepath.Clean(mount.MountPath)+"/", fastletAuthTokenMountPath+"/") {
+				return fmt.Errorf("container %q mounts %q inside the projected credential directory %s", container.Name, mount.MountPath, fastletAuthTokenMountPath)
 			}
 		}
 	}
@@ -2985,6 +2999,48 @@ func (r *SandboxPoolReconciler) ensureFastletServiceAccount(ctx context.Context,
 	if err := r.Create(ctx, serviceAccount); err != nil && !apierrors.IsAlreadyExists(err) {
 		return fmt.Errorf("create Fastlet ServiceAccount %s/%s: %w", pool.Namespace, fastletServiceAccountName, err)
 	}
+	return nil
+}
+
+// preserveImagePullSecrets pins the image pull credentials that were effective
+// under the template-chosen identity (the template's ServiceAccount, or the
+// namespace default) onto the Pod spec. ServiceAccount admission inherits
+// imagePullSecrets from the selected identity even with automount off, so the
+// identity switch would otherwise strand uncached private images in
+// ImagePullBackOff. Admission unions the Pod spec with the new identity's
+// references, so pinning preserves both; dedupe keeps the order stable. The
+// read goes through the durable reader — the cached serviceaccounts informer
+// cannot sync without list/watch.
+func (r *SandboxPoolReconciler) preserveImagePullSecrets(ctx context.Context, podSpec *corev1.PodSpec, namespace string) error {
+	if r.durableReader() == nil {
+		return nil // direct constructions in tests; nothing to preserve from
+	}
+	templateIdentity := podSpec.ServiceAccountName
+	if templateIdentity == "" {
+		templateIdentity = "default"
+	}
+	var inherited corev1.ServiceAccount
+	err := r.durableReader().Get(ctx, client.ObjectKey{Namespace: namespace, Name: templateIdentity}, &inherited)
+	if apierrors.IsNotFound(err) {
+		return nil // fresh namespace: no inherited credentials to preserve
+	}
+	if err != nil {
+		return fmt.Errorf("read ServiceAccount %s/%s: %w", namespace, templateIdentity, err)
+	}
+	pinned := podSpec.ImagePullSecrets
+	for _, secret := range inherited.ImagePullSecrets {
+		duplicate := false
+		for _, existing := range pinned {
+			if existing.Name == secret.Name {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			pinned = append(pinned, secret)
+		}
+	}
+	podSpec.ImagePullSecrets = pinned
 	return nil
 }
 

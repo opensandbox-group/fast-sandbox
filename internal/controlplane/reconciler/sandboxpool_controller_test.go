@@ -3098,6 +3098,21 @@ func TestConstructPodRejectsTemplateOwnedAuthTokenVolume(t *testing.T) {
 		mustRuntimePlan(t, poolReconciler.Catalog))
 	require.ErrorContains(t, err, "reserved by the platform",
 		"a template mount at the projection path is rejected even under an innocent volume name")
+
+	// Nesting defeats an exact-path check: a subPath mount of a foreign volume
+	// shadows the token file itself, and containerd applies the parent
+	// directory before the subpath.
+	_, err = poolReconciler.constructPodWithRuntimePlan(
+		newPool(nil, []corev1.VolumeMount{{Name: "innocent", MountPath: fastletauth.ServiceAccountTokenFile, SubPath: fastletAuthTokenProjectionPath}}),
+		mustRuntimePlan(t, poolReconciler.Catalog))
+	require.ErrorContains(t, err, "inside the projected credential directory",
+		"a subPath shadowing the token file is rejected")
+
+	_, err = poolReconciler.constructPodWithRuntimePlan(
+		newPool(nil, []corev1.VolumeMount{{Name: "innocent", MountPath: fastletAuthTokenMountPath + "/nested"}}),
+		mustRuntimePlan(t, poolReconciler.Catalog))
+	require.ErrorContains(t, err, "inside the projected credential directory",
+		"any mount at or under the credential directory is rejected")
 }
 
 func mustRuntimePlan(t *testing.T, catalog *runtimecatalog.Catalog) runtimeenv.ResolvedRuntimePlan {
@@ -3135,6 +3150,74 @@ func TestEnsureFastletServiceAccountIsIdempotent(t *testing.T) {
 	require.NoError(t, reconciler.ensureFastletServiceAccount(context.Background(), poolB))
 	require.NoError(t, k8sClient.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: fastletServiceAccountName}, &projected))
 	require.Equal(t, fastletServiceAccountName, projected.Name)
+}
+
+// TestConstructPodPreservesInheritedImagePullSecrets pins the credential
+// carry-over across the identity switch: ServiceAccount admission inherits
+// imagePullSecrets from the selected identity, so forcing the dedicated auth
+// identity must pin the previously effective references onto the Pod spec or
+// uncached private images land in ImagePullBackOff.
+func TestConstructPodPreservesInheritedImagePullSecrets(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.ServiceAccount{
+			ObjectMeta:       metav1.ObjectMeta{Name: "custom-sa", Namespace: "tenant-a"},
+			ImagePullSecrets: []corev1.LocalObjectReference{{Name: "regcred"}},
+		},
+		&corev1.ServiceAccount{
+			ObjectMeta:       metav1.ObjectMeta{Name: "default", Namespace: "tenant-a"},
+			ImagePullSecrets: []corev1.LocalObjectReference{{Name: "default-regcred"}},
+		},
+	).Build()
+	reconciler := &SandboxPoolReconciler{Client: k8sClient, Scheme: scheme, Catalog: runtimecatalog.Builtin()}
+
+	newPool := func(serviceAccountName string, imagePullSecrets []corev1.LocalObjectReference) *apiv1alpha2.SandboxPool {
+		return &apiv1alpha2.SandboxPool{
+			TypeMeta:   metav1.TypeMeta{APIVersion: apiv1alpha2.GroupVersion.String(), Kind: "SandboxPool"},
+			ObjectMeta: metav1.ObjectMeta{Name: "pool-pull-secrets", Namespace: "tenant-a", UID: types.UID("pool-uid")},
+			Spec: apiv1alpha2.SandboxPoolSpec{
+				Runtime:            apiv1alpha2.RuntimeContainer,
+				MaxSandboxesPerPod: 5,
+				SandboxResources: apiv1alpha2.NewLegacySandboxResourceProfile(
+					resource.MustParse("1"), resource.MustParse("1Gi"), 256,
+				),
+				FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+					ServiceAccountName: serviceAccountName,
+					ImagePullSecrets:   imagePullSecrets,
+					Containers:         []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}},
+				}},
+			},
+		}
+	}
+	pullSecretNames := func(pod *corev1.Pod) []string {
+		names := make([]string, 0, len(pod.Spec.ImagePullSecrets))
+		for _, secret := range pod.Spec.ImagePullSecrets {
+			names = append(names, secret.Name)
+		}
+		return names
+	}
+
+	// The template identity's credentials are pinned onto the Pod spec while
+	// the fetching identity stays platform-owned.
+	pod, err := reconciler.constructPodWithRuntimePlan(newPool("custom-sa", nil), mustRuntimePlan(t, reconciler.Catalog))
+	require.NoError(t, err)
+	require.Equal(t, fastletServiceAccountName, pod.Spec.ServiceAccountName)
+	require.Equal(t, []string{"regcred"}, pullSecretNames(pod))
+
+	// Template-specified references are unioned with the inherited ones,
+	// deduped by name.
+	pod, err = reconciler.constructPodWithRuntimePlan(
+		newPool("custom-sa", []corev1.LocalObjectReference{{Name: "extra"}, {Name: "regcred"}}),
+		mustRuntimePlan(t, reconciler.Catalog))
+	require.NoError(t, err)
+	require.Equal(t, []string{"extra", "regcred"}, pullSecretNames(pod))
+
+	// No template identity means the namespace default was effective.
+	pod, err = reconciler.constructPodWithRuntimePlan(newPool("", nil), mustRuntimePlan(t, reconciler.Catalog))
+	require.NoError(t, err)
+	require.Equal(t, []string{"default-regcred"}, pullSecretNames(pod))
 }
 
 // TestConstructPodInjectsAuthEnvUnconditionally pins the shadowing guarantee:
