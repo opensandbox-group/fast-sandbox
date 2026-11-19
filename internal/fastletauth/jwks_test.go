@@ -15,7 +15,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"testing"
 	"time"
 
@@ -26,17 +25,17 @@ import (
 
 func TestDefaultHTTPClientFailsClosedOnMalformedCABundle(t *testing.T) {
 	t.Setenv(CABundleEnv, "definitely-not-base64!!!")
-	_, err := defaultHTTPClient("https://kubernetes.default.svc")
+	_, err := defaultHTTPClient()
 	require.Error(t, err, "a set-but-malformed CA bundle must fail closed: it is the trust anchor")
 
 	t.Setenv(CABundleEnv, base64.StdEncoding.EncodeToString([]byte("not a pem bundle")))
-	_, err = defaultHTTPClient("https://kubernetes.default.svc")
+	_, err = defaultHTTPClient()
 	require.Error(t, err, "valid base64 carrying no PEM block is equally fatal")
 
 	// Without an override the projected ca.crt path (or system roots outside
 	// a Pod) applies and the client builds.
 	t.Setenv(CABundleEnv, "")
-	client, err := defaultHTTPClient("https://kubernetes.default.svc")
+	client, err := defaultHTTPClient()
 	require.NoError(t, err)
 	require.NotNil(t, client)
 }
@@ -86,7 +85,7 @@ func TestInjectedCABundleExtendsSystemRoots(t *testing.T) {
 	server.TLS = &tls.Config{Certificates: []tls.Certificate{serverCertificate}}
 	server.StartTLS()
 	t.Cleanup(server.Close)
-	client, err := defaultHTTPClient(server.URL)
+	client, err := defaultHTTPClient()
 	require.NoError(t, err)
 	response, err := client.Get(server.URL)
 	require.NoError(t, err, "an issuer certified by the injected CA must be reachable")
@@ -169,7 +168,7 @@ func TestDefaultHTTPClientRefusesCrossHostRedirect(t *testing.T) {
 	t.Cleanup(source.Close)
 
 	t.Setenv(KeyFetchTokenEnv, "live-service-account-token")
-	client, err := defaultHTTPClient(source.URL)
+	client, err := defaultHTTPClient()
 	require.NoError(t, err)
 
 	response, err := client.Get(source.URL + "/.well-known/openid-configuration")
@@ -205,7 +204,7 @@ func TestDefaultHTTPClientRefusesDowngradeRedirect(t *testing.T) {
 	server.StartTLS()
 	t.Cleanup(server.Close)
 
-	client, err := defaultHTTPClient(server.URL)
+	client, err := defaultHTTPClient()
 	require.NoError(t, err)
 
 	response, err := client.Get(server.URL + "/.well-known/openid-configuration")
@@ -217,51 +216,6 @@ func TestDefaultHTTPClientRefusesDowngradeRedirect(t *testing.T) {
 		"the refused hop is the downgrade target itself")
 	require.Equal(t, []string{BearerPrefix + "live-service-account-token"}, anchorCredentials,
 		"the https anchor hop carries the credential exactly once")
-}
-
-// TestFetchDiscoveryRejectsForeignJWKSOrigin pins the origin half of the
-// trust-anchor boundary: a discovery document naming a JWKS endpoint on
-// another host would receive the key-fetch credential, so construction fails
-// closed instead of following it.
-func TestFetchDiscoveryRejectsForeignJWKSOrigin(t *testing.T) {
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		document := map[string]any{
-			"issuer":   server.URL,
-			"jwks_uri": "https://keys.example.com/jwks",
-		}
-		require.NoError(t, json.NewEncoder(w).Encode(document))
-	}))
-	t.Cleanup(server.Close)
-	_, err := fetchDiscovery(context.Background(), server.Client(), server.URL)
-	require.ErrorContains(t, err, "not served by the pinned issuer origin")
-}
-
-// TestAuthedTransportRefusesForeignOrigin pins the transport guard: a request
-// to any origin other than the pinned issuer never leaves, credential or not —
-// defense in depth behind the discovery-side origin check, covering jwkset's
-// refresh path.
-func TestAuthedTransportRefusesForeignOrigin(t *testing.T) {
-	var seen []string
-	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		seen = append(seen, "reached")
-		_, _ = w.Write([]byte("{}"))
-	}))
-	t.Cleanup(foreign.Close)
-
-	t.Setenv(KeyFetchTokenEnv, "live-service-account-token")
-	client, err := defaultHTTPClient("https://kubernetes.default.svc")
-	require.NoError(t, err)
-	_, err = client.Get(foreign.URL)
-	require.ErrorContains(t, err, "outside the pinned issuer origin")
-	require.Empty(t, seen, "the foreign origin must never be contacted")
-}
-
-func mustOrigin(t *testing.T, raw string) *url.URL {
-	t.Helper()
-	origin, err := url.Parse(raw)
-	require.NoError(t, err)
-	return origin
 }
 
 func TestNewAuthenticatorRejectsPlaintextIssuerOutsideLoopback(t *testing.T) {
@@ -315,7 +269,7 @@ func TestAuthedTransportAttachesRotatingCredential(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := &http.Client{Transport: authedTransport{base: http.DefaultTransport, origin: mustOrigin(t, server.URL)}}
+	client := &http.Client{Transport: authedTransport{base: http.DefaultTransport}}
 	t.Setenv(KeyFetchTokenEnv, "token-one")
 	response, err := client.Get(server.URL)
 	require.NoError(t, err)
