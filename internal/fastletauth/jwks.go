@@ -220,7 +220,10 @@ func fetchJSONDocument(ctx context.Context, client *http.Client, url string, tar
 // issuer origin, so neither redirects nor a foreign jwks_uri can receive the
 // credential.
 func defaultHTTPClient(issuer string) (*http.Client, error) {
-	origin, err := url.Parse(issuer)
+	// The pinned transport origin follows the effective fetch address
+	// (in-cluster port rewrite applied); the issuer anchor used for token
+	// iss validation stays the original port-less form.
+	origin, err := url.Parse(applyInClusterAPIServerPort(issuer))
 	if err != nil || origin.Host == "" {
 		return nil, fmt.Errorf("issuer %q is not a valid URL", issuer)
 	}
