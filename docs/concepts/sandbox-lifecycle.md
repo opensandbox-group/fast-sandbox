@@ -132,6 +132,8 @@ generation. A completed resume consumes the one-shot checkpoint
 (`status.runtime.checkpoint` is cleared; store objects follow store
 lifecycle).
 
+A checkpoint is instance-private: its manifest records the owning Sandbox identity, and a restore verifies that binding before any memory is loaded. A checkpoint address that resolves into another Sandbox is rejected, and a checkpoint set is never usable as a template image. Template sets carry no owner and remain the boot source new Sandboxes share.
+
 While paused there is no placement, `expireTime` still applies, a template
 snapshot is rejected (it requires a running runtime), and reset/expiry drop
 the checkpoint lineage. Pause failures leave the runtime running (the dump

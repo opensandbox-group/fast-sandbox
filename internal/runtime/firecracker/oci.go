@@ -217,7 +217,7 @@ func (d *Driver) prepareOCIRestore(ctx context.Context, directory, reference str
 		return attachment, err
 	}
 
-	if err := validateOCIResumeOwner(metadata, config); err != nil {
+	if err := validateCheckpointResumeOwner(metadata, config); err != nil {
 		return attachment, err
 	}
 	hasMachine := metadata.Machine.VCPUCount > 0 && metadata.Machine.MemoryMiB > 0
