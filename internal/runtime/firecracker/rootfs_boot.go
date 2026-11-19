@@ -2,6 +2,7 @@ package firecracker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,8 @@ import (
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/firecrackerconfig"
 )
+
+var errIncompleteRootfsStart = errors.New("cannot adopt interrupted rootfs boot")
 
 // verifyBootMachine reads the live VMM through the same API socket used for
 // configuration. Full restores and ordinary boots have no override contract.
@@ -41,6 +44,9 @@ func (d *Driver) verifyExistingBoot(ctx context.Context, state *SandboxState) er
 		current, err := client.VMState(ctx)
 		if err != nil {
 			return err
+		}
+		if current == "Not started" || current == "NotStarted" {
+			return fmt.Errorf("%w: VMM state is %q", errIncompleteRootfsStart, current)
 		}
 		if current != vmRunning {
 			return fmt.Errorf("cannot adopt interrupted rootfs boot: VMM state is %q", current)

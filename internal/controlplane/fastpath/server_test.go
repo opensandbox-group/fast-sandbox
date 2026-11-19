@@ -40,7 +40,9 @@ type fastpathRegistry struct {
 }
 
 func TestRootfsCreatePinsDigestAndInheritsFractionalCPU(t *testing.T) {
-	s, k, _, fastlet := newV2Server(t)
+	s, k, registry, fastlet := newV2Server(t)
+	registry.candidates[0].Capabilities = []string{fastletapi.CapabilityRootfsBootCreate}
+	registry.fastlets[registry.candidates[0].ID] = registry.candidates[0]
 	ctx := t.Context()
 	pool := &apiv1alpha2.SandboxPool{}
 	require.NoError(t, k.Get(ctx, types.NamespacedName{Namespace: "default", Name: "pool-a"}, pool))

@@ -400,7 +400,7 @@ func (d *Driver) recoverRootfsCapture(ctx context.Context, state *SandboxState) 
 	return d.cleanupUnpublishedCapture(ctx, state, journal)
 }
 
-// Preserve upstream extension fields; replace only the mode, state files, and file list owned by this capture.
+// Record admitted quotas separately from guest hardware, dropping stale parent limits.
 func setSnapshotResourceLimits(platform map[string]json.RawMessage, limits fastletapi.SandboxRuntimeLimits) error {
 	// Legacy instances can lack recorded limits. Never replay their parent's quota.
 	if limits.CPU == "" && limits.Memory == "" {
@@ -414,6 +414,7 @@ func setSnapshotResourceLimits(platform map[string]json.RawMessage, limits fastl
 	return err
 }
 
+// Preserve upstream extension fields when updating metadata owned by this capture.
 func marshalRootfsSnapshotManifest(source []byte, manifest artifacts.VMManifest, limits fastletapi.SandboxRuntimeLimits) ([]byte, error) {
 	if err := manifest.Validate(); err != nil {
 		return nil, err

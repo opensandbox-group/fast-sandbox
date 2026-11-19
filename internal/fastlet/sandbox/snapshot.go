@@ -9,6 +9,9 @@ import (
 
 	"k8s.io/klog/v2"
 
+	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/fastletsettings"
+
 	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
@@ -82,6 +85,19 @@ func (m *SandboxManager) SnapshotCapabilities() []string {
 		capabilities = append(capabilities, fastletapi.CapabilityNativeRootfsOnlySnapshots)
 	}
 	return capabilities
+}
+
+// Capabilities lists the optional operations this Fastlet can serve.
+func (m *SandboxManager) Capabilities() []string {
+	caps := m.SnapshotCapabilities()
+	if m.supportsRootfsBootCreate() {
+		caps = append(caps, fastletapi.CapabilityRootfsBootCreate)
+	}
+	return caps
+}
+
+func (m *SandboxManager) supportsRootfsBootCreate() bool {
+	return m.runtimeName == string(apiv1alpha2.RuntimeFirecracker) && m.resourceAdmission != nil && m.resourceAdmission.Version == fastletsettings.BoundedFirecrackerVersion
 }
 
 func snapshotFailure(disposition fastletapi.CreateDisposition, failure *fastletapi.FastletError) (*fastletapi.CreateSnapshotResponse, error) {

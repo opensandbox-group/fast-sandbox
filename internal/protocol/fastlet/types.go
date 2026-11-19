@@ -274,6 +274,11 @@ const CapabilityRootfsOnlySnapshots = "rootfsOnlySnapshots"
 // CapabilityNativeRootfsOnlySnapshots marks file-backed RootfsOnly capture and S3 publication.
 const CapabilityNativeRootfsOnlySnapshots = "nativeRootfsOnlySnapshots"
 
+// CapabilityRootfsBootCreate advertises digest-pinned creates with admitted limits.
+const CapabilityRootfsBootCreate = "rootfsBootCreate"
+
+const RootfsBootCreatePath = "/api/v2/fastlet/create-rootfs"
+
 type WarmImageState struct {
 	Image   string `json:"image"`
 	State   string `json:"state"`

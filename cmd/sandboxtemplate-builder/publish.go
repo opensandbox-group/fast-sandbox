@@ -210,7 +210,8 @@ func patchPodAnnotations(ctx context.Context, manifestRef, digest string) error 
 	if err != nil {
 		return err
 	}
-	patch := fmt.Sprintf(`{"metadata":{"annotations":{"%s":%s,"%s":%s}}}`,
+	// Both current builder paths publish the golden VM state and RAM.
+	patch := fmt.Sprintf(`{"metadata":{"annotations":{"sandbox.fast.io/artifact-mode":"Full","%s":%s,"%s":%s}}}`,
 		manifestRefAnnotation, refJSON, digestAnnotation, digestJSON)
 	_, err = clientSet.CoreV1().Pods(namespace).Patch(ctx, name, types.MergePatchType, []byte(patch), metav1.PatchOptions{})
 	return err

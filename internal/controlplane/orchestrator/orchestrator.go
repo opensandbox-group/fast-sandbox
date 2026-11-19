@@ -218,7 +218,7 @@ func (o *Orchestrator) Candidates(ctx context.Context, sandbox *apiv1alpha2.Sand
 		ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
 		FastletRevision: parameters.FastletRevision,
 		ResourceMode:    o.EffectivePlacementMode(parameters.ResourceMode), Demand: parameters.ResourceDemand,
-		Image: sandbox.Spec.Image, StableKey: stableKey,
+		Image: sandbox.Spec.Image, StableKey: stableKey, RequiredCapability: requiredCreateCapability(sandbox),
 	})
 	if len(candidates) == 0 {
 		return nil, parameters, ErrNoCandidate
@@ -240,7 +240,7 @@ func (o *Orchestrator) FastPathCandidatesMatching(sandbox *apiv1alpha2.Sandbox, 
 	}
 	candidates := o.topK(placement.CandidateRequest{
 		Namespace: sandbox.Namespace, PoolName: sandbox.Spec.PoolRef,
-		Image: sandbox.Spec.Image, StableKey: stableKey,
+		Image: sandbox.Spec.Image, StableKey: stableKey, RequiredCapability: requiredCreateCapability(sandbox),
 		RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
 		ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
 		FastletRevision: parameters.FastletRevision, ExcludedFastlets: excluded,
@@ -258,6 +258,13 @@ func (o *Orchestrator) EffectivePlacementMode(mode apiv1alpha2.SandboxResourceMo
 		return apiv1alpha2.SandboxResourceModeLegacySlot
 	}
 	return mode
+}
+
+func requiredCreateCapability(sandbox *apiv1alpha2.Sandbox) string {
+	if sandbox.Annotations[assignment.AnnotationRootfsBootDigest] != "" && ResumeCheckpoint(sandbox) == nil {
+		return fastletapi.CapabilityRootfsBootCreate
+	}
+	return ""
 }
 
 func (o *Orchestrator) topK(request placement.CandidateRequest) []placement.FastletInfo {
@@ -495,6 +502,13 @@ func (o *Orchestrator) CreateRuntimeOnCandidateWithCompletion(ctx context.Contex
 }
 
 func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1alpha2.Sandbox, fastlet placement.FastletInfo, envelope assignment.AssignmentEnvelope, identity fastletapi.SandboxIdentity, completion fastletapi.CreateCompletion, parameters RuntimeParameters, declarative bool) (*fastletapi.CreateSandboxResponse, error) {
+	if cap := requiredCreateCapability(sandbox); cap != "" {
+		current, ok := o.Registry.GetFastletByID(fastlet.ID)
+		if !ok || current.PodUID != envelope.FastletPodUID || !current.SupportsCapability(cap) {
+			failure := &fastletapi.FastletError{Code: fastletapi.ErrorCapacityRejected, Reason: fastletapi.AdmissionReasonUnsupportedProtocol, Message: "assigned Fastlet does not advertise " + cap, Retryable: true}
+			return nil, &fastletapi.CreateCallError{Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects, Failure: failure}
+		}
+	}
 	if local, ok := o.Registry.(localReservationRegistry); ok && createNeedsLocalReservation(sandbox, fastlet, identity) {
 		if !local.ReserveLocal(fastlet.ID, parameters.ResourceDemand) {
 			if declarative {

@@ -165,12 +165,11 @@ func TestNativeRootfsFastletChainE2E(t *testing.T) {
 	if override {
 		resourceProfile = apiv1alpha2.NewResourceAwareSandboxResourceProfile(resource.MustParse("1"), resource.MustParse("512Mi"), resource.MustParse("1"), resource.MustParse("1"), 128)
 		budget := apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("2"), Memory: resource.MustParse("1Gi")}
-		cfg.ResourceAdmission = &fastletsettings.ResourceAdmissionSettings{Version: "v2", Mode: apiv1alpha2.SandboxResourceModeResourceAware, StaticAdmission: true, Capacity: budget, SandboxRuntimeBudget: budget, RuntimeEnvelope: budget, PodMemoryBudget: budget.Memory, ResourceProfileHash: resourceProfile.Hash()}
+		cfg.ResourceAdmission = &fastletsettings.ResourceAdmissionSettings{Version: fastletsettings.BoundedFirecrackerVersion, Mode: apiv1alpha2.SandboxResourceModeResourceAware, StaticAdmission: true, Capacity: budget, SandboxRuntimeBudget: budget, RuntimeEnvelope: budget, PodMemoryBudget: budget.Memory, ResourceProfileHash: resourceProfile.Hash()}
 	}
 	checkpointPod := os.Getenv("FSB_TEST_NATIVE_CHECKPOINT_POD_UID")
 	if checkpointPod != "" {
 		require.True(t, override, "managed checkpoint test requires per-Sandbox limits")
-		cfg.ResourceAdmission.Version = fastletsettings.BoundedFirecrackerVersion
 		cg, err := podcgroup.NewRuntimeManager("/sys/fs/cgroup", checkpointPod, podcgroup.RuntimeBudget{CPU: resource.MustParse("2"), Memory: resource.MustParse("1Gi")})
 		require.NoError(t, err)
 		require.NoError(t, cg.Prepare())

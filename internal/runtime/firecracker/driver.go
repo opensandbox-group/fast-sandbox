@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -1279,6 +1280,9 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 				return nil
 			}
 			if err := d.verifyExistingBoot(ctx, state); err != nil {
+				if state.Phase == PhaseStarting && runtimeCgroups != nil && (errors.Is(err, errIncompleteRootfsStart) || errors.Is(err, ErrInvalidConfig)) {
+					return d.discardInterruptedStart(ctx, state, directory, manager, runtimeCgroups, retireOwner)
+				}
 				return fmt.Errorf("verify boot shape before adopting %s: %w", state.Config.Identity.SandboxUID, err)
 			}
 			if err := recoverRuntimeCgroup(runtimeCgroups, &state.Config, state.PID); err != nil {
@@ -1305,27 +1309,34 @@ func (d *Driver) recoverInterruptedStart(ctx context.Context, state *SandboxStat
 	if state == nil || state.Phase != PhaseStarting || state.PID != 0 || runtimeCgroups == nil {
 		return false, nil
 	}
+	return true, d.discardInterruptedStart(ctx, state, directory, manager, runtimeCgroups, retireOwner)
+}
+
+func (d *Driver) discardInterruptedStart(ctx context.Context, state *SandboxState, directory string, manager *fastletnetwork.Manager, runtimeCgroups *podcgroup.RuntimeManager, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer) error {
 	sandboxUID := state.Config.Identity.SandboxUID
 	d.mu.RLock()
 	podUID := d.podUID
 	d.mu.RUnlock()
 	if podUID == "" || state.Config.Identity.FastletPodUID != podUID {
-		return true, fmt.Errorf("cannot attribute interrupted Firecracker start for sandbox %s to the current Fastlet Pod", sandboxUID)
+		return fmt.Errorf("cannot attribute interrupted Firecracker start for sandbox %s to the current Fastlet Pod", sandboxUID)
 	}
 	pids, exists, err := runtimeCgroups.SandboxProcesses(sandboxUID)
 	if err != nil {
-		return true, fmt.Errorf("inspect interrupted Firecracker start cgroup for sandbox %s: %w", sandboxUID, err)
+		return fmt.Errorf("inspect interrupted Firecracker start cgroup for sandbox %s: %w", sandboxUID, err)
 	}
 	if exists {
+		if state.PID > 0 && len(pids) > 0 && !slices.Contains(pids, state.PID) {
+			return fmt.Errorf("recorded VMM PID %d is not in the interrupted Sandbox cgroup", state.PID)
+		}
 		d.mu.RLock()
 		killProcess := d.killProcess
 		d.mu.RUnlock()
 		for _, pid := range pids {
 			if killProcess == nil {
-				return true, fmt.Errorf("terminate interrupted Firecracker start for sandbox %s: process killer is unavailable", sandboxUID)
+				return fmt.Errorf("terminate interrupted Firecracker start for sandbox %s: process killer is unavailable", sandboxUID)
 			}
 			if err := killProcess(pid); err != nil {
-				return true, fmt.Errorf("terminate interrupted Firecracker PID %d for sandbox %s: %w", pid, sandboxUID, err)
+				return fmt.Errorf("terminate interrupted Firecracker PID %d for sandbox %s: %w", pid, sandboxUID, err)
 			}
 		}
 	}
@@ -1334,20 +1345,20 @@ func (d *Driver) recoverInterruptedStart(ctx context.Context, state *SandboxStat
 		if err := runtimeCgroups.ConfirmAbsent(sandboxUID); err == nil {
 			break
 		} else if time.Now().After(deadline) {
-			return true, fmt.Errorf("confirm interrupted Firecracker start exited for sandbox %s (PID %d, Fastlet Pod %s, phase %s): %w",
+			return fmt.Errorf("confirm interrupted Firecracker start exited for sandbox %s (PID %d, Fastlet Pod %s, phase %s): %w",
 				sandboxUID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
 		}
 		select {
 		case <-ctx.Done():
-			return true, ctx.Err()
+			return ctx.Err()
 		case <-time.After(20 * time.Millisecond):
 		}
 	}
-	if err := d.recoverDeadSandbox(ctx, state, directory, manager, runtimeCgroups, retireOwner, false); err != nil {
-		return true, err
+	if err := d.recoverDeadSandbox(ctx, state, directory, manager, runtimeCgroups, retireOwner, state.PID > 0); err != nil {
+		return err
 	}
 	klog.InfoS("recovered interrupted Firecracker start", "sandboxID", sandboxUID, "terminatedPIDs", pids)
-	return true, nil
+	return nil
 }
 
 // recoverDeadSandbox preserves retirement-before-release ordering for a dead

@@ -91,7 +91,7 @@ func (c *FastletClient) CreateSandbox(ctx context.Context, fastletIP string, req
 	}
 	path := "/api/v2/fastlet/create"
 	if req != nil && req.Sandbox.RootfsBootDigest != "" {
-		path = "/api/v2/fastlet/create-rootfs"
+		path = RootfsBootCreatePath
 	}
 	response, err := postFastletJSONWithTimeout[CreateSandboxRequest, CreateSandboxResponse](c, ctx, fastletIP, path, req, c.createTimeout)
 	if err == nil {
