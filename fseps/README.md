@@ -18,5 +18,5 @@ Add an entry in the same PR as a new proposal; when its content or status change
 | [FSEP-0001](0001-rootfs-only-snapshots-overlaybd.md) | Rootfs-Only Snapshots on the OverlayBD Path | implemented | 2026-11-18 |
 | [FSEP-0002](0002-firecracker-multi-version-delivery.md) | Firecracker Multi-Version Delivery and Selection | implemented | 2026-11-18 |
 | [FSEP-0003](0003-fastlet-control-auth.md) | Fastlet Control Authentication | accepted | 2026-11-18 |
-| [FSEP-0004](0004-chunked-snapshot-transfer.md) | Chunked Snapshot Transfer | draft | 2026-11-18 |
+| [FSEP-0004](0004-chunked-snapshot-transfer.md) | Chunked Snapshot Transfer | draft | 2026-11-24 |
 | [FSEP-0005](0005-rootfs-only-create-overrides.md) | CPU and Memory Overrides for Rootfs-Only Sandbox Creation | draft | 2026-11-18 |

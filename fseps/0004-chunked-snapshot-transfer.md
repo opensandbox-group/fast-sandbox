@@ -3,7 +3,7 @@ title: "Chunked Snapshot Transfer"
 authors:
   - "@kaustubh-765"
 creation-date: 2026-11-17
-last-updated: 2026-11-18
+last-updated: 2026-11-24
 status: draft
 ---
 
@@ -48,21 +48,24 @@ Goals:
 - No new store requirements beyond today's path-style SigV4 `GET`, `PUT` and
   `HEAD`.
 - The OverlayBD/OCI path (FSEP-0001) is unchanged; only native Firecracker
-  sets are chunked.
+  sets are chunked. That includes native RootfsOnly sets (#181), whose chunk
+  index holds only `rootfs.ext4`.
 - The template builder keeps publishing whole-file sets (possible
   follow-up).
-- Local optimizations that change no protocol go in separate small PRs and
-  are not part of this proposal:
-  - the verified-cache marker, with fsynced cache writes and single-flighted
-    cache ensures;
-  - template snapshots kept in the node cache (#57);
-  - parallel and overlapped hashing (#61).
+- Local optimizations that change no protocol are not part of this
+  proposal:
+  - template snapshots kept in the node cache (#57) and a verified-digest
+    memo keyed by file identity: done in #244, which also removed the
+    post-pull re-hash;
+  - fsynced cache writes and single-flighted cache ensures: a separate
+    small PR before PR 1;
+  - parallel and overlapped hashing (#61): a separate PR.
 
-  In #213 the marker and the fsynced cache writes are still switched on by
-  `transfer.format: chunked`. The split removes that coupling: these PRs land
-  before PR 1, independent of `transfer.format`, and #213 is rebased onto
-  them. After that, `transfer.format` selects only the store format. Sparse
-  cache files stay a property of the chunked pull, which skips zero chunks.
+  #213's xattr verified-cache marker is dropped in favor of #244's memo:
+  the chunked pull records each file it committed and verified into that
+  memo, as a whole-file pull does. Nothing local depends on
+  `transfer.format`, which selects only the store format. Sparse cache
+  files stay a property of the chunked pull, which skips zero chunks.
 
   The standalone fixes from #213 are already merged in #214.
 
@@ -134,6 +137,17 @@ today.
 ### Data path
 
 **Publish (runtime-agent):**
+- Validate the staged manifest before uploading anything: every native file
+  entry needs a well-formed digest, and a `legacy` publish may not carry a
+  `chunks` binding. Unless `format: chunked` and `chunkListOnly: true` are
+  both set, the agent fills in any missing whole-file `sha256` and rewrites
+  `SHA256SUMS` from the final manifest. It never writes an empty
+  `SHA256SUMS`, which readers reject. A Fastlet acting on a stale
+  capability, or an agent restarted into another mode between staging and
+  publish, therefore costs a hash, not an unrestorable set.
+- Chunk the native files the staged manifest lists (rootfs, memory and VM
+  state for a full set; only the rootfs for a RootfsOnly set), not a fixed
+  list.
 - Split files into chunks, skipping holes (`SEEK_DATA`/`SEEK_HOLE`) and
   all-zero chunks.
 - Skip chunks the store already has, using an in-memory set of known keys
@@ -150,6 +164,9 @@ today.
 - Verify `chunks.json` against the manifest.
 - Fetch chunks in parallel (`transfer.concurrency`), verify each chunk's
   SHA-256 before writing it, and leave zero ranges as holes.
+- Commit a file only after every one of its chunks was fetched and
+  verified; a cancelled or failed pull commits nothing. Each committed file
+  is recorded in #244's verified-digest memo.
 - Chunk requests use a 10 s per-attempt timeout with retries.
 - In chunked mode, store traffic uses a pooled transport: 64 idle
   connections per host, 30 s idle timeout.
@@ -157,7 +174,14 @@ today.
 **Fastlet:**
 - Learns the agent's mode from optional `transferFormat` and
   `chunkListDigest` fields in `HealthResponse` and `PublishImageResponse`.
+  The agent reports `chunkListDigest` only when `format: chunked` and
+  `chunkListOnly: true`.
 - Older agents omit the fields, which means legacy with whole-file hashes.
+- Calls `Health` right before it decides whether to skip whole-file hashes.
+  A `Health` error clears the cached capability, so the Fastlet falls back
+  to hashing.
+- Drops an inherited `chunks` binding in both manifest assemblers: the full
+  snapshot manifest and the RootfsOnly manifest (#181).
 
 ### Shared-chunk retention and garbage collection
 
@@ -244,10 +268,15 @@ transfer:
   compression: none       # none | zstd (chunked only)
   concurrency: 8
   chunkSizeMiB: 4
-  chunkListOnly: false    # see "Rollout and rollback"
+  chunkListOnly: false    # chunked only; gates the chunkListDigest capability
 ```
 
-- An unknown value, or `zstd` together with `legacy`, fails agent startup.
+- An unknown value, or `zstd` or `chunkListOnly: true` together with
+  `legacy`, fails agent startup.
+- `chunkListOnly: true` lets manifests omit the whole-file `sha256` of
+  native files (see "Rollout and rollback", step 4). With the default
+  `false`, chunked sets keep `sha256` next to `chunkList`, and older chunk
+  readers can still restore them.
 - In the OpenSandbox chart (OpenSandbox#2422) this is
   `runtime.transfer.*`. The default renders exactly as today, and a hash of
   the effective settings is a pod annotation, so any change rolls the
@@ -267,21 +296,20 @@ transfer:
 
 | PR | Content | Depends on |
 |---|---|---|
-| 1 | Chunk format, `chunks.json`, chunked publish and pull, always-on chunk reader, `transfer.format` config, docs | this FSEP accepted |
-| 2 | `chunkList` digest, digest-signed `PUT`s, `chunkListOnly` | 1 |
+| #214 | Standalone snapshot fixes split out of #213 | merged |
+| #244 | Verified-digest memo, same-node cache commit (#57) | merged |
+| cache | Fsynced cache writes, single-flighted cache ensures, independent of `transfer.format` | – |
+| #61 | Parallel and overlapped snapshot hashing, independent of `transfer.format` | – |
+| 1 | Chunk format, `chunks.json`, chunked publish and pull (recording into the #244 memo), always-on chunk reader, `transfer.format` and `transfer.compression`, manifest validation before upload, inherited `chunks` dropped by the publisher and both Fastlet assemblers, a chunk transfer cancelled between jobs fails instead of committing, a coalesced chunk upload counted once, docs | this FSEP accepted, cache |
+| 2 | `chunkList` digest, digest-signed `PUT`s, `chunkListOnly` and the capability rule, agent `sha256` fill-in and `SHA256SUMS` rewrite, Fastlet `Health` refresh | 1, same release |
 | 3 | Pooled store transport; P2P gateway pooling per open question 3 | 1 |
 | 4 | `fsb-store gc` | 1 |
 | – | OpenSandbox chart value and pin bump (OpenSandbox#2422) | 1 merged |
 
-[#213](https://github.com/opensandbox-group/fast-sandbox/pull/213) is the complete reference implementation and already spans PRs 1–3
-(the `chunkList` digest, digest-signed `PUT`s, the pooled transport, the 10 s
-attempt timeout and the `HEAD` 403 fallback are all in it). Landing the split
-means carving up that branch. PR 1 is not an existing subset of it. #213 stays
-a draft until this proposal is decided.
-
-PR 1 also covers the inherited `chunks` binding (see Compatibility): the
-publisher drops it in `legacy`, and the Fastlet drops it when it assembles a
-snapshot manifest.
+[#213](https://github.com/opensandbox-group/fast-sandbox/pull/213) is the complete reference implementation and spans PRs 1–3,
+including the fixes from its review. Each PR is built fresh on `main`
+(after #181 and #244), so PR 1 is not an existing subset of #213. #213 stays
+a draft and is closed once PR 1 is open.
 
 ### Open questions
 
@@ -291,9 +319,11 @@ snapshot manifest.
    closes the sweep window ("Remaining window"): a delete conditioned on
    the chunk not having been refreshed, where the store supports it, or a
    different protocol?
-2. **Rollback:** is the `chunkListOnly` finalize step acceptable (see
-   "Rollout and rollback"), or should manifests always keep the whole-file
-   `sha256` and accept the hash cost?
+2. **Rollback (resolved):** the `chunkListOnly` finalize step is kept. It
+   is safe to defer because `chunkListDigest` is reported only with
+   `chunkListOnly: true`, the agent fills a missing `sha256` otherwise, and
+   the Fastlet refreshes the capability before it skips hashes (see "Data
+   path").
 3. **P2P peer gateway:** chunk `GET`s go through the gateway when it is
    configured. Its client uses the default HTTP transport (2 idle
    connections per host), so parallel pulls churn connections. Should it
@@ -310,11 +340,13 @@ snapshot manifest.
     published manifest is byte-identical to today's.
   - New readers read both layouts in both modes.
   - **Inherited `chunks` binding:** the Fastlet builds a snapshot manifest
-    from the manifest the Sandbox booted from and keeps its other fields. A
-    Sandbox restored from a chunked set and paused again with the agent in
-    `legacy` would publish a `chunks` ref to a `chunks.json` that was never
-    uploaded. The `legacy` publisher drops the binding (#213 does this:
-    `bindChunkIndex` with a nil ref), and from PR 1 the Fastlet drops it too.
+    from the manifest the Sandbox booted from and keeps its other fields;
+    both the full and the RootfsOnly (#181) assembler do this. A Sandbox
+    restored from a chunked set and paused again with the agent in `legacy`
+    would publish a `chunks` ref to a `chunks.json` that was never uploaded.
+    The `legacy` publisher drops the binding (#213 does this:
+    `bindChunkIndex` with a nil ref), and from PR 1 both Fastlet assemblers
+    drop it too.
     An agent older than PR 1 can still restore a chunked set from its
     node cache and republish such a manifest with an old Fastlet. This is one
     more reason not to downgrade below PR 1 (see "Downgrade limits").
@@ -328,7 +360,8 @@ snapshot manifest.
 | new, `legacy` | old | Same as today. The old Fastlet ignores the new response fields. |
 | new, `chunked` | old | Chunked sets are published. The old Fastlet still writes whole-file `sha256`, which is allowed. |
 | old | new | The Fastlet sees no capability and behaves as today. |
-| new, `chunked` | new | Chunked sets; whole-file `sha256` is omitted only with `chunkListOnly: true`. |
+| new, `chunked` | new | Chunked sets. With the default `chunkListOnly: false`, whole-file `sha256` is kept, and the agent fills it in if a stale Fastlet staged without it. |
+| new, `chunked`, `chunkListOnly: true` | new | Whole-file `sha256` of native files is omitted. Only agents with PR 2 can read these manifests. |
 
 **Restore by an old agent:**
 - An agent older than PR 1 cannot read a chunked set: it looks for
@@ -352,7 +385,14 @@ snapshot manifest.
 - config validation;
 - chunk-list digest from an index equals the digest from a file, and a
   mismatch is rejected;
-- `chunkListOnly` off keeps `sha256`.
+- `chunkListOnly` off keeps `sha256`;
+- `chunkListDigest` is reported only for `chunked` with `chunkListOnly`;
+- the agent fills a missing `sha256` and rewrites `SHA256SUMS`, and never
+  writes an empty `SHA256SUMS`;
+- manifest validation fails before any object is uploaded;
+- a `Health` error clears the Fastlet's cached capability;
+- a chunk transfer cancelled between jobs fails and commits nothing;
+- a coalesced chunk upload is counted once in the publish stats.
 
 **Integration:**
 - Publish and pull a 1.5 GiB set in both modes against a second S3
@@ -370,11 +410,16 @@ snapshot manifest.
   - store unavailable during a pull, then a retry.
 - **Compatibility:**
   - every row of the version table above;
-  - switch `chunked` → `legacy` and restore the earlier chunked checkpoints
-    and snapshots;
+  - switch `chunked`+`zstd` → `legacy`+`none` in one change, confirm the
+    agent starts, and restore the earlier chunked checkpoints and
+    snapshots;
   - restore a chunked snapshot, switch to `legacy`, pause again, and verify
     that the new manifest has no `chunks` ref and restores on an agent from
-    before PR 1.
+    before PR 1;
+  - switch the agent's mode between staging and publish (Fastlet not
+    restarted), and verify the published set restores cold on another
+    node;
+  - publish and restore a native RootfsOnly set in `chunked`.
 - **GC acceptance (PR 4, before destructive mode is enabled):**
   - dry-run lists candidates and deletes nothing;
   - a publish that reuses an old chunk after mark 1 keeps it;
@@ -429,11 +474,17 @@ snapshot manifest.
 - a sustained increase in pause or restore failures;
 - a retry rate that does not settle.
 
-**Disable:** set `transfer.format: legacy`.
+**Disable:** set `transfer.format: legacy`. If `transfer.compression` is
+`zstd`, set it to `none` in the same configuration change. `legacy` with
+`zstd` fails validation, so an agent given only the format change does not
+start.
 - New publishes return to whole-file sets.
-- Only the store format changes: the local cache optimizations no longer
-  depend on `transfer.format` (see Non-goals). In #213 as it stands today,
-  this switch also turns off the verified-cache marker.
+- Chunks already stored as `zstd` stay readable: the reader decodes each
+  chunk by the encoding recorded in `chunks.json`, not by the agent's
+  `transfer.compression` setting.
+- Only the store format changes: the local cache optimizations do not
+  depend on `transfer.format` (see Non-goals).
+- With `chunkListOnly: true`, set it to `false` in the same change.
 - The chunk reader stays on, so every chunked set already published remains
   restorable. This is the supported rollback.
 
@@ -455,6 +506,8 @@ snapshot manifest.
 - [#146: Snapshot transfer spends most of its time moving and re-hashing zeros](https://github.com/opensandbox-group/fast-sandbox/issues/146) (problem and measurements).
 - [#213: chunked, zero-elided snapshot transfer](https://github.com/opensandbox-group/fast-sandbox/pull/213) (reference implementation, draft; supersedes [#147](https://github.com/opensandbox-group/fast-sandbox/pull/147)).
 - [#214: standalone snapshot fixes](https://github.com/opensandbox-group/fast-sandbox/pull/214) (merged, split out of #213).
-- [#57](https://github.com/opensandbox-group/fast-sandbox/issues/57) and [#61](https://github.com/opensandbox-group/fast-sandbox/issues/61): local optimizations, handled in separate PRs.
+- [#244](https://github.com/opensandbox-group/fast-sandbox/pull/244): verified-digest memo and same-node cache commit (merged; closes [#57](https://github.com/opensandbox-group/fast-sandbox/issues/57)).
+- [#61](https://github.com/opensandbox-group/fast-sandbox/issues/61): parallel and overlapped snapshot hashing, a separate PR.
+- [#181](https://github.com/opensandbox-group/fast-sandbox/pull/181): native RootfsOnly S3 snapshots, whose sets are chunked too.
 - [OpenSandbox#2422](https://github.com/opensandbox-group/OpenSandbox/pull/2422): chart value `runtime.transfer.*`.
 - FSEP-0001 (rootfs-only snapshots on the OverlayBD path).
