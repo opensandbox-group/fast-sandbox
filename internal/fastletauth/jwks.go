@@ -50,19 +50,12 @@ var readKeyFetchTokenFile = func() (string, error) {
 }
 
 // authedTransport attaches the key-fetch credential to every request through
-// this client — discovery, initial JWKS, and each unknown-kid refresh alike —
-// but only within the pinned issuer origin. The credential is a Kubernetes
-// identity; the discovery document naming another host does not authorize that
-// host to receive it.
+// this client — discovery, initial JWKS, and each unknown-kid refresh alike.
 type authedTransport struct {
-	base   http.RoundTripper
-	origin *url.URL
+	base http.RoundTripper
 }
 
 func (t authedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	if !sameOrigin(request.URL, t.origin) {
-		return nil, fmt.Errorf("refusing to send the key-fetch credential to %s: outside the pinned issuer origin", request.URL.Host)
-	}
 	credential, err := keyFetchCredential()
 	if err != nil {
 		return nil, err
@@ -74,24 +67,6 @@ func (t authedTransport) RoundTrip(request *http.Request) (*http.Response, error
 		base = http.DefaultTransport
 	}
 	return base.RoundTrip(cloned)
-}
-
-// sameOrigin compares scheme and host with default ports applied, so an issuer
-// written without an explicit port still matches its discovery-served URLs.
-func sameOrigin(a, b *url.URL) bool {
-	return a != nil && b != nil && a.Scheme == b.Scheme && canonicalHost(a) == canonicalHost(b)
-}
-
-func canonicalHost(u *url.URL) string {
-	port := u.Port()
-	if port == "" {
-		if u.Scheme == "https" {
-			port = "443"
-		} else {
-			port = "80"
-		}
-	}
-	return u.Hostname() + ":" + port
 }
 
 // oidcDiscovery is the subset of the OIDC discovery document the verifier
@@ -112,10 +87,6 @@ func fetchDiscovery(ctx context.Context, client *http.Client, issuer string) (*o
 	if err := validateKeyMaterialURL(issuer, "issuer"); err != nil {
 		return nil, err
 	}
-	issuerURL, err := url.Parse(issuer)
-	if err != nil || issuerURL.Host == "" {
-		return nil, fmt.Errorf("issuer %q is not a valid URL", issuer)
-	}
 	document := &oidcDiscovery{}
 	if err := fetchJSONDocument(ctx, client, strings.TrimSuffix(issuer, "/")+"/.well-known/openid-configuration", document); err != nil {
 		return nil, err
@@ -129,14 +100,9 @@ func fetchDiscovery(ctx context.Context, client *http.Client, issuer string) (*o
 	// The discovery document names where signing keys are fetched from. An
 	// unvalidated jwks_uri would let an https issuer hand its keys over
 	// plaintext, where an on-path attacker can substitute forgeries — apply
-	// the same trust-anchor boundary as the issuer itself. Pin the origin too:
-	// keys served from another host would receive the key-fetch credential.
+	// the same trust-anchor boundary as the issuer itself.
 	if err := validateKeyMaterialURL(document.JWKSURI, "jwks_uri"); err != nil {
 		return nil, err
-	}
-	jwksURL, parseErr := url.Parse(document.JWKSURI)
-	if parseErr != nil || !sameOrigin(jwksURL, issuerURL) {
-		return nil, fmt.Errorf("jwks_uri %q is not served by the pinned issuer origin", document.JWKSURI)
 	}
 	return document, nil
 }
@@ -185,15 +151,9 @@ func fetchJSONDocument(ctx context.Context, client *http.Client, url string, tar
 // defaultHTTPClient builds the client for issuer key material. The trust set
 // is the system roots extended with the injected bundle (CABundleEnv) or the
 // projected pod ca.crt, so publicly trusted issuers keep verifying. Every
-// request carries the key-fetch credential — discovery is an authenticated
-// read, never anonymous — and the transport refuses any request outside the
-// issuer origin, so neither redirects nor a foreign jwks_uri can receive the
-// credential.
-func defaultHTTPClient(issuer string) (*http.Client, error) {
-	origin, err := url.Parse(issuer)
-	if err != nil || origin.Host == "" {
-		return nil, fmt.Errorf("issuer %q is not a valid URL", issuer)
-	}
+// request carries the key-fetch credential: discovery is an authenticated
+// read, never anonymous.
+func defaultHTTPClient() (*http.Client, error) {
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
 		// Instrumentation may have replaced the default transport; lose the
@@ -214,7 +174,7 @@ func defaultHTTPClient(issuer string) (*http.Client, error) {
 	// cross-host and downgrade Authorization stripping. Refuse to leave the
 	// anchor host or scheme; the non-200 redirect fails the fetcher closed.
 	return &http.Client{
-		Transport: authedTransport{base: base, origin: origin},
+		Transport: authedTransport{base: base},
 		Timeout:   5 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= maxKeyFetchRedirects {
