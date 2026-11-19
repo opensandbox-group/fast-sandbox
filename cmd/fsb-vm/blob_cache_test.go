@@ -386,3 +386,9 @@ func TestBlobCacheWatermarkValidation(t *testing.T) {
 	require.Error(t, validateBlobCacheWatermarks(101, 60, 75))
 	require.Error(t, validateBlobCacheWatermarks(80, -1, 75))
 }
+
+func TestLocalBlobCacheTrimWithoutCacheDirectoryIsANoOp(t *testing.T) {
+	setupBlobCache(t)
+	require.NoError(t, trimBlobCache(blobCacheLimits{maxBytes: 1 << 20, maxFiles: blobCacheMaxFiles}))
+	require.NoDirExists(t, filepath.Join(blobCacheRoot(), "sha256"))
+}

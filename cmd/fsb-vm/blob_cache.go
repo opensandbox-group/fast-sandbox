@@ -247,6 +247,11 @@ func scanBlobCache(root string) (*blobCacheScan, error) {
 func trimBlobCache(limits blobCacheLimits) error {
 	started := time.Now()
 	root := filepath.Join(blobCacheRoot(), "sha256")
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
 	scan, err := scanBlobCache(root)
 	if err != nil {
 		return err
