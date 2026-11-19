@@ -788,12 +788,12 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit,
 			metadata.Phase = sandboxStateUnknown
 		}
 		terminalFailure := metadata.Phase == sandboxStateRuntimeFailed
-		if metadata.RecoveryRequired {
-			metadata.Phase = sandboxStateInfraPending
-		} else if m.infraManager != nil && !terminalFailure {
+		if m.infraManager != nil && !terminalFailure {
 			if metadata.Config.Desired.InfraRevision != m.infraRevision {
 				return fmt.Errorf("recovered Sandbox %s Infra revision does not match Fastlet", identity.SandboxUID)
 			}
+		}
+		if metadata.RecoveryRequired || (m.infraManager != nil && !terminalFailure) {
 			metadata.Phase = sandboxStateInfraPending
 		} else if m.actionManager != nil && m.actionManager.Required() && !terminalFailure {
 			metadata.Phase = sandboxStateActionPending
@@ -815,7 +815,15 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit,
 	publications := make([]RoutePublication, 0, len(recovered))
 	pendingInfra := false
 	for _, metadata := range recovered {
-		if metadata.Phase == sandboxStateRuntimeFailed || metadata.RecoveryRequired {
+		if metadata.Phase == sandboxStateRuntimeFailed {
+			continue
+		}
+		if metadata.RecoveryRequired {
+			if metadata.BootRecoveryPending {
+				publications = append(publications, suspendedRoutePublication(metadata.Config.Identity))
+			} else {
+				pendingInfra = true
+			}
 			continue
 		}
 		if m.infraManager != nil {
@@ -830,9 +838,22 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit,
 			publications = append(publications, publication)
 		}
 	}
-	if m.routePublisher != nil && !pendingInfra {
+	if m.routePublisher != nil {
 		m.routeMu.Lock()
-		err := m.routePublisher.ReconcileRoutes(ctx, publications)
+		var err error
+		if pendingInfra {
+			// Healthy recovered routes are reconciled after their Infra is ready.
+			for _, publication := range publications {
+				if publication.Suspended {
+					err = m.suspendRoute(ctx, publication)
+					if err != nil {
+						break
+					}
+				}
+			}
+		} else {
+			err = m.routePublisher.ReconcileRoutes(ctx, publications)
+		}
 		m.routeMu.Unlock()
 		if err != nil {
 			return fmt.Errorf("reconcile Fastlet Proxy routes: %w", err)

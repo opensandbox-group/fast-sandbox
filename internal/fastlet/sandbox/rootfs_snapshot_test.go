@@ -80,6 +80,7 @@ func TestRootfsSnapshotWorkerRejectsReplacedSandbox(t *testing.T) {
 type recoverySnapshotRuntime struct {
 	*snapshotRuntime
 	recoveryMu    sync.Mutex
+	boot          bool
 	required      bool
 	recoveryErr   error
 	recoveryCalls int
@@ -96,7 +97,7 @@ func (r *recoverySnapshotRuntime) InspectSandbox(context.Context, string) (*Sand
 	if r.inspectErr != nil {
 		return nil, r.inspectErr
 	}
-	return &SandboxMetadata{Config: fastletapi.RuntimeSandboxConfig{Identity: r.identity}, Phase: "Running", RecoveryRequired: r.required, RuntimeMessage: "capture recovery pending"}, nil
+	return &SandboxMetadata{Config: fastletapi.RuntimeSandboxConfig{Identity: r.identity}, Phase: "Running", RecoveryRequired: r.required, BootRecoveryPending: r.boot && r.required, RuntimeMessage: "recovery pending"}, nil
 }
 func (r *recoverySnapshotRuntime) ReconcileSandbox(ctx context.Context, identity fastletapi.SandboxIdentity) error {
 	r.recoveryMu.Lock()
@@ -229,7 +230,15 @@ func TestRootfsRecoveryWorkerDoesNotBlockHeartbeatsOrTouchReplacement(t *testing
 }
 
 func TestRootfsRecoveryRestoresRealProxyRoute(t *testing.T) {
-	r := &recoverySnapshotRuntime{snapshotRuntime: newSnapshotRuntime()}
+	for _, boot := range []bool{false, true} {
+		t.Run(map[bool]string{false: "capture", true: "boot"}[boot], func(t *testing.T) {
+			testRecoveryRestoresRealProxyRoute(t, boot)
+		})
+	}
+}
+
+func testRecoveryRestoresRealProxyRoute(t *testing.T, boot bool) {
+	r := &recoverySnapshotRuntime{snapshotRuntime: newSnapshotRuntime(), boot: boot}
 	m := newSnapshotManager(t, r)
 	meta := m.sandboxes["uid-a"]
 	r.identity = meta.Config.Identity
@@ -253,7 +262,15 @@ func TestRootfsRecoveryRestoresRealProxyRoute(t *testing.T) {
 	m.refreshRuntimeRecovery(t.Context(), r.identity, false)
 	_, err = store.Lookup("uid-a")
 	require.ErrorIs(t, err, fastletproxy.ErrRouteDraining)
-	require.ErrorIs(t, m.ReconcileProxyRoutes(t.Context()), ErrInfraUnavailable)
+	if boot {
+		require.NoError(t, m.ReconcileProxyRoutes(t.Context()))
+		m.refreshRuntimeRecovery(t.Context(), r.identity, false)
+		require.True(t, m.Ready())
+		_, err = store.Lookup("uid-a")
+		require.ErrorIs(t, err, fastletproxy.ErrRouteDraining)
+	} else {
+		require.ErrorIs(t, m.ReconcileProxyRoutes(t.Context()), ErrInfraUnavailable)
+	}
 	require.Len(t, store.Snapshot().Routes, 1, "temporary quarantine must retain route ownership")
 	r.recoveryMu.Lock()
 	r.required = false

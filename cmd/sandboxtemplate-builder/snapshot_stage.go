@@ -117,8 +117,8 @@ func runSnapshotStage(args []string) error {
 	_ = os.Remove(driveLink)
 	if spec.Output.Mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
 		// Boot a private sparse copy so the published filesystem remains clean.
-		if err := exec.Command("cp", "--reflink=auto", "--sparse=always", "--", rootfs, driveLink).Run(); err != nil {
-			return fmt.Errorf("copy template disk for boot verification: %w", err)
+		if output, err := exec.Command("cp", "--reflink=auto", "--sparse=always", "--", rootfs, driveLink).CombinedOutput(); err != nil {
+			return fmt.Errorf("copy template disk for boot verification: %w: %s", err, strings.TrimSpace(string(output)))
 		}
 		defer os.Remove(driveLink)
 	} else if err := os.Symlink(rootfs, driveLink); err != nil {

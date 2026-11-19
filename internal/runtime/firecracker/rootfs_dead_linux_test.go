@@ -3,13 +3,16 @@
 package firecracker
 
 import (
+	"context"
 	"errors"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -56,6 +59,30 @@ func TestRootfsDeadCaptureAbortsWithoutGuestOrDevice(t *testing.T) {
 		})
 	}
 }
+func TestStopVerifiedSocketPeer(t *testing.T) {
+	const childSocket = "FSB_TEST_VERIFIED_PEER_SOCKET"
+	if path := os.Getenv(childSocket); path != "" {
+		listener, err := net.Listen("unix", path)
+		require.NoError(t, err)
+		defer listener.Close()
+		for {
+			conn, err := listener.Accept()
+			require.NoError(t, err)
+			_ = conn.Close()
+		}
+	}
+	socket := filepath.Join(t.TempDir(), "peer.sock")
+	command := exec.Command(os.Args[0], "-test.run=^TestStopVerifiedSocketPeer$")
+	command.Env = append(os.Environ(), childSocket+"="+socket)
+	require.NoError(t, command.Start())
+	t.Cleanup(func() { _ = command.Process.Kill(); _ = command.Wait() })
+	require.Eventually(t, func() bool { _, err := os.Stat(socket); return err == nil }, time.Second*3, time.Millisecond*10)
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	require.ErrorIs(t, stopVerifiedSocketPeer(ctx, socket, os.Getpid()), errCaptureIdentityMismatch)
+	require.NoError(t, stopVerifiedSocketPeer(ctx, socket, command.Process.Pid))
+}
+
 func TestRootfsLiveCaptureIsNotDeclaredDead(t *testing.T) {
 	absent, err := capturePIDAbsent(os.Getpid())
 	require.NoError(t, err)

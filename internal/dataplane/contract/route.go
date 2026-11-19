@@ -35,6 +35,7 @@ type RoutePublication struct {
 	FastletPodUID     string
 	AssignmentAttempt int64
 	RouteGeneration   int64
+	Suspended         bool
 	Access            AccessDescriptor
 	Components        map[string]ComponentRoute
 }

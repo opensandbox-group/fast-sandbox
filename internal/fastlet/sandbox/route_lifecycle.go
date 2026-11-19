@@ -11,6 +11,7 @@ import (
 	"k8s.io/klog/v2"
 
 	dataplane "fast-sandbox/internal/dataplane/contract"
+	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
@@ -28,9 +29,14 @@ func (m *SandboxManager) ReconcileProxyRoutes(ctx context.Context) error {
 	metadata := make([]SandboxMetadata, 0, len(m.sandboxes))
 	owners := make([]*SandboxMetadata, 0, len(m.sandboxes))
 	pendingInfra := false
+	var suspended []RoutePublication
 	for _, sandbox := range m.sandboxes {
-		if sandbox.RecoveryRequired && !sandbox.BootRecoveryPending {
-			pendingInfra = true
+		if sandbox.RecoveryRequired {
+			if sandbox.BootRecoveryPending && runtimeCreatedPhase(sandbox.Phase) {
+				suspended = append(suspended, suspendedRoutePublication(sandbox.Config.Identity))
+			} else if !sandbox.BootRecoveryPending {
+				pendingInfra = true
+			}
 		}
 		if !m.runtimeWorkAllowedLocked(sandbox) {
 			continue
@@ -50,7 +56,7 @@ func (m *SandboxManager) ReconcileProxyRoutes(ctx context.Context) error {
 		m.MarkProxyRouteUnavailable()
 		return fmt.Errorf("reconcile proxy routes: %w", ErrInfraUnavailable)
 	}
-	publications := make([]RoutePublication, 0, len(metadata))
+	publications := suspended
 	publishedOwners := make([]*SandboxMetadata, 0, len(metadata))
 	for index := range metadata {
 		m.mu.RLock()
@@ -257,6 +263,9 @@ func (m *SandboxManager) observeRuntimeRecovery(ctx context.Context, identity fa
 			m.startRuntimeRecovery(metadata, reconciler)
 		}
 	} else if restartDataPlane {
+		if wasRequired {
+			m.recordActionHook(metadata, actionapi.LifecycleHookRuntimeReady, 1)
+		}
 		m.startDataPlaneReconcile(metadata, m.clock.Now())
 	}
 	return observed, inspectErr
@@ -334,13 +343,21 @@ func (m *SandboxManager) suspendRecoveryRoute(ctx context.Context, metadata *San
 	if !current {
 		return nil
 	}
+	return m.suspendRoute(ctx, suspendedRoutePublication(identity))
+}
+
+func (m *SandboxManager) suspendRoute(ctx context.Context, publication RoutePublication) error {
 	publisher, ok := m.routePublisher.(dataplane.RecoveryRoutePublisher)
 	if !ok {
 		return errors.New("proxy does not support reversible recovery suspension")
 	}
+	return publisher.SuspendRoute(ctx, publication)
+}
+
+func suspendedRoutePublication(identity fastletapi.SandboxIdentity) RoutePublication {
 	generation := identity.RouteGeneration
 	if generation <= 0 {
 		generation = 1
 	}
-	return publisher.SuspendRoute(ctx, RoutePublication{SandboxUID: identity.SandboxUID, RouteGeneration: generation})
+	return RoutePublication{SandboxUID: identity.SandboxUID, RouteGeneration: generation, Suspended: true}
 }

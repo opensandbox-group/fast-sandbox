@@ -1674,8 +1674,10 @@ func TestRecoveryIsolatesUnverifiedBootAndPublishesHealthyRoute(t *testing.T) {
 	require.NoError(t, manager.ReconcileProxyRoutes(t.Context()))
 	require.Len(t, publisher.reconciled, 2)
 	for _, routes := range publisher.reconciled {
-		require.Len(t, routes, 1)
-		require.Equal(t, "healthy", routes[0].SandboxUID)
+		require.Len(t, routes, 2)
+		for _, route := range routes {
+			require.Equal(t, route.SandboxUID == "unverified", route.Suspended)
+		}
 	}
 }
 

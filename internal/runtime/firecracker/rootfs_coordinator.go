@@ -349,8 +349,14 @@ func (d *Driver) ReconcileSandbox(ctx context.Context, identity fastletapi.Sandb
 		return err
 	}
 	directory := filepath.Join(d.config.StateRoot, sandboxStateDir, identity.SandboxUID)
+	d.mu.RLock()
 	cgroups := d.runtimeCgroups
-	if cgroups == nil || cgroups.ConfirmAbsent(identity.SandboxUID) != nil {
+	d.mu.RUnlock()
+	exited := cgroups != nil && cgroups.ConfirmAbsent(identity.SandboxUID) == nil
+	if cgroups == nil {
+		exited = d.recordedVMMExited(state)
+	}
+	if !exited {
 		err := d.adoptPinnedBoot(ctx, directory, state, cgroups)
 		if err == nil || state.Phase != PhaseStarting || cgroups == nil || ctx.Err() != nil {
 			return err

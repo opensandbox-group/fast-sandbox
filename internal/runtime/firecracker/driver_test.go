@@ -923,6 +923,32 @@ func TestRecoverRunningOverrideBeforeCreateCommit(t *testing.T) {
 	require.Empty(t, f.killCalls)
 }
 
+func TestRecoverQuarantinedRootfsWithoutCgroups(t *testing.T) {
+	f := newDriverFixture(t)
+	f.sandboxSpec.Desired.RootfsBootDigest = "pinned"
+	id := f.sandboxSpec.Identity
+	dir, err := ensureSandboxDir(f.stateRoot, id.SandboxUID)
+	require.NoError(t, err)
+	// An unreachable socket with a live PID does not prove exit.
+	require.NoError(t, saveState(dir, &SandboxState{Config: f.sandboxSpec, Phase: PhaseRunning, PID: 4321}))
+	f.driver.probeProcess = func(int) error { return nil }
+	require.NoError(t, f.driver.RecoverRuntimeResources(t.Context(), nil, nil))
+	meta, err := f.driver.InspectSandbox(t.Context(), id.SandboxUID)
+	require.NoError(t, err)
+	require.True(t, meta.BootRecoveryPending)
+	require.Error(t, f.driver.DeleteSandbox(t.Context(), id.SandboxUID))
+	require.Empty(t, f.killCalls)
+
+	f.driver.probeProcess = func(int) error { return os.ErrProcessDone }
+	require.NoError(t, f.driver.ReconcileSandbox(t.Context(), id))
+	meta, err = f.driver.InspectSandbox(t.Context(), id.SandboxUID)
+	require.NoError(t, err)
+	require.Equal(t, string(PhaseFailed), meta.Phase)
+	require.NoError(t, f.driver.DeleteSandbox(t.Context(), id.SandboxUID))
+	require.NoDirExists(t, dir)
+	require.Empty(t, f.killCalls)
+}
+
 func TestRecoverInterruptedRootfsStartWithRecordedPID(t *testing.T) {
 	for _, tc := range []struct {
 		name, path, response string
@@ -931,6 +957,7 @@ func TestRecoverInterruptedRootfsStartWithRecordedPID(t *testing.T) {
 		foreignPID           bool
 	}{
 		{"state-read-failure", "/", "", 503, PhaseStarting, false},
+		{"unresponsive-vmm", "/", "", 0, PhaseStarting, false},
 		{"unexpected-state", "/", `{"state":"Paused"}`, 200, PhaseStarting, false},
 		{"machine-read-failure", "/machine-config", "", 503, PhaseStarting, false},
 		{"foreign-pid", "/machine-config", "", 503, PhaseStarting, true},
@@ -948,6 +975,10 @@ func TestRecoverInterruptedRootfsStartWithRecordedPID(t *testing.T) {
 			socket := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case tc.path:
+					if tc.status == 0 {
+						<-r.Context().Done()
+						return
+					}
 					w.WriteHeader(tc.status)
 					_, _ = w.Write([]byte(tc.response))
 				case "/version":

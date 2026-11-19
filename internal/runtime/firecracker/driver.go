@@ -1148,7 +1148,7 @@ func (d *Driver) deleteSandbox(ctx context.Context, sandboxID string, retainTerm
 	if _, err := d.abortExitedRootfsCapture(ctx, state, directory); err != nil {
 		return err
 	}
-	pid, err := terminalCleanupPID(state, runtimeCgroups)
+	pid, err := d.terminalCleanupPID(ctx, state, runtimeCgroups)
 	if err != nil {
 		return err
 	}
@@ -1329,6 +1329,9 @@ func (d *Driver) recoverPinnedBoot(ctx context.Context, directory string, state 
 		} else if cgroups.ConfirmAbsent(state.Config.Identity.SandboxUID) == nil {
 			return d.recoverDeadSandbox(ctx, state, directory, manager, cgroups, retire, true)
 		}
+	} else if d.recordedVMMExited(state) {
+		state.PID = 0
+		return d.recoverDeadSandbox(ctx, state, directory, manager, nil, retire, true)
 	}
 	klog.ErrorS(err, "isolating unverifiable rootfs boot", "sandboxID", state.Config.Identity.SandboxUID)
 	state.BootRecoveryError = err.Error()
@@ -1336,6 +1339,8 @@ func (d *Driver) recoverPinnedBoot(ctx context.Context, directory string, state 
 }
 
 func (d *Driver) adoptPinnedBoot(ctx context.Context, directory string, state *SandboxState, cgroups *podcgroup.RuntimeManager) error {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
 	if state.PID <= 0 {
 		return errors.New("rootfs boot has no recorded VMM PID")
 	}
@@ -2071,10 +2076,18 @@ func (d *Driver) prepareSnapshotSpill(jailRoot string) {
 }
 
 // An empty owned cgroup fences historical PID reuse before terminal cleanup.
-func terminalCleanupPID(state *SandboxState, cgroups *podcgroup.RuntimeManager) (int, error) {
+func (d *Driver) terminalCleanupPID(ctx context.Context, state *SandboxState, cgroups *podcgroup.RuntimeManager) (int, error) {
 	if state.BootRecoveryError != "" {
 		if cgroups == nil {
-			return 0, errors.New("cannot confirm rootfs VMM ownership without its cgroup")
+			if d.recordedVMMExited(state) {
+				return 0, nil
+			}
+			probe, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			if err := stopVerifiedSocketPeer(probe, state.APIAddress, state.PID); err != nil {
+				return 0, fmt.Errorf("stop quarantined VMM: %w", err)
+			}
+			return 0, nil
 		}
 		if cgroups.ConfirmAbsent(state.Config.Identity.SandboxUID) == nil {
 			return 0, nil
@@ -2091,4 +2104,16 @@ func terminalCleanupPID(state *SandboxState, cgroups *podcgroup.RuntimeManager) 
 		return 0, fmt.Errorf("confirm terminal Firecracker sandbox %s exited (PID %d, Fastlet Pod %s, phase %s): %w", state.Config.Identity.SandboxUID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
 	}
 	return 0, nil
+}
+
+// An API error does not prove the process is gone.
+func (d *Driver) recordedVMMExited(state *SandboxState) bool {
+	if state.PID <= 0 {
+		return false
+	}
+	d.mu.RLock()
+	probe := d.probeProcess
+	d.mu.RUnlock()
+	err := probe(state.PID)
+	return errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrProcessDone) || errors.Is(err, os.ErrNotExist)
 }

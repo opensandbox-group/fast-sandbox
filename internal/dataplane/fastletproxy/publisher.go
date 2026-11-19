@@ -51,6 +51,12 @@ func (p *RoutePublisher) ReconcileRoutes(ctx context.Context, publications []dat
 		}
 	}
 	for _, publication := range publications {
+		if publication.Suspended {
+			if err := p.SuspendRoute(ctx, publication); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := p.ResumeRoute(ctx, publication); err != nil {
 			return err
 		}
