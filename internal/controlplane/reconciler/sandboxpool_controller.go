@@ -134,18 +134,16 @@ const (
 	// proxyControlVolumeName is the reserved volume sharing the proxy control socket.
 	proxyControlVolumeName = "proxy-control"
 	// fastletServiceAccountName is the dedicated discovery-only identity the
-	// Pool Controller provisions in every Pool namespace and forces into
-	// Fastlet Pod specs. Its projected token is the Fastlet's key-fetch
-	// credential for the issuer's OIDC discovery and JWKS endpoints.
+	// Pool Controller provisions per Pool namespace; its projected token is
+	// the Fastlet's key-fetch credential.
 	fastletServiceAccountName = "fast-sandbox-fastlet"
-	// fastletAuthTokenVolumeName is the reserved volume carrying the
-	// dedicated identity's projected token into the Fastlet container alone.
+	// fastletAuthTokenVolumeName is the reserved volume carrying that token
+	// into the Fastlet container alone.
 	fastletAuthTokenVolumeName = "fastlet-auth-token"
 )
 
-// fastletAuthTokenMountPath and fastletAuthTokenProjectionPath are derived
-// from the fastletauth package's projected-token path, so the mount cannot
-// drift from the file the Fastlet reads its key-fetch credential from.
+// Mount path and projection item derived from the fastletauth token path so
+// the mount cannot drift from the file the Fastlet reads.
 var (
 	fastletAuthTokenMountPath      = filepath.Dir(fastletauth.ServiceAccountTokenFile)
 	fastletAuthTokenProjectionPath = filepath.Base(fastletauth.ServiceAccountTokenFile)
@@ -1578,10 +1576,9 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 	podSpec.HostPID = false
 	podSpec.RuntimeClassName = nil
 	podSpec.AutomountServiceAccountToken = boolPtr(false)
-	// The key-fetch credential is platform-owned: the Pod presents the
-	// dedicated discovery-only identity, never a template-chosen one.
-	// automountServiceAccountToken stays off — the credential ships as the
-	// explicit projected volume below, so only the Fastlet container reads it.
+	// The fetching identity is platform-owned, never template-chosen; automount
+	// stays off — the credential ships as the projected volume mounted into the
+	// Fastlet container only.
 	podSpec.ServiceAccountName = fastletServiceAccountName
 	if len(podSpec.Containers) == 0 {
 		return nil, errors.New("fastletTemplate.spec.containers must contain the fastlet container")
@@ -1681,10 +1678,8 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			corev1.EnvVar{Name: fastletauth.CABundleEnv, Value: r.FastletAuthCABundle},
 			corev1.EnvVar{Name: fastletauth.AllowedSubjectsEnv, Value: strings.Join(subjects, ",")},
 			corev1.EnvVar{Name: fastletauth.AudienceEnv, Value: r.FastletAuthAudience},
-			// Empty by design: Pods read the mounted token file, and the
-			// explicit entry shadows any envFrom key of the same name, so a
-			// ConfigMap/Secret reference cannot hand the Fastlet an override
-			// credential.
+			// Explicitly empty: Pods read the mounted token file, and the
+			// entry shadows any envFrom key of the same name.
 			corev1.EnvVar{Name: fastletauth.KeyFetchTokenEnv},
 		)
 		if profile.ResidualProcess != runtimecatalog.ResidualProcessNone {
@@ -1698,9 +1693,7 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			corev1.VolumeMount{Name: registryConfigVolumeName, MountPath: registryConfigDir, ReadOnly: true},
 			corev1.VolumeMount{Name: fastletsettings.VolumeName, MountPath: fastletsettings.MountPath, ReadOnly: true},
 			corev1.VolumeMount{Name: proxyControlVolumeName, MountPath: proxyRunDir},
-			// The key-fetch credential: only the Fastlet container mounts the
-			// projected token — the proxy sidecar and template sidecars never
-			// see it.
+			// The key-fetch credential, mounted into the Fastlet container only.
 			corev1.VolumeMount{
 				Name: fastletAuthTokenVolumeName, MountPath: fastletAuthTokenMountPath, ReadOnly: true,
 			},
@@ -1801,10 +1794,8 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
 				Sources: []corev1.VolumeProjection{{
 					ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
-						// fastletauth.DefaultExpirationSeconds: the kubelet
-						// rotates the projected token before expiry and the
-						// Fastlet re-reads the file on every key fetch, so
-						// rotation is followed without restarts.
+						// The kubelet rotates the token before expiry; the
+						// Fastlet re-reads the file per fetch.
 						ExpirationSeconds: int64Ptr(int64(fastletauth.DefaultExpirationSeconds)),
 						Path:              fastletAuthTokenProjectionPath,
 					},
@@ -2564,13 +2555,9 @@ var runtimeOwnedEnv = map[string]struct{}{
 	"FAST_SANDBOX_ACTIONS":         {},
 	"FAST_SANDBOX_SETTINGS_DIR":    {},
 	"NODE_NAME":                    {}, envPodName: {}, "POD_IP": {}, envPodUID: {}, "NAMESPACE": {},
-	// Control authentication env keys are platform-owned: the Pool
-	// Controller injects allow list, audience, and anchor, and a Pool
-	// template must not be able to relax or redirect any of them. The
-	// key-fetch credential override is fenced the same way: keyFetchCredential
-	// prefers it over the mounted token file even inside a Pod, so a
-	// template-supplied value could swap the fetching identity or break every
-	// key fetch on the Pool.
+	// Control authentication env keys are platform-owned: injected by the Pool
+	// Controller and stripped from templates. KeyFetchTokenEnv is fenced the
+	// same way — the override wins over the mounted token even inside a Pod.
 	fastletauth.AllowedSubjectsEnv: {}, fastletauth.IssuerEnv: {}, fastletauth.CABundleEnv: {},
 	fastletauth.AudienceEnv: {}, fastletauth.KeyFetchTokenEnv: {},
 }
@@ -2976,21 +2963,17 @@ func int64Ptr(value int64) *int64 {
 	return &value
 }
 
-// ensureFastletServiceAccount provisions the dedicated discovery-only
-// identity Fastlet Pods present as their serviceAccountName so the kubelet
-// can project their key-fetch token. It Create-then-tolerates-AlreadyExists
-// and never reads the ServiceAccount back: r.Get here would go through the
-// cached client, whose cluster-wide ServiceAccount informer cannot sync
-// without list/watch on serviceaccounts (the RBAC deliberately grants only
-// get/create), and an unsynced informer stalls every Pool reconcile forever —
-// the exact trap documented on the roles/rolebindings rule in
-// config/rbac/base.yaml; ensureBuilderRBAC avoids it the same way. Creation
-// is the whole contract — the identity is never mutated afterwards — so
-// idempotency needs no read. It is shared by every Pool in the namespace and
-// carries no owner reference: cascading deletion from one Pool would strand
-// the others, and the namespace lifecycle already garbage-collects it. It
-// holds no namespaced RBAC; its only cluster-visible authority is the
-// authenticated issuer-discovery pair in config/rbac/base.yaml.
+// ensureFastletServiceAccount provisions the dedicated discovery-only identity
+// Fastlet Pods present as their serviceAccountName. Create + AlreadyExists and
+// never a cached read: the serviceaccounts informer cannot sync without
+// list/watch (the RBAC grants only get/create) and an unsynced informer
+// stalls every Pool reconcile — the trap documented in config/rbac/base.yaml;
+// ensureBuilderRBAC avoids it the same way. Creation is the whole contract (the
+// identity is never mutated), so idempotency needs no read. Shared per
+// namespace with no owner reference — one Pool's cascading deletion would
+// strand the others; the namespace lifecycle garbage-collects it. No
+// namespaced RBAC; its only authority is the issuer-discovery pair in
+// config/rbac/base.yaml.
 func (r *SandboxPoolReconciler) ensureFastletServiceAccount(ctx context.Context, pool *apiv1alpha2.SandboxPool) error {
 	serviceAccount := &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{

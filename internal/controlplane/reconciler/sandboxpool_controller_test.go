@@ -2943,8 +2943,7 @@ func TestConstructPodInjectsFastletAuthAnchor(t *testing.T) {
 			),
 			FastletTemplate: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
 				RuntimeClassName: &runtimeClass,
-				// The fetching identity is platform-owned: a template-chosen
-				// ServiceAccount is overridden, never merged.
+				// A template-chosen ServiceAccount is overridden, never merged.
 				ServiceAccountName:           "attacker-sa",
 				AutomountServiceAccountToken: &automount,
 				Containers:                   []corev1.Container{{Name: "fastlet", Image: "fastlet:test"}},
@@ -2986,8 +2985,7 @@ func TestConstructPodInjectsFastletAuthAnchor(t *testing.T) {
 	require.Nil(t, volumeMountForContainer(pod, 1, fastletAuthTokenVolumeName),
 		"the proxy sidecar must not receive the key-fetch credential")
 	// The mount and projection item must compose to exactly the file the
-	// Fastlet reads: derived from one constant, but pinned here so a future
-	// edit cannot silently break the composition.
+	// Fastlet reads.
 	require.Equal(t, fastletauth.ServiceAccountTokenFile,
 		filepath.Join(fastletAuthTokenMountPath, tokenProjection.Path))
 }
@@ -3019,11 +3017,9 @@ func TestConstructPodStripsTemplateOwnedAuthEnv(t *testing.T) {
 				Containers: []corev1.Container{{
 					Name: "fastlet", Image: "fastlet:test",
 					Env: []corev1.EnvVar{
-						// A Pool template must not be able to relax the allow
-						// list or redirect the issuer anchor, and must not be
-						// able to hand the Fastlet an override key-fetch
-						// credential — the override would win over the
-						// mounted projected token even inside a Pod.
+						// A Pool template must not relax the allow list, redirect
+						// the anchor, or hand the Fastlet an override key-fetch
+						// credential.
 						{Name: fastletauth.AllowedSubjectsEnv, Value: "system:serviceaccount:attacker:default"},
 						{Name: fastletauth.IssuerEnv, Value: "https://attacker.example"},
 						{Name: fastletauth.CABundleEnv, Value: "attacker-ca"},
@@ -3063,10 +3059,9 @@ func TestConstructPodStripsTemplateOwnedAuthEnv(t *testing.T) {
 		"envFrom is preserved for non-auth keys; explicit env entries shadow any auth key it could supply")
 }
 
-// TestConstructPodRejectsTemplateOwnedAuthTokenVolume pins the platform
-// ownership of the key-fetch credential's storage: a Pool template can
-// neither supply a volume named like the projected token nor mount anything
-// at the ServiceAccount projection path — either would let a template place
+// TestConstructPodRejectsTemplateOwnedAuthTokenVolume pins that a Pool
+// template can neither supply a volume named like the key-fetch projection nor
+// mount anything at the projection path — either would let a template place
 // attacker-chosen bytes where the Fastlet reads its fetching identity.
 func TestConstructPodRejectsTemplateOwnedAuthTokenVolume(t *testing.T) {
 	scheme := runtime.NewScheme()
@@ -3112,11 +3107,9 @@ func mustRuntimePlan(t *testing.T, catalog *runtimecatalog.Catalog) runtimeenv.R
 	return runtimePlan
 }
 
-// TestEnsureFastletServiceAccountIsIdempotent pins the provisioning of the
-// dedicated discovery-only identity: created once per Pool namespace,
-// tolerated when it already exists, and shared across Pools — a second Pool
-// in the same namespace reconciles against the same identity instead of
-// fighting over an owner reference.
+// TestEnsureFastletServiceAccountIsIdempotent pins per-namespace provisioning:
+// created once, tolerated when present, and shared across Pools in the
+// namespace.
 func TestEnsureFastletServiceAccountIsIdempotent(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, apiv1alpha2.AddToScheme(scheme))

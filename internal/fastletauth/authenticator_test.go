@@ -25,10 +25,8 @@ func newTestAuthenticatorWithInterval(t *testing.T, issuer *fastletauthtest.Issu
 	if len(subjects) == 0 {
 		subjects = []string{"system:serviceaccount:fast-sandbox-system:fast-sandbox-fastpath"}
 	}
-	// Issuer key access is authenticated: the default client attaches the
-	// key-fetch credential to discovery and JWKS requests. The harness
-	// ignores the header, but the credential must resolve or construction
-	// fails closed, matching production.
+	// The harness ignores the header, but the credential must resolve or
+	// construction fails closed, matching production.
 	t.Setenv(KeyFetchTokenEnv, "test-key-fetch-credential")
 	authenticator, err := NewAuthenticator(issuer.URL(), Audience, subjects, nil, WithRefreshInterval(refreshInterval))
 	require.NoError(t, err)

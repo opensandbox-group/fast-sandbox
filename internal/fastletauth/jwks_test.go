@@ -76,9 +76,8 @@ func TestInjectedCABundleExtendsSystemRoots(t *testing.T) {
 		"the trust set must be the system roots extended with the injected bundle, not a replacement")
 
 	// End to end: the client built from this bundle fetches from an HTTPS
-	// issuer certified by the injected CA. The fetch carries the key-fetch
-	// credential; the loopback harness ignores the header but the credential
-	// must resolve, matching the authenticated production path.
+	// issuer certified by the injected CA. The loopback harness ignores the
+	// header, but the credential must resolve, matching production.
 	t.Setenv(KeyFetchTokenEnv, "test-key-fetch-credential")
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("{}"))
@@ -149,13 +148,10 @@ func (c *testCA) serverCertificate(t *testing.T, dnsName string) tls.Certificate
 	return certificate
 }
 
-// TestDefaultHTTPClientRefusesCrossHostRedirect pins the redirect boundary
-// for the credential: authedTransport injects the Authorization header inside
-// RoundTrip, below the client's redirect handling, so without an explicit
-// guard every hop would re-receive the header — silently undoing the standard
-// library's deliberate cross-host Authorization stripping. The issuer is the
-// trust anchor; the client must refuse to leave its host and hand the
-// redirect response to the fetcher, which fails closed on any non-200.
+// TestDefaultHTTPClientRefusesCrossHostRedirect pins the redirect boundary:
+// the credential is injected inside RoundTrip, below redirect handling, so
+// every hop would re-receive it — undoing the standard library's cross-host
+// Authorization stripping. The client must refuse and fail the fetch closed.
 func TestDefaultHTTPClientRefusesCrossHostRedirect(t *testing.T) {
 	var forwarded []string
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -187,14 +183,12 @@ func TestDefaultHTTPClientRefusesCrossHostRedirect(t *testing.T) {
 }
 
 // TestDefaultHTTPClientRefusesDowngradeRedirect pins the scheme half of the
-// redirect boundary: a same-host https→http redirect keeps the Host check
-// satisfied, and following it would re-attach the credential in plaintext on
-// every hop. The client must refuse the downgrade client-side — the
-// plaintext endpoint is never contacted and the 302 fails the fetch closed.
+// boundary: a same-host https→http redirect would otherwise re-attach the
+// credential in plaintext on every hop. The refusal happens client-side, so
+// the plaintext endpoint is never contacted.
 func TestDefaultHTTPClientRefusesDowngradeRedirect(t *testing.T) {
-	// The client is the production defaultHTTPClient, so the TLS anchor must
-	// be one it trusts: a generated CA injected through CABundleEnv, the same
-	// path a real cluster CA bundle takes.
+	// The production client must trust the TLS anchor: inject the CA through
+	// CABundleEnv, the real cluster-CA path.
 	ca := newTestCA(t, "fastletauth-downgrade-test-ca")
 	t.Setenv(CABundleEnv, base64.StdEncoding.EncodeToString(ca.pem))
 	t.Setenv(KeyFetchTokenEnv, "live-service-account-token")
@@ -245,9 +239,8 @@ func TestKeyFetchCredentialPrefersEnvOverride(t *testing.T) {
 	require.Equal(t, "env-token", token, "the override must be trimmed, not echoed verbatim")
 }
 
-// TestKeyFetchCredentialFailsClosed pins the credential posture: a missing or
-// empty mounted token fails the resolution with a directed error, so a fetch
-// never degrades into a silent anonymous request.
+// TestKeyFetchCredentialFailsClosed pins that a missing or empty mounted
+// token fails with a directed error, never a silent anonymous fetch.
 func TestKeyFetchCredentialFailsClosed(t *testing.T) {
 	t.Setenv(KeyFetchTokenEnv, "")
 	previous := readKeyFetchTokenFile
@@ -265,10 +258,9 @@ func TestKeyFetchCredentialFailsClosed(t *testing.T) {
 	require.ErrorContains(t, err, "is empty", "a whitespace-only token file is no credential")
 }
 
-// TestAuthedTransportAttachesRotatingCredential pins the authenticated key
-// fetch end to end: every request carries the credential resolved at request
-// time, so kubelet's projected-token rotation is followed without restarts,
-// and losing the credential fails the request closed before it is sent.
+// TestAuthedTransportAttachesRotatingCredential pins that every request
+// resolves the credential at request time, so rotation is followed without
+// restarts and a lost credential fails the request closed before it is sent.
 func TestAuthedTransportAttachesRotatingCredential(t *testing.T) {
 	var seen []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
@@ -305,10 +297,8 @@ func TestAuthedTransportAttachesRotatingCredential(t *testing.T) {
 	require.Len(t, seen, 2, "the failed fetch must not reach the issuer")
 }
 
-// TestNewAuthenticatorFailsClosedWithoutKeyFetchCredential pins the startup
-// contract: construction fetches discovery through the authenticated client,
-// so a Fastlet without its credential fails startup with a directed error
-// instead of falling back to an anonymous fetch.
+// TestNewAuthenticatorFailsClosedWithoutKeyFetchCredential pins that
+// construction fails with a directed error instead of an anonymous fallback.
 func TestNewAuthenticatorFailsClosedWithoutKeyFetchCredential(t *testing.T) {
 	issuer := fastletauthtest.NewIssuer(t)
 	t.Setenv(KeyFetchTokenEnv, "")

@@ -21,13 +21,10 @@ const maxKeyDocumentBytes = 1 << 20
 // maxKeyFetchRedirects caps redirect chains at the standard library default.
 const maxKeyFetchRedirects = 10
 
-// keyFetchCredential returns the bearer token attached to every issuer key
-// fetch. The Fastlet presents its dedicated ServiceAccount's projected token:
-// the kubelet rotates it (refresh at 80% of the TTL), so the credential is
-// resolved per request and never cached — a stale token cannot outlive its
-// rotation. KeyFetchTokenEnv overrides for processes running outside a Pod.
-// The resolution is fail-closed: a missing or empty credential fails the
-// fetch with a directed error, never a silent anonymous request.
+// keyFetchCredential returns the bearer token for issuer key fetches: the
+// KeyFetchTokenEnv override, else the mounted projected ServiceAccount token.
+// Resolved per request so kubelet rotation is followed; a missing credential
+// fails closed with a directed error.
 func keyFetchCredential() (string, error) {
 	if override := strings.TrimSpace(os.Getenv(KeyFetchTokenEnv)); override != "" {
 		return override, nil
@@ -52,11 +49,8 @@ var readKeyFetchTokenFile = func() (string, error) {
 	return string(raw), nil
 }
 
-// authedTransport attaches the key-fetch credential to every request. The
-// discovery fetch and every JWKS load — the initial one and each unknown-kid
-// refresh — travel through the same client, so one transport covers them all,
-// and the credential is resolved inside RoundTrip so rotation is followed
-// without restarts.
+// authedTransport attaches the key-fetch credential to every request through
+// this client — discovery, initial JWKS, and each unknown-kid refresh alike.
 type authedTransport struct {
 	base http.RoundTripper
 }
@@ -156,11 +150,9 @@ func fetchJSONDocument(ctx context.Context, client *http.Client, url string, tar
 
 // defaultHTTPClient builds the client for issuer key material. The trust set
 // is the system roots extended with the injected bundle (CABundleEnv) or the
-// projected pod ca.crt: a Kubernetes whose ServiceAccount issuer (or
-// discovery-served jwks_uri) is served with a publicly trusted certificate is
-// a supported deployment and must keep verifying. Every request through this
-// client carries the key-fetch credential (authedTransport): issuer discovery
-// is an authenticated read, never an anonymous one.
+// projected pod ca.crt, so publicly trusted issuers keep verifying. Every
+// request carries the key-fetch credential: discovery is an authenticated
+// read, never anonymous.
 func defaultHTTPClient() (*http.Client, error) {
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
@@ -177,15 +169,10 @@ func defaultHTTPClient() (*http.Client, error) {
 	if found {
 		base.TLSClientConfig = &tls.Config{RootCAs: pool}
 	}
-	// The credential is injected inside RoundTrip, below the client's
-	// redirect handling, so every hop would otherwise receive it — silently
-	// undoing the standard library's deliberate cross-host Authorization
-	// stripping. The issuer is the trust anchor: refuse to leave its host or
-	// to downgrade below its scheme (a same-host https→http redirect would
-	// otherwise carry the credential in plaintext), and hand the redirect
-	// response to the fetcher, which fails closed on any non-200. jwkset's
-	// unknown-kid refreshes travel through this same client and inherit the
-	// boundary.
+	// The credential is injected inside RoundTrip, below redirect handling, so
+	// every hop would re-receive it — undoing the standard library's
+	// cross-host and downgrade Authorization stripping. Refuse to leave the
+	// anchor host or scheme; the non-200 redirect fails the fetcher closed.
 	return &http.Client{
 		Transport: authedTransport{base: base},
 		Timeout:   5 * time.Second,

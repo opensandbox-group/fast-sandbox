@@ -291,9 +291,8 @@ func TestInvokeHandlerRouteDispatchesToFallback(t *testing.T) {
 func TestFastletServerEnforcesControlAuthentication(t *testing.T) {
 	manager := newServerManager(t, newServerRuntime(), false)
 	issuer := fastletauthtest.NewIssuer(t)
-	// The default client attaches the key-fetch credential to discovery; the
-	// harness ignores the header but the credential must resolve, matching
-	// production.
+	// The harness ignores the header, but the credential must resolve,
+	// matching production.
 	t.Setenv(fastletauth.KeyFetchTokenEnv, "test-key-fetch-credential")
 	authenticator, err := fastletauth.NewAuthenticator(issuer.URL(), fastletauth.Audience,
 		[]string{"system:serviceaccount:fast-sandbox-system:fast-sandbox-fastpath"}, nil)

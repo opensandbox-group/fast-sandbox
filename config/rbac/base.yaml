@@ -133,11 +133,11 @@ subjects:
 #    could not mint for same-named SAs in tenant namespaces.
 # 2. The Fastlet fetches OIDC discovery and JWKS with a credential: its
 #    dedicated fast-sandbox-fastlet ServiceAccount (provisioned per Pool
-#    namespace by the Pool Controller, projected-token mounted) authenticates
-#    as a member of system:serviceaccounts, which Kubernetes already binds to
-#    its built-in system:service-account-issuer-discovery role. The pair
-#    below restates that grant self-sufficiently for clusters whose operators
-#    stripped the bootstrap bindings. Nothing binds to system:unauthenticated.
+#    namespace, projected-token mounted) is covered by Kubernetes' built-in
+#    binding of system:service-account-issuer-discovery to the
+#    system:serviceaccounts group. The pair below restates that grant for
+#    clusters that stripped the bootstrap bindings. Nothing binds to
+#    system:unauthenticated.
 #
 # The OpenSandbox base chart mirrors these grants for chart installs
 # (OpenSandbox manifests/charts/base/templates/fast-sandbox-rbac.yaml);

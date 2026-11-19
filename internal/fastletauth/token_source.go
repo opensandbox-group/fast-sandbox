@@ -13,11 +13,10 @@ import (
 	authenticationv1 "k8s.io/api/authentication/v1"
 )
 
-// ServiceAccountTokenFile is the conventional in-Pod path of the projected
-// ServiceAccount token the kubelet writes and rotates. The Fastlet reads its
-// key-fetch credential from this file, and the Pool Controller derives the
-// projected volume's mount path and item name from it, so the mount cannot
-// drift from the file the Fastlet reads.
+// ServiceAccountTokenFile is the projected ServiceAccount token the kubelet
+// writes and rotates. The Fastlet reads its key-fetch credential from here;
+// the Pool Controller derives the projected volume mount from it, so the two
+// cannot drift.
 const ServiceAccountTokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
 // Service account projection locations mounted into every in-cluster Pod by
