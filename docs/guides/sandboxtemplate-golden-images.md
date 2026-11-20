@@ -177,11 +177,7 @@ Behavior:
   the published bytes are exactly what the lineage fingerprints cover. It
   does not verify CA constraints (`BasicConstraints CA:TRUE`), so the entry
   must hold a properly issued CA certificate.
-- The builder writes the certificates into the rootfs at
-  `/opt/opensandbox/mitmproxy-ca-cert.pem` — the path the execd bootstrap
-  script watches — and sets the trust gate
-  (`OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true`, after `spec.envs`, so it
-  wins).
+- The builder writes the certificates into the rootfs at `/opt/opensandbox/mitmproxy-ca-cert.pem` — the path the execd bootstrap script watches — and sets the trust gate (`OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true`) and `MITM_CA_STABILIZE_WINDOW=0` after `spec.envs` so they win (the CA is statically baked into the VM rootfs rather than dynamically exported by a sidecar, so waiting through the default 15s stabilization window is unnecessary).
 - The builder records the baked CA's public-key identity into the manifest
   lineage (`platform.egressMitmCA`): per `CERTIFICATE` block, `certSha256`
   (SHA-256 of the certificate DER — matched byte-for-byte against the egress
