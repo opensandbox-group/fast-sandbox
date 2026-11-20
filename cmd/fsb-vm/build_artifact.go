@@ -210,6 +210,14 @@ func (l artifactLayout) installFile(srcPath, mediaType string, annotations map[s
 }
 
 func writeFileAtomic(path string, payload []byte, mode os.FileMode) error {
+	return writeFileAtomicWithSync(path, payload, mode, true)
+}
+
+func writeFileAtomicNoSync(path string, payload []byte, mode os.FileMode) error {
+	return writeFileAtomicWithSync(path, payload, mode, false)
+}
+
+func writeFileAtomicWithSync(path string, payload []byte, mode os.FileMode, syncDisk bool) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
@@ -227,9 +235,11 @@ func writeFileAtomic(path string, payload []byte, mode os.FileMode) error {
 		_ = temp.Close()
 		return err
 	}
-	if err := temp.Sync(); err != nil {
-		_ = temp.Close()
-		return err
+	if syncDisk {
+		if err := temp.Sync(); err != nil {
+			_ = temp.Close()
+			return err
+		}
 	}
 	if err := temp.Close(); err != nil {
 		return err

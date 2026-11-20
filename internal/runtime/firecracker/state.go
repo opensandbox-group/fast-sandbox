@@ -111,9 +111,19 @@ func metaPath(directory string) string {
 	return filepath.Join(directory, sandboxMetaName)
 }
 
-// saveState replaces meta.json atomically so process death cannot truncate
-// the ownership record needed to recover attached OCI devices.
+// saveState replaces meta.json atomically and syncs both file and parent
+// directory for committed or terminal runtime state transitions.
 func saveState(directory string, state *SandboxState) error {
+	return writeSandboxState(directory, state, true)
+}
+
+// saveStateAtomic replaces meta.json atomically (temp + rename) without fsync
+// for intermediate PhaseStarting progress records on the create hot path.
+func saveStateAtomic(directory string, state *SandboxState) error {
+	return writeSandboxState(directory, state, false)
+}
+
+func writeSandboxState(directory string, state *SandboxState, syncDisk bool) error {
 	if state == nil {
 		return fmt.Errorf("%w: sandbox state is required", ErrInvalidConfig)
 	}
@@ -130,9 +140,11 @@ func saveState(directory string, state *SandboxState) error {
 		file.Close()
 		return err
 	}
-	if err := file.Sync(); err != nil {
-		file.Close()
-		return err
+	if syncDisk {
+		if err := file.Sync(); err != nil {
+			file.Close()
+			return err
+		}
 	}
 	if err := file.Close(); err != nil {
 		return err
@@ -140,7 +152,10 @@ func saveState(directory string, state *SandboxState) error {
 	if err := os.Rename(file.Name(), metaPath(directory)); err != nil {
 		return err
 	}
-	return syncCaptureDirectory(directory)
+	if syncDisk {
+		return syncCaptureDirectory(directory)
+	}
+	return nil
 }
 
 // loadState reads the Sandbox state; os.ErrNotExist means the Sandbox is not

@@ -19,8 +19,11 @@ const sharedSnapfilesMaxIdle = 16
 const sharedSnapfilesIdleTTL = 10 * time.Minute
 
 type sharedSnapfilesState struct {
-	Device *deviceRecord `json:"device"`
+	Device     *deviceRecord `json:"device,omitempty"`
+	RootfsOnly bool          `json:"rootfs_only,omitempty"`
 }
+
+var rootfsOnlySnapfilesEntries = []string{inDiskManifest, "vault.json", "policy.json"}
 
 func sharedSnapfilesRoot() string { return filepath.Join(global.stateDir, sharedSnapfilesDir) }
 
@@ -44,8 +47,16 @@ func sharedSnapfilesKey(reference string, image resolvedImage, auth dockerConfig
 }
 
 func lockSharedSnapfiles(ctx context.Context, key string) (func(), error) {
+	return lockSharedSnapfilesMode(ctx, key, tryLock)
+}
+
+func lockSharedSnapfilesRead(ctx context.Context, key string) (func(), error) {
+	return lockSharedSnapfilesMode(ctx, key, trySharedLock)
+}
+
+func lockSharedSnapfilesMode(ctx context.Context, key string, acquire func(string, string) (func(), error)) (func(), error) {
 	for {
-		unlock, err := tryLock(sharedSnapfilesRoot(), key)
+		unlock, err := acquire(sharedSnapfilesRoot(), key)
 		if !errors.Is(err, errBusy) {
 			return unlock, err
 		}
@@ -69,9 +80,116 @@ func readSharedSnapfiles(home string) (sharedSnapfilesState, error) {
 	return state, err
 }
 
+func hasMaterializedRootfsOnly(home string, cached sharedSnapfilesState) bool {
+	if !cached.RootfsOnly || cached.Device != nil {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(home, snapfilesMount, inDiskManifest))
+	return err == nil && info.Mode().IsRegular()
+}
+
+func installSharedSnapfilesLease(sandboxHome, key, home string, state *sandboxState) error {
+	state.SharedSnapfiles, state.MountPoint = key, filepath.Join(home, snapfilesMount)
+	if err := writeStateAtomic(sandboxHome, state); err != nil {
+		return err
+	}
+	return os.Symlink(state.MountPoint, filepath.Join(sandboxHome, snapfilesMount))
+}
+
+// tryAcquireMaterializedRootfsOnly serves warm RootfsOnly snapfiles under a
+// shared lock without calling ublkd.List, mounting ext4, or serializing
+// concurrent sandbox creates on the same snapshot.
+func tryAcquireMaterializedRootfsOnly(ctx context.Context, sandboxHome, key, home string, state *sandboxState) (bool, error) {
+	unlock, err := lockSharedSnapfilesRead(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	cached, err := readSharedSnapfiles(home)
+	if err != nil || !hasMaterializedRootfsOnly(home, cached) {
+		return false, nil
+	}
+	if err := installSharedSnapfilesLease(sandboxHome, key, home, state); err != nil {
+		return false, err
+	}
+	now := time.Now()
+	return true, os.Chtimes(statePath(home), now, now)
+}
+
+// materializeRootfsOnlySnapfiles copies the small metadata/state files out of a
+// freshly mounted RootfsOnly snapfiles ext4 image into a plain host directory
+// and releases the ublk device immediately so subsequent creates need no ublk
+// device, ext4 mount, or ublkd.List probe. Errors before unmount leave the live
+// mount intact; errors after unmount are returned so create rolls back cleanly.
+func materializeRootfsOnlySnapfiles(ctx context.Context, client *ublkdClient, home string, state *sandboxState, cached *sharedSnapfilesState, persist func() error) error {
+	if cached.Device == nil {
+		return nil
+	}
+	manifest, err := loadManifest(filepath.Join(state.MountPoint, inDiskManifest))
+	if err != nil || !manifest.IsRootfsOnly() {
+		return nil
+	}
+	referenced, err := sharedSnapfilesReferenced(state.SharedSnapfiles, state.SandboxID)
+	if err != nil || referenced {
+		return nil
+	}
+	staged := filepath.Join(home, ".rootfs-only-tmp")
+	_ = os.RemoveAll(staged)
+	if err := os.MkdirAll(staged, 0o750); err != nil {
+		return nil
+	}
+	cleanupStaged := true
+	defer func() {
+		if cleanupStaged {
+			_ = os.RemoveAll(staged)
+		}
+	}()
+	for _, name := range rootfsOnlySnapfilesEntries {
+		source := filepath.Join(state.MountPoint, name)
+		info, statErr := os.Stat(source)
+		if statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) && name != inDiskManifest {
+				continue
+			}
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		if err := copyFile(source, filepath.Join(staged, name), 0o600); err != nil {
+			return nil
+		}
+	}
+	configPath := cached.Device.Config
+	if err := unmount(state.MountPoint); err != nil {
+		return nil
+	}
+	if _, err := releaseOwnedDevicesByConfig(ctx, client, configPath); err != nil {
+		return fmt.Errorf("release materialized rootfsOnly snapfiles device: %w", err)
+	}
+	_ = os.Remove(configPath)
+	_ = os.RemoveAll(filepath.Join(home, ".local-blobs"))
+	cached.Device = nil
+	if err := os.Remove(state.MountPoint); err != nil && !errors.Is(err, os.ErrNotExist) {
+		_ = persist()
+		return err
+	}
+	if err := os.Rename(staged, state.MountPoint); err != nil {
+		_ = persist()
+		return err
+	}
+	cleanupStaged = false
+	cached.RootfsOnly = true
+	return persist()
+}
+
 func acquireSharedSnapfiles(ctx context.Context, client *ublkdClient, sandboxHome string, state *sandboxState, image resolvedImage, auth dockerConfig) error {
 	key, err := sharedSnapfilesKey(state.SnapfilesRef, image, auth)
 	if err != nil {
+		return err
+	}
+	home := filepath.Join(sharedSnapfilesRoot(), key)
+	if reused, err := tryAcquireMaterializedRootfsOnly(ctx, sandboxHome, key, home, state); err != nil || reused {
 		return err
 	}
 	unlock, err := lockSharedSnapfiles(ctx, key)
@@ -79,21 +197,20 @@ func acquireSharedSnapfiles(ctx context.Context, client *ublkdClient, sandboxHom
 		return err
 	}
 	defer unlock()
-	home := filepath.Join(sharedSnapfilesRoot(), key)
 	if err := os.MkdirAll(home, 0700); err != nil {
 		return err
 	}
 	// Install the durable lease while holding the same lock eviction takes.
-	state.SharedSnapfiles, state.MountPoint = key, filepath.Join(home, snapfilesMount)
-	if err := writeState(sandboxHome, state); err != nil {
-		return err
-	}
-	if err := os.Symlink(state.MountPoint, filepath.Join(sandboxHome, snapfilesMount)); err != nil {
+	if err := installSharedSnapfilesLease(sandboxHome, key, home, state); err != nil {
 		return err
 	}
 	cached, err := readSharedSnapfiles(home)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+	if hasMaterializedRootfsOnly(home, cached) {
+		now := time.Now()
+		return os.Chtimes(statePath(home), now, now)
 	}
 	persist := func() error {
 		raw, err := json.Marshal(cached)
@@ -107,6 +224,7 @@ func acquireSharedSnapfiles(ctx context.Context, client *ublkdClient, sandboxHom
 			return err
 		}
 	}
+	freshAttach := false
 	if cached.Device == nil {
 		// Persist cleanup ownership before local lower hard links are created.
 		if err := persist(); err != nil {
@@ -119,9 +237,15 @@ func acquireSharedSnapfiles(ctx context.Context, client *ublkdClient, sandboxHom
 		if _, err := addSandboxDevice(ctx, client, config, &cached.Device, persist); err != nil {
 			return err
 		}
+		freshAttach = true
 	}
 	if !isMounted(state.MountPoint) {
 		if err := mountReadOnly(cached.Device.DevPath, state.MountPoint); err != nil {
+			return err
+		}
+	}
+	if freshAttach {
+		if err := materializeRootfsOnlySnapfiles(ctx, client, home, state, &cached, persist); err != nil {
 			return err
 		}
 	}
@@ -202,7 +326,7 @@ func releaseSharedSnapfilesLease(home string, state *sandboxState) error {
 	}
 	// Failed Adds must not extend retention on each retry.
 	homePath := filepath.Join(sharedSnapfilesRoot(), state.SharedSnapfiles)
-	if cached, err := readSharedSnapfiles(homePath); err == nil && cached.Device != nil && cached.Device.DevPath != "" {
+	if cached, err := readSharedSnapfiles(homePath); err == nil && ((cached.Device != nil && cached.Device.DevPath != "") || cached.RootfsOnly) {
 		now := time.Now()
 		_ = os.Chtimes(statePath(homePath), now, now)
 	}

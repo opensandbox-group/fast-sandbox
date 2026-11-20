@@ -132,12 +132,26 @@ func statePath(home string) string {
 // writeState persists state atomically (tmp+rename+fsync) inside the
 // sandbox home.
 func writeState(home string, state *sandboxState) error {
+	return commitState(home, state, true)
+}
+
+// writeStateAtomic replaces state.json atomically (tmp+rename) without fsync
+// for intermediate phaseCreating updates on the create hot path.
+func writeStateAtomic(home string, state *sandboxState) error {
+	return commitState(home, state, false)
+}
+
+func commitState(home string, state *sandboxState, syncDisk bool) error {
 	state.FormatVersion = stateFileFormat
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}
-	if err := writeFileAtomic(statePath(home), data, 0o640); err != nil {
+	writer := writeFileAtomic
+	if !syncDisk {
+		writer = writeFileAtomicNoSync
+	}
+	if err := writer(statePath(home), data, 0o640); err != nil {
 		return fmt.Errorf("commit state %s: %w", statePath(home), err)
 	}
 	return nil

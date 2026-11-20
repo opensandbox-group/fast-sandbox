@@ -106,6 +106,12 @@ func TestLocalBlobCacheBusyDisabledAndInvalidSource(t *testing.T) {
 	require.Empty(t, cachedLowers(t.TempDir(), image)[0].File)
 	require.ErrorIs(t, retainCheckpointLayers(context.Background(), nil, t.TempDir()), errBusy)
 	unlock()
+
+	// Concurrent readers holding a shared lock must still hit the local blob cache.
+	unlockShared, err := trySharedLock(blobCacheRoot(), "cache")
+	require.NoError(t, err)
+	require.NotEmpty(t, cachedLowers(t.TempDir(), image)[0].File)
+	unlockShared()
 	global.blobCacheMaxBytes = 0
 	require.Empty(t, cachedLowers(t.TempDir(), image)[0].File)
 	require.NoError(t, retainCheckpointLayers(context.Background(), nil, t.TempDir()))

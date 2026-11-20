@@ -198,7 +198,7 @@ func (d *Driver) prepareOCIRestore(ctx context.Context, directory, reference str
 	}()
 	id := config.Identity.SandboxUID
 	// Record ownership before CLI side effects for crash recovery.
-	if err := saveState(directory, &SandboxState{Config: *config, Phase: PhaseStarting}); err != nil {
+	if err := saveStateAtomic(directory, &SandboxState{Config: *config, Phase: PhaseStarting}); err != nil {
 		return attachment, err
 	}
 	var err error

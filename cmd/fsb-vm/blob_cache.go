@@ -155,7 +155,10 @@ func cachedLowers(home string, image resolvedImage) []OverlayBDBSConfigLower {
 	if global.blobCacheMaxBytes <= 0 {
 		return lowers
 	}
-	unlock, err := tryLock(blobCacheRoot(), "cache")
+	// Use a shared lock so concurrent creates can pin locally cached lower
+	// blobs in parallel without colliding with each other, while still
+	// excluding concurrent cache admission/eviction (LOCK_EX).
+	unlock, err := trySharedLock(blobCacheRoot(), "cache")
 	if err != nil {
 		return lowers
 	}

@@ -23,7 +23,6 @@ import (
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/fastlet/podcgroup"
-	"fast-sandbox/internal/firecrackerconfig"
 	"fast-sandbox/internal/firecrackervmm"
 	infracontract "fast-sandbox/internal/infra/contract"
 	"fast-sandbox/internal/nodecleanup"
@@ -114,6 +113,15 @@ type Driver struct {
 	// fcVersion caches the last successfully resolved local Firecracker
 	// binary version (restore admission); unresolved lookups are retried.
 	fcVersion string
+	// kernelCache caches immutable content-addressed copies of host boot
+	// kernels keyed by source path/dev/ino/size/mtime to avoid per-create
+	// full copy + SHA-256 + fsync on RootfsOnly cold boots. Guarded by mu.
+	kernelCache map[string]cachedKernel
+	// hostIdentityOnce caches the static host CPU and kernel release used for
+	// RootfsOnly boot compatibility provenance without re-reading /proc.
+	hostIdentityOnce sync.Once
+	hostCPU          artifacts.CPUIdentity
+	hostKernel       string
 	// metadataPublication tracks in-flight VM discovery payload writes
 	// (metadata.go): the payload goroutine never blocks EnsureSandbox, and
 	// tests wait on it to observe the record after provisioning returns.
@@ -702,7 +710,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 			rootfsKernel, err = d.rootfsKernel(restoreMetadata)
 			if err == nil {
 				pinned := filepath.Join(directory, "boot-kernel")
-				bootKernelSHA256, err = firecrackerconfig.PinKernel(rootfsKernel, pinned)
+				bootKernelSHA256, err = d.pinBootKernel(stateRoot, rootfsKernel, pinned)
 				rootfsKernel = pinned
 				defer os.Remove(pinned)
 			}
@@ -813,11 +821,11 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	if restoreMetadata.IsRootfsOnly() {
 		provStarted := time.Now()
 		state.BootKernelSHA256 = bootKernelSHA256
-		provenance := artifacts.NewVMManifest(restoreMetadata.Machine, restoreMetadata.Kernel.Version, binaryPath, artifacts.CPUTemplateNone).Compatibility
+		provenance := d.bootCompatibility(selectedVMM)
 		state.BootCompatibility = &provenance
 		provenanceDur = time.Since(provStarted)
 	}
-	if err := saveState(directory, state); err != nil {
+	if err := saveStateAtomic(directory, state); err != nil {
 		releaseSlot()
 		return nil, err
 	}
@@ -864,7 +872,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	if err == nil {
 		state.PID = process.PID()
 		d.rememberProcess(identity.SandboxUID, process)
-		if saveErr := saveState(directory, state); saveErr != nil {
+		if saveErr := saveStateAtomic(directory, state); saveErr != nil {
 			d.killAndForget(identity.SandboxUID, process.PID())
 			releaseSlot()
 			observability.End(launchSpan, saveErr)
@@ -1686,23 +1694,37 @@ func (d *Driver) removeJailRoot(sandboxID string) {
 	}
 }
 
-// waitForAPISocket polls until the Firecracker API Unix socket exists. The
-// 20 ms poll keeps the launch latency near the VMM's own startup time
-// (firecracker creates the socket within tens of milliseconds).
+const (
+	// socketPollInitialInterval and socketPollMaxInterval bound the exponential
+	// backoff while waiting for Firecracker to bind its API Unix socket.
+	socketPollInitialInterval = 2 * time.Millisecond
+	socketPollMaxInterval     = 20 * time.Millisecond
+	bootPollInitialInterval   = 5 * time.Millisecond
+)
+
+// waitForAPISocket polls until the Firecracker API Unix socket exists, starting
+// at 2 ms and backing off exponentially to 20 ms so fast VMM startups do not
+// wait a full coarse poll interval.
 func waitForAPISocket(ctx context.Context, socketPath string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	interval := socketPollInitialInterval
 	for {
 		if _, err := os.Stat(socketPath); err == nil {
 			return nil
 		}
-		if time.Now().After(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return fmt.Errorf("socket %s not ready within %s", socketPath, timeout)
 		}
+		wait := min(interval, remaining)
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
-		case <-time.After(20 * time.Millisecond):
+		case <-timer.C:
 		}
+		interval = min(interval*2, socketPollMaxInterval)
 	}
 }
 
@@ -1731,10 +1753,12 @@ func resumeVM(ctx context.Context, client *Client, timeoutSeconds int32) (int, e
 	return waitVMRunning(ctx, client, timeoutSeconds)
 }
 
-// waitVMRunning polls the VM state until it reports Running.
+// waitVMRunning polls the VM state until it reports Running, backing off
+// exponentially from 5 ms to bootPollInterval.
 func waitVMRunning(ctx context.Context, client *Client, timeoutSeconds int32) (int, error) {
 	deadline := time.Now().Add(time.Duration(timeoutSeconds) * time.Second)
 	polls := 0
+	interval := bootPollInitialInterval
 	for {
 		state, err := client.VMState(ctx)
 		if err != nil {
@@ -1744,14 +1768,39 @@ func waitVMRunning(ctx context.Context, client *Client, timeoutSeconds int32) (i
 		if state == vmRunning {
 			return polls, nil
 		}
-		if time.Now().After(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return polls, fmt.Errorf("%w: Firecracker VM did not reach Running within %ds (state %q)", ErrRuntimeNotInitialized, timeoutSeconds, state)
 		}
+		timer := time.NewTimer(min(interval, remaining))
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return polls, ctx.Err()
-		case <-time.After(bootPollInterval):
+		case <-timer.C:
 		}
+		interval = min(interval*2, bootPollInterval)
+	}
+}
+
+// bootCompatibility records the host provenance of a RootfsOnly cold boot
+// using cached host CPU/kernel identity and the already-resolved VMM version,
+// avoiding repeated /proc reads and `firecracker --version` subprocesses.
+func (d *Driver) bootCompatibility(selectedVMM *firecrackervmm.Selection) artifacts.SnapshotCompatibility {
+	d.hostIdentityOnce.Do(func() {
+		d.hostCPU = artifacts.HostCPUIdentity()
+		d.hostKernel = artifacts.HostKernelRelease()
+	})
+	return artifacts.SnapshotCompatibility{
+		CPUArch:            artifacts.HostCPUArch(),
+		Vendor:             d.hostCPU.Vendor,
+		CPUFamily:          d.hostCPU.Family,
+		CPUModel:           d.hostCPU.Model,
+		CPUStepping:        d.hostCPU.Stepping,
+		CPUModelName:       d.hostCPU.ModelName,
+		CPUTemplate:        artifacts.CPUTemplateNone,
+		FirecrackerVersion: d.selectionVersion(selectedVMM),
+		HostKernel:         d.hostKernel,
 	}
 }
 

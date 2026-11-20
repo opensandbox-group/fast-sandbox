@@ -554,3 +554,118 @@ func TestSharedSnapfilesForcedCleanupRejectsBusyCache(t *testing.T) {
 	require.NoError(t, pruneSharedSnapfiles(context.Background(), client, false))
 	require.ErrorIs(t, pruneSharedSnapfiles(context.Background(), client, true), errBusy)
 }
+
+func TestSharedSnapfilesMaterializesRootfsOnlyAndSkipsUblkdOnWarmCreates(t *testing.T) {
+	setupManifestCache(t)
+	global.runtimeDir = t.TempDir()
+	sourceMount := t.TempDir()
+	manifestRaw := []byte(`{
+  "schemaVersion": 1,
+  "runtime": "firecracker",
+  "machine": {"vcpuCount": 2, "memoryMiB": 512, "rootfsSizeMiB": 1024, "rootfsDriveID": "rootfs", "rootfsDrivePath": "rootfs.dev"},
+  "kernel": {"version": "6.1.0", "cmdline": "root=/dev/vda rw"},
+  "compatibility": {"cpuArch": "x86_64", "firecrackerVersion": "1.17.0"},
+  "platform": {"snapshotMode": "rootfsOnly"}
+}`)
+	require.NoError(t, os.WriteFile(filepath.Join(sourceMount, inDiskManifest), manifestRaw, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(sourceMount, "vault.json"), []byte(`{"v":1}`), 0o600))
+
+	bin := t.TempDir()
+	// Symlink to sourceMount for mount; remove symlink for umount.
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "mount"), []byte("#!/bin/sh\nset -eu\nrmdir \"$6\"\nln -s '"+sourceMount+"' \"$6\"\n"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "umount"), []byte("#!/bin/sh\nset -eu\nif [ -L \"$1\" ]; then rm \"$1\"; fi\n"), 0o755))
+	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+
+	var adds, lists, deletes int
+	var devices []ublkdDevice
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/add":
+			var body struct {
+				Config string `json:"config"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			adds++
+			d := ublkdDevice{DevID: adds, Dev: fmt.Sprintf("/dev/ublkb%d", adds), Config: body.Config}
+			devices = append(devices, d)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "dev_id": d.DevID, "dev": d.Dev})
+		case "/v1/list":
+			lists++
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "devices": devices})
+		case "/v1/del", "/v1/release":
+			var body struct {
+				ID int `json:"dev_id"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			for i, d := range devices {
+				if d.DevID == body.ID {
+					devices = append(devices[:i], devices[i+1:]...)
+					break
+				}
+			}
+			deletes++
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+		default:
+			http.Error(w, "unexpected request", 500)
+		}
+	}))
+	t.Cleanup(server.Close)
+	target, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	client := &ublkdClient{httpClient: &http.Client{Transport: snapfilesTransport{target}}}
+
+	image := resolvedImage{RepoBlobURL: "https://r.example/v2/team/t/blobs", Lowers: []lowerLayer{{Digest: "sha256:" + strings.Repeat("b", 64), Size: 4096}}}
+	first := &sandboxState{SandboxID: "first", SnapfilesRef: "r.example/team/t:rootfs-only"}
+	layout1 := newSandboxLayout(first.SandboxID)
+	require.NoError(t, claimSandbox(layout1, first.SandboxID))
+	require.NoError(t, acquireSharedSnapfiles(context.Background(), client, layout1.home, first, image, dockerConfig{}))
+
+	// Cold attach mounted once, materialized manifest+vault, and released the ublk device.
+	require.Equal(t, 1, adds)
+	require.Equal(t, 1, deletes)
+	require.Empty(t, devices)
+	cached, err := readSharedSnapfiles(filepath.Dir(first.MountPoint))
+	require.NoError(t, err)
+	require.True(t, cached.RootfsOnly)
+	require.Nil(t, cached.Device)
+	gotManifest, err := os.ReadFile(filepath.Join(layout1.mountPoint, inDiskManifest))
+	require.NoError(t, err)
+	require.Equal(t, manifestRaw, gotManifest)
+	gotVault, err := os.ReadFile(filepath.Join(layout1.mountPoint, "vault.json"))
+	require.NoError(t, err)
+	require.Equal(t, `{"v":1}`, string(gotVault))
+
+	// Warm concurrent acquires must hit the LOCK_SH materialized path with 0 ublkd RPCs.
+	listsBefore := lists
+	var wg sync.WaitGroup
+	errs := make(chan error, 4)
+	for i := 0; i < 4; i++ {
+		id := fmt.Sprintf("warm-%d", i)
+		s := &sandboxState{SandboxID: id, SnapfilesRef: first.SnapfilesRef}
+		l := newSandboxLayout(id)
+		require.NoError(t, claimSandbox(l, id))
+		wg.Add(1)
+		go func(state *sandboxState, home string) {
+			defer wg.Done()
+			errs <- acquireSharedSnapfiles(context.Background(), client, home, state, image, dockerConfig{})
+		}(s, l.home)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.Equal(t, 1, adds, "warm creates must not re-add ublk device")
+	require.Equal(t, listsBefore, lists, "warm RootfsOnly creates must not call ublkd.List")
+
+	// After releasing all leases, forced prune removes the materialized directory cleanly.
+	require.NoError(t, releaseSandbox(context.Background(), client, layout1, first))
+	for i := 0; i < 4; i++ {
+		id := fmt.Sprintf("warm-%d", i)
+		s, err := readState(global.sandboxHome(id))
+		require.NoError(t, err)
+		require.NoError(t, releaseSandbox(context.Background(), client, newSandboxLayout(id), &s))
+	}
+	require.NoError(t, pruneSharedSnapfiles(context.Background(), client, true))
+	require.NoDirExists(t, filepath.Dir(first.MountPoint))
+}
