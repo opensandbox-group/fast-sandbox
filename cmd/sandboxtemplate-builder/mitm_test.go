@@ -253,7 +253,10 @@ func TestInjectRuntimeBakesMitmCertificateAndGate(t *testing.T) {
 	}
 	spec := apiv1alpha2.SandboxTemplateSpec{
 		Execd: "opensandbox/execd:1.1.0",
-		Envs:  []corev1.EnvVar{{Name: guestMITMTrustGate, Value: "false"}},
+		Envs: []corev1.EnvVar{
+			{Name: guestMITMTrustGate, Value: "false"},
+			{Name: guestMITMStabilizeWindow, Value: "15"},
+		},
 		EgressMITMCertificate: &apiv1alpha2.MITMCertificateSpec{
 			SecretRef: corev1.LocalObjectReference{Name: "mitm-ca"},
 			Key:       "ca.crt",
@@ -278,17 +281,24 @@ func TestInjectRuntimeBakesMitmCertificateAndGate(t *testing.T) {
 		t.Fatalf("read sandbox-init.env: %v", err)
 	}
 	envContent := string(envPayload)
-	userLine := "export " + guestMITMTrustGate + "='false'"
-	gateLine := "export " + guestMITMTrustGate + "=true"
-	userIdx := strings.Index(envContent, userLine)
-	gateIdx := strings.LastIndex(envContent, gateLine)
-	if userIdx == -1 || gateIdx == -1 || gateIdx < userIdx {
-		t.Fatalf("sandbox-init.env must carry the gate after the user env (user at %d, gate at %d):\n%s",
-			userIdx, gateIdx, envContent)
+	for _, check := range []struct {
+		name     string
+		userLine string
+		baked    string
+	}{
+		{"trust gate", "export " + guestMITMTrustGate + "='false'", "export " + guestMITMTrustGate + "=true"},
+		{"stabilize window", "export " + guestMITMStabilizeWindow + "='15'", "export " + guestMITMStabilizeWindow + "=0"},
+	} {
+		userIdx := strings.Index(envContent, check.userLine)
+		bakedIdx := strings.LastIndex(envContent, check.baked)
+		if userIdx == -1 || bakedIdx == -1 || bakedIdx < userIdx {
+			t.Fatalf("sandbox-init.env must carry %s after user env (user at %d, baked at %d):\n%s",
+				check.name, userIdx, bakedIdx, envContent)
+		}
 	}
 }
 
-// TestInjectRuntimeWithoutMitmCertificate: no CA configured, no lineage.
+// TestInjectRuntimeWithoutMitmCertificate: no CA configured, no lineage or MITM envs.
 func TestInjectRuntimeWithoutMitmCertificate(t *testing.T) {
 	workdir, rootfs := t.TempDir(), t.TempDir()
 	if err := os.MkdirAll(filepath.Join(rootfs, "etc"), 0o755); err != nil {
@@ -300,5 +310,13 @@ func TestInjectRuntimeWithoutMitmCertificate(t *testing.T) {
 	}
 	if mitmCA != nil {
 		t.Fatalf("expected nil lineage without egressMitmCertificate, got %+v", mitmCA)
+	}
+	envPayload, err := os.ReadFile(filepath.Join(rootfs, "etc", "sandbox-init.env"))
+	if err != nil {
+		t.Fatalf("read sandbox-init.env: %v", err)
+	}
+	envContent := string(envPayload)
+	if strings.Contains(envContent, guestMITMTrustGate) || strings.Contains(envContent, guestMITMStabilizeWindow) {
+		t.Fatalf("sandbox-init.env must not set MITM vars without egressMitmCertificate:\n%s", envContent)
 	}
 }
