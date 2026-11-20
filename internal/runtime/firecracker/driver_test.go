@@ -923,6 +923,40 @@ func TestRecoverRunningOverrideBeforeCreateCommit(t *testing.T) {
 	require.Empty(t, f.killCalls)
 }
 
+func TestRootfsOverrideRequiresCgroupBeforeCreate(t *testing.T) {
+	f := newDriverFixture(t)
+	f.sandboxSpec.Desired.RootfsBootDigest = "pinned"
+	_, err := f.driver.EnsureSandbox(t.Context(), ensureInput(&f.sandboxSpec))
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.ErrorContains(t, err, "runtime cgroup manager")
+	require.NoDirExists(t, filepath.Join(f.stateRoot, sandboxStateDir, f.sandboxSpec.Identity.SandboxUID))
+	require.Zero(t, f.manager.Snapshot().Bound)
+	require.Empty(t, f.launcher.started)
+}
+
+func TestLegacyPIDLessOverrideRetainsSlot(t *testing.T) {
+	f := newDriverFixture(t)
+	f.sandboxSpec.Desired.RootfsBootDigest = "pinned"
+	id := f.sandboxSpec.Identity
+	f.driver.SetFastletPodUID(id.FastletPodUID)
+	_, err := f.manager.Acquire(t.Context(), f.driver.networkOwner(&f.sandboxSpec))
+	require.NoError(t, err)
+	dir, err := ensureSandboxDir(f.stateRoot, id.SandboxUID)
+	require.NoError(t, err)
+	require.NoError(t, saveState(dir, &SandboxState{Config: f.sandboxSpec, Phase: PhaseStarting}))
+	require.NoError(t, f.driver.RecoverRuntimeResources(t.Context(), nil, nil))
+	meta, err := f.driver.InspectSandbox(t.Context(), id.SandboxUID)
+	require.NoError(t, err)
+	require.True(t, meta.BootRecoveryPending)
+	require.Contains(t, meta.RuntimeMessage, id.SandboxUID)
+	require.Contains(t, meta.RuntimeMessage, id.FastletPodUID)
+	require.ErrorContains(t, f.driver.ReconcileSandbox(t.Context(), id), "retain its resources")
+	require.ErrorContains(t, f.driver.DeleteSandbox(t.Context(), id.SandboxUID), "retain its resources")
+	require.Equal(t, 1, f.manager.Snapshot().Bound)
+	require.Empty(t, f.killCalls)
+	require.DirExists(t, dir)
+}
+
 func TestRecoverQuarantinedRootfsWithoutCgroups(t *testing.T) {
 	f := newDriverFixture(t)
 	f.sandboxSpec.Desired.RootfsBootDigest = "pinned"

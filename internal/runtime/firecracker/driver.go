@@ -517,6 +517,10 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	manager := d.networkManager
 	runtimeCgroups := d.runtimeCgroups
 	d.mu.RUnlock()
+	// The cgroup identifies the VMM if Fastlet exits before persisting its PID.
+	if spec.RootfsBootDigest != "" && runtimeCgroups == nil {
+		return nil, fmt.Errorf("%w: RootfsOnly resource overrides require a runtime cgroup manager", ErrInvalidConfig)
+	}
 	if manager == nil {
 		return nil, fmt.Errorf("%w: firecracker requires the Fastlet network manager", ErrNetworkUnavailable)
 	}
@@ -1342,6 +1346,9 @@ func (d *Driver) adoptPinnedBoot(ctx context.Context, directory string, state *S
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	if state.PID <= 0 {
+		if cgroups == nil {
+			return unattributedBootError(state)
+		}
 		return errors.New("rootfs boot has no recorded VMM PID")
 	}
 	if alive, err := d.probeVM(ctx, state); err != nil || !alive {
@@ -2079,6 +2086,9 @@ func (d *Driver) prepareSnapshotSpill(jailRoot string) {
 func (d *Driver) terminalCleanupPID(ctx context.Context, state *SandboxState, cgroups *podcgroup.RuntimeManager) (int, error) {
 	if state.BootRecoveryError != "" {
 		if cgroups == nil {
+			if state.PID <= 0 {
+				return 0, unattributedBootError(state)
+			}
 			if d.recordedVMMExited(state) {
 				return 0, nil
 			}
@@ -2104,6 +2114,11 @@ func (d *Driver) terminalCleanupPID(ctx context.Context, state *SandboxState, cg
 		return 0, fmt.Errorf("confirm terminal Firecracker sandbox %s exited (PID %d, Fastlet Pod %s, phase %s): %w", state.Config.Identity.SandboxUID, state.PID, state.Config.Identity.FastletPodUID, state.Phase, err)
 	}
 	return 0, nil
+}
+
+func unattributedBootError(state *SandboxState) error {
+	id := state.Config.Identity
+	return fmt.Errorf("sandbox %s has no recorded VMM PID or runtime cgroup manager; retain its resources until all runtime processes of Fastlet Pod UID %s are confirmed gone", id.SandboxUID, id.FastletPodUID)
 }
 
 // An API error does not prove the process is gone.

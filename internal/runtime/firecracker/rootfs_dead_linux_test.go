@@ -11,13 +11,79 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/api/resource"
 
+	"fast-sandbox/internal/fastlet/podcgroup"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
+
+// Requires a disposable cgroup v2 Pod subtree and a real Firecracker binary.
+func TestPIDLessOverrideLauncherCrash(t *testing.T) {
+	pod := os.Getenv("FSB_TEST_OVERRIDE_CRASH_POD_UID")
+	if pod == "" {
+		t.Skip("requires a disposable Pod cgroup")
+	}
+	if leaf := os.Getenv("FSB_TEST_OVERRIDE_CRASH_LEAF"); leaf != "" {
+		if os.Getenv("FSB_TEST_OVERRIDE_CRASH_AFTER_LAUNCH") == "true" {
+			_, err := (ExecProcessRunner{}).StartInCgroup(t.Context(), leaf, "", os.Getenv("FC_BINARY"), []string{"--api-sock", os.Getenv("FSB_TEST_OVERRIDE_CRASH_SOCKET")}, "")
+			require.NoError(t, err)
+		}
+		require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGKILL))
+		return
+	}
+	cg, err := podcgroup.NewRuntimeManager("/sys/fs/cgroup", pod, podcgroup.RuntimeBudget{CPU: resource.MustParse("2"), Memory: resource.MustParse("1Gi")})
+	require.NoError(t, err)
+	require.NoError(t, cg.Prepare())
+	for _, point := range []string{"before-launch", "after-launch"} {
+		t.Run(point, func(t *testing.T) {
+			f := newDriverFixture(t)
+			f.sandboxSpec.Desired.RootfsBootDigest = "pinned"
+			f.sandboxSpec.Identity.FastletPodUID = pod
+			id := f.sandboxSpec.Identity
+			f.driver.SetFastletPodUID(pod)
+			f.driver.runtimeCgroups = cg
+			f.driver.killProcess = killPID
+			_, err := f.manager.Acquire(t.Context(), f.driver.networkOwner(&f.sandboxSpec))
+			require.NoError(t, err)
+			dir, err := ensureSandboxDir(f.stateRoot, id.SandboxUID)
+			require.NoError(t, err)
+			socket := filepath.Join(dir, "api.sock")
+			require.NoError(t, saveState(dir, &SandboxState{Phase: PhaseStarting, Config: f.sandboxSpec, APIAddress: socket}))
+			leaf, err := cg.EnsureSandbox(id.SandboxUID, podcgroup.SandboxLimits{CPU: resource.MustParse("1"), CPURequest: resource.MustParse("1"), PIDs: 128})
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				pids, _, _ := cg.SandboxProcesses(id.SandboxUID)
+				for _, pid := range pids {
+					_ = killPID(pid)
+				}
+			})
+			child := exec.Command(os.Args[0], "-test.run=^TestPIDLessOverrideLauncherCrash$")
+			child.Env = append(os.Environ(), "FSB_TEST_OVERRIDE_CRASH_LEAF="+leaf, "FSB_TEST_OVERRIDE_CRASH_SOCKET="+socket, "FSB_TEST_OVERRIDE_CRASH_AFTER_LAUNCH="+strconv.FormatBool(point == "after-launch"))
+			output, err := child.CombinedOutput()
+			var exit *exec.ExitError
+			require.ErrorAs(t, err, &exit, string(output))
+			require.Equal(t, syscall.SIGKILL, exit.ProcessState.Sys().(syscall.WaitStatus).Signal(), string(output))
+			pids, exists, err := cg.SandboxProcesses(id.SandboxUID)
+			require.NoError(t, err)
+			require.True(t, exists)
+			if point == "after-launch" {
+				require.NotEmpty(t, pids)
+			} else {
+				require.Empty(t, pids)
+			}
+			require.NoError(t, f.driver.RecoverRuntimeResources(t.Context(), nil, nil))
+			require.NoDirExists(t, leaf)
+			require.NoDirExists(t, dir)
+			require.Zero(t, f.manager.Snapshot().Bound)
+		})
+	}
+}
 
 func TestRootfsDeadCaptureAbortsWithoutGuestOrDevice(t *testing.T) {
 	for _, phase := range []capturePhase{captureFreezing, captureQuarantined} {
