@@ -147,12 +147,11 @@ func ParseCompiled(content []byte) (Compiled, error) {
 	if err := json.Unmarshal(content, &compiled); err != nil {
 		return Compiled{}, fmt.Errorf("decode compiled registry configuration: %w", err)
 	}
-	expected, err := NewCompiled(compiled.Credentials)
-	if err != nil {
+	// Keep credential shape validation, but drop the provenance comparison:
+	// the declared revision is treated as informational, so operator-authored
+	// configs (hand-stamped templates) load without recomputing the digest.
+	if _, err := NewCompiled(compiled.Credentials); err != nil {
 		return Compiled{}, err
-	}
-	if compiled.Revision != expected.Revision {
-		return Compiled{}, fmt.Errorf("compiled registry revision %q does not match content %q", compiled.Revision, expected.Revision)
 	}
 	return compiled, nil
 }

@@ -83,12 +83,13 @@ func TestFileProviderReloadsAtomicRegistryProjection(t *testing.T) {
 	require.Equal(t, "second", credential.Username)
 	require.Equal(t, second.Revision, provider.Revision())
 
+	// The declared revision is informational: a stale or placeholder
+	// revision still loads, and lookups simply reflect the configured
+	// credentials.
 	require.NoError(t, os.WriteFile(path, []byte(`{"revision":"wrong","credentials":[]}`), 0o600))
-	_, _, err = provider.Credentials("registry.example.com/team/image:v1")
-	require.ErrorContains(t, err, "does not match content")
-	// Status continues to expose the last valid revision while a projected
-	// update is invalid; the Pool Controller retains the old compiled Secret.
-	require.Equal(t, second.Revision, provider.Revision())
+	_, found, err = provider.Credentials("registry.example.com/team/image:v1")
+	require.NoError(t, err)
+	require.False(t, found)
 }
 
 func TestRegistryConfigRejectsDuplicateMatch(t *testing.T) {
