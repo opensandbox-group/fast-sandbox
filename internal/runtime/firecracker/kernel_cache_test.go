@@ -57,6 +57,47 @@ func TestPinBootKernelCachesByFileIdentityAndIsolatesMutation(t *testing.T) {
 	require.Equal(t, "kernel-v2-updated", string(raw3))
 }
 
+func TestPinBootKernelReplacesCorruptExistingDigestCacheEntry(t *testing.T) {
+	stateRoot := t.TempDir()
+	source := filepath.Join(t.TempDir(), "vmlinux-6.1")
+	goodBytes := []byte("verified-kernel-v1")
+	require.NoError(t, os.WriteFile(source, goodBytes, 0o600))
+	wantSum := fmt.Sprintf("%x", sha256.Sum256(goodBytes))
+
+	// Prepopulate the digest-named cache path with corrupt contents to simulate
+	// disk corruption present across a Fastlet restart.
+	cacheDir := filepath.Join(stateRoot, pinnedKernelsDir)
+	require.NoError(t, os.MkdirAll(cacheDir, 0o750))
+	cachedPath := filepath.Join(cacheDir, wantSum)
+	require.NoError(t, os.WriteFile(cachedPath, []byte("corrupt-kernel-bytes"), 0o444))
+
+	d := &Driver{}
+	target := filepath.Join(stateRoot, "boot-after-restart")
+	gotSum, err := d.pinBootKernel(stateRoot, source, target)
+	require.NoError(t, err)
+	require.Equal(t, wantSum, gotSum)
+
+	bootedBytes, err := os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, goodBytes, bootedBytes, "VMM must boot verified kernel bytes, never corrupt cached bytes")
+
+	healedCache, err := os.ReadFile(cachedPath)
+	require.NoError(t, err)
+	require.Equal(t, goodBytes, healedCache, "corrupt cache entry must be atomically replaced with verified bytes")
+
+	// A subsequent restart finding a valid cached file reuses its existing inode.
+	healedInfo, err := os.Stat(cachedPath)
+	require.NoError(t, err)
+	d2 := &Driver{}
+	target2 := filepath.Join(stateRoot, "boot-second-restart")
+	gotSum2, err := d2.pinBootKernel(stateRoot, source, target2)
+	require.NoError(t, err)
+	require.Equal(t, wantSum, gotSum2)
+	target2Info, err := os.Stat(target2)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(healedInfo, target2Info), "valid pre-existing cache entry should be reused without replacement")
+}
+
 func TestBootCompatibilityReusesSelectedVMMVersionWithoutExec(t *testing.T) {
 	d := &Driver{}
 	selected := &firecrackervmm.Selection{

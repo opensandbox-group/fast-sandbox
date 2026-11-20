@@ -138,8 +138,43 @@ func pinKernelIntoCache(cacheDir, source string) (cachedPath, sum string, key fi
 	}
 	sum = hex.EncodeToString(hash.Sum(nil))
 	final := filepath.Join(cacheDir, sum)
-	if err := os.Link(tempName, final); err != nil && !errors.Is(err, os.ErrExist) {
-		return "", "", fileStatKey{}, err
+	if err := os.Link(tempName, final); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return "", "", fileStatKey{}, err
+		}
+		ok, verifyErr := verifyCachedKernel(final, sum)
+		if verifyErr != nil || !ok {
+			if err := os.Rename(tempName, final); err != nil {
+				return "", "", fileStatKey{}, err
+			}
+		}
 	}
 	return final, sum, key, nil
+}
+
+func verifyCachedKernel(path, wantSHA256 string) (bool, error) {
+	linfo, err := os.Lstat(path)
+	if err != nil {
+		return false, err
+	}
+	if !linfo.Mode().IsRegular() {
+		return false, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	finfo, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	if !finfo.Mode().IsRegular() || !os.SameFile(linfo, finfo) {
+		return false, nil
+	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false, err
+	}
+	return hex.EncodeToString(h.Sum(nil)) == wantSHA256, nil
 }

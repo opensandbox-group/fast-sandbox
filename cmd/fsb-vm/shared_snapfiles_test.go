@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"fast-sandbox/internal/artifacts"
 )
 
 type snapfilesTransport struct{ url *url.URL }
@@ -559,16 +561,24 @@ func TestSharedSnapfilesMaterializesRootfsOnlyAndSkipsUblkdOnWarmCreates(t *test
 	setupManifestCache(t)
 	global.runtimeDir = t.TempDir()
 	sourceMount := t.TempDir()
-	manifestRaw := []byte(`{
+	vaultRaw := []byte(`{"v":1}`)
+	manifestRaw := []byte(fmt.Sprintf(`{
   "schemaVersion": 1,
   "runtime": "firecracker",
   "machine": {"vcpuCount": 2, "memoryMiB": 512, "rootfsSizeMiB": 1024, "rootfsDriveID": "rootfs", "rootfsDrivePath": "rootfs.dev"},
   "kernel": {"version": "6.1.0", "cmdline": "root=/dev/vda rw"},
   "compatibility": {"cpuArch": "x86_64", "firecrackerVersion": "1.17.0"},
-  "platform": {"snapshotMode": "rootfsOnly"}
-}`)
+  "platform": {
+    "snapshotMode": "rootfsOnly",
+    "stateFiles": {
+      "vault.json": {"sha256": %q, "sizeBytes": %d}
+    }
+  }
+}`, artifacts.SHA256Of(vaultRaw), len(vaultRaw)))
 	require.NoError(t, os.WriteFile(filepath.Join(sourceMount, inDiskManifest), manifestRaw, 0o600))
-	require.NoError(t, os.WriteFile(filepath.Join(sourceMount, "vault.json"), []byte(`{"v":1}`), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(sourceMount, "vault.json"), vaultRaw, 0o600))
+	// Undeclared optional bundle file must not be copied into the materialized cache.
+	require.NoError(t, os.WriteFile(filepath.Join(sourceMount, "policy.json"), []byte(`{"undeclared":true}`), 0o600))
 
 	bin := t.TempDir()
 	// Symlink to sourceMount for mount; remove symlink for umount.
@@ -634,6 +644,7 @@ func TestSharedSnapfilesMaterializesRootfsOnlyAndSkipsUblkdOnWarmCreates(t *test
 	gotVault, err := os.ReadFile(filepath.Join(layout1.mountPoint, "vault.json"))
 	require.NoError(t, err)
 	require.Equal(t, `{"v":1}`, string(gotVault))
+	require.NoFileExists(t, filepath.Join(layout1.mountPoint, "policy.json"), "undeclared optional files must not be materialized")
 
 	// Warm concurrent acquires must hit the LOCK_SH materialized path with 0 ublkd RPCs.
 	listsBefore := lists
@@ -668,4 +679,112 @@ func TestSharedSnapfilesMaterializesRootfsOnlyAndSkipsUblkdOnWarmCreates(t *test
 	}
 	require.NoError(t, pruneSharedSnapfiles(context.Background(), client, true))
 	require.NoDirExists(t, filepath.Dir(first.MountPoint))
+}
+
+func TestSharedSnapfilesMaterializeRejectsSymlinksAndInvalidOptionalBundles(t *testing.T) {
+	outside := filepath.Join(t.TempDir(), "host-secret")
+	outsideContent := []byte(`{"secret":"host"}`)
+	require.NoError(t, os.WriteFile(outside, outsideContent, 0o600))
+
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, mountDir string)
+	}{
+		{
+			name: "manifest symlink",
+			setup: func(t *testing.T, mountDir string) {
+				target := filepath.Join(t.TempDir(), "outside-manifest.json")
+				raw := []byte(`{
+  "schemaVersion": 1,
+  "runtime": "firecracker",
+  "machine": {"vcpuCount": 2, "memoryMiB": 512, "rootfsSizeMiB": 1024, "rootfsDriveID": "rootfs", "rootfsDrivePath": "rootfs.dev"},
+  "kernel": {"version": "6.1.0", "cmdline": "root=/dev/vda rw"},
+  "compatibility": {"cpuArch": "x86_64", "firecrackerVersion": "1.17.0"},
+  "platform": {"snapshotMode": "rootfsOnly"}
+}`)
+				require.NoError(t, os.WriteFile(target, raw, 0o600))
+				require.NoError(t, os.Symlink(target, filepath.Join(mountDir, inDiskManifest)))
+			},
+		},
+		{
+			name: "declared vault symlink",
+			setup: func(t *testing.T, mountDir string) {
+				raw := []byte(fmt.Sprintf(`{
+  "schemaVersion": 1,
+  "runtime": "firecracker",
+  "machine": {"vcpuCount": 2, "memoryMiB": 512, "rootfsSizeMiB": 1024, "rootfsDriveID": "rootfs", "rootfsDrivePath": "rootfs.dev"},
+  "kernel": {"version": "6.1.0", "cmdline": "root=/dev/vda rw"},
+  "compatibility": {"cpuArch": "x86_64", "firecrackerVersion": "1.17.0"},
+  "platform": {
+    "snapshotMode": "rootfsOnly",
+    "stateFiles": {"vault.json": {"sha256": %q, "sizeBytes": %d}}
+  }
+}`, artifacts.SHA256Of(outsideContent), len(outsideContent)))
+				require.NoError(t, os.WriteFile(filepath.Join(mountDir, inDiskManifest), raw, 0o600))
+				require.NoError(t, os.Symlink(outside, filepath.Join(mountDir, "vault.json")))
+			},
+		},
+		{
+			name: "declared vault actual size mismatch",
+			setup: func(t *testing.T, mountDir string) {
+				declared := []byte(`{"v":1}`)
+				raw := []byte(fmt.Sprintf(`{
+  "schemaVersion": 1,
+  "runtime": "firecracker",
+  "machine": {"vcpuCount": 2, "memoryMiB": 512, "rootfsSizeMiB": 1024, "rootfsDriveID": "rootfs", "rootfsDrivePath": "rootfs.dev"},
+  "kernel": {"version": "6.1.0", "cmdline": "root=/dev/vda rw"},
+  "compatibility": {"cpuArch": "x86_64", "firecrackerVersion": "1.17.0"},
+  "platform": {
+    "snapshotMode": "rootfsOnly",
+    "stateFiles": {"vault.json": {"sha256": %q, "sizeBytes": %d}}
+  }
+}`, artifacts.SHA256Of(declared), len(declared)))
+				require.NoError(t, os.WriteFile(filepath.Join(mountDir, inDiskManifest), raw, 0o600))
+				require.NoError(t, os.WriteFile(filepath.Join(mountDir, "vault.json"), []byte(`{"v":1,"extra":"more"}`), 0o600))
+			},
+		},
+		{
+			name: "declared policy exceeds max byte limit",
+			setup: func(t *testing.T, mountDir string) {
+				oversized := maxRootfsOnlyPolicyBytes + 1
+				raw := []byte(fmt.Sprintf(`{
+  "schemaVersion": 1,
+  "runtime": "firecracker",
+  "machine": {"vcpuCount": 2, "memoryMiB": 512, "rootfsSizeMiB": 1024, "rootfsDriveID": "rootfs", "rootfsDrivePath": "rootfs.dev"},
+  "kernel": {"version": "6.1.0", "cmdline": "root=/dev/vda rw"},
+  "compatibility": {"cpuArch": "x86_64", "firecrackerVersion": "1.17.0"},
+  "platform": {
+    "snapshotMode": "rootfsOnly",
+    "stateFiles": {"policy.json": {"sha256": %q, "sizeBytes": %d}}
+  }
+}`, strings.Repeat("a", 64), oversized))
+				require.NoError(t, os.WriteFile(filepath.Join(mountDir, inDiskManifest), raw, 0o600))
+				require.NoError(t, os.WriteFile(filepath.Join(mountDir, "policy.json"), make([]byte, oversized), 0o600))
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setupManifestCache(t)
+			global.runtimeDir = t.TempDir()
+			mountDir := t.TempDir()
+			tc.setup(t, mountDir)
+			home := filepath.Join(sharedSnapfilesRoot(), "test-key")
+			require.NoError(t, os.MkdirAll(home, 0o700))
+			cached := &sharedSnapfilesState{
+				Device: &deviceRecord{DevID: 7, DevPath: "/dev/ublkb7", Config: filepath.Join(home, "snap.config")},
+			}
+			state := &sandboxState{SandboxID: "sbx-1", SharedSnapfiles: "test-key", MountPoint: mountDir}
+			persisted := false
+			err := materializeRootfsOnlySnapfiles(context.Background(), nil, home, state, cached, func() error {
+				persisted = true
+				return nil
+			})
+			require.NoError(t, err)
+			require.False(t, persisted, "rejected materialization must not persist RootfsOnly state")
+			require.False(t, cached.RootfsOnly)
+			require.NotNil(t, cached.Device, "live device mount must remain intact")
+		})
+	}
 }
