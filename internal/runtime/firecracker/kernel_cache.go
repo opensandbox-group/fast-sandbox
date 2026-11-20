@@ -54,11 +54,8 @@ func statRegularFileKey(path string) (fileStatKey, error) {
 	return fileKeyFromInfo(path, info)
 }
 
-// pinBootKernel binds source into target as an immutable private inode and
-// returns its SHA-256 digest. Identical node kernel assets (matched by
-// path/dev/ino/size/mtime) are copied, hashed, and fsynced once into a
-// content-addressed cache under stateRoot and hard-linked into each sandbox
-// directory on subsequent boots.
+// pinBootKernel binds source into target as an immutable private inode, caching
+// verified node kernels under stateRoot by file identity and hard-linking on hits.
 func (d *Driver) pinBootKernel(stateRoot, source, target string) (string, error) {
 	if stateRoot == "" {
 		return firecrackerconfig.PinKernel(source, target)
