@@ -63,47 +63,9 @@ func (s *Server) CreateRootfsSandbox(ctx context.Context, in *pb.CreateRootfsSan
 	if !apierrors.IsNotFound(err) {
 		return nil, grpcKubernetesError(err)
 	}
-	var ref, sum, native string
-	defaults := in.GetSourceLimits()
-	switch {
-	case in.GetSnapshotName() != "":
-		var snap api.SandboxSnapshot
-		if err := s.K8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: in.GetSnapshotName()}, &snap); err != nil {
-			return nil, grpcKubernetesError(err)
-		}
-		if snap.Status.Phase != api.SandboxSnapshotPhaseSucceeded || snap.Status.Mode != api.SandboxSnapshotModeRootfsOnly || !snap.DeletionTimestamp.IsZero() {
-			return nil, status.Error(codes.InvalidArgument, "source must be a ready RootfsOnly snapshot")
-		}
-		ref, sum, native = snap.Status.ManifestRef, snap.Status.ArtifactDigest, snap.Spec.TemplateName
-		if recorded := snap.Status.ResourceLimits; recorded != nil {
-			defaults = &pb.ComputeResourceProfile{Cpu: recorded.CPU, Memory: recorded.Memory}
-		}
-	case in.GetTemplateName() != "":
-		var tmpl api.SandboxTemplate
-		if err := s.K8sClient.Get(ctx, client.ObjectKey{Namespace: ns, Name: in.GetTemplateName()}, &tmpl); err != nil {
-			return nil, grpcKubernetesError(err)
-		}
-		if tmpl.Status.Phase != api.SandboxTemplatePhaseSucceeded || tmpl.Status.Mode != api.SandboxSnapshotModeRootfsOnly || !tmpl.DeletionTimestamp.IsZero() {
-			return nil, status.Error(codes.InvalidArgument, "source must be a ready RootfsOnly template")
-		}
-		ref, sum, native = tmpl.Status.ManifestRef, tmpl.Status.ArtifactDigest, tmpl.Spec.Image
-		if tmpl.Spec.IndexKey != "" {
-			native = tmpl.Spec.IndexKey
-		}
-		defaults = &pb.ComputeResourceProfile{Cpu: tmpl.Spec.Machine.VCPU, Memory: tmpl.Spec.Machine.Memory}
-	default:
-		return nil, status.Error(codes.InvalidArgument, "snapshot_name or template_name required")
-	}
-	decoded, err := hex.DecodeString(sum)
-	if err != nil || len(decoded) != 32 {
-		return nil, status.Error(codes.FailedPrecondition, "source has no valid artifact digest")
-	}
-	if strings.HasPrefix(ref, ocitemplate.Prefix) {
-		if ref != req.Image || ocitemplate.ValidateDigestReference(ref, sum) != nil {
-			return nil, status.Error(codes.InvalidArgument, "source OCI identity mismatch")
-		}
-	} else if !strings.HasPrefix(ref, "s3://") || native != req.Image {
-		return nil, status.Error(codes.InvalidArgument, "source native identity mismatch")
+	sum, defaults, err := s.resolveRootfsSource(ctx, req, in)
+	if err != nil {
+		return nil, err
 	}
 	supplied := req.GetResources().GetLimits()
 	cpu, mem := supplied.GetCpu(), supplied.GetMemory()
@@ -144,4 +106,50 @@ func canonicalOverrideQuantity(value string, format resource.Format) (string, er
 	q.Format = format
 	number, suffix := q.CanonicalizeBytes(nil)
 	return string(number) + string(suffix), nil
+}
+
+func (s *Server) resolveRootfsSource(ctx context.Context, req *pb.CreateSandboxRequest, in *pb.CreateRootfsSandboxRequest) (string, *pb.ComputeResourceProfile, error) {
+	var ref, sum, native string
+	defaults := in.GetSourceLimits()
+	switch {
+	case in.GetSnapshotName() != "":
+		var snap api.SandboxSnapshot
+		if err := s.K8sClient.Get(ctx, client.ObjectKey{Namespace: req.Namespace, Name: in.GetSnapshotName()}, &snap); err != nil {
+			return "", nil, grpcKubernetesError(err)
+		}
+		if snap.Status.Phase != api.SandboxSnapshotPhaseSucceeded || snap.Status.Mode != api.SandboxSnapshotModeRootfsOnly || !snap.DeletionTimestamp.IsZero() {
+			return "", nil, status.Error(codes.InvalidArgument, "source must be a ready RootfsOnly snapshot")
+		}
+		ref, sum, native = snap.Status.ManifestRef, snap.Status.ArtifactDigest, snap.Spec.TemplateName
+		if recorded := snap.Status.ResourceLimits; recorded != nil {
+			defaults = &pb.ComputeResourceProfile{Cpu: recorded.CPU, Memory: recorded.Memory}
+		}
+	case in.GetTemplateName() != "":
+		var tmpl api.SandboxTemplate
+		if err := s.K8sClient.Get(ctx, client.ObjectKey{Namespace: req.Namespace, Name: in.GetTemplateName()}, &tmpl); err != nil {
+			return "", nil, grpcKubernetesError(err)
+		}
+		if tmpl.Status.Phase != api.SandboxTemplatePhaseSucceeded || tmpl.Status.Mode != api.SandboxSnapshotModeRootfsOnly || !tmpl.DeletionTimestamp.IsZero() {
+			return "", nil, status.Error(codes.InvalidArgument, "source must be a ready RootfsOnly template")
+		}
+		ref, sum, native = tmpl.Status.ManifestRef, tmpl.Status.ArtifactDigest, tmpl.Spec.Image
+		if tmpl.Spec.IndexKey != "" {
+			native = tmpl.Spec.IndexKey
+		}
+		defaults = &pb.ComputeResourceProfile{Cpu: tmpl.Spec.Machine.VCPU, Memory: tmpl.Spec.Machine.Memory}
+	default:
+		return "", nil, status.Error(codes.InvalidArgument, "snapshot_name or template_name required")
+	}
+	decoded, err := hex.DecodeString(sum)
+	if err != nil || len(decoded) != 32 {
+		return "", nil, status.Error(codes.FailedPrecondition, "source has no valid artifact digest")
+	}
+	if strings.HasPrefix(ref, ocitemplate.Prefix) {
+		if ref != req.Image || ocitemplate.ValidateDigestReference(ref, sum) != nil {
+			return "", nil, status.Error(codes.InvalidArgument, "source OCI identity mismatch")
+		}
+	} else if !strings.HasPrefix(ref, "s3://") || native != req.Image {
+		return "", nil, status.Error(codes.InvalidArgument, "source native identity mismatch")
+	}
+	return sum, defaults, nil
 }

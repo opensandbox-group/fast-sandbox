@@ -251,14 +251,9 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	if err != nil {
 		return nil, err
 	}
-	if state.Config.Desired.RootfsBootDigest != "" {
-		if state.BootMachine == nil {
-			return nil, errors.New("missing actual rootfs boot machine")
-		}
-		manifest.Machine.VCPUCount, manifest.Machine.MemoryMiB = state.BootMachine.VCPUCount, state.BootMachine.MemoryMiB
+	if err := recordRootfsBootMetadata(&manifest, state, caps.HelperVersion); err != nil {
+		return nil, err
 	}
-	manifest.Kernel.SHA256 = state.BootKernelSHA256
-	manifest.GuestControl.HelperVersion = caps.HelperVersion
 	native := !strings.HasPrefix(source, "oci://")
 	device, plan, upperBytes, err := d.prepareRootfsCut(input, source, native)
 	if err != nil {
@@ -269,16 +264,9 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 		return nil, err
 	}
 	record := captureRecord{Owner: &state.Config.Identity, Incarnation: identity, Device: device.Name(), Staging: plan.staging, Request: guestcontrol.Request{Protocol: guestcontrol.Protocol, Epoch: caps.Epoch, Generation: caps.Generation + 1, OperationID: input.SnapshotID, LeaseMillis: 10000}}
-	if native {
-		record.Backend = captureBackendNative
-		record.FileDevice, record.FileInode, err = captureNativeIdentity(device)
-		if err != nil {
-			return nil, err
-		}
-	}
-	journal, err := prepareRootfsJournal(dir, record)
+	journal, err := prepareDeviceJournal(dir, &record, device, native)
 	if err != nil {
-		return nil, errors.Join(err, os.RemoveAll(plan.staging))
+		return nil, err
 	}
 	// Retain the copy and journal if recovery fails; delete only after source recovery and before publication takes ownership.
 	publicationOwned := false
@@ -856,4 +844,32 @@ func validateRootfsSnapshotInput(input *runtimecontract.SnapshotInput) error {
 		return err
 	}
 	return nil
+}
+
+func recordRootfsBootMetadata(manifest *artifacts.VMManifest, state *SandboxState, helperVersion string) error {
+	if state.Config.Desired.RootfsBootDigest != "" {
+		if state.BootMachine == nil {
+			return errors.New("missing actual rootfs boot machine")
+		}
+		manifest.Machine.VCPUCount, manifest.Machine.MemoryMiB = state.BootMachine.VCPUCount, state.BootMachine.MemoryMiB
+	}
+	manifest.Kernel.SHA256 = state.BootKernelSHA256
+	manifest.GuestControl.HelperVersion = helperVersion
+	return nil
+}
+
+func prepareDeviceJournal(directory string, record *captureRecord, device *os.File, native bool) (*captureJournal, error) {
+	if native {
+		record.Backend = captureBackendNative
+		dev, inode, err := captureNativeIdentity(device)
+		if err != nil {
+			return nil, err
+		}
+		record.FileDevice, record.FileInode = dev, inode
+	}
+	journal, err := prepareRootfsJournal(directory, *record)
+	if err != nil {
+		return nil, errors.Join(err, os.RemoveAll(record.Staging))
+	}
+	return journal, nil
 }

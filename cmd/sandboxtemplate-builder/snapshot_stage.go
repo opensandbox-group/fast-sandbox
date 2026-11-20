@@ -117,8 +117,8 @@ func runSnapshotStage(args []string) error {
 	_ = os.Remove(driveLink)
 	if spec.Output.Mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
 		// Boot a private sparse copy so the published filesystem remains clean.
-		if output, err := exec.Command("cp", "--reflink=auto", "--sparse=always", "--", rootfs, driveLink).CombinedOutput(); err != nil {
-			return fmt.Errorf("copy template disk for boot verification: %w: %s", err, strings.TrimSpace(string(output)))
+		if err := copyVerificationDisk(rootfs, driveLink); err != nil {
+			return err
 		}
 		defer os.Remove(driveLink)
 	} else if err := os.Symlink(rootfs, driveLink); err != nil {
@@ -244,12 +244,8 @@ func runSnapshotStage(args []string) error {
 		return err
 	}
 	if control != nil {
-		version, err := guestcontrol.ProbeRootFilesystem(context.Background(), filepath.Join(workdir, "guest-control.sock"), control.Port)
-		if err != nil {
-			return fmt.Errorf("restored native guest helper probe: %w", err)
-		}
-		if version != control.HelperVersion {
-			return errors.New("restored helper version changed")
+		if err := verifyRestoredHelper(workdir, control); err != nil {
+			return err
 		}
 	}
 	phases.RestoreToHeartbeatMs = time.Since(restoreStarted).Milliseconds()
@@ -710,4 +706,22 @@ func memoryMiB(quantity string) (int64, error) {
 		return 128, nil
 	}
 	return miB, nil
+}
+
+func copyVerificationDisk(rootfs, destination string) error {
+	if output, err := exec.Command("cp", "--reflink=auto", "--sparse=always", "--", rootfs, destination).CombinedOutput(); err != nil {
+		return fmt.Errorf("copy template disk for boot verification: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func verifyRestoredHelper(workdir string, control *artifacts.VMGuestControl) error {
+	version, err := guestcontrol.ProbeRootFilesystem(context.Background(), filepath.Join(workdir, "guest-control.sock"), control.Port)
+	if err != nil {
+		return fmt.Errorf("restored native guest helper probe: %w", err)
+	}
+	if version != control.HelperVersion {
+		return errors.New("restored helper version changed")
+	}
+	return nil
 }

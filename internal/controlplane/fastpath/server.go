@@ -150,21 +150,9 @@ func (s *Server) createSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	// Capacity exhaustion may still race with an earlier ambiguous attempt, so
 	// look up the same request ID and resume only that already-durable identity.
 	if selectionErr != nil || replayUID != "" {
-		accepted, found, existingErr := s.loadExistingCreateIntent(ctx, plannedCreate{sandbox: sandbox, candidates: rankedFastlets, assignment: envelope, parameters: parameters})
-		if existingErr != nil {
-			return nil, existingErr
-		}
-		if !found {
-			if replayUID != "" {
-				return nil, status.Error(codes.NotFound, "Sandbox was deleted during create replay")
-			}
-			return nil, selectionErr
-		}
-		if len(accepted.candidates) == 0 {
-			if selectionErr == nil {
-				return nil, status.Error(codes.Unavailable, "Sandbox assignment is not ready")
-			}
-			return nil, selectionErr
+		accepted, err := s.loadReplayCandidate(ctx, plannedCreate{sandbox: sandbox, candidates: rankedFastlets, assignment: envelope, parameters: parameters}, selectionErr)
+		if err != nil {
+			return nil, err
 		}
 		observeCreateAccepted("idempotent", started, nil)
 		acceptedObserved = true
@@ -1539,4 +1527,24 @@ func (s *Server) defaultNamespace() string {
 		return s.DefaultNamespace
 	}
 	return "fast-sandbox"
+}
+
+func (s *Server) loadReplayCandidate(ctx context.Context, plan plannedCreate, selectionErr error) (*acceptedCreate, error) {
+	accepted, found, existingErr := s.loadExistingCreateIntent(ctx, plan)
+	if existingErr != nil {
+		return nil, existingErr
+	}
+	if !found {
+		if plan.sandbox.UID != "" {
+			return nil, status.Error(codes.NotFound, "Sandbox was deleted during create replay")
+		}
+		return nil, selectionErr
+	}
+	if len(accepted.candidates) == 0 {
+		if selectionErr == nil {
+			return nil, status.Error(codes.Unavailable, "Sandbox assignment is not ready")
+		}
+		return nil, selectionErr
+	}
+	return accepted, nil
 }

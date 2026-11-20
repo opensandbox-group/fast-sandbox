@@ -244,11 +244,7 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.
 		logger.Info("sandbox template build pod succeeded", "template", template.Name, "pod", pod.Name)
 		template.Status.ManifestRef = pod.Annotations[sandboxTemplateManifestRefAnnot]
 		template.Status.ArtifactDigest = pod.Annotations[sandboxTemplateArtifactDigestAnn]
-		template.Status.Mode = ""
-		switch mode := apiv1alpha2.SandboxSnapshotMode(pod.Annotations[apiv1alpha2.SandboxTemplateArtifactModeAnnotation]); mode {
-		case apiv1alpha2.SandboxSnapshotModeFull, apiv1alpha2.SandboxSnapshotModeRootfsOnly:
-			template.Status.Mode = mode
-		}
+		template.Status.Mode = reportedTemplateMode(pod)
 		template.Status.Phase = apiv1alpha2.SandboxTemplatePhaseSucceeded
 		now := metav1.Now()
 		template.Status.LastBuildTime = &now
@@ -985,4 +981,13 @@ func exitCodeSuffix(exitCode int32) string {
 // ptr returns a pointer to the given value.
 func ptr[T any](value T) *T {
 	return &value
+}
+
+func reportedTemplateMode(pod *corev1.Pod) apiv1alpha2.SandboxSnapshotMode {
+	switch mode := apiv1alpha2.SandboxSnapshotMode(pod.Annotations[apiv1alpha2.SandboxTemplateArtifactModeAnnotation]); mode {
+	case apiv1alpha2.SandboxSnapshotModeFull, apiv1alpha2.SandboxSnapshotModeRootfsOnly:
+		return mode
+	default:
+		return ""
+	}
 }
