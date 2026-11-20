@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net"
 	"net/http"
@@ -75,7 +76,9 @@ func TestInjectedCABundleExtendsSystemRoots(t *testing.T) {
 		"the trust set must be the system roots extended with the injected bundle, not a replacement")
 
 	// End to end: the client built from this bundle fetches from an HTTPS
-	// issuer certified by the injected CA.
+	// issuer certified by the injected CA. The loopback harness ignores the
+	// header, but the credential must resolve, matching production.
+	t.Setenv(KeyFetchTokenEnv, "test-key-fetch-credential")
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("{}"))
 	}))
@@ -145,9 +148,167 @@ func (c *testCA) serverCertificate(t *testing.T, dnsName string) tls.Certificate
 	return certificate
 }
 
+// TestDefaultHTTPClientRefusesCrossHostRedirect pins the redirect boundary:
+// the credential is injected inside RoundTrip, below redirect handling, so
+// every hop would re-receive it — undoing the standard library's cross-host
+// Authorization stripping. The client must refuse and fail the fetch closed.
+func TestDefaultHTTPClientRefusesCrossHostRedirect(t *testing.T) {
+	var forwarded []string
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		forwarded = append(forwarded, "seen")
+		_, _ = w.Write([]byte("{}"))
+	}))
+	t.Cleanup(target.Close)
+
+	var anchorCredentials []string
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		anchorCredentials = append(anchorCredentials, request.Header.Get("Authorization"))
+		http.Redirect(w, request, target.URL+"/openid/v1/jwks", http.StatusFound)
+	}))
+	t.Cleanup(source.Close)
+
+	t.Setenv(KeyFetchTokenEnv, "live-service-account-token")
+	client, err := defaultHTTPClient()
+	require.NoError(t, err)
+
+	response, err := client.Get(source.URL + "/.well-known/openid-configuration")
+	require.NoError(t, err)
+	defer response.Body.Close()
+	require.Equal(t, http.StatusFound, response.StatusCode,
+		"a cross-host redirect must not be followed: the non-200 reaches the fetcher and fails it closed")
+	require.Equal(t, []string{BearerPrefix + "live-service-account-token"}, anchorCredentials,
+		"the anchor host itself receives the credential")
+	require.Empty(t, forwarded,
+		"the live ServiceAccount credential must never reach a redirect target on another host")
+}
+
+// TestDefaultHTTPClientRefusesDowngradeRedirect pins the scheme half of the
+// boundary: a same-host https→http redirect would otherwise re-attach the
+// credential in plaintext on every hop. The refusal happens client-side, so
+// the plaintext endpoint is never contacted.
+func TestDefaultHTTPClientRefusesDowngradeRedirect(t *testing.T) {
+	// The production client must trust the TLS anchor: inject the CA through
+	// CABundleEnv, the real cluster-CA path.
+	ca := newTestCA(t, "fastletauth-downgrade-test-ca")
+	t.Setenv(CABundleEnv, base64.StdEncoding.EncodeToString(ca.pem))
+	t.Setenv(KeyFetchTokenEnv, "live-service-account-token")
+
+	var anchorCredentials []string
+	var server *httptest.Server
+	server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		anchorCredentials = append(anchorCredentials, request.Header.Get("Authorization"))
+		// Same host, downgraded scheme: the Host-only guard would follow it.
+		http.Redirect(w, request, "http://"+server.Listener.Addr().String()+"/downgraded", http.StatusFound)
+	}))
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{ca.serverCertificate(t, "localhost")}}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
+	client, err := defaultHTTPClient()
+	require.NoError(t, err)
+
+	response, err := client.Get(server.URL + "/.well-known/openid-configuration")
+	require.NoError(t, err)
+	defer response.Body.Close()
+	require.Equal(t, http.StatusFound, response.StatusCode,
+		"a same-host https→http downgrade must not be followed")
+	require.Equal(t, "http://"+server.Listener.Addr().String()+"/downgraded", response.Header.Get("Location"),
+		"the refused hop is the downgrade target itself")
+	require.Equal(t, []string{BearerPrefix + "live-service-account-token"}, anchorCredentials,
+		"the https anchor hop carries the credential exactly once")
+}
+
 func TestNewAuthenticatorRejectsPlaintextIssuerOutsideLoopback(t *testing.T) {
 	authenticator, err := NewAuthenticator("http://issuer.example.com", Audience, DefaultAllowedSubjects, nil)
 	require.Error(t, err, "a plaintext issuer outside loopback would let an on-path attacker serve forged keys")
+	require.Nil(t, authenticator)
+}
+
+// TestKeyFetchCredentialPrefersEnvOverride pins the override order: an env
+// credential serves host-process runs without a token file, and the file is
+// never consulted when the override resolves.
+func TestKeyFetchCredentialPrefersEnvOverride(t *testing.T) {
+	t.Setenv(KeyFetchTokenEnv, "  env-token  ")
+	previous := readKeyFetchTokenFile
+	t.Cleanup(func() { readKeyFetchTokenFile = previous })
+	readKeyFetchTokenFile = func() (string, error) {
+		return "", errors.New("the mounted file must not be consulted when the override is set")
+	}
+	token, err := keyFetchCredential()
+	require.NoError(t, err)
+	require.Equal(t, "env-token", token, "the override must be trimmed, not echoed verbatim")
+}
+
+// TestKeyFetchCredentialFailsClosed pins that a missing or empty mounted
+// token fails with a directed error, never a silent anonymous fetch.
+func TestKeyFetchCredentialFailsClosed(t *testing.T) {
+	t.Setenv(KeyFetchTokenEnv, "")
+	previous := readKeyFetchTokenFile
+	t.Cleanup(func() { readKeyFetchTokenFile = previous })
+
+	readKeyFetchTokenFile = func() (string, error) {
+		return "", errors.New("open /var/run/secrets/kubernetes.io/serviceaccount/token: no such file or directory")
+	}
+	_, err := keyFetchCredential()
+	require.ErrorContains(t, err, "no key-fetch credential",
+		"the error must direct the operator at the override and the mount")
+
+	readKeyFetchTokenFile = func() (string, error) { return "\n", nil }
+	_, err = keyFetchCredential()
+	require.ErrorContains(t, err, "is empty", "a whitespace-only token file is no credential")
+}
+
+// TestAuthedTransportAttachesRotatingCredential pins that every request
+// resolves the credential at request time, so rotation is followed without
+// restarts and a lost credential fails the request closed before it is sent.
+func TestAuthedTransportAttachesRotatingCredential(t *testing.T) {
+	var seen []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		seen = append(seen, request.Header.Get("Authorization"))
+		_, _ = w.Write([]byte("{}"))
+	}))
+	t.Cleanup(server.Close)
+
+	client := &http.Client{Transport: authedTransport{base: http.DefaultTransport}}
+	t.Setenv(KeyFetchTokenEnv, "token-one")
+	response, err := client.Get(server.URL)
+	require.NoError(t, err)
+	_ = response.Body.Close()
+	require.Equal(t, []string{"Bearer token-one"}, seen)
+
+	// A rotated credential applies to the next fetch: the resolution happens
+	// inside RoundTrip, never cached on the transport.
+	t.Setenv(KeyFetchTokenEnv, "token-two")
+	response, err = client.Get(server.URL)
+	require.NoError(t, err)
+	_ = response.Body.Close()
+	require.Equal(t, []string{"Bearer token-one", "Bearer token-two"}, seen)
+
+	// Losing the credential fails the fetch closed; no request reaches the
+	// issuer anonymously.
+	t.Setenv(KeyFetchTokenEnv, "")
+	previous := readKeyFetchTokenFile
+	t.Cleanup(func() { readKeyFetchTokenFile = previous })
+	readKeyFetchTokenFile = func() (string, error) {
+		return "", errors.New("simulated missing token file")
+	}
+	_, err = client.Get(server.URL)
+	require.Error(t, err, "a Fastlet without its key-fetch credential must fail closed")
+	require.Len(t, seen, 2, "the failed fetch must not reach the issuer")
+}
+
+// TestNewAuthenticatorFailsClosedWithoutKeyFetchCredential pins that
+// construction fails with a directed error instead of an anonymous fallback.
+func TestNewAuthenticatorFailsClosedWithoutKeyFetchCredential(t *testing.T) {
+	issuer := fastletauthtest.NewIssuer(t)
+	t.Setenv(KeyFetchTokenEnv, "")
+	previous := readKeyFetchTokenFile
+	t.Cleanup(func() { readKeyFetchTokenFile = previous })
+	readKeyFetchTokenFile = func() (string, error) {
+		return "", errors.New("simulated missing token file")
+	}
+	authenticator, err := NewAuthenticator(issuer.URL(), Audience, DefaultAllowedSubjects, nil)
+	require.Error(t, err, "issuer key access is authenticated; an anonymous fallback would betray the design")
 	require.Nil(t, authenticator)
 }
 

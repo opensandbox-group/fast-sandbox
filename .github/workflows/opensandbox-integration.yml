@@ -4,10 +4,11 @@ name: OpenSandbox Integration
 # the PR head SHA, then waits for that run and mirrors its conclusion, so this
 # check is the real merge gate. pull_request_target keeps the workflow file and
 # secrets on the base branch (PRs can't rewrite the guard or mint tokens); the
-# job only calls the API, never checks out PR code. External PRs need a
-# maintainer-added `ok-to-test` label — their code runs on a self-hosted
-# runner. Requires OSB_APP_ID / OSB_APP_PRIVATE_KEY (GitHub App with Contents
-# read/write + Actions read, installed on the OpenSandbox repo only).
+# job only calls the API, never checks out PR code. Every PR — regardless
+# of author — needs a maintainer-added `ok-to-test` label before running,
+# since its code runs on a self-hosted runner. Requires OSB_APP_ID /
+# OSB_APP_PRIVATE_KEY (GitHub App with Contents read/write + Actions read,
+# installed on the OpenSandbox repo only).
 
 on:
   pull_request_target:
@@ -37,11 +38,10 @@ permissions:
 jobs:
   integration:
     name: OpenSandbox integration (KVM)
-    # Untrusted PRs need a maintainer's ok-to-test label.
+    # Every PR needs a maintainer's ok-to-test label, including PRs from
+    # members and collaborators.
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.author_association == 'MEMBER' ||
-      github.event.pull_request.author_association == 'COLLABORATOR' ||
       contains(github.event.pull_request.labels.*.name, 'ok-to-test')
     runs-on: ubuntu-latest
     # Remote run caps at 180min plus queue time on the single KVM runner.

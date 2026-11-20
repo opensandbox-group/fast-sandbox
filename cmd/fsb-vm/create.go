@@ -90,7 +90,7 @@ func (r *rollback) run() error {
 
 func (r *rollback) disarm() { r.steps = nil }
 
-func runCreate(ctx context.Context, options *createOptions) error { //nolint:gocognit // ordered device transaction keeps rollback ownership visible
+func runCreate(ctx context.Context, options *createOptions) error { //nolint:gocognit,maintidx // ordered device transaction keeps rollback ownership visible
 	provider, err := selectNetworkProvider(options.network)
 	if err != nil {
 		return err
@@ -106,13 +106,17 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 
 	// Startup reachability check: the daemon is pre-deployed via systemd; the
 	// CLI never launches it (ADR-002).
+	tStart := time.Now()
 	ublkd := newUblkdClient(global.ublkdSocket)
 	if err := ublkd.Ping(ctx); err != nil {
 		return err
 	}
+	tPing := time.Since(tStart)
+	t0 := time.Now()
 	if err := resolveTemplate(ctx, &template, dockerAuth); err != nil {
 		return err
 	}
+	tResolveTpl := time.Since(t0)
 
 	release, err := lockSandbox(template.SandboxID)
 	if err != nil {
@@ -164,6 +168,7 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	// Synchronize credentials before resolving manifests, including failed creates.
 	// Step 3: hand the credential to overlaybd's global cred.json before any
 	// device add, or overlaybd's on-demand pulls fail with 401.
+	t0 = time.Now()
 	handoff, err := overlaybdCredentials(dockerAuth, state.RootfsRef, state.SnapfilesRef)
 	if err != nil {
 		return err
@@ -171,8 +176,10 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	if err := mergeCredentials(global.credFile, handoff); err != nil {
 		return err
 	}
+	tCred := time.Since(t0)
 
 	// Step 2: resolve both manifests into ordered lower-layer lists.
+	t0 = time.Now()
 	rootfsImage, err := resolveImage(ctx, state.RootfsRef, dockerAuth)
 	if err != nil {
 		return err
@@ -184,17 +191,21 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	if err != nil {
 		return err
 	}
+	tResolveImg := time.Since(t0)
 
 	// Step 4/5: the snapfiles device is attached and mounted first (a minor
 	// reordering of the ADR's illustrative sequence) because manifest.json —
 	// which lives on it — supplies the disk size that sets the rootfs hybrid
 	// upper's virtual size. Attaching snapfiles read-only carries no such
 	// dependency, so it is the safe first step.
+	t0 = time.Now()
 	if err := acquireSharedSnapfiles(ctx, ublkd, layout.home, state, snapfilesImage, dockerAuth); err != nil {
 		return err
 	}
+	tSnapfiles := time.Since(t0)
 	layout.mountPoint = state.MountPoint
 
+	t0 = time.Now()
 	metadata, err := loadManifest(filepath.Join(layout.mountPoint, inDiskManifest))
 	if err != nil {
 		return err
@@ -213,18 +224,25 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	if err := validateManifest(metadata, global.firecrackerBin, options.force && global.vmmDir == ""); err != nil {
 		return err
 	}
+	tVMMCheck := time.Since(t0)
 	state.VCPU, state.MemoryMB = metadata.Machine.VCPUCount, int(metadata.Machine.MemoryMiB)
 
 	// rootfs device: create the hybrid writable upper sized from the
 	// authoritative disk size, then attach it.
+	t0 = time.Now()
 	rootfsConfig, err := writeRootfsConfig(ctx, layout.home, rootfsImage, int(metadata.Machine.RootfsSizeMiB))
 	if err != nil {
 		return err
 	}
+	tRootfsCfg := time.Since(t0)
+	t0 = time.Now()
 	rootfsDevPath, err := acquireSandboxDevice(ctx, ublkd, rootfsConfig, &state.Rootfs, persist)
 	if err != nil {
 		return err
 	}
+	tAcquireDev := time.Since(t0)
+	fmt.Fprintf(os.Stderr, "fsb-vm create timing: sandbox=%s rootfsOnly=%t layers=%d total=%s ping=%s resolveTpl=%s cred=%s resolveImg=%s snapfiles=%s vmmCheck=%s rootfsCfg=%s ublkdAcquire=%s\n",
+		template.SandboxID, metadata.IsRootfsOnly(), len(rootfsImage.Lowers), time.Since(tStart), tPing, tResolveTpl, tCred, tResolveImg, tSnapfiles, tVMMCheck, tRootfsCfg, tAcquireDev)
 
 	if options.prepareOnly {
 		created = true

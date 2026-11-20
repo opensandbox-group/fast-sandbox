@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,11 +19,83 @@ import (
 // maxKeyDocumentBytes bounds the discovery and JWKS response bodies.
 const maxKeyDocumentBytes = 1 << 20
 
+// maxKeyFetchRedirects caps redirect chains at the standard library default.
+const maxKeyFetchRedirects = 10
+
+// keyFetchCredential returns the bearer token for issuer key fetches: the
+// KeyFetchTokenEnv override, else the mounted projected ServiceAccount token.
+// Resolved per request so kubelet rotation is followed; a missing credential
+// fails closed with a directed error.
+func keyFetchCredential() (string, error) {
+	if override := strings.TrimSpace(os.Getenv(KeyFetchTokenEnv)); override != "" {
+		return override, nil
+	}
+	token, err := readKeyFetchTokenFile()
+	switch {
+	case err != nil:
+		return "", fmt.Errorf("no key-fetch credential: set %s or mount the ServiceAccount token file: %w", KeyFetchTokenEnv, err)
+	case strings.TrimSpace(token) == "":
+		return "", fmt.Errorf("no key-fetch credential: %s is empty; set %s or restore the mounted ServiceAccount token", ServiceAccountTokenFile, KeyFetchTokenEnv)
+	}
+	return strings.TrimSpace(token), nil
+}
+
+// readKeyFetchTokenFile reads the mounted projected token verbatim. It is a
+// package variable only so tests can pin the file location.
+var readKeyFetchTokenFile = func() (string, error) {
+	raw, err := os.ReadFile(ServiceAccountTokenFile)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+// authedTransport attaches the key-fetch credential to every request through
+// this client — discovery, initial JWKS, and each unknown-kid refresh alike.
+type authedTransport struct {
+	base http.RoundTripper
+}
+
+func (t authedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	credential, err := keyFetchCredential()
+	if err != nil {
+		return nil, err
+	}
+	cloned := request.Clone(request.Context())
+	cloned.Header.Set("Authorization", BearerPrefix+credential)
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(cloned)
+}
+
 // oidcDiscovery is the subset of the OIDC discovery document the verifier
 // needs.
 type oidcDiscovery struct {
 	Issuer  string `json:"issuer"`
 	JWKSURI string `json:"jwks_uri"`
+}
+
+// applyInClusterAPIServerPort rewrites the port of key-material URLs that
+// target the in-cluster apiserver service name (KUBERNETES_SERVICE_HOST
+// and KUBERNETES_SERVICE_PORT, injected into every Pod). Some managed
+// clusters expose the apiserver service on a non-443 port while the issuer
+// anchor keeps the conventional port-less form; without this rewrite the
+// discovery and JWKS fetches would target a closed port and the Fastlet
+// could never start.
+func applyInClusterAPIServerPort(raw string) string {
+	port := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_PORT"))
+	host := strings.TrimSpace(os.Getenv("KUBERNETES_SERVICE_HOST"))
+	if port == "" || port == "443" || host == "" {
+		return raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Hostname() != "kubernetes.default.svc" || parsed.Port() != "" {
+		return raw
+	}
+	parsed.Host = net.JoinHostPort(parsed.Hostname(), port)
+	return parsed.String()
 }
 
 // fetchDiscovery resolves the issuer's JWKS URI from its OIDC discovery
@@ -36,8 +109,13 @@ func fetchDiscovery(ctx context.Context, client *http.Client, issuer string) (*o
 	if err := validateKeyMaterialURL(issuer, "issuer"); err != nil {
 		return nil, err
 	}
+	// Some managed clusters expose the apiserver service on a non-443 port
+	// (advertised to Pods through KUBERNETES_SERVICE_HOST/PORT) while the
+	// issuer anchor keeps the conventional port-less form; the fetch URLs
+	// follow the advertised port or they dead-end on a closed 443.
+	discoveryURL := applyInClusterAPIServerPort(strings.TrimSuffix(issuer, "/") + "/.well-known/openid-configuration")
 	document := &oidcDiscovery{}
-	if err := fetchJSONDocument(ctx, client, strings.TrimSuffix(issuer, "/")+"/.well-known/openid-configuration", document); err != nil {
+	if err := fetchJSONDocument(ctx, client, discoveryURL, document); err != nil {
 		return nil, err
 	}
 	if document.Issuer != issuer {
@@ -53,6 +131,7 @@ func fetchDiscovery(ctx context.Context, client *http.Client, issuer string) (*o
 	if err := validateKeyMaterialURL(document.JWKSURI, "jwks_uri"); err != nil {
 		return nil, err
 	}
+	document.JWKSURI = applyInClusterAPIServerPort(document.JWKSURI)
 	return document, nil
 }
 
@@ -99,9 +178,9 @@ func fetchJSONDocument(ctx context.Context, client *http.Client, url string, tar
 
 // defaultHTTPClient builds the client for issuer key material. The trust set
 // is the system roots extended with the injected bundle (CABundleEnv) or the
-// projected pod ca.crt: a Kubernetes whose ServiceAccount issuer (or
-// discovery-served jwks_uri) is served with a publicly trusted certificate is
-// a supported deployment and must keep verifying.
+// projected pod ca.crt, so publicly trusted issuers keep verifying. Every
+// request carries the key-fetch credential: discovery is an authenticated
+// read, never anonymous.
 func defaultHTTPClient() (*http.Client, error) {
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
@@ -118,7 +197,23 @@ func defaultHTTPClient() (*http.Client, error) {
 	if found {
 		base.TLSClientConfig = &tls.Config{RootCAs: pool}
 	}
-	return &http.Client{Transport: base, Timeout: 5 * time.Second}, nil
+	// The credential is injected inside RoundTrip, below redirect handling, so
+	// every hop would re-receive it — undoing the standard library's
+	// cross-host and downgrade Authorization stripping. Refuse to leave the
+	// anchor host or scheme; the non-200 redirect fails the fetcher closed.
+	return &http.Client{
+		Transport: authedTransport{base: base},
+		Timeout:   5 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= maxKeyFetchRedirects {
+				return fmt.Errorf("stopped after %d redirects", maxKeyFetchRedirects)
+			}
+			if req.URL.Host != via[0].URL.Host || req.URL.Scheme != via[0].URL.Scheme {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}, nil
 }
 
 // injectedCABundle resolves the CA trust set: the system roots extended with

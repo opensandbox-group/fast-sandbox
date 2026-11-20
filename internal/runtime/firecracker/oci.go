@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/klog/v2"
 	"oras.land/oras-go/v2/registry"
 
 	"fast-sandbox/internal/artifacts"
@@ -157,6 +158,9 @@ func (d *Driver) attachOCI(ctx context.Context, id, image string) (rootfs, vmsta
 	if err != nil {
 		return "", "", "", fmt.Errorf("attach OCI template: %w: %s", err, output)
 	}
+	if trimmed := strings.TrimSpace(string(output)); trimmed != "" {
+		klog.InfoS("firecracker oci cli timing", "sandboxID", id, "output", trimmed)
+	}
 	var state struct {
 		Rootfs struct {
 			Path string `json:"dev_path"`
@@ -198,7 +202,9 @@ func (d *Driver) prepareOCIRestore(ctx context.Context, directory, reference str
 		return attachment, err
 	}
 	var err error
+	t0 := time.Now()
 	attachment.rootfs, attachment.vmstate, attachment.memory, err = d.attachOCI(ctx, id, reference)
+	attachDur := time.Since(t0)
 	if err != nil {
 		return attachment, err
 	}
@@ -207,15 +213,24 @@ func (d *Driver) prepareOCIRestore(ctx context.Context, directory, reference str
 			resultErr = errors.Join(resultErr, d.releaseOCI(context.Background(), id))
 		}
 	}()
+	t0 = time.Now()
 	attachment.metadata, err = readPreparedOCIMetadata(d.ociRoot(), id)
+	metaDur := time.Since(t0)
 	if err != nil {
 		return attachment, err
 	}
 	metadata := attachment.metadata
+	t0 = time.Now()
 	attachment.vmm, err = d.preparedVMM(ctx, id, metadata)
+	vmmDur := time.Since(t0)
 	if err != nil {
 		return attachment, err
 	}
+	klog.InfoS("firecracker oci prepare timing",
+		"sandboxID", id, "rootfsOnly", metadata.IsRootfsOnly(),
+		"total", time.Since(started).String(), "attachCLI", attachDur.String(),
+		"metadata", metaDur.String(), "vmmSelect", vmmDur.String(),
+	)
 
 	if err := validateOCIResumeOwner(metadata, config); err != nil {
 		return attachment, err

@@ -702,10 +702,12 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		klog.Warningf("baked guest MTU %d differs from slot MTU %d (sandbox %s, image %s); align the template or FAST_SANDBOX_NETWORK_MTU to avoid PMTU-dependent stalls",
 			guestMTU, slot.MTU, identity.SandboxUID, restoreRef)
 	}
+	applyGuestStarted := time.Now()
 	if err := manager.ApplyGuest(ctx, owner, guestIP); err != nil {
 		releaseSlot()
 		return nil, fmt.Errorf("%w: apply Firecracker guest data plane: %w", ErrNetworkUnavailable, err)
 	}
+	applyGuestDur := time.Since(applyGuestStarted)
 
 	rootfsStarted := time.Now()
 	_, rootfsSpan := observability.Start(ctx, "fastlet.firecracker.rootfs")
@@ -726,8 +728,10 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		err = d.validateRestoreCompatibility(stateRoot, restoreRef)
 	}
 	var instanceRootfs, jailRoot, apiAddress string
+	var pinKernelDur, instancePrepDur time.Duration
 	if err == nil {
 		if restoreMetadata.IsRootfsOnly() {
+			pinStarted := time.Now()
 			rootfsKernel, err = d.rootfsKernel(restoreMetadata)
 			if err == nil {
 				pinned := filepath.Join(directory, "boot-kernel")
@@ -735,6 +739,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 				rootfsKernel = pinned
 				defer os.Remove(pinned)
 			}
+			pinKernelDur = time.Since(pinStarted)
 			if err == nil && !isOCI {
 				var source string
 				source, err = resolveRootfsImage(stateRoot, restoreRef)
@@ -744,12 +749,18 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 				}
 			}
 			if err == nil {
+				prepStarted := time.Now()
 				instanceRootfs, jailRoot, apiAddress, err = d.prepareRootfsBootInstance(identity.SandboxUID, directory, ociRootfs, rootfsKernel, rootfsDriveName)
+				instancePrepDur = time.Since(prepStarted)
 			}
 		} else if isOCI {
+			prepStarted := time.Now()
 			instanceRootfs, jailRoot, apiAddress, err = d.prepareOCIInstance(identity.SandboxUID, directory, ociRootfs, vmstatePath, memoryPath)
+			instancePrepDur = time.Since(prepStarted)
 		} else {
+			prepStarted := time.Now()
 			instanceRootfs, jailRoot, apiAddress, err = d.prepareInstance(stateRoot, identity.SandboxUID, restoreRef, directory, vmstatePath, memoryPath)
+			instancePrepDur = time.Since(prepStarted)
 		}
 	}
 	observability.End(rootfsSpan, err)
@@ -831,13 +842,16 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	}
 	// Full restores execute the kernel already present in RAM, not KernelPath.
 	state.BootKernelSHA256 = restoreMetadata.Kernel.SHA256
+	var provenanceDur time.Duration
 	if restoreMetadata.IsRootfsOnly() {
+		provStarted := time.Now()
 		state.BootKernelSHA256 = bootKernelSHA256
 		if config.Desired.RootfsBootDigest != "" {
 			state.BootMachine = &restoreMetadata.Machine
 		}
 		provenance := artifacts.NewVMManifest(restoreMetadata.Machine, restoreMetadata.Kernel.Version, binaryPath, artifacts.CPUTemplateNone).Compatibility
 		state.BootCompatibility = &provenance
+		provenanceDur = time.Since(provStarted)
 	}
 	if err := saveState(directory, state); err != nil {
 		releaseSlot()
@@ -881,6 +895,8 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		LogPath:    filepath.Join(logDir, processLogName),
 		CgroupPath: cgroupPath,
 	}, slot)
+	launchExecDur := time.Since(launchStarted)
+	var waitSocketDur time.Duration
 	if err == nil {
 		state.PID = process.PID()
 		d.rememberProcess(identity.SandboxUID, process)
@@ -890,7 +906,9 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 			observability.End(launchSpan, saveErr)
 			return nil, saveErr
 		}
+		waitSockStarted := time.Now()
 		err = d.waitSocket(launchCtx, state.APIAddress, firecrackerSocketWaitTimeout)
+		waitSocketDur = time.Since(waitSockStarted)
 		if err == nil && selectedVMM != nil {
 			client := d.newClient(state.APIAddress)
 			var actual string
@@ -1013,11 +1031,16 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	}
 	klog.InfoS("firecracker sandbox created",
 		"sandboxID", identity.SandboxUID,
+		"rootfsOnly", restoreMetadata.IsRootfsOnly(),
 		"total", time.Since(createStarted).String(),
+		"ociPrepare", ociPrepareDur.String(),
 		"acquire", acquireDur.String(),
-		"rootfs", rootfsDur.String(), "rootfsMiB", fmt.Sprintf("%.1f", rootfsMiB),
+		"applyGuest", applyGuestDur.String(),
+		"rootfs", rootfsDur.String(), "pinKernel", pinKernelDur.String(), "instancePrep", instancePrepDur.String(), "rootfsMiB", fmt.Sprintf("%.1f", rootfsMiB),
 		"infra", infraDur.String(),
-		"launch", launchDur.String(),
+		"provenance", provenanceDur.String(),
+		"cgroup", cgroupSetup.String(),
+		"launch", launchDur.String(), "launchExec", launchExecDur.String(), "waitSocket", waitSocketDur.String(),
 		"configure", configureDur.String(),
 		"boot", bootDur.String(), "vmStatePolls", polls,
 	)
