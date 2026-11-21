@@ -168,10 +168,12 @@ func TestProjectSnapshotStatusReportsProducedMode(t *testing.T) {
 	status := &apiv1alpha2.SandboxSnapshotStatus{}
 	ProjectSnapshotStatus(status, apiv1alpha2.SandboxSnapshotModeRootfsOnly, &fastletapi.SnapshotStatus{
 		Phase: fastletapi.SnapshotPhaseSucceeded, Mode: fastletapi.SnapshotModeRootfsOnly,
-		ManifestRef: "oci://r.example/ns/snap@sha256:abc",
+		ManifestRef:    "oci://r.example/ns/snap@sha256:abc",
+		ArtifactDigest: "abc", ResourceLimits: &fastletapi.SandboxResourceVector{CPU: "500m", Memory: "384Mi"},
 	})
 	require.Equal(t, apiv1alpha2.SandboxSnapshotPhaseSucceeded, status.Phase)
 	require.Equal(t, apiv1alpha2.SandboxSnapshotModeRootfsOnly, status.Mode)
+	require.Equal(t, &apiv1alpha2.SnapshotResourceLimits{CPU: "500m", Memory: "384Mi"}, status.ResourceLimits)
 }
 
 func TestProjectSnapshotStatusLegacyFullObservation(t *testing.T) {

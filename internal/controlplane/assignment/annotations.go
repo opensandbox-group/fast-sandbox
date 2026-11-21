@@ -6,6 +6,7 @@ import (
 )
 
 const (
+	AnnotationRootfsBootDigest = "fast-sandbox.io/rootfs-boot-digest"
 	// SnapshotCleanupFinalizer protects published OCI artifacts until deletion succeeds.
 	SnapshotCleanupFinalizer = "sandbox.fast.io/snapshot-cleanup"
 	// AnnotationSnapshotPoolRef pins the credential scope independently of the source Sandbox.

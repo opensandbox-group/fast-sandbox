@@ -25,6 +25,12 @@ const guestMITMCertPath = "/opt/opensandbox/mitmproxy-ca-cert.pem"
 // (system store, merged bundle, NSS, JDK keystores, client env vars).
 const guestMITMTrustGate = "OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT"
 
+// guestMITMStabilizeWindow overrides execd bootstrap's default 15s CA
+// stabilization wait. Firecracker VMs bake the CA statically into the rootfs
+// rather than sharing a dynamic sidecar volume, so waiting for an egress
+// purge/re-export would stall every template build and RootfsOnly cold boot.
+const guestMITMStabilizeWindow = "MITM_CA_STABILIZE_WINDOW"
+
 // mitmCALineage is one baked certificate's public-key identity for the
 // manifest lineage (lineage.egressMitmCA.certificates[]) — fingerprints
 // only, never key or Secret material.

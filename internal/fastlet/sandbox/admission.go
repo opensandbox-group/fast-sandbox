@@ -151,6 +151,9 @@ func (m *SandboxManager) prepareCreateInput(req *fastletapi.CreateSandboxRequest
 	if failure := m.validateCreateRequest(req); failure != nil {
 		return fastletapi.EnsureSandboxInput{}, failure
 	}
+	if req.Sandbox.RootfsBootDigest != "" && (!m.supportsRootfsBootCreate() || req.Resources == nil || req.Sandbox.Restore != nil) {
+		return fastletapi.EnsureSandboxInput{}, fastletError(fastletapi.ErrorProfileMismatch, "RootfsOnly boot requires an admitted Firecracker create", false)
+	}
 	identity := req.Identity
 	if identity.RouteGeneration <= 0 {
 		identity.RouteGeneration = 1
@@ -789,6 +792,8 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit,
 			if metadata.Config.Desired.InfraRevision != m.infraRevision {
 				return fmt.Errorf("recovered Sandbox %s Infra revision does not match Fastlet", identity.SandboxUID)
 			}
+		}
+		if metadata.RecoveryRequired || (m.infraManager != nil && !terminalFailure) {
 			metadata.Phase = sandboxStateInfraPending
 		} else if m.actionManager != nil && m.actionManager.Required() && !terminalFailure {
 			metadata.Phase = sandboxStateActionPending
@@ -807,31 +812,9 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit,
 	if activeRecovered > m.capacity {
 		return fmt.Errorf("recovered %d active Sandboxes exceeds Fastlet capacity %d", activeRecovered, m.capacity)
 	}
-	publications := make([]RoutePublication, 0, len(recovered))
-	pendingInfra := false
-	for _, metadata := range recovered {
-		if metadata.Phase == sandboxStateRuntimeFailed {
-			continue
-		}
-		if m.infraManager != nil {
-			pendingInfra = true
-			continue
-		}
-		publication, err := m.routePublication(metadata)
-		if err != nil {
-			return fmt.Errorf("recover route for Sandbox %s: %w", metadata.Config.Identity.SandboxUID, err)
-		}
-		if m.routePublisher != nil {
-			publications = append(publications, publication)
-		}
-	}
-	if m.routePublisher != nil && !pendingInfra {
-		m.routeMu.Lock()
-		err := m.routePublisher.ReconcileRoutes(ctx, publications)
-		m.routeMu.Unlock()
-		if err != nil {
-			return fmt.Errorf("reconcile Fastlet Proxy routes: %w", err)
-		}
+	pendingInfra, err := m.recoverProxyRoutes(ctx, recovered)
+	if err != nil {
+		return err
 	}
 	activeImages := make([]string, 0, len(recovered))
 	for _, metadata := range recovered {
@@ -850,7 +833,7 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit,
 	m.routeReady = m.routePublisher == nil || !pendingInfra
 	m.mu.Unlock()
 	for _, metadata := range recovered {
-		if metadata.Phase == sandboxStateRuntimeFailed {
+		if metadata.Phase == sandboxStateRuntimeFailed || metadata.RecoveryRequired {
 			continue
 		}
 		m.recordActionHook(metadata, actionapi.LifecycleHookRuntimeReady, 1)
@@ -1309,4 +1292,56 @@ func createFailureWithDisposition(failure *fastletapi.FastletError, admission fa
 		disposition = fastletapi.CreateDispositionUnknown
 	}
 	return &fastletapi.CreateSandboxResponse{Disposition: disposition, Admission: admission, Error: failure}, failure
+}
+
+func (m *SandboxManager) recoverProxyRoutes(ctx context.Context, recovered map[string]*SandboxMetadata) (bool, error) {
+	publications := make([]RoutePublication, 0, len(recovered))
+	pendingInfra := false
+	for _, metadata := range recovered {
+		if metadata.Phase == sandboxStateRuntimeFailed {
+			continue
+		}
+		if metadata.RecoveryRequired {
+			if metadata.BootRecoveryPending {
+				publications = append(publications, suspendedRoutePublication(metadata.Config.Identity))
+			} else {
+				pendingInfra = true
+			}
+			continue
+		}
+		if m.infraManager != nil {
+			pendingInfra = true
+			continue
+		}
+		publication, err := m.routePublication(metadata)
+		if err != nil {
+			return false, fmt.Errorf("recover route for Sandbox %s: %w", metadata.Config.Identity.SandboxUID, err)
+		}
+		if m.routePublisher != nil {
+			publications = append(publications, publication)
+		}
+	}
+	if m.routePublisher != nil {
+		if err := m.reconcileRecoveredRoutes(ctx, pendingInfra, publications); err != nil {
+			return false, fmt.Errorf("reconcile Fastlet Proxy routes: %w", err)
+		}
+	}
+	return pendingInfra, nil
+}
+
+func (m *SandboxManager) reconcileRecoveredRoutes(ctx context.Context, pendingInfra bool, publications []RoutePublication) error {
+	m.routeMu.Lock()
+	defer m.routeMu.Unlock()
+	if !pendingInfra {
+		return m.routePublisher.ReconcileRoutes(ctx, publications)
+	}
+	// Healthy recovered routes are reconciled after their Infra is ready.
+	for _, publication := range publications {
+		if publication.Suspended {
+			if err := m.suspendRoute(ctx, publication); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

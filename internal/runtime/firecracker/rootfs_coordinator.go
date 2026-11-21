@@ -224,7 +224,7 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	if err != nil {
 		return nil, err
 	}
-	if !runtimecontract.SameRuntimeIdentity(state.Config.Identity, *input.Identity) || state.Phase != PhaseRunning {
+	if !runtimecontract.SameRuntimeIdentity(state.Config.Identity, *input.Identity) || state.Phase != PhaseRunning || state.BootRecoveryError != "" {
 		return nil, errors.New("snapshot source identity or phase changed")
 	}
 	if err = d.recoverRootfsCapture(ctx, state); err != nil {
@@ -251,8 +251,9 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	if err != nil {
 		return nil, err
 	}
-	manifest.Kernel.SHA256 = state.BootKernelSHA256
-	manifest.GuestControl.HelperVersion = caps.HelperVersion
+	if err := recordRootfsBootMetadata(&manifest, state, caps.HelperVersion); err != nil {
+		return nil, err
+	}
 	native := !strings.HasPrefix(source, "oci://")
 	device, plan, upperBytes, err := d.prepareRootfsCut(input, source, native)
 	if err != nil {
@@ -263,16 +264,9 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 		return nil, err
 	}
 	record := captureRecord{Owner: &state.Config.Identity, Incarnation: identity, Device: device.Name(), Staging: plan.staging, Request: guestcontrol.Request{Protocol: guestcontrol.Protocol, Epoch: caps.Epoch, Generation: caps.Generation + 1, OperationID: input.SnapshotID, LeaseMillis: 10000}}
-	if native {
-		record.Backend = captureBackendNative
-		record.FileDevice, record.FileInode, err = captureNativeIdentity(device)
-		if err != nil {
-			return nil, err
-		}
-	}
-	journal, err := prepareRootfsJournal(dir, record)
+	journal, err := prepareDeviceJournal(dir, &record, device, native)
 	if err != nil {
-		return nil, errors.Join(err, os.RemoveAll(plan.staging))
+		return nil, err
 	}
 	// Retain the copy and journal if recovery fails; delete only after source recovery and before publication takes ownership.
 	publicationOwned := false
@@ -297,7 +291,7 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 		return nil, err
 	}
 	// Once ownership and destination are fixed, pack/upload consume independent staging without holding the source lifecycle lock.
-	publication, err := d.prepareRootfsPublication(ctx, plan, raw, manifest, native)
+	publication, err := d.prepareRootfsPublication(ctx, plan, raw, manifest, native, state.Config.Limits)
 	if err != nil {
 		return nil, err
 	}
@@ -310,9 +304,14 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 	release()
 	release = nil
 	if native {
-		return d.publishNativeRootfs(ctx, plan, input, upperBytes)
+		result, err = d.publishNativeRootfs(ctx, plan, input, upperBytes)
+	} else {
+		result, err = d.publishPreparedOCISnapshot(ctx, plan, upperBytes, publication, input.OnPublishing)
 	}
-	return d.publishPreparedOCISnapshot(ctx, plan, upperBytes, publication, input.OnPublishing)
+	if err == nil && result != nil && (state.Config.Limits.CPU != "" || state.Config.Limits.Memory != "") {
+		result.ResourceLimits = &fastletapi.SandboxResourceVector{CPU: state.Config.Limits.CPU, Memory: state.Config.Limits.Memory}
+	}
+	return result, err
 }
 
 // ReconcileSandbox retries source recovery without accepting or publishing an
@@ -334,7 +333,30 @@ func (d *Driver) ReconcileSandbox(ctx context.Context, identity fastletapi.Sandb
 	if err != nil || dead {
 		return err
 	}
-	return d.recoverRootfsCapture(ctx, state)
+	if err := d.recoverRootfsCapture(ctx, state); err != nil || state.BootRecoveryError == "" {
+		return err
+	}
+	directory := filepath.Join(d.config.StateRoot, sandboxStateDir, identity.SandboxUID)
+	d.mu.RLock()
+	cgroups := d.runtimeCgroups
+	d.mu.RUnlock()
+	exited := cgroups != nil && cgroups.ConfirmAbsent(identity.SandboxUID) == nil
+	if cgroups == nil {
+		exited = d.recordedVMMExited(state)
+	}
+	if !exited {
+		err := d.adoptPinnedBoot(ctx, directory, state, cgroups)
+		if err == nil || state.Phase != PhaseStarting || cgroups == nil || ctx.Err() != nil {
+			return err
+		}
+		if stopErr := d.stopInterruptedStart(ctx, state, cgroups); stopErr != nil {
+			return errors.Join(err, stopErr)
+		}
+	}
+	// The manager retires the Action owner before releasing this instance.
+	state.Phase, state.PID, state.BootRecoveryError = PhaseFailed, 0, ""
+	state.FailureMessage = "rootfs VMM exited during boot recovery"
+	return saveState(directory, state)
 }
 
 func (d *Driver) recoverRootfsCapture(ctx context.Context, state *SandboxState) (resultErr error) {
@@ -394,13 +416,30 @@ func (d *Driver) recoverRootfsCapture(ctx context.Context, state *SandboxState) 
 	return d.cleanupUnpublishedCapture(ctx, state, journal)
 }
 
-// Preserve upstream extension fields; replace only the mode, state files, and file list owned by this capture.
-func marshalRootfsSnapshotManifest(source []byte, manifest artifacts.VMManifest) ([]byte, error) {
+// Record admitted quotas separately from guest hardware, dropping stale parent limits.
+func setSnapshotResourceLimits(platform map[string]json.RawMessage, limits fastletapi.SandboxRuntimeLimits) error {
+	// Legacy instances can lack recorded limits. Never replay their parent's quota.
+	if limits.CPU == "" && limits.Memory == "" {
+		delete(platform, "resourceLimits")
+		return nil
+	}
+	raw, err := json.Marshal(artifacts.VMResourceLimits{CPU: limits.CPU, Memory: limits.Memory})
+	if err == nil {
+		platform["resourceLimits"] = raw
+	}
+	return err
+}
+
+// Preserve upstream extension fields when updating metadata owned by this capture.
+func marshalRootfsSnapshotManifest(source []byte, manifest artifacts.VMManifest, limits fastletapi.SandboxRuntimeLimits) ([]byte, error) {
 	if err := manifest.Validate(); err != nil {
 		return nil, err
 	}
 	var document map[string]json.RawMessage
 	if err := json.Unmarshal(source, &document); err != nil {
+		return nil, err
+	}
+	if err := setSnapshotMachineShape(document, manifest.Machine); err != nil {
 		return nil, err
 	}
 	platform := map[string]json.RawMessage{}
@@ -410,6 +449,9 @@ func marshalRootfsSnapshotManifest(source []byte, manifest artifacts.VMManifest)
 		}
 	}
 	delete(platform, "checkpoint")
+	if err := setSnapshotResourceLimits(platform, limits); err != nil {
+		return nil, err
+	}
 	delete(platform, "stateFiles")
 	platform["snapshotMode"] = json.RawMessage(`"rootfsOnly"`)
 	if len(manifest.Platform.StateFiles) > 0 {
@@ -531,7 +573,7 @@ func (d *Driver) qualifyRootfsSource(ctx context.Context, state *SandboxState, m
 	return identity, nil
 }
 
-func writeRootfsCapturedManifest(staging string, raw []byte, manifest artifacts.VMManifest) error {
+func writeRootfsCapturedManifest(staging string, raw []byte, manifest artifacts.VMManifest, limits fastletapi.SandboxRuntimeLimits) error {
 	var err error
 	if manifest.Platform == nil {
 		manifest.Platform = &artifacts.VMPlatform{}
@@ -575,7 +617,7 @@ func writeRootfsCapturedManifest(staging string, raw []byte, manifest artifacts.
 			return err
 		}
 	}
-	metadata, err := marshalRootfsSnapshotManifest(raw, manifest)
+	metadata, err := marshalRootfsSnapshotManifest(raw, manifest, limits)
 	if err != nil {
 		return err
 	}
@@ -652,11 +694,11 @@ func (d *Driver) cleanupUnpublishedCapture(ctx context.Context, state *SandboxSt
 }
 
 // If template file or publication ownership preparation fails, the capture coordinator remains responsible for reclaiming the copy.
-func (d *Driver) prepareRootfsPublication(ctx context.Context, plan dumpPlan, raw []byte, manifest artifacts.VMManifest, native bool) (ociPublication, error) {
+func (d *Driver) prepareRootfsPublication(ctx context.Context, plan dumpPlan, raw []byte, manifest artifacts.VMManifest, native bool, limits fastletapi.SandboxRuntimeLimits) (ociPublication, error) {
 	if err := d.stageTemplateState(ctx, plan.sandboxID, plan.staging); err != nil {
 		return ociPublication{}, err
 	}
-	if err := writeRootfsCapturedManifest(plan.staging, raw, manifest); err != nil {
+	if err := writeRootfsCapturedManifest(plan.staging, raw, manifest, limits); err != nil {
 		return ociPublication{}, err
 	}
 	if native {
@@ -802,4 +844,32 @@ func validateRootfsSnapshotInput(input *runtimecontract.SnapshotInput) error {
 		return err
 	}
 	return nil
+}
+
+func recordRootfsBootMetadata(manifest *artifacts.VMManifest, state *SandboxState, helperVersion string) error {
+	if state.Config.Desired.RootfsBootDigest != "" {
+		if state.BootMachine == nil {
+			return errors.New("missing actual rootfs boot machine")
+		}
+		manifest.Machine.VCPUCount, manifest.Machine.MemoryMiB = state.BootMachine.VCPUCount, state.BootMachine.MemoryMiB
+	}
+	manifest.Kernel.SHA256 = state.BootKernelSHA256
+	manifest.GuestControl.HelperVersion = helperVersion
+	return nil
+}
+
+func prepareDeviceJournal(directory string, record *captureRecord, device *os.File, native bool) (*captureJournal, error) {
+	if native {
+		record.Backend = captureBackendNative
+		dev, inode, err := captureNativeIdentity(device)
+		if err != nil {
+			return nil, err
+		}
+		record.FileDevice, record.FileInode = dev, inode
+	}
+	journal, err := prepareRootfsJournal(directory, *record)
+	if err != nil {
+		return nil, errors.Join(err, os.RemoveAll(record.Staging))
+	}
+	return journal, nil
 }

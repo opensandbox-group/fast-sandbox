@@ -177,11 +177,7 @@ Behavior:
   the published bytes are exactly what the lineage fingerprints cover. It
   does not verify CA constraints (`BasicConstraints CA:TRUE`), so the entry
   must hold a properly issued CA certificate.
-- The builder writes the certificates into the rootfs at
-  `/opt/opensandbox/mitmproxy-ca-cert.pem` — the path the execd bootstrap
-  script watches — and sets the trust gate
-  (`OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true`, after `spec.envs`, so it
-  wins).
+- The builder writes the certificates into the rootfs at `/opt/opensandbox/mitmproxy-ca-cert.pem` — the path the execd bootstrap script watches — and sets the trust gate (`OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true`) and `MITM_CA_STABILIZE_WINDOW=0` after `spec.envs` so they win (the CA is statically baked into the VM rootfs rather than dynamically exported by a sidecar, so waiting through the default 15s stabilization window is unnecessary).
 - The builder records the baked CA's public-key identity into the manifest
   lineage (`platform.egressMitmCA`): per `CERTIFICATE` block, `certSha256`
   (SHA-256 of the certificate DER — matched byte-for-byte against the egress
@@ -223,6 +219,7 @@ Precedence: custom `probe` → execd `/ping` (when execd is injected) →
 | --- | ---: | --- | --- |
 | `output.rootfsSize` | Yes | `"30Gi"` | Logical capacity of the produced `rootfs.ext4` (Kubernetes quantity). Rounded **up** to SI GiB for oci2rootfs (`30Gi` → 33G → ~30.7 GiB sparse file) |
 | `output.format` | Yes | `overlaybd` | `native` for S3-compatible storage; `overlaybd` requires an explicit `oci://` target |
+| `output.mode` | No | `Full` | Set `RootfsOnly` with `format: native` to boot and probe a private copy of the converted filesystem, then publish the original disk without RAM or VM state. The successful build reports `status.mode: RootfsOnly`. |
 | `output.publish` | No for native; yes for OCI | platform store for native | S3-compatible target for `format: native`, e.g. `s3://sandbox-images/publish`. OverlayBD requires `oci://registry/repository` without a tag or digest (the system generates a UUID per build) and a registry credential Secret. For native output, empty defaults to the platform artifact store (`fast-sandbox-artifact-store` ConfigMap); a non-empty value must equal that store or the build fails with an `InvalidOutput` condition, so a template cannot silently publish where no node agent reads. Digest-addressed publication; the builder itself refuses to run with an empty target unless `SANDBOX_TEMPLATE_ALLOW_NO_PUBLISH=1` |
 | `output.publishSecretRef` | No | — | Name of the write-credential Secret in the template's namespace (`accessKeyId`/`secretAccessKey`/`endpoint`/`region`); the controller mounts it into the build Pod and the builder reads the keys as files (never env-injected). Without it the build relies on platform-level credentials (IRSA/node metadata). Runtime nodes read with a **separate** read-only credential — write keys never reach them |
 | `output.prime` | No | — | Reserved: seed-node cache priming after a successful build; not yet implemented |

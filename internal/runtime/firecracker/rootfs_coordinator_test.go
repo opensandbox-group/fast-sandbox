@@ -97,10 +97,11 @@ func TestRootfsSnapshotPreservesExtensionsAndDropsMemory(t *testing.T) {
 	source["files"] = map[string]any{"memory.snap": map[string]any{}}
 	source["platform"].(map[string]any)["extension"] = "keep"
 	source["platform"].(map[string]any)["checkpoint"] = map[string]any{"sandboxUID": "old"}
+	source["platform"].(map[string]any)["resourceLimits"] = map[string]string{"cpu": "4", "memory": "8Gi"}
 	raw, err = json.Marshal(source)
 	require.NoError(t, err)
 	m.Kernel.SHA256 = strings.Repeat("d", 64)
-	result, err := marshalRootfsSnapshotManifest(raw, m)
+	result, err := marshalRootfsSnapshotManifest(raw, m, fastletapi.SandboxRuntimeLimits{CPU: "500m", Memory: "256Mi"})
 	require.NoError(t, err)
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(result, &got))
@@ -113,6 +114,13 @@ func TestRootfsSnapshotPreservesExtensionsAndDropsMemory(t *testing.T) {
 	decoded, err := artifacts.DecodeVMManifest(result)
 	require.NoError(t, err)
 	require.True(t, decoded.IsRootfsOnly())
+	require.Equal(t, &artifacts.VMResourceLimits{CPU: "500m", Memory: "256Mi"}, decoded.Platform.ResourceLimits)
+	require.Equal(t, 1, decoded.Machine.VCPUCount)
+	legacy, err := marshalRootfsSnapshotManifest(raw, m, fastletapi.SandboxRuntimeLimits{})
+	require.NoError(t, err)
+	decoded, err = artifacts.DecodeVMManifest(legacy)
+	require.NoError(t, err)
+	require.Nil(t, decoded.Platform.ResourceLimits)
 }
 
 func TestRootfsPublicationRetainsOwnerAfterSourceDeletion(t *testing.T) {
@@ -178,7 +186,7 @@ func TestRootfsFailedCaptureStagingRecovery(t *testing.T) {
 			}
 			switch scenario {
 			case "prepare-failed":
-				_, err = d.prepareRootfsPublication(t.Context(), dumpPlan{sandboxID: "source", sandboxDir: directory, staging: staging}, nil, artifacts.VMManifest{}, false)
+				_, err = d.prepareRootfsPublication(t.Context(), dumpPlan{sandboxID: "source", sandboxDir: directory, staging: staging}, nil, artifacts.VMManifest{}, false, fastletapi.SandboxRuntimeLimits{})
 				require.Error(t, err)
 			case "partial-upper-live":
 				require.NoError(t, d.cleanupUnpublishedCapture(t.Context(), state, journal))
@@ -406,7 +414,7 @@ func TestNativeRootfsCapturedManifestAndReadiness(t *testing.T) {
 	raw, err := artifacts.MarshalVMManifest(m)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(staging, publishedRootfsName), []byte("disk"), 0600))
-	require.NoError(t, writeRootfsCapturedManifest(staging, raw, m))
+	require.NoError(t, writeRootfsCapturedManifest(staging, raw, m, fastletapi.SandboxRuntimeLimits{}))
 	payload, err := os.ReadFile(filepath.Join(staging, snapshotManifestName))
 	require.NoError(t, err)
 	got, err := artifacts.DecodeVMManifest(payload)

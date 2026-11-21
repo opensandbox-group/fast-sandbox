@@ -20,6 +20,7 @@ const (
 // resources travel separately and are validated against the immutable Fastlet
 // resource profile before RuntimeSandboxConfig is built.
 type SandboxDesiredSpec struct {
+	RootfsBootDigest    string            `json:"rootfsBootDigest,omitempty"`
 	Image               string            `json:"image"`
 	RuntimeProfileHash  string            `json:"runtimeProfileHash,omitempty"`
 	ResourceProfileHash string            `json:"resourceProfileHash,omitempty"`
@@ -271,6 +272,11 @@ const CapabilityRootfsOnlySnapshots = "rootfsOnlySnapshots"
 
 // CapabilityNativeRootfsOnlySnapshots marks file-backed RootfsOnly capture and S3 publication.
 const CapabilityNativeRootfsOnlySnapshots = "nativeRootfsOnlySnapshots"
+
+// CapabilityRootfsBootCreate advertises digest-pinned creates with admitted limits.
+const CapabilityRootfsBootCreate = "rootfsBootCreate"
+
+const RootfsBootCreatePath = "/api/v2/fastlet/create-rootfs"
 
 type WarmImageState struct {
 	Image   string `json:"image"`
@@ -677,13 +683,14 @@ type SnapshotSpec struct {
 // is a stable classification of a Failed task (e.g. InsufficientStorage);
 // empty for in-flight and unclassified failures.
 type SnapshotStatus struct {
-	SnapshotID     string        `json:"snapshotId,omitempty"`
-	Phase          SnapshotPhase `json:"phase"`
-	Reason         string        `json:"reason,omitempty"`
-	Message        string        `json:"message,omitempty"`
-	ManifestRef    string        `json:"manifestRef,omitempty"`
-	ArtifactDigest string        `json:"artifactDigest,omitempty"`
-	SizeBytes      int64         `json:"sizeBytes,omitempty"`
+	ResourceLimits *SandboxResourceVector `json:"resourceLimits,omitempty"`
+	SnapshotID     string                 `json:"snapshotId,omitempty"`
+	Phase          SnapshotPhase          `json:"phase"`
+	Reason         string                 `json:"reason,omitempty"`
+	Message        string                 `json:"message,omitempty"`
+	ManifestRef    string                 `json:"manifestRef,omitempty"`
+	ArtifactDigest string                 `json:"artifactDigest,omitempty"`
+	SizeBytes      int64                  `json:"sizeBytes,omitempty"`
 	// Mode is the artifact class of the task: the admitted mode while
 	// in flight, the produced artifact's mode once terminal. Empty means
 	// Full (a pre-mode Fastlet never sets it).

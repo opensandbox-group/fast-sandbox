@@ -192,8 +192,8 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 		// bare value containing $ or backticks would be expanded by sh.
 		envLines = append(envLines, fmt.Sprintf("export %s=%s", name, shellQuote(merged[name])))
 	}
-	// Bake the egress MITM CA at the bootstrap contract path; the gate line
-	// follows the merged envs so it wins over spec.envs.
+	// Bake the egress MITM CA at the bootstrap contract path; the gate and
+	// stabilization override follow the merged envs so they win over spec.envs.
 	var mitmCA []mitmCALineage
 	if spec.EgressMITMCertificate != nil {
 		lineage, err := injectEgressMITMCertificate(spec, mountPoint)
@@ -201,7 +201,10 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 			return nil, err
 		}
 		mitmCA = lineage
-		envLines = append(envLines, "export "+guestMITMTrustGate+"=true")
+		envLines = append(envLines,
+			"export "+guestMITMTrustGate+"=true",
+			"export "+guestMITMStabilizeWindow+"=0",
+		)
 	}
 	if err := os.WriteFile(filepath.Join(mountPoint, "etc", "sandbox-init.env"),
 		[]byte(strings.Join(envLines, "\n")+"\n"), 0o600); err != nil {

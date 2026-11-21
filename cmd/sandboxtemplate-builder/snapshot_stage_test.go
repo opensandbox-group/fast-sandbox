@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/guestnetwork"
 )
 
@@ -188,6 +189,15 @@ func TestSnapshotStageKeepsPipelineVMMSelection(t *testing.T) {
 // Run the production native builder stage against a disposable rootfs whose init
 // emits readiness/heartbeat markers and starts the delivered helper.
 func TestNativeSnapshotStageIntegration(t *testing.T) {
+	testNativeSnapshotStage(t, apiv1alpha2.SandboxSnapshotModeFull)
+}
+
+func TestNativeRootfsOnlyTemplateStageIntegration(t *testing.T) {
+	testNativeSnapshotStage(t, apiv1alpha2.SandboxSnapshotModeRootfsOnly)
+}
+
+func testNativeSnapshotStage(t *testing.T, mode apiv1alpha2.SandboxSnapshotMode) {
+	t.Helper()
 	rootfs := os.Getenv("FSB_TEST_NATIVE_BUILDER_ROOTFS")
 	if rootfs == "" {
 		t.Skip("requires disposable KVM builder rootfs")
@@ -203,7 +213,9 @@ func TestNativeSnapshotStageIntegration(t *testing.T) {
 	t.Setenv("PATH", work+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv(workDirEnv, work)
 	t.Setenv("FSB_GUEST_CONTROL_ENABLED", "1")
-	spec := apiv1alpha2.SandboxTemplateSpec{Machine: apiv1alpha2.MachineSpec{VCPU: "1", Memory: "256Mi"}, Output: apiv1alpha2.OutputSpec{Format: apiv1alpha2.ArtifactFormatNative}, Init: "/init"}
+	spec := apiv1alpha2.SandboxTemplateSpec{Machine: apiv1alpha2.MachineSpec{VCPU: "1", Memory: "256Mi"}, Output: apiv1alpha2.OutputSpec{Format: apiv1alpha2.ArtifactFormatNative, Mode: mode}, Init: "/init"}
+	before, err := artifacts.FileEntry(rootfs, map[string]string{})
+	require.NoError(t, err)
 	raw, err := json.Marshal(spec)
 	require.NoError(t, err)
 	t.Setenv(specEnv, string(raw))
@@ -216,4 +228,11 @@ func TestNativeSnapshotStageIntegration(t *testing.T) {
 	require.NotEmpty(t, phases.GuestControl.HelperVersion)
 	require.NotEmpty(t, phases.KernelSHA256)
 	require.Contains(t, phases.KernelCmdline, "root=/dev/vda")
+	if mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+		after, err := artifacts.FileEntry(rootfs, map[string]string{})
+		require.NoError(t, err)
+		require.Equal(t, before, after)
+		require.NoFileExists(t, filepath.Join(work, vmstateFileName))
+		require.NoFileExists(t, filepath.Join(work, memoryFileName))
+	}
 }

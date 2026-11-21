@@ -19,6 +19,7 @@ type Metadata struct {
 	// RecoveryRequired keeps a live runtime unavailable without declaring it
 	// dead or allowing destructive cleanup. Reconciliation must clear the fence.
 	RecoveryRequired       bool
+	BootRecoveryPending    bool
 	Config                 fastletapi.RuntimeSandboxConfig
 	Allocation             fastletapi.RuntimeAllocation
 	ContainerID            string
@@ -91,6 +92,7 @@ type CheckpointDelivery interface {
 
 // SnapshotResult reports the artifact set produced by one snapshot.
 type SnapshotResult struct {
+	ResourceLimits *fastletapi.SandboxResourceVector
 	// SnapshotID is the node-local identity of the snapshot; it scopes the
 	// on-disk staging directory and any cleanup.
 	SnapshotID string

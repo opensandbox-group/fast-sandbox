@@ -148,7 +148,10 @@ type SnapshotTrigger struct {
 // All fields are projections written by the control plane; the artifact
 // facts come from the fastlet that executed the snapshot.
 type SandboxSnapshotStatus struct {
-	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// ResourceLimits records the admitted limits bundled with the published artifact.
+	// +optional
+	ResourceLimits     *SnapshotResourceLimits `json:"resourceLimits,omitempty"`
+	ObservedGeneration int64                   `json:"observedGeneration,omitempty"`
 
 	// Phase is the snapshot lifecycle.
 	// +optional
@@ -213,6 +216,11 @@ type SandboxSnapshotStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+type SnapshotResourceLimits struct {
+	CPU    string `json:"cpu,omitempty"`
+	Memory string `json:"memory,omitempty"`
 }
 
 // +kubebuilder:object:root=true
