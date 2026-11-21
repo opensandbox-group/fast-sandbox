@@ -28,6 +28,7 @@ import (
 	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
+	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 	agentprotocol "fast-sandbox/internal/runtime/firecracker/agent/protocol"
 )
 
@@ -247,61 +248,70 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 		SizeBytes:      sizeBytes,
 		Mode:           fastletapi.SnapshotModeFull,
 	}
-	// A checkpoint keeps the published set in the node-local image cache: a
-	// resume that still lands on this node restores locally (~ms) instead of
+	// Keep the published set in the node-local image cache so a resume or
+	// template create that lands on this node boots locally (~ms) instead of
 	// pulling the full set back from the store (~16s per 3.5GiB). The commit
 	// is best-effort — the store copy is authoritative, and any miss (cache
-	// evicted by the image GC, or a resume on another node) falls back to the
-	// normal pull path. Template snapshots keep discarding staging; their
-	// same-node prewarm is issue #57.
+	// evicted by the image GC, a conflicting same-name template cache, or a
+	// restore on another node) falls back to the normal pull path.
+	cacheRef := input.TemplateName
 	if kind == fastletapi.SnapshotKindCheckpoint {
-		if cacheErr := d.commitCheckpointCache(result, plan.staging); cacheErr != nil {
-			klog.ErrorS(cacheErr, "checkpoint local cache commit failed; a resume will pull from the store",
-				"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "manifestRef", outcome.ManifestRef)
+		if result.ArtifactDigest != "" {
+			cacheRef = artifacts.CheckpointReference(result.ArtifactDigest)
+		} else {
+			cacheRef = ""
 		}
-	} else {
-		_ = os.RemoveAll(plan.staging)
 	}
+	if cacheErr := d.commitSnapshotCache(cacheRef, result.ArtifactDigest, plan.staging, true); cacheErr != nil {
+		klog.ErrorS(cacheErr, "snapshot local cache commit failed; subsequent restores will pull from the store",
+			"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "reference", cacheRef, "manifestRef", outcome.ManifestRef)
+	}
+	_ = os.RemoveAll(plan.staging)
 	klog.InfoS("firecracker snapshot published",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "templateName", input.TemplateName,
 		"manifestRef", outcome.ManifestRef, "sizeBytes", sizeBytes, "publish", time.Since(publishStarted).String())
 	return result, nil
 }
 
-// commitCheckpointCache moves a published checkpoint artifact set from its
-// staging directory into the node-local image cache, under the canonical
-// checkpoint reference (artifacts.CheckpointReference), in the standard cache
-// layout (rootfs.img/vmstate.snap/memory.snap/manifest.json). The set is
-// assembled in a non-digest staging subdirectory and renamed into place
-// atomically, so the image GC — which only considers 64-hex cache names —
-// observes either a complete entry or nothing at all. The staging directory
-// is consumed on every path.
-func (d *Driver) commitCheckpointCache(result *runtimecontract.SnapshotResult, staging string) error {
-	if result == nil || result.ArtifactDigest == "" {
-		return fmt.Errorf("%w: checkpoint result carries no artifact digest", ErrInvalidConfig)
+// commitSnapshotCache moves a published artifact set (Full checkpoint, Full
+// template, or native RootfsOnly template) from its staging directory into the
+// node-local image cache under reference (<stateRoot>/images/<imageKey>/),
+// using the standard cache layout (rootfs.img, manifest.json, optional
+// vmstate.snap/memory.snap for Full snapshots, and optional
+// vault.json/policy.json). The set is assembled in a non-digest staging
+// subdirectory and renamed into place atomically, so readers and the image GC
+// — which only considers 64-hex cache names — observe either a complete entry
+// or nothing at all. Callers remain responsible for removing staging.
+func (d *Driver) commitSnapshotCache(reference, artifactDigest, staging string, full bool) error {
+	if strings.TrimSpace(reference) == "" {
+		return fmt.Errorf("%w: snapshot cache reference is required", ErrInvalidConfig)
 	}
-	reference := artifacts.CheckpointReference(result.ArtifactDigest)
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	d.mu.RUnlock()
-	cacheDir := filepath.Join(stateRoot, imageCacheDir, imageKey(reference))
-	if verifyRestorableImage(stateRoot, reference) == nil {
-		// A concurrent replay already committed the identical set.
-		_ = os.RemoveAll(staging)
+	if alreadyCommittedSnapshotCache(stateRoot, reference, artifactDigest) {
 		d.touchImage(reference)
 		return nil
 	}
-	tmpDir := filepath.Join(stateRoot, imageCacheDir, ".staging-"+filepath.Base(staging))
+	imagesRoot := filepath.Join(stateRoot, imageCacheDir)
+	tmpDir := filepath.Join(imagesRoot, ".staging-"+filepath.Base(staging))
 	_ = os.RemoveAll(tmpDir)
 	if err := os.MkdirAll(tmpDir, 0o750); err != nil {
-		_ = os.RemoveAll(staging)
-		return fmt.Errorf("prepare checkpoint cache staging: %w", err)
+		return fmt.Errorf("prepare snapshot cache staging: %w", err)
 	}
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.RemoveAll(tmpDir)
+		}
+	}()
 	mappings := map[string]string{
 		publishedRootfsName:  rootfsImageName,
-		vmstateSnapshotName:  vmstateSnapshotName,
-		memorySnapshotName:   memorySnapshotName,
 		snapshotManifestName: snapshotManifestName,
+	}
+	if full {
+		mappings[vmstateSnapshotName] = vmstateSnapshotName
+		mappings[memorySnapshotName] = memorySnapshotName
 	}
 	// The vault and policy files are optional bundle members; they ride
 	// into the cache so the restore path finds them next to the snapshot
@@ -312,32 +322,71 @@ func (d *Driver) commitCheckpointCache(result *runtimecontract.SnapshotResult, s
 		if _, err := os.Stat(filepath.Join(staging, bundleName)); err == nil {
 			mappings[bundleName] = bundleName
 		} else if !errors.Is(err, os.ErrNotExist) {
-			_ = os.RemoveAll(tmpDir)
-			_ = os.RemoveAll(staging)
 			return fmt.Errorf("stat staged %s for the cache commit: %w", bundleName, err)
 		}
 	}
 	for from, to := range mappings {
-		if err := os.Rename(filepath.Join(staging, from), filepath.Join(tmpDir, to)); err != nil {
-			_ = os.RemoveAll(tmpDir)
-			_ = os.RemoveAll(staging)
-			return fmt.Errorf("stage checkpoint cache entry: %w", err)
+		dst := filepath.Join(tmpDir, to)
+		if err := os.Rename(filepath.Join(staging, from), dst); err != nil {
+			return fmt.Errorf("stage snapshot cache entry %s: %w", to, err)
+		}
+		if to != snapshotManifestName {
+			agentpull.PrepareCommittedCacheFile(dst)
 		}
 	}
+	cacheDir := filepath.Join(imagesRoot, imageKey(reference))
 	if err := os.Rename(tmpDir, cacheDir); err != nil {
-		_ = os.RemoveAll(tmpDir)
-		_ = os.RemoveAll(staging)
-		// A concurrent commit won the rename; the identical set is already
-		// addressable.
-		if verifyRestorableImage(stateRoot, reference) == nil {
+		// A concurrent commit won the rename; if it committed the identical
+		// manifest digest, the set is already addressable.
+		if alreadyCommittedSnapshotCache(stateRoot, reference, artifactDigest) {
 			d.touchImage(reference)
 			return nil
 		}
-		return fmt.Errorf("commit checkpoint cache entry: %w", err)
+		return fmt.Errorf("commit snapshot cache entry: %w", err)
 	}
-	_ = os.RemoveAll(staging)
+	cleanupTmp = false
+	recordSnapshotCacheDigests(cacheDir)
 	d.touchImage(reference)
 	return nil
+}
+
+func alreadyCommittedSnapshotCache(stateRoot, reference, artifactDigest string) bool {
+	if artifactDigest == "" {
+		return false
+	}
+	digest, ok, err := agentpull.CachedManifestDigest(stateRoot, reference)
+	if err != nil || !ok || digest != artifactDigest {
+		return false
+	}
+	return verifyRestorableImage(stateRoot, reference) == nil
+}
+
+func recordSnapshotCacheDigests(cacheDir string) {
+	payload, err := os.ReadFile(filepath.Join(cacheDir, snapshotManifestName))
+	if err != nil {
+		return
+	}
+	manifest, err := artifacts.DecodeVMManifest(payload)
+	if err != nil {
+		return
+	}
+	fileNames := map[string]string{
+		publishedRootfsName: rootfsImageName,
+		vmstateSnapshotName: vmstateSnapshotName,
+		memorySnapshotName:  memorySnapshotName,
+	}
+	for published, cached := range fileNames {
+		if entry, ok := manifest.Files[published]; ok {
+			agentpull.RecordVerifiedCacheFile(filepath.Join(cacheDir, cached), entry.SHA256)
+		}
+	}
+	if manifest.Platform != nil {
+		for _, name := range []string{vaultBundleName, policyBundleName} {
+			if entry, ok := manifest.Platform.StateFiles[name]; ok {
+				agentpull.RecordVerifiedCacheFile(filepath.Join(cacheDir, name), entry.SHA256)
+			}
+		}
+	}
 }
 
 // publishKind maps the Fastlet-side snapshot kind onto the runtime-agent's

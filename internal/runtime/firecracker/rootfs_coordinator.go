@@ -22,7 +22,6 @@ import (
 	"fast-sandbox/internal/guestcontrol"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
-	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 	"fast-sandbox/internal/ublkd"
 )
 
@@ -777,107 +776,11 @@ func (d *Driver) publishNativeRootfs(ctx context.Context, plan dumpPlan, input *
 	if err != nil {
 		return nil, err
 	}
-	if cacheErr := d.commitNativeRootfsCache(input.TemplateName, out.ArtifactDigest, plan.staging); cacheErr != nil {
+	if cacheErr := d.commitSnapshotCache(input.TemplateName, out.ArtifactDigest, plan.staging, false); cacheErr != nil {
 		klog.ErrorS(cacheErr, "native rootfs local cache commit failed; subsequent creates will pull from the store",
 			"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "templateName", input.TemplateName, "manifestRef", out.ManifestRef)
 	}
 	return &runtimecontract.SnapshotResult{SnapshotID: input.SnapshotID, ManifestRef: out.ManifestRef, ArtifactDigest: out.ArtifactDigest, SizeBytes: size, Mode: fastletapi.SnapshotModeRootfsOnly}, nil
-}
-
-// commitNativeRootfsCache moves a published native RootfsOnly template set
-// from its staging directory into the node-local image cache under reference
-// (<stateRoot>/images/<imageKey(reference)>/), using the standard cache layout
-// (rootfs.img, manifest.json, and optional vault.json/policy.json). The set is
-// assembled in a non-digest staging subdirectory and renamed into place
-// atomically so readers and image GC observe either a complete entry or
-// nothing at all.
-func (d *Driver) commitNativeRootfsCache(reference, artifactDigest, staging string) error {
-	if strings.TrimSpace(reference) == "" {
-		return fmt.Errorf("%w: native rootfs template name is required", ErrInvalidConfig)
-	}
-	d.mu.RLock()
-	stateRoot := d.config.StateRoot
-	d.mu.RUnlock()
-	if alreadyCommittedNativeCache(stateRoot, reference, artifactDigest) {
-		d.touchImage(reference)
-		return nil
-	}
-	imagesRoot := filepath.Join(stateRoot, imageCacheDir)
-	tmpDir := filepath.Join(imagesRoot, ".staging-"+filepath.Base(staging))
-	_ = os.RemoveAll(tmpDir)
-	if err := os.MkdirAll(tmpDir, 0o750); err != nil {
-		return fmt.Errorf("prepare native rootfs cache staging: %w", err)
-	}
-	cleanupTmp := true
-	defer func() {
-		if cleanupTmp {
-			_ = os.RemoveAll(tmpDir)
-		}
-	}()
-	mappings := map[string]string{
-		publishedRootfsName:  rootfsImageName,
-		snapshotManifestName: snapshotManifestName,
-	}
-	for _, bundleName := range []string{vaultBundleName, policyBundleName} {
-		if _, err := os.Stat(filepath.Join(staging, bundleName)); err == nil {
-			mappings[bundleName] = bundleName
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("stat staged %s for native cache commit: %w", bundleName, err)
-		}
-	}
-	for from, to := range mappings {
-		dst := filepath.Join(tmpDir, to)
-		if err := os.Rename(filepath.Join(staging, from), dst); err != nil {
-			return fmt.Errorf("stage native rootfs cache entry %s: %w", to, err)
-		}
-		if to != snapshotManifestName {
-			agentpull.PrepareCommittedCacheFile(dst)
-		}
-	}
-	cacheDir := filepath.Join(imagesRoot, imageKey(reference))
-	if err := os.Rename(tmpDir, cacheDir); err != nil {
-		if alreadyCommittedNativeCache(stateRoot, reference, artifactDigest) {
-			d.touchImage(reference)
-			return nil
-		}
-		return fmt.Errorf("commit native rootfs cache entry: %w", err)
-	}
-	cleanupTmp = false
-	recordNativeRootfsCacheDigests(cacheDir)
-	d.touchImage(reference)
-	return nil
-}
-
-func alreadyCommittedNativeCache(stateRoot, reference, artifactDigest string) bool {
-	if artifactDigest == "" {
-		return false
-	}
-	digest, ok, err := agentpull.CachedManifestDigest(stateRoot, reference)
-	if err != nil || !ok || digest != artifactDigest {
-		return false
-	}
-	return verifyRestorableImage(stateRoot, reference) == nil
-}
-
-func recordNativeRootfsCacheDigests(cacheDir string) {
-	payload, err := os.ReadFile(filepath.Join(cacheDir, snapshotManifestName))
-	if err != nil {
-		return
-	}
-	manifest, err := artifacts.DecodeVMManifest(payload)
-	if err != nil {
-		return
-	}
-	if rootfs, ok := manifest.Files[publishedRootfsName]; ok {
-		agentpull.RecordVerifiedCacheFile(filepath.Join(cacheDir, rootfsImageName), rootfs.SHA256)
-	}
-	if manifest.Platform != nil {
-		for _, name := range []string{vaultBundleName, policyBundleName} {
-			if entry, ok := manifest.Platform.StateFiles[name]; ok {
-				agentpull.RecordVerifiedCacheFile(filepath.Join(cacheDir, name), entry.SHA256)
-			}
-		}
-	}
 }
 
 // Resolve source ownership and capacity before acquiring filesystem protection.
