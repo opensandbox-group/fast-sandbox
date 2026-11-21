@@ -78,12 +78,72 @@ type verifiedDigestCache struct {
 	entries map[string]verifiedDigestEntry
 }
 
+// VerifiedFile binds a verified SHA-256 digest to the stat identity observed
+// on the open file descriptor that was hashed, allowing a later local cache
+// commit to prove inode continuity before prewarming the verified-digest cache.
+type VerifiedFile struct {
+	id     fileIdentity
+	sha256 string
+	valid  bool
+}
+
 var (
 	defaultVerifiedDigests = &verifiedDigestCache{entries: make(map[string]verifiedDigestEntry)}
 	// fileMatchesHashCount counts full-file SHA-256 reads performed by
 	// fileMatches (inspected by unit tests to verify cache hits).
 	fileMatchesHashCount atomic.Int64
 )
+
+// SHA256 returns the verified lowercase hex SHA-256 digest.
+func (v VerifiedFile) SHA256() string {
+	return v.sha256
+}
+
+// MatchesFile reports whether the open file descriptor still refers to the
+// exact unmodified inode (dev/ino/size/mtime/ctime) that was hashed.
+func (v VerifiedFile) MatchesFile(file *os.File) bool {
+	if !v.valid || file == nil {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	id, ok := fileIdentityFromInfo(info)
+	return ok && id == v.id
+}
+
+// HashAndTrackFile hashes path over a single open file descriptor and records
+// its stat identity before and after reading so callers can later prove inode
+// continuity across an atomic cache commit.
+func HashAndTrackFile(path string) (string, int64, VerifiedFile, error) {
+	input, err := os.Open(path)
+	if err != nil {
+		return "", 0, VerifiedFile{}, err
+	}
+	defer input.Close()
+	beforeInfo, err := input.Stat()
+	if err != nil {
+		return "", 0, VerifiedFile{}, err
+	}
+	digest := sha256.New()
+	if _, err := io.Copy(digest, input); err != nil {
+		return "", 0, VerifiedFile{}, err
+	}
+	sum := hex.EncodeToString(digest.Sum(nil))
+	afterInfo, err := input.Stat()
+	if err != nil {
+		return "", 0, VerifiedFile{}, err
+	}
+	beforeID, okBefore := fileIdentityFromInfo(beforeInfo)
+	afterID, okAfter := fileIdentityFromInfo(afterInfo)
+	tracked := VerifiedFile{sha256: sum}
+	if okBefore && okAfter && beforeID == afterID {
+		tracked.id = afterID
+		tracked.valid = true
+	}
+	return sum, afterInfo.Size(), tracked, nil
+}
 
 func (c *verifiedDigestCache) matches(path string, id fileIdentity, expected string) bool {
 	cleaned := filepath.Clean(path)
@@ -119,13 +179,15 @@ func PrepareCommittedCacheFile(path string) {
 }
 
 // RecordVerifiedCacheFile memoizes the verified SHA-256 of an immutable
-// committed cache file so subsequent ImageReady checks skip re-hashing
-// unchanged multi-GiB artifacts.
-func RecordVerifiedCacheFile(path, digest string) {
-	if digest == "" {
+// committed cache file using the stat identity of the verified open file
+// descriptor (never re-stating path by name). If a concurrent replacement
+// overwrote path between rename and recording, the entry stays bound to file's
+// inode so subsequent stat checks on the replacement miss.
+func RecordVerifiedCacheFile(path string, file *os.File, digest string) {
+	if file == nil || digest == "" {
 		return
 	}
-	info, err := os.Stat(path)
+	info, err := file.Stat()
 	if err != nil {
 		return
 	}
@@ -276,18 +338,22 @@ func stageFile(ctx context.Context, c *Client, dir, storeKey string, file native
 	if err := tmp.Chmod(cacheFileMode); err != nil {
 		return err
 	}
-	// Flush before the rename so the committed name never points at a
-	// half-written file; the deferred cleanup skips the already-closed file.
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	closed = true
+	// Keep the verified temporary file open across the rename so the
+	// post-rename stat identity is derived from its open descriptor (fstat)
+	// rather than re-stating target by name.
 	PrepareCommittedCacheFile(tmp.Name())
 	if err := os.Rename(tmp.Name(), target); err != nil {
 		return err
 	}
 	keep = true
-	RecordVerifiedCacheFile(target, sum)
+	info, statErr := tmp.Stat()
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	closed = true
+	if statErr == nil {
+		recordVerifiedFile(target, info, sum, time.Now())
+	}
 	return nil
 }
 

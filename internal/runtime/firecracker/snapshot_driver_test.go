@@ -584,14 +584,14 @@ func TestCommitSnapshotCacheFullTemplatePrewarmsAndGuardsConflicts(t *testing.T)
 	require.NoError(t, os.WriteFile(filepath.Join(staging, policyBundleName), policy, 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(staging, snapshotManifestName), payload, 0o600))
 
-	require.NoError(t, driver.commitSnapshotCache(templateName, digest, staging, true))
+	require.NoError(t, driver.commitSnapshotCache(templateName, digest, staging, true, nil))
 	require.NoError(t, verifyDeliveredImage(root, templateName, true))
 	require.Equal(t, int64(1), driver.imageUseCount[imageKey(templateName)])
 
 	// Concurrent replay with the same manifest digest succeeds idempotently.
 	stagingReplay := filepath.Join(root, snapshotStagingDir, "snap-full-replay")
 	require.NoError(t, os.MkdirAll(stagingReplay, 0o750))
-	require.NoError(t, driver.commitSnapshotCache(templateName, digest, stagingReplay, true))
+	require.NoError(t, driver.commitSnapshotCache(templateName, digest, stagingReplay, true, nil))
 	require.Equal(t, int64(2), driver.imageUseCount[imageKey(templateName)])
 
 	// A conflicting rebuild under the same templateName fails best-effort
@@ -602,10 +602,57 @@ func TestCommitSnapshotCacheFullTemplatePrewarmsAndGuardsConflicts(t *testing.T)
 	require.NoError(t, os.WriteFile(filepath.Join(stagingConflict, vmstateSnapshotName), vmstate, 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(stagingConflict, memorySnapshotName), memory, 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(stagingConflict, snapshotManifestName), payload, 0o600))
-	require.Error(t, driver.commitSnapshotCache(templateName, "different-digest", stagingConflict, true))
+	require.Error(t, driver.commitSnapshotCache(templateName, "different-digest", stagingConflict, true, nil))
 	gotRootfs, err := os.ReadFile(filepath.Join(root, imageCacheDir, imageKey(templateName), rootfsImageName))
 	require.NoError(t, err)
 	require.Equal(t, rootfs, gotRootfs)
+}
+
+// TestRecoverAndGCReclaimInterruptedSnapshotCacheStaging covers an exit after
+// moving rootfs.img into images/.staging-* and before the final directory
+// rename: both startup recovery and image GC must reclaim orphaned staging
+// entries while leaving entries held by active writers untouched.
+func TestRecoverAndGCReclaimInterruptedSnapshotCacheStaging(t *testing.T) {
+	root := t.TempDir()
+	imagesRoot := filepath.Join(root, imageCacheDir)
+	driver := &Driver{config: firecrackerConfigForTest(t, root)}
+
+	// Simulate an active writer holding its staging lock after moving rootfs.img.
+	activeDir, releaseActive, err := acquireSnapshotCacheStaging(imagesRoot, "active-snap")
+	require.NoError(t, err)
+	defer func() {
+		_ = os.RemoveAll(activeDir)
+		releaseActive()
+	}()
+	require.NoError(t, os.WriteFile(filepath.Join(activeDir, rootfsImageName), []byte("active-rootfs"), 0o600))
+
+	// Simulate a crashed writer: rootfs.img was moved into images/.staging-*
+	// before the final rename, then the process exited (lock released without
+	// deferred directory/lock cleanup).
+	crashedRecoveryDir := filepath.Join(imagesRoot, snapshotCacheStagingPrefix+"crashed-recovery")
+	require.NoError(t, os.MkdirAll(crashedRecoveryDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(crashedRecoveryDir, rootfsImageName), []byte("orphaned-rootfs"), 0o600))
+	crashedRecoveryLock := crashedRecoveryDir + snapshotCacheLockSuffix
+	require.NoError(t, os.WriteFile(crashedRecoveryLock, nil, 0o600))
+
+	// Startup recovery reclaims the orphaned entry and preserves the active writer.
+	require.NoError(t, driver.RecoverRuntimeResources(context.Background(), nil, nil))
+	require.NoDirExists(t, crashedRecoveryDir)
+	require.NoFileExists(t, crashedRecoveryLock)
+	require.FileExists(t, filepath.Join(activeDir, rootfsImageName))
+
+	// Image GC also reclaims an orphaned staging entry while skipping the active writer.
+	crashedGCDir := filepath.Join(imagesRoot, snapshotCacheStagingPrefix+"crashed-gc")
+	require.NoError(t, os.MkdirAll(crashedGCDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(crashedGCDir, rootfsImageName), []byte("orphaned-gc-rootfs"), 0o600))
+	crashedGCLock := crashedGCDir + snapshotCacheLockSuffix
+	require.NoError(t, os.WriteFile(crashedGCLock, nil, 0o600))
+
+	_, err = garbageCollectImages(root, defaultImageCacheLimitBytes, nil)
+	require.NoError(t, err)
+	require.NoDirExists(t, crashedGCDir)
+	require.NoFileExists(t, crashedGCLock)
+	require.FileExists(t, filepath.Join(activeDir, rootfsImageName))
 }
 
 // fakeStateMover plays the Handler side of the state transfers: a successful

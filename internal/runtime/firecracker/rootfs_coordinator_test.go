@@ -186,7 +186,8 @@ func TestRootfsFailedCaptureStagingRecovery(t *testing.T) {
 			}
 			switch scenario {
 			case "prepare-failed":
-				_, err = d.prepareRootfsPublication(t.Context(), dumpPlan{sandboxID: "source", sandboxDir: directory, staging: staging}, nil, artifacts.VMManifest{}, false, fastletapi.SandboxRuntimeLimits{})
+				plan := dumpPlan{sandboxID: "source", sandboxDir: directory, staging: staging}
+				_, err = d.prepareRootfsPublication(t.Context(), &plan, nil, artifacts.VMManifest{}, false, fastletapi.SandboxRuntimeLimits{})
 				require.Error(t, err)
 			case "partial-upper-live":
 				require.NoError(t, d.cleanupUnpublishedCapture(t.Context(), state, journal))
@@ -415,7 +416,8 @@ func TestNativeRootfsCapturedManifestAndReadiness(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(staging, publishedRootfsName), []byte("disk"), 0600))
 	require.NoError(t, os.WriteFile(filepath.Join(staging, policyBundleName), []byte(`{"version":1}`), 0600))
-	require.NoError(t, writeRootfsCapturedManifest(staging, raw, m, fastletapi.SandboxRuntimeLimits{}))
+	_, err = writeRootfsCapturedManifest(staging, raw, m, fastletapi.SandboxRuntimeLimits{})
+	require.NoError(t, err)
 	payload, err := os.ReadFile(filepath.Join(staging, snapshotManifestName))
 	require.NoError(t, err)
 	got, err := artifacts.DecodeVMManifest(payload)
@@ -455,7 +457,8 @@ func TestPublishNativeRootfsCommitsLocalCache(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(staging, publishedRootfsName), disk, 0o600))
 	require.NoError(t, os.WriteFile(filepath.Join(staging, policyBundleName), policy, 0o600))
-	require.NoError(t, writeRootfsCapturedManifest(staging, raw, m, fastletapi.SandboxRuntimeLimits{}))
+	verified, err := writeRootfsCapturedManifest(staging, raw, m, fastletapi.SandboxRuntimeLimits{})
+	require.NoError(t, err)
 	manifestBytes, err := os.ReadFile(filepath.Join(staging, snapshotManifestName))
 	require.NoError(t, err)
 	artifactDigest := artifacts.SHA256Of(manifestBytes)
@@ -472,7 +475,7 @@ func TestPublishNativeRootfsCommitsLocalCache(t *testing.T) {
 		newAgentClient: func(string) (AgentClient, error) { return agent, nil },
 		imageUseCount:  make(map[string]int64),
 	}
-	plan := dumpPlan{sandboxID: "sb-1", snapshotID: "snap-1", staging: staging}
+	plan := dumpPlan{sandboxID: "sb-1", snapshotID: "snap-1", staging: staging, verifiedFiles: verified}
 	input := &runtimecontract.SnapshotInput{
 		SandboxID:    "sb-1",
 		SnapshotID:   "snap-1",
@@ -507,18 +510,43 @@ func TestPublishNativeRootfsCommitsLocalCache(t *testing.T) {
 	staging2 := filepath.Join(root, "staging-snap-2")
 	require.NoError(t, os.MkdirAll(staging2, 0o700))
 	require.NoError(t, os.WriteFile(filepath.Join(staging2, publishedRootfsName), []byte("updated-disk-bytes"), 0o600))
-	require.NoError(t, writeRootfsCapturedManifest(staging2, raw, m, fastletapi.SandboxRuntimeLimits{}))
+	verified2, err := writeRootfsCapturedManifest(staging2, raw, m, fastletapi.SandboxRuntimeLimits{})
+	require.NoError(t, err)
 	manifestBytes2, err := os.ReadFile(filepath.Join(staging2, snapshotManifestName))
 	require.NoError(t, err)
 	agent.publishOut.ArtifactDigest = artifacts.SHA256Of(manifestBytes2)
 
-	res2, err := driver.publishNativeRootfs(t.Context(), dumpPlan{sandboxID: "sb-1", snapshotID: "snap-2", staging: staging2}, input, 18)
+	res2, err := driver.publishNativeRootfs(t.Context(), dumpPlan{sandboxID: "sb-1", snapshotID: "snap-2", staging: staging2, verifiedFiles: verified2}, input, 18)
 	require.NoError(t, err)
 	require.Equal(t, artifacts.SHA256Of(manifestBytes2), res2.ArtifactDigest)
 	require.NoDirExists(t, staging2)
 	existingBytes, err := os.ReadFile(cachedDisk)
 	require.NoError(t, err)
 	require.Equal(t, disk, existingBytes)
+
+	// If staged bytes are replaced between hashing and local cache commit,
+	// inode continuity fails, prewarming is skipped, and readiness rejects it.
+	templateBroken := "native-rootfs-broken-continuity"
+	staging3 := filepath.Join(root, "staging-snap-3")
+	require.NoError(t, os.MkdirAll(staging3, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(staging3, publishedRootfsName), disk, 0o600))
+	verified3, err := writeRootfsCapturedManifest(staging3, raw, m, fastletapi.SandboxRuntimeLimits{})
+	require.NoError(t, err)
+	tampered := append([]byte(nil), disk...)
+	tampered[0] ^= 0xff
+	require.NoError(t, os.WriteFile(filepath.Join(staging3, publishedRootfsName+".tmp"), tampered, 0o600))
+	require.NoError(t, os.Rename(filepath.Join(staging3, publishedRootfsName+".tmp"), filepath.Join(staging3, publishedRootfsName)))
+	manifestBytes3, err := os.ReadFile(filepath.Join(staging3, snapshotManifestName))
+	require.NoError(t, err)
+	agent.publishOut.ArtifactDigest = artifacts.SHA256Of(manifestBytes3)
+
+	_, err = driver.publishNativeRootfs(t.Context(), dumpPlan{sandboxID: "sb-1", snapshotID: "snap-3", staging: staging3, verifiedFiles: verified3}, &runtimecontract.SnapshotInput{
+		SandboxID:    "sb-1",
+		SnapshotID:   "snap-3",
+		TemplateName: templateBroken,
+	}, int64(len(disk)))
+	require.NoError(t, err)
+	require.ErrorIs(t, verifyDeliveredImage(root, templateBroken, true), ErrImageNotReady)
 }
 
 func TestNativeQualificationUsesSelectedVMMWithoutOverlayBDBundle(t *testing.T) {

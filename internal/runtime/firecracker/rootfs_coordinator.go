@@ -22,6 +22,7 @@ import (
 	"fast-sandbox/internal/guestcontrol"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
+	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 	"fast-sandbox/internal/ublkd"
 )
 
@@ -293,7 +294,7 @@ func (d *Driver) createRootfsSnapshot(ctx context.Context, input *runtimecontrac
 		return nil, err
 	}
 	// Once ownership and destination are fixed, pack/upload consume independent staging without holding the source lifecycle lock.
-	publication, err := d.prepareRootfsPublication(ctx, plan, raw, manifest, native, state.Config.Limits)
+	publication, err := d.prepareRootfsPublication(ctx, &plan, raw, manifest, native, state.Config.Limits)
 	if err != nil {
 		return nil, err
 	}
@@ -575,7 +576,7 @@ func (d *Driver) qualifyRootfsSource(ctx context.Context, state *SandboxState, m
 	return identity, nil
 }
 
-func writeRootfsCapturedManifest(staging string, raw []byte, manifest artifacts.VMManifest, limits fastletapi.SandboxRuntimeLimits) error {
+func writeRootfsCapturedManifest(staging string, raw []byte, manifest artifacts.VMManifest, limits fastletapi.SandboxRuntimeLimits) (map[string]agentpull.VerifiedFile, error) {
 	var err error
 	if manifest.Platform == nil {
 		manifest.Platform = &artifacts.VMPlatform{}
@@ -586,27 +587,36 @@ func writeRootfsCapturedManifest(staging string, raw []byte, manifest artifacts.
 	manifest.Files = nil
 	// A native cut owns an entire disk file; OCI cuts own upper metadata instead.
 	hashCache := map[string]string{}
-	if _, err := os.Stat(filepath.Join(staging, publishedRootfsName)); err == nil {
-		entry, err := artifacts.FileEntry(filepath.Join(staging, publishedRootfsName), hashCache)
+	verified := map[string]agentpull.VerifiedFile{}
+	rootfsPath := filepath.Join(staging, publishedRootfsName)
+	if _, err := os.Stat(rootfsPath); err == nil {
+		sum, size, tracked, err := agentpull.HashAndTrackFile(rootfsPath)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		manifest.Files = map[string]artifacts.ManifestFile{publishedRootfsName: entry}
+		hashCache[rootfsPath] = sum
+		verified[publishedRootfsName] = tracked
+		manifest.Files = map[string]artifacts.ManifestFile{
+			publishedRootfsName: {SHA256: sum, SizeBytes: size},
+		}
 	} else if !os.IsNotExist(err) {
-		return err
+		return nil, err
 	}
 	for _, name := range []string{vaultBundleName, policyBundleName} {
-		if _, e := os.Stat(filepath.Join(staging, name)); e == nil {
-			entry, e := artifacts.FileEntry(filepath.Join(staging, name), hashCache)
+		bundlePath := filepath.Join(staging, name)
+		if _, e := os.Stat(bundlePath); e == nil {
+			sum, size, tracked, e := agentpull.HashAndTrackFile(bundlePath)
 			if e != nil {
-				return e
+				return nil, e
 			}
+			hashCache[bundlePath] = sum
+			verified[name] = tracked
 			if manifest.Platform.StateFiles == nil {
 				manifest.Platform.StateFiles = map[string]artifacts.ManifestFile{}
 			}
-			manifest.Platform.StateFiles[name] = entry
+			manifest.Platform.StateFiles[name] = artifacts.ManifestFile{SHA256: sum, SizeBytes: size}
 		} else if !os.IsNotExist(e) {
-			return e
+			return nil, e
 		}
 	}
 	if len(manifest.Files) > 0 {
@@ -617,17 +627,17 @@ func writeRootfsCapturedManifest(staging string, raw []byte, manifest artifacts.
 			}
 		}
 		if err := artifacts.WriteSHA256SUMS(staging, names, hashCache); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	metadata, err := marshalRootfsSnapshotManifest(raw, manifest, limits)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err = os.WriteFile(filepath.Join(staging, snapshotManifestName), metadata, 0600); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return verified, nil
 }
 
 func (d *Driver) readRootfsCaptureManifest(state *SandboxState) ([]byte, artifacts.VMManifest, string, error) {
@@ -697,17 +707,19 @@ func (d *Driver) cleanupUnpublishedCapture(ctx context.Context, state *SandboxSt
 }
 
 // If template file or publication ownership preparation fails, the capture coordinator remains responsible for reclaiming the copy.
-func (d *Driver) prepareRootfsPublication(ctx context.Context, plan dumpPlan, raw []byte, manifest artifacts.VMManifest, native bool, limits fastletapi.SandboxRuntimeLimits) (ociPublication, error) {
+func (d *Driver) prepareRootfsPublication(ctx context.Context, plan *dumpPlan, raw []byte, manifest artifacts.VMManifest, native bool, limits fastletapi.SandboxRuntimeLimits) (ociPublication, error) {
 	if err := d.stageTemplateState(ctx, plan.sandboxID, plan.staging); err != nil {
 		return ociPublication{}, err
 	}
-	if err := writeRootfsCapturedManifest(plan.staging, raw, manifest, limits); err != nil {
+	verified, err := writeRootfsCapturedManifest(plan.staging, raw, manifest, limits)
+	if err != nil {
 		return ociPublication{}, err
 	}
+	plan.verifiedFiles = verified
 	if native {
 		return ociPublication{}, nil
 	}
-	return prepareOCIPublication(plan)
+	return prepareOCIPublication(*plan)
 }
 
 func qualifyBootKernel(actual, qualified string) error {
@@ -776,7 +788,7 @@ func (d *Driver) publishNativeRootfs(ctx context.Context, plan dumpPlan, input *
 	if err != nil {
 		return nil, err
 	}
-	if cacheErr := d.commitSnapshotCache(input.TemplateName, out.ArtifactDigest, plan.staging, false); cacheErr != nil {
+	if cacheErr := d.commitSnapshotCache(input.TemplateName, out.ArtifactDigest, plan.staging, false, plan.verifiedFiles); cacheErr != nil {
 		klog.ErrorS(cacheErr, "native rootfs local cache commit failed; subsequent creates will pull from the store",
 			"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "templateName", input.TemplateName, "manifestRef", out.ManifestRef)
 	}

@@ -140,17 +140,68 @@ func TestFileMatchesVerifiedDigestCache(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, match, "same-size in-place corruption must invalidate verified digest cache")
 
-	// RecordVerifiedCacheFile pre-warms the cache after a verified write
-	// (such as stageFile or local cache commit) so the very first check hits.
-	tmp := path + ".replacement"
-	require.NoError(t, os.WriteFile(tmp, content, cacheFileMode))
-	PrepareCommittedCacheFile(tmp)
-	require.NoError(t, os.Rename(tmp, path))
-	RecordVerifiedCacheFile(path, file.sha256)
+	// RecordVerifiedCacheFile pre-warms the cache from the verified open
+	// descriptor after rename so the very first check hits without hashing.
+	tmpFile, err := os.Create(path + ".replacement")
+	require.NoError(t, err)
+	_, err = tmpFile.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, tmpFile.Chmod(cacheFileMode))
+	PrepareCommittedCacheFile(tmpFile.Name())
+	require.NoError(t, os.Rename(tmpFile.Name(), path))
+	RecordVerifiedCacheFile(path, tmpFile, file.sha256)
+	require.NoError(t, tmpFile.Close())
 
 	before = fileMatchesHashCount.Load()
 	match, err = fileMatches(path, file)
 	require.NoError(t, err)
 	require.True(t, match)
 	require.Equal(t, before, fileMatchesHashCount.Load(), "pre-recorded committed file must hit without hashing")
+}
+
+// TestRecordVerifiedCacheFileInterleavedReplacementNeverHits verifies that
+// interleaving a same-size replacement between rename and digest recording
+// cannot bind the old SHA to the replacement inode.
+func TestRecordVerifiedCacheFileInterleavedReplacementNeverHits(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "rootfs.img")
+	contentA := bytes.Repeat([]byte{0xaa}, 64<<10)
+	contentB := bytes.Repeat([]byte{0xbb}, 64<<10)
+	fileA := nativeFile{publish: "rootfs.ext4", cache: "rootfs.img", sha256: sha256Hex(contentA), sizeBytes: int64(len(contentA))}
+	fileB := nativeFile{publish: "rootfs.ext4", cache: "rootfs.img", sha256: sha256Hex(contentB), sizeBytes: int64(len(contentB))}
+
+	// Writer A stages and renames inode A into target while keeping its fd open.
+	tmpA, err := os.Create(filepath.Join(dir, "rootfs.tmp-a"))
+	require.NoError(t, err)
+	defer tmpA.Close()
+	_, err = tmpA.Write(contentA)
+	require.NoError(t, err)
+	PrepareCommittedCacheFile(tmpA.Name())
+	require.NoError(t, os.Rename(tmpA.Name(), target))
+
+	// Writer B concurrently replaces target with a same-size inode B before
+	// Writer A records its verified digest.
+	tmpB, err := os.Create(filepath.Join(dir, "rootfs.tmp-b"))
+	require.NoError(t, err)
+	_, err = tmpB.Write(contentB)
+	require.NoError(t, err)
+	PrepareCommittedCacheFile(tmpB.Name())
+	require.NoError(t, os.Rename(tmpB.Name(), target))
+	require.NoError(t, tmpB.Close())
+
+	// Writer A records against its own verified open fd (inode A).
+	RecordVerifiedCacheFile(target, tmpA, fileA.sha256)
+
+	// Target currently holds inode B, so checking against manifest A must miss
+	// the cache, hash inode B, and reject it.
+	before := fileMatchesHashCount.Load()
+	match, err := fileMatches(target, fileA)
+	require.NoError(t, err)
+	require.False(t, match, "replacement inode B must never hit cached digest for A")
+	require.Equal(t, before+1, fileMatchesHashCount.Load())
+
+	// Checking against manifest B succeeds.
+	match, err = fileMatches(target, fileB)
+	require.NoError(t, err)
+	require.True(t, match)
 }
