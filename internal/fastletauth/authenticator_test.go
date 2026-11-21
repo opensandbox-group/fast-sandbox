@@ -7,6 +7,10 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +35,22 @@ func newTestAuthenticatorWithInterval(t *testing.T, issuer *fastletauthtest.Issu
 	authenticator, err := NewAuthenticator(issuer.URL(), Audience, subjects, nil, WithRefreshInterval(refreshInterval))
 	require.NoError(t, err)
 	return authenticator
+}
+
+func TestSameOriginKeysRejectsCrossOriginBeforeFetch(t *testing.T) {
+	var fetched atomic.Bool
+	keys := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fetched.Store(true)
+		_, _ = w.Write([]byte(`{"keys":[]}`))
+	}))
+	defer keys.Close()
+	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"issuer": "http://" + r.Host, "jwks_uri": keys.URL})
+	}))
+	defer issuer.Close()
+	_, err := NewAuthenticator(issuer.URL, Audience, nil, issuer.Client(), WithSameOriginKeys())
+	require.ErrorContains(t, err, "trusted issuer origin")
+	require.False(t, fetched.Load())
 }
 
 func TestAuthenticateAcceptsRS256Token(t *testing.T) {

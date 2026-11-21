@@ -1,0 +1,239 @@
+package fastpath
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	pb "fast-sandbox/api/proto/v2"
+	"fast-sandbox/internal/fastletauth"
+	"github.com/golang-jwt/jwt/v5"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/klog/v2"
+)
+
+const CallerAudience = "fast-sandbox-fastpath"
+
+type CallerGrant struct {
+	Subject    string   `json:"subject"`
+	Profile    string   `json:"profile"`
+	Namespaces []string `json:"namespaces"`
+}
+
+func LoadCallerPolicy(path string) ([]CallerGrant, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	decoder := json.NewDecoder(io.LimitReader(file, 1<<20))
+	decoder.DisallowUnknownFields()
+	var grants []CallerGrant
+	if err := decoder.Decode(&grants); err != nil {
+		return nil, err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return nil, fmt.Errorf("unexpected trailing caller policy data")
+	}
+	return grants, nil
+}
+
+type CallerAuthenticator struct {
+	policy     map[string]CallerGrant
+	create     func() (*fastletauth.Authenticator, error)
+	mu         sync.Mutex
+	verifier   *fastletauth.Authenticator
+	loaded     time.Time
+	retry      time.Time
+	refreshing bool
+	now        func() time.Time
+}
+
+func NewCallerAuthenticator(issuer string, grants []CallerGrant, client *http.Client) (*CallerAuthenticator, error) {
+	if len(grants) == 0 {
+		return nil, fmt.Errorf("FastPath caller policy must not be empty")
+	}
+	policy := make(map[string]CallerGrant)
+	subjects := make([]string, 0, len(grants))
+	for _, grant := range grants {
+		parts := strings.Split(grant.Subject, ":")
+		if len(parts) != 4 || parts[0] != "system" || parts[1] != "serviceaccount" || len(validation.IsDNS1123Label(parts[2])) != 0 || len(validation.IsDNS1123Subdomain(parts[3])) != 0 {
+			return nil, fmt.Errorf("invalid FastPath caller subject")
+		}
+		if grant.Profile != "server" && grant.Profile != "gateway" {
+			return nil, fmt.Errorf("invalid FastPath caller profile")
+		}
+		if len(grant.Namespaces) == 0 {
+			return nil, fmt.Errorf("caller namespace scope is required")
+		}
+		for _, ns := range grant.Namespaces {
+			if ns != "*" && len(validation.IsDNS1123Label(ns)) != 0 {
+				return nil, fmt.Errorf("invalid caller namespace scope")
+			}
+		}
+		if _, duplicate := policy[grant.Subject]; duplicate {
+			return nil, fmt.Errorf("duplicate caller subject")
+		}
+		grant.Namespaces = append([]string(nil), grant.Namespaces...)
+		policy[grant.Subject] = grant
+		subjects = append(subjects, grant.Subject)
+	}
+	a := &CallerAuthenticator{policy: policy, now: time.Now}
+	a.create = func() (*fastletauth.Authenticator, error) {
+		return fastletauth.NewAuthenticator(issuer, CallerAudience, subjects, client, fastletauth.WithSameOriginKeys())
+	}
+	verifier, err := a.create()
+	if err != nil {
+		return nil, err
+	}
+	a.verifier, a.loaded = verifier, a.now()
+	return a, nil
+}
+
+func (a *CallerAuthenticator) current() (*fastletauth.Authenticator, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := a.now()
+	if now.Sub(a.loaded) >= 5*time.Minute && !a.refreshing && !now.Before(a.retry) {
+		a.refreshing = true
+		go func() {
+			next, err := a.create()
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			a.refreshing = false
+			a.retry = a.now().Add(30 * time.Second)
+			if err == nil {
+				a.verifier, a.loaded = next, a.now()
+			} else {
+				klog.ErrorS(err, "FastPath caller key refresh failed")
+			}
+		}()
+	}
+	if now.Sub(a.loaded) >= 15*time.Minute {
+		return nil, status.Error(codes.Unavailable, "FastPath verification keys unavailable")
+	}
+	return a.verifier, nil
+}
+
+func (a *CallerAuthenticator) authenticate(ctx context.Context) (string, error) {
+	md, _ := metadata.FromIncomingContext(ctx)
+	values := md.Get("authorization")
+	if len(values) != 1 || !strings.HasPrefix(values[0], "Bearer ") || len(values[0]) > 16384 {
+		return "", status.Error(codes.Unauthenticated, "one FastPath bearer credential is required")
+	}
+	raw := strings.TrimPrefix(values[0], "Bearer ")
+	claims := jwt.MapClaims{}
+	if _, _, err := jwt.NewParser().ParseUnverified(raw, claims); err != nil {
+		return "", status.Error(codes.Unauthenticated, "invalid caller token")
+	}
+	if err := validateCallerClaims(claims, a.now()); err != nil {
+		return "", err
+	}
+	verifier, err := a.current()
+	if err != nil {
+		return "", err
+	}
+	subject, err := verifier.Authenticate(ctx, raw)
+	switch {
+	case errors.Is(err, fastletauth.ErrUnauthorized):
+		return "", status.Error(codes.PermissionDenied, "FastPath caller is not allowed")
+	case errors.Is(err, fastletauth.ErrUnavailable):
+		return "", status.Error(codes.Unavailable, "FastPath caller verification unavailable")
+	case err != nil:
+		return "", status.Error(codes.Unauthenticated, "invalid caller token")
+	}
+	return subject, nil
+}
+
+func validateCallerClaims(claims jwt.MapClaims, now time.Time) error {
+	issued, iok := claims["iat"].(float64)
+	expires, eok := claims["exp"].(float64)
+	current := float64(now.UnixNano()) / 1e9
+	if !iok || !eok || expires <= issued || expires-issued > 3600 || issued > current+30 || current >= expires {
+		return status.Error(codes.Unauthenticated, "caller token must have a valid lifetime of at most one hour")
+	}
+	audience, err := claims.GetAudience()
+	if err != nil || len(audience) != 1 || audience[0] != CallerAudience {
+		return status.Error(codes.Unauthenticated, "invalid caller token audience")
+	}
+	return nil
+}
+
+type callerSubjectKey struct{}
+
+func (a *CallerAuthenticator) UnaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	subject, err := a.authenticate(ctx)
+	if err != nil {
+		return nil, err
+	}
+	method, namespace := callerTarget(req)
+	grant := a.policy[subject]
+	allowedMethod := method != "" && info.FullMethod == "/fastpath.v2.FastPathService/"+method
+	if grant.Profile == "gateway" {
+		allowedMethod = allowedMethod && (method == "ResolveEndpoint" || method == "GetSandbox" || method == "ResumeSandbox")
+	}
+	allowedNamespace := false
+	for _, ns := range grant.Namespaces {
+		if namespace != "" && (ns == "*" || ns == namespace) {
+			allowedNamespace = true
+		}
+	}
+	if !allowedMethod || !allowedNamespace {
+		klog.InfoS("FastPath caller denied", "subject", subject, "method", info.FullMethod, "namespace", namespace)
+		return nil, status.Error(codes.PermissionDenied, "FastPath RPC or namespace is not allowed")
+	}
+	return handler(context.WithValue(ctx, callerSubjectKey{}, subject), req)
+}
+
+func (a *CallerAuthenticator) StreamInterceptor(_ any, _ grpc.ServerStream, _ *grpc.StreamServerInfo, _ grpc.StreamHandler) error {
+	return status.Error(codes.PermissionDenied, "FastPath streaming RPC has no caller policy")
+}
+
+func callerTarget(req any) (string, string) {
+	switch r := req.(type) {
+	case *pb.CreateSandboxRequest:
+		return "CreateSandbox", r.GetNamespace()
+	case *pb.GetSandboxRequest:
+		return "GetSandbox", r.GetSandbox().GetNamespacedName().GetNamespace()
+	case *pb.DeleteRequest:
+		return "DeleteSandbox", r.GetSandbox().GetNamespacedName().GetNamespace()
+	case *pb.UpdateSandboxRequest:
+		return "UpdateSandbox", r.GetSandbox().GetNamespacedName().GetNamespace()
+	case *pb.ListSandboxesRequest:
+		return "ListSandboxes", r.GetNamespace()
+	case *pb.SandboxDiagnosticsRequest:
+		return "GetSandboxDiagnostics", r.GetNamespace()
+	case *pb.ResolveEndpointRequest:
+		return "ResolveEndpoint", r.GetSandbox().GetNamespacedName().GetNamespace()
+	case *pb.GetPoolRequest:
+		return "GetPool", r.GetNamespace()
+	case *pb.ListPoolsRequest:
+		return "ListPools", r.GetNamespace()
+	case *pb.CreateSandboxSnapshotRequest:
+		return "CreateSandboxSnapshot", r.GetSandbox().GetNamespacedName().GetNamespace()
+	case *pb.GetSandboxSnapshotRequest:
+		return "GetSandboxSnapshot", r.GetSnapshot().GetNamespace()
+	case *pb.DeleteSandboxSnapshotRequest:
+		return "DeleteSandboxSnapshot", r.GetSnapshot().GetNamespacedName().GetNamespace()
+	case *pb.PauseSandboxRequest:
+		return "PauseSandbox", r.GetSandbox().GetNamespacedName().GetNamespace()
+	case *pb.ResumeSandboxRequest:
+		return "ResumeSandbox", r.GetSandbox().GetNamespacedName().GetNamespace()
+	case *pb.InvokeHandlerActionRequest:
+		return "InvokeHandlerAction", r.GetSandbox().GetNamespacedName().GetNamespace()
+	default:
+		return "", ""
+	}
+}

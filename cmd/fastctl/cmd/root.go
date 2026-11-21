@@ -2,15 +2,23 @@ package cmd
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
+	"fast-sandbox/internal/fastletauth"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 
 	fastpathv2 "fast-sandbox/api/proto/v2"
@@ -23,10 +31,11 @@ const (
 )
 
 var (
-	cfgFile       string
-	endpoint      string
-	namespace     string
-	proxyEndpoint string
+	cfgFile                                                                 string
+	endpoint                                                                string
+	namespace                                                               string
+	proxyEndpoint                                                           string
+	kubeconfig, authNamespace, authServiceAccount, tlsCAFile, tlsServerName string
 
 	// traceShutdown terminates the OTLP exporter installed by Execute.
 	// Command failure paths use it so spans are not lost on os.Exit.
@@ -85,6 +94,11 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&namespace, "namespace", "n", "fast-sandbox", "Kubernetes resource namespace")
 	rootCmd.PersistentFlags().StringVar(&proxyEndpoint, "proxy-endpoint", "", "Override the Sandbox Proxy authority (env: "+sandboxProxyEndpointEnv+")")
 
+	rootCmd.PersistentFlags().StringVar(&kubeconfig, "kubeconfig", "", "Kubernetes bootstrap kubeconfig (default loading rules when empty)")
+	rootCmd.PersistentFlags().StringVar(&authNamespace, "auth-namespace", "fast-sandbox-system", "FastPath caller ServiceAccount namespace")
+	rootCmd.PersistentFlags().StringVar(&authServiceAccount, "auth-service-account", "opensandbox-server-fastpath-client", "Authentication-only FastPath caller ServiceAccount")
+	rootCmd.PersistentFlags().StringVar(&tlsCAFile, "tls-ca-file", "", "FastPath serving CA PEM bundle (empty uses system roots)")
+	rootCmd.PersistentFlags().StringVar(&tlsServerName, "tls-server-name", "", "Expected serving certificate DNS name (empty uses endpoint hostname)")
 	mustBindConfigSources(viper.GetViper(), rootCmd.PersistentFlags())
 }
 
@@ -145,8 +159,36 @@ func defaultClientFactory() (fastpathv2.FastPathServiceClient, *grpc.ClientConn,
 	ep := viper.GetString("endpoint")
 	klog.V(4).InfoS("creating gRPC client connection", "endpoint", ep)
 
-	conn, err := grpc.Dial(ep,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
+	rules.ExplicitPath = kubeconfig
+	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, &clientcmd.ConfigOverrides{}).ClientConfig()
+	if err != nil {
+		return nil, nil, fmt.Errorf("load Kubernetes bootstrap credentials: %w", err)
+	}
+	if config.Insecure || !strings.HasPrefix(config.Host, "https://") {
+		return nil, nil, fmt.Errorf("FastPath TokenRequest requires verified Kubernetes API TLS")
+	}
+	api, err := corev1.NewForConfig(config)
+	if err != nil {
+		return nil, nil, err
+	}
+	source := fastletauth.NewTokenRequestSource(func(ctx context.Context, ns, name string, request *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
+		return api.ServiceAccounts(ns).CreateToken(ctx, name, request, metav1.CreateOptions{})
+	}, fastletauth.PodServiceAccountIdentity{Namespace: authNamespace, ServiceAccount: authServiceAccount}, "fast-sandbox-fastpath")
+	var roots *x509.CertPool
+	if tlsCAFile != "" {
+		pem, err := os.ReadFile(tlsCAFile)
+		if err != nil {
+			return nil, nil, err
+		}
+		roots = x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(pem) {
+			return nil, nil, fmt.Errorf("FastPath CA bundle contains no certificates")
+		}
+	}
+	conn, err := grpc.NewClient(ep,
+		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: tlsServerName})),
+		grpc.WithPerRPCCredentials(callerCredentials{source}),
 		grpc.WithUnaryInterceptor(observability.UnaryClientInterceptor("fastctl")),
 	)
 	if err != nil {
@@ -156,6 +198,20 @@ func defaultClientFactory() (fastpathv2.FastPathServiceClient, *grpc.ClientConn,
 	klog.V(4).InfoS("successfully connected to gRPC endpoint", "endpoint", ep)
 	return fastpathv2.NewFastPathServiceClient(conn), conn, nil
 }
+
+type callerCredentials struct {
+	source *fastletauth.TokenRequestSource
+}
+
+func (c callerCredentials) GetRequestMetadata(ctx context.Context, _ ...string) (map[string]string, error) {
+	token, err := c.source.Token(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("FastPath caller TokenRequest failed; check bootstrap credentials and caller RBAC")
+	}
+	return map[string]string{"authorization": "Bearer " + token}, nil
+}
+
+func (callerCredentials) RequireTransportSecurity() bool { return true }
 
 func getClient() (fastpathv2.FastPathServiceClient, *grpc.ClientConn) {
 	client, conn, err := clientFactory()

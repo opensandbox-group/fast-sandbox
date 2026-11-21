@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -90,6 +91,11 @@ type cachedVerdict struct {
 
 type authenticatorOptions struct {
 	refreshInterval time.Duration
+	sameOrigin      bool
+}
+
+func WithSameOriginKeys() AuthenticatorOption {
+	return func(o *authenticatorOptions) { o.sameOrigin = true }
 }
 
 // AuthenticatorOption customizes the authenticator at construction.
@@ -135,6 +141,13 @@ func NewAuthenticator(issuer, audience string, allowedSubjects []string, httpCli
 	discovery, err := fetchDiscovery(context.Background(), httpClient, issuer)
 	if err != nil {
 		return nil, err
+	}
+	if options.sameOrigin {
+		anchor, _ := url.Parse(applyInClusterAPIServerPort(issuer))
+		keys, _ := url.Parse(discovery.JWKSURI)
+		if anchor.Host != keys.Host || anchor.Scheme != keys.Scheme {
+			return nil, fmt.Errorf("issuer keys must use the trusted issuer origin")
+		}
 	}
 	// No RefreshInterval: no background goroutine — keys refresh only on an
 	// unknown signing key, rate-limited below.
