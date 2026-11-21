@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -182,13 +181,6 @@ func prepareInstanceRootfs(stateRoot, image, instanceDir string) (string, error)
 		return "", err
 	}
 	return target, nil
-}
-
-// reflinkOnly attempts a metadata-only CoW clone of source to target. It
-// never falls back to a full copy: callers that need consistency (e.g. the
-// snapshot rootfs clone) decide where a non-atomic full copy may run.
-func reflinkOnly(source, target string) error {
-	return exec.Command("cp", "--reflink=always", source, target).Run()
 }
 
 // copyReflinkOrCopy attempts a CoW reflink copy and falls back to a plain

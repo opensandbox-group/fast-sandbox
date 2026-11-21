@@ -228,7 +228,9 @@ func (s *Service) manifestDigestFor(image string) string {
 }
 
 // ensureImage pulls the image unless the cache already holds a committed
-// pull. A missing published index maps to ErrImageNotReady for the driver.
+// pull. PullImage stream-verifies every artifact before writing manifest.json
+// as the commit point, so the post-pull check verifies the committed manifest
+// instead of re-hashing multi-GiB artifacts a second time.
 func (s *Service) ensureImage(ctx context.Context, image string) error {
 	ready, err := agentpull.ImageReady(s.stateRoot, image)
 	if err != nil {
@@ -240,11 +242,9 @@ func (s *Service) ensureImage(ctx context.Context, image string) error {
 	if err := s.pull.PullImage(ctx, s.stateRoot, image); err != nil {
 		return err
 	}
-	ready, err = agentpull.ImageReady(s.stateRoot, image)
-	if err != nil {
+	if _, ok, err := agentpull.CachedManifestDigest(s.stateRoot, image); err != nil {
 		return err
-	}
-	if !ready {
+	} else if !ok {
 		return fmt.Errorf("%w: %q", runtimecontract.ErrImageNotReady, image)
 	}
 	return nil
@@ -264,11 +264,9 @@ func (s *Service) ensureCheckpoint(ctx context.Context, reference, manifestRef, 
 	if err := s.pull.PullCheckpoint(ctx, s.stateRoot, reference, manifestRef, artifactDigest); err != nil {
 		return err
 	}
-	ready, err = agentpull.ImageReady(s.stateRoot, reference)
-	if err != nil {
+	if _, ok, err := agentpull.CachedManifestDigest(s.stateRoot, reference); err != nil {
 		return err
-	}
-	if !ready {
+	} else if !ok {
 		return fmt.Errorf("%w: checkpoint %q", runtimecontract.ErrImageNotReady, reference)
 	}
 	return nil

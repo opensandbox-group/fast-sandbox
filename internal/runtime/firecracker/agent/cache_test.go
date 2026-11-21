@@ -93,3 +93,64 @@ func TestCacheComplete(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, complete)
 }
+
+func TestFileMatchesVerifiedDigestCache(t *testing.T) {
+	content := bytes.Repeat([]byte{0x5a}, 64<<10)
+	file := nativeFile{publish: "rootfs.ext4", cache: "rootfs.img", sha256: sha256Hex(content), sizeBytes: int64(len(content))}
+	path := filepath.Join(t.TempDir(), "rootfs.img")
+
+	// A freshly written file whose mtime has not settled past the coarse-tick
+	// guard is not memoized, so immediate same-tick mutations cannot hide.
+	require.NoError(t, os.WriteFile(path, content, cacheFileMode))
+	before := fileMatchesHashCount.Load()
+	match, err := fileMatches(path, file)
+	require.NoError(t, err)
+	require.True(t, match)
+	require.Equal(t, before+1, fileMatchesHashCount.Load())
+
+	match, err = fileMatches(path, file)
+	require.NoError(t, err)
+	require.True(t, match)
+	require.Equal(t, before+2, fileMatchesHashCount.Load())
+
+	// Once committed with PrepareCommittedCacheFile (backdated mtime), the
+	// first verified hash populates the stat-identity cache and subsequent
+	// checks skip full-file hashing.
+	PrepareCommittedCacheFile(path)
+	before = fileMatchesHashCount.Load()
+	match, err = fileMatches(path, file)
+	require.NoError(t, err)
+	require.True(t, match)
+	require.Equal(t, before+1, fileMatchesHashCount.Load())
+
+	match, err = fileMatches(path, file)
+	require.NoError(t, err)
+	require.True(t, match)
+	require.Equal(t, before+1, fileMatchesHashCount.Load(), "warm hit must not re-hash unchanged file")
+
+	// Even an immediate same-size in-place WriteAt advances mtime away from
+	// the backdated value and invalidates the cache deterministically.
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{content[0] ^ 0xff}, 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	match, err = fileMatches(path, file)
+	require.NoError(t, err)
+	require.False(t, match, "same-size in-place corruption must invalidate verified digest cache")
+
+	// RecordVerifiedCacheFile pre-warms the cache after a verified write
+	// (such as stageFile or local cache commit) so the very first check hits.
+	tmp := path + ".replacement"
+	require.NoError(t, os.WriteFile(tmp, content, cacheFileMode))
+	PrepareCommittedCacheFile(tmp)
+	require.NoError(t, os.Rename(tmp, path))
+	RecordVerifiedCacheFile(path, file.sha256)
+
+	before = fileMatchesHashCount.Load()
+	match, err = fileMatches(path, file)
+	require.NoError(t, err)
+	require.True(t, match)
+	require.Equal(t, before, fileMatchesHashCount.Load(), "pre-recorded committed file must hit without hashing")
+}
