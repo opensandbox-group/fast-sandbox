@@ -7,9 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	_ "embed"
@@ -73,8 +76,51 @@ func versionParts(v string) ([3]uint64, error) {
 	return parts, nil
 }
 
+type binaryVersionKey struct {
+	path      string
+	dev       uint64
+	ino       uint64
+	size      int64
+	mtimeNano int64
+}
+
+var (
+	binaryVersionMu    sync.RWMutex
+	binaryVersionCache = map[binaryVersionKey]string{}
+)
+
+func statBinaryKey(path string) (binaryVersionKey, bool) {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return binaryVersionKey{}, false
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return binaryVersionKey{}, false
+	}
+	return binaryVersionKey{
+		path:      path,
+		dev:       uint64(st.Dev),
+		ino:       uint64(st.Ino),
+		size:      info.Size(),
+		mtimeNano: info.ModTime().UnixNano(),
+	}, true
+}
+
 // BinaryVersion probes a selected executable with a bounded deadline.
+// Verified versions are cached by executable file identity (path/dev/ino/size/mtime)
+// so repeated VMM selections avoid redundant subprocess probes while immediately
+// detecting replaced or modified binaries.
 func BinaryVersion(ctx context.Context, path string) (string, error) {
+	key, hasKey := statBinaryKey(path)
+	if hasKey {
+		binaryVersionMu.RLock()
+		cached, ok := binaryVersionCache[key]
+		binaryVersionMu.RUnlock()
+		if ok {
+			return cached, nil
+		}
+	}
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, path, "--version").Output()
@@ -88,6 +134,11 @@ func BinaryVersion(ctx context.Context, path string) (string, error) {
 	v := strings.TrimPrefix(fields[1], "v")
 	if _, err := versionParts(v); err != nil {
 		return "", err
+	}
+	if hasKey {
+		binaryVersionMu.Lock()
+		binaryVersionCache[key] = v
+		binaryVersionMu.Unlock()
 	}
 	return v, nil
 }

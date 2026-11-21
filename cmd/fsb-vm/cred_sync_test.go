@@ -59,3 +59,22 @@ func TestSharedDaemonRejectsCredentialConflictsAtomically(t *testing.T) {
 		require.Equal(t, before, after)
 	}
 }
+
+func TestMergeCredentialsSkipsRewriteAndLockWhenUnchanged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cred.json")
+	original := dockerConfig{Auths: map[string]authEntry{"registry.example/repo": {Auth: "YWxpY2U6c2VjcmV0"}}}
+	require.NoError(t, mergeCredentials(path, original))
+	beforeInfo, err := os.Stat(path)
+	require.NoError(t, err)
+
+	// Hold the global exclusive lock to prove an identical merge takes the
+	// lock-free fast path and does not rewrite cred.json.
+	unlock, err := lockCredentials(path)
+	require.NoError(t, err)
+	defer unlock()
+
+	require.NoError(t, mergeCredentials(path, original))
+	afterInfo, err := os.Stat(path)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(beforeInfo, afterInfo), "unchanged credentials must not rewrite cred.json")
+}

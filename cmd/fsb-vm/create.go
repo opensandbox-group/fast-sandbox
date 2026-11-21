@@ -142,7 +142,7 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	}
 	// The creating record is the first durable write: from here on a crash
 	// leaves state.json behind, and delete reclaims whatever was allocated.
-	if err := writeState(layout.home, state); err != nil {
+	if err := writeStateAtomic(layout.home, state); err != nil {
 		return errors.Join(err, removeSandboxDirs(layout))
 	}
 
@@ -210,6 +210,7 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	if err != nil {
 		return err
 	}
+	resolvedVersion := ""
 	if global.vmmDir != "" {
 		selected, err := firecrackervmm.Resolve(ctx, global.vmmDir, metadata.Compatibility.FirecrackerVersion, false)
 		if err != nil {
@@ -217,11 +218,9 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 		}
 		global.firecrackerBin = selected.BinaryPath
 		state.VMM = &selected
-		if err := persist(); err != nil {
-			return err
-		}
+		resolvedVersion = selected.Version
 	}
-	if err := validateManifest(metadata, global.firecrackerBin, options.force && global.vmmDir == ""); err != nil {
+	if err := validateManifest(metadata, global.firecrackerBin, resolvedVersion, options.force && global.vmmDir == ""); err != nil {
 		return err
 	}
 	tVMMCheck := time.Since(t0)
@@ -236,7 +235,8 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	}
 	tRootfsCfg := time.Since(t0)
 	t0 = time.Now()
-	rootfsDevPath, err := acquireSandboxDevice(ctx, ublkd, rootfsConfig, &state.Rootfs, persist)
+	persistPreAttach := func() error { return writeStateAtomic(layout.home, state) }
+	rootfsDevPath, err := acquireSandboxDevice(ctx, ublkd, rootfsConfig, &state.Rootfs, persistPreAttach, persist)
 	if err != nil {
 		return err
 	}
@@ -314,21 +314,21 @@ func claimSandbox(layout sandboxLayout, sandboxID string) error {
 // read-only snapfiles that the pool does not serve.
 func addSandboxDevice(ctx context.Context, ublkd *ublkdClient, config string, record **deviceRecord, persist func() error) (string, error) {
 	*record = &deviceRecord{Config: config, DevID: -1}
-	return attachSandboxDevice(ctx, ublkd.Add, record, persist)
+	return attachSandboxDevice(ctx, ublkd.Add, record, persist, persist)
 }
 
 // acquireSandboxDevice attaches config through ublkd acquire, an exclusive
 // lease the warm pool can serve. Teardown must use Release.
-func acquireSandboxDevice(ctx context.Context, ublkd *ublkdClient, config string, record **deviceRecord, persist func() error) (string, error) {
+func acquireSandboxDevice(ctx context.Context, ublkd *ublkdClient, config string, record **deviceRecord, persistBefore, persistAfter func() error) (string, error) {
 	*record = &deviceRecord{Config: config, DevID: -1, Acquired: true}
-	return attachSandboxDevice(ctx, ublkd.Acquire, record, persist)
+	return attachSandboxDevice(ctx, ublkd.Acquire, record, persistBefore, persistAfter)
 }
 
 // attachSandboxDevice persists the pre-recorded device before calling attach so
 // a crash mid-call leaves a trace, then completes the record once ublkd replies.
 func attachSandboxDevice(ctx context.Context, attach func(context.Context, string) (int, string, error),
-	record **deviceRecord, persist func() error) (string, error) {
-	if err := persist(); err != nil {
+	record **deviceRecord, persistBefore, persistAfter func() error) (string, error) {
+	if err := persistBefore(); err != nil {
 		return "", err
 	}
 	devID, devPath, err := attach(ctx, (*record).Config)
@@ -337,7 +337,7 @@ func attachSandboxDevice(ctx context.Context, attach func(context.Context, strin
 		return "", err
 	}
 	(*record).DevID, (*record).DevPath = devID, devPath
-	return devPath, persist()
+	return devPath, persistAfter()
 }
 
 // resumeVM drives the Firecracker restore sequence: LoadSnapshot must be the

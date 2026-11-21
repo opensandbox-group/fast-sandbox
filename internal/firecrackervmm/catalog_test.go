@@ -86,3 +86,32 @@ func TestSelectionManagedLayout(t *testing.T) {
 	s.Version = "../1.17.0"
 	require.False(t, s.IsManaged(DefaultDir))
 }
+
+func TestBinaryVersionCachesVerifiedExecutableAndInvalidatesOnChange(t *testing.T) {
+	dir := t.TempDir()
+	counter := filepath.Join(dir, "count")
+	bin := filepath.Join(dir, "firecracker")
+	script := "#!/bin/sh\necho x >> '" + counter + "'\necho 'Firecracker v1.17.0'\n"
+	require.NoError(t, os.WriteFile(bin, []byte(script), 0o755))
+
+	v1, err := BinaryVersion(t.Context(), bin)
+	require.NoError(t, err)
+	require.Equal(t, "1.17.0", v1)
+	v2, err := BinaryVersion(t.Context(), bin)
+	require.NoError(t, err)
+	require.Equal(t, "1.17.0", v2)
+
+	calls, err := os.ReadFile(counter)
+	require.NoError(t, err)
+	require.Equal(t, "x\n", string(calls), "second probe on unchanged binary must hit cache")
+
+	// Replacing the binary must invalidate the cached version.
+	updated := "#!/bin/sh\necho x >> '" + counter + "'\necho 'Firecracker v1.18.0'\n"
+	require.NoError(t, os.WriteFile(bin, []byte(updated+"# extra\n"), 0o755))
+	v3, err := BinaryVersion(t.Context(), bin)
+	require.NoError(t, err)
+	require.Equal(t, "1.18.0", v3)
+	calls, err = os.ReadFile(counter)
+	require.NoError(t, err)
+	require.Equal(t, "x\nx\n", string(calls))
+}

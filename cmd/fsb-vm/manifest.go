@@ -21,8 +21,9 @@ func loadManifest(path string) (artifacts.VMManifest, error) {
 }
 
 // --force only downgrades VMM version mismatches, never machine, architecture,
-// drive-path or CPU compatibility errors.
-func validateManifest(m artifacts.VMManifest, binary string, force bool) error {
+// drive-path or CPU compatibility errors. When resolvedVersion is non-empty,
+// it reuses the already-verified VMM version instead of spawning `--version`.
+func validateManifest(m artifacts.VMManifest, binary, resolvedVersion string, force bool) error {
 	if err := m.Validate(); err != nil {
 		return err
 	}
@@ -32,7 +33,11 @@ func validateManifest(m artifacts.VMManifest, binary string, force bool) error {
 	if m.Compatibility.CPUArch != artifacts.HostCPUArch() {
 		return fmt.Errorf("cpuArch %q does not match host %q", m.Compatibility.CPUArch, artifacts.HostCPUArch())
 	}
-	have, want := artifacts.FirecrackerVersion(binary), m.Compatibility.FirecrackerVersion
+	have := resolvedVersion
+	if have == "" {
+		have = artifacts.FirecrackerVersion(binary)
+	}
+	want := m.Compatibility.FirecrackerVersion
 	if have != want {
 		err := fmt.Errorf("firecracker version mismatch: host %q, template %q", have, want)
 		if !force {

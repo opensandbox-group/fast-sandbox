@@ -21,6 +21,17 @@ var errBusy = errors.New("operation already in progress")
 // and returns its release function. Lock files are never removed: unlinking
 // a lock file races with a waiter that already opened it.
 func tryLock(dir, name string) (func(), error) {
+	return tryFlock(dir, name, syscall.LOCK_EX|syscall.LOCK_NB)
+}
+
+// trySharedLock takes a non-blocking shared flock on <dir>/.locks/<name>.lock
+// so concurrent readers/pinners do not contend with each other while still
+// excluding writers/evictors that hold tryLock.
+func trySharedLock(dir, name string) (func(), error) {
+	return tryFlock(dir, name, syscall.LOCK_SH|syscall.LOCK_NB)
+}
+
+func tryFlock(dir, name string, how int) (func(), error) {
 	lockDir := filepath.Join(dir, locksDirName)
 	if err := os.MkdirAll(lockDir, 0o750); err != nil {
 		return nil, fmt.Errorf("create lock directory %s: %w", lockDir, err)
@@ -30,7 +41,7 @@ func tryLock(dir, name string) (func(), error) {
 	if err != nil {
 		return nil, fmt.Errorf("open lock %s: %w", lockPath, err)
 	}
-	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := syscall.Flock(int(lockFile.Fd()), how); err != nil {
 		_ = lockFile.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {
 			return nil, errBusy

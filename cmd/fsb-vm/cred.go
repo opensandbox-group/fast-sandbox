@@ -39,6 +39,19 @@ func overlaybdCredentials(config dockerConfig, imageRefs ...string) (dockerConfi
 	return handoff, nil
 }
 
+func credentialsMatch(existing, incoming dockerConfig) bool {
+	if existing.Auths == nil {
+		return false
+	}
+	for host, entry := range incoming.Auths {
+		previous, exists := existing.Auths[host]
+		if !exists || previous != entry {
+			return false
+		}
+	}
+	return true
+}
+
 // mergeCredentials merges the entries of the template's dockerAuth into
 // overlaybd's global credential file (default /opt/overlaybd/cred.json).
 // overlaybd lazily reloads this file per remote_path, so without the merge
@@ -47,6 +60,13 @@ func overlaybdCredentials(config dockerConfig, imageRefs ...string) (dockerConfi
 // concurrent CLI instances cannot clobber each other.
 func mergeCredentials(credFile string, incoming dockerConfig) error {
 	if len(incoming.Auths) == 0 {
+		return nil
+	}
+	// Fast path: cred.json is replaced atomically via tmp+rename, so a lock-free
+	// read observes a consistent committed file. When every incoming entry is
+	// already present with identical credentials, avoid taking the global lock
+	// and rewriting/fsyncing the file.
+	if existing, err := readCredentials(credFile); err == nil && credentialsMatch(existing, incoming) {
 		return nil
 	}
 	directory := filepath.Dir(credFile)
@@ -67,11 +87,20 @@ func mergeCredentials(credFile string, incoming dockerConfig) error {
 	if existing.Auths == nil {
 		existing.Auths = map[string]authEntry{}
 	}
+	changed := false
 	for host, entry := range incoming.Auths {
-		if previous, exists := existing.Auths[host]; exists && global.rejectCredentialConflicts && previous != entry {
+		previous, exists := existing.Auths[host]
+		if exists && previous == entry {
+			continue
+		}
+		if exists && global.rejectCredentialConflicts {
 			return fmt.Errorf("shared overlaybd credential conflict for %s: node daemon requires one credential per repository; drain consumers before rotating credentials", host)
 		}
 		existing.Auths[host] = entry
+		changed = true
+	}
+	if !changed {
+		return nil
 	}
 	return writeCredentialsAtomic(credFile, existing)
 }
