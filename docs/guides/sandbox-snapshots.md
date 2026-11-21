@@ -145,6 +145,8 @@ relay-mutated policy rides the checkpoint bundle as the opaque
 `policy.json` and is re-imported node-side before the data plane becomes
 ready. That path never involves the control plane or the manifest.
 
+That checkpoint is also instance-private: the published manifest carries the owning Sandbox identity, and a resume verifies it before loading any memory, so a checkpoint cannot be restored under a different Sandbox — including one whose status was pointed at a foreign address. Snapshot images are the only boot source new Sandboxes share; a checkpoint set is rejected as one.
+
 ## Rules of thumb
 
 - **Same Sandbox, back-to-back snapshots**: allowed once the previous one

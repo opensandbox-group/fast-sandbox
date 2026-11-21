@@ -635,6 +635,17 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 			if restoreMetadata.IsRootfsOnly() && config.Desired.Restore != nil {
 				return nil, fmt.Errorf("%w: RootfsOnly cannot resume a checkpoint", ErrInvalidConfig)
 			}
+			// Ownership admission for artifact-store checkpoints, mirroring
+			// the OCI envelope path: the commit-point manifest binds the set
+			// to the Sandbox that produced it, and a resume must match. A
+			// missing manifest is left to the readback below: agent-delivered
+			// sets commit manifest.json last, so its absence is a delivery in
+			// flight (ErrImageNotReady, the create retries), while a
+			// local-mode cache is hand-seeded and admitted without checks as
+			// before.
+			if err := validateCheckpointResumeOwner(restoreMetadata, config); err != nil {
+				return nil, err
+			}
 		} else if !os.IsNotExist(readErr) {
 			return nil, readErr
 		}

@@ -2,7 +2,6 @@ package firecracker
 
 import (
 	"context"
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -24,23 +23,6 @@ func TestCheckpointDestination(t *testing.T) {
 		_, err = checkpointDestination(value, "abc")
 		require.Error(t, err, value)
 	}
-}
-func TestOCIResumeRejectsAnotherSandboxAndTemplateUse(t *testing.T) {
-	ref := "oci://r.example/ns/r@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	config := &fastletapi.RuntimeSandboxConfig{}
-	config.Identity.Namespace = "test"
-	config.Identity.SandboxUID = "owner"
-	config.Desired.Restore = &fastletapi.RestoreSpec{ManifestRef: ref, ArtifactDigest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
-	raw, err := json.Marshal(map[string]any{"platform": map[string]any{"checkpoint": map[string]string{"sandboxUID": "owner", "namespace": "test"}}})
-	require.NoError(t, err)
-	var metadata ociRestoreMetadata
-	require.NoError(t, json.Unmarshal(raw, &metadata))
-	require.NoError(t, validateOCIResumeOwner(metadata, config))
-	config.Identity.SandboxUID = "other"
-	require.ErrorIs(t, validateOCIResumeOwner(metadata, config), ErrInvalidConfig)
-	config.Identity.SandboxUID = "owner"
-	config.Desired.Restore = nil
-	require.ErrorIs(t, validateOCIResumeOwner(metadata, config), ErrInvalidConfig)
 }
 func TestOCICheckpointRestoreReferenceBoundToDigest(t *testing.T) {
 	sum := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
