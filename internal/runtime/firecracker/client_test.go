@@ -10,7 +10,44 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"fast-sandbox/internal/artifacts"
 )
+
+func TestVerifyRootfsBootMachine(t *testing.T) {
+	state := &SandboxState{BootMachine: &artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 384}}
+	require.NoError(t, verifyBootMachine(t.Context(), nil, state), "ordinary create performs no read-back")
+	state.Config.Desired.RootfsBootDigest = "pinned"
+	for _, tc := range []struct {
+		name, body string
+		code       int
+		wantErr    string
+	}{
+		{"match", `{"vcpu_count":1,"mem_size_mib":384}`, 200, ""},
+		{"wrong_ram", `{"vcpu_count":1,"mem_size_mib":256}`, 200, "expected 1 vCPUs and 384 MiB"},
+		{"wrong_cpu", `{"vcpu_count":2,"mem_size_mib":384}`, 200, "VMM reports 2 vCPUs"},
+		{"unavailable", "", 503, "read back rootfs boot shape"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			socket := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, http.MethodGet, r.Method)
+				require.Equal(t, "/machine-config", r.URL.Path)
+				w.WriteHeader(tc.code)
+				_, _ = w.Write([]byte(tc.body))
+			})
+			client := NewClient(socket)
+			defer client.Close()
+			err := verifyBootMachine(t.Context(), client, state)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.wantErr)
+			}
+		})
+	}
+	state.BootMachine = nil
+	require.ErrorIs(t, verifyBootMachine(t.Context(), nil, state), ErrInvalidConfig)
+}
 
 // startFakeFirecracker serves a scripted API on a Unix socket and returns the
 // socket path plus the handler that recorded calls. The socket lives under a
@@ -41,6 +78,36 @@ func TestClientVersion(t *testing.T) {
 	version, err := client.Version(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, "1.15.1", version)
+}
+
+func TestInterruptedRootfsBootRequiresRunningMatchingMachine(t *testing.T) {
+	d := &Driver{newClient: NewClient}
+	for _, tc := range []struct{ phase, machine, wantErr string }{
+		{"Not started", "{}", "cannot adopt interrupted rootfs boot"},
+		{"Running", `{"vcpu_count":2,"mem_size_mib":384}`, "VMM reports 2 vCPUs"},
+		{"Running", `{"vcpu_count":1,"mem_size_mib":384}`, ""},
+	} {
+		t.Run(tc.phase+"_"+tc.wantErr, func(t *testing.T) {
+			socket := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/":
+					_ = json.NewEncoder(w).Encode(map[string]string{"state": tc.phase})
+				case "/machine-config":
+					_, _ = w.Write([]byte(tc.machine))
+				default:
+					http.NotFound(w, r)
+				}
+			})
+			state := &SandboxState{Phase: PhaseStarting, APIAddress: socket, BootMachine: &artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 384}}
+			state.Config.Desired.RootfsBootDigest = "pinned"
+			err := d.verifyExistingBoot(t.Context(), state)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.wantErr)
+			}
+		})
+	}
 }
 
 func TestClientVersionRejectsMissingVersion(t *testing.T) {

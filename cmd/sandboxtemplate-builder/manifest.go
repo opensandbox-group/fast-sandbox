@@ -58,7 +58,7 @@ func stageManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 	if err := os.WriteFile(filepath.Join(workdir, "manifest.json"), manifestBytes, 0o644); err != nil { //nolint:gosec // published artifact manifest, world-readable by design
 		return nil, err
 	}
-	if err := writeChecksums(workdir, cache); err != nil {
+	if err := artifacts.WriteSHA256SUMS(workdir, templateFiles(spec.Output.Mode), cache); err != nil {
 		return nil, err
 	}
 	return manifestBytes, nil
@@ -86,14 +86,19 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 	document.Platform = templatePlatform(spec, mitmCA)
 	document.GuestNetwork = &artifacts.VMGuestNetwork{Iface: "eth0", MAC: bakedGuestMAC, IP: bakedGuestIP, Gateway: bakedGuestGateway, Netmask: bakedGuestNetmask, MTU: bakedGuestMTU}
 	document.Files = map[string]artifacts.ManifestFile{}
-	for _, file := range []struct{ name, path string }{{rootfsImageName, rootfs}, {vmstateFileName, vmstate}, {memoryFileName, memory}} {
-		entry, err := artifacts.FileEntry(file.path, cache)
+	paths := map[string]string{rootfsImageName: rootfs, vmstateFileName: vmstate, memoryFileName: memory}
+	if spec.Output.Mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+		document.Platform.SnapshotMode = "rootfsOnly"
+	}
+	for _, name := range templateFiles(spec.Output.Mode) {
+		entry, err := artifacts.FileEntry(paths[name], cache)
 		if err != nil {
 			return empty, err
 		}
-		document.Files[file.name] = entry
+		document.Files[name] = entry
 	}
-	return document, document.Validate()
+	// stageManifest validates the complete document after adding boot provenance.
+	return document, nil
 }
 
 func templatePlatform(spec apiv1alpha2.SandboxTemplateSpec, ca []mitmCALineage) *artifacts.VMPlatform {
@@ -120,13 +125,11 @@ func compatibilityCPUTemplate(cpuTemplate string) string {
 	return cpuTemplate
 }
 
-// writeChecksums writes SHA256SUMS covering only the published artifact set
-// (rootfs/vmstate/memory), reusing the checksums already computed for
-// the manifest. Intermediate build files (OCI layout, console logs, etc.) are
-// deliberately excluded.
-func writeChecksums(workdir string, cache map[string]string) error {
-	files := []string{rootfsImageName, vmstateFileName, memoryFileName}
-	return artifacts.WriteSHA256SUMS(workdir, files, cache)
+func templateFiles(mode apiv1alpha2.SandboxSnapshotMode) []string {
+	if mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+		return []string{rootfsImageName}
+	}
+	return []string{rootfsImageName, vmstateFileName, memoryFileName}
 }
 
 // Bind the published capability to the successful boot/restore report and the

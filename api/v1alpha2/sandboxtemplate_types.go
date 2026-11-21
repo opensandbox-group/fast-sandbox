@@ -9,6 +9,9 @@ import (
 // +kubebuilder:validation:Enum=Pending;Building;Succeeded;Failed
 type SandboxTemplatePhase string
 
+// SandboxTemplateArtifactModeAnnotation reports the artifact published by a build Pod.
+const SandboxTemplateArtifactModeAnnotation = "sandbox.fast.io/artifact-mode"
+
 const (
 	// SandboxTemplatePhasePending means the template was accepted and the
 	// build has not started yet.
@@ -107,6 +110,10 @@ type PrimeSpec struct {
 // Cross-field validation runs in the controller so these CRDs ship without CEL
 // (x-kubernetes-validations) for legacy (< 1.25) API servers.
 type OutputSpec struct {
+	// Mode selects the published boot artifact. RootfsOnly requires native storage.
+	// +optional
+	Mode SandboxSnapshotMode `json:"mode,omitempty"`
+
 	// RootfsSize is the logical size of the converted rootfs.ext4 — the
 	// capacity the guest sees as its root drive. A Kubernetes resource
 	// quantity; the file is sparse. It must be large enough to hold the
@@ -241,6 +248,8 @@ type SandboxTemplateSpec struct {
 
 // SandboxTemplateStatus reports the latest build outcome.
 type SandboxTemplateStatus struct {
+	// Mode is the artifact class confirmed by the builder. Empty means unknown.
+	Mode SandboxSnapshotMode `json:"mode,omitempty"`
 	// Phase is the overall build phase.
 	Phase SandboxTemplatePhase `json:"phase,omitempty"`
 	// Conditions detail progress.

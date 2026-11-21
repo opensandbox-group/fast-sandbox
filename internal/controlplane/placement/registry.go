@@ -133,6 +133,7 @@ type FastletRegistry interface {
 }
 
 type CandidateRequest struct {
+	RequiredCapability  string
 	Namespace           string
 	PoolName            string
 	RuntimeName         apiv1alpha2.RuntimeName
@@ -553,6 +554,9 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 }
 
 func hardFilter(info FastletInfo, request CandidateRequest, staleAfter time.Duration, blockedNodes map[string]struct{}) bool {
+	if request.RequiredCapability != "" && !info.SupportsCapability(request.RequiredCapability) {
+		return false
+	}
 	if _, excluded := request.ExcludedFastlets[info.ID]; excluded {
 		return false
 	}

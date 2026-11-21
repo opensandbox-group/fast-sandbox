@@ -2,14 +2,79 @@ package firecracker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"fast-sandbox/internal/artifacts"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/firecrackerconfig"
+	"fast-sandbox/internal/ocitemplate"
 )
+
+var errIncompleteRootfsStart = errors.New("cannot adopt interrupted rootfs boot")
+
+// verifyBootMachine reads the live VMM through the same API socket used for
+// configuration. Full restores and ordinary boots have no override contract.
+func verifyBootMachine(ctx context.Context, c *Client, state *SandboxState) error {
+	if state.Config.Desired.RootfsBootDigest == "" {
+		return nil
+	}
+	want := state.BootMachine
+	if want == nil || want.VCPUCount <= 0 || want.MemoryMiB <= 0 {
+		return fmt.Errorf("%w: missing rootfs boot shape for %s", ErrInvalidConfig, state.Config.Identity.SandboxUID)
+	}
+	got, err := c.DescribeMachine(ctx)
+	if err != nil {
+		return fmt.Errorf("read back rootfs boot shape: %w", err)
+	}
+	if got.VCPUs != want.VCPUCount || int64(got.MemSizeMiB) != want.MemoryMiB {
+		return fmt.Errorf("%w: expected %d vCPUs and %d MiB, VMM reports %d vCPUs and %d MiB", ErrInvalidConfig, want.VCPUCount, want.MemoryMiB, got.VCPUs, got.MemSizeMiB)
+	}
+	return nil
+}
+
+// Called with the lifecycle lock after VMM shape and cgroup ownership checks.
+func (d *Driver) finishVerifiedRootfsAdoption(ctx context.Context, directory string, state *SandboxState) error {
+	if state.Phase != PhaseStarting || state.Config.Desired.RootfsBootDigest == "" {
+		return nil
+	}
+	spec, id := state.Config.Desired, state.Config.Identity
+	bundle := filepath.Dir(cachedManifestPath(d.config.StateRoot, spec.Image))
+	if strings.HasPrefix(spec.Image, ocitemplate.Prefix) {
+		bundle = filepath.Join(d.ociRoot(), "sandboxes", id.SandboxUID, "mnt")
+	}
+	d.importTemplateCarry(ctx, spec, spec.Image, bundle, id.SandboxUID)
+	state.Phase = PhaseRunning
+	if err := saveState(directory, state); err != nil {
+		return err
+	}
+	d.publishVMMetadata(filepath.Dir(state.APIAddress), id)
+	return nil
+}
+
+func (d *Driver) verifyExistingBoot(ctx context.Context, state *SandboxState) error {
+	if state.Config.Desired.RootfsBootDigest == "" {
+		return nil
+	}
+	client := d.newClient(state.APIAddress)
+	defer client.Close()
+	if state.Phase == PhaseStarting {
+		current, err := client.VMState(ctx)
+		if err != nil {
+			return err
+		}
+		if current == "Not started" || current == "NotStarted" {
+			return fmt.Errorf("%w: VMM state is %q", errIncompleteRootfsStart, current)
+		}
+		if current != vmRunning {
+			return fmt.Errorf("cannot adopt interrupted rootfs boot: VMM state is %q", current)
+		}
+	}
+	return verifyBootMachine(ctx, client, state)
+}
 
 // Cold boot uses only a resolved rootfs of the same architecture; it does not reuse the source host CPU template or register state.
 func checkRootfsBootCompatibility(m artifacts.VMManifest, version string) error {

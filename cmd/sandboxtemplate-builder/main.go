@@ -126,6 +126,9 @@ func run(ctx context.Context) error {
 		return err
 	}
 	if strings.HasPrefix(spec.Output.Publish, "oci://") {
+		if spec.Output.Mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+			return errors.New("RootfsOnly template builds require native object storage")
+		}
 		return buildOCITemplate(ctx, spec, workdir, kernel)
 	}
 	return buildObjectStoreTemplate(ctx, spec, workdir, kernel)
@@ -201,7 +204,11 @@ func buildObjectStoreTemplate(ctx context.Context, spec apiv1alpha2.SandboxTempl
 		"publishMs", publishMs,
 		"totalMs", time.Since(started).Milliseconds())
 
-	return patchPodAnnotations(ctx, manifestRef, sha256Of(manifestBytes))
+	mode := apiv1alpha2.SandboxSnapshotModeFull
+	if spec.Output.Mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+		mode = spec.Output.Mode
+	}
+	return patchPodAnnotations(ctx, manifestRef, sha256Of(manifestBytes), mode)
 }
 
 // loadSpecAndWorkdir reads the serialized SandboxTemplateSpec (the controller

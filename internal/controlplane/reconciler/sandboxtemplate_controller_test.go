@@ -233,8 +233,9 @@ func TestSandboxTemplateReconcileCreatesPodAndTracksPhase(t *testing.T) {
 	// Pod succeeds with reported annotations → phase becomes Succeeded and
 	// manifestRef/artifactDigest are consumed before cleanup.
 	pod.Annotations = map[string]string{
-		sandboxTemplateManifestRefAnnot:  "s3://bucket/sandbox-images/abc123/manifest.json",
-		sandboxTemplateArtifactDigestAnn: "deadbeef",
+		sandboxTemplateManifestRefAnnot:                   "s3://bucket/sandbox-images/abc123/manifest.json",
+		sandboxTemplateArtifactDigestAnn:                  "deadbeef",
+		apiv1alpha2.SandboxTemplateArtifactModeAnnotation: "RootfsOnly",
 	}
 	if err := reconciler.Update(context.Background(), pod); err != nil {
 		t.Fatalf("update pod metadata: %v", err)
@@ -255,6 +256,9 @@ func TestSandboxTemplateReconcileCreatesPodAndTracksPhase(t *testing.T) {
 	}
 	if updated.Status.ManifestRef != "s3://bucket/sandbox-images/abc123/manifest.json" {
 		t.Fatalf("expected ManifestRef to be consumed, got %q", updated.Status.ManifestRef)
+	}
+	if updated.Status.Mode != apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+		t.Fatalf("expected builder-reported RootfsOnly mode, got %q", updated.Status.Mode)
 	}
 	if updated.Status.ArtifactDigest != "deadbeef" {
 		t.Fatalf("expected ArtifactDigest to be consumed, got %q", updated.Status.ArtifactDigest)

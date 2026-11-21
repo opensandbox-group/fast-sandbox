@@ -64,6 +64,7 @@ func seedFastlet(tb testing.TB, registry *InMemoryRegistry, info FastletInfo) {
 	}
 	heartbeat := &fastletapi.HeartbeatResponse{
 		FastletStatus: fastletapi.FastletStatus{
+			Capabilities:  info.Capabilities,
 			FastletPodUID: info.PodUID, RuntimeReady: info.RuntimeReady, Draining: info.Draining,
 			RuntimeProfileHash: info.RuntimeProfileHash, Admission: info.Admission, ResourceProfileHash: info.ResourceProfileHash,
 			InfraRevision: info.InfraRevision, InfraReady: info.InfraReady,
@@ -119,6 +120,20 @@ func TestTopKPrefersImageThenLoadAndDoesNotAllocate(t *testing.T) {
 	stored, ok := registry.GetFastletByID("cache-hit")
 	require.True(t, ok)
 	require.Equal(t, 4, stored.Used(), "selection must not consume Registry capacity")
+}
+
+func TestTopKRequiresRootfsBootCapabilityBeforeRanking(t *testing.T) {
+	r := NewInMemoryRegistry()
+	req := candidate("alpine:latest", "override")
+	req.RequiredCapability = fastletapi.CapabilityRootfsBootCreate
+	seedFastlet(t, r, readyFastlet("old-warm", 0, 5, req.Image))
+	require.Empty(t, r.TopK(req, 1))
+	next := readyFastlet("new-cold", 0, 5)
+	next.Capabilities = []string{fastletapi.CapabilityRootfsBootCreate}
+	seedFastlet(t, r, next)
+	got := r.TopK(req, 1)
+	require.Len(t, got, 1)
+	require.Equal(t, next.ID, got[0].ID)
 }
 
 func TestTopKMatchesFirecrackerCacheKeys(t *testing.T) {

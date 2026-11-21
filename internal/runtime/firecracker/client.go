@@ -141,6 +141,13 @@ func (c *Client) ConfigureMachine(ctx context.Context, request MachineConfigRequ
 	return c.do(ctx, http.MethodPut, "/machine-config", request, nil)
 }
 
+// DescribeMachine reads the vCPU and RAM configuration reported by the VMM.
+func (c *Client) DescribeMachine(ctx context.Context) (MachineConfigRequest, error) {
+	var machine MachineConfigRequest
+	err := c.do(ctx, http.MethodGet, "/machine-config", nil, &machine)
+	return machine, err
+}
+
 // ConfigureBootSource sets the kernel image and boot arguments.
 func (c *Client) ConfigureBootSource(ctx context.Context, request BootSourceRequest) error {
 	return c.do(ctx, http.MethodPut, "/boot-source", request, nil)

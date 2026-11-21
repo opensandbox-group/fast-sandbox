@@ -42,6 +42,7 @@ func ProjectSnapshotStatus(status *apiv1alpha2.SandboxSnapshotStatus, requestedM
 	status.ManifestRef = observed.ManifestRef
 	status.ArtifactDigest = observed.ArtifactDigest
 	status.SizeBytes = observed.SizeBytes
+	status.ResourceLimits = nil
 	if !observed.StartedAt.IsZero() {
 		started := metav1.NewTime(observed.StartedAt)
 		status.StartedAt = &started
@@ -72,6 +73,9 @@ func ProjectSnapshotStatus(status *apiv1alpha2.SandboxSnapshotStatus, requestedM
 	status.Message = observed.Message
 	switch observed.Phase {
 	case fastletapi.SnapshotPhaseSucceeded:
+		if observed.ResourceLimits != nil && observed.ArtifactDigest != "" && produced == fastletapi.SnapshotModeRootfsOnly {
+			status.ResourceLimits = &apiv1alpha2.SnapshotResourceLimits{CPU: observed.ResourceLimits.CPU, Memory: observed.ResourceLimits.Memory}
+		}
 		meta.SetStatusCondition(&status.Conditions, metav1.Condition{
 			Type: apiv1alpha2.SandboxSnapshotConditionCompleted, Status: metav1.ConditionTrue,
 			Reason: "SnapshotSucceeded", Message: "Snapshot artifacts were published under the template name",

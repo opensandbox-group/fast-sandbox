@@ -1651,6 +1651,36 @@ func TestDeleteRemovesRouteWhenRuntimeAccessIsAlreadyAbsent(t *testing.T) {
 	publisher.mu.Unlock()
 }
 
+func TestRecoveryIsolatesUnverifiedBootAndPublishesHealthyRoute(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	for _, uid := range []string{"unverified", "healthy"} {
+		pending := uid == "unverified"
+		runtime.managed = append(runtime.managed, &SandboxMetadata{
+			Config: fastletapi.RuntimeSandboxConfig{Identity: fastletapi.SandboxIdentity{
+				SandboxUID: uid, Namespace: "default", FastletPodUID: "pod-a",
+				InstanceGeneration: 1, AssignmentAttempt: 1, RouteGeneration: 1,
+			}},
+			Phase: "running", RecoveryRequired: pending, BootRecoveryPending: pending,
+		})
+	}
+	publisher := &admissionRoutePublisher{}
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 2, FastletPodUID: "pod-a", RecoverOnStart: true, RoutePublisher: publisher,
+	})
+	require.NoError(t, err)
+	require.NoError(t, manager.Recover(t.Context()))
+	require.True(t, manager.Ready())
+	require.Equal(t, 2, manager.admissionStatusLocked().Used)
+	require.NoError(t, manager.ReconcileProxyRoutes(t.Context()))
+	require.Len(t, publisher.reconciled, 2)
+	for _, routes := range publisher.reconciled {
+		require.Len(t, routes, 2)
+		for _, route := range routes {
+			require.Equal(t, route.SandboxUID == "unverified", route.Suspended)
+		}
+	}
+}
+
 func TestRecoveryReconcilesRoutesBeforeReadiness(t *testing.T) {
 	runtime := newAdmissionRuntime()
 	runtime.managed = []*SandboxMetadata{{Config: fastletapi.RuntimeSandboxConfig{Identity: fastletapi.SandboxIdentity{

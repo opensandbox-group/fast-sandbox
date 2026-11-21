@@ -89,7 +89,11 @@ func (c *FastletClient) CreateSandbox(ctx context.Context, fastletIP string, req
 		ctx = withFastletIdentity(ctx, req.Identity)
 		ctx = observability.WithIdentity(ctx, observability.Identity{RequestID: req.RequestID, Namespace: req.Identity.Namespace, SandboxName: req.Identity.Name})
 	}
-	response, err := postFastletJSONWithTimeout[CreateSandboxRequest, CreateSandboxResponse](c, ctx, fastletIP, "/api/v2/fastlet/create", req, c.createTimeout)
+	path := "/api/v2/fastlet/create"
+	if req != nil && req.Sandbox.RootfsBootDigest != "" {
+		path = RootfsBootCreatePath
+	}
+	response, err := postFastletJSONWithTimeout[CreateSandboxRequest, CreateSandboxResponse](c, ctx, fastletIP, path, req, c.createTimeout)
 	if err == nil {
 		return response, nil
 	}

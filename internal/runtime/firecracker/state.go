@@ -45,6 +45,8 @@ const (
 // runtime configuration separate from Driver-produced allocation state so
 // restart recovery preserves both authority boundaries.
 type SandboxState struct {
+	BootRecoveryError string                              `json:"bootRecoveryError,omitempty"`
+	BootMachine       *artifacts.VMMachine                `json:"bootMachine,omitempty"`
 	VMM               *firecrackervmm.Selection           `json:"vmm,omitempty"`
 	BootKernelSHA256  string                              `json:"bootKernelSHA256,omitempty"`
 	BootCompatibility *artifacts.SnapshotCompatibility    `json:"bootCompatibility,omitempty"`
