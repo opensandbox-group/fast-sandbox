@@ -526,3 +526,23 @@ func TestPublishRouteRejectsTemplateWithoutKey(t *testing.T) {
 	require.Contains(t, wireErr.Message, "publish key is required")
 	require.Empty(t, fixture.puller.lastPublish(), "a rejected publish must not reach the publisher")
 }
+
+func TestServerPinImageFailsWhenPullLeavesNoCommittedManifest(t *testing.T) {
+	fixture := newServerFixture(t)
+	fixture.puller.seed = func(string, string) error { return nil }
+
+	status, wireErr, _ := fixture.do(t, agentprotocol.RoutePinImage, agentprotocol.PinImageRequest{
+		Identity: identity("req-no-commit"), Image: testImage,
+	})
+	require.Equal(t, http.StatusNotFound, status)
+	require.Equal(t, agentprotocol.ErrorNotFound, wireErr.Code)
+
+	status, wireErr, _ = fixture.do(t, agentprotocol.RoutePinImage, agentprotocol.PinImageRequest{
+		Identity:       identity("req-ckpt-no-commit"),
+		Image:          "checkpoint:deadbeef",
+		ManifestRef:    "s3://bucket/checkpoints/deadbeef/manifest.json",
+		ArtifactDigest: "deadbeef",
+	})
+	require.Equal(t, http.StatusNotFound, status)
+	require.Equal(t, agentprotocol.ErrorNotFound, wireErr.Code)
+}

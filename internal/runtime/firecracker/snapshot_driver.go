@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
 
 	"fast-sandbox/internal/artifacts"
@@ -28,6 +29,7 @@ import (
 	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
+	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 	agentprotocol "fast-sandbox/internal/runtime/firecracker/agent/protocol"
 )
 
@@ -35,6 +37,13 @@ import (
 //
 //	<StateRoot>/snapshots/<snapshotID>/{rootfs.ext4, vmstate.snap, memory.snap, manifest.json, SHA256SUMS}
 const snapshotStagingDir = "snapshots"
+
+const (
+	// snapshotCacheStagingPrefix names transient cache-commit staging
+	// directories and their companion flock files under <StateRoot>/images/.
+	snapshotCacheStagingPrefix = ".staging-"
+	snapshotCacheLockSuffix    = ".lock"
+)
 
 // publishedRootfsName is the rootfs file name in a published artifact set.
 // The instance drive file is rootfs.img; consumers (the agent pull layer)
@@ -247,61 +256,71 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 		SizeBytes:      sizeBytes,
 		Mode:           fastletapi.SnapshotModeFull,
 	}
-	// A checkpoint keeps the published set in the node-local image cache: a
-	// resume that still lands on this node restores locally (~ms) instead of
+	// Keep the published set in the node-local image cache so a resume or
+	// template create that lands on this node boots locally (~ms) instead of
 	// pulling the full set back from the store (~16s per 3.5GiB). The commit
 	// is best-effort — the store copy is authoritative, and any miss (cache
-	// evicted by the image GC, or a resume on another node) falls back to the
-	// normal pull path. Template snapshots keep discarding staging; their
-	// same-node prewarm is issue #57.
+	// evicted by the image GC, a conflicting same-name template cache, or a
+	// restore on another node) falls back to the normal pull path.
+	cacheRef := input.TemplateName
 	if kind == fastletapi.SnapshotKindCheckpoint {
-		if cacheErr := d.commitCheckpointCache(result, plan.staging); cacheErr != nil {
-			klog.ErrorS(cacheErr, "checkpoint local cache commit failed; a resume will pull from the store",
-				"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "manifestRef", outcome.ManifestRef)
+		if result.ArtifactDigest != "" {
+			cacheRef = artifacts.CheckpointReference(result.ArtifactDigest)
+		} else {
+			cacheRef = ""
 		}
-	} else {
-		_ = os.RemoveAll(plan.staging)
 	}
+	if cacheErr := d.commitSnapshotCache(cacheRef, result.ArtifactDigest, plan.staging, true, nil); cacheErr != nil {
+		klog.ErrorS(cacheErr, "snapshot local cache commit failed; subsequent restores will pull from the store",
+			"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "reference", cacheRef, "manifestRef", outcome.ManifestRef)
+	}
+	_ = os.RemoveAll(plan.staging)
 	klog.InfoS("firecracker snapshot published",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "templateName", input.TemplateName,
 		"manifestRef", outcome.ManifestRef, "sizeBytes", sizeBytes, "publish", time.Since(publishStarted).String())
 	return result, nil
 }
 
-// commitCheckpointCache moves a published checkpoint artifact set from its
-// staging directory into the node-local image cache, under the canonical
-// checkpoint reference (artifacts.CheckpointReference), in the standard cache
-// layout (rootfs.img/vmstate.snap/memory.snap/manifest.json). The set is
-// assembled in a non-digest staging subdirectory and renamed into place
-// atomically, so the image GC — which only considers 64-hex cache names —
-// observes either a complete entry or nothing at all. The staging directory
-// is consumed on every path.
-func (d *Driver) commitCheckpointCache(result *runtimecontract.SnapshotResult, staging string) error {
-	if result == nil || result.ArtifactDigest == "" {
-		return fmt.Errorf("%w: checkpoint result carries no artifact digest", ErrInvalidConfig)
+// commitSnapshotCache moves a published artifact set (Full checkpoint, Full
+// template, or native RootfsOnly template) from its staging directory into the
+// node-local image cache under reference (<stateRoot>/images/<imageKey>/),
+// using the standard cache layout (rootfs.img, manifest.json, optional
+// vmstate.snap/memory.snap for Full snapshots, and optional
+// vault.json/policy.json). The set is assembled in a flock-owned non-digest
+// staging subdirectory and renamed into place atomically, so readers and the
+// image GC observe either a complete entry or nothing at all, and interrupted
+// commits are reclaimed by recovery/GC once the writer exits. Callers remain
+// responsible for removing staging.
+func (d *Driver) commitSnapshotCache(reference, artifactDigest, staging string, full bool, verified map[string]agentpull.VerifiedFile) error {
+	if strings.TrimSpace(reference) == "" {
+		return fmt.Errorf("%w: snapshot cache reference is required", ErrInvalidConfig)
 	}
-	reference := artifacts.CheckpointReference(result.ArtifactDigest)
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	d.mu.RUnlock()
-	cacheDir := filepath.Join(stateRoot, imageCacheDir, imageKey(reference))
-	if verifyRestorableImage(stateRoot, reference) == nil {
-		// A concurrent replay already committed the identical set.
-		_ = os.RemoveAll(staging)
+	if alreadyCommittedSnapshotCache(stateRoot, reference, artifactDigest) {
 		d.touchImage(reference)
 		return nil
 	}
-	tmpDir := filepath.Join(stateRoot, imageCacheDir, ".staging-"+filepath.Base(staging))
-	_ = os.RemoveAll(tmpDir)
-	if err := os.MkdirAll(tmpDir, 0o750); err != nil {
-		_ = os.RemoveAll(staging)
-		return fmt.Errorf("prepare checkpoint cache staging: %w", err)
+	imagesRoot := filepath.Join(stateRoot, imageCacheDir)
+	tmpDir, releaseStaging, err := acquireSnapshotCacheStaging(imagesRoot, filepath.Base(staging))
+	if err != nil {
+		return err
 	}
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.RemoveAll(tmpDir)
+		}
+		releaseStaging()
+	}()
 	mappings := map[string]string{
 		publishedRootfsName:  rootfsImageName,
-		vmstateSnapshotName:  vmstateSnapshotName,
-		memorySnapshotName:   memorySnapshotName,
 		snapshotManifestName: snapshotManifestName,
+	}
+	if full {
+		mappings[vmstateSnapshotName] = vmstateSnapshotName
+		mappings[memorySnapshotName] = memorySnapshotName
 	}
 	// The vault and policy files are optional bundle members; they ride
 	// into the cache so the restore path finds them next to the snapshot
@@ -312,32 +331,186 @@ func (d *Driver) commitCheckpointCache(result *runtimecontract.SnapshotResult, s
 		if _, err := os.Stat(filepath.Join(staging, bundleName)); err == nil {
 			mappings[bundleName] = bundleName
 		} else if !errors.Is(err, os.ErrNotExist) {
-			_ = os.RemoveAll(tmpDir)
-			_ = os.RemoveAll(staging)
 			return fmt.Errorf("stat staged %s for the cache commit: %w", bundleName, err)
 		}
 	}
+	type trackedOpenFile struct {
+		file  *os.File
+		proof agentpull.VerifiedFile
+	}
+	trackedOpen := make(map[string]trackedOpenFile)
+	defer func() {
+		for _, entry := range trackedOpen {
+			_ = entry.file.Close()
+		}
+	}()
 	for from, to := range mappings {
-		if err := os.Rename(filepath.Join(staging, from), filepath.Join(tmpDir, to)); err != nil {
-			_ = os.RemoveAll(tmpDir)
-			_ = os.RemoveAll(staging)
-			return fmt.Errorf("stage checkpoint cache entry: %w", err)
+		src := filepath.Join(staging, from)
+		if to != snapshotManifestName {
+			if f := openVerifiedStagedFile(src, verified[from]); f != nil {
+				trackedOpen[to] = trackedOpenFile{file: f, proof: verified[from]}
+			}
+		}
+		dst := filepath.Join(tmpDir, to)
+		if err := os.Rename(src, dst); err != nil {
+			return fmt.Errorf("stage snapshot cache entry %s: %w", to, err)
+		}
+		if to != snapshotManifestName {
+			agentpull.PrepareCommittedCacheFile(dst)
 		}
 	}
+	cacheDir := filepath.Join(imagesRoot, imageKey(reference))
 	if err := os.Rename(tmpDir, cacheDir); err != nil {
-		_ = os.RemoveAll(tmpDir)
-		_ = os.RemoveAll(staging)
-		// A concurrent commit won the rename; the identical set is already
-		// addressable.
-		if verifyRestorableImage(stateRoot, reference) == nil {
+		// A concurrent commit won the rename; if it committed the identical
+		// manifest digest, the set is already addressable.
+		if alreadyCommittedSnapshotCache(stateRoot, reference, artifactDigest) {
 			d.touchImage(reference)
 			return nil
 		}
-		return fmt.Errorf("commit checkpoint cache entry: %w", err)
+		return fmt.Errorf("commit snapshot cache entry: %w", err)
 	}
-	_ = os.RemoveAll(staging)
+	cleanupTmp = false
+	for to, entry := range trackedOpen {
+		agentpull.RecordVerifiedCacheFile(filepath.Join(cacheDir, to), entry.file, entry.proof.SHA256())
+	}
 	d.touchImage(reference)
 	return nil
+}
+
+// acquireSnapshotCacheStaging creates a lock-owned temporary directory under
+// imagesRoot so crash recovery and image GC can distinguish active writers
+// from orphaned staging directories left behind by an interrupted commit.
+func acquireSnapshotCacheStaging(imagesRoot, base string) (string, func(), error) {
+	if err := os.MkdirAll(imagesRoot, 0o750); err != nil {
+		return "", nil, fmt.Errorf("prepare snapshot cache root: %w", err)
+	}
+	lockFile, err := os.CreateTemp(imagesRoot, snapshotCacheStagingPrefix+base+"-*"+snapshotCacheLockSuffix)
+	if err != nil {
+		return "", nil, fmt.Errorf("prepare snapshot cache staging lock: %w", err)
+	}
+	lockPath := lockFile.Name()
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = lockFile.Close()
+		_ = os.Remove(lockPath)
+		return "", nil, fmt.Errorf("lock snapshot cache staging: %w", err)
+	}
+	if !sameLockInode(lockFile, lockPath) {
+		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+		_ = lockFile.Close()
+		return "", nil, errors.New("snapshot cache staging lock was reclaimed before ownership stabilized")
+	}
+	tmpDir := strings.TrimSuffix(lockPath, snapshotCacheLockSuffix)
+	if err := os.Mkdir(tmpDir, 0o750); err != nil {
+		_ = os.Remove(lockPath)
+		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+		_ = lockFile.Close()
+		return "", nil, fmt.Errorf("prepare snapshot cache staging: %w", err)
+	}
+	release := func() {
+		_ = os.Remove(lockPath)
+		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+		_ = lockFile.Close()
+	}
+	return tmpDir, release, nil
+}
+
+// reclaimOrphanedSnapshotCacheStaging removes local cache staging directories
+// left under <stateRoot>/images/.staging-* after an interrupted commit while
+// leaving entries held by active writers untouched via non-blocking flock.
+func reclaimOrphanedSnapshotCacheStaging(stateRoot string) error {
+	imagesRoot := filepath.Join(stateRoot, imageCacheDir)
+	entries, err := os.ReadDir(imagesRoot)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	candidates := make(map[string]struct{})
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, snapshotCacheStagingPrefix) {
+			continue
+		}
+		base := strings.TrimSuffix(name, snapshotCacheLockSuffix)
+		if base == snapshotCacheStagingPrefix {
+			continue
+		}
+		candidates[base] = struct{}{}
+	}
+	var resultErr error
+	for base := range candidates {
+		dirPath := filepath.Join(imagesRoot, base)
+		lockPath := dirPath + snapshotCacheLockSuffix
+		fd, openErr := unix.Open(lockPath, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+		if openErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("open snapshot cache staging lock %s: %w", lockPath, openErr))
+			continue
+		}
+		lockFile := os.NewFile(uintptr(fd), lockPath)
+		lockErr := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		if lockErr != nil {
+			_ = lockFile.Close()
+			if errors.Is(lockErr, unix.EWOULDBLOCK) || errors.Is(lockErr, unix.EAGAIN) {
+				// Active writer owns this staging directory; leave it alone.
+				continue
+			}
+			resultErr = errors.Join(resultErr, fmt.Errorf("lock snapshot cache staging %s: %w", lockPath, lockErr))
+			continue
+		}
+		if !sameLockInode(lockFile, lockPath) {
+			_ = unix.Flock(fd, unix.LOCK_UN)
+			_ = lockFile.Close()
+			continue
+		}
+		if removeErr := os.RemoveAll(dirPath); removeErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("reclaim orphaned snapshot cache staging %s: %w", dirPath, removeErr))
+		}
+		if removeErr := os.Remove(lockPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			resultErr = errors.Join(resultErr, fmt.Errorf("remove snapshot cache staging lock %s: %w", lockPath, removeErr))
+		}
+		_ = unix.Flock(fd, unix.LOCK_UN)
+		_ = lockFile.Close()
+	}
+	return resultErr
+}
+
+func openVerifiedStagedFile(path string, proof agentpull.VerifiedFile) *os.File {
+	if proof.SHA256() == "" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	if !proof.MatchesFile(f) {
+		_ = f.Close()
+		return nil
+	}
+	return f
+}
+
+func sameLockInode(file *os.File, path string) bool {
+	fdInfo, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(fdInfo, pathInfo)
+}
+
+func alreadyCommittedSnapshotCache(stateRoot, reference, artifactDigest string) bool {
+	if artifactDigest == "" {
+		return false
+	}
+	digest, ok, err := agentpull.CachedManifestDigest(stateRoot, reference)
+	if err != nil || !ok || digest != artifactDigest {
+		return false
+	}
+	return verifyRestorableImage(stateRoot, reference) == nil
 }
 
 // publishKind maps the Fastlet-side snapshot kind onto the runtime-agent's
@@ -478,24 +651,25 @@ func stagingFree(stateRoot string) int64 {
 // covers pause→resume (the business-visible interruption), spillMove the
 // post-resume relocation into the publish staging.
 type dumpPlan struct {
-	identity    *fastletapi.SandboxIdentity
-	stateRoot   string
-	binaryName  string
-	sandboxID   string
-	snapshotID  string
-	sandboxDir  string
-	staging     string
-	jailed      bool
-	bootTimeout int32
-	spillRoot   string
-	spilled     bool
-	pauseWindow time.Duration
-	spillMove   time.Duration
-	rootfsClone time.Duration
-	rootfsCopy  time.Duration
-	pauseAPI    time.Duration
-	dumpAPI     time.Duration
-	resumeAPI   time.Duration
+	identity      *fastletapi.SandboxIdentity
+	stateRoot     string
+	binaryName    string
+	sandboxID     string
+	snapshotID    string
+	sandboxDir    string
+	staging       string
+	jailed        bool
+	bootTimeout   int32
+	spillRoot     string
+	spilled       bool
+	pauseWindow   time.Duration
+	spillMove     time.Duration
+	rootfsClone   time.Duration
+	rootfsCopy    time.Duration
+	verifiedFiles map[string]agentpull.VerifiedFile
+	pauseAPI      time.Duration
+	dumpAPI       time.Duration
+	resumeAPI     time.Duration
 }
 
 // jailRoot returns the jail root of the plan's Sandbox (jailer mode only).

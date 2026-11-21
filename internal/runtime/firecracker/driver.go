@@ -1337,7 +1337,7 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 			return err
 		}
 	}
-	return nil
+	return reclaimOrphanedSnapshotCacheStaging(stateRoot)
 }
 
 const interruptedStartExitTimeout = 2 * time.Second
