@@ -231,8 +231,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 	r.applyResourceAwareFeatureGates(&resolvedResources)
-	compiledRegistry, err := r.ensureRegistrySecret(ctx, &pool)
-	if err != nil {
+	if _, err := r.ensureRegistrySecret(ctx, &pool); err != nil {
 		logger.V(1).Info("pool registry configuration is invalid", "reason", boundedStatusMessage(err.Error()))
 		if condErr := r.updatePoolCondition(ctx, &pool, metav1.Condition{
 			Type: apiv1alpha2.PoolConditionRegistryReady, Status: metav1.ConditionFalse,
@@ -242,7 +241,12 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
-	logger.V(4).Info("pool registry configuration compiled", "revision", compiledRegistry.Revision)
+	if err := r.updatePoolCondition(ctx, &pool, metav1.Condition{
+		Type: apiv1alpha2.PoolConditionRegistryReady, Status: metav1.ConditionTrue,
+		Reason: apiv1alpha2.ReasonRegistryAvailable, Message: "Registry configuration is valid and the compiled Secret is persisted",
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
 	infraPlan, infraErr := r.resolveInfraPlan(&pool, profile)
 	infraCondition := metav1.Condition{
 		Type: apiv1alpha2.PoolConditionInfraReady, Status: metav1.ConditionTrue,
@@ -258,27 +262,12 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// Report registry rollout even when infra validation failed, but do not
-	// provision Fastlets until both configurations are valid.
 	var childPods corev1.PodList
 	if err := r.durableReader().List(ctx, &childPods, client.InNamespace(req.Namespace), client.MatchingLabels(poolLabels(pool.Name))); err != nil {
 		return ctrl.Result{}, err
 	}
 	childPods.Items, err = r.removeRetiredFastlets(ctx, &pool, childPods.Items)
 	if err != nil {
-		return ctrl.Result{}, err
-	}
-	appliedRegistry, totalRegistry := r.registryRolloutCounts(&pool, compiledRegistry, childPods.Items)
-	registryCondition := metav1.Condition{
-		Type: apiv1alpha2.PoolConditionRegistryReady, Status: metav1.ConditionTrue,
-		Reason: apiv1alpha2.ReasonRegistryAvailable, Message: "Registry configuration is applied to every current Fastlet",
-	}
-	if appliedRegistry != totalRegistry {
-		registryCondition.Status = metav1.ConditionFalse
-		registryCondition.Reason = "RegistryPropagating"
-		registryCondition.Message = fmt.Sprintf("Registry configuration is applied to %d/%d current Fastlets", appliedRegistry, totalRegistry)
-	}
-	if err := r.updatePoolCondition(ctx, &pool, registryCondition); err != nil {
 		return ctrl.Result{}, err
 	}
 	if infraErr != nil {
@@ -2376,28 +2365,6 @@ func (r *SandboxPoolReconciler) persistRegistrySecret(
 	}
 	secret.Data[registryconfig.SecretKey] = content
 	return r.Patch(ctx, &secret, client.MergeFrom(before))
-}
-
-func (r *SandboxPoolReconciler) registryRolloutCounts(
-	pool *apiv1alpha2.SandboxPool,
-	compiled registryconfig.Compiled,
-	pods []corev1.Pod,
-) (int32, int32) {
-	children := childPodIdentities(pods)
-	total := int32(len(children))
-	if r.Registry == nil {
-		return 0, total
-	}
-	var applied int32
-	for _, info := range r.Registry.GetAllFastlets() {
-		if info.Namespace != pool.Namespace || info.PoolName != pool.Name || info.RegistryRevision != compiled.Revision {
-			continue
-		}
-		if _, exists := children[info.PodName+"/"+info.PodUID]; exists {
-			applied++
-		}
-	}
-	return applied, total
 }
 
 func (r *SandboxPoolReconciler) ensureInfraPlanConfigMap(

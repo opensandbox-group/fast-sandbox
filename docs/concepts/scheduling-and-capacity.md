@@ -78,9 +78,7 @@ for a complete sizing example and operational guidance.
 Every Fast-Path and Controller replica maintains its own Registry from:
 
 1. Kubernetes watches for Pod membership, Pool labels, assignments, Pod UID changes, and lifecycle intent;
-2. jittered Fastlet heartbeats for runtime capability, aggregate commitment,
-   pressure, phase counts, image-cache state, Infra revision, and Registry
-   revision;
+2. jittered Fastlet heartbeats for runtime capability, aggregate commitment, pressure, phase counts, image-cache state, and Infra revision;
 3. full aggregate admission snapshots piggybacked on Create success,
    definitive rejection, and Delete responses;
 4. short-lived process-local reservations while Create RPCs are in flight.
@@ -94,7 +92,7 @@ a global lock; Fastlet atomic admission resolves cross-replica races.
 
 The Orchestrator:
 
-1. filters by namespace, Pool, readiness, runtime profile, Infra revision, Registry revision, and stale heartbeat;
+1. filters by namespace, Pool, readiness, runtime profile, Infra revision, and stale heartbeat;
 2. requires fresh eligible slot and resource ledgers in ResourceAware mode;
 3. prioritizes image-cache affinity;
 4. ranks by a coarse dominant-load bucket, FastPath Pod UID seed, and a stable

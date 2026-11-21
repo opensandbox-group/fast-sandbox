@@ -341,9 +341,8 @@ func (s *FastletServer) heartbeat(r *http.Request, cursor fastletapi.CacheCursor
 		ResourceProfileHash: s.sandboxManager.ResourceProfileHash(),
 		InfraRevision:       infraRevision,
 		InfraReady:          infraReady, PreparedArtifacts: preparedArtifacts,
-		RegistryRevision: s.sandboxManager.RegistryRevision(),
-		WarmImages:       s.sandboxManager.WarmImageStates(),
-		Capabilities:     s.sandboxManager.Capabilities(),
+		WarmImages:   s.sandboxManager.WarmImageStates(),
+		Capabilities: s.sandboxManager.Capabilities(),
 	}
 	return fastletapi.HeartbeatResponse{
 		FastletStatus: status,

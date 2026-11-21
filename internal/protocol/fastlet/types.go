@@ -255,7 +255,6 @@ type FastletStatus struct {
 	InfraRevision       string           `json:"infraRevision,omitempty"`
 	InfraReady          bool             `json:"infraReady"`
 	PreparedArtifacts   []string         `json:"preparedArtifacts,omitempty"`
-	RegistryRevision    string           `json:"registryRevision,omitempty"`
 	WarmImages          []WarmImageState `json:"warmImages,omitempty"`
 	// Capabilities are the explicitly advertised feature capabilities of
 	// this Fastlet build (CapabilityXxx constants). The control plane gates

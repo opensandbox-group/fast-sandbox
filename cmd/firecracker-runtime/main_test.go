@@ -37,8 +37,6 @@ func (f *fakeProvider) Credentials(reference string) (registryconfig.Credential,
 	return f.credential, f.found, f.err
 }
 
-func (f *fakeProvider) Revision() string { return "" }
-
 func TestResolveCredentialMatchesStoreHost(t *testing.T) {
 	provider := &fakeProvider{
 		credential: registryconfig.Credential{
