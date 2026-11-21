@@ -1,0 +1,69 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: fast-sandbox-fastpath
+  namespace: fast-sandbox-system
+spec:
+  secretName: fast-sandbox-fastpath-tls
+  duration: 2160h
+  renewBefore: 720h
+  privateKey:
+    rotationPolicy: Always
+  issuerRef:
+    name: fast-sandbox-serving
+    kind: ClusterIssuer
+    group: cert-manager.io
+  usages: [digital signature, key encipherment, server auth]
+  dnsNames:
+    - fast-sandbox-fastpath
+    - fast-sandbox-fastpath.fast-sandbox-system
+    - fast-sandbox-fastpath.fast-sandbox-system.svc
+    - fast-sandbox-fastpath.fast-sandbox-system.svc.cluster.local
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fast-sandbox-fastpath-callers
+  namespace: fast-sandbox-system
+data:
+  callers.json: |
+    [
+      {"subject":"system:serviceaccount:fast-sandbox-system:opensandbox-server-fastpath-client","profile":"server","namespaces":["fast-sandbox"]},
+      {"subject":"system:serviceaccount:fast-sandbox-system:opensandbox-ingress-fastpath-client","profile":"gateway","namespaces":["fast-sandbox"]}
+    ]
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opensandbox-server-fastpath-client
+  namespace: fast-sandbox-system
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opensandbox-ingress-fastpath-client
+  namespace: fast-sandbox-system
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: opensandbox-server-fastpath-client-minter
+  namespace: fast-sandbox-system
+rules:
+  - apiGroups: [""]
+    resources: [serviceaccounts/token]
+    resourceNames: [opensandbox-server-fastpath-client]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: opensandbox-ingress-fastpath-client-minter
+  namespace: fast-sandbox-system
+rules:
+  - apiGroups: [""]
+    resources: [serviceaccounts/token]
+    resourceNames: [opensandbox-ingress-fastpath-client]
+    verbs: [create]
