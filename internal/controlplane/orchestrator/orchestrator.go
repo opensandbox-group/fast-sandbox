@@ -217,8 +217,8 @@ func (o *Orchestrator) Candidates(ctx context.Context, sandbox *apiv1alpha2.Sand
 		RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
 		ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
 		FastletRevision: parameters.FastletRevision,
-		ResourceMode:    o.placementResourceMode(parameters.ResourceMode), Demand: parameters.ResourceDemand,
-		Image: sandbox.Spec.Image, StableKey: stableKey,
+		ResourceMode:    o.EffectivePlacementMode(parameters.ResourceMode), Demand: parameters.ResourceDemand,
+		Image: sandbox.Spec.Image, StableKey: stableKey, RequiredCapability: requiredCreateCapability(sandbox),
 	})
 	if len(candidates) == 0 {
 		return nil, parameters, ErrNoCandidate
@@ -240,11 +240,11 @@ func (o *Orchestrator) FastPathCandidatesMatching(sandbox *apiv1alpha2.Sandbox, 
 	}
 	candidates := o.topK(placement.CandidateRequest{
 		Namespace: sandbox.Namespace, PoolName: sandbox.Spec.PoolRef,
-		Image: sandbox.Spec.Image, StableKey: stableKey,
+		Image: sandbox.Spec.Image, StableKey: stableKey, RequiredCapability: requiredCreateCapability(sandbox),
 		RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
 		ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
 		FastletRevision: parameters.FastletRevision, ExcludedFastlets: excluded,
-		ResourceMode: o.placementResourceMode(parameters.ResourceMode), Demand: parameters.ResourceDemand,
+		ResourceMode: o.EffectivePlacementMode(parameters.ResourceMode), Demand: parameters.ResourceDemand,
 	})
 	if len(candidates) == 0 {
 		return nil, ErrNoCandidate
@@ -252,11 +252,19 @@ func (o *Orchestrator) FastPathCandidatesMatching(sandbox *apiv1alpha2.Sandbox, 
 	return candidates, nil
 }
 
-func (o *Orchestrator) placementResourceMode(mode apiv1alpha2.SandboxResourceMode) apiv1alpha2.SandboxResourceMode {
+// EffectivePlacementMode includes the controller-wide placement switch.
+func (o *Orchestrator) EffectivePlacementMode(mode apiv1alpha2.SandboxResourceMode) apiv1alpha2.SandboxResourceMode {
 	if o.DisableResourceAwarePlacement && mode == apiv1alpha2.SandboxResourceModeResourceAware {
 		return apiv1alpha2.SandboxResourceModeLegacySlot
 	}
 	return mode
+}
+
+func requiredCreateCapability(sandbox *apiv1alpha2.Sandbox) string {
+	if sandbox.Annotations[assignment.AnnotationRootfsBootDigest] != "" && ResumeCheckpoint(sandbox) == nil {
+		return fastletapi.CapabilityRootfsBootCreate
+	}
+	return ""
 }
 
 func (o *Orchestrator) topK(request placement.CandidateRequest) []placement.FastletInfo {
@@ -494,6 +502,17 @@ func (o *Orchestrator) CreateRuntimeOnCandidateWithCompletion(ctx context.Contex
 }
 
 func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1alpha2.Sandbox, fastlet placement.FastletInfo, envelope assignment.AssignmentEnvelope, identity fastletapi.SandboxIdentity, completion fastletapi.CreateCompletion, parameters RuntimeParameters, declarative bool) (*fastletapi.CreateSandboxResponse, error) {
+	if capability := requiredCreateCapability(sandbox); capability != "" {
+		current, ok := o.Registry.GetFastletByID(fastlet.ID)
+		if !ok || current.PodUID != envelope.FastletPodUID || !current.SupportsCapability(capability) {
+			failure := &fastletapi.FastletError{Code: fastletapi.ErrorCapacityRejected, Reason: fastletapi.AdmissionReasonUnsupportedProtocol, Message: "assigned Fastlet does not advertise " + capability, Retryable: true}
+			if !ok || current.PodUID != envelope.FastletPodUID {
+				failure.Reason = fastletapi.AdmissionReasonTelemetryStale
+				failure.Message = "assigned Fastlet disappeared or was replaced in the placement registry"
+			}
+			return nil, &fastletapi.CreateCallError{Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects, Failure: failure}
+		}
+	}
 	if local, ok := o.Registry.(localReservationRegistry); ok && createNeedsLocalReservation(sandbox, fastlet, identity) {
 		if !local.ReserveLocal(fastlet.ID, parameters.ResourceDemand) {
 			if declarative {
@@ -529,6 +548,9 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 			ManifestRef:    checkpoint.ManifestRef,
 			ArtifactDigest: checkpoint.ArtifactDigest,
 		}
+	}
+	if spec.Restore == nil {
+		spec.RootfsBootDigest = sandbox.Annotations[assignment.AnnotationRootfsBootDigest]
 	}
 	request := &fastletapi.CreateSandboxRequest{
 		RequestID: sandbox.Annotations[assignment.AnnotationRequestID], Identity: identity,

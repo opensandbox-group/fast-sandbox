@@ -87,3 +87,30 @@ func capturePIDAbsent(pid int) (bool, error) {
 	}
 	return false, err
 }
+
+// Pin the process before checking the socket peer. A recycled numeric PID
+// must never receive a signal intended for the old VMM.
+func stopVerifiedSocketPeer(ctx context.Context, socket string, pid int) error {
+	fd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	if _, err := captureProcessIdentity(ctx, socket, pid); err != nil {
+		return err
+	}
+	if err := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); err != nil && err != unix.ESRCH {
+		return err
+	}
+	fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	for ctx.Err() == nil {
+		n, err := unix.Poll(fds, 50)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil || n > 0 {
+			return err
+		}
+	}
+	return ctx.Err()
+}

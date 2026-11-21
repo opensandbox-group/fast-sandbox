@@ -19,6 +19,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
+	FastPathService_CreateRootfsSandbox_FullMethodName   = "/fastpath.v2.FastPathService/CreateRootfsSandbox"
 	FastPathService_CreateSandbox_FullMethodName         = "/fastpath.v2.FastPathService/CreateSandbox"
 	FastPathService_DeleteSandbox_FullMethodName         = "/fastpath.v2.FastPathService/DeleteSandbox"
 	FastPathService_UpdateSandbox_FullMethodName         = "/fastpath.v2.FastPathService/UpdateSandbox"
@@ -40,6 +41,7 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 type FastPathServiceClient interface {
+	CreateRootfsSandbox(ctx context.Context, in *CreateRootfsSandboxRequest, opts ...grpc.CallOption) (*CreateSandboxResponse, error)
 	CreateSandbox(ctx context.Context, in *CreateSandboxRequest, opts ...grpc.CallOption) (*CreateSandboxResponse, error)
 	DeleteSandbox(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
 	UpdateSandbox(ctx context.Context, in *UpdateSandboxRequest, opts ...grpc.CallOption) (*UpdateSandboxResponse, error)
@@ -81,6 +83,16 @@ type fastPathServiceClient struct {
 
 func NewFastPathServiceClient(cc grpc.ClientConnInterface) FastPathServiceClient {
 	return &fastPathServiceClient{cc}
+}
+
+func (c *fastPathServiceClient) CreateRootfsSandbox(ctx context.Context, in *CreateRootfsSandboxRequest, opts ...grpc.CallOption) (*CreateSandboxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CreateSandboxResponse)
+	err := c.cc.Invoke(ctx, FastPathService_CreateRootfsSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *fastPathServiceClient) CreateSandbox(ctx context.Context, in *CreateSandboxRequest, opts ...grpc.CallOption) (*CreateSandboxResponse, error) {
@@ -237,6 +249,7 @@ func (c *fastPathServiceClient) InvokeHandlerAction(ctx context.Context, in *Inv
 // All implementations must embed UnimplementedFastPathServiceServer
 // for forward compatibility.
 type FastPathServiceServer interface {
+	CreateRootfsSandbox(context.Context, *CreateRootfsSandboxRequest) (*CreateSandboxResponse, error)
 	CreateSandbox(context.Context, *CreateSandboxRequest) (*CreateSandboxResponse, error)
 	DeleteSandbox(context.Context, *DeleteRequest) (*DeleteResponse, error)
 	UpdateSandbox(context.Context, *UpdateSandboxRequest) (*UpdateSandboxResponse, error)
@@ -280,6 +293,9 @@ type FastPathServiceServer interface {
 // pointer dereference when methods are called.
 type UnimplementedFastPathServiceServer struct{}
 
+func (UnimplementedFastPathServiceServer) CreateRootfsSandbox(context.Context, *CreateRootfsSandboxRequest) (*CreateSandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CreateRootfsSandbox not implemented")
+}
 func (UnimplementedFastPathServiceServer) CreateSandbox(context.Context, *CreateSandboxRequest) (*CreateSandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSandbox not implemented")
 }
@@ -344,6 +360,24 @@ func RegisterFastPathServiceServer(s grpc.ServiceRegistrar, srv FastPathServiceS
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&FastPathService_ServiceDesc, srv)
+}
+
+func _FastPathService_CreateRootfsSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateRootfsSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(FastPathServiceServer).CreateRootfsSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: FastPathService_CreateRootfsSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(FastPathServiceServer).CreateRootfsSandbox(ctx, req.(*CreateRootfsSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _FastPathService_CreateSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -623,6 +657,10 @@ var FastPathService_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "fastpath.v2.FastPathService",
 	HandlerType: (*FastPathServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "CreateRootfsSandbox",
+			Handler:    _FastPathService_CreateRootfsSandbox_Handler,
+		},
 		{
 			MethodName: "CreateSandbox",
 			Handler:    _FastPathService_CreateSandbox_Handler,

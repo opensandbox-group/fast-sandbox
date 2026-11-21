@@ -128,12 +128,11 @@ func main() {
 		configurable.SetStateMover(actionManager)
 	}
 	registryProvider := registryconfig.NewFileProvider(getEnv("FAST_SANDBOX_REGISTRY_CONFIG_PATH", registryconfig.MountPath))
-	if revision, err := registryProvider.Refresh(); err != nil {
+	if err := registryProvider.Refresh(); err != nil {
 		klog.ErrorS(err, "Failed to load Registry configuration")
 		os.Exit(1)
-	} else {
-		klog.InfoS("registry configuration loaded", "revision", revision)
 	}
+	klog.InfoS("registry configuration loaded")
 	if configurable, ok := rt.(registryConfigurable); ok {
 		configurable.SetRegistryProvider(registryProvider)
 	}
@@ -168,8 +167,7 @@ func main() {
 		WarmImages:     startup.warmImages,
 		RoutePublisher: fastletproxy.NewRoutePublisher(proxyControlClient),
 		InfraRevision:  infraManager.Revision(), InfraManager: infraManager,
-		RegistryProvider: registryProvider,
-		ActionManager:    actionManager,
+		ActionManager: actionManager,
 	})
 	if err != nil {
 		klog.ErrorS(err, "Failed to initialize Sandbox manager")

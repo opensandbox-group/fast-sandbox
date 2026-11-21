@@ -92,14 +92,21 @@ type VMGuestControl struct {
 }
 
 type VMPlatform struct {
-	SnapshotMode string                  `json:"snapshotMode,omitempty"`
-	Execd        string                  `json:"execd,omitempty"`
-	Entrypoint   []string                `json:"entrypoint,omitempty"`
-	Init         string                  `json:"init,omitempty"`
-	Envs         map[string]string       `json:"envs,omitempty"`
-	EgressMitmCA *MITMCALineage          `json:"egressMitmCA,omitempty"`
-	Checkpoint   *CheckpointOwner        `json:"checkpoint,omitempty"`
-	StateFiles   map[string]ManifestFile `json:"stateFiles,omitempty"`
+	ResourceLimits *VMResourceLimits       `json:"resourceLimits,omitempty"`
+	SnapshotMode   string                  `json:"snapshotMode,omitempty"`
+	Execd          string                  `json:"execd,omitempty"`
+	Entrypoint     []string                `json:"entrypoint,omitempty"`
+	Init           string                  `json:"init,omitempty"`
+	Envs           map[string]string       `json:"envs,omitempty"`
+	EgressMitmCA   *MITMCALineage          `json:"egressMitmCA,omitempty"`
+	Checkpoint     *CheckpointOwner        `json:"checkpoint,omitempty"`
+	StateFiles     map[string]ManifestFile `json:"stateFiles,omitempty"`
+}
+
+// VMResourceLimits records admitted quotas independently of the guest machine.
+type VMResourceLimits struct {
+	CPU    string `json:"cpu,omitempty"`
+	Memory string `json:"memory,omitempty"`
 }
 
 type MITMCALineage struct {

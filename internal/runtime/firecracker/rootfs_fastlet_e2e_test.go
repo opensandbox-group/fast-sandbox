@@ -100,7 +100,7 @@ func TestRootfsFastletChainE2E(t *testing.T) {
 			t.Errorf("keep backing files %s: cleanup failed: %v: %s", root, e, output)
 		}
 	}()
-	manager, err := fastletsandbox.NewSandboxManagerWithConfig(driver, fastletsandbox.SandboxManagerConfig{Capacity: 2, FastletPodUID: pod, RuntimeName: apiv1alpha2.RuntimeFirecracker, RegistryProvider: registryconfig.NewFileProvider(credentialPath)})
+	manager, err := fastletsandbox.NewSandboxManagerWithConfig(driver, fastletsandbox.SandboxManagerConfig{Capacity: 2, FastletPodUID: pod, RuntimeName: apiv1alpha2.RuntimeFirecracker})
 	require.NoError(t, err)
 
 	bundle := filepath.Join(root, "seed")

@@ -16,6 +16,7 @@ import (
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	kvalidation "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
@@ -76,6 +77,10 @@ type acceptedCreate struct {
 }
 
 func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSandboxRequest) (_ *fastpathv2.CreateSandboxResponse, resultErr error) {
+	return s.createSandbox(ctx, request, "", "", "")
+}
+
+func (s *Server) createSandbox(ctx context.Context, request *fastpathv2.CreateSandboxRequest, rootfsDigest, overrideIntentHash string, replayUID types.UID) (_ *fastpathv2.CreateSandboxResponse, resultErr error) {
 	started := time.Now()
 	acceptedObserved := false
 	defer func() {
@@ -121,7 +126,15 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	if err != nil {
 		return nil, status.Error(codes.FailedPrecondition, err.Error())
 	}
+	if rootfsDigest != "" && (pool.Spec.Runtime != apiv1alpha2.RuntimeFirecracker || orchestrator.EffectivePlacementMode(pool.Spec.SandboxResources.ResourceMode()) != apiv1alpha2.SandboxResourceModeResourceAware) {
+		return nil, status.Error(codes.InvalidArgument, "rootfs resource overrides require active ResourceAware placement on a Firecracker pool")
+	}
 	sandbox := newSandboxCRD(request, bindings, resources, createSpecHash)
+	sandbox.UID = replayUID
+	if rootfsDigest != "" {
+		sandbox.Annotations[assignment.AnnotationRootfsBootDigest] = rootfsDigest
+		sandbox.Annotations[assignment.AnnotationCreateSpecHash] = createSpecHash + ":" + rootfsDigest + ":" + overrideIntentHash
+	}
 	releaseCreate := orchestrator.BeginFastPathCreate(client.ObjectKeyFromObject(sandbox))
 	defer releaseCreate()
 	parameters, err := fastPathRuntimeParameters(pool, sandbox)
@@ -136,16 +149,10 @@ func (s *Server) CreateSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	// A failed Create must not leave a new intent for the Controller to execute.
 	// Capacity exhaustion may still race with an earlier ambiguous attempt, so
 	// look up the same request ID and resume only that already-durable identity.
-	if selectionErr != nil {
-		accepted, found, existingErr := s.loadExistingCreateIntent(ctx, plannedCreate{sandbox: sandbox, parameters: parameters})
-		if existingErr != nil {
-			return nil, existingErr
-		}
-		if !found {
-			return nil, selectionErr
-		}
-		if len(accepted.candidates) == 0 {
-			return nil, selectionErr
+	if selectionErr != nil || replayUID != "" {
+		accepted, err := s.loadReplayCandidate(ctx, plannedCreate{sandbox: sandbox, candidates: rankedFastlets, assignment: envelope, parameters: parameters}, selectionErr)
+		if err != nil {
+			return nil, err
 		}
 		observeCreateAccepted("idempotent", started, nil)
 		acceptedObserved = true
@@ -319,7 +326,7 @@ func (s *Server) loadExistingCreateIntent(ctx context.Context, plan plannedCreat
 	if err != nil {
 		return nil, false, grpcKubernetesError(err)
 	}
-	if existing.Annotations[assignment.AnnotationRequestID] != plan.sandbox.Annotations[assignment.AnnotationRequestID] ||
+	if (plan.sandbox.UID != "" && existing.UID != plan.sandbox.UID) || existing.Annotations[assignment.AnnotationRequestID] != plan.sandbox.Annotations[assignment.AnnotationRequestID] ||
 		existing.Annotations[assignment.AnnotationCreateSpecHash] != plan.sandbox.Annotations[assignment.AnnotationCreateSpecHash] {
 		return nil, true, status.Errorf(codes.AlreadyExists, "Sandbox name %q belongs to another create intent", plan.sandbox.Name)
 	}
@@ -1520,4 +1527,24 @@ func (s *Server) defaultNamespace() string {
 		return s.DefaultNamespace
 	}
 	return "fast-sandbox"
+}
+
+func (s *Server) loadReplayCandidate(ctx context.Context, plan plannedCreate, selectionErr error) (*acceptedCreate, error) {
+	accepted, found, existingErr := s.loadExistingCreateIntent(ctx, plan)
+	if existingErr != nil {
+		return nil, existingErr
+	}
+	if !found {
+		if plan.sandbox.UID != "" {
+			return nil, status.Error(codes.NotFound, "Sandbox was deleted during create replay")
+		}
+		return nil, selectionErr
+	}
+	if len(accepted.candidates) == 0 {
+		if selectionErr == nil {
+			return nil, status.Error(codes.Unavailable, "Sandbox assignment is not ready")
+		}
+		return nil, selectionErr
+	}
+	return accepted, nil
 }

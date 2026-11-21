@@ -244,6 +244,7 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, request ctrl.
 		logger.Info("sandbox template build pod succeeded", "template", template.Name, "pod", pod.Name)
 		template.Status.ManifestRef = pod.Annotations[sandboxTemplateManifestRefAnnot]
 		template.Status.ArtifactDigest = pod.Annotations[sandboxTemplateArtifactDigestAnn]
+		template.Status.Mode = reportedTemplateMode(pod)
 		template.Status.Phase = apiv1alpha2.SandboxTemplatePhaseSucceeded
 		now := metav1.Now()
 		template.Status.LastBuildTime = &now
@@ -512,6 +513,9 @@ var errArtifactStoreUnconfigured = errors.New("no platform artifact store is con
 // publishing where no node agent reads. Trailing slashes are ignored in the
 // comparison because the builder strips them when naming objects.
 func (r *SandboxTemplateReconciler) effectiveOutput(output apiv1alpha2.OutputSpec, storeRoot string) (apiv1alpha2.OutputSpec, error) {
+	if output.Mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly && output.Format != apiv1alpha2.ArtifactFormatNative {
+		return output, fmt.Errorf("RootfsOnly template builds require native object storage")
+	}
 	if strings.HasPrefix(output.Publish, "oci://") {
 		if output.Format != apiv1alpha2.ArtifactFormatOverlayBD {
 			return output, fmt.Errorf("OCI templates require overlaybd format")
@@ -977,4 +981,13 @@ func exitCodeSuffix(exitCode int32) string {
 // ptr returns a pointer to the given value.
 func ptr[T any](value T) *T {
 	return &value
+}
+
+func reportedTemplateMode(pod *corev1.Pod) apiv1alpha2.SandboxSnapshotMode {
+	switch mode := apiv1alpha2.SandboxSnapshotMode(pod.Annotations[apiv1alpha2.SandboxTemplateArtifactModeAnnotation]); mode {
+	case apiv1alpha2.SandboxSnapshotModeFull, apiv1alpha2.SandboxSnapshotModeRootfsOnly:
+		return mode
+	default:
+		return ""
+	}
 }

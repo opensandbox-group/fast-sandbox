@@ -54,6 +54,7 @@ func (s *FastletServer) Handler() http.Handler {
 	mux.HandleFunc("/readyz", s.handleReady)
 	mux.Handle("/metrics", promhttp.Handler())
 	mux.HandleFunc("/api/v2/fastlet/create", s.handleCreate)
+	mux.HandleFunc(fastletapi.RootfsBootCreatePath, s.handleCreate)
 	mux.HandleFunc("/api/v2/fastlet/inspect", s.handleInspect)
 	mux.HandleFunc("/api/v2/fastlet/delete", s.handleDelete)
 	mux.HandleFunc("/api/v2/fastlet/bindings/reconcile", s.handleReconcileBindings)
@@ -129,6 +130,10 @@ func (s *FastletServer) handleReady(w http.ResponseWriter, _ *http.Request) {
 func (s *FastletServer) handleCreate(w http.ResponseWriter, r *http.Request) {
 	var req fastletapi.CreateSandboxRequest
 	if !decodePost(w, r, &req) {
+		return
+	}
+	if (r.URL.Path == fastletapi.RootfsBootCreatePath) != (req.Sandbox.RootfsBootDigest != "") {
+		http.Error(w, "rootfs creation contract mismatch", http.StatusBadRequest)
 		return
 	}
 	r = r.WithContext(withFastletRequestIdentity(r.Context(), req.Identity))
@@ -336,9 +341,8 @@ func (s *FastletServer) heartbeat(r *http.Request, cursor fastletapi.CacheCursor
 		ResourceProfileHash: s.sandboxManager.ResourceProfileHash(),
 		InfraRevision:       infraRevision,
 		InfraReady:          infraReady, PreparedArtifacts: preparedArtifacts,
-		RegistryRevision: s.sandboxManager.RegistryRevision(),
-		WarmImages:       s.sandboxManager.WarmImageStates(),
-		Capabilities:     s.sandboxManager.SnapshotCapabilities(),
+		WarmImages:   s.sandboxManager.WarmImageStates(),
+		Capabilities: s.sandboxManager.Capabilities(),
 	}
 	return fastletapi.HeartbeatResponse{
 		FastletStatus: status,

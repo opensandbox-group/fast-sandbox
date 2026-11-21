@@ -66,7 +66,6 @@ type FastletInfo struct {
 	FastletRevision     string
 	InfraReady          bool
 	PreparedArtifacts   []string
-	RegistryRevision    string
 	WarmImages          []fastletapi.WarmImageState
 	// Capabilities are the heartbeat-advertised feature capabilities
 	// (fastletapi.CapabilityXxx). Dispatch sites gate on them so a request
@@ -133,6 +132,7 @@ type FastletRegistry interface {
 }
 
 type CandidateRequest struct {
+	RequiredCapability  string
 	Namespace           string
 	PoolName            string
 	RuntimeName         apiv1alpha2.RuntimeName
@@ -279,7 +279,6 @@ func preserveHeartbeat(target *FastletInfo, previous FastletInfo) {
 	target.resourceFence = previous.resourceFence
 	target.Images = append([]string(nil), previous.Images...)
 	target.PreparedArtifacts = append([]string(nil), previous.PreparedArtifacts...)
-	target.RegistryRevision = previous.RegistryRevision
 	target.WarmImages = cloneWarmImageStates(previous.WarmImages)
 	target.Capabilities = append([]string(nil), previous.Capabilities...)
 	target.CacheEpoch = previous.CacheEpoch
@@ -321,7 +320,6 @@ func (r *InMemoryRegistry) ApplyHeartbeat(id FastletID, expectedPodUID string, h
 	slot.info.InfraReady = heartbeat.InfraReady
 	slot.info.Draining = slot.info.DrainRequested || heartbeat.Draining
 	slot.info.PreparedArtifacts = append([]string(nil), heartbeat.PreparedArtifacts...)
-	slot.info.RegistryRevision = heartbeat.RegistryRevision
 	slot.info.WarmImages = cloneWarmImageStates(heartbeat.WarmImages)
 	slot.info.Capabilities = append([]string(nil), heartbeat.Capabilities...)
 	applyHeartbeatAdmission(&slot.info, heartbeat.Admission, observedAt)
@@ -553,6 +551,9 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 }
 
 func hardFilter(info FastletInfo, request CandidateRequest, staleAfter time.Duration, blockedNodes map[string]struct{}) bool {
+	if request.RequiredCapability != "" && !info.SupportsCapability(request.RequiredCapability) {
+		return false
+	}
 	if _, excluded := request.ExcludedFastlets[info.ID]; excluded {
 		return false
 	}
