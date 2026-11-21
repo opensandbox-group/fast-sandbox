@@ -53,9 +53,9 @@ func writeImageEnv(image v1.Image, workdir string) error {
 // offline builds). The tarball must contain a single image (a docker save of
 // one image with any number of tags is fine; multi-image archives are not
 // supported and an arbitrary member would be picked).
-func pullOCILayout(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir string) (string, error) {
+func pullOCILayout(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir string, auth *registryAuth) (string, error) {
 	if tarPath := os.Getenv("SANDBOX_TEMPLATE_IMAGE_TAR"); tarPath != "" {
-		return pullOCILayoutFromTar(ctx, spec, workdir, tarPath)
+		return pullOCILayoutFromTar(ctx, spec, workdir, tarPath, auth)
 	}
 	reference, err := name.ParseReference(spec.Image)
 	if err != nil {
@@ -63,8 +63,11 @@ func pullOCILayout(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, wo
 	}
 	// Pin the platform explicitly: the builder converts for linux/amd64, and
 	// without a platform the registry's multi-arch index resolves against the
-	// builder host (an arm64 host would pull the wrong architecture).
-	descriptor, err := remote.Get(reference, remote.WithContext(ctx), remote.WithAuthFromKeychain(authn.DefaultKeychain), remote.WithPlatform(linuxAMD64))
+	// builder host (an arm64 host would pull the wrong architecture). This
+	// path (object-store output) never populates DOCKER_CONFIG, so
+	// WithAuthFromKeychain(DefaultKeychain) would always resolve to
+	// anonymous; resolve credentials from the mounted registry config instead.
+	descriptor, err := remote.Get(reference, remote.WithContext(ctx), remote.WithPlatform(linuxAMD64), remote.WithAuth(auth.authenticator(spec.Image)))
 	if err != nil {
 		return "", fmt.Errorf("pull %q: %w", spec.Image, err)
 	}
@@ -79,14 +82,14 @@ func pullOCILayout(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, wo
 		return "", err
 	}
 	if spec.Execd != "" {
-		if err := extractExecd(ctx, spec.Execd, filepath.Join(workdir, "execd-root")); err != nil {
+		if err := extractExecd(ctx, spec.Execd, filepath.Join(workdir, "execd-root"), auth.authenticator(spec.Execd)); err != nil {
 			return "", err
 		}
 	}
 	return descriptor.Digest.String(), nil
 }
 
-func pullOCILayoutFromTar(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir, tarPath string) (string, error) {
+func pullOCILayoutFromTar(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir, tarPath string, auth *registryAuth) (string, error) {
 	image, err := tarball.ImageFromPath(tarPath, nil)
 	if err != nil {
 		return "", fmt.Errorf("load image tarball: %w", err)
@@ -98,7 +101,7 @@ func pullOCILayoutFromTar(ctx context.Context, spec apiv1alpha2.SandboxTemplateS
 		return "", err
 	}
 	if spec.Execd != "" {
-		if err := extractExecd(ctx, spec.Execd, filepath.Join(workdir, "execd-root")); err != nil {
+		if err := extractExecd(ctx, spec.Execd, filepath.Join(workdir, "execd-root"), auth.authenticator(spec.Execd)); err != nil {
 			return "", err
 		}
 	}
@@ -126,12 +129,12 @@ func writeOCILayout(image v1.Image, workdir string) error {
 // (/execd, /bootstrap.sh, /prepare.sh, /usr/local/bin/bwrap) into a local
 // directory for injection. Files are first collected in memory so symlinked
 // entries (e.g. bwrap -> execd) can be resolved across the layer.
-func extractExecd(ctx context.Context, image, destination string) error { //nolint:gocognit // single-pass tar walk; splitting would obscure symlink resolution
+func extractExecd(ctx context.Context, image, destination string, auth authn.Authenticator) error { //nolint:gocognit // single-pass tar walk; splitting would obscure symlink resolution
 	reference, err := name.ParseReference(image)
 	if err != nil {
 		return err
 	}
-	img, err := remote.Image(reference, remote.WithContext(ctx), remote.WithAuthFromKeychain(authn.DefaultKeychain), remote.WithPlatform(linuxAMD64))
+	img, err := remote.Image(reference, remote.WithContext(ctx), remote.WithPlatform(linuxAMD64), remote.WithAuth(auth))
 	if err != nil {
 		return fmt.Errorf("pull execd %q: %w", image, err)
 	}
