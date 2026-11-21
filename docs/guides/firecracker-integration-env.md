@@ -314,6 +314,10 @@ Delivery timing with on-demand loading (two nodes, XFS StateRoot):
 - **loop devices** on the host for the XFS loop image; the builder/driver
   create their own nodes inside pods (see §5).
 - `fs.inotify.max_user_instances` ≥ 8192 (kubelet/containerd watchers).
+- **Pod-level pitfalls have their own page**: Pod `hugetlb` limits, the
+  Firecracker seccomp / `prctl` gap, VMM cgroup placement outside `kubepods`,
+  and the THP vs explicit 2M trade-off — see
+  [Firecracker in Kubernetes pods](firecracker-in-kubernetes-pods.md).
 
 ### 6.2 StateRoot filesystem — the single biggest latency lever
 - Put the node StateRoot on **XFS with `reflink=1`** for short native snapshot pauses. With OCI disabled, Fastlet startup and node readiness require XFS and an actual reflink clone; missing GNU coreutils or disabled reflink blocks startup. With `FAST_SANDBOX_OCI_ENABLED=true`, XFS/reflink validation is skipped with a warning: native templates can still require full rootfs copies, increasing create latency and snapshot pause time. Set the variable on both the Fastlet and runtime-agent to relax both checks; the standalone host-check script accepts the same variable. Directory preparation and the node's minimum free-space requirement remain enforced. A per-instance rootfs CoW clone takes ~1 ms instead of a multi-GiB copy.
