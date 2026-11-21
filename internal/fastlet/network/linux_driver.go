@@ -29,6 +29,12 @@ const (
 	ipSetSubcommand = "set"
 	// eth0Name is the in-namespace name of the sandbox interface.
 	eth0Name = "eth0"
+	// iptablesPrerouting and iptablesPostrouting name the NAT hook chains.
+	iptablesPrerouting  = "PREROUTING"
+	iptablesPostrouting = "POSTROUTING"
+	// sysctlCommandName is the sysctl executable used for host and in-namespace
+	// sysctl writes.
+	sysctlCommandName = "sysctl"
 )
 
 type CommandRunner interface {
@@ -90,7 +96,7 @@ func NewLinuxNetNSDriver(config LinuxDriverConfig) *LinuxNetNSDriver {
 		config.IPTablesCommand = "iptables"
 	}
 	if config.SysctlCommand == "" {
-		config.SysctlCommand = "sysctl"
+		config.SysctlCommand = sysctlCommandName
 	}
 	return &LinuxNetNSDriver{
 		runner: config.Runner, resolverPath: config.ResolverPath,
@@ -263,7 +269,7 @@ func (d *LinuxNetNSDriver) ensureEgress(ctx context.Context, slot *Slot) error {
 		}
 		slot.EgressDevice = egress
 	}
-	check := []string{"-t", "nat", "-C", "POSTROUTING", "-s", slot.PrivateCIDR, "!", "-d", slot.PrivateCIDR, "-o", egress, "-j", "MASQUERADE"}
+	check := []string{"-t", "nat", "-C", iptablesPostrouting, "-s", slot.PrivateCIDR, "!", "-d", slot.PrivateCIDR, "-o", egress, "-j", "MASQUERADE"}
 	if _, err := d.runner.Run(ctx, d.iptablesCommand, check...); err == nil {
 		return nil
 	}
