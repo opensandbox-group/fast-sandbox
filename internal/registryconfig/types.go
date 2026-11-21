@@ -2,7 +2,6 @@ package registryconfig
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,8 +9,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-
-	"k8s.io/klog/v2"
 )
 
 const (
@@ -68,13 +65,11 @@ type Credential struct {
 }
 
 type Compiled struct {
-	Revision    string       `json:"revision"`
 	Credentials []Credential `json:"credentials,omitempty"`
 }
 
 type Provider interface {
 	Credentials(reference string) (Credential, bool, error)
-	Revision() string
 }
 
 func NormalizeAndValidate(config Config) (Config, error) {
@@ -130,12 +125,7 @@ func NewCompiled(credentials []Credential) (Compiled, error) {
 		}
 		return normalized[i].RepositoryPrefix < normalized[j].RepositoryPrefix
 	})
-	payload, err := json.Marshal(normalized)
-	if err != nil {
-		return Compiled{}, err
-	}
-	digest := sha256.Sum256(payload)
-	return Compiled{Revision: "sha256:" + hex.EncodeToString(digest[:]), Credentials: normalized}, nil
+	return Compiled{Credentials: normalized}, nil
 }
 
 func (c Compiled) Marshal() ([]byte, error) {
@@ -147,9 +137,6 @@ func ParseCompiled(content []byte) (Compiled, error) {
 	if err := json.Unmarshal(content, &compiled); err != nil {
 		return Compiled{}, fmt.Errorf("decode compiled registry configuration: %w", err)
 	}
-	// Keep credential shape validation, but drop the provenance comparison:
-	// the declared revision is treated as informational, so operator-authored
-	// configs (hand-stamped templates) load without recomputing the digest.
 	if _, err := NewCompiled(compiled.Credentials); err != nil {
 		return Compiled{}, err
 	}
@@ -232,25 +219,9 @@ func (p *FileProvider) CredentialsForHost(host string) (Credential, bool, error)
 	return credential, found, nil
 }
 
-func (p *FileProvider) Revision() string {
-	compiled, err := p.load()
-	if err != nil {
-		// Serving the last-good revision is deliberate (fail-open for a
-		// transient read failure), but the degraded state must be visible.
-		klog.V(2).InfoS("registry configuration read failed; serving last-good revision", "path", p.path, "err", err)
-		p.mu.RLock()
-		defer p.mu.RUnlock()
-		return p.compiled.Revision
-	}
-	return compiled.Revision
-}
-
-func (p *FileProvider) Refresh() (string, error) {
-	compiled, err := p.load()
-	if err != nil {
-		return "", err
-	}
-	return compiled.Revision, nil
+func (p *FileProvider) Refresh() error {
+	_, err := p.load()
+	return err
 }
 
 func (p *FileProvider) load() (Compiled, error) {

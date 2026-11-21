@@ -214,6 +214,8 @@ include `RuntimeReady`, `InfraReady`, and `RegistryReady`. When `poolMax`
 prevents required scale-out, `CapacityAvailable=False` reports reason
 `PoolMaxReached`; it returns True after demand fits within the replica limit.
 
+`RegistryReady=True` reports successful validation and persistence of the Pool's compiled registry Secret, not propagation to every Fastlet or successful registry authentication.
+
 See the [Infra Components reference](infra-components.md) for the complete
 artifact, process, health, endpoint, validation, and revision contract.
 See [Sandbox Actions](../concepts/sandbox-actions.md) for Binding, lifecycle

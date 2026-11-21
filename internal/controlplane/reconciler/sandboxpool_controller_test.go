@@ -60,7 +60,7 @@ func (r *SandboxPoolReconciler) planResourceAwareScale(
 	return r.planResourceAwareScaleWithDemand(pool, pods, nil, pendingDemands, commitmentCapacity, observed, nil, now)
 }
 
-func TestRegistryConfigCompilesSameNamespaceSecretsAndPreservesLastValidRevision(t *testing.T) {
+func TestRegistryConfigCompilesSameNamespaceSecretsAndPreservesLastValidConfiguration(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
 	require.NoError(t, corev1.AddToScheme(scheme))
@@ -112,13 +112,11 @@ func TestPoolRegistryConditionConvergesWithoutRepeatedStatusWrites(t *testing.T)
 	for _, test := range []struct {
 		name                 string
 		fastlet              bool
-		applied              bool
 		infraInvalid         bool
 		initialRegistryValid bool
 	}{
 		{name: "empty pool"},
-		{name: "configuration propagating", fastlet: true},
-		{name: "configuration applied", fastlet: true, applied: true},
+		{name: "existing fastlet", fastlet: true},
 		{name: "registry recovered with invalid infra", infraInvalid: true, fastlet: true},
 		{name: "new pool with invalid infra", infraInvalid: true, initialRegistryValid: true},
 	} {
@@ -187,21 +185,13 @@ func TestPoolRegistryConditionConvergesWithoutRepeatedStatusWrites(t *testing.T)
 				pod.Status.Phase = corev1.PodRunning
 				pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 				require.NoError(t, k8sClient.Create(ctx, pod))
-				revision := "previous-revision"
-				if test.applied {
-					compiled, err := registryconfig.NewCompiled(nil)
-					require.NoError(t, err)
-					revision = compiled.Revision
-				}
 				seedControllerRegistry(t, registry, placement.FastletInfo{
 					ID: "default/fastlet-a", Namespace: pool.Namespace, PoolName: pool.Name,
 					PodName: pod.Name, PodUID: string(pod.UID), PodReady: true, RuntimeReady: true,
-					LastHeartbeat: time.Now(), RegistryRevision: revision,
+					LastHeartbeat: time.Now(),
 				})
 			}
 
-			// Registry validation and rollout must reflect the current
-			// configuration independently of infra validation.
 			_, err := reconciler.Reconcile(ctx, poolRequest(pool))
 			require.NoError(t, err)
 			require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool))
@@ -221,13 +211,9 @@ func TestPoolRegistryConditionConvergesWithoutRepeatedStatusWrites(t *testing.T)
 			require.NoError(t, k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool))
 			condition = apiMeta.FindStatusCondition(pool.Status.Conditions, apiv1alpha2.PoolConditionRegistryReady)
 			require.NotNil(t, condition)
-			if test.fastlet && !test.applied {
-				require.Equal(t, metav1.ConditionFalse, condition.Status)
-				require.Equal(t, "RegistryPropagating", condition.Reason)
-			} else {
-				require.Equal(t, metav1.ConditionTrue, condition.Status)
-				require.Equal(t, apiv1alpha2.ReasonRegistryAvailable, condition.Reason)
-			}
+			require.Equal(t, metav1.ConditionTrue, condition.Status)
+			require.Equal(t, apiv1alpha2.ReasonRegistryAvailable, condition.Reason)
+			require.Equal(t, "Registry configuration is valid and the compiled Secret is persisted", condition.Message)
 			infraCondition := apiMeta.FindStatusCondition(pool.Status.Conditions, apiv1alpha2.PoolConditionInfraReady)
 			require.NotNil(t, infraCondition)
 			if test.infraInvalid {
@@ -382,7 +368,7 @@ func seedControllerRegistry(t *testing.T, registry *placement.InMemoryRegistry, 
 		FastletStatus: fastletapi.FastletStatus{
 			FastletPodUID: info.PodUID, RuntimeReady: info.RuntimeReady, InfraReady: info.InfraReady,
 			RuntimeProfileHash: info.RuntimeProfileHash, Admission: info.Admission, SandboxStatuses: statuses,
-			InfraRevision: info.InfraRevision, RegistryRevision: info.RegistryRevision,
+			InfraRevision:     info.InfraRevision,
 			PreparedArtifacts: info.PreparedArtifacts, WarmImages: info.WarmImages,
 		},
 		Sequence: 1, Cache: fastletapi.CacheSnapshot{Epoch: "test", Revision: 1, Full: true, Complete: true},
@@ -2323,10 +2309,6 @@ func TestPoolWarmImageFailuresConvergeRegardlessOfFastletOrder(t *testing.T) {
 
 func TestPoolObservabilityAggregatesOnlyCurrentPodIdentities(t *testing.T) {
 	registry := placement.NewInMemoryRegistry()
-	compiled, err := registryconfig.NewCompiled([]registryconfig.Credential{{
-		Host: "registry.example.com", Username: "reader", Password: "secret",
-	}})
-	require.NoError(t, err)
 	now := time.Now()
 	pool := &apiv1alpha2.SandboxPool{
 		ObjectMeta: metav1.ObjectMeta{Name: "pool-a", Namespace: "tenant-a", Generation: 9},
@@ -2341,8 +2323,8 @@ func TestPoolObservabilityAggregatesOnlyCurrentPodIdentities(t *testing.T) {
 	seedControllerRegistry(t, registry, placement.FastletInfo{
 		ID: "tenant-a/fastlet-a", Namespace: "tenant-a", PoolName: "pool-a",
 		PodName: "fastlet-a", PodUID: "uid-a", PodReady: true, RuntimeReady: true, InfraReady: true,
-		Admission:        fastletapi.AdmissionStatus{Capacity: 4},
-		RegistryRevision: compiled.Revision, LastHeartbeat: now,
+		Admission:     fastletapi.AdmissionStatus{Capacity: 4},
+		LastHeartbeat: now,
 		WarmImages: []fastletapi.WarmImageState{
 			{Image: "alpine:latest", State: "Cached"},
 			{Image: "ubuntu:24.04", State: "Pulling"},
@@ -2351,8 +2333,8 @@ func TestPoolObservabilityAggregatesOnlyCurrentPodIdentities(t *testing.T) {
 	seedControllerRegistry(t, registry, placement.FastletInfo{
 		ID: "tenant-a/fastlet-b", Namespace: "tenant-a", PoolName: "pool-a",
 		PodName: "fastlet-b", PodUID: "uid-b", PodReady: true, RuntimeReady: true, InfraReady: true,
-		Admission:        fastletapi.AdmissionStatus{Capacity: 4, Used: 1, Running: 1},
-		RegistryRevision: "stale-revision", LastHeartbeat: now,
+		Admission:     fastletapi.AdmissionStatus{Capacity: 4, Used: 1, Running: 1},
+		LastHeartbeat: now,
 		WarmImages: []fastletapi.WarmImageState{{
 			Image: "alpine:latest", State: "Failed", Message: "pull denied",
 		}},
@@ -2360,8 +2342,8 @@ func TestPoolObservabilityAggregatesOnlyCurrentPodIdentities(t *testing.T) {
 	seedControllerRegistry(t, registry, placement.FastletInfo{
 		ID: "tenant-a/stale-fastlet-a", Namespace: "tenant-a", PoolName: "pool-a",
 		PodName: "fastlet-a", PodUID: "old-uid", PodReady: true, RuntimeReady: true, InfraReady: true,
-		RegistryRevision: compiled.Revision, LastHeartbeat: now,
-		WarmImages: []fastletapi.WarmImageState{{Image: "alpine:latest", State: "Cached"}},
+		LastHeartbeat: now,
+		WarmImages:    []fastletapi.WarmImageState{{Image: "alpine:latest", State: "Cached"}},
 	})
 
 	reconciler := &SandboxPoolReconciler{Registry: registry}
@@ -2435,7 +2417,8 @@ registries:
 	secondPod, err := reconciler.constructPod(pool, profile)
 	require.NoError(t, err)
 
-	require.NotEqual(t, first.Revision, second.Revision)
+	require.Equal(t, "first", first.Credentials[0].Password)
+	require.Equal(t, "rotated", second.Credentials[0].Password)
 	require.Equal(t,
 		firstPod.Annotations[placement.AnnotationPodTemplateHash],
 		secondPod.Annotations[placement.AnnotationPodTemplateHash],
@@ -2447,7 +2430,7 @@ registries:
 	}, &projected))
 	compiled, err := registryconfig.ParseCompiled(projected.Data[registryconfig.SecretKey])
 	require.NoError(t, err)
-	require.Equal(t, second.Revision, compiled.Revision)
+	require.Equal(t, second, compiled)
 }
 
 func TestEnsureFastletSettingsConfigMapIsContentAddressed(t *testing.T) {

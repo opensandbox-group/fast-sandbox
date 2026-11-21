@@ -20,12 +20,12 @@ import (
 	"fast-sandbox/test/e2e/support/suiteenv"
 )
 
-func TestRegistryCredentialRotationReachesFastletWithoutPodReplacement(t *testing.T) {
+func TestRegistryCredentialRotationIsProjectedWithoutPodReplacement(t *testing.T) {
 	suiteenv.RequireBasic(t)
 	feature := features.New("registry-credential-rotation").
 		WithLabel("suite", "basic-validation").
 		WithLabel("tier", "smoke").
-		Assess("namespace Registry Secret rotation is projected and acknowledged without replacing Fastlets", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
+		Assess("namespace Registry Secret rotation updates the mounted credentials without replacing Fastlets", func(ctx context.Context, t *testing.T, _ *envconf.Config) context.Context {
 			k8sClient := testSuite.MustKubeClient(t)
 			fixture := fixtures.New(k8sClient, fixtures.WithPollInterval(250*time.Millisecond))
 			namespace := testSuite.AllocateNamespace("registry-rotation")
@@ -56,21 +56,17 @@ registries:
 				t.Fatalf("wait for Registry rotation Fastlet: %v", err)
 			}
 			podUID := onlyPoolPodUID(t, ctx, k8sClient, namespace, pool.Name)
-			initialRevision := waitForRegistryApplied(t, waitCtx, k8sClient, namespace, pool.Name, "", time.Time{})
+			waitForRegistryProjected(t, waitCtx, k8sClient, namespace, pool.Name, "first")
 
 			var credential corev1.Secret
 			if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: "registry-reader"}, &credential); err != nil {
 				t.Fatalf("get Registry credential Secret: %v", err)
 			}
 			credential.Data[corev1.DockerConfigJsonKey] = registryCredentialPayload("rotated")
-			rotatedAt := time.Now()
 			if err := k8sClient.Update(ctx, &credential); err != nil {
 				t.Fatalf("rotate Registry credential Secret: %v", err)
 			}
-			rotatedRevision := waitForRegistryApplied(t, waitCtx, k8sClient, namespace, pool.Name, initialRevision, rotatedAt)
-			if rotatedRevision == initialRevision {
-				t.Fatalf("Registry revision did not change after credential rotation")
-			}
+			waitForRegistryProjected(t, waitCtx, k8sClient, namespace, pool.Name, "rotated")
 			if current := onlyPoolPodUID(t, ctx, k8sClient, namespace, pool.Name); current != podUID {
 				t.Fatalf("Registry rotation replaced Fastlet Pod: before=%s after=%s", podUID, current)
 			}
@@ -113,36 +109,32 @@ func registryCredentialPayload(password string) []byte {
 	))
 }
 
-func waitForRegistryApplied(
+func waitForRegistryProjected(
 	t *testing.T,
 	ctx context.Context,
 	k8sClient client.Client,
 	namespace string,
 	poolName string,
-	previousRevision string,
-	transitionedAfter time.Time,
-) string {
+	password string,
+) {
 	t.Helper()
 	for {
-		var compiledSecret corev1.Secret
-		if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: poolName + "-registry"}, &compiledSecret); err == nil {
-			compiled, parseErr := registryconfig.ParseCompiled(compiledSecret.Data[registryconfig.SecretKey])
-			if parseErr == nil && compiled.Revision != "" && compiled.Revision != previousRevision {
-				var pool apiv1alpha2.SandboxPool
-				if err := k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: poolName}, &pool); err == nil {
-					for _, condition := range pool.Status.Conditions {
-						transitioned := transitionedAfter.IsZero() || condition.LastTransitionTime.Time.After(transitionedAfter)
-						if condition.Type == apiv1alpha2.PoolConditionRegistryReady && condition.Status == metav1.ConditionTrue &&
-							condition.Reason == apiv1alpha2.ReasonRegistryAvailable && transitioned {
-							return compiled.Revision
-						}
+		var pods corev1.PodList
+		if err := k8sClient.List(ctx, &pods, client.InNamespace(namespace), client.MatchingLabels{"fast-sandbox.io/pool": poolName}); err == nil && len(pods.Items) == 1 {
+			content, err := kubectl(ctx, "exec", "-n", namespace, pods.Items[0].Name, "-c", "fastlet", "--", "cat", registryconfig.MountPath)
+			if err == nil {
+				compiled, parseErr := registryconfig.ParseCompiled(content)
+				if parseErr == nil {
+					credential, found := compiled.Match("registry.example.com/team-a/image:v1")
+					if found && credential.Username == "reader" && credential.Password == password {
+						return
 					}
 				}
 			}
 		}
 		select {
 		case <-ctx.Done():
-			t.Fatalf("wait for Registry revision after %q: %v", previousRevision, ctx.Err())
+			t.Fatalf("wait for Registry credentials to be projected into Fastlet: %v", ctx.Err())
 		case <-time.After(500 * time.Millisecond):
 		}
 	}

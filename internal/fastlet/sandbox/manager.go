@@ -19,7 +19,6 @@ import (
 	fastletinfra "fast-sandbox/internal/fastlet/infra"
 	"fast-sandbox/internal/fastletsettings"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
-	"fast-sandbox/internal/registryconfig"
 	"fast-sandbox/pkg/util/idgen"
 )
 
@@ -38,7 +37,6 @@ type SandboxManagerConfig struct {
 	RoutePublisher     RoutePublisher
 	InfraRevision      string
 	InfraManager       *fastletinfra.Manager
-	RegistryProvider   registryconfig.Provider
 	ActionManager      *fastletaction.Manager
 }
 
@@ -88,7 +86,6 @@ type SandboxManager struct {
 	cacheProtection             *fastletcache.ProtectionIndex
 	warmImages                  []string
 	warmImageStates             map[string]fastletapi.WarmImageState
-	registryProvider            registryconfig.Provider
 	routePublisher              RoutePublisher
 	dataPlaneWorkers            map[string]dataPlaneWorker
 	// deleteWorkers prevents multiple lifecycle callbacks from tearing down
@@ -217,7 +214,6 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		cacheTracker:    fastletcache.NewTracker(cacheSource, config.CacheEpoch, fastletcache.DefaultMaxInventory),
 		cacheProtection: protection, warmImages: append([]string(nil), config.WarmImages...),
 		warmImageStates:        warmImageStates,
-		registryProvider:       config.RegistryProvider,
 		readinessChanged:       make(chan struct{}),
 		routePublisher:         config.RoutePublisher,
 		dataPlaneWorkers:       make(map[string]dataPlaneWorker),
@@ -234,13 +230,6 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 		manager.actionManager.SetChangeNotifier(manager.actionStateChanged)
 	}
 	return manager, nil
-}
-
-func (m *SandboxManager) RegistryRevision() string {
-	if m.registryProvider == nil {
-		return ""
-	}
-	return m.registryProvider.Revision()
 }
 
 func (m *SandboxManager) WarmCache(ctx context.Context) error {
