@@ -144,12 +144,16 @@ type chunkJob struct {
 }
 
 // runChunkJobs runs fn over jobs on n workers and returns the first error;
-// remaining jobs are skipped once one fails.
-func runChunkJobs(ctx context.Context, n int, jobs []chunkJob, fn func(context.Context, chunkJob) error) error {
-	ctx, cancel := context.WithCancel(ctx)
+// remaining jobs are skipped once one fails. It returns nil only when every
+// job ran to success: a parent cancelled between jobs stops the workers
+// without a job error, and must still fail the run, or a pull would commit
+// (and mark verified) files whose unfetched chunks read as zeros.
+func runChunkJobs(parent context.Context, n int, jobs []chunkJob, fn func(context.Context, chunkJob) error) error {
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	var (
 		next     atomic.Int64
+		done     atomic.Int64
 		once     sync.Once
 		firstErr error
 		wg       sync.WaitGroup
@@ -167,11 +171,21 @@ func runChunkJobs(ctx context.Context, n int, jobs []chunkJob, fn func(context.C
 					once.Do(func() { firstErr = err; cancel() })
 					return
 				}
+				done.Add(1)
 			}
 		}()
 	}
 	wg.Wait()
-	return firstErr
+	if firstErr != nil {
+		return firstErr
+	}
+	if completed := done.Load(); completed != int64(len(jobs)) {
+		if err := parent.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("chunk jobs: %d of %d completed", completed, len(jobs))
+	}
+	return nil
 }
 
 // publishStats summarizes one chunked publish for the log line.
@@ -465,6 +479,11 @@ func (c *Client) materializeChunked(ctx context.Context, dir, buildDir string, r
 		return nil
 	})
 	if err != nil {
+		return err
+	}
+	// Never commit or mark verified after a cancellation, whatever the jobs
+	// reported: the files are only complete if every chunk was written.
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	for name, entry := range targets {

@@ -167,6 +167,11 @@ func (c *Client) prepareManifest(ctx context.Context, kind, key, dir string, sta
 		klog.ErrorS(err, "runtime-agent publish failed", "kind", kind, "key", key, "stage", "chunks", "elapsed", time.Since(started).String())
 		return nil, nil, fmt.Errorf("publish chunks: %w", err)
 	}
+	// A cancelled publish must not bind (and rewrite the staged manifest
+	// with) a chunk index that may be missing chunks.
+	if err := ctx.Err(); err != nil {
+		return nil, nil, fmt.Errorf("publish chunks: %w", err)
+	}
 	logPublishStats(kind, key, stats)
 	indexBytes, err := artifacts.MarshalChunkIndex(index)
 	if err != nil {
