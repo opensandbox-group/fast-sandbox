@@ -1544,12 +1544,20 @@ func hashStagedFiles(staging string, names []string, known map[string]string) (m
 		wg       sync.WaitGroup
 		firstErr error
 	)
+	// Known digests go into the map before any hashing goroutine starts: a
+	// known name after an unknown one would otherwise write the map without
+	// the lock while that goroutine writes it under the lock.
+	var misses []string
 	for _, name := range names {
 		path := filepath.Join(staging, name)
 		if sum, ok := known[path]; ok {
 			cache[path] = sum
 			continue
 		}
+		misses = append(misses, name)
+	}
+	for _, name := range misses {
+		path := filepath.Join(staging, name)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

@@ -54,6 +54,38 @@ func TestHashStagedFilesUsesKnownDigests(t *testing.T) {
 	require.Error(t, err)
 }
 
+// An unknown name before known ones starts a hashing goroutine first; the
+// known digests must not be written to the map concurrently with it (run
+// with -race).
+func TestHashStagedFilesUnknownBeforeKnown(t *testing.T) {
+	dir := t.TempDir()
+	var names []string
+	known := map[string]string{}
+	for i := range 16 {
+		name := "f" + string(rune('a'+i))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), bytes.Repeat([]byte{byte(i)}, 4096), 0o640))
+		names = append(names, name)
+		if i%2 == 1 {
+			known[filepath.Join(dir, name)] = "known-" + name
+		}
+	}
+	for range 20 {
+		cache, err := hashStagedFiles(dir, names, known)
+		require.NoError(t, err)
+		require.Len(t, cache, len(names))
+		for i, name := range names {
+			path := filepath.Join(dir, name)
+			if i%2 == 1 {
+				require.Equal(t, "known-"+name, cache[path])
+				continue
+			}
+			want, err := artifacts.SHA256File(path)
+			require.NoError(t, err)
+			require.Equal(t, want, cache[path])
+		}
+	}
+}
+
 // chunkedSnapshotAgent is a snapshot agent fake that reports the chunked
 // transfer mode, like a runtime-agent configured with transfer.format:
 // chunked.
