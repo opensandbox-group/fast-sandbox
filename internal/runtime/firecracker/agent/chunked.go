@@ -294,7 +294,13 @@ func (c *Client) storeChunk(ctx context.Context, sum, encoding string, block []b
 		size   int64
 		reused bool
 	}
-	outcome, err, shared := c.chunkFlight.Do(key, func() (any, error) {
+	// singleflight reports shared=true to the caller that ran the function
+	// as well as to its waiters, so it cannot tell who uploaded. Do runs fn
+	// on the calling goroutine: executed marks the one caller whose outcome
+	// is its own, and only the waiters count the chunk as reused.
+	executed := false
+	outcome, err, _ := c.chunkFlight.Do(key, func() (any, error) {
+		executed = true
 		size, reused, err := c.storeChunkOnce(ctx, key, sum, encoding, block)
 		return stored{size: size, reused: reused}, err
 	})
@@ -302,7 +308,7 @@ func (c *Client) storeChunk(ctx context.Context, sum, encoding string, block []b
 		return 0, false, err
 	}
 	result := outcome.(stored)
-	return result.size, result.reused || shared, nil
+	return result.size, result.reused || !executed, nil
 }
 
 func (c *Client) storeChunkOnce(ctx context.Context, key, sum, encoding string, block []byte) (int64, bool, error) {
