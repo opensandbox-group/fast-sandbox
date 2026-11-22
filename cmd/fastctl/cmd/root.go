@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"fast-sandbox/internal/fastletauth"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -22,6 +21,7 @@ import (
 	"k8s.io/klog/v2"
 
 	fastpathv2 "fast-sandbox/api/proto/v2"
+	"fast-sandbox/internal/fastletauth"
 	"fast-sandbox/internal/observability"
 )
 

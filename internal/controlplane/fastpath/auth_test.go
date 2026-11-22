@@ -14,8 +14,6 @@ import (
 	"testing"
 	"time"
 
-	pb "fast-sandbox/api/proto/v2"
-	"fast-sandbox/internal/fastletauth/fastletauthtest"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/improbable-eng/grpc-web/go/grpcweb"
 	"github.com/stretchr/testify/require"
@@ -26,6 +24,9 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+
+	pb "fast-sandbox/api/proto/v2"
+	"fast-sandbox/internal/fastletauth/fastletauthtest"
 )
 
 const serverSubject = "system:serviceaccount:identities:server-caller"
@@ -144,14 +145,14 @@ func TestCallerMethodInventoryMatchesService(t *testing.T) {
 	serverCtx := metadata.NewIncomingContext(t.Context(), metadata.Pairs("authorization", "Bearer "+issuer.Mint(fastletauthtest.MintOptions{Subject: serverSubject, Audience: CallerAudience})))
 	gatewayCtx := metadata.NewIncomingContext(t.Context(), metadata.Pairs("authorization", "Bearer "+issuer.Mint(fastletauthtest.MintOptions{Subject: gatewaySubject, Audience: CallerAudience})))
 	requests := []proto.Message{
-		&pb.CreateSandboxRequest{}, &pb.GetSandboxRequest{}, &pb.DeleteRequest{}, &pb.UpdateSandboxRequest{},
+		&pb.CreateSandboxRequest{}, &pb.CreateRootfsSandboxRequest{}, &pb.GetSandboxRequest{}, &pb.DeleteRequest{}, &pb.UpdateSandboxRequest{},
 		&pb.ListSandboxesRequest{}, &pb.SandboxDiagnosticsRequest{}, &pb.ResolveEndpointRequest{}, &pb.GetPoolRequest{},
 		&pb.ListPoolsRequest{}, &pb.CreateSandboxSnapshotRequest{}, &pb.GetSandboxSnapshotRequest{}, &pb.DeleteSandboxSnapshotRequest{},
 		&pb.PauseSandboxRequest{}, &pb.ResumeSandboxRequest{}, &pb.InvokeHandlerActionRequest{},
 	}
 	known := map[string]bool{}
 	for _, request := range requests {
-		err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal([]byte(`{"namespace":"tenant-a","sandbox":{"namespacedName":{"namespace":"tenant-a"}},"snapshot":{"namespace":"tenant-a","namespacedName":{"namespace":"tenant-a"}}}`), request)
+		err := (protojson.UnmarshalOptions{DiscardUnknown: true}).Unmarshal([]byte(`{"namespace":"tenant-a","create":{"namespace":"tenant-a"},"sandbox":{"namespacedName":{"namespace":"tenant-a"}},"snapshot":{"namespace":"tenant-a","namespacedName":{"namespace":"tenant-a"}}}`), request)
 		require.NoError(t, err)
 		method, namespace := callerTarget(request)
 		require.Equal(t, "tenant-a", namespace, method)
@@ -178,6 +179,43 @@ func TestCallerMethodInventoryMatchesService(t *testing.T) {
 	delete(auth.policy, serverSubject)
 	_, err = auth.UnaryInterceptor(serverCtx, &pb.GetPoolRequest{Namespace: "tenant-a"}, &grpc.UnaryServerInfo{FullMethod: pb.FastPathService_GetPool_FullMethodName}, func(context.Context, any) (any, error) { t.Fatal("removed subject reached handler"); return nil, nil })
 	require.Equal(t, codes.PermissionDenied, status.Code(err))
+}
+
+func TestCallerRootfsCreateNamespaceScope(t *testing.T) {
+	issuer := fastletauthtest.NewIssuer(t)
+	for _, scope := range []string{"tenant-a", "*"} {
+		t.Run(scope, func(t *testing.T) {
+			auth, err := NewCallerAuthenticator(issuer.URL(), []CallerGrant{
+				{Subject: serverSubject, Profile: "server", Namespaces: []string{scope}},
+			}, &http.Client{Timeout: time.Second})
+			require.NoError(t, err)
+			ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs("authorization", "Bearer "+issuer.Mint(fastletauthtest.MintOptions{Subject: serverSubject, Audience: CallerAudience})))
+			for _, tc := range []struct {
+				name   string
+				create *pb.CreateSandboxRequest
+				code   codes.Code
+			}{
+				{"missing create", nil, codes.PermissionDenied},
+				{"empty namespace", &pb.CreateSandboxRequest{}, codes.PermissionDenied},
+				{"allowed namespace", &pb.CreateSandboxRequest{Namespace: "tenant-a"}, codes.OK},
+				{"other namespace", &pb.CreateSandboxRequest{Namespace: "tenant-b"}, codes.PermissionDenied},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					expected := tc.code
+					if scope == "*" && tc.create.GetNamespace() != "" {
+						expected = codes.OK
+					}
+					called := false
+					_, err := auth.UnaryInterceptor(ctx, &pb.CreateRootfsSandboxRequest{Create: tc.create}, &grpc.UnaryServerInfo{FullMethod: pb.FastPathService_CreateRootfsSandbox_FullMethodName}, func(context.Context, any) (any, error) {
+						called = true
+						return nil, nil
+					})
+					require.Equal(t, expected, status.Code(err))
+					require.Equal(t, expected == codes.OK, called)
+				})
+			}
+		})
+	}
 }
 
 func TestCallerKeyRefreshDiscardsOldIdentityCache(t *testing.T) {

@@ -12,8 +12,6 @@ import (
 	"sync"
 	"time"
 
-	pb "fast-sandbox/api/proto/v2"
-	"fast-sandbox/internal/fastletauth"
 	"github.com/golang-jwt/jwt/v5"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -21,6 +19,9 @@ import (
 	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
+
+	pb "fast-sandbox/api/proto/v2"
+	"fast-sandbox/internal/fastletauth"
 )
 
 const CallerAudience = "fast-sandbox-fastpath"
@@ -205,6 +206,8 @@ func callerTarget(req any) (string, string) {
 	switch r := req.(type) {
 	case *pb.CreateSandboxRequest:
 		return "CreateSandbox", r.GetNamespace()
+	case *pb.CreateRootfsSandboxRequest:
+		return "CreateRootfsSandbox", r.GetCreate().GetNamespace()
 	case *pb.GetSandboxRequest:
 		return "GetSandbox", r.GetSandbox().GetNamespacedName().GetNamespace()
 	case *pb.DeleteRequest:
