@@ -415,47 +415,45 @@ func acquireSnapshotCacheStaging(imagesRoot, base string) (string, func(), error
 }
 
 // reclaimOrphanedSnapshotCacheStaging removes local cache staging directories
-// left under <stateRoot>/images/.staging-* after an interrupted commit while
-// leaving entries held by active writers untouched via non-blocking flock.
-func reclaimOrphanedSnapshotCacheStaging(stateRoot string) error {
+// owned by an existing companion lock file (<stateRoot>/images/.staging-*.lock)
+// after an interrupted commit. Lockless .staging-* directories (e.g., active
+// writers from an older Fastlet during a mixed-version rollout) are left
+// untouched, active lock holders (EWOULDBLOCK) are skipped, and cleanup errors
+// are logged rather than failing startup recovery or image GC.
+func reclaimOrphanedSnapshotCacheStaging(stateRoot string) {
 	imagesRoot := filepath.Join(stateRoot, imageCacheDir)
 	entries, err := os.ReadDir(imagesRoot)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
+		if !errors.Is(err, os.ErrNotExist) {
+			klog.ErrorS(err, "read image cache root for orphaned staging cleanup failed", "imagesRoot", imagesRoot)
 		}
-		return err
+		return
 	}
-	candidates := make(map[string]struct{})
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, snapshotCacheStagingPrefix) {
+		if !strings.HasPrefix(name, snapshotCacheStagingPrefix) || !strings.HasSuffix(name, snapshotCacheLockSuffix) {
 			continue
 		}
 		base := strings.TrimSuffix(name, snapshotCacheLockSuffix)
 		if base == snapshotCacheStagingPrefix {
 			continue
 		}
-		candidates[base] = struct{}{}
-	}
-	var resultErr error
-	for base := range candidates {
 		dirPath := filepath.Join(imagesRoot, base)
-		lockPath := dirPath + snapshotCacheLockSuffix
-		fd, openErr := unix.Open(lockPath, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+		lockPath := filepath.Join(imagesRoot, name)
+		fd, openErr := unix.Open(lockPath, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 		if openErr != nil {
-			resultErr = errors.Join(resultErr, fmt.Errorf("open snapshot cache staging lock %s: %w", lockPath, openErr))
+			if !errors.Is(openErr, os.ErrNotExist) && !errors.Is(openErr, unix.ENOENT) {
+				klog.ErrorS(openErr, "open snapshot cache staging lock failed", "lockPath", lockPath)
+			}
 			continue
 		}
 		lockFile := os.NewFile(uintptr(fd), lockPath)
 		lockErr := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
 		if lockErr != nil {
 			_ = lockFile.Close()
-			if errors.Is(lockErr, unix.EWOULDBLOCK) || errors.Is(lockErr, unix.EAGAIN) {
-				// Active writer owns this staging directory; leave it alone.
-				continue
+			if !errors.Is(lockErr, unix.EWOULDBLOCK) && !errors.Is(lockErr, unix.EAGAIN) {
+				klog.ErrorS(lockErr, "lock snapshot cache staging failed", "lockPath", lockPath)
 			}
-			resultErr = errors.Join(resultErr, fmt.Errorf("lock snapshot cache staging %s: %w", lockPath, lockErr))
 			continue
 		}
 		if !sameLockInode(lockFile, lockPath) {
@@ -464,15 +462,14 @@ func reclaimOrphanedSnapshotCacheStaging(stateRoot string) error {
 			continue
 		}
 		if removeErr := os.RemoveAll(dirPath); removeErr != nil {
-			resultErr = errors.Join(resultErr, fmt.Errorf("reclaim orphaned snapshot cache staging %s: %w", dirPath, removeErr))
-		}
-		if removeErr := os.Remove(lockPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			resultErr = errors.Join(resultErr, fmt.Errorf("remove snapshot cache staging lock %s: %w", lockPath, removeErr))
+			// Retain lockPath so a later recovery/GC sweep can retry reclaiming dirPath.
+			klog.ErrorS(removeErr, "reclaim orphaned snapshot cache staging failed", "stagingDir", dirPath)
+		} else if removeErr := os.Remove(lockPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			klog.ErrorS(removeErr, "remove snapshot cache staging lock failed", "lockPath", lockPath)
 		}
 		_ = unix.Flock(fd, unix.LOCK_UN)
 		_ = lockFile.Close()
 	}
-	return resultErr
 }
 
 func openVerifiedStagedFile(path string, proof agentpull.VerifiedFile) *os.File {

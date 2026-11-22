@@ -635,13 +635,24 @@ func TestRecoverAndGCReclaimInterruptedSnapshotCacheStaging(t *testing.T) {
 	crashedRecoveryLock := crashedRecoveryDir + snapshotCacheLockSuffix
 	require.NoError(t, os.WriteFile(crashedRecoveryLock, nil, 0o600))
 
-	// Startup recovery reclaims the orphaned entry and preserves the active writer.
+	// Simulate an active legacy Fastlet (mixed-version rollout) staging under
+	// images/.staging-* without a companion .lock file: neither recovery nor GC
+	// may synthesize a lock file or remove it.
+	legacyDir := filepath.Join(imagesRoot, snapshotCacheStagingPrefix+"legacy-fastlet")
+	require.NoError(t, os.MkdirAll(legacyDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(legacyDir, rootfsImageName), []byte("legacy-rootfs"), 0o600))
+
+	// Startup recovery reclaims the orphaned entry and preserves both the
+	// active lock holder and the lockless legacy staging directory.
 	require.NoError(t, driver.RecoverRuntimeResources(context.Background(), nil, nil))
 	require.NoDirExists(t, crashedRecoveryDir)
 	require.NoFileExists(t, crashedRecoveryLock)
 	require.FileExists(t, filepath.Join(activeDir, rootfsImageName))
+	require.FileExists(t, filepath.Join(legacyDir, rootfsImageName))
+	require.NoFileExists(t, legacyDir+snapshotCacheLockSuffix)
 
-	// Image GC also reclaims an orphaned staging entry while skipping the active writer.
+	// Image GC also reclaims an orphaned staging entry while skipping both the
+	// active writer and the lockless legacy directory.
 	crashedGCDir := filepath.Join(imagesRoot, snapshotCacheStagingPrefix+"crashed-gc")
 	require.NoError(t, os.MkdirAll(crashedGCDir, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(crashedGCDir, rootfsImageName), []byte("orphaned-gc-rootfs"), 0o600))
@@ -653,6 +664,8 @@ func TestRecoverAndGCReclaimInterruptedSnapshotCacheStaging(t *testing.T) {
 	require.NoDirExists(t, crashedGCDir)
 	require.NoFileExists(t, crashedGCLock)
 	require.FileExists(t, filepath.Join(activeDir, rootfsImageName))
+	require.FileExists(t, filepath.Join(legacyDir, rootfsImageName))
+	require.NoFileExists(t, legacyDir+snapshotCacheLockSuffix)
 }
 
 // fakeStateMover plays the Handler side of the state transfers: a successful

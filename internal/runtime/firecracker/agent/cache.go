@@ -26,6 +26,8 @@ import (
 	"time"
 
 	"k8s.io/klog/v2"
+
+	"fast-sandbox/internal/artifacts"
 )
 
 const (
@@ -231,6 +233,31 @@ func ImageReady(stateRoot, image string) (bool, error) {
 	return cacheComplete(imageDir(stateRoot, image))
 }
 
+// CheckpointReady reports whether reference has a committed non-rootfsOnly
+// checkpoint pull whose manifest digest matches artifactDigest and whose full
+// native artifact set is present and verified.
+func CheckpointReady(stateRoot, reference, artifactDigest string) (bool, error) {
+	dir := imageDir(stateRoot, reference)
+	payload, err := os.ReadFile(filepath.Join(dir, manifestName))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if artifactDigest != "" && sha256Hex(payload) != artifactDigest {
+		return false, nil
+	}
+	document, err := parseManifest(payload)
+	if err != nil {
+		return false, nil //nolint:nilerr // a corrupt cached manifest means the checkpoint is not complete
+	}
+	if artifacts.VMManifest(document).IsRootfsOnly() {
+		return false, nil
+	}
+	return manifestFilesComplete(dir, document)
+}
+
 // CachedManifestDigest returns the sha256 digest of the committed local
 // manifest of an image reference. The digest matches the index
 // artifactDigest the pull verified, so callers can trust it without a
@@ -266,6 +293,10 @@ func cacheComplete(dir string) (bool, error) {
 	if err != nil {
 		return false, nil //nolint:nilerr // a corrupt cached manifest means the pull is not complete
 	}
+	return manifestFilesComplete(dir, document)
+}
+
+func manifestFilesComplete(dir string, document manifest) (bool, error) {
 	files, err := document.downloadFiles()
 	if err != nil {
 		return false, nil //nolint:nilerr // an incomplete native file set means the pull is not complete

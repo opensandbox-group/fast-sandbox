@@ -228,9 +228,9 @@ func (s *Service) manifestDigestFor(image string) string {
 }
 
 // ensureImage pulls the image unless the cache already holds a committed
-// pull. PullImage stream-verifies every artifact before writing manifest.json
-// as the commit point, so the post-pull check verifies the committed manifest
-// instead of re-hashing multi-GiB artifacts a second time.
+// pull. stageFile prewarms the process-local verified-digest cache from its
+// verified open file descriptor, so the post-pull ImageReady check verifies
+// full artifact-set presence without re-hashing unchanged multi-GiB files.
 func (s *Service) ensureImage(ctx context.Context, image string) error {
 	ready, err := agentpull.ImageReady(s.stateRoot, image)
 	if err != nil {
@@ -242,9 +242,11 @@ func (s *Service) ensureImage(ctx context.Context, image string) error {
 	if err := s.pull.PullImage(ctx, s.stateRoot, image); err != nil {
 		return err
 	}
-	if _, ok, err := agentpull.CachedManifestDigest(s.stateRoot, image); err != nil {
+	ready, err = agentpull.ImageReady(s.stateRoot, image)
+	if err != nil {
 		return err
-	} else if !ok {
+	}
+	if !ready {
 		return fmt.Errorf("%w: %q", runtimecontract.ErrImageNotReady, image)
 	}
 	return nil
@@ -252,9 +254,10 @@ func (s *Service) ensureImage(ctx context.Context, image string) error {
 
 // ensureCheckpoint pulls a checkpoint artifact set (addressed by manifest
 // ref + digest, e.g. the canonical checkpoint reference) unless the cache
-// already holds the complete committed set.
+// already holds the complete committed non-rootfsOnly set matching
+// artifactDigest.
 func (s *Service) ensureCheckpoint(ctx context.Context, reference, manifestRef, artifactDigest string) error {
-	ready, err := agentpull.ImageReady(s.stateRoot, reference)
+	ready, err := agentpull.CheckpointReady(s.stateRoot, reference, artifactDigest)
 	if err != nil {
 		return err
 	}
@@ -264,9 +267,11 @@ func (s *Service) ensureCheckpoint(ctx context.Context, reference, manifestRef, 
 	if err := s.pull.PullCheckpoint(ctx, s.stateRoot, reference, manifestRef, artifactDigest); err != nil {
 		return err
 	}
-	if _, ok, err := agentpull.CachedManifestDigest(s.stateRoot, reference); err != nil {
+	ready, err = agentpull.CheckpointReady(s.stateRoot, reference, artifactDigest)
+	if err != nil {
 		return err
-	} else if !ok {
+	}
+	if !ready {
 		return fmt.Errorf("%w: checkpoint %q", runtimecontract.ErrImageNotReady, reference)
 	}
 	return nil

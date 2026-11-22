@@ -253,9 +253,7 @@ func garbageCollectImages(stateRoot string, limitBytes int64, useCount map[strin
 			referenced[imageKey(source)] = struct{}{}
 		}
 	}
-	if err := reclaimOrphanedSnapshotCacheStaging(stateRoot); err != nil {
-		return nil, err
-	}
+	reclaimOrphanedSnapshotCacheStaging(stateRoot)
 	cached, err := listCachedImages(stateRoot)
 	if err != nil {
 		return nil, err
