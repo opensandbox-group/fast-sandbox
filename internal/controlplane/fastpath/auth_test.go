@@ -241,3 +241,20 @@ func TestCallerKeyRefreshDiscardsOldIdentityCache(t *testing.T) {
 	_, err = auth.current()
 	require.Equal(t, codes.Unavailable, status.Code(err))
 }
+
+func TestCallerClaimCacheEnforcesStrictExpiryWithoutLeeway(t *testing.T) {
+	issuer := fastletauthtest.NewIssuer(t)
+	auth, err := NewCallerAuthenticator(issuer.URL(), []CallerGrant{{Subject: serverSubject, Profile: "server", Namespaces: []string{"tenant-a"}}}, &http.Client{Timeout: time.Second})
+	require.NoError(t, err)
+	now := time.Now()
+	auth.now = func() time.Time { return now }
+	token := issuer.Mint(fastletauthtest.MintOptions{Subject: serverSubject, Audience: CallerAudience, IssuedAt: now.Unix(), ExpiresAt: now.Add(10 * time.Second).Unix()})
+	ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs("authorization", "Bearer "+token))
+	_, err = auth.authenticate(ctx)
+	require.NoError(t, err)
+	require.Len(t, auth.claims, 1)
+	now = now.Add(10 * time.Second)
+	_, err = auth.authenticate(ctx)
+	require.Equal(t, codes.Unauthenticated, status.Code(err))
+	require.Empty(t, auth.claims)
+}

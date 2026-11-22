@@ -2,6 +2,7 @@ package fastpath
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -51,11 +52,17 @@ func LoadCallerPolicy(path string) ([]CallerGrant, error) {
 	return grants, nil
 }
 
+type callerClaimBound struct {
+	issued  float64
+	expires float64
+}
+
 type CallerAuthenticator struct {
 	policy     map[string]CallerGrant
 	create     func() (*fastletauth.Authenticator, error)
 	mu         sync.Mutex
 	verifier   *fastletauth.Authenticator
+	claims     map[[32]byte]callerClaimBound
 	loaded     time.Time
 	retry      time.Time
 	refreshing bool
@@ -91,7 +98,7 @@ func NewCallerAuthenticator(issuer string, grants []CallerGrant, client *http.Cl
 		policy[grant.Subject] = grant
 		subjects = append(subjects, grant.Subject)
 	}
-	a := &CallerAuthenticator{policy: policy, now: time.Now}
+	a := &CallerAuthenticator{policy: policy, claims: make(map[[32]byte]callerClaimBound), now: time.Now}
 	a.create = func() (*fastletauth.Authenticator, error) {
 		return fastletauth.NewAuthenticator(issuer, CallerAudience, subjects, client, fastletauth.WithSameOriginKeys())
 	}
@@ -116,7 +123,7 @@ func (a *CallerAuthenticator) current() (*fastletauth.Authenticator, error) {
 			a.refreshing = false
 			a.retry = a.now().Add(30 * time.Second)
 			if err == nil {
-				a.verifier, a.loaded = next, a.now()
+				a.verifier, a.claims, a.loaded = next, make(map[[32]byte]callerClaimBound), a.now()
 			} else {
 				klog.ErrorS(err, "FastPath caller key refresh failed")
 			}
@@ -128,6 +135,39 @@ func (a *CallerAuthenticator) current() (*fastletauth.Authenticator, error) {
 	return a.verifier, nil
 }
 
+func (a *CallerAuthenticator) checkCallerClaims(raw string) error {
+	digest := sha256.Sum256([]byte(raw))
+	now := a.now()
+	current := float64(now.UnixNano()) / 1e9
+	a.mu.Lock()
+	bound, cached := a.claims[digest]
+	if cached && current >= bound.expires {
+		delete(a.claims, digest)
+		cached = false
+	}
+	a.mu.Unlock()
+	if cached {
+		if bound.issued > current+30 || current >= bound.expires {
+			return status.Error(codes.Unauthenticated, "caller token must have a valid lifetime of at most one hour")
+		}
+		return nil
+	}
+	claims := jwt.MapClaims{}
+	if _, _, err := jwt.NewParser().ParseUnverified(raw, claims); err != nil {
+		return status.Error(codes.Unauthenticated, "invalid caller token")
+	}
+	if err := validateCallerClaims(claims, now); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	if len(a.claims) >= 8192 {
+		clear(a.claims)
+	}
+	a.claims[digest] = callerClaimBound{issued: claims["iat"].(float64), expires: claims["exp"].(float64)}
+	a.mu.Unlock()
+	return nil
+}
+
 func (a *CallerAuthenticator) authenticate(ctx context.Context) (string, error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 	values := md.Get("authorization")
@@ -135,11 +175,7 @@ func (a *CallerAuthenticator) authenticate(ctx context.Context) (string, error) 
 		return "", status.Error(codes.Unauthenticated, "one FastPath bearer credential is required")
 	}
 	raw := strings.TrimPrefix(values[0], "Bearer ")
-	claims := jwt.MapClaims{}
-	if _, _, err := jwt.NewParser().ParseUnverified(raw, claims); err != nil {
-		return "", status.Error(codes.Unauthenticated, "invalid caller token")
-	}
-	if err := validateCallerClaims(claims, a.now()); err != nil {
+	if err := a.checkCallerClaims(raw); err != nil {
 		return "", err
 	}
 	verifier, err := a.current()
