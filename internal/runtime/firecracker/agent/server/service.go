@@ -228,7 +228,9 @@ func (s *Service) manifestDigestFor(image string) string {
 }
 
 // ensureImage pulls the image unless the cache already holds a committed
-// pull. A missing published index maps to ErrImageNotReady for the driver.
+// pull. stageFile prewarms the process-local verified-digest cache from its
+// verified open file descriptor, so the post-pull ImageReady check verifies
+// full artifact-set presence without re-hashing unchanged multi-GiB files.
 func (s *Service) ensureImage(ctx context.Context, image string) error {
 	ready, err := agentpull.ImageReady(s.stateRoot, image)
 	if err != nil {
@@ -252,9 +254,10 @@ func (s *Service) ensureImage(ctx context.Context, image string) error {
 
 // ensureCheckpoint pulls a checkpoint artifact set (addressed by manifest
 // ref + digest, e.g. the canonical checkpoint reference) unless the cache
-// already holds the complete committed set.
+// already holds the complete committed non-rootfsOnly set matching
+// artifactDigest.
 func (s *Service) ensureCheckpoint(ctx context.Context, reference, manifestRef, artifactDigest string) error {
-	ready, err := agentpull.ImageReady(s.stateRoot, reference)
+	ready, err := agentpull.CheckpointReady(s.stateRoot, reference, artifactDigest)
 	if err != nil {
 		return err
 	}
@@ -264,7 +267,7 @@ func (s *Service) ensureCheckpoint(ctx context.Context, reference, manifestRef, 
 	if err := s.pull.PullCheckpoint(ctx, s.stateRoot, reference, manifestRef, artifactDigest); err != nil {
 		return err
 	}
-	ready, err = agentpull.ImageReady(s.stateRoot, reference)
+	ready, err = agentpull.CheckpointReady(s.stateRoot, reference, artifactDigest)
 	if err != nil {
 		return err
 	}

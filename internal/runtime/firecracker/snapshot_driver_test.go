@@ -523,7 +523,7 @@ func TestCreateCheckpointCommitsNodeLocalCache(t *testing.T) {
 	require.True(t, os.IsNotExist(statErr), "staging must be consumed by the cache commit")
 }
 
-func TestCreateTemplateSnapshotDoesNotCommitCheckpointCache(t *testing.T) {
+func TestCreateTemplateSnapshotCommitsTemplateCacheNotCheckpointCache(t *testing.T) {
 	fixture, _ := newSnapshotFixture(t)
 	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
 
@@ -531,9 +531,141 @@ func TestCreateTemplateSnapshotDoesNotCommitCheckpointCache(t *testing.T) {
 		SandboxID: sandboxID, SnapshotID: "snap-1", TemplateName: "app-v2",
 	})
 	require.NoError(t, err)
+	// Template snapshots commit under TemplateName (issue #57), never under
+	// the checkpoint reference.
 	reference := artifacts.CheckpointReference(result.ArtifactDigest)
-	require.ErrorIs(t, verifyRestorableImage(fixture.stateRoot, reference), ErrImageNotReady,
-		"template snapshots keep discarding staging (same-node prewarm is issue #57)")
+	require.ErrorIs(t, verifyRestorableImage(fixture.stateRoot, reference), ErrImageNotReady)
+	require.NoError(t, verifyDeliveredImage(fixture.stateRoot, "app-v2", true))
+	for _, name := range []string{rootfsImageName, vmstateSnapshotName, memorySnapshotName, snapshotManifestName} {
+		_, statErr := os.Stat(filepath.Join(fixture.stateRoot, imageCacheDir, imageKey("app-v2"), name))
+		require.NoError(t, statErr, "template cache entry missing %s", name)
+	}
+	_, statErr := os.Stat(filepath.Join(fixture.stateRoot, snapshotStagingDir, "snap-1"))
+	require.True(t, os.IsNotExist(statErr), "staging must be consumed by the cache commit")
+}
+
+func TestCommitSnapshotCacheFullTemplatePrewarmsAndGuardsConflicts(t *testing.T) {
+	root := t.TempDir()
+	driver := &Driver{
+		config:        firecrackerConfigForTest(t, root),
+		imageUseCount: make(map[string]int64),
+	}
+	templateName := "full-template-v1"
+	staging := filepath.Join(root, snapshotStagingDir, "snap-full-1")
+	require.NoError(t, os.MkdirAll(staging, 0o750))
+
+	rootfs := []byte("full-rootfs-bytes")
+	vmstate := []byte("full-vmstate-bytes")
+	memory := []byte("full-memory-bytes")
+	policy := []byte(`{"version":1}`)
+	manifest := artifacts.VMManifest{
+		SchemaVersion: artifacts.VMManifestVersion,
+		Runtime:       "firecracker",
+		Machine:       artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 256, RootfsSizeMiB: 1, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.img"},
+		Kernel:        artifacts.VMKernel{Version: "6.1.177"},
+		Compatibility: artifacts.SnapshotCompatibility{CPUArch: "x86_64", CPUTemplate: artifacts.CPUTemplateT2, FirecrackerVersion: "1.16.1"},
+		Platform: &artifacts.VMPlatform{
+			StateFiles: map[string]artifacts.ManifestFile{
+				policyBundleName: {SHA256: artifacts.SHA256Of(policy), SizeBytes: int64(len(policy))},
+			},
+		},
+		Files: map[string]artifacts.ManifestFile{
+			publishedRootfsName: {SHA256: artifacts.SHA256Of(rootfs), SizeBytes: int64(len(rootfs))},
+			vmstateSnapshotName: {SHA256: artifacts.SHA256Of(vmstate), SizeBytes: int64(len(vmstate))},
+			memorySnapshotName:  {SHA256: artifacts.SHA256Of(memory), SizeBytes: int64(len(memory))},
+		},
+	}
+	payload, err := artifacts.MarshalVMManifest(manifest)
+	require.NoError(t, err)
+	digest := artifacts.SHA256Of(payload)
+	require.NoError(t, os.WriteFile(filepath.Join(staging, publishedRootfsName), rootfs, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, vmstateSnapshotName), vmstate, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, memorySnapshotName), memory, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, policyBundleName), policy, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, snapshotManifestName), payload, 0o600))
+
+	require.NoError(t, driver.commitSnapshotCache(templateName, digest, staging, true, nil))
+	require.NoError(t, verifyDeliveredImage(root, templateName, true))
+	require.Equal(t, int64(1), driver.imageUseCount[imageKey(templateName)])
+
+	// Concurrent replay with the same manifest digest succeeds idempotently.
+	stagingReplay := filepath.Join(root, snapshotStagingDir, "snap-full-replay")
+	require.NoError(t, os.MkdirAll(stagingReplay, 0o750))
+	require.NoError(t, driver.commitSnapshotCache(templateName, digest, stagingReplay, true, nil))
+	require.Equal(t, int64(2), driver.imageUseCount[imageKey(templateName)])
+
+	// A conflicting rebuild under the same templateName fails best-effort
+	// without disturbing the existing cache entry.
+	stagingConflict := filepath.Join(root, snapshotStagingDir, "snap-full-conflict")
+	require.NoError(t, os.MkdirAll(stagingConflict, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(stagingConflict, publishedRootfsName), []byte("newer-rootfs"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(stagingConflict, vmstateSnapshotName), vmstate, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(stagingConflict, memorySnapshotName), memory, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(stagingConflict, snapshotManifestName), payload, 0o600))
+	require.Error(t, driver.commitSnapshotCache(templateName, "different-digest", stagingConflict, true, nil))
+	gotRootfs, err := os.ReadFile(filepath.Join(root, imageCacheDir, imageKey(templateName), rootfsImageName))
+	require.NoError(t, err)
+	require.Equal(t, rootfs, gotRootfs)
+}
+
+// TestRecoverAndGCReclaimInterruptedSnapshotCacheStaging covers an exit after
+// moving rootfs.img into images/.staging-* and before the final directory
+// rename: both startup recovery and image GC must reclaim orphaned staging
+// entries while leaving entries held by active writers untouched.
+func TestRecoverAndGCReclaimInterruptedSnapshotCacheStaging(t *testing.T) {
+	root := t.TempDir()
+	imagesRoot := filepath.Join(root, imageCacheDir)
+	driver := &Driver{config: firecrackerConfigForTest(t, root)}
+
+	// Simulate an active writer holding its staging lock after moving rootfs.img.
+	activeDir, releaseActive, err := acquireSnapshotCacheStaging(imagesRoot, "active-snap")
+	require.NoError(t, err)
+	defer func() {
+		_ = os.RemoveAll(activeDir)
+		releaseActive()
+	}()
+	require.NoError(t, os.WriteFile(filepath.Join(activeDir, rootfsImageName), []byte("active-rootfs"), 0o600))
+
+	// Simulate a crashed writer: rootfs.img was moved into images/.staging-*
+	// before the final rename, then the process exited (lock released without
+	// deferred directory/lock cleanup).
+	crashedRecoveryDir := filepath.Join(imagesRoot, snapshotCacheStagingPrefix+"crashed-recovery")
+	require.NoError(t, os.MkdirAll(crashedRecoveryDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(crashedRecoveryDir, rootfsImageName), []byte("orphaned-rootfs"), 0o600))
+	crashedRecoveryLock := crashedRecoveryDir + snapshotCacheLockSuffix
+	require.NoError(t, os.WriteFile(crashedRecoveryLock, nil, 0o600))
+
+	// Simulate an active legacy Fastlet (mixed-version rollout) staging under
+	// images/.staging-* without a companion .lock file: neither recovery nor GC
+	// may synthesize a lock file or remove it.
+	legacyDir := filepath.Join(imagesRoot, snapshotCacheStagingPrefix+"legacy-fastlet")
+	require.NoError(t, os.MkdirAll(legacyDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(legacyDir, rootfsImageName), []byte("legacy-rootfs"), 0o600))
+
+	// Startup recovery reclaims the orphaned entry and preserves both the
+	// active lock holder and the lockless legacy staging directory.
+	require.NoError(t, driver.RecoverRuntimeResources(context.Background(), nil, nil))
+	require.NoDirExists(t, crashedRecoveryDir)
+	require.NoFileExists(t, crashedRecoveryLock)
+	require.FileExists(t, filepath.Join(activeDir, rootfsImageName))
+	require.FileExists(t, filepath.Join(legacyDir, rootfsImageName))
+	require.NoFileExists(t, legacyDir+snapshotCacheLockSuffix)
+
+	// Image GC also reclaims an orphaned staging entry while skipping both the
+	// active writer and the lockless legacy directory.
+	crashedGCDir := filepath.Join(imagesRoot, snapshotCacheStagingPrefix+"crashed-gc")
+	require.NoError(t, os.MkdirAll(crashedGCDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(crashedGCDir, rootfsImageName), []byte("orphaned-gc-rootfs"), 0o600))
+	crashedGCLock := crashedGCDir + snapshotCacheLockSuffix
+	require.NoError(t, os.WriteFile(crashedGCLock, nil, 0o600))
+
+	_, err = garbageCollectImages(root, defaultImageCacheLimitBytes, nil)
+	require.NoError(t, err)
+	require.NoDirExists(t, crashedGCDir)
+	require.NoFileExists(t, crashedGCLock)
+	require.FileExists(t, filepath.Join(activeDir, rootfsImageName))
+	require.FileExists(t, filepath.Join(legacyDir, rootfsImageName))
+	require.NoFileExists(t, legacyDir+snapshotCacheLockSuffix)
 }
 
 // fakeStateMover plays the Handler side of the state transfers: a successful

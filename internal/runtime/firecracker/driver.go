@@ -1337,6 +1337,7 @@ func (d *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 			return err
 		}
 	}
+	reclaimOrphanedSnapshotCacheStaging(stateRoot)
 	return nil
 }
 

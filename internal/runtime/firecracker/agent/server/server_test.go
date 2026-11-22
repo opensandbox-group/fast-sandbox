@@ -526,3 +526,115 @@ func TestPublishRouteRejectsTemplateWithoutKey(t *testing.T) {
 	require.Contains(t, wireErr.Message, "publish key is required")
 	require.Empty(t, fixture.puller.lastPublish(), "a rejected publish must not reach the publisher")
 }
+
+func TestServerPinImageFailsWhenPullLeavesNoCommittedManifest(t *testing.T) {
+	fixture := newServerFixture(t)
+	fixture.puller.seed = func(string, string) error { return nil }
+
+	status, wireErr, _ := fixture.do(t, agentprotocol.RoutePinImage, agentprotocol.PinImageRequest{
+		Identity: identity("req-no-commit"), Image: testImage,
+	})
+	require.Equal(t, http.StatusNotFound, status)
+	require.Equal(t, agentprotocol.ErrorNotFound, wireErr.Code)
+
+	status, wireErr, _ = fixture.do(t, agentprotocol.RoutePinImage, agentprotocol.PinImageRequest{
+		Identity:       identity("req-ckpt-no-commit"),
+		Image:          "checkpoint:deadbeef",
+		ManifestRef:    "s3://bucket/checkpoints/deadbeef/manifest.json",
+		ArtifactDigest: "deadbeef",
+	})
+	require.Equal(t, http.StatusNotFound, status)
+	require.Equal(t, agentprotocol.ErrorNotFound, wireErr.Code)
+}
+
+func TestServerPinImageRequiresCompleteArtifactSetAndValidCheckpoint(t *testing.T) {
+	// A pull that writes manifest.json without rootfs.img (e.g., swept before
+	// commitManifest) must fail PinImage instead of recording a committed pin.
+	fixture := newServerFixture(t)
+	fixture.puller.seed = func(stateRoot, image string) error {
+		if err := seedCache(stateRoot, image); err != nil {
+			return err
+		}
+		return os.Remove(filepath.Join(stateRoot, "images", imageKeyHex(image), "rootfs.img"))
+	}
+
+	status, wireErr, _ := fixture.do(t, agentprotocol.RoutePinImage, agentprotocol.PinImageRequest{
+		Identity: identity("req-missing-rootfs"), Image: testImage,
+	})
+	require.Equal(t, http.StatusNotFound, status)
+	require.Equal(t, agentprotocol.ErrorNotFound, wireErr.Code)
+	require.Equal(t, 0, fixture.state.Snapshot().PinCount)
+
+	// Checkpoint pull with manifest.json present but rootfs.img missing also fails.
+	status, wireErr, _ = fixture.do(t, agentprotocol.RoutePinImage, agentprotocol.PinImageRequest{
+		Identity:       identity("req-ckpt-missing-rootfs"),
+		Image:          "checkpoint:missing-rootfs",
+		ManifestRef:    "s3://bucket/checkpoints/missing-rootfs/manifest.json",
+		ArtifactDigest: "any-digest",
+	})
+	require.Equal(t, http.StatusNotFound, status)
+	require.Equal(t, agentprotocol.ErrorNotFound, wireErr.Code)
+
+	// Checkpoint pull with a digest mismatch fails even when all files exist.
+	fixture.puller.seed = seedCache
+	status, wireErr, _ = fixture.do(t, agentprotocol.RoutePinImage, agentprotocol.PinImageRequest{
+		Identity:       identity("req-ckpt-wrong-digest"),
+		Image:          "checkpoint:wrong-digest",
+		ManifestRef:    "s3://bucket/checkpoints/wrong-digest/manifest.json",
+		ArtifactDigest: "0000000000000000000000000000000000000000000000000000000000000000",
+	})
+	require.Equal(t, http.StatusNotFound, status)
+	require.Equal(t, agentprotocol.ErrorNotFound, wireErr.Code)
+
+	// Checkpoint pull with a rootfsOnly manifest fails even when digest matches.
+	rootfsOnlyRef := "checkpoint:rootfs-only"
+	rootfsOnlyBytes := []byte("rootfs-only-content")
+	rootfsOnlyManifest := artifacts.VMManifest{
+		SchemaVersion: artifacts.VMManifestVersion,
+		Runtime:       "firecracker",
+		Machine:       artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 1, RootfsSizeMiB: 1, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.img"},
+		Kernel:        artifacts.VMKernel{Version: "6.1.177", Cmdline: "root=/dev/vda rw"},
+		Compatibility: artifacts.SnapshotCompatibility{CPUArch: "x86_64", CPUTemplate: artifacts.CPUTemplateT2, FirecrackerVersion: "1.16.1"},
+		Platform:      &artifacts.VMPlatform{SnapshotMode: "rootfsOnly"},
+		Files: map[string]artifacts.ManifestFile{
+			"rootfs.ext4": {SHA256: hexSHA256(rootfsOnlyBytes), SizeBytes: int64(len(rootfsOnlyBytes))},
+		},
+	}
+	rootfsOnlyPayload, err := artifacts.MarshalVMManifest(rootfsOnlyManifest)
+	require.NoError(t, err)
+	fixture.puller.seed = func(stateRoot, image string) error {
+		dir := filepath.Join(stateRoot, "images", imageKeyHex(image))
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dir, "rootfs.img"), rootfsOnlyBytes, 0o640); err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(dir, "manifest.json"), rootfsOnlyPayload, 0o640)
+	}
+	status, wireErr, _ = fixture.do(t, agentprotocol.RoutePinImage, agentprotocol.PinImageRequest{
+		Identity:       identity("req-ckpt-rootfsonly"),
+		Image:          rootfsOnlyRef,
+		ManifestRef:    "s3://bucket/checkpoints/rootfs-only/manifest.json",
+		ArtifactDigest: hexSHA256(rootfsOnlyPayload),
+	})
+	require.Equal(t, http.StatusNotFound, status)
+	require.Equal(t, agentprotocol.ErrorNotFound, wireErr.Code)
+
+	// A complete non-rootfsOnly checkpoint whose manifest digest matches succeeds.
+	validRef := "checkpoint:valid"
+	require.NoError(t, seedCache(fixture.stateRoot, validRef))
+	validDigest, ok, err := agentpull.CachedManifestDigest(fixture.stateRoot, validRef)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NoError(t, os.RemoveAll(filepath.Join(fixture.stateRoot, "images", imageKeyHex(validRef))))
+	fixture.puller.seed = seedCache
+	status, wireErr, _ = fixture.do(t, agentprotocol.RoutePinImage, agentprotocol.PinImageRequest{
+		Identity:       identity("req-ckpt-valid"),
+		Image:          validRef,
+		ManifestRef:    "s3://bucket/checkpoints/valid/manifest.json",
+		ArtifactDigest: validDigest,
+	})
+	require.Equal(t, http.StatusOK, status)
+	require.Empty(t, wireErr.Code)
+}

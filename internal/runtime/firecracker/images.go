@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -184,13 +183,6 @@ func prepareInstanceRootfs(stateRoot, image, instanceDir string) (string, error)
 	return target, nil
 }
 
-// reflinkOnly attempts a metadata-only CoW clone of source to target. It
-// never falls back to a full copy: callers that need consistency (e.g. the
-// snapshot rootfs clone) decide where a non-atomic full copy may run.
-func reflinkOnly(source, target string) error {
-	return exec.Command("cp", "--reflink=always", source, target).Run()
-}
-
 // copyReflinkOrCopy attempts a CoW reflink copy and falls back to a plain
 // copy when the host filesystem does not support reflinks (e.g. ext4): the
 // fallback pays a full rootfs copy (~1.7 GB/s) per create.
@@ -261,6 +253,7 @@ func garbageCollectImages(stateRoot string, limitBytes int64, useCount map[strin
 			referenced[imageKey(source)] = struct{}{}
 		}
 	}
+	reclaimOrphanedSnapshotCacheStaging(stateRoot)
 	cached, err := listCachedImages(stateRoot)
 	if err != nil {
 		return nil, err

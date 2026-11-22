@@ -318,3 +318,24 @@ func TestNativeRootfsDeliveryRequiresCommittedCompleteCache(t *testing.T) {
 		})
 	}
 }
+
+func TestCopyReflinkOrCopyClonesAndIsolates(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.img")
+	dst := filepath.Join(dir, "dst.img")
+	original := []byte("firecracker-rootfs-clone-test-payload")
+	require.NoError(t, os.WriteFile(src, original, 0o600))
+
+	require.NoError(t, copyReflinkOrCopy(src, dst))
+	got, err := os.ReadFile(dst)
+	require.NoError(t, err)
+	require.Equal(t, original, got)
+
+	// Mutating the clone must never mutate the source.
+	mutated := append([]byte(nil), original...)
+	mutated[0] ^= 0xff
+	require.NoError(t, os.WriteFile(dst, mutated, 0o600))
+	stillOriginal, err := os.ReadFile(src)
+	require.NoError(t, err)
+	require.Equal(t, original, stillOriginal)
+}
