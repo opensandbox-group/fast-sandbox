@@ -99,3 +99,37 @@ func TestPinKernelBindsLoadedBytesAndDoesNotOverwrite(t *testing.T) {
 	require.Error(t, err)
 	require.NoFileExists(t, filepath.Join(dir, "bad"))
 }
+
+func TestRootfsBootFreePageReportingBalloon(t *testing.T) {
+	base := artifacts.VMManifest{
+		Machine: artifacts.VMMachine{VCPUCount: 2, MemoryMiB: 512, RootfsDriveID: "rootfs"},
+		Kernel:  artifacts.VMKernel{Cmdline: "root=/dev/vda rw"},
+	}
+	for _, tc := range []struct {
+		name        string
+		fpr         *bool
+		wantBalloon bool
+	}{
+		{name: "unset", fpr: nil, wantBalloon: false},
+		{name: "false", fpr: new(false), wantBalloon: false},
+		{name: "true", fpr: new(true), wantBalloon: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := base
+			m.FreePageReporting = tc.fpr
+			ops, err := RootfsBoot(m, "/kernel", "rootfs.dev", "", "")
+			require.NoError(t, err)
+			var balloon any
+			for _, op := range ops {
+				if op.Path == "/balloon" {
+					balloon = op.Body
+				}
+			}
+			if !tc.wantBalloon {
+				require.Nil(t, balloon)
+				return
+			}
+			require.Equal(t, FreePageReportingBalloon(), balloon)
+		})
+	}
+}

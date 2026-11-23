@@ -28,19 +28,19 @@ func RootfsBoot(m artifacts.VMManifest, kernel, rootfs, tap, socket string) ([]O
 		return nil, errors.New("network provider requires guestNetwork")
 	}
 	ops := []Operation{
-		{"/boot-source", map[string]any{"kernel_image_path": kernel, "boot_args": m.Kernel.Cmdline}},
-		{"/machine-config", map[string]any{"vcpu_count": m.Machine.VCPUCount, "mem_size_mib": m.Machine.MemoryMiB}},
+		{pathBootSource, map[string]any{"kernel_image_path": kernel, "boot_args": m.Kernel.Cmdline}},
+		{pathMachineConfig, map[string]any{"vcpu_count": m.Machine.VCPUCount, "mem_size_mib": m.Machine.MemoryMiB}},
 		{"/drives/" + m.Machine.RootfsDriveID, map[string]any{"drive_id": m.Machine.RootfsDriveID, "path_on_host": rootfs, "is_root_device": true, "is_read_only": false, "cache_type": "Writeback"}},
 	}
 	if tap != "" {
 		ops = append(ops, Operation{"/network-interfaces/" + m.GuestNetwork.Iface, map[string]string{"iface_id": m.GuestNetwork.Iface, "guest_mac": m.GuestNetwork.MAC, "host_dev_name": tap}})
 	}
 	if m.GuestControl != nil {
-		ops = append(ops, Operation{"/vsock", map[string]any{"guest_cid": 3, "uds_path": socket}})
+		ops = append(ops, Operation{pathVsock, map[string]any{"guest_cid": 3, "uds_path": socket}})
 	}
-	ops = append(ops, Operation{"/entropy", map[string]any{}})
+	ops = append(ops, Operation{pathEntropy, map[string]any{}})
 	if m.FreePageReporting != nil && *m.FreePageReporting {
-		ops = append(ops, Operation{"/balloon", map[string]any{"amount_mib": 0, "deflate_on_oom": true, "free_page_reporting": true}})
+		ops = append(ops, Operation{pathBalloon, FreePageReportingBalloon()})
 	}
 	return ops, nil
 }

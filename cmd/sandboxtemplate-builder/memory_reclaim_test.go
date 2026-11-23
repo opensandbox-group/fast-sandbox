@@ -5,73 +5,20 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/firecrackerconfig"
 )
 
-func TestDefaultGuestReportingSupport(t *testing.T) {
-	for _, test := range []struct {
-		name    string
-		modules []string
-		want    bool
-	}{
-		{name: "supported", modules: []string{"virtio_balloon", "page_reporting"}, want: true},
-		{name: "missing page reporting", modules: []string{"virtio_balloon"}},
-		{name: "missing balloon", modules: []string{"page_reporting"}},
-		{name: "unsupported kernel"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			modules := t.TempDir()
-			for _, module := range test.modules {
-				require.NoError(t, os.Mkdir(filepath.Join(modules, module), 0o755))
-			}
-			script := strings.ReplaceAll(renderFreePageReporting(), "/sys/module", shellQuote(modules))
-			command := exec.Command("sh", "-eu")
-			command.Stdin = strings.NewReader(script + "\necho SANDBOX_READY\n")
-			output, err := command.CombinedOutput()
-			require.NoError(t, err, "%s", output)
-			require.Contains(t, string(output), "SANDBOX_READY", "unsupported kernels must remain bootable")
-			if !test.want {
-				require.Contains(t, string(output), "SANDBOX_FREE_PAGE_REPORTING_UNAVAILABLE")
-			}
-			log := filepath.Join(t.TempDir(), "boot.console.log")
-			require.NoError(t, os.WriteFile(log, output, 0o600))
-			enabled, err := readFreePageReportingSupport(log)
-			require.NoError(t, err)
-			require.Equal(t, test.want, enabled)
-		})
-	}
+func TestDefaultGuestReportingInitWiring(t *testing.T) {
 	init := renderGuestInit(apiv1alpha2.SandboxTemplateSpec{})
-	require.Contains(t, init, renderFreePageReporting(), "reporting needs no template configuration")
+	require.Contains(t, init, firecrackerconfig.RenderFreePageReportingCheck(), "reporting needs no template configuration")
 	require.NotContains(t, init, "damon_reclaim")
-}
-
-func TestReadFreePageReportingSupport(t *testing.T) {
-	for _, test := range []struct {
-		name, log string
-		want      bool
-	}{
-		{name: "serial newlines", log: freePageReportingReadyMarker + "\r\nSANDBOX_READY\r\n", want: true},
-		{name: "missing marker", log: "SANDBOX_READY\n"},
-		{name: "quoted marker", log: "diagnostic: " + freePageReportingReadyMarker + "\n"},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			log := filepath.Join(t.TempDir(), "boot.console.log")
-			require.NoError(t, os.WriteFile(log, []byte(test.log), 0o600))
-			enabled, err := readFreePageReportingSupport(log)
-			require.NoError(t, err)
-			require.Equal(t, test.want, enabled)
-		})
-	}
-	_, err := readFreePageReportingSupport(filepath.Join(t.TempDir(), "missing.log"))
-	require.ErrorContains(t, err, "read guest free-page reporting support")
 }
 
 func TestFreePageReportingDeviceConfiguration(t *testing.T) {

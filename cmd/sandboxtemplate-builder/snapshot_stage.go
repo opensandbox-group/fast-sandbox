@@ -160,13 +160,13 @@ func runSnapshotStage(args []string) error {
 		return fmt.Errorf("guest init startup failed: %s", lastMarkerLine(bootLog, startupFailedMarker))
 	}
 	bootToReadyMs := time.Since(phaseStarted).Milliseconds()
-	freePageReporting, err := readFreePageReportingSupport(bootLog)
+	freePageReporting, err := firecrackerconfig.ReadFreePageReportingSupport(bootLog)
 	if err != nil {
 		vm.stop()
 		return err
 	}
 	if !freePageReporting {
-		klog.Warning("guest free-page reporting unavailable; snapshot will retain legacy memory behavior")
+		klog.Warning(firecrackerconfig.FreePageReportingUnavailableWarning)
 	}
 
 	// Publish capability only after probing the real root on this disposable VM.
@@ -396,54 +396,26 @@ func configureVM(vm *vmm, kernel, rootfs, bootArgs string, spec apiv1alpha2.Sand
 	if err != nil {
 		return err
 	}
-	machineConfig := map[string]any{
-		"vcpu_count":   vcpuCount,
-		"mem_size_mib": memSize,
-		"smt":          false,
-	}
-	if cpuTemplate != "" {
-		machineConfig["cpu_template"] = cpuTemplate
-	}
-	if err := api(vm.socket, "PUT", "/machine-config", machineConfig); err != nil {
-		return err
-	}
-	if err := api(vm.socket, "PUT", "/balloon", map[string]any{
-		"amount_mib": 0, "deflate_on_oom": true,
-		"stats_polling_interval_s": 0, "free_page_reporting": true,
-	}); err != nil {
-		return fmt.Errorf("configure free-page reporting: %w", err)
-	}
-	// Entropy device (virtio-rng): the microVM has no other entropy source —
-	// the T2 CPU template masks RDRAND/RDSEED (snapshot determinism) and no
-	// host RNG device is passed through — so without it the guest CRNG never
-	// initializes and getrandom() callers (Go crypto/rand, uuid, openssl,
-	// python secrets, TLS) block forever; execd POST /command hangs on its
-	// session id while /ping and malformed-JSON 400 stay instant (OpenSandbox
-	// #1695). Seeding the CRNG at prep boot means the golden snapshot carries
-	// an initialized CRNG and every restored instance works.
-	if err := api(vm.socket, "PUT", "/entropy", map[string]any{}); err != nil {
-		return fmt.Errorf("attach entropy device: %w", err)
-	}
-	if err := api(vm.socket, "PUT", "/boot-source", map[string]any{
-		"kernel_image_path": kernel,
-		"boot_args":         bootArgs,
-	}); err != nil {
-		return err
-	}
-	if err := api(vm.socket, "PUT", "/drives/rootfs", map[string]any{
-		"drive_id":       rootfsDirName,
-		"path_on_host":   snapshotDriveName,
-		"is_root_device": true,
-		"is_read_only":   false,
-	}); err != nil {
-		return err
-	}
-	if err := api(vm.socket, "PUT", "/network-interfaces/eth0", map[string]any{
-		"iface_id":      "eth0",
-		"host_dev_name": buildTap,
-		"guest_mac":     bakedGuestMAC,
-	}); err != nil {
-		return err
+	// Entropy (virtio-rng) is installed via BuildBoot because the T2 CPU
+	// template masks RDRAND/RDSEED; seeding the guest CRNG at prep boot keeps
+	// getrandom() callers (e.g. execd POST /command) from blocking after restore.
+	ops := firecrackerconfig.BuildBoot(firecrackerconfig.BuildBootSpec{
+		KernelPath:    kernel,
+		BootArgs:      bootArgs,
+		VCPUCount:     vcpuCount,
+		MemoryMiB:     memSize,
+		SMT:           new(false),
+		CPUTemplate:   cpuTemplate,
+		RootfsDriveID: rootfsDirName,
+		RootfsPath:    snapshotDriveName,
+		TapName:       buildTap,
+		GuestIface:    "eth0",
+		GuestMAC:      bakedGuestMAC,
+	})
+	for _, op := range ops {
+		if err := api(vm.socket, "PUT", op.Path, op.Body); err != nil {
+			return firecrackerconfig.WrapBuildOpError(op.Path, err)
+		}
 	}
 	return nil
 }

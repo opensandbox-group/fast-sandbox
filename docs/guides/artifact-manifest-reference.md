@@ -133,7 +133,7 @@ OCI uses `rootfs.dev`, `vmstate.bin` and `memfile`, with no `files` list. Reusab
 
 `lineage` records optional `image`, `imageDigest` and `createdAt`. Template builds record their source and creation time. Snapshots preserve the original digest and capture compatibility, updating only the source reference for the running Sandbox. `compatibility.cpuModelName` and `hostKernel` are optional diagnostics.
 
-`freePageReporting` records the object-store builder's guest support detection for its configured FPR device. `true` means the guest reported the required kernel interfaces; `false` means support was not detected, although the configured device can still be present. An absent field means the result was not recorded, as with older snapshots or producers that do not report it. Snapshot and checkpoint manifests inherit this value. It is build provenance, not a runtime switch, proof of successful reclamation, or an admission condition; Firecracker's saved device state remains authoritative.
+`freePageReporting` records the builder's (`sandboxtemplate-builder` and `fsb-vm build`) guest support detection for its configured FPR device. `true` means the guest reported the required kernel interfaces; `false` means support was not detected, although the configured device can still be present. An absent field means the result was not recorded, as with older snapshots or producers that do not report it. Snapshot and checkpoint manifests inherit this value, and `RootfsOnly` cold boots attach the FPR balloon when it is `true`. It is build provenance, not a runtime switch, proof of successful reclamation, or an admission condition; Firecracker's saved device state remains authoritative on Full restores.
 
 ## Platform extension
 
