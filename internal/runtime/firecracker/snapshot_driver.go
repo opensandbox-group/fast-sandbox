@@ -327,7 +327,7 @@ func (d *Driver) commitSnapshotCache(reference, artifactDigest, staging string, 
 	// files. Mirror the assembly/publish stat contract: only absence skips
 	// a file — dropping it on a transient error would corrupt the
 	// node-local cache asymmetrically against the published set.
-	for _, bundleName := range []string{vaultBundleName, policyBundleName} {
+	for _, bundleName := range optionalStateBundleNames {
 		if _, err := os.Stat(filepath.Join(staging, bundleName)); err == nil {
 			mappings[bundleName] = bundleName
 		} else if !errors.Is(err, os.ErrNotExist) {
@@ -574,6 +574,9 @@ func (d *Driver) ensureDumpCapacity(ctx context.Context, plan dumpPlan) error {
 	defer cancel()
 	if err := d.reclaimCheckpointBlobs(recoveryCtx, need); err != nil {
 		klog.InfoS("checkpoint blob capacity recovery incomplete", "error", err)
+	}
+	if err := reclaimOCIHotCheckpoints(stateRoot, need); err != nil {
+		klog.InfoS("OCI hot checkpoint capacity recovery incomplete", "error", err)
 	}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -953,6 +956,8 @@ const (
 	vaultBundleName  = agentprotocol.VaultBundleName
 	policyBundleName = agentprotocol.PolicyBundleName
 )
+
+var optionalStateBundleNames = []string{vaultBundleName, policyBundleName}
 
 // stageCheckpointVault exports the subject's egress vault into the checkpoint
 // staging directory (no-op without a mover). The Handler copies the file

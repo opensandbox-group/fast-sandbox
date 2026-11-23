@@ -231,7 +231,13 @@ func (d *Driver) publishPreparedOCISnapshot(ctx context.Context, plan dumpPlan, 
 	if err != nil {
 		return nil, err
 	}
-	return &runtimecontract.SnapshotResult{SnapshotID: plan.snapshotID, ManifestRef: ref, ArtifactDigest: strings.TrimPrefix(parsed.Reference, "sha256:"), SizeBytes: sizeBytes, Mode: producedMode}, nil
+	artifactDigest := strings.TrimPrefix(parsed.Reference, "sha256:")
+	if producedMode == fastletapi.SnapshotModeFull && document.Platform != nil && document.Platform.Checkpoint != nil {
+		if err := retainOCIHotCheckpoint(plan.stateRoot, artifactDigest, plan.staging); err != nil {
+			klog.InfoS("OCI hot checkpoint cache population skipped", "snapshotID", plan.snapshotID, "digest", artifactDigest, "err", err)
+		}
+	}
+	return &runtimecontract.SnapshotResult{SnapshotID: plan.snapshotID, ManifestRef: ref, ArtifactDigest: artifactDigest, SizeBytes: sizeBytes, Mode: producedMode}, nil
 }
 
 // Checkpoints are instance-private even though their bytes use an OCI envelope.

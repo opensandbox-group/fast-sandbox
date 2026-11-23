@@ -17,6 +17,7 @@ Fast Sandbox is a Kubernetes-native sandbox runtime. Start with [Architecture](d
 ## Working rules
 
 - Make the smallest complete change; preserve local style and unrelated user changes.
+- Follow DRY: reuse existing constants, helpers, and test fixtures instead of duplicating logic across production code or tests; extract shared helpers when the same pattern repeats, without introducing premature abstractions or coupling independent packages.
 - Define success criteria, investigate with logs and tests, and avoid guessing behavior.
 - Kubernetes owns durable intent; Fastlet owns atomic admission. Preserve idempotency, generation fencing, and persistence before runtime side effects. Keep shared contracts independent of implementations.
 - Keep lifecycle/routing separate from user protocols such as Execd. Readiness alone does not prove protocol functionality.

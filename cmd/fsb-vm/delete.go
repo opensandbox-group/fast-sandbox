@@ -115,7 +115,7 @@ func releaseSandbox(ctx context.Context, ublkd deviceReleaser, layout sandboxLay
 		failures = append(failures, fmt.Errorf("remove rootfs drive link: %w", err))
 	}
 	var unmountErr error
-	if state.SharedSnapfiles == "" {
+	if state.SharedSnapfiles == "" && !state.HotSnapfiles {
 		unmountErr = unmount(layout.mountPoint)
 	}
 	if unmountErr != nil {
@@ -135,7 +135,7 @@ func releaseSandbox(ctx context.Context, ublkd deviceReleaser, layout sandboxLay
 		state.Rootfs = nil
 	}
 	// The snapfiles device stays attached while its filesystem is mounted.
-	if unmountErr == nil && state.SharedSnapfiles == "" {
+	if unmountErr == nil && state.SharedSnapfiles == "" && !state.HotSnapfiles {
 		snapfilesMatches, releaseErr := releaseOwnedDevices(ctx, ublkd, devices, layout.snapfilesConfig)
 		if releaseErr != nil {
 			failures = append(failures, fmt.Errorf("release snapfiles device: %w", releaseErr))
