@@ -102,7 +102,7 @@ func main() { //nolint:gocognit,gocyclo,funlen,maintidx // pre-existing flag wir
 	flag.StringVar(&probeAddress, "health-probe-bind-address", ":5758", "Health probe listen address.")
 	flag.StringVar(&fastPathAddress, "fastpath-bind-address", ":9090", "FastPath gRPC listen address.")
 	flag.IntVar(&fastPathHTTPPort, "fastpath-http-port", 0, "FastPath gRPC-Web port for HTTP/1.1 clients (0 disables this listener).")
-	flag.BoolVar(&fastPathAuthEnabled, "fastpath-auth-enabled", true, "Enable FastPath caller authentication and TLS (default true; set false for legacy plaintext upgrade transition).")
+	flag.BoolVar(&fastPathAuthEnabled, "fastpath-auth-enabled", false, "Enable FastPath caller authentication and TLS (default false; set true to enforce caller authentication over TLS).")
 	flag.StringVar(&fastPathPolicy, "fastpath-auth-policy-file", "", "Required FastPath caller policy JSON file when --fastpath-auth-enabled is true.")
 	flag.StringVar(&fastPathCert, "fastpath-tls-cert-file", "", "Required FastPath serving certificate PEM file when --fastpath-auth-enabled is true.")
 	flag.StringVar(&fastPathKey, "fastpath-tls-key-file", "", "Required FastPath serving private key PEM file when --fastpath-auth-enabled is true.")

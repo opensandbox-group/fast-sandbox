@@ -96,7 +96,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&namespace, "namespace", "n", "fast-sandbox", "Kubernetes resource namespace")
 	rootCmd.PersistentFlags().StringVar(&proxyEndpoint, "proxy-endpoint", "", "Override the Sandbox Proxy authority (env: "+sandboxProxyEndpointEnv+")")
 
-	rootCmd.PersistentFlags().BoolVar(&authEnabled, "auth-enabled", true, "Enable FastPath caller authentication and TLS (default true; set false for legacy plaintext endpoints)")
+	rootCmd.PersistentFlags().BoolVar(&authEnabled, "auth-enabled", false, "Enable FastPath caller authentication and TLS (default false; set true for authenticated TLS endpoints)")
 	rootCmd.PersistentFlags().StringVar(&kubeconfig, "kubeconfig", "", "Kubernetes bootstrap kubeconfig (default loading rules when empty)")
 	rootCmd.PersistentFlags().StringVar(&authNamespace, "auth-namespace", "fast-sandbox-system", "FastPath caller ServiceAccount namespace")
 	rootCmd.PersistentFlags().StringVar(&authServiceAccount, "auth-service-account", "opensandbox-server-fastpath-client", "Authentication-only FastPath caller ServiceAccount")
