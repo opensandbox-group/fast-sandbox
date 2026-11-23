@@ -32,11 +32,11 @@ const (
 )
 
 var (
-	cfgFile                            string
-	endpoint                           string
-	namespace                          string
-	proxyEndpoint                      string
-	authEnabled                        bool
+	cfgFile                              string
+	endpoint                             string
+	namespace                            string
+	proxyEndpoint                        string
+	authEnabled                          bool
 	kubeconfig, tlsCAFile, tlsServerName string
 
 	// traceShutdown terminates the OTLP exporter installed by Execute.
