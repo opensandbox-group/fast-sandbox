@@ -28,42 +28,42 @@ metadata:
 data:
   callers.json: |
     [
-      {"subject":"system:serviceaccount:fast-sandbox-system:opensandbox-server-fastpath-client","profile":"server","namespaces":["fast-sandbox"]},
-      {"subject":"system:serviceaccount:fast-sandbox-system:opensandbox-ingress-fastpath-client","profile":"gateway","namespaces":["fast-sandbox"]}
+      {"subject":"system:serviceaccount:fast-sandbox-system:opensandbox-server","profile":"server","namespaces":["fast-sandbox"]},
+      {"subject":"system:serviceaccount:fast-sandbox-system:opensandbox-ingress-gateway","profile":"gateway","namespaces":["fast-sandbox"]}
     ]
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: opensandbox-server-fastpath-client
+  name: opensandbox-server
   namespace: fast-sandbox-system
 automountServiceAccountToken: false
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: opensandbox-ingress-fastpath-client
+  name: opensandbox-ingress-gateway
   namespace: fast-sandbox-system
 automountServiceAccountToken: false
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: opensandbox-server-fastpath-client-minter
+  name: opensandbox-server-token-minter
   namespace: fast-sandbox-system
 rules:
   - apiGroups: [""]
     resources: [serviceaccounts/token]
-    resourceNames: [opensandbox-server-fastpath-client]
+    resourceNames: [opensandbox-server]
     verbs: [create]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: opensandbox-ingress-fastpath-client-minter
+  name: opensandbox-ingress-gateway-token-minter
   namespace: fast-sandbox-system
 rules:
   - apiGroups: [""]
     resources: [serviceaccounts/token]
-    resourceNames: [opensandbox-ingress-fastpath-client]
+    resourceNames: [opensandbox-ingress-gateway]
     verbs: [create]

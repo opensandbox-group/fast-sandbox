@@ -191,7 +191,7 @@ func defaultClientFactory() (fastpathv2.FastPathServiceClient, *grpc.ClientConn,
 	}
 	source := fastletauth.NewTokenRequestSource(func(ctx context.Context, ns, name string, request *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 		return api.ServiceAccounts(ns).CreateToken(ctx, name, request, metav1.CreateOptions{})
-	}, fastletauth.PodServiceAccountIdentity{Namespace: callerNamespace, ServiceAccount: "opensandbox-server-fastpath-client"}, "fast-sandbox-fastpath")
+	}, fastletauth.PodServiceAccountIdentity{Namespace: callerNamespace, ServiceAccount: "opensandbox-server"}, "fast-sandbox-fastpath")
 	var roots *x509.CertPool
 	if tlsCAFile != "" {
 		pem, err := os.ReadFile(tlsCAFile)
