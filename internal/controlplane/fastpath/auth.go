@@ -66,6 +66,7 @@ type CallerAuthenticator struct {
 	loaded     time.Time
 	retry      time.Time
 	refreshing bool
+	flight     chan struct{}
 	now        func() time.Time
 }
 
@@ -110,32 +111,60 @@ func NewCallerAuthenticator(issuer string, grants []CallerGrant, client *http.Cl
 	return a, nil
 }
 
-func (a *CallerAuthenticator) current() (*fastletauth.Authenticator, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	now := a.now()
-	if now.Sub(a.loaded) >= 5*time.Minute && !a.refreshing && !now.Before(a.retry) {
-		a.refreshing = true
-		go func() {
-			next, err := a.create()
-			a.mu.Lock()
-			defer a.mu.Unlock()
-			a.refreshing = false
-			a.retry = a.now().Add(30 * time.Second)
-			if err == nil {
-				a.verifier, a.claims, a.loaded = next, make(map[[32]byte]callerClaimBound), a.now()
-			} else {
-				klog.ErrorS(err, "FastPath caller key refresh failed")
-			}
-		}()
+func (a *CallerAuthenticator) startRefreshLocked() chan struct{} {
+	if a.flight != nil {
+		return a.flight
 	}
-	if now.Sub(a.loaded) >= 15*time.Minute {
-		return nil, status.Error(codes.Unavailable, "FastPath verification keys unavailable")
-	}
-	return a.verifier, nil
+	flight := make(chan struct{})
+	a.flight = flight
+	a.refreshing = true
+	go func() {
+		next, err := a.create()
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.refreshing = false
+		a.flight = nil
+		a.retry = a.now().Add(30 * time.Second)
+		if err == nil {
+			a.verifier, a.claims, a.loaded = next, make(map[[32]byte]callerClaimBound), a.now()
+		} else {
+			klog.ErrorS(err, "FastPath caller key refresh failed")
+		}
+		close(flight)
+	}()
+	return flight
 }
 
-func (a *CallerAuthenticator) checkCallerClaims(raw string) error {
+func (a *CallerAuthenticator) current(ctx context.Context) (*fastletauth.Authenticator, error) {
+	a.mu.Lock()
+	now := a.now()
+	age := now.Sub(a.loaded)
+	var flight chan struct{}
+	if age >= 5*time.Minute && (a.flight != nil || !now.Before(a.retry)) {
+		flight = a.startRefreshLocked()
+	}
+	if age < 15*time.Minute {
+		verifier := a.verifier
+		a.mu.Unlock()
+		return verifier, nil
+	}
+	a.mu.Unlock()
+	if flight != nil {
+		select {
+		case <-ctx.Done():
+			return nil, status.FromContextError(ctx.Err()).Err()
+		case <-flight:
+		}
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.now().Sub(a.loaded) < 15*time.Minute {
+			return a.verifier, nil
+		}
+	}
+	return nil, status.Error(codes.Unavailable, "FastPath verification keys unavailable")
+}
+
+func (a *CallerAuthenticator) checkCallerClaims(raw string) ([32]byte, callerClaimBound, bool, error) {
 	digest := sha256.Sum256([]byte(raw))
 	now := a.now()
 	current := float64(now.UnixNano()) / 1e9
@@ -148,24 +177,18 @@ func (a *CallerAuthenticator) checkCallerClaims(raw string) error {
 	a.mu.Unlock()
 	if cached {
 		if bound.issued > current+30 || current >= bound.expires {
-			return status.Error(codes.Unauthenticated, "caller token must have a valid lifetime of at most one hour")
+			return digest, callerClaimBound{}, true, status.Error(codes.Unauthenticated, "caller token must have a valid lifetime of at most one hour")
 		}
-		return nil
+		return digest, bound, true, nil
 	}
 	claims := jwt.MapClaims{}
 	if _, _, err := jwt.NewParser().ParseUnverified(raw, claims); err != nil {
-		return status.Error(codes.Unauthenticated, "invalid caller token")
+		return digest, callerClaimBound{}, false, status.Error(codes.Unauthenticated, "invalid caller token")
 	}
 	if err := validateCallerClaims(claims, now); err != nil {
-		return err
+		return digest, callerClaimBound{}, false, err
 	}
-	a.mu.Lock()
-	if len(a.claims) >= 8192 {
-		clear(a.claims)
-	}
-	a.claims[digest] = callerClaimBound{issued: claims["iat"].(float64), expires: claims["exp"].(float64)}
-	a.mu.Unlock()
-	return nil
+	return digest, callerClaimBound{issued: claims["iat"].(float64), expires: claims["exp"].(float64)}, false, nil
 }
 
 func (a *CallerAuthenticator) authenticate(ctx context.Context) (string, error) {
@@ -175,10 +198,11 @@ func (a *CallerAuthenticator) authenticate(ctx context.Context) (string, error) 
 		return "", status.Error(codes.Unauthenticated, "one FastPath bearer credential is required")
 	}
 	raw := strings.TrimPrefix(values[0], "Bearer ")
-	if err := a.checkCallerClaims(raw); err != nil {
+	digest, bound, cached, err := a.checkCallerClaims(raw)
+	if err != nil {
 		return "", err
 	}
-	verifier, err := a.current()
+	verifier, err := a.current(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -190,6 +214,14 @@ func (a *CallerAuthenticator) authenticate(ctx context.Context) (string, error) 
 		return "", status.Error(codes.Unavailable, "FastPath caller verification unavailable")
 	case err != nil:
 		return "", status.Error(codes.Unauthenticated, "invalid caller token")
+	}
+	if !cached {
+		a.mu.Lock()
+		if len(a.claims) >= 8192 {
+			clear(a.claims)
+		}
+		a.claims[digest] = bound
+		a.mu.Unlock()
 	}
 	return subject, nil
 }

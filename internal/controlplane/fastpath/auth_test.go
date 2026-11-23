@@ -229,16 +229,24 @@ func TestCallerKeyRefreshDiscardsOldIdentityCache(t *testing.T) {
 	issuer.RemoveKey(fastletauthtest.DefaultRSAKeyID)
 	auth.loaded = time.Now().Add(-6 * time.Minute)
 	old := auth.verifier
-	_, err = auth.current()
+	_, err = auth.current(t.Context())
 	require.NoError(t, err)
 	require.Eventually(t, func() bool { auth.mu.Lock(); defer auth.mu.Unlock(); return !auth.refreshing && auth.verifier != old }, 2*time.Second, time.Millisecond)
 	_, err = auth.authenticate(ctx)
 	require.Equal(t, codes.Unauthenticated, status.Code(err))
+	// After >=15 minutes idle, a healthy refresh completes synchronously instead of failing the first call.
+	auth.mu.Lock()
+	auth.loaded = time.Now().Add(-16 * time.Minute)
+	auth.retry = time.Time{}
+	auth.mu.Unlock()
+	_, err = auth.current(t.Context())
+	require.NoError(t, err)
+	// When refresh is throttled and keys are >=15 minutes old, fail closed with Unavailable.
 	auth.mu.Lock()
 	auth.loaded = time.Now().Add(-16 * time.Minute)
 	auth.retry = time.Now().Add(time.Hour)
 	auth.mu.Unlock()
-	_, err = auth.current()
+	_, err = auth.current(t.Context())
 	require.Equal(t, codes.Unavailable, status.Code(err))
 }
 
@@ -248,6 +256,18 @@ func TestCallerClaimCacheEnforcesStrictExpiryWithoutLeeway(t *testing.T) {
 	require.NoError(t, err)
 	now := time.Now()
 	auth.now = func() time.Time { return now }
+	// Unauthenticated/forged tokens with valid-looking claims must not pollute auth.claims.
+	forged, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": serverSubject,
+		"aud": CallerAudience,
+		"iat": float64(now.Unix()),
+		"exp": float64(now.Add(10 * time.Second).Unix()),
+	}).SignedString([]byte("forged-secret"))
+	require.NoError(t, err)
+	_, err = auth.authenticate(metadata.NewIncomingContext(t.Context(), metadata.Pairs("authorization", "Bearer "+forged)))
+	require.Equal(t, codes.Unauthenticated, status.Code(err))
+	require.Empty(t, auth.claims)
+
 	token := issuer.Mint(fastletauthtest.MintOptions{Subject: serverSubject, Audience: CallerAudience, IssuedAt: now.Unix(), ExpiresAt: now.Add(10 * time.Second).Unix()})
 	ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs("authorization", "Bearer "+token))
 	_, err = auth.authenticate(ctx)

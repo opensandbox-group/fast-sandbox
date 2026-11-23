@@ -51,6 +51,9 @@ func TestSameOriginKeysRejectsCrossOriginBeforeFetch(t *testing.T) {
 	_, err := NewAuthenticator(issuer.URL, Audience, nil, issuer.Client(), WithSameOriginKeys())
 	require.ErrorContains(t, err, "trusted issuer origin")
 	require.False(t, fetched.Load())
+	require.True(t, sameOriginURL("https://kubernetes.default.svc", "HTTPS://KUBERNETES.DEFAULT.SVC:443/openid/v1/jwks"))
+	require.True(t, sameOriginURL("http://issuer.test:80", "http://issuer.test/keys"))
+	require.False(t, sameOriginURL("https://kubernetes.default.svc", "https://kubernetes.default.svc:8443/openid/v1/jwks"))
 }
 
 func TestAuthenticateAcceptsRS256Token(t *testing.T) {

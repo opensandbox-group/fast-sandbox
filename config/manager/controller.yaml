@@ -96,9 +96,6 @@ spec:
         - --metrics-bind-address=:9091
         - --health-probe-bind-address=:5758
         - --fastpath-bind-address=:9090
-        - --fastpath-auth-policy-file=/etc/fast-sandbox/callers/callers.json
-        - --fastpath-tls-cert-file=/etc/fast-sandbox/tls/tls.crt
-        - --fastpath-tls-key-file=/etc/fast-sandbox/tls/tls.key
         env:
         - name: POD_UID
           valueFrom:
@@ -124,9 +121,9 @@ spec:
         - {name: component-logs, mountPath: /var/log/fast-sandbox}
       volumes:
       - name: fastpath-callers
-        configMap: {name: fast-sandbox-fastpath-callers}
+        configMap: {name: fast-sandbox-fastpath-callers, optional: true}
       - name: fastpath-tls
-        secret: {secretName: fast-sandbox-fastpath-tls}
+        secret: {secretName: fast-sandbox-fastpath-tls, optional: true}
       - name: component-log-config
         configMap:
           name: fast-sandbox-logging

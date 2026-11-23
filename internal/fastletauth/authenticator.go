@@ -98,6 +98,32 @@ func WithSameOriginKeys() AuthenticatorOption {
 	return func(o *authenticatorOptions) { o.sameOrigin = true }
 }
 
+func sameOriginURL(rawA, rawB string) bool {
+	uA, errA := url.Parse(rawA)
+	uB, errB := url.Parse(rawB)
+	if errA != nil || errB != nil || uA.Scheme == "" || uB.Scheme == "" || uA.Hostname() == "" || uB.Hostname() == "" {
+		return false
+	}
+	if !strings.EqualFold(uA.Scheme, uB.Scheme) || !strings.EqualFold(uA.Hostname(), uB.Hostname()) {
+		return false
+	}
+	return normalizedPort(uA) == normalizedPort(uB)
+}
+
+func normalizedPort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch {
+	case strings.EqualFold(u.Scheme, "https"):
+		return "443"
+	case strings.EqualFold(u.Scheme, "http"):
+		return "80"
+	default:
+		return ""
+	}
+}
+
 // AuthenticatorOption customizes the authenticator at construction.
 type AuthenticatorOption func(*authenticatorOptions)
 
@@ -143,9 +169,7 @@ func NewAuthenticator(issuer, audience string, allowedSubjects []string, httpCli
 		return nil, err
 	}
 	if options.sameOrigin {
-		anchor, _ := url.Parse(applyInClusterAPIServerPort(issuer))
-		keys, _ := url.Parse(discovery.JWKSURI)
-		if anchor.Host != keys.Host || anchor.Scheme != keys.Scheme {
+		if !sameOriginURL(applyInClusterAPIServerPort(issuer), discovery.JWKSURI) {
 			return nil, fmt.Errorf("issuer keys must use the trusted issuer origin")
 		}
 	}

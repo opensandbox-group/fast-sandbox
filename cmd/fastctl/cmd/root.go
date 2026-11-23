@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -178,7 +179,8 @@ func defaultClientFactory() (fastpathv2.FastPathServiceClient, *grpc.ClientConn,
 	if err != nil {
 		return nil, nil, fmt.Errorf("load Kubernetes bootstrap credentials: %w", err)
 	}
-	if config.Insecure || !strings.HasPrefix(config.Host, "https://") {
+	hostURL, parseErr := url.Parse(config.Host)
+	if config.Insecure || parseErr != nil || !strings.EqualFold(hostURL.Scheme, "https") {
 		return nil, nil, fmt.Errorf("FastPath TokenRequest requires verified Kubernetes API TLS")
 	}
 	api, err := corev1.NewForConfig(config)
@@ -223,7 +225,7 @@ type callerCredentials struct {
 func (c callerCredentials) GetRequestMetadata(ctx context.Context, _ ...string) (map[string]string, error) {
 	token, err := c.source.Token(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("FastPath caller TokenRequest failed; check bootstrap credentials and caller RBAC")
+		return nil, fmt.Errorf("FastPath caller TokenRequest failed; check bootstrap credentials and caller RBAC: %w", err)
 	}
 	return map[string]string{"authorization": "Bearer " + token}, nil
 }
