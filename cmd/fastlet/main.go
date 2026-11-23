@@ -178,6 +178,11 @@ func main() {
 	}
 	infraConfigurable.SetInfraManager(infraManager)
 
+	if err := configureGPU(ctx, rt, resourceProfile); err != nil {
+		klog.ErrorS(err, "Failed to configure GPU allocation")
+		os.Exit(1)
+	}
+
 	klog.InfoS("runtime initialized successfully", "name", runtimeName)
 
 	proxyControlClient := fastletproxy.NewControlClient(getEnv("FASTLET_PROXY_CONTROL_SOCKET", fastletproxy.DefaultControlSocket))
@@ -410,6 +415,26 @@ type networkConfigurable interface {
 
 type runtimeCgroupConfigurable interface {
 	SetRuntimeCgroupManager(*podcgroup.RuntimeManager) error
+}
+
+type gpuConfigurable interface {
+	ConfigureGPU(ctx context.Context, profile apiv1alpha2.SandboxResourceProfile, containerName string, expectedDevices int) error
+}
+
+func configureGPU(ctx context.Context, rt runtimecontract.Driver, profile apiv1alpha2.SandboxResourceProfile) error {
+	if profile.GPUs == 0 {
+		return nil
+	}
+	configurable, ok := rt.(gpuConfigurable)
+	if !ok {
+		return fmt.Errorf("%w: GPU allocation requires the container runtime", runtimecontract.ErrUnsupportedRuntime)
+	}
+	expectedDevices, err := strconv.Atoi(os.Getenv("FAST_SANDBOX_GPU_EXPECTED_DEVICES"))
+	if err != nil || expectedDevices != capacityFromEnvironment()*int(profile.GPUs) {
+		return fmt.Errorf("%w: GPU capacity does not match the Kubernetes allocation", runtimecontract.ErrInvalidConfig)
+	}
+	containerName := os.Getenv("FAST_SANDBOX_GPU_CONTAINER_NAME")
+	return configurable.ConfigureGPU(ctx, profile, containerName, expectedDevices)
 }
 
 func configureRuntimeCgroups(

@@ -16,6 +16,13 @@ const (
 )
 
 const (
+	// GPUPodResourcesMountPath is the Fastlet mount for kubelet's PodResources socket.
+	GPUPodResourcesMountPath = "/run/fast-sandbox/pod-resources"
+	// GPUStateRoot is shared by GPU Fastlets on the same node for durable leases.
+	GPUStateRoot = "/var/lib/fast-sandbox/gpu"
+)
+
+const (
 	// runscContainerdConfigPath is the host containerd config fragment of the gVisor runsc handler.
 	runscContainerdConfigPath = "/etc/containerd/runsc.toml"
 	// kvmDevicePath is the host KVM character device required by VM runtimes.

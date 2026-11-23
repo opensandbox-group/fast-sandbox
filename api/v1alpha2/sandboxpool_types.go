@@ -52,6 +52,30 @@ type SandboxResourceProfile struct {
 
 	// +kubebuilder:validation:Minimum=1
 	PIDs int64 `json:"pids"`
+
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	GPUs int32 `json:"gpus,omitempty"`
+
+	// GPURequirements optionally restricts every GPU assigned to a Fastlet.
+	// It requires a positive GPUs count and is verified before GPU readiness.
+	// +optional
+	GPURequirements *GPUDeviceRequirements `json:"gpuRequirements,omitempty"`
+}
+
+// GPUDeviceRequirements selects a homogeneous GPU model and/or a minimum
+// reported total memory per physical device, not a Sandbox memory quota.
+type GPUDeviceRequirements struct {
+	// Model is an exact nvidia.com/gpu.product label value for exclusive GPUs.
+	// When set, the Fastlet Pod also receives the corresponding nodeSelector.
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)?$`
+	// +optional
+	Model string `json:"model,omitempty"`
+
+	// MinimumMemory is the minimum reported total GPU memory per device.
+	// +optional
+	MinimumMemory *resource.Quantity `json:"minimumMemory,omitempty"`
 }
 
 // SandboxOvercommitRatio controls per-resource request derivation.

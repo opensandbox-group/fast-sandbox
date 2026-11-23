@@ -1692,6 +1692,9 @@ func newDrainHarness(t *testing.T, sandboxes []apiv1alpha2.Sandbox) (*SandboxPoo
 	}
 	k8sClient := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&apiv1alpha2.SandboxPool{}, &apiv1alpha2.Sandbox{}).
+		WithIndex(&corev1.Pod{}, "spec.nodeName", func(obj client.Object) []string {
+			return []string{obj.(*corev1.Pod).Spec.NodeName}
+		}).
 		WithObjects(objects...).Build()
 	drainer := &recordingDrainer{}
 	reconciler := &SandboxPoolReconciler{

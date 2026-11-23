@@ -302,6 +302,31 @@ spec:
                       them per request; otherwise they are the defaults.
                     pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
                     x-kubernetes-int-or-string: true
+                  gpuRequirements:
+                    description: |-
+                      GPURequirements optionally restricts every GPU assigned to a Fastlet.
+                      It requires a positive GPUs count and is verified before GPU readiness.
+                    properties:
+                      minimumMemory:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: MinimumMemory is the minimum reported total GPU
+                          memory per device.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      model:
+                        description: |-
+                          Model is an exact nvidia.com/gpu.product label value for exclusive GPUs.
+                          When set, the Fastlet Pod also receives the corresponding nodeSelector.
+                        maxLength: 63
+                        pattern: ^([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)?$
+                        type: string
+                    type: object
+                  gpus:
+                    format: int32
+                    minimum: 0
+                    type: integer
                   memory:
                     anyOf:
                     - type: integer

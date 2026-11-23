@@ -36,6 +36,7 @@ Fast Sandbox documentation is organized by reader intent:
 - [Memory reclamation](guides/memory-reclamation.md)
 - [Private registries](guides/private-registries.md)
 - [Secure runtimes](guides/secure-runtimes.md)
+- [Container GPU support](guides/container-gpu.md) — NVIDIA whole-GPU allocation, CDI setup, and Linux/WSL driver validation.
 - [Runtime node installation](guides/runtime-node-installation.md)
 - [Runtime environments](guides/runtime-environments.md)
 - [Sandbox Actions](guides/sandbox-actions.md)

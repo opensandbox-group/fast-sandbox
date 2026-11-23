@@ -836,6 +836,13 @@ func poolInfo(pool *apiv1alpha2.SandboxPool) *fastpathv2.PoolInfo {
 	resourceProfile := &fastpathv2.SandboxResourceProfileInfo{
 		Limits: &fastpathv2.ComputeResourceProfile{Cpu: limits.CPU.String(), Memory: limits.Memory.String()},
 		Pids:   pool.Spec.SandboxResources.PIDs,
+		Gpus:   pool.Spec.SandboxResources.GPUs,
+	}
+	if requirements := pool.Spec.SandboxResources.GPURequirements; requirements != nil {
+		resourceProfile.GpuRequirements = &fastpathv2.GPUDeviceRequirements{Model: requirements.Model}
+		if requirements.MinimumMemory != nil {
+			resourceProfile.GpuRequirements.MinimumMemory = requirements.MinimumMemory.String()
+		}
 	}
 	switch pool.Spec.SandboxResources.ResourceMode() {
 	case apiv1alpha2.SandboxResourceModeLegacySlot:

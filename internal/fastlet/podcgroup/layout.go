@@ -23,6 +23,8 @@ const (
 	shimGroup  = "fast-sandbox-shims"
 )
 
+var errPodCgroupAbsent = fmt.Errorf("Pod cgroup is absent: %w", fs.ErrNotExist)
+
 type Version string
 
 const (
@@ -204,17 +206,24 @@ func validatePodUID(uid string) error {
 }
 
 func discoverInHierarchy(root, podUID string) (string, error) {
+	return findPodCgroup(root, podUID, false)
+}
+
+func findPodCgroup(root, podUID string, strict bool) (string, error) {
 	for _, candidate := range standardPodPaths(podUID) {
 		info, err := os.Stat(filepath.Join(root, filepath.FromSlash(strings.TrimPrefix(candidate, "/"))))
 		if err == nil && info.IsDir() {
 			return candidate, nil
+		}
+		if strict && err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return "", err
 		}
 	}
 
 	var matches []string
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			if errors.Is(walkErr, fs.ErrPermission) {
+			if !strict && errors.Is(walkErr, fs.ErrPermission) {
 				return fs.SkipDir
 			}
 			return walkErr
@@ -229,7 +238,7 @@ func discoverInHierarchy(root, podUID string) (string, error) {
 		if relative == "." {
 			return nil
 		}
-		if pathDepth(relative) > 8 {
+		if !strict && pathDepth(relative) > 8 {
 			return fs.SkipDir
 		}
 		if matchesPodDirectory(entry.Name(), podUID) {
@@ -242,7 +251,7 @@ func discoverInHierarchy(root, podUID string) (string, error) {
 		return "", fmt.Errorf("scan cgroup hierarchy %q: %w", root, err)
 	}
 	if len(matches) == 0 {
-		return "", fmt.Errorf("locate Pod UID %q below %q: %w", podUID, root, fs.ErrNotExist)
+		return "", fmt.Errorf("locate Pod UID %q below %q: %w", podUID, root, errPodCgroupAbsent)
 	}
 	sort.Strings(matches)
 	if len(matches) > 1 {

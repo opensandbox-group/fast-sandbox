@@ -70,6 +70,40 @@ func TestRemoveSandboxGroupsRemovesPlainAndKataLeaves(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
+func TestVerifySandboxProcessesAbsentFindsSystemdScope(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "cgroup.controllers"), nil, 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "cgroup.procs"), nil, 0600))
+	pod := filepath.Join(root, "kubepods.slice", "kubepods-pod"+strings.ReplaceAll(testPodUID, "-", "_")+".slice")
+	leaf := filepath.Join(pod, "fast-sandbox-"+sandboxCgroupName("sandbox-a")+".scope")
+	require.NoError(t, os.MkdirAll(leaf, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(leaf, "cgroup.events"), []byte("populated 1\n"), 0600))
+	require.ErrorContains(t, VerifySandboxProcessesAbsent(root, testPodUID, "sandbox-a", ""), "populated")
+	require.NoError(t, os.WriteFile(filepath.Join(leaf, "cgroup.events"), []byte("populated 0\n"), 0600))
+	require.NoError(t, VerifySandboxProcessesAbsent(root, testPodUID, "sandbox-a", ""))
+	require.NoError(t, os.RemoveAll(pod))
+	literal := filepath.Join(root, "system.slice", filepath.Base(pod)+":fast-sandbox:"+sandboxCgroupName("sandbox-a"))
+	require.NoError(t, os.MkdirAll(literal, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(literal, "cgroup.events"), []byte("populated 1\n"), 0600))
+	require.ErrorContains(t, VerifySandboxProcessesAbsent(root, testPodUID, "sandbox-a", ""), "populated")
+}
+
+func TestVerifySandboxProcessesAbsentChecksV1Children(t *testing.T) {
+	root := t.TempDir()
+	hierarchy := filepath.Join(root, "pids")
+	leaf := filepath.Join(hierarchy, "k8s.io", "sandbox-a")
+	child := filepath.Join(leaf, "child")
+	require.NoError(t, os.MkdirAll(child, 0755))
+	for _, group := range []string{hierarchy, leaf} {
+		require.NoError(t, os.WriteFile(filepath.Join(group, "cgroup.procs"), nil, 0600))
+	}
+	file := filepath.Join(child, "cgroup.procs")
+	require.NoError(t, os.WriteFile(file, []byte("123\n"), 0600))
+	require.ErrorContains(t, VerifySandboxProcessesAbsent(root, "", "sandbox-a", "/k8s.io/sandbox-a"), "still contains processes")
+	require.NoError(t, os.WriteFile(file, nil, 0600))
+	require.NoError(t, VerifySandboxProcessesAbsent(root, "", "sandbox-a", "/k8s.io/sandbox-a"))
+}
+
 func TestDiscoverV1AcrossControllers(t *testing.T) {
 	root := t.TempDir()
 	relative := filepath.Join("kubepods", "burstable", "pod"+testPodUID)

@@ -704,7 +704,7 @@ func (m *SandboxManager) GetSandboxStatuses(ctx context.Context) []fastletapi.Sa
 				dataPlaneObservation.State = fastletapi.DataPlaneStateFailed
 				dataPlaneObservation.Message = "runtime reported stopped"
 				if checker, ok := m.runtime.(interface{ SandboxRuntimeExited(string) bool }); ok && checker.SandboxRuntimeExited(sandboxID) {
-					m.preserveExitedRuntime(ctx, sandboxID, identity, "runtime reported stopped and its dedicated cgroup is empty")
+					m.preserveExitedRuntime(ctx, sandboxID, identity, "runtime reported stopped and its exit was confirmed by the driver")
 				}
 			}
 		}

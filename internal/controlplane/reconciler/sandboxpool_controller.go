@@ -377,7 +377,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		busyFastlets:       busyFastlets,
 		runtimeRevision:    runtimePlan.Revision,
 		infraRevision:      infraPlan.Revision,
-		fastletRevision:    desiredPodHash,
+		fastletRevision:    admissionFastletRevision(&pool, desiredPod, childPods.Items, observedFastlets, now),
 		preparedFastlets:   preparedFastlets,
 		scaleDownCandidate: scaleDownCandidate,
 		warmImages:         warmImageStatuses,
@@ -937,24 +937,35 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit,gocyclo // 
 	}
 
 	active := activeAssignmentsByPod(sandboxes, pool.Name)
-	if len(draining) < target {
+	var surge *corev1.Pod
+	if len(draining) < target && pool.Spec.SandboxResources.GPUs > 0 {
+		surge = gpuBlockedSurge(pods, desiredPodHash)
+	}
+	// Finish a GPU-starved rollout's in-flight drain before starting another.
+	if len(draining) < target && !(surge != nil && len(draining) > 0) {
 		count := min(target-len(draining), len(available))
 		currentTemplateReady := currentTemplatePodsReady(pods, desiredPodHash, r.Registry)
-		if hasCurrentTemplatePod(pods, desiredPodHash) && !currentTemplateReady {
-			for _, pod := range available {
-				if !fastletPodTemplateCurrent(pod, desiredPodHash) {
-					return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
+		var selections []drainTarget
+		if surge != nil && !currentTemplateReady {
+			candidates, err := gpuDrainCandidates(ctx, r.durableReader(), surge, available, desiredPodHash)
+			if err != nil {
+				return ctrl.Result{RequeueAfter: drainRequeue}, true, err
+			}
+			selections = selectDrainTargets(candidates, 1, nil, desiredPodHash, true, true, active)
+		} else {
+			if hasCurrentTemplatePod(pods, desiredPodHash) && !currentTemplateReady {
+				for _, pod := range available {
+					if !fastletPodTemplateCurrent(pod, desiredPodHash) {
+						return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
+					}
 				}
 			}
+			selections = selectDrainTargets(available, count, preferredScaleDown, desiredPodHash, currentTemplateReady, resourceAware, active)
 		}
-		selections := selectDrainTargets(available, count, preferredScaleDown, desiredPodHash, currentTemplateReady, resourceAware, active)
 		for _, selection := range selections {
 			if err := r.startDrain(ctx, selection.pod, selection.reason); err != nil {
 				return ctrl.Result{RequeueAfter: drainRequeue}, true, err
 			}
-		}
-		if len(selections) < count {
-			return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
 		}
 		return ctrl.Result{RequeueAfter: drainRequeue}, true, nil
 	}
@@ -970,9 +981,10 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit,gocyclo // 
 		timeout = defaultDrainTimeout
 	}
 	for _, pod := range draining {
-		protectedUpgrade := pool.Spec.Runtime == apiv1alpha2.RuntimeFirecracker &&
-			pool.Spec.SandboxResources.ResourceMode() == apiv1alpha2.SandboxResourceModeResourceAware &&
-			pod.Annotations[placement.AnnotationDrainReason] == placement.DrainReasonPlannedUpgrade
+		plannedUpgrade := pod.Annotations[placement.AnnotationDrainReason] == placement.DrainReasonPlannedUpgrade
+		protectedVMUpgrade := plannedUpgrade && pool.Spec.Runtime == apiv1alpha2.RuntimeFirecracker &&
+			pool.Spec.SandboxResources.ResourceMode() == apiv1alpha2.SandboxResourceModeResourceAware
+		protectedUpgrade := protectedVMUpgrade || (plannedUpgrade && pool.Spec.SandboxResources.GPUs > 0)
 		response, err := r.requestDrain(ctx, pod, true, pod.Annotations[placement.AnnotationDrainReason])
 		if err != nil {
 			// Re-fires every drain requeue until acked; the attempt counter
@@ -992,7 +1004,7 @@ func (r *SandboxPoolReconciler) reconcileDraining( //nolint:gocognit,gocyclo // 
 		empty := false
 		legacy := legacyDrainResponse(response)
 		if err == nil {
-			requireResources := resourceAware || protectedUpgrade
+			requireResources := resourceAware || protectedVMUpgrade
 			if legacy {
 				empty, err = r.legacyDrainObservationEmpty(ctx, pod, requireResources)
 				if err != nil {
@@ -1704,6 +1716,10 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 		return nil, err
 	}
 
+	if err := applyGPUResources(pool, runtimePlan, podSpec); err != nil {
+		return nil, err
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: pool.Name + "-fastlet-",
@@ -2407,7 +2423,7 @@ var runtimeOwnedEnv = map[string]struct{}{
 func removeRuntimeOwnedEnv(env []corev1.EnvVar) []corev1.EnvVar {
 	result := env[:0]
 	for _, item := range env {
-		if _, owned := runtimeOwnedEnv[item.Name]; owned {
+		if _, owned := runtimeOwnedEnv[item.Name]; owned || strings.HasPrefix(item.Name, "FAST_SANDBOX_GPU_") {
 			continue
 		}
 		result = append(result, item)
