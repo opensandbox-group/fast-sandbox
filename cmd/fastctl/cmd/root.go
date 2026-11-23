@@ -32,12 +32,12 @@ const (
 )
 
 var (
-	cfgFile                                                                 string
-	endpoint                                                                string
-	namespace                                                               string
-	proxyEndpoint                                                           string
-	authEnabled                                                             bool
-	kubeconfig, authNamespace, authServiceAccount, tlsCAFile, tlsServerName string
+	cfgFile                            string
+	endpoint                           string
+	namespace                          string
+	proxyEndpoint                      string
+	authEnabled                        bool
+	kubeconfig, tlsCAFile, tlsServerName string
 
 	// traceShutdown terminates the OTLP exporter installed by Execute.
 	// Command failure paths use it so spans are not lost on os.Exit.
@@ -98,8 +98,6 @@ func init() {
 
 	rootCmd.PersistentFlags().BoolVar(&authEnabled, "auth-enabled", false, "Enable FastPath caller authentication and TLS (default false; set true for authenticated TLS endpoints)")
 	rootCmd.PersistentFlags().StringVar(&kubeconfig, "kubeconfig", "", "Kubernetes bootstrap kubeconfig (default loading rules when empty)")
-	rootCmd.PersistentFlags().StringVar(&authNamespace, "auth-namespace", "fast-sandbox-system", "FastPath caller ServiceAccount namespace")
-	rootCmd.PersistentFlags().StringVar(&authServiceAccount, "auth-service-account", "opensandbox-server-fastpath-client", "Authentication-only FastPath caller ServiceAccount")
 	rootCmd.PersistentFlags().StringVar(&tlsCAFile, "tls-ca-file", "", "FastPath serving CA PEM bundle (empty uses system roots)")
 	rootCmd.PersistentFlags().StringVar(&tlsServerName, "tls-server-name", "", "Expected serving certificate DNS name (empty uses endpoint hostname)")
 	mustBindConfigSources(viper.GetViper(), rootCmd.PersistentFlags())
@@ -187,9 +185,13 @@ func defaultClientFactory() (fastpathv2.FastPathServiceClient, *grpc.ClientConn,
 	if err != nil {
 		return nil, nil, err
 	}
+	callerNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+	if callerNamespace == "" {
+		callerNamespace = "fast-sandbox-system"
+	}
 	source := fastletauth.NewTokenRequestSource(func(ctx context.Context, ns, name string, request *authenticationv1.TokenRequest) (*authenticationv1.TokenRequest, error) {
 		return api.ServiceAccounts(ns).CreateToken(ctx, name, request, metav1.CreateOptions{})
-	}, fastletauth.PodServiceAccountIdentity{Namespace: authNamespace, ServiceAccount: authServiceAccount}, "fast-sandbox-fastpath")
+	}, fastletauth.PodServiceAccountIdentity{Namespace: callerNamespace, ServiceAccount: "opensandbox-server-fastpath-client"}, "fast-sandbox-fastpath")
 	var roots *x509.CertPool
 	if tlsCAFile != "" {
 		pem, err := os.ReadFile(tlsCAFile)
