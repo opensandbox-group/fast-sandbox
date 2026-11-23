@@ -1131,11 +1131,6 @@ controller_up() {
 	pass "CRDs + controller ready"
 }
 
-# --- task 5: node assets + runtime environment -------------------------------------------
-# (the installer DaemonSet was merged into the agent: agent_up now waits for
-# the readiness labels the agent applies after checking the host and
-# installing the firecracker assets)
-
 # --- task 5: firecracker node assets + runtime DaemonSet --------------------
 # (the agent readiness loop installs the firecracker assets and applies
 # the node labels; this task also waits for both per node)

@@ -39,8 +39,7 @@ func localPairFixture(t *testing.T) string {
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest/pair.json"), raw, 0640))
 	// Use distinct disk manifests while sharing their blobs, as real rootfs
-	// and snapfiles images do. Previously the metadata annotation alone made
-	// this synthetic fixture's otherwise identical images distinct.
+	// and snapfiles images do.
 	var snap oci.Manifest
 	require.NoError(t, json.Unmarshal(raw, &snap))
 	snap.Annotations = map[string]string{"fixture": "snapfiles"}

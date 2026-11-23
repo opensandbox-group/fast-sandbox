@@ -25,14 +25,12 @@ const (
 	kubectlApplyVerb           = "apply"
 	kubectlWaitTimeoutFlag     = "--timeout=120s"
 	// kubectlCommand is the kubectl binary used for all cluster operations.
-	kubectlCommand = "kubectl"
-	// kubectlRolloutSubcommand is the kubectl rollout subcommand.
+	kubectlCommand           = "kubectl"
 	kubectlRolloutSubcommand = "rollout"
 	// kubectlStatusSubcommand is the kubectl rollout status subcommand.
 	kubectlStatusSubcommand = "status"
 	// makeCommand is the local make binary driving the dev images.
-	makeCommand = "make"
-	// kindLoadSubcommand is the kind subcommand that loads an image.
+	makeCommand        = "make"
 	kindLoadSubcommand = "load"
 )
 
