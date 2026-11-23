@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -90,6 +91,37 @@ type cachedVerdict struct {
 
 type authenticatorOptions struct {
 	refreshInterval time.Duration
+	sameOrigin      bool
+}
+
+func WithSameOriginKeys() AuthenticatorOption {
+	return func(o *authenticatorOptions) { o.sameOrigin = true }
+}
+
+func sameOriginURL(rawA, rawB string) bool {
+	uA, errA := url.Parse(rawA)
+	uB, errB := url.Parse(rawB)
+	if errA != nil || errB != nil || uA.Scheme == "" || uB.Scheme == "" || uA.Hostname() == "" || uB.Hostname() == "" {
+		return false
+	}
+	if !strings.EqualFold(uA.Scheme, uB.Scheme) || !strings.EqualFold(uA.Hostname(), uB.Hostname()) {
+		return false
+	}
+	return normalizedPort(uA) == normalizedPort(uB)
+}
+
+func normalizedPort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch {
+	case strings.EqualFold(u.Scheme, "https"):
+		return "443"
+	case strings.EqualFold(u.Scheme, "http"):
+		return "80"
+	default:
+		return ""
+	}
 }
 
 // AuthenticatorOption customizes the authenticator at construction.
@@ -135,6 +167,11 @@ func NewAuthenticator(issuer, audience string, allowedSubjects []string, httpCli
 	discovery, err := fetchDiscovery(context.Background(), httpClient, issuer)
 	if err != nil {
 		return nil, err
+	}
+	if options.sameOrigin {
+		if !sameOriginURL(applyInClusterAPIServerPort(issuer), discovery.JWKSURI) {
+			return nil, fmt.Errorf("issuer keys must use the trusted issuer origin")
+		}
 	}
 	// No RefreshInterval: no background goroutine — keys refresh only on an
 	// unknown signing key, rate-limited below.

@@ -92,6 +92,25 @@ class SDKTest(unittest.TestCase):
             stub=self.stub,
         )
 
+    def test_default_transport_uses_insecure_channel_when_auth_disabled(self):
+        with mock.patch("fast_sandbox.client.grpc.insecure_channel") as insecure:
+            client = Client()
+            insecure.assert_called_once_with("localhost:9090")
+            client.close()
+
+    def test_auth_enabled_requires_authenticated_tls_credentials(self):
+        with mock.patch("fast_sandbox.client.grpc.insecure_channel") as insecure:
+            with self.assertRaisesRegex(ValueError, "TLS channel credentials"):
+                Client(auth_enabled=True)
+            insecure.assert_not_called()
+
+    def test_explicit_credentials_use_secure_channel(self):
+        credentials = object()
+        with mock.patch("fast_sandbox.client.grpc.secure_channel") as secure:
+            client = Client(credentials=credentials)
+            secure.assert_called_once_with("localhost:9090", credentials)
+            client.close()
+
     def test_create_sends_atomic_initial_intent(self):
         sandbox = self.client.create(
             "sandbox-a",
