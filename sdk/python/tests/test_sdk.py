@@ -105,6 +105,12 @@ class SDKTest(unittest.TestCase):
             secure.assert_called_once_with("localhost:9090", credentials)
             client.close()
 
+    def test_explicit_auth_disabled_uses_insecure_channel(self):
+        with mock.patch("fast_sandbox.client.grpc.insecure_channel") as insecure:
+            client = Client(auth_enabled=False)
+            insecure.assert_called_once_with("localhost:9090")
+            client.close()
+
     def test_create_sends_atomic_initial_intent(self):
         sandbox = self.client.create(
             "sandbox-a",

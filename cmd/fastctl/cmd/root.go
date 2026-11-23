@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -35,6 +36,7 @@ var (
 	endpoint                                                                string
 	namespace                                                               string
 	proxyEndpoint                                                           string
+	authEnabled                                                             bool
 	kubeconfig, authNamespace, authServiceAccount, tlsCAFile, tlsServerName string
 
 	// traceShutdown terminates the OTLP exporter installed by Execute.
@@ -94,6 +96,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&namespace, "namespace", "n", "fast-sandbox", "Kubernetes resource namespace")
 	rootCmd.PersistentFlags().StringVar(&proxyEndpoint, "proxy-endpoint", "", "Override the Sandbox Proxy authority (env: "+sandboxProxyEndpointEnv+")")
 
+	rootCmd.PersistentFlags().BoolVar(&authEnabled, "auth-enabled", true, "Enable FastPath caller authentication and TLS (default true; set false for legacy plaintext endpoints)")
 	rootCmd.PersistentFlags().StringVar(&kubeconfig, "kubeconfig", "", "Kubernetes bootstrap kubeconfig (default loading rules when empty)")
 	rootCmd.PersistentFlags().StringVar(&authNamespace, "auth-namespace", "fast-sandbox-system", "FastPath caller ServiceAccount namespace")
 	rootCmd.PersistentFlags().StringVar(&authServiceAccount, "auth-service-account", "opensandbox-server-fastpath-client", "Authentication-only FastPath caller ServiceAccount")
@@ -158,6 +161,18 @@ var clientFactory = defaultClientFactory
 func defaultClientFactory() (fastpathv2.FastPathServiceClient, *grpc.ClientConn, error) {
 	ep := viper.GetString("endpoint")
 	klog.V(4).InfoS("creating gRPC client connection", "endpoint", ep)
+
+	if !authEnabled {
+		conn, err := grpc.NewClient(ep,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithUnaryInterceptor(observability.UnaryClientInterceptor("fastctl")),
+		)
+		if err != nil {
+			klog.ErrorS(err, "Failed to connect to gRPC endpoint", "endpoint", ep)
+			return nil, nil, fmt.Errorf("failed to connect to %s: %w", ep, err)
+		}
+		return fastpathv2.NewFastPathServiceClient(conn), conn, nil
+	}
 
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	rules.ExplicitPath = kubeconfig

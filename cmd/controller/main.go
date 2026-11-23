@@ -65,6 +65,7 @@ func main() { //nolint:gocognit,gocyclo,funlen,maintidx // pre-existing flag wir
 	var probeAddress string
 	var fastPathAddress string
 	var fastPathHTTPPort int
+	var fastPathAuthEnabled bool
 	var fastPathPolicy, fastPathCert, fastPathKey string
 	var fastletPort int
 	var heartbeatInterval time.Duration
@@ -101,9 +102,10 @@ func main() { //nolint:gocognit,gocyclo,funlen,maintidx // pre-existing flag wir
 	flag.StringVar(&probeAddress, "health-probe-bind-address", ":5758", "Health probe listen address.")
 	flag.StringVar(&fastPathAddress, "fastpath-bind-address", ":9090", "FastPath gRPC listen address.")
 	flag.IntVar(&fastPathHTTPPort, "fastpath-http-port", 0, "FastPath gRPC-Web port for HTTP/1.1 clients (0 disables this listener).")
-	flag.StringVar(&fastPathPolicy, "fastpath-auth-policy-file", "", "Required FastPath caller policy JSON file.")
-	flag.StringVar(&fastPathCert, "fastpath-tls-cert-file", "", "Required FastPath serving certificate PEM file.")
-	flag.StringVar(&fastPathKey, "fastpath-tls-key-file", "", "Required FastPath serving private key PEM file.")
+	flag.BoolVar(&fastPathAuthEnabled, "fastpath-auth-enabled", true, "Enable FastPath caller authentication and TLS (default true; set false for legacy plaintext upgrade transition).")
+	flag.StringVar(&fastPathPolicy, "fastpath-auth-policy-file", "", "Required FastPath caller policy JSON file when --fastpath-auth-enabled is true.")
+	flag.StringVar(&fastPathCert, "fastpath-tls-cert-file", "", "Required FastPath serving certificate PEM file when --fastpath-auth-enabled is true.")
+	flag.StringVar(&fastPathKey, "fastpath-tls-key-file", "", "Required FastPath serving private key PEM file when --fastpath-auth-enabled is true.")
 	flag.IntVar(&fastletPort, "fastlet-port", 5758, "Fastlet control port.")
 	flag.DurationVar(&heartbeatInterval, "fastlet-heartbeat-interval", 20*time.Second, "Base Fastlet heartbeat interval; actual probes use jitter.")
 	flag.DurationVar(&heartbeatTimeout, "fastlet-heartbeat-timeout", 5*time.Second, "Timeout for one Fastlet heartbeat request.")
@@ -344,40 +346,51 @@ func main() { //nolint:gocognit,gocyclo,funlen,maintidx // pre-existing flag wir
 			klog.ErrorS(err, "Listen for FastPath", "address", fastPathAddress)
 			os.Exit(1)
 		}
-		tlsConfig, err := fastPathTLS(fastPathCert, fastPathKey)
-		if err != nil {
-			klog.ErrorS(err, "Configure FastPath TLS")
-			os.Exit(1)
+		var grpcServer *grpc.Server
+		var tlsConfig *tls.Config
+		if fastPathAuthEnabled {
+			tlsConfig, err = fastPathTLS(fastPathCert, fastPathKey)
+			if err != nil {
+				klog.ErrorS(err, "Configure FastPath TLS")
+				os.Exit(1)
+			}
+			grants, err := fastpath.LoadCallerPolicy(fastPathPolicy)
+			if err != nil {
+				klog.ErrorS(err, "Load FastPath caller policy")
+				os.Exit(1)
+			}
+			callerAuth, err := fastpath.NewCallerAuthenticator(fastletAuthIssuer, grants, nil)
+			if err != nil {
+				klog.ErrorS(err, "Initialize FastPath caller authentication")
+				os.Exit(1)
+			}
+			grpcServer = grpc.NewServer(
+				grpc.Creds(credentials.NewTLS(tlsConfig)),
+				grpc.ChainUnaryInterceptor(callerAuth.UnaryInterceptor, observability.UnaryServerInterceptor("fastpath")),
+				grpc.ChainStreamInterceptor(callerAuth.StreamInterceptor),
+			)
+		} else {
+			klog.InfoS("FastPath caller authentication disabled; serving legacy plaintext gRPC")
+			grpcServer = grpc.NewServer(
+				grpc.ChainUnaryInterceptor(observability.UnaryServerInterceptor("fastpath")),
+			)
 		}
-		grants, err := fastpath.LoadCallerPolicy(fastPathPolicy)
-		if err != nil {
-			klog.ErrorS(err, "Load FastPath caller policy")
-			os.Exit(1)
-		}
-		callerAuth, err := fastpath.NewCallerAuthenticator(fastletAuthIssuer, grants, nil)
-		if err != nil {
-			klog.ErrorS(err, "Initialize FastPath caller authentication")
-			os.Exit(1)
-		}
-		grpcServer := grpc.NewServer(
-			grpc.Creds(credentials.NewTLS(tlsConfig)),
-			grpc.ChainUnaryInterceptor(callerAuth.UnaryInterceptor, observability.UnaryServerInterceptor("fastpath")),
-			grpc.ChainStreamInterceptor(callerAuth.StreamInterceptor),
-		)
 		fastpathv2.RegisterFastPathServiceServer(grpcServer, &fastpath.Server{
 			K8sClient: durableClient, RouteCache: manager.GetClient(), Orchestrator: orchestrator,
 			DiagnosticsClient: fastletClient,
 			CredentialIssuer:  credentialIssuer, SandboxProxyBaseURL: sandboxProxyBaseURL,
 		})
 		if httpServer := newFastPathHTTPServer(fastPathHTTPPort, grpcServer); httpServer != nil {
-			httpTLS := tlsConfig.Clone()
-			httpTLS.NextProtos = []string{"http/1.1"}
-			httpListener, err := tls.Listen("tcp", httpServer.Server.Addr, httpTLS)
-			if err != nil {
-				klog.ErrorS(err, "Listen for FastPath HTTPS")
-				os.Exit(1)
+			if tlsConfig != nil {
+				httpTLS := tlsConfig.Clone()
+				httpTLS.NextProtos = []string{"http/1.1"}
+				httpListener, err := tls.Listen("tcp", httpServer.Server.Addr, httpTLS)
+				if err != nil {
+					klog.ErrorS(err, "Listen for FastPath HTTPS")
+					os.Exit(1)
+				}
+				httpServer.Listener = httpListener
 			}
-			httpServer.Listener = httpListener
 			if err := manager.Add(httpServer); err != nil {
 				klog.ErrorS(err, "Configure FastPath HTTP listener", "port", fastPathHTTPPort)
 				os.Exit(1)
