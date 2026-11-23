@@ -109,7 +109,7 @@ func TestLivePullThroughDART(t *testing.T) {
 	}
 }
 
-// dartAdmin reads one Prometheus counter line (dart_block_source_total).
+// dartCounter reads one Prometheus counter line (dart_block_source_total).
 func dartCounter(t *testing.T, admin, source string) int {
 	t.Helper()
 	response, err := http.Get("http://" + admin + "/metrics")
