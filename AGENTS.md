@@ -22,6 +22,7 @@ Fast Sandbox is a Kubernetes-native sandbox runtime. Start with [Architecture](d
 - Keep lifecycle/routing separate from user protocols such as Execd. Readiness alone does not prove protocol functionality.
 - Keep public contracts, implementation, clients, configuration, and docs aligned. Discuss breaking changes and migration before implementation.
 - Change generator sources and run `make generate`; include derived protobuf, deepcopy, and CRD output. Never fix generated files alone.
+- Meaningful comments only: explain why, not what — add or keep comments only for non-obvious invariants, constraints, edge cases, workarounds, or required public API docs; omit comments that merely narrate self-explanatory code or change history, avoid boilerplate and commented-out code, and update or remove touched comments when behavior changes.
 
 ## Validation
 
