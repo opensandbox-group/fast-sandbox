@@ -244,7 +244,7 @@ esac
 			if mode == "existing-home" {
 				require.NoError(t, os.MkdirAll(home, 0750))
 			}
-			device, _, _, err := d.attachOCI(context.Background(), "sandbox-1", image)
+			device, _, _, err := d.attachOCI(context.Background(), "sandbox-1", image, "")
 			if mode == "success" {
 				require.NoError(t, err)
 				require.Equal(t, "/dev/ublkb42", device)
@@ -342,7 +342,7 @@ func TestOCITokenOnlyCredentialsFailBeforeAttachment(t *testing.T) {
 	d := &Driver{config: firecrackerConfigForTest(t, root)}
 	image := "oci://r.example/templates/base:build"
 	installOCIRegistryConfig(t, registryconfig.Credential{Host: "r.example", IdentityToken: "private-token"})
-	_, _, _, err := d.attachOCI(context.Background(), "sandbox-1", image)
+	_, _, _, err := d.attachOCI(context.Background(), "sandbox-1", image, "")
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	require.ErrorContains(t, err, "identitytoken-only credentials are not supported")
 	require.NoDirExists(t, filepath.Join(root, "oci/inputs"))

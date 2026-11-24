@@ -153,7 +153,7 @@ func retainOCIHotCheckpoint(stateRoot, artifactDigest, staging string) error {
 	}
 	defer unlock()
 
-	target := filepath.Join(root, artifactDigest)
+	target := ociHotCheckpointPath(stateRoot, artifactDigest)
 	if isValidHotCheckpointDir(target) {
 		touchPath(target)
 		return nil
@@ -232,7 +232,7 @@ func pinOCIHotCheckpoint(stateRoot, artifactDigest, pinDir string) (bool, error)
 	}
 	defer unlock()
 
-	entryDir := filepath.Join(root, artifactDigest)
+	entryDir := ociHotCheckpointPath(stateRoot, artifactDigest)
 	info, err := os.Stat(entryDir)
 	if err != nil || !info.IsDir() {
 		return false, nil
@@ -301,14 +301,51 @@ type hotCacheEntry struct {
 }
 
 func trimOCIHotCacheLocked(root string, maxBytes int64, maxEntries int, minFree uint64, incomingBytes int64, ttl time.Duration) error {
-	items, err := os.ReadDir(root)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
+	entries, total, err := scanHotCheckpointEntries(root)
+	if err != nil {
+		return err
 	}
+	remaining, total, err := reapExpiredHotEntries(entries, total, ttl)
+	if err != nil {
+		return err
+	}
+	avail, err := dirFreeBytes(root)
 	if err != nil {
 		return err
 	}
 
+	count := len(remaining)
+	highWatermark := maxBytes * ociHotCacheHighWatermarkPct / 100
+	needEvict := total+incomingBytes > maxBytes ||
+		(maxBytes > 0 && total > highWatermark) ||
+		count > maxEntries ||
+		avail < minFree
+	if needEvict {
+		targetBytes := hotCacheEvictTarget(maxBytes, incomingBytes)
+		total, count, avail, err = evictHotEntriesToTarget(root, remaining, total, targetBytes, maxEntries, avail, minFree)
+		if err != nil {
+			return err
+		}
+	}
+
+	if maxBytes > 0 && total > maxBytes*ociHotCacheAlarmPct/100 {
+		klog.Warningf("OCI hot checkpoint cache usage remains high after eviction: used=%d bytes budget=%d bytes entries=%d", total, maxBytes, count)
+	}
+	if total+incomingBytes > maxBytes || count > maxEntries || avail < minFree {
+		return fmt.Errorf("hot checkpoint cache budget or free-disk reserve exhausted; pinned entries retained (used=%d incoming=%d budget=%d free=%d minFree=%d)",
+			total, incomingBytes, maxBytes, avail, minFree)
+	}
+	return nil
+}
+
+func scanHotCheckpointEntries(root string) ([]hotCacheEntry, int64, error) {
+	items, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
 	var entries []hotCacheEntry
 	var total int64
 	for _, item := range items {
@@ -336,80 +373,67 @@ func trimOCIHotCacheLocked(root string, maxBytes int64, maxEntries int, minFree 
 			}
 			continue
 		}
-		entries = append(entries, hotCacheEntry{
-			path:    fullPath,
-			bytes:   size,
-			modTime: info.ModTime(),
-			pinned:  pinned,
-		})
+		entries = append(entries, hotCacheEntry{path: fullPath, bytes: size, modTime: info.ModTime(), pinned: pinned})
 		total += size
 	}
+	return entries, total, nil
+}
 
+func reapExpiredHotEntries(entries []hotCacheEntry, total int64, ttl time.Duration) ([]hotCacheEntry, int64, error) {
+	if ttl <= 0 {
+		return entries, total, nil
+	}
 	now := time.Now()
-	count := len(entries)
 	remaining := make([]hotCacheEntry, 0, len(entries))
 	for _, e := range entries {
-		if ttl > 0 && !e.pinned && now.Sub(e.modTime) > ttl {
+		if !e.pinned && now.Sub(e.modTime) > ttl {
 			if err := os.RemoveAll(e.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
+				return nil, total, err
 			}
 			total -= e.bytes
-			count--
 			continue
 		}
 		remaining = append(remaining, e)
 	}
+	return remaining, total, nil
+}
 
-	avail, err := dirFreeBytes(root)
-	if err != nil {
-		return err
-	}
-
-	highWatermark := maxBytes * ociHotCacheHighWatermarkPct / 100
+func hotCacheEvictTarget(maxBytes, incomingBytes int64) int64 {
+	targetBytes := maxBytes - incomingBytes
 	lowWatermark := maxBytes * ociHotCacheLowWatermarkPct / 100
-	needEvict := total+incomingBytes > maxBytes ||
-		(maxBytes > 0 && total > highWatermark) ||
-		count > maxEntries ||
-		avail < minFree
+	if maxBytes > 0 && lowWatermark < targetBytes {
+		targetBytes = lowWatermark
+	}
+	if targetBytes < 0 {
+		return 0
+	}
+	return targetBytes
+}
 
-	if needEvict {
-		targetBytes := maxBytes - incomingBytes
-		if maxBytes > 0 && lowWatermark < targetBytes {
-			targetBytes = lowWatermark
+func evictHotEntriesToTarget(root string, entries []hotCacheEntry, total, targetBytes int64, maxEntries int, avail, minFree uint64) (int64, int, uint64, error) {
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].modTime.Before(entries[j].modTime)
+	})
+	count := len(entries)
+	for _, e := range entries {
+		if total <= targetBytes && count <= maxEntries && avail >= minFree {
+			break
 		}
-		if targetBytes < 0 {
-			targetBytes = 0
+		if e.pinned {
+			continue
 		}
-		sort.Slice(remaining, func(i, j int) bool {
-			return remaining[i].modTime.Before(remaining[j].modTime)
-		})
-		for _, e := range remaining {
-			if total <= targetBytes && count <= maxEntries && avail >= minFree {
-				break
-			}
-			if e.pinned {
-				continue
-			}
-			if err := os.RemoveAll(e.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return err
-			}
-			total -= e.bytes
-			count--
-			avail, err = dirFreeBytes(root)
-			if err != nil {
-				return err
-			}
+		if err := os.RemoveAll(e.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return total, count, avail, err
+		}
+		total -= e.bytes
+		count--
+		var err error
+		avail, err = dirFreeBytes(root)
+		if err != nil {
+			return total, count, avail, err
 		}
 	}
-
-	if maxBytes > 0 && total > maxBytes*ociHotCacheAlarmPct/100 {
-		klog.Warningf("OCI hot checkpoint cache usage remains high after eviction: used=%d bytes budget=%d bytes entries=%d", total, maxBytes, count)
-	}
-	if total+incomingBytes > maxBytes || count > maxEntries || avail < minFree {
-		return fmt.Errorf("hot checkpoint cache budget or free-disk reserve exhausted; pinned entries retained (used=%d incoming=%d budget=%d free=%d minFree=%d)",
-			total, incomingBytes, maxBytes, avail, minFree)
-	}
-	return nil
+	return total, count, avail, nil
 }
 
 func dirFreeBytes(path string) (uint64, error) {

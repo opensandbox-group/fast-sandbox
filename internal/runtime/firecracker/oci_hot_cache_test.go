@@ -227,7 +227,7 @@ func TestPrepareOCIRestoreUsesHotCacheAndFallsBack(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, hit)
 
-		rootfs, vmstate, memfile, err := fixture.driver.attachOCIWithHotSnapfiles(context.Background(), "sandbox-1", image, pinDir)
+		rootfs, vmstate, memfile, err := fixture.driver.attachOCI(context.Background(), "sandbox-1", image, pinDir)
 		require.NoError(t, err)
 		require.Equal(t, "/dev/ublkb42", rootfs)
 		require.Equal(t, filepath.Join(fixture.driver.ociRoot(), "sandboxes", "sandbox-1", "mnt", ociVMStateFileName), vmstate)

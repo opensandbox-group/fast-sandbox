@@ -105,11 +105,7 @@ func (d *Driver) fsbArgs() []string {
 	}
 	return args
 }
-func (d *Driver) attachOCI(ctx context.Context, id, image string) (rootfs, vmstate, memory string, resultErr error) {
-	return d.attachOCIWithHotSnapfiles(ctx, id, image, "")
-}
-
-func (d *Driver) attachOCIWithHotSnapfiles(ctx context.Context, id, image, hotSnapfilesDir string) (rootfs, vmstate, memory string, resultErr error) {
+func (d *Driver) attachOCI(ctx context.Context, id, image, hotSnapfilesDir string) (rootfs, vmstate, memory string, resultErr error) {
 	if err := validateOCIReference(image); err != nil {
 		return "", "", "", err
 	}
@@ -225,7 +221,7 @@ func (d *Driver) prepareOCIRestore(ctx context.Context, directory, reference str
 		}
 	}
 	t0 := time.Now()
-	attachment.rootfs, attachment.vmstate, attachment.memory, err = d.attachOCIWithHotSnapfiles(ctx, id, reference, hotPinDir)
+	attachment.rootfs, attachment.vmstate, attachment.memory, err = d.attachOCI(ctx, id, reference, hotPinDir)
 	attachDur := time.Since(t0)
 	if err != nil {
 		return attachment, err
