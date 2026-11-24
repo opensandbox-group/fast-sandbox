@@ -708,7 +708,7 @@ func (r *Driver) removeSandboxResources(ctx context.Context, sandboxID string) e
 	}
 	var networkErr error
 	if r.networkManager != nil {
-		if slot, exists := r.networkManager.Lookup(sandboxID); exists {
+		if slot, exists := r.networkManager.LookupForCleanup(sandboxID); exists {
 			if err := r.networkManager.Release(ctx, slot.Owner); err != nil {
 				networkErr = fmt.Errorf("release network slot: %w", err)
 			}

@@ -352,3 +352,26 @@ const (
 	testEventuallyTimeout  = 2e9
 	testEventuallyInterval = 10e6
 )
+
+func TestCleanupCanRetryDestroyingSlot(t *testing.T) {
+	ctx := t.Context()
+	driver := &fakeDriver{destroyErr: errors.New("busy")}
+	manager := newTestManager(t, 1, t.TempDir(), driver, "slot-a", "slot-b")
+	require.NoError(t, manager.Initialize(ctx))
+	original, err := manager.Acquire(ctx, owner("sandbox-a", 1))
+	require.NoError(t, err)
+	require.Error(t, manager.Release(ctx, original.Owner))
+	_, routable := manager.Lookup("sandbox-a")
+	require.False(t, routable)
+	pending, found := manager.LookupForCleanup("sandbox-a")
+	require.True(t, found)
+	require.Equal(t, original.ID, pending.ID)
+	require.ErrorIs(t, manager.Release(ctx, owner("sandbox-a", 2)), ErrOwnerConflict)
+	driver.destroyErr = nil
+	require.NoError(t, manager.Release(ctx, pending.Owner))
+	manager.Quiesce()
+	require.Equal(t, 1, manager.Snapshot().Clean)
+	replacement, err := manager.Acquire(ctx, owner("sandbox-b", 1))
+	require.NoError(t, err)
+	require.NotEqual(t, original.ID, replacement.ID)
+}

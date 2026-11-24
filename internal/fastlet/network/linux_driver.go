@@ -214,7 +214,7 @@ func (d *LinuxNetNSDriver) Destroy(ctx context.Context, slot *Slot) error {
 		_, _ = d.runner.Run(ctx, d.ipCommand, "neigh", "del", slot.IP, netDevFlag, slot.Bridge)
 	}
 	if slot.NetNSName != "" {
-		if err := deleteNetNSWithRetry(ctx, d.runner, d.ipCommand, slot.NetNSName); err != nil && !isMissingNetworkResource(err) {
+		if err := d.deleteSlotNetNS(ctx, slot); err != nil && !isMissingNetworkResource(err) {
 			result = errors.Join(result, err)
 		}
 	}
@@ -306,22 +306,29 @@ func isMissingNetworkResource(err error) bool {
 		strings.Contains(message, "no such device") || strings.Contains(message, "cannot open network namespace")
 }
 
-// deleteNetNSWithRetry removes a slot network namespace. The deletion races
-// a VMM that is still exiting and returns EBUSY, which would otherwise leak
-// the namespace (and its private addresses) onto the shared bridge — a
-// stale namespace still owning a slot IP answers ARP and shadows the live
-// netns. The retry is patient (5 x 500 ms) so the dying VMM's references
-// drain before the leak is accepted.
-func deleteNetNSWithRetry(ctx context.Context, runner CommandRunner, ipCommand, name string) error {
+// deleteSlotNetNS also handles copies of a slot mount inherited through the
+// containerd state directory when a Fastlet container restarts.
+func (d *LinuxNetNSDriver) deleteSlotNetNS(ctx context.Context, slot *Slot) error {
 	var err error
-	for range 5 {
-		if _, err = runner.Run(ctx, ipCommand, ipObjectNetns, "delete", name); err == nil {
+	for attempt := range 5 {
+		if _, err = d.runner.Run(ctx, d.ipCommand, ipObjectNetns, "delete", slot.NetNSName); err == nil || isMissingNetworkResource(err) {
 			return nil
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(500 * time.Millisecond):
+		if !strings.Contains(err.Error(), "Device or resource busy") {
+			return err
+		}
+		if attempt == 0 && slot.NetNSPath != "" {
+			if detachErr := detachNetNSAliases(slot.NetNSPath); detachErr != nil {
+				return errors.Join(err, detachErr)
+			}
+			continue
+		}
+		if attempt < 4 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
 		}
 	}
 	return err
