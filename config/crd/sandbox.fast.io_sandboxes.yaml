@@ -500,9 +500,9 @@ spec:
                         type: string
                       fastletName:
                         description: |-
-                          FastletName/FastletPodUID locate the Fastlet that captured the
-                          checkpoint. Diagnostics only: the Fastlet may already be gone and is
-                          never the resume target contract.
+                          FastletName, FastletPodUID, and NodeName locate the Fastlet and host
+                          that captured the checkpoint. Advisory only: the Fastlet or node may
+                          already be gone and is never the resume target contract.
                         type: string
                       fastletPodUID:
                         description: |-
@@ -514,6 +514,8 @@ spec:
                         description: |-
                           ManifestRef is the s3:// URI of the checkpoint manifest, published in
                           the standard artifact-set layout (rootfs/vmstate/memory/SHA256SUMS).
+                        type: string
+                      nodeName:
                         type: string
                       pausedAt:
                         description: PausedAt is when the checkpoint became durable

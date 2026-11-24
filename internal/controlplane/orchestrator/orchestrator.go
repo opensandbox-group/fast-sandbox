@@ -208,6 +208,17 @@ func ResolveSandboxResources(pool *apiv1alpha2.SandboxPool, sandbox *apiv1alpha2
 }
 
 func (o *Orchestrator) Candidates(ctx context.Context, sandbox *apiv1alpha2.Sandbox, stableKey string) ([]placement.FastletInfo, RuntimeParameters, error) {
+	preference := o.resolveResumePreference(sandboxNamespace(sandbox), ResumePreference(sandbox))
+	return o.candidates(ctx, sandbox, stableKey, preference, nil)
+}
+
+func (o *Orchestrator) candidates(
+	ctx context.Context,
+	sandbox *apiv1alpha2.Sandbox,
+	stableKey string,
+	preference placement.ResumePreference,
+	excluded map[placement.FastletID]struct{},
+) ([]placement.FastletInfo, RuntimeParameters, error) {
 	parameters, err := o.ResolveRuntime(ctx, sandbox)
 	if err != nil {
 		return nil, RuntimeParameters{}, err
@@ -216,14 +227,14 @@ func (o *Orchestrator) Candidates(ctx context.Context, sandbox *apiv1alpha2.Sand
 		Namespace: sandbox.Namespace, PoolName: sandbox.Spec.PoolRef,
 		RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
 		ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
-		FastletRevision: parameters.FastletRevision,
-		ResourceMode:    o.EffectivePlacementMode(parameters.ResourceMode), Demand: parameters.ResourceDemand,
-		Image: sandbox.Spec.Image, StableKey: stableKey, RequiredCapability: requiredCreateCapability(sandbox),
+		FastletRevision: parameters.FastletRevision, ExcludedFastlets: excluded,
+		ResourceMode: o.EffectivePlacementMode(parameters.ResourceMode), Demand: parameters.ResourceDemand,
+		Image: sandbox.Spec.Image, Resume: preference, StableKey: stableKey, RequiredCapability: requiredCreateCapability(sandbox),
 	})
 	if len(candidates) == 0 {
 		return nil, parameters, ErrNoCandidate
 	}
-	return candidates, parameters, nil
+	return placement.RankResumeCandidates(candidates, preference), parameters, nil
 }
 
 // FastPathCandidates is intentionally registry-only. Calling it cannot issue
@@ -306,17 +317,15 @@ func AssignmentForCandidate(candidate placement.FastletInfo, attempt, instanceGe
 // first honors any FastPath-written annotation, then performs Pool validation
 // and registry selection only when no durable assignment exists.
 func (o *Orchestrator) AssignDeclarative(ctx context.Context, sandbox *apiv1alpha2.Sandbox, stableKey string) (*apiv1alpha2.Sandbox, bool, error) {
-	return o.AssignDeclarativePreferring(ctx, sandbox, stableKey, "", "")
+	return o.AssignDeclarativePreferring(ctx, sandbox, stableKey, placement.ResumePreference{})
 }
 
-// AssignDeclarativePreferring is AssignDeclarative with a resume hint: the
-// candidate matching the recorded pausing Fastlet (PodName + PodUID) is moved
-// to the front of the Top-K order, so the checkpoint's node-local cache can
-// serve the restore instead of the full pull. The hint is best-effort — a
-// missing/replaced Fastlet, a drained node, or a rejected candidate degrades
-// to the normal order and rejection retry, and a cache miss falls back to the
-// store pull in the runtime delivery layer.
-func (o *Orchestrator) AssignDeclarativePreferring(ctx context.Context, sandbox *apiv1alpha2.Sandbox, stableKey, preferredFastlet, preferredPodUID string) (*apiv1alpha2.Sandbox, bool, error) {
+// AssignDeclarativePreferring is AssignDeclarative with best-effort checkpoint
+// locality hints. Top-K ranks the pausing Fastlet, verified checkpoint cache
+// entries, and same-node Fastlets (sharing host StateRoot / OCI blob caches)
+// before truncating to k candidates, while hard eligibility filters overflow
+// full, draining, or pressured Fastlets to other eligible nodes.
+func (o *Orchestrator) AssignDeclarativePreferring(ctx context.Context, sandbox *apiv1alpha2.Sandbox, stableKey string, preference placement.ResumePreference) (*apiv1alpha2.Sandbox, bool, error) {
 	if sandbox == nil || sandbox.UID == "" {
 		return nil, false, errors.New("persisted Sandbox UID is required")
 	}
@@ -340,11 +349,11 @@ func (o *Orchestrator) AssignDeclarativePreferring(ctx context.Context, sandbox 
 		return projected, false, err
 	}
 
-	candidates, parameters, err := o.Candidates(ctx, sandbox, stableKey)
+	preference = o.resolveResumePreference(sandbox.Namespace, mergeResumePreference(preference, ResumePreference(sandbox)))
+	candidates, parameters, err := o.candidates(ctx, sandbox, stableKey, preference, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	candidates = preferFastlet(candidates, preferredFastlet, preferredPodUID)
 	runtimeInstanceID, err := idgen.GenerateRequestID()
 	if err != nil {
 		return nil, false, fmt.Errorf("generate runtime instance ID: %w", err)
@@ -379,32 +388,38 @@ func validateResolvedResourceAnnotations(sandbox *apiv1alpha2.Sandbox, parameter
 	return nil
 }
 
-// preferFastlet moves the candidate matching (PodName, PodUID) to the front
-// of the candidate list. UID matching keeps the hint precise across a Fastlet
-// Pod replacement under the same name; an empty or unmatched hint leaves the
-// order untouched.
-func preferFastlet(candidates []placement.FastletInfo, name, podUID string) []placement.FastletInfo {
-	if name == "" {
-		return candidates
+func sandboxNamespace(sandbox *apiv1alpha2.Sandbox) string {
+	if sandbox == nil {
+		return ""
 	}
-	for index := range candidates {
-		candidate := candidates[index]
-		if candidate.PodName != name {
-			continue
-		}
-		if podUID != "" && candidate.PodUID != podUID {
-			continue
-		}
-		if index == 0 {
-			return candidates
-		}
-		reordered := make([]placement.FastletInfo, 0, len(candidates))
-		reordered = append(reordered, candidate)
-		reordered = append(reordered, candidates[:index]...)
-		reordered = append(reordered, candidates[index+1:]...)
-		return reordered
+	return sandbox.Namespace
+}
+
+func mergeResumePreference(primary, fallback placement.ResumePreference) placement.ResumePreference {
+	if primary.FastletName == "" {
+		primary.FastletName = fallback.FastletName
 	}
-	return candidates
+	if primary.FastletPodUID == "" {
+		primary.FastletPodUID = fallback.FastletPodUID
+	}
+	if primary.NodeName == "" {
+		primary.NodeName = fallback.NodeName
+	}
+	if primary.CheckpointImage == "" {
+		primary.CheckpointImage = fallback.CheckpointImage
+	}
+	return primary
+}
+
+func (o *Orchestrator) resolveResumePreference(namespace string, preference placement.ResumePreference) placement.ResumePreference {
+	if preference.NodeName != "" || preference.FastletName == "" || o.Registry == nil {
+		return preference
+	}
+	if existing, ok := o.Registry.GetFastletByID(placement.NewFastletID(namespace, preference.FastletName)); ok &&
+		(preference.FastletPodUID == "" || existing.PodUID == preference.FastletPodUID) {
+		preference.NodeName = existing.NodeName
+	}
+	return preference
 }
 
 // ReassignDeclarativeAfterRejection atomically moves a durable assignment to
@@ -422,7 +437,15 @@ func (o *Orchestrator) ReassignDeclarativeAfterRejection(ctx context.Context, sa
 	if current == nil {
 		return sandbox.DeepCopy(), false, nil
 	}
-	candidates, _, err := o.Candidates(ctx, sandbox, stableKey)
+	var excluded map[placement.FastletID]struct{}
+	if o.Registry != nil && current.FastletName != "" {
+		rejectedID := placement.NewFastletID(sandbox.Namespace, current.FastletName)
+		if existing, ok := o.Registry.GetFastletByID(rejectedID); ok && existing.PodUID == current.FastletPodUID {
+			excluded = map[placement.FastletID]struct{}{rejectedID: {}}
+		}
+	}
+	preference := o.resolveResumePreference(sandbox.Namespace, ResumePreference(sandbox))
+	candidates, _, err := o.candidates(ctx, sandbox, stableKey, preference, excluded)
 	if errors.Is(err, ErrNoCandidate) {
 		return sandbox.DeepCopy(), false, nil
 	}

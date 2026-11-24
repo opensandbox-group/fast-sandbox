@@ -200,13 +200,15 @@ type CheckpointStatus struct {
 	// PausedAt is when the checkpoint became durable in the store.
 	// +optional
 	PausedAt *metav1.Time `json:"pausedAt,omitempty"`
-	// FastletName/FastletPodUID locate the Fastlet that captured the
-	// checkpoint. Diagnostics only: the Fastlet may already be gone and is
-	// never the resume target contract.
+	// FastletName, FastletPodUID, and NodeName locate the Fastlet and host
+	// that captured the checkpoint. Advisory only: the Fastlet or node may
+	// already be gone and is never the resume target contract.
 	// +optional
 	FastletName string `json:"fastletName,omitempty"`
 	// +optional
 	FastletPodUID types.UID `json:"fastletPodUID,omitempty"`
+	// +optional
+	NodeName string `json:"nodeName,omitempty"`
 }
 
 // CheckpointActive reports whether Status.Runtime.Checkpoint is

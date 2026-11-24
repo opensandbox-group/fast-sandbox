@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/controlplane/assignment"
 	"fast-sandbox/internal/controlplane/placement"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
@@ -834,25 +835,126 @@ func newHarness(t *testing.T) (*Orchestrator, *fakeRegistry, *fakeFastletClient,
 	return orchestrator, registry, fastletClient, sandbox
 }
 
-func TestPreferFastletMovesResumeTargetFirst(t *testing.T) {
+func TestRankResumeCandidatesOrdersLocalityTiers(t *testing.T) {
+	ckptRef := "checkpoint:sha256:ckpt-1"
 	candidates := []placement.FastletInfo{
-		{ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a"},
-		{ID: "fastlet-b", PodName: "fastlet-b", PodUID: "pod-b"},
-		{ID: "fastlet-c", PodName: "fastlet-c", PodUID: "pod-c"},
+		{ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-a", NodeName: "node-a"},
+		{
+			ID: "fastlet-b", PodName: "fastlet-b", PodUID: "pod-b", NodeName: "node-b",
+			RuntimeName: apiv1alpha2.RuntimeFirecracker, CacheComplete: true,
+			Images: []string{artifacts.ImageIndexKey(ckptRef)},
+		},
+		{ID: "fastlet-c", PodName: "fastlet-c", PodUID: "pod-c", NodeName: "node-c"},
+		{ID: "fastlet-d", PodName: "fastlet-d", PodUID: "pod-d", NodeName: "node-c"},
 	}
-	preferred := preferFastlet(candidates, "fastlet-c", "pod-c")
-	require.Equal(t, []placement.FastletID{"fastlet-c", "fastlet-a", "fastlet-b"},
-		[]placement.FastletID{preferred[0].ID, preferred[1].ID, preferred[2].ID})
+	preferred := placement.RankResumeCandidates(candidates, placement.ResumePreference{
+		FastletName: "fastlet-d", FastletPodUID: "pod-d", NodeName: "node-c", CheckpointImage: ckptRef,
+	})
+	require.Equal(t, []placement.FastletID{"fastlet-d", "fastlet-b", "fastlet-c", "fastlet-a"},
+		[]placement.FastletID{preferred[0].ID, preferred[1].ID, preferred[2].ID, preferred[3].ID})
 
-	// A replaced pod under the same name falls back to the normal order.
-	replaced := preferFastlet(candidates, "fastlet-c", "other-pod")
-	require.Equal(t, placement.FastletID("fastlet-a"), replaced[0].ID)
+	// A replaced Pod on a different node falls back when NodeName does not match,
+	// whereas a replacement Pod on the same NodeName still keeps node locality.
+	replacedDifferentNode := placement.RankResumeCandidates(candidates[:3], placement.ResumePreference{
+		FastletName: "fastlet-c", FastletPodUID: "other-pod",
+	})
+	require.Equal(t, placement.FastletID("fastlet-a"), replacedDifferentNode[0].ID)
+
+	replacedSameNode := placement.RankResumeCandidates(candidates[:3], placement.ResumePreference{
+		FastletName: "fastlet-c", FastletPodUID: "other-pod", NodeName: "node-c",
+	})
+	require.Equal(t, placement.FastletID("fastlet-c"), replacedSameNode[0].ID)
 
 	// Empty or unmatched hints leave the order untouched.
-	require.Equal(t, candidates, preferFastlet(candidates, "", ""))
-	require.Equal(t, candidates, preferFastlet(candidates, "fastlet-z", "pod-z"))
-	// An already-first candidate is a no-op.
-	require.Equal(t, candidates, preferFastlet(candidates, "fastlet-a", "pod-a"))
+	require.Equal(t, candidates, placement.RankResumeCandidates(candidates, placement.ResumePreference{}))
+	require.Equal(t, candidates, placement.RankResumeCandidates(candidates, placement.ResumePreference{
+		FastletName: "fastlet-z", FastletPodUID: "pod-z", NodeName: "node-z",
+	}))
+}
+
+func TestAssignDeclarativePreferringSelectsCachedNodeInLargePoolAndOverflowsOnRejection(t *testing.T) {
+	ctx := context.Background()
+	o, _, _, sandbox := newHarness(t)
+	registry := placement.NewInMemoryRegistry()
+	o.Registry = registry
+	o.TopK = 3
+	now := time.Unix(2000, 0)
+	o.Now = func() time.Time { return now }
+
+	parameters, err := o.ResolveRuntime(ctx, sandbox)
+	require.NoError(t, err)
+
+	seed := func(id, node string, used int, images ...string) {
+		info := placement.FastletInfo{
+			ID: placement.FastletID(id), Namespace: sandbox.Namespace, PoolName: sandbox.Spec.PoolRef,
+			PodName: id, PodUID: "uid-" + id, PodIP: "10.0.0.10", NodeName: node, PodReady: true,
+			RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
+			ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
+		}
+		registry.UpsertPod(info)
+		require.NoError(t, registry.ApplyHeartbeat(info.ID, info.PodUID, &fastletapi.HeartbeatResponse{
+			FastletStatus: fastletapi.FastletStatus{
+				FastletPodUID: info.PodUID, RuntimeReady: true, InfraReady: true,
+				RuntimeProfileHash: info.RuntimeProfileHash, ResourceProfileHash: info.ResourceProfileHash,
+				InfraRevision: info.InfraRevision,
+				Admission:     fastletapi.AdmissionStatus{Capacity: 5, Used: used, Running: used},
+			},
+			Sequence: 1,
+			Cache:    fastletapi.CacheSnapshot{Epoch: "boot", Revision: 1, Full: true, Complete: true, Images: images},
+		}, now))
+	}
+
+	for index := 0; index < 4; index++ {
+		seed("remote-"+string(rune('a'+index)), "node-remote-"+string(rune('a'+index)), 0, "alpine:latest")
+	}
+	// Two replacement/sibling Fastlets on node-cached, more loaded and without base image entry.
+	seed("cached-primary", "node-cached", 3)
+	seed("cached-sibling", "node-cached", 4)
+
+	sandbox.UID = types.UID("sandbox-large-pool")
+	sandbox.Spec.State = apiv1alpha2.SandboxStateRunning
+	sandbox.Status.Runtime = apiv1alpha2.RuntimeStatus{
+		State: apiv1alpha2.RuntimePaused, Generation: 1, PauseAttempt: 1,
+		Checkpoint: &apiv1alpha2.CheckpointStatus{
+			CheckpointID: "ckpt-1", ManifestRef: "oci://registry.example/repo:ckpt", ArtifactDigest: "deadbeef",
+			FastletName: "cached-retired", FastletPodUID: "uid-retired", NodeName: "node-cached",
+		},
+	}
+	require.NoError(t, o.Client.Create(ctx, sandbox))
+	require.NoError(t, o.Client.Status().Update(ctx, sandbox))
+
+	assigned, won, err := o.AssignDeclarativePreferring(ctx, sandbox, string(sandbox.UID), ResumePreference(sandbox))
+	require.NoError(t, err)
+	require.True(t, won)
+	require.Equal(t, "cached-primary", assigned.Status.Placement.FastletName,
+		"same-node Fastlet must be selected even when Pool size > TopK and pausing Pod was replaced")
+
+	// Reject cached-primary at runtime: reassignment prefers cached-sibling on node-cached first.
+	registry.RecordFeedback("cached-primary", placement.LocalFeedback{
+		PodUID: "uid-cached-primary", Code: fastletapi.ErrorCapacityRejected, ObservedAt: now, RetryAfter: 10 * time.Second,
+	})
+	reassigned, moved, err := o.ReassignDeclarativeAfterRejection(ctx, assigned, string(assigned.UID))
+	require.NoError(t, err)
+	require.True(t, moved)
+	envelope, err := assignment.AssignmentFromAnnotation(reassigned)
+	require.NoError(t, err)
+	require.Equal(t, "cached-sibling", envelope.FastletName)
+
+	// Project the reassigned annotation to status (as the next reconcile does)
+	// before testing a second runtime rejection that overflows off-node.
+	reassigned, err = assignment.ProjectAssignmentToStatus(
+		ctx, o.Client, types.NamespacedName{Namespace: reassigned.Namespace, Name: reassigned.Name},
+	)
+	require.NoError(t, err)
+	registry.RecordFeedback("cached-sibling", placement.LocalFeedback{
+		PodUID: "uid-cached-sibling", Code: fastletapi.ErrorCapacityRejected, ObservedAt: now, RetryAfter: 10 * time.Second,
+	})
+	overflowed, moved, err := o.ReassignDeclarativeAfterRejection(ctx, reassigned, string(reassigned.UID))
+	require.NoError(t, err)
+	require.True(t, moved)
+	envelope, err = assignment.AssignmentFromAnnotation(overflowed)
+	require.NoError(t, err)
+	require.Contains(t, envelope.FastletName, "remote-")
 }
 
 func TestRuntimeGoneRequiresExplicitAbsence(t *testing.T) {

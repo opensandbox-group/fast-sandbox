@@ -131,6 +131,20 @@ type FastletRegistry interface {
 	GetFastletByID(id FastletID) (FastletInfo, bool)
 }
 
+// ResumePreference carries best-effort checkpoint locality hints for a Sandbox
+// resuming from pause. Hard eligibility filters run before locality ranking so
+// full, draining, or pressured Fastlets overflow cleanly.
+type ResumePreference struct {
+	FastletName     string
+	FastletPodUID   string
+	NodeName        string
+	CheckpointImage string
+}
+
+func (p ResumePreference) Empty() bool {
+	return p.FastletName == "" && p.FastletPodUID == "" && p.NodeName == "" && p.CheckpointImage == ""
+}
+
 type CandidateRequest struct {
 	RequiredCapability  string
 	Namespace           string
@@ -143,6 +157,7 @@ type CandidateRequest struct {
 	ResourceMode        apiv1alpha2.SandboxResourceMode
 	Demand              ResourceDemand
 	Image               string
+	Resume              ResumePreference
 	StableKey           string
 	Now                 time.Time
 	// ExcludedFastlets is request-local; selection never reserves capacity.
@@ -166,13 +181,21 @@ type fastletSlot struct {
 	info FastletInfo
 }
 
+const (
+	resumeLocalityNone = iota
+	resumeLocalityPreferredNode
+	resumeLocalityVerifiedCheckpoint
+	resumeLocalityExactFastlet
+)
+
 type rankedFastlet struct {
-	slot        *fastletSlot
-	id          FastletID
-	imageHit    bool
-	loadBucket  int
-	serverOrder uint64
-	stableOrder uint64
+	slot           *fastletSlot
+	id             FastletID
+	resumeLocality int
+	imageHit       bool
+	loadBucket     int
+	serverOrder    uint64
+	stableOrder    uint64
 }
 
 type InMemoryRegistry struct {
@@ -487,7 +510,20 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 	for _, slot := range r.fastlets {
 		slots = append(slots, slot)
 	}
+	var preferredSlot *fastletSlot
+	if request.Resume.NodeName == "" && request.Resume.FastletName != "" {
+		preferredSlot = r.fastlets[NewFastletID(request.Namespace, request.Resume.FastletName)]
+	}
 	r.mu.RUnlock()
+
+	resume := request.Resume
+	if preferredSlot != nil {
+		preferredSlot.mu.RLock()
+		if (resume.FastletPodUID == "" || preferredSlot.info.PodUID == resume.FastletPodUID) && preferredSlot.info.NodeName != "" {
+			resume.NodeName = preferredSlot.info.NodeName
+		}
+		preferredSlot.mu.RUnlock()
+	}
 
 	heartbeats := heartbeatAgeSummary{}
 	blockedNodes := resourceBlockedNodes(slots, request.Now, staleAfter)
@@ -506,18 +542,22 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 			serverOrder = stableOrder(r.serverSeed, info.ID)
 		}
 		ranked = append(ranked, rankedFastlet{
-			slot:        slot,
-			id:          info.ID,
-			imageHit:    imageHit(info, request.Image),
-			loadBucket:  int(load * 10),
-			serverOrder: serverOrder,
-			stableOrder: stableOrder(request.StableKey, info.ID),
+			slot:           slot,
+			id:             info.ID,
+			resumeLocality: resumeLocalityTier(info, resume),
+			imageHit:       imageHit(info, request.Image),
+			loadBucket:     int(load * 10),
+			serverOrder:    serverOrder,
+			stableOrder:    stableOrder(request.StableKey, info.ID),
 		})
 		slot.mu.RUnlock()
 	}
 	recordHeartbeatAgeSummary(heartbeats)
 	sort.Slice(ranked, func(i, j int) bool {
 		left, right := ranked[i], ranked[j]
+		if left.resumeLocality != right.resumeLocality {
+			return left.resumeLocality > right.resumeLocality
+		}
 		if left.imageHit != right.imageHit {
 			return left.imageHit
 		}
@@ -548,6 +588,49 @@ func (r *InMemoryRegistry) TopK(request CandidateRequest, k int) []FastletInfo {
 	}
 	recordTopK(len(slots), eligibleCount, request.Image, selectedImageHit)
 	return selected
+}
+
+// RankResumeCandidates stable-orders candidates by checkpoint cache locality
+// while preserving existing tie-breakers within each tier.
+func RankResumeCandidates(candidates []FastletInfo, preference ResumePreference) []FastletInfo {
+	if preference.Empty() || len(candidates) <= 1 {
+		return candidates
+	}
+	ordered := true
+	previous := resumeLocalityTier(candidates[0], preference)
+	for index := 1; index < len(candidates); index++ {
+		tier := resumeLocalityTier(candidates[index], preference)
+		if tier > previous {
+			ordered = false
+			break
+		}
+		previous = tier
+	}
+	if ordered {
+		return candidates
+	}
+	reordered := append([]FastletInfo(nil), candidates...)
+	sort.SliceStable(reordered, func(i, j int) bool {
+		return resumeLocalityTier(reordered[i], preference) > resumeLocalityTier(reordered[j], preference)
+	})
+	return reordered
+}
+
+func resumeLocalityTier(info FastletInfo, preference ResumePreference) int {
+	if preference.Empty() {
+		return resumeLocalityNone
+	}
+	if preference.FastletName != "" && info.PodName == preference.FastletName &&
+		(preference.FastletPodUID == "" || info.PodUID == preference.FastletPodUID) {
+		return resumeLocalityExactFastlet
+	}
+	if imageHit(info, preference.CheckpointImage) {
+		return resumeLocalityVerifiedCheckpoint
+	}
+	if preference.NodeName != "" && info.NodeName == preference.NodeName {
+		return resumeLocalityPreferredNode
+	}
+	return resumeLocalityNone
 }
 
 func hardFilter(info FastletInfo, request CandidateRequest, staleAfter time.Duration, blockedNodes map[string]struct{}) bool {

@@ -14,6 +14,8 @@ import (
 	"fmt"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/controlplane/placement"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
 
@@ -101,4 +103,24 @@ func ResumeCheckpoint(sandbox *apiv1alpha2.Sandbox) *apiv1alpha2.CheckpointStatu
 		}
 	}
 	return sandbox.Status.Runtime.Checkpoint
+}
+
+// ResumePreference derives placement locality hints from an active resume
+// checkpoint so Top-K ranks node-shared checkpoint and OCI blob caches before
+// truncating the candidate set.
+func ResumePreference(sandbox *apiv1alpha2.Sandbox) placement.ResumePreference {
+	checkpoint := ResumeCheckpoint(sandbox)
+	if checkpoint == nil {
+		return placement.ResumePreference{}
+	}
+	checkpointImage := ""
+	if checkpoint.ArtifactDigest != "" {
+		checkpointImage = artifacts.CheckpointReference(checkpoint.ArtifactDigest)
+	}
+	return placement.ResumePreference{
+		FastletName:     checkpoint.FastletName,
+		FastletPodUID:   string(checkpoint.FastletPodUID),
+		NodeName:        checkpoint.NodeName,
+		CheckpointImage: checkpointImage,
+	}
 }
