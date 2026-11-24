@@ -529,6 +529,56 @@ func TestEnsureSandboxRestoresGoldenSnapshot(t *testing.T) {
 	require.Equal(t, "fc-tap", loads[0].NetworkOverrides[0].HostDevName)
 }
 
+func TestEnsureSandboxNativeDeviceTransport(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		pci    bool
+		jailed bool
+	}{
+		{"legacy MMIO", false, false},
+		{"legacy MMIO with jailer", false, true},
+		{"PCI", true, false},
+		{"PCI with jailer", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newDriverFixture(t)
+			if tc.jailed {
+				fixture.enableJailer()
+			}
+			image := fixture.sandboxSpec.Desired.Image
+			fixture.prepareCachedImage(t, image)
+			document := testManifestDocument(t)
+			machine := document["machine"].(map[string]any)
+			require.NotContains(t, machine, "pciEnabled")
+			if tc.pci {
+				machine["pciEnabled"] = true
+			}
+			raw, err := json.Marshal(document)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(cachedManifestPath(fixture.stateRoot, image), raw, 0640))
+			require.NoError(t, fixture.driver.Initialize(t.Context(), ""))
+			_, err = fixture.driver.EnsureSandbox(t.Context(), ensureInput(&fixture.sandboxSpec))
+			require.NoError(t, err)
+			require.Len(t, fixture.server.recordedSnapshotLoads(), 1)
+			require.Len(t, fixture.launcher.started, 1)
+			args := fixture.launcher.started[0]
+			if tc.pci {
+				require.Contains(t, args, "--enable-pci")
+				if tc.jailed {
+					require.Greater(t, argvIndex(args, "--enable-pci"), argvIndex(args, "--"))
+				}
+			} else {
+				require.NotContains(t, args, "--enable-pci")
+			}
+			dir, err := sandboxDir(fixture.stateRoot, fixture.sandboxSpec.Identity.SandboxUID)
+			require.NoError(t, err)
+			state, err := loadState(dir)
+			require.NoError(t, err)
+			require.Equal(t, tc.pci, state.BootPCIEnabled)
+		})
+	}
+}
+
 func TestEnsureSandboxRestoreMachineConfigFromManifest(t *testing.T) {
 	fixture := newDriverFixture(t)
 	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)

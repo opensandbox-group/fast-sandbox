@@ -145,6 +145,7 @@ func applyNativeBootProvenance(manifest *artifacts.VMManifest, phases snapshotPh
 	if phases.KernelSHA256 != entry.SHA256 || strings.TrimSpace(phases.KernelCmdline) == "" {
 		return fmt.Errorf("native snapshot kernel provenance is missing or changed")
 	}
+	manifest.Machine.PCIEnabled = phases.PCIEnabled
 	manifest.Kernel.SHA256 = phases.KernelSHA256
 	manifest.Kernel.Cmdline = phases.KernelCmdline
 	manifest.GuestControl = phases.GuestControl

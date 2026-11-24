@@ -872,6 +872,7 @@ func recordRootfsBootMetadata(manifest *artifacts.VMManifest, state *SandboxStat
 		}
 		manifest.Machine.VCPUCount, manifest.Machine.MemoryMiB = state.BootMachine.VCPUCount, state.BootMachine.MemoryMiB
 	}
+	manifest.Machine.PCIEnabled = state.BootPCIEnabled
 	manifest.Kernel.SHA256 = state.BootKernelSHA256
 	manifest.GuestControl.HelperVersion = helperVersion
 	return nil

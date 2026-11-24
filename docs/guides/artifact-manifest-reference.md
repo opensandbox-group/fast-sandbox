@@ -30,6 +30,8 @@
 
 CPU count is a positive integer; memory and disk capacity are positive integer MiB, recorded exactly once. The rootfs drive path is `rootfs.dev` for fsb-vm/OCI and `rootfs.img` for native snapshots, matching the relative path baked into vmstate. `rootfsDriveID` records the logical device ID. `kernel.version`, CPU architecture and a known Firecracker version are required. `cpuTemplate=none` requires a resolved vendor/family/model/stepping identity; `T2` and `T2A` use the supported Firecracker-version allowlists. Restore validates architecture and CPU compatibility; the independent CLI's `--force` only downgrades VMM version mismatches.
 
+New native templates record `machine.pciEnabled: true`. The builder cold-boots and verifies the template with Firecracker's `--enable-pci` flag. Guest init checks that the PCI bus can be rescanned and that the root disk binds to the virtio block and PCI drivers. Fastlet reads the same field for native restores and carries the running VM's transport into snapshots and pause checkpoints. A missing or false field selects the original MMIO launch. Deploy the PCI-aware Fastlet before consuming new native templates. OCI templates continue to use MMIO.
+
 The fixed OCI snapshot paths are `/vmstate.bin`, `/memfile` and `/manifest.json`. Native object storage publishes `rootfs.ext4`, `vmstate.snap`, `memory.snap`, `manifest.json` and `SHA256SUMS`. VM state and memory reside in those binary files, not in the JSON document.
 
 ## Complete annotated reference
@@ -43,6 +45,7 @@ All current fields are shown below using a native/S3 checkpoint. Values are illu
   "schemaVersion": 1,
   "runtime": "firecracker",
   "machine": { // Captured VM configuration.
+    "pciEnabled": true,
     "vcpuCount": 2,
     "memoryMiB": 1024,
     "rootfsSizeMiB": 20480, // Virtual capacity, not compressed layer size.

@@ -838,8 +838,9 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// state), and the NIC host tap is replaced per instance via the load
 	// request's network_overrides. Nothing else is injected into the rootfs.
 	state := &SandboxState{
-		VMM:    selectedVMM,
-		Config: *config,
+		VMM:            selectedVMM,
+		BootPCIEnabled: !isOCI && restoreMetadata.Machine.PCIEnabled,
+		Config:         *config,
 		Allocation: fastletapi.RuntimeAllocation{Network: fastletapi.NetworkAllocation{
 			SlotID: slot.ID, NamespacePath: slot.HostNetNSPath, IP: slot.IP, Gateway: slot.Gateway,
 			DNSPath: slot.DNSPath, PrivateCIDR: slot.PrivateCIDR, HostVeth: slot.HostVeth,
@@ -895,6 +896,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	launchCtx, launchSpan := observability.Start(ctx, "fastlet.firecracker.launch")
 	launchStarted := time.Now()
 	process, err := d.launchVM(launchCtx, launchConfig{
+		PCIEnabled: state.BootPCIEnabled,
 		BinaryPath: binaryPath,
 		JailerPath: jailerPath,
 		SandboxID:  identity.SandboxUID,

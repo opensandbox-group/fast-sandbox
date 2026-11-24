@@ -153,6 +153,7 @@ func (p *execProcess) Wait() error {
 
 // launchConfig is the immutable per-Sandbox Firecracker launch plan.
 type launchConfig struct {
+	PCIEnabled bool
 	// BinaryPath is the host path of the firecracker binary.
 	BinaryPath string
 	// JailerPath activates the jailer; empty keeps the direct launch.
@@ -188,8 +189,9 @@ type launchConfig struct {
 // The binary name must stay "firecracker" and the --id value must match the
 // NodeJanitor matcher.
 func (c launchConfig) buildArgv() []string {
+	var arguments []string
 	if c.JailerPath != "" {
-		return []string{
+		arguments = []string{
 			"--id", c.truncatedID(),
 			"--netns", c.NetNSPath,
 			"--uid", "0",
@@ -200,10 +202,11 @@ func (c launchConfig) buildArgv() []string {
 			"--api-sock", jailerChrootAPISock,
 			"--log-path", jailerChrootLogPath,
 		}
+	} else {
+		arguments = []string{"--id", c.truncatedID(), "--api-sock", c.APIAddress}
 	}
-	arguments := []string{
-		"--id", c.truncatedID(),
-		"--api-sock", c.APIAddress,
+	if c.PCIEnabled {
+		arguments = append(arguments, "--enable-pci")
 	}
 	return arguments
 }

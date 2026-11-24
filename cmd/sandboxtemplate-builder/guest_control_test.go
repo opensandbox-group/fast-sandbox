@@ -167,10 +167,11 @@ func TestNativeBootProvenanceRequiresProbeAndPinnedKernel(t *testing.T) {
 	var document artifacts.VMManifest
 	require.ErrorContains(t, applyNativeBootProvenance(&document, snapshotPhaseTimings{}, kernel), "freeze/thaw")
 	phases := snapshotPhaseTimings{
-		KernelSHA256: entry.SHA256, KernelCmdline: "root=/dev/vda rw",
+		PCIEnabled: true, KernelSHA256: entry.SHA256, KernelCmdline: "root=/dev/vda rw",
 		GuestControl: &artifacts.VMGuestControl{Protocol: guestcontrol.Protocol, Transport: "vsock", Port: 1234, HelperVersion: "sha256:" + strings.Repeat("a", 64)},
 	}
 	require.NoError(t, applyNativeBootProvenance(&document, phases, kernel))
+	require.True(t, document.Machine.PCIEnabled)
 	require.Equal(t, phases.GuestControl, document.GuestControl)
 	require.Equal(t, phases.KernelSHA256, document.Kernel.SHA256)
 	require.Equal(t, phases.KernelCmdline, document.Kernel.Cmdline)

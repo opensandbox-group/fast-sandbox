@@ -45,6 +45,8 @@ type VMManifest struct {
 }
 
 type VMMachine struct {
+	// PCIEnabled selects the native VMM device transport. Older artifacts used MMIO.
+	PCIEnabled      bool   `json:"pciEnabled,omitempty"`
 	VCPUCount       int    `json:"vcpuCount"`
 	MemoryMiB       int64  `json:"memoryMiB"`
 	RootfsSizeMiB   int64  `json:"rootfsSizeMiB"`

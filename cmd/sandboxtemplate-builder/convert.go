@@ -349,6 +349,18 @@ func renderGuestInitWithControl(spec apiv1alpha2.SandboxTemplateSpec, control bo
 	if control {
 		controlStart = "setsid /usr/local/sbin/fsb-guest-control --mount / --port 1234 </dev/null >/dev/console 2>&1 &\n"
 	}
+	var pciCheck string
+	if spec.Output.Format == apiv1alpha2.ArtifactFormatNative {
+		pciCheck = `
+disk=/sys/class/block/vda/device
+if ! [ -w /sys/bus/pci/rescan ] ||
+   ! [ "$disk/driver" -ef /sys/bus/virtio/drivers/virtio_blk ] ||
+   ! [ "$disk/../driver" -ef /sys/bus/pci/drivers/virtio-pci ]; then
+  echo "SANDBOX_STARTUP_FAILED expected virtio-blk root disk on PCI"
+  exit 1
+fi
+`
+	}
 	var readiness []string
 	if spec.Readiness.Probe != "" {
 		readiness = append(readiness, "READINESS_PROBE="+shellQuote(spec.Readiness.Probe))
@@ -390,7 +402,7 @@ mountpoint -q /tmp || mount -t tmpfs tmpfs /tmp
 ` + loGate + `
 exec </dev/console >/dev/console 2>&1
 hostname sandbox
-` + firecrackerconfig.RenderFreePageReportingCheck() + controlStart + `
+` + pciCheck + firecrackerconfig.RenderFreePageReportingCheck() + controlStart + `
 [ -f /etc/sandbox-init.env ] && . /etc/sandbox-init.env
 if [ -x /opt/opensandbox/bootstrap.sh ]; then
   # The entrypoint becomes the bootstrap's user command: bootstrap.sh TERMs
