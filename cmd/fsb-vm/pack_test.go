@@ -628,7 +628,7 @@ func TestPackRootfsSquashRecoversOvershootChain(t *testing.T) {
 }
 
 func packCheckpoint(ctx context.Context, bundle, outputName string, maxLayers, squashLayers int) error {
-	return packCapturedBundle(ctx, bundle, outputName, maxLayers, squashLayers, false)
+	return packCapturedBundle(ctx, bundle, outputName, maxLayers, squashLayers, packOptions{})
 }
 
 func validatePackBundle(bundle string) ([]byte, *ocitemplate.RootfsUpper, error) {

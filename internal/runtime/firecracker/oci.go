@@ -24,6 +24,7 @@ import (
 )
 
 const ociEnabled = "true"
+const ociDisabled = "false"
 
 func validateOCISupport(image string) error {
 	if !strings.HasPrefix(image, ocitemplate.Prefix) {
@@ -31,13 +32,13 @@ func validateOCISupport(image string) error {
 	}
 	switch os.Getenv("FAST_SANDBOX_OCI_ENABLED") {
 	case ociEnabled:
-	case "", "false":
+	case "", ociDisabled:
 		return fmt.Errorf("%w: OCI templates and checkpoints require FAST_SANDBOX_OCI_ENABLED=true", ErrInvalidConfig)
 	default:
 		return fmt.Errorf("%w: FAST_SANDBOX_OCI_ENABLED must be true or false", ErrInvalidConfig)
 	}
 	switch strings.TrimSpace(os.Getenv("FAST_SANDBOX_OCI_PLAIN_HTTP")) {
-	case "", "false", "0", "true", "1":
+	case "", ociDisabled, "0", ociEnabled, "1":
 	default:
 		return fmt.Errorf("%w: FAST_SANDBOX_OCI_PLAIN_HTTP must be true or false", ErrInvalidConfig)
 	}
@@ -179,7 +180,8 @@ func (d *Driver) attachOCI(ctx context.Context, id, image string) (rootfs, vmsta
 	return state.Rootfs.Path, filepath.Join(home, "mnt/vmstate.bin"), filepath.Join(home, "mnt/memfile"), nil
 }
 
-// Platform metadata comes from the mounted snapfiles, never registry annotations.
+// Platform metadata comes from the prepared files, backed by the OCI config
+// for single-image RootfsOnly artifacts or snapfiles for legacy pairs.
 type ociRestoreMetadata = artifacts.VMManifest
 
 type ociAttachment struct {
@@ -273,14 +275,21 @@ func readPreparedOCIMetadata(ociRoot, id string) (ociRestoreMetadata, error) {
 		return metadata, err
 	}
 	var state struct {
-		Metadata json.RawMessage `json:"template_metadata"`
+		Metadata             json.RawMessage `json:"template_metadata"`
+		RootfsMetadataSHA256 string          `json:"rootfs_metadata_sha256"`
 	}
 	if err := json.Unmarshal(stateRaw, &state); err != nil {
 		return metadata, err
 	}
+	if state.RootfsMetadataSHA256 != "" {
+		if !metadata.IsRootfsOnly() || artifacts.SHA256Of(raw) != state.RootfsMetadataSHA256 {
+			return metadata, fmt.Errorf("%w: prepared RootfsOnly VM manifest disagrees with OCI metadata", ErrInvalidConfig)
+		}
+		return metadata, nil
+	}
 	pair, err := ocitemplate.Decode(state.Metadata)
-	if err != nil || pair == nil {
-		return metadata, fmt.Errorf("%w: fsb-vm prepared state has no valid template pair", ErrInvalidConfig)
+	if err != nil || pair == nil || pair.Metadata != nil {
+		return metadata, fmt.Errorf("%w: fsb-vm prepared state has no valid OCI artifact", ErrInvalidConfig)
 	}
 	var envelope struct {
 		Checkpoint *artifacts.CheckpointOwner `json:"checkpoint"`

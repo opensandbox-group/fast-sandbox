@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 
 	"github.com/opencontainers/go-digest"
@@ -34,17 +35,21 @@ const (
 func newPackCommand() *cobra.Command {
 	var bundle, output string
 	var maxLayers, squashLayers int
-	var rootfsOnly bool
-	cmd := &cobra.Command{Use: "pack", Short: "Package captured rootfs, memory and VM state as an OverlayBD pair", RunE: func(cmd *cobra.Command, _ []string) error {
+	var options packOptions
+	cmd := &cobra.Command{Use: "pack", Short: "Package a captured snapshot as an OverlayBD artifact", RunE: func(cmd *cobra.Command, _ []string) error {
 		if squashLayers < 2 {
 			return fmt.Errorf("--squash-layers must be at least 2, got %d", squashLayers)
 		}
 		if maxLayers <= squashLayers {
 			return fmt.Errorf("--max-rootfs-layers (%d) must exceed --squash-layers (%d)", maxLayers, squashLayers)
 		}
-		return packCapturedBundle(cmd.Context(), bundle, output, maxLayers, squashLayers, rootfsOnly)
+		if options.singleImage && !options.rootfsOnly {
+			return errors.New("--single-image requires --rootfs-only")
+		}
+		return packCapturedBundle(cmd.Context(), bundle, output, maxLayers, squashLayers, options)
 	}}
-	cmd.Flags().BoolVar(&rootfsOnly, "rootfs-only", false, "package an explicit rootfsOnly template without RAM or VM state")
+	cmd.Flags().BoolVar(&options.rootfsOnly, "rootfs-only", false, "package an explicit rootfsOnly template without RAM or VM state")
+	cmd.Flags().BoolVar(&options.singleImage, "single-image", false, "store RootfsOnly startup metadata in the rootfs image config")
 	cmd.Flags().StringVar(&bundle, "bundle-dir", "", "captured checkpoint directory")
 	cmd.Flags().StringVar(&output, "output", "", "local logical output name:tag")
 	cmd.Flags().IntVar(&maxLayers, "max-rootfs-layers", defaultMaxRootfsLayers, "squash the inherited rootfs layer chain once it reaches this many layers")
@@ -54,7 +59,12 @@ func newPackCommand() *cobra.Command {
 	return cmd
 }
 
-func packCapturedBundle(ctx context.Context, bundle, outputName string, maxLayers, squashLayers int, rootfsOnly bool) (resultErr error) {
+type packOptions struct {
+	rootfsOnly  bool
+	singleImage bool
+}
+
+func packCapturedBundle(ctx context.Context, bundle, outputName string, maxLayers, squashLayers int, format packOptions) (resultErr error) {
 	releaseBundle, err := lockPackBundle(bundle)
 	if err != nil {
 		return err
@@ -67,13 +77,20 @@ func packCapturedBundle(ctx context.Context, bundle, outputName string, maxLayer
 	if err != nil {
 		return err
 	}
-	metadata, upper, err := validatePackBundleMode(bundle, rootfsOnly)
+	metadata, upper, err := validatePackBundleMode(bundle, format.rootfsOnly)
 	if err != nil {
 		return err
 	}
 	extras, err := packSnapshotExtras(bundle)
 	if err != nil {
 		return err
+	}
+	var rootfsConfig []byte
+	if format.singleImage {
+		rootfsConfig, err = ocitemplate.EncodeRootfsConfig(minimalImageConfig(), metadata, extras)
+		if err != nil {
+			return err
+		}
 	}
 	name := sanitizeFileName(outputName)
 	release, err := tryLock(global.buildOutputDir, name)
@@ -103,8 +120,18 @@ func packCapturedBundle(ctx context.Context, bundle, outputName string, maxLayer
 	if err != nil {
 		return err
 	}
+	if format.singleImage {
+		rootLayers, err = squashRootfsTail(ctx, layout, rootLayers, upper, maxLayers, squashLayers)
+		if err != nil {
+			return err
+		}
+		if err := writeRootfsMetadataImage(layout, output, rootLayers, rootfsConfig, upper.BaseLayers); err != nil {
+			return err
+		}
+		return publishArtifactLayout(layout, final)
+	}
 	ublkd := newUblkdClient(global.ublkdSocket)
-	options := &buildOptions{rootfsOnly: rootfsOnly, snapshotManifest: metadata, snapshotExtras: extras, snapfilesProgress: func(phase string) error { return writePackResources(activeMarker, work, phase) }}
+	options := &buildOptions{rootfsOnly: format.rootfsOnly, snapshotManifest: metadata, snapshotExtras: extras, snapfilesProgress: func(phase string) error { return writePackResources(activeMarker, work, phase) }}
 	// Preserve backing files if this process is killed or resource rollback fails.
 	if err = writePackResources(activeMarker, work, packPhasePrepared); err != nil {
 		return err
@@ -134,6 +161,30 @@ func packCapturedBundle(ctx context.Context, bundle, outputName string, maxLayer
 	// Device and mount releases are idempotent; keep rollback armed until every
 	// kernel resource has been released, then discard only the scratch directory.
 	return nil
+}
+
+func writeRootfsMetadataImage(layout artifactLayout, output outputNames, layers []ocispec.Descriptor, config []byte, baseLayers int) error {
+	desc, err := layout.installBytes(config, ocispec.MediaTypeImageConfig)
+	if err != nil {
+		return err
+	}
+	annotations := map[string]string{ocitemplate.AnnotationRootfsMetadata: ocitemplate.RootfsMetadataVersion}
+	if baseLayers > 0 {
+		annotations[ocitemplate.AnnotationRootfsBaseLayers] = strconv.Itoa(baseLayers)
+	}
+	payload, manifest, err := assembleManifest(desc, layers, annotations)
+	if err != nil {
+		return err
+	}
+	name := output.rootfsName()
+	file := sanitizeFileName(name) + ".json"
+	if err := writeFileAtomic(layout.manifestPath(file), payload, 0o640); err != nil {
+		return err
+	}
+	return layout.writeLayoutIndex(layoutIndex{
+		SourceRef: "checkpoint",
+		Images:    []layoutIndexEntry{{Name: name, ManifestFile: file, ManifestDigest: manifest.Digest.String()}},
+	})
 }
 
 // State files keep the native snapshot names and opaque contents in snapfiles.

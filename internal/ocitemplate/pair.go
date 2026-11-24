@@ -145,7 +145,7 @@ func pushImmutableManifest(ctx context.Context, repo *remote.Repository, tag str
 	return nil
 }
 
-// DeletePair deletes only the two manifests owned by id, never their blobs.
+// DeletePair deletes the manifest or manifest pair owned by id, never their blobs.
 // Rootfs manifests carry the pair ID too, so identical layer sets in different
 // snapshots have distinct manifest digests and can be deleted independently.
 // The snapfiles publication point is deleted last, making partial deletion
@@ -161,6 +161,9 @@ func DeletePair(ctx context.Context, reference, id string, credentials Credentia
 	if err := ValidateDigestReference(reference, strings.TrimPrefix(ref.Reference, "sha256:")); err != nil {
 		return err
 	}
+	if handled, err := deleteRootfsMetadataImage(ctx, repo, ref.Reference, id); handled || err != nil {
+		return err
+	}
 	var targets []oci.Descriptor
 	// Validate both objects before the first deletion. A mismatched tag or
 	// annotation must never delete one half of another snapshot.
@@ -173,6 +176,10 @@ func DeletePair(ctx context.Context, reference, id string, credentials Credentia
 			return err
 		}
 		raw, err := fetchSmall(ctx, repo, desc)
+		if errors.Is(err, errdef.ErrNotFound) {
+			// Some registries leave a tag alias after deleting its manifest.
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -182,6 +189,9 @@ func DeletePair(ctx context.Context, reference, id string, credentials Credentia
 		}
 		if manifest.Annotations[AnnotationTemplateID] != id {
 			return fmt.Errorf("refusing to delete manifest %s: snapshot pair ID mismatch", desc.Digest)
+		}
+		if _, marked := manifest.Annotations[AnnotationRootfsMetadata]; marked {
+			return fmt.Errorf("refusing to delete RootfsOnly manifest %s through a different digest", desc.Digest)
 		}
 		targets = append(targets, desc)
 	}

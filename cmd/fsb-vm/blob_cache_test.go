@@ -13,6 +13,7 @@ import (
 	"github.com/opencontainers/go-digest"
 	oci "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
+	"oras.land/oras-go/v2/content"
 
 	"fast-sandbox/internal/ocitemplate"
 )
@@ -157,6 +158,57 @@ func TestLocalCheckpointMetadataAndBlobsSurviveStagingCleanup(t *testing.T) {
 	// Invalid publication metadata cannot be admitted even with valid files.
 	result.Manifests[rootRef] = snap
 	require.ErrorContains(t, cacheCheckpoint(context.Background(), result, dockerConfig{}, artifacts), "digest mismatch")
+}
+
+func TestSingleImageRootfsCacheAndPrepareWithoutSnapfiles(t *testing.T) {
+	setupBlobCache(t)
+	vm, err := json.Marshal(rootfsBootManifest())
+	require.NoError(t, err)
+	config, err := ocitemplate.EncodeRootfsConfig(minimalImageConfig(), vm, nil)
+	require.NoError(t, err)
+	configDesc := content.NewDescriptorFromBytes(oci.MediaTypeImageConfig, config)
+	var image oci.Manifest
+	require.NoError(t, json.Unmarshal(cacheTestManifest(t, "rootfs"), &image))
+	image.Config = configDesc
+	image.Annotations = map[string]string{ocitemplate.AnnotationRootfsMetadata: ocitemplate.RootfsMetadataVersion}
+	root, err := json.Marshal(image)
+	require.NoError(t, err)
+	registry := newManifestCacheRegistry(t, root)
+	ref := registry.reference(digest.FromBytes(root).String())
+	metadata, err := json.Marshal(map[string]any{"oci": ocitemplate.Pair{
+		Rootfs: ref, Metadata: &ocitemplate.RootfsMetadata{Manifest: vm},
+	}})
+	require.NoError(t, err)
+	result := &ocitemplate.PublishedCheckpoint{Reference: ocitemplate.Prefix + ref, Metadata: metadata, Manifests: map[string]json.RawMessage{ref: root}}
+	staging := t.TempDir()
+	blob := filepath.Join(staging, "blobs", "sha256", configDesc.Digest.Encoded())
+	require.NoError(t, os.MkdirAll(filepath.Dir(blob), 0700))
+	require.NoError(t, os.WriteFile(blob, config, 0600))
+	require.NoError(t, cacheCheckpoint(t.Context(), result, dockerConfig{}, staging))
+	require.NoError(t, os.RemoveAll(staging))
+	var template templateFile
+	template.Template.Reference = result.Reference
+	require.NoError(t, resolveTemplate(t.Context(), &template, dockerConfig{}))
+	require.Empty(t, template.snapfilesRef())
+	home := t.TempDir()
+	state := &sandboxState{MountPoint: filepath.Join(home, "mnt")}
+	require.NoError(t, prepareTemplateMetadata(t.Context(), nil, home, state, template.RootfsMetadata, dockerConfig{}))
+	raw, err := os.ReadFile(filepath.Join(state.MountPoint, inDiskManifest))
+	require.NoError(t, err)
+	require.JSONEq(t, string(vm), string(raw))
+	require.Empty(t, state.SharedSnapfiles)
+	require.Nil(t, state.Snapfiles)
+	require.Zero(t, registry.requestCount())
+	imageRef, err := parseRegistryReference(ref)
+	require.NoError(t, err)
+	imageRef.Reference = configDesc.Digest.String()
+	path, err := createManifestCachePath(imageRef, dockerConfig{})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, append(config, ' '), 0600))
+	var retry templateFile
+	retry.Template.Reference = result.Reference
+	require.Error(t, resolveTemplate(t.Context(), &retry, dockerConfig{}), "a corrupted config must be fetched again")
+	require.Positive(t, registry.requestCount())
 }
 
 func TestLocalBlobAdmissionFailureKeepsManifestSeed(t *testing.T) {

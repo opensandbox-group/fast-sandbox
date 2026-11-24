@@ -115,7 +115,7 @@ func releaseSandbox(ctx context.Context, ublkd deviceReleaser, layout sandboxLay
 		failures = append(failures, fmt.Errorf("remove rootfs drive link: %w", err))
 	}
 	var unmountErr error
-	if state.SharedSnapfiles == "" {
+	if state.SharedSnapfiles == "" && state.RootfsMetadataSHA256 == "" {
 		unmountErr = unmount(layout.mountPoint)
 	}
 	if unmountErr != nil {

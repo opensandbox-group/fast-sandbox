@@ -15,6 +15,7 @@ import (
 	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/firecrackerconfig"
 	"fast-sandbox/internal/firecrackervmm"
+	"fast-sandbox/internal/ocitemplate"
 )
 
 // createOptions holds the create-command flags (ADR-007/009/010). The machine
@@ -140,6 +141,10 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 		SerialLog:        layout.serialLog,
 		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
 	}
+	if template.RootfsMetadata != nil {
+		state.RootfsMetadataSHA256 = artifacts.SHA256Of(template.RootfsMetadata.Manifest)
+		state.TemplateMetadata = nil
+	}
 	// The creating record is the first durable write: from here on a crash
 	// leaves state.json behind, and delete reclaims whatever was allocated.
 	if err := writeStateAtomic(layout.home, state); err != nil {
@@ -169,7 +174,11 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	// Step 3: hand the credential to overlaybd's global cred.json before any
 	// device add, or overlaybd's on-demand pulls fail with 401.
 	t0 = time.Now()
-	handoff, err := overlaybdCredentials(dockerAuth, state.RootfsRef, state.SnapfilesRef)
+	imageRefs := []string{state.RootfsRef}
+	if state.SnapfilesRef != "" {
+		imageRefs = append(imageRefs, state.SnapfilesRef)
+	}
+	handoff, err := overlaybdCredentials(dockerAuth, imageRefs...)
 	if err != nil {
 		return err
 	}
@@ -178,7 +187,7 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	}
 	tCred := time.Since(t0)
 
-	// Step 2: resolve both manifests into ordered lower-layer lists.
+	// Resolve rootfs lowers before preparing the VM metadata files.
 	t0 = time.Now()
 	rootfsImage, err := resolveImage(ctx, state.RootfsRef, dockerAuth)
 	if err != nil {
@@ -187,19 +196,10 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	// The base boundary rides with the rootfs manifest; record it before the
 	// next persist so checkpoint capture finds it in state.json.
 	state.RootfsBaseLayers = rootfsImage.BaseLayers
-	snapfilesImage, err := resolveImage(ctx, state.SnapfilesRef, dockerAuth)
-	if err != nil {
-		return err
-	}
 	tResolveImg := time.Since(t0)
 
-	// Step 4/5: the snapfiles device is attached and mounted first (a minor
-	// reordering of the ADR's illustrative sequence) because manifest.json —
-	// which lives on it — supplies the disk size that sets the rootfs hybrid
-	// upper's virtual size. Attaching snapfiles read-only carries no such
-	// dependency, so it is the safe first step.
 	t0 = time.Now()
-	if err := acquireSharedSnapfiles(ctx, ublkd, layout.home, state, snapfilesImage, dockerAuth); err != nil {
+	if err := prepareTemplateMetadata(ctx, ublkd, layout.home, state, template.RootfsMetadata, dockerAuth); err != nil {
 		return err
 	}
 	tSnapfiles := time.Since(t0)
@@ -310,6 +310,28 @@ func claimSandbox(layout sandboxLayout, sandboxID string) error {
 	return nil
 }
 
+func prepareTemplateMetadata(ctx context.Context, ublkd *ublkdClient, home string, state *sandboxState, metadata *ocitemplate.RootfsMetadata, auth dockerConfig) error {
+	if metadata == nil {
+		image, err := resolveImage(ctx, state.SnapfilesRef, auth)
+		if err != nil {
+			return err
+		}
+		return acquireSharedSnapfiles(ctx, ublkd, home, state, image, auth)
+	}
+	if err := os.Mkdir(state.MountPoint, 0o750); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(filepath.Join(state.MountPoint, inDiskManifest), metadata.Manifest, 0o600); err != nil {
+		return err
+	}
+	for name, raw := range metadata.StateFiles {
+		if err := writeFileAtomic(filepath.Join(state.MountPoint, name), raw, 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // addSandboxDevice attaches config through ublkd add, used for the shared
 // read-only snapfiles that the pool does not serve.
 func addSandboxDevice(ctx context.Context, ublkd *ublkdClient, config string, record **deviceRecord, persist func() error) (string, error) {
@@ -394,7 +416,7 @@ func printSandbox(state *sandboxState) {
 	fmt.Printf("  rootfs device   : %s (dev_id %d)\n", state.Rootfs.DevPath, state.Rootfs.DevID)
 	if state.SharedSnapfiles != "" {
 		fmt.Printf("  snapfiles shared: %s\n", state.MountPoint)
-	} else {
+	} else if state.Snapfiles != nil {
 		fmt.Printf("  snapfiles device: %s (dev_id %d)\n", state.Snapfiles.DevPath, state.Snapfiles.DevID)
 	}
 	fmt.Printf("  vcpu / memory   : %d / %d MiB\n", state.VCPU, state.MemoryMB)
