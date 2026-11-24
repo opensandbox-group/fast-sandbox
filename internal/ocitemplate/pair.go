@@ -161,40 +161,38 @@ func DeletePair(ctx context.Context, reference, id string, credentials Credentia
 	if err := ValidateDigestReference(reference, strings.TrimPrefix(ref.Reference, "sha256:")); err != nil {
 		return err
 	}
-	if handled, err := deleteRootfsMetadataImage(ctx, repo, ref.Reference, id); handled || err != nil {
+	snapDesc, snapManifest, handled, err := deleteRootfsMetadataImage(ctx, repo, ref.Reference, id)
+	if handled || err != nil {
 		return err
 	}
-	var targets []oci.Descriptor
 	// Validate both objects before the first deletion. A mismatched tag or
 	// annotation must never delete one half of another snapshot.
-	for _, name := range []string{id + "_rootfs", ref.Reference} {
-		desc, err := repo.Resolve(ctx, name)
-		if errors.Is(err, errdef.ErrNotFound) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		raw, err := fetchSmall(ctx, repo, desc)
-		if errors.Is(err, errdef.ErrNotFound) {
-			// Some registries leave a tag alias after deleting its manifest.
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		var manifest oci.Manifest
-		if err := json.Unmarshal(raw, &manifest); err != nil {
-			return err
-		}
-		if manifest.Annotations[AnnotationTemplateID] != id {
-			return fmt.Errorf("refusing to delete manifest %s: snapshot pair ID mismatch", desc.Digest)
-		}
-		if _, marked := manifest.Annotations[AnnotationRootfsMetadata]; marked {
-			return fmt.Errorf("refusing to delete RootfsOnly manifest %s through a different digest", desc.Digest)
-		}
-		targets = append(targets, desc)
+	if snapManifest.Annotations[AnnotationTemplateID] != id {
+		return fmt.Errorf("refusing to delete manifest %s: snapshot pair ID mismatch", snapDesc.Digest)
 	}
+	var targets []oci.Descriptor
+	if rootDesc, err := repo.Resolve(ctx, id+"_rootfs"); err == nil {
+		raw, err := fetchSmall(ctx, repo, rootDesc)
+		if err != nil && !errors.Is(err, errdef.ErrNotFound) {
+			return err
+		}
+		if err == nil {
+			var manifest oci.Manifest
+			if err := json.Unmarshal(raw, &manifest); err != nil {
+				return err
+			}
+			if manifest.Annotations[AnnotationTemplateID] != id {
+				return fmt.Errorf("refusing to delete manifest %s: snapshot pair ID mismatch", rootDesc.Digest)
+			}
+			if _, marked := manifest.Annotations[AnnotationRootfsMetadata]; marked {
+				return fmt.Errorf("refusing to delete RootfsOnly manifest %s through a different digest", rootDesc.Digest)
+			}
+			targets = append(targets, rootDesc)
+		}
+	} else if !errors.Is(err, errdef.ErrNotFound) {
+		return err
+	}
+	targets = append(targets, snapDesc)
 	for _, target := range targets {
 		if err := repo.Manifests().Delete(ctx, target); err != nil && !errors.Is(err, errdef.ErrNotFound) {
 			return err

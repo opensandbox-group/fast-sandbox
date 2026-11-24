@@ -413,7 +413,7 @@ func pushLocalImage(ctx context.Context, repo *remote.Repository, dir, tag strin
 			return nil, "", err
 		}
 		if len(raw) > 1<<20 {
-			return nil, "", fmt.Errorf("snapfiles manifest exceeds 1 MiB metadata limit")
+			return nil, "", fmt.Errorf("OCI manifest exceeds 1 MiB metadata limit")
 		}
 	}
 	for _, desc := range append([]oci.Descriptor{manifest.Config}, manifest.Layers...) {

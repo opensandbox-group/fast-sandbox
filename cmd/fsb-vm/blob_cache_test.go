@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"oras.land/oras-go/v2/content"
 
+	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/ocitemplate"
 )
 
@@ -162,9 +163,16 @@ func TestLocalCheckpointMetadataAndBlobsSurviveStagingCleanup(t *testing.T) {
 
 func TestSingleImageRootfsCacheAndPrepareWithoutSnapfiles(t *testing.T) {
 	setupBlobCache(t)
-	vm, err := json.Marshal(rootfsBootManifest())
+	policy := []byte("{\"allow\":[\"example.com\"]}\n")
+	policyFile := filepath.Join(t.TempDir(), "policy.json")
+	require.NoError(t, os.WriteFile(policyFile, policy, 0600))
+	doc := rootfsBootManifest()
+	doc.Platform.StateFiles = map[string]artifacts.ManifestFile{
+		"policy.json": {SHA256: digest.FromBytes(policy).Encoded(), SizeBytes: int64(len(policy))},
+	}
+	vm, err := json.Marshal(doc)
 	require.NoError(t, err)
-	config, err := ocitemplate.EncodeRootfsConfig(minimalImageConfig(), vm, nil)
+	config, err := ocitemplate.EncodeRootfsConfig(minimalImageConfig(), vm, map[string]string{"policy.json": policyFile})
 	require.NoError(t, err)
 	configDesc := content.NewDescriptorFromBytes(oci.MediaTypeImageConfig, config)
 	var image oci.Manifest
@@ -176,13 +184,18 @@ func TestSingleImageRootfsCacheAndPrepareWithoutSnapfiles(t *testing.T) {
 	registry := newManifestCacheRegistry(t, root)
 	ref := registry.reference(digest.FromBytes(root).String())
 	metadata, err := json.Marshal(map[string]any{"oci": ocitemplate.Pair{
-		Rootfs: ref, Metadata: &ocitemplate.RootfsMetadata{Manifest: vm},
+		Rootfs: ref, Metadata: &ocitemplate.RootfsMetadata{Manifest: vm, StateFiles: map[string][]byte{"policy.json": policy}},
 	}})
 	require.NoError(t, err)
 	result := &ocitemplate.PublishedCheckpoint{Reference: ocitemplate.Prefix + ref, Metadata: metadata, Manifests: map[string]json.RawMessage{ref: root}}
 	staging := t.TempDir()
 	blob := filepath.Join(staging, "blobs", "sha256", configDesc.Digest.Encoded())
 	require.NoError(t, os.MkdirAll(filepath.Dir(blob), 0700))
+	symlinkTarget := filepath.Join(t.TempDir(), "config.json")
+	require.NoError(t, os.WriteFile(symlinkTarget, config, 0600))
+	require.NoError(t, os.Symlink(symlinkTarget, blob))
+	require.ErrorContains(t, cacheCheckpoint(t.Context(), result, dockerConfig{}, staging), "type mismatch")
+	require.NoError(t, os.Remove(blob))
 	require.NoError(t, os.WriteFile(blob, config, 0600))
 	require.NoError(t, cacheCheckpoint(t.Context(), result, dockerConfig{}, staging))
 	require.NoError(t, os.RemoveAll(staging))
@@ -196,6 +209,12 @@ func TestSingleImageRootfsCacheAndPrepareWithoutSnapfiles(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(state.MountPoint, inDiskManifest))
 	require.NoError(t, err)
 	require.JSONEq(t, string(vm), string(raw))
+	gotPolicy, err := os.ReadFile(filepath.Join(state.MountPoint, "policy.json"))
+	require.NoError(t, err)
+	require.Equal(t, policy, gotPolicy)
+	info, err := os.Stat(filepath.Join(state.MountPoint, "policy.json"))
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0600), info.Mode().Perm())
 	require.Empty(t, state.SharedSnapfiles)
 	require.Nil(t, state.Snapfiles)
 	require.Zero(t, registry.requestCount())

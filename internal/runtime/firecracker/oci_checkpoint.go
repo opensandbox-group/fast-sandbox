@@ -28,17 +28,28 @@ const (
 	ociRootfsSingleImageEnv  = "FAST_SANDBOX_OCI_ROOTFS_SINGLE_IMAGE"
 )
 
+func ociRootfsSingleImageEnabled() (bool, error) {
+	switch strings.TrimSpace(os.Getenv(ociRootfsSingleImageEnv)) {
+	case "", ociDisabled:
+		return false, nil
+	case ociEnabled:
+		return true, nil
+	default:
+		return false, fmt.Errorf("%w: %s must be true or false", ErrInvalidConfig, ociRootfsSingleImageEnv)
+	}
+}
+
 func ociSnapshotPackMode(rootfsOnly bool) (fastletapi.SnapshotMode, []string, error) {
 	if !rootfsOnly {
 		return fastletapi.SnapshotModeFull, nil, nil
 	}
 	flags := []string{"--rootfs-only"}
-	switch strings.TrimSpace(os.Getenv(ociRootfsSingleImageEnv)) {
-	case "", ociDisabled:
-	case ociEnabled:
+	singleImage, err := ociRootfsSingleImageEnabled()
+	if err != nil {
+		return "", nil, err
+	}
+	if singleImage {
 		flags = append(flags, "--single-image")
-	default:
-		return "", nil, fmt.Errorf("%w: %s must be true or false", ErrInvalidConfig, ociRootfsSingleImageEnv)
 	}
 	return fastletapi.SnapshotModeRootfsOnly, flags, nil
 }
@@ -284,6 +295,9 @@ func prepareOCISnapshot(plan dumpPlan) (bool, error) {
 		return false, nil
 	}
 	if err := validateOCISupport(source); err != nil {
+		return false, err
+	}
+	if _, err := ociRootfsSingleImageEnabled(); err != nil {
 		return false, err
 	}
 	_, err = checkpointDestinationForSource(source, plan.snapshotID)

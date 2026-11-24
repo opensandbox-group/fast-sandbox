@@ -41,6 +41,21 @@ func TestOCISnapshotPackModeDuringRollout(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidConfig)
 }
 
+func TestInvalidOCIRootfsSingleImageFailsBeforeDump(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_OCI_ENABLED", "true")
+	t.Setenv(ociRootfsSingleImageEnv, "typo")
+	fixture := newSnapshotDriverFixture(t)
+	fixture.sandboxSpec.Desired.Image = "oci://r.example/ns/template:base"
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+	_, err := fixture.driver.CreateSnapshot(t.Context(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "live-snapshot", Kind: fastletapi.SnapshotKindTemplate,
+	})
+	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.ErrorContains(t, err, ociRootfsSingleImageEnv)
+	require.Empty(t, fixture.server.snapshotDumps)
+	require.True(t, fixture.server.running)
+}
+
 func TestCheckpointDestination(t *testing.T) {
 	dest, err := checkpointDestination("r.example/opensandbox-snapshot/checkpoints", "abc")
 	require.NoError(t, err)

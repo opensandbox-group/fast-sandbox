@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -117,6 +118,9 @@ func cacheRootfsConfig(ref registry.Reference, config dockerConfig, artifacts st
 	if configDigest.Validate() != nil || configDigest.Algorithm() != digest.SHA256 {
 		return fmt.Errorf("published RootfsOnly config requires a valid sha256 digest")
 	}
+	if manifest.Config.Size < 0 || manifest.Config.Size > ocitemplate.MaxRootfsConfigBytes {
+		return fmt.Errorf("published RootfsOnly config size mismatch")
+	}
 	configRef := ref
 	configRef.Reference = configDigest.String()
 	path, err := createManifestCachePath(configRef, config)
@@ -125,19 +129,24 @@ func cacheRootfsConfig(ref registry.Reference, config dockerConfig, artifacts st
 	}
 	// Config payloads are private staging files written by pack.
 	blob := filepath.Join(artifacts, "blobs", "sha256", configDigest.Encoded())
-	info, err := os.Stat(blob)
+	info, err := os.Lstat(blob)
 	if err != nil {
 		return err
 	}
-	if info.Size() != manifest.Config.Size || info.Size() > ocitemplate.MaxRootfsConfigBytes {
-		return fmt.Errorf("published RootfsOnly config size mismatch")
+	if !info.Mode().IsRegular() || info.Size() != manifest.Config.Size {
+		return fmt.Errorf("published RootfsOnly config size or type mismatch")
 	}
-	raw, err := os.ReadFile(blob)
+	file, err := os.Open(blob)
 	if err != nil {
 		return err
 	}
-	if digest.FromBytes(raw) != configDigest {
-		return fmt.Errorf("published RootfsOnly config digest mismatch")
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, ocitemplate.MaxRootfsConfigBytes+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(raw)) != manifest.Config.Size || digest.FromBytes(raw) != configDigest {
+		return fmt.Errorf("published RootfsOnly config digest or size mismatch")
 	}
 	return cacheImageManifest(path, configRef.Reference, raw)
 }

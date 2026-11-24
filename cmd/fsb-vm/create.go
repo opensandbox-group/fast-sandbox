@@ -321,11 +321,11 @@ func prepareTemplateMetadata(ctx context.Context, ublkd *ublkdClient, home strin
 	if err := os.Mkdir(state.MountPoint, 0o750); err != nil {
 		return err
 	}
-	if err := writeFileAtomic(filepath.Join(state.MountPoint, inDiskManifest), metadata.Manifest, 0o600); err != nil {
+	if err := writeFileAtomicNoSync(filepath.Join(state.MountPoint, inDiskManifest), metadata.Manifest, 0o600); err != nil {
 		return err
 	}
 	for name, raw := range metadata.StateFiles {
-		if err := writeFileAtomic(filepath.Join(state.MountPoint, name), raw, 0o600); err != nil {
+		if err := writeFileAtomicNoSync(filepath.Join(state.MountPoint, name), raw, 0o600); err != nil {
 			return err
 		}
 	}

@@ -195,36 +195,36 @@ func pushRootfsMetadataImage(ctx context.Context, repo *remote.Repository, ref r
 	return &PublishedCheckpoint{Reference: Prefix + immutable, Metadata: payload, Manifests: map[string]json.RawMessage{immutable: raw}}, nil
 }
 
-func deleteRootfsMetadataImage(ctx context.Context, repo *remote.Repository, reference, id string) (bool, error) {
+func deleteRootfsMetadataImage(ctx context.Context, repo *remote.Repository, reference, id string) (oci.Descriptor, oci.Manifest, bool, error) {
 	desc, err := repo.Resolve(ctx, reference)
 	if errors.Is(err, errdef.ErrNotFound) {
 		// The publication digest is deleted last. An ID can already name a
 		// replacement, so a retry must not follow its mutable rootfs tag.
-		return true, nil
+		return oci.Descriptor{}, oci.Manifest{}, true, nil
 	}
 	if err != nil {
-		return false, err
+		return oci.Descriptor{}, oci.Manifest{}, false, err
 	}
 	raw, err := fetchSmall(ctx, repo, desc)
 	if errors.Is(err, errdef.ErrNotFound) {
-		return true, nil
+		return oci.Descriptor{}, oci.Manifest{}, true, nil
 	}
 	if err != nil {
-		return false, err
+		return oci.Descriptor{}, oci.Manifest{}, false, err
 	}
 	var manifest oci.Manifest
 	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return false, err
+		return oci.Descriptor{}, oci.Manifest{}, false, err
 	}
 	if _, marked := manifest.Annotations[AnnotationRootfsMetadata]; !marked {
-		return false, nil
+		return desc, manifest, false, nil
 	}
 	if desc.Digest.String() != reference || manifest.Annotations[annotationRootfsID] != id {
-		return true, errors.New("refusing to delete RootfsOnly OCI manifest: snapshot ID or digest mismatch")
+		return oci.Descriptor{}, oci.Manifest{}, true, errors.New("refusing to delete RootfsOnly OCI manifest: snapshot ID or digest mismatch")
 	}
 	err = repo.Manifests().Delete(ctx, desc)
 	if errors.Is(err, errdef.ErrNotFound) {
 		err = nil
 	}
-	return true, err
+	return oci.Descriptor{}, oci.Manifest{}, true, err
 }
