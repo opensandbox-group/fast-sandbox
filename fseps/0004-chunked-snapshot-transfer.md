@@ -137,14 +137,28 @@ today.
 ### Data path
 
 **Publish (runtime-agent):**
-- Validate the staged manifest before uploading anything: every native file
-  entry needs a well-formed digest, and a `legacy` publish may not carry a
-  `chunks` binding. Unless `format: chunked` and `chunkListOnly: true` are
-  both set, the agent fills in any missing whole-file `sha256` and rewrites
-  `SHA256SUMS` from the final manifest. It never writes an empty
-  `SHA256SUMS`, which readers reject. A Fastlet acting on a stale
-  capability, or an agent restarted into another mode between staging and
-  publish, therefore costs a hash, not an unrestorable set.
+- A staged entry and a published entry are checked separately:
+  - **Acceptance, before any upload:** the staged manifest parses; every
+    native file the set needs exists, and its `sizeBytes` equals the file
+    size; a digest that is present (`sha256`, `chunkList`) is well-formed. A
+    native entry with only `sizeBytes` is accepted in every mode, since the
+    Fastlet stages that way when it skips whole-file hashes. An inherited
+    `chunks` binding is dropped, not rejected (see Compatibility).
+  - **Completion:** in `chunked`, the agent derives each native file's
+    `chunkList` from the chunks it wrote. Unless `format: chunked` and
+    `chunkListOnly: true` are both set, it computes the whole-file `sha256`
+    of every entry staged without one and rewrites `SHA256SUMS` from the
+    final manifest.
+  - **Pre-manifest check, right before `manifest.json` is written:** every
+    native entry has `sizeBytes` > 0 and the digests its mode requires
+    (`legacy`: `sha256`; `chunked`: `chunkList` bound to the uploaded
+    `chunks.json`, plus `sha256` unless `chunkListOnly: true`). State files
+    (vault, policy) always carry `sha256`, and `SHA256SUMS` is never empty,
+    which readers reject. A failed check fails the publish before any
+    manifest or index object exists; its chunks stay unreferenced.
+  - A Fastlet acting on a stale capability, or an agent restarted into
+    another mode between staging and publish, therefore costs a hash, not
+    a rejected or unrestorable set.
 - Chunk the native files the staged manifest lists (rootfs, memory and VM
   state for a full set; only the rootfs for a RootfsOnly set), not a fixed
   list.
@@ -177,6 +191,8 @@ today.
   The agent reports `chunkListDigest` only when `format: chunked` and
   `chunkListOnly: true`.
 - Older agents omit the fields, which means legacy with whole-file hashes.
+- Stages native files with `sizeBytes` only when the agent reported
+  `chunkListDigest`; otherwise it hashes them as today.
 - Calls `Health` right before it decides whether to skip whole-file hashes.
   A `Health` error clears the cached capability, so the Fastlet falls back
   to hashing.
@@ -389,8 +405,8 @@ transfer:
 | #244 | Verified-digest memo, same-node cache commit (#57) | merged |
 | cache | Fsynced cache writes, single-flighted cache ensures, independent of `transfer.format` | – |
 | #61 | Parallel and overlapped snapshot hashing, independent of `transfer.format` | – |
-| 1 | Chunk format, `chunks.json`, chunked publish and pull (recording into the #244 memo), always-on chunk reader, `transfer.format` and `transfer.compression`, manifest validation before upload, inherited `chunks` dropped by the publisher and both Fastlet assemblers, a chunk transfer cancelled between jobs fails instead of committing, a coalesced chunk upload counted once, docs | this FSEP accepted, cache |
-| 2 | `chunkList` digest, digest-signed `PUT`s, `chunkListOnly` and the capability rule, agent `sha256` fill-in and `SHA256SUMS` rewrite, Fastlet `Health` refresh | 1, same release |
+| 1 | Chunk format, `chunks.json`, chunked publish and pull (recording into the #244 memo), always-on chunk reader, `transfer.format` and `transfer.compression`, staged-manifest acceptance and the pre-manifest digest check, inherited `chunks` dropped by the publisher and both Fastlet assemblers, a chunk transfer cancelled between jobs fails instead of committing, a coalesced chunk upload counted once, docs | this FSEP accepted, cache |
+| 2 | `chunkList` digest, digest-signed `PUT`s, `chunkListOnly` and the capability rule, completion of size-only entries (agent `sha256` fill-in and `SHA256SUMS` rewrite), Fastlet `Health` refresh | 1, same release |
 | 3 | Pooled store transport; P2P gateway pooling per open question 3 | 1 |
 | 4 | Step 1: publisher refresh (server-time `R`, self-copy, known-key expiry, `P_max`), `chunkRefresh` capability, controller gate ConfigMap. Step 2: `fsb-store gc` (dry-run by default, Kubernetes roots, two marks, version-ID sweep, sets phase, opt-in index pruning and repair, store conformance test) | 1; step 1 released for longer than `R` + `P_max` before destructive mode |
 | – | OpenSandbox chart value and pin bump (OpenSandbox#2422) | 1 merged |
@@ -449,7 +465,13 @@ a draft and is closed once PR 1 is open.
 | new, `chunked` | old | Chunked sets are published. The old Fastlet still writes whole-file `sha256`, which is allowed. |
 | old | new | The Fastlet sees no capability and behaves as today. |
 | new, `chunked` | new | Chunked sets. With the default `chunkListOnly: false`, whole-file `sha256` is kept, and the agent fills it in if a stale Fastlet staged without it. |
-| new, `chunked`, `chunkListOnly: true` | new | Whole-file `sha256` of native files is omitted. Only agents with PR 2 can read these manifests. |
+| new, `chunked`, `chunkListOnly: true` | new | Whole-file `sha256` of native files is omitted. Only agents and Fastlets with PR 2 can read these manifests. |
+| new, `chunked`, `chunkListOnly: true` | old | **Not allowed.** The old Fastlet's readiness check (`ImageReady`) requires a whole-file `sha256` and reports such a set, including a RootfsOnly set, as `ErrImageNotReady`. |
+
+Once every agent and Fastlet runs PR 2 or later, configuration switches
+(`legacy` ↔ `chunked` ↔ `chunkListOnly`) are safe in any direction: the
+reader is chosen by each set's manifest, not by the agent's settings, so
+every set published earlier stays restorable.
 
 **Restore by an old agent:**
 - An agent older than PR 1 cannot read a chunked set: it looks for
@@ -477,7 +499,12 @@ a draft and is closed once PR 1 is open.
 - `chunkListDigest` is reported only for `chunked` with `chunkListOnly`;
 - the agent fills a missing `sha256` and rewrites `SHA256SUMS`, and never
   writes an empty `SHA256SUMS`;
-- manifest validation fails before any object is uploaded;
+- a malformed digest or a size mismatch fails acceptance before any object
+  is uploaded;
+- a size-only staged entry is completed in `legacy`, `chunked` and
+  `chunkListOnly`;
+- a missing required digest fails the pre-manifest check, and no
+  `manifest.json` or index object is written;
 - a `Health` error clears the Fastlet's cached capability;
 - a chunk transfer cancelled between jobs fails and commits nothing;
 - a coalesced chunk upload is counted once in the publish stats.
@@ -507,7 +534,13 @@ a draft and is closed once PR 1 is open.
   - switch the agent's mode between staging and publish (Fastlet not
     restarted), and verify the published set restores cold on another
     node;
-  - publish and restore a native RootfsOnly set in `chunked`.
+  - publish and restore a native RootfsOnly set in `chunked`;
+  - stage size-only with `chunkListOnly: true`, switch the agent to
+    `legacy` before publish, and verify the set restores cold on another
+    node;
+  - a `chunkListOnly` RootfsOnly set fails readiness on a Fastlet from
+    before PR 2 (the downgrade limit); after `chunkListOnly: false` and a
+    new snapshot, it boots there.
 - **GC acceptance (PR 4, before destructive mode is enabled):**
   - dry-run lists candidates and deletes nothing;
   - a publish that reuses an old chunk after mark 1 refreshes and keeps it;
@@ -559,8 +592,9 @@ a draft and is closed once PR 1 is open.
 2. Upgrade the Fastlets.
 3. Switch `transfer.format: chunked`, one pool or node group at a time. The
    OpenSandbox chart rolls the DaemonSet on any transfer setting change.
-4. Optionally, once no agent downgrade is planned, set `chunkListOnly: true`
-   to remove the whole-file hash from the pause path. This is the
+4. Optionally, once every agent and Fastlet runs PR 2 or later and no
+   downgrade of either below PR 2 is planned, set `chunkListOnly: true` to
+   remove the whole-file hash from the pause path. This is the
    "finalize" step, similar to Ceph's `require-osd-release`.
 5. **GC (after PR 4):** enable bucket versioning and a
    `NoncurrentVersionExpiration` rule, run `fsb-store gc` in dry-run, and
@@ -591,7 +625,9 @@ start.
   `transfer.compression` setting.
 - Only the store format changes: the local cache optimizations do not
   depend on `transfer.format` (see Non-goals).
-- With `chunkListOnly: true`, set it to `false` in the same change.
+- With `chunkListOnly: true`, set it to `false` in the same change. Sets
+  already published without `sha256` stay restorable on PR 2+ agents and
+  Fastlets.
 - The chunk reader stays on, so every chunked set already published remains
   restorable. This is the supported rollback.
 
@@ -602,11 +638,16 @@ start.
   once `chunked` has been enabled anywhere, or recover by rolling forward.
 - **Agent below PR 2 after `chunkListOnly: true`:** cannot read those
   manifests. That is why the setting is a separate, explicit last step.
-- **Recovery plan for a forced downgrade:** keep one pool on the new agent,
-  restore the affected Sandboxes there, and snapshot them again with
-  `legacy`.
-- **Fastlet downgrade:** always safe. Older Fastlets ignore the new fields
-  and write whole-file hashes.
+- **Fastlet below PR 2 after `chunkListOnly: true`:** its readiness check
+  requires the whole-file `sha256`, so it cannot boot sets published
+  without one, RootfsOnly sets included. Same rule as for the agent.
+- **Fastlet below PR 2 otherwise:** safe. Older Fastlets ignore the new
+  fields and write whole-file hashes.
+- **Recovery plan for a forced downgrade:** keep one pool on the new
+  release and restore the affected Sandboxes there. To go below PR 2 after
+  `chunkListOnly: true`: set `chunkListOnly: false`, snapshot again on a
+  PR 2+ node, or delete, every set published without `sha256`, then
+  downgrade. To go below PR 1: snapshot them again with `legacy`.
 
 ## Related links (optional)
 
