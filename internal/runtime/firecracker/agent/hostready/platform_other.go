@@ -8,9 +8,9 @@ import (
 	"os"
 )
 
-// errNotLinux marks the probes that have no meaning off the Linux nodes
-// this runtime targets. The firecracker-runtime binary only executes its
-// checks on the node (linux); on a development workstation the standalone
+// The probes below have no meaning off the Linux nodes this runtime
+// targets. The firecracker-runtime binary only executes its checks on the
+// node (linux); on a development workstation the standalone
 // scripts/firecracker-host-check.sh is the supported entry point.
 
 // openDeviceRW opens a device node read-write via the portable path.

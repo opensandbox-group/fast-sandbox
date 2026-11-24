@@ -32,6 +32,7 @@ func (s *ControlServer) Handler() http.Handler {
 	mux.HandleFunc("PUT /v1/routes/{sandboxUID}", s.applyRoute)
 	mux.HandleFunc("DELETE /v1/routes/{sandboxUID}", s.deleteRoute)
 	mux.HandleFunc("POST /v1/routes/{sandboxUID}/draining", s.markDraining)
+	mux.HandleFunc("POST /v1/routes/{sandboxUID}/availability", s.setAvailability)
 	mux.HandleFunc("GET /v1/routes", s.snapshotRoutes)
 	mux.HandleFunc("GET /v1/routes/watch", s.watchRoutes)
 	mux.HandleFunc("GET /readyz", func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusOK) })
@@ -308,4 +309,38 @@ func (c *ControlClient) do(ctx context.Context, method, path string, body []byte
 		return json.NewDecoder(response.Body).Decode(result)
 	}
 	return nil
+}
+
+func (s *ControlServer) setAvailability(w http.ResponseWriter, r *http.Request) {
+	generation, err := parseGeneration(r)
+	if err != nil {
+		writeControlError(w, err)
+		return
+	}
+	var change struct {
+		Revision  uint64 `json:"revision"`
+		Suspended bool   `json:"suspended"`
+	}
+	if err := decodeJSON(r, &change); err != nil {
+		writeControlError(w, err)
+		return
+	}
+	revision, err := s.Store.SetSuspended(r.PathValue("sandboxUID"), generation, change.Revision, change.Suspended)
+	if err != nil {
+		writeControlError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]uint64{revisionField: revision})
+}
+
+func (c *ControlClient) SetSuspended(ctx context.Context, uid string, generation int64, revision uint64, suspended bool) error {
+	body, err := json.Marshal(struct {
+		Revision  uint64 `json:"revision"`
+		Suspended bool   `json:"suspended"`
+	}{revision, suspended})
+	if err != nil {
+		return err
+	}
+	path := "/v1/routes/" + url.PathEscape(uid) + "/availability?routeGeneration=" + strconv.FormatInt(generation, 10)
+	return c.do(ctx, http.MethodPost, path, body, nil)
 }

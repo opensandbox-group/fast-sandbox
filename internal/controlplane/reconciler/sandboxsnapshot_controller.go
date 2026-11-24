@@ -277,7 +277,7 @@ func (r *SandboxSnapshotReconciler) projectObservation(ctx context.Context, snap
 			}
 		}
 		status.SandboxUID = sandbox.UID
-		orchestration.ProjectSnapshotStatus(status, observed)
+		orchestration.ProjectSnapshotStatus(status, snapshot.Spec.Mode, observed)
 	})
 }
 

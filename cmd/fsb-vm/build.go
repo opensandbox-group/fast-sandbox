@@ -16,6 +16,7 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/spf13/cobra"
 
+	"fast-sandbox/internal/firecrackervmm"
 	"fast-sandbox/internal/ocitemplate"
 )
 
@@ -26,31 +27,73 @@ import (
 const defaultBuildDiskSizeGiB = 20
 
 type buildOptions struct {
-	snapfilesProgress func(string) error
-	snapshotManifest  []byte
-	snapshotExtras    map[string]string
-	manifestExtraFile string
-	injectDir         string
-	tapName           string
-	guestMAC          string
-	source            string
-	output            string
-	kernel            string
-	kernelVersion     string
-	vcpu              int
-	memoryMB          int
-	diskSizeGiB       int
-	snapfilesSizeMB   int
-	rootfsDriveID     string
-	bootArgs          string
-	initPath          string
-	initScriptFile    string
-	readyPattern      string
-	readyTimeout      time.Duration
-	authFile          string
-	username          string
-	noCompress        bool
-	keepWorkDir       bool
+	guestControlPort    uint32
+	guestControlVersion string
+	kernelSHA256        string
+	freePageReporting   bool
+	rootfsOnly          bool
+	snapfilesProgress   func(string) error
+	snapshotManifest    []byte
+	snapshotExtras      map[string]string
+	manifestExtraFile   string
+	injectDir           string
+	tapName             string
+	guestMAC            string
+	source              string
+	output              string
+	kernel              string
+	kernelVersion       string
+	vcpu                int
+	memoryMB            int
+	diskSizeGiB         int
+	snapfilesSizeMB     int
+	rootfsDriveID       string
+	bootArgs            string
+	initPath            string
+	initScriptFile      string
+	readyPattern        string
+	readyTimeout        time.Duration
+	authFile            string
+	username            string
+	noCompress          bool
+	keepWorkDir         bool
+}
+
+type buildProgress struct {
+	output       io.Writer
+	started      time.Time
+	phaseStarted time.Time
+	phase        string
+}
+
+func (p *buildProgress) start(phase string) {
+	now := time.Now()
+	if p.phase != "" {
+		p.log(now, "completed")
+	} else {
+		p.started = now
+	}
+	p.phase = phase
+	p.phaseStarted = now
+	p.log(now, "started")
+}
+
+func (p *buildProgress) finish(err error) {
+	if p.phase == "" {
+		return
+	}
+	status := "completed"
+	if err != nil {
+		status = "failed"
+	}
+	p.log(time.Now(), status)
+	p.phase = ""
+}
+
+func (p *buildProgress) log(now time.Time, status string) {
+	_, _ = fmt.Fprintf(p.output, "%s [build %s] phase=%q status=%s duration=%s\n",
+		now.UTC().Format(time.RFC3339Nano), now.Sub(p.started).Round(time.Millisecond),
+		p.phase, status, now.Sub(p.phaseStarted).Round(time.Millisecond))
 }
 
 func newBuildCommand() *cobra.Command {
@@ -63,6 +106,7 @@ func newBuildCommand() *cobra.Command {
 		},
 	}
 	flags := command.Flags()
+	flags.Uint32Var(&options.guestControlPort, "guest-control-port", 0, "validate an injected root filesystem helper on the reserved vsock port 1234")
 	flags.StringVar(&options.manifestExtraFile, "manifest-extra-file", "", "optional guestNetwork, lineage and platform fields to supplement the VM manifest")
 	flags.StringVar(&options.injectDir, "inject-dir", "", "directory of guest files to inject before snapshot")
 	flags.StringVar(&options.tapName, "tap-name", "", "preconfigured build tap (optional)")
@@ -120,6 +164,9 @@ func (o outputNames) snapfilesName() string {
 
 // validateBuildOptions checks flag combinations before any side effect.
 func validateBuildOptions(options *buildOptions) error {
+	if options.guestControlPort != 0 && options.guestControlPort != 1234 {
+		return errors.New("guest control uses reserved port 1234")
+	}
 	if strings.TrimSpace(options.source) == "" {
 		return fmt.Errorf("--source is required")
 	}
@@ -218,6 +265,10 @@ func bytesToGiBCeil(size int64) (int, error) {
 // vmstate + 256 MiB of ext4/metadata headroom, rounded up to whole GiB with
 // a 2 GiB floor (a 1 GiB memory file alone needs more than 1 GiB of disk).
 func snapfilesSizeGiB(options *buildOptions, vmstatePath, memfilePath string) (int, error) {
+	// Size the metadata disk independently of Guest memory; do not access RAM files.
+	if options.rootfsOnly {
+		return 1, nil
+	}
 	if options.snapfilesSizeMB > 0 {
 		return gibCeil(options.snapfilesSizeMB), nil
 	}
@@ -483,11 +534,19 @@ func prepareBuildSource(ctx context.Context, repository ocitemplate.MetadataRepo
 // A rollback that cannot release a resource keeps everything it depends on
 // and reports it alongside the build error.
 func runBuild(ctx context.Context, options *buildOptions) (err error) {
+	progress := &buildProgress{output: os.Stdout}
+	progress.start("validating build inputs")
+	defer func() { progress.finish(err) }()
+	if err := selectBuildVMM(ctx); err != nil {
+		return err
+	}
+
 	if err := validateBuildOptions(options); err != nil {
 		return err
 	}
 	output, _ := parseOutput(options.output)
 
+	progress.start("preparing build workspace")
 	ublkd := newUblkdClient(global.ublkdSocket)
 	if err := ublkd.Ping(ctx); err != nil {
 		return err
@@ -531,6 +590,7 @@ func runBuild(ctx context.Context, options *buildOptions) (err error) {
 
 	// Step 1: resolve and classify the selected platform before downloading
 	// layers. Standard OCI layers are converted locally to native overlaybd.
+	progress.start("resolving source image")
 	repository, err := newRemoteRepository(ref, dockerCfg, global.plainHTTP)
 	if err != nil {
 		return err
@@ -539,6 +599,7 @@ func runBuild(ctx context.Context, options *buildOptions) (err error) {
 	if err != nil {
 		return err
 	}
+	progress.start("pulling source image and preparing OverlayBD layers")
 	fetched, err := prepareBuildSource(
 		ctx,
 		repository,
@@ -558,12 +619,14 @@ func runBuild(ctx context.Context, options *buildOptions) (err error) {
 	// Step 2: prepare the rootfs at the requested whole-GiB size. The source
 	// filesystem is resized while the device still has max(source, target)
 	// capacity; only then is a larger upper detached, resized, and reattached.
+	progress.start(fmt.Sprintf("preparing build rootfs (%dGiB)", options.diskSizeGiB))
 	rootfsOps := newBuildRootfsOps(ublkd)
 	rootfs, err := prepareBuildRootfs(ctx, workDir, fetched, options.diskSizeGiB, undo, rootfsOps)
 	if err != nil {
 		return err
 	}
 
+	progress.start("injecting guest runtime")
 	if options.injectDir != "" {
 		if err := injectDirectory(rootfs.devPath, filepath.Join(workDir, "mnt-inject"), options.injectDir, undo); err != nil {
 			return err
@@ -581,22 +644,25 @@ func runBuild(ctx context.Context, options *buildOptions) (err error) {
 	}
 
 	// Step 5: cold boot, wait for readiness, capture the Full snapshot.
-	vmstatePath, memfilePath, err := coldBootAndSnapshot(ctx, options, workDir, rootfs.devPath, undo)
+	vmstatePath, memfilePath, err := coldBootAndSnapshot(ctx, options, workDir, rootfs.devPath, undo, progress)
 	if err != nil {
 		return err
 	}
 
 	// Step 6: build the snapfiles device from a blank ublk disk.
+	progress.start("packaging snapshot files")
 	if err := captureSnapfiles(ctx, ublkd, options, workDir, vmstatePath, memfilePath, undo); err != nil {
 		return err
 	}
 
 	// Step 7: seal both uppers into read-only layer blobs.
 	compress := !options.noCompress
+	progress.start("sealing snapshot layer")
 	snapDesc, err := sealUpper(ctx, layout, workDir, "snapfiles", compress)
 	if err != nil {
 		return err
 	}
+	progress.start("sealing rootfs layer")
 	if err := rootfs.detach(ctx); err != nil {
 		return err
 	}
@@ -607,19 +673,23 @@ func runBuild(ctx context.Context, options *buildOptions) (err error) {
 
 	// Steps 8-9: write the manifests and layout index, then publish. Every
 	// template rootfs layer is immutable base for later checkpoint lineages.
+	progress.start("writing local artifact manifests")
 	rootfsLayers := append(append([]ocispec.Descriptor{}, fetched.Layers...), rootfsDesc)
 	pair, err := writeTemplatePair(layout, output, rootfsLayers, snapDesc, options.source, &fetched, len(rootfsLayers))
 	if err != nil {
 		return err
 	}
+	progress.start("finalizing local artifacts")
 	if err := publishArtifactLayout(layout, finalLayout); err != nil {
 		return err
 	}
 
+	progress.start("cleaning build workspace")
 	undo.disarm()
 	if !options.keepWorkDir {
 		_ = os.RemoveAll(workDir)
 	}
+	progress.finish(nil)
 	printBuildResult(finalLayout, output, pair.rootfs, pair.snapfiles)
 	return nil
 }
@@ -703,11 +773,13 @@ func captureSnapfiles(ctx context.Context, ublkd *ublkdClient, options *buildOpt
 		return err
 	}
 	undo.push("mount "+snapMount, func() error { return unmount(snapMount) })
-	if err := copyFile(vmstatePath, filepath.Join(snapMount, inDiskVMState), 0o640); err != nil {
-		return err
-	}
-	if err := copyFile(memfilePath, filepath.Join(snapMount, inDiskMemfile), 0o640); err != nil {
-		return err
+	if !options.rootfsOnly {
+		if err := copyFile(vmstatePath, filepath.Join(snapMount, inDiskVMState), 0o640); err != nil {
+			return err
+		}
+		if err := copyFile(memfilePath, filepath.Join(snapMount, inDiskMemfile), 0o640); err != nil {
+			return err
+		}
 	}
 	metadataPayload := options.snapshotManifest
 	if len(metadataPayload) == 0 {
@@ -832,4 +904,16 @@ func printBuildResult(layout artifactLayout, output outputNames, rootfsDigest, s
 	fmt.Printf("  %s (manifest %s)\n", output.snapfilesName(), snapDigest)
 	fmt.Printf("  blobs    : %s\n", layout.blobDir())
 	fmt.Printf("  manifests: %s\n", layout.manifestDir())
+}
+
+func selectBuildVMM(ctx context.Context) error {
+	if global.vmmDir == "" {
+		return nil
+	}
+	selected, err := firecrackervmm.Resolve(ctx, global.vmmDir, "", false)
+	if err != nil {
+		return err
+	}
+	global.firecrackerBin = selected.BinaryPath
+	return nil
 }

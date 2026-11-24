@@ -35,6 +35,18 @@ func TestFastletImageBuildDoesNotRequireHostCompilers(t *testing.T) {
 	require.NoDirExists(t, filepath.Join(root, ".build"))
 }
 
+func TestSandboxTemplateBuilderCopiesComponentLogging(t *testing.T) {
+	dockerfile, err := os.ReadFile("../Dockerfile.sandboxtemplate-builder")
+	require.NoError(t, err)
+	_, stage, found := strings.Cut(string(dockerfile), " AS builder-build\n")
+	require.True(t, found)
+	stage, _, found = strings.Cut(stage, "\nFROM ")
+	require.True(t, found)
+	beforeBuild, _, found := strings.Cut(stage, "RUN CGO_ENABLED=0 go build")
+	require.True(t, found)
+	require.Contains(t, beforeBuild, "\nCOPY internal/componentlog ./internal/componentlog\n")
+}
+
 func TestSharedOCIToolImageBuildSelection(t *testing.T) {
 	for _, test := range []struct {
 		name, component, image string

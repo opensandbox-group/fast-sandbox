@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
+
+	"fast-sandbox/internal/backendidentity"
 )
 
 // Host conventions (ADR-002/003/004/009). Every path is overridable through a
@@ -37,8 +41,11 @@ type config struct {
 	kernelDir                 string
 	stateDir                  string
 	manifestCacheDir          string
+	blobCacheDir              string
+	blobCacheMaxBytes         int64
 	runtimeDir                string
 	firecrackerBin            string
+	vmmDir                    string
 	overlaybdCreate           string
 	overlaybdCommit           string
 	overlaybdMerge            string
@@ -93,6 +100,16 @@ func (c *config) absolutize() error {
 		}
 		c.manifestCacheDir = absolute
 	}
+	if c.blobCacheDir != "" {
+		absolute, err := filepath.Abs(c.blobCacheDir)
+		if err != nil {
+			return fmt.Errorf("resolve blob cache: %w", err)
+		}
+		c.blobCacheDir = absolute
+	}
+	if c.blobCacheMaxBytes < 0 {
+		return fmt.Errorf("blob-cache-max-bytes must be nonnegative")
+	}
 	for _, path := range []*string{&c.credFile, &c.kernelDir, &c.stateDir, &c.runtimeDir, &c.buildWorkDir, &c.buildOutputDir} {
 		absolute, err := filepath.Abs(*path)
 		if err != nil {
@@ -119,7 +136,10 @@ func init() {
 	flags.StringVar(&global.kernelDir, "kernel-dir", defaultKernelDir, "directory holding vmlinux-<kernel_version> kernels")
 	flags.StringVar(&global.stateDir, "state-dir", defaultStateDir, "persistent per-sandbox state directory root")
 	flags.StringVar(&global.manifestCacheDir, "manifest-cache-dir", "", "shared immutable registry metadata cache (default <state-dir>/.manifest-cache)")
+	flags.StringVar(&global.blobCacheDir, "blob-cache-dir", "", "local checkpoint blob cache (default <state-dir>/.blob-cache)")
+	flags.Int64Var(&global.blobCacheMaxBytes, "blob-cache-max-bytes", 16<<30, "local checkpoint cache byte budget; zero disables admission and lookup")
 	flags.StringVar(&global.runtimeDir, "runtime-dir", defaultRuntimeDir, "volatile per-sandbox runtime directory root")
+	flags.StringVar(&global.vmmDir, "vmm-dir", "", "managed Firecracker release directory; selects the manifest version, or latest for builds")
 	flags.StringVar(&global.firecrackerBin, "firecracker", defaultFirecrackerBin, "firecracker binary path")
 	flags.StringVar(&global.overlaybdCreate, "overlaybd-create", defaultOverlaybdCreate, "overlaybd-create binary path")
 	flags.StringVar(&global.overlaybdCommit, "overlaybd-commit", defaultOverlaybdCommit, "overlaybd-commit binary path")
@@ -131,6 +151,8 @@ func init() {
 	flags.StringVar(&global.buildOutputDir, "build-output-dir", defaultBuildOutputDir, "artifact output directory root (build command)")
 	flags.BoolVar(&global.plainHTTP, "plain-http", false, "use plain HTTP for registry requests (ORAS and overlaybd repoBlobUrl)")
 
+	rootCmd.MarkFlagsMutuallyExclusive("vmm-dir", "firecracker")
+	rootCmd.AddCommand(newQualifyBackendCommand())
 	rootCmd.AddCommand(newCreateCommand())
 	rootCmd.AddCommand(newListCommand())
 	rootCmd.AddCommand(newDeleteCommand())
@@ -139,4 +161,17 @@ func init() {
 	rootCmd.AddCommand(newPushCommand())
 	rootCmd.AddCommand(newPackCommand())
 	rootCmd.AddCommand(newPackCleanupCommand())
+	rootCmd.AddCommand(newCacheCheckpointCommand())
+	rootCmd.AddCommand(newTrimBlobCacheCommand())
+}
+
+func newQualifyBackendCommand() *cobra.Command {
+	var digest string
+	command := &cobra.Command{Use: "qualify-backend", Short: "Bind a node qualification record to the running OverlayBD daemon", RunE: func(cmd *cobra.Command, _ []string) error {
+		ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
+		defer cancel()
+		return backendidentity.Attest(ctx, global.ublkdSocket, digest)
+	}}
+	command.Flags().StringVar(&digest, "sha256", "", "optional expected daemon executable SHA256; omitted records the running executable")
+	return command
 }

@@ -35,6 +35,7 @@ type RoutePublication struct {
 	FastletPodUID     string
 	AssignmentAttempt int64
 	RouteGeneration   int64
+	Suspended         bool
 	Access            AccessDescriptor
 	Components        map[string]ComponentRoute
 }
@@ -42,6 +43,13 @@ type RoutePublication struct {
 type ComponentRoute struct {
 	Protocol string `json:"protocol"`
 	Port     uint32 `json:"port"`
+}
+
+// RecoveryRoutePublisher temporarily fences access without deleting ownership.
+// Resume must be explicit; ordinary delayed publications cannot lift the fence.
+type RecoveryRoutePublisher interface {
+	SuspendRoute(context.Context, RoutePublication) error
+	ResumeRoute(context.Context, RoutePublication) error
 }
 
 type RoutePublisher interface {

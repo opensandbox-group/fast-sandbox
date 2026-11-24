@@ -54,7 +54,7 @@ type snapshotLoadRequest struct {
 }
 
 type versionResponse struct {
-	Version string `json:"version"`
+	Version string `json:"firecracker_version"`
 }
 
 // version reports the Firecracker version served on the socket; it doubles as
@@ -63,6 +63,9 @@ func (c *firecrackerClient) version(ctx context.Context) (string, error) {
 	var response versionResponse
 	if err := c.do(ctx, http.MethodGet, "/version", nil, &response); err != nil {
 		return "", err
+	}
+	if response.Version == "" {
+		return "", fmt.Errorf("Firecracker /version response missing firecracker_version")
 	}
 	return response.Version, nil
 }
@@ -82,47 +85,12 @@ func (c *firecrackerClient) resume(ctx context.Context) error {
 
 // ---- cold-boot / snapshot-create surface (build flow) ----
 
-// bootSource mirrors PUT /boot-source (build flow cold boot).
-type bootSource struct {
-	KernelImagePath string `json:"kernel_image_path"`
-	BootArgs        string `json:"boot_args,omitempty"`
-}
-
-// drive mirrors PUT /drives/{drive_id} (build flow cold boot).
-type drive struct {
-	DriveID      string `json:"drive_id"`
-	PathOnHost   string `json:"path_on_host"`
-	IsRootDevice bool   `json:"is_root_device"`
-	IsReadOnly   bool   `json:"is_read_only"`
-}
-
-// machineConfig mirrors PUT /machine-config (build flow cold boot).
-type machineConfig struct {
-	VCPUCount  int `json:"vcpu_count"`
-	MemSizeMiB int `json:"mem_size_mib"`
-}
-
 // snapshotCreateRequest mirrors PUT /snapshot/create: capture a Full
 // snapshot (vmstate + full memory file) of a paused VM.
 type snapshotCreateRequest struct {
 	SnapshotType string `json:"snapshot_type"`
 	SnapshotPath string `json:"snapshot_path"`
 	MemFilePath  string `json:"mem_file_path"`
-}
-
-// setBootSource installs the guest kernel and boot arguments.
-func (c *firecrackerClient) setBootSource(ctx context.Context, source bootSource) error {
-	return c.do(ctx, http.MethodPut, "/boot-source", source, nil)
-}
-
-// addDrive attaches a host block device to the guest.
-func (c *firecrackerClient) addDrive(ctx context.Context, drive drive) error {
-	return c.do(ctx, http.MethodPut, "/drives/"+drive.DriveID, drive, nil)
-}
-
-// setMachineConfig sizes the microVM.
-func (c *firecrackerClient) setMachineConfig(ctx context.Context, config machineConfig) error {
-	return c.do(ctx, http.MethodPut, "/machine-config", config, nil)
 }
 
 // startInstance boots the configured microVM (PUT /actions InstanceStart).

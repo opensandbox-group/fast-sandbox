@@ -238,17 +238,23 @@ func launch(ctx context.Context, runner ProcessRunner, config launchConfig) (Pro
 	if !filepath.IsAbs(config.APIAddress) {
 		return nil, fmt.Errorf("%w: firecracker API address must be an absolute path", ErrInvalidConfig)
 	}
+	// Direct launches must also enter the allocated netns; otherwise VMs contend for identically named TAP devices on the host.
+	name, args := config.BinaryPath, config.buildArgv()
+	if config.NetNSPath != "" {
+		name = "nsenter"
+		args = append([]string{"--net=" + config.NetNSPath, "--", config.BinaryPath}, args...)
+	}
 	if config.CgroupPath != "" {
 		cgroupRunner, ok := runner.(CgroupRunner)
 		if !ok {
 			return nil, fmt.Errorf("%w: process runner cannot launch into a cgroup", ErrInvalidConfig)
 		}
-		return cgroupRunner.StartInCgroup(ctx, config.CgroupPath, config.WorkingDir, config.BinaryPath, config.buildArgv(), config.LogPath)
+		return cgroupRunner.StartInCgroup(ctx, config.CgroupPath, config.WorkingDir, name, args, config.LogPath)
 	}
 	if runnerInDir, ok := runner.(WorkingDirRunner); ok && config.WorkingDir != "" {
-		return runnerInDir.StartInDir(ctx, config.WorkingDir, config.BinaryPath, config.buildArgv(), config.LogPath)
+		return runnerInDir.StartInDir(ctx, config.WorkingDir, name, args, config.LogPath)
 	}
-	return runner.Start(ctx, config.BinaryPath, config.buildArgv(), config.LogPath)
+	return runner.Start(ctx, name, args, config.LogPath)
 }
 
 // prepareJailRoot assembles the jail root of a Sandbox before launch: the

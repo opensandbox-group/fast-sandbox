@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"fast-sandbox/internal/ublkd"
 )
 
 // maxUblkdResponseBytes bounds the control-API responses read from ublkd.
@@ -60,15 +62,7 @@ func newUblkdClient(socket string) *ublkdClient {
 
 // ublkdDevice is one device entry returned by /v1/list (and the shape shared
 // by /v1/add success replies).
-type ublkdDevice struct {
-	DevID    int    `json:"dev_id"`
-	Dev      string `json:"dev"`
-	Config   string `json:"config"`
-	Writable bool   `json:"writable"`
-	State    string `json:"state"`
-	Mode     string `json:"mode"`
-	RefCount int    `json:"refcount"`
-}
+type ublkdDevice = ublkd.Device
 
 type ublkdAddResponse struct {
 	OK    bool   `json:"ok"`
@@ -86,12 +80,6 @@ type ublkdAcquireResponse struct {
 	Mode     string `json:"mode"`
 	RefCount int    `json:"refcount"`
 	Error    string `json:"error"`
-}
-
-type ublkdListResponse struct {
-	OK      bool          `json:"ok"`
-	Devices []ublkdDevice `json:"devices"`
-	Error   string        `json:"error"`
 }
 
 type ublkdOKResponse struct {
@@ -175,14 +163,7 @@ func (c *ublkdClient) Release(ctx context.Context, devID int) error {
 
 // List enumerates the devices currently served by the daemon.
 func (c *ublkdClient) List(ctx context.Context) ([]ublkdDevice, error) {
-	var response ublkdListResponse
-	if err := c.do(ctx, http.MethodGet, "/v1/list", nil, &response); err != nil {
-		return nil, err
-	}
-	if !response.OK {
-		return nil, fmt.Errorf("ublkd list: %s", response.Error)
-	}
-	return response.Devices, nil
+	return ublkd.List(ctx, c.httpClient)
 }
 
 func (c *ublkdClient) do(ctx context.Context, method, path string, input, output any) error {

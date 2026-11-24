@@ -80,6 +80,8 @@ type ContainerdConfig struct {
 // microVM per Sandbox create request, restored from the golden snapshot
 // set; nothing is pre-warmed.
 type FirecrackerConfig struct {
+	// VMMDir enables manifest-driven selection from a managed installation.
+	VMMDir             string `json:"vmmDir,omitempty"`
 	BinaryPath         string `json:"binaryPath"`
 	JailerPath         string `json:"jailerPath,omitempty"`
 	KernelPath         string `json:"kernelPath"`

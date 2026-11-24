@@ -25,3 +25,14 @@ func TestResolveKernelDefaultBuilderFilename(t *testing.T) {
 	_, err := resolveKernel(t.TempDir(), "vmlinux.bin", "")
 	require.ErrorContains(t, err, "not found")
 }
+
+func TestResolveKernelRejectsMetadataTraversal(t *testing.T) {
+	for _, version := range []string{"../other", "../../../../etc/passwd", "/etc/passwd", ".", "..", ""} {
+		if _, err := resolveKernel(t.TempDir(), version, ""); err == nil {
+			t.Fatalf("accepted kernel version %q", version)
+		}
+	}
+	if _, err := resolveKernel(t.TempDir(), "6.1.177", t.TempDir()); err == nil {
+		t.Fatal("accepted directory as kernel")
+	}
+}

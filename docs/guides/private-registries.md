@@ -72,8 +72,9 @@ Secret for each Pool. Fastlet Pods mount that Secret.
 - failed warm-image pulls retry and Pool status reports bounded errors;
 - Registry configuration does not make warm images a Fastlet Ready gate.
 
-Pool status includes `RegistryReady`, the target generation, and applied/total
-Fastlet counts.
+`RegistryReady=True` means the Controller validated the source configuration and persisted the compiled Secret. It does not acknowledge projection or loading by every Fastlet, or prove that the credentials can authenticate. Kubernetes projects Secret updates asynchronously, and credential lookups reload the projected file when its contents change.
+
+Compiled registry configuration contains credentials only; no revision is generated, required, or reported in Fastlet status. Update the source ConfigMap and Secrets rather than editing Controller-managed compiled Secrets.
 
 ## Security
 

@@ -6,5 +6,6 @@ resources:
 - ../rbac
 - ../runtime-environments
 - ../artifact-store
+- ../logging
 - ../manager
 - ../janitor

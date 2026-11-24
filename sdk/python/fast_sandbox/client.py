@@ -18,12 +18,22 @@ class Client:
         *,
         proxy_endpoint: str = "",
         channel: Optional[grpc.Channel] = None,
+        credentials: Optional[grpc.ChannelCredentials] = None,
+        auth_enabled: bool = False,
         stub=None,
     ):
         self.endpoint = endpoint
         self.namespace = namespace
         self._owns_channel = channel is None and stub is None
-        self._channel = channel or (None if stub is not None else grpc.insecure_channel(endpoint))
+        if self._owns_channel:
+            if credentials is not None:
+                self._channel = grpc.secure_channel(endpoint, credentials)
+            elif auth_enabled:
+                raise ValueError("FastPath requires TLS channel credentials with caller authentication")
+            else:
+                self._channel = grpc.insecure_channel(endpoint)
+        else:
+            self._channel = channel
         self._stub = stub or fastpath_pb2_grpc.FastPathServiceStub(self._channel)
         self._resolver = EndpointResolver(self._stub, namespace, proxy_endpoint)
 

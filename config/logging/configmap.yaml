@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fast-sandbox-logging
+  namespace: fast-sandbox-system
+data:
+  logging.yaml: |
+    directory: /var/log/fast-sandbox
+    maxSizeMB: 100
+    maxBackups: 10
+    maxAgeDays: 7
+    compress: true
+    alsoStderr: false

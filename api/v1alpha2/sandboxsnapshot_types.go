@@ -63,6 +63,33 @@ type SandboxRef struct {
 	UID types.UID `json:"uid,omitempty"`
 }
 
+// SandboxSnapshotMode selects what a snapshot persists. Full captures
+// memory and device state; RootfsOnly persists only the writable rootfs
+// layer and consumers boot from disk.
+// +kubebuilder:validation:Enum=Full;RootfsOnly
+type SandboxSnapshotMode string
+
+const (
+	// SandboxSnapshotModeFull persists the writable layer plus guest memory
+	// and device state; consumers restore in place.
+	SandboxSnapshotModeFull SandboxSnapshotMode = "Full"
+	// SandboxSnapshotModeRootfsOnly persists only the writable rootfs layer;
+	// consumers cold-boot from the disk. It works on both publication paths
+	// and requires the assigned fastlet to advertise the matching rootfs-only
+	// capability; it is rejected for checkpoint-style snapshots.
+	SandboxSnapshotModeRootfsOnly SandboxSnapshotMode = "RootfsOnly"
+)
+
+// NormalizeSandboxSnapshotMode resolves an absent mode to Full, mirroring
+// fastletapi.NormalizeSnapshotMode: every pre-mode snapshot is a Full
+// snapshot.
+func NormalizeSandboxSnapshotMode(mode SandboxSnapshotMode) SandboxSnapshotMode {
+	if mode == "" {
+		return SandboxSnapshotModeFull
+	}
+	return mode
+}
+
 // SandboxSnapshotSpec defines the desired snapshot. The spec is immutable
 // by convention: a snapshot is one-shot and re-snapshotting requires a new
 // object. These CRDs ship without CEL (x-kubernetes-validations) for legacy
@@ -89,6 +116,15 @@ type SandboxSnapshotSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*(/[a-zA-Z0-9._-]+)*(:[a-zA-Z0-9._-]{1,127})?$`
 	// +kubebuilder:validation:MaxLength=255
 	TemplateName string `json:"templateName,omitempty"`
+
+	// Mode selects what the snapshot persists. RootfsOnly persists only the
+	// writable rootfs layer (consumers boot from disk) and requires the
+	// assigned fastlet to advertise the matching rootfs-only capability;
+	// Full (default) also captures memory and device state. Immutable per
+	// the one-shot spec convention.
+	// +optional
+	// +kubebuilder:default=Full
+	Mode SandboxSnapshotMode `json:"mode,omitempty"`
 }
 
 // SnapshotTrigger pins the target placement a snapshot was triggered
@@ -112,7 +148,10 @@ type SnapshotTrigger struct {
 // All fields are projections written by the control plane; the artifact
 // facts come from the fastlet that executed the snapshot.
 type SandboxSnapshotStatus struct {
-	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// ResourceLimits records the admitted limits bundled with the published artifact.
+	// +optional
+	ResourceLimits     *SnapshotResourceLimits `json:"resourceLimits,omitempty"`
+	ObservedGeneration int64                   `json:"observedGeneration,omitempty"`
 
 	// Phase is the snapshot lifecycle.
 	// +optional
@@ -147,8 +186,17 @@ type SandboxSnapshotStatus struct {
 	// +optional
 	SnapshotID string `json:"snapshotID,omitempty"`
 
+	// Mode is the artifact class the executing fastlet reported for the
+	// produced snapshot (Full or RootfsOnly). It is the fastlet-confirmed
+	// produced mode, not the request: a success observation whose produced
+	// mode drifts from spec.mode fails the snapshot instead of publishing.
+	// +optional
+	Mode SandboxSnapshotMode `json:"mode,omitempty"`
+
 	// ManifestRef is the published s3:// manifest.json or immutable oci://
-	// snapfiles manifest reference (Succeeded only).
+	// snapfiles manifest reference. Set on Succeeded, and also on a Failed
+	// snapshot whose publication already completed (e.g. a mode-drift
+	// rejection) so deletion retains ownership of remote cleanup.
 	// +optional
 	ManifestRef string `json:"manifestRef,omitempty"`
 	// ArtifactDigest is the sha256 of the published manifest document.
@@ -168,6 +216,11 @@ type SandboxSnapshotStatus struct {
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+type SnapshotResourceLimits struct {
+	CPU    string `json:"cpu,omitempty"`
+	Memory string `json:"memory,omitempty"`
 }
 
 // +kubebuilder:object:root=true

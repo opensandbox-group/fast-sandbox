@@ -20,6 +20,7 @@ const (
 // resources travel separately and are validated against the immutable Fastlet
 // resource profile before RuntimeSandboxConfig is built.
 type SandboxDesiredSpec struct {
+	RootfsBootDigest    string            `json:"rootfsBootDigest,omitempty"`
 	Image               string            `json:"image"`
 	RuntimeProfileHash  string            `json:"runtimeProfileHash,omitempty"`
 	ResourceProfileHash string            `json:"resourceProfileHash,omitempty"`
@@ -260,9 +261,28 @@ type FastletStatus struct {
 	InfraRevision       string           `json:"infraRevision,omitempty"`
 	InfraReady          bool             `json:"infraReady"`
 	PreparedArtifacts   []string         `json:"preparedArtifacts,omitempty"`
-	RegistryRevision    string           `json:"registryRevision,omitempty"`
 	WarmImages          []WarmImageState `json:"warmImages,omitempty"`
+	// Capabilities are the explicitly advertised feature capabilities of
+	// this Fastlet build (CapabilityXxx constants). The control plane gates
+	// dispatch on them: an old Fastlet reports none and must never receive
+	// a request whose semantics depend on a capability it silently ignores.
+	Capabilities []string `json:"capabilities,omitempty"`
 }
+
+// CapabilityRootfsOnlySnapshots marks a Fastlet whose runtime driver
+// implements rootfs-only snapshot capture (SnapshotSpec.Mode == RootfsOnly).
+// The control plane requires this capability before dispatching a
+// RootfsOnly snapshot; a Fastlet that does not advertise it would silently
+// execute Full (unknown JSON fields are ignored).
+const CapabilityRootfsOnlySnapshots = "rootfsOnlySnapshots"
+
+// CapabilityNativeRootfsOnlySnapshots marks file-backed RootfsOnly capture and S3 publication.
+const CapabilityNativeRootfsOnlySnapshots = "nativeRootfsOnlySnapshots"
+
+// CapabilityRootfsBootCreate advertises digest-pinned creates with admitted limits.
+const CapabilityRootfsBootCreate = "rootfsBootCreate"
+
+const RootfsBootCreatePath = "/api/v2/fastlet/create-rootfs"
 
 type WarmImageState struct {
 	Image   string `json:"image"`
@@ -293,6 +313,18 @@ const (
 	// ErrorSnapshotUnsupported reports that the Fastlet's runtime driver
 	// does not implement snapshots.
 	ErrorSnapshotUnsupported FastletErrorCode = "SnapshotUnsupported"
+	// ErrorAuthRejected reports that the control authentication middleware
+	// rejected the request before admission: the bearer token is missing,
+	// malformed, or invalid (HTTP 401).
+	ErrorAuthRejected FastletErrorCode = "AuthRejected"
+	// ErrorAuthNotAllowed reports a valid token whose ServiceAccount subject
+	// is not on the Fastlet allow list (HTTP 403).
+	ErrorAuthNotAllowed FastletErrorCode = "AuthNotAllowed"
+	// ErrorAuthUnavailable reports that token validation itself could not
+	// complete, such as an unreachable issuer (HTTP 503). It is a distinct
+	// class from ErrorUnknownOutcome: the request provably never reached
+	// admission, so a rejected Create is always safe to retry.
+	ErrorAuthUnavailable FastletErrorCode = "AuthUnavailable"
 )
 
 type FastletError struct {
@@ -627,7 +659,23 @@ type SnapshotIdentity struct {
 }
 
 // SnapshotSpec is the desired snapshot configuration.
+// SnapshotMode explicitly distinguishes Full from disk-only capture; an empty value preserves legacy Full semantics.
+type SnapshotMode string
+
+const (
+	SnapshotModeFull       SnapshotMode = "Full"
+	SnapshotModeRootfsOnly SnapshotMode = "RootfsOnly"
+)
+
+func NormalizeSnapshotMode(mode SnapshotMode) SnapshotMode {
+	if mode == "" {
+		return SnapshotModeFull
+	}
+	return mode
+}
+
 type SnapshotSpec struct {
+	Mode SnapshotMode `json:"mode,omitempty"`
 	// Kind selects the publish mode. Empty is treated as SnapshotKindTemplate
 	// so callers that predate checkpoints keep working.
 	Kind SnapshotKind `json:"kind,omitempty"`
@@ -641,15 +689,20 @@ type SnapshotSpec struct {
 // is a stable classification of a Failed task (e.g. InsufficientStorage);
 // empty for in-flight and unclassified failures.
 type SnapshotStatus struct {
-	SnapshotID     string        `json:"snapshotId,omitempty"`
-	Phase          SnapshotPhase `json:"phase"`
-	Reason         string        `json:"reason,omitempty"`
-	Message        string        `json:"message,omitempty"`
-	ManifestRef    string        `json:"manifestRef,omitempty"`
-	ArtifactDigest string        `json:"artifactDigest,omitempty"`
-	SizeBytes      int64         `json:"sizeBytes,omitempty"`
-	StartedAt      time.Time     `json:"startedAt,omitempty"`
-	CompletedAt    time.Time     `json:"completedAt,omitempty"`
+	ResourceLimits *SandboxResourceVector `json:"resourceLimits,omitempty"`
+	SnapshotID     string                 `json:"snapshotId,omitempty"`
+	Phase          SnapshotPhase          `json:"phase"`
+	Reason         string                 `json:"reason,omitempty"`
+	Message        string                 `json:"message,omitempty"`
+	ManifestRef    string                 `json:"manifestRef,omitempty"`
+	ArtifactDigest string                 `json:"artifactDigest,omitempty"`
+	SizeBytes      int64                  `json:"sizeBytes,omitempty"`
+	// Mode is the artifact class of the task: the admitted mode while
+	// in flight, the produced artifact's mode once terminal. Empty means
+	// Full (a pre-mode Fastlet never sets it).
+	Mode        SnapshotMode `json:"mode,omitempty"`
+	StartedAt   time.Time    `json:"startedAt,omitempty"`
+	CompletedAt time.Time    `json:"completedAt,omitempty"`
 }
 
 // CreateSnapshotRequest registers one snapshot task. The response returns

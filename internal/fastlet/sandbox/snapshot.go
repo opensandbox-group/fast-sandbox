@@ -9,9 +9,12 @@ import (
 
 	"k8s.io/klog/v2"
 
+	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/fastletsettings"
 	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	runtimecontract "fast-sandbox/internal/runtime/contract"
 	"fast-sandbox/pkg/util/idgen"
 )
 
@@ -30,6 +33,7 @@ var snapshotWorkerTimeout = 30 * time.Minute
 // ever taken toward this Fastlet since start, which is accepted as a small,
 // inspectable leak.
 type snapshotTask struct {
+	mode         fastletapi.SnapshotMode
 	identity     fastletapi.SnapshotIdentity
 	kind         fastletapi.SnapshotKind
 	templateName string
@@ -45,14 +49,55 @@ type snapshotTask struct {
 func (t *snapshotTask) status() fastletapi.SnapshotStatus {
 	status := fastletapi.SnapshotStatus{
 		SnapshotID: t.snapshotID, Phase: t.phase, Reason: t.reason, Message: t.message,
-		StartedAt: t.startedAt, CompletedAt: t.completedAt,
+		Mode: fastletapi.NormalizeSnapshotMode(t.mode), StartedAt: t.startedAt, CompletedAt: t.completedAt,
 	}
 	if t.result != nil {
+		status.ResourceLimits = t.result.ResourceLimits
 		status.ManifestRef = t.result.ManifestRef
 		status.ArtifactDigest = t.result.ArtifactDigest
 		status.SizeBytes = t.result.SizeBytes
+		if t.result.Mode != "" {
+			// Terminal reports carry the produced artifact's class (from
+			// the published manifest), not the admitted request.
+			status.Mode = fastletapi.NormalizeSnapshotMode(t.result.Mode)
+		}
 	}
 	return status
+}
+
+// SnapshotCapabilities reports the snapshot capabilities this Fastlet's
+// runtime driver advertises. The heartbeat surfaces them to the control
+// plane, which gates RootfsOnly dispatch on them: an old Fastlet (or a
+// runtime without the branch) reports none and must never receive a
+// RootfsOnly task — it would ignore the mode field and silently produce a
+// Full artifact.
+func (m *SandboxManager) SnapshotCapabilities() []string {
+	snapshotter, ok := m.runtime.(RuntimeSnapshotter)
+	if !ok {
+		return nil
+	}
+	capable, ok := snapshotter.(runtimecontract.RootfsOnlySnapshotCapability)
+	if !ok || !capable.SupportsRootfsOnlySnapshots() {
+		return nil
+	}
+	capabilities := []string{fastletapi.CapabilityRootfsOnlySnapshots}
+	if native, ok := snapshotter.(runtimecontract.NativeRootfsOnlySnapshotCapability); ok && native.SupportsNativeRootfsOnlySnapshots() {
+		capabilities = append(capabilities, fastletapi.CapabilityNativeRootfsOnlySnapshots)
+	}
+	return capabilities
+}
+
+// Capabilities lists the optional operations this Fastlet can serve.
+func (m *SandboxManager) Capabilities() []string {
+	caps := m.SnapshotCapabilities()
+	if m.supportsRootfsBootCreate() {
+		caps = append(caps, fastletapi.CapabilityRootfsBootCreate)
+	}
+	return caps
+}
+
+func (m *SandboxManager) supportsRootfsBootCreate() bool {
+	return m.runtimeName == string(apiv1alpha2.RuntimeFirecracker) && m.resourceAdmission != nil && m.resourceAdmission.Version == fastletsettings.BoundedFirecrackerVersion
 }
 
 func snapshotFailure(disposition fastletapi.CreateDisposition, failure *fastletapi.FastletError) (*fastletapi.CreateSnapshotResponse, error) {
@@ -87,7 +132,7 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 			"Fastlet is draining", true))
 	}
 	if existing, found := m.snapshots[req.Identity.SnapshotUID]; found {
-		sameClaim := sameSnapshotSandboxClaim(existing.identity.Sandbox, req.Identity.Sandbox)
+		sameClaim := sameSnapshotRequest(existing, req)
 		status := existing.status()
 		m.mu.Unlock()
 		if sameClaim {
@@ -111,7 +156,7 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletError(fastletapi.ErrorSnapshotUnsupported,
 			"Actions v2 management does not support snapshots in this release", false))
 	}
-	if metadata.Phase != sandboxStateRunning {
+	if metadata.Phase != sandboxStateRunning || metadata.RecoveryRequired {
 		m.mu.Unlock()
 		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletError(fastletapi.ErrorRuntimeUnavailable,
 			fmt.Sprintf("target Sandbox runtime is %q, not running", metadata.Phase), true))
@@ -119,6 +164,13 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 	image := metadata.Config.Desired.Image
 	if metadata.Config.Desired.Restore != nil {
 		image = metadata.Config.Desired.Restore.ManifestRef
+	}
+	if req.Snapshot.Mode == fastletapi.SnapshotModeRootfsOnly && !strings.HasPrefix(image, ocitemplate.Prefix) {
+		capable, ok := m.runtime.(runtimecontract.NativeRootfsOnlySnapshotCapability)
+		if !ok || !capable.SupportsNativeRootfsOnlySnapshots() {
+			m.mu.Unlock()
+			return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, fastletError(fastletapi.ErrorSnapshotUnsupported, "native RootfsOnly capture is not qualified on this node", false))
+		}
 	}
 	if req.Snapshot.Kind != fastletapi.SnapshotKindCheckpoint && req.Snapshot.TemplateName == "" && !strings.HasPrefix(image, ocitemplate.Prefix) {
 		m.mu.Unlock()
@@ -139,18 +191,9 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 			return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, failure)
 		}
 	}
-	// Template-name fence — holds to terminal: concurrent publishers of one
-	// index key would race last-writer-wins on the store. Checkpoints carry
-	// no index key and are exempt.
-	if req.Snapshot.Kind != fastletapi.SnapshotKindCheckpoint && req.Snapshot.TemplateName != "" {
-		for _, task := range m.snapshots {
-			if !fastletapi.SnapshotPhaseTerminal(task.phase) && task.templateName == req.Snapshot.TemplateName {
-				failure := fastletError(fastletapi.ErrorSnapshotInProgress,
-					"template name is held by a snapshot that has not terminated; retry after it terminates or use another name", false)
-				m.mu.Unlock()
-				return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, failure)
-			}
-		}
+	if failure := m.snapshotTemplateConflictLocked(req); failure != nil {
+		m.mu.Unlock()
+		return snapshotFailure(fastletapi.CreateDispositionRejectedBeforeSideEffects, failure)
 	}
 	snapshotID, err := idgen.GenerateRequestID()
 	if err != nil {
@@ -159,7 +202,7 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 			"generate snapshot id: "+err.Error(), true, err))
 	}
 	task := &snapshotTask{
-		identity: req.Identity, kind: req.Snapshot.Kind, templateName: req.Snapshot.TemplateName,
+		mode: fastletapi.NormalizeSnapshotMode(req.Snapshot.Mode), identity: req.Identity, kind: req.Snapshot.Kind, templateName: req.Snapshot.TemplateName,
 		snapshotID: snapshotID, phase: fastletapi.SnapshotPhasePending,
 	}
 	m.snapshots[req.Identity.SnapshotUID] = task
@@ -176,6 +219,13 @@ func (m *SandboxManager) CreateSnapshot(_ context.Context, req *fastletapi.Creat
 func (m *SandboxManager) validateSnapshotRequest(req *fastletapi.CreateSnapshotRequest) *fastletapi.FastletError {
 	if req == nil || req.Identity.SnapshotUID == "" || req.Identity.Namespace == "" || req.Identity.Name == "" {
 		return fastletError(fastletapi.ErrorConflict, "snapshotUid, namespace, and name are required", false)
+	}
+	mode := fastletapi.NormalizeSnapshotMode(req.Snapshot.Mode)
+	if mode != fastletapi.SnapshotModeFull && mode != fastletapi.SnapshotModeRootfsOnly {
+		return fastletError(fastletapi.ErrorConflict, "unknown snapshot mode", false)
+	}
+	if mode == fastletapi.SnapshotModeRootfsOnly && req.Snapshot.Kind == fastletapi.SnapshotKindCheckpoint {
+		return fastletError(fastletapi.ErrorConflict, "RootfsOnly supports templates only", false)
 	}
 	switch req.Snapshot.Kind {
 	case "", fastletapi.SnapshotKindTemplate:
@@ -220,15 +270,16 @@ func (m *SandboxManager) runSnapshotWorker(snapshotter RuntimeSnapshotter, task 
 
 	m.mu.RLock()
 	metadata, found := m.sandboxes[sandboxUID]
-	runnable := found && metadata.Phase == sandboxStateRunning
+	runnable := found && metadata.Phase == sandboxStateRunning && sameSnapshotSandboxClaim(metadata.Config.Identity, task.identity.Sandbox)
 	m.mu.RUnlock()
 	if !runnable {
 		m.finishSnapshotTask(task, fastletapi.SnapshotPhaseFailed, "target Sandbox is no longer running on this Fastlet")
 		return
 	}
 
-	m.setSnapshotPhase(task, fastletapi.SnapshotPhaseCreating, "dumping vmstate/memory and cloning the rootfs")
+	m.setSnapshotPhase(task, fastletapi.SnapshotPhaseCreating, "capturing sandbox artifacts")
 	result, err := snapshotter.CreateSnapshot(ctx, &RuntimeSnapshotInput{
+		Mode: task.mode, Identity: &task.identity.Sandbox,
 		SandboxID:    sandboxUID,
 		SnapshotID:   task.snapshotID,
 		Kind:         task.kind,
@@ -254,12 +305,33 @@ func (m *SandboxManager) runSnapshotWorker(snapshotter RuntimeSnapshotter, task 
 		}
 		klog.ErrorS(err, "Sandbox snapshot task failed",
 			"sandboxID", sandboxUID, "snapshotID", task.snapshotID, "kind", task.kind, "reason", reason, "message", message)
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), time.Second)
+		m.refreshRuntimeRecovery(probeCtx, task.identity.Sandbox, false)
+		probeCancel()
 		m.finishSnapshotTaskWithReason(task, fastletapi.SnapshotPhaseFailed, reason, message)
 		return
 	}
 	// The driver has already transitioned the task through Publishing (via
 	// the OnPublishing callback above); CreateSnapshot returning nil means
-	// the artifact upload finished, so the projection lands on Succeeded.
+	// the artifact upload finished. Before reporting success, verify the
+	// produced artifact's class: a driver that ignored the admitted mode
+	// (version skew) produced a Full set from a RootfsOnly task — fail
+	// closed instead of publishing a success that lies about what the
+	// artifact contains. The published reference is still retained on the
+	// task: the object never reported success, but the registry did receive
+	// the artifact set, and dropping the reference would orphan it (remote
+	// cleanup resolves it when the object is deleted).
+	if produced := fastletapi.NormalizeSnapshotMode(result.Mode); produced != fastletapi.NormalizeSnapshotMode(task.mode) {
+		m.mu.Lock()
+		task.result = result
+		m.mu.Unlock()
+		klog.ErrorS(nil, "Sandbox snapshot produced a mode-drifted artifact",
+			"sandboxID", sandboxUID, "snapshotID", task.snapshotID, "admittedMode", task.mode, "producedMode", produced,
+			"manifestRef", result.ManifestRef)
+		m.finishSnapshotTaskWithReason(task, fastletapi.SnapshotPhaseFailed, "SnapshotModeDrift",
+			fmt.Sprintf("produced artifact mode %q does not match the admitted mode %q", produced, fastletapi.NormalizeSnapshotMode(task.mode)))
+		return
+	}
 	m.mu.Lock()
 	task.result = result
 	m.mu.Unlock()
@@ -388,4 +460,22 @@ func (m *SandboxManager) DeleteSnapshot(ctx context.Context, req *fastletapi.Del
 		}
 	}
 	return &fastletapi.DeleteSnapshotResponse{}, nil
+}
+
+func sameSnapshotRequest(existing *snapshotTask, req *fastletapi.CreateSnapshotRequest) bool {
+	return sameSnapshotSandboxClaim(existing.identity.Sandbox, req.Identity.Sandbox) && fastletapi.NormalizeSnapshotMode(existing.mode) == fastletapi.NormalizeSnapshotMode(req.Snapshot.Mode) && existing.kind == req.Snapshot.Kind && existing.templateName == req.Snapshot.TemplateName
+}
+
+func (m *SandboxManager) snapshotTemplateConflictLocked(req *fastletapi.CreateSnapshotRequest) *fastletapi.FastletError {
+	// Protect the template name until the task reaches a terminal state so concurrent publications cannot overwrite the same index; checkpoints have no index key and are exempt.
+	if req.Snapshot.Kind != fastletapi.SnapshotKindCheckpoint && req.Snapshot.TemplateName != "" {
+		for _, task := range m.snapshots {
+			if !fastletapi.SnapshotPhaseTerminal(task.phase) && task.templateName == req.Snapshot.TemplateName {
+				failure := fastletError(fastletapi.ErrorSnapshotInProgress,
+					"template name is held by a snapshot that has not terminated; retry after it terminates or use another name", false)
+				return failure
+			}
+		}
+	}
+	return nil
 }

@@ -11,9 +11,15 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	fastletsandbox "fast-sandbox/internal/fastlet/sandbox"
+	"fast-sandbox/internal/fastletauth"
+	"fast-sandbox/internal/fastletauth/fastletauthtest"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
@@ -280,4 +286,108 @@ func TestInvokeHandlerRouteDispatchesToFallback(t *testing.T) {
 	}, &unknown)
 	require.Equal(t, http.StatusNotFound, recorder.Code)
 	require.Equal(t, fastletapi.ErrorNotFound, unknown.Error.Code)
+}
+
+func TestFastletServerEnforcesControlAuthentication(t *testing.T) {
+	manager := newServerManager(t, newServerRuntime(), false)
+	issuer := fastletauthtest.NewIssuer(t)
+	// The harness ignores the header, but the credential must resolve,
+	// matching production.
+	t.Setenv(fastletauth.KeyFetchTokenEnv, "test-key-fetch-credential")
+	authenticator, err := fastletauth.NewAuthenticator(issuer.URL(), fastletauth.Audience,
+		[]string{"system:serviceaccount:fast-sandbox-system:fast-sandbox-fastpath"}, nil)
+	require.NoError(t, err)
+	fastletServer := NewFastletServer(":0", manager)
+	fastletServer.SetAuthenticator(authenticator)
+	handler := fastletServer.Handler()
+	identity := fastletapi.SandboxIdentity{SandboxUID: "sandbox-auth", Namespace: "default", Name: "sandbox-auth", InstanceGeneration: 1, RuntimeInstanceID: "runtime-auth", AssignmentAttempt: 1, FastletPodUID: "pod-uid-a"}
+	createRequest := func(requestID string) *bytes.Reader {
+		body, err := json.Marshal(fastletapi.CreateSandboxRequest{RequestID: requestID, Identity: identity, SpecGeneration: 1, Sandbox: fastletapi.SandboxDesiredSpec{Image: "alpine:latest"}})
+		require.NoError(t, err)
+		return bytes.NewReader(body)
+	}
+
+	// Without a token the lifecycle API fails closed...
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v2/fastlet/create", createRequest("request-unauth")))
+	require.Equal(t, http.StatusUnauthorized, recorder.Code)
+
+	// ...while the exempt heartbeat keeps serving diagnostics.
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v2/fastlet/heartbeat", nil))
+	require.Equal(t, http.StatusOK, recorder.Code)
+
+	// A valid platform token admits the call.
+	request := httptest.NewRequest(http.MethodPost, "/api/v2/fastlet/create", createRequest("request-auth"))
+	request.Header.Set("Authorization", fastletauth.BearerPrefix+issuer.Mint(fastletauthtest.MintOptions{}))
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	var created fastletapi.CreateSandboxResponse
+	require.NoError(t, json.NewDecoder(recorder.Body).Decode(&created))
+	require.Equal(t, fastletapi.CreateDispositionCreated, created.Disposition)
+
+	// A foreign subject is rejected even with a valid signature.
+	request = httptest.NewRequest(http.MethodPost, "/api/v2/fastlet/create", createRequest("request-foreign"))
+	request.Header.Set("Authorization", fastletauth.BearerPrefix+issuer.Mint(fastletauthtest.MintOptions{
+		Subject: "system:serviceaccount:attacker:default",
+	}))
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+}
+
+// TestFastletServerTracesAuthenticationRejections pins the instrumentation
+// order: authentication runs inside the HTTP tracing wrapper, so 401/403
+// responses are recorded in the Fastlet's own telemetry. During a mixed
+// version rollout the Fastlet is the only side that knows why calls fail.
+func TestFastletServerTracesAuthenticationRejections(t *testing.T) {
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	previous := otel.GetTracerProvider()
+	otel.SetTracerProvider(provider)
+	t.Cleanup(func() {
+		_ = provider.Shutdown(context.Background())
+		otel.SetTracerProvider(previous)
+	})
+
+	manager := newServerManager(t, newServerRuntime(), false)
+	issuer := fastletauthtest.NewIssuer(t)
+	t.Setenv(fastletauth.KeyFetchTokenEnv, "test-key-fetch-credential")
+	authenticator, err := fastletauth.NewAuthenticator(issuer.URL(), fastletauth.Audience,
+		[]string{"system:serviceaccount:fast-sandbox-system:fast-sandbox-fastpath"}, nil)
+	require.NoError(t, err)
+	fastletServer := NewFastletServer(":0", manager)
+	fastletServer.SetAuthenticator(authenticator)
+
+	identity := fastletapi.SandboxIdentity{SandboxUID: "sandbox-trace", Namespace: "default", Name: "sandbox-trace", InstanceGeneration: 1, RuntimeInstanceID: "runtime-trace", AssignmentAttempt: 1, FastletPodUID: "pod-uid-a"}
+	body, err := json.Marshal(fastletapi.CreateSandboxRequest{RequestID: "request-trace", Identity: identity, SpecGeneration: 1, Sandbox: fastletapi.SandboxDesiredSpec{Image: "alpine:latest"}})
+	require.NoError(t, err)
+
+	unauthenticated := httptest.NewRequest(http.MethodPost, "/api/v2/fastlet/create", bytes.NewReader(body))
+	foreign := httptest.NewRequest(http.MethodPost, "/api/v2/fastlet/create", bytes.NewReader(body))
+	foreign.Header.Set("Authorization", fastletauth.BearerPrefix+issuer.Mint(fastletauthtest.MintOptions{
+		Subject: "system:serviceaccount:attacker:default",
+	}))
+	for _, tc := range []struct {
+		request *http.Request
+		status  int
+	}{{unauthenticated, http.StatusUnauthorized}, {foreign, http.StatusForbidden}} {
+		recorderResponse := httptest.NewRecorder()
+		fastletServer.Handler().ServeHTTP(recorderResponse, tc.request)
+		require.Equal(t, tc.status, recorderResponse.Code)
+	}
+
+	statuses := map[int64]bool{}
+	for _, span := range recorder.Ended() {
+		for _, item := range span.Attributes() {
+			if item.Key == attribute.Key("http.response.status_code") {
+				statuses[item.Value.AsInt64()] = true
+			}
+		}
+	}
+	require.True(t, statuses[http.StatusUnauthorized],
+		"authentication rejections must appear in the Fastlet's own spans with their status code")
+	require.True(t, statuses[http.StatusForbidden],
+		"forbidden subjects must appear in the Fastlet's own spans with their status code")
 }

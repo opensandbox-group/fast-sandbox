@@ -5,6 +5,7 @@ package fastpath.v2;
 option go_package = "fast-sandbox/api/proto/v2;fastpathv2";
 
 service FastPathService {
+  rpc CreateRootfsSandbox(CreateRootfsSandboxRequest) returns (CreateSandboxResponse);
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
   rpc DeleteSandbox(DeleteRequest) returns (DeleteResponse);
   rpc UpdateSandbox(UpdateSandboxRequest) returns (UpdateSandboxResponse);
@@ -189,6 +190,18 @@ message CreateSandboxRequest {
   // resources carries caller-owned runtime limits. It is valid only for a
   // ResourceAware Pool; omission selects the Pool defaults.
   SandboxResourceRequirements resources = 15;
+}
+
+// Source names are namespaced CR names. The controller pins their published digest.
+message CreateRootfsSandboxRequest {
+  CreateSandboxRequest create = 1;
+  oneof source {
+    string snapshot_name = 2;
+    string template_name = 3;
+  }
+  // Per-source defaults recorded by the authenticated gateway; resources on
+  // create contain only the dimensions supplied by the caller.
+  ComputeResourceProfile source_limits = 4;
 }
 
 message CreateSandboxResponse {
@@ -401,6 +414,14 @@ enum SnapshotPhase {
   SNAPSHOT_PHASE_FAILED = 5;
 }
 
+// SnapshotMode selects what a snapshot persists. UNSPECIFIED resolves to
+// FULL for compatibility with callers predating the mode field.
+enum SnapshotMode {
+  SNAPSHOT_MODE_UNSPECIFIED = 0;
+  SNAPSHOT_MODE_FULL = 1;
+  SNAPSHOT_MODE_ROOTFS_ONLY = 2;
+}
+
 // CreateSandboxSnapshotRequest snapshots the referenced running Sandbox. The
 // request is rejected while any non-terminal SandboxSnapshot exists for the
 // same Sandbox or the same template_name (no reentrancy): retry after the
@@ -421,6 +442,15 @@ message CreateSandboxSnapshotRequest {
   // metadata is projected as sandbox.fast.io/<k> labels, mirroring
   // CreateSandboxRequest.metadata.
   map<string, string> metadata = 4;
+  // mode selects what the snapshot persists. FULL (default, also when
+  // UNSPECIFIED) captures memory and device state; ROOT_FS_ONLY persists
+  // only the writable rootfs layer and consumers boot from disk.
+  // ROOT_FS_ONLY works on both publication paths: the assigned Fastlet must
+  // advertise the matching rootfs-only capability (rootfsOnlySnapshots for
+  // an OCI source, nativeRootfsOnlySnapshots for a native one); otherwise
+  // the request fails deterministically with UNIMPLEMENTED.
+  // Immutable per request_id.
+  SnapshotMode mode = 5;
 }
 
 // SandboxSnapshotInfo is the observed state of one SandboxSnapshot.
@@ -448,6 +478,10 @@ message SandboxSnapshotInfo {
   // snapshot_id is the random UUID assigned by Fastlet on admission. OCI
   // publication uses it as the prefix of the rootfs and snapfiles tags.
   string snapshot_id = 13;
+  // mode reports the artifact class of the produced snapshot (the mode the
+  // Fastlet confirmed, not the raw request) so clients can tell Full and
+  // RootfsOnly snapshots apart.
+  SnapshotMode mode = 14;
 }
 
 message CreateSandboxSnapshotResponse {

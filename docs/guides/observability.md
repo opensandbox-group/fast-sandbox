@@ -4,6 +4,8 @@ Fast Sandbox uses Prometheus metrics for bounded SLO signals, OpenTelemetry trac
 
 ## Logging conventions
 
+First-party Kubernetes services use shared file logging and rotation, with optional stderr mirroring. See [Component file logging and rotation](component-logging.md) for configuration, covered processes, retention, and inspection commands; `kubectl logs` does not read component log files.
+
 All services log through `k8s.io/klog/v2`. One style applies everywhere:
 
 - Messages are constant strings starting lowercase — except when the first

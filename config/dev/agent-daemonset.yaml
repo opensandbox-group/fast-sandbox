@@ -194,6 +194,8 @@ spec:
           periodSeconds: 5
           timeoutSeconds: 3
         volumeMounts:
+        - {name: component-log-config, mountPath: /etc/fast-sandbox/logging, readOnly: true}
+        - {name: component-logs, mountPath: /var/log/fast-sandbox}
         - name: agent-socket
           mountPath: /run/fast-sandbox/firecracker
         - name: agent-state
@@ -287,6 +289,8 @@ spec:
             fieldRef:
               fieldPath: spec.nodeName
         volumeMounts:
+        - {name: component-log-config, mountPath: /etc/fast-sandbox/logging, readOnly: true}
+        - {name: component-logs, mountPath: /var/log/fast-sandbox}
         - name: network-state
           mountPath: /run/fast-sandbox/network
         - name: network-namespaces
@@ -307,6 +311,14 @@ spec:
           mountPath: /etc/fast-sandbox/runtime-environments
           readOnly: true
       volumes:
+      - name: component-log-config
+        configMap:
+          name: fast-sandbox-logging
+          optional: true
+          items:
+          - {key: logging.yaml, path: logging.yaml}
+      - name: component-logs
+        emptyDir: {}
       - name: oci-tools
         hostPath:
           path: /opt/fast-sandbox/oci

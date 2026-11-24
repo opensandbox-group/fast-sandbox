@@ -27,3 +27,11 @@ spec:
         # config/manager (shared config/artifact-store ConfigMap).
         ports:
         - {name: grpc, containerPort: 9090}
+        volumeMounts:
+        - {name: fastpath-callers, mountPath: /etc/fast-sandbox/callers, readOnly: true}
+        - {name: fastpath-tls, mountPath: /etc/fast-sandbox/tls, readOnly: true}
+      volumes:
+      - name: fastpath-callers
+        configMap: {name: fast-sandbox-fastpath-callers, optional: true}
+      - name: fastpath-tls
+        secret: {secretName: fast-sandbox-fastpath-tls, optional: true}

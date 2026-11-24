@@ -17,7 +17,7 @@ func stateRootFilesystemType(path string) (string, error) {
 	case unix.XFS_SUPER_MAGIC:
 		return "xfs", nil
 	case unix.EXT4_SUPER_MAGIC:
-		return "ext4", nil
+		return rootfsFilesystem, nil
 	case unix.BTRFS_SUPER_MAGIC:
 		return "btrfs", nil
 	default:

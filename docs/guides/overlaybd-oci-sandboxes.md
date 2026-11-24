@@ -193,6 +193,14 @@ The publisher uploads rootfs first and snapfiles last. It rejects replacing an e
 
 `manifestRef` and `artifactDigest` identify the snapfiles manifest. On first resolution, fsb-vm resolves `<id>_rootfs` and caches the pair as digest references. A logical `oci://repository:<id>` input also resolves the pair; mutable tag inputs are resolved remotely on each preparation. Rebuild historical OCI templates, including three-image publications with a separate metadata image and dual-file `metadata.json`/`manifest.json` templates: fsb-vm and Fastlet now require the two-image pair and unified schemaVersion 1 `snapfiles/manifest.json`. Checkpoints and live snapshots produced by the upgraded Fastlet include this file. Deploy matching Builder/fsb-vm and Fastlet versions before publishing new templates. Existing registry artifacts are not rewritten or deleted.
 
+### Local checkpoint blob cache
+
+After publishing an OCI checkpoint, Fastlet seeds the existing credential-scoped manifest cache and moves newly packed blobs into `<StateRoot>/oci/blobs/sha256/<digest>` with a same-filesystem rename. Publication already verifies these files against their OCI descriptors; retention avoids another full-file hash and copy. OverlayBD uses its existing `lower.file` support to read cached blobs. This does not require a cache-import endpoint or a patched OverlayBD build. Registry publication remains required for durability and cross-node restore.
+
+The local blob cache defaults to 16 GiB and 4096 files, independently of `OVERLAYBD_CACHE_SIZE_GB`. Set `FAST_SANDBOX_OCI_BLOB_CACHE_SIZE_BYTES` on Fastlet to change the byte budget; zero disables blob admission and lookup while retaining manifest-cache seeding. Standalone `fsb-vm` exposes `--blob-cache-dir` and `--blob-cache-max-bytes`. Keep staging, the blob cache, and device state on the same filesystem. Cross-filesystem rename/link failures fall back to registry reads without copying the blob.
+
+Admission evicts the least recently selected unpinned files and preserves a 1 GiB free-disk reserve. Device configurations keep hard links beside their state, protecting backing files until existing device teardown removes them. This also covers shared snapfiles, whose idle devices remain pinned until shared-cache cleanup. Pinned bytes count against the cache budget; if they prevent admission, the checkpoint remains usable from the registry. Lowering a budget does not forcibly detach devices or immediately reclaim their files. Eviction runs on subsequent admissions and during the pre-capture capacity recovery when snapshot staging needs more free space. That recovery can reclaim old unpinned blobs even when new blob caching is disabled, and rechecks available space before pausing the VM; pinned files remain protected. Cache contents are best effort and may be lost on node failure; missing entries retain the normal digest/size remote configuration.
+
 ## 4. Create, pause, and resume through FastPath
 
 Run the examples in Bash from the repository root, with `grpcurl` and `jq` installed. First, forward FastPath in one terminal:
@@ -306,7 +314,7 @@ record imported by Fastlet remains authoritative over those bootstrap inputs.
 
 Call the gRPC API directly; it creates and drives the `SandboxSnapshot` CR internally. Creating the CR yourself is an alternative entry point to the same flow.
 
-`CreateSandboxSnapshot` supports running OCI Sandboxes. Omit `template_name` on this path: Fastlet generates a random UUID `snapshot_id` and publishes `<snapshot_id>_rootfs` and `<snapshot_id>_snapfiles` to `FAST_SANDBOX_OCI_SNAPSHOT_REPOSITORY`, or to the source repository when that setting is absent. No third OCI artifact or name index is written.
+`CreateSandboxSnapshot` supports running OCI Sandboxes. Omit `template_name` on this path: Fastlet generates a random UUID `snapshot_id` and publishes `<snapshot_id>_rootfs` and `<snapshot_id>_snapfiles` to `FAST_SANDBOX_OCI_SNAPSHOT_REPOSITORY`, or to the source repository when that setting is absent. No third OCI artifact or name index is written. Set `mode = SNAPSHOT_MODE_ROOTFS_ONLY` (CRD: `spec.mode: RootfsOnly`) to persist only the writable rootfs layer: the artifact's manifest records `platform.snapshotMode: rootfsOnly`, consumers cold-boot from the disk instead of restoring in place, and `GetSandboxSnapshot` reports the produced class as `snapshot.mode = ROOT_FS_ONLY`. The mode requires a Fastlet that advertises the rootfs-only capability; an older Fastlet never receives the request, so it cannot silently produce a Full artifact.
 
 ```text
 CreateSandboxSnapshot(request_id="capture-001", sandbox=<running sandbox>)

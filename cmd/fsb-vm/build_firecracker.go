@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"fast-sandbox/internal/firecrackerconfig"
 )
 
 // This file encapsulates the build-flow Firecracker phase: inject an init
@@ -33,13 +35,15 @@ const (
 )
 
 // defaultInitScript renders the init script baked into the rootfs for the
-// redis sample: it mounts /proc, enters the image workdir and execs
-// redis-server. --init-script-file replaces it for other images.
+// redis sample: it mounts /proc and /sys, reports guest FPR kernel support,
+// enters the image workdir and execs redis-server. --init-script-file replaces
+// it for other images.
 func defaultInitScript() string {
 	return `#!/bin/sh
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 mount -t proc proc /proc 2>/dev/null
-cd /data 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+` + firecrackerconfig.RenderFreePageReportingCheck() + `cd /data 2>/dev/null
 exec /usr/local/bin/redis-server --protected-mode no
 `
 }
@@ -132,7 +136,8 @@ func writeGuestFile(rootDir, guestPath string, payload []byte, mode os.FileMode)
 // before returning; it also joins the rollback, so a VMM that could not be
 // stopped keeps the rootfs device it holds attached. The produced file
 // paths are returned.
-func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, rootfsDevPath string, undo *rollback) (vmstatePath, memfilePath string, err error) {
+func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, rootfsDevPath string, undo *rollback, progress *buildProgress) (vmstatePath, memfilePath string, err error) {
+	progress.start("starting guest VM")
 	runtimeDir := filepath.Join(workDir, "fc")
 	if err := os.MkdirAll(runtimeDir, 0o750); err != nil {
 		return "", "", fmt.Errorf("create firecracker runtime dir: %w", err)
@@ -148,6 +153,11 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 		bootArgs = defaultBootArgs + " init=" + options.initPath
 	}
 
+	pinnedKernel := filepath.Join(runtimeDir, "boot-kernel")
+	options.kernelSHA256, err = firecrackerconfig.PinKernel(options.kernel, pinnedKernel)
+	if err != nil {
+		return "", "", err
+	}
 	process, err := launchFirecracker(global.firecrackerBin, runtimeDir, apiSocket, buildVMID, serialLog)
 	if err != nil {
 		return "", "", err
@@ -169,33 +179,31 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 	if err := client.waitReady(readyCtx); err != nil {
 		return "", "", err
 	}
-	if err := client.setBootSource(ctx, bootSource{KernelImagePath: options.kernel, BootArgs: bootArgs}); err != nil {
-		return "", "", fmt.Errorf("configure boot source: %w", err)
-	}
-	if err := client.addDrive(ctx, drive{
-		DriveID:      options.rootfsDriveID,
-		PathOnHost:   rootfsDriveLink,
-		IsRootDevice: true,
-		IsReadOnly:   false,
-	}); err != nil {
-		return "", "", fmt.Errorf("attach rootfs drive: %w", err)
-	}
-	if err := client.setMachineConfig(ctx, machineConfig{VCPUCount: options.vcpu, MemSizeMiB: options.memoryMB}); err != nil {
-		return "", "", fmt.Errorf("configure machine: %w", err)
-	}
-	if options.tapName != "" {
-		if err := client.do(ctx, "PUT", "/network-interfaces/eth0", map[string]string{"iface_id": "eth0", "host_dev_name": options.tapName, "guest_mac": options.guestMAC}, nil); err != nil {
-			return "", "", err
-		}
-	}
-	if err := client.startInstance(ctx); err != nil {
-		return "", "", fmt.Errorf("start instance: %w", err)
-	}
-
-	if err := waitSerialFor(serialLog, options.readyPattern, options.readyTimeout); err != nil {
+	if err := configureBuildVM(ctx, client, options, pinnedKernel, bootArgs); err != nil {
 		return "", "", err
 	}
 
+	progress.start("waiting for guest readiness")
+	if err := waitSerialFor(serialLog, options.readyPattern, options.readyTimeout); err != nil {
+		return "", "", err
+	}
+	freePageReporting, err := firecrackerconfig.ReadFreePageReportingSupport(serialLog)
+	if err != nil {
+		return "", "", err
+	}
+	options.freePageReporting = freePageReporting
+	if !freePageReporting {
+		fmt.Fprintln(os.Stderr, "warning:", firecrackerconfig.FreePageReportingUnavailableWarning)
+	}
+
+	if options.guestControlPort != 0 {
+		progress.start("probing guest-control helper")
+		options.guestControlVersion, err = probeRootfsHelper(ctx, filepath.Join(runtimeDir, "guest-control.sock"), options.guestControlPort)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	progress.start("capturing VM snapshot")
 	snapDir := filepath.Join(workDir, "snapshot")
 	if err := os.MkdirAll(snapDir, 0o750); err != nil {
 		return "", "", fmt.Errorf("create snapshot dir: %w", err)
@@ -213,6 +221,34 @@ func coldBootAndSnapshot(ctx context.Context, options *buildOptions, workDir, ro
 		return "", "", fmt.Errorf("create full snapshot: %w", err)
 	}
 	return vmstatePath, memfilePath, nil
+}
+
+func configureBuildVM(ctx context.Context, client *firecrackerClient, options *buildOptions, pinnedKernel, bootArgs string) error {
+	vsockPath := ""
+	if options.guestControlPort != 0 {
+		vsockPath = "guest-control.sock"
+	}
+	ops := firecrackerconfig.BuildBoot(firecrackerconfig.BuildBootSpec{
+		KernelPath:    pinnedKernel,
+		BootArgs:      bootArgs,
+		VCPUCount:     options.vcpu,
+		MemoryMiB:     int64(options.memoryMB),
+		RootfsDriveID: options.rootfsDriveID,
+		RootfsPath:    rootfsDriveLink,
+		TapName:       options.tapName,
+		GuestIface:    "eth0",
+		GuestMAC:      options.guestMAC,
+		VsockUDSPath:  vsockPath,
+	})
+	for _, op := range ops {
+		if err := client.do(ctx, "PUT", op.Path, op.Body, nil); err != nil {
+			return firecrackerconfig.WrapBuildOpError(op.Path, err)
+		}
+	}
+	if err := client.startInstance(ctx); err != nil {
+		return fmt.Errorf("start instance: %w", err)
+	}
+	return nil
 }
 
 // waitSerialFor polls the serial log until pattern appears or timeout

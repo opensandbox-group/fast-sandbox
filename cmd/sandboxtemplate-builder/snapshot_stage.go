@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,8 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/firecrackerconfig"
+	"fast-sandbox/internal/guestcontrol"
 	"fast-sandbox/internal/guestnetwork"
 )
 
@@ -27,9 +30,12 @@ import (
 // the workdir for the pipeline: sub-phase durations, the effective CPU
 // template, and detected guest FPR support.
 type snapshotPhaseTimings struct {
-	BootToReadyMs        int64 `json:"bootToReadyMs"`
-	SnapshotCreateMs     int64 `json:"snapshotCreateMs"`
-	RestoreToHeartbeatMs int64 `json:"restoreToHeartbeatMs"`
+	KernelSHA256         string                    `json:"kernelSHA256,omitempty"`
+	KernelCmdline        string                    `json:"kernelCmdline,omitempty"`
+	GuestControl         *artifacts.VMGuestControl `json:"guestControl,omitempty"`
+	BootToReadyMs        int64                     `json:"bootToReadyMs"`
+	SnapshotCreateMs     int64                     `json:"snapshotCreateMs"`
+	RestoreToHeartbeatMs int64                     `json:"restoreToHeartbeatMs"`
 	// CPUTemplate is the tier in effect ("T2"/"T2A"/"none"), normalized by
 	// compatibilityCPUTemplate.
 	CPUTemplate string `json:"cpuTemplate"`
@@ -70,6 +76,9 @@ const (
 // for the guest's SANDBOX_READY marker, pauses, creates a full snapshot, and
 // restores it once for validation.
 func runSnapshotStage(args []string) error {
+	if err := selectBuildVMM(context.Background()); err != nil {
+		return err
+	}
 	if len(args) != 4 {
 		return fmt.Errorf("usage: sandbox-snapshot-stage <kernel> <rootfs> <vmstate> <memory>")
 	}
@@ -106,7 +115,13 @@ func runSnapshotStage(args []string) error {
 	// cwd = workdir).
 	driveLink := filepath.Join(workdir, snapshotDriveName)
 	_ = os.Remove(driveLink)
-	if err := os.Symlink(rootfs, driveLink); err != nil {
+	if spec.Output.Mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+		// Boot a private sparse copy so the published filesystem remains clean.
+		if err := copyVerificationDisk(rootfs, driveLink); err != nil {
+			return err
+		}
+		defer os.Remove(driveLink)
+	} else if err := os.Symlink(rootfs, driveLink); err != nil {
 		return fmt.Errorf("link snapshot drive %s: %w", driveLink, err)
 	}
 
@@ -124,7 +139,14 @@ func runSnapshotStage(args []string) error {
 	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off nomodules net.ifnames=0 biosdevname=0 random.trust_cpu=on root=/dev/vda rw"
 	bootArgs += " init=" + guestInitPath(spec)
 	bootArgs = bakedNetworkBootArgs(bootArgs)
-	vm, cpuTemplate, err := bootPreparationVM(bootSocket, bootLog, workdir, kernel, rootfs, bootArgs, spec)
+	// Hash the same private bytes the VMM loads, not a mutable node path after boot.
+	pinnedKernel := filepath.Join(workdir, "boot-kernel")
+	kernelSHA256, err := firecrackerconfig.PinKernel(kernel, pinnedKernel)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(pinnedKernel)
+	vm, cpuTemplate, err := bootPreparationVM(bootSocket, bootLog, workdir, pinnedKernel, rootfs, bootArgs, spec)
 	if err != nil {
 		return err
 	}
@@ -138,16 +160,32 @@ func runSnapshotStage(args []string) error {
 		return fmt.Errorf("guest init startup failed: %s", lastMarkerLine(bootLog, startupFailedMarker))
 	}
 	bootToReadyMs := time.Since(phaseStarted).Milliseconds()
-	freePageReporting, err := readFreePageReportingSupport(bootLog)
+	freePageReporting, err := firecrackerconfig.ReadFreePageReportingSupport(bootLog)
 	if err != nil {
 		vm.stop()
 		return err
 	}
 	if !freePageReporting {
-		klog.Warning("guest free-page reporting unavailable; snapshot will retain legacy memory behavior")
+		klog.Warning(firecrackerconfig.FreePageReportingUnavailableWarning)
+	}
+
+	// Publish capability only after probing the real root on this disposable VM.
+	control, err := probeNativeGuestControl(workdir)
+	if err != nil {
+		vm.stop()
+		return err
 	}
 
 	// Pause and create the full snapshot.
+	phases := snapshotPhaseTimings{
+		KernelSHA256: kernelSHA256, KernelCmdline: bootArgs, GuestControl: control,
+		BootToReadyMs: bootToReadyMs, CPUTemplate: compatibilityCPUTemplate(cpuTemplate),
+		FreePageReporting: freePageReporting,
+	}
+	if spec.Output.Mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+		vm.stop()
+		return writeSnapshotReport(workdir, spec, phases)
+	}
 	snapshotStarted := time.Now()
 	if err := api(vm.socket, "PATCH", "/vm", map[string]string{"state": "Paused"}); err != nil {
 		vm.stop()
@@ -176,6 +214,13 @@ func runSnapshotStage(args []string) error {
 	restoreStarted := time.Now()
 	restoreLog := filepath.Join(workdir, "restore.console.log")
 	restoreSocket := filepath.Join(workdir, "restore.sock")
+	// The preparation VMM has exited. Its host UDS is not part of vmstate,
+	// but restore rebinds the same relative path; remove that stale socket first.
+	if control != nil {
+		if err := os.Remove(filepath.Join(workdir, "guest-control.sock")); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
 	restored, err := startVMM(restoreSocket, restoreLog, workdir)
 	if err != nil {
 		return err
@@ -198,14 +243,17 @@ func runSnapshotStage(args []string) error {
 	if _, err := waitForAnyMarker(restoreLog, restoreTimeout(spec), "SANDBOX_HEARTBEAT"); err != nil {
 		return err
 	}
-	restoreToHeartbeatMs := time.Since(restoreStarted).Milliseconds()
-	phases := snapshotPhaseTimings{
-		BootToReadyMs:        bootToReadyMs,
-		SnapshotCreateMs:     snapshotCreateMs,
-		RestoreToHeartbeatMs: restoreToHeartbeatMs,
-		CPUTemplate:          compatibilityCPUTemplate(cpuTemplate),
-		FreePageReporting:    freePageReporting,
+	if control != nil {
+		if err := verifyRestoredHelper(workdir, control); err != nil {
+			return err
+		}
 	}
+	phases.RestoreToHeartbeatMs = time.Since(restoreStarted).Milliseconds()
+	phases.SnapshotCreateMs = snapshotCreateMs
+	return writeSnapshotReport(workdir, spec, phases)
+}
+
+func writeSnapshotReport(workdir string, spec apiv1alpha2.SandboxTemplateSpec, phases snapshotPhaseTimings) error {
 	if payload, err := json.Marshal(phases); err != nil {
 		return fmt.Errorf("marshal snapshot stage report: %w", err)
 	} else if err := os.WriteFile(filepath.Join(workdir, "snapshot-phases.json"), payload, 0o644); err != nil { //nolint:gosec // published stage report, world-readable like every staged artifact
@@ -221,7 +269,6 @@ func runSnapshotStage(args []string) error {
 		"bootToReadyMs", phases.BootToReadyMs,
 		"snapshotCreateMs", phases.SnapshotCreateMs,
 		"restoreToHeartbeatMs", phases.RestoreToHeartbeatMs)
-	_, _ = fmt.Fprintln(os.Stderr, "snapshot stage: boot and restore validation passed")
 	return nil
 }
 
@@ -321,6 +368,14 @@ func bootVMM(socket, logPath, workdir, kernel, rootfs, bootArgs string, spec api
 		vm.stop()
 		return nil, err
 	}
+	if spec.Output.Format == apiv1alpha2.ArtifactFormatNative {
+		// Relative paths survive snapshot restore into a different instance cwd.
+		_ = os.Remove(filepath.Join(workdir, "guest-control.sock"))
+		if err := api(vm.socket, "PUT", "/vsock", map[string]any{"guest_cid": 3, "uds_path": "guest-control.sock"}); err != nil {
+			vm.stop()
+			return nil, err
+		}
+	}
 	if err := vm.start(); err != nil {
 		vm.stop()
 		return nil, fmt.Errorf("%w: %w", errInstanceStart, err)
@@ -341,54 +396,26 @@ func configureVM(vm *vmm, kernel, rootfs, bootArgs string, spec apiv1alpha2.Sand
 	if err != nil {
 		return err
 	}
-	machineConfig := map[string]any{
-		"vcpu_count":   vcpuCount,
-		"mem_size_mib": memSize,
-		"smt":          false,
-	}
-	if cpuTemplate != "" {
-		machineConfig["cpu_template"] = cpuTemplate
-	}
-	if err := api(vm.socket, "PUT", "/machine-config", machineConfig); err != nil {
-		return err
-	}
-	if err := api(vm.socket, "PUT", "/balloon", map[string]any{
-		"amount_mib": 0, "deflate_on_oom": true,
-		"stats_polling_interval_s": 0, "free_page_reporting": true,
-	}); err != nil {
-		return fmt.Errorf("configure free-page reporting: %w", err)
-	}
-	// Entropy device (virtio-rng): the microVM has no other entropy source —
-	// the T2 CPU template masks RDRAND/RDSEED (snapshot determinism) and no
-	// host RNG device is passed through — so without it the guest CRNG never
-	// initializes and getrandom() callers (Go crypto/rand, uuid, openssl,
-	// python secrets, TLS) block forever; execd POST /command hangs on its
-	// session id while /ping and malformed-JSON 400 stay instant (OpenSandbox
-	// #1695). Seeding the CRNG at prep boot means the golden snapshot carries
-	// an initialized CRNG and every restored instance works.
-	if err := api(vm.socket, "PUT", "/entropy", map[string]any{}); err != nil {
-		return fmt.Errorf("attach entropy device: %w", err)
-	}
-	if err := api(vm.socket, "PUT", "/boot-source", map[string]any{
-		"kernel_image_path": kernel,
-		"boot_args":         bootArgs,
-	}); err != nil {
-		return err
-	}
-	if err := api(vm.socket, "PUT", "/drives/rootfs", map[string]any{
-		"drive_id":       rootfsDirName,
-		"path_on_host":   snapshotDriveName,
-		"is_root_device": true,
-		"is_read_only":   false,
-	}); err != nil {
-		return err
-	}
-	if err := api(vm.socket, "PUT", "/network-interfaces/eth0", map[string]any{
-		"iface_id":      "eth0",
-		"host_dev_name": buildTap,
-		"guest_mac":     bakedGuestMAC,
-	}); err != nil {
-		return err
+	// Entropy (virtio-rng) is installed via BuildBoot because the T2 CPU
+	// template masks RDRAND/RDSEED; seeding the guest CRNG at prep boot keeps
+	// getrandom() callers (e.g. execd POST /command) from blocking after restore.
+	ops := firecrackerconfig.BuildBoot(firecrackerconfig.BuildBootSpec{
+		KernelPath:    kernel,
+		BootArgs:      bootArgs,
+		VCPUCount:     vcpuCount,
+		MemoryMiB:     memSize,
+		SMT:           new(false),
+		CPUTemplate:   cpuTemplate,
+		RootfsDriveID: rootfsDirName,
+		RootfsPath:    snapshotDriveName,
+		TapName:       buildTap,
+		GuestIface:    "eth0",
+		GuestMAC:      bakedGuestMAC,
+	})
+	for _, op := range ops {
+		if err := api(vm.socket, "PUT", op.Path, op.Body); err != nil {
+			return firecrackerconfig.WrapBuildOpError(op.Path, err)
+		}
 	}
 	return nil
 }
@@ -651,4 +678,22 @@ func memoryMiB(quantity string) (int64, error) {
 		return 128, nil
 	}
 	return miB, nil
+}
+
+func copyVerificationDisk(rootfs, destination string) error {
+	if output, err := exec.Command("cp", "--reflink=auto", "--sparse=always", "--", rootfs, destination).CombinedOutput(); err != nil {
+		return fmt.Errorf("copy template disk for boot verification: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func verifyRestoredHelper(workdir string, control *artifacts.VMGuestControl) error {
+	version, err := guestcontrol.ProbeRootFilesystem(context.Background(), filepath.Join(workdir, "guest-control.sock"), control.Port)
+	if err != nil {
+		return fmt.Errorf("restored native guest helper probe: %w", err)
+	}
+	if version != control.HelperVersion {
+		return errors.New("restored helper version changed")
+	}
+	return nil
 }

@@ -34,9 +34,11 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	infracatalog "fast-sandbox/internal/catalog/infra"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/componentlog"
 	orchestration "fast-sandbox/internal/controlplane/orchestrator"
 	"fast-sandbox/internal/controlplane/placement"
 	"fast-sandbox/internal/fastlet/podcgroup"
+	"fast-sandbox/internal/fastletauth"
 	"fast-sandbox/internal/fastletsettings"
 	"fast-sandbox/internal/nodecleanup"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
@@ -54,6 +56,7 @@ type SandboxPoolReconciler struct {
 	Catalog                             *runtimecatalog.Catalog
 	FastletDrainer                      FastletDrainer
 	FastletProxyImage                   string
+	FastletProxyResources               corev1.ResourceRequirements
 	RouteVerifyPublicKey                string
 	RuntimeEnvironmentNamespace         string
 	RuntimeEnvironmentConfigMap         string
@@ -64,6 +67,20 @@ type SandboxPoolReconciler struct {
 	DisableResourceAwareMemoryAdmission bool
 	DisableResourceAwarePoolScaling     bool
 	Now                                 func() time.Time
+	// FastletAuthIssuer and FastletAuthCABundle are the control
+	// authentication anchor injected into Fastlet Pods. They come from this
+	// Pod's own projected ServiceAccount identity; when empty (a host-process
+	// development run) new Fastlets fail at startup rather than serve an
+	// unauthenticated control API.
+	FastletAuthIssuer   string
+	FastletAuthCABundle string
+	// FastletAuthSubjects is the caller allow list injected into Fastlet
+	// Pods. It comes from the --fastlet-auth-subjects flag; when empty the
+	// platform default is injected so the entry always shadows templates.
+	FastletAuthSubjects []string
+	// FastletAuthAudience is the token audience injected into Fastlet Pods,
+	// resolved from the control plane's own configuration.
+	FastletAuthAudience string
 }
 
 type FastletDrainer interface {
@@ -116,6 +133,20 @@ const (
 	registryConfigVolumeName = "registry-config"
 	// proxyControlVolumeName is the reserved volume sharing the proxy control socket.
 	proxyControlVolumeName = "proxy-control"
+	// fastletServiceAccountName is the dedicated discovery-only identity the
+	// Pool Controller provisions per Pool namespace; its projected token is
+	// the Fastlet's key-fetch credential.
+	fastletServiceAccountName = "fast-sandbox-fastlet"
+	// fastletAuthTokenVolumeName is the reserved volume carrying that token
+	// into the Fastlet container alone.
+	fastletAuthTokenVolumeName = "fastlet-auth-token"
+)
+
+// Mount path and projection item derived from the fastletauth token path so
+// the mount cannot drift from the file the Fastlet reads.
+var (
+	fastletAuthTokenMountPath      = filepath.Dir(fastletauth.ServiceAccountTokenFile)
+	fastletAuthTokenProjectionPath = filepath.Base(fastletauth.ServiceAccountTokenFile)
 )
 
 // Reconcile manages the lifecycle of Fastlet Pods based on the demand from Sandboxes.
@@ -125,6 +156,10 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	var pool apiv1alpha2.SandboxPool
 	if err := r.Get(ctx, req.NamespacedName, &pool); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	// A deleting Pool must not replenish the children being removed.
+	if pool.DeletionTimestamp != nil {
+		return ctrl.Result{}, nil
 	}
 	// The Identity struct has no pool field, so attach the pool key directly:
 	// every log in this reconcile (drain retries, scale-up, condition writes)
@@ -196,8 +231,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 	r.applyResourceAwareFeatureGates(&resolvedResources)
-	compiledRegistry, err := r.ensureRegistrySecret(ctx, &pool)
-	if err != nil {
+	if _, err := r.ensureRegistrySecret(ctx, &pool); err != nil {
 		logger.V(1).Info("pool registry configuration is invalid", "reason", boundedStatusMessage(err.Error()))
 		if condErr := r.updatePoolCondition(ctx, &pool, metav1.Condition{
 			Type: apiv1alpha2.PoolConditionRegistryReady, Status: metav1.ConditionFalse,
@@ -207,7 +241,12 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
-	logger.V(4).Info("pool registry configuration compiled", "revision", compiledRegistry.Revision)
+	if err := r.updatePoolCondition(ctx, &pool, metav1.Condition{
+		Type: apiv1alpha2.PoolConditionRegistryReady, Status: metav1.ConditionTrue,
+		Reason: apiv1alpha2.ReasonRegistryAvailable, Message: "Registry configuration is valid and the compiled Secret is persisted",
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
 	infraPlan, infraErr := r.resolveInfraPlan(&pool, profile)
 	infraCondition := metav1.Condition{
 		Type: apiv1alpha2.PoolConditionInfraReady, Status: metav1.ConditionTrue,
@@ -223,27 +262,19 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
-	// Report registry rollout even when infra validation failed, but do not
-	// provision Fastlets until both configurations are valid.
 	var childPods corev1.PodList
 	if err := r.durableReader().List(ctx, &childPods, client.InNamespace(req.Namespace), client.MatchingLabels(poolLabels(pool.Name))); err != nil {
 		return ctrl.Result{}, err
 	}
-	appliedRegistry, totalRegistry := r.registryRolloutCounts(&pool, compiledRegistry, childPods.Items)
-	registryCondition := metav1.Condition{
-		Type: apiv1alpha2.PoolConditionRegistryReady, Status: metav1.ConditionTrue,
-		Reason: apiv1alpha2.ReasonRegistryAvailable, Message: "Registry configuration is applied to every current Fastlet",
-	}
-	if appliedRegistry != totalRegistry {
-		registryCondition.Status = metav1.ConditionFalse
-		registryCondition.Reason = "RegistryPropagating"
-		registryCondition.Message = fmt.Sprintf("Registry configuration is applied to %d/%d current Fastlets", appliedRegistry, totalRegistry)
-	}
-	if err := r.updatePoolCondition(ctx, &pool, registryCondition); err != nil {
+	childPods.Items, err = r.removeRetiredFastlets(ctx, &pool, childPods.Items)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if infraErr != nil {
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil //nolint:nilerr // invalid configuration is reported through InfraReady and retried at a fixed interval
+	}
+	if err := r.ensureFastletServiceAccount(ctx, &pool); err != nil {
+		return ctrl.Result{}, err
 	}
 	if err := r.ensureInfraPlanConfigMap(ctx, &pool, infraPlan); err != nil {
 		return ctrl.Result{}, err
@@ -251,7 +282,11 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.ensureRuntimePlanConfigMap(ctx, &pool, runtimePlan); err != nil {
 		return ctrl.Result{}, err
 	}
-	settings, err := buildFastletSettingsFromResolved(&pool, resolvedResources)
+	fastletProxyResources, err := r.resolvedFastletProxyResources()
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	settings, err := buildFastletSettingsFromResolved(&pool, resolvedResources, fastletProxyResources)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -305,7 +340,7 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		maxPerPod = 1
 	}
 
-	desiredPod, err := r.constructPodWithResolvedResources(&pool, runtimePlan, resolvedResources, settings)
+	desiredPod, err := r.constructPodWithResolvedResources(ctx, &pool, runtimePlan, resolvedResources, settings, fastletProxyResources)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -399,6 +434,28 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+func (r *SandboxPoolReconciler) removeRetiredFastlets(ctx context.Context, pool *apiv1alpha2.SandboxPool, pods []corev1.Pod) ([]corev1.Pod, error) {
+	active := pods[:0]
+	for index := range pods {
+		pod := &pods[index]
+		terminal := pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded
+		if !metav1.IsControlledBy(pod, pool) || (!terminal && pod.DeletionTimestamp == nil) {
+			active = append(active, *pod)
+			continue
+		}
+		// Deleting Pods no longer admit work, even while Running. Terminal
+		// Pods cannot recover or acknowledge a drain, so retire their exact UID.
+		// Preserve deletion in progress and leave cleanup fences intact.
+		if pod.DeletionTimestamp == nil {
+			if err := r.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}); client.IgnoreNotFound(err) != nil {
+				return nil, err
+			}
+			klog.FromContext(ctx).Info("retired terminal Fastlet Pod", "pod", pod.Name, "podUID", pod.UID, "phase", pod.Status.Phase)
+		}
+	}
+	return active, nil
 }
 
 func (r *SandboxPoolReconciler) aggregateWarmImageStatus(
@@ -1459,19 +1516,25 @@ func (r *SandboxPoolReconciler) constructPodWithRuntimePlan(pool *apiv1alpha2.Sa
 		return nil, err
 	}
 	r.applyResourceAwareFeatureGates(&resolvedResources)
-	settings, err := buildFastletSettingsFromResolved(pool, resolvedResources)
+	fastletProxyResources, err := r.resolvedFastletProxyResources()
 	if err != nil {
 		return nil, err
 	}
-	return r.constructPodWithResolvedResources(pool, runtimePlan, resolvedResources, settings)
+	settings, err := buildFastletSettingsFromResolved(pool, resolvedResources, fastletProxyResources)
+	if err != nil {
+		return nil, err
+	}
+	return r.constructPodWithResolvedResources(context.Background(), pool, runtimePlan, resolvedResources, settings, fastletProxyResources)
 }
 
 //nolint:gocognit,maintidx // Pod assembly covers all runtime variants.
 func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
+	ctx context.Context,
 	pool *apiv1alpha2.SandboxPool,
 	runtimePlan runtimeenv.ResolvedRuntimePlan,
 	resolvedResources resolvedFastletResources,
 	settings fastletsettings.Bundle,
+	fastletProxyResources corev1.ResourceRequirements,
 ) (*corev1.Pod, error) {
 	profile := runtimePlan.Profile
 	sandboxResources := pool.Spec.SandboxResources
@@ -1515,6 +1578,16 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 	podSpec.HostPID = false
 	podSpec.RuntimeClassName = nil
 	podSpec.AutomountServiceAccountToken = boolPtr(false)
+	// Pin the image pull credentials that were effective before the identity
+	// switch, then force the fetching identity. Order matters: the preservation
+	// reads the template-chosen identity, not the platform one.
+	if err := r.preserveImagePullSecrets(ctx, podSpec, pool.Namespace); err != nil {
+		return nil, err
+	}
+	// The fetching identity is platform-owned, never template-chosen; automount
+	// stays off — the credential ships as the projected volume mounted into the
+	// Fastlet container only.
+	podSpec.ServiceAccountName = fastletServiceAccountName
 	if len(podSpec.Containers) == 0 {
 		return nil, errors.New("fastletTemplate.spec.containers must contain the fastlet container")
 	}
@@ -1592,6 +1665,31 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			corev1.EnvVar{Name: envFastSandboxRegistryConfigPath, Value: registryconfig.MountPath},
 			corev1.EnvVar{Name: "INFRA_DIR_IN_POD", Value: infraHostPath},
 		)
+		// Control authentication is platform-owned end to end: the anchor
+		// (issuer + CA), the caller allow list, and the audience all come
+		// from here. Every auth env key is removed from template env above
+		// and re-injected unconditionally — including entries whose platform
+		// value is empty — because kubelet resolves an explicit env entry
+		// over an envFrom key of the same name regardless of value. That
+		// closes every template supply path for the auth keys while the
+		// template's other envFrom inputs (ConfigMap/Secret references)
+		// keep working.
+		subjects := r.FastletAuthSubjects
+		if len(subjects) == 0 {
+			// The controller normally passes its namespace-derived list;
+			// this fallback keeps directly constructed reconcilers on the
+			// platform default.
+			subjects = fastletauth.DefaultAllowedSubjects
+		}
+		c.Env = append(c.Env,
+			corev1.EnvVar{Name: fastletauth.IssuerEnv, Value: r.FastletAuthIssuer},
+			corev1.EnvVar{Name: fastletauth.CABundleEnv, Value: r.FastletAuthCABundle},
+			corev1.EnvVar{Name: fastletauth.AllowedSubjectsEnv, Value: strings.Join(subjects, ",")},
+			corev1.EnvVar{Name: fastletauth.AudienceEnv, Value: r.FastletAuthAudience},
+			// Explicitly empty: Pods read the mounted token file, and the
+			// entry shadows any envFrom key of the same name.
+			corev1.EnvVar{Name: fastletauth.KeyFetchTokenEnv},
+		)
 		if profile.ResidualProcess != runtimecatalog.ResidualProcessNone {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "FAST_SANDBOX_NODE_CLEANUP_SOCKET", Value: nodecleanup.DefaultSocketPath})
 		}
@@ -1603,7 +1701,12 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			corev1.VolumeMount{Name: registryConfigVolumeName, MountPath: registryConfigDir, ReadOnly: true},
 			corev1.VolumeMount{Name: fastletsettings.VolumeName, MountPath: fastletsettings.MountPath, ReadOnly: true},
 			corev1.VolumeMount{Name: proxyControlVolumeName, MountPath: proxyRunDir},
+			// The key-fetch credential, mounted into the Fastlet container only.
+			corev1.VolumeMount{
+				Name: fastletAuthTokenVolumeName, MountPath: fastletAuthTokenMountPath, ReadOnly: true,
+			},
 		)
+		c.VolumeMounts = append(c.VolumeMounts, componentLogVolumeMounts()...)
 		if needsHostCgroup {
 			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{
 				Name: podcgroup.VolumeName, MountPath: podcgroup.HostRoot,
@@ -1633,6 +1736,7 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 	}
 	podSpec.Containers = append(podSpec.Containers, corev1.Container{
 		Name: fastletProxyContainerName, Image: proxyImage, ImagePullPolicy: corev1.PullIfNotPresent,
+		Resources: *fastletProxyResources.DeepCopy(),
 		Env: []corev1.EnvVar{
 			{Name: envFastletProxyControlSocket, Value: "/run/fast-sandbox/proxy/control.sock"},
 			{Name: "FASTLET_PROXY_DATA_ADDRESS", Value: ":5780"},
@@ -1643,7 +1747,7 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			{Name: "data-proxy", ContainerPort: 5780, Protocol: corev1.ProtocolTCP},
 			{Name: "proxy-metrics", ContainerPort: 9093, Protocol: corev1.ProtocolTCP},
 		},
-		VolumeMounts: []corev1.VolumeMount{{Name: proxyControlVolumeName, MountPath: proxyRunDir}},
+		VolumeMounts: append(componentLogVolumeMounts(), corev1.VolumeMount{Name: proxyControlVolumeName, MountPath: proxyRunDir}),
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{
 				Path: "/readyz", Port: intstr.FromInt32(5780), Scheme: corev1.URISchemeHTTP,
@@ -1693,7 +1797,21 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 			}},
 		},
 		corev1.Volume{Name: proxyControlVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		corev1.Volume{
+			Name: fastletAuthTokenVolumeName,
+			VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+				Sources: []corev1.VolumeProjection{{
+					ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+						// The kubelet rotates the token before expiry; the
+						// Fastlet re-reads the file per fetch.
+						ExpirationSeconds: int64Ptr(int64(fastletauth.DefaultExpirationSeconds)),
+						Path:              fastletAuthTokenProjectionPath,
+					},
+				}},
+			}},
+		},
 	)
+	podSpec.Volumes = append(podSpec.Volumes, componentLogVolumes()...)
 	if needsHostCgroup {
 		podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
 			Name: podcgroup.VolumeName,
@@ -1824,17 +1942,44 @@ func podConditionTrue(conditions []corev1.PodCondition, conditionType corev1.Pod
 	return false
 }
 
+func componentLogVolumeMounts() []corev1.VolumeMount {
+	return []corev1.VolumeMount{
+		{Name: componentlog.ConfigVolumeName, MountPath: componentlog.ConfigMountPath, ReadOnly: true},
+		{Name: componentlog.LogVolumeName, MountPath: componentlog.LogDirectory},
+	}
+}
+
+func componentLogVolumes() []corev1.Volume {
+	return []corev1.Volume{
+		{
+			Name: componentlog.ConfigVolumeName,
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: componentlog.ConfigMapName},
+				Optional:             boolPtr(true),
+				Items:                []corev1.KeyToPath{{Key: componentlog.ConfigFileName, Path: componentlog.ConfigFileName}},
+			}},
+		},
+		{
+			Name:         componentlog.LogVolumeName,
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		},
+	}
+}
+
 func validatePlatformOwnedStorage(podSpec *corev1.PodSpec) error {
 	reservedVolumes := map[string]string{
-		tmpVolumeName:              tmpDir,
-		infraToolsVolumeName:       infraHostPath,
-		infraPlanVolumeName:        "/etc/fast-sandbox/infra",
-		runtimePlanVolumeName:      runtimeenv.PlanMountPath,
-		registryConfigVolumeName:   registryConfigDir,
-		fastletsettings.VolumeName: fastletsettings.MountPath,
-		proxyControlVolumeName:     proxyRunDir,
-		nodeCleanupVolumeName:      filepath.Dir(nodecleanup.DefaultSocketPath),
-		podcgroup.VolumeName:       podcgroup.HostRoot,
+		tmpVolumeName:                 tmpDir,
+		infraToolsVolumeName:          infraHostPath,
+		infraPlanVolumeName:           "/etc/fast-sandbox/infra",
+		runtimePlanVolumeName:         runtimeenv.PlanMountPath,
+		registryConfigVolumeName:      registryConfigDir,
+		fastletsettings.VolumeName:    fastletsettings.MountPath,
+		proxyControlVolumeName:        proxyRunDir,
+		nodeCleanupVolumeName:         filepath.Dir(nodecleanup.DefaultSocketPath),
+		podcgroup.VolumeName:          podcgroup.HostRoot,
+		componentlog.ConfigVolumeName: componentlog.ConfigMountPath,
+		componentlog.LogVolumeName:    componentlog.LogDirectory,
+		fastletAuthTokenVolumeName:    fastletAuthTokenMountPath,
 	}
 	for _, volume := range podSpec.Volumes {
 		if _, reserved := reservedVolumes[volume.Name]; reserved {
@@ -1847,6 +1992,13 @@ func validatePlatformOwnedStorage(podSpec *corev1.PodSpec) error {
 				if mount.Name == name || mount.MountPath == path {
 					return fmt.Errorf("container %q uses volume name %s or mount path %s reserved by the platform", container.Name, name, path)
 				}
+			}
+			// An exact-path check is not enough for the credential directory: a
+			// subPath mount of any template volume can shadow an individual file
+			// inside it, and containerd applies the parent directory before the
+			// subpath. Reject everything at or under the directory.
+			if strings.HasPrefix(filepath.Clean(mount.MountPath)+"/", fastletAuthTokenMountPath+"/") {
+				return fmt.Errorf("container %q mounts %q inside the projected credential directory %s", container.Name, mount.MountPath, fastletAuthTokenMountPath)
 			}
 		}
 	}
@@ -1984,10 +2136,14 @@ func buildFastletSettings(pool *apiv1alpha2.SandboxPool, profile runtimecatalog.
 	if err != nil {
 		return fastletsettings.Bundle{}, err
 	}
-	return buildFastletSettingsFromResolved(pool, resolved)
+	return buildFastletSettingsFromResolved(pool, resolved, DefaultFastletProxyResources())
 }
 
-func buildFastletSettingsFromResolved(pool *apiv1alpha2.SandboxPool, resolved resolvedFastletResources) (fastletsettings.Bundle, error) {
+func buildFastletSettingsFromResolved(
+	pool *apiv1alpha2.SandboxPool,
+	resolved resolvedFastletResources,
+	fastletProxyResources corev1.ResourceRequirements,
+) (fastletsettings.Bundle, error) {
 	bundle := fastletsettings.Bundle{
 		WarmImages:      uniqueWarmImages(pool.Spec.WarmImages),
 		ActionHandlers:  pool.Spec.ActionHandlers,
@@ -2012,9 +2168,9 @@ func buildFastletSettingsFromResolved(pool *apiv1alpha2.SandboxPool, resolved re
 		}
 	}
 	// The platform-owned proxy is always injected and runs in the same Pod
-	// cgroup. Its default memory limit must therefore be part of that scope's
+	// cgroup. Its configured memory limit must therefore be part of that scope's
 	// observer budget, while remaining outside Sandbox commitment capacity.
-	podMemoryBudget.Add(defaultPlatformResourceLimit(corev1.ResourceMemory))
+	podMemoryBudget.Add(fastletProxyResources.Limits[corev1.ResourceMemory])
 	bundle.ResourceAdmission = &fastletsettings.ResourceAdmissionSettings{
 		Version: "v2", Mode: apiv1alpha2.SandboxResourceModeResourceAware,
 		StaticAdmission: resolved.StaticAdmission, MemoryAdmission: resolved.MemoryAdmission,
@@ -2227,28 +2383,6 @@ func (r *SandboxPoolReconciler) persistRegistrySecret(
 	return r.Patch(ctx, &secret, client.MergeFrom(before))
 }
 
-func (r *SandboxPoolReconciler) registryRolloutCounts(
-	pool *apiv1alpha2.SandboxPool,
-	compiled registryconfig.Compiled,
-	pods []corev1.Pod,
-) (int32, int32) {
-	children := childPodIdentities(pods)
-	total := int32(len(children))
-	if r.Registry == nil {
-		return 0, total
-	}
-	var applied int32
-	for _, info := range r.Registry.GetAllFastlets() {
-		if info.Namespace != pool.Namespace || info.PoolName != pool.Name || info.RegistryRevision != compiled.Revision {
-			continue
-		}
-		if _, exists := children[info.PodName+"/"+info.PodUID]; exists {
-			applied++
-		}
-	}
-	return applied, total
-}
-
 func (r *SandboxPoolReconciler) ensureInfraPlanConfigMap(
 	ctx context.Context,
 	pool *apiv1alpha2.SandboxPool,
@@ -2418,6 +2552,11 @@ var runtimeOwnedEnv = map[string]struct{}{
 	"FAST_SANDBOX_ACTIONS":         {},
 	"FAST_SANDBOX_SETTINGS_DIR":    {},
 	"NODE_NAME":                    {}, envPodName: {}, "POD_IP": {}, envPodUID: {}, "NAMESPACE": {},
+	// Control authentication env keys are platform-owned: injected by the Pool
+	// Controller and stripped from templates. KeyFetchTokenEnv is fenced the
+	// same way — the override wins over the mounted token even inside a Pod.
+	fastletauth.AllowedSubjectsEnv: {}, fastletauth.IssuerEnv: {}, fastletauth.CABundleEnv: {},
+	fastletauth.AudienceEnv: {}, fastletauth.KeyFetchTokenEnv: {},
 }
 
 func removeRuntimeOwnedEnv(env []corev1.EnvVar) []corev1.EnvVar {
@@ -2519,10 +2658,6 @@ func ensureBoundedPodContainers(podSpec *corev1.PodSpec, runtimeResourceOwner st
 		if container.Name == runtimeResourceOwner {
 			continue
 		}
-		if index == 0 || container.Name == fastletProxyContainerName {
-			applyDefaultPlatformResources(container)
-			continue
-		}
 		if err := validateContainerHasLimits(container); err != nil {
 			return fmt.Errorf("fastlet sidecar resources: %w", err)
 		}
@@ -2533,46 +2668,6 @@ func ensureBoundedPodContainers(podSpec *corev1.PodSpec, runtimeResourceOwner st
 		}
 	}
 	return nil
-}
-
-func applyDefaultPlatformResources(container *corev1.Container) {
-	if container.Resources.Requests == nil {
-		container.Resources.Requests = corev1.ResourceList{}
-	}
-	if container.Resources.Limits == nil {
-		container.Resources.Limits = corev1.ResourceList{}
-	}
-	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
-		defaultRequest := defaultPlatformResourceRequest(name)
-		defaultLimit := defaultPlatformResourceLimit(name)
-		request, hasRequest := container.Resources.Requests[name]
-		if !hasRequest || request.IsZero() {
-			request = defaultRequest
-			container.Resources.Requests[name] = request
-		}
-		limit, hasLimit := container.Resources.Limits[name]
-		if !hasLimit || limit.IsZero() {
-			limit = defaultLimit
-			if request.Cmp(limit) > 0 {
-				limit = request.DeepCopy()
-			}
-			container.Resources.Limits[name] = limit
-		}
-	}
-}
-
-func defaultPlatformResourceRequest(name corev1.ResourceName) resource.Quantity {
-	if name == corev1.ResourceCPU {
-		return resource.MustParse("50m")
-	}
-	return resource.MustParse("64Mi")
-}
-
-func defaultPlatformResourceLimit(name corev1.ResourceName) resource.Quantity {
-	if name == corev1.ResourceCPU {
-		return resource.MustParse("250m")
-	}
-	return resource.MustParse("256Mi")
 }
 
 func validateContainerHasLimits(container *corev1.Container) error {
@@ -2859,6 +2954,77 @@ func (r *SandboxPoolReconciler) updatePoolStatus(ctx context.Context, pool *apiv
 
 func boolPtr(b bool) *bool {
 	return &b
+}
+
+func int64Ptr(value int64) *int64 {
+	return &value
+}
+
+// ensureFastletServiceAccount provisions the dedicated discovery-only identity
+// Fastlet Pods present as their serviceAccountName. Create + AlreadyExists and
+// never a cached read: the serviceaccounts informer cannot sync without
+// list/watch (the RBAC grants only get/create) and an unsynced informer
+// stalls every Pool reconcile — the trap documented in config/rbac/base.yaml;
+// ensureBuilderRBAC avoids it the same way. Creation is the whole contract (the
+// identity is never mutated), so idempotency needs no read. Shared per
+// namespace with no owner reference — one Pool's cascading deletion would
+// strand the others; the namespace lifecycle garbage-collects it. No
+// namespaced RBAC; its only authority is the issuer-discovery pair in
+// config/rbac/base.yaml.
+func (r *SandboxPoolReconciler) ensureFastletServiceAccount(ctx context.Context, pool *apiv1alpha2.SandboxPool) error {
+	serviceAccount := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fastletServiceAccountName,
+			Namespace: pool.Namespace,
+			Labels:    map[string]string{poolLabelKey: pool.Name},
+		},
+	}
+	if err := r.Create(ctx, serviceAccount); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create Fastlet ServiceAccount %s/%s: %w", pool.Namespace, fastletServiceAccountName, err)
+	}
+	return nil
+}
+
+// preserveImagePullSecrets pins the image pull credentials that were effective
+// under the template-chosen identity (the template's ServiceAccount, or the
+// namespace default) onto the Pod spec. ServiceAccount admission inherits
+// imagePullSecrets from the selected identity even with automount off, so the
+// identity switch would otherwise strand uncached private images in
+// ImagePullBackOff. Admission unions the Pod spec with the new identity's
+// references, so pinning preserves both; dedupe keeps the order stable. The
+// read goes through the durable reader — the cached serviceaccounts informer
+// cannot sync without list/watch.
+func (r *SandboxPoolReconciler) preserveImagePullSecrets(ctx context.Context, podSpec *corev1.PodSpec, namespace string) error {
+	if r.durableReader() == nil {
+		return nil // direct constructions in tests; nothing to preserve from
+	}
+	templateIdentity := podSpec.ServiceAccountName
+	if templateIdentity == "" {
+		templateIdentity = "default"
+	}
+	var inherited corev1.ServiceAccount
+	err := r.durableReader().Get(ctx, client.ObjectKey{Namespace: namespace, Name: templateIdentity}, &inherited)
+	if apierrors.IsNotFound(err) {
+		return nil // fresh namespace: no inherited credentials to preserve
+	}
+	if err != nil {
+		return fmt.Errorf("read ServiceAccount %s/%s: %w", namespace, templateIdentity, err)
+	}
+	pinned := podSpec.ImagePullSecrets
+	for _, secret := range inherited.ImagePullSecrets {
+		duplicate := false
+		for _, existing := range pinned {
+			if existing.Name == secret.Name {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			pinned = append(pinned, secret)
+		}
+	}
+	podSpec.ImagePullSecrets = pinned
+	return nil
 }
 
 func (r *SandboxPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {

@@ -4,10 +4,11 @@ name: OpenSandbox Integration
 # the PR head SHA, then waits for that run and mirrors its conclusion, so this
 # check is the real merge gate. pull_request_target keeps the workflow file and
 # secrets on the base branch (PRs can't rewrite the guard or mint tokens); the
-# job only calls the API, never checks out PR code. External PRs need a
-# maintainer-added `ok-to-test` label — their code runs on a self-hosted
-# runner. Requires OSB_APP_ID / OSB_APP_PRIVATE_KEY (GitHub App with Contents
-# read/write + Actions read, installed on the OpenSandbox repo only).
+# job only calls the API, never checks out PR code. Every PR — regardless
+# of author — needs a maintainer-added `ok-to-test` label before running,
+# since its code runs on a self-hosted runner. Requires OSB_APP_ID /
+# OSB_APP_PRIVATE_KEY (GitHub App with Contents read/write + Actions read,
+# installed on the OpenSandbox repo only).
 
 on:
   pull_request_target:
@@ -21,6 +22,11 @@ on:
         description: 'fast-sandbox commit to test on OpenSandbox (default: current ref head)'
         required: false
         type: string
+      egress_modes:
+        description: 'OpenSandbox egress matrix (default | default,credential-bound); PRs auto-detect data-plane changes'
+        required: false
+        type: string
+        default: default
 
 concurrency:
   group: opensandbox-integration-${{ github.event.pull_request.number || github.ref }}
@@ -32,11 +38,10 @@ permissions:
 jobs:
   integration:
     name: OpenSandbox integration (KVM)
-    # Untrusted PRs need a maintainer's ok-to-test label.
+    # Every PR needs a maintainer's ok-to-test label, including PRs from
+    # members and collaborators.
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event.pull_request.author_association == 'MEMBER' ||
-      github.event.pull_request.author_association == 'COLLABORATOR' ||
       contains(github.event.pull_request.labels.*.name, 'ok-to-test')
     runs-on: ubuntu-latest
     # Remote run caps at 180min plus queue time on the single KVM runner.
@@ -54,20 +59,54 @@ jobs:
           owner: opensandbox-group
           repositories: OpenSandbox
 
+      # Route credentials are minted in controlplane/fastpath and enforced in
+      # dataplane; only PRs touching those need the credential-bound leg.
+      - name: Decide egress modes
+        id: egress
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          INPUT_MODES: ${{ inputs.egress_modes }}
+        run: |
+          set -euo pipefail
+          readonly EGRESS_PATH_RE='^(internal/dataplane/|internal/controlplane/fastpath/)'
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "modes=$INPUT_MODES" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          modes="default"
+          if files="$(GH_TOKEN="$GITHUB_TOKEN" gh api --paginate \
+              "repos/$GITHUB_REPO/pulls/$PR_NUMBER/files?per_page=100" \
+              -q '.[] | (.filename, .previous_filename) // empty')"; then
+            if grep -qE "$EGRESS_PATH_RE" <<<"$files"; then
+              modes="default,credential-bound"
+            fi
+          else
+            echo "::warning::failed to list PR files; running the full egress matrix"
+            modes="default,credential-bound"
+          fi
+          echo "modes=$modes" >> "$GITHUB_OUTPUT"
+
       - name: Dispatch and wait for the OpenSandbox KVM run
         env:
           OSB_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          EGRESS_MODES: ${{ steps.egress.outputs.modes }}
         run: |
           set -euo pipefail
-          echo "fast-sandbox @ ${FSB_COMMIT:-<pinned>}"
+          echo "fast-sandbox @ ${FSB_COMMIT:-<pinned>}; egress modes: ${EGRESS_MODES:-default}"
           dispatch_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          payload="$(jq -n --arg fsb "$FSB_COMMIT" --arg pr "$PR_NUMBER" \
+            --arg egress "${EGRESS_MODES:-default}" \
+            '{event_type: "fast-sandbox-pr",
+              client_payload: {fsb_commit: $fsb, pr: $pr, egress_modes: $egress}}')"
           curl -sSf -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $OSB_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             https://api.github.com/repos/opensandbox-group/OpenSandbox/dispatches \
-            -d '{"event_type":"fast-sandbox-pr","client_payload":{"fsb_commit":"'"$FSB_COMMIT"'","pr":"'"$PR_NUMBER"'"}}'
+            -d "$payload"
           echo "dispatched at $dispatch_ts; waiting for the run (poll every 60s)"
 
           run_id=""
@@ -81,11 +120,17 @@ jobs:
             sleep 60
           done
           [[ -n "$run_id" ]] || { echo "::error::no dispatched run appeared"; exit 1; }
-          echo "tracking run https://github.com/opensandbox-group/OpenSandbox/actions/runs/$run_id"
+          echo "tracking run https://github.com/opensandbox-group/OpenSandbox/actions/runs/$run_id (poll every 90s)"
 
+          # Anonymous (the token expires after 1h; 90s polls stay under the
+          # 60 req/h unauthenticated limit). Assign first so curl errors
+          # fail the step instead of being swallowed by read.
           while (( SECONDS < 19200 )); do
-            read -r status conclusion <<<"$(curl -sSf -H "Authorization: Bearer $OSB_TOKEN" \
+            body="$(curl -sSf --retry 5 --retry-all-errors --retry-delay 15 \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
               "$OSB_RUNS/runs/$run_id" | jq -r '[.status, .conclusion] | join(" ")')"
+            read -r status conclusion <<<"$body"
             if [[ "$status" == "completed" ]]; then
               if [[ "$conclusion" == "success" ]]; then
                 echo "OpenSandbox KVM integration passed"
@@ -96,7 +141,7 @@ jobs:
               exit 1
             fi
             echo "run $run_id: $status"
-            sleep 60
+            sleep 90
           done
           echo "::error::timed out waiting for the OpenSandbox run"
           exit 1

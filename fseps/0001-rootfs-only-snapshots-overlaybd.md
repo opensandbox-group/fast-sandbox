@@ -4,8 +4,8 @@ authors:
   - "@Pangjiping"
   - "@Yeaury"
 creation-date: 2026-11-05
-last-updated: 2026-11-07
-status: draft
+last-updated: 2026-11-18
+status: implemented
 ---
 
 # FSEP-0001: Rootfs-Only Snapshots on the OverlayBD Path
@@ -158,6 +158,14 @@ sequenceDiagram
 
 **Latency.** Removing the RAM dump eliminates that component of capture cost, not all pauses. Report guest freeze-to-thaw time, vCPU Pause-to-Resume time, upper-copy time, and publish time separately. Sparse-copy fallback can dominate the protected interval. The historical 512MiB spill measurement is a comparison baseline, not a guarantee for this new protocol.
 
+### Deployment-derived qualification (Issue #184)
+
+The default OverlayBD deployment uses the source instance's persisted managed Firecracker selection. Versioned delivery verifies the executable pair; capture compares the running VMM with that selected binary, rather than a separate global checksum manifest. Only Firecracker 1.17.0 is accepted for capture, including custom binaries; an explicit digest cannot bypass this lifecycle gate. Older templates keep their selected version and Full restore rules. This does not enable cross-version restoration or rewrite manifests.
+
+The kernel expectation comes from the source manifest's boot provenance. Resolve the OCI `current` link once per qualification so its checksum entries and `REVISION` belong to one release, and require `REVISION` to match the checksum-manifest digest. The node daemon always attempts to publish its observed process digest bound to the socket and boot ID. Fastlet compares that observation with the release bundle expectation. Attestation failure revokes the record and disables RootfsOnly without stopping healthy Full storage operation.
+
+`FAST_SANDBOX_ROOTFS_QUALIFICATION` is an optional partial override; explicit malformed values or `exclusiveExt4: false` reject capture. The standard managed VMM directory and state root imply the platform's exclusive-ext4 deployment contract; custom topologies must declare it explicitly, and custom VMMs require an explicit digest. Filesystem detection alone cannot establish absence of raw block, swap or host bypass writers. FSB components are upgraded together; no mixed-FSB-release compatibility is promised. Release validation still qualifies the shipped kernel/storage/VMM combination.
+
 ### Guest control: ownership, delivery, and capability gate
 
 **Proposed v1 decision, pending maintainer acceptance.** FSB owns a dedicated `fsb-guest-control` helper and host client, separate from execd and the user-facing data plane. Use a private virtio-vsock control channel for the minimal protocol below, keeping privileged filesystem control independent of user networking, execd availability, and its release cycle. The cost is a new helper and device/template integration. This is new implementation work, not an existing FSB capability. Mandatory guest-filesystem consistency adds helper, device, and template dependencies beyond simply removing a memory dump; accepting this draft explicitly accepts that scope. No OpenSandbox API or execd change is required for freeze/thaw.
@@ -175,6 +183,8 @@ The host socket is per VM, accessible only to the runtime service and trusted ho
 The helper opens the root mount before freezing. Its control loop, state, watchdog, and logging must run without writable-rootfs dependencies: keep runtime state in memory or `/run` tmpfs and avoid shell/execd subprocesses or blocking disk logging during freeze. Run the potentially blocking freeze ioctl separately from the responsive control loop. A helper crash or lost state is an ambiguous protection state, not permission to start a fresh operation.
 
 The additive manifest declaration is `guestControl: { protocol: "fsb-freeze-v1", transport: "vsock", port: <reserved-port>, helperVersion: <version> }`. The implementation reserves one port consistently across builder and runtime. The builder must validate the helper, guest-kernel vsock support, device configuration, and freeze/thaw behavior before emitting the declaration. Fastlet requires both this declaration and a live handshake reporting compatible protocol, current agent epoch, and the expected root mount. Missing declaration, unsupported version, failed probe, or incompatible restored-device configuration rejects RootfsOnly before freeze. Old templates remain usable for Full but must be rebuilt to gain this capability; adding metadata alone is not a migration. Rootfs-only descendants retain the helper and declaration, which are revalidated before a subsequent capture.
+
+**Builder injection is unconditional on the OverlayBD build path, with no opt-out.** An earlier implementation gated the helper injection and the build-time freeze/thaw probe behind an `FSB_GUEST_CONTROL_ENABLED` environment variable read only by the builder binary. That switch had no deployment surface: the build Pod's environment is a platform-owned, closed list and no chart value, controller flag, or sample set the variable, so no deployment could ever enable it and every built template lacked the declaration. The gate is removed instead of propagated. OverlayBD builds always inject the statically linked helper, start it from guest-init, and run the probe; an incompatible helper or guest vsock stack fails the build instead of shipping a template that silently cannot capture, and the probe, not operator configuration, is the validation gate. The capability is inert unless a capture uses the control channel, so the helper and vsock device cost nothing at runtime for Full snapshots and Pause/Resume. Native (object-store) templates do not carry the helper because rootfs-only capture is OverlayBD-only. Existing templates are unchanged; rebuilding remains the documented migration path, and capture-time revalidation (declaration plus live freeze/thaw handshake) keeps a broken helper from passing a qualified runtime.
 
 ### Operation protocol: cancellation fences late completion
 

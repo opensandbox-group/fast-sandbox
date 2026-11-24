@@ -287,7 +287,7 @@ func TestSnapshotFailedReasonFlowsToCondition(t *testing.T) {
 	// The fastlet observation is a pure projection: a Failed task carrying a
 	// stable reason must surface it verbatim in the Completed condition.
 	status := &apiv1alpha2.SandboxSnapshotStatus{}
-	orchestration.ProjectSnapshotStatus(status, &fastletapi.SnapshotStatus{
+	orchestration.ProjectSnapshotStatus(status, "", &fastletapi.SnapshotStatus{
 		Phase: fastletapi.SnapshotPhaseFailed, Reason: "InsufficientStorage",
 		Message: "staging needs X bytes, Y free",
 	})
@@ -517,6 +517,90 @@ func testOCISnapshotDeletion(t *testing.T, sourceGone bool) {
 	require.True(t, apierrors.IsNotFound(harness.k8sClient.Get(t.Context(), client.ObjectKey{Namespace: "default", Name: "snap-a"}, &deleted)))
 	mu.Lock()
 	require.Empty(t, objects, "both remote manifests must disappear before the CR")
+	mu.Unlock()
+}
+
+// A mode-drifted snapshot fails, but its publication already completed: the
+// reference must stay on the status so deleting the object still cleans up
+// the remote registry instead of orphaning the published pair.
+func TestModeDriftedSnapshotDeletionCleansPublishedArtifacts(t *testing.T) {
+	harness, _ := newSnapshotReconcilerHarness(t)
+	root := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","annotations":{"io.fast-sandbox.template.id":"snapshot-id"}}`)
+	snap := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","annotations":{"io.fast-sandbox.template.id":"snapshot-id"},"layers":[]}`)
+	rootSum, snapSum := digest.FromBytes(root).String(), digest.FromBytes(snap).String()
+	var mu sync.Mutex
+	objects := map[string][]byte{rootSum: root, snapSum: snap}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		user, password, _ := r.BasicAuth()
+		if user != "writer" || password != "secret" {
+			w.Header().Set("WWW-Authenticate", `Basic realm="registry"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		name := strings.TrimPrefix(r.URL.Path, "/v2/snapshots/test/manifests/")
+		if name == "snapshot-id_rootfs" {
+			name = rootSum
+		}
+		body, ok := objects[name]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodDelete {
+			delete(objects, name)
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		w.Header().Set("Content-Type", oci.MediaTypeImageManifest)
+		w.Header().Set("Docker-Content-Digest", digest.FromBytes(body).String())
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+	previous := retry.DefaultClient
+	retry.DefaultClient = server.Client()
+	defer func() { retry.DefaultClient = previous }()
+	host := strings.TrimPrefix(server.URL, "https://")
+	compiled, err := registryconfig.NewCompiled([]registryconfig.Credential{{Host: host, RepositoryPrefix: "snapshots/test", Username: "reader", Password: "read-secret", WriteUsername: "writer", WritePassword: "secret"}})
+	require.NoError(t, err)
+	payload, err := json.Marshal(compiled)
+	require.NoError(t, err)
+	require.NoError(t, harness.k8sClient.Create(t.Context(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: registrySecretName("pool-a")},
+		Data:       map[string][]byte{registryconfig.SecretKey: payload},
+	}))
+
+	// The drift outcome: terminal Failed with the drift reason, but the
+	// artifact facts retained for cleanup ownership.
+	snapshot := getSnapshot(t, harness, "snap-a")
+	snapshot.Spec.Mode = apiv1alpha2.SandboxSnapshotModeRootfsOnly
+	require.NoError(t, harness.k8sClient.Update(t.Context(), snapshot))
+	snapshot = getSnapshot(t, harness, "snap-a")
+	snapshot.Finalizers = []string{SandboxSnapshotFinalizerName}
+	snapshot.Annotations = map[string]string{assignment.AnnotationSnapshotPoolRef: "pool-a"}
+	require.NoError(t, harness.k8sClient.Update(t.Context(), snapshot))
+	snapshot.Status = apiv1alpha2.SandboxSnapshotStatus{
+		Phase: apiv1alpha2.SandboxSnapshotPhaseFailed, Mode: apiv1alpha2.SandboxSnapshotModeFull,
+		SnapshotID: "snapshot-id", ManifestRef: ocitemplate.Prefix + host + "/snapshots/test@" + snapSum,
+		ArtifactDigest: strings.TrimPrefix(snapSum, "sha256:"),
+	}
+	snapshot.Status.Conditions = []metav1.Condition{{Type: apiv1alpha2.SandboxSnapshotConditionCompleted, Status: metav1.ConditionFalse, Reason: "SnapshotModeDrift", LastTransitionTime: metav1.Now()}}
+	require.NoError(t, harness.k8sClient.Status().Update(t.Context(), snapshot))
+	harness.fastlet.snapshotInspectStatus = &fastletapi.SnapshotStatus{SnapshotID: "snapshot-id", Phase: fastletapi.SnapshotPhaseFailed, Reason: "SnapshotModeDrift"}
+
+	require.NoError(t, harness.k8sClient.Delete(t.Context(), snapshot))
+	_, err = harness.reconciler.Reconcile(t.Context(), snapshotRequestFor("snap-a"))
+	require.NoError(t, err)
+	var deleted apiv1alpha2.SandboxSnapshot
+	require.True(t, apierrors.IsNotFound(harness.k8sClient.Get(t.Context(), client.ObjectKey{Namespace: "default", Name: "snap-a"}, &deleted)),
+		"the drifted snapshot object must be removed")
+	mu.Lock()
+	require.Empty(t, objects, "deleting a mode-drifted snapshot must clean up the published remote artifacts")
 	mu.Unlock()
 }
 

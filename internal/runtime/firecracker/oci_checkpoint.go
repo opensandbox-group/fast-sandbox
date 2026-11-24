@@ -3,11 +3,14 @@ package firecracker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"k8s.io/klog/v2"
 	"oras.land/oras-go/v2/registry"
@@ -95,9 +98,87 @@ func checkpointCredentials(destination string) (ocitemplate.CredentialFunc, erro
 	}, nil
 }
 
-// publishOCISnapshot runs inside the existing asynchronous snapshot worker.
-// Success means the snapfiles manifest publication point is visible in ACR.
-func (d *Driver) publishOCISnapshot(ctx context.Context, plan dumpPlan, sizeBytes int64, kind fastletapi.SnapshotKind, onPublishing func()) (*runtimecontract.SnapshotResult, error) {
+// Fix publication inputs while holding the source instance lock; packing and upload must not reread meta.json, which may be deleted or replaced.
+type ociPublication struct{ destination string }
+
+func prepareOCIPublication(plan dumpPlan) (ociPublication, error) {
+	state, err := loadState(plan.sandboxDir)
+	if err != nil {
+		return ociPublication{}, err
+	}
+	sourceRef, err := restoreReference(state.Config.Desired)
+	if err != nil {
+		return ociPublication{}, err
+	}
+	destination, err := checkpointDestinationForSource(sourceRef, plan.snapshotID)
+	if err != nil {
+		return ociPublication{}, err
+	}
+	if err := persistSnapshotOwner(plan.staging, state.Config.Identity); err != nil {
+		return ociPublication{}, err
+	}
+	return ociPublication{destination: destination}, nil
+}
+
+func prepareCaptureStaging(staging string, owner fastletapi.SandboxIdentity) error {
+	if err := os.MkdirAll(staging, 0700); err != nil {
+		return err
+	}
+	return persistSnapshotOwner(staging, owner)
+}
+
+// Persist ownership before capture writes any upper bytes. The marker makes
+// staging discoverable after Pod replacement; it does not transfer publication ownership.
+func persistSnapshotOwner(staging string, owner fastletapi.SandboxIdentity) error {
+	raw, err := json.Marshal(owner)
+	if err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(staging, ".owner-")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if _, err = file.Write(raw); err != nil {
+		file.Close()
+		return err
+	}
+	if err = file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err = file.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(file.Name(), filepath.Join(staging, ".pack-owner.json")); err != nil {
+		return err
+	}
+	if err = syncCaptureDirectory(staging); err != nil {
+		return err
+	}
+	return syncCaptureDirectory(filepath.Dir(staging))
+}
+
+func (d *Driver) publishOCISnapshot(ctx context.Context, plan dumpPlan, sizeBytes int64, kind fastletapi.SnapshotKind, onPublishing func()) (result *runtimecontract.SnapshotResult, resultErr error) {
+	// Preparation writes ownership metadata into staging before packing starts.
+	// Keep cleanup ownership here until preparation succeeds; otherwise a
+	// failed metadata write can orphan a full-snapshot staging directory.
+	prepared := false
+	defer func() {
+		if prepared {
+			return
+		}
+		resultErr = errors.Join(resultErr, d.cleanupSnapshotStaging(ctx, plan.staging))
+	}()
+	publication, err := prepareOCIPublication(plan)
+	if err != nil {
+		return nil, err
+	}
+	prepared = true
+	return d.publishPreparedOCISnapshot(ctx, plan, sizeBytes, publication, onPublishing)
+}
+
+func (d *Driver) publishPreparedOCISnapshot(ctx context.Context, plan dumpPlan, sizeBytes int64, publication ociPublication, onPublishing func()) (*runtimecontract.SnapshotResult, error) {
 	defer func() {
 		if _, err := os.Stat(filepath.Join(plan.staging, ".pack-resources-active")); err == nil {
 			klog.ErrorS(fmt.Errorf("pack resources may still be active"), "checkpoint backing files retained for recovery", "staging", plan.staging)
@@ -105,37 +186,27 @@ func (d *Driver) publishOCISnapshot(ctx context.Context, plan dumpPlan, sizeByte
 		}
 		_ = os.RemoveAll(plan.staging)
 	}()
-	state, err := loadState(plan.sandboxDir)
+	credentials, err := checkpointCredentials(publication.destination)
 	if err != nil {
 		return nil, err
 	}
-	sourceRef, err := restoreReference(state.Config.Desired)
-	if err != nil {
-		return nil, err
-	}
-	destination, err := checkpointDestinationForSource(sourceRef, plan.snapshotID)
-	if err != nil {
-		return nil, err
-	}
-	credentials, err := checkpointCredentials(destination)
-	if err != nil {
-		return nil, err
-	}
-
 	manifestPath := filepath.Join(plan.staging, snapshotManifestName)
 	raw, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return nil, err
 	}
-	// Local recovery ownership is not part of the published artifact manifest.
-	owner, err := json.Marshal(state.Config.Identity)
+	args := append(d.fsbArgs(), "--build-work-dir", filepath.Join(plan.staging, "pack-work"), "--build-output-dir", filepath.Join(plan.staging, "artifacts"), "pack", "--bundle-dir", plan.staging, "--output", "snapshot:"+plan.snapshotID)
+	document, err := artifacts.DecodeVMManifest(raw)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.WriteFile(filepath.Join(plan.staging, ".pack-owner.json"), owner, 0600); err != nil {
-		return nil, err
+	// Report the artifact class from the manifest that was actually packed
+	// and published: the produced mode, not the caller's request.
+	producedMode := fastletapi.SnapshotModeFull
+	if document.IsRootfsOnly() {
+		producedMode = fastletapi.SnapshotModeRootfsOnly
+		args = append(args, "--rootfs-only")
 	}
-	args := append(d.fsbArgs(), "--build-work-dir", filepath.Join(plan.staging, "pack-work"), "--build-output-dir", filepath.Join(plan.staging, "artifacts"), "pack", "--bundle-dir", plan.staging, "--output", "snapshot:"+plan.snapshotID)
 	if output, err := exec.CommandContext(ctx, "fsb-vm", args...).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("package OCI snapshot: %w: %s", err, output)
 	}
@@ -146,15 +217,21 @@ func (d *Driver) publishOCISnapshot(ctx context.Context, plan dumpPlan, sizeByte
 	if ociPlainHTTP() {
 		pushOptions = append(pushOptions, ocitemplate.WithPlainHTTP(true))
 	}
-	ref, _, err := ocitemplate.Push(ctx, filepath.Join(plan.staging, "artifacts", "snapshot_"+plan.snapshotID), destination, raw, credentials, pushOptions...)
+	published, err := ocitemplate.PushForCache(ctx, filepath.Join(plan.staging, "artifacts", "snapshot_"+plan.snapshotID), publication.destination, raw, credentials, pushOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("publish OCI snapshot: %w", err)
+	}
+	ref := published.Reference
+	// Cache population is best effort, but finishes before Paused is reported.
+	// Publication remains authoritative if local cache admission fails.
+	if err := d.cacheOCICheckpoint(ctx, plan.staging, plan.snapshotID, published); err != nil {
+		klog.ErrorS(err, "OCI checkpoint cache population skipped", "snapshotID", plan.snapshotID)
 	}
 	parsed, err := registry.ParseReference(strings.TrimPrefix(ref, ocitemplate.Prefix))
 	if err != nil {
 		return nil, err
 	}
-	return &runtimecontract.SnapshotResult{SnapshotID: plan.snapshotID, ManifestRef: ref, ArtifactDigest: strings.TrimPrefix(parsed.Reference, "sha256:"), SizeBytes: sizeBytes}, nil
+	return &runtimecontract.SnapshotResult{SnapshotID: plan.snapshotID, ManifestRef: ref, ArtifactDigest: strings.TrimPrefix(parsed.Reference, "sha256:"), SizeBytes: sizeBytes, Mode: producedMode}, nil
 }
 
 // Checkpoints are instance-private even though their bytes use an OCI envelope.
@@ -206,4 +283,59 @@ func (d *Driver) cleanupSnapshotStaging(ctx context.Context, staging string) err
 		return err
 	}
 	return os.RemoveAll(staging)
+}
+
+// Reclaim before capture, when old cache entries would otherwise prevent the
+// staging files from being created. The final capacity probe remains authoritative.
+func (d *Driver) reclaimCheckpointBlobs(ctx context.Context, minFree int64) error {
+	if _, err := os.Stat(filepath.Join(d.config.StateRoot, "oci/blobs/sha256")); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	args := append(d.fsbArgs(), "trim-blob-cache", "--min-free-bytes", strconv.FormatInt(minFree, 10))
+	if output, err := exec.CommandContext(ctx, "fsb-vm", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("reclaim checkpoint blobs: %w: %s", err, output)
+	}
+	return nil
+}
+
+func (d *Driver) cacheOCICheckpoint(ctx context.Context, staging, snapshotID string, published *ocitemplate.PublishedCheckpoint) error {
+	started := time.Now()
+	credential, err := checkpointCredential(strings.TrimPrefix(published.Reference, ocitemplate.Prefix))
+	if err != nil {
+		return err
+	}
+	if _, err := ocitemplate.BasicCredential(credential.Username, credential.Password, credential.IdentityToken); err != nil {
+		return err
+	}
+	ref, err := registry.ParseReference(strings.TrimPrefix(published.Reference, ocitemplate.Prefix))
+	if err != nil {
+		return err
+	}
+	auth, err := json.Marshal(map[string]any{"auths": map[string]any{ref.Registry + "/" + ref.Repository: map[string]string{"username": credential.Username, "password": credential.Password}}})
+	if err != nil {
+		return err
+	}
+	raw, err := json.Marshal(published)
+	if err != nil {
+		return err
+	}
+	metadataFile, authFile := filepath.Join(staging, "cache-published.json"), filepath.Join(staging, "cache-auth.json")
+	if err := os.WriteFile(metadataFile, raw, 0600); err != nil {
+		return err
+	}
+	if err := os.WriteFile(authFile, auth, 0600); err != nil {
+		return err
+	}
+	defer os.Remove(authFile)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	args := append(d.fsbArgs(), "cache-checkpoint", "--published", metadataFile, "--docker-auth-file", authFile,
+		"--artifacts", filepath.Join(staging, "artifacts", "snapshot_"+snapshotID))
+	if output, err := exec.CommandContext(ctx, "fsb-vm", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("populate OCI checkpoint cache: %w: %s", err, output)
+	}
+	klog.InfoS("OCI checkpoint cache populated", "reference", published.Reference, "duration", time.Since(started))
+	return nil
 }

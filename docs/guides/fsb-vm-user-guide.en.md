@@ -185,6 +185,10 @@ sudo "$FSB_VM" build \
 - `<registry-repository>:v1.0.0_rootfs`;
 - `<registry-repository>:v1.0.0_snapfiles`.
 
+`build` streams phase logs to stdout before the final artifact summary. Each entry includes a UTC timestamp, cumulative build time (`[build ...]`), phase name, status (`started`, `completed`, or `failed`), and phase duration. Stages cover source resolution and layer preparation, rootfs preparation, runtime injection, guest startup and readiness, the optional guest-control probe, snapshot capture and packaging, layer sealing, and local artifact finalization. A phase starts before its blocking work, so a stalled build leaves the active phase visible. Guest serial output remains in the build work directory; it is not streamed.
+
+For OCI template builds, `sandboxtemplate-builder` also records its own preparation, `fsb-vm build`, publication, and result-reporting phases through the [component logger](component-logging.md), with `elapsedMs` and `durationMs` fields. These logs follow the configured file rotation and optional stderr mirroring. Registry publication is a separate `fsb-vm push` command; its stdout remains a single JSON result, without progress text.
+
 Common build options:
 
 | Option | Default | Description |
@@ -202,6 +206,7 @@ Common build options:
 | `--username` | empty | Registry credentials as `username:password` |
 | `--keep-work-dir` | `false` | Keep build scratch after success |
 | `--no-compress` | `false` | Disable zfile compression when committing layers |
+| `--guest-control-port` | `0` (disabled) | Cold-boot probe that validates the guest-control helper injected via `--inject-dir` over vsock; only the reserved port `1234` is accepted. On success the template manifest records the `guestControl` capability; a failed probe fails the build |
 
 `build` does not execute the source image's OCI Entrypoint, Cmd, or Env automatically. For non-Redis workloads, provide `--init-script-file` and make the script print a stable string matching `--ready-pattern` only after the service is ready. `--init-path` must be a clean absolute guest path without whitespace; `os.Root`-confined writes prevent image symlinks from escaping onto the host. Every build uses an independent temporary scratch directory, and a non-blocking per-output lock rejects a second concurrent build of the same `--output`.
 
@@ -456,6 +461,8 @@ Do not reuse a `sandbox_id` that still exists locally.
 
 Snapfiles devices and mounts are shared by default for identical resolved layers and credential scope within the same `--state-dir` and mount namespace. Writable rootfs devices and uppers remain private. Each Sandbox keeps a durable snapfiles lease until deletion.
 
+If a cached snapfiles device disappears, for example after an `overlaybd-ublkd` restart, the next create rebuilds it from the template after safely unmounting and cleaning up the stale attachment. Recovery is allowed only when no other Sandbox holds a lease; otherwise creation fails without replacing the shared device. Delete the affected Sandboxes before retrying rather than manually removing the shared cache.
+
 ## 8. Inspect VMs
 
 ```bash
@@ -524,3 +531,11 @@ OCI Fastlets share host `/dev` so dynamically created ublk devices remain visibl
 After interrupted checkpoint packaging, retry and staging deletion first recover pack devices by their config paths. Cleanup failures retain backing files. Standalone fsb-vm synchronizes credentials for the actual rootfs/snapfiles repositories; anonymous access replaces that repository’s old credential without deleting other repositories. Fastlets enable `--reject-credential-conflicts` for the node daemon, so differing accounts or an anonymous replacement for the same repository are rejected. This does not promise immediate revocation for already running VMs.
 
 Build the Fastlet with `make images COMPONENT=fastlet FASTLET_IMAGE=opensandbox/fsb-fastlet:dev`, then push it and select that image in the Pool. This is a build example, not a claim that the tag is published. Fastlet uses an Ubuntu 22.04 runtime stage without the Go toolchain or OverlayBD build stage. The runtime-agent image installs fsb-vm and OverlayBD tools on the node; Fastlet mounts them read-only and retains their required system libraries and basic runtime tools. Enable OCI on both the node agent/daemon and the Pool with `FAST_SANDBOX_OCI_ENABLED=true`; see the [OCI deployment guide](overlaybd-oci-sandboxes.md) for paths, cache sizing, credentials, and upgrade requirements. On filesystems without extent seeking, upper copying scans zero blocks to preserve sparsity; scanning can take longer than reflink or extent copying.
+
+## Node backend identity for RootfsOnly capture
+
+The standard `overlaybd-node` launcher automatically runs `fsb-vm --ublkd-socket <socket> qualify-backend` after daemon startup and removes the resulting record on shutdown. With no `--sha256`, the command records the actual socket peer executable digest; Fastlet compares it against its deployed bundle or explicit profile. `--sha256 <expected-digest>` remains an optional extra startup check for manual deployments. Run attestation in the daemon's PID namespace, hold exclusive lifecycle ownership, and revoke the record before replacing the daemon or socket.
+
+Standard deployments require no authored qualification file — `FAST_SANDBOX_ROOTFS_QUALIFICATION` is no longer read. The backend follows the artifact path, the kernel digest comes from the source template's boot provenance, the OverlayBD backend digest comes from the deployed bundle, and the exclusive-writer contract follows the managed VMM release layout. See [Guest-control qualification](../../internal/guestcontrol/README.md) for the deployment assumptions behind it. RootfsOnly still requires a staged matching guest kernel and a rebuilt template with a successful helper probe, and a VMM selection outside the managed release layout rejects capture.
+
+Native (object-store) captures qualify the same way on standard deployments: a managed VMM release layout implies the exclusive-writer contract and the native backend, with the kernel digest taken from the template's boot provenance — no authored profile. A VMM selection outside the managed release layout rejects native capture.

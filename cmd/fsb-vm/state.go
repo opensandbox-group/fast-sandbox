@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"fast-sandbox/internal/firecrackervmm"
 )
 
 // In-disk layout convention of the snapfiles ext4 filesystem (ADR-006). These
@@ -81,10 +83,11 @@ type sandboxState struct {
 	// SharedSnapfiles is a durable lease; shared devices are never Sandbox-owned.
 	SharedSnapfiles string `json:"shared_snapfiles,omitempty"`
 
-	MountPoint  string         `json:"mount_point"`
-	APISocket   string         `json:"api_socket"`
-	SerialLog   string         `json:"serial_log"`
-	Firecracker *processRecord `json:"firecracker,omitempty"`
+	MountPoint  string                    `json:"mount_point"`
+	APISocket   string                    `json:"api_socket"`
+	SerialLog   string                    `json:"serial_log"`
+	VMM         *firecrackervmm.Selection `json:"vmm,omitempty"`
+	Firecracker *processRecord            `json:"firecracker,omitempty"`
 
 	Network   string `json:"network"`
 	VCPU      int    `json:"vcpu"`
@@ -129,12 +132,26 @@ func statePath(home string) string {
 // writeState persists state atomically (tmp+rename+fsync) inside the
 // sandbox home.
 func writeState(home string, state *sandboxState) error {
+	return commitState(home, state, true)
+}
+
+// writeStateAtomic replaces state.json atomically (tmp+rename) without fsync
+// for intermediate phaseCreating updates on the create hot path.
+func writeStateAtomic(home string, state *sandboxState) error {
+	return commitState(home, state, false)
+}
+
+func commitState(home string, state *sandboxState, syncDisk bool) error {
 	state.FormatVersion = stateFileFormat
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}
-	if err := writeFileAtomic(statePath(home), data, 0o640); err != nil {
+	writer := writeFileAtomic
+	if !syncDisk {
+		writer = writeFileAtomicNoSync
+	}
+	if err := writer(statePath(home), data, 0o640); err != nil {
 		return fmt.Errorf("commit state %s: %w", statePath(home), err)
 	}
 	return nil

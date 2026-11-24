@@ -3,7 +3,10 @@ package artifacts
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestCompatibilityCPUTemplate: the node-side tier resolution behind the
@@ -303,5 +306,48 @@ func TestVMManifestContract(t *testing.T) {
 				t.Fatal("invalid contract accepted")
 			}
 		})
+	}
+}
+
+func TestRootfsManifestRetainsArchitectureButNotCPUState(t *testing.T) {
+	m := VMManifest{SchemaVersion: 1, Runtime: "firecracker", Machine: VMMachine{VCPUCount: 1, MemoryMiB: 256, RootfsSizeMiB: 1024, RootfsDrivePath: VMRootfsDrivePath}, Kernel: VMKernel{Version: "6.1.177", Cmdline: "root=/dev/vda rw init=/init"}, Compatibility: SnapshotCompatibility{CPUArch: "aarch64", FirecrackerVersion: "1.16.1"}, Platform: &VMPlatform{SnapshotMode: "rootfsOnly"}}
+	require.NoError(t, m.Validate())
+	full := m
+	full.Platform = nil
+	require.Error(t, full.Validate(), "Full must still require CPU provenance")
+	for _, mutate := range []func(*VMManifest){
+		func(v *VMManifest) { v.Compatibility.CPUArch = "riscv64" },
+		func(v *VMManifest) { v.Kernel.Cmdline = "" },
+		func(v *VMManifest) { v.Files = map[string]ManifestFile{"memory.snap": {}} },
+		func(v *VMManifest) { v.GuestControl = &VMGuestControl{Protocol: "typo"} },
+	} {
+		copy := m
+		mutate(&copy)
+		require.Error(t, copy.Validate())
+	}
+}
+
+func TestBundleChecksumsRejectAmbiguousExpectations(t *testing.T) {
+	sum := strings.Repeat("a", 64)
+	entries, err := ParseSHA256SUMS([]byte("# bundle\n" + sum + "  ./firecracker\n" + sum + " *libexec/overlaybd-ublkd\n"))
+	require.NoError(t, err)
+	require.Equal(t, sum, entries["firecracker"])
+	require.Equal(t, sum, entries["libexec/overlaybd-ublkd"])
+	for _, raw := range []string{"", sum + "  ../firecracker", sum + "  /firecracker", strings.Repeat("z", 64) + "  firecracker", sum + "  firecracker\n" + sum + "  ./firecracker"} {
+		_, err := ParseSHA256SUMS([]byte(raw))
+		require.Error(t, err)
+	}
+}
+
+func TestFirecracker117TemplateCompatibility(t *testing.T) {
+	for _, cpu := range []CPUIdentity{
+		{Vendor: VendorGenuineIntel, Family: 6, Model: 85, Stepping: 7},
+		{Vendor: VendorAuthenticAMD, Family: 25, Model: 1, Stepping: 1},
+	} {
+		template := CompatibilityCPUTemplate("1.17.0", cpu)
+		require.Equal(t, CompatibilityCPUTemplate("1.16.1", cpu), template)
+		compat := SnapshotCompatibility{FirecrackerVersion: "1.17.0", CPUTemplate: template}
+		require.NoError(t, MatchRestoreCompatibility(compat, cpu, "1.17.0"))
+		require.ErrorIs(t, MatchRestoreCompatibility(compat, cpu, "1.16.1"), ErrFirecrackerVersionMismatch)
 	}
 }

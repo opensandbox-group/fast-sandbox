@@ -2,6 +2,7 @@ package placement
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"sync"
 	"testing"
@@ -63,6 +64,7 @@ func seedFastlet(tb testing.TB, registry *InMemoryRegistry, info FastletInfo) {
 	}
 	heartbeat := &fastletapi.HeartbeatResponse{
 		FastletStatus: fastletapi.FastletStatus{
+			Capabilities:  info.Capabilities,
 			FastletPodUID: info.PodUID, RuntimeReady: info.RuntimeReady, Draining: info.Draining,
 			RuntimeProfileHash: info.RuntimeProfileHash, Admission: info.Admission, ResourceProfileHash: info.ResourceProfileHash,
 			InfraRevision: info.InfraRevision, InfraReady: info.InfraReady,
@@ -118,6 +120,57 @@ func TestTopKPrefersImageThenLoadAndDoesNotAllocate(t *testing.T) {
 	stored, ok := registry.GetFastletByID("cache-hit")
 	require.True(t, ok)
 	require.Equal(t, 4, stored.Used(), "selection must not consume Registry capacity")
+}
+
+func TestTopKRequiresRootfsBootCapabilityBeforeRanking(t *testing.T) {
+	r := NewInMemoryRegistry()
+	req := candidate("alpine:latest", "override")
+	req.RequiredCapability = fastletapi.CapabilityRootfsBootCreate
+	seedFastlet(t, r, readyFastlet("old-warm", 0, 5, req.Image))
+	require.Empty(t, r.TopK(req, 1))
+	next := readyFastlet("new-cold", 0, 5)
+	next.Capabilities = []string{fastletapi.CapabilityRootfsBootCreate}
+	seedFastlet(t, r, next)
+	got := r.TopK(req, 1)
+	require.Len(t, got, 1)
+	require.Equal(t, next.ID, got[0].ID)
+}
+
+func TestTopKMatchesFirecrackerCacheKeys(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		image           string
+		cachedReference string
+		wantHit         bool
+	}{
+		{"image reference", "example.com/app:v1", "example.com/app:v1", true},
+		{"raw reference", "docker.io/library/alpine:Latest", "docker.io/library/alpine:Latest", true},
+		{"template ID", "Template-AbC123", "Template-AbC123", true},
+		{"different tag", "example.com/app:v2", "example.com/app:v1", false},
+		{"normalized alias is distinct", "docker.io/library/alpine:latest", "alpine:latest", false},
+		{"checkpoint is distinct", "example.com/app:v1", "checkpoint:sha256:checkpoint-digest", false},
+		{"no image requested", "", "", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := NewInMemoryRegistry()
+			cacheKey := fmt.Sprintf("%x", sha256.Sum256([]byte(test.cachedReference)))
+			cached := readyFastlet("cached", 4, 5, cacheKey)
+			uncached := readyFastlet("uncached", 0, 5)
+			cached.RuntimeName, uncached.RuntimeName = apiv1alpha2.RuntimeFirecracker, apiv1alpha2.RuntimeFirecracker
+			seedFastlet(t, registry, cached)
+			seedFastlet(t, registry, uncached)
+			request := candidate(test.image, "request-a")
+			request.RuntimeName = apiv1alpha2.RuntimeFirecracker
+
+			selected := registry.TopK(request, 1)
+			require.Len(t, selected, 1)
+			want := uncached.ID
+			if test.wantHit {
+				want = cached.ID
+			}
+			require.Equal(t, want, selected[0].ID)
+		})
+	}
 }
 
 func TestTopKDoesNotMutateAdmission(t *testing.T) {
@@ -368,6 +421,43 @@ func TestApplyHeartbeatFencesPodUIDSequenceAndCacheRevision(t *testing.T) {
 
 	require.ErrorIs(t, registry.ApplyHeartbeat("fastlet-a", "wrong-pod", heartbeat, registryNow), ErrStalePodIdentity)
 	require.ErrorIs(t, registry.ApplyHeartbeat("fastlet-a", "pod-uid-a", heartbeat, registryNow), ErrStaleHeartbeat)
+}
+
+func TestApplyHeartbeatCarriesCapabilitiesAndPodReplacementClearsThem(t *testing.T) {
+	registry := NewInMemoryRegistry()
+	registry.UpsertPod(FastletInfo{
+		ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-uid-a", PodIP: "10.0.0.1",
+		Namespace: "default", PoolName: "pool-a", PodReady: true,
+	})
+	heartbeat := &fastletapi.HeartbeatResponse{
+		FastletStatus: fastletapi.FastletStatus{
+			FastletPodUID: "pod-uid-a", RuntimeReady: true,
+			Capabilities: []string{fastletapi.CapabilityRootfsOnlySnapshots},
+			Admission:    fastletapi.AdmissionStatus{Capacity: 5, Used: 2, Running: 2},
+		},
+		Sequence: 1, Cache: fastletapi.CacheSnapshot{Epoch: "boot-a", Revision: 1, Full: true, Complete: true},
+	}
+	require.NoError(t, registry.ApplyHeartbeat("fastlet-a", "pod-uid-a", heartbeat, registryNow))
+	stored, _ := registry.GetFastletByID("fastlet-a")
+	require.True(t, stored.SupportsCapability(fastletapi.CapabilityRootfsOnlySnapshots))
+	require.False(t, stored.SupportsCapability("something-else"))
+
+	// A Pod refresh under the same UID preserves heartbeat-learned facts.
+	registry.UpsertPod(FastletInfo{
+		ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-uid-a", PodIP: "10.0.0.2",
+		Namespace: "default", PoolName: "pool-a", PodReady: true,
+	})
+	stored, _ = registry.GetFastletByID("fastlet-a")
+	require.True(t, stored.SupportsCapability(fastletapi.CapabilityRootfsOnlySnapshots))
+
+	// A replaced Pod inherits nothing: the capability is lost until the new
+	// Fastlet advertises it again (fail closed during version skew).
+	registry.UpsertPod(FastletInfo{
+		ID: "fastlet-a", PodName: "fastlet-a", PodUID: "pod-uid-b", PodIP: "10.0.0.3",
+		Namespace: "default", PoolName: "pool-a", PodReady: true,
+	})
+	stored, _ = registry.GetFastletByID("fastlet-a")
+	require.False(t, stored.SupportsCapability(fastletapi.CapabilityRootfsOnlySnapshots))
 }
 
 func TestApplyHeartbeatFailsClosedOnProfileMismatch(t *testing.T) {

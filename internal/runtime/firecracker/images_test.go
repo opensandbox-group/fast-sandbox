@@ -6,12 +6,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
@@ -164,6 +166,47 @@ func TestGarbageCollectImages(t *testing.T) {
 	require.NoError(t, err, "high-frequency image must survive eviction")
 }
 
+// TestGarbageCollectImagesPinsRestoreCheckpoint covers a Sandbox resumed from
+// a pause checkpoint: its later snapshots read the checkpoint's cached
+// manifest as the source image, so the GC must keep that entry as well as the
+// template image.
+func TestGarbageCollectImagesPinsRestoreCheckpoint(t *testing.T) {
+	root := t.TempDir()
+	seed := func(reference string) string {
+		path, err := imageCachePath(root, reference)
+		require.NoError(t, err)
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+		require.NoError(t, os.WriteFile(path, []byte("rootfs"), 0o640))
+		return imageKey(reference)
+	}
+	digest := strings.Repeat("ab", 32)
+	template := seed("tpl-resumed")
+	checkpoint := seed(artifacts.CheckpointReference(digest))
+	other := seed("example.com/other:v1")
+
+	directory, err := ensureSandboxDir(root, "sbx-resumed")
+	require.NoError(t, err)
+	require.NoError(t, saveState(directory, &SandboxState{
+		Config: fastletapi.RuntimeSandboxConfig{
+			Desired: fastletapi.SandboxDesiredSpec{Image: "tpl-resumed", Restore: &fastletapi.RestoreSpec{
+				ManifestRef: "s3://bucket/publish/abababababababab/manifest.json", ArtifactDigest: digest,
+			}},
+			Identity: fastletapi.SandboxIdentity{SandboxUID: "sbx-resumed"},
+		},
+		Phase: PhaseRunning,
+	}))
+
+	// The limit (6 bytes) fits only one entry: every unpinned entry goes,
+	// the pinned ones stay even though the cache remains over the limit.
+	removed, err := garbageCollectImages(root, 6, map[string]int64{})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{other}, removed)
+	for _, pinned := range []string{template, checkpoint} {
+		_, err = os.Stat(filepath.Join(root, imageCacheDir, pinned))
+		require.NoError(t, err, "the template and the restore checkpoint of a live Sandbox must survive GC")
+	}
+}
+
 // TestImageGCLoopRunsIndependently verifies the cache GC is driven by its own
 // periodic loop, not by Sandbox lifecycle events, and stops on Close.
 func TestImageGCLoopRunsIndependently(t *testing.T) {
@@ -233,4 +276,66 @@ func TestImageGCLoopRunsIndependently(t *testing.T) {
 	time.Sleep(3 * driver.imageGCInterval)
 	_, err = os.Stat(filepath.Join(root, imageCacheDir, after))
 	require.NoError(t, err, "loop must stop when the driver is closed")
+}
+
+// Native cold boots need only rootfs and declared platform files, but the
+// manifest remains the commit point and every declared digest must match.
+func TestNativeRootfsDeliveryRequiresCommittedCompleteCache(t *testing.T) {
+	root, image := t.TempDir(), "native-rootfs"
+	dir := filepath.Dir(cachedManifestPath(root, image))
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	disk, policy := []byte("native-disk"), []byte(`{"version":1}`)
+	manifest := newMetadataTestVMManifest()
+	manifest.Platform = &artifacts.VMPlatform{SnapshotMode: "rootfsOnly", StateFiles: map[string]artifacts.ManifestFile{
+		"policy.json": {SHA256: artifacts.SHA256Of(policy), SizeBytes: int64(len(policy))},
+	}}
+	manifest.Kernel.Cmdline = "root=/dev/vda rw"
+	manifest.Files = map[string]artifacts.ManifestFile{
+		"rootfs.ext4": {SHA256: artifacts.SHA256Of(disk), SizeBytes: int64(len(disk))},
+	}
+	raw, err := artifacts.MarshalVMManifest(manifest)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, rootfsImageName), disk, 0600))
+	require.ErrorIs(t, verifyDeliveredImage(root, image, true), ErrImageNotReady)
+
+	// A committed manifest must not hide a missing declared platform file.
+	require.NoError(t, os.WriteFile(cachedManifestPath(root, image), raw, 0600))
+	require.ErrorIs(t, verifyDeliveredImage(root, image, true), ErrImageNotReady)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "policy.json"), policy, 0600))
+	require.NoError(t, verifyDeliveredImage(root, image, true))
+	require.NoFileExists(t, filepath.Join(dir, vmstateSnapshotName))
+	require.NoFileExists(t, filepath.Join(dir, memorySnapshotName))
+
+	// Size-only checks cannot detect a corrupt native disk or policy bundle.
+	for name, content := range map[string][]byte{rootfsImageName: disk, "policy.json": policy} {
+		t.Run(name, func(t *testing.T) {
+			corrupt := append([]byte(nil), content...)
+			corrupt[0] ^= 1
+			require.NoError(t, os.WriteFile(filepath.Join(dir, name), corrupt, 0600))
+			require.ErrorIs(t, verifyDeliveredImage(root, image, true), ErrImageNotReady)
+			require.NoError(t, os.WriteFile(filepath.Join(dir, name), content, 0600))
+			require.NoError(t, verifyDeliveredImage(root, image, true))
+		})
+	}
+}
+
+func TestCopyReflinkOrCopyClonesAndIsolates(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.img")
+	dst := filepath.Join(dir, "dst.img")
+	original := []byte("firecracker-rootfs-clone-test-payload")
+	require.NoError(t, os.WriteFile(src, original, 0o600))
+
+	require.NoError(t, copyReflinkOrCopy(src, dst))
+	got, err := os.ReadFile(dst)
+	require.NoError(t, err)
+	require.Equal(t, original, got)
+
+	// Mutating the clone must never mutate the source.
+	mutated := append([]byte(nil), original...)
+	mutated[0] ^= 0xff
+	require.NoError(t, os.WriteFile(dst, mutated, 0o600))
+	stillOriginal, err := os.ReadFile(src)
+	require.NoError(t, err)
+	require.Equal(t, original, stillOriginal)
 }

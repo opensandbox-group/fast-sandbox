@@ -37,6 +37,8 @@ import (
 	"k8s.io/klog/v2"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/componentlog"
+	"fast-sandbox/internal/firecrackervmm"
 )
 
 const (
@@ -49,11 +51,29 @@ const (
 
 // Tool paths inside the builder image.
 const (
-	oci2rootfsBin  = "oci2rootfs"
-	firecrackerBin = "firecracker"
-	awsBin         = "aws"
-	kernelDir      = "/usr/local/share/firecracker"
+	oci2rootfsBin = "oci2rootfs"
+	awsBin        = "aws"
+	kernelDir     = "/usr/local/share/firecracker"
 )
+
+var firecrackerBin = "firecracker"
+
+func selectBuildVMM(ctx context.Context) error {
+	if binary := os.Getenv("FAST_SANDBOX_SELECTED_FIRECRACKER"); binary != "" {
+		firecrackerBin = binary
+		return nil
+	}
+	directory := os.Getenv("FAST_SANDBOX_VMM_DIR")
+	if directory == "" {
+		return nil
+	}
+	selected, err := firecrackervmm.Resolve(ctx, directory, os.Getenv("FAST_SANDBOX_FIRECRACKER_VERSION"), false)
+	if err != nil {
+		return err
+	}
+	firecrackerBin = selected.BinaryPath
+	return nil
+}
 
 func main() {
 	// Two ways to reach the snapshot stage entry: the symlinked binary name
@@ -72,17 +92,28 @@ func main() {
 		}
 		return
 	}
-	klog.InitFlags(nil)
-	// Parse flags so klog's -v/-logtostderr work on the command line.
+	componentlog.InitFlags(nil)
 	flag.Parse()
+	closeLogs, err := componentlog.Configure("sandboxtemplate-builder")
+	if err != nil {
+		klog.ErrorS(err, "configure component logging")
+		klog.Flush()
+		os.Exit(1)
+	}
+	defer closeLogs()
 	if err := run(context.Background()); err != nil {
 		klog.ErrorS(err, "sandbox template build failed")
+		klog.Flush()
 		os.Exit(1)
 	}
 }
 
 // run selects the build pipeline by publication destination.
 func run(ctx context.Context) error {
+	if err := selectBuildVMM(ctx); err != nil {
+		return err
+	}
+
 	spec, workdir, err := loadSpecAndWorkdir()
 	if err != nil {
 		return err
@@ -95,6 +126,9 @@ func run(ctx context.Context) error {
 		return err
 	}
 	if strings.HasPrefix(spec.Output.Publish, "oci://") {
+		if spec.Output.Mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+			return errors.New("RootfsOnly template builds require native object storage")
+		}
 		return buildOCITemplate(ctx, spec, workdir, kernel)
 	}
 	return buildObjectStoreTemplate(ctx, spec, workdir, kernel)
@@ -133,7 +167,7 @@ func buildObjectStoreTemplate(ctx context.Context, spec apiv1alpha2.SandboxTempl
 	// Stage 4: manifest + checksums, recording the effective CPU template
 	// and the guest FPR support detected by the snapshot stage.
 	manifestStarted := time.Now()
-	manifestBytes, err := stageManifest(spec, sourceDigest, kernel, rootfs, vmstate, memory, workdir, phases.CPUTemplate, phases.FreePageReporting, mitmCA)
+	manifestBytes, err := stageManifest(spec, sourceDigest, kernel, rootfs, vmstate, memory, workdir, phases, mitmCA)
 	if err != nil {
 		return err
 	}
@@ -170,7 +204,11 @@ func buildObjectStoreTemplate(ctx context.Context, spec apiv1alpha2.SandboxTempl
 		"publishMs", publishMs,
 		"totalMs", time.Since(started).Milliseconds())
 
-	return patchPodAnnotations(ctx, manifestRef, sha256Of(manifestBytes))
+	mode := apiv1alpha2.SandboxSnapshotModeFull
+	if spec.Output.Mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+		mode = spec.Output.Mode
+	}
+	return patchPodAnnotations(ctx, manifestRef, sha256Of(manifestBytes), mode)
 }
 
 // loadSpecAndWorkdir reads the serialized SandboxTemplateSpec (the controller

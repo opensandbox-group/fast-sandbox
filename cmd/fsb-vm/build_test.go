@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -17,7 +19,92 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/firecrackerconfig"
 )
+
+func TestBuildProgress(t *testing.T) {
+	for _, buildErr := range []error{nil, errors.New("build failed")} {
+		status := "completed"
+		if buildErr != nil {
+			status = "failed"
+		}
+		t.Run(status, func(t *testing.T) {
+			var output bytes.Buffer
+			progress := &buildProgress{output: &output}
+			progress.start("resolving source image")
+			require.Contains(t, output.String(), `phase="resolving source image" status=started`)
+			require.NotContains(t, output.String(), "status=completed")
+			progress.start("preparing build rootfs")
+			progress.finish(buildErr)
+			progress.finish(nil)
+
+			lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+			require.Len(t, lines, 4)
+			require.Contains(t, lines[1], `phase="resolving source image" status=completed`)
+			require.Contains(t, lines[2], `phase="preparing build rootfs" status=started`)
+			require.Contains(t, lines[3], `phase="preparing build rootfs" status=`+status)
+			for _, line := range lines {
+				timestamp, _, ok := strings.Cut(line, " ")
+				require.True(t, ok)
+				_, err := time.Parse(time.RFC3339Nano, timestamp)
+				require.NoError(t, err)
+				require.True(t, strings.HasSuffix(timestamp, "Z"))
+				require.Contains(t, line, "[build ")
+				require.Contains(t, line, " duration=")
+			}
+		})
+	}
+}
+
+func TestBuildProgressDurations(t *testing.T) {
+	var output bytes.Buffer
+	started := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.FixedZone("UTC+2", 2*60*60))
+	progress := &buildProgress{
+		output: &output, started: started, phaseStarted: started.Add(2 * time.Second), phase: "pulling source image",
+	}
+	progress.log(started.Add(4250*time.Millisecond), "completed")
+	require.Equal(t, "2026-01-02T01:04:09.25Z [build 4.25s] phase=\"pulling source image\" status=completed duration=2.25s\n", output.String())
+}
+
+func TestBuildProgressStopsAtFailedPhase(t *testing.T) {
+	for _, invalid := range []bool{true, false} {
+		t.Run(strconv.FormatBool(invalid), func(t *testing.T) {
+			options := validBuildOptions(t)
+			previous := global
+			t.Cleanup(func() { global = previous })
+			global.ublkdSocket = filepath.Join(t.TempDir(), "missing.sock")
+			failedPhase := "preparing build workspace"
+			if invalid {
+				options.diskSizeGiB = 0
+				failedPhase = "validating build inputs"
+			}
+			output := captureCommandStdout(t, func() {
+				require.Error(t, runBuild(context.Background(), options))
+			})
+			require.Contains(t, output, fmt.Sprintf("phase=%q status=started", failedPhase))
+			require.Contains(t, output, fmt.Sprintf("phase=%q status=failed", failedPhase))
+			require.NotContains(t, output, fmt.Sprintf("phase=%q status=completed", failedPhase))
+			require.NotContains(t, output, "resolving source image")
+			require.NotContains(t, output, "built template pair")
+		})
+	}
+}
+
+func captureCommandStdout(t *testing.T, run func()) string {
+	t.Helper()
+	output, err := os.Create(filepath.Join(t.TempDir(), "stdout"))
+	require.NoError(t, err)
+	previous := os.Stdout
+	os.Stdout = output
+	defer func() {
+		os.Stdout = previous
+		_ = output.Close()
+	}()
+	run()
+	data, err := os.ReadFile(output.Name())
+	require.NoError(t, err)
+	return string(data)
+}
 
 func TestParseOutput(t *testing.T) {
 	names, err := parseOutput("redis:6.2.1")
@@ -237,6 +324,7 @@ func TestKernelVersionFromPath(t *testing.T) {
 
 func TestBuildSnapfilesManifestStandaloneAndExtras(t *testing.T) {
 	options := validBuildOptions(t)
+	options.kernelSHA256 = strings.Repeat("a", 64)
 	previous := global
 	t.Cleanup(func() { global = previous })
 	binary := filepath.Join(t.TempDir(), "firecracker")
@@ -251,6 +339,7 @@ func TestBuildSnapfilesManifestStandaloneAndExtras(t *testing.T) {
 	require.Equal(t, int64(1024), document.Machine.MemoryMiB)
 	require.Equal(t, int64(20480), document.Machine.RootfsSizeMiB)
 	require.Equal(t, "5.10.0", document.Kernel.Version)
+	require.Equal(t, options.kernelSHA256, document.Kernel.SHA256)
 	require.Equal(t, options.source, document.Lineage.Image)
 	require.Equal(t, created.Format(time.RFC3339), document.Lineage.CreatedAt)
 	require.Nil(t, document.Platform, "standalone builds need no platform input")
@@ -262,7 +351,7 @@ func TestBuildSnapfilesManifestStandaloneAndExtras(t *testing.T) {
 	document, err = artifacts.DecodeVMManifest(raw)
 	require.NoError(t, err)
 	require.Equal(t, "execd:v1", document.Platform.Execd)
-	for _, extra := range []string{`{"machine":{"vcpuCount":9}}`, `{"schemaVersion":9}`, `{"compatibility":{}}`, `null`, `{"guestNetwork":{"ip":"1.2.3.4"}}`, `{"lineage":{"createdAt":"wrong"}}`} {
+	for _, extra := range []string{`{"machine":{"vcpuCount":9}}`, `{"schemaVersion":9}`, `{"compatibility":{}}`, `{"freePageReporting":true}`, `null`, `{"guestNetwork":{"ip":"1.2.3.4"}}`, `{"lineage":{"createdAt":"wrong"}}`} {
 		require.NoError(t, os.WriteFile(options.manifestExtraFile, []byte(extra), 0600))
 		_, err = buildSnapfilesManifest(options, created)
 		require.Error(t, err, extra)
@@ -765,5 +854,141 @@ func TestCopyFile(t *testing.T) {
 	}
 	if err := copyFile(filepath.Join(dir, "absent"), target, 0o640); err == nil {
 		t.Error("missing source must fail")
+	}
+}
+
+func TestBuildManifestRecordsProbedHelperImplementation(t *testing.T) {
+	options := validBuildOptions(t)
+	options.kernelSHA256 = strings.Repeat("a", 64)
+	options.guestControlPort = 1234
+	// This test checks metadata, not host CPU discovery. Use a complete Full
+	// compatibility fixture so both ARM64 and amd64 execute every assertion.
+	base := artifacts.VMManifest{
+		SchemaVersion: artifacts.VMManifestVersion, Runtime: "firecracker",
+		Machine:       artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 1024, RootfsSizeMiB: 20480, RootfsDriveID: "rootfs", RootfsDrivePath: rootfsDriveLink},
+		Kernel:        artifacts.VMKernel{Version: "5.10.0"},
+		Compatibility: artifacts.SnapshotCompatibility{CPUArch: "x86_64", FirecrackerVersion: "1.16.1", CPUTemplate: artifacts.CPUTemplateNone, Vendor: artifacts.VendorGenuineIntel, CPUFamily: 6, CPUModel: 85, CPUStepping: 7},
+	}
+	require.NoError(t, base.Validate())
+	created := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
+	_, err := completeBuildManifest(options, created, base)
+	require.ErrorContains(t, err, "freeze/thaw probe")
+	for _, test := range []struct{ name, version string }{
+		{"helper-a", "sha256:" + strings.Repeat("a", 64)},
+		{"helper-b", "sha256:" + strings.Repeat("b", 64)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			options.guestControlVersion = test.version
+			raw, err := completeBuildManifest(options, created, base)
+			require.NoError(t, err)
+			manifest, err := artifacts.DecodeVMManifest(raw)
+			require.NoError(t, err)
+			require.Equal(t, test.version, manifest.GuestControl.HelperVersion)
+			require.Equal(t, options.kernelSHA256, manifest.Kernel.SHA256)
+			require.Equal(t, base.Compatibility, manifest.Compatibility)
+		})
+	}
+	// Isolating host discovery must not relax production compatibility checks.
+	invalid := base
+	invalid.Compatibility.Vendor = ""
+	_, err = completeBuildManifest(options, created, invalid)
+	require.ErrorContains(t, err, "resolved CPU identity")
+	options.kernelSHA256 = ""
+	_, err = completeBuildManifest(options, created, base)
+	require.ErrorContains(t, err, "boot kernel digest")
+}
+
+func TestConfigureBuildVMInstallsBalloonAndEntropyBeforeBoot(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		failPath string
+		wantErr  string
+	}{
+		{name: "enabled by default"},
+		{name: "unsupported balloon", failPath: "/balloon", wantErr: "configure free-page reporting"},
+		{name: "unsupported entropy", failPath: "/entropy", wantErr: "attach entropy device"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var paths []string
+			var balloon map[string]any
+			var entropy map[string]any
+			client := &firecrackerClient{httpClient: &http.Client{Transport: rootfsRoundTrip(func(r *http.Request) (*http.Response, error) {
+				paths = append(paths, r.URL.Path)
+				switch r.URL.Path {
+				case "/balloon":
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&balloon))
+				case "/entropy":
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&entropy))
+				}
+				code := http.StatusNoContent
+				if r.URL.Path == tc.failPath {
+					code = http.StatusBadRequest
+				}
+				return &http.Response{StatusCode: code, Body: io.NopCloser(strings.NewReader("")), Header: http.Header{}}, nil
+			})}}
+			options := validBuildOptions(t)
+			options.rootfsDriveID = defaultRootfsDriveID
+			options.tapName = "fc-build-tap"
+			options.guestMAC = "02:00:00:00:00:01"
+			options.guestControlPort = 1234
+
+			err := configureBuildVM(t.Context(), client, options, "/tmp/boot-kernel", defaultBootArgs)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, []string{
+				"/machine-config",
+				"/balloon",
+				"/entropy",
+				"/boot-source",
+				"/drives/rootfs",
+				"/network-interfaces/eth0",
+				"/vsock",
+				"/actions",
+			}, paths)
+			require.Equal(t, map[string]any{
+				"amount_mib":               float64(0),
+				"deflate_on_oom":           true,
+				"stats_polling_interval_s": float64(0),
+				"free_page_reporting":      true,
+			}, balloon)
+			require.Equal(t, map[string]any{}, entropy)
+		})
+	}
+}
+
+func TestDefaultInitScriptChecksFreePageReporting(t *testing.T) {
+	script := defaultInitScript()
+	require.Contains(t, script, "mount -t sysfs sysfs /sys")
+	require.Contains(t, script, firecrackerconfig.RenderFreePageReportingCheck())
+}
+
+func TestBuildManifestRecordsFreePageReporting(t *testing.T) {
+	base := artifacts.VMManifest{
+		SchemaVersion: artifacts.VMManifestVersion, Runtime: "firecracker",
+		Machine:       artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 1024, RootfsSizeMiB: 20480, RootfsDriveID: "rootfs", RootfsDrivePath: rootfsDriveLink},
+		Kernel:        artifacts.VMKernel{Version: "5.10.0"},
+		Compatibility: artifacts.SnapshotCompatibility{CPUArch: "x86_64", FirecrackerVersion: "1.16.1", CPUTemplate: artifacts.CPUTemplateNone, Vendor: artifacts.VendorGenuineIntel, CPUFamily: 6, CPUModel: 85, CPUStepping: 7},
+	}
+	created := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
+	for _, want := range []bool{true, false} {
+		t.Run(strconv.FormatBool(want), func(t *testing.T) {
+			options := validBuildOptions(t)
+			options.kernelSHA256 = strings.Repeat("a", 64)
+			options.freePageReporting = want
+			raw, err := completeBuildManifest(options, created, base)
+			require.NoError(t, err)
+			var fields map[string]any
+			require.NoError(t, json.Unmarshal(raw, &fields))
+			value, present := fields["freePageReporting"]
+			require.True(t, present, "freePageReporting must be recorded explicitly even when false")
+			require.Equal(t, want, value)
+			manifest, err := artifacts.DecodeVMManifest(raw)
+			require.NoError(t, err)
+			require.NotNil(t, manifest.FreePageReporting)
+			require.Equal(t, want, *manifest.FreePageReporting)
+		})
 	}
 }

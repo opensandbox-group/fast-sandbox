@@ -12,8 +12,8 @@ import (
 )
 
 // DefaultInterval is the recheck cadence: frequent enough to pull the
-// labels within minutes of a host healing (KVM module reloaded), rare
-// enough to be free.
+// labels within minutes of a host healing (e.g. after the KVM module is
+// reloaded), rare enough to be free.
 const DefaultInterval = 5 * time.Minute
 
 // Settings is the mutable subset of the manager configuration, re-read
@@ -122,14 +122,20 @@ func (m *Manager) Run(ctx context.Context) {
 // pass runs one full check/install/label cycle.
 func (m *Manager) pass(ctx context.Context) {
 	klog.InfoS("host readiness pass started")
+	var assetErr error
 	if m.current.Assets != nil {
 		if err := m.current.Assets.Ensure(ctx); err != nil {
+			assetErr = err
 			// The fc-assets check below fails on the same condition;
 			// the error detail goes to the log for diagnosis.
 			klog.ErrorS(err, "firecracker asset installation failed; the fc-assets check will report the outcome")
 		}
 	}
 	report := RunChecks(m.current.Check, m.config.Probes)
+	if assetErr != nil {
+		report.fail("fc-assets-install", assetErr.Error())
+		report.summarize()
+	}
 	for _, check := range report.Checks {
 		if check.Status == StatusWarn {
 			klog.Warningf("host readiness %s: %s", check.Name, check.Detail)

@@ -58,37 +58,64 @@ func TestCompiledRegistryUsesExactHostAndLongestRepositoryPrefix(t *testing.T) {
 
 func TestFileProviderReloadsAtomicRegistryProjection(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "registry.json")
-	writeCompiled := func(credentials []Credential) Compiled {
+	writeCompiled := func(credentials []Credential) {
 		t.Helper()
 		compiled, err := NewCompiled(credentials)
 		require.NoError(t, err)
 		content, err := compiled.Marshal()
 		require.NoError(t, err)
-		require.NoError(t, os.WriteFile(path, content, 0o600))
-		return compiled
+		temporary := path + ".tmp"
+		require.NoError(t, os.WriteFile(temporary, content, 0o600))
+		require.NoError(t, os.Rename(temporary, path))
 	}
-	first := writeCompiled([]Credential{{Host: "registry.example.com", Username: "first", Password: "secret"}})
+	writeCompiled([]Credential{{Host: "registry.example.com", Username: "first", Password: "secret"}})
 	provider := NewFileProvider(path)
+	require.NoError(t, provider.Refresh())
 	credential, found, err := provider.Credentials("registry.example.com/team/image:v1")
 	require.NoError(t, err)
 	require.True(t, found)
 	require.Equal(t, "first", credential.Username)
-	require.Equal(t, first.Revision, provider.Revision())
 
-	second := writeCompiled([]Credential{{Host: "registry.example.com", Username: "second", Password: "rotated"}})
-	require.NotEqual(t, first.Revision, second.Revision)
+	writeCompiled([]Credential{{Host: "registry.example.com", Username: "second", Password: "rotated"}})
 	credential, found, err = provider.Credentials("registry.example.com/team/image:v1")
 	require.NoError(t, err)
 	require.True(t, found)
 	require.Equal(t, "second", credential.Username)
-	require.Equal(t, second.Revision, provider.Revision())
+	require.Equal(t, "rotated", credential.Password)
+	credential, found, err = provider.CredentialsForHost("registry.example.com")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, "rotated", credential.Password)
 
-	require.NoError(t, os.WriteFile(path, []byte(`{"revision":"wrong","credentials":[]}`), 0o600))
+	require.NoError(t, os.WriteFile(path, []byte(`{"credentials":[{"host":""}]}`), 0o600))
+	require.ErrorContains(t, provider.Refresh(), "host is required")
 	_, _, err = provider.Credentials("registry.example.com/team/image:v1")
-	require.ErrorContains(t, err, "does not match content")
-	// Status continues to expose the last valid revision while a projected
-	// update is invalid; the Pool Controller retains the old compiled Secret.
-	require.Equal(t, second.Revision, provider.Revision())
+	require.ErrorContains(t, err, "host is required")
+	_, _, err = provider.CredentialsForHost("registry.example.com")
+	require.ErrorContains(t, err, "host is required")
+
+	writeCompiled(nil)
+	_, found, err = provider.Credentials("registry.example.com/team/image:v1")
+	require.NoError(t, err)
+	require.False(t, found)
+}
+
+func TestCompiledRegistryContainsOnlyCredentials(t *testing.T) {
+	compiled, err := NewCompiled([]Credential{{Host: "https://REGISTRY.EXAMPLE.COM", RepositoryPrefix: "/team/", Username: "reader", Password: "secret"}})
+	require.NoError(t, err)
+	content, err := compiled.Marshal()
+	require.NoError(t, err)
+	require.JSONEq(t, `{"credentials":[{"host":"registry.example.com","repositoryPrefix":"team","username":"reader","password":"secret"}]}`, string(content))
+	parsed, err := ParseCompiled(content)
+	require.NoError(t, err)
+	require.Equal(t, compiled, parsed)
+}
+
+func TestParseCompiledRejectsInvalidConfiguration(t *testing.T) {
+	for _, content := range []string{`{"credentials":`, `{"credentials":[{"host":""}]}`} {
+		_, err := ParseCompiled([]byte(content))
+		require.Error(t, err)
+	}
 }
 
 func TestRegistryConfigRejectsDuplicateMatch(t *testing.T) {

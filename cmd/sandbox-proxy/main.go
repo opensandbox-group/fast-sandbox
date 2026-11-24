@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/componentlog"
 	routeauth "fast-sandbox/internal/dataplane/auth"
 	"fast-sandbox/internal/dataplane/sandboxproxy"
 	"fast-sandbox/internal/observability"
@@ -38,9 +39,15 @@ func main() {
 	flag.StringVar(&metricsAddress, "metrics-bind-address", ":9094", "Prometheus metrics listen address; empty disables the server.")
 	flag.StringVar(&publicKeyValue, "route-verify-public-key", os.Getenv("FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY"), "Comma-separated base64 Ed25519 route credential public keys.")
 	flag.IntVar(&fastletPort, "fastlet-proxy-port", 5780, "Fastlet Proxy data port.")
-	klog.InitFlags(nil)
+	componentlog.InitFlags(nil)
 	flag.Parse()
-	defer klog.Flush()
+	closeLogs, err := componentlog.Configure("sandbox-proxy")
+	if err != nil {
+		klog.ErrorS(err, "configure component logging")
+		klog.Flush()
+		os.Exit(1)
+	}
+	defer closeLogs()
 	traceShutdown, err := observability.Configure(context.Background(), "fast-sandbox-proxy")
 	if err != nil {
 		klog.ErrorS(err, "Configure OpenTelemetry")

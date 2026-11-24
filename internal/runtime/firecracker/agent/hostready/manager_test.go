@@ -111,3 +111,19 @@ func TestManagerKeepsSettingsOnReloadError(t *testing.T) {
 	_, ok := manager.Snapshot()
 	require.False(t, ok, "no pass has run yet")
 }
+
+func TestManagerRejectsIncompleteVersionedInstallation(t *testing.T) {
+	probes, assets := healthyProbes(t)
+	bundle := versionBundleFixture(t)
+	require.NoError(t, os.Remove(filepath.Join(bundle, "versions", "1.17.0", "jailer")))
+	manager := NewManager(ManagerConfig{
+		Check:  CheckConfig{StateRoot: t.TempDir(), AssetsDir: assets},
+		Assets: &AssetConfig{Dir: assets, BundleDir: bundle, VerifyBinary: func(string) error { return nil }},
+		Probes: probes.probes(assets),
+	})
+	manager.pass(t.Context())
+	report, ok := manager.Snapshot()
+	require.True(t, ok)
+	require.False(t, report.Ready)
+	require.Contains(t, report.String(), "fc-assets-install")
+}

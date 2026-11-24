@@ -3,6 +3,31 @@
 Fast Sandbox configuration is split between Kubernetes CRDs, deployment flags,
 and platform-owned runtime implementation details.
 
+## Shared component logging
+
+The controller binary (roles `controller`, `fastpath`, and `all`), Fastlet, Fastlet Proxy, Sandbox Proxy, Firecracker runtime agent, janitor, and SandboxTemplate builder main pipeline use one YAML schema through `internal/componentlog`, with klog calls and lumberjack v2.2.1 rotation. This policy controls component application logs, not per-VM Firecracker logs, guest serial files, or external subprocess logging. See [Component file logging and rotation](../guides/component-logging.md) for the complete scope, deployment examples, storage planning, and inspection commands.
+
+| YAML field | Default | Meaning |
+|---|---|---|
+| `directory` | `/var/log/fast-sandbox` | Absolute, writable output directory shared by the components' distinct files |
+| `maxSizeMB` | `100` | Positive integer; rotation size in MiB (1,048,576 bytes) |
+| `maxBackups` | `10` | Nonnegative integer; maximum retained backups per component; `0` disables the count cap |
+| `maxAgeDays` | `7` | Nonnegative integer; maximum backup age in 24-hour days; `0` disables the age cap |
+| `compress` | `true` | Gzip rotated backups asynchronously |
+| `alsoStderr` | `false` | Mirror application logs to stderr in addition to files |
+
+The default file is `/etc/fast-sandbox/logging/logging.yaml`. `FAST_SANDBOX_LOG_CONFIG` is the sole configuration-path override; there are no per-component logging environment-variable sets or logging fields in `agent.yaml` or Fastlet settings. An absent default file uses the same built-in file logging defaults, not a stderr fallback. An explicitly selected missing file, invalid configuration, or unwritable output fails startup with a stderr diagnostic. Runtime write failures also produce stderr diagnostics.
+
+The optional `fast-sandbox-logging` ConfigMap supplies the `logging.yaml` key through the read-only `component-log-config` volume at `/etc/fast-sandbox/logging`. It is namespaced: operators deploy the same name/schema in each tenant namespace, with no automatic cross-namespace copying or inheritance. `config/logging/configmap.yaml` and `config/logging/kustomization.yaml` are included by `config/default` and inherited by the development/all-in-one overlays. The controller injects the logging mounts into dynamic Fastlet/Proxy and builder Pods.
+
+The disk-backed, Pod-local `component-logs` emptyDir mounts at `/var/log/fast-sandbox`. A different `directory` requires matching writable mount changes; the supplied mounts do not move with the YAML setting. Active filenames are fixed: `controller.log`, `fastpath.log`, `all.log`, `fastlet.log`, `fastlet-proxy.log`, `sandbox-proxy.log`, `firecracker-runtime.log`, `janitor.log`, and `sandboxtemplate-builder.log`. The controller role selects the first three alternatives. There is no filename override. Colocated components share the directory, not files; separate Pod volumes isolate replicas.
+
+The configuration is read only at startup, with no hot reload or automatic rollout. Apply changes through normal deployment/Pool lifecycle restarts; deleting a live Fastlet Pod destroys its live Sandboxes. The default log volume survives container restarts but not Pod deletion/replacement or node loss.
+
+Both retention caps set to zero allow unbounded historical retention. Backup cleanup runs on log opening/rotation, not a guaranteed daily schedule, and age limits do not apply to the active file. Do not let multiple processes, replicas, or external `logrotate` rotate the same file.
+
+Klog verbosity flags `-v` and `-vmodule` keep their existing behavior across all covered binaries. Legacy output flags `-log_file`, `-log_dir`, `-log_file_max_size`, `-logtostderr`, `-alsologtostderr`, `-stderrthreshold`, `-one_output`, and `-skip_log_headers` are no longer exposed; output is configured only by the shared YAML.
+
 ## Controller roles
 
 | Flag | Default | Meaning |
@@ -11,11 +36,16 @@ and platform-owned runtime implementation details.
 | `--metrics-bind-address` | `:9091` | Prometheus endpoint |
 | `--health-probe-bind-address` | `:5758` | Health endpoint |
 | `--fastpath-bind-address` | `:9090` | FastPath gRPC listener |
+| `--fastpath-http-port` | `0` (disabled) | TCP port for the optional [gRPC-Web listener](api.md#grpc-web-over-http11) in the `fastpath` and `all` roles |
 | `--fastlet-port` | `5758` | Fastlet control port |
 | `--fastlet-heartbeat-interval` | `20s` | Jittered heartbeat base interval |
 | `--fastlet-heartbeat-timeout` | `5s` | One heartbeat timeout |
 | `--fastlet-heartbeat-concurrency` | `8` | Heartbeat concurrency limit |
 | `--fastlet-drain-timeout` | `5m` | Drain deadline before failure policy |
+| `--fastlet-proxy-request-cpu` | `50m` | CPU request for the injected Fastlet Proxy sidecar |
+| `--fastlet-proxy-request-memory` | `64Mi` | Memory request for the injected Fastlet Proxy sidecar |
+| `--fastlet-proxy-limit-cpu` | `250m` | CPU limit for the injected Fastlet Proxy sidecar |
+| `--fastlet-proxy-limit-memory` | `256Mi` | Memory limit for the injected Fastlet Proxy sidecar |
 | `--route-credential-ttl` | `5m` | Caller route credential lifetime |
 | `--sandbox-proxy-base-url` | cluster Service URL | Client-visible proxy base URL |
 | `--runtime-environment-namespace` | `fast-sandbox-system` | Namespace of the platform runtime environment ConfigMap |
@@ -29,10 +59,25 @@ and platform-owned runtime implementation details.
 | `--namespaces` | *(empty = whole cluster)* | Comma-separated namespaces the informer cache watches |
 | `--kube-client-qps` | *(client-go default)* | API-server client rate limit in queries per second |
 | `--kube-client-burst` | *(client-go default)* | API-server client burst budget for the rate limiter |
+| `--fastlet-auth-subjects` | *(platform ServiceAccounts in the control plane's own namespace)* | Comma-separated ServiceAccount subjects allowed to call the Fastlet control API, injected into Fastlet Pods; set it only when the deployment uses identities that do not follow the platform naming convention (env fallback `FASTLET_AUTH_SUBJECTS`) |
+
+Fastlet control authentication is always enabled: every call to the Fastlet
+control API carries an audience-bound ServiceAccount token minted through the
+TokenRequest API for the role's own ServiceAccount, and the Pool Controller
+injects the issuer anchor into Fastlet Pods. Three environment overrides cover
+processes running outside a Pod (integration tooling):
+`FASTLET_AUTH_NAMESPACE` and `FASTLET_AUTH_SERVICE_ACCOUNT` pin the minting
+identity; `FASTLET_AUTH_AUDIENCE` overrides the token audience on both sides;
+`FASTLET_AUTH_KEYFETCH_TOKEN` supplies the credential attached to issuer key
+fetches (OIDC discovery and JWKS) for a Fastlet process running outside a Pod.
+Inside a Pod that credential is the dedicated `fast-sandbox-fastlet`
+ServiceAccount's projected token and needs no configuration.
 
 Resource-aware placement requires static admission. Resource-aware Pool
 scaling requires placement. These constraints prevent a downstream component
 from acting on capacity that an upstream authority does not enforce.
+
+Fastlet Proxy requests and limits must be positive Kubernetes resource quantities, and each request must not exceed its matching limit. The flags apply only to `controller` and `all` roles. A resource change alters the Fastlet Pod template hash and follows the existing surge-and-drain replacement flow; for ResourceAware Pools, the configured proxy memory limit is also included in the aggregate Pod memory observer budget.
 
 ### Cache scoping and client rate limiting
 
@@ -174,7 +219,44 @@ at `/etc/fast-sandbox/registry/registry.json`. See
 - `FAST_SANDBOX_NETWORK_HOST_NETNS_ROOT`;
 - `FAST_SANDBOX_NETWORK_MTU`.
 
-Pool templates cannot override these variables or other platform-owned containers, mounts, runtime handlers, and security settings. Fastlet Pods never mount the service-account token (`automountServiceAccountToken: false` is forced), so they have no Kubernetes API access; control-plane components reach Fastlet over the Pod network.
+Pool templates cannot override these variables or other platform-owned containers, mounts, runtime handlers, and security settings. Fastlet Pods keep `automountServiceAccountToken: false` and hold exactly one Kubernetes credential: the dedicated `fast-sandbox-fastlet` ServiceAccount's projected token, mounted as a platform-owned volume into the Fastlet container alone and used only to read the issuer's OIDC discovery and JWKS endpoints (the identity holds no resource-API permissions). The key-fetch token file is re-read on every fetch, so kubelet's token rotation is followed without restarts; control-plane components reach Fastlet over the Pod network and authenticate with ServiceAccount tokens the Pool Controller anchors at Pod creation.
+
+### Control authentication
+
+Fastlet control authentication is always on. The Pool Controller injects
+the authentication environment into every Fastlet Pod:
+
+- `FASTLET_AUTH_ISSUER`;
+- `FASTLET_AUTH_CA_BUNDLE` (base64-encoded PEM);
+- `FASTLET_AUTH_ALLOWED_SUBJECTS`;
+- `FASTLET_AUTH_AUDIENCE`.
+
+The Fastlet verifies each control call's bearer token against the issuer's
+published signing keys and rejects callers whose ServiceAccount is not on the
+allow list. The allow list defaults to the platform `fast-sandbox-fastpath`
+and `fast-sandbox-controller` ServiceAccounts in the control plane's own
+namespace, so same-convention deployments in any namespace need no override.
+Set `--fastlet-auth-subjects` only when the deployment uses other identities.
+All four injected variables are runtime-owned: Pool templates cannot override
+them through `env` entries (stripped) or through `envFrom` (an explicit env
+entry resolves over an envFrom key of the same name regardless of value), so
+a Pool can neither weaken the allow list nor redirect the issuer anchor or
+audience. Other `envFrom` inputs a Pool template relies on keep working.
+The injected CA bundle extends — never replaces — the system trust roots, so
+issuers served with publicly trusted certificates verify alongside
+cluster-internal ones.
+
+`FASTLET_AUTH_AUDIENCE` overrides the token audience on both sides. The
+`/livez`, `/readyz`, `/metrics`, and `/api/v2/fastlet/heartbeat` endpoints
+stay unauthenticated; every other control endpoint requires a valid token.
+For the required release sequence when upgrading a mixed-version cluster, see
+[Deployment](deployment.md#control-authentication-rollout).
+
+The control channel itself is plaintext HTTP on the Fastlet control port.
+NetworkPolicy strictness is a required compensating control, not an
+optimization: the policy restricting port 5758 to control-plane Pods is what
+protects the bearer token on the pod network, where a captured token remains
+a valid Fastlet control credential for up to its one-hour lifetime.
 
 ## Proxy configuration
 

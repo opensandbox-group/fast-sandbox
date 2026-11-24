@@ -201,6 +201,7 @@ sudo "$FSB_VM" build \
 | `--username` | 空 | `username:password` 形式的 registry 凭证 |
 | `--keep-work-dir` | `false` | 成功后保留构建临时目录 |
 | `--no-compress` | `false` | 提交层时禁用 zfile 压缩 |
+| `--guest-control-port` | `0`（禁用） | 冷启动 probe：通过 vsock 校验经 `--inject-dir` 注入的 guest-control helper；只接受保留端口 `1234`。probe 成功后模板 manifest 记录 `guestControl` 能力，probe 失败则构建失败 |
 
 `build` 不会自动执行源镜像 OCI config 中的 Entrypoint、Cmd 或 Env。对于非 Redis 工作负载，应使用 `--init-script-file` 提供 init，并让脚本在服务真正就绪后输出与 `--ready-pattern` 完全匹配的稳定文本。`--init-path` 必须是无空白的 clean 绝对 guest 路径；写入受 `os.Root` 约束，不会跟随镜像中的符号链接逃逸到宿主机。每次 build 使用独立临时目录；同一 `--output` 的并发构建通过非阻塞锁立即拒绝第二个请求。
 

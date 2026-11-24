@@ -60,12 +60,14 @@ func (*fakeRegistry) ReleaseLocal(placement.FastletID, placement.ResourceDemand)
 type fakeFastletClient struct {
 	heartbeat func(string, *fastletapi.HeartbeatRequest) (*fastletapi.HeartbeatResponse, error)
 
-	create       func(string, *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error)
-	inspect      func(string, *fastletapi.InspectSandboxRequest) (*fastletapi.InspectSandboxResponse, error)
-	delete       func(string, *fastletapi.DeleteSandboxRequest) (*fastletapi.DeleteSandboxResponse, error)
-	inspectCalls int
-	deleted      bool
-	actions      *fastletapi.ReconcileBindingsRequest
+	create          func(string, *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error)
+	inspect         func(string, *fastletapi.InspectSandboxRequest) (*fastletapi.InspectSandboxResponse, error)
+	delete          func(string, *fastletapi.DeleteSandboxRequest) (*fastletapi.DeleteSandboxResponse, error)
+	createSnapshot  func(string, *fastletapi.CreateSnapshotRequest) (*fastletapi.CreateSnapshotResponse, error)
+	inspectCalls    int
+	deleted         bool
+	actions         *fastletapi.ReconcileBindingsRequest
+	snapshotRequest *fastletapi.CreateSnapshotRequest
 }
 
 func (f *fakeFastletClient) Heartbeat(_ context.Context, ip string, request *fastletapi.HeartbeatRequest) (*fastletapi.HeartbeatResponse, error) {
@@ -104,7 +106,11 @@ func (f *fakeFastletClient) DeleteSandbox(_ context.Context, ip string, request 
 	return &fastletapi.DeleteSandboxResponse{}, nil
 }
 
-func (f *fakeFastletClient) CreateSnapshot(context.Context, string, *fastletapi.CreateSnapshotRequest) (*fastletapi.CreateSnapshotResponse, error) {
+func (f *fakeFastletClient) CreateSnapshot(_ context.Context, fastletIP string, request *fastletapi.CreateSnapshotRequest) (*fastletapi.CreateSnapshotResponse, error) {
+	f.snapshotRequest = request
+	if f.createSnapshot != nil {
+		return f.createSnapshot(fastletIP, request)
+	}
 	return nil, errors.New("snapshot create is not configured in this fake")
 }
 
@@ -476,6 +482,42 @@ func TestEnsureRuntimeAcceptsParkedColdCreate(t *testing.T) {
 	observed, err := orchestrator.EnsureRuntime(context.Background(), sandbox)
 	require.NoError(t, err, "a parked cold create is an accepted create, not a failure")
 	require.Equal(t, fastletapi.RuntimeStateCreating, observed.Runtime.State)
+}
+
+func TestCheckpointResumeDispatchKeepsFractionalLimit(t *testing.T) {
+	o, registry, fastlet, sandbox := newHarness(t)
+	ctx := t.Context()
+	var pool apiv1alpha2.SandboxPool
+	require.NoError(t, o.Client.Get(ctx, types.NamespacedName{Namespace: "default", Name: "pool-a"}, &pool))
+	pool.Spec.Runtime = apiv1alpha2.RuntimeFirecracker
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(resource.MustParse("1"), resource.MustParse("2Gi"), resource.MustParse("1"), resource.MustParse("1"), 128)
+	require.NoError(t, o.Client.Update(ctx, &pool))
+	sandbox.UID = "quota-uid"
+	sandbox.Spec.Resources = &apiv1alpha2.SandboxResourceRequirements{Limits: apiv1alpha2.SandboxComputeResources{CPU: resource.MustParse("500m"), Memory: resource.MustParse("384Mi")}}
+	sandbox.Annotations[assignment.AnnotationRootfsBootDigest] = "previous-cold-boot"
+	params, err := o.ResolveRuntime(ctx, sandbox)
+	require.NoError(t, err)
+	candidate := candidateFor(params)
+	registry.fastlets[candidate.ID] = candidate
+	envelope, err := AssignmentForCandidate(candidate, 2, 2, 2, "resumed-vmm")
+	require.NoError(t, err)
+	require.NoError(t, assignment.SetAssignmentAnnotation(sandbox, envelope))
+	sandbox.Status = statusFromEnvelope(envelope)
+	sandbox.Status.Runtime.Checkpoint = &apiv1alpha2.CheckpointStatus{CheckpointID: "full", ManifestRef: "s3://store/full/manifest.json", ArtifactDigest: "checkpoint-digest"}
+	require.NoError(t, o.Client.Create(ctx, sandbox))
+	called := false
+	fastlet.create = func(_ string, r *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error) {
+		called = true
+		require.Empty(t, r.Sandbox.RootfsBootDigest)
+		require.NotNil(t, r.Sandbox.Restore)
+		require.Equal(t, "checkpoint-digest", r.Sandbox.Restore.ArtifactDigest)
+		require.Equal(t, "500m", r.Resources.Limits.CPU)
+		require.Equal(t, "384Mi", r.Resources.Limits.Memory)
+		return &fastletapi.CreateSandboxResponse{Disposition: fastletapi.CreateDispositionCreated, Sandbox: readyFastletObservation(string(sandbox.UID), sandbox.Generation)}, nil
+	}
+	_, err = o.EnsureRuntime(ctx, sandbox)
+	require.NoError(t, err)
+	require.True(t, called)
 }
 
 func TestCreateRejectionImmediatelyForwardsAdmissionSnapshot(t *testing.T) {

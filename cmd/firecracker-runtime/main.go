@@ -22,6 +22,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"fast-sandbox/internal/artifactstore"
+	"fast-sandbox/internal/componentlog"
 	"fast-sandbox/internal/observability"
 	"fast-sandbox/internal/ocitemplate"
 	"fast-sandbox/internal/registryconfig"
@@ -41,6 +42,15 @@ const (
 )
 
 func main() {
+	componentlog.InitFlags(nil)
+	flag.Parse()
+	closeLogs, err := componentlog.Configure("firecracker-runtime")
+	if err != nil {
+		klog.ErrorS(err, "configure component logging")
+		klog.Flush()
+		os.Exit(1)
+	}
+	defer closeLogs()
 	if err := run(); err != nil {
 		klog.ErrorS(err, "firecracker-runtime failed")
 		klog.Flush()
@@ -55,17 +65,12 @@ func main() {
 // The dart child (dart mode) stops when its Run goroutine observes the
 // signal context canceled (SIGTERM/SIGINT), not via defer.
 func run() error {
-	klog.InitFlags(nil)
-	flag.Parse()
 	shutdownTracing, err := observability.Configure(context.Background(), "firecracker-runtime")
 	if err != nil {
 		return err
 	}
 	defer func() { _ = shutdownTracing(context.Background()) }()
-	// All tunables live in the mounted agent.yaml (the
-	// fast-sandbox-firecracker-runtime-config ConfigMap); the environment
-	// only carries the Downward API identities (POD_UID, NODE_NAME,
-	// NODE_IP) and the config path.
+	// Runtime settings are separate from the shared component logging config.
 	configPath := getEnv("FAST_SANDBOX_AGENT_CONFIG", defaultConfigPath)
 	config, err := loadAgentConfig(configPath)
 	if err != nil {

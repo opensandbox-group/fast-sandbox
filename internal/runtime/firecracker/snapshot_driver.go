@@ -20,12 +20,16 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
 
 	"fast-sandbox/internal/artifacts"
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/firecrackervmm"
 	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	runtimecontract "fast-sandbox/internal/runtime/contract"
+	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 	agentprotocol "fast-sandbox/internal/runtime/firecracker/agent/protocol"
 )
 
@@ -33,6 +37,13 @@ import (
 //
 //	<StateRoot>/snapshots/<snapshotID>/{rootfs.ext4, vmstate.snap, memory.snap, manifest.json, SHA256SUMS}
 const snapshotStagingDir = "snapshots"
+
+const (
+	// snapshotCacheStagingPrefix names transient cache-commit staging
+	// directories and their companion flock files under <StateRoot>/images/.
+	snapshotCacheStagingPrefix = ".staging-"
+	snapshotCacheLockSuffix    = ".lock"
+)
 
 // publishedRootfsName is the rootfs file name in a published artifact set.
 // The instance drive file is rootfs.img; consumers (the agent pull layer)
@@ -72,9 +83,29 @@ const snapshotSpillDirEnv = "FAST_SANDBOX_SNAPSHOT_SPILL_DIR"
 // Driver implements the optional snapshot extension.
 var _ runtimecontract.Snapshotter = (*Driver)(nil)
 
+// SupportsRootfsOnlySnapshots advertises the rootfs-only capture branch
+// (runtimecontract.RootfsOnlySnapshotCapability): SnapshotInput.Mode ==
+// RootfsOnly dispatches to the rootfs snapshot coordinator. The Fastlet
+// surfaces this as its heartbeat capability, and the control plane refuses
+// to dispatch RootfsOnly snapshots without it.
+func (d *Driver) SupportsRootfsOnlySnapshots() bool { return true }
+
+// SupportsNativeRootfsOnlySnapshots advertises the node-level eligibility
+// predicate: the fastlet runs the managed release chain at the standard
+// paths, which implies the exclusive-writer storage contract (#224).
+// Fixed-binary or relocated-path fastlets omit the capability and reject at
+// admission; per-instance VMM, kernel and storage checks stay at capture
+// time.
+func (d *Driver) SupportsNativeRootfsOnlySnapshots() bool {
+	return filepath.Clean(d.config.VMMDir) == firecrackervmm.DefaultDir &&
+		filepath.Clean(d.config.StateRoot) == runtimecatalog.FirecrackerStateRootDir
+}
+
 // snapshotMu serializes the pause/dump/resume window across all Sandboxes of
-// this driver: only one VM on the node is ever paused at a time. Manifest
-// assembly and publication run outside the lock.
+// this driver (one Fastlet process): only one of its VMs is paused at a time,
+// and the spill capacity check sees every dump still occupying the spill
+// area. The post-resume relocation, manifest assembly and publication run
+// outside the lock.
 var snapshotMu sync.Mutex
 
 // CreateSnapshot snapshots a running Sandbox in place and publishes the
@@ -87,6 +118,17 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 	if input == nil || input.SandboxID == "" || input.SnapshotID == "" {
 		return nil, fmt.Errorf("%w: sandboxId and snapshotId are required", ErrInvalidConfig)
 	}
+	mode := fastletapi.NormalizeSnapshotMode(input.Mode)
+	if mode != fastletapi.SnapshotModeFull && mode != fastletapi.SnapshotModeRootfsOnly {
+		return nil, fmt.Errorf("%w: unknown snapshot mode", ErrInvalidConfig)
+	}
+	if mode == fastletapi.SnapshotModeRootfsOnly {
+		return d.createRootfsSnapshot(ctx, input)
+	}
+	return d.createFullSnapshot(ctx, input)
+}
+
+func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.SnapshotInput) (*runtimecontract.SnapshotResult, error) {
 	kind := input.Kind
 	if kind == "" {
 		kind = fastletapi.SnapshotKindTemplate
@@ -105,6 +147,7 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 	}
 	d.mu.RLock()
 	plan := dumpPlan{
+		identity:    input.Identity,
 		stateRoot:   d.config.StateRoot,
 		binaryName:  filepath.Base(d.config.BinaryPath),
 		sandboxID:   input.SandboxID,
@@ -128,8 +171,8 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 	}
 
 	// Capacity gate BEFORE any pause: a dump that cannot land wastes the
-	// business interruption. Self-heal once through the image cache GC.
-	if err := d.ensureDumpCapacity(plan); err != nil {
+	// business interruption. Reclaim unused image and checkpoint caches first.
+	if err := d.ensureDumpCapacity(ctx, plan); err != nil {
 		return nil, err
 	}
 
@@ -211,62 +254,73 @@ func (d *Driver) CreateSnapshot(ctx context.Context, input *runtimecontract.Snap
 		ManifestRef:    outcome.ManifestRef,
 		ArtifactDigest: outcome.ArtifactDigest,
 		SizeBytes:      sizeBytes,
+		Mode:           fastletapi.SnapshotModeFull,
 	}
-	// A checkpoint keeps the published set in the node-local image cache: a
-	// resume that still lands on this node restores locally (~ms) instead of
+	// Keep the published set in the node-local image cache so a resume or
+	// template create that lands on this node boots locally (~ms) instead of
 	// pulling the full set back from the store (~16s per 3.5GiB). The commit
 	// is best-effort — the store copy is authoritative, and any miss (cache
-	// evicted by the image GC, or a resume on another node) falls back to the
-	// normal pull path. Template snapshots keep discarding staging; their
-	// same-node prewarm is issue #57.
+	// evicted by the image GC, a conflicting same-name template cache, or a
+	// restore on another node) falls back to the normal pull path.
+	cacheRef := input.TemplateName
 	if kind == fastletapi.SnapshotKindCheckpoint {
-		if cacheErr := d.commitCheckpointCache(result, plan.staging); cacheErr != nil {
-			klog.ErrorS(cacheErr, "checkpoint local cache commit failed; a resume will pull from the store",
-				"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "manifestRef", outcome.ManifestRef)
+		if result.ArtifactDigest != "" {
+			cacheRef = artifacts.CheckpointReference(result.ArtifactDigest)
+		} else {
+			cacheRef = ""
 		}
-	} else {
-		_ = os.RemoveAll(plan.staging)
 	}
+	if cacheErr := d.commitSnapshotCache(cacheRef, result.ArtifactDigest, plan.staging, true, nil); cacheErr != nil {
+		klog.ErrorS(cacheErr, "snapshot local cache commit failed; subsequent restores will pull from the store",
+			"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "reference", cacheRef, "manifestRef", outcome.ManifestRef)
+	}
+	_ = os.RemoveAll(plan.staging)
 	klog.InfoS("firecracker snapshot published",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "templateName", input.TemplateName,
 		"manifestRef", outcome.ManifestRef, "sizeBytes", sizeBytes, "publish", time.Since(publishStarted).String())
 	return result, nil
 }
 
-// commitCheckpointCache moves a published checkpoint artifact set from its
-// staging directory into the node-local image cache, under the canonical
-// checkpoint reference (artifacts.CheckpointReference), in the standard cache
-// layout (rootfs.img/vmstate.snap/memory.snap/manifest.json). The set is
-// assembled in a non-digest staging subdirectory and renamed into place
-// atomically, so the image GC — which only considers 64-hex cache names —
-// observes either a complete entry or nothing at all. The staging directory
-// is consumed on every path.
-func (d *Driver) commitCheckpointCache(result *runtimecontract.SnapshotResult, staging string) error {
-	if result == nil || result.ArtifactDigest == "" {
-		return fmt.Errorf("%w: checkpoint result carries no artifact digest", ErrInvalidConfig)
+// commitSnapshotCache moves a published artifact set (Full checkpoint, Full
+// template, or native RootfsOnly template) from its staging directory into the
+// node-local image cache under reference (<stateRoot>/images/<imageKey>/),
+// using the standard cache layout (rootfs.img, manifest.json, optional
+// vmstate.snap/memory.snap for Full snapshots, and optional
+// vault.json/policy.json). The set is assembled in a flock-owned non-digest
+// staging subdirectory and renamed into place atomically, so readers and the
+// image GC observe either a complete entry or nothing at all, and interrupted
+// commits are reclaimed by recovery/GC once the writer exits. Callers remain
+// responsible for removing staging.
+func (d *Driver) commitSnapshotCache(reference, artifactDigest, staging string, full bool, verified map[string]agentpull.VerifiedFile) error {
+	if strings.TrimSpace(reference) == "" {
+		return fmt.Errorf("%w: snapshot cache reference is required", ErrInvalidConfig)
 	}
-	reference := artifacts.CheckpointReference(result.ArtifactDigest)
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	d.mu.RUnlock()
-	cacheDir := filepath.Join(stateRoot, imageCacheDir, imageKey(reference))
-	if verifyRestorableImage(stateRoot, reference) == nil {
-		// A concurrent replay already committed the identical set.
-		_ = os.RemoveAll(staging)
+	if alreadyCommittedSnapshotCache(stateRoot, reference, artifactDigest) {
 		d.touchImage(reference)
 		return nil
 	}
-	tmpDir := filepath.Join(stateRoot, imageCacheDir, ".staging-"+filepath.Base(staging))
-	_ = os.RemoveAll(tmpDir)
-	if err := os.MkdirAll(tmpDir, 0o750); err != nil {
-		_ = os.RemoveAll(staging)
-		return fmt.Errorf("prepare checkpoint cache staging: %w", err)
+	imagesRoot := filepath.Join(stateRoot, imageCacheDir)
+	tmpDir, releaseStaging, err := acquireSnapshotCacheStaging(imagesRoot, filepath.Base(staging))
+	if err != nil {
+		return err
 	}
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.RemoveAll(tmpDir)
+		}
+		releaseStaging()
+	}()
 	mappings := map[string]string{
 		publishedRootfsName:  rootfsImageName,
-		vmstateSnapshotName:  vmstateSnapshotName,
-		memorySnapshotName:   memorySnapshotName,
 		snapshotManifestName: snapshotManifestName,
+	}
+	if full {
+		mappings[vmstateSnapshotName] = vmstateSnapshotName
+		mappings[memorySnapshotName] = memorySnapshotName
 	}
 	// The vault and policy files are optional bundle members; they ride
 	// into the cache so the restore path finds them next to the snapshot
@@ -277,32 +331,183 @@ func (d *Driver) commitCheckpointCache(result *runtimecontract.SnapshotResult, s
 		if _, err := os.Stat(filepath.Join(staging, bundleName)); err == nil {
 			mappings[bundleName] = bundleName
 		} else if !errors.Is(err, os.ErrNotExist) {
-			_ = os.RemoveAll(tmpDir)
-			_ = os.RemoveAll(staging)
 			return fmt.Errorf("stat staged %s for the cache commit: %w", bundleName, err)
 		}
 	}
+	type trackedOpenFile struct {
+		file  *os.File
+		proof agentpull.VerifiedFile
+	}
+	trackedOpen := make(map[string]trackedOpenFile)
+	defer func() {
+		for _, entry := range trackedOpen {
+			_ = entry.file.Close()
+		}
+	}()
 	for from, to := range mappings {
-		if err := os.Rename(filepath.Join(staging, from), filepath.Join(tmpDir, to)); err != nil {
-			_ = os.RemoveAll(tmpDir)
-			_ = os.RemoveAll(staging)
-			return fmt.Errorf("stage checkpoint cache entry: %w", err)
+		src := filepath.Join(staging, from)
+		if to != snapshotManifestName {
+			if f := openVerifiedStagedFile(src, verified[from]); f != nil {
+				trackedOpen[to] = trackedOpenFile{file: f, proof: verified[from]}
+			}
+		}
+		dst := filepath.Join(tmpDir, to)
+		if err := os.Rename(src, dst); err != nil {
+			return fmt.Errorf("stage snapshot cache entry %s: %w", to, err)
+		}
+		if to != snapshotManifestName {
+			agentpull.PrepareCommittedCacheFile(dst)
 		}
 	}
+	cacheDir := filepath.Join(imagesRoot, imageKey(reference))
 	if err := os.Rename(tmpDir, cacheDir); err != nil {
-		_ = os.RemoveAll(tmpDir)
-		_ = os.RemoveAll(staging)
-		// A concurrent commit won the rename; the identical set is already
-		// addressable.
-		if verifyRestorableImage(stateRoot, reference) == nil {
+		// A concurrent commit won the rename; if it committed the identical
+		// manifest digest, the set is already addressable.
+		if alreadyCommittedSnapshotCache(stateRoot, reference, artifactDigest) {
 			d.touchImage(reference)
 			return nil
 		}
-		return fmt.Errorf("commit checkpoint cache entry: %w", err)
+		return fmt.Errorf("commit snapshot cache entry: %w", err)
 	}
-	_ = os.RemoveAll(staging)
+	cleanupTmp = false
+	for to, entry := range trackedOpen {
+		agentpull.RecordVerifiedCacheFile(filepath.Join(cacheDir, to), entry.file, entry.proof.SHA256())
+	}
 	d.touchImage(reference)
 	return nil
+}
+
+// acquireSnapshotCacheStaging creates a lock-owned temporary directory under
+// imagesRoot so crash recovery and image GC can distinguish active writers
+// from orphaned staging directories left behind by an interrupted commit.
+func acquireSnapshotCacheStaging(imagesRoot, base string) (string, func(), error) {
+	if err := os.MkdirAll(imagesRoot, 0o750); err != nil {
+		return "", nil, fmt.Errorf("prepare snapshot cache root: %w", err)
+	}
+	lockFile, err := os.CreateTemp(imagesRoot, snapshotCacheStagingPrefix+base+"-*"+snapshotCacheLockSuffix)
+	if err != nil {
+		return "", nil, fmt.Errorf("prepare snapshot cache staging lock: %w", err)
+	}
+	lockPath := lockFile.Name()
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = lockFile.Close()
+		_ = os.Remove(lockPath)
+		return "", nil, fmt.Errorf("lock snapshot cache staging: %w", err)
+	}
+	if !sameLockInode(lockFile, lockPath) {
+		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+		_ = lockFile.Close()
+		return "", nil, errors.New("snapshot cache staging lock was reclaimed before ownership stabilized")
+	}
+	tmpDir := strings.TrimSuffix(lockPath, snapshotCacheLockSuffix)
+	if err := os.Mkdir(tmpDir, 0o750); err != nil {
+		_ = os.Remove(lockPath)
+		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+		_ = lockFile.Close()
+		return "", nil, fmt.Errorf("prepare snapshot cache staging: %w", err)
+	}
+	release := func() {
+		_ = os.Remove(lockPath)
+		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+		_ = lockFile.Close()
+	}
+	return tmpDir, release, nil
+}
+
+// reclaimOrphanedSnapshotCacheStaging removes local cache staging directories
+// owned by an existing companion lock file (<stateRoot>/images/.staging-*.lock)
+// after an interrupted commit. Lockless .staging-* directories (e.g., active
+// writers from an older Fastlet during a mixed-version rollout) are left
+// untouched, active lock holders (EWOULDBLOCK) are skipped, and cleanup errors
+// are logged rather than failing startup recovery or image GC.
+func reclaimOrphanedSnapshotCacheStaging(stateRoot string) {
+	imagesRoot := filepath.Join(stateRoot, imageCacheDir)
+	entries, err := os.ReadDir(imagesRoot)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			klog.ErrorS(err, "read image cache root for orphaned staging cleanup failed", "imagesRoot", imagesRoot)
+		}
+		return
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, snapshotCacheStagingPrefix) || !strings.HasSuffix(name, snapshotCacheLockSuffix) {
+			continue
+		}
+		base := strings.TrimSuffix(name, snapshotCacheLockSuffix)
+		if base == snapshotCacheStagingPrefix {
+			continue
+		}
+		dirPath := filepath.Join(imagesRoot, base)
+		lockPath := filepath.Join(imagesRoot, name)
+		fd, openErr := unix.Open(lockPath, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if openErr != nil {
+			if !errors.Is(openErr, os.ErrNotExist) && !errors.Is(openErr, unix.ENOENT) {
+				klog.ErrorS(openErr, "open snapshot cache staging lock failed", "lockPath", lockPath)
+			}
+			continue
+		}
+		lockFile := os.NewFile(uintptr(fd), lockPath)
+		lockErr := unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		if lockErr != nil {
+			_ = lockFile.Close()
+			if !errors.Is(lockErr, unix.EWOULDBLOCK) && !errors.Is(lockErr, unix.EAGAIN) {
+				klog.ErrorS(lockErr, "lock snapshot cache staging failed", "lockPath", lockPath)
+			}
+			continue
+		}
+		if !sameLockInode(lockFile, lockPath) {
+			_ = unix.Flock(fd, unix.LOCK_UN)
+			_ = lockFile.Close()
+			continue
+		}
+		if removeErr := os.RemoveAll(dirPath); removeErr != nil {
+			// Retain lockPath so a later recovery/GC sweep can retry reclaiming dirPath.
+			klog.ErrorS(removeErr, "reclaim orphaned snapshot cache staging failed", "stagingDir", dirPath)
+		} else if removeErr := os.Remove(lockPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			klog.ErrorS(removeErr, "remove snapshot cache staging lock failed", "lockPath", lockPath)
+		}
+		_ = unix.Flock(fd, unix.LOCK_UN)
+		_ = lockFile.Close()
+	}
+}
+
+func openVerifiedStagedFile(path string, proof agentpull.VerifiedFile) *os.File {
+	if proof.SHA256() == "" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	if !proof.MatchesFile(f) {
+		_ = f.Close()
+		return nil
+	}
+	return f
+}
+
+func sameLockInode(file *os.File, path string) bool {
+	fdInfo, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(fdInfo, pathInfo)
+}
+
+func alreadyCommittedSnapshotCache(stateRoot, reference, artifactDigest string) bool {
+	if artifactDigest == "" {
+		return false
+	}
+	digest, ok, err := agentpull.CachedManifestDigest(stateRoot, reference)
+	if err != nil || !ok || digest != artifactDigest {
+		return false
+	}
+	return verifyRestorableImage(stateRoot, reference) == nil
 }
 
 // publishKind maps the Fastlet-side snapshot kind onto the runtime-agent's
@@ -340,10 +545,10 @@ const defaultSnapshotCapacityWait = 15 * time.Second
 
 // ensureDumpCapacity verifies the staging filesystem can hold the full
 // artifact set (instance rootfs + memory + margin), once after triggering
-// the image-cache GC. It must run before the VM is paused: an ENOSPC
-// mid-dump would burn the pause window for nothing. Returns the
-// retryable ErrInsufficientStorage sentinel when space stays short.
-func (d *Driver) ensureDumpCapacity(plan dumpPlan) error {
+// the image-cache GC and reclaiming unpinned OCI blobs. It must run before
+// the VM is paused: an ENOSPC mid-dump would burn the pause window for nothing.
+// Returns the retryable ErrInsufficientStorage sentinel when space stays short.
+func (d *Driver) ensureDumpCapacity(ctx context.Context, plan dumpPlan) error {
 	need, err := d.dumpFootprintBytes(plan)
 	if err != nil {
 		// The dump itself will report a precise error; do not block on
@@ -353,7 +558,11 @@ func (d *Driver) ensureDumpCapacity(plan dumpPlan) error {
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	d.mu.RUnlock()
-	if stagingFree(stateRoot) >= need {
+	freeBytes := d.snapshotFree
+	if freeBytes == nil {
+		freeBytes = stagingFree
+	}
+	if freeBytes(stateRoot) >= need {
 		return nil
 	}
 	d.TriggerImageGC()
@@ -361,17 +570,27 @@ func (d *Driver) ensureDumpCapacity(plan dumpPlan) error {
 	if wait <= 0 {
 		wait = defaultSnapshotCapacityWait
 	}
-	deadline := time.Now().Add(wait)
-	for time.Now().Before(deadline) {
-		time.Sleep(3 * time.Second)
-		if stagingFree(stateRoot) >= need {
+	recoveryCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	if err := d.reclaimCheckpointBlobs(recoveryCtx, need); err != nil {
+		klog.InfoS("checkpoint blob capacity recovery incomplete", "error", err)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if freeBytes(stateRoot) >= need {
 			return nil
 		}
+		select {
+		case <-recoveryCtx.Done():
+			free := freeBytes(stateRoot)
+			klog.InfoS("firecracker snapshot staging space insufficient; parking the task",
+				"stateRoot", stateRoot, "needBytes", need, "freeBytes", free)
+			return fmt.Errorf("%w: staging needs %d bytes, %d free", runtimecontract.ErrInsufficientStorage, need, free)
+		case <-time.After(3 * time.Second):
+		}
 	}
-	free := stagingFree(stateRoot)
-	klog.InfoS("firecracker snapshot staging space insufficient; parking the task",
-		"stateRoot", stateRoot, "needBytes", need, "freeBytes", free)
-	return fmt.Errorf("%w: staging needs %d bytes, %d free", runtimecontract.ErrInsufficientStorage, need, free)
 }
 
 // dumpFootprintBytes computes the full artifact set size: the instance
@@ -393,7 +612,7 @@ func (d *Driver) dumpFootprintBytes(plan dumpPlan) (int64, error) {
 		rootfs = filepath.Join(plan.jailRoot(), rootfsImageName)
 	}
 	if source, e := restoreReference(state.Config.Desired); e == nil && strings.HasPrefix(source, "oci://") {
-		rootfs = filepath.Join(filepath.Dir(rootfs), "rootfs.dev")
+		rootfs = filepath.Join(filepath.Dir(rootfs), rootfsDeviceName)
 	}
 	info, err := d.stat(rootfs)
 	if err != nil {
@@ -404,17 +623,9 @@ func (d *Driver) dumpFootprintBytes(plan dumpPlan) (int64, error) {
 		// Frozen upper extents, snapfiles and compressed output are staged;
 		// remote parent data is never materialized in local scratch space.
 		home := filepath.Join(d.ociRoot(), "sandboxes", plan.sandboxID, "upper")
-		var upperBytes int64
-		for _, name := range []string{"writable_data", "writable_index"} {
-			info, e := os.Stat(filepath.Join(home, name))
-			if e != nil {
-				return 0, e
-			}
-			if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-				upperBytes += stat.Blocks * 512
-			} else {
-				upperBytes += info.Size()
-			}
+		upperBytes, err := allocatedUpperBytes(home)
+		if err != nil {
+			return 0, err
 		}
 		return 3*(upperBytes+(int64(mib)<<20)) + (512 << 20), nil
 	}
@@ -437,23 +648,25 @@ func stagingFree(stateRoot string) int64 {
 // covers pause→resume (the business-visible interruption), spillMove the
 // post-resume relocation into the publish staging.
 type dumpPlan struct {
-	stateRoot   string
-	binaryName  string
-	sandboxID   string
-	snapshotID  string
-	sandboxDir  string
-	staging     string
-	jailed      bool
-	bootTimeout int32
-	spillRoot   string
-	spilled     bool
-	pauseWindow time.Duration
-	spillMove   time.Duration
-	rootfsClone time.Duration
-	rootfsCopy  time.Duration
-	pauseAPI    time.Duration
-	dumpAPI     time.Duration
-	resumeAPI   time.Duration
+	identity      *fastletapi.SandboxIdentity
+	stateRoot     string
+	binaryName    string
+	sandboxID     string
+	snapshotID    string
+	sandboxDir    string
+	staging       string
+	jailed        bool
+	bootTimeout   int32
+	spillRoot     string
+	spilled       bool
+	pauseWindow   time.Duration
+	spillMove     time.Duration
+	rootfsClone   time.Duration
+	rootfsCopy    time.Duration
+	verifiedFiles map[string]agentpull.VerifiedFile
+	pauseAPI      time.Duration
+	dumpAPI       time.Duration
+	resumeAPI     time.Duration
 }
 
 // jailRoot returns the jail root of the plan's Sandbox (jailer mode only).
@@ -516,8 +729,20 @@ func (d *Driver) spillDirFor(snapshotID, memoryQuantity string) string {
 // StateRoot filesystem. The Sandbox keeps running on every failure path,
 // with a failed resume joined after (and never masking) the dump error.
 func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error { //nolint:gocognit,maintidx // pre-existing pause/dump/resume window; refactor tracked separately
+	releaseLifecycle, err := lockSandboxMutation(ctx, plan.stateRoot, plan.sandboxID)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	snapshotMu.Lock()
-	defer snapshotMu.Unlock()
+	locked := true
+	releasePauseWindow := func() {
+		if locked {
+			locked = false
+			snapshotMu.Unlock()
+		}
+	}
+	defer releasePauseWindow()
 
 	state, err := loadState(plan.sandboxDir)
 	if err != nil {
@@ -526,7 +751,10 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		}
 		return err
 	}
-	if state.Phase != PhaseRunning {
+	if plan.identity != nil && !runtimecontract.SameRuntimeIdentity(*plan.identity, state.Config.Identity) {
+		return errors.New("snapshot source runtime identity changed")
+	}
+	if state.Phase != PhaseRunning || state.BootRecoveryError != "" {
 		return fmt.Errorf("%w: sandbox runtime is %q, must be Running", ErrInvalidConfig, state.Phase)
 	}
 	if state.APIAddress == "" {
@@ -592,7 +820,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 	}
 	ociRoot := strings.HasPrefix(sourceRef, "oci://")
 	if ociRoot {
-		rootfs = filepath.Join(filepath.Dir(rootfs), "rootfs.dev")
+		rootfs = filepath.Join(filepath.Dir(rootfs), rootfsDeviceName)
 	}
 	cleanupSpill := func() {
 		if !plan.spilled {
@@ -660,7 +888,11 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 	// The VM resumes regardless of the dump outcome: the business-visible
 	// pause window closes here.
 	resumeStarted := time.Now()
-	if _, resumeErr := resumeVM(ctx, client, plan.bootTimeout); resumeErr != nil {
+	_, resumeErr := resumeVM(ctx, client, plan.bootTimeout)
+	// The pause window is closed: the next VM of this Fastlet may pause while
+	// this dump is moved out of the jail / spill area (its own directory).
+	releasePauseWindow()
+	if resumeErr != nil {
 		plan.pauseWindow = time.Since(pauseStarted)
 		cleanupSpill()
 		if dumpErr != nil {
@@ -703,7 +935,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		jailedDumpVMStateName: vmstateSnapshotName,
 		jailedDumpMemoryName:  memorySnapshotName,
 	} {
-		if err := copyFile(filepath.Join(spillDir, dumped), filepath.Join(plan.staging, staged)); err != nil {
+		if err := relocateSpilled(plan, filepath.Join(spillDir, dumped), filepath.Join(plan.staging, staged)); err != nil {
 			_ = os.RemoveAll(spillDir)
 			return fmt.Errorf("move spilled %s into the staging directory: %w", dumped, err)
 		}
@@ -1196,21 +1428,8 @@ func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, ki
 	if err != nil {
 		return 0, err
 	}
-	// The lineage manifest of the dump: the golden image manifest of a fresh
-	// boot, or the cached checkpoint manifest when the Sandbox was itself
-	// resumed from a checkpoint (the checkpoint carries every lineage field
-	// forward, and the original image may not exist on this node at all).
-	sourceRef, err := restoreReference(state.Config.Desired)
+	document, sourceRef, err := snapshotSourceDocument(stateRoot, ociRoot, state)
 	if err != nil {
-		return 0, err
-	}
-	raw, err := readSourceManifest(stateRoot, ociRoot, sourceRef, state.Config.Identity.SandboxUID)
-	if err != nil {
-		return 0, err
-	}
-
-	var document map[string]json.RawMessage
-	if err = json.Unmarshal(raw, &document); err != nil {
 		return 0, err
 	}
 	isOCI := strings.HasPrefix(sourceRef, ocitemplate.Prefix)
@@ -1253,6 +1472,10 @@ func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, ki
 	if err != nil {
 		return 0, err
 	}
+	if err := setSnapshotResourceLimits(platform, state.Config.Limits); err != nil {
+		return 0, err
+	}
+	delete(platform, "snapshotMode")
 	delete(platform, "checkpoint")
 	if kind == fastletapi.SnapshotKindCheckpoint {
 		platform["checkpoint"], err = json.Marshal(artifacts.CheckpointOwner{SandboxUID: state.Config.Identity.SandboxUID, Namespace: state.Config.Identity.Namespace})
@@ -1296,6 +1519,12 @@ func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, ki
 	return entries.SizeBytes, nil
 }
 
+// relocateSpilled is the post-resume relocation of one spilled dump file
+// (a variable so tests can observe it).
+var relocateSpilled = func(_ *dumpPlan, source, target string) error {
+	return copyFile(source, target)
+}
+
 func readSourceManifest(stateRoot, ociRoot, image, sandboxID string) ([]byte, error) {
 	var payload []byte
 	var err error
@@ -1323,4 +1552,95 @@ func snapshotStagingPath(stateRoot, podUID, snapshotID string, oci bool) string 
 		return filepath.Join(stateRoot, snapshotStagingDir, podUID, snapshotID)
 	}
 	return filepath.Join(stateRoot, snapshotStagingDir, snapshotID)
+}
+
+// Sparse upper logical sizes include holes; budget capacity against the allocated blocks that will actually be copied.
+func allocatedUpperBytes(home string) (int64, error) {
+	var total int64
+	for _, name := range []string{"writable_data", "writable_index"} {
+		info, err := os.Stat(filepath.Join(home, name))
+		if err != nil {
+			return 0, err
+		}
+		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+			total += stat.Blocks * 512
+		} else {
+			total += info.Size()
+		}
+	}
+	return total, nil
+}
+
+func snapshotSourceDocument(stateRoot, ociRoot string, state *SandboxState) (map[string]json.RawMessage, string, error) {
+	// Capture follows source lineage: new instances read the template, while checkpoint-restored instances read the cached checkpoint; the original image may no longer be on this node.
+	sourceRef, err := restoreReference(state.Config.Desired)
+	if err != nil {
+		return nil, "", err
+	}
+	raw, err := readSourceManifest(stateRoot, ociRoot, sourceRef, state.Config.Identity.SandboxUID)
+	if err != nil {
+		return nil, "", err
+	}
+
+	var document map[string]json.RawMessage
+	if err = json.Unmarshal(raw, &document); err != nil {
+		return nil, "", err
+	}
+	// Never upgrade an old live instance from a template inspected only now.
+	if err := setSnapshotKernelDigest(document, state.BootKernelSHA256); err != nil {
+		return nil, "", err
+	}
+	if state.Config.Desired.RootfsBootDigest != "" {
+		if state.BootMachine == nil {
+			return nil, "", errors.New("missing actual rootfs boot machine")
+		}
+		if err := setSnapshotMachineShape(document, *state.BootMachine); err != nil {
+			return nil, "", err
+		}
+	}
+	if state.BootCompatibility != nil {
+		document["compatibility"], err = json.Marshal(state.BootCompatibility)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	return document, sourceRef, nil
+}
+
+// Preserve kernel extension fields while carrying the running VM's provenance.
+func setSnapshotKernelDigest(document map[string]json.RawMessage, sum string) error {
+	var kernel map[string]json.RawMessage
+	if err := json.Unmarshal(document["kernel"], &kernel); err != nil {
+		return err
+	}
+	if kernel == nil {
+		return errors.New("source kernel metadata missing")
+	}
+	delete(kernel, "sha256")
+	if sum != "" {
+		kernel["sha256"], _ = json.Marshal(sum)
+	}
+	encoded, err := json.Marshal(kernel)
+	if err != nil {
+		return err
+	}
+	document["kernel"] = encoded
+	return nil
+}
+
+func setSnapshotMachineShape(document map[string]json.RawMessage, machine artifacts.VMMachine) error {
+	fields, err := manifestSection(document, "machine")
+	if err != nil {
+		return err
+	}
+	fields["vcpuCount"], err = json.Marshal(machine.VCPUCount)
+	if err != nil {
+		return err
+	}
+	fields["memoryMiB"], err = json.Marshal(machine.MemoryMiB)
+	if err != nil {
+		return err
+	}
+	document["machine"], err = json.Marshal(fields)
+	return err
 }

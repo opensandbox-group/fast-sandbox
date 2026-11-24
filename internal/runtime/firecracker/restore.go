@@ -60,19 +60,29 @@ func restoreReference(spec fastletapi.SandboxDesiredSpec) (string, error) {
 // manifestMachine uses the shared integer CPU/MiB contract.
 type manifestMachine = artifacts.VMMachine
 
-// readCachedManifestMachine loads the machine tuple from the cached
-// manifest. Only an absent local manifest reports false; malformed metadata fails.
-func readCachedManifestMachine(stateRoot, image string) (manifestMachine, bool, error) {
+// readCachedManifest loads the full cached manifest. Only an absent local
+// manifest reports false; malformed metadata fails.
+func readCachedManifest(stateRoot, image string) (artifacts.VMManifest, bool, error) {
 	payload, err := os.ReadFile(cachedManifestPath(stateRoot, image))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return manifestMachine{}, false, nil
+			return artifacts.VMManifest{}, false, nil
 		}
-		return manifestMachine{}, false, err
+		return artifacts.VMManifest{}, false, err
 	}
 	document, err := artifacts.DecodeVMManifest(payload)
 	if err != nil {
-		return manifestMachine{}, false, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+		return artifacts.VMManifest{}, false, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
+	}
+	return document, true, nil
+}
+
+// readCachedManifestMachine loads the machine tuple from the cached
+// manifest. Only an absent local manifest reports false; malformed metadata fails.
+func readCachedManifestMachine(stateRoot, image string) (manifestMachine, bool, error) {
+	document, ok, err := readCachedManifest(stateRoot, image)
+	if err != nil || !ok {
+		return manifestMachine{}, ok, err
 	}
 	return document.Machine, true, nil
 }
@@ -215,7 +225,14 @@ func (d *Driver) validateRestoreCompatibility(stateRoot, image string) error {
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
-	return checkRestoreCompatibility(document.Compatibility, artifacts.HostCPUIdentity(), d.firecrackerVersion(), image)
+	selected, err := d.selectVMM(context.Background(), document.Compatibility.FirecrackerVersion)
+	if err != nil {
+		return err
+	}
+	if document.IsRootfsOnly() {
+		return checkRootfsBootCompatibility(document, d.selectionVersion(selected))
+	}
+	return checkRestoreCompatibility(document.Compatibility, artifacts.HostCPUIdentity(), d.selectionVersion(selected), image)
 }
 
 // parseMemMiB parses a resource quantity into whole MiB.

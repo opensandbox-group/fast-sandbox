@@ -40,6 +40,7 @@ data:
           firecracker:
             fastletOverhead: {cpu: 250m, memory: 256Mi}
             firecracker:
+              vmmDir: /opt/fast-sandbox/firecracker
               binaryPath: /opt/fast-sandbox/firecracker/firecracker
               jailerPath: /opt/fast-sandbox/firecracker/jailer
               rootfsPath: /var/lib/fast-sandbox/firecracker/rootfs

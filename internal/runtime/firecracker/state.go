@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/firecrackervmm"
 	infracontract "fast-sandbox/internal/infra/contract"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
@@ -32,7 +34,7 @@ type VMPhase string
 
 const (
 	PhaseStarting VMPhase = "Starting"
-	PhaseRunning  VMPhase = "Running"
+	PhaseRunning  VMPhase = vmRunning
 	PhaseStopped  VMPhase = "Stopped"
 	// PhaseFailed is a durable terminal observation. Physical resources may
 	// already be reclaimed, but the identity remains until Controller ACK.
@@ -43,15 +45,20 @@ const (
 // runtime configuration separate from Driver-produced allocation state so
 // restart recovery preserves both authority boundaries.
 type SandboxState struct {
-	Config           fastletapi.RuntimeSandboxConfig     `json:"config"`
-	Allocation       fastletapi.RuntimeAllocation        `json:"allocation"`
-	Phase            VMPhase                             `json:"phase"`
-	PID              int                                 `json:"pid,omitempty"`
-	APIAddress       string                              `json:"apiAddress,omitempty"`
-	CreatedAt        int64                               `json:"createdAt"`
-	FailureMessage   string                              `json:"failureMessage,omitempty"`
-	InfraServices    []infracontract.ServiceEndpoint     `json:"infraServices,omitempty"`
-	InfraDiagnostics []infracontract.ComponentDiagnostic `json:"infraDiagnostics,omitempty"`
+	BootRecoveryError string                              `json:"bootRecoveryError,omitempty"`
+	BootMachine       *artifacts.VMMachine                `json:"bootMachine,omitempty"`
+	VMM               *firecrackervmm.Selection           `json:"vmm,omitempty"`
+	BootKernelSHA256  string                              `json:"bootKernelSHA256,omitempty"`
+	BootCompatibility *artifacts.SnapshotCompatibility    `json:"bootCompatibility,omitempty"`
+	Config            fastletapi.RuntimeSandboxConfig     `json:"config"`
+	Allocation        fastletapi.RuntimeAllocation        `json:"allocation"`
+	Phase             VMPhase                             `json:"phase"`
+	PID               int                                 `json:"pid,omitempty"`
+	APIAddress        string                              `json:"apiAddress,omitempty"`
+	CreatedAt         int64                               `json:"createdAt"`
+	FailureMessage    string                              `json:"failureMessage,omitempty"`
+	InfraServices     []infracontract.ServiceEndpoint     `json:"infraServices,omitempty"`
+	InfraDiagnostics  []infracontract.ComponentDiagnostic `json:"infraDiagnostics,omitempty"`
 	// StageDurations records the per-stage create timing of the Sandbox
 	// (acquire/rootfs/infra/launch/configure/boot) for load bottleneck
 	// analysis (serial vs parallel clone batches).
@@ -106,9 +113,19 @@ func metaPath(directory string) string {
 	return filepath.Join(directory, sandboxMetaName)
 }
 
-// saveState replaces meta.json atomically so process death cannot truncate
-// the ownership record needed to recover attached OCI devices.
+// saveState replaces meta.json atomically and syncs both file and parent
+// directory for committed or terminal runtime state transitions.
 func saveState(directory string, state *SandboxState) error {
+	return writeSandboxState(directory, state, true)
+}
+
+// saveStateAtomic replaces meta.json atomically (temp + rename) without fsync
+// for intermediate PhaseStarting progress records on the create hot path.
+func saveStateAtomic(directory string, state *SandboxState) error {
+	return writeSandboxState(directory, state, false)
+}
+
+func writeSandboxState(directory string, state *SandboxState, syncDisk bool) error {
 	if state == nil {
 		return fmt.Errorf("%w: sandbox state is required", ErrInvalidConfig)
 	}
@@ -125,10 +142,22 @@ func saveState(directory string, state *SandboxState) error {
 		file.Close()
 		return err
 	}
+	if syncDisk {
+		if err := file.Sync(); err != nil {
+			file.Close()
+			return err
+		}
+	}
 	if err := file.Close(); err != nil {
 		return err
 	}
-	return os.Rename(file.Name(), metaPath(directory))
+	if err := os.Rename(file.Name(), metaPath(directory)); err != nil {
+		return err
+	}
+	if syncDisk {
+		return syncCaptureDirectory(directory)
+	}
+	return nil
 }
 
 // loadState reads the Sandbox state; os.ErrNotExist means the Sandbox is not

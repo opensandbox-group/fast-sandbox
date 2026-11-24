@@ -97,6 +97,7 @@ func (c Config) Validate() error { //nolint:gocognit // pre-existing sequential 
 			if binding.Firecracker != nil {
 				for _, value := range []struct{ field, path string }{
 					{"firecracker.binaryPath", binding.Firecracker.BinaryPath},
+					{"firecracker.vmmDir", binding.Firecracker.VMMDir},
 					{"firecracker.jailerPath", binding.Firecracker.JailerPath},
 					{"firecracker.kernelPath", binding.Firecracker.KernelPath},
 					{"firecracker.rootfsPath", binding.Firecracker.RootfsPath},

@@ -10,7 +10,44 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"fast-sandbox/internal/artifacts"
 )
+
+func TestVerifyRootfsBootMachine(t *testing.T) {
+	state := &SandboxState{BootMachine: &artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 384}}
+	require.NoError(t, verifyBootMachine(t.Context(), nil, state), "ordinary create performs no read-back")
+	state.Config.Desired.RootfsBootDigest = "pinned"
+	for _, tc := range []struct {
+		name, body string
+		code       int
+		wantErr    string
+	}{
+		{"match", `{"vcpu_count":1,"mem_size_mib":384}`, 200, ""},
+		{"wrong_ram", `{"vcpu_count":1,"mem_size_mib":256}`, 200, "expected 1 vCPUs and 384 MiB"},
+		{"wrong_cpu", `{"vcpu_count":2,"mem_size_mib":384}`, 200, "VMM reports 2 vCPUs"},
+		{"unavailable", "", 503, "read back rootfs boot shape"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			socket := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, http.MethodGet, r.Method)
+				require.Equal(t, "/machine-config", r.URL.Path)
+				w.WriteHeader(tc.code)
+				_, _ = w.Write([]byte(tc.body))
+			})
+			client := NewClient(socket)
+			defer client.Close()
+			err := verifyBootMachine(t.Context(), client, state)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.wantErr)
+			}
+		})
+	}
+	state.BootMachine = nil
+	require.ErrorIs(t, verifyBootMachine(t.Context(), nil, state), ErrInvalidConfig)
+}
 
 // startFakeFirecracker serves a scripted API on a Unix socket and returns the
 // socket path plus the handler that recorded calls. The socket lives under a
@@ -33,7 +70,7 @@ func TestClientVersion(t *testing.T) {
 	socketPath := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(t, "/version", r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"version":"1.15.1"}`))
+		_, _ = w.Write([]byte(`{"firecracker_version":"1.15.1"}`))
 	})
 	client := NewClient(socketPath)
 	t.Cleanup(client.Close)
@@ -41,6 +78,51 @@ func TestClientVersion(t *testing.T) {
 	version, err := client.Version(context.Background())
 	require.NoError(t, err)
 	require.Equal(t, "1.15.1", version)
+}
+
+func TestInterruptedRootfsBootRequiresRunningMatchingMachine(t *testing.T) {
+	d := &Driver{newClient: NewClient}
+	for _, tc := range []struct{ phase, machine, wantErr string }{
+		{"Not started", "{}", "cannot adopt interrupted rootfs boot"},
+		{"Running", `{"vcpu_count":2,"mem_size_mib":384}`, "VMM reports 2 vCPUs"},
+		{"Running", `{"vcpu_count":1,"mem_size_mib":384}`, ""},
+	} {
+		t.Run(tc.phase+"_"+tc.wantErr, func(t *testing.T) {
+			socket := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/":
+					_ = json.NewEncoder(w).Encode(map[string]string{"state": tc.phase})
+				case "/machine-config":
+					_, _ = w.Write([]byte(tc.machine))
+				default:
+					http.NotFound(w, r)
+				}
+			})
+			state := &SandboxState{Phase: PhaseStarting, APIAddress: socket, BootMachine: &artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 384}}
+			state.Config.Desired.RootfsBootDigest = "pinned"
+			err := d.verifyExistingBoot(t.Context(), state)
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestClientVersionRejectsMissingVersion(t *testing.T) {
+	for _, body := range []string{`{}`, `{"firecracker_version":""}`, `{"version":"1.15.1"}`} {
+		t.Run(body, func(t *testing.T) {
+			socketPath := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(body))
+			})
+			client := NewClient(socketPath)
+			t.Cleanup(client.Close)
+			version, err := client.Version(context.Background())
+			require.ErrorContains(t, err, "missing firecracker_version")
+			require.Empty(t, version)
+		})
+	}
 }
 
 func TestClientLifecycleCalls(t *testing.T) {
@@ -177,4 +259,25 @@ func TestClientNotReady(t *testing.T) {
 func TestPathEscape(t *testing.T) {
 	require.Equal(t, "root", pathEscape("root"))
 	require.Equal(t, "a%2Fb", pathEscape("a/b"))
+}
+
+func TestClientConfigureVSock(t *testing.T) {
+	var received VSockRequest
+	calls := 0
+	socketPath := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		require.Equal(t, http.MethodPut, r.Method)
+		require.Equal(t, "/vsock", r.URL.Path)
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&received))
+		w.WriteHeader(http.StatusNoContent)
+	})
+	client := NewClient(socketPath)
+	t.Cleanup(client.Close)
+	for _, cid := range []uint32{0, 1, 2, ^uint32(0)} {
+		require.Error(t, client.ConfigureVSock(context.Background(), VSockRequest{GuestCID: cid, UDSPath: "control.sock"}))
+	}
+	require.Error(t, client.ConfigureVSock(context.Background(), VSockRequest{GuestCID: 3}))
+	require.NoError(t, client.ConfigureVSock(context.Background(), VSockRequest{GuestCID: 3, UDSPath: "control.sock"}))
+	require.Equal(t, 1, calls)
+	require.Equal(t, VSockRequest{GuestCID: 3, UDSPath: "control.sock"}, received)
 }

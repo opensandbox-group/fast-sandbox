@@ -12,9 +12,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"k8s.io/klog/v2"
+
+	"fast-sandbox/internal/artifacts"
 )
 
 // defaultBundleDir is the in-image location of the pinned assets.
@@ -91,22 +92,7 @@ func parseSHA256Sums(path string) (map[string]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read SHA256SUMS: %w", err)
 	}
-	manifest := make(map[string]string)
-	for number, line := range strings.Split(string(payload), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) != 2 || len(fields[0]) != hex.EncodedLen(sha256.Size) {
-			return nil, fmt.Errorf("SHA256SUMS line %d is malformed: %q", number+1, line)
-		}
-		manifest[strings.TrimPrefix(fields[1], "./")] = fields[0]
-	}
-	if len(manifest) == 0 {
-		return nil, errors.New("SHA256SUMS lists no entries")
-	}
-	return manifest, nil
+	return artifacts.ParseSHA256SUMS(payload)
 }
 
 func (c AssetConfig) bundleDir() string {

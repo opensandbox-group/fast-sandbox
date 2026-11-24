@@ -16,7 +16,6 @@ package dart
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"os/exec"
@@ -81,7 +80,7 @@ type Config struct {
 type Manager struct {
 	config Config
 	log    io.Writer
-	logMu  sync.Mutex // serializes manager logs and child output
+	logMu  sync.Mutex
 
 	mu         sync.Mutex
 	startCount int
@@ -177,8 +176,7 @@ func (m *Manager) Run(ctx context.Context) error {
 	}
 }
 
-// lockedWriter serializes writes to the underlying writer: the child's
-// output pipe goroutine and the manager's own logs share the sink.
+// Both child pipes can write concurrently to a non-thread-safe sink.
 type lockedWriter struct {
 	writer io.Writer
 	mu     *sync.Mutex
@@ -190,13 +188,6 @@ func (w *lockedWriter) Write(payload []byte) (int, error) {
 	return w.writer.Write(payload)
 }
 
-// logf writes a manager log line through the shared sink.
-func (m *Manager) logf(format string, arguments ...any) {
-	m.logMu.Lock()
-	defer m.logMu.Unlock()
-	fmt.Fprintf(m.log, format, arguments...)
-}
-
 // start spawns the child and returns its process and a channel that yields
 // the Wait error once it exits.
 func (m *Manager) start(ctx context.Context) (*exec.Cmd, <-chan error, error) {
@@ -204,7 +195,7 @@ func (m *Manager) start(ctx context.Context) (*exec.Cmd, <-chan error, error) {
 	command.Stdout = &lockedWriter{writer: m.log, mu: &m.logMu}
 	command.Stderr = &lockedWriter{writer: m.log, mu: &m.logMu}
 	if err := command.Start(); err != nil {
-		m.logf("dart: start failed: %v\n", err)
+		klog.ErrorS(err, "DART start failed")
 		return nil, nil, err
 	}
 	m.mu.Lock()
@@ -213,7 +204,7 @@ func (m *Manager) start(ctx context.Context) (*exec.Cmd, <-chan error, error) {
 	m.healthy.Store(false) // not probed yet
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- command.Wait() }()
-	m.logf("dart: started pid=%d args=%s\n", command.Process.Pid, strings.Join(m.Args(), " "))
+	klog.InfoS("DART started", "pid", command.Process.Pid, "args", m.Args())
 	return command, waitCh, nil
 }
 
@@ -233,7 +224,7 @@ func (m *Manager) runProbes(ctx context.Context, cmd *exec.Cmd, waitCh <-chan er
 		case err := <-waitCh:
 			m.healthy.Store(false)
 			if err != nil && !errors.Is(err, context.Canceled) {
-				m.logf("dart: process exited: %v\n", err)
+				klog.ErrorS(err, "DART process exited")
 			}
 			return
 		}
@@ -245,7 +236,7 @@ func (m *Manager) stop(cmd *exec.Cmd, waitCh <-chan error) {
 	if cmd.Process == nil {
 		return
 	}
-	m.logf("dart: stopping pid=%d\n", cmd.Process.Pid)
+	klog.InfoS("DART stopping", "pid", cmd.Process.Pid)
 	_ = cmd.Process.Signal(syscall.SIGTERM)
 	select {
 	case <-waitCh:
@@ -268,7 +259,7 @@ func (m *Manager) backoffDelay(ctx context.Context) bool {
 		m.backoff = restartBackoffMax
 	}
 	m.mu.Unlock()
-	m.logf("dart: restarting in %s\n", delay)
+	klog.InfoS("DART restarting", "delay", delay)
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {

@@ -9,7 +9,6 @@
 
 ARG OCI_TOOLS_IMAGE=fast-sandbox/oci-tools:dev
 ARG OCI2ROOTFS_REV=76d3f4648a591066a4419f972e4118f2d1d68a35
-ARG FIRECRACKER_VERSION=v1.16.1
 
 # --- shared OCI artifacts ------------------------------------------------
 FROM ${OCI_TOOLS_IMAGE} AS oci-tools
@@ -24,8 +23,15 @@ RUN git clone https://github.com/arcboxlabs/oci2rootfs.git /src/oci2rootfs \
     && git checkout --detach "$OCI2ROOTFS_REV" \
     && cargo build --release --locked -p oci2rootfs-cli
 
+# --- shared Firecracker release bundle -------------------------------------
+FROM alpine:3.19 AS fc-assets
+COPY internal/firecrackervmm/releases.json /releases.json
+COPY build/firecracker/package.sh /package.sh
+RUN apk add --no-cache curl jq coreutils \
+    && sh /package.sh /releases.json /bundle x86_64
+
 # --- sandboxtemplate-builder binary ----------------------------------------
-FROM golang:1.25 AS builder-build
+FROM golang:1.26.11 AS builder-build
 
 # GOPROXY is overridable (docker build --build-arg GOPROXY=...) so hosts
 # without direct proxy.golang.org access can download modules from a mirror;
@@ -40,15 +46,20 @@ RUN go mod download
 # snapshot producer (checksums, manifest encoding, index layout).
 COPY api ./api
 COPY internal/artifacts ./internal/artifacts
+COPY internal/firecrackerconfig ./internal/firecrackerconfig
+COPY internal/firecrackervmm ./internal/firecrackervmm
+COPY internal/componentlog ./internal/componentlog
 COPY internal/guestnetwork ./internal/guestnetwork
+COPY internal/guestcontrol ./internal/guestcontrol
+COPY cmd/fsb-guest-control ./cmd/fsb-guest-control
 COPY internal/ocitemplate ./internal/ocitemplate
 COPY cmd/sandboxtemplate-builder ./cmd/sandboxtemplate-builder
-RUN CGO_ENABLED=0 go build -o /out/sandboxtemplate-builder ./cmd/sandboxtemplate-builder
+RUN CGO_ENABLED=0 go build -o /out/sandboxtemplate-builder ./cmd/sandboxtemplate-builder \
+    && CGO_ENABLED=0 go build -o /out/fsb-guest-control ./cmd/fsb-guest-control
 
 # --- runtime image ---------------------------------------------------------
 FROM ubuntu:22.04
 
-ARG FIRECRACKER_VERSION
 ARG OCI2ROOTFS_REV
 # The default pins the Firecracker CI Amazon microvm kernel (6.18, ACPI +
 # VMGenID) under its real name; override both together to embed a
@@ -80,18 +91,14 @@ RUN set -eux; \
     /tmp/aws/install; \
     rm -rf /tmp/aws /tmp/awscliv2.zip
 
-# Firecracker release binary.
-RUN set -eux; \
-    archive="firecracker-${FIRECRACKER_VERSION}-x86_64.tgz"; \
-    curl -fsSL --retry 5 "https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/${archive}" -o "/tmp/${archive}"; \
-    tar -xzf "/tmp/${archive}" -C /tmp; \
-    install -m 0755 "/tmp/release-${FIRECRACKER_VERSION}-x86_64/firecracker-${FIRECRACKER_VERSION}-x86_64" /usr/local/bin/firecracker; \
-    rm -rf "/tmp/${archive}" "/tmp/release-${FIRECRACKER_VERSION}-x86_64"
+COPY --from=fc-assets /bundle /opt/fast-sandbox/firecracker
+RUN ln -s /opt/fast-sandbox/firecracker/firecracker /usr/local/bin/firecracker
 
 COPY --from=oci2rootfs-build /src/oci2rootfs/target/release/oci2rootfs /usr/local/bin/oci2rootfs
 COPY --from=oci-tools /opt/overlaybd/ /opt/overlaybd/
 COPY --from=oci-tools /usr/local/bin/convertor /usr/local/bin/convertor
 COPY --from=oci-tools /usr/local/bin/fsb-vm /usr/local/bin/fsb-vm
+COPY --from=builder-build /out/fsb-guest-control /usr/local/lib/fsb-guest-control
 COPY --from=builder-build /out/sandboxtemplate-builder /usr/local/bin/sandboxtemplate-builder
 COPY build/oci/overlaybd.json /etc/overlaybd/ublkd.json
 COPY build/oci/entrypoint.sh /usr/local/bin/oci-entrypoint
@@ -101,6 +108,7 @@ RUN sed 's/"enable": true, "uriPrefix"/"enable": false, "uriPrefix"/' /etc/overl
 ENV LD_LIBRARY_PATH=/opt/overlaybd/lib
 ENV PATH=/opt/overlaybd/bin:${PATH}
 ENV FAST_SANDBOX_OCI_ENABLED=auto
+ENV FAST_SANDBOX_VMM_DIR=/opt/fast-sandbox/firecracker
 
 # Guest kernel, embedded in the builder image so builds do not download a
 # kernel at build time. Override KERNEL_URL to pin a specific build.

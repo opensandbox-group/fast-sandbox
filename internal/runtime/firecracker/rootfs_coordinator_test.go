@@ -1,0 +1,563 @@
+package firecracker
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"fast-sandbox/internal/artifacts"
+	runtimecatalog "fast-sandbox/internal/catalog/runtime"
+	"fast-sandbox/internal/firecrackervmm"
+	"fast-sandbox/internal/guestcontrol"
+	"fast-sandbox/internal/janitor"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
+	runtimecontract "fast-sandbox/internal/runtime/contract"
+)
+
+func TestNativeRootfsQualificationSelfDerives(t *testing.T) {
+	// #224: there is no authored profile — the backend follows the source
+	// encoding and the exclusive-writer contract follows the standard
+	// managed VMM directory and StateRoot.
+	sum := strings.Repeat("b", 64)
+	standard := rootfsQualificationSources{
+		Native: true, KernelSHA256: sum, ManagedVMM: true, StandardTopology: true,
+	}
+	q, err := readRootfsQualification(standard)
+	require.NoError(t, err)
+	require.Equal(t, captureBackendNative, q.Backend)
+	require.True(t, q.ExclusiveExt4)
+
+	// Regression (#225 review): a managed VMM with a relocated StateRoot is
+	// NOT qualified — the same disk file can carry host-side writers that a
+	// guest freeze cannot quiesce.
+	relocated := rootfsQualificationSources{
+		Native: true, KernelSHA256: sum, ManagedVMM: true, StandardTopology: false,
+	}
+	_, err = readRootfsQualification(relocated)
+	require.ErrorContains(t, err, "standard managed VMM directory and StateRoot")
+
+	// A VMM outside the managed release layout stays fail-closed.
+	_, err = readRootfsQualification(rootfsQualificationSources{
+		Native: true, KernelSHA256: sum, ManagedVMM: false, StandardTopology: false,
+	})
+	require.ErrorContains(t, err, "standard managed VMM directory and StateRoot")
+}
+
+func TestRootfsCoordinatorRejectsBeforeSideEffects(t *testing.T) {
+	d := &Driver{}
+	for _, input := range []*runtimecontract.SnapshotInput{
+		{Mode: fastletapi.SnapshotModeRootfsOnly, Kind: fastletapi.SnapshotKindCheckpoint},
+		{Mode: fastletapi.SnapshotModeRootfsOnly, Kind: fastletapi.SnapshotKindTemplate},
+		{Mode: "unknown"},
+	} {
+		input.SandboxID = "source"
+		input.SnapshotID = "snapshot"
+		_, err := d.CreateSnapshot(t.Context(), input)
+		require.Error(t, err)
+	}
+}
+
+func TestRootfsBootCompatibilityAndKernelTraversal(t *testing.T) {
+	m := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 256, RootfsSizeMiB: 1024, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.dev"}, "6.1.177", "", artifacts.CPUTemplateNone)
+	m.Compatibility.CPUArch = artifacts.HostCPUArch()
+	m.Compatibility.FirecrackerVersion = "1.16.1"
+	m.Platform = &artifacts.VMPlatform{SnapshotMode: "rootfsOnly"}
+	m.Kernel.SHA256 = strings.Repeat("c", 64)
+	m.Kernel.Cmdline = "root=/dev/vda rw"
+	require.NoError(t, checkRootfsBootCompatibility(m, "1.16.1"))
+	require.Error(t, checkRootfsBootCompatibility(m, "1.17.0"))
+	m.Compatibility.FirecrackerVersion = "1.17.0"
+	require.NoError(t, checkRootfsBootCompatibility(m, "1.17.0"))
+	m.Compatibility.CPUArch = "unsupported"
+	require.Error(t, checkRootfsBootCompatibility(m, "1.16.1"))
+	m.Kernel.Version = "../../kernel"
+	_, err := (&Driver{}).rootfsKernel(m)
+	require.Error(t, err)
+}
+
+func TestRootfsSnapshotPreservesExtensionsAndDropsMemory(t *testing.T) {
+	m := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 256, RootfsSizeMiB: 1024, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.dev"}, "6.1.177", "", artifacts.CPUTemplateNone)
+	m.Compatibility.CPUArch = artifacts.HostCPUArch()
+	m.Compatibility.FirecrackerVersion = "1.16.1"
+	m.Kernel.SHA256 = strings.Repeat("c", 64)
+	m.Kernel.Cmdline = "root=/dev/vda rw"
+	m.Platform = &artifacts.VMPlatform{SnapshotMode: "rootfsOnly"}
+	raw, err := json.Marshal(m)
+	require.NoError(t, err)
+	var source map[string]any
+	require.NoError(t, json.Unmarshal(raw, &source))
+	source["extension"] = map[string]any{"keep": true}
+	source["files"] = map[string]any{"memory.snap": map[string]any{}}
+	source["platform"].(map[string]any)["extension"] = "keep"
+	source["platform"].(map[string]any)["checkpoint"] = map[string]any{"sandboxUID": "old"}
+	source["platform"].(map[string]any)["resourceLimits"] = map[string]string{"cpu": "4", "memory": "8Gi"}
+	raw, err = json.Marshal(source)
+	require.NoError(t, err)
+	m.Kernel.SHA256 = strings.Repeat("d", 64)
+	result, err := marshalRootfsSnapshotManifest(raw, m, fastletapi.SandboxRuntimeLimits{CPU: "500m", Memory: "256Mi"})
+	require.NoError(t, err)
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(result, &got))
+	require.Equal(t, source["extension"], got["extension"])
+	require.Equal(t, m.Kernel.SHA256, got["kernel"].(map[string]any)["sha256"])
+	require.NotContains(t, got, "files")
+	platform := got["platform"].(map[string]any)
+	require.Equal(t, "keep", platform["extension"])
+	require.NotContains(t, platform, "checkpoint")
+	decoded, err := artifacts.DecodeVMManifest(result)
+	require.NoError(t, err)
+	require.True(t, decoded.IsRootfsOnly())
+	require.Equal(t, &artifacts.VMResourceLimits{CPU: "500m", Memory: "256Mi"}, decoded.Platform.ResourceLimits)
+	require.Equal(t, 1, decoded.Machine.VCPUCount)
+	legacy, err := marshalRootfsSnapshotManifest(raw, m, fastletapi.SandboxRuntimeLimits{})
+	require.NoError(t, err)
+	decoded, err = artifacts.DecodeVMManifest(legacy)
+	require.NoError(t, err)
+	require.Nil(t, decoded.Platform.ResourceLimits)
+}
+
+func TestRootfsPublicationRetainsOwnerAfterSourceDeletion(t *testing.T) {
+	t.Setenv(ociSnapshotRepositoryEnv, "registry.example/snapshots")
+	root := t.TempDir()
+	plan := dumpPlan{sandboxDir: filepath.Join(root, "source"), staging: filepath.Join(root, "staging"), snapshotID: "snapshot"}
+	require.NoError(t, os.MkdirAll(plan.sandboxDir, 0700))
+	require.NoError(t, os.MkdirAll(plan.staging, 0700))
+	state := &SandboxState{Phase: PhaseRunning}
+	state.Config.Identity = fastletapi.SandboxIdentity{SandboxUID: "source", FastletPodUID: "pod", Namespace: "test"}
+	state.Config.Desired.Image = "oci://registry.example/templates@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	require.NoError(t, saveState(plan.sandboxDir, state))
+	publication, err := prepareOCIPublication(plan)
+	require.NoError(t, err)
+	require.NoError(t, os.RemoveAll(plan.sandboxDir))
+	require.Equal(t, "registry.example/snapshots:snapshot", publication.destination)
+	owner, err := os.ReadFile(filepath.Join(plan.staging, ".pack-owner.json"))
+	require.NoError(t, err)
+	require.Contains(t, string(owner), "source")
+	require.Contains(t, string(owner), "pod")
+}
+func TestRootfsUpperBudgetUsesAllocatedBlocks(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"writable_data", "writable_index"} {
+		f, err := os.Create(filepath.Join(root, name))
+		require.NoError(t, err)
+		require.NoError(t, f.Truncate(1<<30))
+		_, err = f.WriteAt([]byte("extent"), 1<<29)
+		require.NoError(t, err)
+		require.NoError(t, f.Close())
+	}
+	size, err := allocatedUpperBytes(root)
+	require.NoError(t, err)
+	require.Positive(t, size)
+	require.Less(t, size, int64(1<<20))
+}
+
+func TestRootfsFailedCaptureStagingRecovery(t *testing.T) {
+	for _, scenario := range []string{"partial-upper", "partial-upper-live", "prepare-failed", "published", "quarantined", "wrong-path", "cleanup-failed"} {
+		t.Run(scenario, func(t *testing.T) {
+			root := t.TempDir()
+			d := &Driver{config: firecrackerConfigForTest(t, root), newClient: NewClient}
+			state := &SandboxState{Phase: PhaseRunning}
+			state.Config.Identity = fastletapi.SandboxIdentity{SandboxUID: "source", FastletPodUID: "pod", Namespace: "test"}
+			directory := filepath.Join(root, sandboxStateDir, "source")
+			require.NoError(t, os.MkdirAll(directory, 0700))
+			staging := snapshotStagingPath(root, "pod", "failed", true)
+			require.NoError(t, os.MkdirAll(staging, 0700))
+			require.NoError(t, os.WriteFile(filepath.Join(staging, "writable_data"), []byte("partial"), 0600))
+			fixture := &captureFixture{}
+			tx := fixture.transaction()
+			tx.Request.OperationID = "failed"
+			journal, err := newCaptureJournal(filepath.Join(directory, "rootfs-capture"), captureRecord{
+				Owner: &state.Config.Identity, Incarnation: "boot", Device: "/dev/ublkb0", Staging: staging, Request: tx.Request,
+			})
+			require.NoError(t, err)
+			tx.Progress = journal
+			if strings.HasPrefix(scenario, "partial-upper") {
+				tx.Cut = func() error { return errors.New("index copy failed") }
+				require.ErrorContains(t, tx.run(t.Context()), "index copy failed")
+			} else {
+				require.NoError(t, tx.run(t.Context()))
+			}
+			switch scenario {
+			case "prepare-failed":
+				plan := dumpPlan{sandboxID: "source", sandboxDir: directory, staging: staging}
+				_, err = d.prepareRootfsPublication(t.Context(), &plan, nil, artifacts.VMManifest{}, false, fastletapi.SandboxRuntimeLimits{})
+				require.Error(t, err)
+			case "partial-upper-live":
+				require.NoError(t, d.cleanupUnpublishedCapture(t.Context(), state, journal))
+				require.NoDirExists(t, staging)
+			case "published":
+				journal.record.PublicationOwned = true
+			case "quarantined":
+				journal.record.Phase = captureQuarantined
+			case "wrong-path":
+				journal.record.Staging = filepath.Join(root, "unowned")
+			case "cleanup-failed":
+				// Use ENOTDIR to simulate cleanup failure; retain the old journal so the next capture cannot overwrite it.
+				require.NoError(t, os.RemoveAll(staging))
+				require.NoError(t, os.WriteFile(staging, []byte("not a directory"), 0600))
+			}
+			require.NoError(t, journal.persist())
+			// Reload the disk record to simulate process exit after source recovery but before publication takes ownership.
+			err = d.recoverRootfsCapture(t.Context(), state)
+			switch scenario {
+			case "quarantined", "wrong-path", "cleanup-failed":
+				require.Error(t, err)
+				require.FileExists(t, filepath.Join(directory, "rootfs-capture", "capture.json"))
+				if scenario == "cleanup-failed" {
+					_, err = prepareRootfsJournal(directory, journal.record)
+					require.ErrorContains(t, err, "must be cleaned")
+				}
+			case "published":
+				require.NoError(t, err)
+				require.FileExists(t, filepath.Join(staging, "writable_data"))
+			default:
+				require.NoError(t, err)
+				require.NoDirExists(t, staging)
+				// Cleanup is idempotent; a subsequent capture with a new ID leaves no old data behind.
+				require.NoError(t, d.recoverRootfsCapture(t.Context(), state))
+				record := journal.record
+				record.Request.OperationID = "next"
+				record.Staging = snapshotStagingPath(root, "pod", "next", true)
+				_, err = prepareRootfsJournal(directory, record)
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestRootfsCaptureOwnerVisibleBeforePublicationAfterPodReplacement(t *testing.T) {
+	root := t.TempDir()
+	old := fastletapi.SandboxIdentity{SandboxUID: "source", FastletPodUID: "old-pod"}
+	staging := snapshotStagingPath(root, old.FastletPodUID, "capture", true)
+	require.NoError(t, os.MkdirAll(staging, 0700))
+	require.NoError(t, prepareCaptureStaging(staging, old))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "writable_data"), []byte("partial upper"), 0600))
+	// Publication has not started; a different Driver must not adopt the old Pod.
+	replacement := &Driver{config: firecrackerConfigForTest(t, root)}
+	replacement.SetFastletPodUID("replacement-pod")
+	directory := filepath.Join(root, sandboxStateDir, old.SandboxUID)
+	require.NoError(t, os.MkdirAll(directory, 0700))
+	state := &SandboxState{Phase: PhaseRunning}
+	state.Config.Identity = old
+	require.NoError(t, saveState(directory, state))
+	fixture := &captureFixture{}
+	request := fixture.transaction().Request
+	request.OperationID = "capture"
+	_, err := newCaptureJournal(filepath.Join(directory, "rootfs-capture"), captureRecord{Owner: &old, Incarnation: "old-vmm", Device: "/dev/ublkb0", Staging: staging, Request: request})
+	require.NoError(t, err)
+	require.NoError(t, replacement.RecoverRuntimeResources(t.Context(), nil, nil))
+	require.FileExists(t, filepath.Join(staging, "writable_data"), "replacement must leave old Pod ownership to Janitor")
+	resources, err := janitor.NewOCIBackend(replacement.config.StateRoot).Scan(t.Context())
+	require.NoError(t, err)
+	require.Len(t, resources, 1)
+	require.Equal(t, "old-pod", resources[0].FastletPodUID)
+	require.Equal(t, "pack/old-pod/capture", resources[0].ResourceID)
+	require.NoFileExists(t, filepath.Join(staging, "manifest.json"))
+	entries, err := os.ReadDir(staging)
+	require.NoError(t, err)
+	require.Len(t, entries, 2, "atomic ownership publication must not leave temporary markers")
+}
+
+func TestRootfsQualificationUsesRunningKernelProvenance(t *testing.T) {
+	qualified := strings.Repeat("a", 64)
+	require.NoError(t, qualifyBootKernel(qualified, qualified))
+	require.ErrorContains(t, qualifyBootKernel("", qualified), "provenance is missing")
+	// Full RAM may hold B while this host has a qualified A installation.
+	// No current host path is consulted to promote B to a qualified kernel.
+	require.ErrorContains(t, qualifyBootKernel(strings.Repeat("b", 64), qualified), "running guest kernel")
+	state := &SandboxState{BootKernelSHA256: qualified, Config: fastletapi.RuntimeSandboxConfig{Identity: fastletapi.SandboxIdentity{SandboxUID: "kernel-source"}}, Phase: PhaseRunning}
+	directory := t.TempDir()
+	require.NoError(t, saveState(directory, state))
+	restored, err := loadState(directory)
+	require.NoError(t, err)
+	require.Equal(t, qualified, restored.BootKernelSHA256)
+}
+
+func TestRootfsCaptureChecksActualHelperImplementation(t *testing.T) {
+	for _, version := range []string{"sha256:" + strings.Repeat("a", 64), "sha256:" + strings.Repeat("b", 64)} {
+		manifest := &artifacts.VMGuestControl{Protocol: guestcontrol.Protocol, HelperVersion: version}
+		require.NoError(t, validateCaptureHelper(manifest, guestcontrol.Response{Protocol: guestcontrol.Protocol, HelperVersion: version}))
+		require.Error(t, validateCaptureHelper(manifest, guestcontrol.Response{Protocol: guestcontrol.Protocol, HelperVersion: "1"}))
+		require.Error(t, validateCaptureHelper(manifest, guestcontrol.Response{Protocol: guestcontrol.Protocol}))
+	}
+}
+
+func TestRootfsKernelProvenancePreservesExtensions(t *testing.T) {
+	document := map[string]json.RawMessage{"kernel": json.RawMessage(`{"version":"6.1","sha256":"old","future":{"keep":true}}`)}
+	require.NoError(t, setSnapshotKernelDigest(document, strings.Repeat("b", 64)))
+	require.Contains(t, string(document["kernel"]), `"future":{"keep":true}`)
+	require.Contains(t, string(document["kernel"]), strings.Repeat("b", 64))
+	require.NoError(t, setSnapshotKernelDigest(document, ""))
+	require.NotContains(t, string(document["kernel"]), `"sha256"`)
+}
+
+func qualificationSourcesFixture(t *testing.T) rootfsQualificationSources {
+	t.Helper()
+	dir := t.TempDir()
+	bundle := filepath.Join(dir, "oci")
+	require.NoError(t, os.Mkdir(bundle, 0700))
+	raw := []byte(strings.Repeat("b", 64) + "  libexec/overlaybd-ublkd\n" + strings.Repeat("d", 64) + "  bin/overlaybd-ublkd\n")
+	require.NoError(t, os.WriteFile(filepath.Join(bundle, "SHA256SUMS"), raw, 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(bundle, "REVISION"), []byte(fmt.Sprintf("%x\n", sha256.Sum256(raw))), 0600))
+	return rootfsQualificationSources{KernelSHA256: strings.Repeat("c", 64), ManagedVMM: true, OverlayBDBundle: bundle, StandardTopology: true}
+}
+
+func TestRootfsQualificationDefaultsAndOverrides(t *testing.T) {
+	source := qualificationSourcesFixture(t)
+	q, err := readRootfsQualification(source)
+	require.NoError(t, err)
+	require.Equal(t, strings.Repeat("b", 64), q.OverlayBDSHA256, "use executable, not wrapper digest")
+	require.Equal(t, source.KernelSHA256, q.KernelSHA256)
+	require.True(t, q.ExclusiveExt4)
+	// A VMM outside the managed release layout, or a non-standard StateRoot,
+	// stays fail-closed.
+	source.ManagedVMM = false
+	source.StandardTopology = false
+	_, err = readRootfsQualification(source)
+	require.ErrorContains(t, err, "standard managed VMM directory and StateRoot")
+}
+
+func TestRootfsQualificationBrokenBundlesFailClosed(t *testing.T) {
+	for _, test := range []string{"missing-manifest", "missing-entry", "wrong-revision"} {
+		t.Run(test, func(t *testing.T) {
+			source := qualificationSourcesFixture(t)
+			switch test {
+			case "missing-manifest":
+				require.NoError(t, os.Remove(filepath.Join(source.OverlayBDBundle, "SHA256SUMS")))
+			case "missing-entry":
+				raw := []byte(strings.Repeat("a", 64) + "  bin/overlaybd-ublkd\n")
+				require.NoError(t, os.WriteFile(filepath.Join(source.OverlayBDBundle, "SHA256SUMS"), raw, 0600))
+				require.NoError(t, os.WriteFile(filepath.Join(source.OverlayBDBundle, "REVISION"), []byte(fmt.Sprintf("%x", sha256.Sum256(raw))), 0600))
+			case "wrong-revision":
+				require.NoError(t, os.WriteFile(filepath.Join(source.OverlayBDBundle, "REVISION"), []byte("stale"), 0600))
+			}
+			_, err := readRootfsQualification(source)
+			require.Error(t, err)
+			if test == "missing-entry" {
+				require.ErrorContains(t, err, "bundle does not list libexec/overlaybd-ublkd")
+			}
+		})
+	}
+}
+
+func TestRootfsQualificationTopologyDefaults(t *testing.T) {
+	for _, test := range []struct {
+		dir, state        string
+		managed, standard bool
+	}{
+		{firecrackervmm.DefaultDir, "/var/lib/fast-sandbox/firecracker", true, true},
+		{firecrackervmm.DefaultDir, "/custom/state", true, false},
+		{"/custom/vmm", "/var/lib/fast-sandbox/firecracker", true, false},
+		{"", "/var/lib/fast-sandbox/firecracker", false, false},
+	} {
+		d := &Driver{config: runtimecatalog.FirecrackerConfig{VMMDir: test.dir, StateRoot: test.state}}
+		state := &SandboxState{}
+		if test.managed {
+			state.VMM = &firecrackervmm.Selection{Version: "1.17.0", BinaryPath: filepath.Join(test.dir, "versions", "1.17.0", "firecracker")}
+		}
+		source := d.rootfsQualificationSources(state, artifacts.VMManifest{})
+		require.Equal(t, test.managed, source.ManagedVMM)
+		require.Equal(t, test.standard, source.StandardTopology)
+	}
+}
+
+func TestNativeCapabilityImpliedByStandardTopology(t *testing.T) {
+	// The heartbeat carries the node-level eligibility predicate: a
+	// fixed-binary or relocated-path fastlet omits the capability and
+	// rejects at admission instead of failing later at capture.
+	standard := &Driver{config: runtimecatalog.FirecrackerConfig{
+		VMMDir: firecrackervmm.DefaultDir, StateRoot: runtimecatalog.FirecrackerStateRootDir,
+	}}
+	require.True(t, standard.SupportsNativeRootfsOnlySnapshots())
+	customState := &Driver{config: runtimecatalog.FirecrackerConfig{
+		VMMDir: firecrackervmm.DefaultDir, StateRoot: "/custom/state",
+	}}
+	require.False(t, customState.SupportsNativeRootfsOnlySnapshots())
+	fixedBinary := &Driver{config: runtimecatalog.FirecrackerConfig{
+		VMMDir: "", StateRoot: runtimecatalog.FirecrackerStateRootDir,
+	}}
+	require.False(t, fixedBinary.SupportsNativeRootfsOnlySnapshots())
+}
+
+func TestRootfsQualificationRejectsUnmanagedVMM(t *testing.T) {
+	source := qualificationSourcesFixture(t)
+	source.ManagedVMM = false
+	source.StandardTopology = false
+	_, err := readRootfsQualification(source)
+	require.ErrorContains(t, err, "standard managed VMM directory and StateRoot")
+}
+
+func TestRootfsQualificationKernelDiagnostics(t *testing.T) {
+	d := &Driver{}
+	state := &SandboxState{BootKernelSHA256: strings.Repeat("a", 64)}
+	state.Config.Desired.Image = "oci://example.com/template:latest"
+	_, err := d.qualifyRootfsSource(t.Context(), state, artifacts.VMManifest{})
+	require.ErrorContains(t, err, "rebuild the template and recreate the sandbox")
+}
+
+func TestNativeRootfsCapturedManifestAndReadiness(t *testing.T) {
+	root := t.TempDir()
+	image := "native-captured"
+	staging := filepath.Join(root, "staging")
+	require.NoError(t, os.MkdirAll(staging, 0700))
+	m := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 256, RootfsSizeMiB: 1, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.img"}, "vmlinux.bin", "", artifacts.CPUTemplateNone)
+	m.Compatibility.FirecrackerVersion = "1.16.1"
+	m.Platform = &artifacts.VMPlatform{SnapshotMode: "rootfsOnly"}
+	m.Kernel.Cmdline = "root=/dev/vda rw"
+	m.Kernel.SHA256 = strings.Repeat("a", 64)
+	raw, err := artifacts.MarshalVMManifest(m)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(staging, publishedRootfsName), []byte("disk"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, policyBundleName), []byte(`{"version":1}`), 0600))
+	_, err = writeRootfsCapturedManifest(staging, raw, m, fastletapi.SandboxRuntimeLimits{})
+	require.NoError(t, err)
+	payload, err := os.ReadFile(filepath.Join(staging, snapshotManifestName))
+	require.NoError(t, err)
+	got, err := artifacts.DecodeVMManifest(payload)
+	require.NoError(t, err)
+	require.True(t, got.IsRootfsOnly())
+	require.Len(t, got.Files, 1)
+	require.Equal(t, artifacts.SHA256Of([]byte("disk")), got.Files[publishedRootfsName].SHA256)
+	require.Equal(t, artifacts.SHA256Of([]byte(`{"version":1}`)), got.Platform.StateFiles[policyBundleName].SHA256)
+	sumsRaw, err := os.ReadFile(filepath.Join(staging, artifacts.SHA256SUMSName))
+	require.NoError(t, err)
+	require.Contains(t, string(sumsRaw), got.Files[publishedRootfsName].SHA256+"  "+publishedRootfsName)
+	require.Contains(t, string(sumsRaw), got.Platform.StateFiles[policyBundleName].SHA256+"  "+policyBundleName)
+	cache := filepath.Dir(cachedManifestPath(root, image))
+	require.NoError(t, os.MkdirAll(cache, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(cache, rootfsImageName), []byte("disk"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(cache, policyBundleName), []byte(`{"version":1}`), 0600))
+	require.NoError(t, os.WriteFile(cachedManifestPath(root, image), payload, 0600))
+	require.NoError(t, verifyRestorableImage(root, image))
+	require.NoError(t, os.WriteFile(filepath.Join(cache, rootfsImageName), []byte("oops"), 0600))
+	require.ErrorIs(t, verifyRestorableImage(root, image), ErrImageNotReady)
+}
+
+func TestPublishNativeRootfsCommitsLocalCache(t *testing.T) {
+	root := t.TempDir()
+	templateName := "native-rootfs-template-v1"
+	staging := filepath.Join(root, "staging-snap-1")
+	require.NoError(t, os.MkdirAll(staging, 0o700))
+
+	disk := []byte("native-rootfs-disk-bytes")
+	policy := []byte(`{"version":1}`)
+	m := artifacts.NewVMManifest(artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 256, RootfsSizeMiB: 1, RootfsDriveID: "rootfs", RootfsDrivePath: "rootfs.img"}, "vmlinux.bin", "", artifacts.CPUTemplateNone)
+	m.Compatibility.FirecrackerVersion = "1.16.1"
+	m.Platform = &artifacts.VMPlatform{SnapshotMode: "rootfsOnly"}
+	m.Kernel.Cmdline = "root=/dev/vda rw"
+	m.Kernel.SHA256 = strings.Repeat("a", 64)
+	raw, err := artifacts.MarshalVMManifest(m)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(staging, publishedRootfsName), disk, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, policyBundleName), policy, 0o600))
+	verified, err := writeRootfsCapturedManifest(staging, raw, m, fastletapi.SandboxRuntimeLimits{})
+	require.NoError(t, err)
+	manifestBytes, err := os.ReadFile(filepath.Join(staging, snapshotManifestName))
+	require.NoError(t, err)
+	artifactDigest := artifacts.SHA256Of(manifestBytes)
+
+	agent := &fakeAgentClient{
+		publishOut: PublishOutcome{
+			ManifestRef:    "s3://bucket/publish/0123456789abcdef/manifest.json",
+			ArtifactDigest: artifactDigest,
+		},
+	}
+	driver := &Driver{
+		config:         firecrackerConfigForTest(t, root),
+		agentSocket:    filepath.Join(root, "agent.sock"),
+		newAgentClient: func(string) (AgentClient, error) { return agent, nil },
+		imageUseCount:  make(map[string]int64),
+	}
+	plan := dumpPlan{sandboxID: "sb-1", snapshotID: "snap-1", staging: staging, verifiedFiles: verified}
+	input := &runtimecontract.SnapshotInput{
+		SandboxID:    "sb-1",
+		SnapshotID:   "snap-1",
+		TemplateName: templateName,
+	}
+
+	result, err := driver.publishNativeRootfs(t.Context(), plan, input, int64(len(disk)))
+	require.NoError(t, err)
+	require.Equal(t, artifactDigest, result.ArtifactDigest)
+	require.Equal(t, fastletapi.SnapshotModeRootfsOnly, result.Mode)
+	require.NoDirExists(t, staging)
+
+	// The published set is immediately usable on the same node without S3 pull.
+	require.NoError(t, verifyDeliveredImage(root, templateName, true))
+	require.Equal(t, int64(1), driver.imageUseCount[imageKey(templateName)])
+
+	// Same-size in-place corruption on the locally committed cache is still caught.
+	cachedDisk := filepath.Join(filepath.Dir(cachedManifestPath(root, templateName)), rootfsImageName)
+	f, err := os.OpenFile(cachedDisk, os.O_RDWR, 0)
+	require.NoError(t, err)
+	_, err = f.WriteAt([]byte{disk[0] ^ 0xff}, 0)
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	require.ErrorIs(t, verifyDeliveredImage(root, templateName, true), ErrImageNotReady)
+
+	// Restore valid disk and verify replay/conflict handling does not break publish.
+	require.NoError(t, os.WriteFile(cachedDisk, disk, 0o600))
+	require.NoError(t, verifyDeliveredImage(root, templateName, true))
+
+	// A conflicting publish under the same templateName must still succeed
+	// (S3 is authoritative) and leave the existing cache intact.
+	staging2 := filepath.Join(root, "staging-snap-2")
+	require.NoError(t, os.MkdirAll(staging2, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(staging2, publishedRootfsName), []byte("updated-disk-bytes"), 0o600))
+	verified2, err := writeRootfsCapturedManifest(staging2, raw, m, fastletapi.SandboxRuntimeLimits{})
+	require.NoError(t, err)
+	manifestBytes2, err := os.ReadFile(filepath.Join(staging2, snapshotManifestName))
+	require.NoError(t, err)
+	agent.publishOut.ArtifactDigest = artifacts.SHA256Of(manifestBytes2)
+
+	res2, err := driver.publishNativeRootfs(t.Context(), dumpPlan{sandboxID: "sb-1", snapshotID: "snap-2", staging: staging2, verifiedFiles: verified2}, input, 18)
+	require.NoError(t, err)
+	require.Equal(t, artifacts.SHA256Of(manifestBytes2), res2.ArtifactDigest)
+	require.NoDirExists(t, staging2)
+	existingBytes, err := os.ReadFile(cachedDisk)
+	require.NoError(t, err)
+	require.Equal(t, disk, existingBytes)
+
+	// If staged bytes are replaced between hashing and local cache commit,
+	// inode continuity fails, prewarming is skipped, and readiness rejects it.
+	templateBroken := "native-rootfs-broken-continuity"
+	staging3 := filepath.Join(root, "staging-snap-3")
+	require.NoError(t, os.MkdirAll(staging3, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(staging3, publishedRootfsName), disk, 0o600))
+	verified3, err := writeRootfsCapturedManifest(staging3, raw, m, fastletapi.SandboxRuntimeLimits{})
+	require.NoError(t, err)
+	tampered := append([]byte(nil), disk...)
+	tampered[0] ^= 0xff
+	require.NoError(t, os.WriteFile(filepath.Join(staging3, publishedRootfsName+".tmp"), tampered, 0o600))
+	require.NoError(t, os.Rename(filepath.Join(staging3, publishedRootfsName+".tmp"), filepath.Join(staging3, publishedRootfsName)))
+	manifestBytes3, err := os.ReadFile(filepath.Join(staging3, snapshotManifestName))
+	require.NoError(t, err)
+	agent.publishOut.ArtifactDigest = artifacts.SHA256Of(manifestBytes3)
+
+	_, err = driver.publishNativeRootfs(t.Context(), dumpPlan{sandboxID: "sb-1", snapshotID: "snap-3", staging: staging3, verifiedFiles: verified3}, &runtimecontract.SnapshotInput{
+		SandboxID:    "sb-1",
+		SnapshotID:   "snap-3",
+		TemplateName: templateBroken,
+	}, int64(len(disk)))
+	require.NoError(t, err)
+	require.ErrorIs(t, verifyDeliveredImage(root, templateBroken, true), ErrImageNotReady)
+}
+
+func TestNativeQualificationUsesSelectedVMMWithoutOverlayBDBundle(t *testing.T) {
+	// #224: native capture never touches the OverlayBD bundle — backend,
+	// exclusive-writer contract and kernel provenance all derive from the
+	// managed selection and the source template.
+	source := rootfsQualificationSources{Native: true, ManagedVMM: true, KernelSHA256: strings.Repeat("a", 64), OverlayBDBundle: "/missing-oci-bundle", StandardTopology: true}
+	q, err := readRootfsQualification(source)
+	require.NoError(t, err)
+	require.Equal(t, source.KernelSHA256, q.KernelSHA256)
+	require.Equal(t, captureBackendNative, q.Backend)
+	require.Empty(t, q.OverlayBDSHA256)
+	require.True(t, q.ExclusiveExt4)
+}

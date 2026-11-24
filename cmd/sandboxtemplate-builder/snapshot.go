@@ -33,7 +33,7 @@ func stageBootAndSnapshot(spec apiv1alpha2.SandboxTemplateSpec, workdir, kernel,
 		return "", "", snapshotPhaseTimings{}, err
 	}
 	command := exec.Command(executable, "snapshot-stage", kernel, rootfs, vmstate, memory)
-	command.Env = append(os.Environ(), specEnv+"="+string(specJSON))
+	command.Env = append(os.Environ(), specEnv+"="+string(specJSON), "FAST_SANDBOX_SELECTED_FIRECRACKER="+firecrackerBin)
 	// Stream the stage's klog output to our own stderr so pipeline logs
 	// show the sub-phase timings even on success; keep a copy for errors.
 	var output bytes.Buffer

@@ -39,6 +39,108 @@ type fastpathRegistry struct {
 	reserve    func(placement.FastletID, placement.ResourceDemand) bool
 }
 
+func TestRootfsCreatePinsDigestAndInheritsFractionalCPU(t *testing.T) {
+	s, k, registry, fastlet := newV2Server(t)
+	registry.candidates[0].Capabilities = []string{fastletapi.CapabilityRootfsBootCreate}
+	registry.fastlets[registry.candidates[0].ID] = registry.candidates[0]
+	ctx := t.Context()
+	pool := &apiv1alpha2.SandboxPool{}
+	require.NoError(t, k.Get(ctx, types.NamespacedName{Namespace: "default", Name: "pool-a"}, pool))
+	pool.Spec.Runtime = apiv1alpha2.RuntimeFirecracker
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(resource.MustParse("1"), resource.MustParse("4Gi"), resource.MustParse("1"), resource.MustParse("1"), 128)
+	require.NoError(t, k.Update(ctx, pool))
+	sum := fmt.Sprintf("%064x", 7)
+	snap := &apiv1alpha2.SandboxSnapshot{ObjectMeta: metav1.ObjectMeta{Name: "snapshot", Namespace: "default"}, Spec: apiv1alpha2.SandboxSnapshotSpec{TemplateName: "catalog-key"}, Status: apiv1alpha2.SandboxSnapshotStatus{Phase: apiv1alpha2.SandboxSnapshotPhaseSucceeded, Mode: apiv1alpha2.SandboxSnapshotModeRootfsOnly, ManifestRef: "s3://test/key/manifest.json", ArtifactDigest: sum}}
+	require.NoError(t, k.Create(ctx, snap))
+	req := &fastpathv2.CreateRootfsSandboxRequest{Create: createRequest("from-rootfs"), Source: &fastpathv2.CreateRootfsSandboxRequest_SnapshotName{SnapshotName: "snapshot"}, SourceLimits: &fastpathv2.ComputeResourceProfile{Cpu: "500m", Memory: "1Gi"}}
+	req.Create.Resources = &fastpathv2.SandboxResourceRequirements{Limits: &fastpathv2.ComputeResourceProfile{Memory: "2Gi"}}
+	_, err := s.CreateRootfsSandbox(ctx, req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err), "must reject wrong native index")
+	require.Empty(t, fastlet.createRequests)
+	req.Create.Image = "catalog-key"
+	req.SourceLimits.Cpu = ""
+	_, err = s.CreateRootfsSandbox(ctx, req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err), "missing CPU quota cannot be inferred from the machine")
+	require.Empty(t, fastlet.createRequests)
+	req.SourceLimits.Cpu = "500m"
+	snap.Status.Mode = apiv1alpha2.SandboxSnapshotModeFull
+	require.NoError(t, k.Update(ctx, snap))
+	_, err = s.CreateRootfsSandbox(ctx, req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err), "Full source cannot be resized")
+	require.Empty(t, fastlet.createRequests)
+	snap.Status.Mode = apiv1alpha2.SandboxSnapshotModeRootfsOnly
+	require.NoError(t, k.Update(ctx, snap))
+	s.Orchestrator.DisableResourceAwarePlacement = true
+	_, err = s.CreateRootfsSandbox(ctx, req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.True(t, apierrors.IsNotFound(k.Get(ctx, client.ObjectKey{Namespace: req.Create.Namespace, Name: req.Create.RequestId}, &apiv1alpha2.Sandbox{})))
+	require.Empty(t, fastlet.createRequests)
+	s.Orchestrator.DisableResourceAwarePlacement = false
+	req.SourceLimits = nil
+	snap.Status.ResourceLimits = &apiv1alpha2.SnapshotResourceLimits{CPU: "500m", Memory: "1Gi"}
+	require.NoError(t, k.Update(ctx, snap))
+	response, err := s.CreateRootfsSandbox(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, "500m", response.Sandbox.Resources.Limits.Cpu)
+	require.Equal(t, "2Gi", response.Sandbox.Resources.Limits.Memory)
+	require.Len(t, fastlet.createRequests, 1)
+	require.Equal(t, sum, fastlet.createRequests[0].Sandbox.RootfsBootDigest)
+	require.NoError(t, k.Delete(ctx, snap))
+	for _, memory := range []string{"2048Mi", "2147483648", "2147483648e0"} {
+		req.Create.Resources.Limits.Memory = memory
+		replay, err := s.CreateRootfsSandbox(ctx, req)
+		require.NoError(t, err, memory)
+		require.Equal(t, response.Sandbox.Identity.Uid, replay.Sandbox.Identity.Uid)
+		require.Equal(t, sum, fastlet.createRequests[len(fastlet.createRequests)-1].Sandbox.RootfsBootDigest)
+	}
+	req.Create.Resources.Limits.Cpu = "500m"
+	_, err = s.CreateRootfsSandbox(ctx, req)
+	require.Equal(t, codes.AlreadyExists, status.Code(err), "explicit CPU differs from inherited CPU")
+	req.Create.Resources.Limits.Cpu = ""
+	req.Create.Resources.Limits.Memory = "3Gi"
+	_, err = s.CreateRootfsSandbox(ctx, req)
+	require.Equal(t, codes.AlreadyExists, status.Code(err))
+}
+
+func TestRootfsCreateFromNativeTemplate(t *testing.T) {
+	s, k, registry, fastlet := newV2Server(t)
+	registry.candidates[0].Capabilities = []string{fastletapi.CapabilityRootfsBootCreate}
+	registry.fastlets[registry.candidates[0].ID] = registry.candidates[0]
+	ctx := t.Context()
+	pool := &apiv1alpha2.SandboxPool{}
+	require.NoError(t, k.Get(ctx, client.ObjectKey{Namespace: "default", Name: "pool-a"}, pool))
+	pool.Spec.Runtime = apiv1alpha2.RuntimeFirecracker
+	pool.Spec.SandboxResources = apiv1alpha2.NewResourceAwareSandboxResourceProfile(resource.MustParse("1"), resource.MustParse("4Gi"), resource.MustParse("1"), resource.MustParse("1"), 128)
+	require.NoError(t, k.Update(ctx, pool))
+	template := &apiv1alpha2.SandboxTemplate{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "golden"},
+		Spec:       apiv1alpha2.SandboxTemplateSpec{IndexKey: "catalog-key", Machine: apiv1alpha2.MachineSpec{VCPU: "1", Memory: "1Gi"}},
+		Status:     apiv1alpha2.SandboxTemplateStatus{Phase: apiv1alpha2.SandboxTemplatePhaseSucceeded, Mode: apiv1alpha2.SandboxSnapshotModeFull, ArtifactDigest: fmt.Sprintf("%064x", 7), ManifestRef: "s3://test/key/manifest.json"},
+	}
+	require.NoError(t, k.Create(ctx, template))
+	req := &fastpathv2.CreateRootfsSandboxRequest{Create: createRequest("from-template"), Source: &fastpathv2.CreateRootfsSandboxRequest_TemplateName{TemplateName: template.Name}}
+	req.Create.Image = template.Spec.IndexKey
+	req.Create.Resources = &fastpathv2.SandboxResourceRequirements{Limits: &fastpathv2.ComputeResourceProfile{Memory: "2Gi"}}
+	_, err := s.CreateRootfsSandbox(ctx, req)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Empty(t, fastlet.createRequests)
+	template.Status.Mode = apiv1alpha2.SandboxSnapshotModeRootfsOnly
+	require.NoError(t, k.Update(ctx, template))
+	resp, err := s.CreateRootfsSandbox(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, "1", resp.Sandbox.Resources.Limits.Cpu)
+	require.Equal(t, "2Gi", resp.Sandbox.Resources.Limits.Memory)
+	require.Equal(t, template.Status.ArtifactDigest, fastlet.createRequests[0].Sandbox.RootfsBootDigest)
+}
+
+func TestCanonicalCPUOverride(t *testing.T) {
+	for _, input := range []string{"0.5", "500m", "5e-1"} {
+		got, err := canonicalOverrideQuantity(input, resource.DecimalSI)
+		require.NoError(t, err)
+		require.Equal(t, "500m", got)
+	}
+}
+
 type recordedFeedback struct {
 	id       placement.FastletID
 	feedback placement.LocalFeedback
@@ -248,6 +350,7 @@ type fastpathFastlet struct {
 	diagnostics    *fastletapi.SandboxDiagnosticsResponse
 	diagnosticsErr error
 	snapshotErr    error
+	snapshotSpecs  []fastletapi.SnapshotSpec
 	invokeResponse *fastletapi.InvokeHandlerResponse
 	invokeFailure  error
 	invokeRequests []*fastletapi.InvokeHandlerRequest
@@ -305,6 +408,7 @@ func (*fastpathFastlet) DeleteSandbox(context.Context, string, *fastletapi.Delet
 func (f *fastpathFastlet) CreateSnapshot(_ context.Context, _ string, request *fastletapi.CreateSnapshotRequest) (*fastletapi.CreateSnapshotResponse, error) {
 	f.mu.Lock()
 	snapshotErr := f.snapshotErr
+	f.snapshotSpecs = append(f.snapshotSpecs, request.Snapshot)
 	f.mu.Unlock()
 	if snapshotErr != nil {
 		return &fastletapi.CreateSnapshotResponse{Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects}, snapshotErr
@@ -313,6 +417,7 @@ func (f *fastpathFastlet) CreateSnapshot(_ context.Context, _ string, request *f
 		Disposition: fastletapi.CreateDispositionCreated,
 		Snapshot: &fastletapi.SnapshotStatus{
 			SnapshotID: "snap-" + request.Identity.SnapshotUID, Phase: fastletapi.SnapshotPhaseCreating,
+			Mode: fastletapi.NormalizeSnapshotMode(request.Snapshot.Mode),
 		},
 	}, nil
 }

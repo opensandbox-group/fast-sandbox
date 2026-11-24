@@ -1,12 +1,20 @@
 package main
 
 import (
+	"encoding/json"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
+	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/guestnetwork"
 )
 
@@ -161,5 +169,123 @@ func TestCPUTemplateForVendor(t *testing.T) {
 		if got := cpuTemplateForVendor(test.vendor); got != test.want {
 			t.Fatalf("cpuTemplateForVendor(%q) = %q, want %q", test.vendor, got, test.want)
 		}
+	}
+}
+
+func TestSnapshotStageKeepsPipelineVMMSelection(t *testing.T) {
+	previous := firecrackerBin
+	t.Cleanup(func() { firecrackerBin = previous })
+	t.Setenv("FAST_SANDBOX_VMM_DIR", "/missing-new-inventory")
+	t.Setenv("FAST_SANDBOX_SELECTED_FIRECRACKER", "/bundle/versions/1.16.1/firecracker")
+	if err := selectBuildVMM(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if firecrackerBin != "/bundle/versions/1.16.1/firecracker" {
+		t.Fatalf("subprocess reselected VMM: %s", firecrackerBin)
+	}
+	t.Setenv("FAST_SANDBOX_SELECTED_FIRECRACKER", "")
+	if err := selectBuildVMM(t.Context()); err == nil {
+		t.Fatal("missing managed inventory must not fall back to PATH")
+	}
+}
+
+func TestFreePageReportingDeviceConfiguration(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		rejectAPI bool
+	}{
+		{name: "enabled by default"},
+		{name: "unsupported VMM", rejectAPI: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir, err := os.MkdirTemp("", "fpr-")
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = os.RemoveAll(dir) })
+			socket := filepath.Join(dir, "api.sock")
+			listener, err := net.Listen("unix", socket)
+			require.NoError(t, err)
+			var mu sync.Mutex
+			var paths []string
+			var balloon map[string]any
+			server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				paths = append(paths, r.URL.Path)
+				if r.URL.Path == "/balloon" {
+					_ = json.NewDecoder(r.Body).Decode(&balloon)
+					if test.rejectAPI {
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+				}
+				w.WriteHeader(http.StatusNoContent)
+			})}
+			go func() { _ = server.Serve(listener) }()
+			t.Cleanup(func() { _ = server.Close() })
+			spec := apiv1alpha2.SandboxTemplateSpec{Machine: apiv1alpha2.MachineSpec{VCPU: "1", Memory: "1Gi"}}
+			err = configureVM(&vmm{socket: socket}, "kernel", "rootfs", "args", spec, "")
+			mu.Lock()
+			defer mu.Unlock()
+			if test.rejectAPI {
+				require.ErrorContains(t, err, "configure free-page reporting")
+				require.Equal(t, []string{"/machine-config", "/balloon"}, paths)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, "/balloon", paths[1], "device must be installed before boot")
+			require.Equal(t, map[string]any{"amount_mib": float64(0), "deflate_on_oom": true,
+				"stats_polling_interval_s": float64(0), "free_page_reporting": true}, balloon)
+		})
+	}
+}
+
+// Run the production native builder stage against a disposable rootfs whose init
+// emits readiness/heartbeat markers and starts the delivered helper.
+func TestNativeSnapshotStageIntegration(t *testing.T) {
+	testNativeSnapshotStage(t, apiv1alpha2.SandboxSnapshotModeFull)
+}
+
+func TestNativeRootfsOnlyTemplateStageIntegration(t *testing.T) {
+	testNativeSnapshotStage(t, apiv1alpha2.SandboxSnapshotModeRootfsOnly)
+}
+
+func testNativeSnapshotStage(t *testing.T, mode apiv1alpha2.SandboxSnapshotMode) {
+	t.Helper()
+	rootfs := os.Getenv("FSB_TEST_NATIVE_BUILDER_ROOTFS")
+	if rootfs == "" {
+		t.Skip("requires disposable KVM builder rootfs")
+	}
+	kernel := os.Getenv("FC_KERNEL")
+	binary := os.Getenv("FC_BINARY")
+	require.NotEmpty(t, kernel)
+	require.NotEmpty(t, binary)
+	work, err := os.MkdirTemp(filepath.Dir(rootfs), "builder-")
+	require.NoError(t, err)
+	t.Logf("builder evidence: %s", work)
+	require.NoError(t, os.Symlink(binary, filepath.Join(work, "firecracker")))
+	t.Setenv("PATH", work+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(workDirEnv, work)
+	t.Setenv("FSB_GUEST_CONTROL_ENABLED", "1")
+	spec := apiv1alpha2.SandboxTemplateSpec{Machine: apiv1alpha2.MachineSpec{VCPU: "1", Memory: "256Mi"}, Output: apiv1alpha2.OutputSpec{Format: apiv1alpha2.ArtifactFormatNative, Mode: mode}, Init: "/init"}
+	before, err := artifacts.FileEntry(rootfs, map[string]string{})
+	require.NoError(t, err)
+	raw, err := json.Marshal(spec)
+	require.NoError(t, err)
+	t.Setenv(specEnv, string(raw))
+	require.NoError(t, runSnapshotStage([]string{kernel, rootfs, filepath.Join(work, "vmstate.snap"), filepath.Join(work, "memory.snap")}))
+	raw, err = os.ReadFile(filepath.Join(work, "snapshot-phases.json"))
+	require.NoError(t, err)
+	var phases snapshotPhaseTimings
+	require.NoError(t, json.Unmarshal(raw, &phases))
+	require.NotNil(t, phases.GuestControl)
+	require.NotEmpty(t, phases.GuestControl.HelperVersion)
+	require.NotEmpty(t, phases.KernelSHA256)
+	require.Contains(t, phases.KernelCmdline, "root=/dev/vda")
+	if mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
+		after, err := artifacts.FileEntry(rootfs, map[string]string{})
+		require.NoError(t, err)
+		require.Equal(t, before, after)
+		require.NoFileExists(t, filepath.Join(work, vmstateFileName))
+		require.NoFileExists(t, filepath.Join(work, memoryFileName))
 	}
 }

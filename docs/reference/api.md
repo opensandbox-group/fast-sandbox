@@ -1,7 +1,6 @@
 # API reference
 
-Fast Sandbox exposes Kubernetes CRDs for declarative lifecycle and a gRPC
-FastPath API for latency-sensitive clients.
+Fast Sandbox exposes Kubernetes CRDs for declarative lifecycle and a FastPath API over native gRPC or optional gRPC-Web.
 
 ## Version boundary
 
@@ -215,6 +214,8 @@ include `RuntimeReady`, `InfraReady`, and `RegistryReady`. When `poolMax`
 prevents required scale-out, `CapacityAvailable=False` reports reason
 `PoolMaxReached`; it returns True after demand fits within the replica limit.
 
+`RegistryReady=True` reports successful validation and persistence of the Pool's compiled registry Secret, not propagation to every Fastlet or successful registry authentication.
+
 See the [Infra Components reference](infra-components.md) for the complete
 artifact, process, health, endpoint, validation, and revision contract.
 See [Sandbox Actions](../concepts/sandbox-actions.md) for Binding, lifecycle
@@ -300,7 +301,7 @@ tags are `<uuid>_rootfs` and `<uuid>_snapfiles`; `status.manifestRef` points to
 the latest successful build. Applying an unchanged spec does not rebuild.
 
 
-New object-store golden snapshots configure free-page reporting by default; no template field is required. Existing snapshots need rebuilding to acquire it. See [Memory reclamation](../guides/memory-reclamation.md) for guest kernel support and compatibility.
+New golden snapshots (object-store and OCI/OverlayBD) configure free-page reporting by default; no template field is required. Existing snapshots need rebuilding to acquire it. See [Memory reclamation](../guides/memory-reclamation.md) for guest kernel support and compatibility.
 
 See the [SandboxTemplate guide](../guides/sandboxtemplate-golden-images.md)
 for the end-to-end workflow, artifact layout, and consumption contract.
@@ -372,6 +373,17 @@ The protobuf contract is
 | `PauseSandbox` | Persist `spec.state=Paused` (`expected_uid`/`expected_generation` fenced); completion (`PAUSED`, checkpoint durable) is observed via `GetSandbox` |
 | `ResumeSandbox` | Persist `spec.state=Running` and schedule the recorded checkpoint, possibly cross-host; `expected_checkpoint_id` fences against a re-pause between read and resume; completion (`READY`) is observed via `GetSandbox` |
 | `GetPool`, `ListPools` | Runtime, fixed resources, components, capacity, and warm-image discovery |
+
+### gRPC-Web over HTTP/1.1
+
+Set `--fastpath-http-port=8090` on a `fastpath` or `all` controller to enable HTTP alongside gRPC. The default (`0`) serves FastPath RPCs over gRPC only. For access through the Kubernetes Service, expose the chosen port on `fast-sandbox-fastpath`.
+
+The listener serves the same RPC methods using the [gRPC-Web protocol](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md). Java clients can use [Armeria](https://armeria.dev/docs/client/grpc/) with their existing generated stub:
+
+```java
+var fastpath = GrpcClients.newClient("gproto-web+h1c://localhost:8090/",
+        FastPathServiceGrpc.FastPathServiceBlockingStub.class);
+```
 
 ### Atomic Create
 
