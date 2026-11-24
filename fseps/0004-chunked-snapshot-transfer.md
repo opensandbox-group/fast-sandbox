@@ -198,56 +198,141 @@ today.
    enabling `chunked` has a rollout gate: no store expiration rule
    (including bucket-wide rules) and no external cleanup job may delete
    objects under `chunks/` (see "Rollout and rollback").
-2. **Then a separate, explicit mark-and-sweep tool** (`fsb-store gc`, run as
-   a CronJob, with its own credentials that can list and delete; the agent's
-   credentials stay as they are). It ships **dry-run only**. Destructive mode
-   stays off until both gates below hold:
-   - every live root can be enumerated (open question 1);
-   - a stale sweep decision provably cannot delete a newly reused chunk
-     (see "Remaining window"), with that interleaving in the GC acceptance
-     tests.
-   - **Roots:** every live reference (SandboxTemplate image index keys,
-     snapshot index keys, checkpoint references of existing Sandboxes).
-   - **Mark:** read `manifest.json` → `chunks.json` of every root and
-     collect the chunk keys.
-   - **Sweep:** delete a chunk only when it was unmarked in **two** marks
-     and its `LastModified` was already older than the grace period `G` when
-     mark 1 started. Right before each `DELETE`, the sweep `HEAD`s the chunk
-     again and skips it if `LastModified` has changed.
-3. **Publisher refresh (part of PR 4, before any deletion is enabled):** a
-   publisher reuses an existing chunk only if it is younger than a refresh
-   age `R` (`R` < `G`). A `HEAD` that finds an older chunk is followed by a
-   re-`PUT`, which refreshes its `LastModified`. The in-memory known-key set
-   follows the same rule: an entry older than `R` is checked again.
+2. **Then a separate, explicit mark-and-sweep tool,** `fsb-store gc`. It
+   runs as a CronJob with its own store credentials (list, get, delete
+   object versions) and read-only Kubernetes RBAC; the agent's credentials
+   stay as they are. It ships **dry-run only** and reports what it would
+   delete.
+   - **Roots,** read from the Kubernetes API, plus the store's own recent
+     writes:
+     - `SandboxTemplate` status manifest and `spec.indexKey`;
+     - each Sandbox's `status.checkpoint` and `spec.image`;
+     - `SandboxSnapshot` status manifest and `spec.templateName`;
+     - `SandboxPool` `spec.warmImages`;
+     - each `index/*.json` entry whose key (the `image` field, whose
+       SHA-256 names the object) is still referenced: a `SandboxTemplate`
+       `spec.image` or `spec.indexKey`, a `SandboxSnapshot`
+       `spec.templateName`, a Sandbox `spec.image` or a `SandboxPool`
+       `warmImages` entry. Without `--prune-index` (the default), every
+       index entry is a root;
+     - every index entry and set namespace younger than `G`, which covers a
+       set published before its owner's status records it (for example a
+       pause whose checkpoint is not persisted yet, or a retried pause).
+   - **Fail closed:** any list, read or parse error, or an unreadable root
+     manifest or `chunks.json`, aborts the run without deleting anything.
+   - **Mark:** root → `manifest.json` → `chunks.json` → chunk keys. A root
+     whose chunk has no current version is reported.
+   - **Repair (optional, `--repair`):** for such a chunk, if a noncurrent
+     version still exists (removed by a plain `DELETE` or a lifecycle rule,
+     not yet expired), the run restores it: it removes the delete marker, or
+     copies the latest noncurrent version back as current. A repaired chunk
+     is verified against its digest from `chunks.json`. Without a surviving
+     version the root stays reported, and the set can only be re-created
+     from a node cache that still holds it.
+   - **Sweep (chunks):** a chunk is a candidate only when it was unmarked in
+     **two** marks and its `LastModified` was already older than `G` when
+     mark 1 started. Right before deleting, the sweep re-reads each
+     candidate's versions and deletes exactly the versions it judged, by
+     version ID.
+   - **Sets phase:** a set namespace (whole-file or chunked) that no root
+     references and that is older than `G` is deleted the same way, version
+     by version. This replaces today's out-of-band namespace cleanup for
+     both formats; its chunks then become unmarked for a later sweep.
+   - **Index pruning (`--prune-index`, off by default):** an index entry
+     that no live object references, older than `G`, is deleted in the sets
+     phase. Its set then stops being a root and is collected by a later run.
+     This is what cleans up deleted templates. It stays opt-in because an
+     index key can also be used by a client outside Kubernetes (for example
+     a create that names an image directly); an operator enables it once
+     every such client goes through these objects.
+3. **Publisher refresh (part of PR 4, released before any deletion is
+   enabled):**
+   - A publisher reuses an existing chunk only if it is younger than a
+     refresh age `R`, measured in server time: `Date` minus `Last-Modified`
+     from the same `HEAD` response, so client clock skew does not matter.
+   - An older chunk is refreshed by a server-side copy onto itself
+     (`x-amz-copy-source` = its own key, `MetadataDirective: REPLACE`). The
+     bytes, and so every existing set's `storedSize`, stay identical; a
+     re-`PUT` of re-encoded zstd data could change the length. Where the
+     copy is refused, a raw chunk is re-`PUT` with the same bytes, and a
+     zstd chunk whose re-encoding has a different length is published under
+     its raw key instead of overwriting.
+   - The in-memory known-key set follows the same rule: an entry is trusted
+     only until `R` has passed since the chunk's server-side write.
+   - A publish must write `chunks.json` within `P_max` of its first reuse
+     decision, or fail.
+   - An agent whose code implements the refresh reports the `chunkRefresh`
+     capability in `HealthResponse` and `PublishImageResponse`, in either
+     `transfer.format`: a `legacy` agent reuses no chunks, and an agent
+     switched back to `chunked` refreshes from its first publish.
+   - Defaults: `R` = 1 day, `P_max` = 24 h, `G` = 7 days.
 
-**Why the refresh is needed** (review on this PR): marks alone do not
-protect a publish that starts after mark 1 and reuses an old, unmarked
-chunk C by `HEAD`. Its manifest can land after the sweep, and C, unmarked
-twice and old, would be deleted. The grace period does not help either,
-since reuse does not change C's `LastModified`.
+**Why the refresh is needed** (review on #216): marks alone do not protect
+a publish that starts after mark 1 and reuses an old, unmarked chunk C by
+`HEAD` or from its known-key set. Its manifest can land after the sweep, and
+C, unmarked twice and old, would be deleted. The grace period does not help
+either, since reuse does not change C's `LastModified`.
 
-**Invariant with the refresh:** every chunk a publish binds was uploaded or
-refreshed by a publish within the last `R`. So its `LastModified` stays
-younger than `G` for at least `G` − `R` after the publish uses it. A mark
-that starts after that has to find the publish's manifest, as long as the
-manifest lands and becomes a root within `G` − `R`. Marks that start earlier
-cannot make the chunk a sweep candidate, because the chunk is still younger
-than `G`. Typical values: `R` = 1 day, `G` = 7 days. Re-`PUT`s fall only on
-chunks that no publish has used for `R`, which are rare.
+**Invariant:** every chunk a publish binds was written or refreshed within
+`R` (server time) before the publish used it, and the publish writes
+`chunks.json` within `P_max`. So the chunk is younger than `R` + `P_max` < `G`
+when its set becomes a root (a young set is a root by itself). No mark that
+could make the chunk a sweep candidate can start before that set is
+visible.
 
-**Remaining window (not closed by this design):** the sweep decides from a
-`HEAD`, then issues an unconditional `DELETE`. A publisher can act in
-between. For example: GC does its final `HEAD`; the publisher refreshes the
-chunk, publishes its manifest and completes a post-publish `HEAD`; only then
-does GC issue the `DELETE`. Both checks succeeded, but the published set has
-lost a chunk. Checks on either side only shrink this window. Closing it
-needs a delete that fails when the chunk has been refreshed since the
-sweep's decision, or another protocol with the same guarantee. Which
-mechanism, and which stores support it, is open question 1. Until it is
-answered, destructive GC stays off.
+**Stale sweep decisions (closed by versioning):** the sweep decides from a
+`HEAD`, then deletes. A publisher can refresh the chunk in between: GC does
+its final `HEAD` (version v1); the publisher refreshes the chunk (v2),
+publishes its manifest and completes a post-publish `HEAD`; then GC
+deletes. With an unconditional `DELETE` the set would lose the chunk. With
+bucket versioning, the GC deletes v1 by its version ID, and the refreshed
+v2 stays current. An `ETag` condition cannot do this: a refresh by copy, or
+a re-`PUT` of identical bytes, keeps the same `ETag`. Older versions are
+removed by a `NoncurrentVersionExpiration` lifecycle rule, which never
+touches a current version and so is compatible with rollout gate 0.
 
-**Namespace cleanup** stays where it is today. The chunk GC only assumes
-that a deleted namespace is no longer a root.
+**Gate for destructive mode** (all required; otherwise the run stays
+dry-run):
+- bucket versioning is `Enabled`;
+- every registered Fastlet has advertised the `chunkRefresh` capability
+  (its agent implements the publisher refresh) continuously for longer than
+  `R` + `P_max`. Agents write nothing to Kubernetes:
+  - each Fastlet takes the capability from its node's agent and sends it in
+    its heartbeat `Capabilities`, next to the existing snapshot
+    capabilities;
+  - the leader-elected controller aggregates its Fastlet registry and keeps
+    **one** ConfigMap for the cluster with `chunkRefreshSince`. It resets
+    the time to now whenever any registered Fastlet lacks the capability,
+    and writes only when the value changes;
+  - after a controller restart its registry starts empty, so it may reset
+    `chunkRefreshSince` but not keep or advance it until every Fastlet has
+    re-registered;
+  - `fsb-store gc` reads that ConfigMap and deletes chunks only when
+    `chunkRefreshSince` is older than `R` + `P_max`;
+- the store passes a conformance test: responses carry `Date`, a version-ID
+  delete removes only that version (including the `null` version of
+  objects written before versioning), a self-copy with `REPLACE` creates a
+  new current version with the same bytes and `ETag`, and
+  `ListObjectVersions` pages and reports each version's ID and
+  `LastModified`.
+
+**Store notes** (checked on Ceph RGW 20.2.4 with a throwaway bucket: the
+race above survives a version-ID delete, and the unversioned negative
+control loses the chunk):
+- `HEAD` omits `x-amz-version-id` for an object written before versioning
+  was enabled, and the copy response omits the new version ID. The sweep
+  therefore takes version IDs from `ListObjectVersions`, where such an
+  object is listed as `null`.
+- A self-copy shares an object's data beyond the first 4 MiB but copies the
+  head, so a refreshed chunk (at most 4 MiB) is stored twice until its
+  noncurrent version expires. Bucket usage counts every version at full
+  size, which matters for bucket quotas.
+- Lifecycle rules run once a day in RGW's configured window, so a
+  noncurrent version is removed one to two days after it stops being
+  current.
+
+A store without versioning keeps working for publish and restore; only
+destructive GC is unavailable there.
 
 ### Alternatives considered
 
@@ -289,8 +374,12 @@ transfer:
 - The index ref is restricted to the set's own namespace and fully
   validated before use.
 - Chunk `PUT`s are payload-signed.
-- The agent gets no new credentials, endpoints or permissions. GC uses
-  separate credentials.
+- The agent gets no new credentials, endpoints or permissions; the
+  publisher refresh is a copy within the bucket it already writes to.
+- `fsb-store gc` uses separate store credentials (list, get, delete object
+  versions) and a read-only ClusterRole on the four CRDs plus read access to
+  the gate ConfigMap. A missing permission aborts the run, which then
+  deletes nothing.
 
 ### Implementation plan
 
@@ -303,7 +392,7 @@ transfer:
 | 1 | Chunk format, `chunks.json`, chunked publish and pull (recording into the #244 memo), always-on chunk reader, `transfer.format` and `transfer.compression`, manifest validation before upload, inherited `chunks` dropped by the publisher and both Fastlet assemblers, a chunk transfer cancelled between jobs fails instead of committing, a coalesced chunk upload counted once, docs | this FSEP accepted, cache |
 | 2 | `chunkList` digest, digest-signed `PUT`s, `chunkListOnly` and the capability rule, agent `sha256` fill-in and `SHA256SUMS` rewrite, Fastlet `Health` refresh | 1, same release |
 | 3 | Pooled store transport; P2P gateway pooling per open question 3 | 1 |
-| 4 | `fsb-store gc` | 1 |
+| 4 | Step 1: publisher refresh (server-time `R`, self-copy, known-key expiry, `P_max`), `chunkRefresh` capability, controller gate ConfigMap. Step 2: `fsb-store gc` (dry-run by default, Kubernetes roots, two marks, version-ID sweep, sets phase, opt-in index pruning and repair, store conformance test) | 1; step 1 released for longer than `R` + `P_max` before destructive mode |
 | – | OpenSandbox chart value and pin bump (OpenSandbox#2422) | 1 merged |
 
 [#213](https://github.com/opensandbox-group/fast-sandbox/pull/213) is the complete reference implementation and spans PRs 1–3,
@@ -313,12 +402,11 @@ a draft and is closed once PR 1 is open.
 
 ### Open questions
 
-1. **GC roots and safety (gate for destructive GC):** which component can
-   list every live reference (templates, snapshots, Sandbox checkpoints)?
-   Should the controller own `fsb-store gc`? And which delete mechanism
-   closes the sweep window ("Remaining window"): a delete conditioned on
-   the chunk not having been refreshed, where the store supports it, or a
-   different protocol?
+1. **GC roots and safety (resolved):** `fsb-store gc` reads the roots from
+   the Kubernetes API and treats young sets as roots; a version-ID delete on
+   a versioned bucket closes the sweep window (see "Shared-chunk retention
+   and garbage collection"). Still open: run `fsb-store gc` as a CronJob, as
+   proposed, or inside the leader-elected controller?
 2. **Rollback (resolved):** the `chunkListOnly` finalize step is kept. It
    is safe to defer because `chunkListDigest` is reported only with
    `chunkListOnly: true`, the agent fills a missing `sha256` otherwise, and
@@ -422,10 +510,25 @@ a draft and is closed once PR 1 is open.
   - publish and restore a native RootfsOnly set in `chunked`.
 - **GC acceptance (PR 4, before destructive mode is enabled):**
   - dry-run lists candidates and deletes nothing;
-  - a publish that reuses an old chunk after mark 1 keeps it;
-  - the interleaving from "Remaining window": final `HEAD`, then the
-    publisher's refresh, manifest and post-publish `HEAD`, then the GC
-    `DELETE`. The published set must stay restorable.
+  - a publish that reuses an old chunk after mark 1 refreshes and keeps it;
+  - the interleaving from "Stale sweep decisions": final `HEAD` (v1), the
+    publisher's refresh (v2), manifest and post-publish `HEAD`, then the GC
+    deletes v1. The published set must stay restorable;
+  - negative control: the same sequence with an unversioned `DELETE` loses
+    the chunk, which shows the test can detect the race;
+  - known-key expiry: with a fake server clock past `R`, a remembered chunk
+    is checked again and refreshed;
+  - fail closed: one unreadable root means no deletes;
+  - index pruning: with `--prune-index`, an unreferenced index entry older
+    than `G` is deleted and its set is collected by the next run; without
+    it, or while any object references the key, the entry and its set stay;
+  - sets phase: unrooted namespaces older than `G` are deleted, young or
+    rooted ones are kept, for whole-file and chunked sets;
+  - the gate refuses destructive mode without versioning or `chunkRefresh`,
+    and a restarted controller does not advance `chunkRefreshSince` before
+    every Fastlet has re-registered;
+  - repair: a rooted chunk removed by a plain `DELETE` is restored from its
+    noncurrent version and verified by digest.
 
 **Performance:**
 - **Boundary:** the client-observed duration of the pause, snapshot and
@@ -459,6 +562,10 @@ a draft and is closed once PR 1 is open.
 4. Optionally, once no agent downgrade is planned, set `chunkListOnly: true`
    to remove the whole-file hash from the pause path. This is the
    "finalize" step, similar to Ceph's `require-osd-release`.
+5. **GC (after PR 4):** enable bucket versioning and a
+   `NoncurrentVersionExpiration` rule, run `fsb-store gc` in dry-run, and
+   enable destructive mode only once its gate holds: sets first, then
+   chunks.
 
 **Signals:**
 - `runtime-agent chunked publish stats`: `uploadedBytes` vs `logicalBytes`,
