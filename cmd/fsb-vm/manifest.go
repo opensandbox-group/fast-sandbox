@@ -98,6 +98,8 @@ func completeBuildManifest(options *buildOptions, createdAt time.Time, manifest 
 	if strings.TrimSpace(manifest.Kernel.Cmdline) == "" {
 		manifest.Kernel.Cmdline = defaultBootArgs + " init=" + options.initPath
 	}
+	freePageReporting := options.freePageReporting
+	manifest.FreePageReporting = &freePageReporting
 	manifest.Lineage = &artifacts.VMLineage{Image: options.source, CreatedAt: createdAt.UTC().Format(time.RFC3339)}
 	if ref, err := parseRegistryReference(options.source); err == nil && strings.HasPrefix(ref.Reference, "sha256:") {
 		manifest.Lineage.ImageDigest = ref.Reference

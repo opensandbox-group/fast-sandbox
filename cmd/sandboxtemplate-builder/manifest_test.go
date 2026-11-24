@@ -10,6 +10,7 @@ import (
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/firecrackerconfig"
 	"fast-sandbox/internal/guestcontrol"
 )
 
@@ -58,7 +59,7 @@ func TestManifestRecordsFreePageReporting(t *testing.T) {
 		name, log string
 		want      bool
 	}{
-		{name: "supported guest", log: freePageReportingReadyMarker + "\n", want: true},
+		{name: "supported guest", log: firecrackerconfig.FreePageReportingReadyMarker + "\n", want: true},
 		{name: "unsupported guest", log: "SANDBOX_FREE_PAGE_REPORTING_UNAVAILABLE missing_guest_kernel_support\n"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -66,7 +67,7 @@ func TestManifestRecordsFreePageReporting(t *testing.T) {
 			workdir := filepath.Dir(rootfs)
 			bootLog := filepath.Join(workdir, "boot.console.log")
 			require.NoError(t, os.WriteFile(bootLog, []byte(test.log), 0o600))
-			supported, err := readFreePageReportingSupport(bootLog)
+			supported, err := firecrackerconfig.ReadFreePageReportingSupport(bootLog)
 			require.NoError(t, err)
 			report, err := json.Marshal(func() snapshotPhaseTimings {
 				p := nativeManifestPhases(t, kernel)

@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -17,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/firecrackerconfig"
 )
 
 func TestBuildProgress(t *testing.T) {
@@ -348,7 +351,7 @@ func TestBuildSnapfilesManifestStandaloneAndExtras(t *testing.T) {
 	document, err = artifacts.DecodeVMManifest(raw)
 	require.NoError(t, err)
 	require.Equal(t, "execd:v1", document.Platform.Execd)
-	for _, extra := range []string{`{"machine":{"vcpuCount":9}}`, `{"schemaVersion":9}`, `{"compatibility":{}}`, `null`, `{"guestNetwork":{"ip":"1.2.3.4"}}`, `{"lineage":{"createdAt":"wrong"}}`} {
+	for _, extra := range []string{`{"machine":{"vcpuCount":9}}`, `{"schemaVersion":9}`, `{"compatibility":{}}`, `{"freePageReporting":true}`, `null`, `{"guestNetwork":{"ip":"1.2.3.4"}}`, `{"lineage":{"createdAt":"wrong"}}`} {
 		require.NoError(t, os.WriteFile(options.manifestExtraFile, []byte(extra), 0600))
 		_, err = buildSnapfilesManifest(options, created)
 		require.Error(t, err, extra)
@@ -893,4 +896,99 @@ func TestBuildManifestRecordsProbedHelperImplementation(t *testing.T) {
 	options.kernelSHA256 = ""
 	_, err = completeBuildManifest(options, created, base)
 	require.ErrorContains(t, err, "boot kernel digest")
+}
+
+func TestConfigureBuildVMInstallsBalloonAndEntropyBeforeBoot(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		failPath string
+		wantErr  string
+	}{
+		{name: "enabled by default"},
+		{name: "unsupported balloon", failPath: "/balloon", wantErr: "configure free-page reporting"},
+		{name: "unsupported entropy", failPath: "/entropy", wantErr: "attach entropy device"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var paths []string
+			var balloon map[string]any
+			var entropy map[string]any
+			client := &firecrackerClient{httpClient: &http.Client{Transport: rootfsRoundTrip(func(r *http.Request) (*http.Response, error) {
+				paths = append(paths, r.URL.Path)
+				switch r.URL.Path {
+				case "/balloon":
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&balloon))
+				case "/entropy":
+					require.NoError(t, json.NewDecoder(r.Body).Decode(&entropy))
+				}
+				code := http.StatusNoContent
+				if r.URL.Path == tc.failPath {
+					code = http.StatusBadRequest
+				}
+				return &http.Response{StatusCode: code, Body: io.NopCloser(strings.NewReader("")), Header: http.Header{}}, nil
+			})}}
+			options := validBuildOptions(t)
+			options.rootfsDriveID = defaultRootfsDriveID
+			options.tapName = "fc-build-tap"
+			options.guestMAC = "02:00:00:00:00:01"
+			options.guestControlPort = 1234
+
+			err := configureBuildVM(t.Context(), client, options, "/tmp/boot-kernel", defaultBootArgs)
+			if tc.wantErr != "" {
+				require.ErrorContains(t, err, tc.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, []string{
+				"/machine-config",
+				"/balloon",
+				"/entropy",
+				"/boot-source",
+				"/drives/rootfs",
+				"/network-interfaces/eth0",
+				"/vsock",
+				"/actions",
+			}, paths)
+			require.Equal(t, map[string]any{
+				"amount_mib":               float64(0),
+				"deflate_on_oom":           true,
+				"stats_polling_interval_s": float64(0),
+				"free_page_reporting":      true,
+			}, balloon)
+			require.Equal(t, map[string]any{}, entropy)
+		})
+	}
+}
+
+func TestDefaultInitScriptChecksFreePageReporting(t *testing.T) {
+	script := defaultInitScript()
+	require.Contains(t, script, "mount -t sysfs sysfs /sys")
+	require.Contains(t, script, firecrackerconfig.RenderFreePageReportingCheck())
+}
+
+func TestBuildManifestRecordsFreePageReporting(t *testing.T) {
+	base := artifacts.VMManifest{
+		SchemaVersion: artifacts.VMManifestVersion, Runtime: "firecracker",
+		Machine:       artifacts.VMMachine{VCPUCount: 1, MemoryMiB: 1024, RootfsSizeMiB: 20480, RootfsDriveID: "rootfs", RootfsDrivePath: rootfsDriveLink},
+		Kernel:        artifacts.VMKernel{Version: "5.10.0"},
+		Compatibility: artifacts.SnapshotCompatibility{CPUArch: "x86_64", FirecrackerVersion: "1.16.1", CPUTemplate: artifacts.CPUTemplateNone, Vendor: artifacts.VendorGenuineIntel, CPUFamily: 6, CPUModel: 85, CPUStepping: 7},
+	}
+	created := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
+	for _, want := range []bool{true, false} {
+		t.Run(strconv.FormatBool(want), func(t *testing.T) {
+			options := validBuildOptions(t)
+			options.kernelSHA256 = strings.Repeat("a", 64)
+			options.freePageReporting = want
+			raw, err := completeBuildManifest(options, created, base)
+			require.NoError(t, err)
+			var fields map[string]any
+			require.NoError(t, json.Unmarshal(raw, &fields))
+			value, present := fields["freePageReporting"]
+			require.True(t, present, "freePageReporting must be recorded explicitly even when false")
+			require.Equal(t, want, value)
+			manifest, err := artifacts.DecodeVMManifest(raw)
+			require.NoError(t, err)
+			require.NotNil(t, manifest.FreePageReporting)
+			require.Equal(t, want, *manifest.FreePageReporting)
+		})
+	}
 }

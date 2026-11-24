@@ -15,6 +15,7 @@ import (
 	"k8s.io/klog/v2"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/firecrackerconfig"
 )
 
 // resolveKernel maps the spec kernel name to the embedded file in the
@@ -389,7 +390,7 @@ mountpoint -q /tmp || mount -t tmpfs tmpfs /tmp
 ` + loGate + `
 exec </dev/console >/dev/console 2>&1
 hostname sandbox
-` + renderFreePageReporting() + controlStart + `
+` + firecrackerconfig.RenderFreePageReportingCheck() + controlStart + `
 [ -f /etc/sandbox-init.env ] && . /etc/sandbox-init.env
 if [ -x /opt/opensandbox/bootstrap.sh ]; then
   # The entrypoint becomes the bootstrap's user command: bootstrap.sh TERMs

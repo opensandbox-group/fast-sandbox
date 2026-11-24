@@ -17,6 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	"fast-sandbox/internal/firecrackerconfig"
 )
 
 // TestWriteImageEnv: the pull stage persists the image's OCI Config.Env.
@@ -198,6 +199,16 @@ func TestRenderGuestInitLoopbackGate(t *testing.T) {
 				t.Fatalf("init must not contain %q for this readiness gate", test.wantNot)
 			}
 		})
+	}
+}
+
+func TestDefaultGuestReportingInitWiring(t *testing.T) {
+	init := renderGuestInit(apiv1alpha2.SandboxTemplateSpec{})
+	if !strings.Contains(init, firecrackerconfig.RenderFreePageReportingCheck()) {
+		t.Fatalf("init missing free-page reporting check: reporting needs no template configuration")
+	}
+	if strings.Contains(init, "damon_reclaim") {
+		t.Fatalf("init must not contain legacy damon_reclaim")
 	}
 }
 

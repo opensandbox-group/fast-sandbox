@@ -30,6 +30,7 @@ type buildOptions struct {
 	guestControlPort    uint32
 	guestControlVersion string
 	kernelSHA256        string
+	freePageReporting   bool
 	rootfsOnly          bool
 	snapfilesProgress   func(string) error
 	snapshotManifest    []byte
