@@ -457,6 +457,15 @@ Notes:
   (`internal/runtime/firecracker/agent/live_minio_test.go`,
   `FS_LIVE_MINIO_*` env) and end-to-end in every `up` (the origin counter
   moving exactly once per block is itself signature evidence).
+- The image cache `<StateRoot>/images` is shared by every Fastlet on the
+  node, and each Fastlet runs its own cache GC. A Fastlet publishes the
+  images it needs kept (its warm images, in-flight deliveries, and images
+  used in the last hour) to `<StateRoot>/pins/<pod-uid>.json`; every GC
+  keeps the images in pin files refreshed within max(3 × GC interval,
+  30 min), besides the images that Sandbox state references. A directory
+  without its committed `manifest.json` that was written in the last 30
+  minutes is a pull in progress and is never removed. Entries count their
+  allocated bytes against the 20 GiB cache limit.
 
 ### 6.9 Logging & failure forensics
 - Every stage writes `$WORK/logs/`; failures dump component logs to

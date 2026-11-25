@@ -659,7 +659,7 @@ func TestRecoverAndGCReclaimInterruptedSnapshotCacheStaging(t *testing.T) {
 	crashedGCLock := crashedGCDir + snapshotCacheLockSuffix
 	require.NoError(t, os.WriteFile(crashedGCLock, nil, 0o600))
 
-	_, err = garbageCollectImages(root, defaultImageCacheLimitBytes, nil)
+	_, err = garbageCollectImages(root, defaultImageCacheLimitBytes, nil, nil)
 	require.NoError(t, err)
 	require.NoDirExists(t, crashedGCDir)
 	require.NoFileExists(t, crashedGCLock)

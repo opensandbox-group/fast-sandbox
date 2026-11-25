@@ -95,11 +95,7 @@ func TestGarbageCollectImages(t *testing.T) {
 	root := t.TempDir()
 	useCount := make(map[string]int64)
 	seedImage := func(image string) string {
-		path, err := imageCachePath(root, image)
-		require.NoError(t, err)
-		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
-		require.NoError(t, os.WriteFile(path, []byte("rootfs"), 0o640))
-		return imageKey(image)
+		return seedCommittedImage(t, root, image)
 	}
 	// hot and cold are both unreferenced; the LFU order evicts cold first.
 	hot := seedImage("example.com/hot:v1")
@@ -124,10 +120,10 @@ func TestGarbageCollectImages(t *testing.T) {
 	require.NoError(t, os.MkdirAll(junk, 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(junk, "rootfs.img"), []byte("junk"), 0o640))
 
-	// The limit fits exactly the referenced image (6 bytes): everything
-	// unreferenced is evicted, hot last because it is the most frequently
-	// used.
-	removed, err := garbageCollectImages(root, 6, useCount)
+	// The limit fits exactly the referenced image: everything unreferenced
+	// is evicted, hot last because it is the most frequently used.
+	unit := seededImageBytes(t, root, used)
+	removed, err := garbageCollectImages(root, unit, useCount, nil)
 	require.NoError(t, err)
 	require.ElementsMatch(t, []string{unknown, cold, hot}, removed)
 	_, err = os.Stat(filepath.Join(root, imageCacheDir, used))
@@ -140,7 +136,7 @@ func TestGarbageCollectImages(t *testing.T) {
 	cold = seedImage("example.com/cold:v1")
 	unknown = seedImage("example.com/unknown:v1")
 	hot = seedImage("example.com/hot:v1")
-	removed, err = garbageCollectImages(root, 12, useCount)
+	removed, err = garbageCollectImages(root, 2*unit, useCount, nil)
 	require.NoError(t, err)
 	require.ElementsMatch(t, []string{unknown, cold}, removed)
 	_, err = os.Stat(filepath.Join(root, imageCacheDir, hot))
@@ -150,7 +146,7 @@ func TestGarbageCollectImages(t *testing.T) {
 	second, err := ensureSandboxDir(root, "sbx-2")
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(metaPath(second), []byte("{corrupt"), 0o600))
-	_, err = garbageCollectImages(root, 12, useCount)
+	_, err = garbageCollectImages(root, 2*unit, useCount, nil)
 	require.Error(t, err)
 	_, err = os.Stat(filepath.Join(root, imageCacheDir, hot))
 	require.NoError(t, err, "collection must not remove anything when a state cannot be read")
@@ -159,7 +155,7 @@ func TestGarbageCollectImages(t *testing.T) {
 	// the lower-frequency one goes first.
 	require.NoError(t, removeSandboxDir(directory))
 	require.NoError(t, os.Remove(metaPath(second)))
-	removed, err = garbageCollectImages(root, 6, useCount)
+	removed, err = garbageCollectImages(root, unit, useCount, nil)
 	require.NoError(t, err)
 	require.ElementsMatch(t, []string{used}, removed)
 	_, err = os.Stat(filepath.Join(root, imageCacheDir, hot))
@@ -173,11 +169,7 @@ func TestGarbageCollectImages(t *testing.T) {
 func TestGarbageCollectImagesPinsRestoreCheckpoint(t *testing.T) {
 	root := t.TempDir()
 	seed := func(reference string) string {
-		path, err := imageCachePath(root, reference)
-		require.NoError(t, err)
-		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
-		require.NoError(t, os.WriteFile(path, []byte("rootfs"), 0o640))
-		return imageKey(reference)
+		return seedCommittedImage(t, root, reference)
 	}
 	digest := strings.Repeat("ab", 32)
 	template := seed("tpl-resumed")
@@ -196,9 +188,9 @@ func TestGarbageCollectImagesPinsRestoreCheckpoint(t *testing.T) {
 		Phase: PhaseRunning,
 	}))
 
-	// The limit (6 bytes) fits only one entry: every unpinned entry goes,
-	// the pinned ones stay even though the cache remains over the limit.
-	removed, err := garbageCollectImages(root, 6, map[string]int64{})
+	// The limit fits only one entry: every unpinned entry goes, the pinned
+	// ones stay even though the cache remains over the limit.
+	removed, err := garbageCollectImages(root, seededImageBytes(t, root, other), map[string]int64{}, nil)
 	require.NoError(t, err)
 	require.ElementsMatch(t, []string{other}, removed)
 	for _, pinned := range []string{template, checkpoint} {
@@ -227,6 +219,7 @@ func TestImageGCLoopRunsIndependently(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
 		require.NoError(t, os.WriteFile(path, []byte("rootfs"), 0o640))
+		require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(path), "manifest.json"), []byte("{}"), 0o640))
 		digest := imageKey(image)
 		// The GC loop reads the map concurrently; mutate under the lock.
 		driver.mu.Lock()
@@ -259,7 +252,7 @@ func TestImageGCLoopRunsIndependently(t *testing.T) {
 	// Under its limit again, the loop leaves images alone even when
 	// unreferenced.
 	driver.mu.Lock()
-	driver.imageCacheLimitBytes = 6
+	driver.imageCacheLimitBytes = 1 << 30
 	driver.mu.Unlock()
 	hot := seedImage("example.com/hot:v1")
 	driver.mu.Lock()
@@ -338,4 +331,25 @@ func TestCopyReflinkOrCopyClonesAndIsolates(t *testing.T) {
 	stillOriginal, err := os.ReadFile(src)
 	require.NoError(t, err)
 	require.Equal(t, original, stillOriginal)
+}
+
+// seedCommittedImage writes a cache entry with its commit-point manifest, as
+// the runtime-agent leaves a completed pull.
+func seedCommittedImage(t *testing.T, root, reference string) string {
+	t.Helper()
+	path, err := imageCachePath(root, reference)
+	require.NoError(t, err)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+	require.NoError(t, os.WriteFile(path, []byte("rootfs"), 0o640))
+	require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(path), "manifest.json"), []byte("{}"), 0o640))
+	return imageKey(reference)
+}
+
+// seededImageBytes is the allocated size the GC accounts for one entry.
+func seededImageBytes(t *testing.T, root, key string) int64 {
+	t.Helper()
+	usage, err := imageDirUsage(filepath.Join(root, imageCacheDir, key))
+	require.NoError(t, err)
+	require.Positive(t, usage.allocated)
+	return usage.allocated
 }
