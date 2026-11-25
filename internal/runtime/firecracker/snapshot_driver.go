@@ -575,7 +575,7 @@ func (d *Driver) ensureDumpCapacity(ctx context.Context, plan dumpPlan) error {
 	if err := d.reclaimCheckpointBlobs(recoveryCtx, need); err != nil {
 		klog.InfoS("checkpoint blob capacity recovery incomplete", "error", err)
 	}
-	if err := reclaimOCIHotCheckpoints(stateRoot, need); err != nil {
+	if err := reclaimOCIHotCheckpoints(recoveryCtx, stateRoot, need); err != nil {
 		klog.InfoS("OCI hot checkpoint capacity recovery incomplete", "error", err)
 	}
 	for {

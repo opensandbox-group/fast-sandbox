@@ -1,6 +1,7 @@
 package firecracker
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -13,12 +14,15 @@ import (
 
 	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
+	"oras.land/oras-go/v2/registry"
 
 	"fast-sandbox/internal/artifacts"
+	"fast-sandbox/internal/ocitemplate"
 )
 
 const (
 	ociHotCheckpointDir = "oci/hot-checkpoints"
+	ociHotPinsDir       = "oci/hot-pins"
 
 	ociHotCheckpointCacheSizeEnv = "FAST_SANDBOX_OCI_HOT_CHECKPOINT_CACHE_SIZE_BYTES"
 	ociHotCheckpointCacheTTLEnv  = "FAST_SANDBOX_OCI_HOT_CHECKPOINT_CACHE_TTL"
@@ -34,6 +38,8 @@ const (
 
 	ociHotCacheLockName      = ".cache.lock"
 	ociHotCacheStagingPrefix = ".staging-"
+	ociHotPinLockSuffix      = ".lock"
+	ociHotCacheLockPollDelay = 10 * time.Millisecond
 
 	ociVMStateFileName = "vmstate.bin"
 	ociMemfileName     = "memfile"
@@ -79,8 +85,26 @@ func ociHotCheckpointRoot(stateRoot string) string {
 	return filepath.Join(stateRoot, ociHotCheckpointDir)
 }
 
+func ociHotPinsRoot(stateRoot string) string {
+	return filepath.Join(stateRoot, ociHotPinsDir)
+}
+
 func ociHotCheckpointPath(stateRoot, artifactDigest string) string {
 	return filepath.Join(ociHotCheckpointRoot(stateRoot), artifactDigest)
+}
+
+// ociReferenceMatchesDigest reports whether reference is digest-pinned to
+// sha256:<artifactDigest>. Hot cache lookup requires this match so rootfs and
+// memory state can never be mixed across checkpoints of the same sandbox.
+func ociReferenceMatchesDigest(reference, artifactDigest string) bool {
+	if !validImageDigest(artifactDigest) {
+		return false
+	}
+	parsed, err := registry.ParseReference(strings.TrimPrefix(strings.TrimSpace(reference), ocitemplate.Prefix))
+	if err != nil {
+		return false
+	}
+	return parsed.Reference == "sha256:"+artifactDigest
 }
 
 func touchPath(path string) {
@@ -134,6 +158,77 @@ func lockOCIHotCache(root string, how int) (func(), error) {
 	}, nil
 }
 
+func lockOCIHotCacheWithContext(ctx context.Context, root string, how int) (func(), error) {
+	for {
+		unlock, err := lockOCIHotCache(root, how|unix.LOCK_NB)
+		if err == nil || !errors.Is(err, errHotCacheBusy) {
+			return unlock, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(ociHotCacheLockPollDelay):
+		}
+	}
+}
+
+func lockOCIHotPin(pinDir string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(pinDir), 0o700); err != nil {
+		return nil, fmt.Errorf("prepare hot checkpoint pin root: %w", err)
+	}
+	lockPath := pinDir + ociHotPinLockSuffix
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open hot checkpoint pin lock: %w", err)
+	}
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = lockFile.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, errHotCacheBusy
+		}
+		return nil, fmt.Errorf("lock hot checkpoint pin: %w", err)
+	}
+	return func() {
+		if err := os.RemoveAll(pinDir); err == nil {
+			_ = os.Remove(lockPath)
+		}
+		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+		_ = lockFile.Close()
+	}, nil
+}
+
+// reclaimOrphanedOCIHotPins removes hot-pin directories left behind by a
+// crashed Fastlet process so their hard links do not keep hot-cache entries
+// pinned permanently. Active pins hold an exclusive flock on <pinDir>.lock.
+func reclaimOrphanedOCIHotPins(stateRoot string) {
+	pinsRoot := ociHotPinsRoot(stateRoot)
+	items, err := os.ReadDir(pinsRoot)
+	if err != nil {
+		return
+	}
+	for _, item := range items {
+		name := item.Name()
+		if !strings.HasSuffix(name, ociHotPinLockSuffix) {
+			continue
+		}
+		lockPath := filepath.Join(pinsRoot, name)
+		pinDir := strings.TrimSuffix(lockPath, ociHotPinLockSuffix)
+		lockFile, err := os.OpenFile(lockPath, os.O_RDWR, 0o600)
+		if err != nil {
+			continue
+		}
+		if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+			_ = lockFile.Close()
+			continue
+		}
+		if err := os.RemoveAll(pinDir); err == nil {
+			_ = os.Remove(lockPath)
+		}
+		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+		_ = lockFile.Close()
+	}
+}
+
 // retainOCIHotCheckpoint moves the freshly dumped, uncompressed checkpoint
 // artifacts from staging into the node-local hot cache using same-filesystem
 // renames so the warm kernel page cache is preserved without copying. Callers
@@ -184,7 +279,7 @@ func retainOCIHotCheckpoint(stateRoot, artifactDigest, staging string) error {
 	if entryBytes > maxBytes {
 		return fmt.Errorf("checkpoint size %d exceeds hot cache budget %d", entryBytes, maxBytes)
 	}
-	if err := trimOCIHotCacheLocked(root, maxBytes, ociHotCheckpointMaxEntries-1, ociHotCheckpointMinFreeBytes, entryBytes, ociHotCheckpointCacheTTL()); err != nil {
+	if err := trimOCIHotCacheLocked(stateRoot, root, maxBytes, ociHotCheckpointMaxEntries-1, ociHotCheckpointMinFreeBytes, entryBytes, ociHotCheckpointCacheTTL()); err != nil {
 		return err
 	}
 
@@ -213,75 +308,85 @@ func retainOCIHotCheckpoint(stateRoot, artifactDigest, staging string) error {
 
 // pinOCIHotCheckpoint hard-links a cached raw checkpoint into pinDir under a
 // shared cache lock so concurrent resumes never contend while eviction respects
-// live pins (nlink > 1). Returns (false, nil) on miss, expiration, contention,
-// or cross-filesystem link failure so the caller falls back to OCI snapfiles.
-func pinOCIHotCheckpoint(stateRoot, artifactDigest, pinDir string) (bool, error) {
+// live pins (nlink > 1). The returned release function removes pinDir and
+// releases its crash-recovery lock. Returns (false, nil, nil) on miss,
+// expiration, contention, or cross-filesystem link failure so the caller falls
+// back to OCI snapfiles.
+func pinOCIHotCheckpoint(stateRoot, artifactDigest, pinDir string) (bool, func(), error) {
 	if !validImageDigest(artifactDigest) || ociHotCheckpointCacheMaxBytes() <= 0 {
-		return false, nil
+		return false, nil, nil
 	}
 	root := ociHotCheckpointRoot(stateRoot)
 	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
-		return false, nil
+		return false, nil, nil
 	}
 	unlock, err := lockOCIHotCache(root, unix.LOCK_SH|unix.LOCK_NB)
 	if err != nil {
 		if errors.Is(err, errHotCacheBusy) {
-			return false, nil
+			return false, nil, nil
 		}
-		return false, err
+		return false, nil, err
 	}
 	defer unlock()
 
 	entryDir := ociHotCheckpointPath(stateRoot, artifactDigest)
 	info, err := os.Stat(entryDir)
 	if err != nil || !info.IsDir() {
-		return false, nil
+		return false, nil, nil
 	}
 	if ttl := ociHotCheckpointCacheTTL(); ttl > 0 && time.Since(info.ModTime()) > ttl {
-		return false, nil
+		return false, nil, nil
 	}
 	if !isValidHotCheckpointDir(entryDir) {
-		return false, nil
+		return false, nil, nil
 	}
 
-	_ = os.RemoveAll(pinDir)
-	if err := os.MkdirAll(pinDir, 0o700); err != nil {
-		return false, fmt.Errorf("create hot checkpoint pin dir: %w", err)
+	releasePin, err := lockOCIHotPin(pinDir)
+	if err != nil {
+		if errors.Is(err, errHotCacheBusy) {
+			return false, nil, nil
+		}
+		return false, nil, err
 	}
 	success := false
 	defer func() {
 		if !success {
-			_ = os.RemoveAll(pinDir)
+			releasePin()
 		}
 	}()
 
+	_ = os.RemoveAll(pinDir)
+	if err := os.MkdirAll(pinDir, 0o700); err != nil {
+		return false, nil, fmt.Errorf("create hot checkpoint pin dir: %w", err)
+	}
+
 	optionalFiles, err := presentOptionalBundles(entryDir)
 	if err != nil {
-		return false, nil
+		return false, nil, nil
 	}
 	files := append(append([]string(nil), ociHotRequiredFiles...), optionalFiles...)
 	for _, name := range files {
 		if err := os.Link(filepath.Join(entryDir, name), filepath.Join(pinDir, name)); err != nil {
 			klog.V(2).InfoS("hot checkpoint pin link failed; falling back to OCI snapfiles",
 				"digest", artifactDigest, "file", name, "err", err)
-			return false, nil
+			return false, nil, nil
 		}
 	}
 	touchPath(entryDir)
 	success = true
-	return true, nil
+	return true, releasePin, nil
 }
 
 // reclaimOCIHotCheckpoints evicts unpinned raw hot checkpoint entries when
 // snapshot staging needs free disk space, even if new admission is disabled.
-func reclaimOCIHotCheckpoints(stateRoot string, minFree int64) error {
+func reclaimOCIHotCheckpoints(ctx context.Context, stateRoot string, minFree int64) error {
 	root := ociHotCheckpointRoot(stateRoot)
 	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
 		return err
 	}
-	unlock, err := lockOCIHotCache(root, unix.LOCK_EX|unix.LOCK_NB)
+	unlock, err := lockOCIHotCacheWithContext(ctx, root, unix.LOCK_EX)
 	if err != nil {
 		return err
 	}
@@ -290,7 +395,7 @@ func reclaimOCIHotCheckpoints(stateRoot string, minFree int64) error {
 	if minFree > 0 {
 		requiredFree = uint64(minFree)
 	}
-	return trimOCIHotCacheLocked(root, ociHotCheckpointCacheMaxBytes(), ociHotCheckpointMaxEntries, requiredFree, 0, ociHotCheckpointCacheTTL())
+	return trimOCIHotCacheLocked(stateRoot, root, ociHotCheckpointCacheMaxBytes(), ociHotCheckpointMaxEntries, requiredFree, 0, ociHotCheckpointCacheTTL())
 }
 
 type hotCacheEntry struct {
@@ -300,7 +405,8 @@ type hotCacheEntry struct {
 	pinned  bool
 }
 
-func trimOCIHotCacheLocked(root string, maxBytes int64, maxEntries int, minFree uint64, incomingBytes int64, ttl time.Duration) error {
+func trimOCIHotCacheLocked(stateRoot, root string, maxBytes int64, maxEntries int, minFree uint64, incomingBytes int64, ttl time.Duration) error {
+	reclaimOrphanedOCIHotPins(stateRoot)
 	entries, total, err := scanHotCheckpointEntries(root)
 	if err != nil {
 		return err
@@ -317,7 +423,7 @@ func trimOCIHotCacheLocked(root string, maxBytes int64, maxEntries int, minFree 
 	count := len(remaining)
 	highWatermark := maxBytes * ociHotCacheHighWatermarkPct / 100
 	needEvict := total+incomingBytes > maxBytes ||
-		(maxBytes > 0 && total > highWatermark) ||
+		(maxBytes > 0 && total+incomingBytes > highWatermark) ||
 		count > maxEntries ||
 		avail < minFree
 	if needEvict {
@@ -332,8 +438,14 @@ func trimOCIHotCacheLocked(root string, maxBytes int64, maxEntries int, minFree 
 		klog.Warningf("OCI hot checkpoint cache usage remains high after eviction: used=%d bytes budget=%d bytes entries=%d", total, maxBytes, count)
 	}
 	if total+incomingBytes > maxBytes || count > maxEntries || avail < minFree {
-		return fmt.Errorf("hot checkpoint cache budget or free-disk reserve exhausted; pinned entries retained (used=%d incoming=%d budget=%d free=%d minFree=%d)",
-			total, incomingBytes, maxBytes, avail, minFree)
+		pinnedCount := 0
+		for _, e := range remaining {
+			if e.pinned {
+				pinnedCount++
+			}
+		}
+		return fmt.Errorf("hot checkpoint cache budget or free-disk reserve exhausted (used=%d incoming=%d budget=%d free=%d minFree=%d pinned=%d)",
+			total, incomingBytes, maxBytes, avail, minFree, pinnedCount)
 	}
 	return nil
 }
@@ -470,7 +582,9 @@ func inspectHotCheckpointEntry(dir string) (totalBytes int64, pinned bool, valid
 			continue
 		}
 		totalBytes += info.Size()
-		present[item.Name()] = true
+		if info.Size() > 0 {
+			present[item.Name()] = true
+		}
 		if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Nlink > 1 {
 			pinned = true
 		}

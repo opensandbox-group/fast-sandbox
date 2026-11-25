@@ -87,9 +87,10 @@ func TestOCIHotCheckpointRetainPinAndInodeIdentity(t *testing.T) {
 	require.True(t, os.SameFile(origVMState, cachedVMState), "cached vmstate must retain the original inode")
 
 	pinDir := filepath.Join(stateRoot, "pins", "sandbox-1")
-	hit, err := pinOCIHotCheckpoint(stateRoot, digestHex, pinDir)
+	hit, releasePin, err := pinOCIHotCheckpoint(stateRoot, digestHex, pinDir)
 	require.NoError(t, err)
 	require.True(t, hit)
+	require.NotNil(t, releasePin)
 
 	pinnedMem, err := os.Stat(filepath.Join(pinDir, ociMemfileName))
 	require.NoError(t, err)
@@ -99,12 +100,14 @@ func TestOCIHotCheckpointRetainPinAndInodeIdentity(t *testing.T) {
 
 	// While pinned, eviction cannot delete the live entry even under zero budget.
 	t.Setenv(ociHotCheckpointCacheSizeEnv, "0")
-	require.ErrorContains(t, reclaimOCIHotCheckpoints(stateRoot, 0), "pinned entries retained")
+	require.ErrorContains(t, reclaimOCIHotCheckpoints(context.Background(), stateRoot, 0), "pinned=1")
 	require.DirExists(t, cachedDir)
 
 	// Releasing the pin allows capacity recovery to reclaim the entry even when admission is disabled.
-	require.NoError(t, os.RemoveAll(pinDir))
-	require.NoError(t, reclaimOCIHotCheckpoints(stateRoot, 0))
+	releasePin()
+	require.NoDirExists(t, pinDir)
+	require.NoFileExists(t, pinDir+ociHotPinLockSuffix)
+	require.NoError(t, reclaimOCIHotCheckpoints(context.Background(), stateRoot, 0))
 	require.NoDirExists(t, cachedDir)
 }
 
@@ -145,25 +148,91 @@ func TestOCIHotCheckpointBudgetWatermarksTTLAndLocks(t *testing.T) {
 	t.Setenv(ociHotCheckpointCacheTTLEnv, "1m")
 	expired := time.Now().Add(-5 * time.Minute)
 	require.NoError(t, os.Chtimes(ociHotCheckpointPath(stateRoot, digestC), expired, expired))
-	hit, err := pinOCIHotCheckpoint(stateRoot, digestC, filepath.Join(stateRoot, "pin-expired"))
+	hit, releaseExpired, err := pinOCIHotCheckpoint(stateRoot, digestC, filepath.Join(stateRoot, "pin-expired"))
 	require.NoError(t, err)
 	require.False(t, hit, "expired entry must miss on lookup")
+	require.Nil(t, releaseExpired)
 
 	touchPath(ociHotCheckpointPath(stateRoot, digestC))
 
 	unlockShared, err := lockOCIHotCache(ociHotCheckpointRoot(stateRoot), unix.LOCK_SH|unix.LOCK_NB)
 	require.NoError(t, err)
-	hit, err = pinOCIHotCheckpoint(stateRoot, digestC, filepath.Join(stateRoot, "pin-shared"))
+	hit, releaseShared, err := pinOCIHotCheckpoint(stateRoot, digestC, filepath.Join(stateRoot, "pin-shared"))
 	require.NoError(t, err)
 	require.True(t, hit, "concurrent shared readers must hit hot cache")
+	releaseShared()
 	unlockShared()
 
 	unlockExcl, err := lockOCIHotCache(ociHotCheckpointRoot(stateRoot), unix.LOCK_EX|unix.LOCK_NB)
 	require.NoError(t, err)
-	hit, err = pinOCIHotCheckpoint(stateRoot, digestC, filepath.Join(stateRoot, "pin-busy"))
+	hit, releaseBusy, err := pinOCIHotCheckpoint(stateRoot, digestC, filepath.Join(stateRoot, "pin-busy"))
 	require.NoError(t, err)
 	require.False(t, hit, "exclusive lock contention must fall back cleanly")
+	require.Nil(t, releaseBusy)
 	unlockExcl()
+}
+
+func TestOCIHotCheckpointReclaimWaitsForSharedLockAndRecoversOrphanPins(t *testing.T) {
+	stateRoot := t.TempDir()
+	digestA := strings.Repeat("d", 64)
+	digestB := strings.Repeat("e", 64)
+	rawManifest, err := json.Marshal(hotCheckpointTestMetadata(t))
+	require.NoError(t, err)
+	seedHotCheckpointEntry(t, stateRoot, digestA, rawManifest)
+	seedHotCheckpointEntry(t, stateRoot, digestB, rawManifest)
+
+	// Simulate an orphaned pin left behind by a crashed Fastlet (unlocked .lock file + hard links).
+	orphanPin := filepath.Join(ociHotPinsRoot(stateRoot), "pod-old-sandbox-a")
+	require.NoError(t, os.MkdirAll(orphanPin, 0o700))
+	require.NoError(t, os.WriteFile(orphanPin+ociHotPinLockSuffix, nil, 0o600))
+	for _, name := range ociHotRequiredFiles {
+		require.NoError(t, os.Link(filepath.Join(ociHotCheckpointPath(stateRoot, digestA), name), filepath.Join(orphanPin, name)))
+	}
+
+	// Keep an active pin on digestB; recovery must preserve it.
+	activePin := filepath.Join(ociHotPinsRoot(stateRoot), "pod-live-sandbox-b")
+	hit, releaseActive, err := pinOCIHotCheckpoint(stateRoot, digestB, activePin)
+	require.NoError(t, err)
+	require.True(t, hit)
+	defer releaseActive()
+
+	reclaimOrphanedOCIHotPins(stateRoot)
+	require.NoDirExists(t, orphanPin, "unlocked orphan pin must be removed")
+	require.NoFileExists(t, orphanPin+ociHotPinLockSuffix)
+	require.DirExists(t, activePin, "actively locked pin must be preserved")
+
+	// reclaimOCIHotCheckpoints waits for a transient shared reader instead of failing immediately.
+	unlockShared, err := lockOCIHotCache(ociHotCheckpointRoot(stateRoot), unix.LOCK_SH|unix.LOCK_NB)
+	require.NoError(t, err)
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		unlockShared()
+	}()
+	t.Setenv(ociHotCheckpointCacheSizeEnv, "0")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err = reclaimOCIHotCheckpoints(ctx, stateRoot, 0)
+	require.ErrorContains(t, err, "pinned=1", "active pin on digestB remains protected")
+	require.NoDirExists(t, ociHotCheckpointPath(stateRoot, digestA), "unpinned digestA must be reclaimed once shared lock releases")
+	require.DirExists(t, ociHotCheckpointPath(stateRoot, digestB))
+
+	// If the lock stays held beyond ctx deadline, reclaim returns the context error.
+	unlockShared2, err := lockOCIHotCache(ociHotCheckpointRoot(stateRoot), unix.LOCK_SH|unix.LOCK_NB)
+	require.NoError(t, err)
+	defer unlockShared2()
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 35*time.Millisecond)
+	defer shortCancel()
+	require.ErrorIs(t, reclaimOCIHotCheckpoints(shortCtx, stateRoot, 0), context.DeadlineExceeded)
+}
+
+func TestOCIReferenceMatchesDigest(t *testing.T) {
+	digestA := strings.Repeat("a", 64)
+	digestB := strings.Repeat("b", 64)
+	require.True(t, ociReferenceMatchesDigest("oci://r.example/ns/repo@sha256:"+digestA, digestA))
+	require.False(t, ociReferenceMatchesDigest("oci://r.example/ns/repo@sha256:"+digestB, digestA))
+	require.False(t, ociReferenceMatchesDigest("oci://r.example/ns/repo:latest", digestA))
+	require.False(t, ociReferenceMatchesDigest("oci://r.example/ns/repo@sha256:"+digestA, "sha256:"+digestA))
+	require.False(t, ociReferenceMatchesDigest("oci://r.example/ns/repo@sha256:"+digestA, ""))
 }
 
 func TestPrepareOCIRestoreUsesHotCacheAndFallsBack(t *testing.T) {
@@ -222,8 +291,8 @@ func TestPrepareOCIRestoreUsesHotCacheAndFallsBack(t *testing.T) {
 		fixture, rawMeta, hotArgFile := setupResumeFixture(t, "sandbox-1")
 		cachedMem := seedHotCheckpointEntry(t, fixture.stateRoot, digestHex, rawMeta)
 
-		pinDir := filepath.Join(fixture.driver.ociRoot(), "hot-pins", "sandbox-1")
-		hit, err := pinOCIHotCheckpoint(fixture.stateRoot, digestHex, pinDir)
+		pinDir := filepath.Join(ociHotPinsRoot(fixture.stateRoot), "sandbox-1")
+		hit, releasePin, err := pinOCIHotCheckpoint(fixture.stateRoot, digestHex, pinDir)
 		require.NoError(t, err)
 		require.True(t, hit)
 
@@ -232,7 +301,7 @@ func TestPrepareOCIRestoreUsesHotCacheAndFallsBack(t *testing.T) {
 		require.Equal(t, "/dev/ublkb42", rootfs)
 		require.Equal(t, filepath.Join(fixture.driver.ociRoot(), "sandboxes", "sandbox-1", "mnt", ociVMStateFileName), vmstate)
 		require.Equal(t, filepath.Join(fixture.driver.ociRoot(), "sandboxes", "sandbox-1", "mnt", ociMemfileName), memfile)
-		require.NoError(t, os.RemoveAll(pinDir))
+		releasePin()
 
 		argRaw, err := os.ReadFile(hotArgFile)
 		require.NoError(t, err)
@@ -245,6 +314,23 @@ func TestPrepareOCIRestoreUsesHotCacheAndFallsBack(t *testing.T) {
 		parsedMeta, err := readPreparedOCIMetadata(fixture.driver.ociRoot(), "sandbox-1")
 		require.NoError(t, err)
 		require.NoError(t, validateOCIResumeOwner(parsedMeta, &fixture.sandboxSpec))
+	})
+
+	t.Run("reference digest mismatch skips hot cache", func(t *testing.T) {
+		if !hostCPUKnown() {
+			t.Skip("host CPU identity compatibility check requires Linux /proc/cpuinfo")
+		}
+		fixture, rawMeta, hotArgFile := setupResumeFixture(t, "sandbox-1")
+		seedHotCheckpointEntry(t, fixture.stateRoot, digestHex, rawMeta)
+		otherDigest := strings.Repeat("c", 64)
+		fixture.sandboxSpec.Desired.Image = "oci://r.example/templates/base@sha256:" + otherDigest
+		fixture.sandboxSpec.Desired.Restore.ManifestRef = fixture.sandboxSpec.Desired.Image
+
+		_, err := fixture.driver.EnsureSandbox(context.Background(), ensureInput(&fixture.sandboxSpec))
+		require.NoError(t, err)
+		argRaw, err := os.ReadFile(hotArgFile)
+		require.NoError(t, err)
+		require.Empty(t, string(argRaw), "mismatched reference digest must not use hot cache")
 	})
 
 	t.Run("owner mismatch still rejected on hot cache hit", func(t *testing.T) {

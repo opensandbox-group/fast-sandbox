@@ -208,16 +208,20 @@ func (d *Driver) prepareOCIRestore(ctx context.Context, directory, reference str
 	var err error
 	var hotPinDir string
 	hotCacheHit := false
-	if config.Desired.Restore != nil && config.Desired.Restore.ArtifactDigest != "" {
-		candidatePin := filepath.Join(d.ociRoot(), "hot-pins", id)
-		hit, pinErr := pinOCIHotCheckpoint(d.config.StateRoot, config.Desired.Restore.ArtifactDigest, candidatePin)
+	if config.Desired.Restore != nil && ociReferenceMatchesDigest(reference, config.Desired.Restore.ArtifactDigest) {
+		pinName := id
+		if d.podUID != "" {
+			pinName = d.podUID + "-" + id
+		}
+		candidatePin := filepath.Join(ociHotPinsRoot(d.config.StateRoot), pinName)
+		hit, releasePin, pinErr := pinOCIHotCheckpoint(d.config.StateRoot, config.Desired.Restore.ArtifactDigest, candidatePin)
 		if pinErr != nil {
 			klog.InfoS("OCI hot checkpoint pin failed; falling back to OCI snapfiles",
 				"sandboxID", id, "digest", config.Desired.Restore.ArtifactDigest, "err", pinErr)
 		} else if hit {
 			hotPinDir = candidatePin
 			hotCacheHit = true
-			defer os.RemoveAll(hotPinDir)
+			defer releasePin()
 		}
 	}
 	t0 := time.Now()
