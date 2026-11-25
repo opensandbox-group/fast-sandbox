@@ -18,6 +18,22 @@ import (
 	"fast-sandbox/internal/guestnetwork"
 )
 
+func TestNativeVMMStartsWithPCI(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "firecracker")
+	require.NoError(t, os.WriteFile(stub, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > args\ntouch \"$2\"\n"), 0755))
+	original := firecrackerBin
+	firecrackerBin = stub
+	t.Cleanup(func() { firecrackerBin = original })
+	socket := filepath.Join(dir, "api.sock")
+	vm, err := startNativeVMM(socket, filepath.Join(dir, "console"), dir)
+	require.NoError(t, err)
+	defer vm.stop()
+	args, err := os.ReadFile(filepath.Join(dir, "args"))
+	require.NoError(t, err)
+	require.Equal(t, []string{"--api-sock", socket, "--enable-pci"}, strings.Split(strings.TrimSuffix(string(args), "\n"), "\n"))
+}
+
 func TestEnsureBuildTapSetsGatewayMACBeforeLinkUp(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "ip.log")
@@ -281,6 +297,8 @@ func testNativeSnapshotStage(t *testing.T, mode apiv1alpha2.SandboxSnapshotMode)
 	require.NotEmpty(t, phases.GuestControl.HelperVersion)
 	require.NotEmpty(t, phases.KernelSHA256)
 	require.Contains(t, phases.KernelCmdline, "root=/dev/vda")
+	require.NotContains(t, phases.KernelCmdline, "pci=off")
+	require.True(t, phases.PCIEnabled)
 	if mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {
 		after, err := artifacts.FileEntry(rootfs, map[string]string{})
 		require.NoError(t, err)

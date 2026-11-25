@@ -393,6 +393,25 @@ func TestCreateCheckpointRejectsTemplateName(t *testing.T) {
 	require.ErrorContains(t, err, "templateName must be empty")
 }
 
+func TestSnapshotOfMMIOInstanceAfterTagMovesToPCI(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+
+	// The VM is already running on MMIO when its image tag starts pointing at a PCI template.
+	replacement := newMetadataTestVMManifest()
+	replacement.Machine.PCIEnabled = true
+	raw, err := artifacts.MarshalVMManifest(replacement)
+	require.NoError(t, err)
+	path := cachedManifestPath(fixture.stateRoot, fixture.sandboxSpec.Desired.Image)
+	require.NoError(t, os.WriteFile(path, raw, 0o640))
+
+	_, err = fixture.driver.CreateSnapshot(t.Context(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "snap-mmio", Kind: fastletapi.SnapshotKindTemplate, TemplateName: "from-mmio",
+	})
+	require.NoError(t, err)
+	require.NotContains(t, agent.manifest["machine"].(map[string]any), "pciEnabled")
+}
+
 func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
 	fixture := newSnapshotDriverFixture(t)
 	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
@@ -405,6 +424,7 @@ func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
 	restore := &fastletapi.RestoreSpec{ManifestRef: "s3://bucket/publish/abcdef/manifest.json", ArtifactDigest: "lineage-digest"}
 	state.Config.Desired.Restore = restore
 	state.BootKernelSHA256 = strings.Repeat("b", 64)
+	state.BootPCIEnabled = true
 	require.NoError(t, saveState(dir, state))
 
 	cacheDir := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey(artifacts.CheckpointReference(restore.ArtifactDigest)))
@@ -434,6 +454,7 @@ func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
 	var document map[string]any
 	require.NoError(t, json.Unmarshal(payload, &document))
 	require.Equal(t, state.BootKernelSHA256, document["kernel"].(map[string]any)["sha256"])
+	require.Equal(t, true, document["machine"].(map[string]any)["pciEnabled"])
 	require.Equal(t, true, document["freePageReporting"], "checkpoints inherit guest FPR support provenance")
 	require.Equal(t, "10.0.0.2", document["guestNetwork"].(map[string]any)["ip"],
 		"the checkpoint lineage facts ride forward into the new checkpoint")

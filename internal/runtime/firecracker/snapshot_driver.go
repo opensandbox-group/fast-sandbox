@@ -1439,10 +1439,13 @@ func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, ki
 	}
 	rootfsSize := entries.RootfsSize
 	files, stateFiles := entries.Files, entries.StateFiles
-	// Modify only the actual disk capacity, preserving unknown machine fields.
+	// Preserve unknown machine fields while recording the running VM configuration.
 	machine, err := manifestSection(document, "machine")
 	if err != nil {
 		return 0, err
+	}
+	if !isOCI {
+		setMachinePCI(machine, state.BootPCIEnabled)
 	}
 	if rootfsSize > 0 {
 		machine["rootfsSizeMiB"], err = json.Marshal((rootfsSize + (1 << 20) - 1) >> 20)
@@ -1628,11 +1631,22 @@ func setSnapshotKernelDigest(document map[string]json.RawMessage, sum string) er
 	return nil
 }
 
+// A mutable source tag can now name a different template. Publish the transport
+// used at launch, including MMIO for instances started before PCI was recorded.
+func setMachinePCI(machine map[string]json.RawMessage, enabled bool) {
+	if enabled {
+		machine["pciEnabled"] = json.RawMessage("true")
+	} else {
+		delete(machine, "pciEnabled")
+	}
+}
+
 func setSnapshotMachineShape(document map[string]json.RawMessage, machine artifacts.VMMachine) error {
 	fields, err := manifestSection(document, "machine")
 	if err != nil {
 		return err
 	}
+	setMachinePCI(fields, machine.PCIEnabled)
 	fields["vcpuCount"], err = json.Marshal(machine.VCPUCount)
 	if err != nil {
 		return err

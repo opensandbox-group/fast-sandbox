@@ -838,8 +838,9 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	// state), and the NIC host tap is replaced per instance via the load
 	// request's network_overrides. Nothing else is injected into the rootfs.
 	state := &SandboxState{
-		VMM:    selectedVMM,
-		Config: *config,
+		VMM:            selectedVMM,
+		BootPCIEnabled: !isOCI && restoreMetadata.Machine.PCIEnabled,
+		Config:         *config,
 		Allocation: fastletapi.RuntimeAllocation{Network: fastletapi.NetworkAllocation{
 			SlotID: slot.ID, NamespacePath: slot.HostNetNSPath, IP: slot.IP, Gateway: slot.Gateway,
 			DNSPath: slot.DNSPath, PrivateCIDR: slot.PrivateCIDR, HostVeth: slot.HostVeth,
@@ -855,7 +856,9 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		provStarted := time.Now()
 		state.BootKernelSHA256 = bootKernelSHA256
 		if config.Desired.RootfsBootDigest != "" {
-			state.BootMachine = &restoreMetadata.Machine
+			bootMachine := restoreMetadata.Machine
+			bootMachine.PCIEnabled = state.BootPCIEnabled
+			state.BootMachine = &bootMachine
 		}
 		provenance := d.bootCompatibility(selectedVMM)
 		state.BootCompatibility = &provenance
@@ -895,6 +898,7 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	launchCtx, launchSpan := observability.Start(ctx, "fastlet.firecracker.launch")
 	launchStarted := time.Now()
 	process, err := d.launchVM(launchCtx, launchConfig{
+		PCIEnabled: state.BootPCIEnabled,
 		BinaryPath: binaryPath,
 		JailerPath: jailerPath,
 		SandboxID:  identity.SandboxUID,

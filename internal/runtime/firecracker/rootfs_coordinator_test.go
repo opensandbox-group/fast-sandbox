@@ -123,6 +123,34 @@ func TestRootfsSnapshotPreservesExtensionsAndDropsMemory(t *testing.T) {
 	require.Nil(t, decoded.Platform.ResourceLimits)
 }
 
+func TestNativeRootfsSnapshotUsesBootPCIEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pci  bool
+	}{{"MMIO", false}, {"PCI", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMetadataTestVMManifest()
+			m.Machine.PCIEnabled = !tc.pci
+			m.Platform = &artifacts.VMPlatform{SnapshotMode: "rootfsOnly"}
+			m.Kernel.Cmdline = "root=/dev/vda rw"
+			m.Kernel.SHA256 = strings.Repeat("c", 64)
+			m.GuestControl = &artifacts.VMGuestControl{Protocol: guestcontrol.Protocol, Transport: "vsock", Port: 1234, HelperVersion: "v1"}
+			delete(m.Files, vmstateSnapshotName)
+			delete(m.Files, memorySnapshotName)
+			source, err := artifacts.MarshalVMManifest(m)
+			require.NoError(t, err)
+
+			state := &SandboxState{BootPCIEnabled: tc.pci, BootKernelSHA256: m.Kernel.SHA256}
+			require.NoError(t, recordRootfsBootMetadata(&m, state, m.GuestControl.HelperVersion))
+			raw, err := marshalRootfsSnapshotManifest(source, m, state.Config.Limits)
+			require.NoError(t, err)
+			snapshot, err := artifacts.DecodeVMManifest(raw)
+			require.NoError(t, err)
+			require.Equal(t, tc.pci, snapshot.Machine.PCIEnabled)
+		})
+	}
+}
+
 func TestRootfsPublicationRetainsOwnerAfterSourceDeletion(t *testing.T) {
 	t.Setenv(ociSnapshotRepositoryEnv, "registry.example/snapshots")
 	root := t.TempDir()

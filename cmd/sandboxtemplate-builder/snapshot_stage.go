@@ -30,6 +30,7 @@ import (
 // the workdir for the pipeline: sub-phase durations, the effective CPU
 // template, and detected guest FPR support.
 type snapshotPhaseTimings struct {
+	PCIEnabled           bool                      `json:"pciEnabled,omitempty"`
 	KernelSHA256         string                    `json:"kernelSHA256,omitempty"`
 	KernelCmdline        string                    `json:"kernelCmdline,omitempty"`
 	GuestControl         *artifacts.VMGuestControl `json:"guestControl,omitempty"`
@@ -136,7 +137,7 @@ func runSnapshotStage(args []string) error {
 	// generating a session id for POST /command — blocks forever. The golden
 	// snapshot carries the initialized CRNG, so every restored instance is
 	// fixed too.
-	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off nomodules net.ifnames=0 biosdevname=0 random.trust_cpu=on root=/dev/vda rw"
+	bootArgs := "console=ttyS0 reboot=k panic=1 nomodules net.ifnames=0 biosdevname=0 random.trust_cpu=on root=/dev/vda rw"
 	bootArgs += " init=" + guestInitPath(spec)
 	bootArgs = bakedNetworkBootArgs(bootArgs)
 	// Hash the same private bytes the VMM loads, not a mutable node path after boot.
@@ -178,7 +179,7 @@ func runSnapshotStage(args []string) error {
 
 	// Pause and create the full snapshot.
 	phases := snapshotPhaseTimings{
-		KernelSHA256: kernelSHA256, KernelCmdline: bootArgs, GuestControl: control,
+		PCIEnabled: true, KernelSHA256: kernelSHA256, KernelCmdline: bootArgs, GuestControl: control,
 		BootToReadyMs: bootToReadyMs, CPUTemplate: compatibilityCPUTemplate(cpuTemplate),
 		FreePageReporting: freePageReporting,
 	}
@@ -221,7 +222,7 @@ func runSnapshotStage(args []string) error {
 			return err
 		}
 	}
-	restored, err := startVMM(restoreSocket, restoreLog, workdir)
+	restored, err := startNativeVMM(restoreSocket, restoreLog, workdir)
 	if err != nil {
 		return err
 	}
@@ -279,9 +280,9 @@ type vmm struct {
 	process *exec.Cmd
 }
 
-// startVMM launches firecracker in the background with the serial output
+// startNativeVMM launches firecracker in the background with the serial output
 // captured in the console log, then waits for the API socket.
-func startVMM(socketPath, logPath, workdir string) (*vmm, error) {
+func startNativeVMM(socketPath, logPath, workdir string) (*vmm, error) {
 	// A stale socket file from a crashed or interrupted earlier run makes
 	// the firecracker bind fail (EADDRINUSE) and the process exit right
 	// after startup; remove it before launching.
@@ -290,7 +291,7 @@ func startVMM(socketPath, logPath, workdir string) (*vmm, error) {
 	if err != nil {
 		return nil, err
 	}
-	command := exec.Command(firecrackerBin, "--api-sock", socketPath)
+	command := exec.Command(firecrackerBin, "--api-sock", socketPath, "--enable-pci")
 	command.Dir = workdir
 	command.Stdout = logFile
 	command.Stderr = logFile
@@ -360,7 +361,7 @@ var errInstanceStart = errors.New("instance start failed")
 // bootVMM launches one fresh VMM, configures it, starts the instance, and
 // stops it on any error.
 func bootVMM(socket, logPath, workdir, kernel, rootfs, bootArgs string, spec apiv1alpha2.SandboxTemplateSpec, cpuTemplate string) (*vmm, error) {
-	vm, err := startVMM(socket, logPath, workdir)
+	vm, err := startNativeVMM(socket, logPath, workdir)
 	if err != nil {
 		return nil, err
 	}
