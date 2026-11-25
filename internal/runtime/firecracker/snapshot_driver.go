@@ -351,6 +351,13 @@ func (d *Driver) commitSnapshotCache(reference, artifactDigest, staging string, 
 				trackedOpen[to] = trackedOpenFile{file: f, proof: verified[from]}
 			}
 		}
+		// The staged files were written by the dump and the spill copy
+		// without an fsync; persist them before the cache names commit
+		// them, so a power loss never leaves a committed manifest over
+		// zero-length or torn files.
+		if err := syncSnapshotCacheFile(src); err != nil {
+			return fmt.Errorf("sync snapshot cache entry %s: %w", to, err)
+		}
 		dst := filepath.Join(tmpDir, to)
 		if err := os.Rename(src, dst); err != nil {
 			return fmt.Errorf("stage snapshot cache entry %s: %w", to, err)
@@ -358,6 +365,9 @@ func (d *Driver) commitSnapshotCache(reference, artifactDigest, staging string, 
 		if to != snapshotManifestName {
 			agentpull.PrepareCommittedCacheFile(dst)
 		}
+	}
+	if err := syncSnapshotCacheDir(tmpDir); err != nil {
+		return fmt.Errorf("sync snapshot cache staging: %w", err)
 	}
 	cacheDir := filepath.Join(imagesRoot, imageKey(reference))
 	if err := os.Rename(tmpDir, cacheDir); err != nil {
@@ -370,12 +380,25 @@ func (d *Driver) commitSnapshotCache(reference, artifactDigest, staging string, 
 		return fmt.Errorf("commit snapshot cache entry: %w", err)
 	}
 	cleanupTmp = false
+	// Persist the entry's name in the images root. The entry is already
+	// complete and readable, so a failure is logged, not returned: at worst
+	// a power loss drops the entry and a later restore pulls from the store.
+	if err := syncSnapshotCacheDir(imagesRoot); err != nil {
+		klog.ErrorS(err, "sync snapshot cache root failed; the entry may not survive a power loss", "reference", reference)
+	}
 	for to, entry := range trackedOpen {
 		agentpull.RecordVerifiedCacheFile(filepath.Join(cacheDir, to), entry.file, entry.proof.SHA256())
 	}
 	d.touchImage(reference)
 	return nil
 }
+
+// syncSnapshotCacheFile and syncSnapshotCacheDir make a same-node cache
+// commit durable; tests replace them to observe what a commit syncs.
+var (
+	syncSnapshotCacheFile = agentpull.SyncCacheFile
+	syncSnapshotCacheDir  = agentpull.SyncCacheDir
+)
 
 // acquireSnapshotCacheStaging creates a lock-owned temporary directory under
 // imagesRoot so crash recovery and image GC can distinguish active writers
