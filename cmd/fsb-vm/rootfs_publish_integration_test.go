@@ -53,15 +53,10 @@ func TestRootfsPackPublishIntegration(t *testing.T) {
 	for _, entry := range []struct{ source, target string }{{"data", ocitemplate.UpperDataName}, {"index", ocitemplate.UpperIndexName}} {
 		require.NoError(t, copyFile(filepath.Join(source, entry.source), filepath.Join(bundle, entry.target), 0600))
 	}
-	baseData, baseIndex, baseLayer := filepath.Join(root, "base.data"), filepath.Join(root, "base.index"), filepath.Join(root, "base.zfile")
-	// The source test disk has no remote parent; create an equivalent immutable zero-filled base to verify OCI transfer of the real upper.
-	require.NoError(t, createHybridUpper(t.Context(), global.overlaybdCreate, baseData, baseIndex, 1))
-	require.NoError(t, commitLayer(t.Context(), baseData, baseIndex, baseLayer, true))
-	payload, err := os.ReadFile(baseLayer)
-	require.NoError(t, err)
-	desc := oci.Descriptor{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromBytes(payload), Size: int64(len(payload))}
 	kernel := os.Getenv("FSB_TEST_PACK_BOOT_KERNEL")
 	seed := os.Getenv("FSB_TEST_PACK_BOOT_DISK")
+	var payload []byte
+	var desc oci.Descriptor
 	if kernel != "" {
 		data, index := filepath.Join(root, "raw.data"), filepath.Join(root, "raw.index")
 		sealed := filepath.Join(root, "raw.lsmt")
@@ -77,6 +72,15 @@ func TestRootfsPackPublishIntegration(t *testing.T) {
 		output, err = cmd.CombinedOutput()
 		require.NoError(t, err, string(output))
 		payload, err = os.ReadFile(compressed)
+		require.NoError(t, err)
+		desc = oci.Descriptor{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromBytes(payload), Size: int64(len(payload))}
+	} else {
+		baseData, baseIndex, baseLayer := filepath.Join(root, "base.data"), filepath.Join(root, "base.index"), filepath.Join(root, "base.zfile")
+		// The source test disk has no remote parent; create an equivalent immutable zero-filled base to verify OCI transfer of the real upper.
+		require.NoError(t, createHybridUpper(t.Context(), global.overlaybdCreate, baseData, baseIndex, 1))
+		require.NoError(t, commitLayer(t.Context(), baseData, baseIndex, baseLayer, true))
+		var err error
+		payload, err = os.ReadFile(baseLayer)
 		require.NoError(t, err)
 		desc = oci.Descriptor{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromBytes(payload), Size: int64(len(payload))}
 	}
@@ -127,32 +131,30 @@ func TestRootfsPackPublishIntegration(t *testing.T) {
 	require.Equal(t, pair.Rootfs, named.rootfsRef())
 	require.Empty(t, named.snapfilesRef())
 	// Read the rootfs layers back from the registry before downstream device validation.
-	for _, entry := range []struct{ name, ref string }{{"rootfs", pair.Rootfs}} {
-		remote, parsed, e := ocitemplate.Repository(entry.ref, nil, ocitemplate.WithPlainHTTP(true))
+	remote, parsed, err := ocitemplate.Repository(pair.Rootfs, nil, ocitemplate.WithPlainHTTP(true))
+	require.NoError(t, err)
+	md, err := remote.Resolve(t.Context(), parsed.Reference)
+	require.NoError(t, err)
+	reader, err := remote.Manifests().Fetch(t.Context(), md)
+	require.NoError(t, err)
+	var manifest oci.Manifest
+	require.NoError(t, json.NewDecoder(reader).Decode(&manifest))
+	require.NoError(t, reader.Close())
+	var paths []string
+	for _, layer := range manifest.Layers {
+		stream, e := remote.Blobs().Fetch(t.Context(), layer)
 		require.NoError(t, e)
-		md, e := remote.Resolve(t.Context(), parsed.Reference)
+		body, e := io.ReadAll(stream)
 		require.NoError(t, e)
-		reader, e := remote.Manifests().Fetch(t.Context(), md)
-		require.NoError(t, e)
-		var manifest oci.Manifest
-		require.NoError(t, json.NewDecoder(reader).Decode(&manifest))
-		require.NoError(t, reader.Close())
-		var paths []string
-		for _, layer := range manifest.Layers {
-			stream, e := remote.Blobs().Fetch(t.Context(), layer)
-			require.NoError(t, e)
-			body, e := io.ReadAll(stream)
-			require.NoError(t, e)
-			require.NoError(t, stream.Close())
-			require.Equal(t, layer.Digest, digest.FromBytes(body))
-			path := filepath.Join(root, layer.Digest.Encoded()+".zfile")
-			require.NoError(t, os.WriteFile(path, body, 0600))
-			paths = append(paths, path)
-		}
-		raw, e = json.Marshal(paths)
-		require.NoError(t, e)
-		require.NoError(t, os.WriteFile(filepath.Join(root, entry.name+"-layers.json"), raw, 0600))
+		require.NoError(t, stream.Close())
+		require.Equal(t, layer.Digest, digest.FromBytes(body))
+		path := filepath.Join(root, layer.Digest.Encoded()+".zfile")
+		require.NoError(t, os.WriteFile(path, body, 0600))
+		paths = append(paths, path)
 	}
+	raw, err = json.Marshal(paths)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "rootfs-layers.json"), raw, 0600))
 	t.Log("real upper packed without a snapfiles device; rootfs layers and config metadata published and verified")
 	if kernel != "" {
 		testRootfsMetadataColdBoot(t, root, kernel, named.Template.Repo, named.Template.TemplateID)

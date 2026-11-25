@@ -38,13 +38,15 @@ func resolveTemplate(ctx context.Context, template *templateFile, config dockerC
 		return err
 	}
 	var payload []byte
+	var pair *ocitemplate.Pair
 	if cachePath != "" {
-		payload, _ = readCachedManifest(cachePath + ".template")
-		if pair, err := templatePair(payload, ref); err != nil || pair.Metadata != nil {
-			payload = nil
+		if cachedPayload, ok := readCachedManifest(cachePath + ".template"); ok {
+			if cachedPair, err := templatePair(cachedPayload, ref); err == nil && cachedPair.Metadata == nil {
+				payload, pair = cachedPayload, cachedPair
+			}
 		}
 	}
-	if len(payload) == 0 {
+	if pair == nil {
 		repository, err := newRemoteRepository(ref, config, global.plainHTTP)
 		if err != nil {
 			return err
@@ -58,7 +60,7 @@ func resolveTemplate(ctx context.Context, template *templateFile, config dockerC
 		if err != nil {
 			return fmt.Errorf("resolve OCI template: %w", err)
 		}
-		pair, err := templatePair(payload, ref)
+		pair, err = templatePair(payload, ref)
 		if err != nil {
 			return err
 		}
@@ -67,10 +69,6 @@ func resolveTemplate(ctx context.Context, template *templateFile, config dockerC
 				fmt.Fprintf(os.Stderr, "warning: cache template metadata: %v\n", err)
 			}
 		}
-	}
-	pair, err := templatePair(payload, ref)
-	if err != nil {
-		return err
 	}
 	template.Template.Rootfs, template.Template.Snapfiles = pair.Rootfs, pair.Snapfiles
 	template.Metadata = payload

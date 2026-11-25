@@ -40,6 +40,10 @@ func TestSingleImageRootfsPublishAndResolve(t *testing.T) {
 		"compatibility":{"cpuArch":"x86_64","firecrackerVersion":"1.17.0"},
 		"platform":{"snapshotMode":"rootfsOnly","stateFiles":{"policy.json":{"sha256":"` + digest.FromBytes(state).Encoded() + `","sizeBytes":16}}}
 	}`)
+	stateLink := filepath.Join(dir, "policy-link.json")
+	require.NoError(t, os.Symlink(statePath, stateLink))
+	_, err := EncodeRootfsConfig([]byte(`{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}`), vm, map[string]string{"policy.json": stateLink})
+	require.ErrorContains(t, err, "invalid OCI metadata file")
 	encoded, err := EncodeRootfsConfig([]byte(`{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}`), vm, map[string]string{"policy.json": statePath})
 	require.NoError(t, err)
 	config := content.NewDescriptorFromBytes(oci.MediaTypeImageConfig, encoded)

@@ -78,7 +78,7 @@ var rootCmd = &cobra.Command{
 	Use:   "fsb-vm",
 	Short: "Restore a Firecracker microVM from a remote overlaybd template",
 	Long: `fsb-vm restores a running microVM on the local host from a template
-	stored in a remote OCI registry. It bypasses
+stored in a remote OCI registry. It bypasses
 every control plane and drives overlaybd-ublkd and Firecracker directly.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,

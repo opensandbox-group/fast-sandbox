@@ -114,6 +114,13 @@ func EncodeRootfsConfig(config, manifest []byte, extras map[string]string) ([]by
 }
 
 func readMetadataFile(path string, limit int) ([]byte, error) {
+	linfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !linfo.Mode().IsRegular() || linfo.Size() > int64(limit) {
+		return nil, fmt.Errorf("invalid OCI metadata file %s", path)
+	}
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -123,7 +130,7 @@ func readMetadataFile(path string, limit int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !info.Mode().IsRegular() || info.Size() > int64(limit) {
+	if !os.SameFile(linfo, info) || !info.Mode().IsRegular() || info.Size() > int64(limit) {
 		return nil, fmt.Errorf("invalid OCI metadata file %s", path)
 	}
 	raw, err := io.ReadAll(io.LimitReader(file, int64(limit)+1))
@@ -205,6 +212,9 @@ func deleteRootfsMetadataImage(ctx context.Context, repo *remote.Repository, ref
 	if err != nil {
 		return oci.Descriptor{}, oci.Manifest{}, false, err
 	}
+	if desc.Digest.String() != reference {
+		return oci.Descriptor{}, oci.Manifest{}, true, errors.New("refusing to delete OCI manifest: registry digest mismatch")
+	}
 	raw, err := fetchSmall(ctx, repo, desc)
 	if errors.Is(err, errdef.ErrNotFound) {
 		return oci.Descriptor{}, oci.Manifest{}, true, nil
@@ -219,7 +229,7 @@ func deleteRootfsMetadataImage(ctx context.Context, repo *remote.Repository, ref
 	if _, marked := manifest.Annotations[AnnotationRootfsMetadata]; !marked {
 		return desc, manifest, false, nil
 	}
-	if desc.Digest.String() != reference || manifest.Annotations[annotationRootfsID] != id {
+	if manifest.Annotations[annotationRootfsID] != id {
 		return oci.Descriptor{}, oci.Manifest{}, true, errors.New("refusing to delete RootfsOnly OCI manifest: snapshot ID or digest mismatch")
 	}
 	err = repo.Manifests().Delete(ctx, desc)
