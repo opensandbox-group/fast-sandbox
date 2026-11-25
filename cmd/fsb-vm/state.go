@@ -82,6 +82,9 @@ type sandboxState struct {
 	Snapfiles *deviceRecord `json:"snapfiles_device,omitempty"`
 	// SharedSnapfiles is a durable lease; shared devices are never Sandbox-owned.
 	SharedSnapfiles string `json:"shared_snapfiles,omitempty"`
+	// HotSnapfiles records that mnt/ holds hard-linked raw checkpoint files
+	// from the node-local hot cache, with no snapfiles ublk device or mount.
+	HotSnapfiles bool `json:"hot_snapfiles,omitempty"`
 
 	MountPoint  string                    `json:"mount_point"`
 	APISocket   string                    `json:"api_socket"`

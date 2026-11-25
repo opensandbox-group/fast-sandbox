@@ -41,17 +41,34 @@ func installPreparedOCI(t *testing.T, fixture *driverFixture, metadata string) {
 	bin := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(bin, "fsb-vm"), []byte(`#!/bin/sh
 set -eu
-while [ "$1" != create ] && [ "$1" != delete ]; do shift; done
+cmd=""
+hot_dir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    create|delete) cmd="$1"; shift ;;
+    --hot-snapfiles-dir) hot_dir="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
 home="$TEST_PREPARE_ROOT/oci/sandboxes/sandbox-1"
-if [ "$1" = delete ]; then
+if [ "$cmd" = delete ]; then
   rm -rf "$home"
   exit 0
+fi
+if [ -n "${TEST_HOT_ARG_FILE:-}" ]; then
+  printf '%s' "$hot_dir" > "$TEST_HOT_ARG_FILE"
 fi
 cp "$TEST_PREPARE_ROOT/oci/inputs/sandbox-1.json" "$TEST_PREPARE_ROOT/cli-input.json"
 mkdir -p "$home/mnt"
 printf '%s' "$TEST_PREPARE_STATE" > "$home/state.json"
-touch "$home/mnt/vmstate.bin" "$home/mnt/memfile"
-printf '%s' "$TEST_PREPARE_MANIFEST" > "$home/mnt/manifest.json"
+if [ -n "$hot_dir" ]; then
+  ln "$hot_dir/vmstate.bin" "$home/mnt/vmstate.bin"
+  ln "$hot_dir/memfile" "$home/mnt/memfile"
+  ln "$hot_dir/manifest.json" "$home/mnt/manifest.json"
+else
+  touch "$home/mnt/vmstate.bin" "$home/mnt/memfile"
+  printf '%s' "$TEST_PREPARE_MANIFEST" > "$home/mnt/manifest.json"
+fi
 if [ -n "${TEST_PREPARE_BUNDLE:-}" ]; then
   cp "$TEST_PREPARE_BUNDLE/"* "$home/mnt/"
 fi
@@ -227,7 +244,7 @@ esac
 			if mode == "existing-home" {
 				require.NoError(t, os.MkdirAll(home, 0750))
 			}
-			device, _, _, err := d.attachOCI(context.Background(), "sandbox-1", image)
+			device, _, _, err := d.attachOCI(context.Background(), "sandbox-1", image, "")
 			if mode == "success" {
 				require.NoError(t, err)
 				require.Equal(t, "/dev/ublkb42", device)
@@ -325,7 +342,7 @@ func TestOCITokenOnlyCredentialsFailBeforeAttachment(t *testing.T) {
 	d := &Driver{config: firecrackerConfigForTest(t, root)}
 	image := "oci://r.example/templates/base:build"
 	installOCIRegistryConfig(t, registryconfig.Credential{Host: "r.example", IdentityToken: "private-token"})
-	_, _, _, err := d.attachOCI(context.Background(), "sandbox-1", image)
+	_, _, _, err := d.attachOCI(context.Background(), "sandbox-1", image, "")
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	require.ErrorContains(t, err, "identitytoken-only credentials are not supported")
 	require.NoDirExists(t, filepath.Join(root, "oci/inputs"))

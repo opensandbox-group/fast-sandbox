@@ -20,11 +20,12 @@ import (
 // createOptions holds the create-command flags (ADR-007/009/010). The machine
 // sizing is fixed by the snapshot, so create takes no vCPU/memory flags.
 type createOptions struct {
-	prepareOnly  bool
-	templateFile string
-	kernel       string
-	network      string
-	force        bool
+	prepareOnly     bool
+	templateFile    string
+	kernel          string
+	network         string
+	force           bool
+	hotSnapfilesDir string
 }
 
 func newCreateCommand() *cobra.Command {
@@ -42,6 +43,8 @@ func newCreateCommand() *cobra.Command {
 	flags.StringVar(&options.kernel, "kernel", "", "override the resolved vmlinux path")
 	flags.StringVar(&options.network, "network", networkNone, "network provider (only 'none' is supported)")
 	flags.BoolVar(&options.force, "force", false, "downgrade version-compatibility errors to warnings")
+	flags.StringVar(&options.hotSnapfilesDir, "hot-snapfiles-dir", "", "use pre-pinned local raw checkpoint files instead of attaching the snapfiles ublk device")
+	_ = flags.MarkHidden("hot-snapfiles-dir")
 	_ = command.MarkFlagRequired("file")
 	return command
 }
@@ -128,12 +131,14 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	if err := claimSandbox(layout, template.SandboxID); err != nil {
 		return err
 	}
+	hotSnapfiles := strings.TrimSpace(options.hotSnapfilesDir)
 	state := &sandboxState{
 		SandboxID:        template.SandboxID,
 		Phase:            phaseCreating,
 		RootfsRef:        template.rootfsRef(),
 		SnapfilesRef:     template.snapfilesRef(),
 		TemplateMetadata: template.Metadata,
+		HotSnapfiles:     hotSnapfiles != "",
 		Network:          provider.Name(),
 		MountPoint:       layout.mountPoint,
 		APISocket:        layout.apiSocket,
@@ -169,7 +174,11 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	// Step 3: hand the credential to overlaybd's global cred.json before any
 	// device add, or overlaybd's on-demand pulls fail with 401.
 	t0 = time.Now()
-	handoff, err := overlaybdCredentials(dockerAuth, state.RootfsRef, state.SnapfilesRef)
+	credRefs := []string{state.RootfsRef}
+	if hotSnapfiles == "" {
+		credRefs = append(credRefs, state.SnapfilesRef)
+	}
+	handoff, err := overlaybdCredentials(dockerAuth, credRefs...)
 	if err != nil {
 		return err
 	}
@@ -178,7 +187,7 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	}
 	tCred := time.Since(t0)
 
-	// Step 2: resolve both manifests into ordered lower-layer lists.
+	// Step 2: resolve manifests into ordered lower-layer lists.
 	t0 = time.Now()
 	rootfsImage, err := resolveImage(ctx, state.RootfsRef, dockerAuth)
 	if err != nil {
@@ -187,28 +196,41 @@ func runCreate(ctx context.Context, options *createOptions) error { //nolint:goc
 	// The base boundary rides with the rootfs manifest; record it before the
 	// next persist so checkpoint capture finds it in state.json.
 	state.RootfsBaseLayers = rootfsImage.BaseLayers
-	snapfilesImage, err := resolveImage(ctx, state.SnapfilesRef, dockerAuth)
-	if err != nil {
-		return err
+	var snapfilesImage resolvedImage
+	if hotSnapfiles == "" {
+		snapfilesImage, err = resolveImage(ctx, state.SnapfilesRef, dockerAuth)
+		if err != nil {
+			return err
+		}
 	}
 	tResolveImg := time.Since(t0)
 
 	// Step 4/5: the snapfiles device is attached and mounted first (a minor
 	// reordering of the ADR's illustrative sequence) because manifest.json —
 	// which lives on it — supplies the disk size that sets the rootfs hybrid
-	// upper's virtual size. Attaching snapfiles read-only carries no such
-	// dependency, so it is the safe first step.
+	// upper's virtual size. When hotSnapfiles is provided, hard-link the
+	// local raw checkpoint files directly into mnt/ and skip the snapfiles
+	// ublk device and ext4 mount entirely.
 	t0 = time.Now()
-	if err := acquireSharedSnapfiles(ctx, ublkd, layout.home, state, snapfilesImage, dockerAuth); err != nil {
-		return err
+	if hotSnapfiles != "" {
+		if err := attachHotSnapfiles(hotSnapfiles, layout.mountPoint); err != nil {
+			return err
+		}
+	} else {
+		if err := acquireSharedSnapfiles(ctx, ublkd, layout.home, state, snapfilesImage, dockerAuth); err != nil {
+			return err
+		}
+		layout.mountPoint = state.MountPoint
 	}
 	tSnapfiles := time.Since(t0)
-	layout.mountPoint = state.MountPoint
 
 	t0 = time.Now()
 	metadata, err := loadManifest(filepath.Join(layout.mountPoint, inDiskManifest))
 	if err != nil {
 		return err
+	}
+	if hotSnapfiles != "" && metadata.IsRootfsOnly() {
+		return fmt.Errorf("hot snapfiles directory %s carries a RootfsOnly manifest", hotSnapfiles)
 	}
 	resolvedVersion := ""
 	if global.vmmDir != "" {
@@ -392,9 +414,12 @@ func printSandbox(state *sandboxState) {
 	fmt.Printf("  firecracker pid : %d\n", state.Firecracker.PID)
 	fmt.Printf("  api socket      : %s\n", state.APISocket)
 	fmt.Printf("  rootfs device   : %s (dev_id %d)\n", state.Rootfs.DevPath, state.Rootfs.DevID)
-	if state.SharedSnapfiles != "" {
+	switch {
+	case state.HotSnapfiles:
+		fmt.Printf("  snapfiles hot   : %s\n", state.MountPoint)
+	case state.SharedSnapfiles != "":
 		fmt.Printf("  snapfiles shared: %s\n", state.MountPoint)
-	} else {
+	default:
 		fmt.Printf("  snapfiles device: %s (dev_id %d)\n", state.Snapfiles.DevPath, state.Snapfiles.DevID)
 	}
 	fmt.Printf("  vcpu / memory   : %d / %d MiB\n", state.VCPU, state.MemoryMB)
@@ -445,5 +470,40 @@ func configureRootfsBoot(ctx context.Context, client *firecrackerClient, layout 
 		return err
 	}
 	success = true
+	return nil
+}
+
+// attachHotSnapfiles hard-links pre-pinned raw checkpoint files from sourceDir
+// into mountPoint so the sandbox owns its own links for teardown without
+// copying data or attaching a snapfiles ublk device.
+func attachHotSnapfiles(sourceDir, mountPoint string) error {
+	required := []string{inDiskVMState, inDiskMemfile, inDiskManifest}
+	files := make([]string, 0, len(required)+len(rootfsOnlyOptionalEntries))
+	for _, name := range required {
+		info, err := os.Lstat(filepath.Join(sourceDir, name))
+		if err != nil {
+			return fmt.Errorf("stat hot snapfiles %s: %w", name, err)
+		}
+		if !info.Mode().IsRegular() || info.Size() <= 0 {
+			return fmt.Errorf("hot snapfiles %s is not a non-empty regular file", name)
+		}
+		files = append(files, name)
+	}
+	for _, opt := range rootfsOnlyOptionalEntries {
+		info, err := os.Lstat(filepath.Join(sourceDir, opt.name))
+		if err == nil && info.Mode().IsRegular() {
+			files = append(files, opt.name)
+		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat hot snapfiles %s: %w", opt.name, err)
+		}
+	}
+	if err := os.MkdirAll(mountPoint, 0o750); err != nil {
+		return fmt.Errorf("create hot snapfiles mount dir %s: %w", mountPoint, err)
+	}
+	for _, name := range files {
+		if err := os.Link(filepath.Join(sourceDir, name), filepath.Join(mountPoint, name)); err != nil {
+			return fmt.Errorf("link hot snapfiles %s: %w", name, err)
+		}
+	}
 	return nil
 }
