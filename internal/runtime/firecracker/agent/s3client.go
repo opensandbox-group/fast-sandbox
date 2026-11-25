@@ -197,7 +197,7 @@ func (c *s3Client) putOnce(ctx context.Context, urlString, key string, body io.R
 		return err
 	}
 	request.ContentLength = size
-	c.signWrite(request)
+	c.signWrite(request, unsignedPayload)
 	response, err := c.putHTTP.Do(request)
 	if err != nil {
 		return err
@@ -336,8 +336,7 @@ func (c *s3Client) objectURL(key string) (string, error) {
 	return base.String(), nil
 }
 
-// emptyPayloadHash is the SHA-256 of an empty payload, the fixed
-// X-Amz-Content-Sha256 of a bodyless GET.
+// emptyPayloadHash is the SHA-256 of an empty payload.
 var emptyPayloadHash = sha256Hex(nil)
 
 // unsignedPayload is the presigned-URL payload hash. A presigned GET cannot
@@ -464,23 +463,21 @@ func deriveSigningKey(secretKey, date, region string) []byte {
 	return hmacSHA256(key, "aws4_request")
 }
 
-// signWrite applies AWS Signature Version 4 to a request with the write
-// credential. The payload hash is UNSIGNED-PAYLOAD: streamed bodies cannot
-// promise a content hash header without a second full read.
-func (c *s3Client) signWrite(request *http.Request) {
+// signWrite applies AWS Signature Version 4 with the write credential and the supplied payload hash.
+func (c *s3Client) signWrite(request *http.Request, payloadHash string) {
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	date := now.Format("20060102")
 
 	request.Header.Set("X-Amz-Date", amzDate)
-	request.Header.Set("X-Amz-Content-Sha256", unsignedPayload)
+	request.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
 	canonicalURI := request.URL.EscapedPath()
 	if canonicalURI == "" {
 		canonicalURI = "/"
 	}
 	canonicalHeaders := "host:" + request.URL.Host + "\n" +
-		"x-amz-content-sha256:" + unsignedPayload + "\n" +
+		"x-amz-content-sha256:" + payloadHash + "\n" +
 		"x-amz-date:" + amzDate + "\n"
 	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
 	canonicalRequest := strings.Join([]string{
@@ -489,7 +486,7 @@ func (c *s3Client) signWrite(request *http.Request) {
 		request.URL.RawQuery,
 		canonicalHeaders,
 		signedHeaders,
-		unsignedPayload,
+		payloadHash,
 	}, "\n")
 	scope := date + "/" + c.region + "/s3/aws4_request"
 	stringToSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + sha256Hex([]byte(canonicalRequest))

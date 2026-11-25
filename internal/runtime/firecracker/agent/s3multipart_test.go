@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 
 	"github.com/stretchr/testify/require"
 
@@ -36,10 +37,12 @@ func TestPublishCheckpointUsesMultipartBeforeManifest(t *testing.T) {
 		}
 		switch {
 		case r.Method == http.MethodPost && r.URL.Query().Has("uploads"):
+			require.Equal(t, emptyPayloadHash, r.Header.Get("X-Amz-Content-Sha256"))
 			require.Equal(t, "rootfs.ext4", name)
 			require.Zero(t, uploadedBytes)
 			return fakeS3Reply(http.StatusOK, "<InitiateMultipartUploadResult><UploadId>parse+/=this&amp;</UploadId></InitiateMultipartUploadResult>"), nil
 		case r.Method == http.MethodPut && r.URL.Query().Has("partNumber"):
+			require.Equal(t, unsignedPayload, r.Header.Get("X-Amz-Content-Sha256"))
 			require.Equal(t, "rootfs.ext4", name)
 			require.Equal(t, uploadID, r.URL.Query().Get("uploadId"))
 			partNumber := len(parts) + 1
@@ -60,11 +63,15 @@ func TestPublishCheckpointUsesMultipartBeforeManifest(t *testing.T) {
 				XMLName xml.Name        `xml:"CompleteMultipartUpload"`
 				Parts   []multipartPart `xml:"Part"`
 			}
-			require.NoError(t, xml.NewDecoder(r.Body).Decode(&completion))
+			payload, err := io.ReadAll(r.Body)
+			require.NoError(t, err)
+			require.Equal(t, sha256Hex(payload), r.Header.Get("X-Amz-Content-Sha256"))
+			require.NoError(t, xml.Unmarshal(payload, &completion))
 			require.Equal(t, parts, completion.Parts)
 			uploads = append(uploads, name)
 			return fakeS3Reply(http.StatusOK, " \n<CompleteMultipartUploadResult/>"), nil
 		case r.Method == http.MethodPut:
+			require.Equal(t, unsignedPayload, r.Header.Get("X-Amz-Content-Sha256"))
 			require.Empty(t, r.URL.RawQuery)
 			info, err := os.Stat(filepath.Join(dir, name))
 			require.NoError(t, err)
@@ -165,6 +172,7 @@ func TestS3MultipartFailureAbortsWithoutManifest(t *testing.T) {
 					return fakeS3Reply(http.StatusOK, "<Error><Code>InvalidPart</Code></Error>"), nil
 				case r.Method == http.MethodDelete:
 					aborts++
+					require.Equal(t, emptyPayloadHash, r.Header.Get("X-Amz-Content-Sha256"))
 					require.NoError(t, r.Context().Err())
 					require.Equal(t, "123", r.URL.Query().Get("uploadId"))
 					return fakeS3Reply(http.StatusNoContent, ""), nil
@@ -182,6 +190,55 @@ func TestS3MultipartFailureAbortsWithoutManifest(t *testing.T) {
 			require.Empty(t, result.ManifestRef)
 			require.Equal(t, 1, aborts)
 		})
+	}
+}
+
+func TestS3MultipartRetriesStalledPart(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := &s3Client{endpoint: "https://s3.example.com", region: defaultS3Region, bucket: testBucket, writeAccessKey: "writer", writeSecretKey: "secret"}
+		ctx, cancel := context.WithTimeout(t.Context(), 2*multipartPartTimeout)
+		defer cancel()
+		var attempts int
+		client.putHTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.Body != nil {
+				defer r.Body.Close()
+			}
+			switch {
+			case r.Method == http.MethodPost && r.URL.Query().Has("uploads"):
+				return fakeS3Reply(http.StatusOK, "<InitiateMultipartUploadResult><UploadId>123</UploadId></InitiateMultipartUploadResult>"), nil
+			case r.Method == http.MethodPut:
+				attempts++
+				if attempts == 1 {
+					<-r.Context().Done()
+					require.ErrorIs(t, r.Context().Err(), context.DeadlineExceeded)
+					require.NoError(t, ctx.Err())
+					return nil, r.Context().Err()
+				}
+				require.NoError(t, r.Context().Err())
+				response := fakeS3Reply(http.StatusOK, "")
+				response.Header.Set("ETag", `"etag"`)
+				return response, nil
+			case r.Method == http.MethodPost:
+				return fakeS3Reply(http.StatusOK, "<CompleteMultipartUploadResult/>"), nil
+			default:
+				return nil, errors.New("unexpected multipart request")
+			}
+		})}
+		require.NoError(t, client.putMultipart(ctx, "object", strings.NewReader("abc"), 3, 3))
+		require.Equal(t, 2, attempts)
+	})
+}
+
+func TestS3MultipartRejectsNonPositiveSizes(t *testing.T) {
+	client := testS3Client(t, &fakeStore{bucket: testBucket, prefix: testPrefix})
+	client.writeAccessKey, client.writeSecretKey = "writer", "secret"
+	client.putHTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Errorf("unexpected request %s %s", r.Method, r.URL)
+		return fakeS3Reply(http.StatusBadRequest, ""), nil
+	})}
+	for _, sizes := range [][2]int64{{0, 1}, {-1, 1}, {1, 0}, {1, -1}} {
+		err := client.putMultipart(t.Context(), "object", nil, sizes[0], sizes[1])
+		require.ErrorContains(t, err, "requires positive sizes")
 	}
 }
 

@@ -18,7 +18,12 @@ const (
 	defaultPartSize      = 64 << 20
 	maxMultipartParts    = 10_000
 	maxMultipartPartSize = 5 << 30
-	multipartAbortBudget = 15 * time.Second
+	multipartInitTimeout = 30 * time.Second
+	multipartPartTimeout = 3 * time.Minute
+	// S3 can take several minutes to assemble the object after receiving the completion XML.
+	multipartCompleteTimeout = 5 * time.Minute
+	multipartAbortTimeout    = 5 * time.Second
+	multipartAbortBudget     = 15 * time.Second
 )
 
 type multipartPart struct {
@@ -33,6 +38,9 @@ func multipartPartSize(size int64) int64 {
 func (c *s3Client) putMultipart(ctx context.Context, storeKey string, file io.ReaderAt, size, partSize int64) (err error) {
 	if !c.writable() {
 		return ErrNotWritable
+	}
+	if size <= 0 || partSize <= 0 {
+		return fmt.Errorf("S3 multipart upload requires positive sizes: object size %d, part size %d", size, partSize)
 	}
 	if partSize > maxMultipartPartSize {
 		return fmt.Errorf("object exceeds S3 multipart capacity: %d bytes", size)
@@ -56,7 +64,7 @@ func (c *s3Client) putMultipart(ctx context.Context, storeKey string, file io.Re
 			XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
 			UploadID string   `xml:"UploadId"`
 		}
-		_, err := c.multipartRequest(ctx, http.MethodPost, *target, [][2]string{{"uploads", ""}}, nil, 0, &result)
+		_, err := c.multipartRequest(ctx, http.MethodPost, *target, [][2]string{{"uploads", ""}}, nil, 0, emptyPayloadHash, &result)
 		if err != nil {
 			return err
 		}
@@ -78,7 +86,7 @@ func (c *s3Client) putMultipart(ctx context.Context, storeKey string, file io.Re
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), multipartAbortBudget)
 		defer cancel()
 		abortErr := c.retryMultipart(cleanupCtx, func() error {
-			_, abortErr := c.multipartRequest(cleanupCtx, http.MethodDelete, *target, uploadQuery, nil, 0, nil)
+			_, abortErr := c.multipartRequest(cleanupCtx, http.MethodDelete, *target, uploadQuery, nil, 0, emptyPayloadHash, nil)
 			var status *httpError
 			if errors.As(abortErr, &status) && status.StatusCode == http.StatusNotFound {
 				return nil
@@ -98,7 +106,7 @@ func (c *s3Client) putMultipart(ctx context.Context, storeKey string, file io.Re
 		var etag string
 		err = c.retryMultipart(ctx, func() error {
 			part := io.NewSectionReader(file, offset, length)
-			header, err := c.multipartRequest(ctx, http.MethodPut, *target, query, part, length, nil)
+			header, err := c.multipartRequest(ctx, http.MethodPut, *target, query, part, length, unsignedPayload, nil)
 			if err != nil {
 				return err
 			}
@@ -122,13 +130,14 @@ func (c *s3Client) putMultipart(ctx context.Context, storeKey string, file io.Re
 	if err != nil {
 		return fmt.Errorf("encode multipart completion for %s: %w", key, err)
 	}
+	payloadHash := sha256Hex(request)
 	err = c.retryMultipart(ctx, func() error {
 		var result struct {
 			XMLName xml.Name
 			Code    string
 			Message string
 		}
-		_, err := c.multipartRequest(ctx, http.MethodPost, *target, uploadQuery, bytes.NewReader(request), int64(len(request)), &result)
+		_, err := c.multipartRequest(ctx, http.MethodPost, *target, uploadQuery, bytes.NewReader(request), int64(len(request)), payloadHash, &result)
 		if err != nil {
 			return err
 		}
@@ -153,7 +162,19 @@ func (c *s3Client) putMultipart(ctx context.Context, storeKey string, file io.Re
 	return nil
 }
 
-func (c *s3Client) multipartRequest(ctx context.Context, method string, target url.URL, query [][2]string, body io.Reader, size int64, result any) (http.Header, error) {
+func (c *s3Client) multipartRequest(ctx context.Context, method string, target url.URL, query [][2]string, body io.Reader, size int64, payloadHash string, result any) (http.Header, error) {
+	timeout := multipartInitTimeout
+	switch {
+	case method == http.MethodPut:
+		timeout = multipartPartTimeout
+	case method == http.MethodPost && body != nil:
+		timeout = multipartCompleteTimeout
+	case method == http.MethodDelete:
+		timeout = multipartAbortTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	target.RawQuery = canonicalQueryString(query)
 	request, err := http.NewRequestWithContext(ctx, method, target.String(), body)
 	if err != nil {
@@ -163,7 +184,7 @@ func (c *s3Client) multipartRequest(ctx context.Context, method string, target u
 	if method == http.MethodPost && body != nil {
 		request.Header.Set("Content-Type", "application/xml")
 	}
-	c.signWrite(request)
+	c.signWrite(request, payloadHash)
 	response, err := c.putHTTP.Do(request)
 	if err != nil {
 		return nil, err
