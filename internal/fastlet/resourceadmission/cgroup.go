@@ -61,6 +61,10 @@ func (r *CgroupReader) Read() (Sample, error) {
 	if err != nil {
 		return Sample{}, err
 	}
+	current, err = withoutReclaimableFileCache(current, filepath.Join(r.cgroupPath, "memory.stat"))
+	if err != nil {
+		return Sample{}, err
+	}
 	limitData, err := os.ReadFile(filepath.Join(r.cgroupPath, "memory.max"))
 	if err != nil {
 		return Sample{}, fmt.Errorf("read memory.max: %w", err)
@@ -95,6 +99,32 @@ func (r *CgroupReader) Read() (Sample, error) {
 		MemoryCurrentBytes: current, MemoryLimitBytes: limit, OOMKills: events["oom_kill"],
 		MemoryPSIAvg10: psi, HostAvailableRatio: nodeAvailable, HostMemoryObserved: nodeMemoryObserved,
 	}, nil
+}
+
+// withoutReclaimableFileCache removes the page cache the kernel can drop
+// without writeback from a cgroup's memory.current: file pages that are not
+// mapped (VM memory restored from a snapshot is mapped and stays counted) and
+// not tmpfs (the snapshot spill area stays counted). The Fastlet reads and
+// writes multi-GiB checkpoint files, and that cache alone used to push the
+// usage ratio over the high watermark and block admission on an idle Fastlet.
+// A cgroup without memory.stat keeps the raw value.
+func withoutReclaimableFileCache(current uint64, statPath string) (uint64, error) {
+	stat, err := readKeyValues(statPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return current, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	pinned := stat["file_mapped"] + stat["shmem"] + stat["file_dirty"] + stat["file_writeback"]
+	if stat["file"] <= pinned {
+		return current, nil
+	}
+	reclaimable := stat["file"] - pinned
+	if reclaimable >= current {
+		return 0, nil
+	}
+	return current - reclaimable, nil
 }
 
 func readUintFile(path string) (uint64, error) {

@@ -13,7 +13,7 @@ The builder logs the detected guest kernel support and records it in the manifes
 
 ## Feedback to Fastlet and FastPath
 
-FPR releases backing pages from the Firecracker process. For ResourceAware direct Firecracker, the resulting change is visible in the Pod's shared `fast-sandbox` cgroup. Fastlet's memory observer reads cgroup usage, PSI, OOM events, and host available memory. It uses watermarks and recovery hysteresis to update resource admission state. Fastlet reports that state and its revision to FastPath through heartbeats and Create responses.
+FPR releases backing pages from the Firecracker process. For ResourceAware direct Firecracker, the resulting change is visible in the Pod's shared `fast-sandbox` cgroup. Fastlet's memory observer reads cgroup usage, PSI, OOM events, and host available memory. Cgroup usage excludes clean, unmapped page cache that the kernel can drop without writeback, so cache left by checkpoint and restore I/O does not block admission. It uses watermarks and recovery hysteresis to update resource admission state. Fastlet reports that state and its revision to FastPath through heartbeats and Create responses.
 
 This feature adds no separate pressure policy, admission gate, or Fastlet-to-FastPath protocol. Configure ResourceAware Pools and the existing memory observer as described in [Resource-aware overcommit tuning](resource-aware-overcommit-tuning.md). LegacySlot Pools retain their existing admission behavior. Guest free-memory statistics are not admission headroom and do not change the static commitment ledger.
 
