@@ -339,6 +339,12 @@ func (m *SandboxManager) handleRuntimeCreateFailure(ctx context.Context, input *
 	} else if errors.Is(runtimeErr, ErrIncompatibleArtifact) {
 		code = fastletapi.ErrorProfileMismatch
 		retryable = false
+	} else if errors.Is(runtimeErr, ErrShapeMismatch) {
+		// The request itself is below the snapshot shape: every candidate
+		// would reject it identically, so it is neither retryable nor a
+		// candidate rejection (no Top-K walk, no per-Fastlet penalty).
+		code = fastletapi.ErrorShapeMismatch
+		retryable = false
 	}
 	message := runtimeErr.Error()
 	if cleanupErr != nil {

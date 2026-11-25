@@ -16,6 +16,7 @@ var (
 	ErrRuntimeNotInitialized = runtimecontract.ErrRuntimeNotInitialized
 	ErrInfraUnavailable      = runtimecontract.ErrInfraUnavailable
 	ErrIncompatibleArtifact  = runtimecontract.ErrIncompatibleArtifact
+	ErrShapeMismatch         = runtimecontract.ErrShapeMismatch
 )
 
 var validateExistingRuntimeProfile = runtimecontract.ValidateProfile

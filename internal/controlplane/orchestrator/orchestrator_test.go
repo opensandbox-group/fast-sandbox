@@ -667,6 +667,21 @@ func TestDeclarativeLocalReservationConflictAllowsSafeReassignment(t *testing.T)
 	require.False(t, fastletCalled, "the conflict is proven before any Fastlet side effect")
 }
 
+// TestShapeMismatchIsNotACandidateRejection: a request below the snapshot
+// machine shape is rejected identically by every Fastlet, so FastPath must
+// not walk the remaining candidates (and penalize each) for it, unlike a
+// node-specific ProfileMismatch.
+func TestShapeMismatchIsNotACandidateRejection(t *testing.T) {
+	rejection := func(code fastletapi.FastletErrorCode) error {
+		return &fastletapi.CreateCallError{
+			Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects,
+			Failure:     &fastletapi.FastletError{Code: code, Message: "rejected"},
+		}
+	}
+	require.False(t, IsCandidateRejection(rejection(fastletapi.ErrorShapeMismatch)))
+	require.True(t, IsCandidateRejection(rejection(fastletapi.ErrorProfileMismatch)))
+}
+
 func readyFastletObservation(sandboxID string, generation int64) *fastletapi.SandboxStatus {
 	return &fastletapi.SandboxStatus{
 		SandboxID:          sandboxID,

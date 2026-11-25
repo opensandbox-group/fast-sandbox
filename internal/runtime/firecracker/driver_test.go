@@ -547,6 +547,7 @@ func TestEnsureSandboxRestoreMachineConfigFromManifest(t *testing.T) {
 	small.Limits.Memory = "256Mi"
 	_, err = fixture.driver.EnsureSandbox(context.Background(), ensureInput(&small))
 	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.ErrorIs(t, err, ErrShapeMismatch)
 	require.Contains(t, err.Error(), "below the template snapshot memory")
 }
 
@@ -1419,12 +1420,14 @@ func TestValidateRestoreMachineConfigUsesManifest(t *testing.T) {
 	// A request memory below the snapshot memory is rejected.
 	err = validateRestoreMachineConfig(fastletapi.SandboxRuntimeLimits{Memory: "256Mi"}, config, stateRoot, image)
 	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.ErrorIs(t, err, ErrShapeMismatch, "a shape rejection is distinct from other invalid configs")
 	require.Contains(t, err.Error(), "below the template snapshot memory")
 
 	// A request CPU limit that cannot contain the immutable snapshot vCPU
 	// count is rejected before the VMM starts.
 	err = validateRestoreMachineConfig(fastletapi.SandboxRuntimeLimits{CPU: "500m", Memory: "1Gi"}, config, stateRoot, image)
 	require.ErrorIs(t, err, ErrInvalidConfig)
+	require.ErrorIs(t, err, ErrShapeMismatch)
 	require.Contains(t, err.Error(), "below the template snapshot vCPU count")
 }
 
@@ -1435,6 +1438,7 @@ func TestValidateRestoreMachineConfigFallsBackWithoutManifest(t *testing.T) {
 
 	require.NoError(t, validateRestoreMachineConfig(fastletapi.SandboxRuntimeLimits{CPU: "2", Memory: "1Gi"}, config, stateRoot, image))
 	require.ErrorIs(t, validateRestoreMachineConfig(fastletapi.SandboxRuntimeLimits{CPU: "not-a-quantity"}, config, stateRoot, image), ErrInvalidConfig)
+	require.NotErrorIs(t, validateRestoreMachineConfig(fastletapi.SandboxRuntimeLimits{CPU: "not-a-quantity"}, config, stateRoot, image), ErrShapeMismatch)
 }
 
 // TestCheckRestoreCompatibility: the driver-side admission reads the cached

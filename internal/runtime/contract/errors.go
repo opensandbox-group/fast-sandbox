@@ -15,6 +15,12 @@ var (
 	ErrIncompatibleArtifact   = errors.New("snapshot incompatible with this node")
 	ErrSandboxProfileMismatch = errors.New("sandbox profile mismatch")
 	ErrInvalidConfig          = errors.New("invalid sandbox config")
+	// ErrShapeMismatch reports a request whose CPU or memory limit is below
+	// the immutable machine shape of the snapshot it restores. Every node
+	// restores the same snapshot shape, so the rejection is a property of
+	// the request, not of the node: moving to another candidate cannot help.
+	// Errors carrying it also wrap ErrInvalidConfig.
+	ErrShapeMismatch = errors.New("sandbox shape below the snapshot machine")
 	// ErrImageNotReady reports that a rootfs image has not been converted
 	// and cached yet. It is shared between the driver's local cache and the
 	// firecracker runtime-agent pull layer so both can fail a create with

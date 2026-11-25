@@ -835,6 +835,21 @@ func TestEnsureIncompatibleArtifactMapsToProfileMismatch(t *testing.T) {
 	require.Equal(t, fastletapi.CreateDispositionRejectedBeforeSideEffects, response.Disposition)
 }
 
+// TestEnsureShapeMismatchIsNotACandidateRejection: a request below the
+// snapshot machine shape maps to the non-retryable ShapeMismatch code, which
+// FastPath does not treat as a candidate rejection.
+func TestEnsureShapeMismatchIsNotACandidateRejection(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	runtime.ensureError = fmt.Errorf("%w: %w: requested memory 512 MiB is below the template snapshot memory 1024 MiB", runtimecontract.ErrShapeMismatch, runtimecontract.ErrInvalidConfig)
+	manager := newAdmissionManager(t, runtime, 1)
+	response, err := manager.CreateSandbox(context.Background(), ensureRequest("sandbox-a", 1, 1))
+	requireFastletCode(t, err, fastletapi.ErrorShapeMismatch)
+	var failure *fastletapi.FastletError
+	require.True(t, errors.As(err, &failure))
+	require.False(t, failure.Retryable)
+	require.Equal(t, fastletapi.CreateDispositionRejectedBeforeSideEffects, response.Disposition)
+}
+
 func TestEnsureFailureReleasesCapacity(t *testing.T) {
 	runtime := newAdmissionRuntime()
 	runtime.ensureError = errors.New("create failed")

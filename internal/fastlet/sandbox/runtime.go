@@ -36,6 +36,7 @@ var (
 	ErrIncompatibleArtifact   = runtimecontract.ErrIncompatibleArtifact
 	ErrSandboxProfileMismatch = runtimecontract.ErrSandboxProfileMismatch
 	ErrInvalidConfig          = runtimecontract.ErrInvalidConfig
+	ErrShapeMismatch          = runtimecontract.ErrShapeMismatch
 	ErrImageNotReady          = runtimecontract.ErrImageNotReady
 	ErrSnapshotUnsupported    = runtimecontract.ErrSnapshotUnsupported
 	ErrInsufficientStorage    = runtimecontract.ErrInsufficientStorage

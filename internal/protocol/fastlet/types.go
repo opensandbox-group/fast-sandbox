@@ -301,6 +301,11 @@ const (
 	ErrorNotFound           FastletErrorCode = "NotFound"
 	ErrorGenerationFenced   FastletErrorCode = "GenerationFenced"
 	ErrorProfileMismatch    FastletErrorCode = "ProfileMismatch"
+	// ErrorShapeMismatch reports a request whose CPU/memory limit is below
+	// the machine shape of the snapshot it restores. Not retryable and not
+	// a candidate rejection: every Fastlet restores the same snapshot shape,
+	// so FastPath must not advance to other candidates for it.
+	ErrorShapeMismatch FastletErrorCode = "ShapeMismatch"
 	// ErrorSnapshotInProgress reports the deterministic non-reentrancy
 	// rejection: another non-terminal snapshot holds the target Sandbox.
 	ErrorSnapshotInProgress FastletErrorCode = "SnapshotInProgress"

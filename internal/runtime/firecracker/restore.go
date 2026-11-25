@@ -129,7 +129,8 @@ func requireStaticGuestNetwork(network *artifacts.VMGuestNetwork) error {
 // was created with), so the manifest machine is authoritative AND the
 // machine-config API must not be called before snapshot/load (v1.16
 // rejects it). The request cpu/mem only validate: a request memory below
-// the snapshot memory is rejected with an explicit error. When the cached
+// the snapshot memory is rejected with an explicit error (ErrShapeMismatch,
+// which also wraps ErrInvalidConfig). When the cached
 // manifest carries no machine tuple (hand-seeded local cache), the request
 // profile is validated as the fallback. An explicit CPU limit must also be
 // large enough for the immutable snapshot vCPU tuple.
@@ -156,7 +157,7 @@ func validateRestoreMachine(spec fastletapi.SandboxRuntimeLimits, config runtime
 		}
 		requestedVCPUs := int(math.Ceil(float64(quantity.MilliValue()) / 1000.0))
 		if requestedVCPUs < machine.VCPUCount {
-			return fmt.Errorf("%w: requested CPU %s permits %d vCPU(s), below the template snapshot vCPU count %d", ErrInvalidConfig, spec.CPU, requestedVCPUs, machine.VCPUCount)
+			return fmt.Errorf("%w: %w: requested CPU %s permits %d vCPU(s), below the template snapshot vCPU count %d", ErrShapeMismatch, ErrInvalidConfig, spec.CPU, requestedVCPUs, machine.VCPUCount)
 		}
 	}
 	snapshotMiB := machine.MemoryMiB
@@ -166,7 +167,7 @@ func validateRestoreMachine(spec fastletapi.SandboxRuntimeLimits, config runtime
 			return err
 		}
 		if int64(requestMiB) < snapshotMiB {
-			return fmt.Errorf("%w: requested memory %d MiB is below the template snapshot memory %d MiB", ErrInvalidConfig, requestMiB, snapshotMiB)
+			return fmt.Errorf("%w: %w: requested memory %d MiB is below the template snapshot memory %d MiB", ErrShapeMismatch, ErrInvalidConfig, requestMiB, snapshotMiB)
 		}
 	}
 	return nil
