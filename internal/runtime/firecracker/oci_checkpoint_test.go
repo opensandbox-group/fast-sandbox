@@ -16,46 +16,6 @@ import (
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
 
-func TestOCISnapshotPackModeDuringRollout(t *testing.T) {
-	for _, tt := range []struct {
-		name, gate string
-		rootfsOnly bool
-		mode       fastletapi.SnapshotMode
-		flags      []string
-	}{
-		{"unset", "", true, fastletapi.SnapshotModeRootfsOnly, []string{"--rootfs-only"}},
-		{"disabled", "false", true, fastletapi.SnapshotModeRootfsOnly, []string{"--rootfs-only"}},
-		{"enabled", "true", true, fastletapi.SnapshotModeRootfsOnly, []string{"--rootfs-only", "--single-image"}},
-		{"full", "true", false, fastletapi.SnapshotModeFull, nil},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv(ociRootfsSingleImageEnv, tt.gate)
-			mode, flags, err := ociSnapshotPackMode(tt.rootfsOnly)
-			require.NoError(t, err)
-			require.Equal(t, tt.mode, mode)
-			require.Equal(t, tt.flags, flags)
-		})
-	}
-	t.Setenv(ociRootfsSingleImageEnv, "typo")
-	_, _, err := ociSnapshotPackMode(true)
-	require.ErrorIs(t, err, ErrInvalidConfig)
-}
-
-func TestInvalidOCIRootfsSingleImageFailsBeforeDump(t *testing.T) {
-	t.Setenv("FAST_SANDBOX_OCI_ENABLED", "true")
-	t.Setenv(ociRootfsSingleImageEnv, "typo")
-	fixture := newSnapshotDriverFixture(t)
-	fixture.sandboxSpec.Desired.Image = "oci://r.example/ns/template:base"
-	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
-	_, err := fixture.driver.CreateSnapshot(t.Context(), &runtimecontract.SnapshotInput{
-		SandboxID: sandboxID, SnapshotID: "live-snapshot", Kind: fastletapi.SnapshotKindTemplate,
-	})
-	require.ErrorIs(t, err, ErrInvalidConfig)
-	require.ErrorContains(t, err, ociRootfsSingleImageEnv)
-	require.Empty(t, fixture.server.snapshotDumps)
-	require.True(t, fixture.server.running)
-}
-
 func TestCheckpointDestination(t *testing.T) {
 	dest, err := checkpointDestination("r.example/opensandbox-snapshot/checkpoints", "abc")
 	require.NoError(t, err)

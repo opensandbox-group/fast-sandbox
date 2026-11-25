@@ -23,36 +23,7 @@ import (
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 )
 
-const (
-	ociSnapshotRepositoryEnv = "FAST_SANDBOX_OCI_SNAPSHOT_REPOSITORY"
-	ociRootfsSingleImageEnv  = "FAST_SANDBOX_OCI_ROOTFS_SINGLE_IMAGE"
-)
-
-func ociRootfsSingleImageEnabled() (bool, error) {
-	switch strings.TrimSpace(os.Getenv(ociRootfsSingleImageEnv)) {
-	case "", ociDisabled:
-		return false, nil
-	case ociEnabled:
-		return true, nil
-	default:
-		return false, fmt.Errorf("%w: %s must be true or false", ErrInvalidConfig, ociRootfsSingleImageEnv)
-	}
-}
-
-func ociSnapshotPackMode(rootfsOnly bool) (fastletapi.SnapshotMode, []string, error) {
-	if !rootfsOnly {
-		return fastletapi.SnapshotModeFull, nil, nil
-	}
-	flags := []string{"--rootfs-only"}
-	singleImage, err := ociRootfsSingleImageEnabled()
-	if err != nil {
-		return "", nil, err
-	}
-	if singleImage {
-		flags = append(flags, "--single-image")
-	}
-	return fastletapi.SnapshotModeRootfsOnly, flags, nil
-}
+const ociSnapshotRepositoryEnv = "FAST_SANDBOX_OCI_SNAPSHOT_REPOSITORY"
 
 func checkpointDestination(repository, id string) (string, error) {
 	repository = strings.TrimPrefix(strings.TrimSpace(repository), ocitemplate.Prefix)
@@ -231,11 +202,11 @@ func (d *Driver) publishPreparedOCISnapshot(ctx context.Context, plan dumpPlan, 
 	}
 	// Report the artifact class from the manifest that was actually packed
 	// and published: the produced mode, not the caller's request.
-	producedMode, flags, err := ociSnapshotPackMode(document.IsRootfsOnly())
-	if err != nil {
-		return nil, err
+	producedMode := fastletapi.SnapshotModeFull
+	if document.IsRootfsOnly() {
+		producedMode = fastletapi.SnapshotModeRootfsOnly
+		args = append(args, "--rootfs-only")
 	}
-	args = append(args, flags...)
 	if output, err := exec.CommandContext(ctx, "fsb-vm", args...).CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("package OCI snapshot: %w: %s", err, output)
 	}
@@ -295,9 +266,6 @@ func prepareOCISnapshot(plan dumpPlan) (bool, error) {
 		return false, nil
 	}
 	if err := validateOCISupport(source); err != nil {
-		return false, err
-	}
-	if _, err := ociRootfsSingleImageEnabled(); err != nil {
 		return false, err
 	}
 	_, err = checkpointDestinationForSource(source, plan.snapshotID)

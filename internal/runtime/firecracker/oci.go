@@ -24,7 +24,6 @@ import (
 )
 
 const ociEnabled = "true"
-const ociDisabled = "false"
 
 func validateOCISupport(image string) error {
 	if !strings.HasPrefix(image, ocitemplate.Prefix) {
@@ -32,13 +31,13 @@ func validateOCISupport(image string) error {
 	}
 	switch os.Getenv("FAST_SANDBOX_OCI_ENABLED") {
 	case ociEnabled:
-	case "", ociDisabled:
+	case "", "false":
 		return fmt.Errorf("%w: OCI templates and checkpoints require FAST_SANDBOX_OCI_ENABLED=true", ErrInvalidConfig)
 	default:
 		return fmt.Errorf("%w: FAST_SANDBOX_OCI_ENABLED must be true or false", ErrInvalidConfig)
 	}
 	switch strings.TrimSpace(os.Getenv("FAST_SANDBOX_OCI_PLAIN_HTTP")) {
-	case "", ociDisabled, "0", ociEnabled, "1":
+	case "", "false", "0", ociEnabled, "1":
 	default:
 		return fmt.Errorf("%w: FAST_SANDBOX_OCI_PLAIN_HTTP must be true or false", ErrInvalidConfig)
 	}

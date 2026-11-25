@@ -110,7 +110,7 @@ func TestRootfsPackPublishIntegration(t *testing.T) {
 	raw, err = json.Marshal(m)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(bundle, "manifest.json"), raw, 0600))
-	require.NoError(t, packCapturedBundle(t.Context(), bundle, "rootfs:test", 24, 16, packOptions{rootfsOnly: true, singleImage: true}))
+	require.NoError(t, packCapturedBundle(t.Context(), bundle, "rootfs:test", 24, 16, true))
 	auth := filepath.Join(root, "auth.json")
 	require.NoError(t, os.WriteFile(auth, []byte(`{"auths":{}}`), 0600))
 	destination := strings.TrimPrefix(server.URL, "http://") + "/rootfs/published:test"
@@ -158,53 +158,6 @@ func TestRootfsPackPublishIntegration(t *testing.T) {
 	t.Log("real upper packed without a snapfiles device; rootfs layers and config metadata published and verified")
 	if kernel != "" {
 		testRootfsMetadataColdBoot(t, root, kernel, named.Template.Repo, named.Template.TemplateID)
-		if old := os.Getenv("FSB_TEST_PACK_LEGACY_CLI"); old != "" {
-			testDefaultPackWithLegacyReader(t, root, bundle, kernel, named.Template.Repo, old)
-		}
-	}
-}
-
-func testDefaultPackWithLegacyReader(t *testing.T, root, bundle, kernel, repo, cli string) {
-	t.Helper()
-	pack := newPackCommand()
-	pack.SetArgs([]string{"--bundle-dir", bundle, "--output", "rootfs:legacy", "--rootfs-only"})
-	require.NoError(t, pack.ExecuteContext(t.Context()))
-	staged := filepath.Join(global.buildOutputDir, "rootfs_legacy")
-	raw, err := os.ReadFile(filepath.Join(staged, "manifest", "index.json"))
-	require.NoError(t, err)
-	var index layoutIndex
-	require.NoError(t, json.Unmarshal(raw, &index))
-	require.Len(t, index.Images, 2)
-	raw, err = os.ReadFile(filepath.Join(bundle, inDiskManifest))
-	require.NoError(t, err)
-	ref, _, err := ocitemplate.Push(t.Context(), staged, repo+":legacy", raw, nil, ocitemplate.WithPlainHTTP(true))
-	require.NoError(t, err)
-	current := templateFile{Template: templateRef{Repo: repo, TemplateID: "legacy"}}
-	require.NoError(t, resolveTemplate(t.Context(), &current, dockerConfig{}))
-	require.Nil(t, current.RootfsMetadata)
-	require.Equal(t, ref, ocitemplate.Prefix+current.snapfilesRef())
-
-	const id = "legacy-reader"
-	stateDir, runtimeDir := filepath.Join(root, "state"), filepath.Join(root, "run")
-	input := filepath.Join(root, "legacy-reader.json")
-	raw, err = json.Marshal(templateFile{SandboxID: id, Template: templateRef{Reference: ref}})
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(input, raw, 0600))
-	flags := []string{"--plain-http", "--ublkd-socket", global.ublkdSocket, "--cred-file", global.credFile,
-		"--state-dir", stateDir, "--runtime-dir", runtimeDir, "--firecracker", global.firecrackerBin,
-		"--overlaybd-create", global.overlaybdCreate}
-	t.Cleanup(func() {
-		if pathExists(filepath.Join(stateDir, id)) {
-			output, err := exec.Command(cli, append(flags, "delete", id)...).CombinedOutput()
-			require.NoError(t, err, string(output))
-		}
-	})
-	output, err := exec.CommandContext(t.Context(), cli, append(flags, "create", "-f", input, "--kernel", kernel)...).CombinedOutput()
-	require.NoError(t, err, string(output))
-	t.Logf("old CLI accepted and started the default two-image RootfsOnly artifact: %s", output)
-	serial := filepath.Join(runtimeDir, id, serialLogName)
-	if marker := os.Getenv("FSB_TEST_PACK_BOOT_MARKER"); marker != "" {
-		require.NoError(t, waitSerialFor(serial, marker, 25*time.Second))
 	}
 }
 

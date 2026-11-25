@@ -31,7 +31,6 @@ type buildOptions struct {
 	guestControlVersion string
 	kernelSHA256        string
 	freePageReporting   bool
-	rootfsOnly          bool
 	snapfilesProgress   func(string) error
 	snapshotManifest    []byte
 	snapshotExtras      map[string]string
@@ -265,10 +264,6 @@ func bytesToGiBCeil(size int64) (int, error) {
 // vmstate + 256 MiB of ext4/metadata headroom, rounded up to whole GiB with
 // a 2 GiB floor (a 1 GiB memory file alone needs more than 1 GiB of disk).
 func snapfilesSizeGiB(options *buildOptions, vmstatePath, memfilePath string) (int, error) {
-	// Size the metadata disk independently of Guest memory; do not access RAM files.
-	if options.rootfsOnly {
-		return 1, nil
-	}
 	if options.snapfilesSizeMB > 0 {
 		return gibCeil(options.snapfilesSizeMB), nil
 	}
@@ -773,13 +768,11 @@ func captureSnapfiles(ctx context.Context, ublkd *ublkdClient, options *buildOpt
 		return err
 	}
 	undo.push("mount "+snapMount, func() error { return unmount(snapMount) })
-	if !options.rootfsOnly {
-		if err := copyFile(vmstatePath, filepath.Join(snapMount, inDiskVMState), 0o640); err != nil {
-			return err
-		}
-		if err := copyFile(memfilePath, filepath.Join(snapMount, inDiskMemfile), 0o640); err != nil {
-			return err
-		}
+	if err := copyFile(vmstatePath, filepath.Join(snapMount, inDiskVMState), 0o640); err != nil {
+		return err
+	}
+	if err := copyFile(memfilePath, filepath.Join(snapMount, inDiskMemfile), 0o640); err != nil {
+		return err
 	}
 	metadataPayload := options.snapshotManifest
 	if len(metadataPayload) == 0 {
