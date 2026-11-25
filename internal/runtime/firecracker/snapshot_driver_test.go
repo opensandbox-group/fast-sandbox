@@ -393,6 +393,25 @@ func TestCreateCheckpointRejectsTemplateName(t *testing.T) {
 	require.ErrorContains(t, err, "templateName must be empty")
 }
 
+func TestSnapshotOfMMIOInstanceAfterTagMovesToPCI(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+
+	// The VM is already running on MMIO when its image tag starts pointing at a PCI template.
+	replacement := newMetadataTestVMManifest()
+	replacement.Machine.PCIEnabled = true
+	raw, err := artifacts.MarshalVMManifest(replacement)
+	require.NoError(t, err)
+	path := cachedManifestPath(fixture.stateRoot, fixture.sandboxSpec.Desired.Image)
+	require.NoError(t, os.WriteFile(path, raw, 0o640))
+
+	_, err = fixture.driver.CreateSnapshot(t.Context(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "snap-mmio", Kind: fastletapi.SnapshotKindTemplate, TemplateName: "from-mmio",
+	})
+	require.NoError(t, err)
+	require.NotContains(t, agent.manifest["machine"].(map[string]any), "pciEnabled")
+}
+
 func TestAssembleSnapshotManifestPrefersCheckpointLineage(t *testing.T) {
 	fixture := newSnapshotDriverFixture(t)
 	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)

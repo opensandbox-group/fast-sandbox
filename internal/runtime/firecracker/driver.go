@@ -856,7 +856,9 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		provStarted := time.Now()
 		state.BootKernelSHA256 = bootKernelSHA256
 		if config.Desired.RootfsBootDigest != "" {
-			state.BootMachine = &restoreMetadata.Machine
+			bootMachine := restoreMetadata.Machine
+			bootMachine.PCIEnabled = state.BootPCIEnabled
+			state.BootMachine = &bootMachine
 		}
 		provenance := d.bootCompatibility(selectedVMM)
 		state.BootCompatibility = &provenance
