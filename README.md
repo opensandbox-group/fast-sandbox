@@ -2,7 +2,7 @@
 
 **A high-performance Sandbox runtime on Kubernetes, powered by Firecracker microVMs.**
 
-[中文](README_ZH.md) · [Use with OpenSandbox](#use-with-opensandbox-recommended) · [Standalone deployment](#standalone-deployment) · [Documentation](docs/README.md) · [Architecture](docs/concepts/architecture.md)
+[中文](README_ZH.md) · [Architecture & scope](#architecture-and-scope-boundary) · [Use with OpenSandbox](#use-with-opensandbox-recommended) · [Local runtime verification](#local-runtime-verification) · [Documentation](docs/README.md) · [Architecture](docs/concepts/architecture.md)
 
 Fast Sandbox brings Firecracker microVM isolation and snapshot-based startup to
 Kubernetes. It is built for workloads that frequently create and recycle
@@ -14,10 +14,10 @@ each host multiple Sandboxes, while the Firecracker runtime restores each
 instance from a prepared snapshot. Creating a Sandbox reuses that capacity
 without scheduling and starting a new Kubernetes Pod for every request.
 
-We recommend using Fast Sandbox through [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox),
-which already integrates this runtime with its API, SDKs, ingress, and command
-execution. You can also deploy Fast Sandbox independently as the Sandbox
-scheduling and runtime layer for your own platform.
+Fast Sandbox is built as the Kubernetes scheduling and runtime backend for
+[OpenSandbox](https://github.com/opensandbox-group/OpenSandbox), which owns the
+application-facing API, SDKs, template metadata, request validation,
+authenticated ingress, and command execution.
 
 ![Fast Sandbox system overview](docs/assets/system-overview.svg)
 
@@ -44,6 +44,32 @@ scheduling and runtime layer for your own platform.
   and snapshots, with declarative lifecycle management and observable status.
 
 [How it works](docs/concepts/architecture.md)
+
+## Architecture and scope boundary
+
+Fast Sandbox is an internal execution and scheduling layer behind an upstream
+control plane — primarily [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) —
+rather than a standalone end-user Sandbox product. To keep the critical creation
+path fast and predictable, the project enforces strict behavioral boundaries:
+
+- **No standalone product surface.** Fast Sandbox does not expand its Fast-Path
+  gRPC API, Fastlet wire protocol, or controller state machines to serve
+  standalone end-user workflows or product-level conveniences.
+- **Scheduling-focused Fast-Path.** Fast-Path and Reconcilers focus strictly on
+  Pool capacity discovery, Top-K candidate placement, idempotent intent
+  persistence, runtime lifecycle convergence, and endpoint resolution.
+- **Metadata and validation belong upstream.** Template and snapshot catalogs,
+  tenant metadata storage, and request-vs-template validation (for example,
+  ensuring requested CPU or memory limits satisfy a snapshot's baked machine
+  shape) are delegated to the upstream control plane before a request reaches
+  Fast-Path.
+- **Minimal Fastlet admission.** Fastlet owns node-local atomic capacity
+  admission, microVM/container execution, private networking, and readiness. It
+  enforces host and runtime safety invariants without duplicating upstream
+  catalog lookups or business validation.
+- **Lifecycle separated from guest protocols.** Command execution, file
+  operations, and PTYs belong to guest components such as OpenSandbox Execd,
+  never to the control plane.
 
 ## Use with OpenSandbox (recommended)
 
@@ -119,15 +145,17 @@ and [Python SDK](https://github.com/opensandbox-group/OpenSandbox/tree/main/sdks
 Clean up the development stack with
 `./scripts/fast-sandbox-env/integration-env.sh down` from the OpenSandbox checkout.
 
-## Standalone deployment
+## Local runtime verification
 
-Deploy Fast Sandbox independently when your platform already has a Sandbox API
-or needs its own workload protocols. Use the Fast-Path gRPC API, Fast Sandbox
-SDKs, or Kubernetes CRDs to connect your control plane to Pool scheduling,
-atomic admission, microVM creation, endpoint resolution, and cleanup.
+The helper scripts, `fastctl` CLI, and low-level client packages in this
+repository are provided for developing and verifying the runtime layer directly,
+or for wiring a custom upstream control plane. Any custom caller integrating
+with Fast-Path or Kubernetes CRDs directly must own its own template metadata
+storage and request validation; Fast Sandbox assumes incoming requests already
+satisfy upstream template and policy constraints.
 
 ```text
-Your Sandbox API -> Fast-Path / Kubernetes CRDs -> Fastlet -> Firecracker microVM
+Upstream Control Plane -> Fast-Path / Kubernetes CRDs -> Fastlet -> Firecracker microVM
 ```
 
 From this repository, the standalone Firecracker development environment needs
