@@ -281,10 +281,19 @@ func (m *Manager) Acquire(ctx context.Context, owner Owner) (_ *Slot, resultErr 
 }
 
 func (m *Manager) Lookup(sandboxUID string) (*Slot, bool) {
+	return m.lookup(sandboxUID, false)
+}
+
+// LookupForCleanup includes slots left in Destroying by a failed release.
+func (m *Manager) LookupForCleanup(sandboxUID string) (*Slot, bool) {
+	return m.lookup(sandboxUID, true)
+}
+
+func (m *Manager) lookup(sandboxUID string, includeDestroying bool) (*Slot, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, slot := range m.slots {
-		if slot.Phase == SlotPhaseBound && slot.Owner.SandboxUID == sandboxUID {
+		if slot.Owner.SandboxUID == sandboxUID && (slot.Phase == SlotPhaseBound || includeDestroying && slot.Phase == SlotPhaseDestroying) {
 			return cloneSlot(slot), true
 		}
 	}

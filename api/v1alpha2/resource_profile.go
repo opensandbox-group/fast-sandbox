@@ -185,6 +185,12 @@ func ValidateSandboxResourceProfile(p SandboxResourceProfile) error {
 	if limits.CPU.MilliValue() < 10 {
 		return fmt.Errorf("%w: cpu limit must be at least 10m for Linux CFS enforcement", ErrInvalidSandboxResourceProfile)
 	}
+	if p.GPUs < 0 {
+		return fmt.Errorf("%w: gpus must be non-negative", ErrInvalidSandboxResourceProfile)
+	}
+	if err := validateGPURequirements(p); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidSandboxResourceProfile, err)
+	}
 	if p.ResourceMode() == SandboxResourceModeLegacySlot {
 		return nil
 	}
@@ -211,10 +217,15 @@ func (p SandboxResourceProfile) Hash() string {
 		// Preserve the exact historical payload so upgrading the controller does
 		// not roll or fence every existing Pool.
 		payload, err = json.Marshal(struct {
-			CPU    string `json:"cpu"`
-			Memory string `json:"memory"`
-			PIDs   int64  `json:"pids"`
-		}{CPU: p.CPU.String(), Memory: p.Memory.String(), PIDs: p.PIDs})
+			CPU             string                 `json:"cpu"`
+			Memory          string                 `json:"memory"`
+			PIDs            int64                  `json:"pids"`
+			GPUs            int32                  `json:"gpus,omitempty"`
+			GPURequirements *GPUDeviceRequirements `json:"gpuRequirements,omitempty"`
+		}{
+			CPU: p.CPU.String(), Memory: p.Memory.String(), PIDs: p.PIDs,
+			GPUs: p.GPUs, GPURequirements: p.GPURequirements,
+		})
 	case SandboxResourceModeResourceAware:
 		payload, err = json.Marshal(struct {
 			Version string `json:"version"`
@@ -226,7 +237,9 @@ func (p SandboxResourceProfile) Hash() string {
 				CPU    string `json:"cpu"`
 				Memory string `json:"memory"`
 			} `json:"overcommitRatio"`
-			PIDs int64 `json:"pids"`
+			PIDs            int64                  `json:"pids"`
+			GPUs            int32                  `json:"gpus,omitempty"`
+			GPURequirements *GPUDeviceRequirements `json:"gpuRequirements,omitempty"`
 		}{
 			Version: "resource-aware-v2",
 			Limits: struct {
@@ -237,7 +250,9 @@ func (p SandboxResourceProfile) Hash() string {
 				CPU    string `json:"cpu"`
 				Memory string `json:"memory"`
 			}{CPU: p.OvercommitRatio.CPU.String(), Memory: p.OvercommitRatio.Memory.String()},
-			PIDs: p.PIDs,
+			PIDs:            p.PIDs,
+			GPUs:            p.GPUs,
+			GPURequirements: p.GPURequirements,
 		})
 	default:
 		panic(ErrInvalidSandboxResourceProfile)

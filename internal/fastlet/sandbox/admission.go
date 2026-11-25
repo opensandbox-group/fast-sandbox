@@ -294,21 +294,24 @@ func (m *SandboxManager) ensureRuntimeForCreate(ctx context.Context, createStart
 func (m *SandboxManager) handleRuntimeCreateFailure(ctx context.Context, input *fastletapi.EnsureSandboxInput, placeholder *SandboxMetadata, runtimeErr error) (*fastletapi.CreateSandboxResponse, error) {
 	sandboxUID := input.Sandbox.Identity.SandboxUID
 	m.cacheProtection.ProtectHotUntil(input.Sandbox.Desired.Image, m.clock.Now().Add(time.Hour))
+	// A canceled create RPC can leave runtime resources that still need cleanup.
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancelCleanup()
 	strictActions := m.requiresStrictActionHandling(input.Sandbox.ActionsAPIVersion)
 	var cleanupErr error
 	if strictActions {
 		if m.actionManager == nil {
 			cleanupErr = errors.New("strict Action Handler is unavailable; runtime cleanup is blocked")
 		} else {
-			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			cleanupErr = m.actionManager.DeleteOwned(cleanupCtx, actionAttachment(placeholder))
+			actionCtx, cancel := context.WithTimeout(cleanupCtx, 5*time.Second)
+			cleanupErr = m.actionManager.DeleteOwned(actionCtx, actionAttachment(placeholder))
 			cancel()
 		}
 		if cleanupErr == nil {
-			cleanupErr = m.runtime.DeleteSandbox(ctx, sandboxUID)
+			cleanupErr = m.runtime.DeleteSandbox(cleanupCtx, sandboxUID)
 		}
 	} else {
-		cleanupErr = m.runtime.DeleteSandbox(ctx, sandboxUID)
+		cleanupErr = m.runtime.DeleteSandbox(cleanupCtx, sandboxUID)
 		if m.actionManager != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			cleanupErr = errors.Join(cleanupErr, m.actionManager.Delete(cleanupCtx, sandboxUID))

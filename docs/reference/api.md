@@ -156,7 +156,7 @@ spec:
 | `capacity` | Yes | Pool size and idle-buffer bounds |
 | `maxSandboxesPerPod` | Yes | Fastlet-authoritative admission limit |
 | `runtime` | Yes | Immutable runtime name |
-| `sandboxResources` | Yes | Flat default CPU/memory limits and PID limit; `mode: ResourceAware` adds separate CPU/memory overcommit ratios |
+| `sandboxResources` | Yes | Flat default CPU/memory limits and PID limit; `mode: ResourceAware` adds separate CPU/memory overcommit ratios; optional `gpus` reserves a fixed number of exclusive NVIDIA whole GPUs per Sandbox for `runtime: container` |
 | `warmImages` | No | Asynchronous, GC-protected cache inputs |
 | `infraComponents` | No | Inline immutable artifact/process/health/endpoint definitions |
 | `actionHandlers` | No | Named Pod-loopback Binding receivers and lifecycle Hook subscriptions; protocol mode is platform-owned runtime configuration, not part of the public Pool API |
@@ -456,3 +456,5 @@ trusted direct-ingress contract.
 - Delete is accepted before asynchronous finalizer cleanup completes;
 - stale Pod UID, instance generation, assignment attempt, route generation, or
   route credential is rejected.
+
+GPU Pools expose their fixed per-Sandbox count through `PoolInfo.sandbox_resource_profile.gpus` and optional model and minimum memory through `PoolInfo.sandbox_resource_profile.gpu_requirements`. Zero GPUs means CPU-only. GPU count is independent of CPU/memory overcommit and cannot be changed by a per-Sandbox resource override. See [Container GPU support](../guides/container-gpu.md) for device ownership, deployment prerequisites and validation gates.

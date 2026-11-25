@@ -364,6 +364,8 @@ message SandboxResourceProfileInfo {
   ComputeResourceProfile limits = 3;
   int64 pids = 4;
   ComputeResourceProfile overcommit_ratio = 5;
+  int32 gpus = 6;
+  GPUDeviceRequirements gpu_requirements = 7;
 }
 
 message PoolInfo {
@@ -579,4 +581,11 @@ message HandlerActionResult {
 
 message InvokeHandlerActionResponse {
   HandlerActionResult result = 1;
+}
+
+message GPUDeviceRequirements {
+  // Exact nvidia.com/gpu.product label value; empty permits any model.
+  string model = 1;
+  // Minimum reported total memory per assigned device, as a Kubernetes quantity.
+  string minimum_memory = 2;
 }

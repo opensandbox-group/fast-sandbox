@@ -2,6 +2,7 @@ package containerd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/containerd/errdefs"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"google.golang.org/grpc"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -26,6 +28,7 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
 	dataplane "fast-sandbox/internal/dataplane/contract"
+	"fast-sandbox/internal/fastlet/gpu"
 	"fast-sandbox/internal/fastlet/infra"
 	fastletnetwork "fast-sandbox/internal/fastlet/network"
 	"fast-sandbox/internal/fastlet/podcgroup"
@@ -36,6 +39,8 @@ import (
 )
 
 type Driver struct {
+	gpuManager         *gpu.Manager
+	gpuCgroupRoot      string
 	socketPath         string
 	client             *containerd.Client
 	fastletPodName     string
@@ -126,6 +131,9 @@ func (r *Driver) Initialize(ctx context.Context, socketPath string) error {
 }
 
 func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSandboxInput, allocation fastletapi.RuntimeAllocation) (_ *SandboxMetadata, resultErr error) {
+	if err := r.validateGPUAllocation(input, allocation); err != nil {
+		return nil, err
+	}
 	config := &input.Sandbox
 	identity := config.Identity
 	spec := config.Desired
@@ -214,7 +222,9 @@ func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	if r.config.NeedsTTY {
 		cioOpts = append(cioOpts, cio.WithTerminal)
 	}
-	cioOpts = append(cioOpts, cio.WithStreams(nil, logFile, logFile))
+	// Fastlet and the host shim must see the same FIFO paths. The runtime
+	// plan mounts the socket directory, and Janitor also looks there.
+	cioOpts = append(cioOpts, cio.WithFIFODir(filepath.Join(filepath.Dir(r.socketPath), "fifo")), cio.WithStreams(nil, logFile, logFile))
 
 	var taskOpts []containerd.NewTaskOpts
 	if r.config.RuntimePath != "" {
@@ -297,7 +307,7 @@ func (r *Driver) CreateSandbox(ctx context.Context, input *fastletapi.EnsureSand
 
 // EnsureSandbox is idempotent for a Sandbox runtime identity. It returns the
 // existing managed runtime when a retry observes an already-created Sandbox.
-func (r *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSandboxInput) (*SandboxMetadata, error) {
+func (r *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSandboxInput) (_ *SandboxMetadata, resultErr error) {
 	if input == nil {
 		return nil, fmt.Errorf("%w: Sandbox input is required", runtimecontract.ErrInvalidConfig)
 	}
@@ -312,11 +322,20 @@ func (r *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	finishInspect(inspectErr)
 	if err == nil {
 		if runtimecontract.SameRuntimeIdentity(existing.Config.Identity, identity) {
+			if existing.Phase == gpuFailedPhase {
+				return nil, fmt.Errorf("%w: failed GPU runtime must be deleted before recreation", runtimecontract.ErrInvalidConfig)
+			}
+			if err := r.validateGPUAllocation(input, existing.Allocation); err != nil {
+				return nil, err
+			}
 			if err := validateExistingRuntimeProfile(existing, config); err != nil {
 				return nil, err
 			}
 			existing.UserProcessStartSource = fastletapi.UserProcessStartExistingRuntime
 			return existing, nil
+		}
+		if existing.Allocation.GPU != nil && existing.Config.Identity.FastletPodUID != r.fastletPodUID {
+			return nil, errors.New("cannot replace another Fastlet's GPU runtime")
 		}
 		klog.InfoS("replacing stale runtime owned by a previous Sandbox instance",
 			"sandbox", identity.SandboxUID,
@@ -333,7 +352,29 @@ func (r *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 		return nil, err
 	}
 	allocation := fastletapi.RuntimeAllocation{}
+	if r.gpuManager != nil {
+		if err := r.reclaimForeignGPULease(ctx, identity.SandboxUID); err != nil {
+			return nil, err
+		}
+		allocation.GPU, err = r.gpuManager.Acquire(identity)
+		if err != nil {
+			return nil, fmt.Errorf("reserve GPU: %w", err)
+		}
+	}
 	var owner fastletnetwork.Owner
+	defer func() {
+		if resultErr == nil {
+			return
+		}
+		if allocation.GPU != nil {
+			if err := r.releaseFailedCreateGPU(ctx, identity, allocation.GPU); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("release GPU after failed Create: %w", err))
+			}
+		}
+		if allocation.Network.SlotID != "" {
+			resultErr = errors.Join(resultErr, r.networkManager.Release(ctx, owner))
+		}
+	}()
 	if r.networkManager != nil {
 		owner = r.networkOwner(config)
 		networkContext, finishNetwork := startContainerdCreateStage(ctx, string(r.runtimeName), "network_acquire")
@@ -347,12 +388,7 @@ func (r *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 			Gateway: slot.Gateway, DNSPath: slot.DNSPath, PrivateCIDR: slot.PrivateCIDR, HostVeth: slot.HostVeth,
 		}
 	}
-	metadata, createErr := r.CreateSandbox(ctx, input, allocation)
-	if createErr != nil && r.networkManager != nil {
-		releaseErr := r.networkManager.Release(ctx, owner)
-		return nil, errors.Join(createErr, releaseErr)
-	}
-	return metadata, createErr
+	return r.CreateSandbox(ctx, input, allocation)
 }
 
 func userProcessStartAfterTaskStart(instance *infra.PreparedInstance, observedAt time.Time) (time.Time, fastletapi.UserProcessStartSource) {
@@ -475,6 +511,9 @@ func (r *Driver) prepareSpecOpts(ctx context.Context, config *fastletapi.Runtime
 
 	networkNamespace := specs.LinuxNamespace{Type: specs.NetworkNamespace, Path: network.NamespacePath}
 	specOpts = append(specOpts, oci.WithLinuxNamespace(networkNamespace))
+	if allocation.GPU != nil {
+		specOpts = append(specOpts, gpuSpecOpt(allocation.GPU))
+	}
 
 	return specOpts, infraInstance, nil
 }
@@ -605,6 +644,10 @@ func (r *Driver) prepareLabels(config *fastletapi.RuntimeSandboxConfig, allocati
 		"fast-sandbox.io/network-gateway":       network.Gateway,
 		"fast-sandbox.io/network-dns-path":      network.DNSPath,
 	}
+	if allocation.GPU != nil {
+		encoded, _ := json.Marshal(allocation.GPU.Devices)
+		labels["fast-sandbox.io/gpu-devices"] = string(encoded)
+	}
 	if network.PrivateCIDR != "" {
 		labels["fast-sandbox.io/network-private-cidr"] = network.PrivateCIDR
 	}
@@ -631,14 +674,31 @@ func (r *Driver) SetNodeCleanupClient(client nodecleanup.RuntimeProcessCleaner) 
 }
 
 func (r *Driver) DeleteSandbox(ctx context.Context, sandboxID string) error {
-	var owner fastletnetwork.Owner
-	if r.networkManager != nil {
-		if slot, exists := r.networkManager.Lookup(sandboxID); exists {
-			owner = slot.Owner
-		}
-	}
-	if err := r.deleteContainerdSandbox(ctx, sandboxID); err != nil {
+	lease, hasGPULease, err := r.lookupGPULease(sandboxID)
+	if err != nil {
 		return err
+	}
+	if hasGPULease && lease.Owner.FastletPodUID != r.fastletPodUID {
+		// A failed Create can retry cleanup before it can retry admission.
+		// Reconcile the old lease without ever deleting the foreign runtime.
+		return r.releaseGPULease(ctx, lease)
+	}
+	runtimeErr := r.deleteContainerdSandbox(ctx, sandboxID)
+	var gpuErr error
+	if hasGPULease {
+		gpuErr = r.releaseGPULease(ctx, lease)
+	}
+	if runtimeErr != nil {
+		return errors.Join(runtimeErr, gpuErr)
+	}
+	return errors.Join(gpuErr, r.removeSandboxResources(ctx, sandboxID))
+}
+
+func (r *Driver) removeSandboxResources(ctx context.Context, sandboxID string) error {
+	if r.podCgroup != nil {
+		if err := r.podCgroup.RemoveSandboxGroups(podcgroup.HostRoot, sandboxID); err != nil {
+			return fmt.Errorf("remove Sandbox cgroup: %w", err)
+		}
 	}
 	var infraErr error
 	if r.infraMgr != nil {
@@ -647,9 +707,11 @@ func (r *Driver) DeleteSandbox(ctx context.Context, sandboxID string) error {
 		}
 	}
 	var networkErr error
-	if r.networkManager != nil && owner.SandboxUID != "" {
-		if err := r.networkManager.Release(ctx, owner); err != nil {
-			networkErr = fmt.Errorf("release network slot: %w", err)
+	if r.networkManager != nil {
+		if slot, exists := r.networkManager.LookupForCleanup(sandboxID); exists {
+			if err := r.networkManager.Release(ctx, slot.Owner); err != nil {
+				networkErr = fmt.Errorf("release network slot: %w", err)
+			}
 		}
 	}
 	return errors.Join(infraErr, networkErr)
@@ -666,15 +728,7 @@ func (r *Driver) deleteContainerdSandbox(ctx context.Context, sandboxID string) 
 	); err != nil {
 		return err
 	}
-	if err := r.ensureResidualProcessAbsent(ctx, sandboxID); err != nil {
-		return err
-	}
-	if r.podCgroup != nil {
-		if err := r.podCgroup.RemoveSandboxGroups(podcgroup.HostRoot, sandboxID); err != nil {
-			return fmt.Errorf("remove Sandbox cgroup: %w", err)
-		}
-	}
-	return nil
+	return r.ensureResidualProcessAbsent(ctx, sandboxID)
 }
 
 func (r *Driver) ensureResidualProcessAbsent(ctx context.Context, sandboxID string) error {
@@ -720,7 +774,10 @@ func (r *Driver) InspectSandbox(ctx context.Context, sandboxID string) (*Sandbox
 	ctx = r.withNamespace(ctx)
 	container, err := r.client.LoadContainer(ctx, sandboxID)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrSandboxNotFound, err)
+		if r.gpuManager == nil || errdefs.IsNotFound(err) {
+			return nil, fmt.Errorf("%w: %w", ErrSandboxNotFound, err)
+		}
+		return nil, err
 	}
 	info, err := container.Info(ctx)
 	if err != nil {
@@ -753,26 +810,47 @@ func (r *Driver) InspectSandbox(ctx context.Context, sandboxID string) (*Sandbox
 		CreatedAt:   info.CreatedAt.Unix(),
 		Phase:       "stopped",
 	}
+	if raw := info.Labels["fast-sandbox.io/gpu-devices"]; raw != "" {
+		var devices []string
+		if err := json.Unmarshal([]byte(raw), &devices); err != nil {
+			return nil, fmt.Errorf("invalid GPU allocation label: %w", err)
+		}
+		metadata.Allocation.GPU = &fastletapi.GPUAllocation{Devices: devices}
+	}
 	metadata.Config.Limits.PIDs, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/resource-pids"], 10, 64)
 	metadata.Config.Identity.InstanceGeneration, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/instance-generation"], 10, 64)
 	metadata.Config.Identity.AssignmentAttempt, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/assignment-attempt"], 10, 64)
 	metadata.Config.Identity.RouteGeneration, _ = strconv.ParseInt(info.Labels["fast-sandbox.io/route-generation"], 10, 64)
+	if message := info.Labels[gpuFailureLabel]; metadata.Allocation.GPU != nil && message != "" {
+		metadata.Phase, metadata.RuntimeMessage = gpuFailedPhase, message
+		return metadata, nil
+	}
 	if task, taskErr := container.Task(ctx, nil); taskErr == nil {
 		metadata.PID = int(task.Pid())
 		if status, statusErr := task.Status(ctx); statusErr == nil {
 			metadata.Phase = string(status.Status)
+		} else if metadata.Allocation.GPU != nil && !errdefs.IsNotFound(statusErr) {
+			return nil, statusErr
 		}
+	} else if metadata.Allocation.GPU != nil && !errdefs.IsNotFound(taskErr) {
+		return nil, taskErr
 	}
 	return metadata, nil
 }
 
-func (r *Driver) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata, _ runtimecontract.ResourceRecoveryOwnerRetirer) error {
+func (r *Driver) RecoverRuntimeResources(ctx context.Context, managed []*SandboxMetadata, retireOwner runtimecontract.ResourceRecoveryOwnerRetirer) error {
+	if err := r.recoverGPUTerminalFailures(ctx, managed, retireOwner); err != nil {
+		return err
+	}
+	if err := r.recoverGPUs(ctx, managed); err != nil {
+		return err
+	}
 	if r.networkManager == nil {
 		return nil
 	}
 	owners := make([]fastletnetwork.Owner, 0, len(managed))
 	for _, metadata := range managed {
-		if metadata == nil {
+		if metadata == nil || metadata.Phase == gpuFailedPhase {
 			continue
 		}
 		identity := metadata.Config.Identity
@@ -788,7 +866,7 @@ func (r *Driver) RecoverRuntimeResources(ctx context.Context, managed []*Sandbox
 }
 
 func (r *Driver) RuntimeResourceAvailable() bool {
-	return r.networkManager == nil || r.networkManager.Snapshot().Clean > 0
+	return (r.networkManager == nil || r.networkManager.Snapshot().Clean > 0) && (r.gpuManager == nil || r.gpuManager.Available())
 }
 
 func (r *Driver) GetAccessDescriptor(sandboxID string) (dataplane.AccessDescriptor, error) {
@@ -839,7 +917,10 @@ func (r *Driver) ListManagedSandboxes(ctx context.Context) ([]*SandboxMetadata, 
 		}
 		metadata, err := r.InspectSandbox(ctx, container.ID())
 		if err != nil {
-			continue
+			if r.gpuManager == nil || errors.Is(err, ErrSandboxNotFound) {
+				continue
+			}
+			return nil, err
 		}
 		managed = append(managed, metadata)
 	}
@@ -889,10 +970,14 @@ func (r *Driver) PullImage(ctx context.Context, image string) error {
 }
 
 func (r *Driver) Close() error {
+	var err error
 	if r.client != nil {
-		return r.client.Close()
+		err = r.client.Close()
 	}
-	return nil
+	if r.gpuManager != nil {
+		err = errors.Join(err, r.gpuManager.Close())
+	}
+	return err
 }
 
 func (r *Driver) containerdNamespace() string {

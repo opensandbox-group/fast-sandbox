@@ -6,10 +6,12 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/validate/content"
 	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
 )
 
@@ -38,6 +40,9 @@ func (s *SandboxPoolSpec) ValidateResourceContract() error {
 		return fmt.Errorf("%w: pool spec is required", ErrRuntimeOwnerResources)
 	}
 	if err := ValidateSandboxResourceProfile(s.SandboxResources); err != nil {
+		return err
+	}
+	if err := s.ValidateGPUContract(); err != nil {
 		return err
 	}
 	if s.SandboxResources.ResourceMode() != SandboxResourceModeResourceAware {
@@ -363,6 +368,57 @@ func (p *PlacementStatus) Validate() error {
 	}
 	if p.Attempt < 1 {
 		return errors.New("attempt must be at least 1")
+	}
+	return nil
+}
+
+// ValidateGPUContract keeps Kubernetes GPU ownership and Sandbox slot capacity aligned.
+func (s *SandboxPoolSpec) ValidateGPUContract() error {
+	if s.SandboxResources.GPUs < 0 {
+		return fmt.Errorf("gpus must be non-negative")
+	}
+	if err := validateGPURequirements(s.SandboxResources); err != nil {
+		return err
+	}
+	if s.SandboxResources.GPUs == 0 {
+		return nil
+	}
+	if s.Runtime != RuntimeContainer {
+		return fmt.Errorf("GPU allocation requires runtime container")
+	}
+	if s.MaxSandboxesPerPod <= 0 {
+		return fmt.Errorf("GPU allocation requires positive maxSandboxesPerPod")
+	}
+	if len(s.FastletTemplate.Spec.Containers) == 0 {
+		return fmt.Errorf("GPU allocation requires a Fastlet container")
+	}
+	spec := &s.FastletTemplate.Spec
+	for _, container := range slices.Concat(spec.Containers, spec.InitContainers) {
+		_, hasRequest := container.Resources.Requests["nvidia.com/gpu"]
+		_, hasLimit := container.Resources.Limits["nvidia.com/gpu"]
+		if hasRequest || hasLimit {
+			return fmt.Errorf("GPU Pool resources.nvidia.com/gpu is derived; do not set it on container %q", container.Name)
+		}
+	}
+	return nil
+}
+
+func validateGPURequirements(profile SandboxResourceProfile) error {
+	requirements := profile.GPURequirements
+	if requirements == nil {
+		return nil
+	}
+	if profile.GPUs <= 0 {
+		return errors.New("gpuRequirements requires a positive gpus count")
+	}
+	if requirements.Model == "" && requirements.MinimumMemory == nil {
+		return errors.New("gpuRequirements must specify model or minimumMemory")
+	}
+	if len(content.IsLabelValue(requirements.Model)) > 0 {
+		return errors.New("GPU model must be a valid nvidia.com/gpu.product label value")
+	}
+	if requirements.MinimumMemory != nil && requirements.MinimumMemory.Sign() <= 0 {
+		return errors.New("GPU minimumMemory must be greater than zero")
 	}
 	return nil
 }

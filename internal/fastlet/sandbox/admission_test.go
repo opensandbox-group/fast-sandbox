@@ -404,7 +404,10 @@ func (r *admissionRuntime) InspectSandbox(_ context.Context, sandboxID string) (
 	return &copy, nil
 }
 
-func (r *admissionRuntime) DeleteSandbox(_ context.Context, sandboxID string) error {
+func (r *admissionRuntime) DeleteSandbox(ctx context.Context, sandboxID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	r.deleteCalls++
 	entered, block := r.deleteEntered, r.deleteBlock
@@ -848,6 +851,23 @@ func TestEnsureFailureReleasesCapacity(t *testing.T) {
 	require.NoError(t, err)
 	admission, _, _ := manager.State()
 	require.Equal(t, 1, admission.Running)
+}
+
+func TestCanceledCreateCleansRuntimeBeforeNextAttempt(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	runtime.ensureError = context.Canceled
+	manager := newAdmissionManager(t, runtime, 1)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	response, err := manager.CreateSandbox(ctx, ensureRequest("sandbox-a", 1, 1))
+	requireFastletCode(t, err, fastletapi.ErrorRuntimeUnavailable)
+	require.Equal(t, fastletapi.CreateDispositionRejectedBeforeSideEffects, response.Disposition)
+	require.Zero(t, response.Admission.Used)
+
+	runtime.ensureError = nil
+	response, err = manager.CreateSandbox(t.Context(), ensureRequest("sandbox-a", 1, 2))
+	require.NoError(t, err)
+	require.Equal(t, fastletapi.CreateDispositionCreated, response.Disposition)
 }
 
 func TestFailedCreateCleanupIsRetriedBySameIdentity(t *testing.T) {

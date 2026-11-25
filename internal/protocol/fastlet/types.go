@@ -159,7 +159,13 @@ type NetworkAllocation struct {
 
 // RuntimeAllocation contains resources actually assigned to one runtime.
 // Allocation is observed/persisted state, separate from RuntimeSandboxConfig.
+// GPUAllocation is selected by Fastlet, never by the caller.
+type GPUAllocation struct {
+	Devices []string `json:"devices"`
+}
+
 type RuntimeAllocation struct {
+	GPU     *GPUAllocation    `json:"gpu,omitempty"`
 	Network NetworkAllocation `json:"network"`
 }
 
