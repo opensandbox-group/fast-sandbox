@@ -10,9 +10,12 @@ package firecracker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1672,8 +1675,150 @@ func proofHolds(path string, proof agentpull.VerifiedFile) bool {
 
 // relocateSpilled is the post-resume relocation of one spilled dump file
 // (a variable so tests can observe it).
-var relocateSpilled = func(_ *dumpPlan, source, target string) error {
-	return copyFile(source, target)
+var relocateSpilled = relocateSpilledFile
+
+// relocateSpilledFile copies one spilled dump file into the staging
+// directory. The copy hashes the bytes as it moves them (they are read from
+// the spill area anyway) and records the digest with its proof in
+// plan.verifiedFiles, so the manifest assembly does not read guest memory a
+// second time.
+func relocateSpilledFile(plan *dumpPlan, source, target string) error {
+	sum, proof, err := copyFileHashed(source, target)
+	if err != nil {
+		return err
+	}
+	if plan.verifiedFiles == nil {
+		plan.verifiedFiles = map[string]agentpull.VerifiedFile{}
+	}
+	plan.verifiedFiles[filepath.Base(target)] = proof
+	klog.V(4).InfoS("spilled dump file relocated and hashed", "target", target, "sha256", sum)
+	return nil
+}
+
+// copyFileBlockSize is the read unit of copyFileHashed, and copyFileSlots
+// how many blocks are in flight between the reader, the hasher and the
+// writer.
+const (
+	copyFileBlockSize = 4 << 20
+	copyFileSlots     = 4
+)
+
+// copyFileHashed copies source to target like copyFile and returns the
+// sha256 of the content with a proof bound to the written target. Reading,
+// hashing and writing run concurrently over a small ring of blocks: the
+// hasher consumes blocks strictly in order, so the digest equals a serial
+// hash, and on hosts without SHA extensions the copy costs about the hash
+// alone instead of hash plus write.
+func copyFileHashed(source, target string) (string, agentpull.VerifiedFile, error) { //nolint:gocognit // one read/hash/write pipeline; splitting it scatters the ordering invariants
+	input, err := os.Open(source)
+	if err != nil {
+		return "", agentpull.VerifiedFile{}, err
+	}
+	defer input.Close()
+	output, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
+	if err != nil {
+		return "", agentpull.VerifiedFile{}, err
+	}
+
+	type block struct {
+		data   []byte
+		offset int64
+		users  sync.WaitGroup
+	}
+	free := make(chan []byte, copyFileSlots)
+	for range copyFileSlots {
+		free <- make([]byte, copyFileBlockSize)
+	}
+	hashQueue := make(chan *block, copyFileSlots)
+	writeQueue := make(chan *block, copyFileSlots)
+	recycleQueue := make(chan *block, copyFileSlots)
+	stop := make(chan struct{})
+	var (
+		failOnce sync.Once
+		failure  error
+	)
+	fail := func(err error) {
+		failOnce.Do(func() {
+			failure = err
+			close(stop)
+		})
+	}
+
+	digest := sha256.New()
+	var workers sync.WaitGroup
+	workers.Add(3)
+	go func() { // hasher: strictly in order, so the digest equals a serial hash
+		defer workers.Done()
+		for current := range hashQueue {
+			_, _ = digest.Write(current.data)
+			current.users.Done()
+		}
+	}()
+	go func() { // writer: positional writes, so a block never waits for the hash
+		defer workers.Done()
+		for current := range writeQueue {
+			if _, err := output.WriteAt(current.data, current.offset); err != nil {
+				fail(err)
+			}
+			current.users.Done()
+		}
+	}()
+	go func() { // recycler: a buffer is reused only after both consumers are done
+		defer workers.Done()
+		for current := range recycleQueue {
+			current.users.Wait()
+			free <- current.data[:cap(current.data)]
+		}
+	}()
+
+	var size int64
+	func() {
+		defer func() {
+			close(hashQueue)
+			close(writeQueue)
+			close(recycleQueue)
+		}()
+		for {
+			var buffer []byte
+			select {
+			case buffer = <-free:
+			case <-stop:
+				return
+			}
+			n, readErr := io.ReadFull(input, buffer)
+			if n > 0 {
+				current := &block{data: buffer[:n], offset: size}
+				current.users.Add(2)
+				hashQueue <- current
+				writeQueue <- current
+				recycleQueue <- current
+				size += int64(n)
+			}
+			if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+				return
+			}
+			if readErr != nil {
+				fail(readErr)
+				return
+			}
+		}
+	}()
+	workers.Wait()
+	if failure != nil {
+		_ = output.Close()
+		return "", agentpull.VerifiedFile{}, failure
+	}
+	sum := hex.EncodeToString(digest.Sum(nil))
+	// Bind the digest to the file as written; nothing writes it afterwards.
+	proof, err := agentpull.TrackWrittenFile(output, sum)
+	if err != nil {
+		_ = output.Close()
+		return "", agentpull.VerifiedFile{}, err
+	}
+	if err := output.Close(); err != nil {
+		return "", agentpull.VerifiedFile{}, err
+	}
+	return sum, proof, nil
 }
 
 func readSourceManifest(stateRoot, ociRoot, image, sandboxID string) ([]byte, error) {

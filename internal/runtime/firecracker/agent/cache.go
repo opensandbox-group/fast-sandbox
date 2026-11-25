@@ -147,6 +147,20 @@ func HashAndTrackFile(path string) (string, int64, VerifiedFile, error) {
 	return sum, afterInfo.Size(), tracked, nil
 }
 
+// TrackWrittenFile binds digest, computed over exactly the bytes the caller
+// wrote to file, to the file's current stat identity. Unlike
+// HashAndTrackFile it does not read the file back: the caller vouches that
+// the digest covers the content it wrote and that nothing writes the file
+// afterwards. Any later write changes the identity and voids the proof.
+func TrackWrittenFile(file *os.File, digest string) (VerifiedFile, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return VerifiedFile{}, err
+	}
+	id, ok := fileIdentityFromInfo(info)
+	return VerifiedFile{id: id, sha256: digest, valid: ok}, nil
+}
+
 func (c *verifiedDigestCache) matches(path string, id fileIdentity, expected string) bool {
 	cleaned := filepath.Clean(path)
 	c.mu.RLock()

@@ -248,3 +248,70 @@ func TestCreateSnapshotWithoutCloneSkipsBackgroundRootfsHash(t *testing.T) {
 	require.Empty(t, background(), "a copied rootfs is not hashed in the background")
 	require.Equal(t, want, manifestRootfsDigest(t, agent))
 }
+
+// The spilled dump files are relocated with the hashing copy, and the
+// manifest assembly reuses those digests instead of reading them again.
+func TestCreateSnapshotReusesSpillCopyDigests(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	withSnapshotSpill(t)
+	assembly := countStagedHashes(t)
+
+	createTemplateSnapshot(t, fixture)
+	for _, name := range []string{memorySnapshotName, vmstateSnapshotName} {
+		require.NotContains(t, assembly(), name, "%s digest comes from the spill copy", name)
+		sum, ok := agent.manifest["files"].(map[string]any)[name].(map[string]any)["sha256"].(string)
+		require.True(t, ok, name)
+		cached := filepath.Join(fixture.stateRoot, imageCacheDir, imageKey("app-v2"), name)
+		want, err := artifacts.SHA256File(cached)
+		require.NoError(t, err)
+		require.Equal(t, want, sum)
+		require.Contains(t, agent.sums, sum+"  "+name)
+	}
+}
+
+// The pipelined copy must produce exactly the content and digest of a
+// serial copy for dense, zero-heavy and unaligned files that span many
+// in-flight blocks, and a proof that holds for the written file.
+func TestCopyFileHashedPipelineShapes(t *testing.T) {
+	dense := make([]byte, 9*copyFileBlockSize+12345)
+	for i := range dense {
+		dense[i] = byte(i*7 + i>>13)
+	}
+	zeroHeavy := make([]byte, 6*copyFileBlockSize+32<<10)
+	for offset := 0; offset < len(zeroHeavy); offset += 192 << 10 {
+		copy(zeroHeavy[offset:], bytes.Repeat([]byte{0x5a}, 100))
+	}
+	shapes := map[string][]byte{
+		"empty":       {},
+		"one byte":    {1},
+		"dense":       dense,
+		"zero heavy":  zeroHeavy,
+		"all zero":    make([]byte, 2*copyFileBlockSize+1),
+		"block exact": bytes.Repeat([]byte{0xff}, copyFileSlots*copyFileBlockSize),
+	}
+	for name, payload := range shapes {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			source := filepath.Join(dir, "source")
+			require.NoError(t, os.WriteFile(source, payload, 0o640))
+			target := filepath.Join(dir, "target")
+			sum, proof, err := copyFileHashed(source, target)
+			require.NoError(t, err)
+			want, err := artifacts.SHA256File(source)
+			require.NoError(t, err)
+			require.Equal(t, want, sum)
+			require.Equal(t, want, proof.SHA256())
+			require.True(t, proofHolds(target, proof), "the proof binds the written file")
+			got, err := os.ReadFile(target)
+			require.NoError(t, err)
+			require.True(t, bytes.Equal(payload, got))
+		})
+	}
+}
+
+// A read failure stops the pipeline and is returned.
+func TestCopyFileHashedReportsReadError(t *testing.T) {
+	dir := t.TempDir()
+	_, _, err := copyFileHashed(dir, filepath.Join(t.TempDir(), "target"))
+	require.Error(t, err)
+}
