@@ -316,10 +316,7 @@ func TestPrepareOCIRestoreUsesHotCacheAndFallsBack(t *testing.T) {
 		require.NoError(t, validateOCIResumeOwner(parsedMeta, &fixture.sandboxSpec))
 	})
 
-	t.Run("reference digest mismatch skips hot cache", func(t *testing.T) {
-		if !hostCPUKnown() {
-			t.Skip("host CPU identity compatibility check requires Linux /proc/cpuinfo")
-		}
+	t.Run("reference digest mismatch rejected without using hot cache", func(t *testing.T) {
 		fixture, rawMeta, hotArgFile := setupResumeFixture(t, "sandbox-1")
 		seedHotCheckpointEntry(t, fixture.stateRoot, digestHex, rawMeta)
 		otherDigest := strings.Repeat("c", 64)
@@ -327,10 +324,8 @@ func TestPrepareOCIRestoreUsesHotCacheAndFallsBack(t *testing.T) {
 		fixture.sandboxSpec.Desired.Restore.ManifestRef = fixture.sandboxSpec.Desired.Image
 
 		_, err := fixture.driver.EnsureSandbox(context.Background(), ensureInput(&fixture.sandboxSpec))
-		require.NoError(t, err)
-		argRaw, err := os.ReadFile(hotArgFile)
-		require.NoError(t, err)
-		require.Empty(t, string(argRaw), "mismatched reference digest must not use hot cache")
+		require.ErrorIs(t, err, ErrInvalidConfig)
+		require.NoFileExists(t, hotArgFile, "mismatched reference digest must not attach via hot cache")
 	})
 
 	t.Run("owner mismatch still rejected on hot cache hit", func(t *testing.T) {
