@@ -126,6 +126,10 @@ func TestHashStagedFilesUnknownBeforeKnown(t *testing.T) {
 // proofs reach the same-node cache commit.
 func TestCreateSnapshotHashesEachStagedFileOnce(t *testing.T) {
 	fixture, agent := newSnapshotFixture(t)
+	// No reflink clone: the assembly hashes the rootfs too.
+	original := cloneRootfs
+	cloneRootfs = func(string, string) error { return os.ErrInvalid }
+	t.Cleanup(func() { cloneRootfs = original })
 	hashed := countStagedHashes(t)
 	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
 
@@ -148,4 +152,99 @@ func TestCreateSnapshotHashesEachStagedFileOnce(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, want, entry["sha256"], "%s digest", name)
 	}
+}
+
+// withClonedRootfs stands in for a reflink-capable filesystem: the snapshot
+// rootfs "clone" succeeds (as a plain copy), enabling the background hash.
+func withClonedRootfs(t *testing.T) {
+	t.Helper()
+	original := cloneRootfs
+	cloneRootfs = copyFile
+	t.Cleanup(func() { cloneRootfs = original })
+}
+
+// observeRootfsHash wraps the background rootfs hash, failing it when fail
+// is set, and returns the paths it was called with.
+func observeRootfsHash(t *testing.T, fail bool) func() []string {
+	t.Helper()
+	var (
+		mu    sync.Mutex
+		calls []string
+	)
+	original := hashStagedRootfs
+	hashStagedRootfs = func(path string) (string, int64, agentpull.VerifiedFile, error) {
+		mu.Lock()
+		calls = append(calls, path)
+		mu.Unlock()
+		if fail {
+			return "", 0, agentpull.VerifiedFile{}, os.ErrPermission
+		}
+		return original(path)
+	}
+	t.Cleanup(func() { hashStagedRootfs = original })
+	return func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), calls...)
+	}
+}
+
+func manifestRootfsDigest(t *testing.T, agent *snapshotAgentFake) string {
+	t.Helper()
+	files, ok := agent.manifest["files"].(map[string]any)
+	require.True(t, ok, "manifest files section")
+	entry, ok := files[publishedRootfsName].(map[string]any)
+	require.True(t, ok, "manifest rootfs entry")
+	return entry["sha256"].(string)
+}
+
+func createTemplateSnapshot(t *testing.T, fixture *driverFixture) string {
+	t.Helper()
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+	want, err := artifacts.SHA256File(filepath.Join(fixture.stateRoot, sandboxStateDir, sandboxID, instanceRootfsName))
+	require.NoError(t, err)
+	_, err = fixture.driver.CreateSnapshot(context.Background(), &runtimecontract.SnapshotInput{
+		SandboxID: sandboxID, SnapshotID: "snap-1", Kind: fastletapi.SnapshotKindTemplate, TemplateName: "app-v2",
+	})
+	require.NoError(t, err)
+	return want
+}
+
+func TestCreateSnapshotHashesClonedRootfsInBackground(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	withClonedRootfs(t)
+	background := observeRootfsHash(t, false)
+	assembly := countStagedHashes(t)
+
+	want := createTemplateSnapshot(t, fixture)
+	require.Equal(t, []string{filepath.Join(fixture.stateRoot, snapshotStagingDir, "snap-1", publishedRootfsName)}, background(),
+		"the cloned rootfs is hashed by the background hash")
+	require.NotContains(t, assembly(), publishedRootfsName, "the assembly reuses the background digest")
+	require.Equal(t, want, manifestRootfsDigest(t, agent))
+}
+
+func TestCreateSnapshotFallsBackWhenBackgroundRootfsHashFails(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	withClonedRootfs(t)
+	background := observeRootfsHash(t, true)
+	assembly := countStagedHashes(t)
+
+	want := createTemplateSnapshot(t, fixture)
+	require.Len(t, background(), 1)
+	require.Contains(t, assembly(), publishedRootfsName, "the manifest assembly hashes the rootfs itself")
+	require.Equal(t, want, manifestRootfsDigest(t, agent))
+}
+
+// Without a reflink clone the rootfs is copied in the pause window and the
+// manifest assembly hashes it, as before.
+func TestCreateSnapshotWithoutCloneSkipsBackgroundRootfsHash(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	original := cloneRootfs
+	cloneRootfs = func(string, string) error { return os.ErrInvalid }
+	t.Cleanup(func() { cloneRootfs = original })
+	background := observeRootfsHash(t, false)
+
+	want := createTemplateSnapshot(t, fixture)
+	require.Empty(t, background(), "a copied rootfs is not hashed in the background")
+	require.Equal(t, want, manifestRootfsDigest(t, agent))
 }
