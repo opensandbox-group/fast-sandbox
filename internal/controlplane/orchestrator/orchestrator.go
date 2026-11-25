@@ -967,14 +967,32 @@ func IsCandidateRejection(err error) bool {
 	}
 }
 
+// IsRequestRejection reports a create that a Fastlet rejected before any side
+// effect because the request itself cannot be satisfied: every candidate
+// would reject it identically. Callers must neither advance to another
+// candidate nor retry the same one; the request has to change.
+func IsRequestRejection(err error) bool {
+	var failure *fastletapi.FastletError
+	if !errors.As(err, &failure) || fastletapi.CreateDispositionFromError(err) != fastletapi.CreateDispositionRejectedBeforeSideEffects {
+		return false
+	}
+	switch failure.Code {
+	case fastletapi.ErrorShapeMismatch:
+		return true
+	default:
+		return false
+	}
+}
+
 func (o *Orchestrator) recordFeedback(fastlet placement.FastletInfo, response *fastletapi.CreateSandboxResponse, err error) {
 	var failure *fastletapi.FastletError
 	if !errors.As(err, &failure) {
 		return
 	}
-	// The feedback blacklists the fastlet for a short window (scheduling-
-	// visible via RejectedUntil); leave one line explaining why.
-	klog.V(2).InfoS("recording fastlet rejection feedback; candidate penalized", "fastlet", fastlet.ID, "code", failure.Code)
+	// Registry.RecordFeedback decides from the code whether the Fastlet is
+	// held back (RejectedUntil); request-level codes such as ProfileMismatch
+	// and ShapeMismatch only refresh the observed admission state.
+	klog.V(2).InfoS("recording fastlet create feedback", "fastlet", fastlet.ID, "code", failure.Code)
 	feedback := localFeedbackForFastlet(fastlet)
 	feedback.Code, feedback.Reason, feedback.ObservedAt = failure.Code, failure.Reason, o.now()
 	if response != nil {

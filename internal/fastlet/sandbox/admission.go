@@ -1278,7 +1278,7 @@ func fastletErrorWithCause(code fastletapi.FastletErrorCode, message string, ret
 
 func defaultCreateDisposition(code fastletapi.FastletErrorCode) fastletapi.CreateDisposition {
 	switch code {
-	case fastletapi.ErrorCapacityRejected, fastletapi.ErrorDraining, fastletapi.ErrorProfileMismatch:
+	case fastletapi.ErrorCapacityRejected, fastletapi.ErrorDraining, fastletapi.ErrorProfileMismatch, fastletapi.ErrorShapeMismatch:
 		return fastletapi.CreateDispositionRejectedBeforeSideEffects
 	case fastletapi.ErrorInProgress:
 		return fastletapi.CreateDispositionInProgress

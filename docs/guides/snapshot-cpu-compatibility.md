@@ -141,6 +141,14 @@ to the `ProfileMismatch` fastlet error (deterministic, not retryable on
 the same node), and the fastpath orchestrator advances to the next
 top-k candidate.
 
+A request whose CPU or memory limit is below the machine shape of the
+snapshot it restores is different: every node restores the same shape,
+so it maps to the `ShapeMismatch` fastlet error (HTTP 422), which is a
+request rejection, not a candidate rejection. FastPath does not try
+other candidates; it rolls back the Sandbox intent it created and
+returns `FAILED_PRECONDITION`. The Controller records `Runtime=Failed`
+with Ready reason `ShapeMismatch` instead of retrying Create.
+
 ## Node labels
 
 The `firecracker-runtime` DaemonSet agent stamps scheduling labels on

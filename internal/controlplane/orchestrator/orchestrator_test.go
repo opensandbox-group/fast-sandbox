@@ -682,6 +682,30 @@ func TestShapeMismatchIsNotACandidateRejection(t *testing.T) {
 	require.True(t, IsCandidateRejection(rejection(fastletapi.ErrorProfileMismatch)))
 }
 
+// TestIsRequestRejection: only a ShapeMismatch proven to have no side effects
+// is a request-level rejection; node-specific codes stay candidate rejections.
+func TestIsRequestRejection(t *testing.T) {
+	call := func(code fastletapi.FastletErrorCode, disposition fastletapi.CreateDisposition) error {
+		return &fastletapi.CreateCallError{Disposition: disposition, Failure: &fastletapi.FastletError{Code: code, Message: "rejected"}}
+	}
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"shape mismatch before side effects", call(fastletapi.ErrorShapeMismatch, fastletapi.CreateDispositionRejectedBeforeSideEffects), true},
+		{"shape mismatch with unknown outcome", call(fastletapi.ErrorShapeMismatch, fastletapi.CreateDispositionUnknown), false},
+		{"profile mismatch", call(fastletapi.ErrorProfileMismatch, fastletapi.CreateDispositionRejectedBeforeSideEffects), false},
+		{"capacity rejected", call(fastletapi.ErrorCapacityRejected, fastletapi.CreateDispositionRejectedBeforeSideEffects), false},
+		{"plain error", errors.New("transport"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, IsRequestRejection(tc.err))
+		})
+	}
+}
+
 func readyFastletObservation(sandboxID string, generation int64) *fastletapi.SandboxStatus {
 	return &fastletapi.SandboxStatus{
 		SandboxID:          sandboxID,

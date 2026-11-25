@@ -314,6 +314,10 @@ func statusForFastletError(err error) int {
 		return http.StatusNotImplemented
 	case fastletapi.ErrorSnapshotInProgress:
 		return http.StatusConflict
+	case fastletapi.ErrorShapeMismatch:
+		// The request cannot fit the snapshot it restores; no Fastlet state
+		// conflicts with it, so it is not a 409.
+		return http.StatusUnprocessableEntity
 	default:
 		return http.StatusConflict
 	}

@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -292,6 +293,34 @@ func TestExplicitCapacityRejectionPreservesDurableAssignmentAndAttemptFence(t *t
 	require.NotEmpty(t, current.Annotations["sandbox.fast.io/assignment"])
 	require.Equal(t, int64(1), current.Status.Placement.Attempt)
 	require.Equal(t, apiv1alpha2.RuntimePending, current.Status.Runtime.State)
+}
+
+// TestShapeMismatchRecordsTerminalFailureWithoutRetrying: a request-level
+// rejection is recorded as a terminal failure on the current assignment, is
+// never returned as a reconcile error, and Create is not called again.
+func TestShapeMismatchRecordsTerminalFailureWithoutRetrying(t *testing.T) {
+	reconciler, _, fastlet, sandbox := newControllerHarness(t)
+	fastlet.ensureErr = &fastletapi.CreateCallError{
+		Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects,
+		Failure:     &fastletapi.FastletError{Code: fastletapi.ErrorShapeMismatch, Message: "requested memory 512 MiB is below the template snapshot memory 1024 MiB"},
+	}
+	for range 4 {
+		_, err := reconciler.Reconcile(context.Background(), requestFor(sandbox.Name))
+		require.NoError(t, err)
+	}
+
+	current := getControllerSandbox(t, reconciler, sandbox.Name)
+	require.Equal(t, apiv1alpha2.RuntimeFailed, current.Status.Runtime.State)
+	require.True(t, terminalRuntimeFailureRecorded(current), "the failure is recorded for the projected assignment")
+	ready := apiMeta.FindStatusCondition(current.Status.Conditions, orchestration.ConditionReady)
+	require.NotNil(t, ready)
+	require.Equal(t, metav1.ConditionFalse, ready.Status)
+	require.Equal(t, string(fastletapi.ErrorShapeMismatch), ready.Reason)
+	require.Contains(t, ready.Message, "snapshot memory")
+	fastlet.mu.Lock()
+	defer fastlet.mu.Unlock()
+	require.Equal(t, 1, fastlet.ensureCall, "a request-level rejection must not be retried")
+	require.GreaterOrEqual(t, fastlet.deleteCall, 1, "the terminal path fences the identity with Delete")
 }
 
 func TestUnknownOutcomePreservesDurableAssignment(t *testing.T) {

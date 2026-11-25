@@ -836,6 +836,56 @@ func TestExistingIntentExplicitRejectionIsNeverDeleted(t *testing.T) {
 	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "existing-intent"}, &persisted))
 }
 
+func shapeMismatchCallError() error {
+	return &fastletapi.CreateCallError{
+		Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects,
+		Failure:     &fastletapi.FastletError{Code: fastletapi.ErrorShapeMismatch, Message: "requested memory 512 MiB is below the template snapshot memory 1024 MiB"},
+	}
+}
+
+// TestShapeMismatchRollsBackNewIntentWithoutCandidateWalk: every Fastlet would
+// reject the request identically, so FastPath must stop at the first
+// candidate, roll back the intent it created and return a non-retryable code.
+func TestShapeMismatchRollsBackNewIntentWithoutCandidateWalk(t *testing.T) {
+	server, k8sClient, registry, fastlet := newV2Server(t)
+	second := testCandidate("fastlet-b", "pod-b", "10.0.0.2")
+	registry.candidates = append(registry.candidates, second)
+	registry.fastlets[second.ID] = second
+	fastlet.createFailure = shapeMismatchCallError()
+
+	_, err := server.CreateSandbox(context.Background(), createRequest("shape-mismatch"))
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Contains(t, status.Convert(err).Message(), "snapshot memory")
+	fastlet.mu.Lock()
+	require.Equal(t, []string{"10.0.0.1"}, fastlet.createIPs, "no Top-K walk for a request-level rejection")
+	fastlet.mu.Unlock()
+
+	var persisted apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "shape-mismatch"}, &persisted))
+	require.NotNil(t, persisted.DeletionTimestamp, "the intent created by this call is rolled back")
+	require.Contains(t, persisted.Finalizers, assignment.CleanupFinalizer)
+	envelope, err := assignment.AssignmentFromAnnotation(&persisted)
+	require.NoError(t, err)
+	require.Equal(t, "fastlet-a", envelope.FastletName, "the assignment is not advanced")
+}
+
+// TestShapeMismatchKeepsReplayedIntent: a replayed request does not own the
+// intent, so it is never deleted; the caller still gets the non-retryable code.
+func TestShapeMismatchKeepsReplayedIntent(t *testing.T) {
+	server, k8sClient, _, fastlet := newV2Server(t)
+	fastlet.createFailure = errors.New("transport response lost")
+	_, err := server.CreateSandbox(context.Background(), createRequest("replayed-shape"))
+	require.Equal(t, codes.Unavailable, status.Code(err))
+
+	fastlet.createFailure = shapeMismatchCallError()
+	_, err = server.CreateSandbox(context.Background(), createRequest("replayed-shape"))
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+
+	var persisted apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "replayed-shape"}, &persisted))
+	require.Nil(t, persisted.DeletionTimestamp)
+}
+
 func TestNewIntentLocalReservationConflictRollsBackBeforeReturningFailure(t *testing.T) {
 	server, k8sClient, registry, fastlet := newV2Server(t)
 	second := testCandidate("fastlet-b", "pod-b", "10.0.0.2")

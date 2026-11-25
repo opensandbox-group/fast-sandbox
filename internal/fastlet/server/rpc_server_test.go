@@ -391,3 +391,8 @@ func TestFastletServerTracesAuthenticationRejections(t *testing.T) {
 	require.True(t, statuses[http.StatusForbidden],
 		"forbidden subjects must appear in the Fastlet's own spans with their status code")
 }
+
+func TestShapeMismatchMapsToUnprocessableEntity(t *testing.T) {
+	require.Equal(t, http.StatusUnprocessableEntity, statusForFastletError(&fastletapi.FastletError{Code: fastletapi.ErrorShapeMismatch}))
+	require.Equal(t, http.StatusConflict, statusForFastletError(&fastletapi.FastletError{Code: fastletapi.ErrorProfileMismatch}))
+}

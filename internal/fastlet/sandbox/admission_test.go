@@ -835,6 +835,10 @@ func TestEnsureIncompatibleArtifactMapsToProfileMismatch(t *testing.T) {
 	require.Equal(t, fastletapi.CreateDispositionRejectedBeforeSideEffects, response.Disposition)
 }
 
+func TestDefaultCreateDispositionShapeMismatchIsRejectedBeforeSideEffects(t *testing.T) {
+	require.Equal(t, fastletapi.CreateDispositionRejectedBeforeSideEffects, defaultCreateDisposition(fastletapi.ErrorShapeMismatch))
+}
+
 // TestEnsureShapeMismatchIsNotACandidateRejection: a request below the
 // snapshot machine shape maps to the non-retryable ShapeMismatch code, which
 // FastPath does not treat as a candidate rejection.

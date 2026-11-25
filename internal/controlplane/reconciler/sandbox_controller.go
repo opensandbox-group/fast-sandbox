@@ -240,6 +240,9 @@ func (r *SandboxReconciler) reconcileEnsure(ctx context.Context, orchestrator *o
 			}
 			return ctrl.Result{RequeueAfter: DefaultRequeueInterval}, nil
 		}
+		if orchestration.IsRequestRejection(err) {
+			return r.recordRequestRejection(ctx, assigned, err)
+		}
 		var failure *fastletapi.FastletError
 		if errors.As(err, &failure) && failure.Code == fastletapi.ErrorInProgress {
 			if statusErr := r.markCreating(ctx, assigned, failure.Message); statusErr != nil {
@@ -388,6 +391,35 @@ func (r *SandboxReconciler) markPending(ctx context.Context, sandbox *apiv1alpha
 			return
 		}
 		setControllerStates(status, apiv1alpha2.RuntimePending, apiv1alpha2.DataPlanePending, message)
+		setSandboxReadyCondition(status, sandbox.Generation, reason, message)
+	})
+}
+
+// recordRequestRejection handles a create that no candidate can satisfy (for
+// example ShapeMismatch): neither rescheduling nor retrying the same Fastlet
+// helps. It records a terminal failure for this exact assignment, so the next
+// pass takes the terminal path, which fences the identity with Delete instead
+// of calling Create again.
+func (r *SandboxReconciler) recordRequestRejection(ctx context.Context, sandbox *apiv1alpha2.Sandbox, rejection error) (ctrl.Result, error) {
+	if err := r.markRequestRejected(ctx, sandbox, rejection); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{Requeue: true}, nil
+}
+
+// markRequestRejected writes the terminal failure status. The status keeps the
+// projected assignment, so terminalRuntimeFailureRecorded matches it.
+func (r *SandboxReconciler) markRequestRejected(ctx context.Context, sandbox *apiv1alpha2.Sandbox, rejection error) error {
+	reason, message := "RequestRejected", rejection.Error()
+	var failure *fastletapi.FastletError
+	if errors.As(rejection, &failure) {
+		reason = string(failure.Code)
+		if failure.Message != "" {
+			message = failure.Message
+		}
+	}
+	return r.patchStatus(ctx, sandbox, func(status *apiv1alpha2.SandboxStatus) {
+		setControllerStates(status, apiv1alpha2.RuntimeFailed, apiv1alpha2.DataPlanePending, message)
 		setSandboxReadyCondition(status, sandbox.Generation, reason, message)
 	})
 }

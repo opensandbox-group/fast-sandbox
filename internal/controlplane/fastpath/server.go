@@ -401,13 +401,8 @@ func (s *Server) provisionRuntime(ctx context.Context, accepted *acceptedCreate,
 		if callErr == nil {
 			return nil, status.Error(codes.Unavailable, "Fastlet Create returned no Sandbox observation; Sandbox intent is persisted for Controller recovery")
 		}
-		// A local reservation conflict happens before the Fastlet RPC. It is a
-		// definitive rejection only while this call owns the newly created
-		// intent, so candidate retry or rollback cannot disrupt an idempotent
-		// replay that is already using the durable assignment.
-		ownedLocalRejection := accepted.created && errors.Is(callErr, orchestration.ErrLocalReservationConflict)
-		if !orchestration.IsCandidateRejection(callErr) && !ownedLocalRejection {
-			return nil, status.Errorf(codes.Unavailable, "Sandbox intent is persisted and Controller will retry: %v", callErr)
+		if err := s.stopUnlessCandidateRejection(ctx, accepted, callErr); err != nil {
+			return nil, err
 		}
 		hasBudget := len(tried) < maxCreateCandidateAttempts
 		if accepted.created && index+1 == len(accepted.candidates) && hasBudget {
@@ -436,6 +431,30 @@ func (s *Server) finishRejectedCreate(ctx context.Context, accepted *acceptedCre
 		return nil, err
 	}
 	return nil, status.Errorf(codes.ResourceExhausted, "all Fastlet candidates rejected admission: %v", rejection)
+}
+
+// stopUnlessCandidateRejection returns nil only when callErr lets FastPath
+// try another candidate, and otherwise the error that ends this create.
+func (s *Server) stopUnlessCandidateRejection(ctx context.Context, accepted *acceptedCreate, callErr error) error {
+	if orchestration.IsRequestRejection(callErr) {
+		// Every candidate would reject this request identically. Roll back an
+		// intent this call created (a replayed intent keeps its durable
+		// identity; the Controller records the terminal failure on it) and
+		// report a non-retryable precondition failure.
+		if err := s.rollbackRejectedCreate(ctx, accepted, callErr); err != nil {
+			return err
+		}
+		return status.Errorf(codes.FailedPrecondition, "Sandbox request rejected by Fastlet: %v", callErr)
+	}
+	// A local reservation conflict happens before the Fastlet RPC. It is a
+	// definitive rejection only while this call owns the newly created
+	// intent, so candidate retry or rollback cannot disrupt an idempotent
+	// replay that is already using the durable assignment.
+	ownedLocalRejection := accepted.created && errors.Is(callErr, orchestration.ErrLocalReservationConflict)
+	if !orchestration.IsCandidateRejection(callErr) && !ownedLocalRejection {
+		return status.Errorf(codes.Unavailable, "Sandbox intent is persisted and Controller will retry: %v", callErr)
+	}
+	return nil
 }
 
 // Only an intent created by this call can be rolled back after every attempted
