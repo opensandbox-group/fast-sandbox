@@ -34,7 +34,7 @@ func (e *httpError) Error() string {
 	if len(body) > 200 {
 		body = body[:200] + "..."
 	}
-	return fmt.Sprintf("S3 GET failed with status %d: %s", e.StatusCode, body)
+	return fmt.Sprintf("S3 request failed with status %d: %s", e.StatusCode, body)
 }
 
 const (
@@ -461,7 +461,7 @@ func deriveSigningKey(secretKey, date, region string) []byte {
 	return hmacSHA256(key, "aws4_request")
 }
 
-// signWrite applies AWS Signature Version 4 to a PUT with the write
+// signWrite applies AWS Signature Version 4 to a request with the write
 // credential. The payload hash is UNSIGNED-PAYLOAD: streamed bodies cannot
 // promise a content hash header without a second full read.
 func (c *s3Client) signWrite(request *http.Request) {
@@ -481,7 +481,7 @@ func (c *s3Client) signWrite(request *http.Request) {
 		"x-amz-date:" + amzDate + "\n"
 	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
 	canonicalRequest := strings.Join([]string{
-		http.MethodPut,
+		request.Method,
 		canonicalURI,
 		request.URL.RawQuery,
 		canonicalHeaders,
