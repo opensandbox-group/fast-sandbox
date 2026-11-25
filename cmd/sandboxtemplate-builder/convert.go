@@ -214,7 +214,7 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 
 	hosts := filepath.Join(mountPoint, "etc", "hosts")
 	if _, err := os.Stat(hosts); err != nil {
-		if err := os.WriteFile(hosts, []byte("127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n"), 0o644); err != nil { //nolint:gosec // guest /etc/hosts, world-readable by design
+		if err := os.WriteFile(hosts, []byte("127.0.0.1 localhost\n127.0.0.1 sandbox\n::1 localhost ip6-localhost ip6-loopback\n"), 0o644); err != nil { //nolint:gosec // guest /etc/hosts, world-readable by design
 			return nil, err
 		}
 	}
@@ -390,6 +390,7 @@ mountpoint -q /tmp || mount -t tmpfs tmpfs /tmp
 ` + loGate + `
 exec </dev/console >/dev/console 2>&1
 hostname sandbox
+grep -Eq '^[[:space:]]*[^#].*[[:space:]]sandbox([[:space:]]|$)' /etc/hosts 2>/dev/null || echo "127.0.0.1 sandbox" >> /etc/hosts
 ` + firecrackerconfig.RenderFreePageReportingCheck() + controlStart + `
 [ -f /etc/sandbox-init.env ] && . /etc/sandbox-init.env
 if [ -x /opt/opensandbox/bootstrap.sh ]; then

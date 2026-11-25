@@ -212,6 +212,80 @@ func TestDefaultGuestReportingInitWiring(t *testing.T) {
 	}
 }
 
+func TestGuestInitEnsuresSandboxHostsEntry(t *testing.T) {
+	script := renderGuestInit(apiv1alpha2.SandboxTemplateSpec{})
+	const marker = "hostname sandbox\n"
+	idx := strings.Index(script, marker)
+	if idx < 0 {
+		t.Fatal("rendered init missing hostname sandbox")
+	}
+	line, _, ok := strings.Cut(script[idx+len(marker):], "\n")
+	if !ok || !strings.Contains(line, `echo "127.0.0.1 sandbox" >> /etc/hosts`) {
+		t.Fatalf("expected sandbox /etc/hosts line after hostname sandbox, got %q", line)
+	}
+
+	tests := []struct {
+		name    string
+		initial string
+		want    string
+	}{
+		{
+			name:    "appends when missing",
+			initial: "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n",
+			want:    "127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n127.0.0.1 sandbox\n",
+		},
+		{
+			name:    "idempotent when already present",
+			initial: "127.0.0.1 localhost\n127.0.0.1 sandbox\n",
+			want:    "127.0.0.1 localhost\n127.0.0.1 sandbox\n",
+		},
+		{
+			name:    "appends when only comment or substring mentions sandbox",
+			initial: "# sandbox\n10.0.0.1 my-sandbox\n127.0.0.1 sandbox.local\n",
+			want:    "# sandbox\n10.0.0.1 my-sandbox\n127.0.0.1 sandbox.local\n127.0.0.1 sandbox\n",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			hosts := filepath.Join(t.TempDir(), "hosts")
+			if err := os.WriteFile(hosts, []byte(test.initial), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cmdLine := strings.ReplaceAll(line, "/etc/hosts", shellQuote(hosts))
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if output, err := exec.CommandContext(ctx, "/bin/sh", "-eu", "-c", cmdLine).CombinedOutput(); err != nil {
+				t.Fatalf("hosts snippet failed: %v: %s", err, output)
+			}
+			got, err := os.ReadFile(hosts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != test.want {
+				t.Fatalf("hosts = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestInjectRuntimeDefaultHostsIncludesSandbox(t *testing.T) {
+	workdir := t.TempDir()
+	mountPoint := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(mountPoint, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := injectRuntime(apiv1alpha2.SandboxTemplateSpec{}, workdir, mountPoint); err != nil {
+		t.Fatalf("injectRuntime: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(mountPoint, "etc", "hosts"))
+	if err != nil {
+		t.Fatalf("read injected /etc/hosts: %v", err)
+	}
+	if !strings.Contains(string(got), "127.0.0.1 sandbox\n") {
+		t.Fatalf("injected /etc/hosts = %q, want 127.0.0.1 sandbox", got)
+	}
+}
+
 // TestInjectBusyboxFrom: the builder's static busybox lands at the path the
 // init's fallback chain references; no readable candidate reports false.
 func TestInjectBusyboxFrom(t *testing.T) {
