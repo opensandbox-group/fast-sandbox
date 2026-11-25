@@ -34,6 +34,57 @@ func TestParseStoreRoot(t *testing.T) {
 	require.Contains(t, err.Error(), "bucket is required")
 }
 
+func TestArtifactBodyOutlivesMetadataTimeout(t *testing.T) {
+	for _, route := range []string{"S3", "DART"} {
+		t.Run(route, func(t *testing.T) {
+			finishArtifact := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				w.(http.Flusher).Flush()
+				if strings.HasSuffix(r.URL.Path, "/metadata.json") {
+					<-r.Context().Done()
+					return
+				}
+				select {
+				case <-finishArtifact:
+					if strings.HasPrefix(r.URL.Path, "/dart/") {
+						_, _ = io.WriteString(w, "DART")
+						return
+					}
+					_, _ = io.WriteString(w, "S3")
+				case <-r.Context().Done():
+				}
+			}))
+			t.Cleanup(server.Close)
+			options := []Option{WithEndpoint(server.URL)}
+			if route == "DART" {
+				options = append(options, WithPeerGateway(server.URL, ""))
+			}
+			client, err := NewClient("s3://artifacts", registryconfig.Credential{Username: "key", Password: "secret"}, options...)
+			require.NoError(t, err)
+			require.Equal(t, 5*time.Minute, client.s3.http.Timeout)
+			require.Equal(t, 15*time.Minute, client.artifactHTTP.Timeout)
+			client.s3.http.Timeout = 250 * time.Millisecond
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+
+			artifact, err := client.getArtifact(ctx, "rootfs.img")
+			require.NoError(t, err)
+			defer artifact.Close()
+			metadata, err := client.s3.get(ctx, "metadata.json")
+			require.NoError(t, err)
+			defer metadata.Close()
+			_, err = io.ReadAll(metadata)
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+
+			close(finishArtifact)
+			contents, err := io.ReadAll(artifact)
+			require.NoError(t, err)
+			require.Equal(t, route, string(contents))
+		})
+	}
+}
+
 func TestS3GetPathAndSigningHeaders(t *testing.T) {
 	var received *http.Request
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
