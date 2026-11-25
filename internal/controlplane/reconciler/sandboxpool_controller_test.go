@@ -1674,6 +1674,76 @@ func TestPlannedUpgradeWaitsForReadySurgeThenDrainsOldTemplate(t *testing.T) {
 	require.False(t, needsPlannedUpgradeSurge([]corev1.Pod{*oldPod, *newPod}, 1, desiredHash))
 }
 
+func surgeTestPod(name, templateHash string, ready bool) corev1.Pod {
+	pod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{placement.AnnotationPodTemplateHash: templateHash}}}
+	if ready {
+		pod.Status.Phase = corev1.PodRunning
+		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	} else {
+		pod.Status.Phase = corev1.PodPending
+	}
+	return pod
+}
+
+func surgeTestPods(prefix, templateHash string, ready bool, count int) []corev1.Pod {
+	pods := make([]corev1.Pod, 0, count)
+	for index := range count {
+		pods = append(pods, surgeTestPod(fmt.Sprintf("%s-%d", prefix, index), templateHash, ready))
+	}
+	return pods
+}
+
+func TestNeedsPlannedUpgradeSurgeBounds(t *testing.T) {
+	const desiredHash = "desired-template"
+	old := func(count int) []corev1.Pod { return surgeTestPods("old", "old-template", true, count) }
+	starting := func(count int) []corev1.Pod { return surgeTestPods("new-starting", desiredHash, false, count) }
+	ready := func(count int) []corev1.Pod { return surgeTestPods("new-ready", desiredHash, true, count) }
+	join := func(groups ...[]corev1.Pod) []corev1.Pod {
+		var pods []corev1.Pod
+		for _, group := range groups {
+			pods = append(pods, group...)
+		}
+		return pods
+	}
+	cases := []struct {
+		name   string
+		pods   []corev1.Pod
+		target int32
+		want   bool
+	}{
+		{"at target with outdated Pods", old(9), 9, true},
+		{"below target is ordinary scale-up", old(8), 9, false},
+		{"no outdated Pods", ready(9), 9, false},
+		{"two Pods still starting", join(old(9), starting(2)), 9, true},
+		{"three Pods still starting", join(old(9), starting(3)), 9, false},
+		{"three above target", join(old(9), ready(3)), 9, false},
+		{"ready surge Pods free the budget while old Pods drain", join(old(7), ready(2), starting(1)), 9, true},
+		{"enough new-template Pods for the target", join(old(1), ready(1)), 1, false},
+		{"zero target", old(2), 0, false},
+		{"more outdated Pods than the target scale down first", old(10), 9, false},
+	}
+	for _, tc := range cases {
+		require.Equal(t, tc.want, needsPlannedUpgradeSurge(tc.pods, tc.target, desiredHash), tc.name)
+	}
+}
+
+// A surge Pod that cannot be scheduled must hold the upgrade, not multiply: the
+// reconciler used to compare against the stabilized target, which grew with
+// every surge Pod (238 Pods for a 9-Fastlet Pool on a full cluster).
+func TestPlannedUpgradeSurgeStopsWhenSurgePodsStayPending(t *testing.T) {
+	const desiredHash = "desired-template"
+	pods := surgeTestPods("old", "old-template", true, 9)
+	created := 0
+	for range 1000 {
+		if !needsPlannedUpgradeSurge(pods, 9, desiredHash) {
+			continue
+		}
+		pods = append(pods, surgeTestPod(fmt.Sprintf("surge-%d", created), desiredHash, false))
+		created++
+	}
+	require.Equal(t, maxPlannedUpgradeSurge, created)
+}
+
 func TestSandboxNeedsPlacementExcludesTerminalAndAssignedStates(t *testing.T) {
 	require.True(t, sandboxNeedsPlacement(&apiv1alpha2.Sandbox{}))
 	expired := &apiv1alpha2.Sandbox{Status: apiv1alpha2.SandboxStatus{
