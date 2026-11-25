@@ -216,14 +216,15 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 		return nil, err
 	}
 
-	sizeBytes, err := assembleSnapshotManifest(plan.stateRoot, d.ociRoot(), plan.staging, plan.sandboxDir, kind)
+	assembleStarted := time.Now()
+	sizeBytes, err := d.assemblePlanManifest(&plan, kind)
 	if err != nil {
 		_ = os.RemoveAll(plan.staging)
 		return nil, err
 	}
 	klog.InfoS("firecracker checkpoint manifest assembled",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind,
-		"sizeBytes", sizeBytes, "staging", plan.staging)
+		"sizeBytes", sizeBytes, "staging", plan.staging, "assemble", time.Since(assembleStarted).String())
 
 	if ociSnapshot {
 		return d.publishOCISnapshot(ctx, plan, sizeBytes, kind, input.OnPublishing)
@@ -270,7 +271,7 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 			cacheRef = ""
 		}
 	}
-	if cacheErr := d.commitSnapshotCache(cacheRef, result.ArtifactDigest, plan.staging, true, nil); cacheErr != nil {
+	if cacheErr := d.commitSnapshotCache(cacheRef, result.ArtifactDigest, plan.staging, true, plan.verifiedFiles); cacheErr != nil {
 		klog.ErrorS(cacheErr, "snapshot local cache commit failed; subsequent restores will pull from the store",
 			"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "reference", cacheRef, "manifestRef", outcome.ManifestRef)
 	}
@@ -279,6 +280,19 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "templateName", input.TemplateName,
 		"manifestRef", outcome.ManifestRef, "sizeBytes", sizeBytes, "publish", time.Since(publishStarted).String())
 	return result, nil
+}
+
+// assemblePlanManifest writes the manifest and SHA256SUMS of the staged set.
+// It reuses the digests proven while the set was staged (plan.verifiedFiles),
+// hashes the remaining files in parallel, and leaves every file's proof in
+// plan.verifiedFiles for the same-node cache commit.
+func (d *Driver) assemblePlanManifest(plan *dumpPlan, kind fastletapi.SnapshotKind) (int64, error) {
+	sizeBytes, verified, err := assembleSnapshotManifestWith(plan.stateRoot, d.ociRoot(), plan.staging, plan.sandboxDir, kind, plan.verifiedFiles)
+	if err != nil {
+		return 0, err
+	}
+	plan.verifiedFiles = verified
+	return sizeBytes, nil
 }
 
 // commitSnapshotCache moves a published artifact set (Full checkpoint, Full
@@ -1380,9 +1394,15 @@ type snapshotManifestEntries struct {
 	RootfsSize, SizeBytes int64
 	Cache                 map[string]string
 	Names                 []string
+	// Verified holds the proof of every hashed staged file (staged name ->
+	// digest bound to the file identity it was computed on).
+	Verified map[string]agentpull.VerifiedFile
 }
 
-func collectSnapshotManifestEntries(staging string, isOCI bool) (snapshotManifestEntries, error) {
+// collectSnapshotManifestEntries describes the staged files of a snapshot
+// set. Digests proven earlier (known) are reused while their proof still
+// matches the file; the other files are hashed concurrently.
+func collectSnapshotManifestEntries(staging string, isOCI bool, known map[string]agentpull.VerifiedFile) (snapshotManifestEntries, error) {
 	bundleFiles, err := stagedBundleFiles(staging)
 	if err != nil {
 		return snapshotManifestEntries{}, err
@@ -1393,7 +1413,10 @@ func collectSnapshotManifestEntries(staging string, isOCI bool) (snapshotManifes
 	}
 	files, stateFiles := map[string]artifacts.ManifestFile{}, map[string]artifacts.ManifestFile{}
 	var sizeBytes, rootfsSize int64
-	cache := map[string]string{}
+	cache, verified, err := hashStagedFiles(staging, bundleFiles, known)
+	if err != nil {
+		return snapshotManifestEntries{}, err
+	}
 	for _, name := range bundleFiles {
 		file, err := artifacts.FileEntry(filepath.Join(staging, name), cache)
 		if err != nil {
@@ -1420,103 +1443,169 @@ func collectSnapshotManifestEntries(staging string, isOCI bool) (snapshotManifes
 		rootfsSize = upper.VirtualSizeBytes
 		sizeBytes += rootfsSize
 	}
-	return snapshotManifestEntries{Files: files, StateFiles: stateFiles, RootfsSize: rootfsSize, SizeBytes: sizeBytes, Cache: cache, Names: bundleFiles}, nil
+	return snapshotManifestEntries{Files: files, StateFiles: stateFiles, RootfsSize: rootfsSize, SizeBytes: sizeBytes, Cache: cache, Names: bundleFiles, Verified: verified}, nil
 }
 
-func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, kind fastletapi.SnapshotKind) (int64, error) {
+// assembleSnapshotManifestWith writes the manifest and SHA256SUMS of a staged
+// snapshot set and returns its size and the proofs of its hashed files (see
+// collectSnapshotManifestEntries for known).
+func assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir string, kind fastletapi.SnapshotKind, known map[string]agentpull.VerifiedFile) (int64, map[string]agentpull.VerifiedFile, error) {
 	state, err := loadState(sandboxDir)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	document, sourceRef, err := snapshotSourceDocument(stateRoot, ociRoot, state)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	isOCI := strings.HasPrefix(sourceRef, ocitemplate.Prefix)
-	entries, err := collectSnapshotManifestEntries(staging, isOCI)
+	entries, err := collectSnapshotManifestEntries(staging, isOCI, known)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	rootfsSize := entries.RootfsSize
 	files, stateFiles := entries.Files, entries.StateFiles
 	// Modify only the actual disk capacity, preserving unknown machine fields.
 	machine, err := manifestSection(document, "machine")
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if rootfsSize > 0 {
 		machine["rootfsSizeMiB"], err = json.Marshal((rootfsSize + (1 << 20) - 1) >> 20)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 	}
 	document["machine"], err = json.Marshal(machine)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	// imageDigest continues to anchor the original build, not the latest dump.
 	lineage, err := manifestSection(document, "lineage")
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	image, err := json.Marshal(state.Config.Desired.Image)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	lineage["image"] = image
 	document["lineage"], err = json.Marshal(lineage)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	platform, err := manifestSection(document, "platform")
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if err := setSnapshotResourceLimits(platform, state.Config.Limits); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	delete(platform, "snapshotMode")
 	delete(platform, "checkpoint")
 	if kind == fastletapi.SnapshotKindCheckpoint {
 		platform["checkpoint"], err = json.Marshal(artifacts.CheckpointOwner{SandboxUID: state.Config.Identity.SandboxUID, Namespace: state.Config.Identity.Namespace})
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 	}
 	delete(platform, "stateFiles")
 	if len(stateFiles) > 0 {
 		platform["stateFiles"], err = json.Marshal(stateFiles)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 	}
 	document["platform"], err = json.Marshal(platform)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	delete(document, "files")
 	if !isOCI {
 		document["files"], err = json.Marshal(files)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 	}
 	if !isOCI {
 		if err = artifacts.WriteSHA256SUMS(staging, entries.Names, entries.Cache); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 	}
 	payload, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if _, err = artifacts.DecodeVMManifest(payload); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if err = os.WriteFile(filepath.Join(staging, snapshotManifestName), append(payload, '\n'), 0644); err != nil { //nolint:gosec // published metadata, readable by the runtime-agent
-		return 0, err
+		return 0, nil, err
 	}
-	return entries.SizeBytes, nil
+	return entries.SizeBytes, entries.Verified, nil
+}
+
+// hashStagedFile hashes one staged file and proves the file identity it
+// hashed (a variable so tests can count the reads).
+var hashStagedFile = agentpull.HashAndTrackFile
+
+// hashStagedFiles returns the checksum cache of the named staged files
+// (path -> sha256) and their proofs (name -> VerifiedFile). A file whose
+// proof in known still matches it is not read again. The other files are
+// hashed concurrently, so the set costs its largest file instead of the sum
+// of all of them; SHA256File and HashAndTrackFile use per-call buffers.
+func hashStagedFiles(staging string, names []string, known map[string]agentpull.VerifiedFile) (map[string]string, map[string]agentpull.VerifiedFile, error) {
+	cache := make(map[string]string, len(names))
+	verified := make(map[string]agentpull.VerifiedFile, len(names))
+	// Known digests go into the maps before any hashing goroutine starts:
+	// from then on only the goroutines write them, under the lock.
+	var misses []string
+	for _, name := range names {
+		path := filepath.Join(staging, name)
+		if proof, ok := known[name]; ok && proofHolds(path, proof) {
+			cache[path] = proof.SHA256()
+			verified[name] = proof
+			continue
+		}
+		misses = append(misses, name)
+	}
+	var (
+		mu   sync.Mutex
+		wg   sync.WaitGroup
+		errs []error
+	)
+	for _, name := range misses {
+		path := filepath.Join(staging, name)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sum, _, proof, err := hashStagedFile(path)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("checksum %s: %w", name, err))
+				return
+			}
+			cache[path] = sum
+			verified[name] = proof
+		}()
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return nil, nil, err
+	}
+	return cache, verified, nil
+}
+
+// proofHolds reports whether path is still the unmodified file proof was
+// computed on.
+func proofHolds(path string, proof agentpull.VerifiedFile) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	return proof.MatchesFile(file)
 }
 
 // relocateSpilled is the post-resume relocation of one spilled dump file
