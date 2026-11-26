@@ -47,6 +47,7 @@ Fast Sandbox documentation is organized by reader intent:
 - [Testing](guides/testing.md)
 - [Firecracker runtime E2E](guides/firecracker-runtime-e2e.md)
 - [Firecracker full-chain E2E](guides/firecracker-chain-e2e.md)
+- [Firecracker in Kubernetes pods](guides/firecracker-in-kubernetes-pods.md)
 - [fsb-vm CLI user guide](guides/fsb-vm-user-guide.en.md)
 - [fsb-vm 命令行使用指南](guides/fsb-vm-user-guide.md)
 
