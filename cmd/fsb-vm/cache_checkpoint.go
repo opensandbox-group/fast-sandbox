@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/opencontainers/go-digest"
 	oci "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/spf13/cobra"
+	"oras.land/oras-go/v2/registry"
 
 	"fast-sandbox/internal/ocitemplate"
 )
@@ -57,12 +59,16 @@ func cacheCheckpoint(ctx context.Context, result *ocitemplate.PublishedCheckpoin
 	if err != nil {
 		return err
 	}
-	if pair.Snapfiles != strings.TrimPrefix(result.Reference, ocitemplate.Prefix) {
+	publicationRef := pair.Snapfiles
+	if pair.Metadata != nil {
+		publicationRef = pair.Rootfs
+	}
+	if publicationRef != strings.TrimPrefix(result.Reference, ocitemplate.Prefix) {
 		return fmt.Errorf("published checkpoint pair mismatch")
 	}
 	// Validate all manifests before writing metadata or requesting blob imports.
 	var layers []oci.Descriptor
-	for _, reference := range []string{pair.Rootfs, pair.Snapfiles} {
+	for _, reference := range pair.ImageRefs() {
 		imageRef, err := parseRegistryReference(reference)
 		if err != nil {
 			return err
@@ -77,7 +83,7 @@ func cacheCheckpoint(ctx context.Context, result *ocitemplate.PublishedCheckpoin
 		}
 		layers = append(layers, manifest.Layers...)
 	}
-	for _, reference := range []string{pair.Rootfs, pair.Snapfiles} {
+	for _, reference := range pair.ImageRefs() {
 		imageRef, _ := parseRegistryReference(reference)
 		path, err := createManifestCachePath(imageRef, config)
 		if err != nil {
@@ -87,6 +93,12 @@ func cacheCheckpoint(ctx context.Context, result *ocitemplate.PublishedCheckpoin
 			return err
 		}
 	}
+	if pair.Metadata != nil {
+		if err := cacheRootfsConfig(ref, config, artifacts, result.Manifests[pair.Rootfs]); err != nil {
+			return err
+		}
+		return retainCheckpointLayers(ctx, layers, artifacts)
+	}
 	path, err := createManifestCachePath(ref, config)
 	if err != nil {
 		return err
@@ -95,6 +107,48 @@ func cacheCheckpoint(ctx context.Context, result *ocitemplate.PublishedCheckpoin
 		return err
 	}
 	return retainCheckpointLayers(ctx, layers, artifacts)
+}
+
+func cacheRootfsConfig(ref registry.Reference, config dockerConfig, artifacts string, manifestBytes []byte) error {
+	var manifest oci.Manifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		return err
+	}
+	configDigest := manifest.Config.Digest
+	if configDigest.Validate() != nil || configDigest.Algorithm() != digest.SHA256 {
+		return fmt.Errorf("published RootfsOnly config requires a valid sha256 digest")
+	}
+	if manifest.Config.Size < 0 || manifest.Config.Size > ocitemplate.MaxRootfsConfigBytes {
+		return fmt.Errorf("published RootfsOnly config size mismatch")
+	}
+	configRef := ref
+	configRef.Reference = configDigest.String()
+	path, err := createManifestCachePath(configRef, config)
+	if err != nil {
+		return err
+	}
+	// Config payloads are private staging files written by pack.
+	blob := filepath.Join(artifacts, "blobs", "sha256", configDigest.Encoded())
+	info, err := os.Lstat(blob)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() != manifest.Config.Size {
+		return fmt.Errorf("published RootfsOnly config size or type mismatch")
+	}
+	file, err := os.Open(blob)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(io.LimitReader(file, ocitemplate.MaxRootfsConfigBytes+1))
+	if err != nil {
+		return err
+	}
+	if int64(len(raw)) != manifest.Config.Size || digest.FromBytes(raw) != configDigest {
+		return fmt.Errorf("published RootfsOnly config digest or size mismatch")
+	}
+	return cacheImageManifest(path, configRef.Reference, raw)
 }
 
 // The publisher has already verified these private staging files against their

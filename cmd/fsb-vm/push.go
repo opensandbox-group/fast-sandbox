@@ -14,7 +14,7 @@ import (
 
 func newPushCommand() *cobra.Command {
 	var dir, destination, metadata, authFile string
-	cmd := &cobra.Command{Use: "push", Short: "Publish rootfs and snapfiles images to an OCI registry", RunE: func(cmd *cobra.Command, _ []string) error {
+	cmd := &cobra.Command{Use: "push", Short: "Publish an OverlayBD artifact to an OCI registry", RunE: func(cmd *cobra.Command, _ []string) error {
 		raw, err := os.ReadFile(authFile)
 		if err != nil {
 			return err

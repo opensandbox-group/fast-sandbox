@@ -2,13 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	registrytest "github.com/google/go-containerregistry/pkg/registry"
 	"github.com/opencontainers/go-digest"
@@ -16,10 +19,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"oras.land/oras-go/v2/registry/remote/retry"
 
+	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/ocitemplate"
 )
 
-// Requires root, ublkd, and real OverlayBD tools; consumes only an upper copy already captured by the external lab.
+// Requires real OverlayBD tools and an upper copy captured by the external lab.
 // The Registry is local to this test; nothing is published to an external repository.
 func TestRootfsPackPublishIntegration(t *testing.T) {
 	if os.Getenv("FSB_TEST_ROOTFS_PACK") != "1" {
@@ -33,7 +37,9 @@ func TestRootfsPackPublishIntegration(t *testing.T) {
 	old := global
 	t.Cleanup(func() { global = old })
 	global.ublkdSocket = os.Getenv("FSB_TEST_UBLKD_SOCKET")
-	require.NotEmpty(t, global.ublkdSocket)
+	if global.ublkdSocket == "" {
+		global.ublkdSocket = filepath.Join(root, "no-ublkd.sock")
+	}
 	tools := os.Getenv("FSB_TEST_OVERLAYBD_TOOLS")
 	require.NotEmpty(t, tools)
 	global.overlaybdCreate = filepath.Join(tools, "overlaybd-create")
@@ -47,20 +53,45 @@ func TestRootfsPackPublishIntegration(t *testing.T) {
 	for _, entry := range []struct{ source, target string }{{"data", ocitemplate.UpperDataName}, {"index", ocitemplate.UpperIndexName}} {
 		require.NoError(t, copyFile(filepath.Join(source, entry.source), filepath.Join(bundle, entry.target), 0600))
 	}
-	baseData, baseIndex, baseLayer := filepath.Join(root, "base.data"), filepath.Join(root, "base.index"), filepath.Join(root, "base.zfile")
-	// The source test disk has no remote parent; create an equivalent immutable zero-filled base to verify OCI transfer of the real upper.
-	require.NoError(t, createHybridUpper(t.Context(), global.overlaybdCreate, baseData, baseIndex, 1))
-	require.NoError(t, commitLayer(t.Context(), baseData, baseIndex, baseLayer, true))
-	payload, err := os.ReadFile(baseLayer)
-	require.NoError(t, err)
-	desc := oci.Descriptor{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromBytes(payload), Size: int64(len(payload))}
-	server := httptest.NewTLSServer(registrytest.New())
+	kernel := os.Getenv("FSB_TEST_PACK_BOOT_KERNEL")
+	seed := os.Getenv("FSB_TEST_PACK_BOOT_DISK")
+	var payload []byte
+	var desc oci.Descriptor
+	if kernel != "" {
+		data, index := filepath.Join(root, "raw.data"), filepath.Join(root, "raw.index")
+		sealed := filepath.Join(root, "raw.lsmt")
+		cmd := exec.CommandContext(t.Context(), filepath.Join(tools, "overlaybd-import-raw"), seed, data, index, sealed)
+		output, err := cmd.CombinedOutput()
+		require.NoError(t, err, string(output))
+		mergeConfig, err := json.Marshal(overlaybdMergeConfig{Lowers: []overlaybdMergeLayer{{File: sealed}}})
+		require.NoError(t, err)
+		configPath := filepath.Join(root, "base-merge.json")
+		require.NoError(t, os.WriteFile(configPath, mergeConfig, 0600))
+		compressed := filepath.Join(root, "raw.zfile")
+		cmd = exec.CommandContext(t.Context(), filepath.Join(tools, "overlaybd-merge"), "--service_config_path", os.Getenv("FSB_TEST_PACK_BOOT_SERVICE_CONFIG"), configPath, compressed)
+		output, err = cmd.CombinedOutput()
+		require.NoError(t, err, string(output))
+		payload, err = os.ReadFile(compressed)
+		require.NoError(t, err)
+		desc = oci.Descriptor{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromBytes(payload), Size: int64(len(payload))}
+	} else {
+		baseData, baseIndex, baseLayer := filepath.Join(root, "base.data"), filepath.Join(root, "base.index"), filepath.Join(root, "base.zfile")
+		// The source test disk has no remote parent; create an equivalent immutable zero-filled base to verify OCI transfer of the real upper.
+		require.NoError(t, createHybridUpper(t.Context(), global.overlaybdCreate, baseData, baseIndex, 1))
+		require.NoError(t, commitLayer(t.Context(), baseData, baseIndex, baseLayer, true))
+		var err error
+		payload, err = os.ReadFile(baseLayer)
+		require.NoError(t, err)
+		desc = oci.Descriptor{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromBytes(payload), Size: int64(len(payload))}
+	}
+	server := httptest.NewServer(registrytest.New())
+	global.plainHTTP = true
 	defer server.Close()
 	oldClient := retry.DefaultClient
 	retry.DefaultClient = server.Client()
 	defer func() { retry.DefaultClient = oldClient }()
-	repository := strings.TrimPrefix(server.URL, "https://") + "/rootfs/base"
-	repo, _, err := ocitemplate.Repository(repository+":base", nil)
+	repository := strings.TrimPrefix(server.URL, "http://") + "/rootfs/base"
+	repo, _, err := ocitemplate.Repository(repository+":base", nil, ocitemplate.WithPlainHTTP(true))
 	require.NoError(t, err)
 	require.NoError(t, repo.Blobs().Push(t.Context(), desc, bytes.NewReader(payload)))
 	upper := ocitemplate.RootfsUpper{Repository: repository, VirtualSizeBytes: 1 << 30, Lowers: []oci.Descriptor{desc}, BaseLayers: 1}
@@ -71,48 +102,107 @@ func TestRootfsPackPublishIntegration(t *testing.T) {
 	m.Machine.MemoryMiB = 256
 	m.Machine.RootfsSizeMiB = 1024
 	m.Kernel.Version = "6.1.177"
+	if kernel != "" {
+		global.firecrackerBin = os.Getenv("FSB_TEST_PACK_FIRECRACKER")
+		require.NotEmpty(t, global.firecrackerBin)
+		m.Compatibility.FirecrackerVersion = artifacts.FirecrackerVersion(global.firecrackerBin)
+	}
 	raw, err = json.Marshal(m)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(filepath.Join(bundle, "manifest.json"), raw, 0600))
 	require.NoError(t, packCapturedBundle(t.Context(), bundle, "rootfs:test", 24, 16, true))
 	auth := filepath.Join(root, "auth.json")
 	require.NoError(t, os.WriteFile(auth, []byte(`{"auths":{}}`), 0600))
-	destination := strings.TrimPrefix(server.URL, "https://") + "/rootfs/published:test"
+	destination := strings.TrimPrefix(server.URL, "http://") + "/rootfs/published:test"
 	command := newPushCommand()
 	command.SetArgs([]string{"--artifact-dir", filepath.Join(global.buildOutputDir, "rootfs_test"), "--destination", destination, "--metadata-file", filepath.Join(bundle, "manifest.json"), "--auth-file", auth})
 	require.NoError(t, command.Execute())
-	target, ref, err := ocitemplate.Repository(destination, nil)
+	target, ref, err := ocitemplate.Repository(destination, nil, ocitemplate.WithPlainHTTP(true))
 	require.NoError(t, err)
 	resolved, err := ocitemplate.ResolveFrom(t.Context(), ref, target)
 	require.NoError(t, err)
 	pair, err := ocitemplate.Decode(resolved)
 	require.NoError(t, err)
-	// Read the manifest and every layer back from the registry, verifying digests before downstream mount validation.
-	for _, entry := range []struct{ name, ref string }{{"rootfs", pair.Rootfs}, {"snapfiles", pair.Snapfiles}} {
-		remote, parsed, e := ocitemplate.Repository(entry.ref, nil)
+	require.NotNil(t, pair.Metadata)
+	require.Empty(t, pair.Snapfiles)
+	require.JSONEq(t, string(raw), string(pair.Metadata.Manifest))
+	named := templateFile{Template: templateRef{Repo: ref.Registry + "/" + ref.Repository, TemplateID: ref.Reference}}
+	require.NoError(t, resolveTemplate(t.Context(), &named, dockerConfig{}))
+	require.Equal(t, pair.Rootfs, named.rootfsRef())
+	require.Empty(t, named.snapfilesRef())
+	// Read the rootfs layers back from the registry before downstream device validation.
+	remote, parsed, err := ocitemplate.Repository(pair.Rootfs, nil, ocitemplate.WithPlainHTTP(true))
+	require.NoError(t, err)
+	md, err := remote.Resolve(t.Context(), parsed.Reference)
+	require.NoError(t, err)
+	reader, err := remote.Manifests().Fetch(t.Context(), md)
+	require.NoError(t, err)
+	var manifest oci.Manifest
+	require.NoError(t, json.NewDecoder(reader).Decode(&manifest))
+	require.NoError(t, reader.Close())
+	var paths []string
+	for _, layer := range manifest.Layers {
+		stream, e := remote.Blobs().Fetch(t.Context(), layer)
 		require.NoError(t, e)
-		md, e := remote.Resolve(t.Context(), parsed.Reference)
+		body, e := io.ReadAll(stream)
 		require.NoError(t, e)
-		reader, e := remote.Manifests().Fetch(t.Context(), md)
-		require.NoError(t, e)
-		var manifest oci.Manifest
-		require.NoError(t, json.NewDecoder(reader).Decode(&manifest))
-		require.NoError(t, reader.Close())
-		var paths []string
-		for _, layer := range manifest.Layers {
-			stream, e := remote.Blobs().Fetch(t.Context(), layer)
-			require.NoError(t, e)
-			body, e := io.ReadAll(stream)
-			require.NoError(t, e)
-			require.NoError(t, stream.Close())
-			require.Equal(t, layer.Digest, digest.FromBytes(body))
-			path := filepath.Join(root, layer.Digest.Encoded()+".zfile")
-			require.NoError(t, os.WriteFile(path, body, 0600))
-			paths = append(paths, path)
-		}
-		raw, e = json.Marshal(paths)
-		require.NoError(t, e)
-		require.NoError(t, os.WriteFile(filepath.Join(root, entry.name+"-layers.json"), raw, 0600))
+		require.NoError(t, stream.Close())
+		require.Equal(t, layer.Digest, digest.FromBytes(body))
+		path := filepath.Join(root, layer.Digest.Encoded()+".zfile")
+		require.NoError(t, os.WriteFile(path, body, 0600))
+		paths = append(paths, path)
 	}
-	t.Log("real upper packed; rootfs and metadata layers published, fetched, and digest verified")
+	raw, err = json.Marshal(paths)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "rootfs-layers.json"), raw, 0600))
+	t.Log("real upper packed without a snapfiles device; rootfs layers and config metadata published and verified")
+	if kernel != "" {
+		testRootfsMetadataColdBoot(t, root, kernel, named.Template.Repo, named.Template.TemplateID)
+	}
+}
+
+func testRootfsMetadataColdBoot(t *testing.T, root, kernel, repo, templateID string) {
+	t.Helper()
+	global.stateDir, global.runtimeDir = filepath.Join(root, "state"), filepath.Join(root, "run")
+	const id = "metadata"
+	path := filepath.Join(root, "input.json")
+	raw, err := json.Marshal(templateFile{SandboxID: id, Template: templateRef{Repo: repo, TemplateID: templateID}})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, raw, 0600))
+	layout := newSandboxLayout(id)
+	defer func() {
+		if pathExists(layout.home) {
+			require.NoError(t, runDelete(context.Background(), id))
+		}
+	}()
+	require.NoError(t, runCreate(t.Context(), &createOptions{templateFile: path, kernel: kernel}))
+	state, err := readState(layout.home)
+	require.NoError(t, err)
+	require.NotEmpty(t, state.RootfsMetadataSHA256)
+	require.NotNil(t, state.Rootfs)
+	require.Nil(t, state.Snapfiles)
+	require.Empty(t, state.SharedSnapfiles)
+	require.False(t, isMounted(layout.mountPoint))
+	devices, err := newUblkdClient(global.ublkdSocket).List(t.Context())
+	require.NoError(t, err)
+	require.Len(t, devices, 1, "the disposable daemon must only own the rootfs device")
+	require.Equal(t, state.Rootfs.DevID, devices[0].DevID)
+	defer func() {
+		if t.Failed() {
+			serial, _ := os.ReadFile(layout.serialLog)
+			t.Logf("guest serial output: %s", serial)
+		}
+	}()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if marker := os.Getenv("FSB_TEST_PACK_BOOT_MARKER"); marker != "" {
+		require.NoError(t, waitSerialFor(layout.serialLog, marker, 25*time.Second))
+		return
+	}
+	require.Eventually(t, func() bool {
+		probe, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		_, err := probeRootfsHelper(probe, filepath.Join(layout.runtime, "guest-control.sock"), 1234)
+		return err == nil
+	}, 25*time.Second, 300*time.Millisecond, "guest helper did not respond after cold boot")
 }

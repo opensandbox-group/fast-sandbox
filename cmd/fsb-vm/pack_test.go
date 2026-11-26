@@ -674,9 +674,66 @@ func TestRootfsOnlyPackBoundary(t *testing.T) {
 			}
 		})
 	}
-	size, err := snapfilesSizeGiB(&buildOptions{rootfsOnly: true}, "/absent/vmstate", "/absent/memory")
+}
+
+func TestPackRootfsOnlyProducesSingleImageWithoutUblkd(t *testing.T) {
+	previous := global
+	t.Cleanup(func() { global = previous })
+	dir := t.TempDir()
+	squashTestStubs(t, dir)
+	global.overlaybdCommit = filepath.Join(dir, "overlaybd-commit")
+	global.buildWorkDir = filepath.Join(dir, "work")
+	global.buildOutputDir = filepath.Join(dir, "output")
+	global.ublkdSocket = filepath.Join(dir, "missing-ublkd.sock")
+
+	bundle := filepath.Join(dir, "bundle")
+	require.NoError(t, os.Mkdir(bundle, 0o700))
+	policy := []byte(`{"v":1,"policy":{"defaultAction":"deny"}}`)
+	require.NoError(t, os.WriteFile(filepath.Join(bundle, "policy.json"), policy, 0o600))
+	m := testVMManifest()
+	m.Platform = &artifacts.VMPlatform{
+		SnapshotMode: "rootfsOnly",
+		StateFiles: map[string]artifacts.ManifestFile{
+			"policy.json": {SHA256: digest.FromBytes(policy).Encoded(), SizeBytes: int64(len(policy))},
+		},
+	}
+	m.Kernel.Cmdline = "console=ttyS0 root=/dev/vda rw init=/init"
+	rawManifest, err := json.Marshal(m)
 	require.NoError(t, err)
-	require.Equal(t, 1, size)
+	require.NoError(t, os.WriteFile(filepath.Join(bundle, "manifest.json"), rawManifest, 0o600))
+	upper := ocitemplate.RootfsUpper{
+		Repository:       "example.com/test/rootfs",
+		VirtualSizeBytes: 1 << 20,
+		BaseLayers:       1,
+		Lowers:           []oci.Descriptor{{MediaType: ocitemplate.OverlayBDLayerMediaType, Digest: digest.FromString("parent"), Size: 100}},
+	}
+	rawUpper, err := json.Marshal(upper)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(bundle, ocitemplate.RootfsUpperName), rawUpper, 0o600))
+	for _, name := range []string{ocitemplate.UpperDataName, ocitemplate.UpperIndexName} {
+		require.NoError(t, os.WriteFile(filepath.Join(bundle, name), []byte("upper"), 0o600))
+	}
+
+	cmd := newPackCommand()
+	cmd.SetArgs([]string{"--bundle-dir", bundle, "--output", "rootfs:single", "--rootfs-only"})
+	require.NoError(t, cmd.ExecuteContext(t.Context()))
+
+	staged := filepath.Join(global.buildOutputDir, "rootfs_single")
+	rawIndex, err := os.ReadFile(filepath.Join(staged, "manifest", "index.json"))
+	require.NoError(t, err)
+	var index layoutIndex
+	require.NoError(t, json.Unmarshal(rawIndex, &index))
+	require.Len(t, index.Images, 1)
+	require.True(t, strings.HasSuffix(index.Images[0].Name, "_rootfs"))
+
+	rawImageManifest, err := os.ReadFile(filepath.Join(staged, "manifest", index.Images[0].ManifestFile))
+	require.NoError(t, err)
+	var manifest ocispec.Manifest
+	require.NoError(t, json.Unmarshal(rawImageManifest, &manifest))
+	require.Equal(t, ocitemplate.RootfsMetadataVersion, manifest.Annotations[ocitemplate.AnnotationRootfsMetadata])
+	require.Equal(t, "1", manifest.Annotations[ocitemplate.AnnotationRootfsBaseLayers])
+	require.Len(t, manifest.Layers, 2)
+	require.FileExists(t, filepath.Join(staged, "blobs", "sha256", manifest.Config.Digest.Encoded()))
 }
 
 func TestCheckSquashCapacityIncludesRemoteInputsAndMergeOutput(t *testing.T) {

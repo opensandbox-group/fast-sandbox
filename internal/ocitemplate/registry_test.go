@@ -1,6 +1,7 @@
 package ocitemplate
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,8 +19,114 @@ import (
 	oci "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 	"oras.land/oras-go/v2/content"
+	"oras.land/oras-go/v2/errdef"
 	"oras.land/oras-go/v2/registry/remote/retry"
 )
+
+func TestSingleImageRootfsPublishAndResolve(t *testing.T) {
+	ctx := t.Context()
+	handler := registrytest.New()
+	configReads, otherBlobReads := atomic.Int32{}, atomic.Int32{}
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "manifest"), 0750))
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "blobs/sha256"), 0750))
+	state := []byte("{\"opaque\":true}\n")
+	statePath := filepath.Join(dir, "policy.json")
+	require.NoError(t, os.WriteFile(statePath, state, 0600))
+	vm := []byte(`{
+		"schemaVersion":1,"runtime":"firecracker",
+		"machine":{"vcpuCount":1,"memoryMiB":256,"rootfsSizeMiB":1024,"rootfsDrivePath":"rootfs.img"},
+		"kernel":{"version":"6.1.177","cmdline":"root=/dev/vda rw"},
+		"compatibility":{"cpuArch":"x86_64","firecrackerVersion":"1.17.0"},
+		"platform":{"snapshotMode":"rootfsOnly","stateFiles":{"policy.json":{"sha256":"` + digest.FromBytes(state).Encoded() + `","sizeBytes":16}}}
+	}`)
+	stateLink := filepath.Join(dir, "policy-link.json")
+	require.NoError(t, os.Symlink(statePath, stateLink))
+	_, err := EncodeRootfsConfig([]byte(`{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}`), vm, map[string]string{"policy.json": stateLink})
+	require.ErrorContains(t, err, "invalid OCI metadata file")
+	encoded, err := EncodeRootfsConfig([]byte(`{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}`), vm, map[string]string{"policy.json": statePath})
+	require.NoError(t, err)
+	config := content.NewDescriptorFromBytes(oci.MediaTypeImageConfig, encoded)
+	layer := content.NewDescriptorFromBytes(oci.MediaTypeImageLayer, []byte("layer"))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "blobs/sha256", config.Digest.Encoded()), encoded, 0640))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "blobs/sha256", layer.Digest.Encoded()), []byte("layer"), 0640))
+	manifest, err := json.Marshal(oci.Manifest{Versioned: specs.Versioned{SchemaVersion: 2}, MediaType: oci.MediaTypeImageManifest, Config: config, Layers: []oci.Descriptor{layer}, Annotations: map[string]string{AnnotationRootfsMetadata: RootfsMetadataVersion}})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest/root.json"), manifest, 0640))
+	index, err := json.Marshal(map[string]any{"images": []localImage{{Name: "snapshot:x_rootfs", File: "root.json", Digest: digest.FromBytes(manifest).String()}}})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest/index.json"), index, 0640))
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/blobs/") {
+			if strings.HasSuffix(r.URL.Path, config.Digest.String()) {
+				configReads.Add(1)
+			} else {
+				otherBlobReads.Add(1)
+			}
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	defer server.Close()
+	old := retry.DefaultClient
+	retry.DefaultClient = server.Client()
+	defer func() { retry.DefaultClient = old }()
+	destination := strings.TrimPrefix(server.URL, "https://") + "/ns/root:build"
+	pub, err := PushForCache(ctx, dir, destination, vm, nil)
+	require.NoError(t, err)
+	require.Len(t, pub.Manifests, 1)
+	for _, raw := range pub.Manifests {
+		var manifest oci.Manifest
+		require.NoError(t, json.Unmarshal(raw, &manifest))
+		require.NotContains(t, manifest.Annotations, AnnotationTemplateID, "legacy pair readers must reject the new format")
+	}
+	for _, source := range []string{destination, pub.Reference} {
+		payload, err := resolveTestPair(t, ctx, source, nil)
+		require.NoError(t, err)
+		require.JSONEq(t, string(pub.Metadata), string(payload))
+		pair, err := Decode(payload)
+		require.NoError(t, err)
+		require.Empty(t, pair.Snapfiles)
+		require.Equal(t, strings.TrimPrefix(pub.Reference, Prefix), pair.Rootfs)
+		require.Equal(t, state, pair.Metadata.StateFiles["policy.json"])
+	}
+	require.EqualValues(t, 2, configReads.Load())
+	require.Zero(t, otherBlobReads.Load())
+	var legacy oci.Manifest
+	require.NoError(t, json.Unmarshal(manifest, &legacy))
+	legacy.Annotations = map[string]string{AnnotationTemplateID: "legacy"}
+	legacyBytes, err := json.Marshal(legacy)
+	require.NoError(t, err)
+	repo, _, err := Repository(destination, nil)
+	require.NoError(t, err)
+	legacyDesc := content.NewDescriptorFromBytes(oci.MediaTypeImageManifest, legacyBytes)
+	require.NoError(t, repo.Manifests().PushReference(ctx, legacyDesc, bytes.NewReader(legacyBytes), "legacy_rootfs"))
+	_, err = resolveTestPair(t, ctx, strings.TrimSuffix(destination, "build")+"legacy", nil)
+	require.ErrorContains(t, err, "missing its snapfiles manifest")
+	require.ErrorContains(t, DeletePair(ctx, pub.Reference, "other", nil), "snapshot ID or digest mismatch")
+	require.NoError(t, DeletePair(ctx, pub.Reference, "build", nil))
+	retained, err := repo.Blobs().Exists(ctx, layer)
+	require.NoError(t, err)
+	require.True(t, retained, "shared data layers are reclaimed only by registry GC")
+	_, err = resolveTestPair(t, ctx, pub.Reference, nil)
+	require.ErrorIs(t, err, errdef.ErrNotFound)
+	require.NoError(t, DeletePair(ctx, pub.Reference, "build", nil))
+}
+
+func TestLogicalPairIDEndingInRootfs(t *testing.T) {
+	server := httptest.NewTLSServer(registrytest.New())
+	defer server.Close()
+	old := retry.DefaultClient
+	retry.DefaultClient = server.Client()
+	defer func() { retry.DefaultClient = old }()
+	destination := strings.TrimPrefix(server.URL, "https://") + "/ns/pair:nightly_rootfs"
+	pinned, _, err := Push(t.Context(), localPairFixture(t), destination, []byte("{}"), nil)
+	require.NoError(t, err)
+	want, err := resolveTestPair(t, t.Context(), pinned, nil)
+	require.NoError(t, err)
+	got, err := resolveTestPair(t, t.Context(), destination, nil)
+	require.NoError(t, err)
+	require.JSONEq(t, string(want), string(got))
+}
 
 func TestDecodeRequiresImmutablePair(t *testing.T) {
 	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -33,7 +140,7 @@ func TestDecodeRequiresImmutablePair(t *testing.T) {
 		{"invalid digest", "r.example/ns/t@sha256:bad", "r.example/ns/t@" + digest, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			raw, err := json.Marshal(map[string]any{"oci": Pair{test.root, test.snap}})
+			raw, err := json.Marshal(map[string]any{"oci": Pair{Rootfs: test.root, Snapfiles: test.snap}})
 			require.NoError(t, err)
 			pair, err := Decode(raw)
 			if test.valid {

@@ -21,10 +21,15 @@ import (
 // layer-manifest resolution. Fastlet never needs its own registry/cache client.
 // Existing explicit-pair CLI inputs continue to work without an envelope.
 func resolveTemplate(ctx context.Context, template *templateFile, config dockerConfig) error {
-	if template.Template.Reference == "" {
-		return nil
+	reference := template.Template.Reference
+	named := reference == ""
+	if named {
+		if template.Template.Rootfs != "" || template.Template.Snapfiles != "" {
+			return nil
+		}
+		reference = template.Template.Repo + ":" + template.Template.TemplateID
 	}
-	ref, err := parseRegistryReference(strings.TrimPrefix(template.Template.Reference, ocitemplate.Prefix))
+	ref, err := parseRegistryReference(strings.TrimPrefix(reference, ocitemplate.Prefix))
 	if err != nil {
 		return err
 	}
@@ -33,37 +38,41 @@ func resolveTemplate(ctx context.Context, template *templateFile, config dockerC
 		return err
 	}
 	var payload []byte
+	var pair *ocitemplate.Pair
 	if cachePath != "" {
-		payload, _ = readCachedManifest(cachePath + ".template")
-		if _, err := templatePair(payload, ref); err != nil {
-			payload = nil
+		if cachedPayload, ok := readCachedManifest(cachePath + ".template"); ok {
+			if cachedPair, err := templatePair(cachedPayload, ref); err == nil && cachedPair.Metadata == nil {
+				payload, pair = cachedPayload, cachedPair
+			}
 		}
 	}
-	if len(payload) == 0 {
+	if pair == nil {
 		repository, err := newRemoteRepository(ref, config, global.plainHTTP)
 		if err != nil {
 			return err
 		}
 		cached := &templateRepository{MetadataRepository: repository, ref: ref, config: config}
-		payload, err = ocitemplate.ResolveFrom(ctx, ref, cached)
+		resolve := ocitemplate.ResolveFrom
+		if named {
+			resolve = ocitemplate.ResolveNamed
+		}
+		payload, err = resolve(ctx, ref, cached)
 		if err != nil {
 			return fmt.Errorf("resolve OCI template: %w", err)
 		}
-		if _, err := templatePair(payload, ref); err != nil {
+		pair, err = templatePair(payload, ref)
+		if err != nil {
 			return err
 		}
-		if cachePath != "" {
+		if cachePath != "" && pair.Metadata == nil {
 			if err := cacheManifestFile(cachePath+".template", payload); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: cache template metadata: %v\n", err)
 			}
 		}
 	}
-	pair, err := templatePair(payload, ref)
-	if err != nil {
-		return err
-	}
 	template.Template.Rootfs, template.Template.Snapfiles = pair.Rootfs, pair.Snapfiles
 	template.Metadata = payload
+	template.RootfsMetadata = pair.Metadata
 	return nil
 }
 
@@ -75,11 +84,15 @@ func templatePair(payload []byte, ref registry.Reference) (*ocitemplate.Pair, er
 	if pair == nil {
 		return nil, fmt.Errorf("OCI template has no pair")
 	}
-	for _, reference := range []string{pair.Rootfs, pair.Snapfiles} {
+	for _, reference := range pair.ImageRefs() {
 		value, err := parseRegistryReference(reference)
 		if err != nil || value.Registry != ref.Registry || value.Repository != ref.Repository {
 			return nil, fmt.Errorf("template pair must stay in the template repository")
 		}
+	}
+	if pair.Metadata != nil && strings.HasPrefix(ref.Reference, "sha256:") &&
+		pair.Rootfs != ref.Registry+"/"+ref.Repository+"@"+ref.Reference {
+		return nil, fmt.Errorf("RootfsOnly OCI metadata references a different rootfs digest")
 	}
 	return pair, nil
 }
@@ -120,8 +133,12 @@ func (r *templateRepository) Resolve(ctx context.Context, reference string) (oci
 }
 
 func (r *templateRepository) Fetch(ctx context.Context, desc oci.Descriptor) (io.ReadCloser, error) {
-	if desc.Size < 0 || desc.Size > 1<<20 {
-		return nil, fmt.Errorf("template metadata exceeds 1 MiB")
+	limit := int64(1 << 20)
+	if desc.MediaType == oci.MediaTypeImageConfig {
+		limit = ocitemplate.MaxRootfsConfigBytes
+	}
+	if desc.Size < 0 || desc.Size > limit {
+		return nil, fmt.Errorf("template metadata exceeds %d bytes", limit)
 	}
 	raw, path, err := r.cached(desc.Digest.String())
 	if err != nil {

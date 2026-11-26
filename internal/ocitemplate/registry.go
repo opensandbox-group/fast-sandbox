@@ -1,4 +1,4 @@
-// Package ocitemplate publishes and resolves fsb-vm template pairs. Only small
+// Package ocitemplate publishes and resolves fsb-vm OCI artifacts. Only small
 // metadata is fetched here; OverlayBD owns the remote layer reads.
 package ocitemplate
 
@@ -27,8 +27,16 @@ import (
 const Prefix = "oci://"
 
 type Pair struct {
-	Rootfs    string `json:"rootfs"`
-	Snapfiles string `json:"snapfiles"`
+	Rootfs    string          `json:"rootfs"`
+	Snapfiles string          `json:"snapfiles,omitempty"`
+	Metadata  *RootfsMetadata `json:"rootfsMetadata,omitempty"`
+}
+
+func (p Pair) ImageRefs() []string {
+	if p.Metadata != nil {
+		return []string{p.Rootfs}
+	}
+	return []string{p.Rootfs, p.Snapfiles}
 }
 
 // MetadataRepository is the small registry surface needed to resolve a template.
@@ -101,7 +109,15 @@ func Decode(payload []byte) (*Pair, error) {
 		return nil, err
 	}
 	if document.OCI != nil {
-		for _, value := range []string{document.OCI.Rootfs, document.OCI.Snapfiles} {
+		if document.OCI.Metadata != nil {
+			if document.OCI.Snapfiles != "" {
+				return nil, errors.New("RootfsOnly OCI metadata cannot also reference snapfiles")
+			}
+			if err := document.OCI.Metadata.validate(); err != nil {
+				return nil, err
+			}
+		}
+		for _, value := range document.OCI.ImageRefs() {
 			ref, err := registry.ParseReference(value)
 			if err != nil || !strings.HasPrefix(ref.Reference, "sha256:") {
 				return nil, fmt.Errorf("template pair must use immutable sha256 references")
@@ -116,12 +132,39 @@ func Decode(payload []byte) (*Pair, error) {
 
 // ResolveFrom resolves the platform envelope through the caller's registry/cache.
 func ResolveFrom(ctx context.Context, ref registry.Reference, repo MetadataRepository) ([]byte, error) {
-	desc, err := repo.Resolve(ctx, ref.Reference)
-	if errors.Is(err, errdef.ErrNotFound) && !strings.HasPrefix(ref.Reference, "sha256:") {
-		desc, err = repo.Resolve(ctx, ref.Reference+"_snapfiles")
+	return resolveArtifact(ctx, ref, repo, false)
+}
+
+// ResolveNamed resolves the conventional tags used by repo + template_id.
+func ResolveNamed(ctx context.Context, ref registry.Reference, repo MetadataRepository) ([]byte, error) {
+	if err := validatePairID(ref.Reference); err != nil {
+		return nil, err
 	}
+	return resolveArtifact(ctx, ref, repo, true)
+}
+
+func resolvePublication(ctx context.Context, ref registry.Reference, repo MetadataRepository, named bool) (oci.Descriptor, string, error) {
+	if !named {
+		desc, err := repo.Resolve(ctx, ref.Reference)
+		if !errors.Is(err, errdef.ErrNotFound) || strings.HasPrefix(ref.Reference, "sha256:") {
+			return desc, ref.Reference, err
+		}
+	}
+	desc, err := repo.Resolve(ctx, ref.Reference+"_snapfiles")
+	if !errors.Is(err, errdef.ErrNotFound) {
+		return desc, ref.Reference + "_snapfiles", err
+	}
+	desc, err = repo.Resolve(ctx, ref.Reference+"_rootfs")
+	return desc, ref.Reference + "_rootfs", err
+}
+
+func resolveArtifact(ctx context.Context, ref registry.Reference, repo MetadataRepository, named bool) ([]byte, error) {
+	desc, resolvedReference, err := resolvePublication(ctx, ref, repo, named)
 	if err != nil {
 		return nil, err
+	}
+	if strings.HasPrefix(ref.Reference, "sha256:") && desc.Digest.String() != ref.Reference {
+		return nil, errors.New("registry returned an unexpected OCI manifest digest")
 	}
 	if desc.MediaType != oci.MediaTypeImageManifest {
 		return nil, fmt.Errorf("unexpected template manifest media type %q", desc.MediaType)
@@ -137,11 +180,42 @@ func ResolveFrom(ctx context.Context, ref registry.Reference, repo MetadataRepos
 	if manifest.Config.MediaType != oci.MediaTypeImageConfig {
 		return nil, fmt.Errorf("unexpected template config media type %q; rebuild the template as a rootfs/snapfiles pair", manifest.Config.MediaType)
 	}
+	if version, marked := manifest.Annotations[AnnotationRootfsMetadata]; marked {
+		if version != RootfsMetadataVersion || len(manifest.Layers) == 0 {
+			return nil, fmt.Errorf("unsupported or incomplete RootfsOnly OCI manifest (metadata version %q)", version)
+		}
+		if manifest.Config.Digest.Validate() != nil || manifest.Config.Digest.Algorithm() != digest.SHA256 {
+			return nil, errors.New("RootfsOnly config requires a valid sha256 digest")
+		}
+		if manifest.Config.Size < 0 || manifest.Config.Size > MaxRootfsConfigBytes {
+			return nil, errors.New("RootfsOnly image config exceeds 8 MiB")
+		}
+		config, err := content.FetchAll(ctx, repo, manifest.Config)
+		if err != nil {
+			return nil, err
+		}
+		metadata, err := decodeRootfsConfig(config)
+		if err != nil {
+			return nil, err
+		}
+		return rootfsMetadataEnvelope(ref.Registry+"/"+ref.Repository+"@"+desc.Digest.String(), metadata)
+	}
+	if strings.HasSuffix(resolvedReference, "_rootfs") {
+		return nil, errors.New("legacy OCI artifact is missing its snapfiles manifest")
+	}
+	if named {
+		// The explicit name has always selected both tags by convention,
+		// including direct CLI publications without a pairing annotation.
+		if manifest.Annotations == nil {
+			manifest.Annotations = make(map[string]string)
+		}
+		manifest.Annotations[AnnotationTemplateID] = ref.Reference
+	}
 	return resolvePair(ctx, repo, ref, desc, manifest)
 }
 
 func fetchSmall(ctx context.Context, repo MetadataRepository, desc oci.Descriptor) ([]byte, error) {
-	if desc.Size < 0 || desc.Size > 1<<20 {
+	if desc.Size < 0 || desc.Size > maxMetadataBytes {
 		return nil, fmt.Errorf("template metadata exceeds 1 MiB")
 	}
 	return content.FetchAll(ctx, repo, desc)
@@ -155,7 +229,7 @@ type PublishedCheckpoint struct {
 	Manifests map[string]json.RawMessage `json:"manifests"`
 }
 
-// Push publishes rootfs first and the snapfiles manifest last as the publication point.
+// Push publishes a RootfsOnly image or a pair with snapfiles as its publication point.
 func Push(ctx context.Context, dir, destination string, metadata []byte, credentials CredentialFunc, options ...RepositoryOption) (string, string, error) {
 	result, err := PushForCache(ctx, dir, destination, metadata, credentials, options...)
 	if err != nil {
@@ -185,8 +259,8 @@ func PushForCache(ctx context.Context, dir, destination string, metadata []byte,
 	if err = json.Unmarshal(raw, &index); err != nil {
 		return nil, err
 	}
-	if len(index.Images) != 2 {
-		return nil, fmt.Errorf("expected exactly two template images")
+	if len(index.Images) != 1 && len(index.Images) != 2 {
+		return nil, fmt.Errorf("expected a RootfsOnly image or a template pair")
 	}
 	// Incremental exports carry descriptors for inherited remote layers, not
 	// local copies. Keep those blobs reachable from the checkpoint repository.
@@ -201,6 +275,13 @@ func PushForCache(ctx context.Context, dir, destination string, metadata []byte,
 	annotations, err := pairAnnotations(ref.Reference, metadata)
 	if err != nil {
 		return nil, err
+	}
+	if len(index.Images) == 1 {
+		root := index.Images[0]
+		if !strings.HasSuffix(root.Name, "_rootfs") || annotations[AnnotationSandboxUID] != "" {
+			return nil, errors.New("single-image OCI artifacts require an unowned RootfsOnly rootfs")
+		}
+		return pushRootfsMetadataImage(ctx, repo, ref, dir, root, sources, credentials)
 	}
 	var root, snap *localImage
 	for i := range index.Images {
@@ -321,7 +402,7 @@ func pushLocalImage(ctx context.Context, repo *remote.Repository, dir, tag strin
 		if manifest.Annotations == nil {
 			manifest.Annotations = make(map[string]string)
 		}
-		for _, key := range []string{AnnotationSandboxUID, AnnotationNamespace, AnnotationCheckpointID} {
+		for _, key := range []string{AnnotationSandboxUID, AnnotationNamespace, AnnotationCheckpointID, AnnotationTemplateID, annotationRootfsID} {
 			delete(manifest.Annotations, key)
 		}
 		for key, value := range annotations {
@@ -332,7 +413,7 @@ func pushLocalImage(ctx context.Context, repo *remote.Repository, dir, tag strin
 			return nil, "", err
 		}
 		if len(raw) > 1<<20 {
-			return nil, "", fmt.Errorf("snapfiles manifest exceeds 1 MiB metadata limit")
+			return nil, "", fmt.Errorf("OCI manifest exceeds 1 MiB metadata limit")
 		}
 	}
 	for _, desc := range append([]oci.Descriptor{manifest.Config}, manifest.Layers...) {

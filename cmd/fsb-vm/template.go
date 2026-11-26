@@ -5,17 +5,20 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"fast-sandbox/internal/ocitemplate"
 )
 
 // templateFile is the sole CLI input manifest (glossary: template.json).
 type templateFile struct {
-	SandboxID string          `json:"sandbox_id"`
-	Template  templateRef     `json:"template"`
-	Metadata  json.RawMessage `json:"metadata,omitempty"`
+	SandboxID      string                      `json:"sandbox_id"`
+	Template       templateRef                 `json:"template"`
+	Metadata       json.RawMessage             `json:"metadata,omitempty"`
+	RootfsMetadata *ocitemplate.RootfsMetadata `json:"-"`
 }
 
 // templateRef accepts a platform reference or an explicit image pair.
-// Existing repo + template_id inputs name the pair by convention.
+// The repo + template_id form selects the conventional publication tags.
 type templateRef struct {
 	Reference  string       `json:"reference,omitempty"`
 	Rootfs     string       `json:"rootfs,omitempty"`
@@ -45,6 +48,9 @@ func (t templateFile) rootfsRef() string {
 // snapfilesRef returns the overlaybd snapfiles image reference
 // (${repo}:${template_id}_snapfiles).
 func (t templateFile) snapfilesRef() string {
+	if t.RootfsMetadata != nil {
+		return ""
+	}
 	if t.Template.Snapfiles != "" {
 		return t.Template.Snapfiles
 	}

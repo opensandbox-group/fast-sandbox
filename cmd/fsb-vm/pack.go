@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 
 	"github.com/opencontainers/go-digest"
@@ -35,7 +36,7 @@ func newPackCommand() *cobra.Command {
 	var bundle, output string
 	var maxLayers, squashLayers int
 	var rootfsOnly bool
-	cmd := &cobra.Command{Use: "pack", Short: "Package captured rootfs, memory and VM state as an OverlayBD pair", RunE: func(cmd *cobra.Command, _ []string) error {
+	cmd := &cobra.Command{Use: "pack", Short: "Package a captured snapshot as an OverlayBD artifact", RunE: func(cmd *cobra.Command, _ []string) error {
 		if squashLayers < 2 {
 			return fmt.Errorf("--squash-layers must be at least 2, got %d", squashLayers)
 		}
@@ -44,7 +45,7 @@ func newPackCommand() *cobra.Command {
 		}
 		return packCapturedBundle(cmd.Context(), bundle, output, maxLayers, squashLayers, rootfsOnly)
 	}}
-	cmd.Flags().BoolVar(&rootfsOnly, "rootfs-only", false, "package an explicit rootfsOnly template without RAM or VM state")
+	cmd.Flags().BoolVar(&rootfsOnly, "rootfs-only", false, "package an explicit rootfsOnly template as a single rootfs image without RAM or VM state")
 	cmd.Flags().StringVar(&bundle, "bundle-dir", "", "captured checkpoint directory")
 	cmd.Flags().StringVar(&output, "output", "", "local logical output name:tag")
 	cmd.Flags().IntVar(&maxLayers, "max-rootfs-layers", defaultMaxRootfsLayers, "squash the inherited rootfs layer chain once it reaches this many layers")
@@ -75,6 +76,13 @@ func packCapturedBundle(ctx context.Context, bundle, outputName string, maxLayer
 	if err != nil {
 		return err
 	}
+	var rootfsConfig []byte
+	if rootfsOnly {
+		rootfsConfig, err = ocitemplate.EncodeRootfsConfig(minimalImageConfig(), metadata, extras)
+		if err != nil {
+			return err
+		}
+	}
 	name := sanitizeFileName(outputName)
 	release, err := tryLock(global.buildOutputDir, name)
 	if err != nil {
@@ -103,8 +111,18 @@ func packCapturedBundle(ctx context.Context, bundle, outputName string, maxLayer
 	if err != nil {
 		return err
 	}
+	if rootfsOnly {
+		rootLayers, err = squashRootfsTail(ctx, layout, rootLayers, upper, maxLayers, squashLayers)
+		if err != nil {
+			return err
+		}
+		if err := writeRootfsMetadataImage(layout, output, rootLayers, rootfsConfig, upper.BaseLayers); err != nil {
+			return err
+		}
+		return publishArtifactLayout(layout, final)
+	}
 	ublkd := newUblkdClient(global.ublkdSocket)
-	options := &buildOptions{rootfsOnly: rootfsOnly, snapshotManifest: metadata, snapshotExtras: extras, snapfilesProgress: func(phase string) error { return writePackResources(activeMarker, work, phase) }}
+	options := &buildOptions{snapshotManifest: metadata, snapshotExtras: extras, snapfilesProgress: func(phase string) error { return writePackResources(activeMarker, work, phase) }}
 	// Preserve backing files if this process is killed or resource rollback fails.
 	if err = writePackResources(activeMarker, work, packPhasePrepared); err != nil {
 		return err
@@ -134,6 +152,30 @@ func packCapturedBundle(ctx context.Context, bundle, outputName string, maxLayer
 	// Device and mount releases are idempotent; keep rollback armed until every
 	// kernel resource has been released, then discard only the scratch directory.
 	return nil
+}
+
+func writeRootfsMetadataImage(layout artifactLayout, output outputNames, layers []ocispec.Descriptor, config []byte, baseLayers int) error {
+	desc, err := layout.installBytes(config, ocispec.MediaTypeImageConfig)
+	if err != nil {
+		return err
+	}
+	annotations := map[string]string{ocitemplate.AnnotationRootfsMetadata: ocitemplate.RootfsMetadataVersion}
+	if baseLayers > 0 {
+		annotations[ocitemplate.AnnotationRootfsBaseLayers] = strconv.Itoa(baseLayers)
+	}
+	payload, manifest, err := assembleManifest(desc, layers, annotations)
+	if err != nil {
+		return err
+	}
+	name := output.rootfsName()
+	file := sanitizeFileName(name) + ".json"
+	if err := writeFileAtomic(layout.manifestPath(file), payload, 0o640); err != nil {
+		return err
+	}
+	return layout.writeLayoutIndex(layoutIndex{
+		SourceRef: "checkpoint",
+		Images:    []layoutIndexEntry{{Name: name, ManifestFile: file, ManifestDigest: manifest.Digest.String()}},
+	})
 }
 
 // State files keep the native snapshot names and opaque contents in snapfiles.

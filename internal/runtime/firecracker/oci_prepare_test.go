@@ -11,6 +11,7 @@ import (
 	oci "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/stretchr/testify/require"
 
+	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/ocitemplate"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 	"fast-sandbox/internal/registryconfig"
@@ -99,6 +100,29 @@ func TestOCIMetadataComesOnlyFromMountedManifest(t *testing.T) {
 	require.NoError(t, os.WriteFile(manifest, []byte(`{"machine":`), 0600))
 	_, err = readPreparedOCIMetadata(filepath.Join(root, "oci"), "sandbox-1")
 	require.Error(t, err)
+}
+
+func TestPreparedOCIRootfsMetadataChecksum(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "sandboxes", "sandbox-1")
+	require.NoError(t, os.MkdirAll(filepath.Join(home, "mnt"), 0750))
+	document := preparedMetadata(t)
+	document["platform"] = map[string]string{"snapshotMode": "rootfsOnly"}
+	document["kernel"].(map[string]any)["cmdline"] = "root=/dev/vda rw init=/init"
+	document["compatibility"] = map[string]string{"cpuArch": "aarch64", "firecrackerVersion": "1.17.0"}
+	raw, err := json.Marshal(document)
+	require.NoError(t, err)
+	state, err := json.Marshal(map[string]string{"rootfs_metadata_sha256": artifacts.SHA256Of(raw)})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(home, "state.json"), state, 0600))
+	manifest := filepath.Join(home, "mnt", snapshotManifestName)
+	require.NoError(t, os.WriteFile(manifest, raw, 0600))
+	metadata, err := readPreparedOCIMetadata(root, "sandbox-1")
+	require.NoError(t, err)
+	require.True(t, metadata.IsRootfsOnly())
+	require.NoError(t, os.WriteFile(manifest, append(raw, '\n'), 0600))
+	_, err = readPreparedOCIMetadata(root, "sandbox-1")
+	require.ErrorContains(t, err, "disagrees with OCI metadata")
 }
 
 func TestOCICreateAndResumeUseCLIResultWithoutAgentMetadata(t *testing.T) {

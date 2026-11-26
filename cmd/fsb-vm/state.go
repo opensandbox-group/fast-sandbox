@@ -72,6 +72,9 @@ type sandboxState struct {
 	RootfsRef        string          `json:"rootfs_ref"`
 	SnapfilesRef     string          `json:"snapfiles_ref"`
 	TemplateMetadata json.RawMessage `json:"template_metadata,omitempty"`
+	// Single-image metadata lives under mnt. Keep only its manifest checksum
+	// here so state transitions do not rewrite private state files.
+	RootfsMetadataSHA256 string `json:"rootfs_metadata_sha256,omitempty"`
 	// RootfsBaseLayers mirrors the immutable template base boundary of the
 	// rootfs manifest so checkpoint capture can carry it into RootfsUpper.
 	RootfsBaseLayers int `json:"rootfs_base_layers,omitempty"`
