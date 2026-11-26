@@ -2,7 +2,7 @@
 
 **构建在 Kubernetes 之上的高性能 Sandbox 运行时，基于 Firecracker microVM。**
 
-[English](README.md) · [通过 OpenSandbox 使用](#通过-opensandbox-使用推荐) · [独立部署](#独立部署) · [完整文档](docs/README.md) · [架构](docs/concepts/architecture.md)
+[English](README.md) · [架构决策与行为边界](#架构决策与行为边界) · [通过 OpenSandbox 使用](#通过-opensandbox-使用推荐) · [本地运行时验证](#本地运行时验证) · [完整文档](docs/README.md) · [架构](docs/concepts/architecture.md)
 
 Fast Sandbox 将 Firecracker microVM 的虚拟机隔离与快照启动能力带到 Kubernetes，
 面向需要频繁创建和回收执行环境的场景：AI Agent、代码解释器，以及按需开发和测试沙箱。
@@ -11,9 +11,9 @@ Kubernetes 管理资源容量和生命周期期望状态。预热的 **Fastlet P
 Firecracker 运行时从预先构建的快照恢复每个实例。创建 Sandbox 时直接复用已有容量，
 无需为每次请求重新调度和启动一个 Kubernetes Pod。
 
-推荐通过 [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) 使用，
-它已经集成 Fast Sandbox，提供 API、SDK、入口网关和命令执行能力。也可以独立部署
-Fast Sandbox，作为你自己的平台的 Sandbox 调度与运行时层。
+Fast Sandbox 定位为 [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox)
+在 Kubernetes 之上的调度与运行时底座；面向应用的 API、SDK、模板元数据存储、请求参数校验、
+鉴权入口网关以及命令执行协议均由上游 OpenSandbox Server 负责。
 
 ![Fast Sandbox 系统总览](docs/assets/system-overview.svg)
 
@@ -36,6 +36,23 @@ Fast Sandbox，作为你自己的平台的 Sandbox 调度与运行时层。
   生命周期管理和状态观测。
 
 [工作原理](docs/concepts/architecture.md)
+
+## 架构决策与行为边界
+
+Fast Sandbox 是位于上游控制面（主要为 [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox)）
+之后的内部调度与执行层，而非面向终端用户的独立（Standalone）沙箱产品。为保持关键创建路径的简洁、
+低延迟与可预期性，项目严格控制各组件的行为边界：
+
+- **不为 Standalone 产品形态买单**：不因绕过上游网关的直连调用诉求，而去扩展 Fast-Path gRPC API、
+  Fastlet 通信协议或 Controller 状态机。
+- **Fast-Path 专注调度与生命周期编排**：Fast-Path 与 Reconciler 仅负责 Pool 容量发现、
+  Top-K 候选节点选择、幂等意图持久化、运行时生命周期收敛以及端点路由解析。
+- **元数据存储与参数校验委托给上游**：模板与快照目录、租户/业务元数据存储，以及“请求规格与模板快照规格是否匹配”
+  （例如请求的 CPU/内存上限是否满足快照固化的机器规格）等业务校验均由上游控制面在请求进入 Fast-Path 之前完成。
+- **极简的 Fastlet 节点准入**：Fastlet 专注节点本地的原子容量准入、microVM/容器启停、私有网络隔离与就绪探测，
+  仅兜底宿主机与运行时的物理安全不变量，不重复实现上游的目录查询或业务规则校验。
+- **生命周期控制与客体协议解耦**：命令执行、文件读写、PTY 等能力由客体内的组件（如 OpenSandbox Execd）承载，
+  不耦合进控制面。
 
 ## 通过 OpenSandbox 使用（推荐）
 
@@ -107,14 +124,14 @@ asyncio.run(main())
 体验完成后，在 OpenSandbox 目录执行
 `./scripts/fast-sandbox-env/integration-env.sh down` 清理开发环境。
 
-## 独立部署
+## 本地运行时验证
 
-如果你的平台已经有 Sandbox API，或者需要自己的应用协议，可以独立部署 Fast Sandbox，
-作为 Sandbox 调度与运行时层。通过 Fast-Path gRPC API、Fast Sandbox SDK 或 Kubernetes
-CRD 接入，复用 Pool 调度、原子容量准入、microVM 创建、端点解析和资源清理能力。
+本仓库内的辅助脚本、`fastctl` CLI 及底层客户端包仅用于直接开发、验证运行时底座，或供自定义上游控制面集成。
+任何直接对接 Fast-Path 或 Kubernetes CRD 的上游调用方，都必须自行负责模板元数据管理与请求合法性校验；
+Fast Sandbox 默认进入底层的请求已通过上游的模板与策略校验。
 
 ```text
-你的 Sandbox API -> Fast-Path / Kubernetes CRD -> Fastlet -> Firecracker microVM
+上游控制面 -> Fast-Path / Kubernetes CRD -> Fastlet -> Firecracker microVM
 ```
 
 在本仓库中运行独立 Firecracker 开发环境，需要 Linux、KVM、`/dev/net/tun`、Docker、
