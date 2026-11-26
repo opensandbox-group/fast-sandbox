@@ -354,7 +354,11 @@ func (r *SandboxSnapshotReconciler) deletePublishedOCISnapshot(ctx context.Conte
 		}
 		return ocitemplate.BasicCredential(value.Username, value.Password, value.IdentityToken)
 	}
-	return ocitemplate.DeletePair(ctx, snapshot.Status.ManifestRef, snapshot.Status.SnapshotID, credentials)
+	var deleteOptions []ocitemplate.RepositoryOption
+	if matched, ok := compiled.Match(strings.TrimPrefix(snapshot.Status.ManifestRef, ocitemplate.Prefix)); ok && matched.PlainHTTP {
+		deleteOptions = append(deleteOptions, ocitemplate.WithPlainHTTP(true))
+	}
+	return ocitemplate.DeletePair(ctx, snapshot.Status.ManifestRef, snapshot.Status.SnapshotID, credentials, deleteOptions...)
 }
 
 // waitSnapshotTerminal reports whether the in-flight task reached a terminal

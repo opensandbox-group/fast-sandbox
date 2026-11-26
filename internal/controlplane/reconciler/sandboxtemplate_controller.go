@@ -30,6 +30,7 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifactstore"
 	"fast-sandbox/internal/ocitemplate"
+	"fast-sandbox/internal/registryconfig"
 )
 
 const (
@@ -85,8 +86,10 @@ const (
 // the path to the builder and is only set when the reference exists; unset
 // means the build relies on ambient credentials (IRSA / node metadata).
 const (
-	sandboxTemplatePublishSecretDir = "/etc/fast-sandbox/publish-credentials"
-	publishCredentialsDirEnv        = "SANDBOX_TEMPLATE_PUBLISH_SECRET_DIR"
+	sandboxTemplatePublishSecretDir  = "/etc/fast-sandbox/publish-credentials"
+	publishCredentialsDirEnv         = "SANDBOX_TEMPLATE_PUBLISH_SECRET_DIR"
+	sandboxTemplateRegistryConfigDir = "/etc/fast-sandbox/registry-config"
+	registryConfigFileEnv            = "SANDBOX_TEMPLATE_REGISTRY_CONFIG"
 )
 
 // SandboxTemplateReconciler reconciles SandboxTemplate resources by driving
@@ -612,6 +615,24 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "host-dev", MountPath: "/dev"})
 		volumes = append(volumes, corev1.Volume{Name: "host-dev", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/dev", Type: ptr(corev1.HostPathDirectory)}}})
 	}
+	// Mount the namespace's optional fast-sandbox-registry ConfigMap so the
+	// builder honors per-registry settings such as plainHTTP: true without
+	// requiring the ConfigMap to exist.
+	env = append(env, corev1.EnvVar{Name: registryConfigFileEnv, Value: sandboxTemplateRegistryConfigDir + "/" + registryconfig.ConfigMapKey})
+	volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		Name: "registry-config", MountPath: sandboxTemplateRegistryConfigDir, ReadOnly: true,
+	})
+	volumes = append(volumes, corev1.Volume{
+		Name: "registry-config",
+		VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: registryconfig.ConfigMapName},
+			Optional:             ptr(true),
+			Items: []corev1.KeyToPath{{
+				Key:  registryconfig.ConfigMapKey,
+				Path: registryconfig.ConfigMapKey,
+			}},
+		}},
+	})
 	if ref := template.Spec.Output.PublishSecretRef; ref != nil {
 		env = append(env, corev1.EnvVar{Name: publishCredentialsDirEnv, Value: sandboxTemplatePublishSecretDir})
 		volumeMounts = append(volumeMounts, corev1.VolumeMount{

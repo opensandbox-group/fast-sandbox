@@ -2249,50 +2249,56 @@ func (r *SandboxPoolReconciler) registryCredentialFromSecret(
 	namespace string,
 	rule registryconfig.RegistryRule,
 ) (registryconfig.Credential, error) {
-	var secret corev1.Secret
-	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: rule.SecretRef.Name}, &secret); err != nil {
-		return registryconfig.Credential{}, fmt.Errorf("read Registry Secret %s: %w", rule.SecretRef.Name, err)
-	}
-	if secret.Type != corev1.SecretTypeDockerConfigJson {
-		return registryconfig.Credential{}, fmt.Errorf("registry Secret %s must have type %s", secret.Name, corev1.SecretTypeDockerConfigJson)
-	}
-	content := secret.Data[corev1.DockerConfigJsonKey]
-	if len(content) == 0 {
-		return registryconfig.Credential{}, fmt.Errorf("registry Secret %s has no %s data", secret.Name, corev1.DockerConfigJsonKey)
-	}
-	var dockerConfig dockerConfigJSON
-	if err := json.Unmarshal(content, &dockerConfig); err != nil {
-		return registryconfig.Credential{}, fmt.Errorf("decode Registry Secret %s: %w", secret.Name, err)
-	}
-	var auth dockerAuthConfig
-	found := false
-	for host, candidate := range dockerConfig.Auths {
-		if registryconfig.NormalizeHost(host) == rule.Host {
-			auth = candidate
-			found = true
-			break
-		}
-	}
-	if !found {
-		return registryconfig.Credential{}, fmt.Errorf("registry Secret %s has no credentials for host %s", secret.Name, rule.Host)
-	}
-	if auth.Username == "" && auth.Password == "" && auth.Auth != "" {
-		decoded, err := base64.StdEncoding.DecodeString(auth.Auth)
-		if err != nil {
-			return registryconfig.Credential{}, fmt.Errorf("decode auth for host %s in Secret %s: %w", rule.Host, secret.Name, err)
-		}
-		username, password, found := strings.Cut(string(decoded), ":")
-		if !found {
-			return registryconfig.Credential{}, fmt.Errorf("auth for host %s in Secret %s is invalid", rule.Host, secret.Name)
-		}
-		auth.Username, auth.Password = username, password
-	}
-	if auth.Username == "" && auth.Password == "" && auth.IdentityToken == "" {
-		return registryconfig.Credential{}, fmt.Errorf("registry Secret %s has empty credentials for host %s", secret.Name, rule.Host)
-	}
 	credential := registryconfig.Credential{
-		Host: rule.Host, RepositoryPrefix: rule.RepositoryPrefix,
-		Username: auth.Username, Password: auth.Password, IdentityToken: auth.IdentityToken,
+		Host:             rule.Host,
+		RepositoryPrefix: rule.RepositoryPrefix,
+		PlainHTTP:        rule.PlainHTTP,
+	}
+	if rule.SecretRef.Name != "" {
+		var secret corev1.Secret
+		if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: rule.SecretRef.Name}, &secret); err != nil {
+			return registryconfig.Credential{}, fmt.Errorf("read Registry Secret %s: %w", rule.SecretRef.Name, err)
+		}
+		if secret.Type != corev1.SecretTypeDockerConfigJson {
+			return registryconfig.Credential{}, fmt.Errorf("registry Secret %s must have type %s", secret.Name, corev1.SecretTypeDockerConfigJson)
+		}
+		content := secret.Data[corev1.DockerConfigJsonKey]
+		if len(content) == 0 {
+			return registryconfig.Credential{}, fmt.Errorf("registry Secret %s has no %s data", secret.Name, corev1.DockerConfigJsonKey)
+		}
+		var dockerConfig dockerConfigJSON
+		if err := json.Unmarshal(content, &dockerConfig); err != nil {
+			return registryconfig.Credential{}, fmt.Errorf("decode Registry Secret %s: %w", secret.Name, err)
+		}
+		var auth dockerAuthConfig
+		found := false
+		for host, candidate := range dockerConfig.Auths {
+			if registryconfig.NormalizeHost(host) == rule.Host {
+				auth = candidate
+				found = true
+				break
+			}
+		}
+		if !found {
+			return registryconfig.Credential{}, fmt.Errorf("registry Secret %s has no credentials for host %s", secret.Name, rule.Host)
+		}
+		if auth.Username == "" && auth.Password == "" && auth.Auth != "" {
+			decoded, err := base64.StdEncoding.DecodeString(auth.Auth)
+			if err != nil {
+				return registryconfig.Credential{}, fmt.Errorf("decode auth for host %s in Secret %s: %w", rule.Host, secret.Name, err)
+			}
+			username, password, found := strings.Cut(string(decoded), ":")
+			if !found {
+				return registryconfig.Credential{}, fmt.Errorf("auth for host %s in Secret %s is invalid", rule.Host, secret.Name)
+			}
+			auth.Username, auth.Password = username, password
+		}
+		if auth.Username == "" && auth.Password == "" && auth.IdentityToken == "" {
+			return registryconfig.Credential{}, fmt.Errorf("registry Secret %s has empty credentials for host %s", secret.Name, rule.Host)
+		}
+		credential.Username = auth.Username
+		credential.Password = auth.Password
+		credential.IdentityToken = auth.IdentityToken
 	}
 	if rule.WriteSecretRef != nil {
 		writeUsername, writePassword, err := r.registryWriteCredential(ctx, namespace, rule.Host, *rule.WriteSecretRef)

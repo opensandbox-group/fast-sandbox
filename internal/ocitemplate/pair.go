@@ -150,11 +150,11 @@ func pushImmutableManifest(ctx context.Context, repo *remote.Repository, tag str
 // snapshots have distinct manifest digests and can be deleted independently.
 // The snapfiles publication point is deleted last, making partial deletion
 // retryable using the same immutable reference and ID.
-func DeletePair(ctx context.Context, reference, id string, credentials CredentialFunc) error {
+func DeletePair(ctx context.Context, reference, id string, credentials CredentialFunc, options ...RepositoryOption) error {
 	if err := validatePairID(id); err != nil {
 		return err
 	}
-	repo, ref, err := Repository(reference, credentials)
+	repo, ref, err := Repository(reference, credentials, options...)
 	if err != nil {
 		return err
 	}

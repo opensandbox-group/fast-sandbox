@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/opencontainers/go-digest"
@@ -353,6 +354,46 @@ func TestOCITokenOnlyCredentialsFailBeforeAttachment(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidConfig)
 	require.ErrorContains(t, err, "identitytoken-only credentials are not supported")
 	require.NoDirExists(t, filepath.Join(root, "oci/inputs"))
+}
+
+func TestAttachOCIPropagatesPerRegistryPlainHTTP(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		plainHTTP bool
+	}{
+		{name: "https-default", plainHTTP: false},
+		{name: "plain-http-enabled", plainHTTP: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("FAST_SANDBOX_OCI_PLAIN_HTTP", "")
+			root := t.TempDir()
+			d := &Driver{config: firecrackerConfigForTest(t, root)}
+			installOCIRegistryConfig(t, registryconfig.Credential{Host: "bench-registry.ns.svc:5000", PlainHTTP: tc.plainHTTP})
+			bin := t.TempDir()
+			argsOut := filepath.Join(root, "fsb-args.txt")
+			t.Setenv("TEST_ARGS_OUT", argsOut)
+			t.Setenv("TEST_OCI_HOME", filepath.Join(root, "oci/sandboxes/sandbox-1"))
+			require.NoError(t, os.WriteFile(filepath.Join(bin, "fsb-vm"), []byte(`#!/bin/sh
+set -eu
+printf '%s\n' "$@" > "$TEST_ARGS_OUT"
+mkdir -p "$TEST_OCI_HOME/mnt"
+printf '{"rootfs_device":{"dev_path":"/dev/ublkb0"}}' > "$TEST_OCI_HOME/state.json"
+`), 0755))
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+			rootfs, _, _, err := d.attachOCI(context.Background(), "sandbox-1", "oci://bench-registry.ns.svc:5000/templates/py:v1")
+			require.NoError(t, err)
+			require.Equal(t, "/dev/ublkb0", rootfs)
+			raw, err := os.ReadFile(argsOut)
+			require.NoError(t, err)
+			args := strings.Split(strings.TrimSpace(string(raw)), "\n")
+			if tc.plainHTTP {
+				require.Contains(t, args, "--plain-http")
+			} else {
+				require.NotContains(t, args, "--plain-http")
+			}
+		})
+	}
 }
 
 func TestPreparedOCIManifestFollowsSharedSnapfiles(t *testing.T) {

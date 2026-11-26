@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -181,4 +182,34 @@ done
 	require.JSONEq(t, `{"auths":{"r.example/checkpoints/sandbox":{"username":"reader","password":"read-secret"}}}`, string(raw))
 	_, err = os.Stat(filepath.Join(staging, "cache-auth.json"))
 	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestCheckpointCacheAndPlainHTTPForReferenceUseRegistryConfig(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_OCI_PLAIN_HTTP", "")
+	installOCIRegistryConfig(t,
+		registryconfig.Credential{Host: "bench-registry.ns.svc:5000", PlainHTTP: true},
+		registryconfig.Credential{Host: "secure.example.com", Username: "u", Password: "p"},
+	)
+	require.True(t, ociPlainHTTPForReference("oci://bench-registry.ns.svc:5000/checkpoints/sb:snap-1"))
+	require.True(t, ociPlainHTTPForReference("bench-registry.ns.svc:5000/checkpoints/sb:snap-1"))
+	require.False(t, ociPlainHTTPForReference("oci://secure.example.com/checkpoints/sb:snap-1"))
+	require.False(t, ociPlainHTTPForReference("oci://unconfigured.example.com/checkpoints/sb:snap-1"))
+
+	dir := t.TempDir()
+	argsOut := filepath.Join(dir, "cache-args.txt")
+	t.Setenv("CACHE_TEST_ARGS_OUTPUT", argsOut)
+	script := `#!/bin/sh
+printf '%s\n' "$@" > "$CACHE_TEST_ARGS_OUTPUT"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "fsb-vm"), []byte(script), 0700))
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	staging := filepath.Join(dir, "staging")
+	require.NoError(t, os.Mkdir(staging, 0700))
+	d := &Driver{}
+	d.config.StateRoot = dir
+	published := &ocitemplate.PublishedCheckpoint{Reference: "oci://bench-registry.ns.svc:5000/checkpoints/sandbox@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	require.NoError(t, d.cacheOCICheckpoint(context.Background(), staging, "checkpoint-id", published))
+	raw, err := os.ReadFile(argsOut)
+	require.NoError(t, err)
+	require.Contains(t, strings.Split(strings.TrimSpace(string(raw)), "\n"), "--plain-http")
 }

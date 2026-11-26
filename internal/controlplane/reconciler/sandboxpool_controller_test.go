@@ -3280,3 +3280,59 @@ func TestConstructPodSeedsDefaultAuthSubjects(t *testing.T) {
 		envValue(pod.Spec.Containers[0].Env, fastletauth.AllowedSubjectsEnv),
 		"the platform default allow list must be injected explicitly when no flag override is set")
 }
+
+func TestRegistryConfigCompilesPlainHTTPWithAndWithoutSecretRef(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, apiv1alpha2.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	pool := &apiv1alpha2.SandboxPool{
+		ObjectMeta: metav1.ObjectMeta{Name: "pool-plain", Namespace: "tenant-a", UID: types.UID("pool-plain-uid")},
+	}
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: registryconfig.ConfigMapName, Namespace: "tenant-a"},
+		Data: map[string]string{registryconfig.ConfigMapKey: `
+registries:
+  - host: opensandbox-bench-registry.tenant-a.svc:5000
+    plainHTTP: true
+  - host: auth-http.tenant-a.svc:5000
+    repositoryPrefix: templates
+    secretRef:
+      name: http-auth
+    plainHTTP: true
+  - host: secure.example.com
+    secretRef:
+      name: https-auth
+`},
+	}
+	httpAuth := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "http-auth", Namespace: "tenant-a"},
+		Type:       corev1.SecretTypeDockerConfigJson,
+		Data:       map[string][]byte{corev1.DockerConfigJsonKey: []byte(`{"auths":{"auth-http.tenant-a.svc:5000":{"username":"u","password":"p"}}}`)},
+	}
+	httpsAuth := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "https-auth", Namespace: "tenant-a"},
+		Type:       corev1.SecretTypeDockerConfigJson,
+		Data:       map[string][]byte{corev1.DockerConfigJsonKey: []byte(`{"auths":{"secure.example.com":{"username":"s","password":"pw"}}}`)},
+	}
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pool, configMap, httpAuth, httpsAuth).Build()
+	r := &SandboxPoolReconciler{Client: k8sClient, Scheme: scheme}
+	compiled, err := r.ensureRegistrySecret(context.Background(), pool)
+	require.NoError(t, err)
+
+	anon, ok := compiled.Match("opensandbox-bench-registry.tenant-a.svc:5000/templates/base:v1")
+	require.True(t, ok)
+	require.True(t, anon.PlainHTTP)
+	require.Empty(t, anon.Username)
+	require.Empty(t, anon.Password)
+
+	authed, ok := compiled.Match("auth-http.tenant-a.svc:5000/templates/base:v1")
+	require.True(t, ok)
+	require.True(t, authed.PlainHTTP)
+	require.Equal(t, "u", authed.Username)
+	require.Equal(t, "p", authed.Password)
+
+	httpsCred, ok := compiled.Match("secure.example.com/templates/base:v1")
+	require.True(t, ok)
+	require.False(t, httpsCred.PlainHTTP)
+	require.Equal(t, "s", httpsCred.Username)
+}

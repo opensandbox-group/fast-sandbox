@@ -28,10 +28,12 @@ data:
         repositoryPrefix: team-b
         secretRef:
           name: registry-team-b
+      # Optional: plain HTTP for an in-cluster registry without TLS (secretRef may be omitted when anonymous).
+      - host: registry.fast-sandbox.svc:5000
+        plainHTTP: true
 ```
 
-Each Secret must be a same-namespace
-`kubernetes.io/dockerconfigjson` Secret:
+Each Secret must be a same-namespace `kubernetes.io/dockerconfigjson` Secret. `plainHTTP` defaults to `false` (HTTPS); setting `plainHTTP: true` opts only matching references into plain HTTP across template builds, Fastlet OCI attach/snapshot operations, and snapshot deletion, and allows omitting `secretRef` for anonymous HTTP registries:
 
 ```bash
 kubectl create secret docker-registry registry-team-a \

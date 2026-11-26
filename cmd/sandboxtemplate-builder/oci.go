@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/google/go-containerregistry/pkg/authn"
-	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/layout"
@@ -54,10 +53,14 @@ func writeImageEnv(image v1.Image, workdir string) error {
 // one image with any number of tags is fine; multi-image archives are not
 // supported and an arbitrary member would be picked).
 func pullOCILayout(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir string) (string, error) {
-	if tarPath := os.Getenv("SANDBOX_TEMPLATE_IMAGE_TAR"); tarPath != "" {
-		return pullOCILayoutFromTar(ctx, spec, workdir, tarPath)
+	registryPolicy, err := loadBuilderRegistryPolicy()
+	if err != nil {
+		return "", err
 	}
-	reference, err := name.ParseReference(spec.Image)
+	if tarPath := os.Getenv("SANDBOX_TEMPLATE_IMAGE_TAR"); tarPath != "" {
+		return pullOCILayoutFromTar(ctx, spec, workdir, tarPath, registryPolicy)
+	}
+	reference, err := parseOCIReference(spec.Image, registryPolicy.plainHTTP(spec.Image))
 	if err != nil {
 		return "", fmt.Errorf("parse image %q: %w", spec.Image, err)
 	}
@@ -79,14 +82,14 @@ func pullOCILayout(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, wo
 		return "", err
 	}
 	if spec.Execd != "" {
-		if err := extractExecd(ctx, spec.Execd, filepath.Join(workdir, "execd-root")); err != nil {
+		if err := extractExecdWithPlainHTTP(ctx, spec.Execd, filepath.Join(workdir, "execd-root"), registryPolicy.plainHTTP(spec.Execd)); err != nil {
 			return "", err
 		}
 	}
 	return descriptor.Digest.String(), nil
 }
 
-func pullOCILayoutFromTar(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir, tarPath string) (string, error) {
+func pullOCILayoutFromTar(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir, tarPath string, policy builderRegistryPolicy) (string, error) {
 	image, err := tarball.ImageFromPath(tarPath, nil)
 	if err != nil {
 		return "", fmt.Errorf("load image tarball: %w", err)
@@ -98,7 +101,7 @@ func pullOCILayoutFromTar(ctx context.Context, spec apiv1alpha2.SandboxTemplateS
 		return "", err
 	}
 	if spec.Execd != "" {
-		if err := extractExecd(ctx, spec.Execd, filepath.Join(workdir, "execd-root")); err != nil {
+		if err := extractExecdWithPlainHTTP(ctx, spec.Execd, filepath.Join(workdir, "execd-root"), policy.plainHTTP(spec.Execd)); err != nil {
 			return "", err
 		}
 	}
@@ -126,8 +129,12 @@ func writeOCILayout(image v1.Image, workdir string) error {
 // (/execd, /bootstrap.sh, /prepare.sh, /usr/local/bin/bwrap) into a local
 // directory for injection. Files are first collected in memory so symlinked
 // entries (e.g. bwrap -> execd) can be resolved across the layer.
-func extractExecd(ctx context.Context, image, destination string) error { //nolint:gocognit // single-pass tar walk; splitting would obscure symlink resolution
-	reference, err := name.ParseReference(image)
+func extractExecd(ctx context.Context, image, destination string) error {
+	return extractExecdWithPlainHTTP(ctx, image, destination, false)
+}
+
+func extractExecdWithPlainHTTP(ctx context.Context, image, destination string, plainHTTP bool) error { //nolint:gocognit // single-pass tar walk; splitting would obscure symlink resolution
+	reference, err := parseOCIReference(image, plainHTTP)
 	if err != nil {
 		return err
 	}
