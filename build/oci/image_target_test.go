@@ -45,6 +45,7 @@ func TestSandboxTemplateBuilderCopiesComponentLogging(t *testing.T) {
 	beforeBuild, _, found := strings.Cut(stage, "RUN CGO_ENABLED=0 go build")
 	require.True(t, found)
 	require.Contains(t, beforeBuild, "\nCOPY internal/componentlog ./internal/componentlog\n")
+	require.Contains(t, beforeBuild, "\nCOPY internal/registryconfig ./internal/registryconfig\n")
 }
 
 func TestSharedOCIToolImageBuildSelection(t *testing.T) {
