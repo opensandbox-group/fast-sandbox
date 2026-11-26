@@ -92,7 +92,7 @@ func (m *SandboxManager) waitUntilSandboxReady(ctx context.Context, identity fas
 				message = "Sandbox failed before overall Ready"
 			}
 			m.mu.Unlock()
-			failure := fastletError(fastletapi.ErrorActionUnavailable, message, false)
+			failure := fastletError(fastletapi.ErrorActionFailed, message, false)
 			return &status, failure
 		}
 		changed := m.readinessChanged

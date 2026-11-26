@@ -88,7 +88,7 @@ func TestValidateExecActionHandlers(t *testing.T) {
 					Stdin:                 ExecActionStdinBindingInput,
 					SkipOnRestore:         true,
 					TimeoutSeconds:        15,
-					NonRetryableExitCodes: []int32{22},
+					NonRetryableExitCodes: []ExecActionExitCode{22},
 					MaxRetries:            10,
 					FailurePolicy:         ExecActionFailurePolicyFailSandbox,
 					Command: []string{
@@ -102,17 +102,18 @@ func TestValidateExecActionHandlers(t *testing.T) {
 	}
 	require.NoError(t, validHTTPExec.ValidateActionHandlers())
 
+	// VSock is withheld until runtime drivers populate it.
 	vsockExec := SandboxPoolSpec{
 		ActionHandlers: []ActionHandler{{
 			Name:  "runtime-init",
 			Hooks: []LifecycleHook{LifecycleHookDataPlaneReady},
 			Exec: &ExecActionHandler{
 				Stdin:   ExecActionStdinBindingInput,
-				Command: []string{"/usr/bin/vsock-exec", "{{.Attachment.VSock.UDSPath}}", "{{.Sandbox.UID}}", "{{.Revision.InstanceGeneration}}"},
+				Command: []string{"/usr/bin/vsock-exec", "{{.Attachment.VSock.UDSPath}}"},
 			},
 		}},
 	}
-	require.NoError(t, vsockExec.ValidateActionHandlers())
+	require.ErrorIs(t, vsockExec.ValidateActionHandlers(), ErrActionHandlersInvalid)
 
 	// Neither targetHTTPPort nor exec
 	neither := SandboxPoolSpec{ActionHandlers: []ActionHandler{{Name: "empty"}}}
@@ -138,7 +139,7 @@ func TestValidateExecActionHandlers(t *testing.T) {
 
 	// Invalid exit code and failurePolicy
 	badExit := SandboxPoolSpec{ActionHandlers: []ActionHandler{{
-		Name: "exit", Exec: &ExecActionHandler{Command: []string{"/bin/true"}, NonRetryableExitCodes: []int32{0}},
+		Name: "exit", Exec: &ExecActionHandler{Command: []string{"/bin/true"}, NonRetryableExitCodes: []ExecActionExitCode{0}},
 	}}}
 	require.ErrorIs(t, badExit.ValidateActionHandlers(), ErrActionHandlersInvalid)
 

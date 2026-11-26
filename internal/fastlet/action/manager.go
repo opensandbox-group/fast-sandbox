@@ -243,12 +243,12 @@ type Attachment struct {
 	RuntimeInstanceID  string
 	RouteGeneration    int64
 	Restored           bool
+	Recovered          bool
 	IP                 string
 	Gateway            string
 	NetNSPath          string
 	PrivateCIDR        string
 	HostVeth           string
-	VSockUDSPath       string
 }
 
 type HookCheckpoint struct {
@@ -312,7 +312,6 @@ type Manager struct {
 	byName     map[string]apiv1alpha2.ActionHandler
 	caller     Caller
 	execRunner ExecRunner
-	stateDir   string
 	states     map[string]*sandboxState
 	terminal   map[string]Attachment
 	observed   map[string]handlerObservation
@@ -385,15 +384,6 @@ func (m *Manager) SetChangeNotifier(notify func(string)) {
 	m.notifyMu.Lock()
 	m.notify = notify
 	m.notifyMu.Unlock()
-}
-
-// SetStateDir enables local persistence of completed exec Action Handler state
-// under <dir>/actions/<sandboxUID>.json so Fastlet restarts skip re-running
-// already-completed one-shot commands.
-func (m *Manager) SetStateDir(dir string) {
-	m.mu.Lock()
-	m.stateDir = dir
-	m.mu.Unlock()
 }
 
 // SetExecRunner overrides the process runner for exec Action Handlers.
@@ -1290,7 +1280,6 @@ func (m *Manager) finishDelete(sandboxUID string, state *sandboxState, attachmen
 		m.terminal[sandboxUID] = attachment
 	}
 	m.mu.Unlock()
-	m.removePersistedExecState(sandboxUID)
 	m.notifyChanged(sandboxUID)
 }
 
@@ -1306,9 +1295,11 @@ func (m *Manager) Statuses(sandboxUID string) ([]fastletapi.ActionBindingStatus,
 
 func (m *Manager) retryState(parent context.Context, state *sandboxState) {
 	timeout := defaultTimeout * time.Duration(max(1, len(m.handlers)))
+	_, maxBackoff := m.execBackoffBounds()
 	for _, handler := range m.handlers {
 		if handler.Exec != nil {
-			timeout += effectiveExecTimeout(handler.Exec) * time.Duration(1+handler.Exec.MaxRetries)
+			timeout += effectiveExecTimeout(handler.Exec)*time.Duration(1+handler.Exec.MaxRetries) +
+				time.Duration(handler.Exec.MaxRetries)*maxBackoff
 		}
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
@@ -1422,7 +1413,6 @@ func (m *Manager) getOrCreateState(attachment Attachment) (*sandboxState, error)
 	state := m.states[attachment.SandboxUID]
 	if state == nil {
 		state = newSandboxState()
-		m.hydratePersistedExecStateLocked(state, attachment)
 		m.states[attachment.SandboxUID] = state
 	}
 	return state, nil

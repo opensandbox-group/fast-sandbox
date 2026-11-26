@@ -215,9 +215,15 @@ const (
 // ExecActionEnvVar defines one static environment variable passed to an exec
 // Action Handler process.
 type ExecActionEnvVar struct {
+	// +kubebuilder:validation:MinLength=1
 	Name  string `json:"name"`
 	Value string `json:"value"`
 }
+
+// ExecActionExitCode is a non-zero process exit code in the POSIX 1..255 range.
+// +kubebuilder:validation:Minimum=1
+// +kubebuilder:validation:Maximum=255
+type ExecActionExitCode int32
 
 // ExecActionHandler declares a Fastlet-local command template executed directly
 // via execve without invoking a shell.
@@ -241,7 +247,8 @@ type ExecActionHandler struct {
 	Stdin ExecActionStdinMode `json:"stdin,omitempty"`
 
 	// SkipOnRestore marks the binding ActionReady immediately on checkpoint
-	// restore (Pause -> Resume) without re-executing Command.
+	// restore (Pause -> Resume) and in-place Fastlet recovery without
+	// re-executing Command.
 	SkipOnRestore bool `json:"skipOnRestore,omitempty"`
 
 	// TimeoutSeconds bounds a single command invocation. Defaults to 15.
@@ -253,7 +260,7 @@ type ExecActionHandler struct {
 	// NonRetryableExitCodes lists non-zero exit codes that fail immediately
 	// without retrying.
 	// +kubebuilder:validation:MaxItems=32
-	NonRetryableExitCodes []int32 `json:"nonRetryableExitCodes,omitempty"`
+	NonRetryableExitCodes []ExecActionExitCode `json:"nonRetryableExitCodes,omitempty"`
 
 	// MaxRetries limits retries after the initial attempt.
 	// +kubebuilder:validation:Minimum=0
@@ -322,7 +329,8 @@ type SandboxPoolSpec struct {
 	// +kubebuilder:validation:MaxItems=16
 	InfraComponents []InfraComponent `json:"infraComponents,omitempty"`
 
-	// ActionHandlers are Pod-local HTTP receivers used by ordered per-Sandbox
+	// ActionHandlers are Pod-local HTTP receivers (targetHTTPPort) or
+	// Fastlet-local execve command handlers (exec) used by ordered per-Sandbox
 	// Action Bindings.
 	// +listType=map
 	// +listMapKey=name

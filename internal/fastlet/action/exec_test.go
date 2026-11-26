@@ -3,8 +3,6 @@ package action
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -54,7 +52,7 @@ func runtimeInitHandler() apiv1alpha2.ActionHandler {
 			Stdin:                 apiv1alpha2.ExecActionStdinBindingInput,
 			SkipOnRestore:         true,
 			TimeoutSeconds:        15,
-			NonRetryableExitCodes: []int32{22},
+			NonRetryableExitCodes: []apiv1alpha2.ExecActionExitCode{22},
 			MaxRetries:            3,
 			FailurePolicy:         apiv1alpha2.ExecActionFailurePolicyFailSandbox,
 			Command: []string{
@@ -124,7 +122,6 @@ func TestExecActionOrdersAfterHTTPAndPassesInputOnStdin(t *testing.T) {
 
 	att := attachment("sb-order")
 	att.NetNSPath = "/run/netns/sb-order"
-	att.VSockUDSPath = "/run/vsock/sb-order.sock"
 	// Shell metacharacters must pass verbatim via stdin and never reach argv.
 	payload := `{"sandboxId":"sb-order","envs":{"EVIL":"$(touch /tmp/pwned); 'quote'\nline2"}}`
 
@@ -152,6 +149,48 @@ func TestExecActionOrdersAfterHTTPAndPassesInputOnStdin(t *testing.T) {
 	// Relay must be rejected on exec handlers.
 	_, _, relayErr := manager.RelayHandler(context.Background(), att, "runtime-init", "POST", "/x", nil)
 	require.ErrorContains(t, relayErr, "does not support HTTP relay")
+}
+
+func TestExecActionImmutabilityAllowsSiblingUpdatesAndRejectsInputChange(t *testing.T) {
+	httpCaller := &stubHTTPCaller{
+		status: actionapi.HandlerStatus{APIVersion: actionapi.APIVersion, InstanceID: "egress-1", Ready: true},
+	}
+	execRunner := &recordingExecRunner{}
+	handlers := []apiv1alpha2.ActionHandler{
+		{Name: "egress", TargetHTTPPort: 18080, Hooks: []apiv1alpha2.LifecycleHook{apiv1alpha2.LifecycleHookDataPlaneReady}},
+		runtimeInitHandler(),
+	}
+	manager, err := NewManager(handlers, httpCaller)
+	require.NoError(t, err)
+	manager.SetExecRunner(execRunner)
+	manager.probe(context.Background())
+
+	att := attachment("sb-immut")
+	_, _, err = manager.Reconcile(context.Background(), att, 1, []DesiredInput{
+		{Handler: "egress", Input: `{"v":1}`},
+		{Handler: "runtime-init", Input: `{"sandboxId":"sb-immut"}`},
+	})
+	require.NoError(t, err)
+	require.NoError(t, manager.ReachHook(context.Background(), att.SandboxUID, att, actionapi.LifecycleHookDataPlaneReady, 1))
+	require.Equal(t, 1, execRunner.count())
+
+	// Updating sibling HTTP binding at generation 2 keeps exec Ready without re-running it.
+	statuses, appliedGen, err := manager.Reconcile(context.Background(), att, 2, []DesiredInput{
+		{Handler: "egress", Input: `{"v":2}`},
+		{Handler: "runtime-init", Input: `{"sandboxId":"sb-immut"}`},
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(2), appliedGen)
+	require.Equal(t, string(apiv1alpha2.ActionReady), statuses[1].State)
+	require.Equal(t, 1, execRunner.count())
+
+	// Mutating the exec binding input at generation 3 must be rejected.
+	_, _, err = manager.Reconcile(context.Background(), att, 3, []DesiredInput{
+		{Handler: "egress", Input: `{"v":2}`},
+		{Handler: "runtime-init", Input: `{"sandboxId":"mutated"}`},
+	})
+	require.ErrorContains(t, err, "immutable")
+	require.Equal(t, 1, execRunner.count())
 }
 
 func TestExecActionRetriesUntilSuccess(t *testing.T) {
@@ -215,8 +254,7 @@ func TestExecActionNonRetryableFailSandboxTriggersCallback(t *testing.T) {
 	require.Equal(t, 1, execRunner.count())
 }
 
-func TestExecActionSkipOnRestoreAndPersistRecovery(t *testing.T) {
-	stateDir := t.TempDir()
+func TestExecActionSkipOnRestoreAndRecovery(t *testing.T) {
 	var runs atomic.Int32
 	execRunner := &recordingExecRunner{
 		fn: func(_ context.Context, _ int, _ ExecRequest) ExecResult {
@@ -225,49 +263,36 @@ func TestExecActionSkipOnRestoreAndPersistRecovery(t *testing.T) {
 		},
 	}
 
-	// 1. Pause -> Resume (Restored=true) skips execution.
-	mgr1, err := NewManager([]apiv1alpha2.ActionHandler{runtimeInitHandler()}, nil)
+	mgr, err := NewManager([]apiv1alpha2.ActionHandler{runtimeInitHandler()}, nil)
 	require.NoError(t, err)
-	mgr1.SetExecRunner(execRunner)
-	mgr1.SetStateDir(stateDir)
+	mgr.SetExecRunner(execRunner)
 
+	// 1. Pause -> Resume (Restored=true) skips execution.
 	restoredAtt := attachment("sb-restored")
 	restoredAtt.Restored = true
-	_, _, err = mgr1.Reconcile(context.Background(), restoredAtt, 1, []DesiredInput{{Handler: "runtime-init", Input: `{}`}})
+	_, _, err = mgr.Reconcile(context.Background(), restoredAtt, 1, []DesiredInput{{Handler: "runtime-init", Input: `{}`}})
 	require.NoError(t, err)
-	require.NoError(t, mgr1.ReachHook(context.Background(), restoredAtt.SandboxUID, restoredAtt, actionapi.LifecycleHookDataPlaneReady, 1))
+	require.NoError(t, mgr.ReachHook(context.Background(), restoredAtt.SandboxUID, restoredAtt, actionapi.LifecycleHookDataPlaneReady, 1))
 	require.Equal(t, int32(0), runs.Load())
 
-	statuses, _ := mgr1.Statuses(restoredAtt.SandboxUID)
+	statuses, _ := mgr.Statuses(restoredAtt.SandboxUID)
 	require.Equal(t, string(apiv1alpha2.ActionReady), statuses[0].State)
 	require.Contains(t, statuses[0].Message, "skipped on checkpoint restore")
 
-	// 2. Normal create executes once and persists state to disk.
-	freshAtt := attachment("sb-persist")
-	_, _, err = mgr1.Reconcile(context.Background(), freshAtt, 1, []DesiredInput{{Handler: "runtime-init", Input: `{"sandboxId":"sb-persist"}`}})
+	// 2. In-place Fastlet restart (Recovered=true) skips execution without disk state.
+	recoveredAtt := attachment("sb-recovered")
+	recoveredAtt.Recovered = true
+	_, _, err = mgr.Reconcile(context.Background(), recoveredAtt, 1, []DesiredInput{{Handler: "runtime-init", Input: `{}`}})
 	require.NoError(t, err)
-	require.NoError(t, mgr1.ReachHook(context.Background(), freshAtt.SandboxUID, freshAtt, actionapi.LifecycleHookDataPlaneReady, 1))
-	require.Equal(t, int32(1), runs.Load())
-	require.FileExists(t, filepath.Join(stateDir, "actions", "sb-persist.json"))
+	require.NoError(t, mgr.ReachHook(context.Background(), recoveredAtt.SandboxUID, recoveredAtt, actionapi.LifecycleHookDataPlaneReady, 1))
+	require.Equal(t, int32(0), runs.Load())
 
-	// 3. Simulated Fastlet restart recovers persisted state and does not re-run command.
-	mgr2, err := NewManager([]apiv1alpha2.ActionHandler{runtimeInitHandler()}, nil)
-	require.NoError(t, err)
-	mgr2.SetExecRunner(execRunner)
-	mgr2.SetStateDir(stateDir)
-
-	_, _, err = mgr2.Reconcile(context.Background(), freshAtt, 1, []DesiredInput{{Handler: "runtime-init", Input: `{"sandboxId":"sb-persist"}`}})
-	require.NoError(t, err)
-	require.NoError(t, mgr2.ReachHook(context.Background(), freshAtt.SandboxUID, freshAtt, actionapi.LifecycleHookDataPlaneReady, 1))
-	require.Equal(t, int32(1), runs.Load(), "Fastlet restart must not re-run already-completed exec action")
-
-	// 4. Delete removes persisted state file.
-	require.NoError(t, mgr2.Delete(context.Background(), freshAtt.SandboxUID))
-	_, statErr := os.Stat(filepath.Join(stateDir, "actions", "sb-persist.json"))
-	require.True(t, os.IsNotExist(statErr))
+	statuses, _ = mgr.Statuses(recoveredAtt.SandboxUID)
+	require.Equal(t, string(apiv1alpha2.ActionReady), statuses[0].State)
+	require.Contains(t, statuses[0].Message, "skipped on Fastlet recovery")
 }
 
-func TestOSExecRunnerDirectExecveAndTimeout(t *testing.T) {
+func TestOSExecRunnerDirectExecveAndProcessGroupTimeout(t *testing.T) {
 	runner := OSExecRunner{}
 	res := runner.Run(context.Background(), ExecRequest{
 		Command: []string{"/bin/cat"},
@@ -277,12 +302,15 @@ func TestOSExecRunnerDirectExecveAndTimeout(t *testing.T) {
 	require.Equal(t, 0, res.ExitCode)
 	require.Equal(t, `{"hello":"$(not_executed)"}`, res.Stdout)
 
-	timeoutCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	// Verify a background descendant inheriting stdout does not hang timeout.
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
+	started := time.Now()
 	timedOut := runner.Run(timeoutCtx, ExecRequest{
-		Command: []string{"/bin/sleep", "5"},
+		Command: []string{"/bin/sh", "-c", "sleep 30 & wait"},
 	})
 	require.Error(t, timedOut.Err)
 	require.True(t, timedOut.TimedOut)
 	require.Equal(t, -1, timedOut.ExitCode)
+	require.Less(t, time.Since(started), 3*time.Second)
 }

@@ -578,6 +578,10 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 			createErr = fmt.Errorf("%w: %w", ErrUnknownFastletOutcome, createErr)
 		}
 	}
+	if IsTerminalSandboxActionFailure(createErr) {
+		o.recordAdmissionSnapshot(fastlet, response)
+		return response, createErr
+	}
 	o.recordFeedback(fastlet, response, createErr)
 	return response, createErr
 }
@@ -952,6 +956,14 @@ func envMap(values []corev1.EnvVar) map[string]string {
 		result[value.Name] = value.Value
 	}
 	return result
+}
+
+// IsTerminalSandboxActionFailure reports a per-Sandbox terminal Action failure
+// (such as an exec Action Handler triggering FailSandbox). It must not penalize
+// the Fastlet candidate or trigger candidate retries.
+func IsTerminalSandboxActionFailure(err error) bool {
+	var failure *fastletapi.FastletError
+	return errors.As(err, &failure) && failure.Code == fastletapi.ErrorActionFailed
 }
 
 func IsCandidateRejection(err error) bool {

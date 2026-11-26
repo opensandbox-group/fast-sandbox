@@ -192,16 +192,14 @@ var execTemplateSample = struct {
 		RouteGeneration    int64
 	}
 	Attachment struct {
-		Restored bool
-		Network  struct {
+		Restored  bool
+		Recovered bool
+		Network   struct {
 			IP          string
 			Gateway     string
 			NetNSPath   string
 			PrivateCIDR string
 			HostVeth    string
-		}
-		VSock struct {
-			UDSPath string
 		}
 	}
 }{}

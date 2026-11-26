@@ -41,7 +41,8 @@ spec:
             properties:
               actionHandlers:
                 description: |-
-                  ActionHandlers are Pod-local HTTP receivers used by ordered per-Sandbox
+                  ActionHandlers are Pod-local HTTP receivers (targetHTTPPort) or
+                  Fastlet-local execve command handlers (exec) used by ordered per-Sandbox
                   Action Bindings.
                 items:
                   description: |-
@@ -78,6 +79,7 @@ spec:
                               Action Handler process.
                             properties:
                               name:
+                                minLength: 1
                                 type: string
                               value:
                                 type: string
@@ -107,14 +109,19 @@ spec:
                             NonRetryableExitCodes lists non-zero exit codes that fail immediately
                             without retrying.
                           items:
+                            description: ExecActionExitCode is a non-zero process
+                              exit code in the POSIX 1..255 range.
                             format: int32
+                            maximum: 255
+                            minimum: 1
                             type: integer
                           maxItems: 32
                           type: array
                         skipOnRestore:
                           description: |-
                             SkipOnRestore marks the binding ActionReady immediately on checkpoint
-                            restore (Pause -> Resume) without re-executing Command.
+                            restore (Pause -> Resume) and in-place Fastlet recovery without
+                            re-executing Command.
                           type: boolean
                         stdin:
                           default: None

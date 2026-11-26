@@ -160,8 +160,7 @@ type NetworkAllocation struct {
 // RuntimeAllocation contains resources actually assigned to one runtime.
 // Allocation is observed/persisted state, separate from RuntimeSandboxConfig.
 type RuntimeAllocation struct {
-	Network      NetworkAllocation `json:"network"`
-	VSockUDSPath string            `json:"vsockUdsPath,omitempty"`
+	Network NetworkAllocation `json:"network"`
 }
 
 type RuntimeState string
@@ -298,10 +297,14 @@ const (
 	ErrorNetworkUnavailable FastletErrorCode = "NetworkUnavailable"
 	ErrorInfraUnavailable   FastletErrorCode = "InfraUnavailable"
 	ErrorActionUnavailable  FastletErrorCode = "ActionUnavailable"
-	ErrorUnknownOutcome     FastletErrorCode = "UnknownOutcome"
-	ErrorNotFound           FastletErrorCode = "NotFound"
-	ErrorGenerationFenced   FastletErrorCode = "GenerationFenced"
-	ErrorProfileMismatch    FastletErrorCode = "ProfileMismatch"
+	// ErrorActionFailed reports a terminal per-Sandbox Action failure (such as
+	// an exec Action Handler triggering FailSandbox). Unlike node-level
+	// ErrorActionUnavailable, it does not indicate an unhealthy Fastlet.
+	ErrorActionFailed     FastletErrorCode = "ActionFailed"
+	ErrorUnknownOutcome   FastletErrorCode = "UnknownOutcome"
+	ErrorNotFound         FastletErrorCode = "NotFound"
+	ErrorGenerationFenced FastletErrorCode = "GenerationFenced"
+	ErrorProfileMismatch  FastletErrorCode = "ProfileMismatch"
 	// ErrorSnapshotInProgress reports the deterministic non-reentrancy
 	// rejection: another non-terminal snapshot holds the target Sandbox.
 	ErrorSnapshotInProgress FastletErrorCode = "SnapshotInProgress"

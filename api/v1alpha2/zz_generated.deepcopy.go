@@ -142,7 +142,7 @@ func (in *ExecActionHandler) DeepCopyInto(out *ExecActionHandler) {
 	}
 	if in.NonRetryableExitCodes != nil {
 		in, out := &in.NonRetryableExitCodes, &out.NonRetryableExitCodes
-		*out = make([]int32, len(*in))
+		*out = make([]ExecActionExitCode, len(*in))
 		copy(*out, *in)
 	}
 }

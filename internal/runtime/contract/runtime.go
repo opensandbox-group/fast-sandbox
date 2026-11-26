@@ -18,8 +18,12 @@ import (
 type Metadata struct {
 	// RecoveryRequired keeps a live runtime unavailable without declaring it
 	// dead or allowing destructive cleanup. Reconciliation must clear the fence.
-	RecoveryRequired       bool
-	BootRecoveryPending    bool
+	RecoveryRequired    bool
+	BootRecoveryPending bool
+	// Recovered marks a Sandbox reconstructed during Fastlet startup recovery
+	// (in-place daemon restart) so one-shot exec handlers with SkipOnRestore do
+	// not re-execute.
+	Recovered              bool
 	Config                 fastletapi.RuntimeSandboxConfig
 	Allocation             fastletapi.RuntimeAllocation
 	ContainerID            string

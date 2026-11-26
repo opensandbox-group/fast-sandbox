@@ -401,13 +401,8 @@ func (s *Server) provisionRuntime(ctx context.Context, accepted *acceptedCreate,
 		if callErr == nil {
 			return nil, status.Error(codes.Unavailable, "Fastlet Create returned no Sandbox observation; Sandbox intent is persisted for Controller recovery")
 		}
-		// A local reservation conflict happens before the Fastlet RPC. It is a
-		// definitive rejection only while this call owns the newly created
-		// intent, so candidate retry or rollback cannot disrupt an idempotent
-		// replay that is already using the durable assignment.
-		ownedLocalRejection := accepted.created && errors.Is(callErr, orchestration.ErrLocalReservationConflict)
-		if !orchestration.IsCandidateRejection(callErr) && !ownedLocalRejection {
-			return nil, status.Errorf(codes.Unavailable, "Sandbox intent is persisted and Controller will retry: %v", callErr)
+		if err, retryable := s.handleProvisionFailure(ctx, accepted, callErr); !retryable {
+			return nil, err
 		}
 		hasBudget := len(tried) < maxCreateCandidateAttempts
 		if accepted.created && index+1 == len(accepted.candidates) && hasBudget {
@@ -426,6 +421,27 @@ func (s *Server) provisionRuntime(ctx context.Context, accepted *acceptedCreate,
 		return s.finishRejectedCreate(ctx, accepted, callErr)
 	}
 	return nil, status.Error(codes.ResourceExhausted, orchestration.ErrNoCandidate.Error())
+}
+
+func (s *Server) handleProvisionFailure(ctx context.Context, accepted *acceptedCreate, callErr error) (error, bool) {
+	if orchestration.IsTerminalSandboxActionFailure(callErr) {
+		if accepted.created {
+			uid := accepted.sandbox.UID
+			if delErr := s.K8sClient.Delete(ctx, accepted.sandbox, client.Preconditions{UID: &uid}); delErr != nil && !apierrors.IsNotFound(delErr) {
+				klog.FromContext(ctx).Error(delErr, "delete Sandbox CR after terminal Action failure", "sandbox", accepted.sandbox.Name)
+			}
+		}
+		return status.Errorf(codes.FailedPrecondition, "Sandbox Action failed: %v", callErr), false
+	}
+	// A local reservation conflict happens before the Fastlet RPC. It is a
+	// definitive rejection only while this call owns the newly created intent,
+	// so candidate retry or rollback cannot disrupt an idempotent replay that
+	// is already using the durable assignment.
+	ownedLocalRejection := accepted.created && errors.Is(callErr, orchestration.ErrLocalReservationConflict)
+	if !orchestration.IsCandidateRejection(callErr) && !ownedLocalRejection {
+		return status.Errorf(codes.Unavailable, "Sandbox intent is persisted and Controller will retry: %v", callErr), false
+	}
+	return nil, true
 }
 
 func (s *Server) finishRejectedCreate(ctx context.Context, accepted *acceptedCreate, rejection error) (*fastletapi.SandboxStatus, error) {
@@ -725,9 +741,53 @@ func (s *Server) applySandboxUpdate(ctx context.Context, sandbox *apiv1alpha2.Sa
 		if err := probe.ValidateActionBindings(pool.Spec.ActionHandlers); err != nil {
 			return status.Error(codes.FailedPrecondition, err.Error())
 		}
+		if err := validateExecActionBindingsImmutable(sandbox.Spec.ActionBindings, bindings, pool.Spec.ActionHandlers); err != nil {
+			return status.Error(codes.InvalidArgument, err.Error())
+		}
 		sandbox.Spec.ActionBindings = bindings
 	default:
 		return status.Error(codes.InvalidArgument, "unknown Sandbox update")
+	}
+	return nil
+}
+
+// validateExecActionBindingsImmutable rejects adding, removing, or modifying
+// input for any exec ActionHandler binding after Sandbox creation.
+func validateExecActionBindingsImmutable(existing, updated []apiv1alpha2.ActionBinding, handlers []apiv1alpha2.ActionHandler) error {
+	execHandlers := make(map[string]struct{})
+	for _, h := range handlers {
+		if h.Exec != nil {
+			execHandlers[h.Name] = struct{}{}
+		}
+	}
+	if len(execHandlers) == 0 {
+		return nil
+	}
+	oldInputs := make(map[string]string)
+	for _, b := range existing {
+		if _, isExec := execHandlers[b.Handler]; isExec {
+			oldInputs[b.Handler] = b.Input
+		}
+	}
+	newInputs := make(map[string]string)
+	for _, b := range updated {
+		if _, isExec := execHandlers[b.Handler]; isExec {
+			newInputs[b.Handler] = b.Input
+		}
+	}
+	for name, newVal := range newInputs {
+		oldVal, existed := oldInputs[name]
+		if !existed {
+			return fmt.Errorf("exec Action Binding %q cannot be added after Sandbox creation", name)
+		}
+		if oldVal != newVal {
+			return fmt.Errorf("exec Action Binding %q is immutable after Sandbox creation", name)
+		}
+	}
+	for name := range oldInputs {
+		if _, stillPresent := newInputs[name]; !stillPresent {
+			return fmt.Errorf("exec Action Binding %q cannot be removed after Sandbox creation", name)
+		}
 	}
 	return nil
 }

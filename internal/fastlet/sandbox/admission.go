@@ -801,6 +801,7 @@ func (m *SandboxManager) Recover(ctx context.Context) error { //nolint:gocognit,
 		if metadata.RuntimeMessage != "" {
 			recoveredMessages[identity.SandboxUID] = metadata.RuntimeMessage
 		}
+		metadata.Recovered = true
 		recovered[identity.SandboxUID] = metadata
 	}
 	activeRecovered := 0

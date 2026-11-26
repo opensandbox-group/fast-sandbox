@@ -77,7 +77,6 @@ func main() {
 	resourceAdmission := startup.resourceAdmission
 	actionManager := startup.actionManager
 	actionManager.SetVaultHandler(fastletaction.VaultHandlerFromEnv())
-	actionManager.SetStateDir(fastletActionStateDir(podUID))
 
 	klog.InfoS("fastlet starting",
 		"podName", podName, "podIP", podIP, "nodeName", nodeName,
@@ -238,17 +237,6 @@ func setupFastletNetwork(ctx context.Context, rt runtimecontract.Driver, podUID 
 	}
 	configurable.SetNetworkManager(networkManager)
 	klog.InfoS("fastlet-owned network initialized", "capacity", networkManager.Snapshot().Capacity, "cleanSlots", networkManager.Snapshot().Clean)
-}
-
-func fastletActionStateDir(podUID string) string {
-	if configured := getEnv("FAST_SANDBOX_ACTION_STATE_DIR", ""); configured != "" {
-		return configured
-	}
-	base := getEnv("FAST_SANDBOX_STATE_DIR", "/run/fast-sandbox")
-	if podUID != "" {
-		return filepath.Join(base, podUID)
-	}
-	return base
 }
 
 type fastletStartupSettings struct {

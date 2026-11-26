@@ -21,7 +21,7 @@ func (s stubExecRunner) Run(ctx context.Context, req fastletaction.ExecRequest) 
 	return s.fn(ctx, req)
 }
 
-func TestCreateSandboxExecActionFailSandboxWakesWaiter(t *testing.T) {
+func TestCreateSandboxExecActionFailSandboxWakesWaiterWithActionFailed(t *testing.T) {
 	runtime := newAdmissionRuntime()
 	runtime.allocation = fastletapi.RuntimeAllocation{
 		Network: fastletapi.NetworkAllocation{IP: "172.30.0.10", Gateway: "172.30.0.1", NamespacePath: "/run/netns/sb-1"},
@@ -32,7 +32,7 @@ func TestCreateSandboxExecActionFailSandboxWakesWaiter(t *testing.T) {
 		Hooks: []apiv1alpha2.LifecycleHook{apiv1alpha2.LifecycleHookDataPlaneReady},
 		Exec: &apiv1alpha2.ExecActionHandler{
 			Stdin:                 apiv1alpha2.ExecActionStdinBindingInput,
-			NonRetryableExitCodes: []int32{22},
+			NonRetryableExitCodes: []apiv1alpha2.ExecActionExitCode{22},
 			MaxRetries:            2,
 			FailurePolicy:         apiv1alpha2.ExecActionFailurePolicyFailSandbox,
 			Command:               []string{"/usr/bin/curl", "http://{{.Attachment.Network.IP}}:44772/internal/init"},
@@ -67,14 +67,25 @@ func TestCreateSandboxExecActionFailSandboxWakesWaiter(t *testing.T) {
 		},
 	})
 	require.Error(t, createErr)
-	require.ErrorContains(t, createErr, "bad init")
+	var failure *fastletapi.FastletError
+	require.ErrorAs(t, createErr, &failure)
+	require.Equal(t, fastletapi.ErrorActionFailed, failure.Code)
+	require.False(t, failure.Retryable)
+	require.Contains(t, failure.Message, "bad init")
+
+	// Verify cleanup transitions to RuntimeFailed after DeleteSandbox finishes.
+	require.Eventually(t, func() bool {
+		manager.mu.RLock()
+		defer manager.mu.RUnlock()
+		meta := manager.sandboxes["sb-exec-fail"]
+		return meta != nil && meta.Phase == sandboxStateRuntimeFailed
+	}, 2*time.Second, 10*time.Millisecond)
 }
 
 func TestCreateSandboxExecActionReadySucceeds(t *testing.T) {
 	runtime := newAdmissionRuntime()
 	runtime.allocation = fastletapi.RuntimeAllocation{
-		Network:      fastletapi.NetworkAllocation{IP: "172.30.0.11", Gateway: "172.30.0.1", NamespacePath: "/run/netns/sb-2"},
-		VSockUDSPath: "/run/vsock/sb-2.sock",
+		Network: fastletapi.NetworkAllocation{IP: "172.30.0.11", Gateway: "172.30.0.1", NamespacePath: "/run/netns/sb-2"},
 	}
 
 	var captured fastletaction.ExecRequest
@@ -84,7 +95,7 @@ func TestCreateSandboxExecActionReadySucceeds(t *testing.T) {
 		Exec: &apiv1alpha2.ExecActionHandler{
 			Stdin:         apiv1alpha2.ExecActionStdinBindingInput,
 			FailurePolicy: apiv1alpha2.ExecActionFailurePolicyFailSandbox,
-			Command:       []string{"/usr/bin/init-helper", "{{.Attachment.Network.IP}}", "{{.Attachment.Network.NetNSPath}}", "{{.Attachment.VSock.UDSPath}}"},
+			Command:       []string{"/usr/bin/init-helper", "{{.Attachment.Network.IP}}", "{{.Attachment.Network.NetNSPath}}"},
 		},
 	}}, nil)
 	require.NoError(t, err)
@@ -117,6 +128,6 @@ func TestCreateSandboxExecActionReadySucceeds(t *testing.T) {
 	})
 	require.NoError(t, createErr)
 	require.NotNil(t, resp.Sandbox)
-	require.Equal(t, []string{"/usr/bin/init-helper", "172.30.0.11", "/run/netns/sb-2", "/run/vsock/sb-2.sock"}, captured.Command)
+	require.Equal(t, []string{"/usr/bin/init-helper", "172.30.0.11", "/run/netns/sb-2"}, captured.Command)
 	require.Equal(t, `{"sandboxId":"sb-exec-ok"}`, string(captured.Stdin))
 }
