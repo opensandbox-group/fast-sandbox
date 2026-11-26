@@ -28,8 +28,7 @@ const (
 	defaultExecWaitDelay   = time.Second
 	maxExecCapturedBytes   = 8 << 10
 
-	execOpApply   = "apply"
-	execOpCleanup = "cleanup"
+	execOpApply = "apply"
 
 	execResultSuccess      = "success"
 	execResultError        = "error"
@@ -357,16 +356,17 @@ func execSkipReason(cfg *apiv1alpha2.ExecActionHandler, attachment Attachment) (
 }
 
 type execInvocationSpec struct {
-	state       *sandboxState
-	handler     apiv1alpha2.ActionHandler
-	op          string
-	hookName    string
-	attachment  Attachment
-	argv        []string
-	env         []string
-	stdin       []byte
-	timeout     time.Duration
-	maxAttempts int
+	state        *sandboxState
+	handler      apiv1alpha2.ActionHandler
+	op           string
+	hookName     string
+	attachment   Attachment
+	argv         []string
+	env          []string
+	stdin        []byte
+	hasSensitive bool
+	timeout      time.Duration
+	maxAttempts  int
 }
 
 func (m *Manager) runExecAction(
@@ -409,7 +409,7 @@ func (m *Manager) runExecAction(
 	}
 	spec := execInvocationSpec{
 		state: state, handler: handler, op: op, hookName: hookName, attachment: attachment,
-		argv: argv, env: buildExecEnv(cfg.Env), stdin: stdinPayload,
+		argv: argv, env: buildExecEnv(cfg.Env), stdin: stdinPayload, hasSensitive: sensitiveInput != "",
 		timeout: effectiveExecTimeout(cfg), maxAttempts: maxAttempts,
 	}
 	backoff, maxBackoff := m.execBackoffBounds()
@@ -486,9 +486,23 @@ func (m *Manager) runExecAttempt(ctx context.Context, spec *execInvocationSpec, 
 		return nil, true
 	}
 
+	// If the caller's parent context was canceled or expired, abort this
+	// reconcile without tripping FailSandbox or discarding sensitiveInput so a
+	// subsequent reconcile with a fresh context can resume cleanly.
+	if ctx.Err() != nil {
+		klog.V(2).InfoS("fastlet action exec interrupted by caller context",
+			"sandboxUID", att.SandboxUID, "namespace", att.Namespace, "sandboxName", att.SandboxName,
+			"handler", spec.handler.Name, "op", spec.op, "hook", spec.hookName, "attempt", attempt,
+			"durationMs", duration.Milliseconds(), "err", ctx.Err())
+		return ctx.Err(), true
+	}
+
 	nonRetryable := spec.op == execOpApply && isNonRetryableExit(cfg, res.ExitCode)
 	resultLabel := execFailureResultLabel(res.TimedOut, nonRetryable)
-	output := execOutputSummary(res)
+	output := ""
+	if !spec.hasSensitive {
+		output = execOutputSummary(res)
+	}
 	attemptErr := formatExecAttemptError(spec, attempt, res, output)
 
 	terminal := spec.op == execOpApply && cfg.FailurePolicy == apiv1alpha2.ExecActionFailurePolicyFailSandbox && (nonRetryable || attempt == spec.maxAttempts)
@@ -514,7 +528,13 @@ func execFailureResultLabel(timedOut, nonRetryable bool) string {
 
 func formatExecAttemptError(spec *execInvocationSpec, attempt int, res ExecResult, output string) error {
 	if res.TimedOut {
+		if output == "" {
+			return fmt.Errorf("exec action %s timed out after %s (attempt %d/%d)", spec.handler.Name, spec.timeout, attempt, spec.maxAttempts)
+		}
 		return fmt.Errorf("exec action %s timed out after %s (attempt %d/%d): %s", spec.handler.Name, spec.timeout, attempt, spec.maxAttempts, output)
+	}
+	if output == "" {
+		return fmt.Errorf("exec action %s failed (attempt %d/%d, exit=%d)", spec.handler.Name, attempt, spec.maxAttempts, res.ExitCode)
 	}
 	return fmt.Errorf("exec action %s failed (attempt %d/%d, exit=%d): %s", spec.handler.Name, attempt, spec.maxAttempts, res.ExitCode, output)
 }
@@ -522,18 +542,28 @@ func formatExecAttemptError(spec *execInvocationSpec, attempt int, res ExecResul
 func logExecFailure(spec *execInvocationSpec, attempt int, res ExecResult, nonRetryable, terminal bool, duration time.Duration, resultLabel, output string, attemptErr error) {
 	att := spec.attachment
 	if attempt == 1 || terminal {
-		klog.ErrorS(attemptErr, "fastlet action exec failed",
+		fields := []any{
 			"sandboxUID", att.SandboxUID, "namespace", att.Namespace, "sandboxName", att.SandboxName,
 			"handler", spec.handler.Name, "op", spec.op, "hook", spec.hookName, "attempt", attempt, "maxAttempts", spec.maxAttempts,
 			"exitCode", res.ExitCode, "timedOut", res.TimedOut, "nonRetryable", nonRetryable,
-			"durationMs", duration.Milliseconds(), "outcome", resultLabel, "output", output)
+			"durationMs", duration.Milliseconds(), "outcome", resultLabel,
+		}
+		if !spec.hasSensitive && output != "" {
+			fields = append(fields, "output", output)
+		}
+		klog.ErrorS(attemptErr, "fastlet action exec failed", fields...)
 		return
 	}
-	klog.V(2).InfoS("fastlet action exec retryable failure",
+	fields := []any{
 		"sandboxUID", att.SandboxUID, "namespace", att.Namespace, "sandboxName", att.SandboxName,
 		"handler", spec.handler.Name, "op", spec.op, "hook", spec.hookName, "attempt", attempt, "maxAttempts", spec.maxAttempts,
 		"exitCode", res.ExitCode, "timedOut", res.TimedOut,
-		"durationMs", duration.Milliseconds(), "outcome", resultLabel, "output", output)
+		"durationMs", duration.Milliseconds(), "outcome", resultLabel,
+	}
+	if !spec.hasSensitive && output != "" {
+		fields = append(fields, "output", output)
+	}
+	klog.V(2).InfoS("fastlet action exec retryable failure", fields...)
 }
 
 func clearSensitiveInputLocked(state *sandboxState, handlerName string) {
@@ -588,11 +618,8 @@ func (m *Manager) setExecBinding(
 	handlerName := handler.Name
 	cfg := handler.Exec
 
-	// Removing a live binding runs optional cleanupCommand and returns.
+	// Removal of an exec binding is a local no-op.
 	if input == nil {
-		if len(cfg.CleanupCommand) > 0 {
-			return m.runExecAction(ctx, nil, handler, execOpCleanup, "", generation, attachment, "", "", nil, cfg.CleanupCommand)
-		}
 		return nil
 	}
 

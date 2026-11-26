@@ -130,11 +130,6 @@ func (in *ExecActionHandler) DeepCopyInto(out *ExecActionHandler) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
-	if in.CleanupCommand != nil {
-		in, out := &in.CleanupCommand, &out.CleanupCommand
-		*out = make([]string, len(*in))
-		copy(*out, *in)
-	}
 	if in.Env != nil {
 		in, out := &in.Env, &out.Env
 		*out = make([]ExecActionEnvVar, len(*in))

@@ -23,7 +23,12 @@ type Metadata struct {
 	// Recovered marks a Sandbox reconstructed during Fastlet startup recovery
 	// (in-place daemon restart) so one-shot exec handlers with SkipOnRestore do
 	// not re-execute.
-	Recovered              bool
+	Recovered bool
+	// ActionTerminalFailed records that terminal failure cleanup was triggered
+	// by an Action Handler FailSandbox policy (as opposed to an unexpected VMM
+	// or container exit), so CreateSandbox only returns ErrorActionFailed for
+	// true action failures.
+	ActionTerminalFailed   bool
 	Config                 fastletapi.RuntimeSandboxConfig
 	Allocation             fastletapi.RuntimeAllocation
 	ContainerID            string

@@ -54,14 +54,6 @@ spec:
                         Exec selects a Fastlet-local command template executed via execve.
                         Mutually exclusive with TargetHTTPPort.
                       properties:
-                        cleanupCommand:
-                          description: |-
-                            CleanupCommand is an optional argv template executed on REMOVE_BINDING.
-                            Omitting it makes removal a local no-op.
-                          items:
-                            type: string
-                          maxItems: 64
-                          type: array
                         command:
                           description: Command is the argv template executed directly
                             via execve.

@@ -233,11 +233,6 @@ type ExecActionHandler struct {
 	// +kubebuilder:validation:MaxItems=64
 	Command []string `json:"command"`
 
-	// CleanupCommand is an optional argv template executed on REMOVE_BINDING.
-	// Omitting it makes removal a local no-op.
-	// +kubebuilder:validation:MaxItems=64
-	CleanupCommand []string `json:"cleanupCommand,omitempty"`
-
 	// Env sets static environment variables for the child process.
 	// +kubebuilder:validation:MaxItems=64
 	Env []ExecActionEnvVar `json:"env,omitempty"`

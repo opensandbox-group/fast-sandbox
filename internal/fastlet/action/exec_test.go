@@ -422,3 +422,94 @@ func TestExecActionSensitiveFileMaterializedAndCleanedUp(t *testing.T) {
 	_, statErr = os.Stat(observedPath)
 	require.True(t, os.IsNotExist(statErr))
 }
+
+func TestExecActionCallerCancelDoesNotTriggerFailSandbox(t *testing.T) {
+	handler := runtimeInitHandler()
+	handler.Exec.MaxRetries = 0
+	var attempts atomic.Int32
+	execRunner := &recordingExecRunner{
+		fn: func(ctx context.Context, _ int, _ ExecRequest) ExecResult {
+			if attempts.Add(1) == 1 {
+				<-ctx.Done()
+				return ExecResult{ExitCode: -1, Err: ctx.Err()}
+			}
+			return ExecResult{ExitCode: 0}
+		},
+	}
+
+	mgr, err := NewManager([]apiv1alpha2.ActionHandler{handler}, nil)
+	require.NoError(t, err)
+	mgr.SetExecRunner(execRunner)
+
+	var terminalFired atomic.Bool
+	mgr.SetTerminalFailureCallback(func(string, Attachment, string, string) {
+		terminalFired.Store(true)
+	})
+
+	att := attachment("sb-caller-cancel")
+	_, _, err = mgr.Reconcile(context.Background(), att, 1, []DesiredInput{{
+		Handler:        "runtime-init",
+		Input:          `{"sandboxId":"sb-caller-cancel"}`,
+		SensitiveInput: "X-Token: keep-me\n",
+	}})
+	require.NoError(t, err)
+
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
+	err = mgr.ReachHook(cancelCtx, att.SandboxUID, att, actionapi.LifecycleHookDataPlaneReady, 1)
+	require.ErrorIs(t, err, context.Canceled)
+	require.False(t, terminalFired.Load(), "caller cancellation must not trigger FailSandbox")
+
+	// Subsequent reconcile with a fresh context must resume and succeed.
+	require.NoError(t, mgr.ReachHook(context.Background(), att.SandboxUID, att, actionapi.LifecycleHookDataPlaneReady, 1))
+	require.False(t, terminalFired.Load())
+	statuses, _ := mgr.Statuses(att.SandboxUID)
+	require.Equal(t, string(apiv1alpha2.ActionReady), statuses[0].State)
+}
+
+func TestExecActionSensitiveFailureRedactsOutput(t *testing.T) {
+	execRunner := &recordingExecRunner{
+		fn: func(_ context.Context, _ int, _ ExecRequest) ExecResult {
+			return ExecResult{
+				ExitCode: 22,
+				Stdout:   "leaked-token-stdout-999",
+				Stderr:   "leaked-token-stderr-999",
+				Err:      errors.New("exit status 22"),
+			}
+		},
+	}
+
+	mgr, err := NewManager([]apiv1alpha2.ActionHandler{runtimeInitHandler()}, nil)
+	require.NoError(t, err)
+	mgr.SetExecRunner(execRunner)
+
+	failCh := make(chan string, 1)
+	mgr.SetTerminalFailureCallback(func(_ string, _ Attachment, _ string, message string) {
+		failCh <- message
+	})
+
+	att := attachment("sb-sensitive-redact")
+	_, _, err = mgr.Reconcile(context.Background(), att, 1, []DesiredInput{{
+		Handler:        "runtime-init",
+		Input:          `{"sandboxId":"sb-sensitive-redact"}`,
+		SensitiveInput: "X-Token: leaked-token-999\n",
+	}})
+	require.NoError(t, err)
+	err = mgr.ReachHook(context.Background(), att.SandboxUID, att, actionapi.LifecycleHookDataPlaneReady, 1)
+	require.ErrorContains(t, err, "exit=22")
+	require.NotContains(t, err.Error(), "leaked-token")
+
+	statuses, _ := mgr.Statuses(att.SandboxUID)
+	require.NotContains(t, statuses[0].Message, "leaked-token")
+
+	select {
+	case msg := <-failCh:
+		require.Contains(t, msg, "exit=22")
+		require.NotContains(t, msg, "leaked-token")
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected FailSandbox callback")
+	}
+}

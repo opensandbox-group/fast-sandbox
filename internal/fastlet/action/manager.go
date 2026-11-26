@@ -1201,11 +1201,6 @@ func (m *Manager) deleteState(ctx context.Context, state *sandboxState, expected
 		name := order[index]
 		handler := m.byName[name]
 		if handler.Exec != nil {
-			if len(handler.Exec.CleanupCommand) > 0 {
-				if err := m.runExecAction(ctx, nil, handler, execOpCleanup, "", generation, attachment, "", "", nil, handler.Exec.CleanupCommand); err != nil {
-					result = errors.Join(result, err)
-				}
-			}
 			continue
 		}
 		instanceID, _ := m.handlerInstance(name)
@@ -1243,9 +1238,6 @@ func (m *Manager) deleteRemoteOwner(ctx context.Context, attachment Attachment, 
 func (m *Manager) deleteRemoteHandler(ctx context.Context, name string, attachment Attachment, generation int64) error {
 	handler := m.byName[name]
 	if handler.Exec != nil {
-		if len(handler.Exec.CleanupCommand) > 0 {
-			return m.runExecAction(ctx, nil, handler, execOpCleanup, "", generation, attachment, "", "", nil, handler.Exec.CleanupCommand)
-		}
 		return nil
 	}
 	owner := ownerFromAttachment(attachment)

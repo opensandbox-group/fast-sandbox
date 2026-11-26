@@ -91,8 +91,12 @@ func (m *SandboxManager) waitUntilSandboxReady(ctx context.Context, identity fas
 			if message == "" {
 				message = "Sandbox failed before overall Ready"
 			}
+			code := fastletapi.ErrorRuntimeUnavailable
+			if metadata.ActionTerminalFailed {
+				code = fastletapi.ErrorActionFailed
+			}
 			m.mu.Unlock()
-			failure := fastletError(fastletapi.ErrorActionFailed, message, false)
+			failure := fastletError(code, message, false)
 			return &status, failure
 		}
 		changed := m.readinessChanged

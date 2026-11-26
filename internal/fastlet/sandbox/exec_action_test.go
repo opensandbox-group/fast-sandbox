@@ -3,6 +3,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -130,4 +131,98 @@ func TestCreateSandboxExecActionReadySucceeds(t *testing.T) {
 	require.NotNil(t, resp.Sandbox)
 	require.Equal(t, []string{"/usr/bin/init-helper", "172.30.0.11", "/run/netns/sb-2"}, captured.Command)
 	require.Equal(t, `{"sandboxId":"sb-exec-ok"}`, string(captured.Stdin))
+}
+
+func TestWaitUntilSandboxReadyPreservesRuntimeFailureCode(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 2, FastletPodUID: "pod-uid-a",
+	})
+	require.NoError(t, err)
+
+	identity := fastletapi.SandboxIdentity{
+		SandboxUID: "sb-vmm-exit", Namespace: "default", Name: "sb-vmm-exit",
+		FastletPodUID: "pod-uid-a", InstanceGeneration: 1, AssignmentAttempt: 1, RuntimeInstanceID: "rt-vmm",
+	}
+	manager.mu.Lock()
+	manager.sandboxes[identity.SandboxUID] = &SandboxMetadata{
+		Config: fastletapi.RuntimeSandboxConfig{Identity: identity},
+		Phase:  sandboxStateRuntimeFailureCleanup,
+	}
+	manager.runtimeMessages[identity.SandboxUID] = "vmm exited unexpectedly"
+	manager.mu.Unlock()
+
+	_, waitErr := manager.waitUntilSandboxReady(context.Background(), identity, 1)
+	require.Error(t, waitErr)
+	var failure *fastletapi.FastletError
+	require.ErrorAs(t, waitErr, &failure)
+	require.Equal(t, fastletapi.ErrorRuntimeUnavailable, failure.Code)
+	require.Contains(t, failure.Message, "vmm exited unexpectedly")
+}
+
+type failingRemoveRoutePublisher struct {
+	failRemove atomic.Bool
+}
+
+func (p *failingRemoveRoutePublisher) ApplyRoute(context.Context, RoutePublication) error { return nil }
+func (p *failingRemoveRoutePublisher) ReconcileRoutes(context.Context, []RoutePublication) error {
+	return nil
+}
+func (p *failingRemoveRoutePublisher) RemoveRoute(context.Context, RoutePublication) error {
+	if p.failRemove.Load() {
+		return errors.New("proxy control socket unavailable")
+	}
+	return nil
+}
+
+func TestReclaimFailedActionSandboxRetainsSlotWhenRemoveRouteFails(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	publisher := &failingRemoveRoutePublisher{}
+	publisher.failRemove.Store(true)
+
+	manager, err := NewSandboxManagerWithConfig(runtime, SandboxManagerConfig{
+		Capacity: 2, FastletPodUID: "pod-uid-a", RoutePublisher: publisher,
+	})
+	require.NoError(t, err)
+
+	identity := fastletapi.SandboxIdentity{
+		SandboxUID: "sb-route-fail", Namespace: "default", Name: "sb-route-fail",
+		FastletPodUID: "pod-uid-a", InstanceGeneration: 1, AssignmentAttempt: 1, RuntimeInstanceID: "rt-rf", RouteGeneration: 1,
+	}
+	meta := &SandboxMetadata{
+		Config: fastletapi.RuntimeSandboxConfig{
+			Identity: identity,
+			Desired:  fastletapi.SandboxDesiredSpec{Image: "alpine:latest"},
+		},
+		Phase:                sandboxStateRuntimeFailureCleanup,
+		ActionTerminalFailed: true,
+	}
+	runtime.sandboxes[identity.SandboxUID] = meta
+	manager.mu.Lock()
+	manager.sandboxes[identity.SandboxUID] = meta
+	manager.terminalFailureWorkers[identity.SandboxUID] = meta
+	manager.mu.Unlock()
+
+	// When RemoveRoute fails, DeleteSandbox must NOT run and phase stays in cleanup.
+	manager.reclaimFailedActionSandbox(identity.SandboxUID, meta)
+	runtime.mu.Lock()
+	_, stillInRuntime := runtime.sandboxes[identity.SandboxUID]
+	runtime.mu.Unlock()
+	require.True(t, stillInRuntime, "runtime slot must be retained while route withdrawal fails")
+	manager.mu.RLock()
+	require.Equal(t, sandboxStateRuntimeFailureCleanup, meta.Phase)
+	manager.mu.RUnlock()
+
+	// Once RemoveRoute recovers, retry via startTerminalFailureCleanup reclaims runtime.
+	publisher.failRemove.Store(false)
+	manager.startTerminalFailureCleanup(identity.SandboxUID, meta)
+	require.Eventually(t, func() bool {
+		manager.mu.RLock()
+		defer manager.mu.RUnlock()
+		return meta.Phase == sandboxStateRuntimeFailed
+	}, 2*time.Second, 10*time.Millisecond)
+	runtime.mu.Lock()
+	_, stillInRuntime = runtime.sandboxes[identity.SandboxUID]
+	runtime.mu.Unlock()
+	require.False(t, stillInRuntime)
 }

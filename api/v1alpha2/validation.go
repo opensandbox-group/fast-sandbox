@@ -217,17 +217,6 @@ func validateExecActionHandler(handlerName string, cfg *ExecActionHandler) error
 	if err := validateExecArgTemplates(handlerName, "command", cfg.Command); err != nil {
 		return err
 	}
-	if len(cfg.CleanupCommand) > 64 {
-		return fmt.Errorf("%w: Handler %s exec.cleanupCommand allows at most 64 arguments", ErrActionHandlersInvalid, handlerName)
-	}
-	if len(cfg.CleanupCommand) > 0 {
-		if strings.TrimSpace(cfg.CleanupCommand[0]) == "" {
-			return fmt.Errorf("%w: Handler %s exec.cleanupCommand[0] must be non-empty", ErrActionHandlersInvalid, handlerName)
-		}
-		if err := validateExecArgTemplates(handlerName, "cleanupCommand", cfg.CleanupCommand); err != nil {
-			return err
-		}
-	}
 	if len(cfg.Env) > 64 {
 		return fmt.Errorf("%w: Handler %s exec.env allows at most 64 variables", ErrActionHandlersInvalid, handlerName)
 	}

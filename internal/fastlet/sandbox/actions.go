@@ -241,12 +241,18 @@ func (m *SandboxManager) handleActionTerminalFailure(sandboxUID string, attachme
 		metadata.AppliedGeneration = generation
 	}
 	m.runtimeMessages[sandboxUID] = message
+	metadata.ActionTerminalFailed = true
 	m.recordDiagnosticLocked(sandboxUID, "error", "action", "fail-sandbox", fmt.Sprintf("handler %s triggered FailSandbox: %s", handlerName, message))
 	_, supportsDurableFailure := m.runtime.(RuntimeTerminalFailureHandler)
 	if !supportsDurableFailure {
+		if m.terminalFailureWorkers[sandboxUID] == metadata {
+			m.mu.Unlock()
+			return
+		}
+		m.terminalFailureWorkers[sandboxUID] = metadata
 		m.cancelDataPlaneReconcileLocked(metadata)
-		// Retain slot and resource commitment until removeRoute and
-		// DeleteSandbox actually release the underlying runtime and network.
+		// Retain slot and resource commitment until action retirement,
+		// removeRoute, and DeleteSandbox all succeed.
 		metadata.Phase = sandboxStateRuntimeFailureCleanup
 		m.signalReadinessChangedLocked()
 		m.mu.Unlock()
@@ -258,22 +264,35 @@ func (m *SandboxManager) handleActionTerminalFailure(sandboxUID string, attachme
 }
 
 func (m *SandboxManager) reclaimFailedActionSandbox(sandboxUID string, expected *SandboxMetadata) {
+	defer m.finishTerminalFailureWorker(sandboxUID, expected)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	routeErr := m.removeRoute(ctx, expected)
-	if routeErr != nil {
-		m.recordDiagnostic(sandboxUID, "error", "action", sandboxStateRuntimeFailureCleanup, fmt.Sprintf("remove route after FailSandbox: %v", routeErr))
-	}
-	deleteErr := m.runtime.DeleteSandbox(ctx, sandboxUID)
-	if deleteErr != nil {
-		m.recordDiagnostic(sandboxUID, "error", "action", sandboxStateRuntimeFailureCleanup, fmt.Sprintf("delete runtime after FailSandbox: %v", deleteErr))
-	}
-	if m.actionManager != nil {
+	if m.requiresStrictActionHandling(expected.Config.ActionsAPIVersion) {
+		if m.actionManager == nil {
+			m.recordTerminalCleanupError(sandboxUID, expected, "strict Action Handler is unavailable")
+			return
+		}
+		if err := m.actionManager.DeleteOwned(ctx, actionAttachment(expected)); err != nil {
+			m.recordTerminalCleanupError(sandboxUID, expected, err.Error())
+			return
+		}
+		if err := m.actionManager.ConfirmOwnerRetired(ctx, actionAttachment(expected)); err != nil {
+			m.recordTerminalCleanupError(sandboxUID, expected, err.Error())
+			return
+		}
+	} else if m.actionManager != nil {
 		if err := m.actionManager.Delete(ctx, sandboxUID); err != nil {
 			m.recordDiagnostic(sandboxUID, "error", "action", sandboxStateRuntimeFailureCleanup, fmt.Sprintf("cleanup actions after FailSandbox: %v", err))
 		}
 	}
-	if routeErr != nil || deleteErr != nil {
+	// Never release the runtime or network slot until route withdrawal
+	// succeeds; otherwise the proxy can retain a stale route to a reused IP.
+	if err := m.removeRoute(ctx, expected); err != nil {
+		m.recordTerminalCleanupError(sandboxUID, expected, fmt.Sprintf("remove route after FailSandbox: %v", err))
+		return
+	}
+	if err := m.runtime.DeleteSandbox(ctx, sandboxUID); err != nil {
+		m.recordTerminalCleanupError(sandboxUID, expected, fmt.Sprintf("delete runtime after FailSandbox: %v", err))
 		return
 	}
 	m.mu.Lock()
