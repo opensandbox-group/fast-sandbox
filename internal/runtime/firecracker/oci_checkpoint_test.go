@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -181,4 +182,98 @@ done
 	require.JSONEq(t, `{"auths":{"r.example/checkpoints/sandbox":{"username":"reader","password":"read-secret"}}}`, string(raw))
 	_, err = os.Stat(filepath.Join(staging, "cache-auth.json"))
 	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+func TestCheckpointCacheAndPlainHTTPForReferenceUseRegistryConfig(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_OCI_PLAIN_HTTP", "")
+	installOCIRegistryConfig(t,
+		registryconfig.Credential{Host: "bench-registry.ns.svc:5000", PlainHTTP: true},
+		registryconfig.Credential{Host: "secure.example.com", Username: "u", Password: "p"},
+	)
+	for _, tc := range []struct {
+		ref  string
+		want bool
+	}{
+		{"oci://bench-registry.ns.svc:5000/checkpoints/sb:snap-1", true},
+		{"bench-registry.ns.svc:5000/checkpoints/sb:snap-1", true},
+		{"oci://secure.example.com/checkpoints/sb:snap-1", false},
+		{"oci://unconfigured.example.com/checkpoints/sb:snap-1", false},
+	} {
+		got, err := ociPlainHTTPForReference(tc.ref)
+		require.NoError(t, err, tc.ref)
+		require.Equal(t, tc.want, got, tc.ref)
+	}
+
+	dir := t.TempDir()
+	argsOut := filepath.Join(dir, "cache-args.txt")
+	t.Setenv("CACHE_TEST_ARGS_OUTPUT", argsOut)
+	script := `#!/bin/sh
+printf '%s\n' "$@" > "$CACHE_TEST_ARGS_OUTPUT"
+`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "fsb-vm"), []byte(script), 0700))
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	staging := filepath.Join(dir, "staging")
+	require.NoError(t, os.Mkdir(staging, 0700))
+	d := &Driver{}
+	d.config.StateRoot = dir
+	published := &ocitemplate.PublishedCheckpoint{Reference: "oci://bench-registry.ns.svc:5000/checkpoints/sandbox@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+	require.NoError(t, d.cacheOCICheckpoint(context.Background(), staging, "checkpoint-id", published))
+	raw, err := os.ReadFile(argsOut)
+	require.NoError(t, err)
+	require.Contains(t, strings.Split(strings.TrimSpace(string(raw)), "\n"), "--plain-http")
+}
+
+func TestOCIPlainHTTPForReferencePropagatesConfigErrors(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_OCI_PLAIN_HTTP", "")
+
+	t.Run("missing-file", func(t *testing.T) {
+		t.Setenv("FAST_SANDBOX_REGISTRY_CONFIG_PATH", filepath.Join(t.TempDir(), "missing.json"))
+		_, err := ociPlainHTTPForReference("oci://bench-registry.ns.svc:5000/checkpoints/sb:snap-1")
+		require.ErrorIs(t, err, os.ErrNotExist)
+	})
+
+	t.Run("malformed-json", func(t *testing.T) {
+		badPath := filepath.Join(t.TempDir(), "registry.json")
+		require.NoError(t, os.WriteFile(badPath, []byte("{not-json"), 0600))
+		t.Setenv("FAST_SANDBOX_REGISTRY_CONFIG_PATH", badPath)
+		_, err := ociPlainHTTPForReference("oci://bench-registry.ns.svc:5000/checkpoints/sb:snap-1")
+		require.ErrorContains(t, err, "decode compiled registry configuration")
+	})
+}
+
+func TestPublishPreparedOCISnapshotRejectsMixedHTTPAndHTTPS(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_OCI_PLAIN_HTTP", "")
+	installOCIRegistryConfig(t,
+		registryconfig.Credential{Host: "http-registry.ns.svc:5000", PlainHTTP: true},
+		registryconfig.Credential{Host: "https.example.com", Username: "u", Password: "p"},
+	)
+
+	for _, tc := range []struct {
+		name        string
+		source      string
+		destination string
+	}{
+		{
+			name:        "http-source-to-https-destination",
+			source:      "oci://http-registry.ns.svc:5000/templates/base:v1",
+			destination: "https.example.com/checkpoints/sb:snap-1",
+		},
+		{
+			name:        "https-source-to-http-destination",
+			source:      "oci://https.example.com/templates/base:v1",
+			destination: "http-registry.ns.svc:5000/checkpoints/sb:snap-1",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			staging := filepath.Join(t.TempDir(), "staging")
+			require.NoError(t, os.Mkdir(staging, 0700))
+			d := &Driver{}
+			_, err := d.publishPreparedOCISnapshot(context.Background(), dumpPlan{staging: staging, snapshotID: "snap-1"}, 1, ociPublication{
+				source:      tc.source,
+				destination: tc.destination,
+			}, nil)
+			require.ErrorIs(t, err, ErrInvalidConfig)
+			require.ErrorContains(t, err, "must use the same protocol")
+		})
+	}
 }

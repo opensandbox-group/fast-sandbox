@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -21,9 +22,44 @@ import (
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	"fast-sandbox/internal/artifacts"
 	"fast-sandbox/internal/ocitemplate"
+	"fast-sandbox/internal/registryconfig"
 )
 
-const buildIDEnvName = "SANDBOX_TEMPLATE_BUILD_ID"
+const (
+	buildIDEnvName        = "SANDBOX_TEMPLATE_BUILD_ID"
+	registryConfigFileEnv = "SANDBOX_TEMPLATE_REGISTRY_CONFIG"
+)
+
+type builderRegistryPolicy struct {
+	config registryconfig.Config
+}
+
+func loadBuilderRegistryPolicy() (builderRegistryPolicy, error) {
+	var policy builderRegistryPolicy
+	if path := strings.TrimSpace(os.Getenv(registryConfigFileEnv)); path != "" {
+		cfg, err := registryconfig.LoadConfig(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return policy, fmt.Errorf("load registry config %s: %w", path, err)
+		}
+		policy.config = cfg
+	}
+	return policy, nil
+}
+
+func (p builderRegistryPolicy) plainHTTP(reference string) bool {
+	if strings.TrimSpace(reference) == "" {
+		return false
+	}
+	rule, found := p.config.Match(strings.TrimPrefix(reference, ocitemplate.Prefix))
+	return found && rule.PlainHTTP
+}
+
+func parseOCIReference(reference string, plainHTTP bool) (name.Reference, error) {
+	if plainHTTP {
+		return name.ParseReference(reference, name.Insecure)
+	}
+	return name.ParseReference(reference)
+}
 
 type ociBuildProgress struct {
 	started      time.Time
@@ -74,6 +110,10 @@ func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 	if err != nil {
 		return err
 	}
+	registryPolicy, err := loadBuilderRegistryPolicy()
+	if err != nil {
+		return err
+	}
 	progress.start("prepare-credentials")
 	authDir := os.Getenv(publishCredentialsDirEnv)
 	authFile := filepath.Join(authDir, ".dockerconfigjson")
@@ -98,7 +138,7 @@ func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 		return err
 	}
 	progress.start("prepare-source")
-	source, sourceDigest, err := prepareOCISource(ctx, spec, workdir)
+	source, sourceDigest, err := prepareOCISource(ctx, spec, workdir, registryPolicy)
 	if err != nil {
 		return err
 	}
@@ -132,6 +172,9 @@ func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 	}
 	defer deleteBuildTap()
 	args := []string{"--firecracker", firecrackerBin, "--overlaybd-convertor", "/usr/local/bin/convertor", "--build-work-dir", filepath.Join(workdir, "builds"), "--build-output-dir", filepath.Join(workdir, "artifacts"), "build", "--source", source, "--output", "template:build", "--kernel", kernel, "--kernel-version", strings.TrimPrefix(filepath.Base(kernel), "vmlinux-"), "--vcpu", strconv.FormatInt(vcpu.Value(), 10), "--memory-mb", strconv.FormatInt((memory.Value()+(1<<20)-1)/(1<<20), 10), "--disk-size-gb", strconv.Itoa(size), "--inject-dir", inject, "--init-path", guestInitPath(spec), "--init-script-file", filepath.Join(inject, strings.TrimPrefix(guestInitPath(spec), "/")), "--boot-args", bakedNetworkBootArgs("console=ttyS0 reboot=k panic=1 pci=off nomodules net.ifnames=0 biosdevname=0 random.trust_cpu=on root=/dev/vda rw init=" + guestInitPath(spec)), "--tap-name", tap, "--guest-mac", bakedGuestMAC, "--ready-pattern", "SANDBOX_READY", "--ready-timeout", readinessTimeout(spec).String(), "--auth-file", authFile}
+	if registryPolicy.plainHTTP(spec.Image) {
+		args = append([]string{"--plain-http"}, args...)
+	}
 	// The build-time freeze/thaw probe validates the injected helper end to
 	// end and is what records the guestControl declaration: it runs on every
 	// OverlayBD build, so a builder image with an incompatible helper or
@@ -162,7 +205,11 @@ func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 		return fmt.Errorf("fsb-vm build: %w", err)
 	}
 	progress.start("push")
-	cmd = exec.CommandContext(ctx, "fsb-vm", "push", "--artifact-dir", filepath.Join(workdir, "artifacts", "template_build"), "--destination", destination, "--auth-file", authFile)
+	pushArgs := []string{"push", "--artifact-dir", filepath.Join(workdir, "artifacts", "template_build"), "--destination", destination, "--auth-file", authFile}
+	if registryPolicy.plainHTTP(destination) {
+		pushArgs = append(pushArgs, "--plain-http")
+	}
+	cmd = exec.CommandContext(ctx, "fsb-vm", pushArgs...)
 	cmd.Stderr = os.Stderr
 	output, err := cmd.Output()
 	if err != nil {
@@ -199,8 +246,8 @@ func ociBuildDestination(repository, buildID string) (string, error) {
 
 // prepareOCISource reads only the source metadata. fsb-vm downloads the layers
 // directly from this pinned platform reference instead of a staged OCI layout.
-func prepareOCISource(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir string) (string, string, error) {
-	ref, err := name.ParseReference(spec.Image)
+func prepareOCISource(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec, workdir string, policy builderRegistryPolicy) (string, string, error) {
+	ref, err := parseOCIReference(spec.Image, policy.plainHTTP(spec.Image))
 	if err != nil {
 		return "", "", fmt.Errorf("parse image %q: %w", spec.Image, err)
 	}
@@ -220,7 +267,7 @@ func prepareOCISource(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 		return "", "", err
 	}
 	if spec.Execd != "" {
-		if err := extractExecd(ctx, spec.Execd, filepath.Join(workdir, "execd-root")); err != nil {
+		if err := extractExecdWithPlainHTTP(ctx, spec.Execd, filepath.Join(workdir, "execd-root"), policy.plainHTTP(spec.Execd)); err != nil {
 			return "", "", err
 		}
 	}

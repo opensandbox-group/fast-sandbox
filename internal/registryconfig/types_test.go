@@ -125,3 +125,65 @@ func TestRegistryConfigRejectsDuplicateMatch(t *testing.T) {
 	}})
 	require.ErrorContains(t, err, "duplicate registry match")
 }
+
+func TestRegistryConfigPlainHTTPParsingValidationAndMatching(t *testing.T) {
+	cfg, err := ParseConfig([]byte(`
+registries:
+  - host: opensandbox-bench-registry.bench.svc:5000
+    plainHTTP: true
+  - host: registry.example.com
+    repositoryPrefix: insecure-team
+    secretRef:
+      name: team-secret
+    plainHTTP: true
+  - host: registry.example.com
+    secretRef:
+      name: default-secret
+`))
+	require.NoError(t, err)
+	require.Len(t, cfg.Registries, 3)
+
+	rule, found := cfg.Match("opensandbox-bench-registry.bench.svc:5000/templates/py:v1")
+	require.True(t, found)
+	require.True(t, rule.PlainHTTP)
+	require.Empty(t, rule.SecretRef.Name)
+
+	rule, found = cfg.Match("registry.example.com/insecure-team/img:latest")
+	require.True(t, found)
+	require.True(t, rule.PlainHTTP)
+	require.Equal(t, "team-secret", rule.SecretRef.Name)
+
+	rule, found = cfg.Match("registry.example.com/other/img:latest")
+	require.True(t, found)
+	require.False(t, rule.PlainHTTP)
+	require.Equal(t, "default-secret", rule.SecretRef.Name)
+
+	_, found = cfg.Match("ghcr.io/opensandbox/execd:latest")
+	require.False(t, found)
+
+	// HTTPS entries still require secretRef.name.
+	_, err = ParseConfig([]byte(`
+registries:
+  - host: registry.example.com
+`))
+	require.ErrorContains(t, err, "requires secretRef.name")
+
+	// Compiled credentials preserve plainHTTP: true and omit plainHTTP when false.
+	compiled, err := NewCompiled([]Credential{
+		{Host: "opensandbox-bench-registry.bench.svc:5000", PlainHTTP: true},
+		{Host: "registry.example.com", Username: "u", Password: "p"},
+	})
+	require.NoError(t, err)
+	raw, err := compiled.Marshal()
+	require.NoError(t, err)
+	require.Contains(t, string(raw), `"plainHTTP":true`)
+	require.NotContains(t, string(raw), `"plainHTTP":false`)
+	parsed, err := ParseCompiled(raw)
+	require.NoError(t, err)
+	cred, ok := parsed.Match("opensandbox-bench-registry.bench.svc:5000/templates/py@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	require.True(t, ok)
+	require.True(t, cred.PlainHTTP)
+	cred, ok = parsed.Match("registry.example.com/app:v1")
+	require.True(t, ok)
+	require.False(t, cred.PlainHTTP)
+}

@@ -411,3 +411,100 @@ func TestOCIBuilderRejectsTaggedOrInvalidPublishBeforeBuild(t *testing.T) {
 		})
 	}
 }
+
+func TestParseOCIReferenceSchemeForNonLocalhost(t *testing.T) {
+	const rawRef = "opensandbox-bench-registry.opensandbox-bench.svc:5000/opensandbox/tpl:latest"
+
+	httpRef, err := parseOCIReference(rawRef, true)
+	require.NoError(t, err)
+	require.Equal(t, "http", httpRef.Context().Registry.Scheme())
+
+	httpsRef, err := parseOCIReference(rawRef, false)
+	require.NoError(t, err)
+	require.Equal(t, "https", httpsRef.Context().Registry.Scheme())
+}
+
+func TestOCIBuilderPlainHTTPPerRegistry(t *testing.T) {
+	t.Run("missing-config-file-defaults-to-https", func(t *testing.T) {
+		t.Setenv(registryConfigFileEnv, filepath.Join(t.TempDir(), "absent-registries.yaml"))
+		policy, err := loadBuilderRegistryPolicy()
+		require.NoError(t, err)
+		require.False(t, policy.plainHTTP("opensandbox-bench-registry.ns.svc:5000/templates:v1"))
+	})
+
+	t.Run("per-registry-plain-http-only-applies-to-matching-target", func(t *testing.T) {
+		dir := t.TempDir()
+		t.Setenv("DOCKER_CONFIG", dir)
+		t.Setenv("SANDBOX_TEMPLATE_IMAGE_TAR", "")
+		t.Setenv("KUBERNETES_SERVICE_HOST", "")
+
+		amd64 := ociTestImage(t, "amd64")
+		handler := registry.New(registry.Logger(log.New(io.Discard, "", 0)))
+		server := httptest.NewServer(handler)
+		defer server.Close()
+		host := strings.TrimPrefix(server.URL, "http://")
+		tag, err := name.NewTag(host + "/base:v1")
+		require.NoError(t, err)
+		require.NoError(t, remote.Write(tag, amd64))
+
+		// Configure only the destination repository as plainHTTP: true; the source
+		// is on a different repository prefix without plainHTTP, so only push gets --plain-http.
+		regCfgPath := filepath.Join(dir, "registries.yaml")
+		require.NoError(t, os.WriteFile(regCfgPath, []byte(fmt.Sprintf(`
+registries:
+  - host: %s
+    repositoryPrefix: templates
+    plainHTTP: true
+`, host)), 0600))
+		t.Setenv(registryConfigFileEnv, regCfgPath)
+
+		t.Setenv(publishCredentialsDirEnv, dir)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, ".dockerconfigjson"), []byte(`{"auths":{}}`), 0600))
+		bin := t.TempDir()
+		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+		t.Setenv("TEST_OCI_COMMANDS", dir)
+		setGuestControlHelper(t, staticHelperBinary(t))
+		buildID := uuid.NewString()
+		t.Setenv(buildIDEnvName, buildID)
+		require.NoError(t, os.WriteFile(filepath.Join(bin, "ip"), []byte("#!/bin/sh\nexit 0\n"), 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(bin, "fsb-vm"), []byte(`#!/bin/sh
+if [ "$1" = push ]; then
+  printf '%s\n' "$@" > "$TEST_OCI_COMMANDS/push-args"
+  printf '%s\n' '{"manifestRef":"oci://registry.example.com/templates@sha256:abc","artifactDigest":"sha256:abc"}'
+  exit 0
+fi
+printf '%s\n' "$@" > "$TEST_OCI_COMMANDS/fsb-args"
+`), 0755))
+
+		spec := apiv1alpha2.SandboxTemplateSpec{
+			Image:   tag.String(),
+			Machine: apiv1alpha2.MachineSpec{VCPU: "1", Memory: "512Mi"},
+			Output:  apiv1alpha2.OutputSpec{Format: apiv1alpha2.ArtifactFormatOverlayBD, RootfsSize: "1Gi", Publish: "oci://" + host + "/templates/py"},
+		}
+		require.NoError(t, buildOCITemplate(context.Background(), spec, dir, "/kernels/vmlinux-6.1.0"))
+
+		buildRaw, err := os.ReadFile(filepath.Join(dir, "fsb-args"))
+		require.NoError(t, err)
+		require.NotContains(t, strings.Split(strings.TrimSpace(string(buildRaw)), "\n"), "--plain-http")
+
+		pushRaw, err := os.ReadFile(filepath.Join(dir, "push-args"))
+		require.NoError(t, err)
+		require.Contains(t, strings.Split(strings.TrimSpace(string(pushRaw)), "\n"), "--plain-http")
+
+		// Now enable plainHTTP for the whole host and verify both build and push receive --plain-http.
+		require.NoError(t, os.WriteFile(regCfgPath, []byte(fmt.Sprintf(`
+registries:
+  - host: %s
+    plainHTTP: true
+`, host)), 0600))
+		require.NoError(t, buildOCITemplate(context.Background(), spec, dir, "/kernels/vmlinux-6.1.0"))
+
+		buildRaw, err = os.ReadFile(filepath.Join(dir, "fsb-args"))
+		require.NoError(t, err)
+		require.Contains(t, strings.Split(strings.TrimSpace(string(buildRaw)), "\n"), "--plain-http")
+
+		pushRaw, err = os.ReadFile(filepath.Join(dir, "push-args"))
+		require.NoError(t, err)
+		require.Contains(t, strings.Split(strings.TrimSpace(string(pushRaw)), "\n"), "--plain-http")
+	})
+}

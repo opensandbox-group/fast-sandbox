@@ -1248,3 +1248,39 @@ func TestOCIInvalidPublishFailsBeforeCreatingPod(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildPodMountsOptionalRegistryConfigMap(t *testing.T) {
+	template := newSandboxTemplate("default", "oci-plain-http-mount")
+	template.Spec.Output.Format = apiv1alpha2.ArtifactFormatOverlayBD
+	template.Spec.Output.Publish = "oci://opensandbox-bench-registry.default.svc:5000/templates"
+	template.Spec.Output.PublishSecretRef = &corev1.LocalObjectReference{Name: "registry"}
+	r := newSandboxTemplateReconciler(t, template)
+	reconcileOnce(t, r, client.ObjectKeyFromObject(template))
+
+	var pods corev1.PodList
+	require.NoError(t, r.List(context.Background(), &pods))
+	require.Len(t, pods.Items, 1)
+	pod := pods.Items[0]
+
+	var foundVol *corev1.Volume
+	for i := range pod.Spec.Volumes {
+		if pod.Spec.Volumes[i].Name == "registry-config" {
+			foundVol = &pod.Spec.Volumes[i]
+			break
+		}
+	}
+	require.NotNil(t, foundVol)
+	require.NotNil(t, foundVol.ConfigMap)
+	require.Equal(t, "fast-sandbox-registry", foundVol.ConfigMap.Name)
+	require.NotNil(t, foundVol.ConfigMap.Optional)
+	require.True(t, *foundVol.ConfigMap.Optional)
+
+	var foundMount bool
+	for _, mount := range pod.Spec.Containers[0].VolumeMounts {
+		if mount.Name == "registry-config" && mount.MountPath == sandboxTemplateRegistryConfigDir && mount.ReadOnly {
+			foundMount = true
+		}
+	}
+	require.True(t, foundMount)
+	require.Equal(t, sandboxTemplateRegistryConfigDir+"/registries.yaml", envValue(pod.Spec.Containers[0].Env, registryConfigFileEnv))
+}

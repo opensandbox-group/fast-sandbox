@@ -99,7 +99,31 @@ func checkpointCredentials(destination string) (ocitemplate.CredentialFunc, erro
 }
 
 // Fix publication inputs while holding the source instance lock; packing and upload must not reread meta.json, which may be deleted or replaced.
-type ociPublication struct{ destination string }
+type ociPublication struct {
+	source      string
+	destination string
+}
+
+func ociPlainHTTPForReference(reference string) (bool, error) {
+	if ociPlainHTTP() {
+		return true, nil
+	}
+	if strings.TrimSpace(reference) == "" {
+		return false, nil
+	}
+	path := os.Getenv("FAST_SANDBOX_REGISTRY_CONFIG_PATH")
+	if path == "" {
+		path = registryconfig.MountPath
+	}
+	credential, found, err := registryconfig.NewFileProvider(path).Credentials(strings.TrimPrefix(reference, ocitemplate.Prefix))
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+	return credential.PlainHTTP, nil
+}
 
 func prepareOCIPublication(plan dumpPlan) (ociPublication, error) {
 	state, err := loadState(plan.sandboxDir)
@@ -117,7 +141,7 @@ func prepareOCIPublication(plan dumpPlan) (ociPublication, error) {
 	if err := persistSnapshotOwner(plan.staging, state.Config.Identity); err != nil {
 		return ociPublication{}, err
 	}
-	return ociPublication{destination: destination}, nil
+	return ociPublication{source: sourceRef, destination: destination}, nil
 }
 
 func prepareCaptureStaging(staging string, owner fastletapi.SandboxIdentity) error {
@@ -190,12 +214,24 @@ func (d *Driver) publishPreparedOCISnapshot(ctx context.Context, plan dumpPlan, 
 	if err != nil {
 		return nil, err
 	}
+	destPlainHTTP, err := ociPlainHTTPForReference(publication.destination)
+	if err != nil {
+		return nil, err
+	}
+	sourcePlainHTTP, err := ociPlainHTTPForReference(publication.source)
+	if err != nil {
+		return nil, err
+	}
+	if destPlainHTTP != sourcePlainHTTP {
+		return nil, fmt.Errorf("%w: OCI snapshot source (%s, plainHTTP=%t) and destination (%s, plainHTTP=%t) must use the same protocol; mixing HTTP and HTTPS or promoting HTTP artifacts to HTTPS is not supported",
+			ErrInvalidConfig, publication.source, sourcePlainHTTP, publication.destination, destPlainHTTP)
+	}
 	manifestPath := filepath.Join(plan.staging, snapshotManifestName)
 	raw, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return nil, err
 	}
-	args := append(d.fsbArgs(), "--build-work-dir", filepath.Join(plan.staging, "pack-work"), "--build-output-dir", filepath.Join(plan.staging, "artifacts"), "pack", "--bundle-dir", plan.staging, "--output", "snapshot:"+plan.snapshotID)
+	args := append(d.fsbArgsWithPlainHTTP(destPlainHTTP), "--build-work-dir", filepath.Join(plan.staging, "pack-work"), "--build-output-dir", filepath.Join(plan.staging, "artifacts"), "pack", "--bundle-dir", plan.staging, "--output", "snapshot:"+plan.snapshotID)
 	document, err := artifacts.DecodeVMManifest(raw)
 	if err != nil {
 		return nil, err
@@ -214,7 +250,7 @@ func (d *Driver) publishPreparedOCISnapshot(ctx context.Context, plan dumpPlan, 
 		onPublishing()
 	}
 	pushOptions := []ocitemplate.RepositoryOption{}
-	if ociPlainHTTP() {
+	if destPlainHTTP {
 		pushOptions = append(pushOptions, ocitemplate.WithPlainHTTP(true))
 	}
 	published, err := ocitemplate.PushForCache(ctx, filepath.Join(plan.staging, "artifacts", "snapshot_"+plan.snapshotID), publication.destination, raw, credentials, pushOptions...)
@@ -331,7 +367,7 @@ func (d *Driver) cacheOCICheckpoint(ctx context.Context, staging, snapshotID str
 	defer os.Remove(authFile)
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	args := append(d.fsbArgs(), "cache-checkpoint", "--published", metadataFile, "--docker-auth-file", authFile,
+	args := append(d.fsbArgsWithPlainHTTP(ociPlainHTTP() || credential.PlainHTTP), "cache-checkpoint", "--published", metadataFile, "--docker-auth-file", authFile,
 		"--artifacts", filepath.Join(staging, "artifacts", "snapshot_"+snapshotID))
 	if output, err := exec.CommandContext(ctx, "fsb-vm", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("populate OCI checkpoint cache: %w: %s", err, output)

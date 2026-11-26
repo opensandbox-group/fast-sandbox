@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"sigs.k8s.io/yaml"
 )
 
 const (
@@ -28,12 +30,16 @@ type Config struct {
 type RegistryRule struct {
 	Host             string    `json:"host" yaml:"host"`
 	RepositoryPrefix string    `json:"repositoryPrefix,omitempty" yaml:"repositoryPrefix,omitempty"`
-	SecretRef        SecretRef `json:"secretRef" yaml:"secretRef"`
+	SecretRef        SecretRef `json:"secretRef,omitempty" yaml:"secretRef,omitempty"`
 	// WriteSecretRef optionally references an Opaque secret holding the
 	// publish (write) credential pair of an artifact store or OCI registry:
 	// keys accessKeyId and secretAccessKey (username/password for OCI; the SandboxTemplate
 	// PublishSecretRef convention). Empty keeps the store read-only.
 	WriteSecretRef *SecretRef `json:"writeSecretRef,omitempty" yaml:"writeSecretRef,omitempty"`
+	// PlainHTTP opts this registry entry into unencrypted HTTP requests
+	// instead of HTTPS (e.g. for an in-cluster ephemeral registry).
+	// When true, secretRef may be omitted for anonymous HTTP registries.
+	PlainHTTP bool `json:"plainHTTP,omitempty" yaml:"plainHTTP,omitempty"`
 }
 
 type SecretRef struct {
@@ -62,6 +68,8 @@ type Credential struct {
 	// port and is used verbatim, so it is exempt from host normalization.
 	// Image-registry credentials leave it empty.
 	Endpoint string `json:"endpoint,omitempty"`
+	// PlainHTTP indicates that OCI requests matching this entry use plain HTTP.
+	PlainHTTP bool `json:"plainHTTP,omitempty"`
 }
 
 type Compiled struct {
@@ -91,7 +99,7 @@ func NormalizeAndValidate(config Config) (Config, error) {
 		if strings.ContainsAny(rule.Host, "/ \t\r\n") {
 			return Config{}, fmt.Errorf("registry host %q is invalid", rule.Host)
 		}
-		if rule.SecretRef.Name == "" {
+		if rule.SecretRef.Name == "" && !rule.PlainHTTP {
 			return Config{}, fmt.Errorf("registry %s requires secretRef.name", rule.Host)
 		}
 		key := rule.Host + "/" + rule.RepositoryPrefix
@@ -108,6 +116,46 @@ func NormalizeAndValidate(config Config) (Config, error) {
 		return result.Registries[i].RepositoryPrefix < result.Registries[j].RepositoryPrefix
 	})
 	return result, nil
+}
+
+// ParseConfig strictly decodes a registries.yaml payload and normalizes its rules.
+func ParseConfig(content []byte) (Config, error) {
+	var config Config
+	if err := yaml.UnmarshalStrict(content, &config); err != nil {
+		return Config{}, fmt.Errorf("decode Registry configuration: %w", err)
+	}
+	return NormalizeAndValidate(config)
+}
+
+// LoadConfig reads and strictly parses a registries.yaml file from disk.
+func LoadConfig(path string) (Config, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, err
+	}
+	return ParseConfig(content)
+}
+
+// Match selects the rule matching reference by exact normalized host and
+// longest repositoryPrefix, mirroring Compiled.Match.
+func (c Config) Match(reference string) (RegistryRule, bool) {
+	host, repository := splitReference(reference)
+	var selected RegistryRule
+	selectedLength := -1
+	for _, rule := range c.Registries {
+		if NormalizeHost(rule.Host) != host {
+			continue
+		}
+		prefix := strings.Trim(rule.RepositoryPrefix, "/")
+		if prefix != "" && repository != prefix && !strings.HasPrefix(repository, prefix+"/") {
+			continue
+		}
+		if len(prefix) > selectedLength {
+			selected = rule
+			selectedLength = len(prefix)
+		}
+	}
+	return selected, selectedLength >= 0
 }
 
 func NewCompiled(credentials []Credential) (Compiled, error) {

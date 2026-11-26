@@ -73,6 +73,10 @@ func ociPlainHTTP() bool {
 }
 
 func (d *Driver) fsbArgs() []string {
+	return d.fsbArgsWithPlainHTTP(ociPlainHTTP())
+}
+
+func (d *Driver) fsbArgsWithPlainHTTP(plainHTTP bool) []string {
 	tools := filepath.Join(runtimecatalog.OCIToolsDir, "current", "bin")
 	if resolved, err := filepath.EvalSymlinks(tools); err == nil {
 		tools = resolved
@@ -97,7 +101,7 @@ func (d *Driver) fsbArgs() []string {
 	} else {
 		args = append(args, "--firecracker", d.config.BinaryPath)
 	}
-	if ociPlainHTTP() {
+	if plainHTTP {
 		args = append(args, "--plain-http")
 	}
 	if budget := os.Getenv("FAST_SANDBOX_OCI_BLOB_CACHE_SIZE_BYTES"); budget != "" {
@@ -153,7 +157,7 @@ func (d *Driver) attachOCI(ctx context.Context, id, image string) (rootfs, vmsta
 			resultErr = errors.Join(resultErr, d.releaseOCI(context.Background(), id))
 		}
 	}()
-	args := append(d.fsbArgs(), "create", "--prepare-only", "-f", file)
+	args := append(d.fsbArgsWithPlainHTTP(ociPlainHTTP() || credential.PlainHTTP), "create", "--prepare-only", "-f", file)
 	output, err := exec.CommandContext(ctx, "fsb-vm", args...).CombinedOutput()
 	if err != nil {
 		return "", "", "", fmt.Errorf("attach OCI template: %w: %s", err, output)

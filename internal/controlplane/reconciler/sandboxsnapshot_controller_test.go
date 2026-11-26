@@ -604,6 +604,72 @@ func TestModeDriftedSnapshotDeletionCleansPublishedArtifacts(t *testing.T) {
 	mu.Unlock()
 }
 
+func TestDeletePublishedOCISnapshotUsesPlainHTTPFromRegistryConfig(t *testing.T) {
+	harness, _ := newSnapshotReconcilerHarness(t)
+	rootBody := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2},"layers":[],"annotations":{"io.fast-sandbox.template.id":"snapshot-id"}}`)
+	snapBody := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2},"layers":[],"annotations":{"io.fast-sandbox.template.id":"snapshot-id"}}`)
+	rootSum := digest.FromBytes(rootBody).String()
+	snapSum := digest.FromBytes(snapBody).String()
+	var mu sync.Mutex
+	objects := map[string][]byte{
+		"snapshot-id_rootfs": rootBody,
+		rootSum:              rootBody,
+		snapSum:              snapBody,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/v2/snapshots/test/manifests/")
+		mu.Lock()
+		defer mu.Unlock()
+		body, ok := objects[name]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if r.Method == http.MethodDelete {
+			delete(objects, name)
+			if name == rootSum {
+				delete(objects, "snapshot-id_rootfs")
+			}
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		w.Header().Set("Content-Type", oci.MediaTypeImageManifest)
+		w.Header().Set("Docker-Content-Digest", digest.FromBytes(body).String())
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+	host := strings.TrimPrefix(server.URL, "http://")
+	compiled, err := registryconfig.NewCompiled([]registryconfig.Credential{{Host: host, PlainHTTP: true}})
+	require.NoError(t, err)
+	payload, err := json.Marshal(compiled)
+	require.NoError(t, err)
+	require.NoError(t, harness.k8sClient.Create(t.Context(), &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: registrySecretName("pool-a")},
+		Data:       map[string][]byte{registryconfig.SecretKey: payload},
+	}))
+
+	snapshot := &apiv1alpha2.SandboxSnapshot{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "default",
+			Name:        "snap-http",
+			Annotations: map[string]string{assignment.AnnotationSnapshotPoolRef: "pool-a"},
+		},
+		Status: apiv1alpha2.SandboxSnapshotStatus{
+			SnapshotID:     "snapshot-id",
+			ManifestRef:    ocitemplate.Prefix + host + "/snapshots/test@" + snapSum,
+			ArtifactDigest: strings.TrimPrefix(snapSum, "sha256:"),
+		},
+	}
+	require.NoError(t, harness.reconciler.deletePublishedOCISnapshot(t.Context(), snapshot))
+	mu.Lock()
+	require.Empty(t, objects)
+	mu.Unlock()
+}
+
 func TestSnapshotObservePinnedAcrossReassignment(t *testing.T) {
 	harness, _ := newSnapshotReconcilerHarness(t)
 	_, err := harness.reconciler.Reconcile(context.Background(), snapshotRequestFor("snap-a"))
