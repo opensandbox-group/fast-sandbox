@@ -86,6 +86,14 @@ func (m *SandboxManager) waitUntilSandboxReady(ctx context.Context, identity fas
 			m.mu.Unlock()
 			failure := fastletError(fastletapi.ErrorConflict, "Sandbox stopped before overall Ready", false)
 			return &status, failure
+		case sandboxStateCreateFailed, sandboxStateRuntimeFailureCleanup, sandboxStateRuntimeFailed:
+			message := m.runtimeMessages[identity.SandboxUID]
+			if message == "" {
+				message = "Sandbox failed before overall Ready"
+			}
+			m.mu.Unlock()
+			failure := fastletError(fastletapi.ErrorActionUnavailable, message, false)
+			return &status, failure
 		}
 		changed := m.readinessChanged
 		if changed == nil {

@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	fastletaction "fast-sandbox/internal/fastlet/action"
+	fastletcache "fast-sandbox/internal/fastlet/cache"
 	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
@@ -113,7 +115,10 @@ func actionAttachment(metadata *SandboxMetadata) fastletaction.Attachment {
 		FastletPodUID: identity.FastletPodUID, InstanceGeneration: identity.InstanceGeneration,
 		AssignmentAttempt: identity.AssignmentAttempt, RuntimeInstanceID: identity.RuntimeInstanceID, RouteGeneration: identity.RouteGeneration,
 		SandboxUID: identity.SandboxUID, SandboxName: identity.Name, Namespace: identity.Namespace,
-		IP: network.IP, Gateway: network.Gateway, PrivateCIDR: network.PrivateCIDR, HostVeth: network.HostVeth,
+		Restored: metadata.Config.Desired.Restore != nil,
+		IP:       network.IP, Gateway: network.Gateway, NetNSPath: network.NamespacePath,
+		PrivateCIDR: network.PrivateCIDR, HostVeth: network.HostVeth,
+		VSockUDSPath: metadata.Allocation.VSockUDSPath,
 	}
 }
 
@@ -213,4 +218,57 @@ func (m *SandboxManager) actionStateChanged(sandboxUID string) {
 		}
 	}
 	m.signalReadinessChangedLocked()
+}
+
+// handleActionTerminalFailure tears down a Sandbox when an exec Action Handler
+// with failurePolicy=FailSandbox fails terminally, waking any synchronous
+// CreateSandbox waiter immediately with the failure reason.
+func (m *SandboxManager) handleActionTerminalFailure(sandboxUID string, attachment fastletaction.Attachment, handlerName, message string) {
+	m.mu.Lock()
+	metadata := m.sandboxes[sandboxUID]
+	if metadata == nil || actionAttachmentID(metadata) != attachment.ID || !runtimeCreatedPhase(metadata.Phase) {
+		m.mu.Unlock()
+		return
+	}
+	identity := metadata.Config.Identity
+	if m.actionManager != nil {
+		statuses, generation := m.actionManager.Statuses(sandboxUID)
+		metadata.ActionBindingStatuses = append(metadata.ActionBindingStatuses[:0], statuses...)
+		metadata.AppliedGeneration = generation
+	}
+	m.runtimeMessages[sandboxUID] = message
+	m.recordDiagnosticLocked(sandboxUID, "error", "action", "fail-sandbox", fmt.Sprintf("handler %s triggered FailSandbox: %s", handlerName, message))
+	_, supportsDurableFailure := m.runtime.(RuntimeTerminalFailureHandler)
+	if !supportsDurableFailure {
+		m.cancelDataPlaneReconcileLocked(metadata)
+		metadata.Phase = sandboxStateRuntimeFailed
+		m.signalReadinessChangedLocked()
+		m.mu.Unlock()
+		go m.reclaimFailedActionSandbox(sandboxUID, metadata)
+		return
+	}
+	m.mu.Unlock()
+	m.preserveExitedRuntime(context.Background(), sandboxUID, identity, message)
+}
+
+func (m *SandboxManager) reclaimFailedActionSandbox(sandboxUID string, expected *SandboxMetadata) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := m.removeRoute(ctx, expected); err != nil {
+		m.recordDiagnostic(sandboxUID, "error", "action", sandboxStateRuntimeFailed, fmt.Sprintf("remove route after FailSandbox: %v", err))
+	}
+	if err := m.runtime.DeleteSandbox(ctx, sandboxUID); err != nil {
+		m.recordDiagnostic(sandboxUID, "error", "action", sandboxStateRuntimeFailed, fmt.Sprintf("delete runtime after FailSandbox: %v", err))
+	}
+	if m.actionManager != nil {
+		if err := m.actionManager.Delete(ctx, sandboxUID); err != nil {
+			m.recordDiagnostic(sandboxUID, "error", "action", sandboxStateRuntimeFailed, fmt.Sprintf("cleanup actions after FailSandbox: %v", err))
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sandboxes[sandboxUID] == expected {
+		m.cacheProtection.Unprotect(expected.Config.Desired.Image, fastletcache.ProtectActive)
+		m.cacheProtection.ProtectHotUntil(expected.Config.Desired.Image, m.clock.Now().Add(time.Hour))
+	}
 }

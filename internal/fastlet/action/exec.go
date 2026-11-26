@@ -1,0 +1,763 @@
+package action
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"text/template"
+	"time"
+
+	"k8s.io/klog/v2"
+
+	apiv1alpha2 "fast-sandbox/api/v1alpha2"
+	actionapi "fast-sandbox/internal/protocol/action"
+	fastletapi "fast-sandbox/internal/protocol/fastlet"
+)
+
+const (
+	execLocalInstanceID    = "exec-local"
+	defaultExecTimeout     = 15 * time.Second
+	defaultExecInitialWait = 50 * time.Millisecond
+	defaultExecMaxWait     = time.Second
+	maxExecCapturedBytes   = 8 << 10
+
+	execOpApply   = "apply"
+	execOpCleanup = "cleanup"
+
+	execResultSuccess      = "success"
+	execResultError        = "error"
+	execResultTimeout      = "timeout"
+	execResultNonRetryable = "non_retryable"
+)
+
+// ExecTemplateData exposes only platform-trusted metadata to exec argv
+// templates. Binding input is intentionally excluded to prevent command
+// injection; callers receive it strictly via stdin.
+type ExecTemplateData struct {
+	Sandbox    ExecTemplateSandbox
+	Revision   ExecTemplateRevision
+	Attachment ExecTemplateAttachment
+}
+
+type ExecTemplateSandbox struct {
+	UID       string
+	Name      string
+	Namespace string
+}
+
+type ExecTemplateRevision struct {
+	InstanceGeneration int64
+	SpecGeneration     int64
+	RuntimeInstanceID  string
+	AttachmentID       string
+	RouteGeneration    int64
+}
+
+type ExecTemplateAttachment struct {
+	Restored bool
+	Network  ExecTemplateNetwork
+	VSock    ExecTemplateVSock
+}
+
+type ExecTemplateNetwork struct {
+	IP          string
+	Gateway     string
+	NetNSPath   string
+	PrivateCIDR string
+	HostVeth    string
+}
+
+type ExecTemplateVSock struct {
+	UDSPath string
+}
+
+// ExecRequest is one rendered, shell-free execve invocation.
+type ExecRequest struct {
+	Command []string
+	Env     []string
+	Stdin   []byte
+}
+
+// ExecResult captures the bounded outcome of one execve invocation.
+type ExecResult struct {
+	ExitCode int
+	TimedOut bool
+	Stdout   string
+	Stderr   string
+	Err      error
+}
+
+// ExecRunner executes a rendered argv directly via execve.
+type ExecRunner interface {
+	Run(ctx context.Context, req ExecRequest) ExecResult
+}
+
+// OSExecRunner executes commands directly via os/exec without a shell.
+type OSExecRunner struct{}
+
+func (OSExecRunner) Run(ctx context.Context, req ExecRequest) ExecResult {
+	if len(req.Command) == 0 {
+		return ExecResult{ExitCode: -1, Err: errors.New("exec command is empty")}
+	}
+	cmd := exec.CommandContext(ctx, req.Command[0], req.Command[1:]...) //nolint:gosec // argv is operator-declared on SandboxPool and never interpolates binding.input
+	if len(req.Env) > 0 {
+		cmd.Env = append(os.Environ(), req.Env...)
+	}
+	if len(req.Stdin) > 0 {
+		cmd.Stdin = bytes.NewReader(req.Stdin)
+	}
+	var stdout, stderr limitedBuffer
+	stdout.limit = maxExecCapturedBytes
+	stderr.limit = maxExecCapturedBytes
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	result := ExecResult{
+		Stdout: stdout.String(),
+		Stderr: stderr.String(),
+		Err:    err,
+	}
+	if err == nil {
+		return result
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		result.TimedOut = true
+		result.ExitCode = -1
+		return result
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		result.ExitCode = exitErr.ExitCode()
+		return result
+	}
+	result.ExitCode = -1
+	return result
+}
+
+type limitedBuffer struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	total := len(p)
+	if b.limit <= 0 {
+		return total, nil
+	}
+	remaining := b.limit - b.buf.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			_, _ = b.buf.Write(p[:remaining])
+			b.truncated = true
+		} else {
+			_, _ = b.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		b.truncated = true
+	}
+	return total, nil
+}
+
+func (b *limitedBuffer) String() string {
+	return b.buf.String()
+}
+
+func execTemplateData(generation int64, attachment Attachment) ExecTemplateData {
+	return ExecTemplateData{
+		Sandbox: ExecTemplateSandbox{
+			UID:       attachment.SandboxUID,
+			Name:      attachment.SandboxName,
+			Namespace: attachment.Namespace,
+		},
+		Revision: ExecTemplateRevision{
+			InstanceGeneration: attachment.InstanceGeneration,
+			SpecGeneration:     generation,
+			RuntimeInstanceID:  attachment.RuntimeInstanceID,
+			AttachmentID:       attachment.ID,
+			RouteGeneration:    attachment.RouteGeneration,
+		},
+		Attachment: ExecTemplateAttachment{
+			Restored: attachment.Restored,
+			Network: ExecTemplateNetwork{
+				IP:          attachment.IP,
+				Gateway:     attachment.Gateway,
+				NetNSPath:   attachment.NetNSPath,
+				PrivateCIDR: attachment.PrivateCIDR,
+				HostVeth:    attachment.HostVeth,
+			},
+			VSock: ExecTemplateVSock{
+				UDSPath: attachment.VSockUDSPath,
+			},
+		},
+	}
+}
+
+func renderExecCommand(args []string, data ExecTemplateData) ([]string, error) {
+	rendered := make([]string, len(args))
+	var buf bytes.Buffer
+	for index, raw := range args {
+		parsed, err := template.New(fmt.Sprintf("arg[%d]", index)).Option("missingkey=error").Parse(raw)
+		if err != nil {
+			return nil, fmt.Errorf("parse exec argv[%d]: %w", index, err)
+		}
+		buf.Reset()
+		if err := parsed.Execute(&buf, data); err != nil {
+			return nil, fmt.Errorf("render exec argv[%d]: %w", index, err)
+		}
+		rendered[index] = buf.String()
+	}
+	return rendered, nil
+}
+
+func buildExecEnv(vars []apiv1alpha2.ExecActionEnvVar) []string {
+	if len(vars) == 0 {
+		return nil
+	}
+	env := make([]string, 0, len(vars))
+	for _, entry := range vars {
+		env = append(env, entry.Name+"="+entry.Value)
+	}
+	return env
+}
+
+func buildExecStdin(mode apiv1alpha2.ExecActionStdinMode, input string, envelope *actionapi.Request) ([]byte, error) {
+	switch mode {
+	case "", apiv1alpha2.ExecActionStdinNone:
+		return nil, nil
+	case apiv1alpha2.ExecActionStdinBindingInput:
+		return []byte(input), nil
+	case apiv1alpha2.ExecActionStdinEnvelope:
+		if envelope == nil {
+			return nil, errors.New("exec envelope payload is required")
+		}
+		return json.Marshal(envelope)
+	default:
+		return nil, fmt.Errorf("unsupported exec stdin mode %q", mode)
+	}
+}
+
+func effectiveExecTimeout(cfg *apiv1alpha2.ExecActionHandler) time.Duration {
+	if cfg == nil || cfg.TimeoutSeconds <= 0 {
+		return defaultExecTimeout
+	}
+	return time.Duration(cfg.TimeoutSeconds) * time.Second
+}
+
+func isNonRetryableExit(cfg *apiv1alpha2.ExecActionHandler, exitCode int) bool {
+	if cfg == nil || exitCode <= 0 {
+		return false
+	}
+	for _, configured := range cfg.NonRetryableExitCodes {
+		if int(configured) == exitCode {
+			return true
+		}
+	}
+	return false
+}
+
+func execOutputSummary(result ExecResult) string {
+	stderr := strings.TrimSpace(result.Stderr)
+	stdout := strings.TrimSpace(result.Stdout)
+	switch {
+	case stderr != "" && stdout != "":
+		return truncate(stderr+" | stdout: "+stdout, 512)
+	case stderr != "":
+		return truncate(stderr, 512)
+	case stdout != "":
+		return truncate(stdout, 512)
+	case result.Err != nil:
+		return truncate(result.Err.Error(), 512)
+	default:
+		return ""
+	}
+}
+
+// persistedExecState stores per-Sandbox completed exec Action Handler records
+// under <stateDir>/actions/<sandboxUID>.json so an in-place Fastlet daemon
+// restart (RecoverOnStart) recognizes already-initialized Sandboxes without
+// re-running one-shot commands.
+type persistedExecState struct {
+	Handlers map[string]persistedExecRecord `json:"handlers"`
+}
+
+type persistedExecRecord struct {
+	AttachmentID       string                            `json:"attachmentId"`
+	InstanceGeneration int64                             `json:"instanceGeneration"`
+	Digest             string                            `json:"digest"`
+	AppliedGeneration  int64                             `json:"appliedGeneration"`
+	AppliedHooks       map[actionapi.LifecycleHook]int64 `json:"appliedHooks,omitempty"`
+	CompletedAt        time.Time                         `json:"completedAt"`
+}
+
+func (m *Manager) execStatePath(sandboxUID string) string {
+	m.mu.RLock()
+	dir := m.stateDir
+	m.mu.RUnlock()
+	if dir == "" || sandboxUID == "" || strings.ContainsAny(sandboxUID, `/\`) || sandboxUID == "." || sandboxUID == ".." {
+		return ""
+	}
+	return filepath.Join(dir, "actions", sandboxUID+".json")
+}
+
+func (m *Manager) savePersistedExecState(sandboxUID string, state *sandboxState) {
+	path := m.execStatePath(sandboxUID)
+	if path == "" {
+		return
+	}
+	persisted := persistedExecState{Handlers: make(map[string]persistedExecRecord)}
+	state.mu.RLock()
+	for name, binding := range state.bindings {
+		handler, found := m.byName[name]
+		if !found || handler.Exec == nil || binding == nil || binding.appliedGeneration <= 0 || binding.terminalFailed {
+			continue
+		}
+		if binding.status.State != string(apiv1alpha2.ActionReady) {
+			continue
+		}
+		hooksCopy := make(map[actionapi.LifecycleHook]int64, len(binding.appliedHooks))
+		for hook, seq := range binding.appliedHooks {
+			hooksCopy[hook] = seq
+		}
+		persisted.Handlers[name] = persistedExecRecord{
+			AttachmentID:       binding.attachmentID,
+			InstanceGeneration: state.attachment.InstanceGeneration,
+			Digest:             binding.digest,
+			AppliedGeneration:  binding.appliedGeneration,
+			AppliedHooks:       hooksCopy,
+			CompletedAt:        time.Now().UTC(),
+		}
+	}
+	state.mu.RUnlock()
+	if len(persisted.Handlers) == 0 {
+		return
+	}
+	encoded, err := json.Marshal(persisted)
+	if err != nil {
+		klog.ErrorS(err, "encode persisted action exec state", "sandboxUID", sandboxUID)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		klog.ErrorS(err, "create action exec state directory", "sandboxUID", sandboxUID, "dir", filepath.Dir(path))
+		return
+	}
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, encoded, 0o600); err != nil {
+		klog.ErrorS(err, "write temporary action exec state", "sandboxUID", sandboxUID, "path", tmpPath)
+		return
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		klog.ErrorS(err, "commit persisted action exec state", "sandboxUID", sandboxUID, "path", path)
+		_ = os.Remove(tmpPath)
+	}
+}
+
+func (m *Manager) removePersistedExecState(sandboxUID string) {
+	path := m.execStatePath(sandboxUID)
+	if path == "" {
+		return
+	}
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		klog.ErrorS(err, "remove persisted action exec state", "sandboxUID", sandboxUID, "path", path)
+	}
+}
+
+type execInvocationSpec struct {
+	state       *sandboxState
+	handler     apiv1alpha2.ActionHandler
+	op          string
+	hookName    string
+	attachment  Attachment
+	argv        []string
+	env         []string
+	stdin       []byte
+	timeout     time.Duration
+	maxAttempts int
+}
+
+func (m *Manager) runExecAction(
+	ctx context.Context,
+	state *sandboxState,
+	handler apiv1alpha2.ActionHandler,
+	op string,
+	hookName string,
+	generation int64,
+	attachment Attachment,
+	input string,
+	envelope *actionapi.Request,
+	argvTemplate []string,
+) error {
+	cfg := handler.Exec
+	argv, err := renderExecCommand(argvTemplate, execTemplateData(generation, attachment))
+	if err != nil {
+		klog.ErrorS(err, "render exec action command failed",
+			"sandboxUID", attachment.SandboxUID, "namespace", attachment.Namespace, "sandboxName", attachment.SandboxName,
+			"handler", handler.Name, "op", op, "hook", hookName)
+		return err
+	}
+	stdinPayload, err := buildExecStdin(cfg.Stdin, input, envelope)
+	if err != nil {
+		return err
+	}
+	maxAttempts := 1
+	if op == execOpApply {
+		maxAttempts = 1 + int(cfg.MaxRetries)
+	}
+	spec := execInvocationSpec{
+		state: state, handler: handler, op: op, hookName: hookName, attachment: attachment,
+		argv: argv, env: buildExecEnv(cfg.Env), stdin: stdinPayload,
+		timeout: effectiveExecTimeout(cfg), maxAttempts: maxAttempts,
+	}
+	backoff, maxBackoff := m.execBackoffBounds()
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			if err := sleepWithContext(ctx, backoff); err != nil {
+				return err
+			}
+			backoff = min(backoff*2, maxBackoff)
+		} else if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		attemptErr, stop := m.runExecAttempt(ctx, &spec, attempt)
+		if attemptErr == nil {
+			return nil
+		}
+		lastErr = attemptErr
+		if stop {
+			return attemptErr
+		}
+	}
+	return lastErr
+}
+
+func (m *Manager) execBackoffBounds() (time.Duration, time.Duration) {
+	m.mu.RLock()
+	initial, maxWait := m.execInitialBackoff, m.execMaxBackoff
+	m.mu.RUnlock()
+	if initial <= 0 {
+		initial = defaultExecInitialWait
+	}
+	if maxWait <= 0 {
+		maxWait = defaultExecMaxWait
+	}
+	return initial, maxWait
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (m *Manager) runExecAttempt(ctx context.Context, spec *execInvocationSpec, attempt int) (error, bool) {
+	cfg := spec.handler.Exec
+	att := spec.attachment
+	attemptCtx, cancel := context.WithTimeout(ctx, spec.timeout)
+	klog.V(2).InfoS("fastlet action exec starting",
+		"sandboxUID", att.SandboxUID, "namespace", att.Namespace, "sandboxName", att.SandboxName,
+		"handler", spec.handler.Name, "op", spec.op, "hook", spec.hookName, "attempt", attempt, "maxAttempts", spec.maxAttempts, "argv", spec.argv)
+
+	started := time.Now()
+	res := m.execRunner.Run(attemptCtx, ExecRequest{
+		Command: spec.argv,
+		Env:     spec.env,
+		Stdin:   spec.stdin,
+	})
+	duration := time.Since(started)
+	cancel()
+
+	if res.Err == nil {
+		klog.InfoS("fastlet action exec completed",
+			"sandboxUID", att.SandboxUID, "namespace", att.Namespace, "sandboxName", att.SandboxName,
+			"handler", spec.handler.Name, "op", spec.op, "hook", spec.hookName, "attempt", attempt, "exitCode", 0,
+			"durationMs", duration.Milliseconds(), "outcome", execResultSuccess)
+		return nil, true
+	}
+
+	nonRetryable := spec.op == execOpApply && isNonRetryableExit(cfg, res.ExitCode)
+	resultLabel := execFailureResultLabel(res.TimedOut, nonRetryable)
+	output := execOutputSummary(res)
+	attemptErr := formatExecAttemptError(spec, attempt, res, output)
+
+	terminal := spec.op == execOpApply && cfg.FailurePolicy == apiv1alpha2.ExecActionFailurePolicyFailSandbox && (nonRetryable || attempt == spec.maxAttempts)
+	logExecFailure(spec, attempt, res, nonRetryable, terminal, duration, resultLabel, output, attemptErr)
+	m.recordExecFailureStatus(spec, attempt, res.ExitCode, terminal, attemptErr)
+
+	if terminal {
+		m.notifyTerminalFailure(att.SandboxUID, att, spec.handler.Name, attemptErr.Error())
+		return attemptErr, true
+	}
+	return attemptErr, nonRetryable
+}
+
+func execFailureResultLabel(timedOut, nonRetryable bool) string {
+	if timedOut {
+		return execResultTimeout
+	}
+	if nonRetryable {
+		return execResultNonRetryable
+	}
+	return execResultError
+}
+
+func formatExecAttemptError(spec *execInvocationSpec, attempt int, res ExecResult, output string) error {
+	if res.TimedOut {
+		return fmt.Errorf("exec action %s timed out after %s (attempt %d/%d): %s", spec.handler.Name, spec.timeout, attempt, spec.maxAttempts, output)
+	}
+	return fmt.Errorf("exec action %s failed (attempt %d/%d, exit=%d): %s", spec.handler.Name, attempt, spec.maxAttempts, res.ExitCode, output)
+}
+
+func logExecFailure(spec *execInvocationSpec, attempt int, res ExecResult, nonRetryable, terminal bool, duration time.Duration, resultLabel, output string, attemptErr error) {
+	att := spec.attachment
+	if attempt == 1 || terminal {
+		klog.ErrorS(attemptErr, "fastlet action exec failed",
+			"sandboxUID", att.SandboxUID, "namespace", att.Namespace, "sandboxName", att.SandboxName,
+			"handler", spec.handler.Name, "op", spec.op, "hook", spec.hookName, "attempt", attempt, "maxAttempts", spec.maxAttempts,
+			"exitCode", res.ExitCode, "timedOut", res.TimedOut, "nonRetryable", nonRetryable,
+			"durationMs", duration.Milliseconds(), "outcome", resultLabel, "output", output)
+		return
+	}
+	klog.V(2).InfoS("fastlet action exec retryable failure",
+		"sandboxUID", att.SandboxUID, "namespace", att.Namespace, "sandboxName", att.SandboxName,
+		"handler", spec.handler.Name, "op", spec.op, "hook", spec.hookName, "attempt", attempt, "maxAttempts", spec.maxAttempts,
+		"exitCode", res.ExitCode, "timedOut", res.TimedOut,
+		"durationMs", duration.Milliseconds(), "outcome", resultLabel, "output", output)
+}
+
+func (m *Manager) recordExecFailureStatus(spec *execInvocationSpec, attempt, exitCode int, terminal bool, attemptErr error) {
+	if spec.state == nil || spec.op != execOpApply {
+		return
+	}
+	spec.state.mu.Lock()
+	if binding := spec.state.bindings[spec.handler.Name]; binding != nil {
+		switch {
+		case terminal:
+			binding.terminalFailed = true
+			setBindingStatus(binding, apiv1alpha2.ActionFailed, attemptErr.Error())
+		case attempt < spec.maxAttempts:
+			setBindingStatus(binding, apiv1alpha2.ActionApplying, fmt.Sprintf("exec attempt %d/%d failed (exit=%d), retrying", attempt, spec.maxAttempts, exitCode))
+		default:
+			setBindingStatus(binding, apiv1alpha2.ActionFailed, attemptErr.Error())
+		}
+	}
+	spec.state.mu.Unlock()
+	m.notifyChanged(spec.attachment.SandboxUID)
+}
+
+func (m *Manager) hydratePersistedExecStateLocked(state *sandboxState, attachment Attachment) {
+	if m.stateDir == "" || attachment.SandboxUID == "" || strings.ContainsAny(attachment.SandboxUID, `/\`) || attachment.SandboxUID == "." || attachment.SandboxUID == ".." {
+		return
+	}
+	path := filepath.Join(m.stateDir, "actions", attachment.SandboxUID+".json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			klog.ErrorS(err, "read persisted action exec state", "sandboxUID", attachment.SandboxUID, "path", path)
+		}
+		return
+	}
+	var persisted persistedExecState
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		klog.ErrorS(err, "decode persisted action exec state", "sandboxUID", attachment.SandboxUID, "path", path)
+		return
+	}
+	for name, rec := range persisted.Handlers {
+		handler, found := m.byName[name]
+		if !found || handler.Exec == nil {
+			continue
+		}
+		if rec.AttachmentID != attachment.ID && rec.InstanceGeneration != attachment.InstanceGeneration {
+			continue
+		}
+		appliedHooks := make(map[actionapi.LifecycleHook]int64, len(rec.AppliedHooks))
+		for hook, seq := range rec.AppliedHooks {
+			appliedHooks[hook] = seq
+		}
+		binding := &bindingState{
+			status: fastletapi.ActionBindingStatus{
+				Handler:                name,
+				ObservedSpecGeneration: rec.AppliedGeneration,
+				DesiredInputDigest:     rec.Digest,
+				AppliedInputDigest:     rec.Digest,
+			},
+			digest:            rec.Digest,
+			appliedGeneration: rec.AppliedGeneration,
+			attachmentID:      attachment.ID,
+			handlerInstanceID: execLocalInstanceID,
+			appliedHooks:      appliedHooks,
+			readyMessage:      "recovered from persisted exec state",
+		}
+		setBindingStatus(binding, apiv1alpha2.ActionReady, binding.readyMessage)
+		state.bindings[name] = binding
+		klog.InfoS("fastlet action exec recovered from persisted state",
+			"sandboxUID", attachment.SandboxUID, "namespace", attachment.Namespace, "sandboxName", attachment.SandboxName,
+			"handler", name, "attachmentID", attachment.ID, "appliedGeneration", rec.AppliedGeneration, "outcome", "skipped_recovered")
+	}
+}
+
+func (m *Manager) setExecBinding(
+	ctx context.Context,
+	state *sandboxState,
+	handler apiv1alpha2.ActionHandler,
+	generation int64,
+	attachment Attachment,
+	input *string,
+	digest string,
+	replayHooks bool,
+) error {
+	handlerName := handler.Name
+	cfg := handler.Exec
+
+	// Removing a live binding runs optional cleanupCommand and returns.
+	if input == nil {
+		if len(cfg.CleanupCommand) > 0 {
+			return m.runExecAction(ctx, nil, handler, execOpCleanup, "", generation, attachment, "", nil, cfg.CleanupCommand)
+		}
+		return nil
+	}
+
+	state.mu.Lock()
+	binding := state.bindings[handlerName]
+	if binding == nil {
+		binding = &bindingState{status: fastletapi.ActionBindingStatus{Handler: handlerName}, appliedHooks: make(map[actionapi.LifecycleHook]int64)}
+		state.bindings[handlerName] = binding
+	}
+	binding.status.ObservedSpecGeneration = generation
+	binding.status.DesiredInputDigest = digest
+
+	// Hook-subscribed exec handlers defer command execution until their
+	// subscribed lifecycle hook fires so binding order (e.g., [egress, runtime-init])
+	// is preserved at the hook boundary.
+	if len(handler.Hooks) > 0 {
+		binding.input = *input
+		binding.digest = digest
+		binding.appliedGeneration = generation
+		binding.attachmentID = attachment.ID
+		binding.handlerInstanceID = execLocalInstanceID
+		binding.status.AppliedInputDigest = digest
+		if replayHooks {
+			binding.appliedHooks = make(map[actionapi.LifecycleHook]int64)
+			binding.readyMessage = ""
+		}
+		m.refreshBindingStatusLocked(state, handlerName, binding)
+		state.mu.Unlock()
+		return nil
+	}
+
+	if cfg.SkipOnRestore && attachment.Restored {
+		binding.input = *input
+		binding.digest = digest
+		binding.appliedGeneration = generation
+		binding.attachmentID = attachment.ID
+		binding.handlerInstanceID = execLocalInstanceID
+		binding.status.AppliedInputDigest = digest
+		binding.readyMessage = "skipped on checkpoint restore"
+		m.refreshBindingStatusLocked(state, handlerName, binding)
+		state.mu.Unlock()
+		klog.InfoS("fastlet action exec skipped on checkpoint restore",
+			"sandboxUID", attachment.SandboxUID, "namespace", attachment.Namespace, "sandboxName", attachment.SandboxName,
+			"handler", handlerName, "op", execOpApply, "outcome", "skipped_restore")
+		m.savePersistedExecState(attachment.SandboxUID, state)
+		return nil
+	}
+
+	setBindingStatus(binding, apiv1alpha2.ActionApplying, "")
+	binding.attachmentID = attachment.ID
+	state.mu.Unlock()
+
+	request := buildRequest(actionapi.OperationSetBinding, stableInvocationID(actionapi.OperationSetBinding, handlerName, execLocalInstanceID, generation, attachment, digest, ""), generation, attachment)
+	request.Binding = &actionapi.BindingPayload{Input: input}
+	if err := m.runExecAction(ctx, state, handler, execOpApply, "", generation, attachment, *input, &request, cfg.Command); err != nil {
+		return err
+	}
+
+	state.mu.Lock()
+	if state.terminating || state.desiredGeneration != generation || state.attachment.ID != attachment.ID {
+		setBindingStatus(binding, apiv1alpha2.ActionPending, "SetBinding result belongs to an obsolete Sandbox revision")
+		state.mu.Unlock()
+		return errors.New("SetBinding result belongs to an obsolete Sandbox revision")
+	}
+	binding.input = *input
+	binding.digest = digest
+	binding.appliedGeneration = generation
+	binding.attachmentID = attachment.ID
+	binding.handlerInstanceID = execLocalInstanceID
+	binding.status.AppliedInputDigest = digest
+	binding.readyMessage = ""
+	m.refreshBindingStatusLocked(state, handlerName, binding)
+	state.mu.Unlock()
+	m.savePersistedExecState(attachment.SandboxUID, state)
+	return nil
+}
+
+func (m *Manager) invokeExecHook(
+	ctx context.Context,
+	state *sandboxState,
+	handler apiv1alpha2.ActionHandler,
+	generation int64,
+	attachment Attachment,
+	checkpoint HookCheckpoint,
+) error {
+	handlerName := handler.Name
+	cfg := handler.Exec
+
+	state.mu.Lock()
+	binding := state.bindings[handlerName]
+	if binding == nil || binding.appliedGeneration != generation || binding.handlerInstanceID != execLocalInstanceID {
+		state.mu.Unlock()
+		return errors.New("SetBinding is not current for lifecycle Hook")
+	}
+	if cfg.SkipOnRestore && attachment.Restored {
+		binding.appliedHooks[checkpoint.Name] = checkpoint.Sequence
+		binding.readyMessage = "skipped on checkpoint restore"
+		m.refreshBindingStatusLocked(state, handlerName, binding)
+		state.mu.Unlock()
+		klog.InfoS("fastlet action exec skipped on checkpoint restore",
+			"sandboxUID", attachment.SandboxUID, "namespace", attachment.Namespace, "sandboxName", attachment.SandboxName,
+			"handler", handlerName, "op", execOpApply, "hook", string(checkpoint.Name), "outcome", "skipped_restore")
+		m.savePersistedExecState(attachment.SandboxUID, state)
+		return nil
+	}
+	bindingInput := binding.input
+	bindingDigest := binding.digest
+	setBindingStatus(binding, apiv1alpha2.ActionApplying, "")
+	state.mu.Unlock()
+
+	extra := fmt.Sprintf("%s/%d", checkpoint.Name, checkpoint.Sequence)
+	request := buildRequest(actionapi.OperationLifecycleHook, stableInvocationID(actionapi.OperationLifecycleHook, handlerName, execLocalInstanceID, generation, attachment, bindingDigest, extra), generation, attachment)
+	request.Hook = &actionapi.LifecycleHookPayload{Name: checkpoint.Name, Sequence: checkpoint.Sequence}
+	inputCopy := bindingInput
+	request.Binding = &actionapi.BindingPayload{Input: &inputCopy}
+
+	if err := m.runExecAction(ctx, state, handler, execOpApply, string(checkpoint.Name), generation, attachment, bindingInput, &request, cfg.Command); err != nil {
+		return err
+	}
+
+	state.mu.Lock()
+	if state.terminating || state.desiredGeneration != generation || state.attachment.ID != attachment.ID {
+		setBindingStatus(binding, apiv1alpha2.ActionPending, "Lifecycle Hook result belongs to an obsolete Sandbox revision")
+		state.mu.Unlock()
+		return errors.New("Lifecycle Hook result belongs to an obsolete Sandbox revision")
+	}
+	binding.appliedHooks[checkpoint.Name] = checkpoint.Sequence
+	binding.readyMessage = ""
+	m.refreshBindingStatusLocked(state, handlerName, binding)
+	state.mu.Unlock()
+	m.savePersistedExecState(attachment.SandboxUID, state)
+	return nil
+}

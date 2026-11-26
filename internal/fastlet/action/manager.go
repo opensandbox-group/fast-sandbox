@@ -242,10 +242,13 @@ type Attachment struct {
 	AssignmentAttempt  int64
 	RuntimeInstanceID  string
 	RouteGeneration    int64
+	Restored           bool
 	IP                 string
 	Gateway            string
+	NetNSPath          string
 	PrivateCIDR        string
 	HostVeth           string
+	VSockUDSPath       string
 }
 
 type HookCheckpoint struct {
@@ -261,6 +264,8 @@ type bindingState struct {
 	attachmentID      string
 	handlerInstanceID string
 	appliedHooks      map[actionapi.LifecycleHook]int64
+	terminalFailed    bool
+	readyMessage      string
 }
 
 type sandboxState struct {
@@ -306,6 +311,8 @@ type Manager struct {
 	apiVersion string
 	byName     map[string]apiv1alpha2.ActionHandler
 	caller     Caller
+	execRunner ExecRunner
+	stateDir   string
 	states     map[string]*sandboxState
 	terminal   map[string]Attachment
 	observed   map[string]handlerObservation
@@ -315,10 +322,15 @@ type Manager struct {
 	// vault surface; empty disables the driver-invoked vault transfer.
 	vaultHandler string
 
-	startOnce sync.Once
-	probeMu   sync.Mutex
-	notifyMu  sync.RWMutex
-	notify    func(string)
+	execInitialBackoff time.Duration
+	execMaxBackoff     time.Duration
+
+	startOnce         sync.Once
+	probeMu           sync.Mutex
+	notifyMu          sync.RWMutex
+	notify            func(string)
+	terminalFailureMu sync.RWMutex
+	onTerminalFailure func(sandboxUID string, attachment Attachment, handlerName, message string)
 }
 
 func NewManager(handlers []apiv1alpha2.ActionHandler, caller Caller) (*Manager, error) {
@@ -343,14 +355,22 @@ func NewManagerWithAPIVersion(handlers []apiv1alpha2.ActionHandler, apiVersion s
 		caller = NewHTTPCaller()
 	}
 	byName := make(map[string]apiv1alpha2.ActionHandler, len(handlers))
+	observed := make(map[string]handlerObservation, len(handlers))
+	httpHandlers := 0
 	for _, handler := range handlers {
 		byName[handler.Name] = handler
+		if handler.Exec != nil {
+			observed[handler.Name] = handlerObservation{instanceID: execLocalInstanceID}
+		} else {
+			httpHandlers++
+		}
 	}
 	return &Manager{
 		handlers:   append([]apiv1alpha2.ActionHandler(nil), handlers...),
-		apiVersion: apiVersion, byName: byName, caller: caller, states: make(map[string]*sandboxState),
+		apiVersion: apiVersion, byName: byName, caller: caller, execRunner: OSExecRunner{},
+		states:   make(map[string]*sandboxState),
 		terminal: make(map[string]Attachment),
-		observed: make(map[string]handlerObservation), ready: len(handlers) == 0,
+		observed: observed, ready: httpHandlers == 0,
 	}, nil
 }
 
@@ -365,6 +385,51 @@ func (m *Manager) SetChangeNotifier(notify func(string)) {
 	m.notifyMu.Lock()
 	m.notify = notify
 	m.notifyMu.Unlock()
+}
+
+// SetStateDir enables local persistence of completed exec Action Handler state
+// under <dir>/actions/<sandboxUID>.json so Fastlet restarts skip re-running
+// already-completed one-shot commands.
+func (m *Manager) SetStateDir(dir string) {
+	m.mu.Lock()
+	m.stateDir = dir
+	m.mu.Unlock()
+}
+
+// SetExecRunner overrides the process runner for exec Action Handlers.
+func (m *Manager) SetExecRunner(runner ExecRunner) {
+	if runner == nil {
+		runner = OSExecRunner{}
+	}
+	m.mu.Lock()
+	m.execRunner = runner
+	m.mu.Unlock()
+}
+
+// SetExecBackoff configures the initial and maximum retry backoff for exec
+// Action Handlers.
+func (m *Manager) SetExecBackoff(initial, maxWait time.Duration) {
+	m.mu.Lock()
+	m.execInitialBackoff = initial
+	m.execMaxBackoff = maxWait
+	m.mu.Unlock()
+}
+
+// SetTerminalFailureCallback registers the SandboxManager callback invoked when
+// an exec Action Handler with failurePolicy=FailSandbox fails terminally.
+func (m *Manager) SetTerminalFailureCallback(fn func(sandboxUID string, attachment Attachment, handlerName, message string)) {
+	m.terminalFailureMu.Lock()
+	m.onTerminalFailure = fn
+	m.terminalFailureMu.Unlock()
+}
+
+func (m *Manager) notifyTerminalFailure(sandboxUID string, attachment Attachment, handlerName, message string) {
+	m.terminalFailureMu.RLock()
+	fn := m.onTerminalFailure
+	m.terminalFailureMu.RUnlock()
+	if fn != nil {
+		go fn(sandboxUID, attachment, handlerName, message)
+	}
 }
 
 // ErrUnknownHandler reports a relay request naming a Handler the Fastlet's
@@ -386,6 +451,9 @@ func (m *Manager) RelayHandler(ctx context.Context, attachment Attachment, name,
 	m.mu.RUnlock()
 	if !found {
 		return 0, nil, ErrUnknownHandler
+	}
+	if handler.Exec != nil {
+		return 0, nil, fmt.Errorf("exec Action Handler %q does not support HTTP relay", name)
 	}
 	if err := m.ValidateAPIVersion(attachment.APIVersion); err != nil {
 		return 0, nil, err
@@ -469,6 +537,13 @@ func (m *Manager) probe(ctx context.Context) {
 	}
 	results := make([]result, 0, len(m.handlers))
 	for _, handler := range m.handlers {
+		if handler.Exec != nil {
+			results = append(results, result{
+				handler: handler,
+				status:  actionapi.HandlerStatus{APIVersion: m.apiVersion, InstanceID: execLocalInstanceID, Ready: true, OwnerStatus: true},
+			})
+			continue
+		}
 		probeCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
 		status, err := m.caller.Status(probeCtx, handler.TargetHTTPPort, m.apiVersion)
 		cancel()
@@ -732,6 +807,10 @@ func (m *Manager) convergeLocked(ctx context.Context, state *sandboxState) error
 			binding = &bindingState{status: fastletapi.ActionBindingStatus{Handler: input.Handler}, appliedHooks: make(map[actionapi.LifecycleHook]int64)}
 			state.bindings[input.Handler] = binding
 		}
+		if binding.terminalFailed && binding.attachmentID == attachment.ID {
+			state.mu.Unlock()
+			return errors.New(binding.status.Message)
+		}
 		needsSet := binding.appliedGeneration != generation || binding.digest != input.Digest ||
 			binding.attachmentID != attachment.ID || binding.handlerInstanceID != instanceID
 		replayHooks := binding.handlerInstanceID == "" || binding.handlerInstanceID != instanceID || binding.attachmentID != attachment.ID
@@ -763,7 +842,15 @@ func (m *Manager) convergeLocked(ctx context.Context, state *sandboxState) error
 			state.mu.RLock()
 			binding := state.bindings[input.Handler]
 			alreadyApplied := binding != nil && binding.appliedHooks[checkpoint.Name] >= checkpoint.Sequence
+			terminalFailed := binding != nil && binding.terminalFailed && binding.attachmentID == attachment.ID
+			terminalMsg := ""
+			if terminalFailed {
+				terminalMsg = binding.status.Message
+			}
 			state.mu.RUnlock()
+			if terminalFailed {
+				return errors.New(terminalMsg)
+			}
 			if alreadyApplied {
 				continue
 			}
@@ -817,6 +904,9 @@ func (m *Manager) parkUnattachedBindings(state *sandboxState, desired []DesiredI
 
 func (m *Manager) setBinding(ctx context.Context, state *sandboxState, handlerName string, generation int64, attachment Attachment, input *string, digest string, replayHooks bool) error {
 	handler := m.byName[handlerName]
+	if handler.Exec != nil {
+		return m.setExecBinding(ctx, state, handler, generation, attachment, input, digest, replayHooks)
+	}
 	instanceID, err := m.handlerInstance(handlerName)
 	state.mu.Lock()
 	binding := state.bindings[handlerName]
@@ -889,6 +979,9 @@ func (m *Manager) setBinding(ctx context.Context, state *sandboxState, handlerNa
 
 func (m *Manager) invokeHook(ctx context.Context, state *sandboxState, handlerName string, generation int64, attachment Attachment, checkpoint HookCheckpoint) error {
 	handler := m.byName[handlerName]
+	if handler.Exec != nil {
+		return m.invokeExecHook(ctx, state, handler, generation, attachment, checkpoint)
+	}
 	instanceID, err := m.handlerInstance(handlerName)
 	if err != nil {
 		return err
@@ -991,6 +1084,9 @@ func (m *Manager) ConfirmOwnerRetired(ctx context.Context, attachment Attachment
 	}
 	owner := ownerFromAttachment(attachment)
 	for _, handler := range m.handlers {
+		if handler.Exec != nil {
+			continue
+		}
 		observed, err := m.observeOwner(ctx, handler.TargetHTTPPort, owner)
 		if err != nil {
 			return fmt.Errorf("confirm Action Handler %s owner retirement: %w", handler.Name, err)
@@ -1016,6 +1112,9 @@ func (m *Manager) CheckCreateOwner(ctx context.Context, attachment Attachment) e
 	var probes sync.WaitGroup
 	errs := make([]error, len(m.handlers))
 	for index, handler := range m.handlers {
+		if handler.Exec != nil {
+			continue
+		}
 		probes.Go(func() {
 			observed, err := m.observeOwner(probeCtx, handler.TargetHTTPPort, ownerFromAttachment(attachment))
 			if err != nil {
@@ -1086,6 +1185,14 @@ func (m *Manager) deleteState(ctx context.Context, state *sandboxState, expected
 	for index := len(order) - 1; index >= 0; index-- {
 		name := order[index]
 		handler := m.byName[name]
+		if handler.Exec != nil {
+			if len(handler.Exec.CleanupCommand) > 0 {
+				if err := m.runExecAction(ctx, nil, handler, execOpCleanup, "", generation, attachment, "", nil, handler.Exec.CleanupCommand); err != nil {
+					result = errors.Join(result, err)
+				}
+			}
+			continue
+		}
 		instanceID, _ := m.handlerInstance(name)
 		request := buildRequest(actionapi.OperationRemoveBinding, stableInvocationID(actionapi.OperationRemoveBinding, name, instanceID, generation, attachment, "", "terminal"), generation, attachment)
 		if err := m.caller.Invoke(ctx, handler.TargetHTTPPort, request); err != nil {
@@ -1120,6 +1227,12 @@ func (m *Manager) deleteRemoteOwner(ctx context.Context, attachment Attachment, 
 
 func (m *Manager) deleteRemoteHandler(ctx context.Context, name string, attachment Attachment, generation int64) error {
 	handler := m.byName[name]
+	if handler.Exec != nil {
+		if len(handler.Exec.CleanupCommand) > 0 {
+			return m.runExecAction(ctx, nil, handler, execOpCleanup, "", generation, attachment, "", nil, handler.Exec.CleanupCommand)
+		}
+		return nil
+	}
 	owner := ownerFromAttachment(attachment)
 	observed, err := m.observeOwner(ctx, handler.TargetHTTPPort, owner)
 	if err != nil {
@@ -1177,6 +1290,7 @@ func (m *Manager) finishDelete(sandboxUID string, state *sandboxState, attachmen
 		m.terminal[sandboxUID] = attachment
 	}
 	m.mu.Unlock()
+	m.removePersistedExecState(sandboxUID)
 	m.notifyChanged(sandboxUID)
 }
 
@@ -1191,7 +1305,13 @@ func (m *Manager) Statuses(sandboxUID string) ([]fastletapi.ActionBindingStatus,
 }
 
 func (m *Manager) retryState(parent context.Context, state *sandboxState) {
-	ctx, cancel := context.WithTimeout(parent, defaultTimeout*time.Duration(max(1, len(m.handlers))))
+	timeout := defaultTimeout * time.Duration(max(1, len(m.handlers)))
+	for _, handler := range m.handlers {
+		if handler.Exec != nil {
+			timeout += effectiveExecTimeout(handler.Exec) * time.Duration(1+handler.Exec.MaxRetries)
+		}
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	if !state.lockOperations(ctx) {
 		return
@@ -1199,12 +1319,13 @@ func (m *Manager) retryState(parent context.Context, state *sandboxState) {
 	defer state.unlockOperations()
 	state.mu.RLock()
 	terminating := state.terminating
+	sandboxUID := state.attachment.SandboxUID
 	state.mu.RUnlock()
 	if !terminating {
 		if convergeErr := m.convergeLocked(ctx, state); convergeErr != nil {
 			// The retry loop swallows nothing else; without this line a
 			// persistently failing hook converge is invisible.
-			klog.V(2).InfoS("sandbox action retry converge failed", "sandbox", state.attachment.SandboxUID, "err", convergeErr)
+			klog.V(2).InfoS("sandbox action retry converge failed", "sandbox", sandboxUID, "err", convergeErr)
 		}
 	}
 }
@@ -1238,13 +1359,21 @@ func (m *Manager) refreshBindingStatusLocked(state *sandboxState, handlerName st
 		}
 		return
 	}
+	if handler := m.byName[handlerName]; handler.Exec != nil {
+		for _, hook := range handler.Hooks {
+			if binding.appliedHooks[actionapi.LifecycleHook(hook)] <= 0 {
+				setBindingStatus(binding, apiv1alpha2.ActionPending, fmt.Sprintf("Lifecycle Hook %s is pending", hook))
+				return
+			}
+		}
+	}
 	for _, checkpoint := range state.reachedHooks {
 		if m.subscribes(handlerName, checkpoint.Name) && binding.appliedHooks[checkpoint.Name] < checkpoint.Sequence {
 			setBindingStatus(binding, apiv1alpha2.ActionPending, fmt.Sprintf("Lifecycle Hook %s is pending", checkpoint.Name))
 			return
 		}
 	}
-	setBindingStatus(binding, apiv1alpha2.ActionReady, "")
+	setBindingStatus(binding, apiv1alpha2.ActionReady, binding.readyMessage)
 }
 
 func (m *Manager) validateDesired(desired []DesiredInput) ([]DesiredInput, string, error) {
@@ -1293,6 +1422,7 @@ func (m *Manager) getOrCreateState(attachment Attachment) (*sandboxState, error)
 	state := m.states[attachment.SandboxUID]
 	if state == nil {
 		state = newSandboxState()
+		m.hydratePersistedExecStateLocked(state, attachment)
 		m.states[attachment.SandboxUID] = state
 	}
 	return state, nil

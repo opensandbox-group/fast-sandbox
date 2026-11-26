@@ -228,6 +228,7 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 	}
 	if manager.actionManager != nil {
 		manager.actionManager.SetChangeNotifier(manager.actionStateChanged)
+		manager.actionManager.SetTerminalFailureCallback(manager.handleActionTerminalFailure)
 	}
 	return manager, nil
 }

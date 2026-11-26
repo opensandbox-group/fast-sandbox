@@ -191,15 +191,98 @@ const (
 	LifecycleHookDataPlaneReady LifecycleHook = "sandbox.data-plane-ready"
 )
 
-// ActionHandler declares one Pod-local HTTP receiver served on loopback.
+// ExecActionStdinMode selects what Fastlet writes to an exec Action Handler's
+// standard input.
+// +kubebuilder:validation:Enum=None;BindingInput;Envelope
+type ExecActionStdinMode string
+
+const (
+	ExecActionStdinNone         ExecActionStdinMode = "None"
+	ExecActionStdinBindingInput ExecActionStdinMode = "BindingInput"
+	ExecActionStdinEnvelope     ExecActionStdinMode = "Envelope"
+)
+
+// ExecActionFailurePolicy controls how Fastlet reacts when an exec Action
+// Handler exits with a non-retryable exit code or exhausts maxRetries.
+// +kubebuilder:validation:Enum=Retry;FailSandbox
+type ExecActionFailurePolicy string
+
+const (
+	ExecActionFailurePolicyRetry       ExecActionFailurePolicy = "Retry"
+	ExecActionFailurePolicyFailSandbox ExecActionFailurePolicy = "FailSandbox"
+)
+
+// ExecActionEnvVar defines one static environment variable passed to an exec
+// Action Handler process.
+type ExecActionEnvVar struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// ExecActionHandler declares a Fastlet-local command template executed directly
+// via execve without invoking a shell.
+type ExecActionHandler struct {
+	// Command is the argv template executed directly via execve.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=64
+	Command []string `json:"command"`
+
+	// CleanupCommand is an optional argv template executed on REMOVE_BINDING.
+	// Omitting it makes removal a local no-op.
+	// +kubebuilder:validation:MaxItems=64
+	CleanupCommand []string `json:"cleanupCommand,omitempty"`
+
+	// Env sets static environment variables for the child process.
+	// +kubebuilder:validation:MaxItems=64
+	Env []ExecActionEnvVar `json:"env,omitempty"`
+
+	// Stdin selects the payload piped to the child process stdin.
+	// +kubebuilder:default=None
+	Stdin ExecActionStdinMode `json:"stdin,omitempty"`
+
+	// SkipOnRestore marks the binding ActionReady immediately on checkpoint
+	// restore (Pause -> Resume) without re-executing Command.
+	SkipOnRestore bool `json:"skipOnRestore,omitempty"`
+
+	// TimeoutSeconds bounds a single command invocation. Defaults to 15.
+	// +kubebuilder:default=15
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=300
+	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
+
+	// NonRetryableExitCodes lists non-zero exit codes that fail immediately
+	// without retrying.
+	// +kubebuilder:validation:MaxItems=32
+	NonRetryableExitCodes []int32 `json:"nonRetryableExitCodes,omitempty"`
+
+	// MaxRetries limits retries after the initial attempt.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	MaxRetries int32 `json:"maxRetries,omitempty"`
+
+	// FailurePolicy controls behavior on non-retryable exit or retry exhaustion.
+	// +kubebuilder:default=Retry
+	FailurePolicy ExecActionFailurePolicy `json:"failurePolicy,omitempty"`
+}
+
+// ActionHandler declares either one Pod-local HTTP receiver served on loopback
+// (targetHTTPPort) or one Fastlet-local execve command handler (exec).
 type ActionHandler struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	// +kubebuilder:validation:MaxLength=63
 	Name string `json:"name"`
 
+	// TargetHTTPPort selects a Pod-local HTTP loopback receiver. Mutually
+	// exclusive with Exec.
+	// +optional
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
-	TargetHTTPPort int32 `json:"targetHTTPPort"`
+	TargetHTTPPort int32 `json:"targetHTTPPort,omitempty"`
+
+	// Exec selects a Fastlet-local command template executed via execve.
+	// Mutually exclusive with TargetHTTPPort.
+	// +optional
+	Exec *ExecActionHandler `json:"exec,omitempty"`
 
 	// Hooks selects the lifecycle checkpoints delivered to this Handler. An
 	// empty list makes the Handler config-only: it receives SetBinding and

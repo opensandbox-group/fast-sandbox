@@ -382,7 +382,7 @@ func (m *SandboxManager) commitRuntimeCreate(req *fastletapi.CreateSandboxReques
 		m.recordDiagnosticLocked(sandboxUID, "info", "fastlet", sandboxStateRunning, "runtime is ready; no asynchronous data-plane initialization is required")
 	}
 	status := m.sandboxStatusLocked(metadata)
-	return status, m.admissionStatusLocked(), metadata.Phase == sandboxStateRunning, nil
+	return status, m.admissionStatusLocked(), metadata.Phase == sandboxStateRunning || metadata.Phase == sandboxStateActionPending, nil
 }
 
 func (m *SandboxManager) finishStrictCreateDelete(metadata *SandboxMetadata) {

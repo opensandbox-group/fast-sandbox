@@ -160,7 +160,8 @@ type NetworkAllocation struct {
 // RuntimeAllocation contains resources actually assigned to one runtime.
 // Allocation is observed/persisted state, separate from RuntimeSandboxConfig.
 type RuntimeAllocation struct {
-	Network NetworkAllocation `json:"network"`
+	Network      NetworkAllocation `json:"network"`
+	VSockUDSPath string            `json:"vsockUdsPath,omitempty"`
 }
 
 type RuntimeState string
