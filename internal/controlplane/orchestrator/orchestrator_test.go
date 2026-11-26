@@ -595,6 +595,43 @@ func TestCreateSuccessImmediatelyForwardsAdmissionSnapshot(t *testing.T) {
 	require.Equal(t, "500m", registry.feedbacks[0].Admission.Resources.Committed.CPU)
 }
 
+func TestCreateRuntimeInvalidRequestDoesNotPenalizeCandidate(t *testing.T) {
+	orchestrator, registry, fastletClient, sandbox := newHarness(t)
+	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+	candidate := candidateFor(parameters)
+	registry.fastlets[candidate.ID] = candidate
+	sandbox.UID = types.UID("sandbox-uid-invalid")
+	envelope, err := AssignmentForCandidate(candidate, 1, 1, 1, "runtime-invalid")
+	require.NoError(t, err)
+	require.NoError(t, assignment.SetAssignmentAnnotation(sandbox, envelope))
+
+	response := &fastletapi.CreateSandboxResponse{
+		Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects,
+		Admission:   fastletapi.AdmissionStatus{Capacity: 8, Used: 0, Running: 0},
+	}
+	failure := &fastletapi.FastletError{
+		Code:    fastletapi.ErrorInvalidRequest,
+		Message: "invalid sandbox config: requested CPU 2 permits 2 vCPU(s), below the template snapshot vCPU count 4",
+	}
+	fastletClient.create = func(string, *fastletapi.CreateSandboxRequest) (*fastletapi.CreateSandboxResponse, error) {
+		return response, &fastletapi.CreateCallError{Disposition: response.Disposition, Failure: failure}
+	}
+
+	_, err = orchestrator.CreateRuntime(context.Background(), sandbox)
+	require.Error(t, err)
+	require.True(t, IsInvalidRequestRejection(err))
+	require.False(t, IsCandidateRejection(err))
+	require.Len(t, registry.feedbacks, 1)
+	require.Empty(t, registry.feedbacks[0].Code, "invalid request must record admission snapshot without penalizing the Fastlet")
+
+	cleanupErr := &fastletapi.CreateCallError{
+		Disposition: fastletapi.CreateDispositionFailedNeedsCleanup,
+		Failure:     failure,
+	}
+	require.False(t, IsInvalidRequestRejection(cleanupErr))
+}
+
 func TestDeleteImmediatelyForwardsAdmissionSnapshot(t *testing.T) {
 	orchestrator, registry, fastletClient, sandbox := newHarness(t)
 	parameters, err := orchestrator.ResolveRuntime(context.Background(), sandbox)

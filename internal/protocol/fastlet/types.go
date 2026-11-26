@@ -301,6 +301,11 @@ const (
 	ErrorNotFound           FastletErrorCode = "NotFound"
 	ErrorGenerationFenced   FastletErrorCode = "GenerationFenced"
 	ErrorProfileMismatch    FastletErrorCode = "ProfileMismatch"
+	// ErrorInvalidRequest reports a deterministic client/configuration error
+	// (such as requested CPU/memory below a template snapshot's machine shape).
+	// It is not retryable on another candidate and does not indicate an
+	// unhealthy Fastlet.
+	ErrorInvalidRequest FastletErrorCode = "InvalidRequest"
 	// ErrorSnapshotInProgress reports the deterministic non-reentrancy
 	// rejection: another non-terminal snapshot holds the target Sandbox.
 	ErrorSnapshotInProgress FastletErrorCode = "SnapshotInProgress"

@@ -327,9 +327,6 @@ func (m *SandboxManager) handleRuntimeCreateFailure(ctx context.Context, input *
 	}
 	admission := m.admissionStatusLocked()
 	m.mu.Unlock()
-	// Deterministic node-vs-artifact mismatch, not a runtime fault: the
-	// orchestrator moves to the next candidate and never re-queues this
-	// node for the same image.
 	code := fastletapi.ErrorRuntimeUnavailable
 	retryable := true
 	if errors.Is(runtimeErr, ErrNetworkUnavailable) {
@@ -337,7 +334,15 @@ func (m *SandboxManager) handleRuntimeCreateFailure(ctx context.Context, input *
 	} else if errors.Is(runtimeErr, ErrInfraUnavailable) {
 		code = fastletapi.ErrorInfraUnavailable
 	} else if errors.Is(runtimeErr, ErrIncompatibleArtifact) {
+		// Deterministic node-vs-artifact mismatch, not a runtime fault: the
+		// orchestrator moves to the next candidate and never re-queues this
+		// node for the same image.
 		code = fastletapi.ErrorProfileMismatch
+		retryable = false
+	} else if errors.Is(runtimeErr, ErrInvalidConfig) {
+		// Deterministic sandbox configuration error: no candidate can admit
+		// this spec and the Fastlet itself is healthy.
+		code = fastletapi.ErrorInvalidRequest
 		retryable = false
 	}
 	message := runtimeErr.Error()
@@ -1272,7 +1277,7 @@ func fastletErrorWithCause(code fastletapi.FastletErrorCode, message string, ret
 
 func defaultCreateDisposition(code fastletapi.FastletErrorCode) fastletapi.CreateDisposition {
 	switch code {
-	case fastletapi.ErrorCapacityRejected, fastletapi.ErrorDraining, fastletapi.ErrorProfileMismatch:
+	case fastletapi.ErrorCapacityRejected, fastletapi.ErrorDraining, fastletapi.ErrorProfileMismatch, fastletapi.ErrorInvalidRequest:
 		return fastletapi.CreateDispositionRejectedBeforeSideEffects
 	case fastletapi.ErrorInProgress:
 		return fastletapi.CreateDispositionInProgress

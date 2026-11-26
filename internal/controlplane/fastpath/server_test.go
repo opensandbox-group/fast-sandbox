@@ -276,6 +276,50 @@ func TestCandidateRefreshIsBoundedAndRollsBackRejectedIntent(t *testing.T) {
 	require.Equal(t, apiv1alpha2.RuntimeState(""), persisted.Status.Runtime.State)
 }
 
+func TestInvalidRequestRejectionReturnsInvalidArgumentWithoutRetryOrPenalty(t *testing.T) {
+	server, k8sClient, registry, fastlet := newV2Server(t)
+	registry.candidates = []placement.FastletInfo{
+		testCandidate("fastlet-0", "pod-0", "10.0.0.1"),
+		testCandidate("fastlet-1", "pod-1", "10.0.0.2"),
+		testCandidate("fastlet-2", "pod-2", "10.0.0.3"),
+	}
+	fastlet.createFailure = &fastletapi.CreateCallError{
+		Disposition: fastletapi.CreateDispositionRejectedBeforeSideEffects,
+		Failure: &fastletapi.FastletError{
+			Code:    fastletapi.ErrorInvalidRequest,
+			Message: "invalid sandbox config: requested CPU 2 permits 2 vCPU(s), below the template snapshot vCPU count 4",
+		},
+	}
+
+	_, err := server.CreateSandbox(context.Background(), createRequest("invalid-config"))
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Contains(t, err.Error(), "below the template snapshot vCPU count 4")
+	require.Equal(t, []string{"10.0.0.1"}, fastlet.createIPs, "invalid config must not fan out to other candidates")
+	require.Len(t, registry.feedback, 1)
+	require.Empty(t, registry.feedback[0].feedback.Code, "healthy Fastlet must not be penalized for client config errors")
+
+	var persisted apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "invalid-config"}, &persisted))
+	require.NotNil(t, persisted.DeletionTimestamp, "newly created Sandbox intent must be rolled back")
+
+	// When cleanup fails after an invalid config rejection, keep the intent so
+	// the Controller can finish cleanup instead of rolling it back.
+	fastlet.createIPs = nil
+	fastlet.createFailure = &fastletapi.CreateCallError{
+		Disposition: fastletapi.CreateDispositionFailedNeedsCleanup,
+		Failure: &fastletapi.FastletError{
+			Code:    fastletapi.ErrorInvalidRequest,
+			Message: "invalid sandbox config; cleanup failed",
+		},
+	}
+	_, err = server.CreateSandbox(context.Background(), createRequest("invalid-config-cleanup"))
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.Equal(t, []string{"10.0.0.1"}, fastlet.createIPs)
+	var needsCleanup apiv1alpha2.Sandbox
+	require.NoError(t, k8sClient.Client.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "invalid-config-cleanup"}, &needsCleanup))
+	require.Nil(t, needsCleanup.DeletionTimestamp)
+}
+
 func TestCandidateRefreshKeepsAssignmentProfiles(t *testing.T) {
 	server, _, registry, fastlet := newV2Server(t)
 	for i := 1; i < 5; i++ {

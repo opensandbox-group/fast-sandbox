@@ -391,3 +391,8 @@ func TestFastletServerTracesAuthenticationRejections(t *testing.T) {
 	require.True(t, statuses[http.StatusForbidden],
 		"forbidden subjects must appear in the Fastlet's own spans with their status code")
 }
+
+func TestStatusForFastletErrorInvalidRequest(t *testing.T) {
+	err := &fastletapi.FastletError{Code: fastletapi.ErrorInvalidRequest, Message: "invalid sandbox config"}
+	require.Equal(t, http.StatusBadRequest, statusForFastletError(err))
+}

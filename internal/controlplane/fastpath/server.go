@@ -401,13 +401,8 @@ func (s *Server) provisionRuntime(ctx context.Context, accepted *acceptedCreate,
 		if callErr == nil {
 			return nil, status.Error(codes.Unavailable, "Fastlet Create returned no Sandbox observation; Sandbox intent is persisted for Controller recovery")
 		}
-		// A local reservation conflict happens before the Fastlet RPC. It is a
-		// definitive rejection only while this call owns the newly created
-		// intent, so candidate retry or rollback cannot disrupt an idempotent
-		// replay that is already using the durable assignment.
-		ownedLocalRejection := accepted.created && errors.Is(callErr, orchestration.ErrLocalReservationConflict)
-		if !orchestration.IsCandidateRejection(callErr) && !ownedLocalRejection {
-			return nil, status.Errorf(codes.Unavailable, "Sandbox intent is persisted and Controller will retry: %v", callErr)
+		if err, retryable := s.handleProvisionFailure(ctx, accepted, callErr); !retryable {
+			return nil, err
 		}
 		hasBudget := len(tried) < maxCreateCandidateAttempts
 		if accepted.created && index+1 == len(accepted.candidates) && hasBudget {
@@ -426,6 +421,27 @@ func (s *Server) provisionRuntime(ctx context.Context, accepted *acceptedCreate,
 		return s.finishRejectedCreate(ctx, accepted, callErr)
 	}
 	return nil, status.Error(codes.ResourceExhausted, orchestration.ErrNoCandidate.Error())
+}
+
+func (s *Server) handleProvisionFailure(ctx context.Context, accepted *acceptedCreate, callErr error) (error, bool) {
+	if orchestration.IsInvalidRequestRejection(callErr) {
+		if accepted.created {
+			uid := accepted.sandbox.UID
+			if delErr := s.K8sClient.Delete(ctx, accepted.sandbox, client.Preconditions{UID: &uid}); delErr != nil && !apierrors.IsNotFound(delErr) {
+				klog.FromContext(ctx).Error(delErr, "delete Sandbox CR after invalid request rejection", "sandbox", accepted.sandbox.Name)
+			}
+		}
+		return status.Errorf(codes.InvalidArgument, "invalid Sandbox configuration: %v", callErr), false
+	}
+	// A local reservation conflict happens before the Fastlet RPC. It is a
+	// definitive rejection only while this call owns the newly created intent,
+	// so candidate retry or rollback cannot disrupt an idempotent replay that
+	// is already using the durable assignment.
+	ownedLocalRejection := accepted.created && errors.Is(callErr, orchestration.ErrLocalReservationConflict)
+	if !orchestration.IsCandidateRejection(callErr) && !ownedLocalRejection {
+		return status.Errorf(codes.Unavailable, "Sandbox intent is persisted and Controller will retry: %v", callErr), false
+	}
+	return nil, true
 }
 
 func (s *Server) finishRejectedCreate(ctx context.Context, accepted *acceptedCreate, rejection error) (*fastletapi.SandboxStatus, error) {

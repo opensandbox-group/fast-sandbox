@@ -835,6 +835,23 @@ func TestEnsureIncompatibleArtifactMapsToProfileMismatch(t *testing.T) {
 	require.Equal(t, fastletapi.CreateDispositionRejectedBeforeSideEffects, response.Disposition)
 }
 
+func TestEnsureInvalidConfigMapsToInvalidRequest(t *testing.T) {
+	runtime := newAdmissionRuntime()
+	runtime.ensureError = fmt.Errorf("%w: requested CPU 2 permits 2 vCPU(s), below the template snapshot vCPU count 4", runtimecontract.ErrInvalidConfig)
+	manager := newAdmissionManager(t, runtime, 1)
+	response, err := manager.CreateSandbox(context.Background(), ensureRequest("sandbox-invalid-config", 1, 1))
+	requireFastletCode(t, err, fastletapi.ErrorInvalidRequest)
+	var failure *fastletapi.FastletError
+	require.True(t, errors.As(err, &failure))
+	require.False(t, failure.Retryable)
+	require.Equal(t, fastletapi.CreateDispositionRejectedBeforeSideEffects, response.Disposition)
+
+	runtime.deleteError = errors.New("cleanup failed")
+	response, err = manager.CreateSandbox(context.Background(), ensureRequest("sandbox-invalid-config-cleanup", 1, 1))
+	requireFastletCode(t, err, fastletapi.ErrorInvalidRequest)
+	require.Equal(t, fastletapi.CreateDispositionFailedNeedsCleanup, response.Disposition)
+}
+
 func TestEnsureFailureReleasesCapacity(t *testing.T) {
 	runtime := newAdmissionRuntime()
 	runtime.ensureError = errors.New("create failed")

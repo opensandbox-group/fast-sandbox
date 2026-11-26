@@ -578,6 +578,10 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 			createErr = fmt.Errorf("%w: %w", ErrUnknownFastletOutcome, createErr)
 		}
 	}
+	if IsInvalidRequestRejection(createErr) {
+		o.recordAdmissionSnapshot(fastlet, response)
+		return response, createErr
+	}
 	o.recordFeedback(fastlet, response, createErr)
 	return response, createErr
 }
@@ -952,6 +956,16 @@ func envMap(values []corev1.EnvVar) map[string]string {
 		result[value.Name] = value.Value
 	}
 	return result
+}
+
+// IsInvalidRequestRejection reports a deterministic client/configuration
+// rejection from Fastlet before any runtime side effects. It must not penalize
+// the Fastlet candidate or trigger candidate retries.
+func IsInvalidRequestRejection(err error) bool {
+	var failure *fastletapi.FastletError
+	return errors.As(err, &failure) &&
+		failure.Code == fastletapi.ErrorInvalidRequest &&
+		fastletapi.CreateDispositionFromError(err) == fastletapi.CreateDispositionRejectedBeforeSideEffects
 }
 
 func IsCandidateRejection(err error) bool {

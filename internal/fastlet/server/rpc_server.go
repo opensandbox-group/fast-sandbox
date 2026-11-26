@@ -310,6 +310,8 @@ func statusForFastletError(err error) int {
 		return http.StatusServiceUnavailable
 	case fastletapi.ErrorNotFound:
 		return http.StatusNotFound
+	case fastletapi.ErrorInvalidRequest:
+		return http.StatusBadRequest
 	case fastletapi.ErrorSnapshotUnsupported:
 		return http.StatusNotImplemented
 	case fastletapi.ErrorSnapshotInProgress:
