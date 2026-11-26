@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"math/big"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -256,6 +257,7 @@ func TestInjectRuntimeBakesMitmCertificateAndGate(t *testing.T) {
 		Envs: []corev1.EnvVar{
 			{Name: guestMITMTrustGate, Value: "false"},
 			{Name: guestMITMStabilizeWindow, Value: "15"},
+			{Name: guestMITMWatchInterval, Value: "30"},
 		},
 		EgressMITMCertificate: &apiv1alpha2.MITMCertificateSpec{
 			SecretRef: corev1.LocalObjectReference{Name: "mitm-ca"},
@@ -288,6 +290,7 @@ func TestInjectRuntimeBakesMitmCertificateAndGate(t *testing.T) {
 	}{
 		{"trust gate", "export " + guestMITMTrustGate + "='false'", "export " + guestMITMTrustGate + "=true"},
 		{"stabilize window", "export " + guestMITMStabilizeWindow + "='15'", "export " + guestMITMStabilizeWindow + "=0"},
+		{"watch interval", "export " + guestMITMWatchInterval + "='30'", "export " + guestMITMWatchInterval + "=0"},
 	} {
 		userIdx := strings.Index(envContent, check.userLine)
 		bakedIdx := strings.LastIndex(envContent, check.baked)
@@ -316,7 +319,140 @@ func TestInjectRuntimeWithoutMitmCertificate(t *testing.T) {
 		t.Fatalf("read sandbox-init.env: %v", err)
 	}
 	envContent := string(envPayload)
-	if strings.Contains(envContent, guestMITMTrustGate) || strings.Contains(envContent, guestMITMStabilizeWindow) {
+	if strings.Contains(envContent, guestMITMTrustGate) || strings.Contains(envContent, guestMITMStabilizeWindow) || strings.Contains(envContent, guestMITMWatchInterval) {
 		t.Fatalf("sandbox-init.env must not set MITM vars without egressMitmCertificate:\n%s", envContent)
+	}
+}
+
+func TestRenderGuestInitMITMCAReadinessGate(t *testing.T) {
+	withoutCA := renderGuestInit(apiv1alpha2.SandboxTemplateSpec{Execd: "opensandbox/execd:1.1.0"})
+	if strings.Contains(withoutCA, "mitm_ca_not_installed") {
+		t.Fatalf("init must omit MITM CA readiness gate when egressMitmCertificate is unset")
+	}
+
+	withCA := renderGuestInit(apiv1alpha2.SandboxTemplateSpec{
+		Execd: "opensandbox/execd:1.1.0",
+		EgressMITMCertificate: &apiv1alpha2.MITMCertificateSpec{
+			SecretRef: corev1.LocalObjectReference{Name: "mitm-ca"},
+			Key:       "ca.crt",
+		},
+	})
+	gateIdx := strings.Index(withCA, `echo "SANDBOX_STARTUP_FAILED mitm_ca_not_installed"`)
+	readyIdx := strings.Index(withCA, "echo SANDBOX_READY")
+	if gateIdx == -1 || readyIdx == -1 || gateIdx > readyIdx {
+		t.Fatalf("MITM CA readiness gate must appear before SANDBOX_READY (gate=%d, ready=%d)", gateIdx, readyIdx)
+	}
+}
+
+// Execute the rendered MITM CA readiness gate with real sh under set -eu to
+// verify Debian, RHEL, and minimal (no-tooling) trust-store outcomes.
+func TestMITMCAReadinessGateBehavior(t *testing.T) {
+	certPEM := testCACertificatePEM(t)
+	otherPEM := testCACertificatePEM(t)
+	gate := renderMITMCAReadinessGate(apiv1alpha2.SandboxTemplateSpec{
+		EgressMITMCertificate: &apiv1alpha2.MITMCertificateSpec{
+			SecretRef: corev1.LocalObjectReference{Name: "mitm-ca"},
+		},
+	})
+
+	tests := []struct {
+		name        string
+		tool        string
+		anchor      []byte
+		bundle      []byte
+		wantLog     string
+		wantFailure bool
+	}{
+		{name: "debian installed", tool: "update-ca-certificates", anchor: certPEM, bundle: append([]byte("root\n"), certPEM...), wantLog: "mitm CA verified in system trust store (update-ca-certificates)"},
+		{name: "debian missing anchor", tool: "update-ca-certificates", bundle: certPEM, wantFailure: true},
+		{name: "debian missing from bundle", tool: "update-ca-certificates", anchor: certPEM, bundle: otherPEM, wantFailure: true},
+		{name: "rhel installed", tool: "update-ca-trust", anchor: certPEM, bundle: append([]byte("root\n"), certPEM...), wantLog: "mitm CA verified in system trust store (update-ca-trust)"},
+		{name: "rhel missing from bundle", tool: "update-ca-trust", anchor: certPEM, bundle: otherPEM, wantFailure: true},
+		{name: "minimal image without trust tooling", tool: "", wantLog: "mitm CA trust-store check skipped (no update-ca-certificates or update-ca-trust)"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			binDir := filepath.Join(root, "bin")
+			if err := os.MkdirAll(binDir, 0o755); err != nil {
+				t.Fatalf("mkdir bin: %v", err)
+			}
+			for _, name := range []string{"grep", "head", "tail"} {
+				src, err := exec.LookPath(name)
+				if err != nil {
+					t.Fatalf("lookpath %s: %v", name, err)
+				}
+				if err := os.Symlink(src, filepath.Join(binDir, name)); err != nil {
+					t.Fatalf("symlink %s: %v", name, err)
+				}
+			}
+			if test.tool != "" {
+				if err := os.WriteFile(filepath.Join(binDir, test.tool), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+					t.Fatalf("write stub %s: %v", test.tool, err)
+				}
+			}
+
+			bakedPath := filepath.Join(root, "mitmproxy-ca-cert.pem")
+			if err := os.WriteFile(bakedPath, certPEM, 0o644); err != nil {
+				t.Fatalf("write baked cert: %v", err)
+			}
+			debAnchor := filepath.Join(root, "opensandbox-mitmproxy-ca.crt")
+			debBundle := filepath.Join(root, "ca-certificates.crt")
+			rhelAnchor := filepath.Join(root, "opensandbox-mitmproxy-ca.pem")
+			rhelBundle := filepath.Join(root, "tls-ca-bundle.pem")
+			if test.tool == "update-ca-certificates" {
+				if len(test.anchor) > 0 {
+					if err := os.WriteFile(debAnchor, test.anchor, 0o644); err != nil {
+						t.Fatalf("write debian anchor: %v", err)
+					}
+				}
+				if len(test.bundle) > 0 {
+					if err := os.WriteFile(debBundle, test.bundle, 0o644); err != nil {
+						t.Fatalf("write debian bundle: %v", err)
+					}
+				}
+			} else if test.tool == "update-ca-trust" {
+				if len(test.anchor) > 0 {
+					if err := os.WriteFile(rhelAnchor, test.anchor, 0o644); err != nil {
+						t.Fatalf("write rhel anchor: %v", err)
+					}
+				}
+				if len(test.bundle) > 0 {
+					if err := os.WriteFile(rhelBundle, test.bundle, 0o644); err != nil {
+						t.Fatalf("write rhel bundle: %v", err)
+					}
+				}
+			}
+
+			script := "set -eu\n" + gate + "echo GATE_OK\n"
+			script = strings.ReplaceAll(script, guestMITMCertPath, bakedPath)
+			script = strings.ReplaceAll(script, "/usr/local/share/ca-certificates/opensandbox-mitmproxy-ca.crt", debAnchor)
+			script = strings.ReplaceAll(script, "/etc/ssl/certs/ca-certificates.crt", debBundle)
+			script = strings.ReplaceAll(script, "/etc/pki/ca-trust/source/anchors/opensandbox-mitmproxy-ca.pem", rhelAnchor)
+			script = strings.ReplaceAll(script, "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", rhelBundle)
+
+			cmd := exec.Command("/bin/sh", "-c", script)
+			cmd.Env = []string{"PATH=" + binDir}
+			out, err := cmd.CombinedOutput()
+			if test.wantFailure {
+				if err == nil {
+					t.Fatalf("expected gate failure, got success:\n%s", out)
+				}
+				if !strings.Contains(string(out), "SANDBOX_STARTUP_FAILED mitm_ca_not_installed") {
+					t.Fatalf("expected mitm_ca_not_installed marker, got:\n%s", out)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected gate success, got %v:\n%s", err, out)
+			}
+			if !strings.Contains(string(out), "GATE_OK") {
+				t.Fatalf("expected GATE_OK, got:\n%s", out)
+			}
+			if test.wantLog != "" && !strings.Contains(string(out), test.wantLog) {
+				t.Fatalf("expected log %q, got:\n%s", test.wantLog, out)
+			}
+		})
 	}
 }

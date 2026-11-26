@@ -205,6 +205,7 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 		envLines = append(envLines,
 			"export "+guestMITMTrustGate+"=true",
 			"export "+guestMITMStabilizeWindow+"=0",
+			"export "+guestMITMWatchInterval+"=0",
 		)
 	}
 	if err := os.WriteFile(filepath.Join(mountPoint, "etc", "sandbox-init.env"),
@@ -430,7 +431,7 @@ else
     until /bin/sh -c "$HEALTHCHECK" >/dev/null 2>&1; do sleep 1; done
   fi
 fi
-echo SANDBOX_READY
+` + renderMITMCAReadinessGate(spec) + `echo SANDBOX_READY
 while true; do echo SANDBOX_HEARTBEAT; sleep 5; done
 `
 }

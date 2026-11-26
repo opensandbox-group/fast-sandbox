@@ -31,6 +31,44 @@ const guestMITMTrustGate = "OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT"
 // purge/re-export would stall every template build and RootfsOnly cold boot.
 const guestMITMStabilizeWindow = "MITM_CA_STABILIZE_WINDOW"
 
+// guestMITMWatchInterval disables execd bootstrap's background 30s CA rotation
+// watcher. Baked VM CAs never rotate in place, so leaving the watcher armed
+// would freeze an idle sleep loop into every template snapshot.
+const guestMITMWatchInterval = "MITM_CA_WATCH_INTERVAL"
+
+// renderMITMCAReadinessGate emits a shell gate that fails the template build
+// before SANDBOX_READY if a baked MITM CA did not land in the guest's system
+// trust store (e.g. update-ca-certificates failed or readiness fired before
+// bootstrap finished trusting the CA).
+func renderMITMCAReadinessGate(spec apiv1alpha2.SandboxTemplateSpec) string {
+	if spec.EgressMITMCertificate == nil {
+		return ""
+	}
+	// Use the penultimate base64 line (inside the certificate signature) rather
+	// than line 1, which can collide across X.509 certs sharing ASN.1 headers.
+	return `mitm_ca_line="$(grep -v '^-----' ` + guestMITMCertPath + ` 2>/dev/null | tail -n 2 | head -n 1 || true)"
+if [ -z "$mitm_ca_line" ]; then
+  echo "SANDBOX_STARTUP_FAILED mitm_ca_not_installed"
+  exit 1
+fi
+if command -v update-ca-certificates >/dev/null 2>&1; then
+  if [ ! -s /usr/local/share/ca-certificates/opensandbox-mitmproxy-ca.crt ] || ! grep -Fq "$mitm_ca_line" /etc/ssl/certs/ca-certificates.crt 2>/dev/null; then
+    echo "SANDBOX_STARTUP_FAILED mitm_ca_not_installed"
+    exit 1
+  fi
+  echo "mitm CA verified in system trust store (update-ca-certificates)"
+elif command -v update-ca-trust >/dev/null 2>&1; then
+  if [ ! -s /etc/pki/ca-trust/source/anchors/opensandbox-mitmproxy-ca.pem ] || ! grep -Fq "$mitm_ca_line" /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem 2>/dev/null; then
+    echo "SANDBOX_STARTUP_FAILED mitm_ca_not_installed"
+    exit 1
+  fi
+  echo "mitm CA verified in system trust store (update-ca-trust)"
+else
+  echo "mitm CA trust-store check skipped (no update-ca-certificates or update-ca-trust)"
+fi
+`
+}
+
 // mitmCALineage is one baked certificate's public-key identity for the
 // manifest lineage (lineage.egressMitmCA.certificates[]) — fingerprints
 // only, never key or Secret material.
