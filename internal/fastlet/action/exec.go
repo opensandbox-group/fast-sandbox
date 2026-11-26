@@ -493,7 +493,7 @@ func (m *Manager) runExecAttempt(ctx context.Context, spec *execInvocationSpec, 
 
 	terminal := spec.op == execOpApply && cfg.FailurePolicy == apiv1alpha2.ExecActionFailurePolicyFailSandbox && (nonRetryable || attempt == spec.maxAttempts)
 	logExecFailure(spec, attempt, res, nonRetryable, terminal, duration, resultLabel, output, attemptErr)
-	m.recordExecFailureStatus(spec, attempt, res.ExitCode, terminal, attemptErr)
+	m.recordExecFailureStatus(spec, attempt, res.ExitCode, nonRetryable, terminal, attemptErr)
 
 	if terminal {
 		m.notifyTerminalFailure(att.SandboxUID, att, spec.handler.Name, attemptErr.Error())
@@ -536,7 +536,21 @@ func logExecFailure(spec *execInvocationSpec, attempt int, res ExecResult, nonRe
 		"durationMs", duration.Milliseconds(), "outcome", resultLabel, "output", output)
 }
 
-func (m *Manager) recordExecFailureStatus(spec *execInvocationSpec, attempt, exitCode int, terminal bool, attemptErr error) {
+func clearSensitiveInputLocked(state *sandboxState, handlerName string) {
+	if state == nil {
+		return
+	}
+	if binding := state.bindings[handlerName]; binding != nil {
+		binding.sensitiveInput = ""
+	}
+	for index := range state.desired {
+		if state.desired[index].Handler == handlerName {
+			state.desired[index].SensitiveInput = ""
+		}
+	}
+}
+
+func (m *Manager) recordExecFailureStatus(spec *execInvocationSpec, attempt, exitCode int, nonRetryable, terminal bool, attemptErr error) {
 	if spec.state == nil || spec.op != execOpApply {
 		return
 	}
@@ -545,7 +559,10 @@ func (m *Manager) recordExecFailureStatus(spec *execInvocationSpec, attempt, exi
 		switch {
 		case terminal:
 			binding.terminalFailed = true
-			binding.sensitiveInput = ""
+			clearSensitiveInputLocked(spec.state, spec.handler.Name)
+			setBindingStatus(binding, apiv1alpha2.ActionFailed, attemptErr.Error())
+		case nonRetryable:
+			clearSensitiveInputLocked(spec.state, spec.handler.Name)
 			setBindingStatus(binding, apiv1alpha2.ActionFailed, attemptErr.Error())
 		case attempt < spec.maxAttempts:
 			setBindingStatus(binding, apiv1alpha2.ActionApplying, fmt.Sprintf("exec attempt %d/%d failed (exit=%d), retrying", attempt, spec.maxAttempts, exitCode))
@@ -630,7 +647,7 @@ func (m *Manager) setExecBinding(
 
 	if skipMsg, skipOutcome, skip := execSkipReason(cfg, attachment); skip {
 		binding.input = *input
-		binding.sensitiveInput = ""
+		clearSensitiveInputLocked(state, handlerName)
 		binding.digest = digest
 		binding.appliedGeneration = generation
 		binding.attachmentID = attachment.ID
@@ -662,7 +679,7 @@ func (m *Manager) setExecBinding(
 		return errors.New("SetBinding result belongs to an obsolete Sandbox revision")
 	}
 	binding.input = *input
-	binding.sensitiveInput = ""
+	clearSensitiveInputLocked(state, handlerName)
 	binding.digest = digest
 	binding.appliedGeneration = generation
 	binding.attachmentID = attachment.ID
@@ -693,7 +710,7 @@ func (m *Manager) invokeExecHook(
 	}
 	if skipMsg, skipOutcome, skip := execSkipReason(cfg, attachment); skip {
 		binding.appliedHooks[checkpoint.Name] = checkpoint.Sequence
-		binding.sensitiveInput = ""
+		clearSensitiveInputLocked(state, handlerName)
 		binding.readyMessage = skipMsg
 		m.refreshBindingStatusLocked(state, handlerName, binding)
 		state.mu.Unlock()
@@ -725,7 +742,7 @@ func (m *Manager) invokeExecHook(
 		return errors.New("Lifecycle Hook result belongs to an obsolete Sandbox revision")
 	}
 	binding.appliedHooks[checkpoint.Name] = checkpoint.Sequence
-	binding.sensitiveInput = ""
+	clearSensitiveInputLocked(state, handlerName)
 	binding.readyMessage = ""
 	m.refreshBindingStatusLocked(state, handlerName, binding)
 	state.mu.Unlock()

@@ -673,8 +673,31 @@ func (m *Manager) registerDesired(state *sandboxState, attachment Attachment, ge
 			binding.appliedHooks = make(map[actionapi.LifecycleHook]int64)
 		}
 	}
+	sameAttachment := state.attachment.ID == attachment.ID
+	nextDesired := appendDesired(nil, desired)
+	if sameAttachment && len(state.desired) > 0 {
+		prevSensitive := make(map[string]string)
+		for _, prev := range state.desired {
+			if prev.SensitiveInput != "" {
+				prevSensitive[prev.Handler] = prev.SensitiveInput
+			}
+		}
+		for index := range nextDesired {
+			if nextDesired[index].SensitiveInput != "" {
+				continue
+			}
+			secret, found := prevSensitive[nextDesired[index].Handler]
+			if !found {
+				continue
+			}
+			binding := state.bindings[nextDesired[index].Handler]
+			if binding == nil || (!binding.terminalFailed && binding.status.State != string(apiv1alpha2.ActionReady)) {
+				nextDesired[index].SensitiveInput = secret
+			}
+		}
+	}
 	state.attachment = attachment
-	state.desired = appendDesired(nil, desired)
+	state.desired = nextDesired
 	state.desiredGeneration, state.desiredSignature = generation, signature
 	return nil
 }

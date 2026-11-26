@@ -366,11 +366,47 @@ func TestExecActionSensitiveFileMaterializedAndCleanedUp(t *testing.T) {
 	// Temp file must be removed immediately after execution.
 	_, statErr := os.Stat(observedPath)
 	require.True(t, os.IsNotExist(statErr))
-	// Secret must be cleared from Fastlet memory after completion.
+	// Secret must be cleared from both binding and state.desired in Fastlet memory.
 	state := mgr.getState(att.SandboxUID)
 	state.mu.RLock()
 	require.Empty(t, state.bindings["runtime-init"].sensitiveInput)
+	for _, d := range state.desired {
+		require.Empty(t, d.SensitiveInput)
+	}
 	state.mu.RUnlock()
+
+	// Parked cold-boot (IP == "") must preserve unconsumed SensitiveInput across
+	// a ReconcileBindings call with SensitiveInput == "" until the IP attaches.
+	observedPath, observedContent = "", ""
+	parked := attachment("sb-parked-sensitive")
+	parked.IP = ""
+	require.NoError(t, mgr.RegisterDesired(parked, 1, []DesiredInput{{
+		Handler:        "runtime-init",
+		Input:          `{"sandboxId":"sb-parked-sensitive"}`,
+		SensitiveInput: "X-EXECD-ACCESS-TOKEN: parked-secret\n",
+	}}))
+	// Re-register at generation 2 with empty SensitiveInput while still unattached.
+	_, _, err = mgr.Reconcile(context.Background(), parked, 2, []DesiredInput{{
+		Handler: "runtime-init",
+		Input:   `{"sandboxId":"sb-parked-sensitive"}`,
+	}})
+	require.NoError(t, err)
+	// Now network attaches and hook fires: preserved secret must be delivered.
+	parked.IP = "172.30.0.2"
+	_, _, err = mgr.Reconcile(context.Background(), parked, 2, []DesiredInput{{
+		Handler: "runtime-init",
+		Input:   `{"sandboxId":"sb-parked-sensitive"}`,
+	}})
+	require.NoError(t, err)
+	require.NoError(t, mgr.ReachHook(context.Background(), parked.SandboxUID, parked, actionapi.LifecycleHookDataPlaneReady, 1))
+	require.Equal(t, "X-EXECD-ACCESS-TOKEN: parked-secret\n", observedContent)
+	parkedState := mgr.getState(parked.SandboxUID)
+	parkedState.mu.RLock()
+	require.Empty(t, parkedState.bindings["runtime-init"].sensitiveInput)
+	for _, d := range parkedState.desired {
+		require.Empty(t, d.SensitiveInput)
+	}
+	parkedState.mu.RUnlock()
 
 	// Empty sensitive_input still creates an empty 0600 file and cleans it up.
 	observedPath, observedContent = "", "sentinel"
