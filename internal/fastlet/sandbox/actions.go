@@ -105,7 +105,7 @@ func desiredActionInputs(bindings []fastletapi.ActionBindingInput) []fastletacti
 		desired = append(desired, fastletaction.DesiredInput{
 			Handler:        input.Handler,
 			Input:          input.Input,
-			EphemeralInput: input.EphemeralInput,
+			SensitiveInput: input.SensitiveInput,
 		})
 	}
 	return desired

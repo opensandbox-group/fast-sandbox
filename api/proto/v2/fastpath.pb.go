@@ -1213,12 +1213,12 @@ type ActionBinding struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
 	Handler string                 `protobuf:"bytes,1,opt,name=handler,proto3" json:"handler,omitempty"`
 	Input   string                 `protobuf:"bytes,2,opt,name=input,proto3" json:"input,omitempty"`
-	// ephemeral_input carries create-time sensitive material (for example,
+	// sensitive_input carries create-time sensitive material (for example,
 	// curl header lines containing a per-Sandbox plaintext token) delivered
 	// only in memory to a Fastlet-local exec ActionHandler via
-	// {{.Ephemeral.File}}. It is never persisted to the Sandbox CRD, etcd, or
+	// {{.Sensitive.File}}. It is never persisted to the Sandbox CRD, etcd, or
 	// durable node state, and is rejected on UpdateSandbox and HTTP handlers.
-	EphemeralInput string `protobuf:"bytes,3,opt,name=ephemeral_input,json=ephemeralInput,proto3" json:"ephemeral_input,omitempty"`
+	SensitiveInput string `protobuf:"bytes,3,opt,name=sensitive_input,json=sensitiveInput,proto3" json:"sensitive_input,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -1267,9 +1267,9 @@ func (x *ActionBinding) GetInput() string {
 	return ""
 }
 
-func (x *ActionBinding) GetEphemeralInput() string {
+func (x *ActionBinding) GetSensitiveInput() string {
 	if x != nil {
-		return x.EphemeralInput
+		return x.SensitiveInput
 	}
 	return ""
 }
@@ -4352,7 +4352,7 @@ const file_api_proto_v2_fastpath_proto_rawDesc = "" +
 	"\rActionBinding\x12\x18\n" +
 	"\ahandler\x18\x01 \x01(\tR\ahandler\x12\x14\n" +
 	"\x05input\x18\x02 \x01(\tR\x05input\x12'\n" +
-	"\x0fephemeral_input\x18\x03 \x01(\tR\x0eephemeralInput\"\xd7\x06\n" +
+	"\x0fsensitive_input\x18\x03 \x01(\tR\x0esensitiveInput\"\xd7\x06\n" +
 	"\x14CreateSandboxRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1c\n" +

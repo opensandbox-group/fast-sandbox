@@ -107,7 +107,7 @@ func (s *Server) createSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	if err != nil {
 		return nil, err
 	}
-	bindings, ephemeralInputs, err := buildActionBindings(request, pool)
+	bindings, sensitiveInputs, err := buildActionBindings(request, pool)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +141,7 @@ func (s *Server) createSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "resolve Sandbox resources: %v", err)
 	}
-	parameters.EphemeralActionInputs = ephemeralInputs
+	parameters.SensitiveActionInputs = sensitiveInputs
 	assignment.ProjectResolvedResourceAnnotations(sandbox, pool.Spec.SandboxResources.Hash(), parameters.ResolvedResources)
 	rankedFastlets, envelope, selectionErr := s.selectFastletsForPool(ctx, orchestrator, sandbox, request.RequestId, parameters)
 	if selectionErr != nil && status.Code(selectionErr) != codes.ResourceExhausted {
@@ -228,14 +228,14 @@ func buildActionBindings(request *fastpathv2.CreateSandboxRequest, pool *apiv1al
 	if err := (&apiv1alpha2.SandboxSpec{ActionBindings: bindings}).ValidateActionBindings(pool.Spec.ActionHandlers); err != nil {
 		return nil, nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	ephemeralInputs, err := extractEphemeralActionInputs(request.ActionBindings, pool.Spec.ActionHandlers)
+	sensitiveInputs, err := extractSensitiveActionInputs(request.ActionBindings, pool.Spec.ActionHandlers)
 	if err != nil {
 		return nil, nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	return bindings, ephemeralInputs, nil
+	return bindings, sensitiveInputs, nil
 }
 
-func extractEphemeralActionInputs(items []*fastpathv2.ActionBinding, handlers []apiv1alpha2.ActionHandler) (map[string]string, error) {
+func extractSensitiveActionInputs(items []*fastpathv2.ActionBinding, handlers []apiv1alpha2.ActionHandler) (map[string]string, error) {
 	execHandlers := make(map[string]struct{}, len(handlers))
 	for _, h := range handlers {
 		if h.Exec != nil {
@@ -245,23 +245,23 @@ func extractEphemeralActionInputs(items []*fastpathv2.ActionBinding, handlers []
 	var result map[string]string
 	total := 0
 	for _, item := range items {
-		if item == nil || item.EphemeralInput == "" {
+		if item == nil || item.SensitiveInput == "" {
 			continue
 		}
 		if _, isExec := execHandlers[item.Handler]; !isExec {
-			return nil, fmt.Errorf("ephemeral_input is only supported for exec Action Handlers (%q is not an exec handler)", item.Handler)
+			return nil, fmt.Errorf("sensitive_input is only supported for exec Action Handlers (%q is not an exec handler)", item.Handler)
 		}
-		if len(item.EphemeralInput) > apiv1alpha2.MaxActionBindingInputBytes {
-			return nil, fmt.Errorf("action Binding %q ephemeral_input exceeds %d bytes", item.Handler, apiv1alpha2.MaxActionBindingInputBytes)
+		if len(item.SensitiveInput) > apiv1alpha2.MaxActionBindingInputBytes {
+			return nil, fmt.Errorf("action Binding %q sensitive_input exceeds %d bytes", item.Handler, apiv1alpha2.MaxActionBindingInputBytes)
 		}
-		total += len(item.EphemeralInput)
+		total += len(item.SensitiveInput)
 		if total > apiv1alpha2.MaxSandboxActionBindingInputBytes {
-			return nil, fmt.Errorf("action Binding ephemeral_inputs exceed %d bytes", apiv1alpha2.MaxSandboxActionBindingInputBytes)
+			return nil, fmt.Errorf("action Binding sensitive_inputs exceed %d bytes", apiv1alpha2.MaxSandboxActionBindingInputBytes)
 		}
 		if result == nil {
 			result = make(map[string]string)
 		}
-		result[item.Handler] = item.EphemeralInput
+		result[item.Handler] = item.SensitiveInput
 	}
 	return result, nil
 }
@@ -774,8 +774,8 @@ func (s *Server) applyActionBindingsUpdate(ctx context.Context, sandbox *apiv1al
 		return status.Error(codes.InvalidArgument, "action_bindings is required")
 	}
 	for _, item := range update.Items {
-		if item != nil && item.EphemeralInput != "" {
-			return status.Error(codes.InvalidArgument, "ephemeral_input is only supported at Sandbox creation")
+		if item != nil && item.SensitiveInput != "" {
+			return status.Error(codes.InvalidArgument, "sensitive_input is only supported at Sandbox creation")
 		}
 	}
 	bindings, err := apiActionBindings(update.Items)

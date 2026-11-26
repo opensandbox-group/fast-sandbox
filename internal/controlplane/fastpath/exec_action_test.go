@@ -44,23 +44,23 @@ func TestValidateExecActionBindingsImmutable(t *testing.T) {
 	), "cannot be added")
 }
 
-func TestExtractEphemeralActionInputs(t *testing.T) {
+func TestExtractSensitiveActionInputs(t *testing.T) {
 	handlers := []apiv1alpha2.ActionHandler{
 		{Name: "egress", TargetHTTPPort: 18080},
-		{Name: "runtime-init", Exec: &apiv1alpha2.ExecActionHandler{Command: []string{"/usr/bin/curl", "-H", "@{{.Ephemeral.File}}"}}},
+		{Name: "runtime-init", Exec: &apiv1alpha2.ExecActionHandler{Command: []string{"/usr/bin/curl", "-H", "@{{.Sensitive.File}}"}}},
 	}
 
-	// Exec handler accepts ephemeral_input; CRD ActionBinding omits it.
-	extracted, err := extractEphemeralActionInputs([]*fastpathv2.ActionBinding{
+	// Exec handler accepts sensitive_input; CRD ActionBinding omits it.
+	extracted, err := extractSensitiveActionInputs([]*fastpathv2.ActionBinding{
 		{Handler: "egress", Input: `{"v":1}`},
-		{Handler: "runtime-init", Input: `{"sandboxId":"sb-1"}`, EphemeralInput: "X-Token: secret\n"},
+		{Handler: "runtime-init", Input: `{"sandboxId":"sb-1"}`, SensitiveInput: "X-Token: secret\n"},
 	}, handlers)
 	require.NoError(t, err)
 	require.Equal(t, map[string]string{"runtime-init": "X-Token: secret\n"}, extracted)
 
-	// HTTP handler rejects ephemeral_input.
-	_, err = extractEphemeralActionInputs([]*fastpathv2.ActionBinding{
-		{Handler: "egress", Input: `{"v":1}`, EphemeralInput: "X-Token: secret\n"},
+	// HTTP handler rejects sensitive_input.
+	_, err = extractSensitiveActionInputs([]*fastpathv2.ActionBinding{
+		{Handler: "egress", Input: `{"v":1}`, SensitiveInput: "X-Token: secret\n"},
 	}, handlers)
 	require.ErrorContains(t, err, "only supported for exec Action Handlers")
 }

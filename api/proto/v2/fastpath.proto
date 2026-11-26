@@ -164,12 +164,12 @@ message CheckpointInfo {
 message ActionBinding {
   string handler = 1;
   string input = 2;
-  // ephemeral_input carries create-time sensitive material (for example,
+  // sensitive_input carries create-time sensitive material (for example,
   // curl header lines containing a per-Sandbox plaintext token) delivered
   // only in memory to a Fastlet-local exec ActionHandler via
-  // {{.Ephemeral.File}}. It is never persisted to the Sandbox CRD, etcd, or
+  // {{.Sensitive.File}}. It is never persisted to the Sandbox CRD, etcd, or
   // durable node state, and is rejected on UpdateSandbox and HTTP handlers.
-  string ephemeral_input = 3;
+  string sensitive_input = 3;
 }
 
 enum CreateCompletion {

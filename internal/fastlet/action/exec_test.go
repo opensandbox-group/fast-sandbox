@@ -317,11 +317,11 @@ func TestOSExecRunnerDirectExecveAndProcessGroupTimeout(t *testing.T) {
 	require.Less(t, time.Since(started), 3*time.Second)
 }
 
-func TestExecActionEphemeralFileMaterializedAndCleanedUp(t *testing.T) {
+func TestExecActionSensitiveFileMaterializedAndCleanedUp(t *testing.T) {
 	handler := runtimeInitHandler()
 	handler.Exec.Command = []string{
 		"/usr/bin/curl", "-fsS",
-		"-H", "@{{.Ephemeral.File}}",
+		"-H", "@{{.Sensitive.File}}",
 		"--data-binary", "@-",
 		"http://{{.Attachment.Network.IP}}:44772/internal/init",
 	}
@@ -350,12 +350,12 @@ func TestExecActionEphemeralFileMaterializedAndCleanedUp(t *testing.T) {
 	require.NoError(t, err)
 	mgr.SetExecRunner(execRunner)
 
-	att := attachment("sb-ephemeral")
+	att := attachment("sb-sensitive")
 	secretHeader := "X-EXECD-ACCESS-TOKEN: per-sandbox-secret-123\n"
 	_, _, err = mgr.Reconcile(context.Background(), att, 1, []DesiredInput{{
 		Handler:        "runtime-init",
-		Input:          `{"sandboxId":"sb-ephemeral"}`,
-		EphemeralInput: secretHeader,
+		Input:          `{"sandboxId":"sb-sensitive"}`,
+		SensitiveInput: secretHeader,
 	}})
 	require.NoError(t, err)
 	require.NoError(t, mgr.ReachHook(context.Background(), att.SandboxUID, att, actionapi.LifecycleHookDataPlaneReady, 1))
@@ -369,15 +369,15 @@ func TestExecActionEphemeralFileMaterializedAndCleanedUp(t *testing.T) {
 	// Secret must be cleared from Fastlet memory after completion.
 	state := mgr.getState(att.SandboxUID)
 	state.mu.RLock()
-	require.Empty(t, state.bindings["runtime-init"].ephemeralInput)
+	require.Empty(t, state.bindings["runtime-init"].sensitiveInput)
 	state.mu.RUnlock()
 
-	// Empty ephemeral_input still creates an empty 0600 file and cleans it up.
+	// Empty sensitive_input still creates an empty 0600 file and cleans it up.
 	observedPath, observedContent = "", "sentinel"
-	attEmpty := attachment("sb-ephemeral-empty")
+	attEmpty := attachment("sb-sensitive-empty")
 	_, _, err = mgr.Reconcile(context.Background(), attEmpty, 1, []DesiredInput{{
 		Handler: "runtime-init",
-		Input:   `{"sandboxId":"sb-ephemeral-empty"}`,
+		Input:   `{"sandboxId":"sb-sensitive-empty"}`,
 	}})
 	require.NoError(t, err)
 	require.NoError(t, mgr.ReachHook(context.Background(), attEmpty.SandboxUID, attEmpty, actionapi.LifecycleHookDataPlaneReady, 1))

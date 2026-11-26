@@ -206,15 +206,15 @@ def _action_bindings(values: Iterable[tuple]):
     for item in values:
         if len(item) == 2:
             handler, value = item
-            ephemeral = ""
+            sensitive = ""
         elif len(item) == 3:
-            handler, value, ephemeral = item
+            handler, value, sensitive = item
         else:
-            raise TypeError("Action Binding must be a (handler, input) or (handler, input, ephemeral_input) tuple")
-        if not isinstance(value, str) or not isinstance(ephemeral, str):
-            raise TypeError("Action Binding input and ephemeral_input must be opaque strings")
+            raise TypeError("Action Binding must be a (handler, input) or (handler, input, sensitive_input) tuple")
+        if not isinstance(value, str) or not isinstance(sensitive, str):
+            raise TypeError("Action Binding input and sensitive_input must be opaque strings")
         binding = fastpath_pb2.ActionBinding(handler=handler, input=value)
-        if ephemeral:
-            binding.ephemeral_input = ephemeral
+        if sensitive:
+            binding.sensitive_input = sensitive
         result.append(binding)
     return result

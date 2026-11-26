@@ -202,7 +202,7 @@ var execTemplateSample = struct {
 			HostVeth    string
 		}
 	}
-	Ephemeral struct {
+	Sensitive struct {
 		File string
 	}
 }{}

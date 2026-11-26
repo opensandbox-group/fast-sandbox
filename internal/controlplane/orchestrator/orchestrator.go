@@ -111,7 +111,7 @@ type RuntimeParameters struct {
 	ResourceMode          apiv1alpha2.SandboxResourceMode
 	ResourceDemand        placement.ResourceDemand
 	ResolvedResources     *fastletapi.ResolvedSandboxResources
-	EphemeralActionInputs map[string]string
+	SensitiveActionInputs map[string]string
 }
 
 func (o *Orchestrator) ResolveRuntime(ctx context.Context, sandbox *apiv1alpha2.Sandbox) (RuntimeParameters, error) {
@@ -534,7 +534,7 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 	if err != nil {
 		return nil, err
 	}
-	attachEphemeralActionInputs(bindings, parameters.EphemeralActionInputs)
+	attachSensitiveActionInputs(bindings, parameters.SensitiveActionInputs)
 	spec := fastletapi.SandboxDesiredSpec{
 		Image:              sandbox.Spec.Image,
 		RuntimeProfileHash: envelope.RuntimeProfileHash, ResourceProfileHash: envelope.ResourceProfileHash,
@@ -1026,13 +1026,13 @@ func setReadyCondition(status *apiv1alpha2.SandboxStatus, generation int64, read
 	})
 }
 
-func attachEphemeralActionInputs(bindings []fastletapi.ActionBindingInput, ephemeral map[string]string) {
-	if len(ephemeral) == 0 {
+func attachSensitiveActionInputs(bindings []fastletapi.ActionBindingInput, sensitive map[string]string) {
+	if len(sensitive) == 0 {
 		return
 	}
 	for index := range bindings {
-		if secret, ok := ephemeral[bindings[index].Handler]; ok {
-			bindings[index].EphemeralInput = secret
+		if secret, ok := sensitive[bindings[index].Handler]; ok {
+			bindings[index].SensitiveInput = secret
 		}
 	}
 }

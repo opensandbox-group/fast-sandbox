@@ -229,7 +229,7 @@ type DesiredInput struct {
 	Handler        string
 	Input          string
 	Digest         string
-	EphemeralInput string
+	SensitiveInput string
 }
 
 type Attachment struct {
@@ -260,7 +260,7 @@ type HookCheckpoint struct {
 type bindingState struct {
 	status            fastletapi.ActionBindingStatus
 	input             string
-	ephemeralInput    string
+	sensitiveInput    string
 	digest            string
 	appliedGeneration int64
 	attachmentID      string
@@ -816,7 +816,7 @@ func (m *Manager) convergeLocked(ctx context.Context, state *sandboxState) error
 		}
 		if needsSet {
 			value := input.Input
-			if err := m.setBinding(ctx, state, input.Handler, generation, attachment, &value, input.EphemeralInput, input.Digest, replayHooks); err != nil {
+			if err := m.setBinding(ctx, state, input.Handler, generation, attachment, &value, input.SensitiveInput, input.Digest, replayHooks); err != nil {
 				m.notifyChanged(attachment.SandboxUID)
 				return fmt.Errorf("setBinding %s: %w", input.Handler, err)
 			}
@@ -894,10 +894,10 @@ func (m *Manager) parkUnattachedBindings(state *sandboxState, desired []DesiredI
 	}
 }
 
-func (m *Manager) setBinding(ctx context.Context, state *sandboxState, handlerName string, generation int64, attachment Attachment, input *string, ephemeralInput, digest string, replayHooks bool) error {
+func (m *Manager) setBinding(ctx context.Context, state *sandboxState, handlerName string, generation int64, attachment Attachment, input *string, sensitiveInput, digest string, replayHooks bool) error {
 	handler := m.byName[handlerName]
 	if handler.Exec != nil {
-		return m.setExecBinding(ctx, state, handler, generation, attachment, input, ephemeralInput, digest, replayHooks)
+		return m.setExecBinding(ctx, state, handler, generation, attachment, input, sensitiveInput, digest, replayHooks)
 	}
 	instanceID, err := m.handlerInstance(handlerName)
 	state.mu.Lock()
@@ -1388,8 +1388,8 @@ func (m *Manager) validateDesired(desired []DesiredInput) ([]DesiredInput, strin
 		if len(input.Input) > apiv1alpha2.MaxActionBindingInputBytes {
 			return nil, "", fmt.Errorf("action Binding %s input exceeds %d bytes", input.Handler, apiv1alpha2.MaxActionBindingInputBytes)
 		}
-		if len(input.EphemeralInput) > apiv1alpha2.MaxActionBindingInputBytes {
-			return nil, "", fmt.Errorf("action Binding %s ephemeralInput exceeds %d bytes", input.Handler, apiv1alpha2.MaxActionBindingInputBytes)
+		if len(input.SensitiveInput) > apiv1alpha2.MaxActionBindingInputBytes {
+			return nil, "", fmt.Errorf("action Binding %s sensitiveInput exceeds %d bytes", input.Handler, apiv1alpha2.MaxActionBindingInputBytes)
 		}
 		total += len(input.Input)
 		if total > apiv1alpha2.MaxSandboxActionBindingInputBytes {

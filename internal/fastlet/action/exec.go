@@ -44,10 +44,10 @@ type ExecTemplateData struct {
 	Sandbox    ExecTemplateSandbox
 	Revision   ExecTemplateRevision
 	Attachment ExecTemplateAttachment
-	Ephemeral  ExecTemplateEphemeral
+	Sensitive  ExecTemplateSensitive
 }
 
-type ExecTemplateEphemeral struct {
+type ExecTemplateSensitive struct {
 	File string
 }
 
@@ -186,7 +186,7 @@ func (b *limitedBuffer) String() string {
 	return b.buf.String()
 }
 
-func execTemplateData(generation int64, attachment Attachment, ephemeralFile string) ExecTemplateData {
+func execTemplateData(generation int64, attachment Attachment, sensitiveFile string) ExecTemplateData {
 	return ExecTemplateData{
 		Sandbox: ExecTemplateSandbox{
 			UID:       attachment.SandboxUID,
@@ -211,54 +211,54 @@ func execTemplateData(generation int64, attachment Attachment, ephemeralFile str
 				HostVeth:    attachment.HostVeth,
 			},
 		},
-		Ephemeral: ExecTemplateEphemeral{
-			File: ephemeralFile,
+		Sensitive: ExecTemplateSensitive{
+			File: sensitiveFile,
 		},
 	}
 }
 
-func argvUsesEphemeral(args []string) bool {
+func argvUsesSensitive(args []string) bool {
 	for _, arg := range args {
-		if strings.Contains(arg, ".Ephemeral") {
+		if strings.Contains(arg, ".Sensitive") {
 			return true
 		}
 	}
 	return false
 }
 
-// materializeEphemeralFile writes create-time secret material to a private 0600
-// temporary file (preferring /dev/shm when available) so exec helpers like
-// `curl -H @{{.Ephemeral.File}}` can consume it without shell expansion, argv
+// materializeSensitiveFile writes create-time sensitive material to a private
+// 0600 temporary file (preferring /dev/shm when available) so exec helpers like
+// `curl -H @{{.Sensitive.File}}` can consume it without shell expansion, argv
 // exposure, or CRD persistence.
-func materializeEphemeralFile(content string) (string, func(), error) {
+func materializeSensitiveFile(content string) (string, func(), error) {
 	dir := ""
 	if info, err := os.Stat("/dev/shm"); err == nil && info.IsDir() {
 		dir = "/dev/shm"
 	}
-	file, err := os.CreateTemp(dir, "fsb-action-ephemeral-*")
+	file, err := os.CreateTemp(dir, "fsb-action-sensitive-*")
 	if err != nil && dir != "" {
-		file, err = os.CreateTemp("", "fsb-action-ephemeral-*")
+		file, err = os.CreateTemp("", "fsb-action-sensitive-*")
 	}
 	if err != nil {
-		return "", nil, fmt.Errorf("create ephemeral action file: %w", err)
+		return "", nil, fmt.Errorf("create sensitive action file: %w", err)
 	}
 	path := file.Name()
 	cleanup := func() { _ = os.Remove(path) }
 	if err := file.Chmod(0o600); err != nil {
 		_ = file.Close()
 		cleanup()
-		return "", nil, fmt.Errorf("chmod ephemeral action file: %w", err)
+		return "", nil, fmt.Errorf("chmod sensitive action file: %w", err)
 	}
 	if content != "" {
 		if _, err := file.WriteString(content); err != nil {
 			_ = file.Close()
 			cleanup()
-			return "", nil, fmt.Errorf("write ephemeral action file: %w", err)
+			return "", nil, fmt.Errorf("write sensitive action file: %w", err)
 		}
 	}
 	if err := file.Close(); err != nil {
 		cleanup()
-		return "", nil, fmt.Errorf("close ephemeral action file: %w", err)
+		return "", nil, fmt.Errorf("close sensitive action file: %w", err)
 	}
 	return path, cleanup, nil
 }
@@ -378,21 +378,21 @@ func (m *Manager) runExecAction(
 	generation int64,
 	attachment Attachment,
 	input string,
-	ephemeralInput string,
+	sensitiveInput string,
 	envelope *actionapi.Request,
 	argvTemplate []string,
 ) error {
 	cfg := handler.Exec
-	ephemeralFile := ""
-	if ephemeralInput != "" || argvUsesEphemeral(argvTemplate) {
-		path, cleanup, err := materializeEphemeralFile(ephemeralInput)
+	sensitiveFile := ""
+	if sensitiveInput != "" || argvUsesSensitive(argvTemplate) {
+		path, cleanup, err := materializeSensitiveFile(sensitiveInput)
 		if err != nil {
 			return err
 		}
 		defer cleanup()
-		ephemeralFile = path
+		sensitiveFile = path
 	}
-	argv, err := renderExecCommand(argvTemplate, execTemplateData(generation, attachment, ephemeralFile))
+	argv, err := renderExecCommand(argvTemplate, execTemplateData(generation, attachment, sensitiveFile))
 	if err != nil {
 		klog.ErrorS(err, "render exec action command failed",
 			"sandboxUID", attachment.SandboxUID, "namespace", attachment.Namespace, "sandboxName", attachment.SandboxName,
@@ -545,7 +545,7 @@ func (m *Manager) recordExecFailureStatus(spec *execInvocationSpec, attempt, exi
 		switch {
 		case terminal:
 			binding.terminalFailed = true
-			binding.ephemeralInput = ""
+			binding.sensitiveInput = ""
 			setBindingStatus(binding, apiv1alpha2.ActionFailed, attemptErr.Error())
 		case attempt < spec.maxAttempts:
 			setBindingStatus(binding, apiv1alpha2.ActionApplying, fmt.Sprintf("exec attempt %d/%d failed (exit=%d), retrying", attempt, spec.maxAttempts, exitCode))
@@ -564,7 +564,7 @@ func (m *Manager) setExecBinding(
 	generation int64,
 	attachment Attachment,
 	input *string,
-	ephemeralInput string,
+	sensitiveInput string,
 	digest string,
 	replayHooks bool,
 ) error {
@@ -598,8 +598,8 @@ func (m *Manager) setExecBinding(
 		}
 		binding.status.ObservedSpecGeneration = generation
 		binding.appliedGeneration = generation
-		if ephemeralInput != "" && binding.status.State != string(apiv1alpha2.ActionReady) {
-			binding.ephemeralInput = ephemeralInput
+		if sensitiveInput != "" && binding.status.State != string(apiv1alpha2.ActionReady) {
+			binding.sensitiveInput = sensitiveInput
 		}
 		m.refreshBindingStatusLocked(state, handlerName, binding)
 		state.mu.Unlock()
@@ -613,7 +613,7 @@ func (m *Manager) setExecBinding(
 	// is preserved at the hook boundary.
 	if len(handler.Hooks) > 0 {
 		binding.input = *input
-		binding.ephemeralInput = ephemeralInput
+		binding.sensitiveInput = sensitiveInput
 		binding.digest = digest
 		binding.appliedGeneration = generation
 		binding.attachmentID = attachment.ID
@@ -630,7 +630,7 @@ func (m *Manager) setExecBinding(
 
 	if skipMsg, skipOutcome, skip := execSkipReason(cfg, attachment); skip {
 		binding.input = *input
-		binding.ephemeralInput = ""
+		binding.sensitiveInput = ""
 		binding.digest = digest
 		binding.appliedGeneration = generation
 		binding.attachmentID = attachment.ID
@@ -651,7 +651,7 @@ func (m *Manager) setExecBinding(
 
 	request := buildRequest(actionapi.OperationSetBinding, stableInvocationID(actionapi.OperationSetBinding, handlerName, execLocalInstanceID, generation, attachment, digest, ""), generation, attachment)
 	request.Binding = &actionapi.BindingPayload{Input: input}
-	if err := m.runExecAction(ctx, state, handler, execOpApply, "", generation, attachment, *input, ephemeralInput, &request, cfg.Command); err != nil {
+	if err := m.runExecAction(ctx, state, handler, execOpApply, "", generation, attachment, *input, sensitiveInput, &request, cfg.Command); err != nil {
 		return err
 	}
 
@@ -662,7 +662,7 @@ func (m *Manager) setExecBinding(
 		return errors.New("SetBinding result belongs to an obsolete Sandbox revision")
 	}
 	binding.input = *input
-	binding.ephemeralInput = ""
+	binding.sensitiveInput = ""
 	binding.digest = digest
 	binding.appliedGeneration = generation
 	binding.attachmentID = attachment.ID
@@ -693,7 +693,7 @@ func (m *Manager) invokeExecHook(
 	}
 	if skipMsg, skipOutcome, skip := execSkipReason(cfg, attachment); skip {
 		binding.appliedHooks[checkpoint.Name] = checkpoint.Sequence
-		binding.ephemeralInput = ""
+		binding.sensitiveInput = ""
 		binding.readyMessage = skipMsg
 		m.refreshBindingStatusLocked(state, handlerName, binding)
 		state.mu.Unlock()
@@ -703,7 +703,7 @@ func (m *Manager) invokeExecHook(
 		return nil
 	}
 	bindingInput := binding.input
-	ephemeralInput := binding.ephemeralInput
+	sensitiveInput := binding.sensitiveInput
 	bindingDigest := binding.digest
 	setBindingStatus(binding, apiv1alpha2.ActionApplying, "")
 	state.mu.Unlock()
@@ -714,7 +714,7 @@ func (m *Manager) invokeExecHook(
 	inputCopy := bindingInput
 	request.Binding = &actionapi.BindingPayload{Input: &inputCopy}
 
-	if err := m.runExecAction(ctx, state, handler, execOpApply, string(checkpoint.Name), generation, attachment, bindingInput, ephemeralInput, &request, cfg.Command); err != nil {
+	if err := m.runExecAction(ctx, state, handler, execOpApply, string(checkpoint.Name), generation, attachment, bindingInput, sensitiveInput, &request, cfg.Command); err != nil {
 		return err
 	}
 
@@ -725,7 +725,7 @@ func (m *Manager) invokeExecHook(
 		return errors.New("Lifecycle Hook result belongs to an obsolete Sandbox revision")
 	}
 	binding.appliedHooks[checkpoint.Name] = checkpoint.Sequence
-	binding.ephemeralInput = ""
+	binding.sensitiveInput = ""
 	binding.readyMessage = ""
 	m.refreshBindingStatusLocked(state, handlerName, binding)
 	state.mu.Unlock()
