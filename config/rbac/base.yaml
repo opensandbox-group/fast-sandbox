@@ -28,7 +28,7 @@ metadata:
   name: fast-sandbox-controller
 rules:
 - apiGroups: [""]
-  resources: ["pods", "nodes"]
+  resources: ["pods"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: [""]
   resources: ["configmaps", "secrets"]
