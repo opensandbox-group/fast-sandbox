@@ -1,10 +1,12 @@
 package resourceadmission
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -88,4 +90,77 @@ func TestCgroupReaderExcludesReclaimableFileCache(t *testing.T) {
 	sample, err = reader.Read()
 	require.NoError(t, err)
 	require.Equal(t, 5*gib, sample.MemoryCurrentBytes)
+}
+
+func TestIsPSIOptionallyUnavailable(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "not exist", err: os.ErrNotExist, want: true},
+		{name: "eopnotsupp", err: syscall.EOPNOTSUPP, want: true},
+		{
+			name: "wrapped eopnotsupp path error",
+			err:  &os.PathError{Op: "read", Path: "/sys/fs/cgroup/memory.pressure", Err: syscall.EOPNOTSUPP},
+			want: true,
+		},
+		{name: "err unsupported", err: errors.ErrUnsupported, want: true},
+		{name: "eacces", err: syscall.EACCES, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, isPSIOptionallyUnavailable(tc.err))
+		})
+	}
+}
+
+func TestCgroupReaderToleratesUnavailablePSI(t *testing.T) {
+	cgroupPath := t.TempDir()
+	writeTestFile(t, filepath.Join(cgroupPath, "memory.current"), "1048576\n")
+	writeTestFile(t, filepath.Join(cgroupPath, "memory.max"), "4194304\n")
+	writeTestFile(t, filepath.Join(cgroupPath, "memory.events"), "oom_kill 2\n")
+
+	reader, err := NewCgroupPathReader(cgroupPath, filepath.Join(cgroupPath, "no-meminfo"), 0)
+	require.NoError(t, err)
+
+	t.Run("missing memory.pressure", func(t *testing.T) {
+		reader.readPSI = nil
+		sample, err := reader.Read()
+		require.NoError(t, err)
+		require.Equal(t, uint64(1048576), sample.MemoryCurrentBytes)
+		require.Equal(t, uint64(4194304), sample.MemoryLimitBytes)
+		require.Equal(t, uint64(2), sample.OOMKills)
+		require.Zero(t, sample.MemoryPSIAvg10)
+	})
+
+	t.Run("psi read returns EOPNOTSUPP", func(t *testing.T) {
+		reader.readPSI = func(path string) (float64, error) {
+			return 99, &os.PathError{Op: "read", Path: path, Err: syscall.EOPNOTSUPP}
+		}
+		sample, err := reader.Read()
+		require.NoError(t, err)
+		require.Equal(t, uint64(1048576), sample.MemoryCurrentBytes)
+		require.Equal(t, uint64(4194304), sample.MemoryLimitBytes)
+		require.Equal(t, uint64(2), sample.OOMKills)
+		require.Zero(t, sample.MemoryPSIAvg10)
+	})
+
+	t.Run("psi read returns ErrUnsupported", func(t *testing.T) {
+		reader.readPSI = func(string) (float64, error) {
+			return 0, errors.ErrUnsupported
+		}
+		sample, err := reader.Read()
+		require.NoError(t, err)
+		require.Zero(t, sample.MemoryPSIAvg10)
+	})
+
+	t.Run("psi read returns EACCES fails closed", func(t *testing.T) {
+		reader.readPSI = func(path string) (float64, error) {
+			return 0, &os.PathError{Op: "open", Path: path, Err: syscall.EACCES}
+		}
+		_, err := reader.Read()
+		require.ErrorIs(t, err, syscall.EACCES)
+	})
 }

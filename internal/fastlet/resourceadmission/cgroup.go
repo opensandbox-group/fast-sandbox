@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 const (
@@ -20,6 +21,7 @@ type CgroupReader struct {
 	cgroupPath    string
 	meminfoPath   string
 	fallbackLimit uint64
+	readPSI       func(string) (float64, error)
 }
 
 func NewSelfCgroupReader(fallbackLimit uint64) (*CgroupReader, error) {
@@ -87,9 +89,16 @@ func (r *CgroupReader) Read() (Sample, error) {
 	if err != nil {
 		return Sample{}, err
 	}
-	psi, err := readPSIAvg10(filepath.Join(r.cgroupPath, "memory.pressure"))
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return Sample{}, err
+	readPSI := r.readPSI
+	if readPSI == nil {
+		readPSI = readPSIAvg10
+	}
+	psi, err := readPSI(filepath.Join(r.cgroupPath, "memory.pressure"))
+	if err != nil {
+		if !isPSIOptionallyUnavailable(err) {
+			return Sample{}, err
+		}
+		psi = 0
 	}
 	nodeAvailable, nodeMemoryObserved, err := readNodeAvailableRatio(r.meminfoPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -159,6 +168,16 @@ func readKeyValues(path string) (map[string]uint64, error) {
 		values[fields[0]] = value
 	}
 	return values, scanner.Err()
+}
+
+// isPSIOptionallyUnavailable reports errors indicating that cgroup v2 PSI is
+// absent or disabled by the kernel (for example CONFIG_PSI_DEFAULT_DISABLED=y
+// without the psi=1 boot parameter, where memory.pressure exists but reading
+// it returns EOPNOTSUPP).
+func isPSIOptionallyUnavailable(err error) bool {
+	return errors.Is(err, os.ErrNotExist) ||
+		errors.Is(err, syscall.EOPNOTSUPP) ||
+		errors.Is(err, errors.ErrUnsupported)
 }
 
 func readPSIAvg10(path string) (float64, error) {
