@@ -102,7 +102,11 @@ func (m *SandboxManager) ReconcileBindings(ctx context.Context, req *fastletapi.
 func desiredActionInputs(bindings []fastletapi.ActionBindingInput) []fastletaction.DesiredInput {
 	desired := make([]fastletaction.DesiredInput, 0, len(bindings))
 	for _, input := range bindings {
-		desired = append(desired, fastletaction.DesiredInput{Handler: input.Handler, Input: input.Input})
+		desired = append(desired, fastletaction.DesiredInput{
+			Handler:        input.Handler,
+			Input:          input.Input,
+			EphemeralInput: input.EphemeralInput,
+		})
 	}
 	return desired
 }

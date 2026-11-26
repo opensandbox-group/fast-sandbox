@@ -226,9 +226,10 @@ func endpoint(port int32, path string) string {
 }
 
 type DesiredInput struct {
-	Handler string
-	Input   string
-	Digest  string
+	Handler        string
+	Input          string
+	Digest         string
+	EphemeralInput string
 }
 
 type Attachment struct {
@@ -259,6 +260,7 @@ type HookCheckpoint struct {
 type bindingState struct {
 	status            fastletapi.ActionBindingStatus
 	input             string
+	ephemeralInput    string
 	digest            string
 	appliedGeneration int64
 	attachmentID      string
@@ -780,7 +782,7 @@ func (m *Manager) convergeLocked(ctx context.Context, state *sandboxState) error
 		if _, found := desiredByName[name]; found {
 			continue
 		}
-		if err := m.setBinding(ctx, state, name, generation, attachment, nil, "sha256:removed", false); err != nil {
+		if err := m.setBinding(ctx, state, name, generation, attachment, nil, "", "sha256:removed", false); err != nil {
 			m.notifyChanged(attachment.SandboxUID)
 			return fmt.Errorf("remove live Action Binding %s: %w", name, err)
 		}
@@ -814,7 +816,7 @@ func (m *Manager) convergeLocked(ctx context.Context, state *sandboxState) error
 		}
 		if needsSet {
 			value := input.Input
-			if err := m.setBinding(ctx, state, input.Handler, generation, attachment, &value, input.Digest, replayHooks); err != nil {
+			if err := m.setBinding(ctx, state, input.Handler, generation, attachment, &value, input.EphemeralInput, input.Digest, replayHooks); err != nil {
 				m.notifyChanged(attachment.SandboxUID)
 				return fmt.Errorf("setBinding %s: %w", input.Handler, err)
 			}
@@ -892,10 +894,10 @@ func (m *Manager) parkUnattachedBindings(state *sandboxState, desired []DesiredI
 	}
 }
 
-func (m *Manager) setBinding(ctx context.Context, state *sandboxState, handlerName string, generation int64, attachment Attachment, input *string, digest string, replayHooks bool) error {
+func (m *Manager) setBinding(ctx context.Context, state *sandboxState, handlerName string, generation int64, attachment Attachment, input *string, ephemeralInput, digest string, replayHooks bool) error {
 	handler := m.byName[handlerName]
 	if handler.Exec != nil {
-		return m.setExecBinding(ctx, state, handler, generation, attachment, input, digest, replayHooks)
+		return m.setExecBinding(ctx, state, handler, generation, attachment, input, ephemeralInput, digest, replayHooks)
 	}
 	instanceID, err := m.handlerInstance(handlerName)
 	state.mu.Lock()
@@ -1177,7 +1179,7 @@ func (m *Manager) deleteState(ctx context.Context, state *sandboxState, expected
 		handler := m.byName[name]
 		if handler.Exec != nil {
 			if len(handler.Exec.CleanupCommand) > 0 {
-				if err := m.runExecAction(ctx, nil, handler, execOpCleanup, "", generation, attachment, "", nil, handler.Exec.CleanupCommand); err != nil {
+				if err := m.runExecAction(ctx, nil, handler, execOpCleanup, "", generation, attachment, "", "", nil, handler.Exec.CleanupCommand); err != nil {
 					result = errors.Join(result, err)
 				}
 			}
@@ -1219,7 +1221,7 @@ func (m *Manager) deleteRemoteHandler(ctx context.Context, name string, attachme
 	handler := m.byName[name]
 	if handler.Exec != nil {
 		if len(handler.Exec.CleanupCommand) > 0 {
-			return m.runExecAction(ctx, nil, handler, execOpCleanup, "", generation, attachment, "", nil, handler.Exec.CleanupCommand)
+			return m.runExecAction(ctx, nil, handler, execOpCleanup, "", generation, attachment, "", "", nil, handler.Exec.CleanupCommand)
 		}
 		return nil
 	}
@@ -1385,6 +1387,9 @@ func (m *Manager) validateDesired(desired []DesiredInput) ([]DesiredInput, strin
 		seen[input.Handler] = struct{}{}
 		if len(input.Input) > apiv1alpha2.MaxActionBindingInputBytes {
 			return nil, "", fmt.Errorf("action Binding %s input exceeds %d bytes", input.Handler, apiv1alpha2.MaxActionBindingInputBytes)
+		}
+		if len(input.EphemeralInput) > apiv1alpha2.MaxActionBindingInputBytes {
+			return nil, "", fmt.Errorf("action Binding %s ephemeralInput exceeds %d bytes", input.Handler, apiv1alpha2.MaxActionBindingInputBytes)
 		}
 		total += len(input.Input)
 		if total > apiv1alpha2.MaxSandboxActionBindingInputBytes {

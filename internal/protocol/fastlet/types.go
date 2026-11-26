@@ -492,6 +492,9 @@ type DeleteSandboxResponse struct {
 type ActionBindingInput struct {
 	Handler string `json:"handler"`
 	Input   string `json:"input"`
+	// EphemeralInput carries create-time sensitive material delivered in memory
+	// to an exec ActionHandler. It is never persisted to the Sandbox CRD.
+	EphemeralInput string `json:"ephemeralInput,omitempty"`
 }
 
 // ReconcileBindingsRequest carries persisted desired Binding state from

@@ -107,7 +107,7 @@ func (s *Server) createSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	if err != nil {
 		return nil, err
 	}
-	bindings, err := buildActionBindings(request, pool)
+	bindings, ephemeralInputs, err := buildActionBindings(request, pool)
 	if err != nil {
 		return nil, err
 	}
@@ -141,6 +141,7 @@ func (s *Server) createSandbox(ctx context.Context, request *fastpathv2.CreateSa
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "resolve Sandbox resources: %v", err)
 	}
+	parameters.EphemeralActionInputs = ephemeralInputs
 	assignment.ProjectResolvedResourceAnnotations(sandbox, pool.Spec.SandboxResources.Hash(), parameters.ResolvedResources)
 	rankedFastlets, envelope, selectionErr := s.selectFastletsForPool(ctx, orchestrator, sandbox, request.RequestId, parameters)
 	if selectionErr != nil && status.Code(selectionErr) != codes.ResourceExhausted {
@@ -216,18 +217,53 @@ func (s *Server) validateCreateRequest(request *fastpathv2.CreateSandboxRequest)
 	return nil
 }
 
-func buildActionBindings(request *fastpathv2.CreateSandboxRequest, pool *apiv1alpha2.SandboxPool) ([]apiv1alpha2.ActionBinding, error) {
+func buildActionBindings(request *fastpathv2.CreateSandboxRequest, pool *apiv1alpha2.SandboxPool) ([]apiv1alpha2.ActionBinding, map[string]string, error) {
 	bindings, err := apiActionBindings(request.ActionBindings)
 	if err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+		return nil, nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 	if err := pool.Spec.ValidateActionHandlers(); err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "invalid Pool Action Handlers: %v", err)
+		return nil, nil, status.Errorf(codes.FailedPrecondition, "invalid Pool Action Handlers: %v", err)
 	}
 	if err := (&apiv1alpha2.SandboxSpec{ActionBindings: bindings}).ValidateActionBindings(pool.Spec.ActionHandlers); err != nil {
-		return nil, status.Error(codes.InvalidArgument, err.Error())
+		return nil, nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	return bindings, nil
+	ephemeralInputs, err := extractEphemeralActionInputs(request.ActionBindings, pool.Spec.ActionHandlers)
+	if err != nil {
+		return nil, nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	return bindings, ephemeralInputs, nil
+}
+
+func extractEphemeralActionInputs(items []*fastpathv2.ActionBinding, handlers []apiv1alpha2.ActionHandler) (map[string]string, error) {
+	execHandlers := make(map[string]struct{}, len(handlers))
+	for _, h := range handlers {
+		if h.Exec != nil {
+			execHandlers[h.Name] = struct{}{}
+		}
+	}
+	var result map[string]string
+	total := 0
+	for _, item := range items {
+		if item == nil || item.EphemeralInput == "" {
+			continue
+		}
+		if _, isExec := execHandlers[item.Handler]; !isExec {
+			return nil, fmt.Errorf("ephemeral_input is only supported for exec Action Handlers (%q is not an exec handler)", item.Handler)
+		}
+		if len(item.EphemeralInput) > apiv1alpha2.MaxActionBindingInputBytes {
+			return nil, fmt.Errorf("action Binding %q ephemeral_input exceeds %d bytes", item.Handler, apiv1alpha2.MaxActionBindingInputBytes)
+		}
+		total += len(item.EphemeralInput)
+		if total > apiv1alpha2.MaxSandboxActionBindingInputBytes {
+			return nil, fmt.Errorf("action Binding ephemeral_inputs exceed %d bytes", apiv1alpha2.MaxSandboxActionBindingInputBytes)
+		}
+		if result == nil {
+			result = make(map[string]string)
+		}
+		result[item.Handler] = item.EphemeralInput
+	}
+	return result, nil
 }
 
 func newSandboxCRD(request *fastpathv2.CreateSandboxRequest, bindings []apiv1alpha2.ActionBinding, resources *apiv1alpha2.SandboxResourceRequirements, createSpecHash string) *apiv1alpha2.Sandbox {
@@ -726,28 +762,38 @@ func (s *Server) applySandboxUpdate(ctx context.Context, sandbox *apiv1alpha2.Sa
 		}
 		sandbox.Spec.RecoveryTimeoutSeconds = value.RecoveryTimeoutSeconds
 	case *fastpathv2.UpdateSandboxRequest_ActionBindings:
-		if value.ActionBindings == nil {
-			return status.Error(codes.InvalidArgument, "action_bindings is required")
-		}
-		bindings, err := apiActionBindings(value.ActionBindings.Items)
-		if err != nil {
-			return status.Error(codes.InvalidArgument, err.Error())
-		}
-		pool, err := s.getPool(ctx, sandbox.Namespace, sandbox.Spec.PoolRef)
-		if err != nil {
-			return err
-		}
-		probe := apiv1alpha2.SandboxSpec{ActionBindings: bindings}
-		if err := probe.ValidateActionBindings(pool.Spec.ActionHandlers); err != nil {
-			return status.Error(codes.FailedPrecondition, err.Error())
-		}
-		if err := validateExecActionBindingsImmutable(sandbox.Spec.ActionBindings, bindings, pool.Spec.ActionHandlers); err != nil {
-			return status.Error(codes.InvalidArgument, err.Error())
-		}
-		sandbox.Spec.ActionBindings = bindings
+		return s.applyActionBindingsUpdate(ctx, sandbox, value.ActionBindings)
 	default:
 		return status.Error(codes.InvalidArgument, "unknown Sandbox update")
 	}
+	return nil
+}
+
+func (s *Server) applyActionBindingsUpdate(ctx context.Context, sandbox *apiv1alpha2.Sandbox, update *fastpathv2.ReplaceActionBindings) error {
+	if update == nil {
+		return status.Error(codes.InvalidArgument, "action_bindings is required")
+	}
+	for _, item := range update.Items {
+		if item != nil && item.EphemeralInput != "" {
+			return status.Error(codes.InvalidArgument, "ephemeral_input is only supported at Sandbox creation")
+		}
+	}
+	bindings, err := apiActionBindings(update.Items)
+	if err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	pool, err := s.getPool(ctx, sandbox.Namespace, sandbox.Spec.PoolRef)
+	if err != nil {
+		return err
+	}
+	probe := apiv1alpha2.SandboxSpec{ActionBindings: bindings}
+	if err := probe.ValidateActionBindings(pool.Spec.ActionHandlers); err != nil {
+		return status.Error(codes.FailedPrecondition, err.Error())
+	}
+	if err := validateExecActionBindingsImmutable(sandbox.Spec.ActionBindings, bindings, pool.Spec.ActionHandlers); err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	sandbox.Spec.ActionBindings = bindings
 	return nil
 }
 

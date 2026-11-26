@@ -5,6 +5,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	fastpathv2 "fast-sandbox/api/proto/v2"
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 )
 
@@ -41,4 +42,25 @@ func TestValidateExecActionBindingsImmutable(t *testing.T) {
 		existing,
 		handlers,
 	), "cannot be added")
+}
+
+func TestExtractEphemeralActionInputs(t *testing.T) {
+	handlers := []apiv1alpha2.ActionHandler{
+		{Name: "egress", TargetHTTPPort: 18080},
+		{Name: "runtime-init", Exec: &apiv1alpha2.ExecActionHandler{Command: []string{"/usr/bin/curl", "-H", "@{{.Ephemeral.File}}"}}},
+	}
+
+	// Exec handler accepts ephemeral_input; CRD ActionBinding omits it.
+	extracted, err := extractEphemeralActionInputs([]*fastpathv2.ActionBinding{
+		{Handler: "egress", Input: `{"v":1}`},
+		{Handler: "runtime-init", Input: `{"sandboxId":"sb-1"}`, EphemeralInput: "X-Token: secret\n"},
+	}, handlers)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"runtime-init": "X-Token: secret\n"}, extracted)
+
+	// HTTP handler rejects ephemeral_input.
+	_, err = extractEphemeralActionInputs([]*fastpathv2.ActionBinding{
+		{Handler: "egress", Input: `{"v":1}`, EphemeralInput: "X-Token: secret\n"},
+	}, handlers)
+	require.ErrorContains(t, err, "only supported for exec Action Handlers")
 }

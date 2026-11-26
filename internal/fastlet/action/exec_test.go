@@ -3,6 +3,8 @@ package action
 import (
 	"context"
 	"errors"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -313,4 +315,74 @@ func TestOSExecRunnerDirectExecveAndProcessGroupTimeout(t *testing.T) {
 	require.True(t, timedOut.TimedOut)
 	require.Equal(t, -1, timedOut.ExitCode)
 	require.Less(t, time.Since(started), 3*time.Second)
+}
+
+func TestExecActionEphemeralFileMaterializedAndCleanedUp(t *testing.T) {
+	handler := runtimeInitHandler()
+	handler.Exec.Command = []string{
+		"/usr/bin/curl", "-fsS",
+		"-H", "@{{.Ephemeral.File}}",
+		"--data-binary", "@-",
+		"http://{{.Attachment.Network.IP}}:44772/internal/init",
+	}
+
+	var observedPath string
+	var observedContent string
+	var observedMode os.FileMode
+	execRunner := &recordingExecRunner{
+		fn: func(_ context.Context, _ int, req ExecRequest) ExecResult {
+			for _, arg := range req.Command {
+				if strings.HasPrefix(arg, "@") && arg != "@-" {
+					observedPath = strings.TrimPrefix(arg, "@")
+					info, err := os.Stat(observedPath)
+					require.NoError(t, err)
+					observedMode = info.Mode().Perm()
+					raw, err := os.ReadFile(observedPath)
+					require.NoError(t, err)
+					observedContent = string(raw)
+				}
+			}
+			return ExecResult{}
+		},
+	}
+
+	mgr, err := NewManager([]apiv1alpha2.ActionHandler{handler}, nil)
+	require.NoError(t, err)
+	mgr.SetExecRunner(execRunner)
+
+	att := attachment("sb-ephemeral")
+	secretHeader := "X-EXECD-ACCESS-TOKEN: per-sandbox-secret-123\n"
+	_, _, err = mgr.Reconcile(context.Background(), att, 1, []DesiredInput{{
+		Handler:        "runtime-init",
+		Input:          `{"sandboxId":"sb-ephemeral"}`,
+		EphemeralInput: secretHeader,
+	}})
+	require.NoError(t, err)
+	require.NoError(t, mgr.ReachHook(context.Background(), att.SandboxUID, att, actionapi.LifecycleHookDataPlaneReady, 1))
+
+	require.NotEmpty(t, observedPath)
+	require.Equal(t, os.FileMode(0o600), observedMode)
+	require.Equal(t, secretHeader, observedContent)
+	// Temp file must be removed immediately after execution.
+	_, statErr := os.Stat(observedPath)
+	require.True(t, os.IsNotExist(statErr))
+	// Secret must be cleared from Fastlet memory after completion.
+	state := mgr.getState(att.SandboxUID)
+	state.mu.RLock()
+	require.Empty(t, state.bindings["runtime-init"].ephemeralInput)
+	state.mu.RUnlock()
+
+	// Empty ephemeral_input still creates an empty 0600 file and cleans it up.
+	observedPath, observedContent = "", "sentinel"
+	attEmpty := attachment("sb-ephemeral-empty")
+	_, _, err = mgr.Reconcile(context.Background(), attEmpty, 1, []DesiredInput{{
+		Handler: "runtime-init",
+		Input:   `{"sandboxId":"sb-ephemeral-empty"}`,
+	}})
+	require.NoError(t, err)
+	require.NoError(t, mgr.ReachHook(context.Background(), attEmpty.SandboxUID, attEmpty, actionapi.LifecycleHookDataPlaneReady, 1))
+	require.NotEmpty(t, observedPath)
+	require.Empty(t, observedContent)
+	_, statErr = os.Stat(observedPath)
+	require.True(t, os.IsNotExist(statErr))
 }

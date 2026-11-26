@@ -201,10 +201,20 @@ def _sandbox_reference(name: str, namespace: str, expected_uid: str = ""):
     )
 
 
-def _action_bindings(values: Iterable[tuple[str, str]]):
+def _action_bindings(values: Iterable[tuple]):
     result = []
-    for handler, value in values:
-        if not isinstance(value, str):
-            raise TypeError("Action Binding input must be an opaque string")
-        result.append(fastpath_pb2.ActionBinding(handler=handler, input=value))
+    for item in values:
+        if len(item) == 2:
+            handler, value = item
+            ephemeral = ""
+        elif len(item) == 3:
+            handler, value, ephemeral = item
+        else:
+            raise TypeError("Action Binding must be a (handler, input) or (handler, input, ephemeral_input) tuple")
+        if not isinstance(value, str) or not isinstance(ephemeral, str):
+            raise TypeError("Action Binding input and ephemeral_input must be opaque strings")
+        binding = fastpath_pb2.ActionBinding(handler=handler, input=value)
+        if ephemeral:
+            binding.ephemeral_input = ephemeral
+        result.append(binding)
     return result

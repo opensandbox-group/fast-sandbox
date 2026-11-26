@@ -202,6 +202,9 @@ var execTemplateSample = struct {
 			HostVeth    string
 		}
 	}
+	Ephemeral struct {
+		File string
+	}
 }{}
 
 func validateExecActionHandler(handlerName string, cfg *ExecActionHandler) error {

@@ -103,14 +103,15 @@ type Orchestrator struct {
 // Pool against the watched Fastlet profile. Fastlet remains authoritative for
 // the concrete CPU/memory/PID values it injects into the runtime request.
 type RuntimeParameters struct {
-	RuntimeName         apiv1alpha2.RuntimeName
-	RuntimeProfileHash  string
-	ResourceProfileHash string
-	InfraRevision       string
-	FastletRevision     string
-	ResourceMode        apiv1alpha2.SandboxResourceMode
-	ResourceDemand      placement.ResourceDemand
-	ResolvedResources   *fastletapi.ResolvedSandboxResources
+	RuntimeName           apiv1alpha2.RuntimeName
+	RuntimeProfileHash    string
+	ResourceProfileHash   string
+	InfraRevision         string
+	FastletRevision       string
+	ResourceMode          apiv1alpha2.SandboxResourceMode
+	ResourceDemand        placement.ResourceDemand
+	ResolvedResources     *fastletapi.ResolvedSandboxResources
+	EphemeralActionInputs map[string]string
 }
 
 func (o *Orchestrator) ResolveRuntime(ctx context.Context, sandbox *apiv1alpha2.Sandbox) (RuntimeParameters, error) {
@@ -533,6 +534,7 @@ func (o *Orchestrator) createRuntimeOnTarget(ctx context.Context, sandbox *apiv1
 	if err != nil {
 		return nil, err
 	}
+	attachEphemeralActionInputs(bindings, parameters.EphemeralActionInputs)
 	spec := fastletapi.SandboxDesiredSpec{
 		Image:              sandbox.Spec.Image,
 		RuntimeProfileHash: envelope.RuntimeProfileHash, ResourceProfileHash: envelope.ResourceProfileHash,
@@ -1022,6 +1024,17 @@ func setReadyCondition(status *apiv1alpha2.SandboxStatus, generation int64, read
 		Type: ConditionReady, Status: conditionStatus, Reason: reason, Message: message,
 		ObservedGeneration: generation, LastTransitionTime: metav1.Now(),
 	})
+}
+
+func attachEphemeralActionInputs(bindings []fastletapi.ActionBindingInput, ephemeral map[string]string) {
+	if len(ephemeral) == 0 {
+		return
+	}
+	for index := range bindings {
+		if secret, ok := ephemeral[bindings[index].Handler]; ok {
+			bindings[index].EphemeralInput = secret
+		}
+	}
 }
 
 func compileActionBindings(bindings []apiv1alpha2.ActionBinding) ([]fastletapi.ActionBindingInput, error) {
