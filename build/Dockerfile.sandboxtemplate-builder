@@ -53,6 +53,7 @@ COPY internal/guestnetwork ./internal/guestnetwork
 COPY internal/guestcontrol ./internal/guestcontrol
 COPY cmd/fsb-guest-control ./cmd/fsb-guest-control
 COPY internal/ocitemplate ./internal/ocitemplate
+COPY internal/registryconfig ./internal/registryconfig
 COPY cmd/sandboxtemplate-builder ./cmd/sandboxtemplate-builder
 RUN CGO_ENABLED=0 go build -o /out/sandboxtemplate-builder ./cmd/sandboxtemplate-builder \
     && CGO_ENABLED=0 go build -o /out/fsb-guest-control ./cmd/fsb-guest-control
