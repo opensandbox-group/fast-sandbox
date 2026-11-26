@@ -29,7 +29,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
-	"sigs.k8s.io/yaml"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	infracatalog "fast-sandbox/internal/catalog/infra"
@@ -2221,11 +2220,7 @@ func (r *SandboxPoolReconciler) ensureRegistrySecret(ctx context.Context, pool *
 	if !found {
 		return registryconfig.Compiled{}, fmt.Errorf("configMap %s must contain %s", registryconfig.ConfigMapName, registryconfig.ConfigMapKey)
 	}
-	var config registryconfig.Config
-	if err := yaml.UnmarshalStrict([]byte(raw), &config); err != nil {
-		return registryconfig.Compiled{}, fmt.Errorf("decode Registry configuration: %w", err)
-	}
-	config, err = registryconfig.NormalizeAndValidate(config)
+	config, err := registryconfig.ParseConfig([]byte(raw))
 	if err != nil {
 		return registryconfig.Compiled{}, err
 	}

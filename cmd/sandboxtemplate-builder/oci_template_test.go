@@ -412,19 +412,24 @@ func TestOCIBuilderRejectsTaggedOrInvalidPublishBeforeBuild(t *testing.T) {
 	}
 }
 
-func TestOCIBuilderPlainHTTPPerRegistryAndGlobalOverride(t *testing.T) {
+func TestParseOCIReferenceSchemeForNonLocalhost(t *testing.T) {
+	const rawRef = "opensandbox-bench-registry.opensandbox-bench.svc:5000/opensandbox/tpl:latest"
+
+	httpRef, err := parseOCIReference(rawRef, true)
+	require.NoError(t, err)
+	require.Equal(t, "http", httpRef.Context().Registry.Scheme())
+
+	httpsRef, err := parseOCIReference(rawRef, false)
+	require.NoError(t, err)
+	require.Equal(t, "https", httpsRef.Context().Registry.Scheme())
+}
+
+func TestOCIBuilderPlainHTTPPerRegistry(t *testing.T) {
 	t.Run("missing-config-file-defaults-to-https", func(t *testing.T) {
 		t.Setenv(registryConfigFileEnv, filepath.Join(t.TempDir(), "absent-registries.yaml"))
-		t.Setenv(ociPlainHTTPEnv, "")
 		policy, err := loadBuilderRegistryPolicy()
 		require.NoError(t, err)
 		require.False(t, policy.plainHTTP("opensandbox-bench-registry.ns.svc:5000/templates:v1"))
-	})
-
-	t.Run("invalid-env-rejected", func(t *testing.T) {
-		t.Setenv(ociPlainHTTPEnv, "yes")
-		_, err := loadBuilderRegistryPolicy()
-		require.ErrorContains(t, err, ociPlainHTTPEnv+" must be true or false")
 	})
 
 	t.Run("per-registry-plain-http-only-applies-to-matching-target", func(t *testing.T) {
@@ -432,7 +437,6 @@ func TestOCIBuilderPlainHTTPPerRegistryAndGlobalOverride(t *testing.T) {
 		t.Setenv("DOCKER_CONFIG", dir)
 		t.Setenv("SANDBOX_TEMPLATE_IMAGE_TAR", "")
 		t.Setenv("KUBERNETES_SERVICE_HOST", "")
-		t.Setenv(ociPlainHTTPEnv, "")
 
 		amd64 := ociTestImage(t, "amd64")
 		handler := registry.New(registry.Logger(log.New(io.Discard, "", 0)))

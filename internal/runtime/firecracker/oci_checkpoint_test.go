@@ -190,10 +190,19 @@ func TestCheckpointCacheAndPlainHTTPForReferenceUseRegistryConfig(t *testing.T) 
 		registryconfig.Credential{Host: "bench-registry.ns.svc:5000", PlainHTTP: true},
 		registryconfig.Credential{Host: "secure.example.com", Username: "u", Password: "p"},
 	)
-	require.True(t, ociPlainHTTPForReference("oci://bench-registry.ns.svc:5000/checkpoints/sb:snap-1"))
-	require.True(t, ociPlainHTTPForReference("bench-registry.ns.svc:5000/checkpoints/sb:snap-1"))
-	require.False(t, ociPlainHTTPForReference("oci://secure.example.com/checkpoints/sb:snap-1"))
-	require.False(t, ociPlainHTTPForReference("oci://unconfigured.example.com/checkpoints/sb:snap-1"))
+	for _, tc := range []struct {
+		ref  string
+		want bool
+	}{
+		{"oci://bench-registry.ns.svc:5000/checkpoints/sb:snap-1", true},
+		{"bench-registry.ns.svc:5000/checkpoints/sb:snap-1", true},
+		{"oci://secure.example.com/checkpoints/sb:snap-1", false},
+		{"oci://unconfigured.example.com/checkpoints/sb:snap-1", false},
+	} {
+		got, err := ociPlainHTTPForReference(tc.ref)
+		require.NoError(t, err, tc.ref)
+		require.Equal(t, tc.want, got, tc.ref)
+	}
 
 	dir := t.TempDir()
 	argsOut := filepath.Join(dir, "cache-args.txt")
@@ -212,4 +221,59 @@ printf '%s\n' "$@" > "$CACHE_TEST_ARGS_OUTPUT"
 	raw, err := os.ReadFile(argsOut)
 	require.NoError(t, err)
 	require.Contains(t, strings.Split(strings.TrimSpace(string(raw)), "\n"), "--plain-http")
+}
+
+func TestOCIPlainHTTPForReferencePropagatesConfigErrors(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_OCI_PLAIN_HTTP", "")
+
+	t.Run("missing-file", func(t *testing.T) {
+		t.Setenv("FAST_SANDBOX_REGISTRY_CONFIG_PATH", filepath.Join(t.TempDir(), "missing.json"))
+		_, err := ociPlainHTTPForReference("oci://bench-registry.ns.svc:5000/checkpoints/sb:snap-1")
+		require.ErrorIs(t, err, os.ErrNotExist)
+	})
+
+	t.Run("malformed-json", func(t *testing.T) {
+		badPath := filepath.Join(t.TempDir(), "registry.json")
+		require.NoError(t, os.WriteFile(badPath, []byte("{not-json"), 0600))
+		t.Setenv("FAST_SANDBOX_REGISTRY_CONFIG_PATH", badPath)
+		_, err := ociPlainHTTPForReference("oci://bench-registry.ns.svc:5000/checkpoints/sb:snap-1")
+		require.ErrorContains(t, err, "decode compiled registry configuration")
+	})
+}
+
+func TestPublishPreparedOCISnapshotRejectsMixedHTTPAndHTTPS(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_OCI_PLAIN_HTTP", "")
+	installOCIRegistryConfig(t,
+		registryconfig.Credential{Host: "http-registry.ns.svc:5000", PlainHTTP: true},
+		registryconfig.Credential{Host: "https.example.com", Username: "u", Password: "p"},
+	)
+
+	for _, tc := range []struct {
+		name        string
+		source      string
+		destination string
+	}{
+		{
+			name:        "http-source-to-https-destination",
+			source:      "oci://http-registry.ns.svc:5000/templates/base:v1",
+			destination: "https.example.com/checkpoints/sb:snap-1",
+		},
+		{
+			name:        "https-source-to-http-destination",
+			source:      "oci://https.example.com/templates/base:v1",
+			destination: "http-registry.ns.svc:5000/checkpoints/sb:snap-1",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			staging := filepath.Join(t.TempDir(), "staging")
+			require.NoError(t, os.Mkdir(staging, 0700))
+			d := &Driver{}
+			_, err := d.publishPreparedOCISnapshot(context.Background(), dumpPlan{staging: staging, snapshotID: "snap-1"}, 1, ociPublication{
+				source:      tc.source,
+				destination: tc.destination,
+			}, nil)
+			require.ErrorIs(t, err, ErrInvalidConfig)
+			require.ErrorContains(t, err, "must use the same protocol")
+		})
+	}
 }

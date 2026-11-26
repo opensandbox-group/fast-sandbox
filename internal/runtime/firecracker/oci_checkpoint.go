@@ -104,22 +104,25 @@ type ociPublication struct {
 	destination string
 }
 
-func ociPlainHTTPForReference(reference string) bool {
+func ociPlainHTTPForReference(reference string) (bool, error) {
 	if ociPlainHTTP() {
-		return true
+		return true, nil
 	}
 	if strings.TrimSpace(reference) == "" {
-		return false
+		return false, nil
 	}
 	path := os.Getenv("FAST_SANDBOX_REGISTRY_CONFIG_PATH")
 	if path == "" {
 		path = registryconfig.MountPath
 	}
 	credential, found, err := registryconfig.NewFileProvider(path).Credentials(strings.TrimPrefix(reference, ocitemplate.Prefix))
-	if err != nil || !found {
-		return false
+	if err != nil {
+		return false, err
 	}
-	return credential.PlainHTTP
+	if !found {
+		return false, nil
+	}
+	return credential.PlainHTTP, nil
 }
 
 func prepareOCIPublication(plan dumpPlan) (ociPublication, error) {
@@ -211,14 +214,24 @@ func (d *Driver) publishPreparedOCISnapshot(ctx context.Context, plan dumpPlan, 
 	if err != nil {
 		return nil, err
 	}
+	destPlainHTTP, err := ociPlainHTTPForReference(publication.destination)
+	if err != nil {
+		return nil, err
+	}
+	sourcePlainHTTP, err := ociPlainHTTPForReference(publication.source)
+	if err != nil {
+		return nil, err
+	}
+	if destPlainHTTP != sourcePlainHTTP {
+		return nil, fmt.Errorf("%w: OCI snapshot source (%s, plainHTTP=%t) and destination (%s, plainHTTP=%t) must use the same protocol; mixing HTTP and HTTPS or promoting HTTP artifacts to HTTPS is not supported",
+			ErrInvalidConfig, publication.source, sourcePlainHTTP, publication.destination, destPlainHTTP)
+	}
 	manifestPath := filepath.Join(plan.staging, snapshotManifestName)
 	raw, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return nil, err
 	}
-	destPlainHTTP := ociPlainHTTPForReference(publication.destination)
-	packPlainHTTP := destPlainHTTP || ociPlainHTTPForReference(publication.source)
-	args := append(d.fsbArgsWithPlainHTTP(packPlainHTTP), "--build-work-dir", filepath.Join(plan.staging, "pack-work"), "--build-output-dir", filepath.Join(plan.staging, "artifacts"), "pack", "--bundle-dir", plan.staging, "--output", "snapshot:"+plan.snapshotID)
+	args := append(d.fsbArgsWithPlainHTTP(destPlainHTTP), "--build-work-dir", filepath.Join(plan.staging, "pack-work"), "--build-output-dir", filepath.Join(plan.staging, "artifacts"), "pack", "--bundle-dir", plan.staging, "--output", "snapshot:"+plan.snapshotID)
 	document, err := artifacts.DecodeVMManifest(raw)
 	if err != nil {
 		return nil, err

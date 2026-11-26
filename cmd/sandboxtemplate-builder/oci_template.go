@@ -28,23 +28,14 @@ import (
 const (
 	buildIDEnvName        = "SANDBOX_TEMPLATE_BUILD_ID"
 	registryConfigFileEnv = "SANDBOX_TEMPLATE_REGISTRY_CONFIG"
-	ociPlainHTTPEnv       = "FAST_SANDBOX_OCI_PLAIN_HTTP"
 )
 
 type builderRegistryPolicy struct {
-	config          registryconfig.Config
-	globalPlainHTTP bool
+	config registryconfig.Config
 }
 
 func loadBuilderRegistryPolicy() (builderRegistryPolicy, error) {
 	var policy builderRegistryPolicy
-	switch strings.TrimSpace(os.Getenv(ociPlainHTTPEnv)) {
-	case "", "false", "0":
-	case "true", "1":
-		policy.globalPlainHTTP = true
-	default:
-		return policy, fmt.Errorf("%s must be true or false", ociPlainHTTPEnv)
-	}
 	if path := strings.TrimSpace(os.Getenv(registryConfigFileEnv)); path != "" {
 		cfg, err := registryconfig.LoadConfig(path)
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -56,9 +47,6 @@ func loadBuilderRegistryPolicy() (builderRegistryPolicy, error) {
 }
 
 func (p builderRegistryPolicy) plainHTTP(reference string) bool {
-	if p.globalPlainHTTP {
-		return true
-	}
 	if strings.TrimSpace(reference) == "" {
 		return false
 	}
