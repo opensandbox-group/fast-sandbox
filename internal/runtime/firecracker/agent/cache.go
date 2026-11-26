@@ -355,7 +355,7 @@ func stageFile(ctx context.Context, c *Client, dir, storeKey string, file native
 		}
 	}()
 	digest := sha256.New()
-	written, err := io.Copy(tmp, io.TeeReader(body, digest))
+	written, err := copySparse(tmp, io.TeeReader(body, digest))
 	if err != nil {
 		return fmt.Errorf("download %s: %w", file.publish, err)
 	}
@@ -386,6 +386,55 @@ func stageFile(ctx context.Context, c *Client, dir, storeKey string, file native
 		recordVerifiedFile(target, info, sum, time.Now())
 	}
 	return nil
+}
+
+// sparseChunkSize is the granularity of hole detection during artifact
+// downloads. Filesystem block size is typically 4 KiB; 32 KiB keeps the
+// comparison cost low while still skipping small holes.
+const sparseChunkSize = 32 << 10
+
+// copySparse copies input into output like io.Copy, but skips the physical
+// write for chunks that are entirely zero, leaving a hole on disk. The
+// returned count is the full logical length; callers wrap input (e.g. with
+// io.TeeReader) so skipped zeros are still hashed and counted. output is
+// truncated to that length so a trailing hole is preserved rather than
+// materialized by the seek.
+func copySparse(output *os.File, input io.Reader) (int64, error) {
+	buf := make([]byte, sparseChunkSize)
+	var total int64
+	for {
+		n, readErr := io.ReadFull(input, buf)
+		if n > 0 {
+			if isZeroChunk(buf[:n]) {
+				if _, err := output.Seek(int64(n), io.SeekCurrent); err != nil {
+					return total, err
+				}
+			} else if _, err := output.Write(buf[:n]); err != nil {
+				return total, err
+			}
+			total += int64(n)
+		}
+		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+			break
+		}
+		if readErr != nil {
+			return total, readErr
+		}
+	}
+	if err := output.Truncate(total); err != nil {
+		return total, err
+	}
+	return total, nil
+}
+
+// isZeroChunk reports whether every byte of b is zero.
+func isZeroChunk(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // commitManifest writes the downloaded manifest as the pull commit point:
