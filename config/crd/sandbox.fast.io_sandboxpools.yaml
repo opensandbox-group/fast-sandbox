@@ -62,33 +62,6 @@ spec:
                           maxItems: 64
                           minItems: 1
                           type: array
-                        env:
-                          description: Env sets static environment variables for the
-                            child process.
-                          items:
-                            description: |-
-                              ExecActionEnvVar defines one static environment variable passed to an exec
-                              Action Handler process.
-                            properties:
-                              name:
-                                minLength: 1
-                                type: string
-                              value:
-                                type: string
-                            required:
-                            - name
-                            - value
-                            type: object
-                          maxItems: 64
-                          type: array
-                        failurePolicy:
-                          default: Retry
-                          description: FailurePolicy controls behavior on non-retryable
-                            exit or retry exhaustion.
-                          enum:
-                          - Retry
-                          - FailSandbox
-                          type: string
                         maxRetries:
                           description: MaxRetries limits retries after the initial
                             attempt.
@@ -96,34 +69,6 @@ spec:
                           maximum: 100
                           minimum: 0
                           type: integer
-                        nonRetryableExitCodes:
-                          description: |-
-                            NonRetryableExitCodes lists non-zero exit codes that fail immediately
-                            without retrying.
-                          items:
-                            description: ExecActionExitCode is a non-zero process
-                              exit code in the POSIX 1..255 range.
-                            format: int32
-                            maximum: 255
-                            minimum: 1
-                            type: integer
-                          maxItems: 32
-                          type: array
-                        skipOnRestore:
-                          description: |-
-                            SkipOnRestore marks the binding ActionReady immediately on checkpoint
-                            restore (Pause -> Resume) and in-place Fastlet recovery without
-                            re-executing Command.
-                          type: boolean
-                        stdin:
-                          default: None
-                          description: Stdin selects the payload piped to the child
-                            process stdin.
-                          enum:
-                          - None
-                          - BindingInput
-                          - Envelope
-                          type: string
                         timeoutSeconds:
                           default: 15
                           description: TimeoutSeconds bounds a single command invocation.

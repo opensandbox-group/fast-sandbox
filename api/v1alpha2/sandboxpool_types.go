@@ -191,60 +191,15 @@ const (
 	LifecycleHookDataPlaneReady LifecycleHook = "sandbox.data-plane-ready"
 )
 
-// ExecActionStdinMode selects what Fastlet writes to an exec Action Handler's
-// standard input.
-// +kubebuilder:validation:Enum=None;BindingInput;Envelope
-type ExecActionStdinMode string
-
-const (
-	ExecActionStdinNone         ExecActionStdinMode = "None"
-	ExecActionStdinBindingInput ExecActionStdinMode = "BindingInput"
-	ExecActionStdinEnvelope     ExecActionStdinMode = "Envelope"
-)
-
-// ExecActionFailurePolicy controls how Fastlet reacts when an exec Action
-// Handler exits with a non-retryable exit code or exhausts maxRetries.
-// +kubebuilder:validation:Enum=Retry;FailSandbox
-type ExecActionFailurePolicy string
-
-const (
-	ExecActionFailurePolicyRetry       ExecActionFailurePolicy = "Retry"
-	ExecActionFailurePolicyFailSandbox ExecActionFailurePolicy = "FailSandbox"
-)
-
-// ExecActionEnvVar defines one static environment variable passed to an exec
-// Action Handler process.
-type ExecActionEnvVar struct {
-	// +kubebuilder:validation:MinLength=1
-	Name  string `json:"name"`
-	Value string `json:"value"`
-}
-
-// ExecActionExitCode is a non-zero process exit code in the POSIX 1..255 range.
-// +kubebuilder:validation:Minimum=1
-// +kubebuilder:validation:Maximum=255
-type ExecActionExitCode int32
-
 // ExecActionHandler declares a Fastlet-local command template executed directly
-// via execve without invoking a shell.
+// via execve without invoking a shell. Binding input is piped to stdin,
+// checkpoint restores and Fastlet recoveries skip re-execution, and exhausting
+// maxRetries fails the Sandbox.
 type ExecActionHandler struct {
 	// Command is the argv template executed directly via execve.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=64
 	Command []string `json:"command"`
-
-	// Env sets static environment variables for the child process.
-	// +kubebuilder:validation:MaxItems=64
-	Env []ExecActionEnvVar `json:"env,omitempty"`
-
-	// Stdin selects the payload piped to the child process stdin.
-	// +kubebuilder:default=None
-	Stdin ExecActionStdinMode `json:"stdin,omitempty"`
-
-	// SkipOnRestore marks the binding ActionReady immediately on checkpoint
-	// restore (Pause -> Resume) and in-place Fastlet recovery without
-	// re-executing Command.
-	SkipOnRestore bool `json:"skipOnRestore,omitempty"`
 
 	// TimeoutSeconds bounds a single command invocation. Defaults to 15.
 	// +kubebuilder:default=15
@@ -252,19 +207,10 @@ type ExecActionHandler struct {
 	// +kubebuilder:validation:Maximum=300
 	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
 
-	// NonRetryableExitCodes lists non-zero exit codes that fail immediately
-	// without retrying.
-	// +kubebuilder:validation:MaxItems=32
-	NonRetryableExitCodes []ExecActionExitCode `json:"nonRetryableExitCodes,omitempty"`
-
 	// MaxRetries limits retries after the initial attempt.
 	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=100
 	MaxRetries int32 `json:"maxRetries,omitempty"`
-
-	// FailurePolicy controls behavior on non-retryable exit or retry exhaustion.
-	// +kubebuilder:default=Retry
-	FailurePolicy ExecActionFailurePolicy `json:"failurePolicy,omitempty"`
 }
 
 // ActionHandler declares either one Pod-local HTTP receiver served on loopback

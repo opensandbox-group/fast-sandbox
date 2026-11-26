@@ -32,11 +32,8 @@ func TestCreateSandboxExecActionFailSandboxWakesWaiterWithActionFailed(t *testin
 		Name:  "runtime-init",
 		Hooks: []apiv1alpha2.LifecycleHook{apiv1alpha2.LifecycleHookDataPlaneReady},
 		Exec: &apiv1alpha2.ExecActionHandler{
-			Stdin:                 apiv1alpha2.ExecActionStdinBindingInput,
-			NonRetryableExitCodes: []apiv1alpha2.ExecActionExitCode{22},
-			MaxRetries:            2,
-			FailurePolicy:         apiv1alpha2.ExecActionFailurePolicyFailSandbox,
-			Command:               []string{"/usr/bin/curl", "http://{{.Attachment.Network.IP}}:44772/internal/init"},
+			MaxRetries: 2,
+			Command:    []string{"/usr/bin/curl", "http://{{.Attachment.Network.IP}}:44772/internal/init"},
 		},
 	}}, nil)
 	require.NoError(t, err)
@@ -94,9 +91,7 @@ func TestCreateSandboxExecActionReadySucceeds(t *testing.T) {
 		Name:  "runtime-init",
 		Hooks: []apiv1alpha2.LifecycleHook{apiv1alpha2.LifecycleHookDataPlaneReady},
 		Exec: &apiv1alpha2.ExecActionHandler{
-			Stdin:         apiv1alpha2.ExecActionStdinBindingInput,
-			FailurePolicy: apiv1alpha2.ExecActionFailurePolicyFailSandbox,
-			Command:       []string{"/usr/bin/init-helper", "{{.Attachment.Network.IP}}", "{{.Attachment.Network.NetNSPath}}"},
+			Command: []string{"/usr/bin/init-helper", "{{.Attachment.Network.IP}}", "{{.Attachment.Network.NetNSPath}}"},
 		},
 	}}, nil)
 	require.NoError(t, err)

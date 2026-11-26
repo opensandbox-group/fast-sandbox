@@ -51,12 +51,8 @@ func runtimeInitHandler() apiv1alpha2.ActionHandler {
 		Name:  "runtime-init",
 		Hooks: []apiv1alpha2.LifecycleHook{apiv1alpha2.LifecycleHookDataPlaneReady},
 		Exec: &apiv1alpha2.ExecActionHandler{
-			Stdin:                 apiv1alpha2.ExecActionStdinBindingInput,
-			SkipOnRestore:         true,
-			TimeoutSeconds:        15,
-			NonRetryableExitCodes: []apiv1alpha2.ExecActionExitCode{22},
-			MaxRetries:            3,
-			FailurePolicy:         apiv1alpha2.ExecActionFailurePolicyFailSandbox,
+			TimeoutSeconds: 15,
+			MaxRetries:     3,
 			Command: []string{
 				"/usr/bin/curl",
 				"-fsS",
@@ -219,13 +215,15 @@ func TestExecActionRetriesUntilSuccess(t *testing.T) {
 	require.Equal(t, 3, execRunner.count())
 }
 
-func TestExecActionNonRetryableFailSandboxTriggersCallback(t *testing.T) {
+func TestExecActionExhaustedRetriesFailSandboxTriggersCallback(t *testing.T) {
 	execRunner := &recordingExecRunner{
 		fn: func(_ context.Context, _ int, _ ExecRequest) ExecResult {
 			return ExecResult{ExitCode: 22, Stdout: `{"error":"invalid token hash"}`, Err: errors.New("exit status 22")}
 		},
 	}
-	manager, err := NewManager([]apiv1alpha2.ActionHandler{runtimeInitHandler()}, nil)
+	handler := runtimeInitHandler()
+	handler.Exec.MaxRetries = 1
+	manager, err := NewManager([]apiv1alpha2.ActionHandler{handler}, nil)
 	require.NoError(t, err)
 	manager.SetExecRunner(execRunner)
 	manager.SetExecBackoff(time.Millisecond, 2*time.Millisecond)
@@ -240,7 +238,7 @@ func TestExecActionNonRetryableFailSandboxTriggersCallback(t *testing.T) {
 	require.NoError(t, err)
 	err = manager.ReachHook(context.Background(), att.SandboxUID, att, actionapi.LifecycleHookDataPlaneReady, 1)
 	require.ErrorContains(t, err, "exit=22")
-	require.Equal(t, 1, execRunner.count(), "non-retryable exit code must not retry")
+	require.Equal(t, 2, execRunner.count(), "must stop after 1 + maxRetries attempts")
 
 	select {
 	case msg := <-failCh:
@@ -253,7 +251,7 @@ func TestExecActionNonRetryableFailSandboxTriggersCallback(t *testing.T) {
 	// Subsequent converge must not re-run a terminally failed exec binding.
 	_, _, err = manager.Reconcile(context.Background(), att, 1, []DesiredInput{{Handler: "runtime-init", Input: `{}`}})
 	require.Error(t, err)
-	require.Equal(t, 1, execRunner.count())
+	require.Equal(t, 2, execRunner.count())
 }
 
 func TestExecActionSkipOnRestoreAndRecovery(t *testing.T) {
@@ -265,7 +263,9 @@ func TestExecActionSkipOnRestoreAndRecovery(t *testing.T) {
 		},
 	}
 
-	mgr, err := NewManager([]apiv1alpha2.ActionHandler{runtimeInitHandler()}, nil)
+	handler := runtimeInitHandler()
+	handler.Exec.MaxRetries = 0
+	mgr, err := NewManager([]apiv1alpha2.ActionHandler{handler}, nil)
 	require.NoError(t, err)
 	mgr.SetExecRunner(execRunner)
 
@@ -425,11 +425,14 @@ func TestExecActionSensitiveFileMaterializedAndCleanedUp(t *testing.T) {
 
 func TestExecActionCallerCancelDoesNotTriggerFailSandbox(t *testing.T) {
 	handler := runtimeInitHandler()
+	handler.Hooks = nil
 	handler.Exec.MaxRetries = 0
+	started := make(chan struct{})
 	var attempts atomic.Int32
 	execRunner := &recordingExecRunner{
 		fn: func(ctx context.Context, _ int, _ ExecRequest) ExecResult {
 			if attempts.Add(1) == 1 {
+				close(started)
 				<-ctx.Done()
 				return ExecResult{ExitCode: -1, Err: ctx.Err()}
 			}
@@ -447,24 +450,24 @@ func TestExecActionCallerCancelDoesNotTriggerFailSandbox(t *testing.T) {
 	})
 
 	att := attachment("sb-caller-cancel")
-	_, _, err = mgr.Reconcile(context.Background(), att, 1, []DesiredInput{{
+	desired := []DesiredInput{{
 		Handler:        "runtime-init",
 		Input:          `{"sandboxId":"sb-caller-cancel"}`,
 		SensitiveInput: "X-Token: keep-me\n",
-	}})
-	require.NoError(t, err)
+	}}
 
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	go func() {
-		time.Sleep(10 * time.Millisecond)
+		<-started
 		cancel()
 	}()
-	err = mgr.ReachHook(cancelCtx, att.SandboxUID, att, actionapi.LifecycleHookDataPlaneReady, 1)
+	_, _, err = mgr.Reconcile(cancelCtx, att, 1, desired)
 	require.ErrorIs(t, err, context.Canceled)
 	require.False(t, terminalFired.Load(), "caller cancellation must not trigger FailSandbox")
 
 	// Subsequent reconcile with a fresh context must resume and succeed.
-	require.NoError(t, mgr.ReachHook(context.Background(), att.SandboxUID, att, actionapi.LifecycleHookDataPlaneReady, 1))
+	_, _, err = mgr.Reconcile(context.Background(), att, 1, desired)
+	require.NoError(t, err)
 	require.False(t, terminalFired.Load())
 	statuses, _ := mgr.Statuses(att.SandboxUID)
 	require.Equal(t, string(apiv1alpha2.ActionReady), statuses[0].State)
@@ -482,7 +485,9 @@ func TestExecActionSensitiveFailureRedactsOutput(t *testing.T) {
 		},
 	}
 
-	mgr, err := NewManager([]apiv1alpha2.ActionHandler{runtimeInitHandler()}, nil)
+	handler := runtimeInitHandler()
+	handler.Exec.MaxRetries = 0
+	mgr, err := NewManager([]apiv1alpha2.ActionHandler{handler}, nil)
 	require.NoError(t, err)
 	mgr.SetExecRunner(execRunner)
 

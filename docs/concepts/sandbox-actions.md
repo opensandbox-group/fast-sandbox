@@ -40,12 +40,8 @@ spec:
     hooks:
     - sandbox.data-plane-ready
     exec:
-      stdin: BindingInput
-      skipOnRestore: true
       timeoutSeconds: 15
-      nonRetryableExitCodes: [22]
       maxRetries: 10
-      failurePolicy: FailSandbox
       command:
       - /usr/bin/curl
       - -fsS
@@ -56,6 +52,8 @@ spec:
       - POST
       - -H
       - "Content-Type: application/json"
+      - -H
+      - "@{{.Sensitive.File}}"
       - --data-binary
       - "@-"
       - "http://{{.Attachment.Network.IP}}:44772/internal/init"
@@ -63,9 +61,9 @@ spec:
 
 `targetHTTPPort` is always reached at `127.0.0.1` from the Fastlet container. The Handler process itself belongs in `fastletTemplate` as a sidecar or another Pod-local process.
 
-`exec` runs `command` directly via `execve` in its own process group without invoking a shell, so user input never undergoes shell interpolation. Command arguments are rendered with Go `text/template` (`missingkey=error`) against platform-trusted metadata only: `Sandbox.{UID,Name,Namespace}`, `Revision.{InstanceGeneration,SpecGeneration,RuntimeInstanceID,AttachmentID,RouteGeneration}`, `Attachment.{Restored,Recovered,Network.{IP,Gateway,NetNSPath,PrivateCIDR,HostVeth}}`, and `Sensitive.File`. Per-Sandbox `binding.input` is never exposed to templates and is delivered strictly over `stdin` (`None`, `BindingInput`, or `Envelope`). Create-time sensitive material (such as a per-Sandbox plaintext token header) can be passed in `ActionBinding.sensitive_input` on `FastPath.CreateSandbox`; FastPath keeps it in memory only (never persisting it to the `Sandbox` CRD or etcd), and Fastlet materializes it into a `0600` temporary file (preferring `/dev/shm`) referenced via `{{.Sensitive.File}}` (for example `-H @{{.Sensitive.File}}`), unlinking the file immediately after execution and clearing it from memory on completion. `RemoveBinding` is a local no-op for `exec` handlers.
+`exec` runs `command` directly via `execve` in its own process group without invoking a shell, so user input never undergoes shell interpolation. Command arguments are rendered with Go `text/template` (`missingkey=error`) against platform-trusted metadata only: `Sandbox.{UID,Name,Namespace}`, `Revision.{InstanceGeneration,SpecGeneration,RuntimeInstanceID,AttachmentID,RouteGeneration}`, `Attachment.{Restored,Recovered,Network.{IP,Gateway,NetNSPath,PrivateCIDR,HostVeth}}`, and `Sensitive.File`. Per-Sandbox `binding.input` is never exposed to templates and is always piped verbatim to `stdin`. Create-time sensitive material (such as a per-Sandbox plaintext token header) can be passed in `ActionBinding.sensitive_input` on `FastPath.CreateSandbox`; FastPath keeps it in memory only (never persisting it to the `Sandbox` CRD or etcd), and Fastlet materializes it into a `0600` temporary file (preferring `/dev/shm`) referenced via `{{.Sensitive.File}}` (for example `-H @{{.Sensitive.File}}`), unlinking the file immediately after execution and clearing it from memory on completion. `RemoveBinding` is a local no-op for `exec` handlers.
 
-`exec` Bindings are create-only and immutable after Sandbox creation: `FastPath.UpdateSandbox` rejects adding, removing, or modifying an `exec` Binding, and Fastlet rejects input digest changes on an existing attachment while still allowing `specGeneration` to advance when sibling HTTP Bindings update. When `skipOnRestore` is `true`, Fastlet marks the Binding `Ready` without re-executing `command` on both checkpoint restore (`Attachment.Restored`) and in-place Fastlet daemon recovery (`Attachment.Recovered`). When `failurePolicy` is `FailSandbox`, hitting a `nonRetryableExitCodes` exit code or exhausting `maxRetries` transitions the Sandbox through `runtime-failure-cleanup` to terminal failure, wakes synchronous `CreateSandbox` with `ErrorActionFailed` (`codes.FailedPrecondition`), and deletes the newly created `Sandbox` CR without penalizing the healthy Fastlet or retrying other candidates.
+`exec` Bindings are create-only and immutable after Sandbox creation: `FastPath.UpdateSandbox` rejects adding, removing, or modifying an `exec` Binding, and Fastlet rejects input digest changes on an existing attachment while still allowing `specGeneration` to advance when sibling HTTP Bindings update. On checkpoint restore (`Attachment.Restored`) and in-place Fastlet daemon recovery (`Attachment.Recovered`), Fastlet marks the Binding `Ready` without re-executing `command`. When `command` exhausts `maxRetries` (excluding caller context cancellation), Fastlet transitions the Sandbox through `runtime-failure-cleanup` to terminal failure, wakes synchronous `CreateSandbox` with `ErrorActionFailed` (`codes.FailedPrecondition`), and deletes the newly created `Sandbox` CR without penalizing the healthy Fastlet or retrying other candidates.
 
 `hooks` is the authoritative subscription list. An empty list defines a
 config-only Handler that receives `SetBinding` and `RemoveBinding`, but no

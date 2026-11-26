@@ -3,7 +3,6 @@ package action
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -30,10 +29,9 @@ const (
 
 	execOpApply = "apply"
 
-	execResultSuccess      = "success"
-	execResultError        = "error"
-	execResultTimeout      = "timeout"
-	execResultNonRetryable = "non_retryable"
+	execResultSuccess = "success"
+	execResultError   = "error"
+	execResultTimeout = "timeout"
 )
 
 // ExecTemplateData exposes only platform-trusted metadata to exec argv
@@ -81,7 +79,6 @@ type ExecTemplateNetwork struct {
 // ExecRequest is one rendered, shell-free execve invocation.
 type ExecRequest struct {
 	Command []string
-	Env     []string
 	Stdin   []byte
 }
 
@@ -121,9 +118,6 @@ func (OSExecRunner) Run(ctx context.Context, req ExecRequest) ExecResult {
 		return err
 	}
 	cmd.WaitDelay = defaultExecWaitDelay
-	if len(req.Env) > 0 {
-		cmd.Env = append(os.Environ(), req.Env...)
-	}
 	if len(req.Stdin) > 0 {
 		cmd.Stdin = bytes.NewReader(req.Stdin)
 	}
@@ -279,50 +273,11 @@ func renderExecCommand(args []string, data ExecTemplateData) ([]string, error) {
 	return rendered, nil
 }
 
-func buildExecEnv(vars []apiv1alpha2.ExecActionEnvVar) []string {
-	if len(vars) == 0 {
-		return nil
-	}
-	env := make([]string, 0, len(vars))
-	for _, entry := range vars {
-		env = append(env, entry.Name+"="+entry.Value)
-	}
-	return env
-}
-
-func buildExecStdin(mode apiv1alpha2.ExecActionStdinMode, input string, envelope *actionapi.Request) ([]byte, error) {
-	switch mode {
-	case "", apiv1alpha2.ExecActionStdinNone:
-		return nil, nil
-	case apiv1alpha2.ExecActionStdinBindingInput:
-		return []byte(input), nil
-	case apiv1alpha2.ExecActionStdinEnvelope:
-		if envelope == nil {
-			return nil, errors.New("exec envelope payload is required")
-		}
-		return json.Marshal(envelope)
-	default:
-		return nil, fmt.Errorf("unsupported exec stdin mode %q", mode)
-	}
-}
-
 func effectiveExecTimeout(cfg *apiv1alpha2.ExecActionHandler) time.Duration {
 	if cfg == nil || cfg.TimeoutSeconds <= 0 {
 		return defaultExecTimeout
 	}
 	return time.Duration(cfg.TimeoutSeconds) * time.Second
-}
-
-func isNonRetryableExit(cfg *apiv1alpha2.ExecActionHandler, exitCode int) bool {
-	if cfg == nil || exitCode <= 0 {
-		return false
-	}
-	for _, configured := range cfg.NonRetryableExitCodes {
-		if int(configured) == exitCode {
-			return true
-		}
-	}
-	return false
 }
 
 func execOutputSummary(result ExecResult) string {
@@ -342,10 +297,7 @@ func execOutputSummary(result ExecResult) string {
 	}
 }
 
-func execSkipReason(cfg *apiv1alpha2.ExecActionHandler, attachment Attachment) (string, string, bool) {
-	if cfg == nil || !cfg.SkipOnRestore {
-		return "", "", false
-	}
+func execSkipReason(attachment Attachment) (string, string, bool) {
 	if attachment.Restored {
 		return "skipped on checkpoint restore", "skipped_restore", true
 	}
@@ -362,7 +314,6 @@ type execInvocationSpec struct {
 	hookName     string
 	attachment   Attachment
 	argv         []string
-	env          []string
 	stdin        []byte
 	hasSensitive bool
 	timeout      time.Duration
@@ -379,7 +330,6 @@ func (m *Manager) runExecAction(
 	attachment Attachment,
 	input string,
 	sensitiveInput string,
-	envelope *actionapi.Request,
 	argvTemplate []string,
 ) error {
 	cfg := handler.Exec
@@ -399,17 +349,10 @@ func (m *Manager) runExecAction(
 			"handler", handler.Name, "op", op, "hook", hookName)
 		return err
 	}
-	stdinPayload, err := buildExecStdin(cfg.Stdin, input, envelope)
-	if err != nil {
-		return err
-	}
-	maxAttempts := 1
-	if op == execOpApply {
-		maxAttempts = 1 + int(cfg.MaxRetries)
-	}
+	maxAttempts := 1 + int(cfg.MaxRetries)
 	spec := execInvocationSpec{
 		state: state, handler: handler, op: op, hookName: hookName, attachment: attachment,
-		argv: argv, env: buildExecEnv(cfg.Env), stdin: stdinPayload, hasSensitive: sensitiveInput != "",
+		argv: argv, stdin: []byte(input), hasSensitive: sensitiveInput != "",
 		timeout: effectiveExecTimeout(cfg), maxAttempts: maxAttempts,
 	}
 	backoff, maxBackoff := m.execBackoffBounds()
@@ -462,7 +405,6 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 }
 
 func (m *Manager) runExecAttempt(ctx context.Context, spec *execInvocationSpec, attempt int) (error, bool) {
-	cfg := spec.handler.Exec
 	att := spec.attachment
 	attemptCtx, cancel := context.WithTimeout(ctx, spec.timeout)
 	klog.V(2).InfoS("fastlet action exec starting",
@@ -472,7 +414,6 @@ func (m *Manager) runExecAttempt(ctx context.Context, spec *execInvocationSpec, 
 	started := time.Now()
 	res := m.execRunner.Run(attemptCtx, ExecRequest{
 		Command: spec.argv,
-		Env:     spec.env,
 		Stdin:   spec.stdin,
 	})
 	duration := time.Since(started)
@@ -487,8 +428,8 @@ func (m *Manager) runExecAttempt(ctx context.Context, spec *execInvocationSpec, 
 	}
 
 	// If the caller's parent context was canceled or expired, abort this
-	// reconcile without tripping FailSandbox or discarding sensitiveInput so a
-	// subsequent reconcile with a fresh context can resume cleanly.
+	// reconcile without tripping terminal failure or discarding sensitiveInput
+	// so a subsequent reconcile with a fresh context can resume cleanly.
 	if ctx.Err() != nil {
 		klog.V(2).InfoS("fastlet action exec interrupted by caller context",
 			"sandboxUID", att.SandboxUID, "namespace", att.Namespace, "sandboxName", att.SandboxName,
@@ -497,33 +438,25 @@ func (m *Manager) runExecAttempt(ctx context.Context, spec *execInvocationSpec, 
 		return ctx.Err(), true
 	}
 
-	nonRetryable := spec.op == execOpApply && isNonRetryableExit(cfg, res.ExitCode)
-	resultLabel := execFailureResultLabel(res.TimedOut, nonRetryable)
+	resultLabel := execResultError
+	if res.TimedOut {
+		resultLabel = execResultTimeout
+	}
 	output := ""
 	if !spec.hasSensitive {
 		output = execOutputSummary(res)
 	}
 	attemptErr := formatExecAttemptError(spec, attempt, res, output)
 
-	terminal := spec.op == execOpApply && cfg.FailurePolicy == apiv1alpha2.ExecActionFailurePolicyFailSandbox && (nonRetryable || attempt == spec.maxAttempts)
-	logExecFailure(spec, attempt, res, nonRetryable, terminal, duration, resultLabel, output, attemptErr)
-	m.recordExecFailureStatus(spec, attempt, res.ExitCode, nonRetryable, terminal, attemptErr)
+	terminal := attempt == spec.maxAttempts
+	logExecFailure(spec, attempt, res, terminal, duration, resultLabel, output, attemptErr)
+	m.recordExecFailureStatus(spec, attempt, res.ExitCode, terminal, attemptErr)
 
 	if terminal {
 		m.notifyTerminalFailure(att.SandboxUID, att, spec.handler.Name, attemptErr.Error())
 		return attemptErr, true
 	}
-	return attemptErr, nonRetryable
-}
-
-func execFailureResultLabel(timedOut, nonRetryable bool) string {
-	if timedOut {
-		return execResultTimeout
-	}
-	if nonRetryable {
-		return execResultNonRetryable
-	}
-	return execResultError
+	return attemptErr, false
 }
 
 func formatExecAttemptError(spec *execInvocationSpec, attempt int, res ExecResult, output string) error {
@@ -539,13 +472,13 @@ func formatExecAttemptError(spec *execInvocationSpec, attempt int, res ExecResul
 	return fmt.Errorf("exec action %s failed (attempt %d/%d, exit=%d): %s", spec.handler.Name, attempt, spec.maxAttempts, res.ExitCode, output)
 }
 
-func logExecFailure(spec *execInvocationSpec, attempt int, res ExecResult, nonRetryable, terminal bool, duration time.Duration, resultLabel, output string, attemptErr error) {
+func logExecFailure(spec *execInvocationSpec, attempt int, res ExecResult, terminal bool, duration time.Duration, resultLabel, output string, attemptErr error) {
 	att := spec.attachment
 	if attempt == 1 || terminal {
 		fields := []any{
 			"sandboxUID", att.SandboxUID, "namespace", att.Namespace, "sandboxName", att.SandboxName,
 			"handler", spec.handler.Name, "op", spec.op, "hook", spec.hookName, "attempt", attempt, "maxAttempts", spec.maxAttempts,
-			"exitCode", res.ExitCode, "timedOut", res.TimedOut, "nonRetryable", nonRetryable,
+			"exitCode", res.ExitCode, "timedOut", res.TimedOut,
 			"durationMs", duration.Milliseconds(), "outcome", resultLabel,
 		}
 		if !spec.hasSensitive && output != "" {
@@ -580,8 +513,8 @@ func clearSensitiveInputLocked(state *sandboxState, handlerName string) {
 	}
 }
 
-func (m *Manager) recordExecFailureStatus(spec *execInvocationSpec, attempt, exitCode int, nonRetryable, terminal bool, attemptErr error) {
-	if spec.state == nil || spec.op != execOpApply {
+func (m *Manager) recordExecFailureStatus(spec *execInvocationSpec, attempt, exitCode int, terminal bool, attemptErr error) {
+	if spec.state == nil {
 		return
 	}
 	spec.state.mu.Lock()
@@ -589,9 +522,6 @@ func (m *Manager) recordExecFailureStatus(spec *execInvocationSpec, attempt, exi
 		switch {
 		case terminal:
 			binding.terminalFailed = true
-			clearSensitiveInputLocked(spec.state, spec.handler.Name)
-			setBindingStatus(binding, apiv1alpha2.ActionFailed, attemptErr.Error())
-		case nonRetryable:
 			clearSensitiveInputLocked(spec.state, spec.handler.Name)
 			setBindingStatus(binding, apiv1alpha2.ActionFailed, attemptErr.Error())
 		case attempt < spec.maxAttempts:
@@ -672,7 +602,7 @@ func (m *Manager) setExecBinding(
 		return nil
 	}
 
-	if skipMsg, skipOutcome, skip := execSkipReason(cfg, attachment); skip {
+	if skipMsg, skipOutcome, skip := execSkipReason(attachment); skip {
 		binding.input = *input
 		clearSensitiveInputLocked(state, handlerName)
 		binding.digest = digest
@@ -693,9 +623,7 @@ func (m *Manager) setExecBinding(
 	binding.attachmentID = attachment.ID
 	state.mu.Unlock()
 
-	request := buildRequest(actionapi.OperationSetBinding, stableInvocationID(actionapi.OperationSetBinding, handlerName, execLocalInstanceID, generation, attachment, digest, ""), generation, attachment)
-	request.Binding = &actionapi.BindingPayload{Input: input}
-	if err := m.runExecAction(ctx, state, handler, execOpApply, "", generation, attachment, *input, sensitiveInput, &request, cfg.Command); err != nil {
+	if err := m.runExecAction(ctx, state, handler, execOpApply, "", generation, attachment, *input, sensitiveInput, cfg.Command); err != nil {
 		return err
 	}
 
@@ -735,7 +663,7 @@ func (m *Manager) invokeExecHook(
 		state.mu.Unlock()
 		return errors.New("SetBinding is not current for lifecycle Hook")
 	}
-	if skipMsg, skipOutcome, skip := execSkipReason(cfg, attachment); skip {
+	if skipMsg, skipOutcome, skip := execSkipReason(attachment); skip {
 		binding.appliedHooks[checkpoint.Name] = checkpoint.Sequence
 		clearSensitiveInputLocked(state, handlerName)
 		binding.readyMessage = skipMsg
@@ -748,17 +676,10 @@ func (m *Manager) invokeExecHook(
 	}
 	bindingInput := binding.input
 	sensitiveInput := binding.sensitiveInput
-	bindingDigest := binding.digest
 	setBindingStatus(binding, apiv1alpha2.ActionApplying, "")
 	state.mu.Unlock()
 
-	extra := fmt.Sprintf("%s/%d", checkpoint.Name, checkpoint.Sequence)
-	request := buildRequest(actionapi.OperationLifecycleHook, stableInvocationID(actionapi.OperationLifecycleHook, handlerName, execLocalInstanceID, generation, attachment, bindingDigest, extra), generation, attachment)
-	request.Hook = &actionapi.LifecycleHookPayload{Name: checkpoint.Name, Sequence: checkpoint.Sequence}
-	inputCopy := bindingInput
-	request.Binding = &actionapi.BindingPayload{Input: &inputCopy}
-
-	if err := m.runExecAction(ctx, state, handler, execOpApply, string(checkpoint.Name), generation, attachment, bindingInput, sensitiveInput, &request, cfg.Command); err != nil {
+	if err := m.runExecAction(ctx, state, handler, execOpApply, string(checkpoint.Name), generation, attachment, bindingInput, sensitiveInput, cfg.Command); err != nil {
 		return err
 	}
 

@@ -217,42 +217,11 @@ func validateExecActionHandler(handlerName string, cfg *ExecActionHandler) error
 	if err := validateExecArgTemplates(handlerName, "command", cfg.Command); err != nil {
 		return err
 	}
-	if len(cfg.Env) > 64 {
-		return fmt.Errorf("%w: Handler %s exec.env allows at most 64 variables", ErrActionHandlersInvalid, handlerName)
-	}
-	envNames := make(map[string]struct{}, len(cfg.Env))
-	for _, envVar := range cfg.Env {
-		if envVar.Name == "" || strings.ContainsAny(envVar.Name, "=\x00") {
-			return fmt.Errorf("%w: Handler %s exec.env has invalid variable name %q", ErrActionHandlersInvalid, handlerName, envVar.Name)
-		}
-		if _, dup := envNames[envVar.Name]; dup {
-			return fmt.Errorf("%w: Handler %s exec.env declares duplicate variable %q", ErrActionHandlersInvalid, handlerName, envVar.Name)
-		}
-		envNames[envVar.Name] = struct{}{}
-	}
-	switch cfg.Stdin {
-	case "", ExecActionStdinNone, ExecActionStdinBindingInput, ExecActionStdinEnvelope:
-	default:
-		return fmt.Errorf("%w: Handler %s exec.stdin %q is unsupported", ErrActionHandlersInvalid, handlerName, cfg.Stdin)
-	}
 	if cfg.TimeoutSeconds < 0 || cfg.TimeoutSeconds > 300 {
 		return fmt.Errorf("%w: Handler %s exec.timeoutSeconds must be between 1 and 300", ErrActionHandlersInvalid, handlerName)
 	}
-	if len(cfg.NonRetryableExitCodes) > 32 {
-		return fmt.Errorf("%w: Handler %s exec.nonRetryableExitCodes allows at most 32 entries", ErrActionHandlersInvalid, handlerName)
-	}
-	for _, code := range cfg.NonRetryableExitCodes {
-		if code < 1 || code > 255 {
-			return fmt.Errorf("%w: Handler %s exec.nonRetryableExitCodes entry %d must be in 1..255", ErrActionHandlersInvalid, handlerName, code)
-		}
-	}
 	if cfg.MaxRetries < 0 || cfg.MaxRetries > 100 {
 		return fmt.Errorf("%w: Handler %s exec.maxRetries must be between 0 and 100", ErrActionHandlersInvalid, handlerName)
-	}
-	switch cfg.FailurePolicy {
-	case "", ExecActionFailurePolicyRetry, ExecActionFailurePolicyFailSandbox:
-	default:
-		return fmt.Errorf("%w: Handler %s exec.failurePolicy %q is unsupported", ErrActionHandlersInvalid, handlerName, cfg.FailurePolicy)
 	}
 	return nil
 }

@@ -85,12 +85,8 @@ func TestValidateExecActionHandlers(t *testing.T) {
 				Name:  "runtime-init",
 				Hooks: []LifecycleHook{LifecycleHookDataPlaneReady},
 				Exec: &ExecActionHandler{
-					Stdin:                 ExecActionStdinBindingInput,
-					SkipOnRestore:         true,
-					TimeoutSeconds:        15,
-					NonRetryableExitCodes: []ExecActionExitCode{22},
-					MaxRetries:            10,
-					FailurePolicy:         ExecActionFailurePolicyFailSandbox,
+					TimeoutSeconds: 15,
+					MaxRetries:     10,
 					Command: []string{
 						"/usr/bin/curl", "-fsS", "--fail-with-body",
 						"--data-binary", "@-",
@@ -108,7 +104,6 @@ func TestValidateExecActionHandlers(t *testing.T) {
 			Name:  "runtime-init",
 			Hooks: []LifecycleHook{LifecycleHookDataPlaneReady},
 			Exec: &ExecActionHandler{
-				Stdin:   ExecActionStdinBindingInput,
 				Command: []string{"/usr/bin/vsock-exec", "{{.Attachment.VSock.UDSPath}}"},
 			},
 		}},
@@ -137,16 +132,16 @@ func TestValidateExecActionHandlers(t *testing.T) {
 	}}}
 	require.ErrorIs(t, badSyntax.ValidateActionHandlers(), ErrActionHandlersInvalid)
 
-	// Invalid exit code and failurePolicy
-	badExit := SandboxPoolSpec{ActionHandlers: []ActionHandler{{
-		Name: "exit", Exec: &ExecActionHandler{Command: []string{"/bin/true"}, NonRetryableExitCodes: []ExecActionExitCode{0}},
+	// Invalid timeoutSeconds and maxRetries
+	badTimeout := SandboxPoolSpec{ActionHandlers: []ActionHandler{{
+		Name: "timeout", Exec: &ExecActionHandler{Command: []string{"/bin/true"}, TimeoutSeconds: 301},
 	}}}
-	require.ErrorIs(t, badExit.ValidateActionHandlers(), ErrActionHandlersInvalid)
+	require.ErrorIs(t, badTimeout.ValidateActionHandlers(), ErrActionHandlersInvalid)
 
-	badPolicy := SandboxPoolSpec{ActionHandlers: []ActionHandler{{
-		Name: "policy", Exec: &ExecActionHandler{Command: []string{"/bin/true"}, FailurePolicy: "Drop"},
+	badRetries := SandboxPoolSpec{ActionHandlers: []ActionHandler{{
+		Name: "retries", Exec: &ExecActionHandler{Command: []string{"/bin/true"}, MaxRetries: 101},
 	}}}
-	require.ErrorIs(t, badPolicy.ValidateActionHandlers(), ErrActionHandlersInvalid)
+	require.ErrorIs(t, badRetries.ValidateActionHandlers(), ErrActionHandlersInvalid)
 }
 
 func TestGenerationAndAssignmentValidation(t *testing.T) {
