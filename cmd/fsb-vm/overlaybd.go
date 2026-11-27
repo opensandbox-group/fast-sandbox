@@ -35,11 +35,16 @@ type OverlayBDBSConfigLower struct {
 }
 
 // OverlayBDBSConfigUpper is the writable top layer (index/data on the local
-// filesystem). Vsize is the virtual device size in GiB.
+// filesystem). Vsize is the virtual device size in GiB. When CreateIfMissing is
+// true, overlaybd-ublkd creates the empty LSMT RW upper layer in-process via
+// LSMT::create_file_rw (containerd/overlaybd#487) instead of spawning an
+// external overlaybd-create subprocess on the hot create path.
 type OverlayBDBSConfigUpper struct {
-	Index string `json:"index,omitempty"`
-	Data  string `json:"data,omitempty"`
-	Vsize int    `json:"vsize,omitempty"`
+	Index           string `json:"index,omitempty"`
+	Data            string `json:"data,omitempty"`
+	Vsize           int    `json:"vsize,omitempty"`
+	CreateIfMissing bool   `json:"createIfMissing,omitempty"`
+	RWType          string `json:"rwType,omitempty"`
 }
 
 // overlaybd upper filenames inside a sandbox's upper/ directory.
@@ -62,26 +67,32 @@ func lowersFor(image resolvedImage) []OverlayBDBSConfigLower {
 	return lowers
 }
 
-// writeRootfsConfig creates the hybrid writable upper (data/index) and emits
-// the rootfs config.v1.json referencing it, returning the config path. The
-// upper's virtual size (GiB, rounded up from the template disk size) is the
-// device size overlaybd reports to the guest.
-func writeRootfsConfig(ctx context.Context, home string, image resolvedImage, diskSizeMB int) (string, error) {
+// writeRootfsConfig emits the rootfs config.v1.json configured for in-process
+// hybrid writable upper creation by overlaybd-ublkd (createIfMissing=true,
+// rwType="hybrid"), returning the config path. The upper's virtual size (GiB,
+// rounded up from the template disk size) is the device size overlaybd reports
+// to the guest.
+func writeRootfsConfig(_ context.Context, home string, image resolvedImage, diskSizeMB int) (string, error) {
 	upperDir := filepath.Join(home, upperDirName)
 	if err := os.MkdirAll(upperDir, 0o750); err != nil {
 		return "", fmt.Errorf("create upper directory: %w", err)
 	}
 	dataFile := filepath.Join(upperDir, upperDataName)
 	indexFile := filepath.Join(upperDir, upperIndexName)
+	_ = os.Remove(dataFile)
+	_ = os.Remove(indexFile)
 	vsizeGiB := gibCeil(diskSizeMB)
-	if err := createHybridUpper(ctx, global.overlaybdCreate, dataFile, indexFile, vsizeGiB); err != nil {
-		return "", err
-	}
 	config := OverlayBDBSConfig{
 		RepoBlobURL: image.RepoBlobURL,
 		Lowers:      cachedLowers(home, image),
-		Upper:       OverlayBDBSConfigUpper{Index: indexFile, Data: dataFile, Vsize: vsizeGiB},
-		ResultFile:  filepath.Join(home, "rootfs."+overlaybdResultName),
+		Upper: OverlayBDBSConfigUpper{
+			Index:           indexFile,
+			Data:            dataFile,
+			Vsize:           vsizeGiB,
+			CreateIfMissing: true,
+			RWType:          "hybrid",
+		},
+		ResultFile: filepath.Join(home, "rootfs."+overlaybdResultName),
 	}
 	return writeConfig(filepath.Join(home, rootfsConfigName), config)
 }
