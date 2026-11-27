@@ -97,8 +97,11 @@ const (
 	defaultFastletStartupGrace            = 2 * time.Minute
 	defaultResourceScaleDownStabilization = time.Minute
 	// maxPlannedUpgradeSurge bounds the extra new-template Fastlets a planned
-	// upgrade creates above the Pool target while outdated Fastlets drain.
-	maxPlannedUpgradeSurge = 3
+	// upgrade creates above the Pool target while outdated Fastlets drain. It
+	// stays 1: an outdated Fastlet drains only once every new-template Pod is
+	// Ready (currentTemplatePodsReady), so a second surge Pod that cannot be
+	// scheduled would block the drain that frees room for it.
+	maxPlannedUpgradeSurge = 1
 )
 
 const (
@@ -399,7 +402,8 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 	if needsPlannedUpgradeSurge(childPods.Items, upgradeTarget, desiredPodHash) {
-		logger.Info("creating Fastlet surge Pod before planned upgrade drain", "desiredPods", desiredPods, "templateHash", desiredPodHash)
+		logger.Info("creating Fastlet surge Pod before planned upgrade drain",
+			"upgradeTarget", upgradeTarget, "desiredPods", desiredPods, "templateHash", desiredPodHash)
 		if err := r.Create(ctx, desiredPod.DeepCopy()); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1873,10 +1877,12 @@ func stampFastletPodTemplateHash(pod *corev1.Pod) error {
 }
 
 // needsPlannedUpgradeSurge reports whether a planned upgrade should create one
-// more new-template Fastlet before draining an outdated one. It surges only
-// while outdated Pods remain (no more than the target: excess Pods scale down
-// first), fewer new-template Pods than the target exist,
-// the Pool is at most maxPlannedUpgradeSurge Pods above its target, and fewer
+// more new-template Fastlet before draining an outdated one. target is the
+// capped target from before scale-down stabilization, which would otherwise
+// hold it at the current Pod count and let every surge Pod justify the next.
+// It surges only while outdated Pods remain (no more than the target: excess
+// Pods scale down first), fewer new-template Pods than the target exist, the
+// Pool is less than maxPlannedUpgradeSurge Pods above its target, and fewer
 // than maxPlannedUpgradeSurge new-template Pods are still starting. A surge Pod
 // that cannot be scheduled therefore holds the upgrade instead of multiplying.
 func needsPlannedUpgradeSurge(pods []corev1.Pod, target int32, desiredPodHash string) bool {
