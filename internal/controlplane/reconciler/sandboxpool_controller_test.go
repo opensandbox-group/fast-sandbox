@@ -1674,6 +1674,235 @@ func TestPlannedUpgradeWaitsForReadySurgeThenDrainsOldTemplate(t *testing.T) {
 	require.False(t, needsPlannedUpgradeSurge([]corev1.Pod{*oldPod, *newPod}, 1, desiredHash))
 }
 
+func surgeTestPod(name, templateHash string, ready bool) corev1.Pod {
+	pod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Annotations: map[string]string{placement.AnnotationPodTemplateHash: templateHash}}}
+	if ready {
+		pod.Status.Phase = corev1.PodRunning
+		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	} else {
+		pod.Status.Phase = corev1.PodPending
+	}
+	return pod
+}
+
+func surgeTestPods(prefix, templateHash string, ready bool, count int) []corev1.Pod {
+	pods := make([]corev1.Pod, 0, count)
+	for index := range count {
+		pods = append(pods, surgeTestPod(fmt.Sprintf("%s-%d", prefix, index), templateHash, ready))
+	}
+	return pods
+}
+
+func TestNeedsPlannedUpgradeSurgeBounds(t *testing.T) {
+	const desiredHash = "desired-template"
+	old := func(count int) []corev1.Pod { return surgeTestPods("old", "old-template", true, count) }
+	starting := func(count int) []corev1.Pod { return surgeTestPods("new-starting", desiredHash, false, count) }
+	ready := func(count int) []corev1.Pod { return surgeTestPods("new-ready", desiredHash, true, count) }
+	join := func(groups ...[]corev1.Pod) []corev1.Pod {
+		var pods []corev1.Pod
+		for _, group := range groups {
+			pods = append(pods, group...)
+		}
+		return pods
+	}
+	cases := []struct {
+		name   string
+		pods   []corev1.Pod
+		target int32
+		want   bool
+	}{
+		{"at target with outdated Pods", old(9), 9, true},
+		{"below target is ordinary scale-up", old(8), 9, false},
+		{"no outdated Pods", ready(9), 9, false},
+		{"one surge Pod still starting", join(old(9), starting(1)), 9, false},
+		{"one ready surge Pod waits for its drain", join(old(9), ready(1)), 9, false},
+		{"after a drain the next surge Pod follows", join(old(8), ready(1)), 9, true},
+		{"a starting replacement holds the next surge", join(old(8), starting(1)), 9, false},
+		{"enough new-template Pods for the target", join(old(1), ready(1)), 1, false},
+		{"zero target", old(2), 0, false},
+		{"more outdated Pods than the target scale down first", old(10), 9, false},
+	}
+	for _, tc := range cases {
+		require.Equal(t, tc.want, needsPlannedUpgradeSurge(tc.pods, tc.target, desiredHash), tc.name)
+	}
+}
+
+// A surge Pod that cannot be scheduled must hold the upgrade, not multiply: the
+// reconciler used to compare against the stabilized target, which grew with
+// every surge Pod (238 Pods for a 9-Fastlet Pool on a full cluster).
+func TestPlannedUpgradeSurgeStopsWhenSurgePodsStayPending(t *testing.T) {
+	const desiredHash = "desired-template"
+	pods := surgeTestPods("old", "old-template", true, 9)
+	created := 0
+	for range 1000 {
+		if !needsPlannedUpgradeSurge(pods, 9, desiredHash) {
+			continue
+		}
+		pods = append(pods, surgeTestPod(fmt.Sprintf("surge-%d", created), desiredHash, false))
+		created++
+	}
+	require.Equal(t, maxPlannedUpgradeSurge, created)
+}
+
+// plannedUpgradeHarness is a ResourceAware Pool whose Fastlets all run an
+// outdated template, so every Reconcile is in the middle of a planned upgrade.
+type plannedUpgradeHarness struct {
+	reconciler *SandboxPoolReconciler
+	client     client.Client
+	drainer    *recordingDrainer
+	registry   *placement.InMemoryRegistry
+	pool       *apiv1alpha2.SandboxPool
+	now        *time.Time
+}
+
+func newPlannedUpgradeHarness(t *testing.T, fastlets int, poolMax int32, busy bool) *plannedUpgradeHarness {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Date(2026, 11, 27, 0, 0, 0, 0, time.UTC)
+	var sandboxes []apiv1alpha2.Sandbox
+	if busy {
+		for index := range fastlets {
+			sandboxes = append(sandboxes, assignedSandbox(fmt.Sprintf("sandbox-%d", index), fmt.Sprintf("old-%d", index), fmt.Sprintf("old-uid-%d", index)))
+		}
+	}
+	reconciler, k8sClient, drainer, pool := newDrainHarness(t, sandboxes)
+	reconciler.Now = func() time.Time { return now }
+	for _, name := range []string{"fastlet-a", "fastlet-b"} {
+		require.NoError(t, k8sClient.Delete(ctx, getFastletPod(t, k8sClient, name)))
+	}
+	resourceAware := resourceAwareScalingPool()
+	pool.Spec.SandboxResources = resourceAware.Spec.SandboxResources
+	pool.Spec.MaxSandboxesPerPod = resourceAware.Spec.MaxSandboxesPerPod
+	pool.Spec.Capacity = apiv1alpha2.PoolCapacity{PoolMin: 1, PoolMax: poolMax, BufferMin: 2, BufferMax: 4}
+	require.NoError(t, k8sClient.Update(ctx, pool))
+	registry := placement.NewInMemoryRegistry()
+	reconciler.Registry = registry
+	// The API server stamps creationTimestamp and a UID on create and the fake
+	// client does not; Pool scaling counts a Pending Pod as starting capacity by
+	// age, and the Registry matches heartbeats by Pod UID.
+	created := 0
+	reconciler.Client = interceptor.NewClient(k8sClient.(client.WithWatch), interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if stamp := obj.GetCreationTimestamp(); stamp.IsZero() {
+				obj.SetCreationTimestamp(metav1.NewTime(now))
+			}
+			if obj.GetUID() == "" {
+				created++
+				obj.SetUID(types.UID(fmt.Sprintf("created-uid-%d", created)))
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	})
+	plan, err := runtimeenv.ResolveDefault(reconciler.Catalog, pool.Spec.Runtime)
+	require.NoError(t, err)
+	used := 1
+	if busy {
+		used = 4
+	}
+	for index := range fastlets {
+		pod, err := reconciler.constructPodWithRuntimePlan(pool, plan)
+		require.NoError(t, err)
+		pod.Name, pod.GenerateName, pod.UID = fmt.Sprintf("old-%d", index), "", types.UID(fmt.Sprintf("old-uid-%d", index))
+		pod.Annotations[placement.AnnotationPodTemplateHash] = "old-template"
+		pod.Status.Phase = corev1.PodRunning
+		pod.Status.PodIP = fmt.Sprintf("10.0.1.%d", index+1)
+		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+		require.NoError(t, k8sClient.Create(ctx, pod))
+		seedControllerRegistry(t, registry, resourceAwareControllerFastlet(pod.Name, string(pod.UID), used, fastletapi.AdmissionStateOpen, now))
+	}
+	return &plannedUpgradeHarness{reconciler: reconciler, client: k8sClient, drainer: drainer, registry: registry, pool: pool, now: &now}
+}
+
+func (h *plannedUpgradeHarness) pods(t *testing.T) []corev1.Pod {
+	t.Helper()
+	var pods corev1.PodList
+	require.NoError(t, h.client.List(context.Background(), &pods, client.InNamespace(h.pool.Namespace), client.MatchingLabels(poolLabels(h.pool.Name))))
+	return pods.Items
+}
+
+func newTemplatePods(pods []corev1.Pod) []corev1.Pod {
+	var current []corev1.Pod
+	for _, pod := range pods {
+		if pod.Annotations[placement.AnnotationPodTemplateHash] != "old-template" {
+			current = append(current, pod)
+		}
+	}
+	return current
+}
+
+// #272: a surge Pod that cannot be scheduled used to raise the stabilized
+// target, so every Reconcile created another one (one per pass, past PoolMax).
+// Through the real Reconcile wiring (scale plan, PoolMax cap, upgrade target,
+// scale-down stabilization) the upgrade now keeps exactly one surge Pod and
+// waits for it.
+func TestPlannedUpgradeReconcileKeepsOnePendingSurgePod(t *testing.T) {
+	const fastlets = 4
+	for _, test := range []struct {
+		name    string
+		poolMax int32
+		busy    bool
+	}{
+		{name: "PoolMax set", poolMax: fastlets},
+		{name: "PoolMax set with busy Fastlets", poolMax: fastlets, busy: true},
+		{name: "PoolMax unset with busy Fastlets", busy: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			harness := newPlannedUpgradeHarness(t, fastlets, test.poolMax, test.busy)
+			for round := range 12 {
+				_, err := harness.reconciler.Reconcile(context.Background(), poolRequest(harness.pool))
+				require.NoError(t, err)
+				pods := harness.pods(t)
+				require.Len(t, newTemplatePods(pods), 1, "round %d: one surge Pod at a time", round)
+				require.Len(t, pods, fastlets+1, "round %d: the Pool stays at most one Pod above its target", round)
+				*harness.now = harness.now.Add(2 * time.Second)
+			}
+			require.Empty(t, harness.drainer.requests, "no outdated Fastlet drains before its replacement is Ready")
+		})
+	}
+}
+
+// With a surge of one, the upgrade still progresses: once the surge Pod is
+// Ready, one outdated Fastlet drains and no second surge Pod is created first.
+func TestPlannedUpgradeReconcileDrainsAfterSurgePodIsReady(t *testing.T) {
+	const fastlets = 4
+	ctx := context.Background()
+	harness := newPlannedUpgradeHarness(t, fastlets, fastlets, false)
+	harness.reconciler.ResourceScaleDownStabilization = time.Nanosecond
+	// Hold the target at four Fastlets so the only drain is the upgrade's,
+	// not an ordinary scale-down of the lightly loaded Pool.
+	require.NoError(t, harness.client.Get(ctx, client.ObjectKeyFromObject(harness.pool), harness.pool))
+	harness.pool.Spec.Capacity.PoolMin = fastlets
+	require.NoError(t, harness.client.Update(ctx, harness.pool))
+	_, err := harness.reconciler.Reconcile(ctx, poolRequest(harness.pool))
+	require.NoError(t, err)
+	surge := newTemplatePods(harness.pods(t))
+	require.Len(t, surge, 1)
+
+	pod := surge[0]
+	pod.Status.Phase = corev1.PodRunning
+	pod.Status.PodIP = "10.0.2.1"
+	pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	require.NoError(t, harness.client.Status().Update(ctx, &pod))
+	seedControllerRegistry(t, harness.registry, resourceAwareControllerFastlet(pod.Name, string(pod.UID), 0, fastletapi.AdmissionStateOpen, *harness.now))
+
+	for range 3 {
+		*harness.now = harness.now.Add(2 * time.Second)
+		_, err = harness.reconciler.Reconcile(ctx, poolRequest(harness.pool))
+		require.NoError(t, err)
+	}
+	pods := harness.pods(t)
+	require.Len(t, newTemplatePods(pods), 1, "no second surge Pod while an outdated Fastlet drains")
+	draining := 0
+	for _, pod := range pods {
+		if placement.PodDrainRequested(&pod) {
+			require.Equal(t, "old-template", pod.Annotations[placement.AnnotationPodTemplateHash])
+			require.Equal(t, placement.DrainReasonPlannedUpgrade, pod.Annotations[placement.AnnotationDrainReason])
+			draining++
+		}
+	}
+	require.Equal(t, 1, draining, "the Ready surge Pod releases exactly one outdated Fastlet")
+}
+
 func TestSandboxNeedsPlacementExcludesTerminalAndAssignedStates(t *testing.T) {
 	require.True(t, sandboxNeedsPlacement(&apiv1alpha2.Sandbox{}))
 	expired := &apiv1alpha2.Sandbox{Status: apiv1alpha2.SandboxStatus{

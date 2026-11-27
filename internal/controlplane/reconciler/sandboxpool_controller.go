@@ -97,6 +97,12 @@ const (
 	drainRequeue                          = 2 * time.Second
 	defaultFastletStartupGrace            = 2 * time.Minute
 	defaultResourceScaleDownStabilization = time.Minute
+	// maxPlannedUpgradeSurge bounds the extra new-template Fastlets a planned
+	// upgrade creates above the Pool target while outdated Fastlets drain. It
+	// stays 1: an outdated Fastlet drains only once every new-template Pod is
+	// Ready (currentTemplatePodsReady), so a second surge Pod that cannot be
+	// scheduled would block the drain that frees room for it.
+	maxPlannedUpgradeSurge = 1
 )
 
 const (
@@ -373,6 +379,10 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, err
 	}
 
+	// The planned-upgrade surge is measured against the capped target, before
+	// scale-down stabilization can hold the target at the current Pod count
+	// (which would otherwise make every new surge Pod justify the next one).
+	upgradeTarget := desiredPods
 	var scaleDownCandidate *metav1.Condition
 	if resourceAwareScaling {
 		// Every persisted drain is already a committed removal, including a
@@ -394,8 +404,9 @@ func (r *SandboxPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			}
 		}
 	}
-	if needsPlannedUpgradeSurge(childPods.Items, desiredPods, desiredPodHash) {
-		logger.Info("creating Fastlet surge Pod before planned upgrade drain", "desiredPods", desiredPods, "templateHash", desiredPodHash)
+	if needsPlannedUpgradeSurge(childPods.Items, upgradeTarget, desiredPodHash) {
+		logger.Info("creating Fastlet surge Pod before planned upgrade drain",
+			"upgradeTarget", upgradeTarget, "desiredPods", desiredPods, "templateHash", desiredPodHash)
 		if err := r.Create(ctx, desiredPod.DeepCopy()); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1869,16 +1880,33 @@ func stampFastletPodTemplateHash(pod *corev1.Pod) error {
 	return nil
 }
 
-func needsPlannedUpgradeSurge(pods []corev1.Pod, desiredPods int32, desiredPodHash string) bool {
-	if desiredPods <= 0 || len(pods) != int(desiredPods) {
+// needsPlannedUpgradeSurge reports whether a planned upgrade should create one
+// more new-template Fastlet before draining an outdated one. target is the
+// capped target from before scale-down stabilization, which would otherwise
+// hold it at the current Pod count and let every surge Pod justify the next.
+// It surges only while outdated Pods remain (no more than the target: excess
+// Pods scale down first), fewer new-template Pods than the target exist, the
+// Pool is less than maxPlannedUpgradeSurge Pods above its target, and fewer
+// than maxPlannedUpgradeSurge new-template Pods are still starting. A surge Pod
+// that cannot be scheduled therefore holds the upgrade instead of multiplying.
+func needsPlannedUpgradeSurge(pods []corev1.Pod, target int32, desiredPodHash string) bool {
+	if target <= 0 || len(pods) < int(target) || len(pods) >= int(target)+maxPlannedUpgradeSurge {
 		return false
 	}
+	var current, starting, outdated int
 	for index := range pods {
-		if !fastletPodTemplateCurrent(&pods[index], desiredPodHash) {
-			return true
+		pod := &pods[index]
+		if !fastletPodTemplateCurrent(pod, desiredPodHash) {
+			outdated++
+			continue
+		}
+		current++
+		if pod.Status.Phase != corev1.PodRunning || !podConditionTrue(pod.Status.Conditions, corev1.PodReady) {
+			starting++
 		}
 	}
-	return false
+	// More outdated Pods than the target is a scale-down, which runs first.
+	return outdated > 0 && outdated <= int(target) && current < int(target) && starting < maxPlannedUpgradeSurge
 }
 
 func fastletPodTemplateCurrent(pod *corev1.Pod, desiredPodHash string) bool {
