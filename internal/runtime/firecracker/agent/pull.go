@@ -28,7 +28,8 @@ import (
 // the node-local cache. With a P2P peer gateway (WithPeerGateway) artifact
 // bytes route through it, falling back to direct header-signed S3.
 type Client struct {
-	s3 *s3Client
+	s3           *s3Client
+	artifactHTTP *http.Client
 	// peer is the P2P peer gateway; nil keeps pulls on the direct path.
 	peer *peerGateway
 }
@@ -54,16 +55,16 @@ func NewClient(storeRoot string, credential registryconfig.Credential, options .
 	if err != nil {
 		return nil, err
 	}
-	client := &Client{s3: s3}
+	artifactHTTP := config.httpClient
+	if artifactHTTP == nil {
+		artifactHTTP = &http.Client{Timeout: defaultArtifactRequestTimeout}
+	}
+	client := &Client{s3: s3, artifactHTTP: artifactHTTP}
 	if config.peerBase != "" {
-		httpClient := config.httpClient
-		if httpClient == nil {
-			httpClient = &http.Client{Timeout: defaultS3RequestTimeout}
-		}
 		client.peer = &peerGateway{
 			base:        strings.TrimRight(config.peerBase, "/"),
 			routePrefix: normalizePeerRoutePrefix(config.peerRoutePrefix),
-			http:        httpClient,
+			http:        artifactHTTP,
 		}
 	}
 	return client, nil
@@ -91,8 +92,7 @@ func WithEndpoint(endpoint string) Option {
 	return func(config *optionsConfig) { config.endpoint = endpoint }
 }
 
-// WithHTTPClient replaces the default HTTP client (5-minute request
-// timeout), e.g. to tune timeouts or the transport.
+// WithHTTPClient replaces the default HTTP client for S3 and peer delivery.
 func WithHTTPClient(client *http.Client) Option {
 	return func(config *optionsConfig) { config.httpClient = client }
 }
@@ -293,7 +293,7 @@ func (c *Client) materializeSet(ctx context.Context, dir, manifestKey, artifactD
 // stage-1 behavior without failing the pull.
 func (c *Client) getArtifact(ctx context.Context, storeKey string) (io.ReadCloser, error) {
 	if c.peer == nil {
-		return c.s3.get(ctx, storeKey)
+		return c.getArtifactFromS3(ctx, storeKey)
 	}
 	body, err := c.getArtifactViaGateway(ctx, storeKey)
 	if err == nil {
@@ -314,7 +314,14 @@ func (c *Client) getArtifact(ctx context.Context, storeKey string) (io.ReadClose
 	// header-signed path (which carries its own retry loop). Never silent:
 	// origin-bandwidth spikes are diagnosed from exactly this line.
 	klog.ErrorS(err, "P2P gateway artifact fetch failed; falling back to direct S3", "storeKey", storeKey, "err", err)
-	return c.s3.get(ctx, storeKey)
+	return c.getArtifactFromS3(ctx, storeKey)
+}
+
+func (c *Client) getArtifactFromS3(ctx context.Context, storeKey string) (io.ReadCloser, error) {
+	if c.artifactHTTP == nil {
+		return c.s3.get(ctx, storeKey)
+	}
+	return c.s3.getWithClient(ctx, storeKey, c.artifactHTTP)
 }
 
 // getArtifactViaGateway performs one presigned GET through the gateway

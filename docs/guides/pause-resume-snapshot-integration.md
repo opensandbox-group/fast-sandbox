@@ -48,6 +48,8 @@ the task (`UNIMPLEMENTED` on the snapshot trigger, a `SnapshotUnsupported`
   provides this; the integration environment wires it automatically for
   `verify-snapshot` / `verify-pause`.
 
+Native S3 checkpoints use multipart upload for individual files above 5 GB. The runtime agent writes the manifest after all referenced files have been committed. Grant the write credential `s3:AbortMultipartUpload` alongside `s3:PutObject` and configure lifecycle cleanup for incomplete multipart uploads left by a node or process failure.
+
 ## Surface one: FastPath gRPC (recommended)
 
 ### Pause

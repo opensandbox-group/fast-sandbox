@@ -34,17 +34,16 @@ func (e *httpError) Error() string {
 	if len(body) > 200 {
 		body = body[:200] + "..."
 	}
-	return fmt.Sprintf("S3 GET failed with status %d: %s", e.StatusCode, body)
+	return fmt.Sprintf("S3 request failed with status %d: %s", e.StatusCode, body)
 }
 
 const (
 	// defaultS3Region is the SigV4 signing region when none is configured.
 	// S3-compatible stores with endpoint overrides accept it regardless of
 	// their real region.
-	defaultS3Region = "us-east-1"
-	// defaultS3RequestTimeout bounds a single GET. Rootfs images are
-	// multi-GiB, so the default is generous.
-	defaultS3RequestTimeout = 5 * time.Minute
+	defaultS3Region               = "us-east-1"
+	defaultS3RequestTimeout       = 5 * time.Minute
+	defaultArtifactRequestTimeout = 15 * time.Minute
 	// s3RetryAttempts is how many times a transient GET failure is retried
 	// with exponential backoff (2s, 4s, 8s).
 	s3RetryAttempts = 3
@@ -198,7 +197,7 @@ func (c *s3Client) putOnce(ctx context.Context, urlString, key string, body io.R
 		return err
 	}
 	request.ContentLength = size
-	c.signWrite(request)
+	c.signWrite(request, unsignedPayload)
 	response, err := c.putHTTP.Do(request)
 	if err != nil {
 		return err
@@ -262,6 +261,10 @@ func (c *s3Client) resolveRef(ref string) (string, error) {
 // returned body and must close it. Transport errors and 5xx responses are
 // retried with exponential backoff; 4xx responses (including 404) are not.
 func (c *s3Client) get(ctx context.Context, storeKey string) (io.ReadCloser, error) {
+	return c.getWithClient(ctx, storeKey, c.http)
+}
+
+func (c *s3Client) getWithClient(ctx context.Context, storeKey string, client *http.Client) (io.ReadCloser, error) {
 	key := storeKey
 	if c.prefix != "" {
 		key = c.prefix + "/" + storeKey
@@ -281,7 +284,7 @@ func (c *s3Client) get(ctx context.Context, storeKey string) (io.ReadCloser, err
 			}
 			backoff *= 2
 		}
-		body, err := c.getOnce(ctx, urlString, key)
+		body, err := c.getOnce(ctx, urlString, key, client)
 		if err == nil {
 			if attempt > 0 {
 				klog.V(2).InfoS("S3 GET succeeded after retries", "key", key, "attempt", attempt+1)
@@ -302,13 +305,13 @@ func (c *s3Client) get(ctx context.Context, storeKey string) (io.ReadCloser, err
 }
 
 // getOnce performs a single signed GET and returns the response body on 200.
-func (c *s3Client) getOnce(ctx context.Context, urlString, key string) (io.ReadCloser, error) {
+func (c *s3Client) getOnce(ctx context.Context, urlString, key string, client *http.Client) (io.ReadCloser, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, urlString, nil)
 	if err != nil {
 		return nil, err
 	}
 	c.sign(request)
-	response, err := c.http.Do(request)
+	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
 	}
@@ -333,8 +336,7 @@ func (c *s3Client) objectURL(key string) (string, error) {
 	return base.String(), nil
 }
 
-// emptyPayloadHash is the SHA-256 of an empty payload, the fixed
-// X-Amz-Content-Sha256 of a bodyless GET.
+// emptyPayloadHash is the SHA-256 of an empty payload.
 var emptyPayloadHash = sha256Hex(nil)
 
 // unsignedPayload is the presigned-URL payload hash. A presigned GET cannot
@@ -461,32 +463,30 @@ func deriveSigningKey(secretKey, date, region string) []byte {
 	return hmacSHA256(key, "aws4_request")
 }
 
-// signWrite applies AWS Signature Version 4 to a PUT with the write
-// credential. The payload hash is UNSIGNED-PAYLOAD: streamed bodies cannot
-// promise a content hash header without a second full read.
-func (c *s3Client) signWrite(request *http.Request) {
+// signWrite applies AWS Signature Version 4 with the write credential and the supplied payload hash.
+func (c *s3Client) signWrite(request *http.Request, payloadHash string) {
 	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	date := now.Format("20060102")
 
 	request.Header.Set("X-Amz-Date", amzDate)
-	request.Header.Set("X-Amz-Content-Sha256", unsignedPayload)
+	request.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
 	canonicalURI := request.URL.EscapedPath()
 	if canonicalURI == "" {
 		canonicalURI = "/"
 	}
 	canonicalHeaders := "host:" + request.URL.Host + "\n" +
-		"x-amz-content-sha256:" + unsignedPayload + "\n" +
+		"x-amz-content-sha256:" + payloadHash + "\n" +
 		"x-amz-date:" + amzDate + "\n"
 	signedHeaders := "host;x-amz-content-sha256;x-amz-date"
 	canonicalRequest := strings.Join([]string{
-		http.MethodPut,
+		request.Method,
 		canonicalURI,
 		request.URL.RawQuery,
 		canonicalHeaders,
 		signedHeaders,
-		unsignedPayload,
+		payloadHash,
 	}, "\n")
 	scope := date + "/" + c.region + "/s3/aws4_request"
 	stringToSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + sha256Hex([]byte(canonicalRequest))

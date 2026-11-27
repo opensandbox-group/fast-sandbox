@@ -153,6 +153,14 @@ func (c *Client) putFile(ctx context.Context, dir, name, storeKey string) error 
 	if err != nil {
 		return err
 	}
+	if info.Size() > maxSinglePUTSize {
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+		return c.s3.putMultipart(ctx, storeKey, file, info.Size(), multipartPartSize(info.Size()))
+	}
 	return c.s3.put(ctx, storeKey, info.Size(), func() (io.ReadCloser, error) {
 		return os.Open(path)
 	})
