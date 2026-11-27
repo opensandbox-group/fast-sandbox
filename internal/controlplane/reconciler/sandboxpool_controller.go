@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -1680,6 +1681,9 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 		if profile.ResidualProcess != runtimecatalog.ResidualProcessNone {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "FAST_SANDBOX_NODE_CLEANUP_SOCKET", Value: nodecleanup.DefaultSocketPath})
 		}
+		if cidr := strings.TrimSpace(os.Getenv("FAST_SANDBOX_NETWORK_CIDR")); cidr != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: "FAST_SANDBOX_NETWORK_CIDR", Value: cidr})
+		}
 		c.VolumeMounts = append(c.VolumeMounts,
 			corev1.VolumeMount{Name: tmpVolumeName, MountPath: tmpDir},
 			corev1.VolumeMount{Name: infraToolsVolumeName, MountPath: infraHostPath},
@@ -2536,7 +2540,10 @@ var runtimeOwnedEnv = map[string]struct{}{
 	"FAST_SANDBOX_ACTION_HANDLERS": {},
 	"FAST_SANDBOX_ACTIONS":         {},
 	"FAST_SANDBOX_SETTINGS_DIR":    {},
-	"NODE_NAME":                    {}, envPodName: {}, "POD_IP": {}, envPodUID: {}, "NAMESPACE": {},
+	// Network CIDR is controller-owned so SandboxTemplate builders and
+	// SandboxPool fastlets always share the same guest netmask.
+	"FAST_SANDBOX_NETWORK_CIDR": {},
+	"NODE_NAME":                 {}, envPodName: {}, "POD_IP": {}, envPodUID: {}, "NAMESPACE": {},
 	// Control authentication env keys are platform-owned: injected by the Pool
 	// Controller and stripped from templates. KeyFetchTokenEnv is fenced the
 	// same way — the override wins over the mounted token even inside a Pod.
