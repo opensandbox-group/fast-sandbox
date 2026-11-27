@@ -125,14 +125,10 @@ func writeOCILayout(image v1.Image, workdir string) error {
 	return nil
 }
 
-// extractExecd pulls the execd image and copies its runtime files
+// extractExecdWithPlainHTTP pulls the execd image and copies its runtime files
 // (/execd, /bootstrap.sh, /prepare.sh, /usr/local/bin/bwrap) into a local
 // directory for injection. Files are first collected in memory so symlinked
 // entries (e.g. bwrap -> execd) can be resolved across the layer.
-func extractExecd(ctx context.Context, image, destination string) error {
-	return extractExecdWithPlainHTTP(ctx, image, destination, false)
-}
-
 func extractExecdWithPlainHTTP(ctx context.Context, image, destination string, plainHTTP bool) error { //nolint:gocognit // single-pass tar walk; splitting would obscure symlink resolution
 	reference, err := parseOCIReference(image, plainHTTP)
 	if err != nil {
