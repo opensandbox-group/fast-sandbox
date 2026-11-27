@@ -53,9 +53,26 @@ rules:
 - apiGroups: ["sandbox.fast.io"]
   resources: ["sandboxes", "sandboxpools", "sandboxtemplates", "sandboxsnapshots", "sandboxes/status", "sandboxpools/status", "sandboxtemplates/status", "sandboxsnapshots/status"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+# Leader election is scoped to the control-plane namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: fast-sandbox-controller-leader-election
+  namespace: fast-sandbox-system
+rules:
 - apiGroups: ["coordination.k8s.io"]
   resources: ["leases"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: fast-sandbox-controller-leader-election
+  namespace: fast-sandbox-system
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: fast-sandbox-controller-leader-election}
+subjects:
+- {kind: ServiceAccount, name: fast-sandbox-controller, namespace: fast-sandbox-system}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
