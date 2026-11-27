@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"time"
 
 	apiv1alpha2 "fast-sandbox/api/v1alpha2"
 	fastletaction "fast-sandbox/internal/fastlet/action"
+	fastletcache "fast-sandbox/internal/fastlet/cache"
 	actionapi "fast-sandbox/internal/protocol/action"
 	fastletapi "fast-sandbox/internal/protocol/fastlet"
 )
@@ -100,7 +102,11 @@ func (m *SandboxManager) ReconcileBindings(ctx context.Context, req *fastletapi.
 func desiredActionInputs(bindings []fastletapi.ActionBindingInput) []fastletaction.DesiredInput {
 	desired := make([]fastletaction.DesiredInput, 0, len(bindings))
 	for _, input := range bindings {
-		desired = append(desired, fastletaction.DesiredInput{Handler: input.Handler, Input: input.Input})
+		desired = append(desired, fastletaction.DesiredInput{
+			Handler:        input.Handler,
+			Input:          input.Input,
+			SensitiveInput: input.SensitiveInput,
+		})
 	}
 	return desired
 }
@@ -113,7 +119,10 @@ func actionAttachment(metadata *SandboxMetadata) fastletaction.Attachment {
 		FastletPodUID: identity.FastletPodUID, InstanceGeneration: identity.InstanceGeneration,
 		AssignmentAttempt: identity.AssignmentAttempt, RuntimeInstanceID: identity.RuntimeInstanceID, RouteGeneration: identity.RouteGeneration,
 		SandboxUID: identity.SandboxUID, SandboxName: identity.Name, Namespace: identity.Namespace,
-		IP: network.IP, Gateway: network.Gateway, PrivateCIDR: network.PrivateCIDR, HostVeth: network.HostVeth,
+		Restored:  metadata.Config.Desired.Restore != nil,
+		Recovered: metadata.Recovered,
+		IP:        network.IP, Gateway: network.Gateway, NetNSPath: network.NamespacePath,
+		PrivateCIDR: network.PrivateCIDR, HostVeth: network.HostVeth,
 	}
 }
 
@@ -213,4 +222,85 @@ func (m *SandboxManager) actionStateChanged(sandboxUID string) {
 		}
 	}
 	m.signalReadinessChangedLocked()
+}
+
+// handleActionTerminalFailure tears down a Sandbox when an exec Action Handler
+// with failurePolicy=FailSandbox fails terminally, waking any synchronous
+// CreateSandbox waiter immediately with the failure reason.
+func (m *SandboxManager) handleActionTerminalFailure(sandboxUID string, attachment fastletaction.Attachment, handlerName, message string) {
+	m.mu.Lock()
+	metadata := m.sandboxes[sandboxUID]
+	if metadata == nil || actionAttachmentID(metadata) != attachment.ID || !runtimeCreatedPhase(metadata.Phase) {
+		m.mu.Unlock()
+		return
+	}
+	identity := metadata.Config.Identity
+	if m.actionManager != nil {
+		statuses, generation := m.actionManager.Statuses(sandboxUID)
+		metadata.ActionBindingStatuses = append(metadata.ActionBindingStatuses[:0], statuses...)
+		metadata.AppliedGeneration = generation
+	}
+	m.runtimeMessages[sandboxUID] = message
+	metadata.ActionTerminalFailed = true
+	m.recordDiagnosticLocked(sandboxUID, "error", "action", "fail-sandbox", fmt.Sprintf("handler %s triggered FailSandbox: %s", handlerName, message))
+	_, supportsDurableFailure := m.runtime.(RuntimeTerminalFailureHandler)
+	if !supportsDurableFailure {
+		if m.terminalFailureWorkers[sandboxUID] == metadata {
+			m.mu.Unlock()
+			return
+		}
+		m.terminalFailureWorkers[sandboxUID] = metadata
+		m.cancelDataPlaneReconcileLocked(metadata)
+		// Retain slot and resource commitment until action retirement,
+		// removeRoute, and DeleteSandbox all succeed.
+		metadata.Phase = sandboxStateRuntimeFailureCleanup
+		m.signalReadinessChangedLocked()
+		m.mu.Unlock()
+		go m.reclaimFailedActionSandbox(sandboxUID, metadata)
+		return
+	}
+	m.mu.Unlock()
+	m.preserveExitedRuntime(context.Background(), sandboxUID, identity, message)
+}
+
+func (m *SandboxManager) reclaimFailedActionSandbox(sandboxUID string, expected *SandboxMetadata) {
+	defer m.finishTerminalFailureWorker(sandboxUID, expected)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if m.requiresStrictActionHandling(expected.Config.ActionsAPIVersion) {
+		if m.actionManager == nil {
+			m.recordTerminalCleanupError(sandboxUID, expected, "strict Action Handler is unavailable")
+			return
+		}
+		if err := m.actionManager.DeleteOwned(ctx, actionAttachment(expected)); err != nil {
+			m.recordTerminalCleanupError(sandboxUID, expected, err.Error())
+			return
+		}
+		if err := m.actionManager.ConfirmOwnerRetired(ctx, actionAttachment(expected)); err != nil {
+			m.recordTerminalCleanupError(sandboxUID, expected, err.Error())
+			return
+		}
+	} else if m.actionManager != nil {
+		if err := m.actionManager.Delete(ctx, sandboxUID); err != nil {
+			m.recordDiagnostic(sandboxUID, "error", "action", sandboxStateRuntimeFailureCleanup, fmt.Sprintf("cleanup actions after FailSandbox: %v", err))
+		}
+	}
+	// Never release the runtime or network slot until route withdrawal
+	// succeeds; otherwise the proxy can retain a stale route to a reused IP.
+	if err := m.removeRoute(ctx, expected); err != nil {
+		m.recordTerminalCleanupError(sandboxUID, expected, fmt.Sprintf("remove route after FailSandbox: %v", err))
+		return
+	}
+	if err := m.runtime.DeleteSandbox(ctx, sandboxUID); err != nil {
+		m.recordTerminalCleanupError(sandboxUID, expected, fmt.Sprintf("delete runtime after FailSandbox: %v", err))
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sandboxes[sandboxUID] == expected && expected.Phase == sandboxStateRuntimeFailureCleanup {
+		expected.Phase = sandboxStateRuntimeFailed
+		m.cacheProtection.Unprotect(expected.Config.Desired.Image, fastletcache.ProtectActive)
+		m.cacheProtection.ProtectHotUntil(expected.Config.Desired.Image, m.clock.Now().Add(time.Hour))
+		m.signalReadinessChangedLocked()
+	}
 }

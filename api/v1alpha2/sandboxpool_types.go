@@ -191,15 +191,46 @@ const (
 	LifecycleHookDataPlaneReady LifecycleHook = "sandbox.data-plane-ready"
 )
 
-// ActionHandler declares one Pod-local HTTP receiver served on loopback.
+// ExecActionHandler declares a Fastlet-local command template executed directly
+// via execve without invoking a shell. Binding input is piped to stdin,
+// checkpoint restores and Fastlet recoveries skip re-execution, and exhausting
+// maxRetries fails the Sandbox.
+type ExecActionHandler struct {
+	// Command is the argv template executed directly via execve.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=64
+	Command []string `json:"command"`
+
+	// TimeoutSeconds bounds a single command invocation. Defaults to 15.
+	// +kubebuilder:default=15
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=300
+	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
+
+	// MaxRetries limits retries after the initial attempt.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	MaxRetries int32 `json:"maxRetries,omitempty"`
+}
+
+// ActionHandler declares either one Pod-local HTTP receiver served on loopback
+// (targetHTTPPort) or one Fastlet-local execve command handler (exec).
 type ActionHandler struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
 	// +kubebuilder:validation:MaxLength=63
 	Name string `json:"name"`
 
+	// TargetHTTPPort selects a Pod-local HTTP loopback receiver. Mutually
+	// exclusive with Exec.
+	// +optional
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
-	TargetHTTPPort int32 `json:"targetHTTPPort"`
+	TargetHTTPPort int32 `json:"targetHTTPPort,omitempty"`
+
+	// Exec selects a Fastlet-local command template executed via execve.
+	// Mutually exclusive with TargetHTTPPort.
+	// +optional
+	Exec *ExecActionHandler `json:"exec,omitempty"`
 
 	// Hooks selects the lifecycle checkpoints delivered to this Handler. An
 	// empty list makes the Handler config-only: it receives SetBinding and
@@ -239,7 +270,8 @@ type SandboxPoolSpec struct {
 	// +kubebuilder:validation:MaxItems=16
 	InfraComponents []InfraComponent `json:"infraComponents,omitempty"`
 
-	// ActionHandlers are Pod-local HTTP receivers used by ordered per-Sandbox
+	// ActionHandlers are Pod-local HTTP receivers (targetHTTPPort) or
+	// Fastlet-local execve command handlers (exec) used by ordered per-Sandbox
 	// Action Bindings.
 	// +listType=map
 	// +listMapKey=name

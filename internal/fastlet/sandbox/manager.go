@@ -228,6 +228,7 @@ func NewSandboxManagerWithConfig(runtime RuntimeDriver, config SandboxManagerCon
 	}
 	if manager.actionManager != nil {
 		manager.actionManager.SetChangeNotifier(manager.actionStateChanged)
+		manager.actionManager.SetTerminalFailureCallback(manager.handleActionTerminalFailure)
 	}
 	return manager, nil
 }
@@ -591,7 +592,12 @@ func (m *SandboxManager) startTerminalFailureCleanup(sandboxID string, expected 
 		return
 	}
 	m.terminalFailureWorkers[sandboxID] = expected
+	_, supportsDurableFailure := m.runtime.(RuntimeTerminalFailureHandler)
 	m.mu.Unlock()
+	if !supportsDurableFailure {
+		go m.reclaimFailedActionSandbox(sandboxID, expected)
+		return
+	}
 	go m.cleanupTerminalFailure(sandboxID, expected)
 }
 

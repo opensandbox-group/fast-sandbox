@@ -77,6 +77,73 @@ func TestValidateActionHandlersAndRejectRemoval(t *testing.T) {
 	require.ErrorIs(t, ValidateSandboxPoolUpdate(&base, &removed), ErrActionHandlersRemoved)
 }
 
+func TestValidateExecActionHandlers(t *testing.T) {
+	validHTTPExec := SandboxPoolSpec{
+		ActionHandlers: []ActionHandler{
+			{Name: "egress", TargetHTTPPort: 18080, Hooks: []LifecycleHook{LifecycleHookRuntimeReady, LifecycleHookDataPlaneReady}},
+			{
+				Name:  "runtime-init",
+				Hooks: []LifecycleHook{LifecycleHookDataPlaneReady},
+				Exec: &ExecActionHandler{
+					TimeoutSeconds: 15,
+					MaxRetries:     10,
+					Command: []string{
+						"/usr/bin/curl", "-fsS", "--fail-with-body",
+						"--data-binary", "@-",
+						"http://{{.Attachment.Network.IP}}:44772/internal/init",
+					},
+				},
+			},
+		},
+	}
+	require.NoError(t, validHTTPExec.ValidateActionHandlers())
+
+	// VSock is withheld until runtime drivers populate it.
+	vsockExec := SandboxPoolSpec{
+		ActionHandlers: []ActionHandler{{
+			Name:  "runtime-init",
+			Hooks: []LifecycleHook{LifecycleHookDataPlaneReady},
+			Exec: &ExecActionHandler{
+				Command: []string{"/usr/bin/vsock-exec", "{{.Attachment.VSock.UDSPath}}"},
+			},
+		}},
+	}
+	require.ErrorIs(t, vsockExec.ValidateActionHandlers(), ErrActionHandlersInvalid)
+
+	// Neither targetHTTPPort nor exec
+	neither := SandboxPoolSpec{ActionHandlers: []ActionHandler{{Name: "empty"}}}
+	require.ErrorIs(t, neither.ValidateActionHandlers(), ErrActionHandlersInvalid)
+
+	// Both targetHTTPPort and exec
+	both := SandboxPoolSpec{ActionHandlers: []ActionHandler{{
+		Name: "both", TargetHTTPPort: 18080, Exec: &ExecActionHandler{Command: []string{"/bin/true"}},
+	}}}
+	require.ErrorIs(t, both.ValidateActionHandlers(), ErrActionHandlersInvalid)
+
+	// Disallowed binding.input interpolation
+	badField := SandboxPoolSpec{ActionHandlers: []ActionHandler{{
+		Name: "inject", Exec: &ExecActionHandler{Command: []string{"/bin/echo", "{{.Binding.Input}}"}},
+	}}}
+	require.ErrorIs(t, badField.ValidateActionHandlers(), ErrActionHandlersInvalid)
+
+	// Invalid template syntax
+	badSyntax := SandboxPoolSpec{ActionHandlers: []ActionHandler{{
+		Name: "syntax", Exec: &ExecActionHandler{Command: []string{"/bin/echo", "{{.Sandbox.UID"}},
+	}}}
+	require.ErrorIs(t, badSyntax.ValidateActionHandlers(), ErrActionHandlersInvalid)
+
+	// Invalid timeoutSeconds and maxRetries
+	badTimeout := SandboxPoolSpec{ActionHandlers: []ActionHandler{{
+		Name: "timeout", Exec: &ExecActionHandler{Command: []string{"/bin/true"}, TimeoutSeconds: 301},
+	}}}
+	require.ErrorIs(t, badTimeout.ValidateActionHandlers(), ErrActionHandlersInvalid)
+
+	badRetries := SandboxPoolSpec{ActionHandlers: []ActionHandler{{
+		Name: "retries", Exec: &ExecActionHandler{Command: []string{"/bin/true"}, MaxRetries: 101},
+	}}}
+	require.ErrorIs(t, badRetries.ValidateActionHandlers(), ErrActionHandlersInvalid)
+}
+
 func TestGenerationAndAssignmentValidation(t *testing.T) {
 	require.Equal(t, int64(1), NextInstanceGeneration(0))
 	require.Equal(t, int64(2), NextInstanceGeneration(1))

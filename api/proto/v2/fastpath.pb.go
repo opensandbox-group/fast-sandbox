@@ -1210,11 +1210,17 @@ func (x *CheckpointInfo) GetFastletName() string {
 }
 
 type ActionBinding struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Handler       string                 `protobuf:"bytes,1,opt,name=handler,proto3" json:"handler,omitempty"`
-	Input         string                 `protobuf:"bytes,2,opt,name=input,proto3" json:"input,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Handler string                 `protobuf:"bytes,1,opt,name=handler,proto3" json:"handler,omitempty"`
+	Input   string                 `protobuf:"bytes,2,opt,name=input,proto3" json:"input,omitempty"`
+	// sensitive_input carries create-time sensitive material (for example,
+	// curl header lines containing a per-Sandbox plaintext token) delivered
+	// only in memory to a Fastlet-local exec ActionHandler via
+	// {{.Sensitive.File}}. It is never persisted to the Sandbox CRD, etcd, or
+	// durable node state, and is rejected on UpdateSandbox and HTTP handlers.
+	SensitiveInput string `protobuf:"bytes,3,opt,name=sensitive_input,json=sensitiveInput,proto3" json:"sensitive_input,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ActionBinding) Reset() {
@@ -1257,6 +1263,13 @@ func (x *ActionBinding) GetHandler() string {
 func (x *ActionBinding) GetInput() string {
 	if x != nil {
 		return x.Input
+	}
+	return ""
+}
+
+func (x *ActionBinding) GetSensitiveInput() string {
+	if x != nil {
+		return x.SensitiveInput
 	}
 	return ""
 }
@@ -4335,10 +4348,11 @@ const file_api_proto_v2_fastpath_proto_rawDesc = "" +
 	"\n" +
 	"size_bytes\x18\x04 \x01(\x03R\tsizeBytes\x12.\n" +
 	"\x13paused_unix_seconds\x18\x05 \x01(\x03R\x11pausedUnixSeconds\x12!\n" +
-	"\ffastlet_name\x18\x06 \x01(\tR\vfastletName\"?\n" +
+	"\ffastlet_name\x18\x06 \x01(\tR\vfastletName\"h\n" +
 	"\rActionBinding\x12\x18\n" +
 	"\ahandler\x18\x01 \x01(\tR\ahandler\x12\x14\n" +
-	"\x05input\x18\x02 \x01(\tR\x05input\"\xd7\x06\n" +
+	"\x05input\x18\x02 \x01(\tR\x05input\x12'\n" +
+	"\x0fsensitive_input\x18\x03 \x01(\tR\x0esensitiveInput\"\xd7\x06\n" +
 	"\x14CreateSandboxRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1c\n" +

@@ -20,7 +20,7 @@ RUN case "$DEBUG" in 0) set -- ;; 1) set -- '-gcflags=all=-N -l' ;; *) exit 2 ;;
 
 FROM ubuntu:22.04
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    ca-certificates coreutils e2fsprogs iproute2 iptables mount tcpdump util-linux \
+    ca-certificates coreutils curl e2fsprogs iproute2 iptables mount tcpdump util-linux \
     libaio1 libcurl4 libssl3 libzstd1 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=fastlet-build /out/fastlet /workspace/fastlet

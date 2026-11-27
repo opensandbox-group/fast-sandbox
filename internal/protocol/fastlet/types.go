@@ -297,10 +297,14 @@ const (
 	ErrorNetworkUnavailable FastletErrorCode = "NetworkUnavailable"
 	ErrorInfraUnavailable   FastletErrorCode = "InfraUnavailable"
 	ErrorActionUnavailable  FastletErrorCode = "ActionUnavailable"
-	ErrorUnknownOutcome     FastletErrorCode = "UnknownOutcome"
-	ErrorNotFound           FastletErrorCode = "NotFound"
-	ErrorGenerationFenced   FastletErrorCode = "GenerationFenced"
-	ErrorProfileMismatch    FastletErrorCode = "ProfileMismatch"
+	// ErrorActionFailed reports a terminal per-Sandbox Action failure (such as
+	// an exec Action Handler triggering FailSandbox). Unlike node-level
+	// ErrorActionUnavailable, it does not indicate an unhealthy Fastlet.
+	ErrorActionFailed     FastletErrorCode = "ActionFailed"
+	ErrorUnknownOutcome   FastletErrorCode = "UnknownOutcome"
+	ErrorNotFound         FastletErrorCode = "NotFound"
+	ErrorGenerationFenced FastletErrorCode = "GenerationFenced"
+	ErrorProfileMismatch  FastletErrorCode = "ProfileMismatch"
 	// ErrorSnapshotInProgress reports the deterministic non-reentrancy
 	// rejection: another non-terminal snapshot holds the target Sandbox.
 	ErrorSnapshotInProgress FastletErrorCode = "SnapshotInProgress"
@@ -488,6 +492,9 @@ type DeleteSandboxResponse struct {
 type ActionBindingInput struct {
 	Handler string `json:"handler"`
 	Input   string `json:"input"`
+	// SensitiveInput carries create-time sensitive material delivered in memory
+	// to an exec ActionHandler. It is never persisted to the Sandbox CRD.
+	SensitiveInput string `json:"sensitiveInput,omitempty"`
 }
 
 // ReconcileBindingsRequest carries persisted desired Binding state from

@@ -18,8 +18,17 @@ import (
 type Metadata struct {
 	// RecoveryRequired keeps a live runtime unavailable without declaring it
 	// dead or allowing destructive cleanup. Reconciliation must clear the fence.
-	RecoveryRequired       bool
-	BootRecoveryPending    bool
+	RecoveryRequired    bool
+	BootRecoveryPending bool
+	// Recovered marks a Sandbox reconstructed during Fastlet startup recovery
+	// (in-place daemon restart) so one-shot exec handlers with SkipOnRestore do
+	// not re-execute.
+	Recovered bool
+	// ActionTerminalFailed records that terminal failure cleanup was triggered
+	// by an Action Handler FailSandbox policy (as opposed to an unexpected VMM
+	// or container exit), so CreateSandbox only returns ErrorActionFailed for
+	// true action failures.
+	ActionTerminalFailed   bool
 	Config                 fastletapi.RuntimeSandboxConfig
 	Allocation             fastletapi.RuntimeAllocation
 	ContainerID            string

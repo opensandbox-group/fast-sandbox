@@ -3,10 +3,12 @@ package v1alpha2
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"path"
 	"regexp"
 	"strings"
+	"text/template"
 
 	corev1 "k8s.io/api/core/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
@@ -115,8 +117,9 @@ func IsRuntimeName(name RuntimeName) bool {
 	}
 }
 
-// ValidateActionHandlers verifies names and Pod-loopback target ports.
-func (s *SandboxPoolSpec) ValidateActionHandlers() error {
+// ValidateActionHandlers verifies Handler names, transport oneOf constraints,
+// exec command templates, and lifecycle Hook subscriptions.
+func (s *SandboxPoolSpec) ValidateActionHandlers() error { //nolint:gocognit // cross-field validation across HTTP and exec ActionHandler modes
 	if s == nil {
 		return fmt.Errorf("%w: pool spec is required", ErrActionHandlersInvalid)
 	}
@@ -137,16 +140,27 @@ func (s *SandboxPoolSpec) ValidateActionHandlers() error {
 			return fmt.Errorf("%w: duplicate Handler name %q", ErrActionHandlersInvalid, handler.Name)
 		}
 		names[handler.Name] = struct{}{}
-		if handler.TargetHTTPPort < 1 || handler.TargetHTTPPort > 65535 {
-			return fmt.Errorf("%w: Handler %s targetHTTPPort is invalid", ErrActionHandlersInvalid, handler.Name)
+		hasHTTP := handler.TargetHTTPPort != 0
+		hasExec := handler.Exec != nil
+		if hasHTTP == hasExec {
+			return fmt.Errorf("%w: Handler %s must declare exactly one of targetHTTPPort or exec", ErrActionHandlersInvalid, handler.Name)
 		}
-		if owner, reserved := reservedActionHandlerPorts[handler.TargetHTTPPort]; reserved {
-			return fmt.Errorf("%w: Handler %s targetHTTPPort %d is reserved by %s", ErrActionHandlersInvalid, handler.Name, handler.TargetHTTPPort, owner)
+		if hasHTTP {
+			if handler.TargetHTTPPort < 1 || handler.TargetHTTPPort > 65535 {
+				return fmt.Errorf("%w: Handler %s targetHTTPPort is invalid", ErrActionHandlersInvalid, handler.Name)
+			}
+			if owner, reserved := reservedActionHandlerPorts[handler.TargetHTTPPort]; reserved {
+				return fmt.Errorf("%w: Handler %s targetHTTPPort %d is reserved by %s", ErrActionHandlersInvalid, handler.Name, handler.TargetHTTPPort, owner)
+			}
+			if owner, found := ports[handler.TargetHTTPPort]; found {
+				return fmt.Errorf("%w: Handlers %s and %s use duplicate targetHTTPPort %d", ErrActionHandlersInvalid, owner, handler.Name, handler.TargetHTTPPort)
+			}
+			ports[handler.TargetHTTPPort] = handler.Name
+		} else {
+			if err := validateExecActionHandler(handler.Name, handler.Exec); err != nil {
+				return err
+			}
 		}
-		if owner, found := ports[handler.TargetHTTPPort]; found {
-			return fmt.Errorf("%w: Handlers %s and %s use duplicate targetHTTPPort %d", ErrActionHandlersInvalid, owner, handler.Name, handler.TargetHTTPPort)
-		}
-		ports[handler.TargetHTTPPort] = handler.Name
 		hooks := make(map[LifecycleHook]struct{}, len(handler.Hooks))
 		for _, hook := range handler.Hooks {
 			if _, supported := supportedHooks[hook]; !supported {
@@ -156,6 +170,70 @@ func (s *SandboxPoolSpec) ValidateActionHandlers() error {
 				return fmt.Errorf("%w: Handler %s declares duplicate lifecycle Hook %q", ErrActionHandlersInvalid, handler.Name, hook)
 			}
 			hooks[hook] = struct{}{}
+		}
+	}
+	return nil
+}
+
+// execTemplateSample matches the platform-trusted template context rendered by
+// Fastlet (never exposing binding.input) so invalid field references fail Pool
+// validation before reaching any node.
+var execTemplateSample = struct {
+	Sandbox struct {
+		UID       string
+		Name      string
+		Namespace string
+	}
+	Revision struct {
+		InstanceGeneration int64
+		SpecGeneration     int64
+		RuntimeInstanceID  string
+		AttachmentID       string
+		RouteGeneration    int64
+	}
+	Attachment struct {
+		Restored  bool
+		Recovered bool
+		Network   struct {
+			IP          string
+			Gateway     string
+			NetNSPath   string
+			PrivateCIDR string
+			HostVeth    string
+		}
+	}
+	Sensitive struct {
+		File string
+	}
+}{}
+
+func validateExecActionHandler(handlerName string, cfg *ExecActionHandler) error {
+	if len(cfg.Command) == 0 || len(cfg.Command) > 64 {
+		return fmt.Errorf("%w: Handler %s exec.command must contain 1..64 arguments", ErrActionHandlersInvalid, handlerName)
+	}
+	if strings.TrimSpace(cfg.Command[0]) == "" {
+		return fmt.Errorf("%w: Handler %s exec.command[0] must be non-empty", ErrActionHandlersInvalid, handlerName)
+	}
+	if err := validateExecArgTemplates(handlerName, "command", cfg.Command); err != nil {
+		return err
+	}
+	if cfg.TimeoutSeconds < 0 || cfg.TimeoutSeconds > 300 {
+		return fmt.Errorf("%w: Handler %s exec.timeoutSeconds must be between 1 and 300", ErrActionHandlersInvalid, handlerName)
+	}
+	if cfg.MaxRetries < 0 || cfg.MaxRetries > 100 {
+		return fmt.Errorf("%w: Handler %s exec.maxRetries must be between 0 and 100", ErrActionHandlersInvalid, handlerName)
+	}
+	return nil
+}
+
+func validateExecArgTemplates(handlerName, field string, args []string) error {
+	for index, raw := range args {
+		parsed, err := template.New(fmt.Sprintf("%s[%d]", field, index)).Option("missingkey=error").Parse(raw)
+		if err != nil {
+			return fmt.Errorf("%w: Handler %s exec.%s[%d] template parse failed: %w", ErrActionHandlersInvalid, handlerName, field, index, err)
+		}
+		if err := parsed.Execute(io.Discard, execTemplateSample); err != nil {
+			return fmt.Errorf("%w: Handler %s exec.%s[%d] references unsupported template field: %w", ErrActionHandlersInvalid, handlerName, field, index, err)
 		}
 	}
 	return nil
