@@ -104,8 +104,15 @@ func (d *Driver) fsbArgsWithPlainHTTP(plainHTTP bool) []string {
 	if plainHTTP {
 		args = append(args, "--plain-http")
 	}
-	if budget := os.Getenv("FAST_SANDBOX_OCI_BLOB_CACHE_SIZE_BYTES"); budget != "" {
-		args = append(args, "--blob-cache-max-bytes", budget)
+	for _, setting := range []struct{ env, flag string }{
+		{"FAST_SANDBOX_OCI_BLOB_CACHE_SIZE_BYTES", "--blob-cache-max-bytes"},
+		{"FAST_SANDBOX_OCI_BLOB_CACHE_EVICT_TRIGGER_PERCENT", "--blob-cache-evict-trigger-percent"},
+		{"FAST_SANDBOX_OCI_BLOB_CACHE_EVICT_TARGET_PERCENT", "--blob-cache-evict-target-percent"},
+		{"FAST_SANDBOX_OCI_BLOB_CACHE_WARN_PERCENT", "--blob-cache-warn-percent"},
+	} {
+		if value := os.Getenv(setting.env); value != "" {
+			args = append(args, setting.flag, value)
+		}
 	}
 	return args
 }

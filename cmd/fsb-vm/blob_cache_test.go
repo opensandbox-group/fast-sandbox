@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -70,12 +72,12 @@ func TestLocalBlobPinsSurviveEvictionUntilDeviceCleanup(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, os.SameFile(source, pin))
 	require.Equal(t, desc.Digest.String(), lowers[0].Digest)
-	require.ErrorContains(t, trimBlobCache(0, 0, 0), "live device files retained")
+	require.ErrorContains(t, trimBlobCache(blobCacheLimits{}), "live device files retained")
 	require.FileExists(t, blobCachePath(desc.Digest))
 	require.Equal(t, lowers, cachedLowers(home, image), "pin creation is idempotent")
 	// Existing teardown removes the owning directory after device release.
 	require.NoError(t, os.RemoveAll(home))
-	require.NoError(t, trimBlobCache(0, 0, 0))
+	require.NoError(t, trimBlobCache(blobCacheLimits{}))
 	require.Empty(t, cachedLowers(t.TempDir(), image)[0].File, "evicted blobs use remote digest/size")
 }
 
@@ -85,7 +87,7 @@ func TestLocalBlobCacheEvictsOldestAndProtectsPinnedBudget(t *testing.T) {
 	second, _ := retainTestBlob(t, "new")
 	old := time.Now().Add(-time.Hour)
 	require.NoError(t, os.Chtimes(blobCachePath(first.Digest), old, old))
-	require.NoError(t, trimBlobCache(3, 1, 0))
+	require.NoError(t, trimBlobCache(blobCacheLimits{maxBytes: 3, maxFiles: 1}))
 	require.NoFileExists(t, blobCachePath(first.Digest))
 	require.FileExists(t, blobCachePath(second.Digest))
 	image := blobTestImage(t, second)
@@ -96,7 +98,7 @@ func TestLocalBlobCacheEvictsOldestAndProtectsPinnedBudget(t *testing.T) {
 	require.Error(t, retainBlob(path, digest.FromString("add"), 3))
 	require.FileExists(t, path, "rejected admission leaves staging for normal cleanup")
 	require.FileExists(t, blobCachePath(second.Digest))
-	require.Error(t, trimBlobCache(100, 100, ^uint64(0)), "free-space protection preserves live files")
+	require.Error(t, trimBlobCache(blobCacheLimits{maxBytes: 100, maxFiles: 100, minFree: ^uint64(0)}), "free-space protection preserves live files")
 }
 
 func TestLocalBlobCacheBusyDisabledAndInvalidSource(t *testing.T) {
@@ -304,4 +306,166 @@ func TestTrimBlobCacheForSnapshotCapacity(t *testing.T) {
 	unlock()
 	require.NoError(t, run(0))
 	require.NoFileExists(t, blobCachePath(pinned.Digest))
+}
+
+// seedBlobCacheEntry writes a cache entry directly so watermark tests control
+// resident bytes and age without going through admission.
+func seedBlobCacheEntry(t *testing.T, value string, size int, age time.Duration) digest.Digest {
+	t.Helper()
+	desc := digest.FromString(value)
+	path := blobCachePath(desc)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0700))
+	require.NoError(t, os.WriteFile(path, []byte(strings.Repeat("x", size)), 0600))
+	stamp := time.Now().Add(-age)
+	require.NoError(t, os.Chtimes(path, stamp, stamp))
+	return desc
+}
+
+func cacheDiskBytes(t *testing.T, desc digest.Digest) int64 {
+	t.Helper()
+	info, err := os.Stat(blobCachePath(desc))
+	require.NoError(t, err)
+	return info.Sys().(*syscall.Stat_t).Blocks * 512
+}
+
+func TestLocalBlobCacheWatermarksDriveToTarget(t *testing.T) {
+	setupBlobCache(t)
+	global.blobCacheMaxBytes = 1000
+	var descs []digest.Digest
+	for i := 0; i < 10; i++ {
+		descs = append(descs, seedBlobCacheEntry(t, fmt.Sprintf("entry-%d", i), 100, time.Duration(10-i)*time.Minute))
+	}
+	require.NoError(t, trimBlobCache(blobCacheLimits{maxBytes: 1000, maxFiles: blobCacheMaxFiles}))
+	// Ledger usage crossed the 80% trigger, so the pass drove it down to the
+	// 60% target instead of stopping at the boundary.
+	for i, desc := range descs {
+		if i < 4 {
+			require.NoFileExists(t, blobCachePath(desc))
+		} else {
+			require.FileExists(t, blobCachePath(desc))
+		}
+	}
+	stats := loadBlobCacheStats()
+	require.Equal(t, int64(1000), stats.BudgetBytes)
+	require.Equal(t, blobCacheStatWatermark{TriggerBytes: 800, TargetBytes: 600, WarnBytes: 750}, stats.Watermarks)
+	require.Equal(t, 6, stats.Cache.Entries)
+	require.Equal(t, int64(600), stats.Cache.Bytes)
+	require.Equal(t, 60, stats.Cache.UsagePercent)
+	require.Equal(t, stats.Cache.Bytes-stats.Cache.DiskBytes, stats.Cache.LedgerDiskDeltaBytes)
+	expectedState := blobCacheStateOK
+	if stats.Cache.DiskBytes > 750 {
+		expectedState = blobCacheStateWarn
+	}
+	require.Equal(t, expectedState, stats.State)
+	require.Zero(t, stats.Cache.PinnedCount)
+	require.NotNil(t, stats.LastTrim)
+	require.Equal(t, 4, stats.LastTrim.EvictedEntries)
+	require.Equal(t, int64(400), stats.LastTrim.EvictedBytes)
+	require.True(t, stats.LastTrim.ReachedTarget)
+	require.Equal(t, int64(4), stats.Counters.Evictions)
+	require.Equal(t, int64(400), stats.Counters.EvictedBytes)
+	require.Equal(t, int64(1), stats.Counters.EvictionPasses)
+	require.Zero(t, stats.Counters.EvictionFailures)
+}
+
+func TestLocalBlobCacheReservationTriggersAheadOfAdmission(t *testing.T) {
+	setupBlobCache(t)
+	global.blobCacheMaxBytes = 1000
+	var descs []digest.Digest
+	for i := 0; i < 7; i++ {
+		descs = append(descs, seedBlobCacheEntry(t, fmt.Sprintf("reserved-%d", i), 100, time.Duration(7-i)*time.Minute))
+	}
+	// 700 resident bytes are below the 800 trigger, but the reserved admission
+	// quota pushes the fill across it, so eviction runs before the rename.
+	require.NoError(t, trimBlobCache(blobCacheLimits{maxBytes: 1000, maxFiles: blobCacheMaxFiles, reserve: 150}))
+	require.NoFileExists(t, blobCachePath(descs[0]))
+	require.FileExists(t, blobCachePath(descs[1]))
+	stats := loadBlobCacheStats()
+	require.Equal(t, 6, stats.Cache.Entries)
+	require.Equal(t, int64(600), stats.Cache.Bytes)
+	require.Equal(t, 1, stats.LastTrim.EvictedEntries)
+	require.True(t, stats.LastTrim.ReachedTarget)
+	// Without the reservation the same state does not trigger: the sweep only
+	// runs when the incoming quota would cross the watermark.
+	require.NoError(t, trimBlobCache(blobCacheLimits{maxBytes: 1000, maxFiles: blobCacheMaxFiles}))
+	stats = loadBlobCacheStats()
+	require.Equal(t, 6, stats.Cache.Entries)
+	require.Zero(t, stats.LastTrim.EvictedEntries)
+	require.True(t, stats.LastTrim.ReachedTarget)
+	require.Equal(t, int64(2), stats.Counters.EvictionPasses)
+	require.Equal(t, int64(1), stats.Counters.Evictions)
+}
+
+func TestLocalBlobPinsHoldWatermarkAndReportExhaustion(t *testing.T) {
+	setupBlobCache(t)
+	global.blobCacheMaxBytes = 2000
+	desc := seedBlobCacheEntry(t, "pinned-live", 1600, time.Minute)
+	home := t.TempDir()
+	pin := filepath.Join(home, ".local-blobs", desc.Encoded())
+	require.NoError(t, os.MkdirAll(filepath.Dir(pin), 0700))
+	require.NoError(t, os.Link(blobCachePath(desc), pin))
+	disk := cacheDiskBytes(t, desc)
+	require.GreaterOrEqual(t, disk, int64(1600))
+	// 1600 resident pin-only bytes plus a 100-byte reservation cross the 1600
+	// trigger, but the only entry is a live device file: the pass keeps it and
+	// the alarm gauge reads allocated disk bytes above the 1500 watermark.
+	require.NoError(t, trimBlobCache(blobCacheLimits{maxBytes: 2000, maxFiles: blobCacheMaxFiles, reserve: 100}))
+	require.FileExists(t, blobCachePath(desc))
+	stats := loadBlobCacheStats()
+	require.Equal(t, blobCacheStateWarn, stats.State)
+	require.Equal(t, 1, stats.Cache.PinnedCount)
+	require.Equal(t, int64(1600), stats.Cache.PinnedBytes)
+	require.Equal(t, disk, stats.Cache.DiskBytes)
+	require.Equal(t, int(disk*100/2000), stats.Cache.DiskUsagePercent)
+	require.False(t, stats.LastTrim.ReachedTarget)
+	require.Zero(t, stats.Counters.Evictions)
+	// An impossible free-space request cannot unlink the live file and is
+	// published as the exhausted state.
+	require.ErrorContains(t, trimBlobCache(blobCacheLimits{maxBytes: 2000, maxFiles: blobCacheMaxFiles, minFree: ^uint64(0)}), "live device files retained")
+	stats = loadBlobCacheStats()
+	require.Equal(t, blobCacheStateExhausted, stats.State)
+	require.Equal(t, int64(1), stats.Counters.EvictionFailures)
+	require.FileExists(t, blobCachePath(desc))
+}
+
+func TestLocalBlobCacheStatsCountAdmissionsLookupsAndPins(t *testing.T) {
+	setupBlobCache(t)
+	desc, _ := retainTestBlob(t, "checkpoint")
+	require.NotEmpty(t, cachedLowers(t.TempDir(), blobTestImage(t, desc))[0].File)
+	missing := oci.Descriptor{Digest: digest.FromString("missing"), Size: 7}
+	require.Empty(t, cachedLowers(t.TempDir(), blobTestImage(t, missing))[0].File)
+	stats := loadBlobCacheStats()
+	require.Equal(t, int64(1), stats.Counters.Admissions)
+	require.Equal(t, int64(len("checkpoint")), stats.Counters.AdmissionBytes)
+	require.Equal(t, int64(1), stats.Counters.LookupHits)
+	require.Equal(t, int64(1), stats.Counters.LookupMisses)
+	require.Equal(t, 1, stats.Cache.Entries)
+	require.Equal(t, int64(len("checkpoint")), stats.Cache.Bytes)
+	require.Zero(t, stats.Cache.PinnedBytes, "lookup pins live beside device state, not in the cache directory")
+}
+
+func TestLocalBlobCacheStatsRestartOnCorruptSnapshot(t *testing.T) {
+	setupBlobCache(t)
+	require.NoError(t, os.MkdirAll(blobCacheRoot(), 0700))
+	require.NoError(t, os.WriteFile(blobCacheStatsPath(), []byte("{broken"), 0600))
+	updateBlobCacheStats(func(stats *blobCacheStats) { stats.Counters.LookupHits++ })
+	stats := loadBlobCacheStats()
+	require.Equal(t, int64(1), stats.Counters.LookupHits)
+	require.Equal(t, blobCacheStatsVersion, stats.Version)
+}
+
+func TestBlobCacheWatermarkValidation(t *testing.T) {
+	require.NoError(t, validateBlobCacheWatermarks(80, 60, 75))
+	require.NoError(t, validateBlobCacheWatermarks(100, 100, 100))
+	require.NoError(t, validateBlobCacheWatermarks(0, 0, 0))
+	require.Error(t, validateBlobCacheWatermarks(70, 60, 75), "the alarm must not exceed the trigger")
+	require.Error(t, validateBlobCacheWatermarks(80, 75, 60), "the target must not exceed the alarm")
+	require.Error(t, validateBlobCacheWatermarks(101, 60, 75))
+	require.Error(t, validateBlobCacheWatermarks(80, -1, 75))
+}
+
+func TestLocalBlobCacheTrimWithoutCacheDirectoryIsANoOp(t *testing.T) {
+	setupBlobCache(t)
+	require.NoError(t, trimBlobCache(blobCacheLimits{maxBytes: 1 << 20, maxFiles: blobCacheMaxFiles}))
+	require.NoDirExists(t, filepath.Join(blobCacheRoot(), "sha256"))
 }

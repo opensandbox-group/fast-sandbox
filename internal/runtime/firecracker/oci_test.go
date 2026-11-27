@@ -150,6 +150,30 @@ func TestOCIBackingPathsArePrivateToFastletPod(t *testing.T) {
 	require.Contains(t, second, cache)
 }
 
+func TestOCIFsbArgsForwardBlobCacheWatermarks(t *testing.T) {
+	fixture := newDriverFixture(t)
+	t.Setenv("FAST_SANDBOX_OCI_BLOB_CACHE_SIZE_BYTES", "1024")
+	t.Setenv("FAST_SANDBOX_OCI_BLOB_CACHE_EVICT_TRIGGER_PERCENT", "85")
+	t.Setenv("FAST_SANDBOX_OCI_BLOB_CACHE_EVICT_TARGET_PERCENT", "55")
+	t.Setenv("FAST_SANDBOX_OCI_BLOB_CACHE_WARN_PERCENT", "70")
+	args := fixture.driver.fsbArgs()
+	value := func(flag string) string {
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] == flag {
+				return args[i+1]
+			}
+		}
+		return ""
+	}
+	require.Equal(t, "1024", value("--blob-cache-max-bytes"))
+	require.Equal(t, "85", value("--blob-cache-evict-trigger-percent"))
+	require.Equal(t, "55", value("--blob-cache-evict-target-percent"))
+	require.Equal(t, "70", value("--blob-cache-warn-percent"))
+	// Empty values keep the fsb-vm defaults instead of forwarding an empty flag.
+	t.Setenv("FAST_SANDBOX_OCI_BLOB_CACHE_WARN_PERCENT", "")
+	require.NotContains(t, fixture.driver.fsbArgs(), "--blob-cache-warn-percent")
+}
+
 func TestOCIPackRecoveryDoesNotShareReplacementPodStaging(t *testing.T) {
 	root := t.TempDir()
 	require.NotEqual(t, snapshotStagingPath(root, "old-pod", "same-snapshot", true), snapshotStagingPath(root, "new-pod", "same-snapshot", true))
