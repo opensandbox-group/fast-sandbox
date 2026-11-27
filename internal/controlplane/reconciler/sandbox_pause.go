@@ -176,7 +176,7 @@ func (r *SandboxReconciler) persistPauseCheckpoint(ctx context.Context, orchestr
 			CheckpointID: checkpointID,
 			ManifestRef:  observed.ManifestRef, ArtifactDigest: observed.ArtifactDigest, SizeBytes: observed.SizeBytes,
 			PausedAt:    &now,
-			FastletName: envelope.FastletName, FastletPodUID: types.UID(envelope.FastletPodUID),
+			FastletName: envelope.FastletName, FastletPodUID: types.UID(envelope.FastletPodUID), NodeName: envelope.NodeName,
 		}
 		message := "Checkpoint is durable in the artifact store; releasing the runtime"
 		setControllerStates(status, apiv1alpha2.RuntimePausing, apiv1alpha2.DataPlaneUnavailable, message)

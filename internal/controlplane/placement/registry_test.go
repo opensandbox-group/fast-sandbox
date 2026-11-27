@@ -779,3 +779,107 @@ func TestStaleRegistryHintsCannotExceedFastletCapacity(t *testing.T) {
 	admission, _, _ := manager.State()
 	require.Equal(t, 5, admission.Used)
 }
+
+func TestTopKResumeLocalityRanksBeforeTruncationInLargePool(t *testing.T) {
+	registry := NewInMemoryRegistry()
+	for index := 0; index < 7; index++ {
+		id := fmt.Sprintf("fastlet-%d", index)
+		info := readyFastlet(id, 0, 5, "alpine:latest")
+		info.NodeName = fmt.Sprintf("node-%d", index)
+		info.RuntimeName = apiv1alpha2.RuntimeFirecracker
+		info.Images = []string{fmt.Sprintf("%x", sha256.Sum256([]byte("alpine:latest")))}
+		seedFastlet(t, registry, info)
+	}
+	target := readyFastlet("fastlet-7", 4, 5)
+	target.NodeName = "node-7"
+	target.RuntimeName = apiv1alpha2.RuntimeFirecracker
+	seedFastlet(t, registry, target)
+
+	baseReq := candidate("alpine:latest", "sandbox-resume")
+	baseReq.RuntimeName = apiv1alpha2.RuntimeFirecracker
+	baseline := registry.TopK(baseReq, 3)
+	require.Len(t, baseline, 3)
+	for _, item := range baseline {
+		require.NotEqual(t, FastletID("fastlet-7"), item.ID, "loaded uncached Fastlet is outside baseline Top-3")
+	}
+
+	// Exact pausing Fastlet wins before k=3 truncation in an 8-Fastlet pool.
+	exactReq := baseReq
+	exactReq.Resume = ResumePreference{FastletName: "fastlet-7", FastletPodUID: "uid-fastlet-7", NodeName: "node-7"}
+	selected := registry.TopK(exactReq, 3)
+	require.Len(t, selected, 3)
+	require.Equal(t, FastletID("fastlet-7"), selected[0].ID)
+
+	// A replaced Fastlet Pod on the same host still matches via NodeName so
+	// node-shared StateRoot / OCI blob caches are reused.
+	nodeReq := baseReq
+	nodeReq.Resume = ResumePreference{FastletName: "fastlet-retired", FastletPodUID: "uid-retired", NodeName: "node-7"}
+	selected = registry.TopK(nodeReq, 3)
+	require.Len(t, selected, 3)
+	require.Equal(t, FastletID("fastlet-7"), selected[0].ID)
+
+	// Verified checkpoint cache entry precedes heuristic NodeName when the
+	// checkpoint artifact set is advertised in FastletInfo.Images.
+	ckptRef := "checkpoint:sha256:ckpt-digest"
+	ckptKey := fmt.Sprintf("%x", sha256.Sum256([]byte(ckptRef)))
+	verified := readyFastlet("fastlet-6", 2, 5, ckptKey)
+	verified.NodeName = "node-6"
+	verified.RuntimeName = apiv1alpha2.RuntimeFirecracker
+	seedFastlet(t, registry, verified)
+
+	ckptReq := baseReq
+	ckptReq.Resume = ResumePreference{
+		FastletName: "fastlet-retired", FastletPodUID: "uid-retired",
+		NodeName: "node-7", CheckpointImage: ckptRef,
+	}
+	selected = registry.TopK(ckptReq, 3)
+	require.Len(t, selected, 3)
+	require.Equal(t, FastletID("fastlet-6"), selected[0].ID)
+	require.Equal(t, FastletID("fastlet-7"), selected[1].ID)
+}
+
+func TestTopKResumeLocalityInfersSiblingNodeAndOverflowsWhenFullOrPressured(t *testing.T) {
+	registry := NewInMemoryRegistry()
+	fullOrigin := resourceAwareFastlet("fastlet-origin", 4, fastletapi.AdmissionStateOpen, 1)
+	fullOrigin.Admission.Used = 10
+	fullOrigin.NodeName = "node-cached"
+	sibling := resourceAwareFastlet("fastlet-sibling", 1, fastletapi.AdmissionStateOpen, 1)
+	sibling.NodeName = "node-cached"
+	remote := resourceAwareFastlet("fastlet-remote", 0, fastletapi.AdmissionStateOpen, 1, "alpine:latest")
+	remote.NodeName = "node-remote"
+	for _, info := range []FastletInfo{fullOrigin, sibling, remote} {
+		seedFastlet(t, registry, info)
+	}
+
+	// Legacy checkpoint without NodeName still resolves node-cached from the
+	// full origin Fastlet when PodUID matches, selecting the sibling Fastlet.
+	req := resourceAwareCandidate("alpine:latest")
+	req.Resume = ResumePreference{FastletName: "fastlet-origin", FastletPodUID: "uid-fastlet-origin"}
+	selected := registry.TopK(req, 3)
+	require.Len(t, selected, 2)
+	require.Equal(t, FastletID("fastlet-sibling"), selected[0].ID)
+	require.Equal(t, FastletID("fastlet-remote"), selected[1].ID)
+
+	// A mismatched PodUID under the same Fastlet name must not attribute the
+	// replacement Pod's node to the old checkpoint.
+	reqMismatch := resourceAwareCandidate("alpine:latest")
+	reqMismatch.Resume = ResumePreference{FastletName: "fastlet-origin", FastletPodUID: "uid-other"}
+	selected = registry.TopK(reqMismatch, 3)
+	require.Equal(t, FastletID("fastlet-remote"), selected[0].ID)
+
+	// Fresh host memory pressure on node-cached hard-filters every Fastlet on
+	// that node and overflows cleanly to node-remote.
+	pressuredOrigin := fullOrigin
+	pressuredOrigin.Admission = cloneAdmission(fullOrigin.Admission)
+	pressuredOrigin.Admission.Used = 1
+	pressuredOrigin.Admission.Resources.State = fastletapi.AdmissionStateBlocked
+	pressuredOrigin.Admission.Resources.Reason = fastletapi.AdmissionReasonHostMemoryPressure
+	pressuredOrigin.Admission.Resources.Revision = 2
+	pressuredOrigin.ResourceReceivedAt = registryNow
+	seedFastlet(t, registry, pressuredOrigin)
+
+	req.Resume.NodeName = "node-cached"
+	selected = registry.TopK(req, 3)
+	require.Len(t, selected, 1)
+	require.Equal(t, FastletID("fastlet-remote"), selected[0].ID)
+}

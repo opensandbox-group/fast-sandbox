@@ -94,10 +94,11 @@ The Orchestrator:
 
 1. filters by namespace, Pool, readiness, runtime profile, Infra revision, and stale heartbeat;
 2. requires fresh eligible slot and resource ledgers in ResourceAware mode;
-3. prioritizes image-cache affinity;
-4. ranks by a coarse dominant-load bucket, FastPath Pod UID seed, and a stable
+3. prioritizes checkpoint and node-cache locality for Sandboxes resuming from pause (exact pausing Fastlet, verified checkpoint cache entry, then same `nodeName`), overflowing to other eligible nodes when full or pressured;
+4. prioritizes image-cache affinity;
+5. ranks by a coarse dominant-load bucket, FastPath Pod UID seed, and a stable
    Sandbox tie-breaker;
-5. returns a bounded Top-K candidate list.
+6. returns a bounded Top-K candidate list.
 
 The candidate list is not a reservation. A newly accepted Fast-Path create
 refreshes Top-K after a batch of proven side-effect-free rejections, excluding

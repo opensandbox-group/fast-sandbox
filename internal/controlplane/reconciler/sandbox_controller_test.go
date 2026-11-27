@@ -732,6 +732,7 @@ func TestPauseReleasesRuntimeAndRecordsCheckpoint(t *testing.T) {
 	require.Equal(t, apiv1alpha2.RuntimePaused, current.Status.Runtime.State)
 	require.NotNil(t, current.Status.Runtime.Checkpoint)
 	require.Equal(t, "deadbeef", current.Status.Runtime.Checkpoint.ArtifactDigest)
+	require.Equal(t, "node-a", current.Status.Runtime.Checkpoint.NodeName)
 	require.NotEmpty(t, current.Status.Runtime.Checkpoint.CheckpointID)
 	require.Empty(t, current.Status.Placement.FastletName, "a paused Sandbox occupies no Fastlet placement")
 	require.True(t, current.Status.HasCondition(apiv1alpha2.SandboxConditionSuspended, metav1.ConditionTrue, "CheckpointPublished"))
@@ -821,6 +822,72 @@ func TestResumePrefersCheckpointFastlet(t *testing.T) {
 	require.Equal(t, "fastlet-b", current.Status.Placement.FastletName,
 		"resume must prefer the Fastlet that captured the checkpoint")
 	require.Equal(t, types.UID("pod-b"), current.Status.Placement.FastletPodUID)
+}
+
+func TestResumePrefersSameNodeReplacementFastletInLargePool(t *testing.T) {
+	reconciler, _, _, sandbox := newControllerHarness(t)
+	now := time.Unix(3000, 0)
+	reconciler.Now = func() time.Time { return now }
+	reconciler.Orchestrator.Now = func() time.Time { return now }
+	reconciler.Orchestrator.TopK = 3
+	registry := placement.NewInMemoryRegistry()
+	reconciler.Orchestrator.Registry = registry
+
+	parameters, err := reconciler.Orchestrator.ResolveRuntime(context.Background(), sandbox)
+	require.NoError(t, err)
+
+	seed := func(name, node string, used int, images ...string) {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: "default", UID: types.UID("uid-" + name),
+			Labels: map[string]string{"app": "sandbox-fastlet"},
+		}}
+		require.NoError(t, reconciler.Create(context.Background(), pod))
+		info := placement.FastletInfo{
+			ID: placement.FastletID(name), Namespace: "default", PoolName: "pool-a",
+			PodName: name, PodUID: "uid-" + name, PodIP: "10.0.1.1", NodeName: node, PodReady: true,
+			RuntimeName: parameters.RuntimeName, RuntimeProfileHash: parameters.RuntimeProfileHash,
+			ResourceProfileHash: parameters.ResourceProfileHash, InfraRevision: parameters.InfraRevision,
+		}
+		registry.UpsertPod(info)
+		require.NoError(t, registry.ApplyHeartbeat(info.ID, info.PodUID, &fastletapi.HeartbeatResponse{
+			FastletStatus: fastletapi.FastletStatus{
+				FastletPodUID: info.PodUID, RuntimeReady: true, InfraReady: true,
+				RuntimeProfileHash: info.RuntimeProfileHash, ResourceProfileHash: parameters.ResourceProfileHash,
+				InfraRevision: info.InfraRevision,
+				Admission:     fastletapi.AdmissionStatus{Capacity: 8, Used: used, Running: used},
+			},
+			Sequence: 1,
+			Cache:    fastletapi.CacheSnapshot{Epoch: "boot", Revision: 1, Full: true, Complete: true, Images: images},
+		}, now))
+	}
+
+	for index := 0; index < 5; index++ {
+		seed("remote-"+string(rune('a'+index)), "node-remote-"+string(rune('a'+index)), 0, "alpine:latest")
+	}
+	seed("fastlet-target-v2", "node-target", 5)
+
+	current := getControllerSandbox(t, reconciler, sandbox.Name)
+	current.Finalizers = []string{FinalizerName}
+	current.Spec.State = apiv1alpha2.SandboxStateRunning
+	require.NoError(t, reconciler.Update(context.Background(), current))
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	current.Status = apiv1alpha2.SandboxStatus{
+		Runtime: apiv1alpha2.RuntimeStatus{
+			State: apiv1alpha2.RuntimePaused, Generation: 1, PauseAttempt: 1,
+			Checkpoint: &apiv1alpha2.CheckpointStatus{
+				CheckpointID: "ckpt-node", ManifestRef: "oci://registry.example/repo:ckpt", ArtifactDigest: "deadbeef",
+				FastletName: "fastlet-target-v1", FastletPodUID: "uid-fastlet-target-v1", NodeName: "node-target",
+			},
+		},
+		DataPlane: apiv1alpha2.DataPlaneStatus{State: apiv1alpha2.DataPlaneUnavailable, RouteGeneration: 1},
+	}
+	require.NoError(t, reconciler.Status().Update(context.Background(), current))
+
+	reconcileTwice(t, reconciler, sandbox.Name)
+	current = getControllerSandbox(t, reconciler, sandbox.Name)
+	require.Equal(t, "fastlet-target-v2", current.Status.Placement.FastletName,
+		"resume must select replacement Fastlet on the checkpoint's node even when Pool size > TopK")
+	require.Equal(t, types.UID("uid-fastlet-target-v2"), current.Status.Placement.FastletPodUID)
 }
 
 func TestActiveFastPathCreateProjectsStatusAndDefersRuntimeUntilRelease(t *testing.T) {
