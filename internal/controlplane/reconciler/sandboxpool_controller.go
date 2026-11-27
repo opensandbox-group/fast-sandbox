@@ -2555,7 +2555,7 @@ var runtimeOwnedEnv = map[string]struct{}{
 	// Network CIDR is controller-owned so SandboxTemplate builders and
 	// SandboxPool fastlets always share the same guest netmask.
 	envFastSandboxNetworkCIDR: {},
-	"NODE_NAME":                 {}, envPodName: {}, "POD_IP": {}, envPodUID: {}, "NAMESPACE": {},
+	"NODE_NAME":               {}, envPodName: {}, "POD_IP": {}, envPodUID: {}, "NAMESPACE": {},
 	// Control authentication env keys are platform-owned: injected by the Pool
 	// Controller and stripped from templates. KeyFetchTokenEnv is fenced the
 	// same way — the override wins over the mounted token even inside a Pod.
