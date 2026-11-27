@@ -412,3 +412,41 @@ func TestRootfsOnlyPullRejectsCorruptDisk(t *testing.T) {
 	require.ErrorContains(t, err, "digest mismatch")
 	require.NoFileExists(t, filepath.Join(imageDir(root, "rootfs-template"), manifestName))
 }
+
+func TestFailedReplacementPreservesPublishedIndex(t *testing.T) {
+	store := newFakePublishStore()
+	server := httptest.NewServer(http.HandlerFunc(store.handle))
+	defer server.Close()
+	client, err := NewClient("s3://bucket/publish", writeCredential(), WithEndpoint(server.URL))
+	require.NoError(t, err)
+	dir := stageArtifactSet(t)
+	first, err := client.PublishImage(t.Context(), "", "app", dir)
+	require.NoError(t, err)
+	key := "bucket/publish/index/" + artifacts.ImageIndexKey("app") + ".json"
+	original := store.body(key)
+	require.NotEmpty(t, original)
+
+	// A different valid manifest targets a new content-addressed namespace.
+	manifest := append(mustManifestBytes(t, dir), '\n')
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), manifest, 0o644))
+	base := "bucket/publish/" + artifacts.Digest16(manifest)
+	require.NotEqual(t, first.ArtifactDigest, artifacts.SHA256Of(manifest))
+	for _, tc := range []struct{ name, failedKey string }{
+		{"memory upload", base + "/memory.snap"},
+		{"index update", key},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store.mu.Lock()
+			store.failFirst[tc.failedKey] = 100
+			store.mu.Unlock()
+			t.Cleanup(func() {
+				store.mu.Lock()
+				delete(store.failFirst, tc.failedKey)
+				store.mu.Unlock()
+			})
+			_, err := client.PublishImage(t.Context(), "", "app", dir)
+			require.Error(t, err)
+			require.Equal(t, original, store.body(key))
+		})
+	}
+}

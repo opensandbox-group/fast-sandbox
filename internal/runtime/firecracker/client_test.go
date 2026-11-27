@@ -194,6 +194,25 @@ func TestClientLoadSnapshot(t *testing.T) {
 	}, received)
 }
 
+func TestClientLoadSnapshotRequestsDirtyPageTracking(t *testing.T) {
+	socketPath := startFakeFirecracker(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/snapshot/load", r.URL.Path)
+		var body map[string]json.RawMessage
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		require.JSONEq(t, "true", string(body["track_dirty_pages"]))
+		require.NotContains(t, body, "enable_diff_snapshots")
+		w.WriteHeader(http.StatusNoContent)
+	})
+	client := NewClient(socketPath)
+	t.Cleanup(client.Close)
+
+	require.NoError(t, client.LoadSnapshot(t.Context(), SnapshotLoadRequest{
+		SnapshotPath:    "/cache/images/abc/vmstate.snap",
+		MemBackend:      SnapshotMemBackend{BackendType: "File", BackendPath: "/cache/images/abc/memory.snap"},
+		TrackDirtyPages: true,
+	}))
+}
+
 func TestClientPauseAndCreateSnapshot(t *testing.T) {
 	var calls []string
 	var createRequest SnapshotCreateRequest

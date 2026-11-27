@@ -965,7 +965,13 @@ func (d *Driver) EnsureSandbox(ctx context.Context, input *fastletapi.EnsureSand
 	if restoreMetadata.IsRootfsOnly() {
 		err = configureRootfsVM(configureCtx, client, slot, restoreMetadata, rootfsKernel, rootfsDriveName, jailRoot != "")
 	} else {
-		err = configureRestoreVM(configureCtx, client, slot, vmstatePath, memoryPath, jailRoot != "")
+		trackDirtyPages := !isOCI && os.Getenv("FAST_SANDBOX_NATIVE_MEMORY_DIFF") == "1"
+		state.TrackDirtyPages, err = configureRestoreVM(configureCtx, client, slot, vmstatePath, memoryPath, jailRoot != "", trackDirtyPages)
+		if err == nil && state.TrackDirtyPages {
+			if baseErr := initializeMemoryDiffBase(directory, memoryPath); baseErr != nil {
+				klog.Warningf("cannot retain initial memory diff base for %s: %v", identity.SandboxUID, baseErr)
+			}
+		}
 	}
 	observability.End(configureSpan, err)
 	if err != nil {

@@ -13,9 +13,11 @@ package firecracker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -293,27 +295,51 @@ func resolveRestoreSnapshotFiles(stateRoot, image string) (vmstate, memory strin
 // directory). In jailer mode the chroot fixes the working directory to the
 // jail root, so the snapshot files prepared under snapshots/ are addressed
 // with their chroot-relative paths.
-func configureRestoreVM(ctx context.Context, client *Client, slot *fastletnetwork.Slot, vmstatePath, memoryPath string, jailed bool) error {
+func configureRestoreVM(ctx context.Context, client *Client, slot *fastletnetwork.Slot, vmstatePath, memoryPath string, jailed, trackDirtyPages bool) (bool, error) {
 	tapDevice := slot.GuestTap
 	if tapDevice == "" {
-		return fmt.Errorf("%w: slot %s has no pre-provisioned guest tap", ErrNetworkUnavailable, slot.ID)
+		return false, fmt.Errorf("%w: slot %s has no pre-provisioned guest tap", ErrNetworkUnavailable, slot.ID)
 	}
 	snapshotPath, memPath := vmstatePath, memoryPath
 	if jailed {
 		snapshotPath = filepath.ToSlash(filepath.Join("/", jailerChrootSnapshotsDir, vmstateSnapshotName))
 		memPath = filepath.ToSlash(filepath.Join("/", jailerChrootSnapshotsDir, memorySnapshotName))
 	}
-	if err := client.LoadSnapshot(ctx, SnapshotLoadRequest{
+	request := SnapshotLoadRequest{
 		SnapshotPath: snapshotPath,
 		MemBackend: SnapshotMemBackend{
 			BackendType: "File", BackendPath: memPath,
 		},
-		ResumeVM: false,
+		ResumeVM:        false,
+		TrackDirtyPages: trackDirtyPages,
 		NetworkOverrides: []SnapshotNetworkOverride{{
 			IfaceID: "eth0", HostDevName: tapDevice,
 		}},
-	}); err != nil {
-		return fmt.Errorf("load Firecracker snapshot: %w", err)
 	}
-	return nil
+	err := client.LoadSnapshot(ctx, request)
+	if trackDirtyPages && rejectsDirtyTrackingField(err) {
+		// A JSON parsing rejection occurs before Firecracker changes the VM.
+		// Retrying other load failures on this VMM could reuse partial state.
+		klog.InfoS("Firecracker rejected the tracking field; restoring without tracking", "slot", slot.ID)
+		request.TrackDirtyPages = false
+		err = client.LoadSnapshot(ctx, request)
+	}
+	if err != nil {
+		return false, fmt.Errorf("load Firecracker snapshot: %w", err)
+	}
+	return request.TrackDirtyPages, nil
+}
+
+func rejectsDirtyTrackingField(err error) bool {
+	var response *apiResponseError
+	if !errors.As(err, &response) || response.statusCode != http.StatusBadRequest {
+		return false
+	}
+	var fault struct {
+		Message string `json:"fault_message"`
+	}
+	if json.Unmarshal([]byte(response.body), &fault) != nil {
+		return false
+	}
+	return strings.Contains(fault.Message, "unknown field `track_dirty_pages`")
 }

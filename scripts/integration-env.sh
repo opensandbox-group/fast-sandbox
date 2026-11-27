@@ -4119,7 +4119,9 @@ verify_policy() {
 # name), SNAPSHOT_TARGET / SNAPSHOT_RESTORE (sandbox names),
 # SNAPSHOT_TIMEOUT_S, SNAPSHOT_PING_INTERVAL_MS,
 # SNAPSHOT_SKIP_IMAGE_REBUILD=1 (skip rolling controller/fastlet/agent images
-# when the deployed ones already carry the snapshot chain).
+# when the deployed ones already carry the snapshot chain),
+# SNAPSHOT_NATIVE_MEMORY_DIFF=1 requires Diff, SNAPSHOT_COLD_RESTORE=1 clears
+# the test template cache before using the published snapshot.
 SNAPSHOT_TEMPLATE="${SNAPSHOT_TEMPLATE:-e2e-live-snapshot}"
 SNAPSHOT_NAME="${SNAPSHOT_NAME:-e2e-live-snapshot}"
 SNAPSHOT_TARGET="${SNAPSHOT_TARGET:-sandbox-snap-src}"
@@ -4127,6 +4129,8 @@ SNAPSHOT_RESTORE="${SNAPSHOT_RESTORE:-sandbox-snap-restore}"
 SNAPSHOT_TIMEOUT_S="${SNAPSHOT_TIMEOUT_S:-600}"
 SNAPSHOT_PING_INTERVAL_MS="${SNAPSHOT_PING_INTERVAL_MS:-500}"
 SNAPSHOT_SKIP_IMAGE_REBUILD="${SNAPSHOT_SKIP_IMAGE_REBUILD:-0}"
+SNAPSHOT_NATIVE_MEMORY_DIFF="${SNAPSHOT_NATIVE_MEMORY_DIFF:-0}"
+SNAPSHOT_COLD_RESTORE="${SNAPSHOT_COLD_RESTORE:-0}"
 SNAPSHOTCTL_BIN="$WORK/bin/snapshotctl"
 SNAP_E2E_DIR=""
 SNAP_TIMINGS=""
@@ -4511,7 +4515,7 @@ snapshot_record() { # key value
 # snapshot_run triggers the snapshot through fastpath, polls the CR to a
 # terminal phase, and extracts the driver-side pause/publish timings.
 snapshot_run() {
-	local fwd fwd_ip fwd_port t0 rpc_out rpc_ms phase last_phase="" t_terminal fastlet snapshot_id gap line ref dir recorded
+	local fwd fwd_ip fwd_port t0 rpc_out rpc_ms phase last_phase="" t_terminal fastlet snapshot_id gap line ref dir recorded captured_type
 	fwd="$(snapshot_ping_warm "$SNAPSHOT_TARGET")"
 	fwd_ip="${fwd%% *}"
 	fwd_port="${fwd##* }"
@@ -4564,11 +4568,16 @@ snapshot_run() {
 
 	# Driver timings: pause window + publish duration from the fastlet logs.
 	log "driver timings (fastlet $fastlet):"
+	captured_type=""
 	while IFS= read -r line; do
+		[[ "$(klog_field "$line" snapshotId)" == "$snapshot_id" ]] || continue
 		log "  $line"
 		case "$line" in
 			*sandbox\ dumped*)
 				snapshot_record "vm_pause_window_ms" "$(duration_to_ms "$(klog_field "$line" pauseWindow)")"
+				captured_type="$(klog_field "$line" snapshotType)"
+				snapshot_record "vm_snapshot_type" "$captured_type"
+				snapshot_record "vm_memory_merge_ms" "$(duration_to_ms "$(klog_field "$line" memoryMerge)")"
 				snapshot_record "vm_spill_move_ms" "$(duration_to_ms "$(klog_field "$line" spillMove)")"
 				log "  spilled=$(klog_field "$line" spilled)"
 				;;
@@ -4577,7 +4586,10 @@ snapshot_run() {
 				;;
 		esac
 	done < <(kubectl -n "$NS" logs "$fastlet" --since=30m --tail=2000 2>/dev/null \
-		| grep -E "sandbox dumped|snapshot published" | tail -4)
+		| grep -E "sandbox dumped|snapshot published")
+	if [[ "$SNAPSHOT_NATIVE_MEMORY_DIFF" == 1 && "$captured_type" != Diff ]]; then
+		fail "expected Diff for snapshot $snapshot_id, observed ${captured_type:-no capture log}"
+	fi
 	pass "snapshot Succeeded in $(ms2s $(( (t_terminal - t0) / 1000000 )))s"
 
 	# The source Sandbox must still be ALIVE after the snapshot: aggregate
@@ -4611,6 +4623,33 @@ snapshot_cr_phase() { # name
 	kubectl_get "sandboxsnapshot/$1" '{.status.phase}' 2>/dev/null || true
 }
 
+# Keep the working set resident in guest tmpfs across the two captures.
+snapshot_dirty_memory() {
+	local cmd out
+	case "$1" in
+		64MiB) cmd='grep -q " /tmp tmpfs " /proc/mounts && dd if=/dev/zero of=/tmp/fsb-snapshot-dirty bs=1048576 count=64 && echo DIRTY_READY' ;;
+		4KiB) cmd='test "$(wc -c < /tmp/fsb-snapshot-dirty)" -eq 67108864 && dd if=/dev/urandom of=/tmp/fsb-snapshot-dirty bs=4096 count=1 conv=notrunc && echo DIRTY_READY' ;;
+		*) return 1 ;;
+	esac
+	out="$(egress_execd_run "$SNAPSHOT_TARGET" "$(jq -nc --arg command "$cmd" '{command:$command}')" 45)"
+	grep -qx DIRTY_READY <<<"$out" || fail "guest could not dirty $1 of tmpfs"
+}
+
+snapshot_check_diff_pair() {
+	local fastlet id line first second
+	fastlet="$(kubectl_get "sandboxsnapshot/$FENCE_SNAPSHOT_A" '{.status.fastletName}')"
+	id="$(kubectl_get "sandboxsnapshot/$FENCE_SNAPSHOT_A" '{.status.snapshotID}')"
+	line="$(kubectl -n "$NS" logs "$fastlet" --since=30m | grep -F 'firecracker sandbox dumped' | grep -F "snapshotId=\"$id\"" | tail -1)"
+	[[ -n "$id" && "$(klog_field "$line" snapshotType)" == Diff ]] || fail "second capture missing Diff timing for $id"
+	first="$(awk '$1 == "vm_pause_window_ms" {print $2; exit}' "$SNAP_TIMINGS")"
+	second="$(duration_to_ms "$(klog_field "$line" pauseWindow)")"
+	snapshot_record "dirty_64m_vm_pause_window_ms" "$first"
+	snapshot_record "dirty_4k_vm_pause_window_ms" "$second"
+	[[ "$first" =~ ^[0-9]+$ && "$second" =~ ^[0-9]+$ ]] || fail "missing paired pause timings"
+	(( first > 0 && second * 2 <= first )) || fail "4 KiB Diff pause (${second}ms) exceeded half of 64 MiB Diff pause (${first}ms)"
+	pass "paired Diff pause: 64 MiB ${first}ms, 4 KiB ${second}ms"
+}
+
 snapshot_fence_cleanup() {
 	local name
 	for name in "$FENCE_SNAPSHOT_A" "$FENCE_SNAPSHOT_B" "$FENCE_SNAPSHOT_C"; do
@@ -4636,7 +4675,7 @@ snapshot_phase_reaches() { # name phase
 
 snapshot_fencing() {
 	snapshot_fence_cleanup
-	local out_a out_b out_c rc t0
+	local out_a out_b out_c rejected_cr rc t0
 
 	# A: the reference snapshot.
 	t0="$(now_ms)"
@@ -4657,7 +4696,7 @@ snapshot_fencing() {
 	fi
 	pass "fence B rejected during A's pause window (no CR persisted)"
 
-	# Wait for A to surface Publishing, then fire C (different template).
+	# Publishing releases the sandbox fence while A still owns its template.
 	local waited=0
 	until snapshot_phase_reaches "$FENCE_SNAPSHOT_A" "Publishing"; do
 		if [[ "$(snapshot_cr_phase "$FENCE_SNAPSHOT_A")" == "Succeeded" ]]; then
@@ -4668,7 +4707,14 @@ snapshot_fencing() {
 		waited=$((waited + 1))
 	done
 	snapshot_record "fence_a_to_publishing_ms" "$(( ($(now_ms) - t0) / 1000000 ))"
-	log "fence A in Publishing after ${waited} polls — firing C"
+	rc=0
+	out_b="$("$SNAPSHOTCTL_BIN" create "$FASTPATH_LOCAL" "$NS" "$SNAPSHOT_TARGET" "$FENCE_SNAPSHOT_B" "$FENCE_TEMPLATE_A" 2>&1)" || rc=$?
+	[[ "$rc" -ne 0 && "$out_b" == *"template name \"$FENCE_TEMPLATE_A\" is held by snapshot $NS/$FENCE_SNAPSHOT_A"* ]] \
+		|| fail "expected A's template fence during Publishing: rc=$rc out=$out_b"
+	rejected_cr="$(kubectl -n "$NS" get sandboxsnapshot "$FENCE_SNAPSHOT_B" --ignore-not-found -o name)" \
+		|| fail "could not check whether the same-template request persisted"
+	[[ -z "$rejected_cr" ]] || fail "same-template rejection persisted a snapshot"
+	pass "same template rejected during Publishing; no snapshot created"
 
 	out_c="$("$SNAPSHOTCTL_BIN" create "$FASTPATH_LOCAL" "$NS" "$SNAPSHOT_TARGET" "$FENCE_SNAPSHOT_C" "$FENCE_TEMPLATE_C")"
 	log "fence C create (expected admission): $out_c"
@@ -4721,6 +4767,20 @@ snapshot_guest_uptime() { # sandbox -> seconds (may be empty)
 snapshot_policy_render_pool() {
 	local rendered="$WORK/pool-firecracker-egress-snapshot.yaml"
 	render_firecracker_pool_spec "$REPO_ROOT/config/samples/pool-firecracker-egress.yaml" "$rendered"
+	if [[ "$SNAPSHOT_NATIVE_MEMORY_DIFF" == 1 ]]; then
+		awk '
+			/^[[:space:]]*- name: FAST_SANDBOX_SNAPSHOT_SPILL_DIR$/ {
+				indent = $0
+				sub(/-.*/, "", indent)
+				print indent "- name: FAST_SANDBOX_NATIVE_MEMORY_DIFF"
+				print indent "  value: \"1\""
+				count++
+			}
+			{ print }
+			END { if (count != 1) exit 1 }
+		' "$rendered" > "$rendered.diff" || fail "could not locate the egress Fastlet env"
+		mv "$rendered.diff" "$rendered"
+	fi
 	pass "egress pool spec rendered (warmImages -> $SBX_IMAGE)"
 }
 
@@ -4790,28 +4850,31 @@ snapshot_validate_artifacts() {
 	done
 
 	# Manifest facts: the baked guest network is copied from the source
-	# image; a live snapshot records native format and boot-only validation.
+	# image. A native Full manifest names Firecracker and includes both
+	# memory.snap and vmstate.snap in its files map.
 	[[ "$(printf '%s' "$manifest_json" | jq -r .guestNetwork.ip)" == "172.30.0.3" ]] \
 		|| fail "manifest.guestNetwork.ip != 172.30.0.3 (source facts not copied)"
-	[[ "$(printf '%s' "$manifest_json" | jq -r .format)" == "native" ]] || fail "manifest.format != native"
-	[[ "$(printf '%s' "$manifest_json" | jq -r .validation.booted)" == "true" ]] || fail "manifest.validation.booted != true"
-	[[ "$(printf '%s' "$manifest_json" | jq -r .validation.restored)" == "false" ]] || fail "manifest.validation.restored != false"
+	printf '%s' "$manifest_json" | jq -e '
+		.schemaVersion == 1 and .runtime == "firecracker" and
+		(.platform.snapshotMode // "") == "" and
+		(.files | has("rootfs.ext4") and has("memory.snap") and has("vmstate.snap"))
+	' >/dev/null || fail "snapshot manifest is not a native Firecracker Full artifact"
 
 	# Per-object sizes against manifest.files, and the total against the CR.
 	local object want_size stored_size total=0
 	while IFS= read -r object; do
 		[[ -n "$object" ]] || continue
-		want_size="$(printf '%s' "$manifest_json" | jq -r --arg n "$object" '.files[$n].sizeBytes')"
+		want_size="$(printf '%s' "$manifest_json" | jq -r --arg n "$object" '(.files + (.platform.stateFiles // {}))[$n].sizeBytes')"
 		[[ "$want_size" != "null" && -n "$want_size" ]] || fail "manifest.files has no entry for $object"
 		stored_size="$(mc stat --json "chain/$MINIO_BUCKET/$build_dir/$object" 2>/dev/null | jq -r .size)"
 		[[ "$stored_size" == "$want_size" ]] || fail "stored $object size $stored_size != manifest $want_size"
 		total=$((total + want_size))
-	done < <(printf '%s' "$manifest_json" | jq -r '.files | keys[]')
+	done < <(printf '%s' "$manifest_json" | jq -r '(.files + (.platform.stateFiles // {})) | keys[]')
 	[[ "$total" == "$(kubectl_get "sandboxsnapshot/$SNAPSHOT_NAME" '{.status.sizeBytes}')" ]] \
 		|| fail "CR sizeBytes != sum(manifest.files.sizeBytes)"
 
 	mc ls --recursive "chain/$MINIO_BUCKET/$build_dir" > "$SNAP_E2E_DIR/artifact-listing.txt" || true
-	pass "artifact set complete and consistent (index + 5 objects, sizes match, facts copied)"
+	pass "artifact set complete and consistent (index, artifact sizes including state files, source facts)"
 }
 
 # snapshot_restore boots a NEW sandbox whose image IS the snapshot's template
@@ -4846,7 +4909,15 @@ snapshot_ensure_disk() {
 
 snapshot_restore() {
 	snapshot_ensure_disk
-	local t0 elapsed=0 applied
+	local t0 elapsed=0 applied cache_key cache_dir manifest_digest
+	cache_key="$(printf '%s' "$SNAPSHOT_TEMPLATE" | sha256sum | awk '{print $1}')"
+	cache_dir="$XFS_MOUNT_POINT/firecracker/images/$cache_key"
+	if [[ "$SNAPSHOT_COLD_RESTORE" == 1 ]]; then
+		[[ "$cache_key" =~ ^[[:xdigit:]]{64}$ ]] || fail "invalid snapshot cache key"
+		sudo_ rm -rf -- "$cache_dir"
+		[[ ! -e "$cache_dir" ]] || fail "snapshot cache still exists before restore"
+		pass "published snapshot absent from the node image cache before restore"
+	fi
 	t0="$(now_ms)"
 	# A clone from a snapshot image is a new policy subject: pass the deny
 	# binding explicitly on the create.
@@ -4871,9 +4942,13 @@ snapshot_restore() {
 		|| fail "restored sandbox image is not $SNAPSHOT_TEMPLATE"
 	show_restore_timings "$SNAPSHOT_RESTORE"
 	pass "restored sandbox Ready + /ping (image=$SNAPSHOT_TEMPLATE pulled through the snapshot index)"
-	local cache_key
-	cache_key="$(printf '%s' "$SNAPSHOT_TEMPLATE" | sha256sum | awk '{print $1}')"
-	highlight "  restored manifest on the host (node cache): /var/lib/fast-sandbox/firecracker/images/$cache_key/manifest.json"
+	if [[ "$SNAPSHOT_COLD_RESTORE" == 1 ]]; then
+		manifest_digest="$(sudo_ sha256sum "$cache_dir/manifest.json" | awk '{print $1}')"
+		[[ "$manifest_digest" == "$(kubectl_get "sandboxsnapshot/$SNAPSHOT_NAME" '{.status.artifactDigest}')" ]] \
+			|| fail "cold-restored manifest digest differs from the published snapshot"
+		pass "cold restore repopulated the node cache with the published manifest"
+	fi
+	highlight "  restored manifest on the host (node cache): $cache_dir/manifest.json"
 
 	# The create passed the deny binding explicitly; it must be EFFECTIVE on
 	# the restored sandbox.
@@ -4885,12 +4960,18 @@ snapshot_restore() {
 	test_egress_denied "$SNAPSHOT_RESTORE"
 	pass "restore enforces the create-time deny policy"
 
-	# An allow binding create doubles as a post-restore reachability control.
+	# A conflicting allow seed tests precedence of the captured deny record.
 	snapshot_policy_run "$SNAPSHOT_RESTORE_ALLOW" "$SNAPSHOT_TEMPLATE" "$EGRESS_ALLOW_POLICY"
-	wait_for "override sandbox Ready" 300 sandbox_ready "$SNAPSHOT_RESTORE_ALLOW"
-	wait_for "override egress binding Ready" 120 egress_binding_ready "$SNAPSHOT_RESTORE_ALLOW"
-	wait_for "override reachable in-guest" 180 egress_guest_reachable "$SNAPSHOT_RESTORE_ALLOW"
-	pass "allow-binding create is reachable in-guest"
+	wait_for "allow-seeded sandbox Ready" 300 sandbox_ready "$SNAPSHOT_RESTORE_ALLOW"
+	wait_for "allow-seeded egress binding Ready" 120 egress_binding_ready "$SNAPSHOT_RESTORE_ALLOW"
+	if egress_template_state_capable; then
+		wait_for "allow-seeded execd control intact" 120 egress_execd_control "$SNAPSHOT_RESTORE_ALLOW"
+		test_egress_denied "$SNAPSHOT_RESTORE_ALLOW"
+		pass "recorded deny policy takes precedence over the allow seed"
+	else
+		wait_for "allow-seeded sandbox reachable in-guest" 180 egress_guest_reachable "$SNAPSHOT_RESTORE_ALLOW"
+		pass "legacy egress applies the allow seed"
+	fi
 }
 
 snapshot_evidence() {
@@ -4931,7 +5012,7 @@ snapshot_timing_report() {
 	while IFS=$'\t' read -r key value; do
 		[[ -n "$key" ]] || continue
 		case "$key" in
-			*failures) printf '  %-32s %8s\n' "$key" "$value" ;;
+			*failures|vm_snapshot_type) printf '  %-32s %8s\n' "$key" "$value" ;;
 			*) printf '  %-32s %8sms\n' "$key" "$value" ;;
 		esac
 	done < "$SNAP_TIMINGS"
@@ -4954,8 +5035,11 @@ verify_snapshot() {
 	port_forward_up
 	resolve_daemon_up
 	run_stage "snapshot 2: source sandbox Ready" snapshot_source_up
+	if [[ "$SNAPSHOT_NATIVE_MEMORY_DIFF" == 1 ]]; then snapshot_dirty_memory 64MiB; fi
 	run_stage "snapshot 3: live snapshot (pause/dump/resume/publish)" snapshot_run
+	if [[ "$SNAPSHOT_NATIVE_MEMORY_DIFF" == 1 ]]; then snapshot_dirty_memory 4KiB; fi
 	run_stage "snapshot 4: reentrancy fencing (reject in window / admit in Publishing)" snapshot_fencing
+	if [[ "$SNAPSHOT_NATIVE_MEMORY_DIFF" == 1 ]]; then snapshot_check_diff_pair; fi
 	run_stage "snapshot 5: artifact validation (MinIO)" snapshot_validate_artifacts
 	run_stage "snapshot 6: restore from snapshot image (+ policy auto-apply)" snapshot_restore
 	trap - EXIT
