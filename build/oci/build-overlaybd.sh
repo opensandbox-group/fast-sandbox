@@ -3,7 +3,8 @@
 set -eu
 out=${1:?usage: build-overlaybd.sh OUTPUT_DIR}
 tools_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-revision=${OVERLAYBD_REV:-fbb2a84bf53eea0d4b1c346dce831a80c1cca291}
+repo=${OVERLAYBD_REPO:-https://github.com/Pangjiping/overlaybd.git}
+revision=${OVERLAYBD_REV:-509c8cd5ae2aab015799ea5c4475be7ce1367867}
 
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -15,7 +16,7 @@ rm -rf /var/lib/apt/lists/*
 
 git init /src/overlaybd
 cd /src/overlaybd
-git remote add origin https://github.com/containerd/overlaybd.git
+git remote add origin "$repo"
 # Retry the fetch: the GitHub connection can stall.
 for attempt in 1 2 3; do
   git -c http.version=HTTP/1.1 fetch --depth 1 origin "$revision" && break
