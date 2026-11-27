@@ -171,7 +171,11 @@ func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 		return err
 	}
 	defer deleteBuildTap()
-	args := []string{"--firecracker", firecrackerBin, "--overlaybd-convertor", "/usr/local/bin/convertor", "--build-work-dir", filepath.Join(workdir, "builds"), "--build-output-dir", filepath.Join(workdir, "artifacts"), "build", "--source", source, "--output", "template:build", "--kernel", kernel, "--kernel-version", strings.TrimPrefix(filepath.Base(kernel), "vmlinux-"), "--vcpu", strconv.FormatInt(vcpu.Value(), 10), "--memory-mb", strconv.FormatInt((memory.Value()+(1<<20)-1)/(1<<20), 10), "--disk-size-gb", strconv.Itoa(size), "--inject-dir", inject, "--init-path", guestInitPath(spec), "--init-script-file", filepath.Join(inject, strings.TrimPrefix(guestInitPath(spec), "/")), "--boot-args", bakedNetworkBootArgs("console=ttyS0 reboot=k panic=1 pci=off nomodules net.ifnames=0 biosdevname=0 random.trust_cpu=on root=/dev/vda rw init=" + guestInitPath(spec)), "--tap-name", tap, "--guest-mac", bakedGuestMAC, "--ready-pattern", "SANDBOX_READY", "--ready-timeout", readinessTimeout(spec).String(), "--auth-file", authFile}
+	bootArgs, err := bakedNetworkBootArgs("console=ttyS0 reboot=k panic=1 pci=off nomodules net.ifnames=0 biosdevname=0 random.trust_cpu=on root=/dev/vda rw init=" + guestInitPath(spec))
+	if err != nil {
+		return err
+	}
+	args := []string{"--firecracker", firecrackerBin, "--overlaybd-convertor", "/usr/local/bin/convertor", "--build-work-dir", filepath.Join(workdir, "builds"), "--build-output-dir", filepath.Join(workdir, "artifacts"), "build", "--source", source, "--output", "template:build", "--kernel", kernel, "--kernel-version", strings.TrimPrefix(filepath.Base(kernel), "vmlinux-"), "--vcpu", strconv.FormatInt(vcpu.Value(), 10), "--memory-mb", strconv.FormatInt((memory.Value()+(1<<20)-1)/(1<<20), 10), "--disk-size-gb", strconv.Itoa(size), "--inject-dir", inject, "--init-path", guestInitPath(spec), "--init-script-file", filepath.Join(inject, strings.TrimPrefix(guestInitPath(spec), "/")), "--boot-args", bootArgs, "--tap-name", tap, "--guest-mac", bakedGuestMAC, "--ready-pattern", "SANDBOX_READY", "--ready-timeout", readinessTimeout(spec).String(), "--auth-file", authFile}
 	if registryPolicy.plainHTTP(spec.Image) {
 		args = append([]string{"--plain-http"}, args...)
 	}
@@ -181,13 +185,17 @@ func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 	// guest kernel vsock stack fails the build instead of shipping a template
 	// that silently cannot capture.
 	args = append(args, "--guest-control-port", "1234")
+	netCfg, err := resolveBakedGuestNetwork()
+	if err != nil {
+		return err
+	}
 	platform := templatePlatform(spec, ca)
 	extra := struct {
 		Lineage      *artifacts.VMLineage  `json:"lineage"`
 		GuestNetwork map[string]any        `json:"guestNetwork"`
 		Platform     *artifacts.VMPlatform `json:"platform"`
 	}{Lineage: &artifacts.VMLineage{Image: spec.Image, ImageDigest: sourceDigest},
-		GuestNetwork: map[string]any{"ip": bakedGuestIP, "gateway": bakedGuestGateway, "netmask": bakedGuestNetmask, "mtu": bakedGuestMTU}, Platform: platform}
+		GuestNetwork: map[string]any{"ip": netCfg.IP, "gateway": netCfg.Gateway, "netmask": netCfg.Netmask, "mtu": netCfg.MTU}, Platform: platform}
 	raw, err := json.Marshal(extra)
 	if err != nil {
 		return err

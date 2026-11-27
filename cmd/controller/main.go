@@ -190,6 +190,10 @@ func main() { //nolint:gocognit,gocyclo,funlen,maintidx // pre-existing flag wir
 			klog.ErrorS(parseErr, "route-verify-public-key is invalid; data plane fails closed")
 			os.Exit(1)
 		}
+		if err := reconciler.ValidateNetworkCIDR(os.Getenv(reconciler.EnvFastSandboxNetworkCIDR)); err != nil {
+			klog.ErrorS(err, "Invalid controller network CIDR", "env", reconciler.EnvFastSandboxNetworkCIDR)
+			os.Exit(1)
+		}
 	}
 	var credentialIssuer *routeauth.Issuer
 	if role.RunsFastPath() {

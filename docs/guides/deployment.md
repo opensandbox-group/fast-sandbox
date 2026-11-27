@@ -73,6 +73,12 @@ The default overlay contains:
 
 Production deployments must create `fast-sandbox-route-keys` through a secret manager. Do not copy the public development key from `config/dev`.
 
+### Guest network CIDR
+
+Set `FAST_SANDBOX_NETWORK_CIDR` on the Controller Deployment during cluster bootstrap if the default `172.30.0.0/24` does not provide enough slots per Fastlet (for example `172.30.0.0/20` for >126 Firecracker sandboxes per Fastlet; valid range is IPv4 `/8`–`/29`). The controller validates the CIDR at startup and propagates it to both `sandboxtemplate-builder` Pods and `SandboxPool` Fastlet Pods.
+
+Treat `FAST_SANDBOX_NETWORK_CIDR` as a cluster-bootstrap setting rather than a routine runtime toggle. Changing it on a live cluster rolls `SandboxPool` Fastlet Pods onto the new CIDR without rebuilding existing Firecracker `SandboxTemplate`s, which causes new sandbox creates from old templates to fail until those templates are manually rebuilt, and makes checkpoints and snapshots captured under the previous CIDR non-restorable on the new CIDR. See [Guest network CIDR](../reference/configuration.md#guest-network-cidr-fast_sandbox_network_cidr) for details.
+
 ## All-in-one development mode
 
 ```bash

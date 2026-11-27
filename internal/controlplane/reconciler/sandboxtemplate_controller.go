@@ -669,6 +669,7 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 	if endpoint != "" {
 		env = append(env, corev1.EnvVar{Name: "AWS_ENDPOINT_URL", Value: endpoint})
 	}
+	env = appendControllerNetworkCIDREnv(env)
 
 	// The build Pod runs the sandbox template builder: privileged for the
 	// loop mount, with the host's KVM/tun devices passed through via hostPath

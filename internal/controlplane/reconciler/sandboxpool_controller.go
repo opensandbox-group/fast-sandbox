@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -108,6 +110,8 @@ const (
 	envPodUID = "POD_UID"
 	// envFastSandboxRegistryConfigPath carries the registry config file path into containers.
 	envFastSandboxRegistryConfigPath = "FAST_SANDBOX_REGISTRY_CONFIG_PATH"
+	// EnvFastSandboxNetworkCIDR carries the controller-owned guest network CIDR into builders and fastlets.
+	EnvFastSandboxNetworkCIDR = "FAST_SANDBOX_NETWORK_CIDR"
 	// infraHostPath is the in-Pod directory where infra component tools are exposed.
 	infraHostPath = "/opt/fast-sandbox/infra"
 	// tmpDir is the node's /tmp shared into the Fastlet container.
@@ -1680,6 +1684,7 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 		if profile.ResidualProcess != runtimecatalog.ResidualProcessNone {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "FAST_SANDBOX_NODE_CLEANUP_SOCKET", Value: nodecleanup.DefaultSocketPath})
 		}
+		c.Env = appendControllerNetworkCIDREnv(c.Env)
 		c.VolumeMounts = append(c.VolumeMounts,
 			corev1.VolumeMount{Name: tmpVolumeName, MountPath: tmpDir},
 			corev1.VolumeMount{Name: infraToolsVolumeName, MountPath: infraHostPath},
@@ -2250,46 +2255,9 @@ func (r *SandboxPoolReconciler) registryCredentialFromSecret(
 		PlainHTTP:        rule.PlainHTTP,
 	}
 	if rule.SecretRef.Name != "" {
-		var secret corev1.Secret
-		if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: rule.SecretRef.Name}, &secret); err != nil {
-			return registryconfig.Credential{}, fmt.Errorf("read Registry Secret %s: %w", rule.SecretRef.Name, err)
-		}
-		if secret.Type != corev1.SecretTypeDockerConfigJson {
-			return registryconfig.Credential{}, fmt.Errorf("registry Secret %s must have type %s", secret.Name, corev1.SecretTypeDockerConfigJson)
-		}
-		content := secret.Data[corev1.DockerConfigJsonKey]
-		if len(content) == 0 {
-			return registryconfig.Credential{}, fmt.Errorf("registry Secret %s has no %s data", secret.Name, corev1.DockerConfigJsonKey)
-		}
-		var dockerConfig dockerConfigJSON
-		if err := json.Unmarshal(content, &dockerConfig); err != nil {
-			return registryconfig.Credential{}, fmt.Errorf("decode Registry Secret %s: %w", secret.Name, err)
-		}
-		var auth dockerAuthConfig
-		found := false
-		for host, candidate := range dockerConfig.Auths {
-			if registryconfig.NormalizeHost(host) == rule.Host {
-				auth = candidate
-				found = true
-				break
-			}
-		}
-		if !found {
-			return registryconfig.Credential{}, fmt.Errorf("registry Secret %s has no credentials for host %s", secret.Name, rule.Host)
-		}
-		if auth.Username == "" && auth.Password == "" && auth.Auth != "" {
-			decoded, err := base64.StdEncoding.DecodeString(auth.Auth)
-			if err != nil {
-				return registryconfig.Credential{}, fmt.Errorf("decode auth for host %s in Secret %s: %w", rule.Host, secret.Name, err)
-			}
-			username, password, found := strings.Cut(string(decoded), ":")
-			if !found {
-				return registryconfig.Credential{}, fmt.Errorf("auth for host %s in Secret %s is invalid", rule.Host, secret.Name)
-			}
-			auth.Username, auth.Password = username, password
-		}
-		if auth.Username == "" && auth.Password == "" && auth.IdentityToken == "" {
-			return registryconfig.Credential{}, fmt.Errorf("registry Secret %s has empty credentials for host %s", secret.Name, rule.Host)
+		auth, err := r.registryPullCredential(ctx, namespace, rule.Host, rule.SecretRef.Name)
+		if err != nil {
+			return registryconfig.Credential{}, err
 		}
 		credential.Username = auth.Username
 		credential.Password = auth.Password
@@ -2303,6 +2271,55 @@ func (r *SandboxPoolReconciler) registryCredentialFromSecret(
 		credential.WriteUsername, credential.WritePassword = writeUsername, writePassword
 	}
 	return credential, nil
+}
+
+func (r *SandboxPoolReconciler) registryPullCredential(
+	ctx context.Context,
+	namespace, host, secretName string,
+) (dockerAuthConfig, error) {
+	var secret corev1.Secret
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: secretName}, &secret); err != nil {
+		return dockerAuthConfig{}, fmt.Errorf("read Registry Secret %s: %w", secretName, err)
+	}
+	if secret.Type != corev1.SecretTypeDockerConfigJson {
+		return dockerAuthConfig{}, fmt.Errorf("registry Secret %s must have type %s", secret.Name, corev1.SecretTypeDockerConfigJson)
+	}
+	content := secret.Data[corev1.DockerConfigJsonKey]
+	if len(content) == 0 {
+		return dockerAuthConfig{}, fmt.Errorf("registry Secret %s has no %s data", secret.Name, corev1.DockerConfigJsonKey)
+	}
+	var dockerConfig dockerConfigJSON
+	if err := json.Unmarshal(content, &dockerConfig); err != nil {
+		return dockerAuthConfig{}, fmt.Errorf("decode Registry Secret %s: %w", secret.Name, err)
+	}
+	auth, found := findDockerAuthForHost(dockerConfig.Auths, host)
+	if !found {
+		return dockerAuthConfig{}, fmt.Errorf("registry Secret %s has no credentials for host %s", secret.Name, host)
+	}
+	if auth.Username == "" && auth.Password == "" && auth.Auth != "" {
+		decoded, err := base64.StdEncoding.DecodeString(auth.Auth)
+		if err != nil {
+			return dockerAuthConfig{}, fmt.Errorf("decode auth for host %s in Secret %s: %w", host, secret.Name, err)
+		}
+		username, password, ok := strings.Cut(string(decoded), ":")
+		if !ok {
+			return dockerAuthConfig{}, fmt.Errorf("auth for host %s in Secret %s is invalid", host, secret.Name)
+		}
+		auth.Username, auth.Password = username, password
+	}
+	if auth.Username == "" && auth.Password == "" && auth.IdentityToken == "" {
+		return dockerAuthConfig{}, fmt.Errorf("registry Secret %s has empty credentials for host %s", secret.Name, host)
+	}
+	return auth, nil
+}
+
+func findDockerAuthForHost(auths map[string]dockerAuthConfig, host string) (dockerAuthConfig, bool) {
+	for candidateHost, candidate := range auths {
+		if registryconfig.NormalizeHost(candidateHost) == host {
+			return candidate, true
+		}
+	}
+	return dockerAuthConfig{}, false
 }
 
 // Keys of the Opaque write (publish) secret; they mirror the SandboxTemplate
@@ -2536,12 +2553,43 @@ var runtimeOwnedEnv = map[string]struct{}{
 	"FAST_SANDBOX_ACTION_HANDLERS": {},
 	"FAST_SANDBOX_ACTIONS":         {},
 	"FAST_SANDBOX_SETTINGS_DIR":    {},
-	"NODE_NAME":                    {}, envPodName: {}, "POD_IP": {}, envPodUID: {}, "NAMESPACE": {},
+	// Network CIDR is controller-owned so SandboxTemplate builders and
+	// SandboxPool fastlets always share the same guest netmask.
+	EnvFastSandboxNetworkCIDR: {},
+	"NODE_NAME":               {}, envPodName: {}, "POD_IP": {}, envPodUID: {}, "NAMESPACE": {},
 	// Control authentication env keys are platform-owned: injected by the Pool
 	// Controller and stripped from templates. KeyFetchTokenEnv is fenced the
 	// same way — the override wins over the mounted token even inside a Pod.
 	fastletauth.AllowedSubjectsEnv: {}, fastletauth.IssuerEnv: {}, fastletauth.CABundleEnv: {},
 	fastletauth.AudienceEnv: {}, fastletauth.KeyFetchTokenEnv: {},
+}
+
+// ValidateNetworkCIDR validates the controller-owned FAST_SANDBOX_NETWORK_CIDR
+// value at startup. An empty value is valid and leaves the built-in default
+// (172.30.0.0/24) in effect.
+func ValidateNetworkCIDR(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	prefix, err := netip.ParsePrefix(raw)
+	if err != nil {
+		return fmt.Errorf("parse %s %q: %w", EnvFastSandboxNetworkCIDR, raw, err)
+	}
+	if !prefix.Addr().Is4() {
+		return fmt.Errorf("%s %q must be an IPv4 CIDR", EnvFastSandboxNetworkCIDR, raw)
+	}
+	if bits := prefix.Bits(); bits < 8 || bits > 29 {
+		return fmt.Errorf("%s %q prefix length /%d must be between /8 and /29", EnvFastSandboxNetworkCIDR, raw, bits)
+	}
+	return nil
+}
+
+func appendControllerNetworkCIDREnv(env []corev1.EnvVar) []corev1.EnvVar {
+	if cidr := strings.TrimSpace(os.Getenv(EnvFastSandboxNetworkCIDR)); cidr != "" {
+		return append(env, corev1.EnvVar{Name: EnvFastSandboxNetworkCIDR, Value: cidr})
+	}
+	return env
 }
 
 func removeRuntimeOwnedEnv(env []corev1.EnvVar) []corev1.EnvVar {
