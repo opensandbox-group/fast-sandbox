@@ -224,8 +224,12 @@ func injectRuntime(spec apiv1alpha2.SandboxTemplateSpec, workdir, mountPoint str
 	// egress DNS proxy — so the resolver is baked alongside the gateway it
 	// points at (deterministic; no per-instance rootfs mutation at Create
 	// time, which previously corrupted the image on the loop-mount write).
+	netCfg, err := resolveBakedGuestNetwork()
+	if err != nil {
+		return nil, err
+	}
 	if err := os.WriteFile(filepath.Join(mountPoint, "etc", "resolv.conf"), //nolint:gosec // guest resolv.conf, world-readable by design
-		[]byte("nameserver "+bakedGuestGateway+"\n"), 0o644); err != nil {
+		[]byte("nameserver "+netCfg.Gateway+"\n"), 0o644); err != nil {
 		return nil, err
 	}
 	return mitmCA, nil

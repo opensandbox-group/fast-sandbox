@@ -181,13 +181,17 @@ func buildOCITemplate(ctx context.Context, spec apiv1alpha2.SandboxTemplateSpec,
 	// guest kernel vsock stack fails the build instead of shipping a template
 	// that silently cannot capture.
 	args = append(args, "--guest-control-port", "1234")
+	netCfg, err := resolveBakedGuestNetwork()
+	if err != nil {
+		return err
+	}
 	platform := templatePlatform(spec, ca)
 	extra := struct {
 		Lineage      *artifacts.VMLineage  `json:"lineage"`
 		GuestNetwork map[string]any        `json:"guestNetwork"`
 		Platform     *artifacts.VMPlatform `json:"platform"`
 	}{Lineage: &artifacts.VMLineage{Image: spec.Image, ImageDigest: sourceDigest},
-		GuestNetwork: map[string]any{"ip": bakedGuestIP, "gateway": bakedGuestGateway, "netmask": bakedGuestNetmask, "mtu": bakedGuestMTU}, Platform: platform}
+		GuestNetwork: map[string]any{"ip": netCfg.IP, "gateway": netCfg.Gateway, "netmask": netCfg.Netmask, "mtu": netCfg.MTU}, Platform: platform}
 	raw, err := json.Marshal(extra)
 	if err != nil {
 		return err

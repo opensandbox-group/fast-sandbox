@@ -84,7 +84,11 @@ func buildManifest(spec apiv1alpha2.SandboxTemplateSpec, sourceDigest, kernel, r
 	document.FreePageReporting = &freePageReporting
 	document.Lineage = &artifacts.VMLineage{Image: spec.Image, ImageDigest: sourceDigest, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
 	document.Platform = templatePlatform(spec, mitmCA)
-	document.GuestNetwork = &artifacts.VMGuestNetwork{Iface: "eth0", MAC: bakedGuestMAC, IP: bakedGuestIP, Gateway: bakedGuestGateway, Netmask: bakedGuestNetmask, MTU: bakedGuestMTU}
+	netCfg, err := resolveBakedGuestNetwork()
+	if err != nil {
+		return empty, err
+	}
+	document.GuestNetwork = &artifacts.VMGuestNetwork{Iface: "eth0", MAC: netCfg.MAC, IP: netCfg.IP, Gateway: netCfg.Gateway, Netmask: netCfg.Netmask, MTU: netCfg.MTU}
 	document.Files = map[string]artifacts.ManifestFile{}
 	paths := map[string]string{rootfsImageName: rootfs, vmstateFileName: vmstate, memoryFileName: memory}
 	if spec.Output.Mode == apiv1alpha2.SandboxSnapshotModeRootfsOnly {

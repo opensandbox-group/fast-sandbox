@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -668,6 +669,9 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 	}
 	if endpoint != "" {
 		env = append(env, corev1.EnvVar{Name: "AWS_ENDPOINT_URL", Value: endpoint})
+	}
+	if cidr := strings.TrimSpace(os.Getenv("FAST_SANDBOX_NETWORK_CIDR")); cidr != "" {
+		env = append(env, corev1.EnvVar{Name: "FAST_SANDBOX_NETWORK_CIDR", Value: cidr})
 	}
 
 	// The build Pod runs the sandbox template builder: privileged for the

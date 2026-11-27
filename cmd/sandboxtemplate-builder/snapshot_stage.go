@@ -461,7 +461,11 @@ func bakedNetworkBootArgs(base string) string {
 	if strings.Contains(base, " ip=") {
 		return base
 	}
-	return base + " ip=" + bakedGuestIP + "::" + bakedGuestGateway + ":" + bakedGuestNetmask + "::eth0:off"
+	netCfg, err := resolveBakedGuestNetwork()
+	if err != nil {
+		netCfg = bakedGuestNetwork{IP: bakedGuestIP, Gateway: bakedGuestGateway, Netmask: bakedGuestNetmask}
+	}
+	return base + " ip=" + netCfg.IP + "::" + netCfg.Gateway + ":" + netCfg.Netmask + "::eth0:off"
 }
 
 // api performs one Firecracker API call over its Unix domain socket. A
