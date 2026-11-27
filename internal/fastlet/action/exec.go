@@ -499,6 +499,18 @@ func logExecFailure(spec *execInvocationSpec, attempt int, res ExecResult, termi
 	klog.V(2).InfoS("fastlet action exec retryable failure", fields...)
 }
 
+func allSubscribedExecHooksApplied(handler apiv1alpha2.ActionHandler, binding *bindingState) bool {
+	if binding == nil {
+		return true
+	}
+	for _, hook := range handler.Hooks {
+		if binding.appliedHooks[actionapi.LifecycleHook(hook)] <= 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func clearSensitiveInputLocked(state *sandboxState, handlerName string) {
 	if state == nil {
 		return
@@ -665,7 +677,9 @@ func (m *Manager) invokeExecHook(
 	}
 	if skipMsg, skipOutcome, skip := execSkipReason(attachment); skip {
 		binding.appliedHooks[checkpoint.Name] = checkpoint.Sequence
-		clearSensitiveInputLocked(state, handlerName)
+		if allSubscribedExecHooksApplied(handler, binding) {
+			clearSensitiveInputLocked(state, handlerName)
+		}
 		binding.readyMessage = skipMsg
 		m.refreshBindingStatusLocked(state, handlerName, binding)
 		state.mu.Unlock()
@@ -690,7 +704,9 @@ func (m *Manager) invokeExecHook(
 		return errors.New("Lifecycle Hook result belongs to an obsolete Sandbox revision")
 	}
 	binding.appliedHooks[checkpoint.Name] = checkpoint.Sequence
-	clearSensitiveInputLocked(state, handlerName)
+	if allSubscribedExecHooksApplied(handler, binding) {
+		clearSensitiveInputLocked(state, handlerName)
+	}
 	binding.readyMessage = ""
 	m.refreshBindingStatusLocked(state, handlerName, binding)
 	state.mu.Unlock()

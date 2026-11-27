@@ -518,3 +518,65 @@ func TestExecActionSensitiveFailureRedactsOutput(t *testing.T) {
 		t.Fatal("expected FailSandbox callback")
 	}
 }
+
+func TestExecActionSensitiveInputPersistsAcrossMultipleHooks(t *testing.T) {
+	var observed []string
+	execRunner := &recordingExecRunner{
+		fn: func(_ context.Context, _ int, req ExecRequest) ExecResult {
+			for _, arg := range req.Command {
+				if strings.HasPrefix(arg, "@") {
+					raw, err := os.ReadFile(strings.TrimPrefix(arg, "@"))
+					if err != nil {
+						return ExecResult{ExitCode: 1, Err: err}
+					}
+					observed = append(observed, string(raw))
+				}
+			}
+			return ExecResult{ExitCode: 0}
+		},
+	}
+
+	handler := runtimeInitHandler()
+	handler.Hooks = []apiv1alpha2.LifecycleHook{
+		apiv1alpha2.LifecycleHookRuntimeReady,
+		apiv1alpha2.LifecycleHookDataPlaneReady,
+	}
+	handler.Exec.Command = []string{"/usr/bin/curl", "-H", "@{{.Sensitive.File}}", "http://{{.Attachment.Network.IP}}:44772/internal/init"}
+	mgr, err := NewManager([]apiv1alpha2.ActionHandler{handler}, nil)
+	require.NoError(t, err)
+	mgr.SetExecRunner(execRunner)
+
+	const secret = "X-EXECD-ACCESS-TOKEN: multi-hook-secret\n"
+	att := attachment("sb-multi-hook-sensitive")
+	_, _, err = mgr.Reconcile(context.Background(), att, 1, []DesiredInput{{
+		Handler:        "runtime-init",
+		Input:          `{"sandboxId":"sb-multi-hook-sensitive"}`,
+		SensitiveInput: secret,
+	}})
+	require.NoError(t, err)
+
+	// First subscribed hook must receive the credential and keep it in memory
+	// for the remaining subscribed hook.
+	require.NoError(t, mgr.ReachHook(context.Background(), att.SandboxUID, att, actionapi.LifecycleHookRuntimeReady, 1))
+	require.Equal(t, []string{secret}, observed)
+
+	state := mgr.getState(att.SandboxUID)
+	state.mu.RLock()
+	require.Equal(t, secret, state.bindings["runtime-init"].sensitiveInput)
+	require.Equal(t, secret, state.desired[0].SensitiveInput)
+	state.mu.RUnlock()
+
+	// Second (last) subscribed hook must also receive the credential and clear
+	// it from Fastlet memory once complete.
+	require.NoError(t, mgr.ReachHook(context.Background(), att.SandboxUID, att, actionapi.LifecycleHookDataPlaneReady, 2))
+	require.Equal(t, []string{secret, secret}, observed)
+
+	state.mu.RLock()
+	require.Empty(t, state.bindings["runtime-init"].sensitiveInput)
+	for _, d := range state.desired {
+		require.Empty(t, d.SensitiveInput)
+	}
+	state.mu.RUnlock()
+	statuses, _ := mgr.Statuses(att.SandboxUID)
+	require.Equal(t, string(apiv1alpha2.ActionReady), statuses[0].State)
+}
