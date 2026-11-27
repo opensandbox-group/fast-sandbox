@@ -4,7 +4,7 @@ set -eu
 out=${1:?usage: build-overlaybd.sh OUTPUT_DIR}
 tools_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo=${OVERLAYBD_REPO:-https://github.com/Pangjiping/overlaybd.git}
-revision=${OVERLAYBD_REV:-99390bd0458ccc06ea42a44d7a48d409fd173f8a}
+revision=${OVERLAYBD_REV:-b222af58446e8291b72db66f73c783328551b850}
 
 apt-get update
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
