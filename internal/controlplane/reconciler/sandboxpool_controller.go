@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -109,8 +110,8 @@ const (
 	envPodUID = "POD_UID"
 	// envFastSandboxRegistryConfigPath carries the registry config file path into containers.
 	envFastSandboxRegistryConfigPath = "FAST_SANDBOX_REGISTRY_CONFIG_PATH"
-	// envFastSandboxNetworkCIDR carries the controller-owned guest network CIDR into builders and fastlets.
-	envFastSandboxNetworkCIDR = "FAST_SANDBOX_NETWORK_CIDR"
+	// EnvFastSandboxNetworkCIDR carries the controller-owned guest network CIDR into builders and fastlets.
+	EnvFastSandboxNetworkCIDR = "FAST_SANDBOX_NETWORK_CIDR"
 	// infraHostPath is the in-Pod directory where infra component tools are exposed.
 	infraHostPath = "/opt/fast-sandbox/infra"
 	// tmpDir is the node's /tmp shared into the Fastlet container.
@@ -2554,7 +2555,7 @@ var runtimeOwnedEnv = map[string]struct{}{
 	"FAST_SANDBOX_SETTINGS_DIR":    {},
 	// Network CIDR is controller-owned so SandboxTemplate builders and
 	// SandboxPool fastlets always share the same guest netmask.
-	envFastSandboxNetworkCIDR: {},
+	EnvFastSandboxNetworkCIDR: {},
 	"NODE_NAME":               {}, envPodName: {}, "POD_IP": {}, envPodUID: {}, "NAMESPACE": {},
 	// Control authentication env keys are platform-owned: injected by the Pool
 	// Controller and stripped from templates. KeyFetchTokenEnv is fenced the
@@ -2563,9 +2564,30 @@ var runtimeOwnedEnv = map[string]struct{}{
 	fastletauth.AudienceEnv: {}, fastletauth.KeyFetchTokenEnv: {},
 }
 
+// ValidateNetworkCIDR validates the controller-owned FAST_SANDBOX_NETWORK_CIDR
+// value at startup. An empty value is valid and leaves the built-in default
+// (172.30.0.0/24) in effect.
+func ValidateNetworkCIDR(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	prefix, err := netip.ParsePrefix(raw)
+	if err != nil {
+		return fmt.Errorf("parse %s %q: %w", EnvFastSandboxNetworkCIDR, raw, err)
+	}
+	if !prefix.Addr().Is4() {
+		return fmt.Errorf("%s %q must be an IPv4 CIDR", EnvFastSandboxNetworkCIDR, raw)
+	}
+	if bits := prefix.Bits(); bits < 8 || bits > 29 {
+		return fmt.Errorf("%s %q prefix length /%d must be between /8 and /29", EnvFastSandboxNetworkCIDR, raw, bits)
+	}
+	return nil
+}
+
 func appendControllerNetworkCIDREnv(env []corev1.EnvVar) []corev1.EnvVar {
-	if cidr := strings.TrimSpace(os.Getenv(envFastSandboxNetworkCIDR)); cidr != "" {
-		return append(env, corev1.EnvVar{Name: envFastSandboxNetworkCIDR, Value: cidr})
+	if cidr := strings.TrimSpace(os.Getenv(EnvFastSandboxNetworkCIDR)); cidr != "" {
+		return append(env, corev1.EnvVar{Name: EnvFastSandboxNetworkCIDR, Value: cidr})
 	}
 	return env
 }

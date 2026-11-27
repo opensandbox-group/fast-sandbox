@@ -100,14 +100,24 @@ client's rate limiter (they must be set together, and `0` keeps the client-go
 default). Raising them speeds up the initial cache-sync LISTs on large
 clusters; watches are exempt from the limiter.
 
-Image and route-key flags can also be supplied by environment:
+Image, route-key, and cluster network settings can also be supplied by environment:
 
 - `FASTLET_PROXY_IMAGE`;
 - `FAST_SANDBOX_ROUTE_VERIFY_PUBLIC_KEY`;
 - `FAST_SANDBOX_ROUTE_SIGNING_PRIVATE_KEY`;
-- `FAST_SANDBOX_PROXY_BASE_URL`.
+- `FAST_SANDBOX_PROXY_BASE_URL`;
+- `FAST_SANDBOX_NETWORK_CIDR`.
 
 Only Fast-Path receives the route-signing private key. Controllers and proxies use verification public keys.
+
+### Guest network CIDR (`FAST_SANDBOX_NETWORK_CIDR`)
+
+`FAST_SANDBOX_NETWORK_CIDR` is a controller-level, cluster-bootstrap environment setting (valid IPv4 CIDR from `/8` through `/29`, default `172.30.0.0/24`). The controller validates it at startup (failing fast on malformed, non-IPv4, or out-of-range CIDRs) and propagates it consistently to both `sandboxtemplate-builder` Pods and `SandboxPool` Fastlet Pods, stripping any `FAST_SANDBOX_NETWORK_CIDR` entry declared in a Pool template's `env`. Sizing this CIDR at cluster bootstrap (for example `172.30.0.0/20` for >126 Firecracker sandboxes per Fastlet) keeps template guest network masks and Fastlet slot IPAM aligned without drift.
+
+> **Warning: Changing `FAST_SANDBOX_NETWORK_CIDR` on a live cluster is disruptive.**
+> - **Fastlet Pods roll automatically:** changing the value alters the Fastlet Pod template hash (`AnnotationPodTemplateHash`), triggering a surge-and-drain rollout of `SandboxPool` Fastlet Pods onto the new CIDR. In `LegacySlot` mode, draining Pods that do not empty before `--fastlet-drain-timeout` are deleted along with any remaining running Sandboxes.
+> - **Existing Firecracker `SandboxTemplate`s are not automatically rebuilt:** `Succeeded` templates with `ObservedGeneration == Generation` remain terminal, so their baked `guestNetwork` (`ip`, `gateway`, `netmask`), `/etc/resolv.conf`, and memory snapshots stay pinned to the previous CIDR.
+> - **New creates and checkpoint/snapshot restores fail until templates are rebuilt:** once traffic moves to Fastlet Pods on the new CIDR, creating Firecracker Sandboxes from existing templates fails `validateManifestGuestNetwork`, so every existing Firecracker `SandboxTemplate` must be manually rebuilt. Checkpoints and snapshots captured under the previous CIDR cannot be restored on the new CIDR.
 
 ## Artifact store
 
@@ -211,7 +221,7 @@ at `/etc/fast-sandbox/registry/registry.json`. See
 
 ### Network
 
-- `FAST_SANDBOX_NETWORK_CIDR`;
+- `FAST_SANDBOX_NETWORK_CIDR` (propagated from the controller; valid IPv4 `/8`–`/29`, default `172.30.0.0/24`; see [Guest network CIDR](#guest-network-cidr-fast_sandbox_network_cidr) for bootstrap guidance and in-place change impact);
 - `FAST_SANDBOX_NETWORK_BRIDGE`;
 - `FAST_SANDBOX_NETWORK_EGRESS_DEVICE`;
 - `FAST_SANDBOX_NETWORK_STATE_ROOT`;

@@ -43,6 +43,13 @@ func TestResolveBakedGuestNetworkFromCIDR(t *testing.T) {
 
 func TestBakedNetworkBootArgsUsesConfiguredCIDR(t *testing.T) {
 	t.Setenv(networkCIDREnv, "172.30.0.0/20")
-	got := bakedNetworkBootArgs("console=ttyS0 root=/dev/vda rw")
+	got, err := bakedNetworkBootArgs("console=ttyS0 root=/dev/vda rw")
+	require.NoError(t, err)
 	require.Contains(t, got, "ip=172.30.0.3::172.30.0.1:255.255.240.0::eth0:off")
+}
+
+func TestBakedNetworkBootArgsRejectsInvalidCIDR(t *testing.T) {
+	t.Setenv(networkCIDREnv, "172.30.0.0/30")
+	_, err := bakedNetworkBootArgs("console=ttyS0 root=/dev/vda rw")
+	require.Error(t, err)
 }

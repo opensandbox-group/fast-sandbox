@@ -66,6 +66,33 @@ const (
 	bakedGuestMTU = 1500
 )
 
+type snapshotStageInputs struct {
+	kernel, rootfs, vmstate, memory, workdir string
+	spec                                     apiv1alpha2.SandboxTemplateSpec
+}
+
+func loadSnapshotStageInputs(args []string) (snapshotStageInputs, error) {
+	if len(args) != 4 {
+		return snapshotStageInputs{}, fmt.Errorf("usage: sandbox-snapshot-stage <kernel> <rootfs> <vmstate> <memory>")
+	}
+	payload := os.Getenv(specEnv)
+	if payload == "" {
+		return snapshotStageInputs{}, fmt.Errorf("SANDBOX_TEMPLATE_SPEC is required")
+	}
+	var spec apiv1alpha2.SandboxTemplateSpec
+	if err := json.Unmarshal([]byte(payload), &spec); err != nil {
+		return snapshotStageInputs{}, fmt.Errorf("parse template spec: %w", err)
+	}
+	workdir := os.Getenv(workDirEnv)
+	if workdir == "" {
+		workdir = "/build"
+	}
+	return snapshotStageInputs{
+		kernel: args[0], rootfs: args[1], vmstate: args[2], memory: args[3],
+		workdir: workdir, spec: spec,
+	}, nil
+}
+
 // runSnapshotStage drives a Firecracker VM from cold boot to a validated
 // full snapshot. It is invoked by the builder image as the snapshot stage
 // helper:
@@ -79,24 +106,11 @@ func runSnapshotStage(args []string) error {
 	if err := selectBuildVMM(context.Background()); err != nil {
 		return err
 	}
-	if len(args) != 4 {
-		return fmt.Errorf("usage: sandbox-snapshot-stage <kernel> <rootfs> <vmstate> <memory>")
+	in, err := loadSnapshotStageInputs(args)
+	if err != nil {
+		return err
 	}
-	kernel, rootfs, vmstate, memory := args[0], args[1], args[2], args[3]
-
-	payload := os.Getenv(specEnv)
-	if payload == "" {
-		return fmt.Errorf("SANDBOX_TEMPLATE_SPEC is required")
-	}
-	var spec apiv1alpha2.SandboxTemplateSpec
-	if err := json.Unmarshal([]byte(payload), &spec); err != nil {
-		return fmt.Errorf("parse template spec: %w", err)
-	}
-
-	workdir := os.Getenv(workDirEnv)
-	if workdir == "" {
-		workdir = "/build"
-	}
+	kernel, rootfs, vmstate, memory, workdir, spec := in.kernel, in.rootfs, in.vmstate, in.memory, in.workdir, in.spec
 
 	// The baked NIC needs a host tap as its backing device while the VM
 	// runs. It is kept alive through the restore validation (the snapshot's
@@ -138,7 +152,10 @@ func runSnapshotStage(args []string) error {
 	// fixed too.
 	bootArgs := "console=ttyS0 reboot=k panic=1 pci=off nomodules net.ifnames=0 biosdevname=0 random.trust_cpu=on root=/dev/vda rw"
 	bootArgs += " init=" + guestInitPath(spec)
-	bootArgs = bakedNetworkBootArgs(bootArgs)
+	bootArgs, err = bakedNetworkBootArgs(bootArgs)
+	if err != nil {
+		return err
+	}
 	// Hash the same private bytes the VMM loads, not a mutable node path after boot.
 	pinnedKernel := filepath.Join(workdir, "boot-kernel")
 	kernelSHA256, err := firecrackerconfig.PinKernel(kernel, pinnedKernel)
@@ -457,15 +474,15 @@ func deleteBuildTap() {
 // command line so the snapshot carries a live eth0 configuration (the
 // restored guest owns the address without kernel ip= args — the snapshot
 // is authoritative).
-func bakedNetworkBootArgs(base string) string {
+func bakedNetworkBootArgs(base string) (string, error) {
 	if strings.Contains(base, " ip=") {
-		return base
+		return base, nil
 	}
 	netCfg, err := resolveBakedGuestNetwork()
 	if err != nil {
-		netCfg = bakedGuestNetwork{IP: bakedGuestIP, Gateway: bakedGuestGateway, Netmask: bakedGuestNetmask}
+		return "", err
 	}
-	return base + " ip=" + netCfg.IP + "::" + netCfg.Gateway + ":" + netCfg.Netmask + "::eth0:off"
+	return base + " ip=" + netCfg.IP + "::" + netCfg.Gateway + ":" + netCfg.Netmask + "::eth0:off", nil
 }
 
 // api performs one Firecracker API call over its Unix domain socket. A
