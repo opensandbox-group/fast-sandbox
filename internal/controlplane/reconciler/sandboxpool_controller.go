@@ -109,6 +109,8 @@ const (
 	envPodUID = "POD_UID"
 	// envFastSandboxRegistryConfigPath carries the registry config file path into containers.
 	envFastSandboxRegistryConfigPath = "FAST_SANDBOX_REGISTRY_CONFIG_PATH"
+	// envFastSandboxNetworkCIDR carries the controller-owned guest network CIDR into builders and fastlets.
+	envFastSandboxNetworkCIDR = "FAST_SANDBOX_NETWORK_CIDR"
 	// infraHostPath is the in-Pod directory where infra component tools are exposed.
 	infraHostPath = "/opt/fast-sandbox/infra"
 	// tmpDir is the node's /tmp shared into the Fastlet container.
@@ -1681,9 +1683,7 @@ func (r *SandboxPoolReconciler) constructPodWithResolvedResources(
 		if profile.ResidualProcess != runtimecatalog.ResidualProcessNone {
 			c.Env = append(c.Env, corev1.EnvVar{Name: "FAST_SANDBOX_NODE_CLEANUP_SOCKET", Value: nodecleanup.DefaultSocketPath})
 		}
-		if cidr := strings.TrimSpace(os.Getenv("FAST_SANDBOX_NETWORK_CIDR")); cidr != "" {
-			c.Env = append(c.Env, corev1.EnvVar{Name: "FAST_SANDBOX_NETWORK_CIDR", Value: cidr})
-		}
+		c.Env = appendControllerNetworkCIDREnv(c.Env)
 		c.VolumeMounts = append(c.VolumeMounts,
 			corev1.VolumeMount{Name: tmpVolumeName, MountPath: tmpDir},
 			corev1.VolumeMount{Name: infraToolsVolumeName, MountPath: infraHostPath},
@@ -2542,13 +2542,20 @@ var runtimeOwnedEnv = map[string]struct{}{
 	"FAST_SANDBOX_SETTINGS_DIR":    {},
 	// Network CIDR is controller-owned so SandboxTemplate builders and
 	// SandboxPool fastlets always share the same guest netmask.
-	"FAST_SANDBOX_NETWORK_CIDR": {},
+	envFastSandboxNetworkCIDR: {},
 	"NODE_NAME":                 {}, envPodName: {}, "POD_IP": {}, envPodUID: {}, "NAMESPACE": {},
 	// Control authentication env keys are platform-owned: injected by the Pool
 	// Controller and stripped from templates. KeyFetchTokenEnv is fenced the
 	// same way — the override wins over the mounted token even inside a Pod.
 	fastletauth.AllowedSubjectsEnv: {}, fastletauth.IssuerEnv: {}, fastletauth.CABundleEnv: {},
 	fastletauth.AudienceEnv: {}, fastletauth.KeyFetchTokenEnv: {},
+}
+
+func appendControllerNetworkCIDREnv(env []corev1.EnvVar) []corev1.EnvVar {
+	if cidr := strings.TrimSpace(os.Getenv(envFastSandboxNetworkCIDR)); cidr != "" {
+		return append(env, corev1.EnvVar{Name: envFastSandboxNetworkCIDR, Value: cidr})
+	}
+	return env
 }
 
 func removeRuntimeOwnedEnv(env []corev1.EnvVar) []corev1.EnvVar {
