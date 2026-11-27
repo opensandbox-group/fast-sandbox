@@ -231,22 +231,42 @@ func TestGuestNATBatchPrepareAndReplay(t *testing.T) {
 	slot := guestVMSlotForTest(t.TempDir())
 	require.NoError(t, driver.Prepare(context.Background(), slot))
 	require.True(t, slot.GuestNATBatch)
+	// Prepare pre-warms the default BakedGuestIP (gateway + 2 = 10.17.0.3).
+	require.Equal(t, "10.17.0.3", slot.GuestIP)
+	require.Contains(t, strings.Join(runner.commands, "\n"), "ip -n ns-1 route replace 10.17.0.3/32 dev vmtap0")
 	require.Contains(t, runner.inputs[0], "-A PREROUTING -j FSB_GUEST_DNAT")
 	require.Contains(t, runner.inputs[0], "-A POSTROUTING -j FSB_GUEST_SNAT")
-	for range 2 {
-		runner.commands = nil
-		require.NoError(t, driver.ApplyGuest(context.Background(), slot, "10.17.0.9"))
-		require.Len(t, runner.commands, 2)
-		require.Equal(t, "ip -n ns-1 route replace 10.17.0.9/32 dev vmtap0", runner.commands[0])
-		require.Equal(t, "ip netns exec ns-1 iptables-restore --noflush", runner.commands[1])
-	}
-	require.Equal(t, runner.inputs[1], runner.inputs[2])
+	require.Contains(t, runner.inputs[0], "-A FSB_GUEST_DNAT -d 10.17.0.2/32 -j DNAT --to-destination 10.17.0.3")
+	require.Contains(t, runner.inputs[0], "-A FSB_GUEST_SNAT -s 10.17.0.3/32 -j SNAT --to-source 10.17.0.2")
+
+	// Fast path: ApplyGuest for the pre-warmed BakedGuestIP skips route + iptables execs.
+	runner.commands = nil
+	require.NoError(t, driver.ApplyGuest(context.Background(), slot, "10.17.0.3"))
+	require.Empty(t, runner.commands)
+	require.Len(t, runner.inputs, 1)
+
+	// Switching to a different guestIP runs route replace + iptables-restore once.
+	runner.commands = nil
+	require.NoError(t, driver.ApplyGuest(context.Background(), slot, "10.17.0.9"))
+	require.Equal(t, "10.17.0.9", slot.GuestIP)
+	require.Len(t, runner.commands, 2)
+	require.Equal(t, "ip -n ns-1 route replace 10.17.0.9/32 dev vmtap0", runner.commands[0])
+	require.Equal(t, "ip netns exec ns-1 iptables-restore --noflush", runner.commands[1])
 	require.Contains(t, runner.inputs[1], "-A FSB_GUEST_DNAT -d 10.17.0.2/32 -j DNAT --to-destination 10.17.0.9")
 	require.Contains(t, runner.inputs[1], "-A FSB_GUEST_SNAT -s 10.17.0.9/32 -j SNAT --to-source 10.17.0.2")
 	require.NotContains(t, runner.inputs[1], "-A PREROUTING")
 	require.NotContains(t, runner.inputs[1], "-F")
+
+	// Re-applying the same guestIP hits the fast path with zero execs.
+	runner.commands = nil
+	require.NoError(t, driver.ApplyGuest(context.Background(), slot, "10.17.0.9"))
+	require.Empty(t, runner.commands)
+	require.Len(t, runner.inputs, 2)
+
+	// Switching again replaces the NAT rules cleanly.
 	require.NoError(t, driver.ApplyGuest(context.Background(), slot, "10.17.0.10"))
-	require.NotContains(t, runner.inputs[3], "10.17.0.9")
+	require.Equal(t, "10.17.0.10", slot.GuestIP)
+	require.NotContains(t, runner.inputs[2], "10.17.0.9")
 }
 
 func TestGuestNATBatchFailureDoesNotFallback(t *testing.T) {

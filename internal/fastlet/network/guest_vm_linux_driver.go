@@ -30,6 +30,11 @@ const (
 	guestNATPrepareRules  = guestNATChains +
 		"-A PREROUTING -j " + guestDNATChain + "\n" +
 		"-A POSTROUTING -j " + guestSNATChain + "\nCOMMIT\n"
+	guestNATPrepareAndApplyRules = guestNATChains +
+		"-A PREROUTING -j " + guestDNATChain + "\n" +
+		"-A POSTROUTING -j " + guestSNATChain + "\n" +
+		"-A " + guestDNATChain + " -d %s/32 -j DNAT --to-destination %s\n" +
+		"-A " + guestSNATChain + " -s %s/32 -j SNAT --to-source %s\nCOMMIT\n"
 	guestNATApplyRules = guestNATChains +
 		"-A " + guestDNATChain + " -d %s/32 -j DNAT --to-destination %s\n" +
 		"-A " + guestSNATChain + " -s %s/32 -j SNAT --to-source %s\nCOMMIT\n"
@@ -142,10 +147,22 @@ func (d *GuestVMNetNSDriver) Prepare(ctx context.Context, slot *Slot) error {
 		}
 	}
 	if d.restoreRunner != nil {
-		if err := d.restoreGuestNAT(ctx, slot, guestNATPrepareRules); err != nil {
-			return fmt.Errorf("prepare guest NAT chains: %w", err)
+		if bakedIP, err := BakedGuestIP(slot); err == nil && slot.IP != "" && bakedIP != slot.IP {
+			if _, err := d.runner.Run(ctx, d.ipCommand, "-n", slot.NetNSName, "route", "replace", bakedIP+"/32", netDevFlag, guestVMDefaultTapName); err != nil {
+				return fmt.Errorf("prepare guest delivery route: %w", err)
+			}
+			payload := fmt.Sprintf(guestNATPrepareAndApplyRules, slot.IP, bakedIP, bakedIP, slot.IP)
+			if err := d.restoreGuestNAT(ctx, slot, payload); err != nil {
+				return fmt.Errorf("prepare guest NAT chains: %w", err)
+			}
+			slot.GuestNATBatch = true
+			slot.GuestIP = bakedIP
+		} else {
+			if err := d.restoreGuestNAT(ctx, slot, guestNATPrepareRules); err != nil {
+				return fmt.Errorf("prepare guest NAT chains: %w", err)
+			}
+			slot.GuestNATBatch = true
 		}
-		slot.GuestNATBatch = true
 	}
 	return nil
 }
@@ -155,8 +172,9 @@ func (d *GuestVMNetNSDriver) Prepare(ctx context.Context, slot *Slot) error {
 // the ingress DNAT (slot IP -> guest IP) / egress source NAT (guest IP ->
 // slot IP) rules. Every slot translates its slot IP to the SAME baked guest
 // address (per-clone clone model); slot.IP+1 is NOT the guest address
-// except for the first slot. New slots replace dedicated chains; old slots
-// retain idempotent check-then-add.
+// except for the first slot. When Prepare has already pre-warmed the slot
+// with the same guestIP in batch mode, ApplyGuest skips redundant route and
+// iptables subprocesses and only runs the ARP warm-up.
 func (d *GuestVMNetNSDriver) ApplyGuest(ctx context.Context, slot *Slot, guestIP string) error {
 	if slot == nil || slot.NetNSName == "" || slot.IP == "" {
 		return fmt.Errorf("incomplete guest-VM slot")
@@ -176,27 +194,31 @@ func (d *GuestVMNetNSDriver) ApplyGuest(ctx context.Context, slot *Slot, guestIP
 		// address, so this indicates a misconfigured template or CIDR.
 		return fmt.Errorf("baked guest IP %q collides with the slot IP", guestIP)
 	}
-	slot.GuestIP = guestIP
-	// Ingress delivery: the baked guest address is routed via the tap. The
-	// address is deliberately NOT assigned to the tap: a local address
-	// would shadow the guest (the netns kernel would answer for the guest
-	// IP itself and refuse TCP with no listener).
-	routeCtx, finishRoute := startGuestApplyStage(ctx, "route_replace")
-	_, err = d.runner.Run(routeCtx, d.ipCommand, "-n", slot.NetNSName, "route", "replace", guestIP+"/32", netDevFlag, guestVMDefaultTapName)
-	finishRoute(err)
-	if err != nil {
-		return fmt.Errorf("apply guest delivery route: %w", err)
-	}
-	if slot.GuestNATBatch {
-		natCtx, finishNAT := startGuestApplyStage(ctx, "nat_apply")
-		payload := fmt.Sprintf(guestNATApplyRules, slot.IP, guestIP, guestIP, slot.IP)
-		err := d.restoreGuestNAT(natCtx, slot, payload)
-		finishNAT(err)
+	// Fast path: Prepare (or a prior ApplyGuest) already installed the /32
+	// delivery route and DNAT/SNAT rules for this exact guestIP.
+	if !slot.GuestNATBatch || slot.GuestIP != guestIP {
+		// Ingress delivery: the baked guest address is routed via the tap. The
+		// address is deliberately NOT assigned to the tap: a local address
+		// would shadow the guest (the netns kernel would answer for the guest
+		// IP itself and refuse TCP with no listener).
+		routeCtx, finishRoute := startGuestApplyStage(ctx, "route_replace")
+		_, err = d.runner.Run(routeCtx, d.ipCommand, "-n", slot.NetNSName, "route", "replace", guestIP+"/32", netDevFlag, guestVMDefaultTapName)
+		finishRoute(err)
 		if err != nil {
-			return fmt.Errorf("apply guest NAT batch: %w", err)
+			return fmt.Errorf("apply guest delivery route: %w", err)
 		}
-	} else if err := d.applyLegacyGuestNAT(ctx, slot, guestIP); err != nil {
-		return err
+		if slot.GuestNATBatch {
+			natCtx, finishNAT := startGuestApplyStage(ctx, "nat_apply")
+			payload := fmt.Sprintf(guestNATApplyRules, slot.IP, guestIP, guestIP, slot.IP)
+			err := d.restoreGuestNAT(natCtx, slot, payload)
+			finishNAT(err)
+			if err != nil {
+				return fmt.Errorf("apply guest NAT batch: %w", err)
+			}
+		} else if err := d.applyLegacyGuestNAT(ctx, slot, guestIP); err != nil {
+			return err
+		}
+		slot.GuestIP = guestIP
 	}
 	// ARP warm-up: one datagram to the slot IP forces the host bridge to
 	// resolve the address against the netns eth0 (which owns it) right
