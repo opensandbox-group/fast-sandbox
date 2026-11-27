@@ -4,6 +4,7 @@ ARG GOPROXY=https://proxy.golang.org,direct
 
 FROM ubuntu:22.04 AS overlaybd-build
 
+ARG OVERLAYBD_REPO
 ARG OVERLAYBD_REV
 COPY build/oci/build-overlaybd.sh build/sandboxtemplate-builder/overlaybd-import-raw.cpp /build-tools/
 RUN sh /build-tools/build-overlaybd.sh /out
