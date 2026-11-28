@@ -20,6 +20,9 @@ import (
 
 const currentSlotVersion = 1
 
+// DefaultResetTimeout bounds a deep reset plus its post-reset audit.
+const DefaultResetTimeout = 2 * time.Second
+
 // Defaults of the Fastlet slot data plane; exported for callers (fastlet
 // main) that need the same values for pre-flight validation.
 const (
@@ -48,6 +51,18 @@ type Config struct {
 	IDGenerator      func() (string, error)
 	Now              func() time.Time
 	ReplenishTimeout time.Duration
+	// CleanReturn enables return-style pooling: Release deep resets a
+	// returned slot against its golden state and, if the post-reset audit is
+	// empty, marks it Clean again with the same identity. The default
+	// destroy-per-slot semantics make cross-tenant leakage structurally
+	// impossible; with CleanReturn the audit is the guarantee. Slots whose
+	// driver cannot audit or that carry no golden state keep the destroy
+	// path even when this is enabled.
+	CleanReturn bool
+	// ResetTimeout bounds one deep reset plus audit. A wedged shaping qdisc
+	// can stall a link transition for hundreds of milliseconds; on breach
+	// the slot is quarantined (destroyed and rebuilt) instead of reused.
+	ResetTimeout time.Duration
 }
 
 func DefaultConfig(capacity int, podUID string) Config {
@@ -56,6 +71,7 @@ func DefaultConfig(capacity int, podUID string) Config {
 		Bridge: DefaultBridge, MTU: DefaultMTU,
 		StateRoot: "/run/fast-sandbox/network", NetNSRoot: "/run/netns",
 		HostNetNSRoot: "/run/fast-sandbox/netns", ReplenishTimeout: time.Minute,
+		ResetTimeout: DefaultResetTimeout,
 	}
 }
 
@@ -97,6 +113,14 @@ func NewManager(config Config, driver Driver, store StateStore) (*Manager, error
 	}
 	if config.ReplenishTimeout <= 0 {
 		config.ReplenishTimeout = time.Minute
+	}
+	if config.ResetTimeout <= 0 {
+		config.ResetTimeout = DefaultResetTimeout
+	}
+	if config.CleanReturn {
+		if _, hygienist := driver.(SlotHygienist); !hygienist {
+			return nil, fmt.Errorf("return-style pooling requires a network driver that supports residue audit")
+		}
 	}
 	var (
 		ipam *IPv4IPAM
@@ -143,19 +167,8 @@ func (m *Manager) Initialize(ctx context.Context) error {
 	}
 
 	for _, slot := range loaded {
-		if slot.Phase == SlotPhaseDestroying {
-			if err := m.destroySlot(ctx, slot.ID); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := m.driver.Validate(ctx, slot); err != nil {
-			if slot.Phase == SlotPhaseBound {
-				return fmt.Errorf("%w: bound slot %s failed validation: %w", ErrStateInconsistent, slot.ID, err)
-			}
-			if destroyErr := m.markAndDestroy(ctx, slot.ID); destroyErr != nil {
-				return fmt.Errorf("invalid clean slot %s: %w; destroy: %w", slot.ID, err, destroyErr)
-			}
+		if err := m.initializeSlot(ctx, slot); err != nil {
+			return err
 		}
 	}
 	if err := m.Replenish(ctx); err != nil {
@@ -164,6 +177,34 @@ func (m *Manager) Initialize(ctx context.Context) error {
 	m.mu.Lock()
 	m.recordPhasesLocked()
 	m.mu.Unlock()
+	return nil
+}
+
+// initializeSlot brings one durable slot back to a usable state. Slots
+// interrupted mid-destroy or mid-return are destroyed rather than trusted;
+// clean slots without a golden state (durable state written before
+// return-style pooling) are re-goldened, because their namespace has never
+// been handed to a tenant and its current state IS the pool-build state.
+func (m *Manager) initializeSlot(ctx context.Context, slot *Slot) error {
+	if slot.Phase == SlotPhaseDestroying || slot.Phase == SlotPhaseReturning {
+		return m.destroySlot(ctx, slot.ID)
+	}
+	if err := m.driver.Validate(ctx, slot); err != nil {
+		if slot.Phase == SlotPhaseBound {
+			return fmt.Errorf("%w: bound slot %s failed validation: %w", ErrStateInconsistent, slot.ID, err)
+		}
+		if destroyErr := m.markAndDestroy(ctx, slot.ID); destroyErr != nil {
+			return fmt.Errorf("invalid clean slot %s: %w; destroy: %w", slot.ID, err, destroyErr)
+		}
+		return nil
+	}
+	if slot.Phase == SlotPhaseClean && m.config.CleanReturn && slot.Golden == nil {
+		if err := m.captureGolden(ctx, slot); err != nil {
+			if destroyErr := m.markAndDestroy(ctx, slot.ID); destroyErr != nil {
+				return fmt.Errorf("golden capture for slot %s: %w; destroy: %w", slot.ID, err, destroyErr)
+			}
+		}
+	}
 	return nil
 }
 
@@ -347,13 +388,19 @@ func (m *Manager) ApplyGuest(ctx context.Context, owner Owner, guestIP string) e
 	return err
 }
 
-// Release destroys a used slot. It never returns that slot directly to the
-// clean pool; a new slot with a new ID/resources is prepared asynchronously.
+// Release ends a binding. Without return-style pooling the slot is
+// destroyed and replaced asynchronously, which makes cross-tenant residue
+// structurally impossible at the cost of full teardown. With CleanReturn the
+// slot is deep reset against its golden state and returned to the clean pool
+// with the same identity when the post-reset audit is empty; any reset
+// failure, timeout, or audit violation quarantines the slot (destroy plus
+// rebuild), degrading to one destroy cycle. Reset runs outside the manager
+// lock, bounded by ResetTimeout.
 func (m *Manager) Release(ctx context.Context, owner Owner) error {
 	m.mu.RLock()
 	var target *Slot
 	for _, slot := range m.slots {
-		if slot.Owner.SandboxUID == owner.SandboxUID && (slot.Phase == SlotPhaseBound || slot.Phase == SlotPhaseDestroying) {
+		if slot.Owner.SandboxUID == owner.SandboxUID && (slot.Phase == SlotPhaseBound || slot.Phase == SlotPhaseDestroying || slot.Phase == SlotPhaseReturning) {
 			target = cloneSlot(slot)
 			break
 		}
@@ -365,9 +412,31 @@ func (m *Manager) Release(ctx context.Context, owner Owner) error {
 	if !target.Owner.Equal(owner) {
 		return ErrOwnerConflict
 	}
-	if err := m.markAndDestroy(ctx, target.ID); err != nil {
+	switch target.Phase {
+	case SlotPhaseReturning:
+		// A return is already in flight for this binding.
+		return nil
+	case SlotPhaseDestroying:
+		// Retry the interrupted destroy.
+		return m.destroyAndReplenish(ctx, target.ID)
+	}
+	hygienist, hygienistOK := m.driver.(SlotHygienist)
+	if !m.config.CleanReturn || !hygienistOK || target.Golden == nil {
+		return m.destroyAndReplenish(ctx, target.ID)
+	}
+	return m.returnToPool(ctx, hygienist, target)
+}
+
+// destroyAndReplenish destroys a slot and refills capacity asynchronously.
+func (m *Manager) destroyAndReplenish(ctx context.Context, slotID string) error {
+	if err := m.markAndDestroy(ctx, slotID); err != nil {
 		return err
 	}
+	m.replenishAsync()
+	return nil
+}
+
+func (m *Manager) replenishAsync() {
 	m.replenishWG.Add(1)
 	go func() {
 		defer m.replenishWG.Done()
@@ -377,7 +446,111 @@ func (m *Manager) Release(ctx context.Context, owner Owner) error {
 			klog.V(2).InfoS("background slot replenish failed", "err", err)
 		}
 	}()
+}
+
+// returnToPool deep resets a released slot and returns it to the clean pool
+// with the same identity when the post-reset audit is empty. Any failure,
+// timeout, or audit violation quarantines the slot: it is destroyed and its
+// capacity is rebuilt from scratch, so the pool contract degrades to one
+// destroy cycle instead of ever reusing a suspect namespace.
+func (m *Manager) returnToPool(ctx context.Context, hygienist SlotHygienist, target *Slot) error {
+	transitioned, err := m.markReturning(ctx, target.ID)
+	if err != nil {
+		return err
+	}
+	if !transitioned {
+		// A concurrent release of the same binding already owns the return.
+		return nil
+	}
+	resetStarted := time.Now()
+	resetCtx, cancel := context.WithTimeout(ctx, m.config.ResetTimeout)
+	defer cancel()
+	resetErr := hygienist.DeepReset(resetCtx, target, target.Golden)
+	if resetErr == nil {
+		auditStarted := time.Now()
+		var violations []Violation
+		violations, resetErr = hygienist.Audit(resetCtx, target, target.Golden)
+		observeSlotReturnStage("audit", auditStarted, resetErr)
+		if resetErr == nil && len(violations) > 0 {
+			logAuditViolations(target.ID, violations)
+			resetErr = fmt.Errorf("residue audit found %d violations", len(violations))
+		}
+	}
+	observeSlotReturnStage("reset", resetStarted, resetErr)
+	if resetErr != nil {
+		klog.Warningf("network slot %s pooled return failed: %v; quarantining slot", target.ID, resetErr)
+		if destroyErr := m.markAndDestroy(ctx, target.ID); destroyErr != nil {
+			recordSlotReturn("quarantine")
+			return destroyErr
+		}
+		recordSlotReturn("quarantine")
+		m.replenishAsync()
+		return nil
+	}
+	recordSlotReturn("clean")
+	m.mu.Lock()
+	current := m.slots[target.ID]
+	if current == nil || current.Phase != SlotPhaseReturning || !current.Owner.Equal(target.Owner) {
+		// Close destroyed the slot while the reset ran; nothing to commit.
+		m.mu.Unlock()
+		return nil
+	}
+	candidate := *current
+	candidate.Phase = SlotPhaseClean
+	candidate.Owner = Owner{}
+	candidate.GuestIP = ""
+	candidate.BoundAt = nil
+	candidate.Access = AccessDescriptor{}
+	persistStarted := time.Now()
+	persistContext, persistSpan := observability.Start(ctx, "fastlet.network.release.persist")
+	persistErr := m.store.Save(persistContext, &candidate)
+	observability.End(persistSpan, persistErr)
+	observeSlotPersist(persistStarted, persistErr)
+	if persistErr != nil {
+		m.mu.Unlock()
+		klog.Warningf("network slot %s pooled return commit failed: %v; quarantining slot", target.ID, persistErr)
+		return m.markAndDestroy(ctx, target.ID)
+	}
+	*current = candidate
+	m.recordPhasesLocked()
+	m.mu.Unlock()
 	return nil
+}
+
+// captureGolden snapshots the slot namespace right after preparation. It
+// runs while the slot is still private to the manager (reserved, not yet
+// visible to Acquire), so the snapshot is the kernel's own view of the
+// freshly built slot rather than an assumed default state.
+func (m *Manager) captureGolden(ctx context.Context, slot *Slot) error {
+	hygienist := m.driver.(SlotHygienist)
+	golden, err := hygienist.CaptureGolden(ctx, slot)
+	if err != nil {
+		return err
+	}
+	slot.Golden = golden
+	return nil
+}
+
+// markReturning persists the Returning phase and reports whether this call
+// performed the transition.
+func (m *Manager) markReturning(ctx context.Context, slotID string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	slot := m.slots[slotID]
+	if slot == nil {
+		return false, nil
+	}
+	if slot.Phase == SlotPhaseReturning {
+		return false, nil
+	}
+	candidate := *slot
+	candidate.Phase = SlotPhaseReturning
+	if err := m.store.Save(ctx, &candidate); err != nil {
+		return false, err
+	}
+	*slot = candidate
+	m.recordPhasesLocked()
+	return true, nil
 }
 
 // Quiesce waits for any background replenish spawned by Release to finish.
@@ -457,6 +630,8 @@ func (m *Manager) Snapshot() Snapshot {
 			result.Clean++
 		case SlotPhaseBound:
 			result.Bound++
+		case SlotPhaseReturning:
+			result.Returning++
 		case SlotPhaseDestroying:
 			result.Destroying++
 		}
@@ -525,6 +700,15 @@ func (m *Manager) prepareOne(ctx context.Context) error {
 		return fmt.Errorf("prepare network slot %s: %w", id, err)
 	}
 	slot.Phase = SlotPhaseClean
+	if m.config.CleanReturn {
+		if err := m.captureGolden(ctx, slot); err != nil {
+			m.destroyFailedSlot(context.Background(), slot, "golden-capture")
+			m.mu.Lock()
+			delete(m.slots, id)
+			m.mu.Unlock()
+			return fmt.Errorf("capture golden state for network slot %s: %w", id, err)
+		}
+	}
 	if err := m.store.Save(ctx, slot); err != nil {
 		m.destroyFailedSlot(context.Background(), slot, "save")
 		m.mu.Lock()
@@ -603,11 +787,11 @@ func (m *Manager) validateStoredSlot(slot *Slot) error {
 		slot.HostNetNSPath == "" || slot.IP == "" || slot.PrivateCIDR != m.ipam.CIDR() {
 		return fmt.Errorf("%w: invalid stored network slot", ErrStateInconsistent)
 	}
-	if slot.Phase != SlotPhaseClean && slot.Phase != SlotPhaseBound && slot.Phase != SlotPhaseDestroying {
+	if slot.Phase != SlotPhaseClean && slot.Phase != SlotPhaseBound && slot.Phase != SlotPhaseDestroying && slot.Phase != SlotPhaseReturning {
 		return fmt.Errorf("%w: invalid phase %q", ErrStateInconsistent, slot.Phase)
 	}
-	if slot.Phase == SlotPhaseBound && slot.Owner.SandboxUID == "" {
-		return fmt.Errorf("%w: bound slot has no owner", ErrStateInconsistent)
+	if (slot.Phase == SlotPhaseBound || slot.Phase == SlotPhaseReturning) && slot.Owner.SandboxUID == "" {
+		return fmt.Errorf("%w: %s slot has no owner", ErrStateInconsistent, slot.Phase)
 	}
 	return nil
 }
@@ -622,7 +806,7 @@ func (m *Manager) sortedSlotIDsLocked() []string {
 }
 
 func (m *Manager) recordPhasesLocked() {
-	clean, bound, destroying := 0, 0, 0
+	clean, bound, destroying, returning := 0, 0, 0, 0
 	for _, slot := range m.slots {
 		switch slot.Phase {
 		case SlotPhaseClean:
@@ -631,9 +815,11 @@ func (m *Manager) recordPhasesLocked() {
 			bound++
 		case SlotPhaseDestroying:
 			destroying++
+		case SlotPhaseReturning:
+			returning++
 		}
 	}
-	recordSlotPhases(clean, bound, destroying)
+	recordSlotPhases(clean, bound, destroying, returning)
 }
 
 func cloneSlot(slot *Slot) *Slot {

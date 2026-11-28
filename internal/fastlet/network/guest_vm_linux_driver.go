@@ -252,10 +252,10 @@ func (d *GuestVMNetNSDriver) applyLegacyGuestNAT(ctx context.Context, slot *Slot
 	rules := [][]string{
 		// Ingress: the uniquely addressed slot IP is DNATed to the baked
 		// guest address before the namespace routing decision.
-		nsIPTables("-t", "nat", "-A", "PREROUTING", "-d", slot.IP+"/32", "-j", "DNAT", "--to-destination", guestIP),
+		nsIPTables("-t", "nat", "-A", iptablesPrerouting, "-d", slot.IP+"/32", "-j", "DNAT", "--to-destination", guestIP),
 		// Egress source address: the shared baked guest IP becomes the
 		// unique slot IP so upstream source-IP dispatch keeps working.
-		nsIPTables("-t", "nat", "-A", "POSTROUTING", "-s", guestIP+"/32", "-j", "SNAT", "--to-source", slot.IP),
+		nsIPTables("-t", "nat", "-A", iptablesPostrouting, "-s", guestIP+"/32", "-j", "SNAT", "--to-source", slot.IP),
 	}
 	for index, arguments := range rules {
 		stage := "dnat"
@@ -315,7 +315,7 @@ func (d *GuestVMNetNSDriver) Validate(ctx context.Context, slot *Slot) error {
 		return fmt.Errorf("guest tap %s must use gateway MAC %s: %s", guestVMDefaultTapName, guestnetwork.GatewayMAC, output)
 	}
 	if slot.GuestNATBatch {
-		for _, hook := range []struct{ chain, target string }{{"PREROUTING", guestDNATChain}, {"POSTROUTING", guestSNATChain}} {
+		for _, hook := range []struct{ chain, target string }{{iptablesPrerouting, guestDNATChain}, {iptablesPostrouting, guestSNATChain}} {
 			if _, err := d.runner.Run(ctx, d.ipCommand, ipObjectNetns, execSubcommand, slot.NetNSName,
 				d.iptablesCommand, "-t", "nat", "-C", hook.chain, "-j", hook.target); err != nil {
 				return fmt.Errorf("guest NAT hook %s: %w", hook.chain, err)
@@ -341,8 +341,8 @@ func (d *GuestVMNetNSDriver) Destroy(ctx context.Context, slot *Slot) error {
 		var rules [][]string
 		if slot.GuestIP != "" && !slot.GuestNATBatch {
 			rules = append(rules,
-				nsIPTables("-t", "nat", "-D", "PREROUTING", "-d", slot.IP+"/32", "-j", "DNAT", "--to-destination", slot.GuestIP),
-				nsIPTables("-t", "nat", "-D", "POSTROUTING", "-s", slot.GuestIP+"/32", "-j", "SNAT", "--to-source", slot.IP),
+				nsIPTables("-t", "nat", "-D", iptablesPrerouting, "-d", slot.IP+"/32", "-j", "DNAT", "--to-destination", slot.GuestIP),
+				nsIPTables("-t", "nat", "-D", iptablesPostrouting, "-s", slot.GuestIP+"/32", "-j", "SNAT", "--to-source", slot.IP),
 			)
 		}
 		rules = append(rules,
@@ -408,4 +408,55 @@ func errorsJoin(left, right error) error {
 		return left
 	}
 	return fmt.Errorf("%w; %w", left, right)
+}
+
+// DeepReset returns the guest-VM slot to its golden state: the standard
+// Linux reset plus the in-namespace guest data plane. The per-restore DNAT
+// and SNAT rules describe the PREVIOUS tenant's baked guest address and
+// delivery route, so they must be replaced by the prepare-time state
+// (empty dedicated chains with their hooks) before the slot can be reused.
+func (d *GuestVMNetNSDriver) DeepReset(ctx context.Context, slot *Slot, golden *GoldenState) error {
+	extra, err := d.guestResetLines(slot)
+	if err != nil {
+		return err
+	}
+	return runDeepReset(ctx, d.runner, slot, golden, extra)
+}
+
+// guestResetLines builds the guest data plane reset commands. Values are
+// validated before they are interpolated into the reset shell: slot fields
+// are durable inputs, not kernel output.
+func (d *GuestVMNetNSDriver) guestResetLines(slot *Slot) ([]string, error) {
+	if slot == nil {
+		return nil, fmt.Errorf("incomplete guest-VM slot")
+	}
+	if slot.GuestNATBatch {
+		lines := []string{
+			"iptables -t nat -F " + guestDNATChain,
+			"iptables -t nat -F " + guestSNATChain,
+		}
+		for _, hook := range []struct{ chain, target string }{{iptablesPrerouting, guestDNATChain}, {iptablesPostrouting, guestSNATChain}} {
+			lines = append(lines, "iptables -t nat -C "+hook.chain+" -j "+hook.target+
+				" || iptables -t nat -A "+hook.chain+" -j "+hook.target)
+		}
+		return lines, nil
+	}
+	// Legacy slots (pre-batch data plane) carry per-guest-address rules
+	// directly in PREROUTING/POSTROUTING; delete them by their exact
+	// specification. A missing rule is not a reset failure.
+	if slot.GuestIP == "" {
+		return nil, nil
+	}
+	ip, err := netip.ParseAddr(slot.IP)
+	if err != nil || !ip.Is4() {
+		return nil, fmt.Errorf("invalid slot IP %q", slot.IP)
+	}
+	guest, err := netip.ParseAddr(slot.GuestIP)
+	if err != nil || !guest.Is4() {
+		return nil, fmt.Errorf("invalid baked guest IP %q", slot.GuestIP)
+	}
+	return []string{
+		"iptables -t nat -D PREROUTING -d " + ip.String() + "/32 -j DNAT --to-destination " + guest.String() + " || true",
+		"iptables -t nat -D POSTROUTING -s " + guest.String() + "/32 -j SNAT --to-source " + ip.String() + " || true",
+	}, nil
 }
