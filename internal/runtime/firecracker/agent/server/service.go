@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	runtimecontract "fast-sandbox/internal/runtime/contract"
 	agentpull "fast-sandbox/internal/runtime/firecracker/agent"
 	agentprotocol "fast-sandbox/internal/runtime/firecracker/agent/protocol"
@@ -49,6 +51,9 @@ type Service struct {
 	// hostReady reports the node-readiness check outcome (ready flag +
 	// summary); nil when the hostready manager is not running.
 	hostReady func() (bool, string)
+	// ensures single-flights concurrent ensures of one cache entry, so a
+	// Pin racing a Lease of the same image runs one pull (see ensureOnce).
+	ensures singleflight.Group
 }
 
 // NewService assembles the stage-1 backend. When the pull client also
@@ -232,6 +237,30 @@ func (s *Service) manifestDigestFor(image string) string {
 // verified open file descriptor, so the post-pull ImageReady check verifies
 // full artifact-set presence without re-hashing unchanged multi-GiB files.
 func (s *Service) ensureImage(ctx context.Context, image string) error {
+	return s.ensureOnce(ctx, "image\x00"+image, func() error { return s.ensureImageOnce(ctx, image) })
+}
+
+// ensureOnce runs ensure once for all concurrent callers with the same key.
+// Without it, a Pin and a Lease of one image (or two Leases) each find the
+// cache incomplete and download the same multi-GiB set into the same cache
+// directory at the same time: twice the store traffic, and two writers
+// racing on the same temporary files and renames.
+//
+// The shared run uses the context of the caller that started it. When that
+// caller is cancelled, a waiter whose own context is still live retries
+// instead of inheriting the cancellation.
+func (s *Service) ensureOnce(ctx context.Context, key string, ensure func() error) error {
+	for {
+		_, err, shared := s.ensures.Do(key, func() (any, error) { return nil, ensure() })
+		if shared && err != nil && ctx.Err() == nil &&
+			(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			continue
+		}
+		return err
+	}
+}
+
+func (s *Service) ensureImageOnce(ctx context.Context, image string) error {
 	ready, err := agentpull.ImageReady(s.stateRoot, image)
 	if err != nil {
 		return err
@@ -257,6 +286,14 @@ func (s *Service) ensureImage(ctx context.Context, image string) error {
 // already holds the complete committed non-rootfsOnly set matching
 // artifactDigest.
 func (s *Service) ensureCheckpoint(ctx context.Context, reference, manifestRef, artifactDigest string) error {
+	// The digest is part of the key: callers that disagree on the set
+	// behind a reference must not share each other's result.
+	return s.ensureOnce(ctx, "checkpoint\x00"+reference+"\x00"+artifactDigest, func() error {
+		return s.ensureCheckpointOnce(ctx, reference, manifestRef, artifactDigest)
+	})
+}
+
+func (s *Service) ensureCheckpointOnce(ctx context.Context, reference, manifestRef, artifactDigest string) error {
 	ready, err := agentpull.CheckpointReady(s.stateRoot, reference, artifactDigest)
 	if err != nil {
 		return err

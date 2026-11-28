@@ -1196,3 +1196,55 @@ touch "$TEST_PACK_STAGING/cleaned"
 		}
 	}
 }
+
+func TestCommitSnapshotCacheSyncsBeforeCommitting(t *testing.T) {
+	root := t.TempDir()
+	driver := &Driver{
+		config:        firecrackerConfigForTest(t, root),
+		imageUseCount: make(map[string]int64),
+	}
+	templateName := "durable-template-v1"
+	cacheDir := filepath.Join(root, imageCacheDir, imageKey(templateName))
+	staging := filepath.Join(root, snapshotStagingDir, "snap-durable")
+	require.NoError(t, os.MkdirAll(staging, 0o750))
+	for _, name := range []string{publishedRootfsName, vmstateSnapshotName, memorySnapshotName, snapshotManifestName} {
+		require.NoError(t, os.WriteFile(filepath.Join(staging, name), []byte(name+"-bytes"), 0o600))
+	}
+
+	var syncedFiles, syncedDirs []string
+	previousFile, previousDir := syncSnapshotCacheFile, syncSnapshotCacheDir
+	t.Cleanup(func() { syncSnapshotCacheFile, syncSnapshotCacheDir = previousFile, previousDir })
+	syncSnapshotCacheFile = func(path string) error {
+		_, err := os.Stat(cacheDir)
+		require.True(t, os.IsNotExist(err), "%s is synced before the entry is committed", path)
+		syncedFiles = append(syncedFiles, filepath.Base(path))
+		return previousFile(path)
+	}
+	syncSnapshotCacheDir = func(dir string) error {
+		syncedDirs = append(syncedDirs, dir)
+		return previousDir(dir)
+	}
+
+	require.NoError(t, driver.commitSnapshotCache(templateName, "", staging, true, nil))
+
+	require.ElementsMatch(t, []string{publishedRootfsName, vmstateSnapshotName, memorySnapshotName, snapshotManifestName}, syncedFiles)
+	require.Len(t, syncedDirs, 2)
+	// The staging directory is synced before it is renamed into place, then
+	// the images root after the rename.
+	require.Contains(t, filepath.Base(syncedDirs[0]), snapshotCacheStagingPrefix)
+	require.Equal(t, filepath.Join(root, imageCacheDir), syncedDirs[1])
+	_, err := os.Stat(filepath.Join(cacheDir, rootfsImageName))
+	require.NoError(t, err)
+
+	// A file that cannot be made durable fails the commit and leaves no
+	// entry behind; the caller logs it and restores pull from the store.
+	syncSnapshotCacheFile = func(string) error { return os.ErrPermission }
+	otherStaging := filepath.Join(root, snapshotStagingDir, "snap-durable-2")
+	require.NoError(t, os.MkdirAll(otherStaging, 0o750))
+	for _, name := range []string{publishedRootfsName, vmstateSnapshotName, memorySnapshotName, snapshotManifestName} {
+		require.NoError(t, os.WriteFile(filepath.Join(otherStaging, name), []byte(name+"-bytes"), 0o600))
+	}
+	require.ErrorIs(t, driver.commitSnapshotCache("durable-template-v2", "", otherStaging, true, nil), os.ErrPermission)
+	_, err = os.Stat(filepath.Join(root, imageCacheDir, imageKey("durable-template-v2")))
+	require.True(t, os.IsNotExist(err))
+}
