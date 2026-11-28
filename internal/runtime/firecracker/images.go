@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
+	"time"
 
 	"k8s.io/klog/v2"
 
@@ -212,26 +214,39 @@ func copyFile(source, target string) error {
 	return output.Close()
 }
 
-// defaultImageCacheLimitBytes bounds the converted-image cache. When the
-// cache exceeds it, the GC evicts unreferenced images in least-frequently-used
-// order. 20 GiB holds roughly a few dozen rootfs images.
+// defaultImageCacheLimitBytes bounds the converted-image cache, measured in
+// allocated bytes (rootfs and memory files are sparse). When the cache exceeds
+// it, the GC evicts unreferenced images in least-frequently-used order.
 const defaultImageCacheLimitBytes = 20 << 30
 
-// garbageCollectImages evicts cached rootfs images to keep the cache under
-// limitBytes. Candidates are images no managed Sandbox references; among them
-// the least frequently used (recorded in memory by the driver, not derived
-// from filesystem timestamps) are removed first, newest/unknown entries
-// counting as zero uses. References are read from the durable per-Sandbox
-// state, so a VM that died with its Fastlet still pins its image until its
-// state directory is removed. A Sandbox also pins the cache entry it was
-// restored from (the checkpoint of a resume): its rootfs is an independent
-// reflink copy, but its later snapshots read that entry's manifest as their
-// source image. A Sandbox
-// whose state cannot be read aborts the whole collection: it might reference
-// an image, and the cost of keeping a few hundred MiB beats breaking a
+// imagePullGraceWindow protects an image directory that has no committed
+// manifest yet (the runtime-agent writes manifest.json last): it is a pull in
+// progress until it has been idle this long.
+const imagePullGraceWindow = 30 * time.Minute
+
+// garbageCollectImages evicts cached images to keep the cache under
+// limitBytes. Candidates are images that no Sandbox on the node references
+// and that no Fastlet on the node pins (pinned: warm, in-flight and recently
+// used images published under pins/, see pins.go); among them the least
+// frequently used (recorded in memory by the driver, not derived from
+// filesystem timestamps) are removed first, newest/unknown entries counting as
+// zero uses. Sizes are allocated bytes, so sparse rootfs and memory files
+// count what they occupy. A directory without a committed manifest that was
+// written recently is a pull in progress and is never removed.
+//
+// References are read from the durable per-Sandbox state, so a VM that died
+// with its Fastlet still pins its image until its state directory is removed.
+// A Sandbox also pins the cache entry it was restored from (the checkpoint of
+// a resume): its rootfs is an independent reflink copy, but its later
+// snapshots read that entry's manifest as their source image. A Sandbox whose
+// state cannot be read aborts the whole collection: it might reference an
+// image, and the cost of keeping a few hundred MiB beats breaking a
 // recoverable Sandbox.
-func garbageCollectImages(stateRoot string, limitBytes int64, useCount map[string]int64) ([]string, error) {
+func garbageCollectImages(stateRoot string, limitBytes int64, useCount map[string]int64, pinned map[string]struct{}) ([]string, error) {
 	referenced := make(map[string]struct{})
+	for key := range pinned {
+		referenced[key] = struct{}{}
+	}
 	directories, err := listSandboxDirs(stateRoot)
 	if err != nil {
 		return nil, err
@@ -265,21 +280,25 @@ func garbageCollectImages(stateRoot string, limitBytes int64, useCount map[strin
 	}
 	entries := make([]entry, 0, len(cached))
 	total := int64(0)
+	now := time.Now()
 	for _, digest := range cached {
 		// Only content-addressed cache directories (64 lowercase hex chars)
 		// are eligible; anything else in the cache root is left untouched.
 		if !validImageDigest(digest) {
 			continue
 		}
-		info, err := os.Stat(filepath.Join(stateRoot, imageCacheDir, digest, rootfsImageName))
-		if err != nil {
+		usage, err := imageDirUsage(filepath.Join(stateRoot, imageCacheDir, digest))
+		if err != nil || usage.files == 0 {
 			continue
 		}
-		total += info.Size()
+		total += usage.allocated
 		if _, used := referenced[digest]; used {
 			continue
 		}
-		entries = append(entries, entry{digest: digest, bytes: info.Size(), uses: useCount[digest]})
+		if !usage.committed && now.Sub(usage.newest) < imagePullGraceWindow {
+			continue
+		}
+		entries = append(entries, entry{digest: digest, bytes: usage.allocated, uses: useCount[digest]})
 	}
 	// Least-frequently-used first; ties resolve deterministically by digest.
 	sort.Slice(entries, func(i, j int) bool {
@@ -300,6 +319,48 @@ func garbageCollectImages(stateRoot string, limitBytes int64, useCount map[strin
 		removed = append(removed, candidate.digest)
 	}
 	return removed, nil
+}
+
+// imageUsage summarizes one image cache directory.
+type imageUsage struct {
+	files     int
+	allocated int64
+	newest    time.Time
+	committed bool
+}
+
+// imageDirUsage sums the allocated bytes of the regular files of an image
+// directory and reports whether its manifest (the commit point) exists.
+func imageDirUsage(directory string) (imageUsage, error) {
+	var usage imageUsage
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return usage, err
+	}
+	for _, item := range entries {
+		info, err := item.Info()
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		usage.files++
+		usage.allocated += allocatedBytes(info)
+		if info.ModTime().After(usage.newest) {
+			usage.newest = info.ModTime()
+		}
+		if item.Name() == "manifest.json" {
+			usage.committed = true
+		}
+	}
+	return usage, nil
+}
+
+// allocatedBytes is the space a file occupies on disk (sparse-aware), falling
+// back to its logical size when the platform does not report blocks.
+func allocatedBytes(info os.FileInfo) int64 {
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		return int64(stat.Blocks) * 512 //nolint:unconvert // Blocks is int64 on linux, not on every platform
+	}
+	return info.Size()
 }
 
 // validImageDigest reports whether name is a lowercase sha256 hex digest.
@@ -340,6 +401,9 @@ func (d *Driver) PullImage(ctx context.Context, image string) error {
 	d.mu.RLock()
 	stateRoot := d.config.StateRoot
 	d.mu.RUnlock()
+	// PullImage is the warm-image path: keep the image pinned node-wide for
+	// as long as this Fastlet runs, including while it is being pulled.
+	d.pinImage(image)
 	client, err := d.agentClientOrNil()
 	if err == nil && client != nil {
 		if _, err := client.PinImage(ctx, d.warmPullRequestID(image), image); err != nil {

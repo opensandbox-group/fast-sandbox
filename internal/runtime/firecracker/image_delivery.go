@@ -183,6 +183,10 @@ func (d *Driver) runDeliveryAttempt(reference string, pin func(context.Context) 
 	attemptContext, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	klog.InfoS("firecracker artifact delivery attempt started", "reference", reference, "timeout", timeout.String())
+	// Pin the reference node-wide while it is being pulled, so another
+	// Fastlet's GC cannot remove the partially written cache entry.
+	d.noteImageUse(reference)
+	d.publishImagePins(true)
 	err := pin(attemptContext)
 	if err == nil {
 		d.mu.RLock()
@@ -224,10 +228,33 @@ func (d *Driver) pinImageForDelivery(ctx context.Context, image string) error {
 	if client == nil {
 		return fmt.Errorf("%w: runtime-agent disappeared while delivering %q", ErrImageNotReady, image)
 	}
-	if _, err := client.PinImage(ctx, d.warmPullRequestID(image), image); err != nil {
+	return d.pinVerified(ctx, image, func(ctx context.Context, requestID string) error {
+		_, err := client.PinImage(ctx, requestID, image)
+		return err
+	})
+}
+
+// pinVerified pins reference through pin and checks that its complete
+// restore set is committed in the local cache. The runtime-agent journal
+// replays a completed request id without pulling, so after the cache entry of
+// an earlier pin was evicted the pod-scoped warm-pull id is a no-op; one
+// retry under a fresh request id makes the agent pull again.
+func (d *Driver) pinVerified(ctx context.Context, reference string, pin func(context.Context, string) error) error {
+	requestID := d.warmPullRequestID(reference)
+	if err := pin(ctx, requestID); err != nil {
 		return err
 	}
-	return nil
+	d.mu.RLock()
+	stateRoot := d.config.StateRoot
+	requireCommit := d.agentSocket != ""
+	d.mu.RUnlock()
+	if verifyDeliveredImage(stateRoot, reference, requireCommit) == nil {
+		return nil
+	}
+	retryID := fmt.Sprintf("%s-r%d", requestID, time.Now().UnixNano())
+	klog.InfoS("cache entry missing under a committed pin; re-pinning with a fresh request id",
+		"reference", reference, "requestID", retryID)
+	return pin(ctx, retryID)
 }
 
 // pinCheckpointForDelivery pins (and thereby pulls) a checkpoint artifact set
@@ -241,10 +268,10 @@ func (d *Driver) pinCheckpointForDelivery(ctx context.Context, reference string,
 	if client == nil {
 		return fmt.Errorf("%w: runtime-agent disappeared while delivering checkpoint %q", ErrImageNotReady, reference)
 	}
-	if _, err := client.PinCheckpoint(ctx, d.warmPullRequestID(reference), reference, restore.ManifestRef, restore.ArtifactDigest); err != nil {
+	return d.pinVerified(ctx, reference, func(ctx context.Context, requestID string) error {
+		_, err := client.PinCheckpoint(ctx, requestID, reference, restore.ManifestRef, restore.ArtifactDigest)
 		return err
-	}
-	return nil
+	})
 }
 
 func (d *Driver) deliveryAttemptTimeoutSetting() time.Duration {
