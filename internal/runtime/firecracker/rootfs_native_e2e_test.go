@@ -508,7 +508,7 @@ func verifyNativeFullLayout(t *testing.T, ctx context.Context, driver *Driver, n
 	plan := dumpPlan{identity: &source.Config.Identity, stateRoot: driver.config.StateRoot, sandboxDir: filepath.Join(driver.config.StateRoot, sandboxStateDir, id), sandboxID: id,
 		snapshotID: "native-full-layout", binaryName: filepath.Base(driver.config.BinaryPath), jailed: driver.config.JailerPath != "", bootTimeout: 30,
 		staging: filepath.Join(driver.config.StateRoot, "full-layout-dump")}
-	defer os.RemoveAll(plan.staging)
+	defer plan.discardStaging()
 	size, err := driver.dumpFootprintBytes(plan)
 	require.NoError(t, err, "native cold boot must satisfy the Full/checkpoint capacity gate")
 	require.Positive(t, size)

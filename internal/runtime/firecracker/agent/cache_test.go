@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -204,4 +205,29 @@ func TestRecordVerifiedCacheFileInterleavedReplacementNeverHits(t *testing.T) {
 	match, err = fileMatches(target, fileB)
 	require.NoError(t, err)
 	require.True(t, match)
+}
+
+func TestTrackWrittenFileProofVoidedByLaterWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.snap")
+	file, err := os.Create(path)
+	require.NoError(t, err)
+	_, err = file.WriteString("dump")
+	require.NoError(t, err)
+	proof, err := TrackWrittenFile(file, "digest-of-dump")
+	require.NoError(t, err)
+	require.NoError(t, file.Close())
+	require.Equal(t, "digest-of-dump", proof.SHA256())
+
+	reopened, err := os.Open(path)
+	require.NoError(t, err)
+	require.True(t, proof.MatchesFile(reopened))
+	require.NoError(t, reopened.Close())
+
+	// Make sure the next write lands on a later timestamp tick.
+	time.Sleep(20 * time.Millisecond)
+	require.NoError(t, os.WriteFile(path, []byte("DUMP"), 0o640))
+	reopened, err = os.Open(path)
+	require.NoError(t, err)
+	defer reopened.Close()
+	require.False(t, proof.MatchesFile(reopened), "a write after the proof voids it")
 }

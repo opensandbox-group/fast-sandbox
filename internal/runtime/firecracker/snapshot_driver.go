@@ -10,9 +10,12 @@ package firecracker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -178,7 +181,7 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 
 	dumpErr := d.dumpRunningSandbox(ctx, &plan)
 	if dumpErr != nil {
-		_ = os.RemoveAll(plan.staging)
+		plan.discardStaging()
 		return nil, dumpErr
 	}
 	klog.InfoS("firecracker sandbox dumped",
@@ -204,37 +207,38 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 	//     boundary.
 	if kind == fastletapi.SnapshotKindCheckpoint {
 		if err := d.stageCheckpointVault(ctx, input.SandboxID, plan.staging); err != nil {
-			_ = os.RemoveAll(plan.staging)
+			plan.discardStaging()
 			return nil, err
 		}
 		if err := d.stageCheckpointPolicy(ctx, input.SandboxID, plan.staging); err != nil {
-			_ = os.RemoveAll(plan.staging)
+			plan.discardStaging()
 			return nil, err
 		}
 	} else if err := d.stageTemplateState(ctx, input.SandboxID, plan.staging); err != nil {
-		_ = os.RemoveAll(plan.staging)
+		plan.discardStaging()
 		return nil, err
 	}
 
-	sizeBytes, err := assembleSnapshotManifest(plan.stateRoot, d.ociRoot(), plan.staging, plan.sandboxDir, kind)
+	assembleStarted := time.Now()
+	sizeBytes, err := d.assemblePlanManifest(&plan, kind)
 	if err != nil {
-		_ = os.RemoveAll(plan.staging)
+		plan.discardStaging()
 		return nil, err
 	}
 	klog.InfoS("firecracker checkpoint manifest assembled",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind,
-		"sizeBytes", sizeBytes, "staging", plan.staging)
+		"sizeBytes", sizeBytes, "staging", plan.staging, "assemble", time.Since(assembleStarted).String())
 
 	if ociSnapshot {
 		return d.publishOCISnapshot(ctx, plan, sizeBytes, kind, input.OnPublishing)
 	}
 	client, err := d.agentClientOrNil()
 	if err != nil {
-		_ = os.RemoveAll(plan.staging)
+		plan.discardStaging()
 		return nil, err
 	}
 	if client == nil {
-		_ = os.RemoveAll(plan.staging)
+		plan.discardStaging()
 		return nil, fmt.Errorf("%w: live snapshots require the firecracker runtime-agent for artifact publication", ErrInvalidConfig)
 	}
 	// The pause window is closed and the staged set is complete: report
@@ -246,7 +250,7 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 	publishStarted := time.Now()
 	outcome, publishErr := client.PublishImage(ctx, "snapshot-"+plan.snapshotID, publishKind(kind), input.TemplateName, plan.staging)
 	if publishErr != nil {
-		_ = os.RemoveAll(plan.staging)
+		plan.discardStaging()
 		return nil, fmt.Errorf("publish snapshot artifacts: %w", publishErr)
 	}
 	result := &runtimecontract.SnapshotResult{
@@ -270,15 +274,29 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 			cacheRef = ""
 		}
 	}
-	if cacheErr := d.commitSnapshotCache(cacheRef, result.ArtifactDigest, plan.staging, true, nil); cacheErr != nil {
+	if cacheErr := d.commitSnapshotCache(cacheRef, result.ArtifactDigest, plan.staging, true, plan.verifiedFiles); cacheErr != nil {
 		klog.ErrorS(cacheErr, "snapshot local cache commit failed; subsequent restores will pull from the store",
 			"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "reference", cacheRef, "manifestRef", outcome.ManifestRef)
 	}
-	_ = os.RemoveAll(plan.staging)
+	plan.discardStaging()
 	klog.InfoS("firecracker snapshot published",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "kind", kind, "templateName", input.TemplateName,
 		"manifestRef", outcome.ManifestRef, "sizeBytes", sizeBytes, "publish", time.Since(publishStarted).String())
 	return result, nil
+}
+
+// assemblePlanManifest writes the manifest and SHA256SUMS of the staged set.
+// It reuses the digests proven while the set was staged (plan.verifiedFiles),
+// hashes the remaining files in parallel, and leaves every file's proof in
+// plan.verifiedFiles for the same-node cache commit.
+func (d *Driver) assemblePlanManifest(plan *dumpPlan, kind fastletapi.SnapshotKind) (int64, error) {
+	plan.awaitRootfsHash()
+	sizeBytes, verified, err := assembleSnapshotManifestWith(plan.stateRoot, d.ociRoot(), plan.staging, plan.sandboxDir, kind, plan.verifiedFiles)
+	if err != nil {
+		return 0, err
+	}
+	plan.verifiedFiles = verified
+	return sizeBytes, nil
 }
 
 // commitSnapshotCache moves a published artifact set (Full checkpoint, Full
@@ -667,6 +685,64 @@ type dumpPlan struct {
 	pauseAPI      time.Duration
 	dumpAPI       time.Duration
 	resumeAPI     time.Duration
+	// rootfsHash delivers the proof of the reflinked staged rootfs, hashed
+	// in the background from the clone on, so the hash runs during the
+	// pause, the dump and the relocation instead of after them.
+	rootfsHash chan stagedProof
+}
+
+// stagedProof is the outcome of one background staged-file hash.
+type stagedProof struct {
+	path  string
+	proof agentpull.VerifiedFile
+	err   error
+}
+
+// cloneRootfs clones the instance rootfs into the staging directory (a
+// variable so tests can stand in for a reflink-capable filesystem).
+var cloneRootfs = reflinkOnly
+
+// hashStagedRootfs hashes the staged rootfs in the background (a variable
+// so tests can observe it).
+var hashStagedRootfs = agentpull.HashAndTrackFile
+
+// startRootfsHash hashes the staged rootfs in the background. Only for a
+// reflink clone: it is immutable from the clone on (guest writes COW into
+// the instance's own extents), so hashing it concurrently with the pause
+// window is safe. The assembly still checks the proof against the file.
+func (p *dumpPlan) startRootfsHash(path string) {
+	p.rootfsHash = make(chan stagedProof, 1)
+	go func(out chan<- stagedProof) {
+		_, _, proof, err := hashStagedRootfs(path)
+		out <- stagedProof{path: path, proof: proof, err: err}
+	}(p.rootfsHash)
+}
+
+// discardStaging drops the staged set of a failed snapshot, after the
+// background rootfs hash (which reads from it) has finished.
+func (p *dumpPlan) discardStaging() {
+	p.awaitRootfsHash()
+	_ = os.RemoveAll(p.staging)
+}
+
+// awaitRootfsHash waits for the background rootfs hash (if any) and records
+// its proof in verifiedFiles. A failed hash is dropped: the manifest
+// assembly then hashes the file itself. Every path that discards the
+// staging directory calls it first, so no hash outlives its snapshot.
+func (p *dumpPlan) awaitRootfsHash() {
+	if p.rootfsHash == nil {
+		return
+	}
+	result := <-p.rootfsHash
+	p.rootfsHash = nil
+	if result.err != nil {
+		klog.InfoS("background rootfs hash failed; the manifest assembly hashes it", "path", result.path, "err", result.err)
+		return
+	}
+	if p.verifiedFiles == nil {
+		p.verifiedFiles = map[string]agentpull.VerifiedFile{}
+	}
+	p.verifiedFiles[filepath.Base(result.path)] = result.proof
 }
 
 // jailRoot returns the jail root of the plan's Sandbox (jailer mode only).
@@ -840,11 +916,14 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 	rootfsCloned := false
 	reflinkStarted := time.Now()
 	if !ociRoot {
-		if err := reflinkOnly(rootfs, stagedRootfs); err == nil {
+		if err := cloneRootfs(rootfs, stagedRootfs); err == nil {
 			rootfsCloned = true
 		}
 	}
 	plan.rootfsClone = time.Since(reflinkStarted)
+	if rootfsCloned {
+		plan.startRootfsHash(stagedRootfs)
+	}
 
 	client := d.newClient(state.APIAddress)
 	defer client.Close()
@@ -1380,9 +1459,15 @@ type snapshotManifestEntries struct {
 	RootfsSize, SizeBytes int64
 	Cache                 map[string]string
 	Names                 []string
+	// Verified holds the proof of every hashed staged file (staged name ->
+	// digest bound to the file identity it was computed on).
+	Verified map[string]agentpull.VerifiedFile
 }
 
-func collectSnapshotManifestEntries(staging string, isOCI bool) (snapshotManifestEntries, error) {
+// collectSnapshotManifestEntries describes the staged files of a snapshot
+// set. Digests proven earlier (known) are reused while their proof still
+// matches the file; the other files are hashed concurrently.
+func collectSnapshotManifestEntries(staging string, isOCI bool, known map[string]agentpull.VerifiedFile) (snapshotManifestEntries, error) {
 	bundleFiles, err := stagedBundleFiles(staging)
 	if err != nil {
 		return snapshotManifestEntries{}, err
@@ -1393,7 +1478,10 @@ func collectSnapshotManifestEntries(staging string, isOCI bool) (snapshotManifes
 	}
 	files, stateFiles := map[string]artifacts.ManifestFile{}, map[string]artifacts.ManifestFile{}
 	var sizeBytes, rootfsSize int64
-	cache := map[string]string{}
+	cache, verified, err := hashStagedFiles(staging, bundleFiles, known)
+	if err != nil {
+		return snapshotManifestEntries{}, err
+	}
 	for _, name := range bundleFiles {
 		file, err := artifacts.FileEntry(filepath.Join(staging, name), cache)
 		if err != nil {
@@ -1420,109 +1508,317 @@ func collectSnapshotManifestEntries(staging string, isOCI bool) (snapshotManifes
 		rootfsSize = upper.VirtualSizeBytes
 		sizeBytes += rootfsSize
 	}
-	return snapshotManifestEntries{Files: files, StateFiles: stateFiles, RootfsSize: rootfsSize, SizeBytes: sizeBytes, Cache: cache, Names: bundleFiles}, nil
+	return snapshotManifestEntries{Files: files, StateFiles: stateFiles, RootfsSize: rootfsSize, SizeBytes: sizeBytes, Cache: cache, Names: bundleFiles, Verified: verified}, nil
 }
 
-func assembleSnapshotManifest(stateRoot, ociRoot, staging, sandboxDir string, kind fastletapi.SnapshotKind) (int64, error) {
+// assembleSnapshotManifestWith writes the manifest and SHA256SUMS of a staged
+// snapshot set and returns its size and the proofs of its hashed files (see
+// collectSnapshotManifestEntries for known).
+func assembleSnapshotManifestWith(stateRoot, ociRoot, staging, sandboxDir string, kind fastletapi.SnapshotKind, known map[string]agentpull.VerifiedFile) (int64, map[string]agentpull.VerifiedFile, error) {
 	state, err := loadState(sandboxDir)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	document, sourceRef, err := snapshotSourceDocument(stateRoot, ociRoot, state)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	isOCI := strings.HasPrefix(sourceRef, ocitemplate.Prefix)
-	entries, err := collectSnapshotManifestEntries(staging, isOCI)
+	entries, err := collectSnapshotManifestEntries(staging, isOCI, known)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	rootfsSize := entries.RootfsSize
 	files, stateFiles := entries.Files, entries.StateFiles
 	// Modify only the actual disk capacity, preserving unknown machine fields.
 	machine, err := manifestSection(document, "machine")
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if rootfsSize > 0 {
 		machine["rootfsSizeMiB"], err = json.Marshal((rootfsSize + (1 << 20) - 1) >> 20)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 	}
 	document["machine"], err = json.Marshal(machine)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	// imageDigest continues to anchor the original build, not the latest dump.
 	lineage, err := manifestSection(document, "lineage")
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	image, err := json.Marshal(state.Config.Desired.Image)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	lineage["image"] = image
 	document["lineage"], err = json.Marshal(lineage)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	platform, err := manifestSection(document, "platform")
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if err := setSnapshotResourceLimits(platform, state.Config.Limits); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	delete(platform, "snapshotMode")
 	delete(platform, "checkpoint")
 	if kind == fastletapi.SnapshotKindCheckpoint {
 		platform["checkpoint"], err = json.Marshal(artifacts.CheckpointOwner{SandboxUID: state.Config.Identity.SandboxUID, Namespace: state.Config.Identity.Namespace})
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 	}
 	delete(platform, "stateFiles")
 	if len(stateFiles) > 0 {
 		platform["stateFiles"], err = json.Marshal(stateFiles)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 	}
 	document["platform"], err = json.Marshal(platform)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	delete(document, "files")
 	if !isOCI {
 		document["files"], err = json.Marshal(files)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 	}
 	if !isOCI {
 		if err = artifacts.WriteSHA256SUMS(staging, entries.Names, entries.Cache); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 	}
 	payload, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if _, err = artifacts.DecodeVMManifest(payload); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	if err = os.WriteFile(filepath.Join(staging, snapshotManifestName), append(payload, '\n'), 0644); err != nil { //nolint:gosec // published metadata, readable by the runtime-agent
-		return 0, err
+		return 0, nil, err
 	}
-	return entries.SizeBytes, nil
+	return entries.SizeBytes, entries.Verified, nil
+}
+
+// hashStagedFile hashes one staged file and proves the file identity it
+// hashed (a variable so tests can count the reads).
+var hashStagedFile = agentpull.HashAndTrackFile
+
+// hashStagedFiles returns the checksum cache of the named staged files
+// (path -> sha256) and their proofs (name -> VerifiedFile). A file whose
+// proof in known still matches it is not read again. The other files are
+// hashed concurrently, so the set costs its largest file instead of the sum
+// of all of them; SHA256File and HashAndTrackFile use per-call buffers.
+func hashStagedFiles(staging string, names []string, known map[string]agentpull.VerifiedFile) (map[string]string, map[string]agentpull.VerifiedFile, error) {
+	cache := make(map[string]string, len(names))
+	verified := make(map[string]agentpull.VerifiedFile, len(names))
+	// Known digests go into the maps before any hashing goroutine starts:
+	// from then on only the goroutines write them, under the lock.
+	var misses []string
+	for _, name := range names {
+		path := filepath.Join(staging, name)
+		if proof, ok := known[name]; ok && proofHolds(path, proof) {
+			cache[path] = proof.SHA256()
+			verified[name] = proof
+			continue
+		}
+		misses = append(misses, name)
+	}
+	var (
+		mu   sync.Mutex
+		wg   sync.WaitGroup
+		errs []error
+	)
+	for _, name := range misses {
+		path := filepath.Join(staging, name)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sum, _, proof, err := hashStagedFile(path)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("checksum %s: %w", name, err))
+				return
+			}
+			cache[path] = sum
+			verified[name] = proof
+		}()
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return nil, nil, err
+	}
+	return cache, verified, nil
+}
+
+// proofHolds reports whether path is still the unmodified file proof was
+// computed on.
+func proofHolds(path string, proof agentpull.VerifiedFile) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	return proof.MatchesFile(file)
 }
 
 // relocateSpilled is the post-resume relocation of one spilled dump file
 // (a variable so tests can observe it).
-var relocateSpilled = func(_ *dumpPlan, source, target string) error {
-	return copyFile(source, target)
+var relocateSpilled = relocateSpilledFile
+
+// relocateSpilledFile copies one spilled dump file into the staging
+// directory. The copy hashes the bytes as it moves them (they are read from
+// the spill area anyway) and records the digest with its proof in
+// plan.verifiedFiles, so the manifest assembly does not read guest memory a
+// second time.
+func relocateSpilledFile(plan *dumpPlan, source, target string) error {
+	sum, proof, err := copyFileHashed(source, target)
+	if err != nil {
+		return err
+	}
+	if plan.verifiedFiles == nil {
+		plan.verifiedFiles = map[string]agentpull.VerifiedFile{}
+	}
+	plan.verifiedFiles[filepath.Base(target)] = proof
+	klog.V(4).InfoS("spilled dump file relocated and hashed", "target", target, "sha256", sum)
+	return nil
+}
+
+// copyFileBlockSize is the read unit of copyFileHashed, and copyFileSlots
+// how many blocks are in flight between the reader, the hasher and the
+// writer.
+const (
+	copyFileBlockSize = 4 << 20
+	copyFileSlots     = 4
+)
+
+// copyFileHashed copies source to target like copyFile and returns the
+// sha256 of the content with a proof bound to the written target. Reading,
+// hashing and writing run concurrently over a small ring of blocks: the
+// hasher consumes blocks strictly in order, so the digest equals a serial
+// hash, and on hosts without SHA extensions the copy costs about the hash
+// alone instead of hash plus write.
+func copyFileHashed(source, target string) (string, agentpull.VerifiedFile, error) { //nolint:gocognit // one read/hash/write pipeline; splitting it scatters the ordering invariants
+	input, err := os.Open(source)
+	if err != nil {
+		return "", agentpull.VerifiedFile{}, err
+	}
+	defer input.Close()
+	output, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
+	if err != nil {
+		return "", agentpull.VerifiedFile{}, err
+	}
+
+	type block struct {
+		data   []byte
+		offset int64
+		users  sync.WaitGroup
+	}
+	free := make(chan []byte, copyFileSlots)
+	for range copyFileSlots {
+		free <- make([]byte, copyFileBlockSize)
+	}
+	hashQueue := make(chan *block, copyFileSlots)
+	writeQueue := make(chan *block, copyFileSlots)
+	recycleQueue := make(chan *block, copyFileSlots)
+	stop := make(chan struct{})
+	var (
+		failOnce sync.Once
+		failure  error
+	)
+	fail := func(err error) {
+		failOnce.Do(func() {
+			failure = err
+			close(stop)
+		})
+	}
+
+	digest := sha256.New()
+	var workers sync.WaitGroup
+	workers.Add(3)
+	go func() { // hasher: strictly in order, so the digest equals a serial hash
+		defer workers.Done()
+		for current := range hashQueue {
+			_, _ = digest.Write(current.data)
+			current.users.Done()
+		}
+	}()
+	go func() { // writer: positional writes, so a block never waits for the hash
+		defer workers.Done()
+		for current := range writeQueue {
+			if _, err := output.WriteAt(current.data, current.offset); err != nil {
+				fail(err)
+			}
+			current.users.Done()
+		}
+	}()
+	go func() { // recycler: a buffer is reused only after both consumers are done
+		defer workers.Done()
+		for current := range recycleQueue {
+			current.users.Wait()
+			free <- current.data[:cap(current.data)]
+		}
+	}()
+
+	var size int64
+	func() {
+		defer func() {
+			close(hashQueue)
+			close(writeQueue)
+			close(recycleQueue)
+		}()
+		for {
+			var buffer []byte
+			select {
+			case buffer = <-free:
+			case <-stop:
+				return
+			}
+			n, readErr := io.ReadFull(input, buffer)
+			if n > 0 {
+				current := &block{data: buffer[:n], offset: size}
+				current.users.Add(2)
+				hashQueue <- current
+				writeQueue <- current
+				recycleQueue <- current
+				size += int64(n)
+			}
+			if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+				return
+			}
+			if readErr != nil {
+				fail(readErr)
+				return
+			}
+		}
+	}()
+	workers.Wait()
+	if failure != nil {
+		_ = output.Close()
+		return "", agentpull.VerifiedFile{}, failure
+	}
+	sum := hex.EncodeToString(digest.Sum(nil))
+	// Bind the digest to the file as written; nothing writes it afterwards.
+	proof, err := agentpull.TrackWrittenFile(output, sum)
+	if err != nil {
+		_ = output.Close()
+		return "", agentpull.VerifiedFile{}, err
+	}
+	if err := output.Close(); err != nil {
+		return "", agentpull.VerifiedFile{}, err
+	}
+	return sum, proof, nil
 }
 
 func readSourceManifest(stateRoot, ociRoot, image, sandboxID string) ([]byte, error) {
