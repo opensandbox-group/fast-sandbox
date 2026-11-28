@@ -1284,3 +1284,77 @@ func TestBuildPodMountsOptionalRegistryConfigMap(t *testing.T) {
 	require.True(t, foundMount)
 	require.Equal(t, sandboxTemplateRegistryConfigDir+"/registries.yaml", envValue(pod.Spec.Containers[0].Env, registryConfigFileEnv))
 }
+
+func TestBuildPodEscapesDollarSignsInTemplateSpec(t *testing.T) {
+	template := newSandboxTemplate("default", "dollar-escape")
+	template.Spec.Entrypoint = []string{
+		"/bin/sh",
+		"-c",
+		`set -eu; printf '%s\n' "$$" > /tmp/pid; cut -d ' ' -f 22 /proc/$$/stat > /tmp/start; echo $(POD_NAMESPACE) $(SANDBOX_TEMPLATE_WORKDIR) $(UNKNOWN) $HOME; exec sleep 86400`,
+	}
+	template.Spec.Envs = []corev1.EnvVar{
+		{Name: "LITERAL_DOUBLE_DOLLAR", Value: "$$"},
+		{Name: "LITERAL_REF", Value: "$(POD_NAMESPACE)/$(SANDBOX_TEMPLATE_WORKDIR)/$(UNKNOWN)"},
+		{Name: "LITERAL_SINGLE_DOLLAR", Value: "$HOME/price=$100$"},
+	}
+
+	r := newSandboxTemplateReconciler(t, template)
+	reconcileOnce(t, r, client.ObjectKeyFromObject(template))
+
+	var pods corev1.PodList
+	require.NoError(t, r.List(context.Background(), &pods))
+	require.Len(t, pods.Items, 1)
+
+	rawEnv := envValue(pods.Items[0].Spec.Containers[0].Env, builderImageEnv)
+	require.NotEmpty(t, rawEnv)
+
+	envMap := map[string]string{
+		"POD_NAMESPACE":           "default",
+		workdirEnvName:            sandboxTemplateBuildDir,
+		"KUBERNETES_SERVICE_HOST": "10.96.0.1",
+	}
+	expanded := expandKubeEnvValue(rawEnv, envMap)
+
+	var got apiv1alpha2.SandboxTemplateSpec
+	require.NoError(t, json.Unmarshal([]byte(expanded), &got))
+	require.Equal(t, template.Spec, got)
+}
+
+// expandKubeEnvValue mirrors Kubernetes's expansion.Expand for EnvVar.Value:
+// "$$" becomes "$", "$(NAME)" expands via mapping when present (otherwise stays
+// literal), and any other "$x" stays literal.
+func expandKubeEnvValue(input string, mapping map[string]string) string {
+	var out strings.Builder
+	for i := 0; i < len(input); i++ {
+		if input[i] != '$' || i+1 >= len(input) {
+			out.WriteByte(input[i])
+			continue
+		}
+		switch input[i+1] {
+		case '$':
+			out.WriteByte('$')
+			i++
+		case '(':
+			end := strings.IndexByte(input[i+2:], ')')
+			if end < 0 {
+				out.WriteString("$(")
+				i++
+				continue
+			}
+			name := input[i+2 : i+2+end]
+			if val, ok := mapping[name]; ok {
+				out.WriteString(val)
+			} else {
+				out.WriteString("$(")
+				out.WriteString(name)
+				out.WriteByte(')')
+			}
+			i += 2 + end
+		default:
+			out.WriteByte('$')
+			out.WriteByte(input[i+1])
+			i++
+		}
+	}
+	return out.String()
+}

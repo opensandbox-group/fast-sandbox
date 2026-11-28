@@ -569,7 +569,7 @@ func (r *SandboxTemplateReconciler) createBuildPod(ctx context.Context, template
 		return err
 	}
 	env := []corev1.EnvVar{{
-		Name: builderImageEnv, Value: string(payload),
+		Name: builderImageEnv, Value: escapeKubeEnvValue(string(payload)),
 	}, {
 		Name: workdirEnvName, Value: sandboxTemplateBuildDir,
 	}, {
@@ -998,6 +998,12 @@ func exitCodeSuffix(exitCode int32) string {
 		return ""
 	}
 	return fmt.Sprintf(" (exit code %d)", exitCode)
+}
+
+// escapeKubeEnvValue escapes literal '$' characters for Kubernetes EnvVar.Value
+// so kubelet's $(VAR)/$$ expansion delivers the original string verbatim.
+func escapeKubeEnvValue(value string) string {
+	return strings.ReplaceAll(value, "$", "$$")
 }
 
 // ptr returns a pointer to the given value.
