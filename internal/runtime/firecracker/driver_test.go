@@ -124,7 +124,9 @@ func newNetworkManagerWithDriverForTest(t *testing.T, driver fastletnetwork.Driv
 	}, driver, newMemoryStateStore())
 	require.NoError(t, err)
 	require.NoError(t, manager.Initialize(context.Background()))
-	t.Cleanup(manager.Quiesce)
+	t.Cleanup(func() {
+		require.NoError(t, manager.Stop(context.Background()))
+	})
 	return manager
 }
 

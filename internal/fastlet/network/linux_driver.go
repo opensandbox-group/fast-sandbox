@@ -10,9 +10,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
-
-	"k8s.io/klog/v2"
 )
 
 // Shared iproute2 literals used to build `ip` command lines.
@@ -74,6 +73,12 @@ type LinuxNetNSDriver struct {
 	ipCommand       string
 	iptablesCommand string
 	sysctlCommand   string
+
+	hostMu           sync.Mutex
+	readyBridge      string
+	readyGatewayCIDR string
+	readyPrivateCIDR string
+	readyEgress      string
 }
 
 func NewLinuxNetNSDriver(config LinuxDriverConfig) *LinuxNetNSDriver {
@@ -98,17 +103,13 @@ func NewLinuxNetNSDriver(config LinuxDriverConfig) *LinuxNetNSDriver {
 	}
 }
 
-func (d *LinuxNetNSDriver) Prepare(ctx context.Context, slot *Slot) (result error) {
+func (d *LinuxNetNSDriver) Prepare(ctx context.Context, slot *Slot) error {
 	if err := validateLinuxSlot(slot); err != nil {
 		return err
 	}
-	defer func() {
-		if result != nil {
-			if destroyErr := d.Destroy(context.Background(), slot); destroyErr != nil {
-				klog.V(2).InfoS("slot destroy after failed preparation leaked resources", "slot", slot.ID, "err", destroyErr)
-			}
-		}
-	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(slot.NetNSPath), 0o755); err != nil {
 		return err
 	}
@@ -123,10 +124,7 @@ func (d *LinuxNetNSDriver) Prepare(ctx context.Context, slot *Slot) (result erro
 		return fmt.Errorf("write slot resolver configuration: %w", err)
 	}
 
-	if err := d.ensureBridge(ctx, slot); err != nil {
-		return err
-	}
-	if err := d.ensureEgress(ctx, slot); err != nil {
+	if err := d.ensureHostNetwork(ctx, slot); err != nil {
 		return err
 	}
 	if _, err := d.runner.Run(ctx, d.ipCommand, ipObjectNetns, "add", slot.NetNSName); err != nil {
@@ -226,12 +224,45 @@ func (d *LinuxNetNSDriver) Destroy(ctx context.Context, slot *Slot) error {
 	return result
 }
 
+// ensureHostNetwork serializes and caches one-time host bridge and MASQUERADE
+// setup so parallel slot preparations neither race on bridge/iptables creation
+// nor repeat six host-namespace execs on every slot.
+func (d *LinuxNetNSDriver) ensureHostNetwork(ctx context.Context, slot *Slot) error {
+	d.hostMu.Lock()
+	defer d.hostMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	gwPrefix := gatewayPrefix(slot)
+	if d.readyBridge == slot.Bridge &&
+		d.readyGatewayCIDR == gwPrefix &&
+		d.readyPrivateCIDR == slot.PrivateCIDR &&
+		d.readyEgress != "" &&
+		(slot.EgressDevice == "" || slot.EgressDevice == d.readyEgress) {
+		if slot.EgressDevice == "" {
+			slot.EgressDevice = d.readyEgress
+		}
+		return nil
+	}
+	if err := d.ensureBridge(ctx, slot); err != nil {
+		return err
+	}
+	if err := d.ensureEgress(ctx, slot); err != nil {
+		return err
+	}
+	d.readyBridge = slot.Bridge
+	d.readyGatewayCIDR = gwPrefix
+	d.readyPrivateCIDR = slot.PrivateCIDR
+	d.readyEgress = slot.EgressDevice
+	return nil
+}
+
 func (d *LinuxNetNSDriver) ensureBridge(ctx context.Context, slot *Slot) error {
 	if _, err := d.runner.Run(ctx, d.ipCommand, linkSubcommand, "show", netDevFlag, slot.Bridge); err != nil {
-		if _, addErr := d.runner.Run(ctx, d.ipCommand, linkSubcommand, "add", slot.Bridge, "type", "bridge"); addErr != nil {
+		if _, addErr := d.runner.Run(ctx, d.ipCommand, linkSubcommand, "add", slot.Bridge, "type", "bridge"); addErr != nil && !isAlreadyExistsNetworkError(addErr) {
 			return addErr
 		}
-		if _, addrErr := d.runner.Run(ctx, d.ipCommand, "addr", "add", gatewayPrefix(slot), netDevFlag, slot.Bridge); addrErr != nil {
+		if _, addrErr := d.runner.Run(ctx, d.ipCommand, "addr", "add", gatewayPrefix(slot), netDevFlag, slot.Bridge); addrErr != nil && !isAlreadyExistsNetworkError(addrErr) {
 			return addrErr
 		}
 	}
@@ -301,22 +332,34 @@ func defaultRouteDevice(output string) string {
 }
 
 func isMissingNetworkResource(err error) bool {
+	if err == nil {
+		return false
+	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "cannot find device") || strings.Contains(message, "no such file") ||
 		strings.Contains(message, "no such device") || strings.Contains(message, "cannot open network namespace")
+}
+
+func isAlreadyExistsNetworkError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "file exists")
 }
 
 // deleteNetNSWithRetry removes a slot network namespace. The deletion races
 // a VMM that is still exiting and returns EBUSY, which would otherwise leak
 // the namespace (and its private addresses) onto the shared bridge — a
 // stale namespace still owning a slot IP answers ARP and shadows the live
-// netns. The retry is patient (5 x 500 ms) so the dying VMM's references
-// drain before the leak is accepted.
+// netns. Missing namespaces return immediately so failed preparations never
+// stall on retry sleeps.
 func deleteNetNSWithRetry(ctx context.Context, runner CommandRunner, ipCommand, name string) error {
+	const maxAttempts = 5
 	var err error
-	for range 5 {
-		if _, err = runner.Run(ctx, ipCommand, ipObjectNetns, "delete", name); err == nil {
+	for attempt := range maxAttempts {
+		_, err = runner.Run(ctx, ipCommand, ipObjectNetns, "delete", name)
+		if err == nil || isMissingNetworkResource(err) {
 			return nil
+		}
+		if attempt == maxAttempts-1 {
+			break
 		}
 		select {
 		case <-ctx.Done():

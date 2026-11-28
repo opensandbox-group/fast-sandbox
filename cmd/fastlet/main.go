@@ -136,7 +136,15 @@ func main() {
 	if configurable, ok := rt.(registryConfigurable); ok {
 		configurable.SetRegistryProvider(registryProvider)
 	}
-	setupFastletNetwork(ctx, rt, podUID, runtimeProfile)
+	if networkManager := setupFastletNetwork(ctx, rt, podUID, runtimeProfile); networkManager != nil {
+		defer func() {
+			stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			if err := networkManager.Stop(stopCtx); err != nil {
+				klog.ErrorS(err, "Failed to stop Fastlet-owned network manager")
+			}
+		}()
+	}
 	infraRevision := getEnv("FAST_SANDBOX_INFRA_REVISION", "")
 	infraManager, err := newInfraManager(
 		podUID,
@@ -206,9 +214,9 @@ func main() {
 // use a dedicated netns: slot CIDR conflict detection, the network manager,
 // and the driver binding. It is a no-op otherwise. Fatal misconfigurations
 // exit the process, matching main's startup posture.
-func setupFastletNetwork(ctx context.Context, rt runtimecontract.Driver, podUID string, runtimeProfile runtimecatalog.RuntimeProfile) {
+func setupFastletNetwork(ctx context.Context, rt runtimecontract.Driver, podUID string, runtimeProfile runtimecatalog.RuntimeProfile) *fastletnetwork.Manager {
 	if !runtimeProfile.UsesFastletNetNS() {
-		return
+		return nil
 	}
 	tuneNeighborGCThresholds()
 	// The slot CIDR must not overlap any live pod/node route (CNI pod
@@ -237,6 +245,7 @@ func setupFastletNetwork(ctx context.Context, rt runtimecontract.Driver, podUID 
 	}
 	configurable.SetNetworkManager(networkManager)
 	klog.InfoS("fastlet-owned network initialized", "capacity", networkManager.Snapshot().Capacity, "cleanSlots", networkManager.Snapshot().Clean)
+	return networkManager
 }
 
 type fastletStartupSettings struct {

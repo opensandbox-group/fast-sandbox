@@ -3,11 +3,13 @@ package network
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -88,4 +90,135 @@ func TestDefaultRouteDevice(t *testing.T) {
 func TestMissingNetworkResourceRecognizesIdempotentIPLinkDelete(t *testing.T) {
 	require.True(t, isMissingNetworkResource(errors.New("ip link delete fh123: exit status 2: RTNETLINK answers: No such device")))
 	require.False(t, isMissingNetworkResource(errors.New("ip link delete fh123: permission denied")))
+	require.False(t, isMissingNetworkResource(nil))
+}
+
+type scriptedNetNSDeleteRunner struct {
+	mu     sync.Mutex
+	calls  int
+	errors []error
+}
+
+func (r *scriptedNetNSDeleteRunner) Run(_ context.Context, _ string, _ ...string) ([]byte, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	idx := r.calls
+	r.calls++
+	if idx < len(r.errors) {
+		return nil, r.errors[idx]
+	}
+	return nil, nil
+}
+
+func TestDeleteNetNSWithRetryFastFailsOnMissingAndRetriesBusy(t *testing.T) {
+	missing := &scriptedNetNSDeleteRunner{
+		errors: []error{errors.New(`ip netns delete fsb-missing: exit status 1: Cannot open network namespace "fsb-missing": No such file or directory`)},
+	}
+	started := time.Now()
+	require.NoError(t, deleteNetNSWithRetry(context.Background(), missing, "ip", "fsb-missing"))
+	require.Equal(t, 1, missing.calls, "missing netns must not retry")
+	require.Less(t, time.Since(started), 100*time.Millisecond)
+
+	busyThenOK := &scriptedNetNSDeleteRunner{
+		errors: []error{
+			errors.New(`Cannot remove namespace file "/run/netns/fsb-busy": Device or resource busy`),
+			errors.New(`Cannot remove namespace file "/run/netns/fsb-busy": Device or resource busy`),
+			nil,
+		},
+	}
+	require.NoError(t, deleteNetNSWithRetry(context.Background(), busyThenOK, "ip", "fsb-busy"))
+	require.Equal(t, 3, busyThenOK.calls)
+}
+
+func TestLinuxNetNSDriverConcurrentPrepareInitializesHostOnce(t *testing.T) {
+	root := t.TempDir()
+	resolver := filepath.Join(root, "resolv.conf")
+	require.NoError(t, os.WriteFile(resolver, []byte("nameserver 10.96.0.10\n"), 0o644))
+
+	runner := &recordingRunner{}
+	driver := NewLinuxNetNSDriver(LinuxDriverConfig{Runner: runner, ResolverPath: resolver})
+
+	const workers = 8
+	slots := make([]*Slot, workers)
+	var wg sync.WaitGroup
+	for i := range workers {
+		slot := &Slot{
+			ID: fmt.Sprintf("slot-%d", i), NetNSName: fmt.Sprintf("fsb-%d", i),
+			NetNSPath:     filepath.Join(root, "netns", fmt.Sprintf("fsb-%d", i)),
+			HostNetNSPath: fmt.Sprintf("/run/fast-sandbox/netns/fsb-%d", i),
+			HostVeth:      fmt.Sprintf("fh%d", i), PeerVeth: fmt.Sprintf("fp%d", i),
+			Bridge: "fsb0", Address: fmt.Sprintf("172.30.0.%d/24", i+2),
+			IP: fmt.Sprintf("172.30.0.%d", i+2), Gateway: "172.30.0.1",
+			PrivateCIDR: "172.30.0.0/24",
+			DNSPath:     filepath.Join(root, "state", fmt.Sprintf("slot-%d.resolv.conf", i)),
+			MTU:         1500,
+		}
+		slots[i] = slot
+		wg.Add(1)
+		go func(target *Slot) {
+			defer wg.Done()
+			require.NoError(t, driver.Prepare(context.Background(), target))
+		}(slot)
+	}
+	wg.Wait()
+
+	for _, slot := range slots {
+		require.Equal(t, "eth0", slot.EgressDevice)
+	}
+	runner.mu.Lock()
+	bridgeAdds := 0
+	masqueradeAdds := 0
+	for _, cmd := range runner.commands {
+		if cmd == "ip link add fsb0 type bridge" {
+			bridgeAdds++
+		}
+		if strings.Contains(cmd, "iptables -t nat -A POSTROUTING") {
+			masqueradeAdds++
+		}
+	}
+	runner.mu.Unlock()
+	require.Equal(t, 1, bridgeAdds)
+	require.Equal(t, 1, masqueradeAdds)
+}
+
+type missingNetNSRunner struct {
+	mu       sync.Mutex
+	commands []string
+}
+
+func (r *missingNetNSRunner) Run(_ context.Context, command string, args ...string) ([]byte, error) {
+	line := command + " " + strings.Join(args, " ")
+	r.mu.Lock()
+	r.commands = append(r.commands, line)
+	r.mu.Unlock()
+	if strings.Contains(line, "netns") || strings.Contains(line, "link delete") {
+		return nil, errors.New(`Cannot open network namespace "ns-missing": No such file or directory`)
+	}
+	return nil, nil
+}
+
+func TestGuestVMNetNSDriverDestroyShortCircuitsMissingNetNS(t *testing.T) {
+	runner := &missingNetNSRunner{}
+	driver := NewGuestVMNetNSDriver(LinuxDriverConfig{Runner: runner})
+	slot := &Slot{
+		NetNSName: "ns-missing", HostVeth: "fh-missing", Bridge: "fsb0",
+		Address: "10.17.0.2/16", IP: "10.17.0.2", PrivateCIDR: "10.17.0.0/16",
+		Gateway: "10.17.0.1", GuestTap: "vmtap0", GuestIP: "10.17.0.3",
+	}
+	started := time.Now()
+	require.NoError(t, driver.Destroy(context.Background(), slot))
+	require.Less(t, time.Since(started), 100*time.Millisecond)
+
+	iptablesExecs := 0
+	netnsDeletes := 0
+	for _, cmd := range runner.commands {
+		if strings.Contains(cmd, "ip netns exec ns-missing iptables") {
+			iptablesExecs++
+		}
+		if strings.Contains(cmd, "ip netns delete ns-missing") {
+			netnsDeletes++
+		}
+	}
+	require.Equal(t, 1, iptablesExecs, "must stop rule cleanup once netns is confirmed absent")
+	require.Equal(t, 1, netnsDeletes, "must not retry deleting an absent netns")
 }

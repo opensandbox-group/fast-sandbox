@@ -355,7 +355,9 @@ func (d *GuestVMNetNSDriver) Destroy(ctx context.Context, slot *Slot) error {
 		for _, arguments := range rules {
 			// Best-effort: the rules disappear with the namespace, and
 			// a missing namespace or rule must not fail the destroy.
-			_, _ = d.runner.Run(ctx, d.ipCommand, arguments...)
+			if _, err := d.runner.Run(ctx, d.ipCommand, arguments...); err != nil && isMissingNetworkResource(err) {
+				break
+			}
 		}
 	}
 	if err := d.LinuxNetNSDriver.Destroy(ctx, slot); err != nil {
