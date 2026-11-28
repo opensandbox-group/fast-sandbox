@@ -283,10 +283,11 @@ today.
      only until `R` has passed since the chunk's server-side write.
    - A publish must write `chunks.json` within `P_max` of its first reuse
      decision, or fail.
-   - An agent whose code implements the refresh reports the `chunkRefresh`
-     capability in `HealthResponse` and `PublishImageResponse`, in either
-     `transfer.format`: a `legacy` agent reuses no chunks, and an agent
-     switched back to `chunked` refreshes from its first publish.
+   - The refresh is agent-only: no Fastlet, controller or API change. It
+     applies in either `transfer.format`: a `legacy` agent reuses no
+     chunks, and an agent switched back to `chunked` refreshes from its
+     first publish. The agent logs `R` and `P_max` at startup and
+     `refreshedChunks` in its publish stats.
    - Defaults: `R` = 1 day, `P_max` = 24 h, `G` = 7 days.
 
 **Why the refresh is needed** (review on #216): marks alone do not protect
@@ -313,32 +314,22 @@ a re-`PUT` of identical bytes, keeps the same `ETag`. Older versions are
 removed by a `NoncurrentVersionExpiration` lifecycle rule, which never
 touches a current version and so is compatible with rollout gate 0.
 
-**Gate for destructive mode** (all required; otherwise the run stays
-dry-run):
+**Deletion mode (operator-enabled):** the Fastlet and the controller take
+no part in GC. Deletion is an explicit operator setting, like the
+`chunkListOnly` finalize step, kept in GC's own ConfigMap `fsb-store-gc`:
+- `mode: dry-run` (default): report only;
+- `mode: sets`: the sets phase may delete; chunks are only reported. Safe
+  with any agent release, since it deletes only unrooted namespaces older
+  than `G`;
+- `mode: all`: chunks may be deleted too. The operator sets it only after
+  every runtime-agent has run a release with the publisher refresh (PR 4
+  step 1) for longer than `R` + `P_max` (see "Rollout and rollback").
+
+A run reads `mode` at the start and again before every delete batch (at
+most 1,000 objects or 1 minute), so lowering it stops deletion within one
+batch. Whatever the mode, the run stays in dry-run unless all of these
+hold, each checked by `fsb-store gc` itself:
 - bucket versioning is `Enabled`;
-- every registered Fastlet has advertised the `chunkRefresh` capability
-  (its agent implements the publisher refresh) continuously for longer than
-  `R` + `P_max`. Agents write nothing to Kubernetes:
-  - each Fastlet takes the capability from its node's agent and sends it in
-    its heartbeat `Capabilities`, next to the existing snapshot
-    capabilities. It reads the agent's `Health` on every heartbeat and
-    before every publish, sends a heartbeat at once when the capability
-    changes, and reports it missing when `Health` fails;
-  - the leader-elected controller aggregates its Fastlet registry and keeps
-    **one** ConfigMap for the cluster with `chunkRefreshSince` and
-    `observedAt`. It resets `chunkRefreshSince` to now as soon as any
-    registered Fastlet lacks the capability, and renews `observedAt` every
-    minute;
-  - after a controller restart its registry starts empty, so it may reset
-    `chunkRefreshSince` but not keep or advance it until every Fastlet has
-    re-registered;
-  - `fsb-store gc` deletes chunks only while `observedAt` is younger than
-    `T_stale` (default 5 minutes) and `chunkRefreshSince` is older than
-    `R` + `P_max`. It checks both at the start of the sweep and again
-    before every delete batch (at most 1,000 objects or 1 minute). A failed
-    check ends the run, and the remaining candidates wait for the next
-    run. A stopped controller or a lost leader therefore stops deletion
-    within `T_stale` instead of leaving an old observation in force;
 - the store prefix is owned by this cluster (see "Store prefix
   ownership");
 - the store passes a conformance test: responses carry `Date`, a version-ID
@@ -350,16 +341,17 @@ dry-run):
   overwrite (used by `claim`).
 
 **Writer downgrades and running sweeps:** a destructive run holds the
-Kubernetes Lease `fsb-store-gc` and renews it while it runs. Before an
-agent is rolled back to a release without the publisher refresh (below
-PR 4 step 1), the operator suspends the CronJob and waits until the Lease
-is released or has expired; only then are agents rolled back. The
-rolled-back agents' Fastlets reset `chunkRefreshSince`, so later runs stay
-in dry-run for at least `R` + `P_max`. Without this step the per-batch
-check bounds the exposure to about one heartbeat plus one batch, but does
-not remove it, so it is a downgrade limit (see "Rollout and rollback"). A
-snapshot admitted before the rollback ends within the Fastlet's 30-minute
-snapshot timeout, well inside `P_max`.
+Kubernetes Lease `fsb-store-gc` and renews it while it runs, so runs never
+overlap. Before an agent is rolled back to a release without the publisher
+refresh (below PR 4 step 1), the operator sets `mode` to `sets` or
+`dry-run` (or suspends the CronJob) and waits until the Lease is released
+or has expired; only then are agents rolled back. `mode: all` may be set
+again only after the refreshing release has run on every agent for
+`R` + `P_max` once more. Nothing detects a rollback that skips this step,
+so it is a downgrade limit (see "Rollout and rollback"). The same applies
+to a node group pinned to an older agent image. A snapshot admitted before
+the rollback ends within the Fastlet's 30-minute snapshot timeout, well
+inside `P_max`.
 
 **Store prefix ownership:** GC sees only its own cluster's roots, so a
 destructive run needs one cluster that owns the store prefix and is its
@@ -398,6 +390,7 @@ destructive GC is unavailable there.
 | Content-defined chunking (rolling hash) | Better dedup for shifted data, but guest memory and block images change in place at fixed offsets. Fixed 4 MiB alignment matches holes and the store's stripe size, and keeps the index simple to validate. |
 | Store-side multipart copy of unchanged ranges | Depends on store features (`UploadPartCopy`) not available everywhere, and cannot drop zeros. |
 | OverlayBD layers for memory | OverlayBD covers block devices (rootfs). Guest memory and VM state stay native files. |
+| Automatic GC gate: Fastlets report a `chunkRefresh` capability in heartbeats, the controller keeps a cluster ConfigMap, GC reads it (earlier draft of this amendment) | Puts store knowledge into the control plane, which owns scheduling and lifecycle only. One node's agent restart or failed `Health` resets the clock for the whole cluster, so GC may never leave dry-run under normal churn. Non-Firecracker pools never report the capability, and after a controller restart the registry briefly holds Fastlets with empty capabilities. Debugging spans five components. An operator-enabled mode plus the Lease covers the same downgrade case (review on #256). |
 
 ### Configuration
 
@@ -434,9 +427,9 @@ transfer:
   publisher refresh is a copy within the bucket it already writes to.
 - `fsb-store gc` uses separate store credentials (list, get, delete object
   versions, and put on `gc/owner.json` only) and a read-only ClusterRole on
-  the four CRDs, plus read access to the gate ConfigMap and the
+  the four CRDs, plus get on its own ConfigMap (`mode`) and the
   `kube-system` namespace (cluster ID) and get, create and update on its
-  own Lease. A missing permission aborts the run, which then deletes
+  own Lease. The controller and the Fastlet get no new permissions. A missing permission aborts the run, which then deletes
   nothing.
 
 ### Implementation plan
@@ -450,7 +443,7 @@ transfer:
 | 1 | Chunk format, `chunks.json`, chunked publish and pull (recording into the #244 memo), always-on chunk reader, `transfer.format` and `transfer.compression`, staged-manifest acceptance and the pre-manifest digest check, inherited `chunks` dropped by the publisher and both Fastlet assemblers, a chunk transfer cancelled between jobs fails instead of committing, a coalesced chunk upload counted once, docs | this FSEP accepted, cache |
 | 2 | `chunkList` digest, digest-signed `PUT`s, `chunkListOnly` and the capability rule, completion of size-only entries (agent `sha256` fill-in and `SHA256SUMS` rewrite), Fastlet `Health` refresh | 1, same release |
 | 3 | Pooled store transport; P2P gateway pooling per open question 3 | 1 |
-| 4 | Step 1: publisher refresh (server-time `R`, self-copy, known-key expiry, `P_max`), `chunkRefresh` capability with an immediate Fastlet heartbeat on change, controller gate ConfigMap with `observedAt`. Step 2: `fsb-store gc` (dry-run by default, Kubernetes roots, two marks, version-ID sweep with a gate check before every batch, Lease, sets phase, index report, opt-in repair, `claim` and the owner marker, store conformance test) | 1; step 1 released for longer than `R` + `P_max` before destructive mode |
+| 4 | Step 1: publisher refresh in the agent only (server-time `R`, self-copy, known-key expiry, `P_max`, `refreshedChunks` in the publish stats). Step 2: `fsb-store gc` as a CronJob (`mode` `dry-run` by default, then `sets` or `all`, re-read before every batch; Kubernetes roots, two marks, version-ID sweep, Lease, sets phase, index report, opt-in repair, `claim` and the owner marker, store conformance test). No Fastlet or controller change | 1; the operator sets `mode: all` only after step 1 has run on every agent for longer than `R` + `P_max` |
 | – | OpenSandbox chart value and pin bump (OpenSandbox#2422) | 1 merged |
 
 [#213](https://github.com/opensandbox-group/fast-sandbox/pull/213) is the complete reference implementation and spans PRs 1–3,
@@ -462,12 +455,12 @@ a draft and is closed once PR 1 is open.
 
 1. **GC roots and safety (resolved):** `fsb-store gc` reads the roots from
    the Kubernetes API and treats young sets and every index entry as roots;
-   a version-ID delete on a versioned bucket closes the sweep window; the
-   gate expires with the controller's observation and is re-checked before
-   every batch; the Lease orders writer downgrades after running sweeps; a
-   claimed prefix keeps other clusters' roots out of scope (see
-   "Shared-chunk retention and garbage collection"). Still open: run `fsb-store gc` as a CronJob, as
-   proposed, or inside the leader-elected controller?
+   a version-ID delete on a versioned bucket closes the sweep window;
+   deletion is an operator-set `mode`, re-read before every batch; the
+   Lease orders writer downgrades after running sweeps; a claimed prefix
+   keeps other clusters' roots out of scope (see "Shared-chunk retention
+   and garbage collection"). `fsb-store gc` runs as its own CronJob; the
+   controller takes no part in GC.
 2. **Rollback (resolved):** the `chunkListOnly` finalize step is kept. It
    is safe to defer because `chunkListDigest` is reported only with
    `chunkListOnly: true`, the agent fills a missing `sha256` otherwise, and
@@ -605,13 +598,12 @@ every set published earlier stays restorable.
     deletes the entry, the set is collected once older than `G`;
   - sets phase: unrooted namespaces older than `G` are deleted, young or
     rooted ones are kept, for whole-file and chunked sets;
-  - the gate refuses destructive mode without versioning or `chunkRefresh`,
-    and a restarted controller does not advance `chunkRefreshSince` before
-    every Fastlet has re-registered;
-  - gate freshness: an `observedAt` older than `T_stale` means no deletes,
-    and a gate that fails during a run stops it before the next batch;
-  - writer downgrade: with the CronJob suspended, the downgrade waits for
-    the Lease, and the following runs stay in dry-run;
+  - modes: `dry-run` deletes nothing, `sets` deletes no chunk, and any
+    mode stays in dry-run without versioning, an owned prefix or a passed
+    conformance test;
+  - lowering `mode` during a run stops deletion before the next batch;
+  - writer downgrade: after `mode` is lowered, the downgrade waits for the
+    Lease, and the following runs delete no chunk;
   - prefix ownership: a missing or foreign `gc/owner.json` means dry-run,
     and `claim` never overwrites an existing marker;
   - repair: a rooted chunk removed by a plain `DELETE` is restored from its
@@ -650,10 +642,15 @@ every set published earlier stays restorable.
    downgrade of either below PR 2 is planned, set `chunkListOnly: true` to
    remove the whole-file hash from the pause path. This is the
    "finalize" step, similar to Ceph's `require-osd-release`.
-5. **GC (after PR 4):** enable bucket versioning and a
-   `NoncurrentVersionExpiration` rule, run `fsb-store gc` in dry-run, run
-   `fsb-store gc claim` for the cluster's prefix, and enable destructive
-   mode only once its gate holds: sets first, then chunks.
+5. **GC (after PR 4):**
+   1. enable bucket versioning and a `NoncurrentVersionExpiration` rule;
+   2. run `fsb-store gc claim` for the cluster's prefix;
+   3. run `fsb-store gc` in `mode: dry-run` and review its reports;
+   4. set `mode: sets`;
+   5. once every runtime-agent has run the release with the publisher
+      refresh for longer than `R` + `P_max` (every DaemonSet Pod on that
+      image, none restarted onto an older one), set `mode: all`. Like
+      `chunkListOnly`, this is an explicit last step.
 
 **Signals:**
 - `runtime-agent chunked publish stats`: `uploadedBytes` vs `logicalBytes`,
@@ -692,9 +689,10 @@ start.
   once `chunked` has been enabled anywhere, or recover by rolling forward.
 - **Agent below PR 2 after `chunkListOnly: true`:** cannot read those
   manifests. That is why the setting is a separate, explicit last step.
-- **Agent below PR 4 step 1 while destructive chunk GC is on:** suspend
-  the `fsb-store gc` CronJob and wait until its Lease is released first
-  (see "Writer downgrades and running sweeps").
+- **Agent below PR 4 step 1 while `mode: all`:** set `mode` to `sets` or
+  `dry-run` and wait until the Lease is released first, and set `all`
+  again only `R` + `P_max` after the roll forward (see "Writer downgrades
+  and running sweeps"). GC does not detect a rollback that skips this.
 - **Fastlet below PR 2 after `chunkListOnly: true`:** its readiness check
   requires the whole-file `sha256`, so it cannot boot sets published
   without one, RootfsOnly sets included. Same rule as for the agent.
