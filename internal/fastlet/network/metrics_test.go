@@ -40,14 +40,26 @@ func (*failingGuestApplyDriver) ApplyGuest(context.Context, *Slot, string) error
 func TestNetworkLatencyMetricsAreCollectable(t *testing.T) {
 	acquireLabels := map[string]string{"result": "bound"}
 	persistLabels := map[string]string{"result": "success"}
+	prepareSuccessLabels := map[string]string{"result": "success"}
+	prepareErrorLabels := map[string]string{"result": "error"}
 	acquireBefore, _ := fsbtest.HistogramSampleCount("fast_sandbox_network_slot_acquire_latency_seconds", acquireLabels)
 	persistBefore, _ := fsbtest.HistogramSampleCount("fast_sandbox_network_slot_persist_latency_seconds", persistLabels)
+	prepareSuccessBefore, _ := fsbtest.HistogramSampleCount("fast_sandbox_network_slot_prepare_latency_seconds", prepareSuccessLabels)
+	prepareErrorBefore, _ := fsbtest.HistogramSampleCount("fast_sandbox_network_slot_prepare_latency_seconds", prepareErrorLabels)
 	observeSlotAcquire("bound", time.Now())
 	observeSlotPersist(time.Now(), nil)
+	observeSlotPrepare(time.Now(), nil)
+	observeSlotPrepare(time.Now(), errors.New("boom"))
 	acquireAfter, err := fsbtest.HistogramSampleCount("fast_sandbox_network_slot_acquire_latency_seconds", acquireLabels)
 	require.NoError(t, err)
 	persistAfter, err := fsbtest.HistogramSampleCount("fast_sandbox_network_slot_persist_latency_seconds", persistLabels)
 	require.NoError(t, err)
+	prepareSuccessAfter, err := fsbtest.HistogramSampleCount("fast_sandbox_network_slot_prepare_latency_seconds", prepareSuccessLabels)
+	require.NoError(t, err)
+	prepareErrorAfter, err := fsbtest.HistogramSampleCount("fast_sandbox_network_slot_prepare_latency_seconds", prepareErrorLabels)
+	require.NoError(t, err)
 	require.Equal(t, acquireBefore+1, acquireAfter)
 	require.Equal(t, persistBefore+1, persistAfter)
+	require.Equal(t, prepareSuccessBefore+1, prepareSuccessAfter)
+	require.Equal(t, prepareErrorBefore+1, prepareErrorAfter)
 }

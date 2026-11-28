@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
 	runtimecatalog "fast-sandbox/internal/catalog/runtime"
@@ -352,3 +354,255 @@ const (
 	testEventuallyTimeout  = 2e9
 	testEventuallyInterval = 10e6
 )
+
+type burstChaosDriver struct {
+	mu             sync.Mutex
+	enableChaos    atomic.Bool
+	attempts       atomic.Int32
+	inFlight       atomic.Int32
+	maxInFlight    atomic.Int32
+	preparedIDs    []string
+	destroyByID    map[string]int
+	prepareDelay   time.Duration
+	failFastCount  int32
+	stallTimeoutTo int32
+}
+
+func (d *burstChaosDriver) Prepare(ctx context.Context, slot *Slot) error {
+	if !d.enableChaos.Load() {
+		d.mu.Lock()
+		d.preparedIDs = append(d.preparedIDs, slot.ID)
+		d.mu.Unlock()
+		return nil
+	}
+	current := d.inFlight.Add(1)
+	defer d.inFlight.Add(-1)
+	for {
+		observed := d.maxInFlight.Load()
+		if current <= observed || d.maxInFlight.CompareAndSwap(observed, current) {
+			break
+		}
+	}
+
+	attempt := d.attempts.Add(1)
+	if attempt <= d.failFastCount {
+		return errors.New("transient netlink busy")
+	}
+	if attempt <= d.stallTimeoutTo {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d.prepareDelay):
+	}
+	d.mu.Lock()
+	d.preparedIDs = append(d.preparedIDs, slot.ID)
+	d.mu.Unlock()
+	return nil
+}
+
+func (d *burstChaosDriver) Validate(_ context.Context, _ *Slot) error { return nil }
+
+func (d *burstChaosDriver) Destroy(_ context.Context, slot *Slot) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.destroyByID == nil {
+		d.destroyByID = make(map[string]int)
+	}
+	d.destroyByID[slot.ID]++
+	return nil
+}
+
+func gatherGaugeValue(t *testing.T, name string, labels map[string]string) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, metric := range family.Metric {
+			if len(metric.Label) != len(labels) {
+				continue
+			}
+			matched := true
+			for _, pair := range metric.Label {
+				if labels[pair.GetName()] != pair.GetValue() {
+					matched = false
+					break
+				}
+			}
+			if matched && metric.Gauge != nil {
+				return metric.Gauge.GetValue()
+			}
+		}
+	}
+	t.Fatalf("gauge %s with labels %v not found", name, labels)
+	return 0
+}
+
+func TestManagerBurstReleaseConvergesUnderSlowAndTransientFailingPrepare(t *testing.T) {
+	const capacity = 50
+	root := t.TempDir()
+	driver := &burstChaosDriver{
+		prepareDelay:   8 * time.Millisecond,
+		failFastCount:  3,
+		stallTimeoutTo: 6,
+	}
+	var nextID atomic.Int64
+	config := DefaultConfig(capacity, "pod-burst")
+	config.PrivateCIDR = "172.30.0.0/20"
+	config.StateRoot = root
+	config.NetNSRoot = filepath.Join(root, "netns")
+	config.HostNetNSRoot = filepath.Join(root, "host-netns")
+	// Total work across 50 slots (50 * 8ms = 400ms) intentionally exceeds the
+	// 60ms per-slot timeout so queued per-Release goroutines would expire under
+	// the old implementation while per-slot bounded workers converge cleanly.
+	config.ReplenishTimeout = 60 * time.Millisecond
+	config.ReplenishConcurrency = 4
+	config.ReplenishBaseBackoff = 5 * time.Millisecond
+	config.ReplenishMaxBackoff = 20 * time.Millisecond
+	config.IDGenerator = func() (string, error) {
+		return fmt.Sprintf("slot-%d", nextID.Add(1)), nil
+	}
+	manager, err := NewManager(config, driver, NewFileStateStore(filepath.Join(root, config.PodUID)))
+	require.NoError(t, err)
+	t.Cleanup(manager.Quiesce)
+	require.NoError(t, manager.Initialize(context.Background()))
+	require.Equal(t, capacity, manager.Snapshot().Clean)
+
+	owners := make([]Owner, capacity)
+	initialIDs := make(map[string]struct{}, capacity)
+	for i := range capacity {
+		owners[i] = owner(fmt.Sprintf("sandbox-%d", i), 1)
+		slot, acquireErr := manager.Acquire(context.Background(), owners[i])
+		require.NoError(t, acquireErr)
+		initialIDs[slot.ID] = struct{}{}
+	}
+	require.Zero(t, manager.Snapshot().Clean)
+	require.Equal(t, capacity, manager.Snapshot().Bound)
+
+	driver.enableChaos.Store(true)
+
+	var releaseWG sync.WaitGroup
+	for i := range capacity {
+		releaseOwner := owners[i]
+		releaseWG.Add(1)
+		go func() {
+			defer releaseWG.Done()
+			require.NoError(t, manager.Release(context.Background(), releaseOwner))
+		}()
+	}
+	releaseWG.Wait()
+	manager.Quiesce()
+
+	snap := manager.Snapshot()
+	require.Equal(t, capacity, snap.Clean)
+	require.Zero(t, snap.Bound)
+	require.Zero(t, snap.Destroying)
+	require.LessOrEqual(t, driver.maxInFlight.Load(), int32(config.ReplenishConcurrency))
+	require.GreaterOrEqual(t, driver.maxInFlight.Load(), int32(2))
+
+	require.InDelta(t, float64(capacity), gatherGaugeValue(t, "fastlet_network_slots", map[string]string{"phase": "clean"}), 0)
+	require.InDelta(t, 0, gatherGaugeValue(t, "fastlet_network_slots", map[string]string{"phase": "bound"}), 0)
+	require.InDelta(t, 0, gatherGaugeValue(t, "fastlet_network_slots", map[string]string{"phase": "destroying"}), 0)
+	require.InDelta(t, float64(capacity), gatherGaugeValue(t, "fast_sandbox_network_slot_available", nil), 0)
+	require.InDelta(t, 0, gatherGaugeValue(t, "fast_sandbox_network_slot_inuse", nil), 0)
+
+	driver.mu.Lock()
+	for id, count := range driver.destroyByID {
+		if _, wasInitial := initialIDs[id]; !wasInitial {
+			require.Equal(t, 1, count, "failed preparation of %s must tear down once", id)
+		}
+	}
+	driver.mu.Unlock()
+}
+
+type blockingPrepareDriver struct {
+	fakeDriver
+	blockNext atomic.Bool
+	entered   chan struct{}
+	unblock   chan struct{}
+}
+
+func (d *blockingPrepareDriver) Prepare(ctx context.Context, slot *Slot) error {
+	if d.blockNext.CompareAndSwap(true, false) {
+		close(d.entered)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-d.unblock:
+		}
+	}
+	return d.fakeDriver.Prepare(ctx, slot)
+}
+
+func TestManagerSyncReplenishWaitsForInFlightBackgroundPrepare(t *testing.T) {
+	driver := &blockingPrepareDriver{
+		entered: make(chan struct{}),
+		unblock: make(chan struct{}),
+	}
+	manager := newTestManager(t, 1, t.TempDir(), driver, "slot-a", "slot-b")
+	require.NoError(t, manager.Initialize(context.Background()))
+
+	bound := owner("sandbox-sync", 1)
+	_, err := manager.Acquire(context.Background(), bound)
+	require.NoError(t, err)
+
+	driver.blockNext.Store(true)
+	require.NoError(t, manager.Release(context.Background(), bound))
+	<-driver.entered
+	require.Zero(t, manager.Snapshot().Clean)
+	require.Zero(t, manager.Snapshot().Destroying, "in-flight preparation must not report as Destroying")
+
+	replenishDone := make(chan error, 1)
+	go func() {
+		replenishDone <- manager.Replenish(context.Background())
+	}()
+	select {
+	case prematureErr := <-replenishDone:
+		t.Fatalf("Replenish returned %v before in-flight slot finished preparing", prematureErr)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(driver.unblock)
+	require.NoError(t, <-replenishDone)
+	require.Equal(t, 1, manager.Snapshot().Clean)
+}
+
+func TestManagerCloseCancelsInFlightPrepareAndBackoff(t *testing.T) {
+	driver := &blockingPrepareDriver{
+		entered: make(chan struct{}),
+		unblock: make(chan struct{}),
+	}
+	manager := newTestManager(t, 1, t.TempDir(), driver, "slot-a", "slot-b")
+	require.NoError(t, manager.Initialize(context.Background()))
+
+	bound := owner("sandbox-close", 1)
+	_, err := manager.Acquire(context.Background(), bound)
+	require.NoError(t, err)
+
+	driver.blockNext.Store(true)
+	require.NoError(t, manager.Release(context.Background(), bound))
+	<-driver.entered
+
+	started := time.Now()
+	require.NoError(t, manager.Close(context.Background()))
+	require.Less(t, time.Since(started), time.Second)
+	require.Zero(t, manager.Snapshot().Clean)
+	require.Zero(t, manager.Snapshot().Bound)
+	require.Zero(t, manager.Snapshot().Destroying)
+}
+
+func TestManagerCanceledContextSkipsSlotAllocation(t *testing.T) {
+	driver := &fakeDriver{}
+	manager := newTestManager(t, 1, t.TempDir(), driver, "slot-never")
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.ErrorIs(t, manager.Initialize(canceledCtx), context.Canceled)
+	require.Empty(t, driver.prepared)
+	require.Empty(t, driver.destroyed)
+}

@@ -12,14 +12,19 @@ import (
 
 // resultLabel distinguishes acquire/persist outcomes on the slot metrics.
 const (
-	resultLabel       = "result"
-	metricResultError = "error"
+	resultLabel         = "result"
+	metricResultSuccess = "success"
+	metricResultError   = "error"
 )
 
 var (
 	networkSlotAcquireTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "fastlet_network_slot_acquire_total",
 		Help: "Number of Fastlet network slot acquisitions by warm-pool result.",
+	}, []string{resultLabel})
+	networkSlotReplenishTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "fastlet_network_slot_replenish_total",
+		Help: "Number of Fastlet network slot preparation attempts by result.",
 	}, []string{resultLabel})
 	networkSlots = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "fastlet_network_slots",
@@ -43,6 +48,11 @@ var (
 		Help:    "Latency of the durable state write performed when a clean network slot is bound.",
 		Buckets: prometheus.ExponentialBuckets(.00025, 2, 15),
 	}, []string{resultLabel})
+	networkSlotPrepareLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "fast_sandbox_network_slot_prepare_latency_seconds",
+		Help:    "Latency to prepare and durably persist a clean Fastlet network slot.",
+		Buckets: prometheus.ExponentialBuckets(.001, 2, 16),
+	}, []string{resultLabel})
 )
 
 func recordSlotAcquire(result string) {
@@ -62,11 +72,20 @@ func observeSlotAcquire(result string, started time.Time) {
 }
 
 func observeSlotPersist(started time.Time, err error) {
-	result := "success"
+	result := metricResultSuccess
 	if err != nil {
 		result = metricResultError
 	}
 	networkSlotPersistLatency.WithLabelValues(result).Observe(time.Since(started).Seconds())
+}
+
+func observeSlotPrepare(started time.Time, err error) {
+	result := metricResultSuccess
+	if err != nil {
+		result = metricResultError
+	}
+	networkSlotReplenishTotal.WithLabelValues(result).Inc()
+	networkSlotPrepareLatency.WithLabelValues(result).Observe(time.Since(started).Seconds())
 }
 
 var guestApplyStageLatency = promauto.NewHistogramVec(prometheus.HistogramOpts{
@@ -79,7 +98,7 @@ func startGuestApplyStage(ctx context.Context, stage string) (context.Context, f
 	started := time.Now()
 	stageContext, span := observability.Start(ctx, "fastlet.network.guest_apply."+stage)
 	return stageContext, func(err error) {
-		result := "success"
+		result := metricResultSuccess
 		if err != nil {
 			result = metricResultError
 		}
