@@ -72,7 +72,9 @@ func newRecoverNetworkManager(t *testing.T) *fastletnetwork.Manager {
 	}, noopNetDriver{}, newMemStateStore())
 	require.NoError(t, err)
 	require.NoError(t, manager.Initialize(context.Background()))
-	t.Cleanup(manager.Quiesce)
+	t.Cleanup(func() {
+		require.NoError(t, manager.Stop(context.Background()))
+	})
 	return manager
 }
 

@@ -66,10 +66,9 @@ func newTestManager(t *testing.T, capacity int, root string, driver Driver, ids 
 	}
 	manager, err := NewManager(config, driver, NewFileStateStore(filepath.Join(root, config.PodUID)))
 	require.NoError(t, err)
-	// Quiesce before TempDir cleanup: a Release inside the test spawns a
-	// background replenish that keeps writing state files after the body
-	// returns, racing the RemoveAll with "directory not empty".
-	t.Cleanup(manager.Quiesce)
+	t.Cleanup(func() {
+		require.NoError(t, manager.Stop(context.Background()))
+	})
 	return manager
 }
 
@@ -125,6 +124,9 @@ func TestManagerApplyGuestRecordsAndPersists(t *testing.T) {
 	reloaded, err := NewManager(DefaultConfig(1, "pod-uid-1"), &guestDataPlaneDriver{}, NewFileStateStore(filepath.Join(root, "pod-uid-1")))
 	require.NoError(t, err)
 	require.NoError(t, reloaded.Initialize(context.Background()))
+	t.Cleanup(func() {
+		require.NoError(t, reloaded.Stop(context.Background()))
+	})
 	slot, exists = reloaded.Lookup("sandbox-1")
 	require.True(t, exists)
 	require.Equal(t, "10.17.0.9", slot.GuestIP)
@@ -356,23 +358,20 @@ const (
 )
 
 type burstChaosDriver struct {
-	mu             sync.Mutex
-	enableChaos    atomic.Bool
-	attempts       atomic.Int32
-	inFlight       atomic.Int32
-	maxInFlight    atomic.Int32
-	preparedIDs    []string
-	destroyByID    map[string]int
-	prepareDelay   time.Duration
-	failFastCount  int32
-	stallTimeoutTo int32
+	mu                sync.Mutex
+	enableChaos       atomic.Bool
+	attempts          atomic.Int32
+	inFlight          atomic.Int32
+	maxInFlight       atomic.Int32
+	destroyByID       map[string]int
+	prepareDelay      time.Duration
+	failFastCount     int32
+	stallTimeoutTo    int32
+	allowFirstFailure <-chan struct{}
 }
 
 func (d *burstChaosDriver) Prepare(ctx context.Context, slot *Slot) error {
 	if !d.enableChaos.Load() {
-		d.mu.Lock()
-		d.preparedIDs = append(d.preparedIDs, slot.ID)
-		d.mu.Unlock()
 		return nil
 	}
 	current := d.inFlight.Add(1)
@@ -385,6 +384,9 @@ func (d *burstChaosDriver) Prepare(ctx context.Context, slot *Slot) error {
 	}
 
 	attempt := d.attempts.Add(1)
+	if attempt == 1 {
+		<-d.allowFirstFailure
+	}
 	if attempt <= d.failFastCount {
 		return errors.New("transient netlink busy")
 	}
@@ -397,9 +399,6 @@ func (d *burstChaosDriver) Prepare(ctx context.Context, slot *Slot) error {
 		return ctx.Err()
 	case <-time.After(d.prepareDelay):
 	}
-	d.mu.Lock()
-	d.preparedIDs = append(d.preparedIDs, slot.ID)
-	d.mu.Unlock()
 	return nil
 }
 
@@ -446,10 +445,14 @@ func gatherGaugeValue(t *testing.T, name string, labels map[string]string) float
 func TestManagerBurstReleaseConvergesUnderSlowAndTransientFailingPrepare(t *testing.T) {
 	const capacity = 50
 	root := t.TempDir()
+	allowFirstFailure := make(chan struct{})
+	allowFailure := sync.OnceFunc(func() { close(allowFirstFailure) })
+	defer allowFailure()
 	driver := &burstChaosDriver{
-		prepareDelay:   8 * time.Millisecond,
-		failFastCount:  3,
-		stallTimeoutTo: 6,
+		prepareDelay:      8 * time.Millisecond,
+		failFastCount:     3,
+		stallTimeoutTo:    6,
+		allowFirstFailure: allowFirstFailure,
 	}
 	var nextID atomic.Int64
 	config := DefaultConfig(capacity, "pod-burst")
@@ -457,11 +460,7 @@ func TestManagerBurstReleaseConvergesUnderSlowAndTransientFailingPrepare(t *test
 	config.StateRoot = root
 	config.NetNSRoot = filepath.Join(root, "netns")
 	config.HostNetNSRoot = filepath.Join(root, "host-netns")
-	// Total work across 50 slots (50 * 8ms = 400ms) intentionally exceeds the
-	// 60ms per-slot timeout so queued per-Release goroutines would expire under
-	// the old implementation while per-slot bounded workers converge cleanly.
-	config.ReplenishTimeout = 60 * time.Millisecond
-	config.ReplenishConcurrency = 4
+	config.ReplenishTimeout = 200 * time.Millisecond
 	config.ReplenishBaseBackoff = 5 * time.Millisecond
 	config.ReplenishMaxBackoff = 20 * time.Millisecond
 	config.IDGenerator = func() (string, error) {
@@ -469,7 +468,9 @@ func TestManagerBurstReleaseConvergesUnderSlowAndTransientFailingPrepare(t *test
 	}
 	manager, err := NewManager(config, driver, NewFileStateStore(filepath.Join(root, config.PodUID)))
 	require.NoError(t, err)
-	t.Cleanup(manager.Quiesce)
+	t.Cleanup(func() {
+		require.NoError(t, manager.Stop(context.Background()))
+	})
 	require.NoError(t, manager.Initialize(context.Background()))
 	require.Equal(t, capacity, manager.Snapshot().Clean)
 
@@ -487,23 +488,32 @@ func TestManagerBurstReleaseConvergesUnderSlowAndTransientFailingPrepare(t *test
 	driver.enableChaos.Store(true)
 
 	var releaseWG sync.WaitGroup
+	releaseResults := make(chan error, capacity)
 	for i := range capacity {
 		releaseOwner := owners[i]
 		releaseWG.Add(1)
 		go func() {
 			defer releaseWG.Done()
-			require.NoError(t, manager.Release(context.Background(), releaseOwner))
+			releaseResults <- manager.Release(context.Background(), releaseOwner)
 		}()
 	}
 	releaseWG.Wait()
-	manager.Quiesce()
+	close(releaseResults)
+	for releaseErr := range releaseResults {
+		require.NoError(t, releaseErr)
+	}
+	// No Release or Replenish call follows the first preparation failure.
+	allowFailure()
+	require.Eventually(t, func() bool {
+		return manager.Snapshot().Clean == capacity
+	}, 10*time.Second, testEventuallyInterval)
 
 	snap := manager.Snapshot()
 	require.Equal(t, capacity, snap.Clean)
 	require.Zero(t, snap.Bound)
 	require.Zero(t, snap.Destroying)
-	require.LessOrEqual(t, driver.maxInFlight.Load(), int32(config.ReplenishConcurrency))
-	require.GreaterOrEqual(t, driver.maxInFlight.Load(), int32(2))
+	require.Equal(t, int32(1), driver.maxInFlight.Load())
+	require.Equal(t, int32(capacity)+driver.stallTimeoutTo, driver.attempts.Load())
 
 	require.InDelta(t, float64(capacity), gatherGaugeValue(t, "fastlet_network_slots", map[string]string{"phase": "clean"}), 0)
 	require.InDelta(t, 0, gatherGaugeValue(t, "fastlet_network_slots", map[string]string{"phase": "bound"}), 0)
@@ -556,6 +566,9 @@ func TestManagerSyncReplenishWaitsForInFlightBackgroundPrepare(t *testing.T) {
 	<-driver.entered
 	require.Zero(t, manager.Snapshot().Clean)
 	require.Zero(t, manager.Snapshot().Destroying, "in-flight preparation must not report as Destroying")
+	waitCtx, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, manager.Replenish(waitCtx), context.Canceled)
 
 	replenishDone := make(chan error, 1)
 	go func() {
@@ -572,7 +585,7 @@ func TestManagerSyncReplenishWaitsForInFlightBackgroundPrepare(t *testing.T) {
 	require.Equal(t, 1, manager.Snapshot().Clean)
 }
 
-func TestManagerCloseCancelsInFlightPrepareAndBackoff(t *testing.T) {
+func TestManagerCloseCancelsInFlightPrepare(t *testing.T) {
 	driver := &blockingPrepareDriver{
 		entered: make(chan struct{}),
 		unblock: make(chan struct{}),
@@ -594,6 +607,90 @@ func TestManagerCloseCancelsInFlightPrepareAndBackoff(t *testing.T) {
 	require.Zero(t, manager.Snapshot().Clean)
 	require.Zero(t, manager.Snapshot().Bound)
 	require.Zero(t, manager.Snapshot().Destroying)
+}
+
+type failedPreparationDriver struct {
+	fakeDriver
+	allowCleanup    chan struct{}
+	cleanupAttempts atomic.Int32
+}
+
+func (d *failedPreparationDriver) Prepare(ctx context.Context, slot *Slot) error {
+	if slot.ID == "slot-b" {
+		return errors.New("partial preparation failed")
+	}
+	return d.fakeDriver.Prepare(ctx, slot)
+}
+
+func (d *failedPreparationDriver) Destroy(ctx context.Context, slot *Slot) error {
+	if slot.ID == "slot-b" {
+		d.cleanupAttempts.Add(1)
+		select {
+		case <-d.allowCleanup:
+		default:
+			return errors.New("failed preparation still owns network resources")
+		}
+	}
+	return d.fakeDriver.Destroy(ctx, slot)
+}
+
+func TestManagerRetriesCleanupBeforePreparingAnotherSlot(t *testing.T) {
+	driver := &failedPreparationDriver{allowCleanup: make(chan struct{})}
+	manager := newTestManager(t, 1, t.TempDir(), driver, "slot-a", "slot-b", "slot-c")
+	ctx := t.Context()
+	require.NoError(t, manager.Initialize(ctx))
+	bound := owner("sandbox-cleanup", 1)
+	_, err := manager.Acquire(ctx, bound)
+	require.NoError(t, err)
+	require.NoError(t, manager.Release(ctx, bound))
+
+	require.Eventually(t, func() bool {
+		return driver.cleanupAttempts.Load() >= 2
+	}, testEventuallyTimeout, testEventuallyInterval)
+	require.Zero(t, manager.Snapshot().Clean)
+	durable, err := manager.store.LoadAll(ctx)
+	require.NoError(t, err)
+	require.Len(t, durable, 1)
+	require.Equal(t, "slot-b", durable[0].ID)
+	require.Equal(t, SlotPhaseDestroying, durable[0].Phase)
+	waitCtx, cancel := context.WithTimeout(ctx, testEventuallyTimeout)
+	defer cancel()
+	require.ErrorContains(t, manager.Replenish(waitCtx), "failed preparation still owns network resources")
+
+	close(driver.allowCleanup)
+	require.Eventually(t, func() bool {
+		return manager.Snapshot().Clean == 1
+	}, testEventuallyTimeout, testEventuallyInterval)
+	durable, err = manager.store.LoadAll(ctx)
+	require.NoError(t, err)
+	require.Len(t, durable, 1)
+	require.Equal(t, "slot-c", durable[0].ID)
+	require.Equal(t, SlotPhaseClean, durable[0].Phase)
+}
+
+func TestManagerCloseCancelsReplenishBackoff(t *testing.T) {
+	driver := &failedPreparationDriver{allowCleanup: make(chan struct{})}
+	manager := newTestManager(t, 1, t.TempDir(), driver, "slot-a", "slot-b", "slot-c")
+	manager.config.ReplenishBaseBackoff = time.Minute
+	manager.config.ReplenishMaxBackoff = time.Minute
+	ctx := t.Context()
+	require.NoError(t, manager.Initialize(ctx))
+	bound := owner("sandbox-backoff", 1)
+	_, err := manager.Acquire(ctx, bound)
+	require.NoError(t, err)
+	require.NoError(t, manager.Release(ctx, bound))
+	require.Eventually(t, func() bool {
+		manager.mu.RLock()
+		defer manager.mu.RUnlock()
+		return manager.replenishFailureCount > 0
+	}, testEventuallyTimeout, testEventuallyInterval)
+
+	close(driver.allowCleanup)
+	closeCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	require.NoError(t, manager.Close(closeCtx))
+	require.Zero(t, manager.Snapshot().Clean)
+	require.Equal(t, []string{"slot-a"}, driver.prepared)
 }
 
 func TestManagerCanceledContextSkipsSlotAllocation(t *testing.T) {

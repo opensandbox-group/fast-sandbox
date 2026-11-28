@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"sort"
@@ -30,11 +31,7 @@ const (
 	// is MSS-aligned without PMTUD. Overlay deployments must lower it via
 	// FAST_SANDBOX_NETWORK_MTU (the create-time guest MTU warning then
 	// flags the resulting mismatch).
-	DefaultMTU = 1500
-	// DefaultReplenishConcurrency bounds parallel slot preparations so burst
-	// deletes recover throughput without overwhelming host netlink/exec.
-	DefaultReplenishConcurrency = 4
-
+	DefaultMTU                  = 1500
 	defaultReplenishBaseBackoff = 100 * time.Millisecond
 	defaultReplenishMaxBackoff  = 5 * time.Second
 	failedSlotDestroyTimeout    = 10 * time.Second
@@ -55,7 +52,6 @@ type Config struct {
 	IDGenerator          func() (string, error)
 	Now                  func() time.Time
 	ReplenishTimeout     time.Duration
-	ReplenishConcurrency int
 	ReplenishBaseBackoff time.Duration
 	ReplenishMaxBackoff  time.Duration
 }
@@ -65,31 +61,28 @@ func DefaultConfig(capacity int, podUID string) Config {
 		Capacity: capacity, PodUID: podUID, PrivateCIDR: DefaultPrivateCIDR,
 		Bridge: DefaultBridge, MTU: DefaultMTU,
 		StateRoot: "/run/fast-sandbox/network", NetNSRoot: "/run/netns",
-		HostNetNSRoot:        "/run/fast-sandbox/netns",
-		ReplenishTimeout:     time.Minute,
-		ReplenishConcurrency: DefaultReplenishConcurrency,
+		HostNetNSRoot: "/run/fast-sandbox/netns", ReplenishTimeout: time.Minute,
 	}
 }
 
 type Manager struct {
-	mu               sync.RWMutex
-	prepareSem       chan struct{}
-	config           Config
-	driver           Driver
-	store            StateStore
-	ipam             *IPv4IPAM
-	slots            map[string]*Slot
-	preparing        map[string]string // slotID -> reserved IP while Prepare/Save is in flight
-	prepNotify       chan struct{}     // closed and replaced whenever preparing changes
-	lifecycleCtx     context.Context
-	lifecycleCancel  context.CancelFunc
-	closed           chan struct{} // closed by Close: no more slot preparation
-	initialized      bool
-	replenishRunning bool
-	replenishPending bool
-	replenishWG      sync.WaitGroup
-	hit              atomic.Uint64
-	miss             atomic.Uint64
+	mu                    sync.RWMutex
+	config                Config
+	driver                Driver
+	store                 StateStore
+	ipam                  *IPv4IPAM
+	slots                 map[string]*Slot
+	failedPreparation     *Slot
+	lifecycleCtx          context.Context
+	lifecycleCancel       context.CancelFunc
+	workerDone            chan struct{} // covers startup prefill and then the worker
+	initialized           bool
+	replenishWake         chan struct{}
+	replenishChanged      chan struct{} // broadcasts progress to synchronous callers
+	replenishFailureCount uint64
+	lastReplenishError    error
+	hit                   atomic.Uint64
+	miss                  atomic.Uint64
 }
 
 func NewManager(config Config, driver Driver, store StateStore) (*Manager, error) {
@@ -117,9 +110,6 @@ func NewManager(config Config, driver Driver, store StateStore) (*Manager, error
 	if config.ReplenishTimeout <= 0 {
 		config.ReplenishTimeout = time.Minute
 	}
-	if config.ReplenishConcurrency <= 0 {
-		config.ReplenishConcurrency = DefaultReplenishConcurrency
-	}
 	if config.ReplenishBaseBackoff <= 0 {
 		config.ReplenishBaseBackoff = defaultReplenishBaseBackoff
 	}
@@ -142,23 +132,57 @@ func NewManager(config Config, driver Driver, store StateStore) (*Manager, error
 	}
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	return &Manager{
-		prepareSem:      make(chan struct{}, config.ReplenishConcurrency),
-		config:          config,
-		driver:          driver,
-		store:           store,
-		ipam:            ipam,
-		slots:           make(map[string]*Slot),
-		preparing:       make(map[string]string),
-		prepNotify:      make(chan struct{}),
-		lifecycleCtx:    lifecycleCtx,
-		lifecycleCancel: lifecycleCancel,
-		closed:          make(chan struct{}),
+		config:           config,
+		driver:           driver,
+		store:            store,
+		ipam:             ipam,
+		slots:            make(map[string]*Slot),
+		lifecycleCtx:     lifecycleCtx,
+		lifecycleCancel:  lifecycleCancel,
+		replenishWake:    make(chan struct{}, 1),
+		replenishChanged: make(chan struct{}),
 	}, nil
 }
 
 // Initialize loads and validates durable state, retries interrupted destroys,
 // and prepares the clean capacity needed before Fastlet becomes Ready.
 func (m *Manager) Initialize(ctx context.Context) error {
+	m.mu.Lock()
+	if m.isClosed() {
+		m.mu.Unlock()
+		return context.Canceled
+	}
+	if m.workerDone != nil {
+		m.mu.Unlock()
+		return fmt.Errorf("network manager initialization already started")
+	}
+	done := make(chan struct{})
+	m.workerDone = done
+	m.mu.Unlock()
+
+	initCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(m.lifecycleCtx, cancel)
+	defer stop()
+
+	if err := m.initialize(initCtx); err != nil {
+		close(done)
+		return err
+	}
+	m.mu.Lock()
+	if m.isClosed() {
+		m.mu.Unlock()
+		close(done)
+		return context.Canceled
+	}
+	m.initialized = true
+	m.recordPhasesLocked()
+	m.mu.Unlock()
+	go m.replenishLoop(done)
+	return nil
+}
+
+func (m *Manager) initialize(ctx context.Context) error {
 	loaded, err := m.store.LoadAll(ctx)
 	if err != nil {
 		return err
@@ -196,14 +220,12 @@ func (m *Manager) Initialize(ctx context.Context) error {
 			}
 		}
 	}
-	if err := m.Replenish(ctx); err != nil {
-		return err
+	for m.hasDeficit() {
+		if err := m.prepareNext(ctx); err != nil {
+			return err
+		}
 	}
-	m.mu.Lock()
-	m.initialized = true
-	m.recordPhasesLocked()
-	m.mu.Unlock()
-	return nil
+	return ctx.Err()
 }
 
 // Reconcile binds durable slots to the runtime inventory during Fastlet
@@ -261,6 +283,9 @@ func (m *Manager) Acquire(ctx context.Context, owner Owner) (_ *Slot, resultErr 
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.isClosed() {
+		return nil, ErrNoCleanSlot
+	}
 	for _, slot := range m.slots {
 		if slot.Phase == SlotPhaseBound && slot.Owner.SandboxUID == owner.SandboxUID {
 			if !slot.Owner.Equal(owner) {
@@ -393,6 +418,10 @@ func (m *Manager) Release(ctx context.Context, owner Owner) error {
 		return fmt.Errorf("invalid network slot owner")
 	}
 	m.mu.RLock()
+	if m.isClosed() {
+		m.mu.RUnlock()
+		return nil
+	}
 	var target *Slot
 	for _, slot := range m.slots {
 		if slot.Owner.SandboxUID == owner.SandboxUID && (slot.Phase == SlotPhaseBound || slot.Phase == SlotPhaseDestroying) {
@@ -407,188 +436,106 @@ func (m *Manager) Release(ctx context.Context, owner Owner) error {
 	if !target.Owner.Equal(owner) {
 		return ErrOwnerConflict
 	}
-	if err := m.markAndDestroy(ctx, target.ID); err != nil {
-		return err
-	}
-	m.scheduleReplenishIfNeeded()
-	return nil
+	return m.markAndDestroy(ctx, target.ID)
 }
 
-// Quiesce waits for any background replenish triggered by Release to finish.
-// Snapshot phases right after a Release are only deterministic once the
-// replacement slot's asynchronous preparation has settled, and the
-// preparation writes durable state — callers (and tests) that must observe
-// a settled manager wait here.
-func (m *Manager) Quiesce() { m.replenishWG.Wait() }
-
-// destroyFailedSlot tears down a slot whose preparation failed; a destroy
-// failure here leaks host network resources, so it is never silent.
-func (m *Manager) destroyFailedSlot(slot *Slot, stage string) {
-	destroyCtx, cancel := context.WithTimeout(context.Background(), failedSlotDestroyTimeout)
-	defer cancel()
-	if err := m.driver.Destroy(destroyCtx, slot); err != nil {
-		klog.ErrorS(err, "Failed slot destroy after failed preparation", "slot", slot.ID, "stage", stage)
-	}
+// Quiesce waits for the pool to settle. It is used by tests that observe
+// durable state or metrics after an asynchronous Release.
+func (m *Manager) Quiesce() {
+	_ = m.waitForReplenish(context.Background(), false)
 }
 
 func (m *Manager) Replenish(ctx context.Context) error {
-	err := m.replenishSync(ctx)
-	if err != nil {
-		m.scheduleReplenishIfNeeded()
-	}
-	return err
+	return m.waitForReplenish(ctx, true)
 }
 
-func (m *Manager) replenishSync(ctx context.Context) error {
-	for {
-		m.mu.RLock()
-		if m.isClosedLocked() || len(m.slots) >= m.config.Capacity {
-			m.mu.RUnlock()
-			return nil
-		}
-		unreserved := m.config.Capacity - (len(m.slots) + len(m.preparing))
-		waitCh := m.prepNotify
+func (m *Manager) waitForReplenish(ctx context.Context, synchronous bool) error {
+	m.mu.RLock()
+	if !m.initialized && !m.isClosed() && synchronous {
 		m.mu.RUnlock()
-
-		if unreserved <= 0 {
-			select {
-			case <-m.closed:
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-waitCh:
-				continue
-			}
-		}
-		if unreserved == 1 || m.config.ReplenishConcurrency == 1 {
-			if _, err := m.prepareOne(ctx, false); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := m.prepareWave(ctx, unreserved, false); err != nil {
+		return fmt.Errorf("network manager is not initialized")
+	}
+	failureCount := m.replenishFailureCount
+	if synchronous && len(m.slots) < m.config.Capacity && ctx.Err() == nil {
+		m.wakeReplenish()
+	}
+	for m.initialized && !m.isClosed() && len(m.slots) < m.config.Capacity {
+		if err := ctx.Err(); err != nil {
+			m.mu.RUnlock()
 			return err
 		}
+		if synchronous && m.replenishFailureCount != failureCount {
+			err := m.lastReplenishError
+			m.mu.RUnlock()
+			return err
+		}
+		changed := m.replenishChanged
+		m.mu.RUnlock()
+		select {
+		case <-m.lifecycleCtx.Done():
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+		m.mu.RLock()
+	}
+	m.mu.RUnlock()
+	return nil
+}
+
+func (m *Manager) wakeReplenish() {
+	select {
+	case m.replenishWake <- struct{}{}:
+	default:
 	}
 }
 
-func (m *Manager) prepareWave(ctx context.Context, unreserved int, perSlotTimeout bool) error {
-	workers := min(unreserved, m.config.ReplenishConcurrency)
-	waveCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var (
-		wg       sync.WaitGroup
-		errMu    sync.Mutex
-		firstErr error
-	)
-	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				if !m.hasUnreservedDeficit() {
-					return
-				}
-				errMu.Lock()
-				failed := firstErr != nil
-				errMu.Unlock()
-				if failed {
-					return
-				}
-				prepared, err := m.prepareOne(waveCtx, perSlotTimeout)
-				if err != nil {
-					errMu.Lock()
-					if firstErr == nil {
-						firstErr = err
-						cancel()
-					}
-					errMu.Unlock()
-					return
-				}
-				if !prepared {
-					return
-				}
-			}
-		}()
-	}
-	wg.Wait()
-	return firstErr
+func (m *Manager) signalReplenishChangedLocked() {
+	close(m.replenishChanged)
+	m.replenishChanged = make(chan struct{})
 }
 
-func (m *Manager) scheduleReplenishIfNeeded() {
-	m.mu.Lock()
-	if !m.initialized || m.isClosedLocked() || len(m.slots) >= m.config.Capacity {
-		m.mu.Unlock()
-		return
-	}
-	if m.replenishRunning {
-		m.replenishPending = true
-		m.mu.Unlock()
-		return
-	}
-	m.replenishRunning = true
-	m.replenishPending = false
-	m.replenishWG.Add(1)
-	m.mu.Unlock()
-	go m.replenishLoop()
+func (m *Manager) hasDeficit() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.slots) < m.config.Capacity
 }
 
-func (m *Manager) replenishLoop() {
-	defer m.replenishWG.Done()
+func (m *Manager) replenishLoop(done chan struct{}) {
+	defer close(done)
 	consecutiveFailures := 0
-	for {
-		m.mu.Lock()
-		if m.isClosedLocked() {
-			m.replenishRunning = false
-			m.replenishPending = false
-			m.mu.Unlock()
-			return
-		}
-		if len(m.slots) >= m.config.Capacity {
-			if m.replenishPending {
-				m.replenishPending = false
-				m.mu.Unlock()
-				continue
-			}
-			m.replenishRunning = false
-			m.mu.Unlock()
-			return
-		}
-		m.replenishPending = false
-		unreserved := m.config.Capacity - (len(m.slots) + len(m.preparing))
-		waitCh := m.prepNotify
-		m.mu.Unlock()
-
-		if unreserved <= 0 {
+	for !m.isClosed() {
+		if !m.hasDeficit() {
 			select {
-			case <-m.closed:
-				continue
-			case <-waitCh:
+			case <-m.lifecycleCtx.Done():
+				return
+			case <-m.replenishWake:
 				continue
 			}
 		}
 
-		var waveErr error
-		if consecutiveFailures > 0 || unreserved == 1 || m.config.ReplenishConcurrency == 1 {
-			_, waveErr = m.prepareOne(m.lifecycleCtx, true)
-		} else {
-			waveErr = m.prepareWave(m.lifecycleCtx, unreserved, true)
-		}
+		err := m.prepareNext(m.lifecycleCtx)
 		if m.isClosed() {
-			continue
+			return
 		}
-		if waveErr != nil {
+		if err != nil {
+			m.mu.Lock()
+			m.replenishFailureCount++
+			m.lastReplenishError = err
+			m.signalReplenishChangedLocked()
+			m.mu.Unlock()
 			consecutiveFailures++
 			backoff := m.replenishBackoff(consecutiveFailures)
 			snap := m.Snapshot()
-			klog.ErrorS(waveErr, "background network slot replenish failed; scheduling retry",
+			klog.ErrorS(err, "background network slot replenish failed; scheduling retry",
 				"capacity", snap.Capacity, "clean", snap.Clean, "bound", snap.Bound,
 				"destroying", snap.Destroying, "consecutiveFailures", consecutiveFailures, "retryIn", backoff)
 			timer := time.NewTimer(backoff)
 			select {
-			case <-m.closed:
+			case <-m.lifecycleCtx.Done():
 				timer.Stop()
+				return
 			case <-timer.C:
 			}
 			continue
@@ -623,17 +570,17 @@ func (m *Manager) replenishBackoff(failures int) time.Duration {
 // down. Acquire after Close fails with ErrNoCleanSlot (the clean pool is
 // empty); Release after Close is a silent no-op.
 func (m *Manager) Close(ctx context.Context) error {
-	m.mu.Lock()
-	if !m.isClosedLocked() {
-		close(m.closed)
-		m.lifecycleCancel()
+	if err := m.Stop(ctx); err != nil {
+		return err
 	}
-	m.mu.Unlock()
-
-	m.replenishWG.Wait()
-	m.waitInFlightPreparations(ctx)
+	if err := m.cleanupFailedPreparation(ctx); err != nil {
+		return err
+	}
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		m.mu.RLock()
 		ids := m.sortedSlotIDsLocked()
 		m.mu.RUnlock()
@@ -648,20 +595,21 @@ func (m *Manager) Close(ctx context.Context) error {
 	}
 }
 
-func (m *Manager) waitInFlightPreparations(ctx context.Context) {
-	for {
-		m.mu.RLock()
-		inFlight := len(m.preparing)
-		waitCh := m.prepNotify
-		m.mu.RUnlock()
-		if inFlight == 0 {
-			return
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-waitCh:
-		}
+// Stop waits for the network manager to stop, leaving committed slots for
+// recovery. Close also removes their durable state and host resources.
+func (m *Manager) Stop(ctx context.Context) error {
+	m.mu.Lock()
+	m.lifecycleCancel()
+	done := m.workerDone
+	m.mu.Unlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -682,111 +630,106 @@ func (m *Manager) Snapshot() Snapshot {
 	return result
 }
 
-func (m *Manager) prepareOne(ctx context.Context, applySlotTimeout bool) (bool, error) {
-	if m.isClosed() {
-		return false, nil
-	}
+func (m *Manager) prepareNext(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
-		return false, err
+		return err
 	}
-	select {
-	case <-m.closed:
-		return false, nil
-	case <-ctx.Done():
-		return false, ctx.Err()
-	case m.prepareSem <- struct{}{}:
-	}
-	defer func() { <-m.prepareSem }()
-
-	if m.isClosed() {
-		return false, nil
-	}
-	if err := ctx.Err(); err != nil {
-		return false, err
-	}
-	slotCtx := ctx
-	var cancel context.CancelFunc
-	if applySlotTimeout {
-		slotCtx, cancel = context.WithTimeout(ctx, m.config.ReplenishTimeout)
-		defer cancel()
+	m.mu.RLock()
+	cleanupPending := m.failedPreparation != nil
+	m.mu.RUnlock()
+	if cleanupPending {
+		return m.cleanupFailedPreparation(context.WithoutCancel(ctx))
 	}
 
-	slot, err := m.reservePrepareSlot(slotCtx)
-	if err != nil || slot == nil {
-		return false, err
+	slotCtx, cancel := context.WithTimeout(ctx, m.config.ReplenishTimeout)
+	defer cancel()
+	slot, err := m.newSlot()
+	if err != nil {
+		return err
 	}
-	id := slot.ID
-
 	started := time.Now()
-	if err := m.driver.Prepare(slotCtx, slot); err != nil {
-		if !m.isClosed() {
-			observeSlotPrepare(started, err)
-		}
-		m.destroyFailedSlot(slot, "prepare")
-		m.mu.Lock()
-		m.finishPreparingLocked(id)
-		m.recordPhasesLocked()
-		m.mu.Unlock()
-		if m.isClosed() {
-			return false, nil
-		}
-		return false, fmt.Errorf("prepare network slot %s: %w", id, err)
+	err = m.prepareSlot(slotCtx, slot)
+	if !m.isClosed() {
+		observeSlotPrepare(started, err)
 	}
-	slot.Phase = SlotPhaseClean
-	if err := m.store.Save(slotCtx, slot); err != nil {
-		if !m.isClosed() {
-			observeSlotPrepare(started, err)
-		}
-		m.destroyFailedSlot(slot, "save")
-		m.mu.Lock()
-		m.finishPreparingLocked(id)
-		m.recordPhasesLocked()
-		m.mu.Unlock()
-		if m.isClosed() {
-			return false, nil
-		}
-		return false, err
+	if err == nil {
+		return nil
 	}
+
 	m.mu.Lock()
-	if m.isClosedLocked() {
-		// Close raced this preparation: the slot must not surface, and its
-		// freshly created host resources are torn down so Close leaves no
-		// leftovers.
-		m.mu.Unlock()
-		m.destroyFailedSlot(slot, "close-race")
-		deleteCtx, deleteCancel := context.WithTimeout(context.Background(), failedSlotDestroyTimeout)
-		_ = m.store.Delete(deleteCtx, id)
-		deleteCancel()
-		m.mu.Lock()
-		m.finishPreparingLocked(id)
-		m.recordPhasesLocked()
-		m.mu.Unlock()
-		return false, nil
-	}
-	m.slots[id] = slot
-	m.finishPreparingLocked(id)
-	m.recordPhasesLocked()
+	m.failedPreparation = slot
 	m.mu.Unlock()
-	observeSlotPrepare(started, nil)
-	return true, nil
+	return errors.Join(err, m.cleanupFailedPreparation(context.WithoutCancel(ctx)))
 }
 
-func (m *Manager) reservePrepareSlot(ctx context.Context) (*Slot, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.isClosedLocked() || len(m.slots)+len(m.preparing) >= m.config.Capacity {
-		return nil, nil //nolint:nilnil // nil slot with nil error signals no reservation needed
+func (m *Manager) prepareSlot(ctx context.Context, slot *Slot) error {
+	// Persist a cleanup record before creating host resources so Initialize can
+	// reclaim this slot if Fastlet stops partway through preparation.
+	slot.Phase = SlotPhaseDestroying
+	if err := m.store.Save(ctx, slot); err != nil {
+		return fmt.Errorf("save cleanup record for network slot %s: %w", slot.ID, err)
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return err
 	}
-	used := make(map[string]struct{}, len(m.slots)+len(m.preparing))
+	if err := m.driver.Prepare(ctx, slot); err != nil {
+		return fmt.Errorf("prepare network slot %s: %w", slot.ID, err)
+	}
+	slot.Phase = SlotPhaseClean
+	if err := m.store.Save(ctx, slot); err != nil {
+		return fmt.Errorf("persist clean network slot %s: %w", slot.ID, err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if m.isClosed() {
+		return context.Canceled
+	}
+	m.slots[slot.ID] = slot
+	m.recordPhasesLocked()
+	m.signalReplenishChangedLocked()
+	return nil
+}
+
+func (m *Manager) cleanupFailedPreparation(parent context.Context) error {
+	m.mu.RLock()
+	slot := m.failedPreparation
+	m.mu.RUnlock()
+	if slot == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(parent, failedSlotDestroyTimeout)
+	defer cancel()
+	if slot.Phase == SlotPhaseClean {
+		// Save can return an error after committing the file. Ensure recovery
+		// will tear down the slot before touching its host resources again.
+		cleanupRecord := *slot
+		cleanupRecord.Phase = SlotPhaseDestroying
+		if err := m.store.Save(ctx, &cleanupRecord); err != nil {
+			return fmt.Errorf("restore cleanup record for network slot %s: %w", slot.ID, err)
+		}
+	}
+	if err := m.driver.Destroy(ctx, slot); err != nil {
+		return fmt.Errorf("destroy failed network slot %s: %w", slot.ID, err)
+	}
+	if err := m.store.Delete(ctx, slot.ID); err != nil {
+		return fmt.Errorf("delete failed network slot %s: %w", slot.ID, err)
+	}
+	m.mu.Lock()
+	m.failedPreparation = nil
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *Manager) newSlot() (*Slot, error) {
+	m.mu.RLock()
+	used := make(map[string]struct{}, len(m.slots))
 	for _, slot := range m.slots {
 		used[slot.IP] = struct{}{}
 	}
-	for _, reservedIP := range m.preparing {
-		used[reservedIP] = struct{}{}
-	}
+	m.mu.RUnlock()
 	ip, address, err := m.ipam.Allocate(used)
 	if err != nil {
 		return nil, err
@@ -799,11 +742,11 @@ func (m *Manager) reservePrepareSlot(ctx context.Context) (*Slot, error) {
 	if !safeSlotID.MatchString(id) {
 		return nil, fmt.Errorf("ID generator returned invalid slot id %q", id)
 	}
-	if _, duplicate := m.slots[id]; duplicate {
+	m.mu.RLock()
+	_, duplicate := m.slots[id]
+	m.mu.RUnlock()
+	if duplicate {
 		return nil, fmt.Errorf("slot ID generator returned duplicate %q", id)
-	}
-	if _, duplicate := m.preparing[id]; duplicate {
-		return nil, fmt.Errorf("slot ID generator returned in-flight duplicate %q", id)
 	}
 	netnsName := resourceName("fsb", m.config.PodUID, id, 63)
 	hostVeth := resourceName("fh", m.config.PodUID, id, 15)
@@ -820,33 +763,11 @@ func (m *Manager) reservePrepareSlot(ctx context.Context) (*Slot, error) {
 		DNSPath: filepath.Join(m.config.StateRoot, m.config.PodUID, id+".resolv.conf"),
 		MTU:     m.config.MTU, EgressDevice: m.config.EgressDevice, CreatedAt: m.config.Now(),
 	}
-	m.preparing[id] = ip
 	return slot, nil
 }
 
-func (m *Manager) finishPreparingLocked(id string) {
-	delete(m.preparing, id)
-	close(m.prepNotify)
-	m.prepNotify = make(chan struct{})
-}
-
-func (m *Manager) hasUnreservedDeficit() bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return !m.isClosedLocked() && len(m.slots)+len(m.preparing) < m.config.Capacity
-}
-
 func (m *Manager) isClosed() bool {
-	select {
-	case <-m.closed:
-		return true
-	default:
-		return false
-	}
-}
-
-func (m *Manager) isClosedLocked() bool {
-	return m.isClosed()
+	return m.lifecycleCtx.Err() != nil
 }
 
 func (m *Manager) markAndDestroy(ctx context.Context, slotID string) error {
@@ -890,6 +811,7 @@ func (m *Manager) destroySlot(ctx context.Context, slotID string) error {
 	delete(m.slots, slotID)
 	m.recordPhasesLocked()
 	m.mu.Unlock()
+	m.wakeReplenish()
 	return nil
 }
 
