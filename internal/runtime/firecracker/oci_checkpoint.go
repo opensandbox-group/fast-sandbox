@@ -270,25 +270,6 @@ func (d *Driver) publishPreparedOCISnapshot(ctx context.Context, plan dumpPlan, 
 	return &runtimecontract.SnapshotResult{SnapshotID: plan.snapshotID, ManifestRef: ref, ArtifactDigest: strings.TrimPrefix(parsed.Reference, "sha256:"), SizeBytes: sizeBytes, Mode: producedMode}, nil
 }
 
-// Checkpoints are instance-private even though their bytes use an OCI envelope.
-// They cannot be used as golden templates to boot a different sandbox.
-func validateOCIResumeOwner(document ociRestoreMetadata, config *fastletapi.RuntimeSandboxConfig) error {
-	var owner *artifacts.CheckpointOwner
-	if document.Platform != nil {
-		owner = document.Platform.Checkpoint
-	}
-	if config.Desired.Restore != nil && owner == nil {
-		return fmt.Errorf("%w: OCI resume reference is not a checkpoint", ErrInvalidConfig)
-	}
-	if owner == nil {
-		return nil
-	}
-	if config.Desired.Restore == nil || owner.SandboxUID != config.Identity.SandboxUID || owner.Namespace != config.Identity.Namespace {
-		return fmt.Errorf("%w: OCI checkpoint belongs to a different sandbox", ErrInvalidConfig)
-	}
-	return nil
-}
-
 func prepareOCISnapshot(plan dumpPlan) (bool, error) {
 	state, err := loadState(plan.sandboxDir)
 	if err != nil {

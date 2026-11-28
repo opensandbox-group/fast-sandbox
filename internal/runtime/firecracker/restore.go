@@ -57,6 +57,41 @@ func restoreReference(spec fastletapi.SandboxDesiredSpec) (string, error) {
 	return artifacts.CheckpointReference(spec.Restore.ArtifactDigest), nil
 }
 
+// validateCheckpointResumeOwner enforces the checkpoint ownership boundary on
+// every restore, for both publication paths (OCI envelope and native
+// artifact-store sets): a pause checkpoint carries the complete guest memory
+// image, so a checkpoint artifact set must only restore under the Sandbox
+// identity that produced it. The owner travels inside the commit-point
+// manifest (platform.checkpoint, written by the capture path), and a restore
+// verifies it before any memory is loaded, so a checkpoint address that
+// leaked or mis-resolved into another Sandbox CR cannot become a cross-tenant
+// memory read.
+//
+// A resume whose manifest carries no owner is rejected too: the reference is
+// not a checkpoint (checkpoints are instance-private and never addressable as
+// template images). The same rule rejects an owner-carrying set used as a
+// fresh boot image. Template sets carry no owner and keep booting fresh
+// Sandboxes — that is the intended sharing path.
+func validateCheckpointResumeOwner(document artifacts.VMManifest, config *fastletapi.RuntimeSandboxConfig) error {
+	var owner *artifacts.CheckpointOwner
+	if document.Platform != nil {
+		owner = document.Platform.Checkpoint
+	}
+	if config.Desired.Restore != nil && owner == nil {
+		return fmt.Errorf("%w: resume reference is not a checkpoint", ErrInvalidConfig)
+	}
+	if owner == nil {
+		return nil
+	}
+	if config.Desired.Restore == nil {
+		return fmt.Errorf("%w: checkpoint artifact set cannot boot a fresh sandbox", ErrInvalidConfig)
+	}
+	if owner.SandboxUID != config.Identity.SandboxUID || owner.Namespace != config.Identity.Namespace {
+		return fmt.Errorf("%w: checkpoint belongs to a different sandbox", ErrInvalidConfig)
+	}
+	return nil
+}
+
 // manifestMachine uses the shared integer CPU/MiB contract.
 type manifestMachine = artifacts.VMMachine
 
