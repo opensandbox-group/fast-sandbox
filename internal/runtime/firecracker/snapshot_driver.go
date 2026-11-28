@@ -184,7 +184,8 @@ func (d *Driver) createFullSnapshot(ctx context.Context, input *runtimecontract.
 	klog.InfoS("firecracker sandbox dumped",
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID,
 		"pauseWindow", plan.pauseWindow.String(), "spillMove", plan.spillMove.String(),
-		"spilled", plan.spilled, "rootfsClone", plan.rootfsClone.String(), "rootfsCopy", plan.rootfsCopy.String(),
+		"spilled", plan.spilled, "snapshotType", plan.snapshotType, "memoryMerge", plan.memoryMerge.String(),
+		"rootfsClone", plan.rootfsClone.String(), "rootfsCopy", plan.rootfsCopy.String(),
 		"pauseAPI", plan.pauseAPI.String(), "dumpAPI", plan.dumpAPI.String(), "resumeAPI", plan.resumeAPI.String())
 
 	// Both snapshot kinds carry the egress-owned state files (vault,
@@ -661,6 +662,8 @@ type dumpPlan struct {
 	spilled       bool
 	pauseWindow   time.Duration
 	spillMove     time.Duration
+	snapshotType  string
+	memoryMerge   time.Duration
 	rootfsClone   time.Duration
 	rootfsCopy    time.Duration
 	verifiedFiles map[string]agentpull.VerifiedFile
@@ -829,6 +832,16 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		_ = os.RemoveAll(spillDir)
 	}
 
+	trackDirtyPages := !ociRoot && state.TrackDirtyPages
+	basePath, err := prepareMemoryCapture(plan, trackDirtyPages, jailDumpDir, spillDir)
+	if err != nil {
+		cleanupSpill()
+		return err
+	}
+	if basePath != "" {
+		defer os.Remove(basePath)
+	}
+
 	// Clone the instance rootfs BEFORE pausing when the filesystem supports
 	// reflinks: the clone is atomic at the extent level (concurrent guest
 	// writes COW into new extents and never touch the copy), and
@@ -868,7 +881,7 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		}
 		dumpStarted := time.Now()
 		err := client.CreateSnapshot(ctx, SnapshotCreateRequest{
-			SnapshotType: "Full",
+			SnapshotType: plan.snapshotType,
 			SnapshotPath: vmstateTarget,
 			MemFilePath:  memoryTarget,
 		})
@@ -910,38 +923,18 @@ func (d *Driver) dumpRunningSandbox(ctx context.Context, plan *dumpPlan) error {
 		"sandboxID", plan.sandboxID, "snapshotId", plan.snapshotID, "pauseWindow", plan.pauseWindow.String(),
 		"rootfsClone", plan.rootfsClone.String(), "rootfsCopy", plan.rootfsCopy.String(),
 		"pauseAPI", plan.pauseAPI.String(), "dumpAPI", plan.dumpAPI.String(), "resumeAPI", plan.resumeAPI.String())
-	if !plan.spilled {
-		if plan.jailed {
-			// Move the chroot-local dump into the staging directory: the
-			// jailed VMM wrote under its own credentials, but the files are
-			// regular and movable by this (privileged) driver.
-			for dumped, staged := range map[string]string{
-				jailedDumpVMStateName: vmstateSnapshotName,
-				jailedDumpMemoryName:  memorySnapshotName,
-			} {
-				if err := os.Rename(filepath.Join(jailDumpDir, dumped), filepath.Join(plan.staging, staged)); err != nil {
-					return fmt.Errorf("move dumped %s out of the jail root: %w", dumped, err)
-				}
-			}
-		}
-		return nil
+	if err := stageCapturedMemory(plan, basePath, jailDumpDir, spillDir); err != nil {
+		cleanupSpill()
+		return err
 	}
-
-	// Spilled: relocate the dump into the publish staging OUTSIDE the pause
-	// window (cross-device tmpfs→StateRoot is a plain copy). The jail's
-	// spill bind persists with the sandbox and is released at its deletion.
-	moveStarted := time.Now()
-	for dumped, staged := range map[string]string{
-		jailedDumpVMStateName: vmstateSnapshotName,
-		jailedDumpMemoryName:  memorySnapshotName,
-	} {
-		if err := relocateSpilled(plan, filepath.Join(spillDir, dumped), filepath.Join(plan.staging, staged)); err != nil {
-			_ = os.RemoveAll(spillDir)
-			return fmt.Errorf("move spilled %s into the staging directory: %w", dumped, err)
+	cleanupSpill()
+	if trackDirtyPages {
+		memory := filepath.Join(plan.staging, memorySnapshotName)
+		if err := os.Link(memory, filepath.Join(plan.sandboxDir, memoryDiffBaseName)); err != nil {
+			// The staged result is still complete. The next capture uses Full.
+			klog.Warningf("cannot retain memory diff base for %s: %v", plan.sandboxID, err)
 		}
 	}
-	plan.spillMove = time.Since(moveStarted)
-	_ = os.RemoveAll(spillDir)
 	return nil
 }
 

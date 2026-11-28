@@ -550,7 +550,8 @@ func verifyNativeFullLayout(t *testing.T, ctx context.Context, driver *Driver, n
 			}
 			client := NewClient(socket)
 			defer client.Close()
-			require.NoError(t, configureRestoreVM(ctx, client, slot, vmstate, memory, jail != ""))
+			_, err = configureRestoreVM(ctx, client, slot, vmstate, memory, jail != "", false)
+			require.NoError(t, err)
 			_, err = resumeVM(ctx, client, 30)
 			require.NoError(t, err)
 			require.Eventually(t, func() bool {

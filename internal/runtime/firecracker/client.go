@@ -51,6 +51,7 @@ type SnapshotLoadRequest struct {
 	SnapshotPath     string                    `json:"snapshot_path"`
 	MemBackend       SnapshotMemBackend        `json:"mem_backend"`
 	ResumeVM         bool                      `json:"resume_vm"`
+	TrackDirtyPages  bool                      `json:"track_dirty_pages,omitempty"`
 	NetworkOverrides []SnapshotNetworkOverride `json:"network_overrides,omitempty"`
 }
 
@@ -214,6 +215,15 @@ func (c *Client) VMState(ctx context.Context) (string, error) {
 	return response.State, nil
 }
 
+type apiResponseError struct {
+	method, path, status, body string
+	statusCode                 int
+}
+
+func (e *apiResponseError) Error() string {
+	return fmt.Sprintf("firecracker %s %s failed with %s: %s", e.method, e.path, e.status, e.body)
+}
+
 func (c *Client) do(ctx context.Context, method, path string, input, output any) error {
 	var body io.Reader
 	if input != nil {
@@ -241,7 +251,7 @@ func (c *Client) do(ctx context.Context, method, path string, input, output any)
 		if readErr != nil {
 			return fmt.Errorf("firecracker %s %s failed with %s: %w", method, path, response.Status, readErr)
 		}
-		return fmt.Errorf("firecracker %s %s failed with %s: %s", method, path, response.Status, bytes.TrimSpace(payload))
+		return &apiResponseError{method: method, path: path, status: response.Status, statusCode: response.StatusCode, body: string(bytes.TrimSpace(payload))}
 	}
 	if output == nil {
 		return nil

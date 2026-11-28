@@ -130,14 +130,15 @@ func newNetworkManagerWithDriverForTest(t *testing.T, driver fastletnetwork.Driv
 
 // statefulFakeServer scripts the Firecracker API and records calls.
 type statefulFakeServer struct {
-	mu            sync.Mutex
-	calls         []string
-	snapshotLoads []SnapshotLoadRequest
-	snapshotDumps []SnapshotCreateRequest
-	failSnapshot  bool
-	failVersion   bool
-	running       bool
-	socket        string
+	mu                  sync.Mutex
+	calls               []string
+	snapshotLoads       []SnapshotLoadRequest
+	snapshotDumps       []SnapshotCreateRequest
+	failSnapshot        bool
+	rejectDirtyTracking bool
+	failVersion         bool
+	running             bool
+	socket              string
 }
 
 func newStatefulFakeServer(t *testing.T) *statefulFakeServer {
@@ -149,10 +150,12 @@ func newStatefulFakeServer(t *testing.T) *statefulFakeServer {
 func (s *statefulFakeServer) handle(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.calls = append(s.calls, r.Method+" "+r.URL.Path)
+	var rejectTracking bool
 	if r.URL.Path == "/snapshot/load" {
 		var request SnapshotLoadRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err == nil {
 			s.snapshotLoads = append(s.snapshotLoads, request)
+			rejectTracking = s.rejectDirtyTracking && request.TrackDirtyPages
 		}
 	}
 	if r.URL.Path == "/snapshot/create" {
@@ -165,6 +168,13 @@ func (s *statefulFakeServer) handle(w http.ResponseWriter, r *http.Request) {
 	failVersion := s.failVersion
 	s.mu.Unlock()
 	switch r.URL.Path {
+	case "/snapshot/load":
+		if rejectTracking {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("{\"fault_message\":\"Error parsing JSON: unknown field `track_dirty_pages`\"}"))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	case "/version":
 		if failVersion {
 			w.WriteHeader(http.StatusServiceUnavailable)
@@ -527,6 +537,74 @@ func TestEnsureSandboxRestoresGoldenSnapshot(t *testing.T) {
 	require.Len(t, loads[0].NetworkOverrides, 1)
 	require.Equal(t, "eth0", loads[0].NetworkOverrides[0].IfaceID)
 	require.Equal(t, "fc-tap", loads[0].NetworkOverrides[0].HostDevName)
+}
+
+func TestEnsureSandboxNativeDiffTracksExactRestoreBase(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_NATIVE_MEMORY_DIFF", "1")
+	fixture := newDriverFixture(t)
+	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
+	require.NoError(t, fixture.driver.Initialize(t.Context(), ""))
+
+	_, err := fixture.driver.EnsureSandbox(t.Context(), ensureInput(&fixture.sandboxSpec))
+	require.NoError(t, err)
+	loads := fixture.server.recordedSnapshotLoads()
+	require.Len(t, loads, 1)
+	require.True(t, loads[0].TrackDirtyPages)
+
+	dir := filepath.Join(fixture.stateRoot, sandboxStateDir, fixture.sandboxSpec.Identity.SandboxUID)
+	state, err := loadState(dir)
+	require.NoError(t, err)
+	require.True(t, state.TrackDirtyPages)
+	base, err := os.Stat(filepath.Join(dir, memoryDiffBaseName))
+	require.NoError(t, err)
+	loaded, err := os.Stat(loads[0].MemBackend.BackendPath)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(base, loaded))
+
+	// Reuse the sandbox UID for a new runtime that restores a different image.
+	require.NoError(t, fixture.driver.DeleteSandbox(t.Context(), fixture.sandboxSpec.Identity.SandboxUID))
+	require.NoFileExists(t, filepath.Join(dir, memoryDiffBaseName))
+	require.Eventually(t, func() bool { return fixture.manager.Snapshot().Clean == 1 }, time.Second, time.Millisecond)
+	next := fixture.sandboxSpec
+	next.Identity.InstanceGeneration++
+	next.Identity.RuntimeInstanceID = "replacement"
+	next.Desired.Image = "second-golden"
+	fixture.prepareCachedImage(t, next.Desired.Image)
+
+	_, err = fixture.driver.EnsureSandbox(t.Context(), ensureInput(&next))
+	require.NoError(t, err)
+	loads = fixture.server.recordedSnapshotLoads()
+	require.Len(t, loads, 2)
+	require.True(t, loads[1].TrackDirtyPages)
+	replacement, err := os.Stat(filepath.Join(dir, memoryDiffBaseName))
+	require.NoError(t, err)
+	loaded, err = os.Stat(loads[1].MemBackend.BackendPath)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(replacement, loaded))
+	require.False(t, os.SameFile(replacement, base))
+}
+
+func TestEnsureSandboxFallsBackWhenFirecrackerRejectsTrackingField(t *testing.T) {
+	t.Setenv("FAST_SANDBOX_NATIVE_MEMORY_DIFF", "1")
+	fixture := newDriverFixture(t)
+	fixture.prepareCachedImage(t, fixture.sandboxSpec.Desired.Image)
+	fixture.server.mu.Lock()
+	fixture.server.rejectDirtyTracking = true
+	fixture.server.mu.Unlock()
+	require.NoError(t, fixture.driver.Initialize(t.Context(), ""))
+
+	_, err := fixture.driver.EnsureSandbox(t.Context(), ensureInput(&fixture.sandboxSpec))
+	require.NoError(t, err)
+	loads := fixture.server.recordedSnapshotLoads()
+	require.Len(t, loads, 2)
+	require.True(t, loads[0].TrackDirtyPages)
+	loads[0].TrackDirtyPages = false
+	require.Equal(t, loads[0], loads[1])
+	dir := filepath.Join(fixture.stateRoot, sandboxStateDir, fixture.sandboxSpec.Identity.SandboxUID)
+	state, err := loadState(dir)
+	require.NoError(t, err)
+	require.False(t, state.TrackDirtyPages)
+	require.NoFileExists(t, filepath.Join(dir, memoryDiffBaseName))
 }
 
 func TestEnsureSandboxRestoreMachineConfigFromManifest(t *testing.T) {

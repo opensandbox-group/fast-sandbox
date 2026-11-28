@@ -21,6 +21,29 @@ failures with a spill area configured).
 
 The source remains running for both publication paths. OCI snapshots use a random UUID `snapshot_id`; `template_name` is optional and no image-name index is published. Native snapshots retain the named-index behavior described below.
 
+## Incremental native Firecracker snapshots
+
+Set `FAST_SANDBOX_NATIVE_MEMORY_DIFF=1` in the Fastlet container environment to enable Firecracker dirty-page tracking for native sandboxes restored after the setting takes effect. Tracking is disabled by default. Existing untracked VMs and native VMs started from root filesystem-only images continue to take Full snapshots.
+
+The driver captures a memory Diff during the pause window when it has a valid baseline and the dump filesystem can distinguish holes from written zero pages. It resumes the VM before merging the Diff into a complete memory image. The store receives a self-contained snapshot that consumers can restore through the existing index, and publication still uploads the complete memory image.
+
+If Firecracker rejects the tracking field as unknown during restore, the driver retries without the field. A missing or invalidated baseline makes the next capture Full. Remove the environment variable and roll out the Fastlet configuration to disable tracking for subsequent restores. Replace or restore an already tracked VM under the disabled configuration to stop tracking on that VM. Published snapshots remain restorable.
+
+### Verification
+
+Use the [Firecracker integration environment](firecracker-integration-env.md) with a disposable Linux host or guest that provides KVM, cgroup v2, OverlayFS, and XFS reflink. The cold-restore option removes the test snapshot's node-local image cache. Use an isolated cluster and artifact bucket with space for the golden image, the retained snapshots, and a cold pull.
+
+In the disposable checkout, set `alsoStderr: true` in `config/logging/configmap.yaml` before bringing up the cluster, so the verifier can read the capture type from the Fastlet pod logs. Ensure the runtime stage of `build/Dockerfile.fastlet` includes `nslookup`, for example by adding the `dnsutils` package to its install step. Keep test environment adjustments local to the verification checkout. If Docker Hub is unreachable, preload MinIO and `minio/mc` in the test Docker daemon and follow the registry mirror setup in the integration guide. The `mc` container must use `/root/.mc` as its config directory so the integration script can persist its MinIO alias.
+
+```bash
+./scripts/integration-env.sh up
+docker pull opensandbox/egress:latest
+SNAPSHOT_NATIVE_MEMORY_DIFF=1 SNAPSHOT_COLD_RESTORE=1 ./scripts/integration-env.sh verify-snapshot
+SNAPSHOT_NATIVE_MEMORY_DIFF=0 SNAPSHOT_COLD_RESTORE=1 ./scripts/integration-env.sh verify-snapshot
+```
+
+Keep the evidence directory from each run. For the enabled run, confirm that `vm_snapshot_type` is `Diff` and check `vm_pause_window_ms` and the cold-restore digest check. For the disabled run, confirm that `vm_snapshot_type` is `Full` and that the cold-restore digest check passes. The pause-window counter covers Pause → Dump → Resume. Merge, publication, and cold restore have separate timings.
+
 ## Prerequisites
 
 - The target Sandbox is `Ready` on a Firecracker pool.

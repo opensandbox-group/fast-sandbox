@@ -1196,3 +1196,35 @@ touch "$TEST_PACK_STAGING/cleaned"
 		}
 	}
 }
+
+func TestNativeMemoryDiffFallsBackToFullAfterMergeFailure(t *testing.T) {
+	fixture, agent := newSnapshotFixture(t)
+	spill := withSnapshotSpill(t)
+	if !artifacts.SupportsMemoryDiffExtents(spill) {
+		t.Skip("spill filesystem cannot represent Firecracker diff extents")
+	}
+	sandboxID := seedRunningSandbox(t, fixture, PhaseRunning)
+	dir := filepath.Join(fixture.stateRoot, sandboxStateDir, sandboxID)
+	state, err := loadState(dir)
+	require.NoError(t, err)
+	state.TrackDirtyPages = true
+	require.NoError(t, saveState(dir, state))
+	// The fake writes a longer diff. Merge must fail without publishing,
+	// and the next snapshot must re-establish the baseline with a Full.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, memoryDiffBaseName), []byte("short"), 0600))
+	snapshot := func(id string) error {
+		_, err := fixture.driver.CreateSnapshot(t.Context(), &runtimecontract.SnapshotInput{
+			SandboxID: sandboxID, SnapshotID: id, TemplateName: id,
+		})
+		return err
+	}
+	require.ErrorContains(t, snapshot("snap-1"), "equal size")
+	require.True(t, fixture.server.running)
+	require.Empty(t, agent.fakeAgentClient.publishes)
+	require.NoError(t, snapshot("snap-2"))
+	require.NoError(t, snapshot("snap-3"))
+	require.Len(t, fixture.server.snapshotDumps, 3)
+	require.Equal(t, "Diff", fixture.server.snapshotDumps[0].SnapshotType)
+	require.Equal(t, "Full", fixture.server.snapshotDumps[1].SnapshotType)
+	require.Equal(t, "Diff", fixture.server.snapshotDumps[2].SnapshotType)
+}
