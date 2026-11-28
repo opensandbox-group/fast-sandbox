@@ -3,7 +3,7 @@ title: "Chunked Snapshot Transfer"
 authors:
   - "@kaustubh-765"
 creation-date: 2026-11-17
-last-updated: 2026-11-18
+last-updated: 2026-11-24
 status: draft
 ---
 
@@ -48,21 +48,24 @@ Goals:
 - No new store requirements beyond today's path-style SigV4 `GET`, `PUT` and
   `HEAD`.
 - The OverlayBD/OCI path (FSEP-0001) is unchanged; only native Firecracker
-  sets are chunked.
+  sets are chunked. That includes native RootfsOnly sets (#181), whose chunk
+  index holds only `rootfs.ext4`.
 - The template builder keeps publishing whole-file sets (possible
   follow-up).
-- Local optimizations that change no protocol go in separate small PRs and
-  are not part of this proposal:
-  - the verified-cache marker, with fsynced cache writes and single-flighted
-    cache ensures;
-  - template snapshots kept in the node cache (#57);
-  - parallel and overlapped hashing (#61).
+- Local optimizations that change no protocol are not part of this
+  proposal:
+  - template snapshots kept in the node cache (#57) and a verified-digest
+    memo keyed by file identity: done in #244, which also removed the
+    post-pull re-hash;
+  - fsynced cache writes and single-flighted cache ensures: a separate
+    small PR before PR 1;
+  - parallel and overlapped hashing (#61): a separate PR.
 
-  In #213 the marker and the fsynced cache writes are still switched on by
-  `transfer.format: chunked`. The split removes that coupling: these PRs land
-  before PR 1, independent of `transfer.format`, and #213 is rebased onto
-  them. After that, `transfer.format` selects only the store format. Sparse
-  cache files stay a property of the chunked pull, which skips zero chunks.
+  #213's xattr verified-cache marker is dropped in favor of #244's memo:
+  the chunked pull records each file it committed and verified into that
+  memo, as a whole-file pull does. Nothing local depends on
+  `transfer.format`, which selects only the store format. Sparse cache
+  files stay a property of the chunked pull, which skips zero chunks.
 
   The standalone fixes from #213 are already merged in #214.
 
@@ -134,6 +137,31 @@ today.
 ### Data path
 
 **Publish (runtime-agent):**
+- A staged entry and a published entry are checked separately:
+  - **Acceptance, before any upload:** the staged manifest parses; every
+    native file the set needs exists, and its `sizeBytes` equals the file
+    size; a digest that is present (`sha256`, `chunkList`) is well-formed. A
+    native entry with only `sizeBytes` is accepted in every mode, since the
+    Fastlet stages that way when it skips whole-file hashes. An inherited
+    `chunks` binding is dropped, not rejected (see Compatibility).
+  - **Completion:** in `chunked`, the agent derives each native file's
+    `chunkList` from the chunks it wrote. Unless `format: chunked` and
+    `chunkListOnly: true` are both set, it computes the whole-file `sha256`
+    of every entry staged without one and rewrites `SHA256SUMS` from the
+    final manifest.
+  - **Pre-manifest check, right before `manifest.json` is written:** every
+    native entry has `sizeBytes` > 0 and the digests its mode requires
+    (`legacy`: `sha256`; `chunked`: `chunkList` bound to the uploaded
+    `chunks.json`, plus `sha256` unless `chunkListOnly: true`). State files
+    (vault, policy) always carry `sha256`, and `SHA256SUMS` is never empty,
+    which readers reject. A failed check fails the publish before any
+    manifest or index object exists; its chunks stay unreferenced.
+  - A Fastlet acting on a stale capability, or an agent restarted into
+    another mode between staging and publish, therefore costs a hash, not
+    a rejected or unrestorable set.
+- Chunk the native files the staged manifest lists (rootfs, memory and VM
+  state for a full set; only the rootfs for a RootfsOnly set), not a fixed
+  list.
 - Split files into chunks, skipping holes (`SEEK_DATA`/`SEEK_HOLE`) and
   all-zero chunks.
 - Skip chunks the store already has, using an in-memory set of known keys
@@ -150,6 +178,9 @@ today.
 - Verify `chunks.json` against the manifest.
 - Fetch chunks in parallel (`transfer.concurrency`), verify each chunk's
   SHA-256 before writing it, and leave zero ranges as holes.
+- Commit a file only after every one of its chunks was fetched and
+  verified; a cancelled or failed pull commits nothing. Each committed file
+  is recorded in #244's verified-digest memo.
 - Chunk requests use a 10 s per-attempt timeout with retries.
 - In chunked mode, store traffic uses a pooled transport: 64 idle
   connections per host, 30 s idle timeout.
@@ -157,7 +188,16 @@ today.
 **Fastlet:**
 - Learns the agent's mode from optional `transferFormat` and
   `chunkListDigest` fields in `HealthResponse` and `PublishImageResponse`.
+  The agent reports `chunkListDigest` only when `format: chunked` and
+  `chunkListOnly: true`.
 - Older agents omit the fields, which means legacy with whole-file hashes.
+- Stages native files with `sizeBytes` only when the agent reported
+  `chunkListDigest`; otherwise it hashes them as today.
+- Calls `Health` right before it decides whether to skip whole-file hashes.
+  A `Health` error clears the cached capability, so the Fastlet falls back
+  to hashing.
+- Drops an inherited `chunks` binding in both manifest assemblers: the full
+  snapshot manifest and the RootfsOnly manifest (#181).
 
 ### Shared-chunk retention and garbage collection
 
@@ -174,56 +214,173 @@ today.
    enabling `chunked` has a rollout gate: no store expiration rule
    (including bucket-wide rules) and no external cleanup job may delete
    objects under `chunks/` (see "Rollout and rollback").
-2. **Then a separate, explicit mark-and-sweep tool** (`fsb-store gc`, run as
-   a CronJob, with its own credentials that can list and delete; the agent's
-   credentials stay as they are). It ships **dry-run only**. Destructive mode
-   stays off until both gates below hold:
-   - every live root can be enumerated (open question 1);
-   - a stale sweep decision provably cannot delete a newly reused chunk
-     (see "Remaining window"), with that interleaving in the GC acceptance
-     tests.
-   - **Roots:** every live reference (SandboxTemplate image index keys,
-     snapshot index keys, checkpoint references of existing Sandboxes).
-   - **Mark:** read `manifest.json` → `chunks.json` of every root and
-     collect the chunk keys.
-   - **Sweep:** delete a chunk only when it was unmarked in **two** marks
-     and its `LastModified` was already older than the grace period `G` when
-     mark 1 started. Right before each `DELETE`, the sweep `HEAD`s the chunk
-     again and skips it if `LastModified` has changed.
-3. **Publisher refresh (part of PR 4, before any deletion is enabled):** a
-   publisher reuses an existing chunk only if it is younger than a refresh
-   age `R` (`R` < `G`). A `HEAD` that finds an older chunk is followed by a
-   re-`PUT`, which refreshes its `LastModified`. The in-memory known-key set
-   follows the same rule: an entry older than `R` is checked again.
+2. **Then a separate, explicit mark-and-sweep tool,** `fsb-store gc`. It
+   runs as a CronJob with its own store credentials (list, get, delete
+   object versions) and read-only Kubernetes RBAC; the agent's credentials
+   stay as they are. It ships **dry-run only** and reports what it would
+   delete.
+   - **Roots,** read from the Kubernetes API, plus the store's own recent
+     writes:
+     - `SandboxTemplate` `status.manifestRef` and `spec.indexKey`;
+     - each Sandbox's `status.runtime.checkpoint.manifestRef` and
+       `spec.image`. A paused Sandbox's checkpoint is private: no index
+       entry names it, so this field is its only root;
+     - `SandboxSnapshot` `status.manifestRef` and `spec.templateName`;
+     - `SandboxPool` `spec.warmImages`;
+     - every `index/*.json` entry (see "Index report");
+     - every set namespace younger than `G`, which covers a set published
+       before its owner's status records it (for example a pause whose
+       checkpoint is not persisted yet, or a retried pause).
+   - **Fail closed:** any list, read or parse error, or an unreadable root
+     manifest or `chunks.json`, aborts the run without deleting anything.
+   - **Mark:** root → `manifest.json` → `chunks.json` → chunk keys. A root
+     whose chunk has no current version is reported.
+   - **Repair (optional, `--repair`):** for such a chunk, if a noncurrent
+     version still exists (removed by a plain `DELETE` or a lifecycle rule,
+     not yet expired), the run restores it: it removes the delete marker, or
+     copies the latest noncurrent version back as current. A repaired chunk
+     is verified against its digest from `chunks.json`. Without a surviving
+     version the root stays reported, and the set can only be re-created
+     from a node cache that still holds it.
+   - **Sweep (chunks):** a chunk is a candidate only when it was unmarked in
+     **two** marks and its `LastModified` was already older than `G` when
+     mark 1 started. Right before deleting, the sweep re-reads each
+     candidate's versions and deletes exactly the versions it judged, by
+     version ID.
+   - **Sets phase:** a set namespace (whole-file or chunked) that no root
+     references and that is older than `G` is deleted the same way, version
+     by version. This replaces today's out-of-band namespace cleanup for
+     both formats; its chunks then become unmarked for a later sweep.
+   - **Index report (`--report-index`):** lists index entries older than
+     `G` that no object references (a `SandboxTemplate` `spec.image` or
+     `spec.indexKey`, a `SandboxSnapshot` `spec.templateName`, a Sandbox
+     `spec.image`, a `SandboxPool` `warmImages` entry). GC never deletes an
+     index entry. An entry is found by name only
+     (`index/<sha256(image)>.json`), and creating a Sandbox that names image
+     K writes nothing to the store, so a reference created between the
+     root scan and a delete would be invisible to GC, even when every
+     client goes through Kubernetes. Retiring an image is a coordinated
+     action by the operator or an API layer in front of the cluster:
+     1. mark the image retired and refuse new creates that name it;
+     2. confirm that no Kubernetes object references it;
+     3. delete the index entry.
 
-**Why the refresh is needed** (review on this PR): marks alone do not
-protect a publish that starts after mark 1 and reuses an old, unmarked
-chunk C by `HEAD`. Its manifest can land after the sweep, and C, unmarked
-twice and old, would be deleted. The grace period does not help either,
-since reuse does not change C's `LastModified`.
+     The set then stops being a root, and the sets phase collects it once
+     it is older than `G`.
+3. **Publisher refresh (part of PR 4, released before any deletion is
+   enabled):**
+   - A publisher reuses an existing chunk only if it is younger than a
+     refresh age `R`, measured in server time: `Date` minus `Last-Modified`
+     from the same `HEAD` response, so client clock skew does not matter.
+   - An older chunk is refreshed by a server-side copy onto itself
+     (`x-amz-copy-source` = its own key, `MetadataDirective: REPLACE`). The
+     bytes, and so every existing set's `storedSize`, stay identical; a
+     re-`PUT` of re-encoded zstd data could change the length. Where the
+     copy is refused, a raw chunk is re-`PUT` with the same bytes, and a
+     zstd chunk whose re-encoding has a different length is published under
+     its raw key instead of overwriting.
+   - The in-memory known-key set follows the same rule: an entry is trusted
+     only until `R` has passed since the chunk's server-side write.
+   - A publish must write `chunks.json` within `P_max` of its first reuse
+     decision, or fail.
+   - The refresh is agent-only: no Fastlet, controller or API change. It
+     applies in either `transfer.format`: a `legacy` agent reuses no
+     chunks, and an agent switched back to `chunked` refreshes from its
+     first publish. The agent logs `R` and `P_max` at startup and
+     `refreshedChunks` in its publish stats.
+   - Defaults: `R` = 1 day, `P_max` = 24 h, `G` = 7 days.
 
-**Invariant with the refresh:** every chunk a publish binds was uploaded or
-refreshed by a publish within the last `R`. So its `LastModified` stays
-younger than `G` for at least `G` − `R` after the publish uses it. A mark
-that starts after that has to find the publish's manifest, as long as the
-manifest lands and becomes a root within `G` − `R`. Marks that start earlier
-cannot make the chunk a sweep candidate, because the chunk is still younger
-than `G`. Typical values: `R` = 1 day, `G` = 7 days. Re-`PUT`s fall only on
-chunks that no publish has used for `R`, which are rare.
+**Why the refresh is needed** (review on #216): marks alone do not protect
+a publish that starts after mark 1 and reuses an old, unmarked chunk C by
+`HEAD` or from its known-key set. Its manifest can land after the sweep, and
+C, unmarked twice and old, would be deleted. The grace period does not help
+either, since reuse does not change C's `LastModified`.
 
-**Remaining window (not closed by this design):** the sweep decides from a
-`HEAD`, then issues an unconditional `DELETE`. A publisher can act in
-between. For example: GC does its final `HEAD`; the publisher refreshes the
-chunk, publishes its manifest and completes a post-publish `HEAD`; only then
-does GC issue the `DELETE`. Both checks succeeded, but the published set has
-lost a chunk. Checks on either side only shrink this window. Closing it
-needs a delete that fails when the chunk has been refreshed since the
-sweep's decision, or another protocol with the same guarantee. Which
-mechanism, and which stores support it, is open question 1. Until it is
-answered, destructive GC stays off.
+**Invariant:** every chunk a publish binds was written or refreshed within
+`R` (server time) before the publish used it, and the publish writes
+`chunks.json` within `P_max`. So the chunk is younger than `R` + `P_max` < `G`
+when its set becomes a root (a young set is a root by itself). No mark that
+could make the chunk a sweep candidate can start before that set is
+visible.
 
-**Namespace cleanup** stays where it is today. The chunk GC only assumes
-that a deleted namespace is no longer a root.
+**Stale sweep decisions (closed by versioning):** the sweep decides from a
+`HEAD`, then deletes. A publisher can refresh the chunk in between: GC does
+its final `HEAD` (version v1); the publisher refreshes the chunk (v2),
+publishes its manifest and completes a post-publish `HEAD`; then GC
+deletes. With an unconditional `DELETE` the set would lose the chunk. With
+bucket versioning, the GC deletes v1 by its version ID, and the refreshed
+v2 stays current. An `ETag` condition cannot do this: a refresh by copy, or
+a re-`PUT` of identical bytes, keeps the same `ETag`. Older versions are
+removed by a `NoncurrentVersionExpiration` lifecycle rule, which never
+touches a current version and so is compatible with rollout gate 0.
+
+**Deletion mode (operator-enabled):** the Fastlet and the controller take
+no part in GC. Deletion is an explicit operator setting, like the
+`chunkListOnly` finalize step, kept in GC's own ConfigMap `fsb-store-gc`:
+- `mode: dry-run` (default): report only;
+- `mode: sets`: the sets phase may delete; chunks are only reported. Safe
+  with any agent release, since it deletes only unrooted namespaces older
+  than `G`;
+- `mode: all`: chunks may be deleted too. The operator sets it only after
+  every runtime-agent has run a release with the publisher refresh (PR 4
+  step 1) for longer than `R` + `P_max` (see "Rollout and rollback").
+
+A run reads `mode` at the start and again before every delete batch (at
+most 1,000 objects or 1 minute), so lowering it stops deletion within one
+batch. Whatever the mode, the run stays in dry-run unless all of these
+hold, each checked by `fsb-store gc` itself:
+- bucket versioning is `Enabled`;
+- the store prefix is owned by this cluster (see "Store prefix
+  ownership");
+- the store passes a conformance test: responses carry `Date`, a version-ID
+  delete removes only that version (including the `null` version of
+  objects written before versioning), a self-copy with `REPLACE` creates a
+  new current version with the same bytes and `ETag`,
+  `ListObjectVersions` pages and reports each version's ID and
+  `LastModified`, and whether a `PUT` with `If-None-Match: *` refuses to
+  overwrite (used by `claim`).
+
+**Writer downgrades and running sweeps:** a destructive run holds the
+Kubernetes Lease `fsb-store-gc` and renews it while it runs, so runs never
+overlap. Before an agent is rolled back to a release without the publisher
+refresh (below PR 4 step 1), the operator sets `mode` to `sets` or
+`dry-run` (or suspends the CronJob) and waits until the Lease is released
+or has expired; only then are agents rolled back. `mode: all` may be set
+again only after the refreshing release has run on every agent for
+`R` + `P_max` once more. Nothing detects a rollback that skips this step,
+so it is a downgrade limit (see "Rollout and rollback"). The same applies
+to a node group pinned to an older agent image. A snapshot admitted before
+the rollback ends within the Fastlet's 30-minute snapshot timeout, well
+inside `P_max`.
+
+**Store prefix ownership:** GC sees only its own cluster's roots, so a
+destructive run needs one cluster that owns the store prefix and is its
+only publisher. `fsb-store gc claim` writes `gc/owner.json` with the
+cluster ID (the UID of the `kube-system` namespace), only if the object is
+absent: a create-only `PUT` (`If-None-Match: *`) where the store supports
+it, which the conformance test checks, otherwise a write followed by a
+read-back and compare. A missing marker, or one that names another
+cluster, keeps the run in dry-run. Clusters that share a bucket use
+separate prefixes; roots from several clusters on one prefix are not
+supported.
+
+**Store notes** (checked on Ceph RGW 20.2.4 with a throwaway bucket: the
+race above survives a version-ID delete, and the unversioned negative
+control loses the chunk):
+- `HEAD` omits `x-amz-version-id` for an object written before versioning
+  was enabled, and the copy response omits the new version ID. The sweep
+  therefore takes version IDs from `ListObjectVersions`, where such an
+  object is listed as `null`.
+- A self-copy shares an object's data beyond the first 4 MiB but copies the
+  head, so a refreshed chunk (at most 4 MiB) is stored twice until its
+  noncurrent version expires. Bucket usage counts every version at full
+  size, which matters for bucket quotas.
+- Lifecycle rules run once a day in RGW's configured window, so a
+  noncurrent version is removed one to two days after it stops being
+  current.
+
+A store without versioning keeps working for publish and restore; only
+destructive GC is unavailable there.
 
 ### Alternatives considered
 
@@ -233,6 +390,7 @@ that a deleted namespace is no longer a root.
 | Content-defined chunking (rolling hash) | Better dedup for shifted data, but guest memory and block images change in place at fixed offsets. Fixed 4 MiB alignment matches holes and the store's stripe size, and keeps the index simple to validate. |
 | Store-side multipart copy of unchanged ranges | Depends on store features (`UploadPartCopy`) not available everywhere, and cannot drop zeros. |
 | OverlayBD layers for memory | OverlayBD covers block devices (rootfs). Guest memory and VM state stay native files. |
+| Automatic GC gate: Fastlets report a `chunkRefresh` capability in heartbeats, the controller keeps a cluster ConfigMap, GC reads it (earlier draft of this amendment) | Puts store knowledge into the control plane, which owns scheduling and lifecycle only. One node's agent restart or failed `Health` resets the clock for the whole cluster, so GC may never leave dry-run under normal churn. Non-Firecracker pools never report the capability, and after a controller restart the registry briefly holds Fastlets with empty capabilities. Debugging spans five components. An operator-enabled mode plus the Lease covers the same downgrade case (review on #256). |
 
 ### Configuration
 
@@ -244,10 +402,15 @@ transfer:
   compression: none       # none | zstd (chunked only)
   concurrency: 8
   chunkSizeMiB: 4
-  chunkListOnly: false    # see "Rollout and rollback"
+  chunkListOnly: false    # chunked only; gates the chunkListDigest capability
 ```
 
-- An unknown value, or `zstd` together with `legacy`, fails agent startup.
+- An unknown value, or `zstd` or `chunkListOnly: true` together with
+  `legacy`, fails agent startup.
+- `chunkListOnly: true` lets manifests omit the whole-file `sha256` of
+  native files (see "Rollout and rollback", step 4). With the default
+  `false`, chunked sets keep `sha256` next to `chunkList`, and older chunk
+  readers can still restore them.
 - In the OpenSandbox chart (OpenSandbox#2422) this is
   `runtime.transfer.*`. The default renders exactly as today, and a hash of
   the effective settings is a pod annotation, so any change rolls the
@@ -260,40 +423,49 @@ transfer:
 - The index ref is restricted to the set's own namespace and fully
   validated before use.
 - Chunk `PUT`s are payload-signed.
-- The agent gets no new credentials, endpoints or permissions. GC uses
-  separate credentials.
+- The agent gets no new credentials, endpoints or permissions; the
+  publisher refresh is a copy within the bucket it already writes to.
+- `fsb-store gc` uses separate store credentials (list, get, delete object
+  versions, and put on `gc/owner.json` only) and a read-only ClusterRole on
+  the four CRDs, plus get on its own ConfigMap (`mode`) and the
+  `kube-system` namespace (cluster ID) and get, create and update on its
+  own Lease. The controller and the Fastlet get no new permissions. A missing permission aborts the run, which then deletes
+  nothing.
 
 ### Implementation plan
 
 | PR | Content | Depends on |
 |---|---|---|
-| 1 | Chunk format, `chunks.json`, chunked publish and pull, always-on chunk reader, `transfer.format` config, docs | this FSEP accepted |
-| 2 | `chunkList` digest, digest-signed `PUT`s, `chunkListOnly` | 1 |
+| #214 | Standalone snapshot fixes split out of #213 | merged |
+| #244 | Verified-digest memo, same-node cache commit (#57) | merged |
+| cache | Fsynced cache writes, single-flighted cache ensures, independent of `transfer.format` | – |
+| #61 | Parallel and overlapped snapshot hashing, independent of `transfer.format` | – |
+| 1 | Chunk format, `chunks.json`, chunked publish and pull (recording into the #244 memo), always-on chunk reader, `transfer.format` and `transfer.compression`, staged-manifest acceptance and the pre-manifest digest check, inherited `chunks` dropped by the publisher and both Fastlet assemblers, a chunk transfer cancelled between jobs fails instead of committing, a coalesced chunk upload counted once, docs | this FSEP accepted, cache |
+| 2 | `chunkList` digest, digest-signed `PUT`s, `chunkListOnly` and the capability rule, completion of size-only entries (agent `sha256` fill-in and `SHA256SUMS` rewrite), Fastlet `Health` refresh | 1, same release |
 | 3 | Pooled store transport; P2P gateway pooling per open question 3 | 1 |
-| 4 | `fsb-store gc` | 1 |
+| 4 | Step 1: publisher refresh in the agent only (server-time `R`, self-copy, known-key expiry, `P_max`, `refreshedChunks` in the publish stats). Step 2: `fsb-store gc` as a CronJob (`mode` `dry-run` by default, then `sets` or `all`, re-read before every batch; Kubernetes roots, two marks, version-ID sweep, Lease, sets phase, index report, opt-in repair, `claim` and the owner marker, store conformance test). No Fastlet or controller change | 1; the operator sets `mode: all` only after step 1 has run on every agent for longer than `R` + `P_max` |
 | – | OpenSandbox chart value and pin bump (OpenSandbox#2422) | 1 merged |
 
-[#213](https://github.com/opensandbox-group/fast-sandbox/pull/213) is the complete reference implementation and already spans PRs 1–3
-(the `chunkList` digest, digest-signed `PUT`s, the pooled transport, the 10 s
-attempt timeout and the `HEAD` 403 fallback are all in it). Landing the split
-means carving up that branch. PR 1 is not an existing subset of it. #213 stays
-a draft until this proposal is decided.
-
-PR 1 also covers the inherited `chunks` binding (see Compatibility): the
-publisher drops it in `legacy`, and the Fastlet drops it when it assembles a
-snapshot manifest.
+[#213](https://github.com/opensandbox-group/fast-sandbox/pull/213) is the complete reference implementation and spans PRs 1–3,
+including the fixes from its review. Each PR is built fresh on `main`
+(after #181 and #244), so PR 1 is not an existing subset of #213. #213 stays
+a draft and is closed once PR 1 is open.
 
 ### Open questions
 
-1. **GC roots and safety (gate for destructive GC):** which component can
-   list every live reference (templates, snapshots, Sandbox checkpoints)?
-   Should the controller own `fsb-store gc`? And which delete mechanism
-   closes the sweep window ("Remaining window"): a delete conditioned on
-   the chunk not having been refreshed, where the store supports it, or a
-   different protocol?
-2. **Rollback:** is the `chunkListOnly` finalize step acceptable (see
-   "Rollout and rollback"), or should manifests always keep the whole-file
-   `sha256` and accept the hash cost?
+1. **GC roots and safety (resolved):** `fsb-store gc` reads the roots from
+   the Kubernetes API and treats young sets and every index entry as roots;
+   a version-ID delete on a versioned bucket closes the sweep window;
+   deletion is an operator-set `mode`, re-read before every batch; the
+   Lease orders writer downgrades after running sweeps; a claimed prefix
+   keeps other clusters' roots out of scope (see "Shared-chunk retention
+   and garbage collection"). `fsb-store gc` runs as its own CronJob; the
+   controller takes no part in GC.
+2. **Rollback (resolved):** the `chunkListOnly` finalize step is kept. It
+   is safe to defer because `chunkListDigest` is reported only with
+   `chunkListOnly: true`, the agent fills a missing `sha256` otherwise, and
+   the Fastlet refreshes the capability before it skips hashes (see "Data
+   path").
 3. **P2P peer gateway:** chunk `GET`s go through the gateway when it is
    configured. Its client uses the default HTTP transport (2 idle
    connections per host), so parallel pulls churn connections. Should it
@@ -310,11 +482,13 @@ snapshot manifest.
     published manifest is byte-identical to today's.
   - New readers read both layouts in both modes.
   - **Inherited `chunks` binding:** the Fastlet builds a snapshot manifest
-    from the manifest the Sandbox booted from and keeps its other fields. A
-    Sandbox restored from a chunked set and paused again with the agent in
-    `legacy` would publish a `chunks` ref to a `chunks.json` that was never
-    uploaded. The `legacy` publisher drops the binding (#213 does this:
-    `bindChunkIndex` with a nil ref), and from PR 1 the Fastlet drops it too.
+    from the manifest the Sandbox booted from and keeps its other fields;
+    both the full and the RootfsOnly (#181) assembler do this. A Sandbox
+    restored from a chunked set and paused again with the agent in `legacy`
+    would publish a `chunks` ref to a `chunks.json` that was never uploaded.
+    The `legacy` publisher drops the binding (#213 does this:
+    `bindChunkIndex` with a nil ref), and from PR 1 both Fastlet assemblers
+    drop it too.
     An agent older than PR 1 can still restore a chunked set from its
     node cache and republish such a manifest with an old Fastlet. This is one
     more reason not to downgrade below PR 1 (see "Downgrade limits").
@@ -328,7 +502,14 @@ snapshot manifest.
 | new, `legacy` | old | Same as today. The old Fastlet ignores the new response fields. |
 | new, `chunked` | old | Chunked sets are published. The old Fastlet still writes whole-file `sha256`, which is allowed. |
 | old | new | The Fastlet sees no capability and behaves as today. |
-| new, `chunked` | new | Chunked sets; whole-file `sha256` is omitted only with `chunkListOnly: true`. |
+| new, `chunked` | new | Chunked sets. With the default `chunkListOnly: false`, whole-file `sha256` is kept, and the agent fills it in if a stale Fastlet staged without it. |
+| new, `chunked`, `chunkListOnly: true` | new | Whole-file `sha256` of native files is omitted. Only agents and Fastlets with PR 2 can read these manifests. |
+| new, `chunked`, `chunkListOnly: true` | old | **Not allowed.** The old Fastlet's readiness check (`ImageReady`) requires a whole-file `sha256` and reports such a set, including a RootfsOnly set, as `ErrImageNotReady`. |
+
+Once every agent and Fastlet runs PR 2 or later, configuration switches
+(`legacy` ↔ `chunked` ↔ `chunkListOnly`) are safe in any direction: the
+reader is chosen by each set's manifest, not by the agent's settings, so
+every set published earlier stays restorable.
 
 **Restore by an old agent:**
 - An agent older than PR 1 cannot read a chunked set: it looks for
@@ -352,7 +533,19 @@ snapshot manifest.
 - config validation;
 - chunk-list digest from an index equals the digest from a file, and a
   mismatch is rejected;
-- `chunkListOnly` off keeps `sha256`.
+- `chunkListOnly` off keeps `sha256`;
+- `chunkListDigest` is reported only for `chunked` with `chunkListOnly`;
+- the agent fills a missing `sha256` and rewrites `SHA256SUMS`, and never
+  writes an empty `SHA256SUMS`;
+- a malformed digest or a size mismatch fails acceptance before any object
+  is uploaded;
+- a size-only staged entry is completed in `legacy`, `chunked` and
+  `chunkListOnly`;
+- a missing required digest fails the pre-manifest check, and no
+  `manifest.json` or index object is written;
+- a `Health` error clears the Fastlet's cached capability;
+- a chunk transfer cancelled between jobs fails and commits nothing;
+- a coalesced chunk upload is counted once in the publish stats.
 
 **Integration:**
 - Publish and pull a 1.5 GiB set in both modes against a second S3
@@ -370,17 +563,51 @@ snapshot manifest.
   - store unavailable during a pull, then a retry.
 - **Compatibility:**
   - every row of the version table above;
-  - switch `chunked` → `legacy` and restore the earlier chunked checkpoints
-    and snapshots;
+  - switch `chunked`+`zstd` → `legacy`+`none` in one change, confirm the
+    agent starts, and restore the earlier chunked checkpoints and
+    snapshots;
   - restore a chunked snapshot, switch to `legacy`, pause again, and verify
     that the new manifest has no `chunks` ref and restores on an agent from
-    before PR 1.
+    before PR 1;
+  - switch the agent's mode between staging and publish (Fastlet not
+    restarted), and verify the published set restores cold on another
+    node;
+  - publish and restore a native RootfsOnly set in `chunked`;
+  - stage size-only with `chunkListOnly: true`, switch the agent to
+    `legacy` before publish, and verify the set restores cold on another
+    node;
+  - a `chunkListOnly` RootfsOnly set fails readiness on a Fastlet from
+    before PR 2 (the downgrade limit); after `chunkListOnly: false` and a
+    new snapshot, it boots there.
 - **GC acceptance (PR 4, before destructive mode is enabled):**
   - dry-run lists candidates and deletes nothing;
-  - a publish that reuses an old chunk after mark 1 keeps it;
-  - the interleaving from "Remaining window": final `HEAD`, then the
-    publisher's refresh, manifest and post-publish `HEAD`, then the GC
-    `DELETE`. The published set must stay restorable.
+  - a publish that reuses an old chunk after mark 1 refreshes and keeps it;
+  - the interleaving from "Stale sweep decisions": final `HEAD` (v1), the
+    publisher's refresh (v2), manifest and post-publish `HEAD`, then the GC
+    deletes v1. The published set must stay restorable;
+  - negative control: the same sequence with an unversioned `DELETE` loses
+    the chunk, which shows the test can detect the race;
+  - known-key expiry: with a fake server clock past `R`, a remembered chunk
+    is checked again and refreshed;
+  - fail closed: one unreadable root means no deletes;
+  - paused checkpoint: a Sandbox paused for longer than `G` (shortened for
+    the test), with destructive runs in between, resumes cold on another
+    node;
+  - index report: an unreferenced index entry older than `G` is reported
+    and never deleted, and its set stays; after a coordinated retirement
+    deletes the entry, the set is collected once older than `G`;
+  - sets phase: unrooted namespaces older than `G` are deleted, young or
+    rooted ones are kept, for whole-file and chunked sets;
+  - modes: `dry-run` deletes nothing, `sets` deletes no chunk, and any
+    mode stays in dry-run without versioning, an owned prefix or a passed
+    conformance test;
+  - lowering `mode` during a run stops deletion before the next batch;
+  - writer downgrade: after `mode` is lowered, the downgrade waits for the
+    Lease, and the following runs delete no chunk;
+  - prefix ownership: a missing or foreign `gc/owner.json` means dry-run,
+    and `claim` never overwrites an existing marker;
+  - repair: a rooted chunk removed by a plain `DELETE` is restored from its
+    noncurrent version and verified by digest.
 
 **Performance:**
 - **Boundary:** the client-observed duration of the pause, snapshot and
@@ -411,9 +638,19 @@ snapshot manifest.
 2. Upgrade the Fastlets.
 3. Switch `transfer.format: chunked`, one pool or node group at a time. The
    OpenSandbox chart rolls the DaemonSet on any transfer setting change.
-4. Optionally, once no agent downgrade is planned, set `chunkListOnly: true`
-   to remove the whole-file hash from the pause path. This is the
+4. Optionally, once every agent and Fastlet runs PR 2 or later and no
+   downgrade of either below PR 2 is planned, set `chunkListOnly: true` to
+   remove the whole-file hash from the pause path. This is the
    "finalize" step, similar to Ceph's `require-osd-release`.
+5. **GC (after PR 4):**
+   1. enable bucket versioning and a `NoncurrentVersionExpiration` rule;
+   2. run `fsb-store gc claim` for the cluster's prefix;
+   3. run `fsb-store gc` in `mode: dry-run` and review its reports;
+   4. set `mode: sets`;
+   5. once every runtime-agent has run the release with the publisher
+      refresh for longer than `R` + `P_max` (every DaemonSet Pod on that
+      image, none restarted onto an older one), set `mode: all`. Like
+      `chunkListOnly`, this is an explicit last step.
 
 **Signals:**
 - `runtime-agent chunked publish stats`: `uploadedBytes` vs `logicalBytes`,
@@ -429,11 +666,19 @@ snapshot manifest.
 - a sustained increase in pause or restore failures;
 - a retry rate that does not settle.
 
-**Disable:** set `transfer.format: legacy`.
+**Disable:** set `transfer.format: legacy`. If `transfer.compression` is
+`zstd`, set it to `none` in the same configuration change. `legacy` with
+`zstd` fails validation, so an agent given only the format change does not
+start.
 - New publishes return to whole-file sets.
-- Only the store format changes: the local cache optimizations no longer
-  depend on `transfer.format` (see Non-goals). In #213 as it stands today,
-  this switch also turns off the verified-cache marker.
+- Chunks already stored as `zstd` stay readable: the reader decodes each
+  chunk by the encoding recorded in `chunks.json`, not by the agent's
+  `transfer.compression` setting.
+- Only the store format changes: the local cache optimizations do not
+  depend on `transfer.format` (see Non-goals).
+- With `chunkListOnly: true`, set it to `false` in the same change. Sets
+  already published without `sha256` stay restorable on PR 2+ agents and
+  Fastlets.
 - The chunk reader stays on, so every chunked set already published remains
   restorable. This is the supported rollback.
 
@@ -444,17 +689,28 @@ snapshot manifest.
   once `chunked` has been enabled anywhere, or recover by rolling forward.
 - **Agent below PR 2 after `chunkListOnly: true`:** cannot read those
   manifests. That is why the setting is a separate, explicit last step.
-- **Recovery plan for a forced downgrade:** keep one pool on the new agent,
-  restore the affected Sandboxes there, and snapshot them again with
-  `legacy`.
-- **Fastlet downgrade:** always safe. Older Fastlets ignore the new fields
-  and write whole-file hashes.
+- **Agent below PR 4 step 1 while `mode: all`:** set `mode` to `sets` or
+  `dry-run` and wait until the Lease is released first, and set `all`
+  again only `R` + `P_max` after the roll forward (see "Writer downgrades
+  and running sweeps"). GC does not detect a rollback that skips this.
+- **Fastlet below PR 2 after `chunkListOnly: true`:** its readiness check
+  requires the whole-file `sha256`, so it cannot boot sets published
+  without one, RootfsOnly sets included. Same rule as for the agent.
+- **Fastlet below PR 2 otherwise:** safe. Older Fastlets ignore the new
+  fields and write whole-file hashes.
+- **Recovery plan for a forced downgrade:** keep one pool on the new
+  release and restore the affected Sandboxes there. To go below PR 2 after
+  `chunkListOnly: true`: set `chunkListOnly: false`, snapshot again on a
+  PR 2+ node, or delete, every set published without `sha256`, then
+  downgrade. To go below PR 1: snapshot them again with `legacy`.
 
 ## Related links (optional)
 
 - [#146: Snapshot transfer spends most of its time moving and re-hashing zeros](https://github.com/opensandbox-group/fast-sandbox/issues/146) (problem and measurements).
 - [#213: chunked, zero-elided snapshot transfer](https://github.com/opensandbox-group/fast-sandbox/pull/213) (reference implementation, draft; supersedes [#147](https://github.com/opensandbox-group/fast-sandbox/pull/147)).
 - [#214: standalone snapshot fixes](https://github.com/opensandbox-group/fast-sandbox/pull/214) (merged, split out of #213).
-- [#57](https://github.com/opensandbox-group/fast-sandbox/issues/57) and [#61](https://github.com/opensandbox-group/fast-sandbox/issues/61): local optimizations, handled in separate PRs.
+- [#244](https://github.com/opensandbox-group/fast-sandbox/pull/244): verified-digest memo and same-node cache commit (merged; closes [#57](https://github.com/opensandbox-group/fast-sandbox/issues/57)).
+- [#61](https://github.com/opensandbox-group/fast-sandbox/issues/61): parallel and overlapped snapshot hashing, a separate PR.
+- [#181](https://github.com/opensandbox-group/fast-sandbox/pull/181): native RootfsOnly S3 snapshots, whose sets are chunked too.
 - [OpenSandbox#2422](https://github.com/opensandbox-group/OpenSandbox/pull/2422): chart value `runtime.transfer.*`.
 - FSEP-0001 (rootfs-only snapshots on the OverlayBD path).
